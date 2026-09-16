@@ -13,7 +13,7 @@ a web front-end for chat, the live job board, and per-agent transcripts.
 ```bash
 npm install
 npm test        # lint + typecheck + build + full test suite
-npm start       # serve GET /health on 127.0.0.1:7665 (config: ~/.gru-command/config.toml)
+npm start       # serve GET /health on 127.0.0.1:7665 — requires dist/ from npm test/build; run `npm run build` first if you skipped both
 ```
 
 Configuration reference: [docs/CONFIG.md](docs/CONFIG.md).

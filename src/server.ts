@@ -8,8 +8,9 @@ import { SERVICE_NAME, VERSION } from './version.js';
 /**
  * Three-signal liveness per the approved architecture amendments:
  * (a) /health reachable, (b) agent-session state + last activity,
- * (c) session-jsonl growth. Signals (b) and (c) are structurally present
- * but stubbed until the runtime adapter layer (E2) — declared, not faked.
+ * (c) session-jsonl growth. All three carry their structure with
+ * `stubbed: true` until the runtime adapter layer (E2) wires real values —
+ * declared, not faked.
  */
 export interface LivenessSignal {
   readonly value: unknown;
@@ -57,6 +58,11 @@ export interface ServiceHandle {
   stop(): Promise<void>;
 }
 
+/** Hard cap on request bodies; GET /health accepts none but drains politely. */
+const MAX_BODY_BYTES = 1_000_000;
+
+class RequestBodyTooLarge extends Error {}
+
 function jsonBody(res: import('node:http').ServerResponse, status: number, body: unknown): void {
   const payload = `${JSON.stringify(body)}\n`;
   res.writeHead(status, {
@@ -66,18 +72,25 @@ function jsonBody(res: import('node:http').ServerResponse, status: number, body:
   res.end(payload);
 }
 
-function readRequestBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolveBody, reject) => {
-    let data = '';
+function readRequestBody(req: IncomingMessage): Promise<void> {
+  return new Promise((resolveBody, rejectBody) => {
+    let seen = 0;
+    let rejected = false;
     req.on('data', (chunk: Buffer) => {
-      data += chunk.toString('utf-8');
-      if (data.length > 1_000_000) {
-        reject(new Error('request body too large'));
-        req.destroy();
+      if (rejected) return;
+      seen += chunk.length;
+      if (seen > MAX_BODY_BYTES) {
+        rejected = true;
+        // Keep draining so the client can observe the 413; the response
+        // below is written before any socket teardown.
+        rejectBody(new RequestBodyTooLarge());
       }
     });
-    req.on('end', () => resolveBody(data));
-    req.on('error', reject);
+    req.on('end', () => resolveBody());
+    req.on('error', (error: Error) => {
+      if (!rejected) rejectBody(error);
+      else resolveBody();
+    });
   });
 }
 
@@ -88,9 +101,11 @@ export function buildHealthPayload(
 ): HealthPayload {
   const liveness: LivenessBlock = {
     healthy: true,
-    note: 'agent_session and session_growth are stubbed until the runtime adapter layer (E2)',
+    note:
+      'all three signals are stubbed until the runtime adapter layer (E2); ' +
+      'health reachability is self-evident from this response itself',
     signals: {
-      health_reachable: { value: true, stubbed: false },
+      health_reachable: { value: true, stubbed: true },
       agent_session: { state: 'no-runtime', last_activity: null, stubbed: true },
       session_growth: { value: 'no-runtime', stubbed: true },
     },
@@ -117,44 +132,99 @@ export function buildHealthPayload(
   };
 }
 
+export interface RequestLogFields {
+  readonly method: string;
+  readonly path: string;
+  readonly status: number;
+  readonly duration_ms: number;
+  readonly request_id: string;
+}
+
 export function createService(
   config: GruCommandConfig,
   identity: InstallIdentity,
-  onRequest: (msg: string, fields?: Record<string, unknown>) => void = () => {},
+  onEvent: (msg: string, fields?: Record<string, unknown>) => void = () => {},
 ): { start(): Promise<ServiceHandle> } {
   const startedAt = process.hrtime.bigint();
   const server: HttpServer = createServer(
     (req: IncomingMessage, res: import('node:http').ServerResponse) => {
-      const url = new URL(req.url ?? '/', 'http://localhost');
+      const requestStarted = process.hrtime.bigint();
+      const requestId = randomUUID();
+      let path = '?';
+      try {
+        path = new URL(req.url ?? '/', 'http://localhost').pathname;
+      } catch {
+        jsonBody(res, 400, { error: 'bad_request', detail: 'malformed request target' });
+        onEvent('request', {
+          method: req.method,
+          path: '(malformed)',
+          status: 400,
+          duration_ms: Number(process.hrtime.bigint() - requestStarted) / 1_000_000,
+          request_id: requestId,
+        });
+        return;
+      }
       void (async () => {
-        if (url.pathname === '/health') {
+        if (path === '/health') {
           if (req.method !== 'GET' && req.method !== 'HEAD') {
+            req.resume();
             jsonBody(res, 405, { error: 'method_not_allowed', allowed: ['GET', 'HEAD'] });
-            return;
+            return { status: 405 };
           }
-          if (req.method === 'GET') {
-            await readRequestBody(req).catch(() => '');
+          try {
+            await readRequestBody(req);
+          } catch (error) {
+            if (error instanceof RequestBodyTooLarge) {
+              jsonBody(res, 413, { error: 'payload_too_large', limit_bytes: MAX_BODY_BYTES });
+              return { status: 413 };
+            }
+            throw error;
           }
           jsonBody(res, 200, buildHealthPayload(config, identity, startedAt));
-          return;
+          return { status: 200 };
         }
-        jsonBody(res, 404, { error: 'not_found', path: url.pathname });
-      })().catch((error: unknown) => {
-        onRequest('request failed', { error: String(error) });
-        if (!res.headersSent) {
-          jsonBody(res, 500, { error: 'internal_error' });
-        } else {
-          res.end();
-        }
-      });
+        req.resume();
+        jsonBody(res, 404, { error: 'not_found', path });
+        return { status: 404 };
+      })()
+        .then((outcome: { status: number }) => {
+          onEvent('request', {
+            method: req.method,
+            path,
+            status: outcome.status,
+            duration_ms: Number(process.hrtime.bigint() - requestStarted) / 1_000_000,
+            request_id: requestId,
+          });
+        })
+        .catch((error: unknown) => {
+          onEvent('request failed', {
+            method: req.method,
+            path,
+            error: String(error),
+            request_id: requestId,
+          });
+          if (!res.headersSent) {
+            jsonBody(res, 500, { error: 'internal_error' });
+          } else {
+            res.end();
+          }
+        });
     },
   );
 
   return {
     async start(): Promise<ServiceHandle> {
       await new Promise<void>((resolveListen, rejectListen) => {
-        server.once('error', rejectListen);
-        server.listen(config.server.port, config.server.host, () => resolveListen());
+        const onError = (error: Error) => rejectListen(error);
+        server.once('error', onError);
+        server.listen(config.server.port, config.server.host, () => {
+          // The listen-time rejection path is done; from here on, server
+          // errors are runtime events that must be logged, never swallowed
+          // by a settled promise.
+          server.off('error', onError);
+          server.on('error', (error: Error) => onEvent('server error', { error: String(error) }));
+          resolveListen();
+        });
       });
       const address = server.address();
       if (address === null || typeof address === 'string') {
@@ -164,12 +234,18 @@ export function createService(
         host: config.server.host,
         port: address.port,
         stop: async () => {
-          await new Promise<void>((resolveClose, rejectClose) => {
-            server.close((closeError?: Error | null) => {
-              if (closeError) rejectClose(closeError);
-              else resolveClose();
+          await new Promise<void>((resolveClose) => {
+            const drainTimeout = setTimeout(() => {
+              // Wedged or streaming connections: tear them down rather than
+              // hanging the shutdown forever.
+              server.closeAllConnections();
+            }, 2_500);
+            server.close(() => {
+              clearTimeout(drainTimeout);
+              resolveClose();
             });
-            server.closeAllConnections();
+            // Idle keep-alive sockets never end on their own.
+            server.closeIdleConnections();
           });
         },
       };

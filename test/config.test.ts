@@ -1,7 +1,7 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import {
   configPathFor,
   ConfigError,
@@ -10,8 +10,15 @@ import {
   loadConfig,
 } from '../src/config.js';
 
+const cleanupDirs: string[] = [];
+afterAll(() => {
+  for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
+});
+
 function tmpHome(): string {
-  return mkdtempSync(join(tmpdir(), 'gru-command-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'gru-command-test-'));
+  cleanupDirs.push(dir);
+  return dir;
 }
 
 function writeConfig(home: string, toml: string): void {
@@ -71,7 +78,7 @@ describe('config defaults', () => {
 
 describe('config round-trip', () => {
   it('loads a valid file with resolved values', () => {
-    const home = mkdtempSync(join(tmpdir(), 'gru-command-rt-'));
+    const home = tmpHome();
     writeConfig(home, VALID_CONFIG);
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     expect(config.sourceFile).toBe(configPathFor(home));
@@ -90,7 +97,7 @@ describe('config round-trip', () => {
   });
 
   it('a reloaded identical file yields an identical config', () => {
-    const home = mkdtempSync(join(tmpdir(), 'gru-command-rt2-'));
+    const home = tmpHome();
     writeConfig(home, VALID_CONFIG);
     const first = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     const second = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
@@ -165,5 +172,41 @@ describe('config fail-loud validation', () => {
     const home = tmpHome();
     writeConfig(home, '[server]\nhostname = "x"');
     expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/unknown key `hostname` in \[server\]/);
+  });
+
+  it('rejects a TOML datetime where a table is expected (no silent empty table)', () => {
+    const home = tmpHome();
+    writeConfig(home, 'server = 2024-01-01T00:00:00Z');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/server must be a table/);
+  });
+
+  it('rejects relative paths that never resolve to absolute', () => {
+    const home = tmpHome();
+    writeConfig(home, 'workspace_root = "relative/path"');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /workspace_root must resolve to an absolute path/,
+    );
+    const home2 = tmpHome();
+    writeConfig(home2, 'data_dir = "relative/data"');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home2 }, '/home/tester')).toThrow(
+      /data_dir must resolve to an absolute path/,
+    );
+  });
+
+  it('rejects data_dir nested inside workspace_root (SPEC ruling 7)', () => {
+    const home = tmpHome();
+    writeConfig(home, 'workspace_root = "/home/tester/code"\ndata_dir = "/home/tester/code/state"');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /data_dir must not live inside workspace_root/,
+    );
+    const home2 = tmpHome();
+    writeConfig(home2, 'workspace_root = "/home/tester/code"\ndata_dir = "/home/tester/code"');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home2 }, '/home/tester')).toThrow(
+      /data_dir must not live inside workspace_root/,
+    );
+  });
+
+  it('rejects an empty GRU_COMMAND_HOME like any non-absolute value', () => {
+    expect(() => instanceDirFromEnv({ GRU_COMMAND_HOME: '' })).toThrow(ConfigError);
   });
 });

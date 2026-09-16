@@ -29,13 +29,19 @@ export class Logger {
 
   log(level: LogLevel, msg: string, fields: Record<string, unknown> = {}): void {
     const record: LogRecord = {
+      // Reserved keys last: a call site can never overwrite ts/level/msg.
+      ...fields,
       ts: new Date().toISOString(),
       level,
       msg,
-      ...fields,
     };
     const line = `${JSON.stringify(record)}\n`;
-    appendFileSync(this.logFile, line, 'utf-8');
+    try {
+      appendFileSync(this.logFile, line, 'utf-8');
+    } catch {
+      // Disk-full or permissions must never take the serving process down;
+      // the stderr mirror below still carries the line.
+    }
     if (this.mirrorToStderr) {
       process.stderr.write(line);
     }

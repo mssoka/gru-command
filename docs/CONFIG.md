@@ -8,7 +8,7 @@ Gru Command keeps all instance state in one per-user directory — by default
 
 | Source | Rule |
 |---|---|
-| `GRU_COMMAND_HOME` env | If set (and absolute), that directory is the instance dir. Intended for tests and multi-instance setups. |
+| `GRU_COMMAND_HOME` env | If set (and absolute), that directory is the instance dir. Intended for tests and multi-instance setups. An empty or relative value is rejected at startup. |
 | Default | `~/.gru-command/` |
 
 The config file is always `<instance dir>/config.toml`.
@@ -23,6 +23,11 @@ The config file is always `<instance dir>/config.toml`.
   instead of letting a misconfigured field silently fall back to a default.
 - `~` and `~/…` expand to the user's home directory in path fields.
 - All path fields must resolve to absolute paths after expansion.
+- **`data_dir` must not live inside `workspace_root`** (and must not equal
+  it) — instance state stays out of the managed-repos tree (SPEC ruling 7).
+- Model policy: `[models].default` may be empty ("unset until the runtime
+  layer ships"), but any `[models.roles]` override must be a non-empty
+  string when present — an empty override is meaningless; omit it instead.
 
 ## Schema
 
@@ -85,8 +90,11 @@ example.
 | Unknown runtime id | `unknown runtime \`x\` (valid runtimes: pi, claude-code)` |
 | Unknown role | `unknown role \`x\` (valid roles: gru, silas, minion, perkins, bob)` |
 | Bad port | `server.port must be an integer between 0 and 65535 (0 = ephemeral)` |
-| Relative `GRU_COMMAND_HOME` | `GRU_COMMAND_HOME must be an absolute path` |
+| Relative `GRU_COMMAND_HOME` | `GRU_COMMAND_HOME must be an absolute path` (an empty value is rejected the same way) |
 | Path not absolute after expansion | `workspace_root must resolve to an absolute path` |
+| `data_dir` inside `workspace_root` | `data_dir must not live inside workspace_root … — SPEC ruling 7` |
+| TOML date where a table is expected | `server must be a table` (dates never pass as empty tables) |
+| Unreadable config file | `cannot read config file: EACCES — check permissions` (distinct from a TOML parse error) |
 
 ## What reads the config today
 

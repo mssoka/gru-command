@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { parse, type TomlPrimitive } from 'smol-toml';
 
 /** Roles are product-native and runtime-agnostic (SPEC ruling 15). */
@@ -58,7 +58,7 @@ const ENV_INSTANCE_DIR = 'GRU_COMMAND_HOME';
 
 export function instanceDirFromEnv(env: NodeJS.ProcessEnv = process.env): string {
   const override = env[ENV_INSTANCE_DIR];
-  if (override !== undefined && override !== '') {
+  if (override !== undefined) {
     if (!isAbsolute(override)) {
       throw new ConfigError(
         `${ENV_INSTANCE_DIR} must be an absolute path, got: ${override}`,
@@ -90,7 +90,12 @@ const TOP_LEVEL_KEYS = [
 ] as const;
 
 function isPlainObject(value: unknown): value is Record<string, TomlPrimitive> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  // TOML dates/times parse to Date-like class instances, not tables; without
+  // this check they slip through as silently-empty tables.
+  return Object.getPrototypeOf(value) === Object.prototype;
 }
 
 function requireString(
@@ -181,9 +186,21 @@ export function loadConfig(
 
   if (existsSync(file)) {
     sourceFile = file;
+    let text: string;
+    try {
+      text = readFileSync(file, 'utf-8');
+    } catch (error) {
+      const errno = (error as NodeJS.ErrnoException).code;
+      throw new ConfigError(
+        errno !== undefined
+          ? `cannot read config file: ${errno} — check permissions`
+          : `cannot read config file: ${(error as Error).message}`,
+        file,
+      );
+    }
     let raw: Record<string, TomlPrimitive>;
     try {
-      raw = parse(readFileSync(file, 'utf-8')) as Record<string, TomlPrimitive>;
+      raw = parse(text) as Record<string, TomlPrimitive>;
     } catch (error) {
       throw new ConfigError(
         `failed to parse TOML: ${(error as Error).message}`,
@@ -308,6 +325,16 @@ export function loadConfig(
     if (!isAbsolute(dir)) {
       throw new ConfigError(`${label} must resolve to an absolute path, got: ${dir}`, file, label);
     }
+  }
+
+  // SPEC ruling 7: instance state NEVER lives inside the workspace root.
+  const relData = relative(workspaceRoot, dataDir);
+  if (relData === '' || (!relData.startsWith('..') && !isAbsolute(relData))) {
+    throw new ConfigError(
+      `data_dir must not live inside workspace_root (workspace_root: ${workspaceRoot}, data_dir: ${dataDir}) — SPEC ruling 7`,
+      file,
+      'data_dir',
+    );
   }
 
   return {

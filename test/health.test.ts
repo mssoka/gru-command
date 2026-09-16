@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { loadConfig } from '../src/config.js';
+import { configPathFor, loadConfig } from '../src/config.js';
 import { loadOrCreateIdentity } from '../src/identity.js';
 import { createService, type ServiceHandle } from '../src/server.js';
 import { VERSION } from '../src/version.js';
@@ -19,6 +19,9 @@ function tmpHome(): string {
 }
 
 async function bootService(home: string): Promise<ServiceHandle> {
+  // Ephemeral port: the suite must never collide with a dev instance on
+  // the configured default port.
+  writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
   const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
   const identity = loadOrCreateIdentity(config.dataDir);
   const service = createService(config, identity);
@@ -59,7 +62,7 @@ describe('GET /health', () => {
         'session_growth',
       ]);
       expect(signals['health_reachable']?.['value']).toBe(true);
-      expect(signals['health_reachable']?.['stubbed']).toBe(false);
+      expect(signals['health_reachable']?.['stubbed']).toBe(true);
       expect(signals['agent_session']?.['stubbed']).toBe(true);
       expect(signals['agent_session']?.['last_activity']).toBeNull();
       expect(signals['session_growth']?.['stubbed']).toBe(true);
@@ -113,13 +116,57 @@ describe('GET /health', () => {
     }
   });
 
+  it('returns 400 for a malformed request target without dying', async () => {
+    const home = tmpHome();
+    const handle = await bootService(home);
+    try {
+      const { connect } = await import('node:net');
+      const statusLine = await new Promise<string>((resolveStatus, rejectStatus) => {
+        const sock = connect(handle.port, '127.0.0.1', () => {
+          sock.write('GET http://x:70000/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+        });
+        sock.once('data', (d: Buffer) => resolveStatus(d.toString('utf-8').split('\r\n')[0] ?? ''));
+        sock.once('error', rejectStatus);
+        setTimeout(() => rejectStatus(new Error('no response')), 5_000);
+      });
+      expect(statusLine).toContain('400');
+      // Service still alive afterwards:
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it('returns 413 for an oversized body on /health (or resets the uploader)', async () => {
+    const home = tmpHome();
+    const handle = await bootService(home);
+    try {
+      const outcome = await fetch(`http://127.0.0.1:${handle.port}/health`, {
+        method: 'GET',
+        headers: { 'content-length': String(2_000_000) },
+        body: 'x'.repeat(2_000_000),
+      }).then(
+        (r) => `status:${r.status}`,
+        () => 'upload-reset',
+      );
+      // 413 delivered, or the connection reset while the client streamed
+      // past the limit — either way the service must still be alive:
+      expect(['status:413', 'upload-reset']).toContain(outcome);
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+
   it('uptime resets across restarts (fresh hrtime baseline)', async () => {
     const home = tmpHome();
     const first = await bootService(home);
+    await new Promise((resolve) => setTimeout(resolve, 200));
     const firstBody = (await (
       await fetch(`http://127.0.0.1:${first.port}/health`)
     ).json()) as Record<string, number>;
-    await new Promise((resolve) => setTimeout(resolve, 50));
     const firstUptime = firstBody['uptime_ms']!;
     await first.stop();
 
@@ -130,6 +177,9 @@ describe('GET /health', () => {
     const secondUptime = secondBody['uptime_ms']!;
     await second.stop();
 
-    expect(secondUptime).toBeLessThan(firstUptime + 50);
+    // Boot 1 had a guaranteed 200ms head start; boot 2 answers within that
+    // window, so its uptime baseline is provably fresh.
+    expect(firstUptime).toBeGreaterThanOrEqual(200);
+    expect(secondUptime).toBeLessThan(200);
   });
 });
