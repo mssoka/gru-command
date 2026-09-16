@@ -1,0 +1,11 @@
+# Build output
+dist/
+# Dependencies
+node_modules/
+# Test coverage
+coverage/
+# Logs
+*.log
+# Local env — never commit secrets
+.env
+.env.*

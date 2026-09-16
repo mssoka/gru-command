@@ -1,0 +1,29 @@
+# Example configuration for Gru Command.
+# Copy to ~/.gru-command/config.toml and edit.
+# Every value below is generic — replace with your own.
+
+workspace_root = "~/code"          # where your managed repos live (e.g. repos named alpha, beta)
+data_dir = "~/.gru-command"        # per-instance state; never inside workspace_root
+
+[server]
+host = "127.0.0.1"                 # v1 default is local-only; LAN + pairing arrive later
+port = 7665
+
+[auth]
+token = "replace-with-a-random-string"
+
+[runtimes]
+default = "pi"                     # "pi" | "claude-code"
+
+[runtimes.roles]                   # optional per-role overrides
+gru = "pi"
+silas = "pi"
+minion = "claude-code"
+perkins = "pi"
+bob = "pi"
+
+[models]
+default = "provider/model-a"
+
+[models.roles]                     # optional per-role overrides
+gru = "provider/model-b"
