@@ -104,6 +104,11 @@ describe('graceful shutdown', () => {
       const boot = lines.find((line) => line.msg === 'boot');
       expect(boot?.['version']).toBeTypeOf('string');
       expect(boot?.['install_id']).toBeTypeOf('string');
+      // Per-request structured logging is exercised and asserted, not just wired:
+      const requestLine = lines.find((line) => line.msg === 'request');
+      expect(requestLine?.['status']).toBe(200);
+      expect(requestLine?.['level']).toBe('info');
+      expect(requestLine?.['request_id']).toBeTypeOf('string');
 
       const afterStop = await fetch(`http://127.0.0.1:${port}/health`).then(
         () => 'reachable',

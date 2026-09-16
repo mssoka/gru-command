@@ -1,13 +1,12 @@
 # Gru Command — Epics & Stories (v1)
 
 Epic order = build order; each epic ships a PR (pr_review=1) and a
-runnable increment on the dev machine. Model: glm-5.3 @ max (hold regime)
-unless ruled otherwise. Every story carries tests; every gate
-fails-before-fix where applicable.
+runnable increment on the dev machine. Every story carries tests; every
+gate fails-before-fix where applicable.
 
 ## E1 — Foundation & scaffold
 1. Repo scaffold: TypeScript/Node service package, build + test harness,
-   lint, README skeleton. (mssoka/gru-command, PRIVATE initially.)
+   lint, README skeleton. (private repo initially.)
 2. Config system: `~/.gru-command/config.toml` — workspace_root (default
    ~/code), data_dir, runtimes (default + per-role), models, auth token.
    Fail-loud validation; documented schema.

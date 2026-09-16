@@ -82,10 +82,9 @@ async function main(): Promise<number> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  const service = createService(config, identity, (msg, fields) => {
-    if (msg === 'request') logger.info(msg, fields);
-    else logger.warn(msg, fields);
-  });
+  const service = createService(config, identity, (level, msg, fields) =>
+    logger.log(level, msg, fields),
+  );
   state.handle = await service.start();
   const handle = state.handle;
   logger.info('listening', { host: handle.host, port: handle.port });

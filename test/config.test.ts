@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -208,5 +208,58 @@ describe('config fail-loud validation', () => {
 
   it('rejects an empty GRU_COMMAND_HOME like any non-absolute value', () => {
     expect(() => instanceDirFromEnv({ GRU_COMMAND_HOME: '' })).toThrow(ConfigError);
+  });
+
+  it('rejects empty model role overrides (default may be empty; overrides may not)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[models.roles]\ngru = ""');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(
+      /models.roles.gru must not be empty/,
+    );
+  });
+
+  it('rejects out-of-range and non-integer ports (all documented legs)', () => {
+    for (const leg of ['port = -1', 'port = 7.5', 'port = "8080"']) {
+      const home = tmpHome();
+      writeConfig(home, `[server]\n${leg}`);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(
+        /server.port must be an integer/,
+      );
+    }
+  });
+
+  it('reports an unreadable config file distinctly (EACCES, not a parse error)', () => {
+    const home = tmpHome();
+    writeConfig(home, 'workspace_root = "~/code"');
+    chmodSync(configPathFor(home), 0o000);
+    try {
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(
+        /cannot read config file: EACCES/,
+      );
+    } finally {
+      chmodSync(configPathFor(home), 0o644);
+    }
+  });
+
+  it('fails loud on a dangling config symlink instead of booting on defaults', () => {
+    const home = tmpHome();
+    symlinkSync(join(home, 'does-not-exist.toml'), configPathFor(home));
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/dangling symlink/);
+  });
+
+  it('rejects data_dir reaching inside workspace_root through a symlink (realpath check)', () => {
+    const realWorkspace = tmpHome();
+    const aliasParent = tmpHome();
+    const alias = join(aliasParent, 'ws-alias');
+    symlinkSync(realWorkspace, alias);
+    mkdirSync(join(alias, 'state')); // created through the alias = inside the real root
+    const home = tmpHome();
+    writeConfig(
+      home,
+      `workspace_root = "${realWorkspace}"\ndata_dir = "${join(alias, 'state')}"`,
+    );
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(
+      /data_dir must not live inside workspace_root/,
+    );
   });
 });

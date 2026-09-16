@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { GruCommandConfig } from './config.js';
 import type { InstallIdentity } from './identity.js';
+import type { LogLevel } from './logger.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
 /**
@@ -35,8 +36,7 @@ export interface HealthPayload {
   readonly service: string;
   readonly version: string;
   readonly request_id: string;
-  readonly uptime_ms: number;
-  readonly config: {
+  readonly uptime_ms: number;  readonly config: {
     readonly workspace_root: string;
     readonly data_dir: string;
   };
@@ -63,11 +63,17 @@ const MAX_BODY_BYTES = 1_000_000;
 
 class RequestBodyTooLarge extends Error {}
 
-function jsonBody(res: import('node:http').ServerResponse, status: number, body: unknown): void {
+function jsonBody(
+  res: import('node:http').ServerResponse,
+  status: number,
+  body: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
   const payload = `${JSON.stringify(body)}\n`;
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(payload),
+    ...extraHeaders,
   });
   res.end(payload);
 }
@@ -98,6 +104,7 @@ export function buildHealthPayload(
   config: GruCommandConfig,
   identity: InstallIdentity,
   startedAt: bigint,
+  requestId: string,
 ): HealthPayload {
   const liveness: LivenessBlock = {
     healthy: true,
@@ -113,7 +120,7 @@ export function buildHealthPayload(
   return {
     service: SERVICE_NAME,
     version: VERSION,
-    request_id: randomUUID(),
+    request_id: requestId,
     uptime_ms: Number(process.hrtime.bigint() - startedAt) / 1_000_000,
     config: {
       workspace_root: config.workspaceRoot,
@@ -132,18 +139,16 @@ export function buildHealthPayload(
   };
 }
 
-export interface RequestLogFields {
-  readonly method: string;
-  readonly path: string;
-  readonly status: number;
-  readonly duration_ms: number;
-  readonly request_id: string;
-}
+export type ServiceEvent = (
+  level: LogLevel,
+  msg: string,
+  fields?: Record<string, unknown>,
+) => void;
 
 export function createService(
   config: GruCommandConfig,
   identity: InstallIdentity,
-  onEvent: (msg: string, fields?: Record<string, unknown>) => void = () => {},
+  onEvent: ServiceEvent = () => {},
 ): { start(): Promise<ServiceHandle> } {
   const startedAt = process.hrtime.bigint();
   const server: HttpServer = createServer(
@@ -155,7 +160,7 @@ export function createService(
         path = new URL(req.url ?? '/', 'http://localhost').pathname;
       } catch {
         jsonBody(res, 400, { error: 'bad_request', detail: 'malformed request target' });
-        onEvent('request', {
+        onEvent('info', 'request', {
           method: req.method,
           path: '(malformed)',
           status: 400,
@@ -168,7 +173,12 @@ export function createService(
         if (path === '/health') {
           if (req.method !== 'GET' && req.method !== 'HEAD') {
             req.resume();
-            jsonBody(res, 405, { error: 'method_not_allowed', allowed: ['GET', 'HEAD'] });
+            jsonBody(
+              res,
+              405,
+              { error: 'method_not_allowed', allowed: ['GET', 'HEAD'] },
+              { allow: 'GET, HEAD' },
+            );
             return { status: 405 };
           }
           try {
@@ -180,7 +190,7 @@ export function createService(
             }
             throw error;
           }
-          jsonBody(res, 200, buildHealthPayload(config, identity, startedAt));
+          jsonBody(res, 200, buildHealthPayload(config, identity, startedAt, requestId));
           return { status: 200 };
         }
         req.resume();
@@ -188,7 +198,7 @@ export function createService(
         return { status: 404 };
       })()
         .then((outcome: { status: number }) => {
-          onEvent('request', {
+          onEvent('info', 'request', {
             method: req.method,
             path,
             status: outcome.status,
@@ -197,7 +207,7 @@ export function createService(
           });
         })
         .catch((error: unknown) => {
-          onEvent('request failed', {
+          onEvent('error', 'request failed', {
             method: req.method,
             path,
             error: String(error),
@@ -222,7 +232,7 @@ export function createService(
           // errors are runtime events that must be logged, never swallowed
           // by a settled promise.
           server.off('error', onError);
-          server.on('error', (error: Error) => onEvent('server error', { error: String(error) }));
+          server.on('error', (error: Error) => onEvent('error', 'server error', { error: String(error) }));
           resolveListen();
         });
       });

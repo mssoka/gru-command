@@ -138,23 +138,44 @@ describe('GET /health', () => {
     }
   });
 
-  it('returns 413 for an oversized body on /health (or resets the uploader)', async () => {
+  it('returns 413 to a raw client streaming an oversized body on /health', async () => {
     const home = tmpHome();
     const handle = await bootService(home);
     try {
-      const outcome = await fetch(`http://127.0.0.1:${handle.port}/health`, {
-        method: 'GET',
-        headers: { 'content-length': String(2_000_000) },
-        body: 'x'.repeat(2_000_000),
-      }).then(
-        (r) => `status:${r.status}`,
-        () => 'upload-reset',
-      );
-      // 413 delivered, or the connection reset while the client streamed
-      // past the limit — either way the service must still be alive:
-      expect(['status:413', 'upload-reset']).toContain(outcome);
+      const { connect } = await import('node:net');
+      const statusLine = await new Promise<string>((resolveStatus, rejectStatus) => {
+        const sock = connect(handle.port, '127.0.0.1', () => {
+          sock.write(
+            'GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2000000\r\n\r\n',
+          );
+          const chunk = Buffer.alloc(100_000, 97);
+          for (let i = 0; i < 11; i += 1) sock.write(chunk);
+        });
+        sock.once('data', (d: Buffer) => {
+          const line = d.toString('utf-8').split('\r\n')[0] ?? '';
+          sock.destroy();
+          resolveStatus(line);
+        });
+        sock.once('error', rejectStatus);
+        const timer = setTimeout(() => rejectStatus(new Error('no response within 5s')), 5_000);
+        timer.unref();
+      });
+      expect(statusLine).toContain('413');
+      // Service still alive afterwards:
       const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
       expect(res.status).toBe(200);
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it('serves HEAD /health with 200 and an empty body', async () => {
+    const home = tmpHome();
+    const handle = await bootService(home);
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`, { method: 'HEAD' });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('');
     } finally {
       await handle.stop();
     }

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { lstatSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { parse, type TomlPrimitive } from 'smol-toml';
@@ -161,6 +161,36 @@ function validateRuntimeId(value: unknown, file: string, field: string): Runtime
   return id as RuntimeId;
 }
 
+function isInsideOrEqual(outer: string, inner: string): boolean {
+  const rel = relative(outer, inner);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/**
+ * Distinguish "no config file" (boot on defaults) from a broken config
+ * path: a dangling symlink must fail loud, not silently vanish.
+ */
+function configState(file: string): 'present' | 'absent' {
+  try {
+    statSync(file);
+    return 'present';
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') {
+      throw new ConfigError(`cannot stat config file: ${code ?? String(error)}`, file);
+    }
+    try {
+      lstatSync(file);
+    } catch {
+      return 'absent';
+    }
+    throw new ConfigError(
+      'config path is a dangling symlink — fix or remove it (refusing to silently boot on defaults)',
+      file,
+    );
+  }
+}
+
 /**
  * Load and validate the instance configuration.
  *
@@ -184,7 +214,7 @@ export function loadConfig(
   let models: ModelsConfig = { default: '', roles: {} };
   let sourceFile: string | null = null;
 
-  if (existsSync(file)) {
+  if (configState(file) === 'present') {
     sourceFile = file;
     let text: string;
     try {
@@ -328,8 +358,17 @@ export function loadConfig(
   }
 
   // SPEC ruling 7: instance state NEVER lives inside the workspace root.
-  const relData = relative(workspaceRoot, dataDir);
-  if (relData === '' || (!relData.startsWith('..') && !isAbsolute(relData))) {
+  // A purely lexical check is bypassable by symlinks and case-insensitive
+  // filesystems — compare the realpath pair too when both paths exist on
+  // disk (fresh installs without the directories fall back to lexical).
+  const insideLexically = isInsideOrEqual(workspaceRoot, dataDir);
+  let insideReally = false;
+  try {
+    insideReally = isInsideOrEqual(realpathSync(workspaceRoot), realpathSync(dataDir));
+  } catch {
+    // one or both paths not on disk yet — lexical verdict stands
+  }
+  if (insideLexically || insideReally) {
     throw new ConfigError(
       `data_dir must not live inside workspace_root (workspace_root: ${workspaceRoot}, data_dir: ${dataDir}) — SPEC ruling 7`,
       file,

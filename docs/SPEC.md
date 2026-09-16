@@ -59,16 +59,8 @@ integrated. Other users can install it on their laptops from GitHub.
     consolidation) — defined by prompt + skill set + permissions,
     runtime-agnostic.
 
-## Our instance (ops note, not product architecture)
-
-The current herdr factory keeps running untouched during the build. When
-the product reaches parity we adopt it as an instance via config
-(`workspace_root = ~/code`, fresh instance state in `~/.gru-command/`)
-and stop using herdr. Adoption, not migration. Legacy `_bmad-output`
-stays in place as untouched archive.
-
 ## Sources
 
-- Product brief + design system (lavish, approved): .lavish/gru-command-brief.html
-- Architecture rev 2 (lavish, approved): .lavish/gru-command-architecture.html
-- Silas amendments: .lavish/gru-command-silas-amendments.md
+Approved via structured review rounds (product brief, architecture rev 2,
+and review amendments), 2026-09-15/16. Provenance records live outside
+this repo.
