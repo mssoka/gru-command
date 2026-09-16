@@ -99,8 +99,6 @@ export type ServerFrame =
   | ErrorFrame
   | ReplayedUserFrame;
 
-export type AnyFrame = ClientFrame | ServerFrame;
-
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -172,7 +170,7 @@ export function parseServerFrame(raw: unknown): ServerFrame | null {
         ? { type: 'user', text: value.text, client_msg_id: value.client_msg_id, seq: value.seq }
         : null;
     case 'error': {
-      if (typeof value.message !== 'string') return null;
+      if (!isNonEmptyString(value.message)) return null;
       const frame: ErrorFrame = { type: 'error', message: value.message };
       return {
         ...frame,

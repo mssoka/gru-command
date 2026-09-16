@@ -26,7 +26,7 @@ export type ConnectionState =
   | 'reconnecting'
   | 'offline';
 
-export type MessageStatus = 'queued' | 'sent' | 'acked' | 'incomplete';
+export type MessageStatus = 'queued' | 'sent' | 'acked';
 
 export interface ChatMessage {
   readonly client_msg_id: string;
@@ -76,6 +76,10 @@ export type WebSocketCtor = new (url: string) => SocketLike;
 
 const OUTBOX_KEY = 'gru-outbox';
 const SOCKET_OPEN = 1;
+/** Guard against a wedge pasting unbounded text into storage + frames. */
+export const MAX_MESSAGE_CHARS = 4_000;
+/** A socket that never finishes handshaking is treated as down. */
+const CONNECT_TIMEOUT_MS = 10_000;
 
 const BACKOFF_MS = [800, 1_600, 3_200, 6_400, 12_000] as const;
 
@@ -117,6 +121,11 @@ export class ChatClient {
 
   connect(): void {
     this.stopped = false;
+    // Defensive: a second connect must not leak the old socket or timers.
+    for (const timer of this.timers) clearTimeout(timer);
+    this.timers.clear();
+    this.socket?.close();
+    this.socket = null;
     // Surface restored queued messages so the UI renders them as bubbles.
     for (const id of this.outbox) {
       const message = this.messages.get(id);
@@ -131,11 +140,18 @@ export class ChatClient {
     this.timers.clear();
     this.socket?.close();
     this.socket = null;
+    // onclose's stale-socket check returns early after nulling, so the
+    // terminal transition is made here explicitly.
+    this.setState('idle');
   }
 
-  /** Queue-or-send a user message. Never throws; never drops text. */
+  /** Queue-or-send a user message. Throws on empty/oversized text. */
   send(text: string): ChatMessage {
     const trimmed = text.trim();
+    if (trimmed === '') throw new Error('empty message');
+    if (trimmed.length > MAX_MESSAGE_CHARS) {
+      throw new Error(`message too long (${trimmed.length} > ${MAX_MESSAGE_CHARS} chars)`);
+    }
     const message: ChatMessage = {
       client_msg_id: this.id(),
       text: trimmed,
@@ -168,7 +184,16 @@ export class ChatClient {
     const socket = new ctor(`${scheme}://${this.options.host}${WS_PATH}`);
     this.socket = socket;
 
+    const connectTimer = setTimeout(() => {
+      this.timers.delete(connectTimer);
+      // Handshake never completed: treat as down, let onclose drive retry.
+      socket.close();
+    }, CONNECT_TIMEOUT_MS);
+    this.timers.add(connectTimer);
+
     socket.onopen = () => {
+      clearTimeout(connectTimer);
+      this.timers.delete(connectTimer);
       this.setState('authenticating');
       const auth: Record<string, unknown> = { type: 'auth', token: this.options.token };
       if (this.lastSeenSeq > 0) auth.last_seen_seq = this.lastSeenSeq;
@@ -202,13 +227,30 @@ export class ChatClient {
   }
 
   private handleFrame(socket: SocketLike, frame: ServerFrame): void {
+    if (socket !== this.socket) return; // stale socket from a prior attempt
     if (frame.type === 'auth_ok') {
+      // Server restarted with a truncated/reset log: its high-water mark is
+      // below what we already saw — resync with a full replay instead of
+      // deduping every future frame into silence.
+      if (frame.seq < this.lastSeenSeq) {
+        this.lastSeenSeq = 0;
+        // Detach before closing so onclose treats it as stale and doesn't
+        // schedule a second reconnect.
+        this.socket = null;
+        socket.close();
+        this.setState('offline');
+        this.scheduleReconnect();
+        return;
+      }
       this.highWaterSeq = frame.seq;
       this.attempts = 0;
       // Unacked messages from a previous connection are re-queued; the
       // server dedups re-received user frames by client_msg_id and re-acks.
       for (const message of this.messages.values()) {
-        if (message.status === 'sent') message.status = 'queued';
+        if (message.status === 'sent') {
+          message.status = 'queued';
+          this.events.messageStatus({ ...message });
+        }
       }
       this.replaying = true;
       this.events.replayStart(this.lastSeenSeq === 0);
@@ -238,6 +280,7 @@ export class ChatClient {
     }
 
     if (frame.type === 'error') {
+      if (typeof frame.seq === 'number') this.bumpSeq(frame.seq);
       this.events.frame(frame);
       return;
     }

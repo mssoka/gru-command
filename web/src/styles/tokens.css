@@ -5,6 +5,8 @@
  */
 
 :root {
+  color-scheme: light;
+
   /* Surfaces & ink */
   --ink: #22304a;
   --paper: #faf6ef;
@@ -47,6 +49,8 @@
 }
 
 .dark {
+  color-scheme: dark;
+
   --ink: #e8ecf4;
   --paper: #141a2b;
   --card: #1c2438;

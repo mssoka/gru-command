@@ -25,21 +25,24 @@ export class ChatView {
   private mobile = window.matchMedia(MOBILE_QUERY);
 
   constructor(onSend: (text: string) => void) {
-    for (const formId of ['chat-form']) {
-      mustGet<HTMLFormElement>(formId).addEventListener('submit', (event) => {
-        event.preventDefault();
-        const input = mustGet<HTMLInputElement>('chat-input');
-        const text = input.value.trim();
-        if (text === '') return;
-        input.value = '';
-        onSend(text);
-      });
-    }
+    mustGet<HTMLFormElement>('chat-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      const input = mustGet<HTMLInputElement>('chat-input');
+      const text = input.value.trim();
+      if (text === '') return;
+      input.value = '';
+      onSend(text);
+    });
 
     this.bubble.addEventListener('click', () => this.setSheetOpen(true));
-    mustGet<HTMLElement>('chat-sheet-grip').addEventListener('click', () =>
-      this.setSheetOpen(false),
-    );
+    const grip = mustGet<HTMLElement>('chat-sheet-grip');
+    grip.addEventListener('click', () => this.setSheetOpen(false));
+    grip.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        this.setSheetOpen(false);
+      }
+    });
 
     const place = (): void => {
       if (this.mobile.matches) {
@@ -53,10 +56,14 @@ export class ChatView {
     };
     this.mobile.addEventListener('change', place);
     place();
+    // Sheet starts closed: inert until first opened.
+    this.sheet.toggleAttribute('inert', this.sheet.dataset.open !== 'true');
   }
 
   private setSheetOpen(open: boolean): void {
     this.sheet.dataset.open = String(open);
+    // A closed sheet is visually hidden AND unfocusable/unannounced.
+    this.sheet.toggleAttribute('inert', !open);
     if (open) {
       this.unread = 0;
       this.bubble.dataset.unread = '0';
@@ -115,13 +122,18 @@ export class ChatView {
         if (frame.state === 'start') {
           this.activeTool?.remove();
           const line = el('div', 'tool-line tool-line--active', `⚙️ ${frame.name}`);
+          line.dataset.toolName = frame.name;
           this.log.append(line);
           this.activeTool = line;
         } else {
-          if (this.activeTool !== null) {
+          // Only settle the line whose name matches; a stray end for an
+          // unknown tool renders standalone instead of cross-labeling.
+          if (this.activeTool !== null && this.activeTool.dataset.toolName === frame.name) {
             this.activeTool.classList.remove('tool-line--active');
             this.activeTool.textContent = `⚙️ ${frame.name} · done`;
             this.activeTool = null;
+          } else if (this.activeTool === null) {
+            this.log.append(el('div', 'tool-line', `⚙️ ${frame.name} · done`));
           }
         }
         this.scrollToEnd();
@@ -186,5 +198,7 @@ export function renderConnectionDot(state: ConnectionState): void {
   else if (state === 'connecting' || state === 'authenticating' || state === 'reconnecting')
     dot.classList.add('conn-dot--busy');
   else dot.classList.add('conn-dot--down');
-  dot.title = `socket: ${state}`;
+  const label = `socket: ${state}`;
+  dot.title = label;
+  dot.setAttribute('aria-label', label);
 }

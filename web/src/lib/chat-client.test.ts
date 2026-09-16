@@ -117,6 +117,7 @@ interface Harness {
   statuses: ChatMessage[];
   states: ConnectionState[];
   fatals: string[];
+  replayStarts: boolean[];
   replayEnds: number;
 }
 
@@ -125,6 +126,7 @@ function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Ha
   const statuses: ChatMessage[] = [];
   const states: ConnectionState[] = [];
   const fatals: string[] = [];
+  const replayStarts: boolean[] = [];
   let replayEnds = 0;
   const client = new ChatClient(
     {
@@ -139,7 +141,7 @@ function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Ha
       connection: (s) => states.push(s),
       messageStatus: (m) => statuses.push(m),
       frame: (f) => frames.push(f),
-      replayStart: () => {},
+      replayStart: (full) => replayStarts.push(full),
       replayEnd: () => {
         replayEnds += 1;
       },
@@ -152,6 +154,7 @@ function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Ha
     statuses,
     states,
     fatals,
+    replayStarts,
     get replayEnds() {
       return replayEnds;
     },
@@ -186,6 +189,8 @@ describe('ChatClient', () => {
     clients.push(h.client);
     h.client.connect();
     await waitFor(() => h.client.getState() === 'open');
+    // Fresh connect = full replay request.
+    expect(h.replayStarts).toEqual([true]);
     h.client.send('hello boss');
     await waitFor(() => h.statuses.some((m) => m.status === 'acked'));
     const order = h.statuses.map((m) => m.status);
@@ -262,6 +267,9 @@ describe('ChatClient', () => {
     expect(h.states).toContain('offline');
     await waitFor(() => h.client.getState() === 'open', 15_000);
     expect(h.states).toEqual(expect.arrayContaining(['connecting', 'open', 'offline']));
+    // Same-client reconnect = incremental replay (full === false), so the
+    // UI must NOT wipe the log.
+    expect(h.replayStarts).toEqual([true, false]);
 
     // Nothing new happened while down → zero frames replayed.
     await new Promise((r) => setTimeout(r, 200));
@@ -281,6 +289,43 @@ describe('ChatClient', () => {
     expect(h.fatals[0]).toContain('unauthorized');
     await new Promise((r) => setTimeout(r, 300));
     expect(h.client.getState()).not.toBe('open');
+  });
+
+  it('stop() settles the client to idle', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open');
+    h.client.stop();
+    expect(h.client.getState()).toBe('idle');
+  });
+
+  it('send() rejects empty and oversized text without queueing', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    expect(() => h.client.send('   ')).toThrow('empty message');
+    expect(() => h.client.send('x'.repeat(4_001))).toThrow('too long');
+    expect(h.client.getMessages().length).toBe(0);
+  });
+
+  it('server log reset is detected and resynced with a full replay', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open');
+    h.client.send('before reset');
+    await waitFor(() => h.frames.some((f) => f.type === 'turn' && f.state === 'end'));
+
+    // Simulate E4-style log truncation: counter restarts at zero.
+    server.log.length = 0;
+    server.seq = 0;
+    server.dropAll();
+
+    await waitFor(() => h.client.getState() === 'open', 15_000);
+    h.client.send('after reset');
+    await waitFor(() =>
+      h.frames.some((f) => f.type === 'delta' && f.text.includes('after reset')),
+    );
   });
 
   it('non-fatal server errors surface as frames, session stays open', async () => {

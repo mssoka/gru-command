@@ -91,7 +91,20 @@ everything. The client dedupes by `seq`/`client_msg_id`; re-sent user
 frames (unacked across a drop) are deduped server-side and re-acked.
 
 **Mock control plane (tests):** `POST /__reset` on the mock port clears
-the frame log and sequence — keeps e2e snapshots hermetic.
+the frame log and sequence — keeps e2e snapshots hermetic. `POST
+/__drop` terminates every connected socket — drives degraded-mode e2e.
+
+**Client guards:** messages are capped at 4 000 chars (`MAX_MESSAGE_CHARS`,
+mirrored by the composer's `maxlength`); a socket that never finishes
+handshaking is abandoned after 10 s; a server whose `auth_ok.seq`
+arrives below the client's high-water mark (truncated store) triggers an
+automatic full-replay resync.
+
+**E4 protocol considerations (deferred, not gates):** no heartbeat/
+keepalive frames yet (a silently dead socket only surfaces via TCP
+timeout — consider ping frames or an activity watchdog in E4); the
+pairing token persists indefinitely in `localStorage` (`gru-pairing-token`)
+— lifetime/rotation belongs to the E4/E9 token flow.
 
 **Never lose a typed word:** unacked messages persist in `localStorage`
 (`gru-outbox`, id + text), render as queued bubbles, and flush in order

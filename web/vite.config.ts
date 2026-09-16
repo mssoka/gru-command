@@ -22,6 +22,7 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    sourcemap: true,
+    // No public sourcemaps on the production bundle; vite dev has its own.
+    sourcemap: false,
   },
 });

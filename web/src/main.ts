@@ -13,7 +13,7 @@ import { clearBanner, showBanner } from './ui/banner.js';
 import { ChatView, renderConnectionDot } from './ui/chat.js';
 import { mustGet } from './ui/dom.js';
 import { initPairing, showPairingError } from './ui/pairing.js';
-import { initSettings } from './ui/settings.js';
+import { initSettings, THEME_EVENT } from './ui/settings.js';
 
 const TOKEN_KEY = 'gru-pairing-token';
 
@@ -55,17 +55,29 @@ function startChat(token: string): void {
   showView('chat-view');
   chatView ??= new ChatView((text) => client?.send(text));
   client?.stop();
+  let replaying = false;
   client = new ChatClient(
     { token, host: location.host, secure, storage },
     {
       connection: onConnection,
       messageStatus: (message) => chatView?.upsertMessage(message),
-      frame: (frame: LoggedFrame) => chatView?.addFrame(frame, true),
+      frame: (frame: LoggedFrame) => chatView?.addFrame(frame, !replaying),
       replayStart: (full) => {
-        if (full) chatView?.reset();
+        replaying = true;
+        if (full) {
+          chatView?.reset();
+          // reset() wipes the DOM — re-render locally-queued bubbles so a
+          // never-delivered typed word stays visible during replay.
+          for (const message of client?.getMessages() ?? []) {
+            if (message.status !== 'acked') chatView?.upsertMessage({ ...message });
+          }
+        }
       },
-      replayEnd: () => {},
+      replayEnd: () => {
+        replaying = false;
+      },
       fatal: (message) => {
+        clearBanner('conn');
         storage.removeItem(TOKEN_KEY);
         showView('pairing-view');
         showPairingError(`Pairing failed: ${message}`);
@@ -80,12 +92,16 @@ function pair(token: string): void {
   startChat(token);
 }
 
-// Theme toggle in the nav mirrors the settings one.
+// Theme toggles stay in sync via a window event (nav + settings).
+function applyThemeChoice(theme: 'light' | 'dark'): void {
+  setTheme(storage, theme);
+  applyTheme(document, theme);
+  mustGet<HTMLButtonElement>('theme-toggle').textContent = theme === 'dark' ? '☀️' : '🌙';
+  window.dispatchEvent(new CustomEvent(THEME_EVENT, { detail: theme }));
+}
+
 mustGet<HTMLButtonElement>('theme-toggle').addEventListener('click', () => {
-  const next = getTheme(storage) === 'dark' ? 'light' : 'dark';
-  setTheme(storage, next);
-  applyTheme(document, next);
-  mustGet<HTMLButtonElement>('theme-toggle').textContent = next === 'dark' ? '☀️' : '🌙';
+  applyThemeChoice(getTheme(storage) === 'dark' ? 'light' : 'dark');
 });
 mustGet<HTMLButtonElement>('theme-toggle').textContent =
   getTheme(storage) === 'dark' ? '☀️' : '🌙';

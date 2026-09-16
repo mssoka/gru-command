@@ -66,6 +66,30 @@ test('mobile viewport: chat is a corner bubble that opens a sheet', async ({ pag
   await expect(reply).not.toHaveClass(/msg--streaming/);
 });
 
+test('wrong token: inline error, stays on pairing across reload', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#pairing-view')).toBeVisible();
+  await page.locator('#pair-token').fill('definitely-wrong');
+  await page.locator('#pair-submit').click();
+  await expect(page.locator('#pair-error')).toBeVisible();
+  await expect(page.locator('#pair-error')).toContainText('unauthorized');
+  await expect(page.locator('#pairing-view')).toBeVisible();
+  // The bad token must not stick: a reload returns to pairing, not a dead chat.
+  await page.reload();
+  await expect(page.locator('#pairing-view')).toBeVisible();
+  await expect(page.locator('#chat-view')).toBeHidden();
+});
+
+test('socket drop shows a degraded banner that clears on recovery', async ({ page }) => {
+  await pair(page);
+  await page.request.post('http://localhost:8788/__drop');
+  await expect(page.locator('#banners .banner')).toBeVisible();
+  // The client reconnects by itself; the banner clears when the socket opens.
+  await expect(page.locator('#banners .banner')).toBeHidden({ timeout: 15_000 });
+  // And chat still works after recovery.
+  await sendAndWaitReply(page, 'post-drop message');
+});
+
 test.describe('themes', () => {
   // Hermetic snapshots: reset the mock log so prior tests' history
   // cannot leak into the frame.

@@ -58,10 +58,10 @@
 
     <div id="chat-main-mount" class="reveal">
       <section id="chat-view" class="pp-card chat-panel chat-panel--desktop" hidden>
-        <div class="chat-log" id="chat-log" aria-live="polite"></div>
+        <div class="chat-log" id="chat-log"></div>
         <form class="chat-compose" id="chat-form">
           <input class="pp-input" id="chat-input" placeholder="Tell Gru what you need, boss…"
-                 autocomplete="off" aria-label="Message Gru">
+                 autocomplete="off" maxlength="4000" aria-label="Message Gru">
           <button class="pp-btn" type="submit" id="chat-send">Send 🚀</button>
         </form>
       </section>
@@ -72,7 +72,7 @@
     💬<span class="chat-bubble__badge" id="chat-badge">0</span>
   </button>
   <div class="chat-sheet" id="chat-sheet" data-open="false">
-    <div class="chat-sheet__grip" id="chat-sheet-grip" role="button" aria-label="Close chat"></div>
+    <div class="chat-sheet__grip" id="chat-sheet-grip" role="button" tabindex="0" aria-label="Close chat"></div>
     <div id="chat-sheet-mount"></div>
   </div>
 

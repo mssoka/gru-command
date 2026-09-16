@@ -13,7 +13,14 @@ const KIND_CLASS: Record<BannerKind, string> = {
 const shown = new Map<string, HTMLElement>();
 
 export function showBanner(key: string, kind: BannerKind, message: string): void {
-  if (shown.has(key)) return;
+  const existing = shown.get(key);
+  if (existing) {
+    // Same condition, new wording (e.g. reconnecting → offline): update.
+    const textNode = existing.lastElementChild;
+    if (textNode) textNode.textContent = message;
+    existing.className = KIND_CLASS[kind];
+    return;
+  }
   const node = el('div', KIND_CLASS[kind]);
   node.setAttribute('role', 'status');
   node.dataset.bannerKey = key;
@@ -29,8 +36,4 @@ export function clearBanner(key: string): void {
     node.remove();
     shown.delete(key);
   }
-}
-
-export function clearAllBanners(): void {
-  for (const key of [...shown.keys()]) clearBanner(key);
 }

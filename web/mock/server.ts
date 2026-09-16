@@ -44,9 +44,15 @@ function send(socket: WebSocket, frame: ServerFrame): void {
 }
 
 function sendError(socket: WebSocket, message: string, fatal: boolean): void {
-  const frame: ErrorFrame = fatal
-    ? { type: 'error', message, fatal: true }
-    : { type: 'error', message, seq: nextSeq() };
+  // Every seq-consuming frame is logged: the counter must always equal the
+  // log's high-water mark, or replay-end arithmetic wedges for clients.
+  let frame: ErrorFrame;
+  if (fatal) {
+    frame = { type: 'error', message, fatal: true };
+  } else {
+    frame = { type: 'error', message, seq: nextSeq() };
+    record(frame);
+  }
   send(socket, frame);
 }
 
@@ -61,23 +67,43 @@ function scriptedReply(socket: WebSocket, userText: string): void {
   emit({ type: 'tool', name: 'mock-echo', state: 'start', seq: nextSeq() });
 
   let index = 0;
+  let toolEnded = false;
+  let settled = false;
   const timer = setInterval(() => {
     if (socket.readyState !== socket.OPEN) {
-      clearInterval(timer);
+      finishAborted();
       return;
     }
-    if (index === 2) {
+    if (index === 2 && !toolEnded) {
+      toolEnded = true;
       emit({ type: 'tool', name: 'mock-echo', state: 'end', seq: nextSeq() });
     }
     const chunk = tokens[index];
     if (chunk === undefined) {
+      settled = true;
       clearInterval(timer);
+      socket.off('close', finishAborted);
       emit({ type: 'turn', state: 'end', seq: nextSeq() });
       return;
     }
     emit({ type: 'delta', text: chunk, seq: nextSeq() });
     index += 1;
   }, DELTA_INTERVAL_MS);
+
+  socket.once('close', finishAborted);
+
+  // A dropped socket must not leave an unterminated turn in the log:
+  // closing frames are recorded (not sent) so replays see a settled turn.
+  function finishAborted(): void {
+    if (settled) return;
+    settled = true;
+    clearInterval(timer);
+    if (!toolEnded) {
+      toolEnded = true;
+      record({ type: 'tool', name: 'mock-echo', state: 'end', seq: nextSeq() });
+    }
+    record({ type: 'turn', state: 'end', seq: nextSeq() });
+  }
 
   function emit(frame: LoggedFrame): void {
     record(frame);
@@ -86,7 +112,14 @@ function scriptedReply(socket: WebSocket, userText: string): void {
 }
 
 const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
-  // Dev control plane (tests): POST /__reset clears the frame log.
+  // Dev control plane (tests): POST /__reset clears the frame log;
+  // POST /__drop terminates every connected socket.
+  if (req.method === 'POST' && req.url === '/__drop') {
+    for (const socket of server.clients) socket.terminate();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}\n');
+    return;
+  }
   if (req.method === 'POST' && req.url === '/__reset') {
     log.length = 0;
     seq = 0;
@@ -129,7 +162,9 @@ server.on('connection', (socket) => {
         return;
       }
       authed = true;
-      const lastSeen = frame.last_seen_seq ?? 0;
+    const lastSeen = frame.last_seen_seq ?? 0;
+      // auth_ok.seq is the log high-water mark; because every seq-consuming
+      // frame is logged, counter === max logged seq at all times.
       send(socket, { type: 'auth_ok', seq });
       for (const logged of log) {
         const frameSeq = 'seq' in logged && typeof logged.seq === 'number' ? logged.seq : 0;
@@ -158,11 +193,11 @@ function handleUserFrame(socket: WebSocket, frame: UserFrame): void {
       logged.type === 'user' && logged.client_msg_id === frame.client_msg_id,
   );
   if (prior !== undefined) {
-    send(socket, { type: 'ack', client_msg_id: frame.client_msg_id, seq: nextSeq() });
+    send(socket, record({ type: 'ack', client_msg_id: frame.client_msg_id, seq: nextSeq() }));
     return;
   }
   record({ type: 'user', text: frame.text, client_msg_id: frame.client_msg_id, seq: nextSeq() });
-  send(socket, { type: 'ack', client_msg_id: frame.client_msg_id, seq: nextSeq() });
+  send(socket, record({ type: 'ack', client_msg_id: frame.client_msg_id, seq: nextSeq() }));
   scriptedReply(socket, frame.text);
 }
 
