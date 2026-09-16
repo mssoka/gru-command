@@ -69,13 +69,24 @@ async function main(): Promise<number> {
     const handle = state.handle;
     void Promise.resolve()
       .then(async () => {
-        // Release session locks and persist the size snapshot BEFORE the
-        // process goes away — the next boot's growth detection depends on
-        // the snapshot reflecting what this process last saw (SPEC ruling 12).
-        if (state.registry !== undefined) await state.registry.dispose();
+        // Each stage isolated: a failure in one must never skip lock
+        // release or the final snapshot — the next boot's growth detection
+        // depends on the snapshot reflecting what this process last saw
+        // (SPEC ruling 12).
+        if (state.registry !== undefined) {
+          try {
+            await state.registry.dispose();
+          } catch (error) {
+            logger.error('registry dispose failed', { error: String(error) });
+          }
+        }
         if (state.store !== undefined) {
-          state.store.dispose();
-          state.store.persistSnapshot();
+          try {
+            state.store.dispose();
+            state.store.persistSnapshot();
+          } catch (error) {
+            logger.error('session store shutdown failed', { error: String(error) });
+          }
         }
         await handle.stop();
       })

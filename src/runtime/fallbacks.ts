@@ -13,11 +13,13 @@ import type {
 /**
  * Interface-layer capability fallbacks (EPICS E2 story 4).
  *
- * steer-unable runtimes (capabilities.steer === 'queued') get steer()
- * transparently queued-until-idle: the text is held while a turn is live
- * and delivered as a fresh prompt once the agent is idle. Callers observe
- * a `queued` event and steer() resolves only after delivery completes —
- * the same contract a native-steer runtime offers.
+ * steer-unable runtimes (capabilities.steer === 'queued') get the uniform
+ * never-interleave contract: while a turn is live, prompt() AND steer()
+ * are held (event `queued`, reason 'steer-unable') and delivered in
+ * arrival order once the agent reports a non-busy state (idle OR error —
+ * an error-ended turn must never strand the queue). Callers observe the
+ * queue event and their call resolves only after delivery — the same
+ * no-interleaving guarantee every runtime offers its users.
  */
 export function withFallbacks(runtime: AgentRuntime): AgentRuntime {
   if (runtime.capabilities.steer === 'native') return runtime;
@@ -56,7 +58,7 @@ class FallbackHandle implements AgentHandle {
   private disposed = false;
   private readonly steerQueue: {
     text: string;
-    owner: string;
+    options: PromptOptions;
     resolve: () => void;
     reject: (error: Error) => void;
   }[] = [];
@@ -71,28 +73,55 @@ class FallbackHandle implements AgentHandle {
 
   private onInnerEvent(event: RuntimeEvent): void {
     if (event.type === 'state') {
-      this.busy = event.state === 'streaming' || event.state === 'spawning';
-      if (event.state === 'idle' && this.steerQueue.length > 0) void this.pump();
+      this.busy = isStreamingState(event.state);
+      // Any non-busy state drains: an idle turn is the normal case; an
+      // error-ended turn must not strand queued callers either.
+      if (!this.busy && this.steerQueue.length > 0) void this.pump();
+      if (event.state === 'disposed') this.rejectQueue('agent session disposed');
     }
     this.emit(event);
   }
 
-  async prompt(text: string, options?: PromptOptions): Promise<void> {
+  async prompt(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
-    return this.inner.prompt(text, options);
+    if (this.busy) {
+      return this.enqueue(text, options);
+    }
+    this.busy = true; // synchronous: state events arrive later (E3)
+    return this.deliverPrompt(text, options);
   }
 
   steer(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
-    if (!this.busy) {
-      // Nothing live to steer — a steering message against an idle agent is
-      // just a prompt on every runtime.
-      return this.inner.prompt(text, options);
+    if (this.busy) {
+      return this.enqueue(text, options);
     }
+    this.busy = true; // synchronous: state events arrive later (E3)
+    // Nothing live to steer — a steering message against an idle agent is
+    // just a prompt on every runtime.
+    return this.deliverPrompt(text, options);
+  }
+
+  private async deliverPrompt(text: string, options: PromptOptions): Promise<void> {
+    try {
+      await this.inner.prompt(text, options);
+    } catch (error) {
+      this.busy = false;
+      void this.pump();
+      throw error;
+    }
+    // prompt() resolves only after the turn completes — clear busy even
+    // if the inner runtime never emits state events (they are not
+    // guaranteed by the fallback contract alone).
+    this.busy = false;
+    void this.pump();
+  }
+
+  private enqueue(text: string, options: PromptOptions): Promise<void> {
     const owner = options.owner ?? 'default';
     this.emit({ type: 'queued', reason: 'steer-unable', owner });
     return new Promise<void>((resolve, reject) => {
-      this.steerQueue.push({ text, owner, resolve, reject });
+      this.steerQueue.push({ text, options, resolve, reject });
     });
   }
 
@@ -114,11 +143,15 @@ class FallbackHandle implements AgentHandle {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.rejectQueue('agent session disposed before queued steer was delivered');
+    await this.inner.dispose();
+  }
+
+  private rejectQueue(message: string): void {
     const drained = this.steerQueue.splice(0);
     for (const item of drained) {
-      item.reject(new Error('agent session disposed before queued steer was delivered'));
+      item.reject(new Error(message));
     }
-    await this.inner.dispose();
   }
 
   private assertLive(): void {
@@ -129,14 +162,10 @@ class FallbackHandle implements AgentHandle {
     if (this.pumping) return;
     this.pumping = true;
     try {
-      while (
-        !this.disposed &&
-        this.steerQueue.length > 0 &&
-        !this.busy
-      ) {
+      while (!this.disposed && this.steerQueue.length > 0 && !this.busy) {
         const next = this.steerQueue.shift()!;
         try {
-          await this.inner.prompt(next.text, { owner: next.owner });
+          await this.inner.prompt(next.text, next.options);
           next.resolve();
         } catch (error) {
           next.reject(error instanceof Error ? error : new Error(String(error)));

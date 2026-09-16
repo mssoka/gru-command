@@ -3,7 +3,7 @@ import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
 import type { PiRuntimeOptions } from './pi-adapter.js';
 import { PiRuntime } from './pi-adapter.js';
-import { withFallbacks } from './fallbacks.js';
+import { isStreamingState, withFallbacks } from './fallbacks.js';
 import type { AgentHandle, AgentRuntime } from './types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -46,9 +46,10 @@ export class RuntimeRegistry {
   boot(): GrowthReport {
     this.growth = this.opts.store.detectGrowth();
     for (const finding of this.growth.findings) {
-      this.log('warn', 'session jsonl grew while service was down', {
+      this.log('warn', 'session jsonl changed while service was down', {
         file: finding.file,
-        grew_by_bytes: finding.grewByBytes,
+        kind: finding.kind,
+        byte_delta: finding.grewByBytes,
         previous_bytes: finding.previousBytes,
         current_bytes: finding.currentBytes,
       });
@@ -97,12 +98,20 @@ export class RuntimeRegistry {
           }
         : {},
     );
+    const thinkingLevel = applyThinkingFallback(adapter, policy.thinkingLevel, this.log);
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
       model: policy.model,
-      thinkingLevel: policy.thinkingLevel,
+      thinkingLevel,
     });
     this.handles.add(handle);
+    // Self-healing membership: a handle disposed by ANY caller leaves the
+    // registry set — the status surface must never contradict itself.
+    handle.subscribe((event) => {
+      if (event.type === 'state' && event.state === 'disposed') {
+        this.handles.delete(handle);
+      }
+    });
     return handle;
   }
 
@@ -119,7 +128,7 @@ export class RuntimeRegistry {
       const health = handle.health();
       if (health.state === 'disposed') continue;
       anySession = true;
-      if (health.state === 'streaming' || health.state === 'spawning') streaming = true;
+      if (isStreamingState(health.state)) streaming = true;
       if (
         health.lastActivity !== null &&
         (lastActivity === null || health.lastActivity > lastActivity)
@@ -142,4 +151,24 @@ export class RuntimeRegistry {
     for (const adapter of this.adapters.values()) await adapter.dispose();
     this.adapters.clear();
   }
+}
+
+/**
+ * Ruling-16 degrade: an adapter declaring thinkingLevelControl: false
+ * cannot set the level — a non-default request degrades to warn +
+ * proceed (the level is omitted, never silently ignored).
+ */
+export function applyThinkingFallback(
+  adapter: AgentRuntime,
+  thinkingLevel: string,
+  log: Log = () => {},
+): string {
+  if (thinkingLevel !== 'default' && !adapter.capabilities.thinkingLevelControl) {
+    log('warn', 'runtime cannot set thinking level — proceeding without it', {
+      runtime: adapter.id,
+      requested_thinking_level: thinkingLevel,
+    });
+    return 'default';
+  }
+  return thinkingLevel;
 }

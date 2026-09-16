@@ -6,7 +6,7 @@ import {
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import type { GruCommandConfig, Role } from '../config.js';
 import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
@@ -39,6 +39,7 @@ export interface PiRuntimeOptions {
 interface QueuedMessage {
   readonly text: string;
   readonly owner: string;
+  readonly images?: PromptOptions['images'];
   readonly resolve: () => void;
   readonly reject: (error: Error) => void;
 }
@@ -140,38 +141,65 @@ export class PiRuntime implements AgentRuntime {
   async spawn(role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
     const roleDef = ROLE_DEFINITIONS[role];
     const cwd = this.config.workspaceRoot;
-    const model = await this.resolveModel(role, options.model);
-    const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
-    const sessionManager =
-      options.resumeFile !== undefined
-        ? SessionManager.open(options.resumeFile, dirname(options.resumeFile), cwd)
-        : SessionManager.create(cwd, this.store.sessionDirFor(role, cwd));
-    const loader = new DefaultResourceLoader({
-      cwd,
-      agentDir: this.agentDir,
-      systemPromptOverride: () => roleDef.systemPrompt,
-    });
-    await loader.reload();
-    const { session } = await createAgentSession({
-      cwd,
-      agentDir: this.agentDir,
-      model,
-      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
-      tools: [...roleDef.tools],
-      resourceLoader: loader,
-      sessionManager,
-      modelRuntime: await this.runtime(),
-    });
-    const sessionFile = session.sessionFile ?? null;
-    if (sessionFile !== null) {
-      this.store.acquireLock(sessionFile);
-    } else {
-      throw new Error('pi session is not persisted to a file — refusing untracked session');
+    try {
+      const model = await this.resolveModel(role, options.model);
+      const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
+      // Normalize so the lock key matches the session's own file path.
+      const resumeFile =
+        options.resumeFile !== undefined ? resolve(options.resumeFile) : undefined;
+      // Resume: lock BEFORE touching the file — a second writer must never
+      // even open a session another process holds (single-writer, ruling 1).
+      if (resumeFile !== undefined) {
+        this.store.acquireLock(resumeFile);
+      }
+      try {
+        const sessionManager =
+          resumeFile !== undefined
+            ? SessionManager.open(resumeFile, dirname(resumeFile), cwd)
+            : SessionManager.create(cwd, this.store.sessionDirFor(role, cwd));
+        const loader = new DefaultResourceLoader({
+          cwd,
+          agentDir: this.agentDir,
+          systemPromptOverride: () => roleDef.systemPrompt,
+        });
+        await loader.reload();
+        const { session } = await createAgentSession({
+          cwd,
+          agentDir: this.agentDir,
+          model,
+          ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+          tools: [...roleDef.tools],
+          resourceLoader: loader,
+          sessionManager,
+          modelRuntime: await this.runtime(),
+        });
+        const sessionFile = session.sessionFile ?? null;
+        if (sessionFile === null) {
+          session.dispose();
+          throw new Error('pi session is not persisted to a file — refusing untracked session');
+        }
+        try {
+          if (resumeFile === undefined) {
+            this.store.acquireLock(sessionFile);
+          }
+        } catch (error) {
+          session.dispose();
+          throw error;
+        }
+        const handle = new PiAgentHandle(role, session, sessionFile, this.store, this.log);
+        this.handles.add(handle);
+        this.down = undefined;
+        return handle;
+      } catch (error) {
+        if (resumeFile !== undefined) {
+          this.store.releaseLock(resumeFile);
+        }
+        throw error;
+      }
+    } catch (error) {
+      this.down = String(error);
+      throw error;
     }
-    const handle = new PiAgentHandle(role, session, sessionFile, this.store, this.log);
-    this.handles.add(handle);
-    this.down = undefined;
-    return handle;
   }
 
   health(): RuntimeHealth {
@@ -200,6 +228,8 @@ export class PiAgentHandle implements AgentHandle {
   readonly id: string;
   readonly sessionFile: string;
 
+  /** The principal unnamed callers are attributed to (single-writer). */
+  private readonly principal: string;
   private state: AgentState = 'idle';
   private lastActivity: string | null = null;
   private stateError: string | undefined;
@@ -228,6 +258,10 @@ export class PiAgentHandle implements AgentHandle {
     this.role = role;
     this.id = session.sessionId;
     this.sessionFile = sessionFile;
+    // Unnamed callers share one principal PER HANDLE — one chat brain per
+    // session (SPEC ruling 1). Two distinct sessions always differ, so a
+    // stranger's steer/followUp queues instead of passing natively.
+    this.principal = `handle:${this.id}`;
     session.subscribe((event) => this.onPiEvent(event));
   }
 
@@ -249,37 +283,37 @@ export class PiAgentHandle implements AgentHandle {
 
   async prompt(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
-    const owner = options.owner ?? 'default';
+    const owner = options.owner ?? this.principal;
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer');
+      return this.enqueue(text, owner, 'single-writer', options.images);
     }
-    return this.runTurn(text, owner);
+    return this.runTurn(text, owner, options.images);
   }
 
   async steer(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
-    const owner = options.owner ?? 'default';
+    const owner = options.owner ?? this.principal;
     if (this.liveTurn !== null && owner === this.liveOwner) {
       await this.session.steer(text);
       return;
     }
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer');
+      return this.enqueue(text, owner, 'single-writer', options.images);
     }
-    return this.runTurn(text, owner);
+    return this.runTurn(text, owner, options.images);
   }
 
   async followUp(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
-    const owner = options.owner ?? 'default';
+    const owner = options.owner ?? this.principal;
     if (this.liveTurn !== null && owner === this.liveOwner) {
       await this.session.followUp(text);
       return;
     }
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer');
+      return this.enqueue(text, owner, 'single-writer', options.images);
     }
-    return this.runTurn(text, owner);
+    return this.runTurn(text, owner, options.images);
   }
 
   async dispose(): Promise<void> {
@@ -305,6 +339,7 @@ export class PiAgentHandle implements AgentHandle {
     text: string,
     owner: string,
     reason: 'single-writer' | 'steer-unable',
+    images?: PromptOptions['images'],
   ): Promise<void> {
     this.emit({ type: 'queued', reason, owner });
     this.log('info', 'message queued (single-writer)', {
@@ -313,14 +348,27 @@ export class PiAgentHandle implements AgentHandle {
       owner,
     });
     return new Promise<void>((resolve, reject) => {
-      this.queue.push({ text, owner, resolve, reject });
+      this.queue.push({
+        text,
+        owner,
+        ...(images !== undefined ? { images } : {}),
+        resolve,
+        reject,
+      });
     });
   }
 
-  private runTurn(text: string, owner: string): Promise<void> {
+  private runTurn(text: string, owner: string, images?: PromptOptions['images']): Promise<void> {
     this.liveOwner = owner;
+    const promptOptions: Record<string, unknown> = {};
+    if (images !== undefined && images.length > 0) {
+      promptOptions['images'] = images.map((image) => ({
+        type: 'image',
+        source: { type: 'base64', mediaType: image.mediaType, data: image.data },
+      }));
+    }
     const turn = this.session
-      .prompt(text)
+      .prompt(text, promptOptions)
       .catch((error: unknown) => {
         this.setState('error', String(error));
         this.emit({ type: 'error', error: String(error), fatal: false });
@@ -342,7 +390,7 @@ export class PiAgentHandle implements AgentHandle {
     while (!this.disposed && this.queue.length > 0 && this.liveTurn === null) {
       const next = this.queue.shift()!;
       try {
-        await this.runTurn(next.text, next.owner);
+        await this.runTurn(next.text, next.owner, next.images);
         next.resolve();
       } catch (error) {
         next.reject(error instanceof Error ? error : new Error(String(error)));

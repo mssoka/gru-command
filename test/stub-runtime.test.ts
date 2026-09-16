@@ -7,7 +7,6 @@ import type {
   AgentState,
   PromptOptions,
   RuntimeEvent,
-  SpawnOptions,
 } from '../src/runtime/types.js';
 
 /**
@@ -18,6 +17,11 @@ import type {
 class ScriptRuntime implements AgentRuntime {
   readonly id = 'script';
   readonly steerMode: 'native' | 'queued';
+  /** When true, the first turn's streaming state event fires a macrotask
+   * LATE (simulates an adapter whose first event is async — the E3 hole). */
+  deferStateEvents = false;
+  /** Optional hold applied to the NEXT prompt-driven turn. */
+  nextHold?: Promise<void>;
   readonly capabilities: AgentCapabilities = {
     streaming: true,
     steer: 'queued',
@@ -58,10 +62,18 @@ class ScriptHandle implements AgentHandle {
   /** Test hook: simulate a turn; stays streaming until `hold` resolves. */
   async simulateTurn(text: string, owner: string, hold?: Promise<void>): Promise<void> {
     this.runtime.calls.push({ op: 'prompt', text, owner });
+    if (this.runtime.deferStateEvents) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     this.setState('streaming');
     if (hold !== undefined) await hold;
     else await new Promise((resolve) => setTimeout(resolve, 5));
     this.setState('idle');
+  }
+
+  /** Test hook: the turn dies in state 'error' (never reports 'idle'). */
+  simulateError(): void {
+    this.setState('error');
   }
 
   private setState(state: AgentState): void {
@@ -75,7 +87,9 @@ class ScriptHandle implements AgentHandle {
 
   async prompt(text: string, options?: PromptOptions): Promise<void> {
     const owner = options?.owner ?? 'default';
-    await this.simulateTurn(text, owner);
+    const hold = this.runtime.nextHold;
+    this.runtime.nextHold = undefined;
+    await this.simulateTurn(text, owner, hold);
   }
   async steer(text: string, options?: PromptOptions): Promise<void> {
     const owner = options?.owner ?? 'default';
@@ -180,12 +194,73 @@ describe('interface-layer fallbacks (steer-unable → queue-until-idle)', () => 
     await inFlight;
     expect(inner.calls.some((c) => c.text === 'never-lands')).toBe(false);
   });
-});
 
-describe('spawn options surface', () => {
-  it('carries resumeFile and model through SpawnOptions untouched', async () => {
-    const opts: SpawnOptions = { resumeFile: '/tmp/x.jsonl', model: 'p/m' };
-    expect(opts.resumeFile).toBe('/tmp/x.jsonl');
-    expect(opts.model).toBe('p/m');
+  it('prompt while a turn is live also queues (uniform never-interleave, ruling 1)', async () => {
+    const inner = new ScriptRuntime('queued');
+    const runtime = withFallbacks(inner);
+    const handle = await runtime.spawn('gru');
+    let release!: () => void;
+    const hold = new Promise<void>((resolveHold) => {
+      release = resolveHold;
+    });
+    const innerHandle = inner.handle!;
+    const events: RuntimeEvent[] = [];
+    handle.subscribe((event) => events.push(event));
+    const inFlight = innerHandle.simulateTurn('first', 'alice', hold);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    const second = handle.prompt('second', { owner: 'bob' });
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    expect(inner.calls.filter((c) => c.text === 'second')).toEqual([]);
+    expect(events.some((e) => e.type === 'queued')).toBe(true);
+    release();
+    await inFlight;
+    await second;
+    expect(inner.calls.findIndex((c) => c.text === 'second')).toBeGreaterThan(
+      inner.calls.findIndex((c) => c.text === 'first'),
+    );
+  });
+
+  it('a turn ending in ERROR still drains the queue (no stranded callers)', async () => {
+    const inner = new ScriptRuntime('queued');
+    const runtime = withFallbacks(inner);
+    const handle = await runtime.spawn('gru');
+    const innerHandle = inner.handle!;
+    let release!: () => void;
+    const hold = new Promise<void>((resolveHold) => {
+      release = resolveHold;
+    });
+    const inFlight = innerHandle.simulateTurn('turn', 'alice', hold);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    const steered = handle.steer('queued-during-error', { owner: 'bob' });
+    innerHandle.simulateError(); // turn dies in state 'error', never 'idle'
+    release();
+    await inFlight;
+    await steered; // must settle, not hang forever
+    expect(inner.calls).toContainEqual({
+      op: 'prompt',
+      text: 'queued-during-error',
+      owner: 'bob',
+    });
+  });
+
+  it('steer issued synchronously after prompt cannot interleave (busy before first event)', async () => {
+    const inner = new ScriptRuntime('queued');
+    inner.deferStateEvents = true; // first streaming event arrives ~10ms late
+    const runtime = withFallbacks(inner);
+    const handle = await runtime.spawn('gru');
+    let release!: () => void;
+    inner.nextHold = new Promise<void>((resolveHold) => {
+      release = resolveHold;
+    });
+    // First turn delegated; the inner's streaming event arrives LATE. A
+    // synchronous follow-up must still queue (busy is set synchronously).
+    const first = handle.prompt('turn', { owner: 'alice' });
+    const steered = handle.steer('sync-steer', { owner: 'bob' });
+    // Immediately: not delivered mid-turn even though no event has fired.
+    expect(inner.calls.filter((c) => c.text === 'sync-steer')).toEqual([]);
+    release();
+    await first;
+    await steered;
+    expect(inner.calls).toContainEqual({ op: 'prompt', text: 'sync-steer', owner: 'bob' });
   });
 });

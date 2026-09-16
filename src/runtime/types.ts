@@ -102,7 +102,9 @@ export type RuntimeEventListener = (event: RuntimeEvent) => void;
 export type PromptOwner = string;
 
 export interface PromptOptions {
-  /** Who is asking (single-writer identity). Defaults to 'default'. */
+  /** Who is asking (single-writer identity). Defaults to the handle's own
+   * principal — all unnamed callers of one handle share it; two distinct
+   * sessions always attribute differently (SPEC ruling 1). */
   readonly owner?: PromptOwner;
   /** Images attached to the prompt (capability-checked). */
   readonly images?: ReadonlyArray<{ readonly mediaType: string; readonly data: string }>;

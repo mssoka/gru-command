@@ -87,11 +87,13 @@ describe('GET /health', () => {
         findings: [
           {
             file: join(home, 'sessions', 'grew.jsonl'),
+            kind: 'grew' as const,
             grewByBytes: 42,
             previousBytes: 10,
             currentBytes: 52,
           },
         ],
+        snapshotState: 'ok' as const,
         scannedAt: wiredAt,
       },
       activeSessions: 1,
@@ -131,7 +133,7 @@ describe('GET /health', () => {
       () => {},
       () => ({
         agentSession: { state: 'no-session' as const, lastActivity: null },
-        sessionGrowth: { findings: [], scannedAt: new Date().toISOString() },
+        sessionGrowth: { findings: [], snapshotState: 'ok' as const, scannedAt: new Date().toISOString() },
         activeSessions: 0,
       }),
     );

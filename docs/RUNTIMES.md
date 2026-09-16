@@ -52,16 +52,24 @@ One prompt-owner per live turn:
 - The live turn's owner keeps native mid-turn channels: `steer()` and
   `followUp()` pass straight through to the runtime.
 - A non-owner's `steer()`/`followUp()` during a live turn queues like a
-  prompt.
+  prompt. Unnamed callers are attributed to the HANDLE's own principal
+  (one chat brain per session); two distinct sessions always attribute
+  differently, so a stranger can never steer natively.
 
 ## Fallback semantics (interface layer)
 
 Runtimes declaring `steer: "queued"` (cannot interrupt mid-turn) get
-`withFallbacks()` wrapping (`src/runtime/fallbacks.ts`): `steer()` while
-busy is held and delivered as a prompt at idle — the caller observes a
-`queued` event with `reason: steer-unable`, and the call resolves after
-delivery. The same contract a native-steer runtime offers, implemented
-above the adapter.
+`withFallbacks()` wrapping (`src/runtime/fallbacks.ts`): the uniform
+never-interleave contract — while a turn is live, prompt() AND steer()
+are held (event `queued`, reason `steer-unable`) and delivered in
+arrival order once the agent reports a non-busy state (idle OR error —
+an error-ended turn never strands the queue). Callers observe the queue
+event and their call resolves after delivery — the same guarantee a
+native-steer runtime offers, implemented above the adapter.
+
+No session spawns in production until the chat epic (E4) — the registry
+exists, boots, and is health-observable; `agent_session` honestly reads
+`no-session` until then.
 
 ## Session store (SPEC ruling 12)
 
@@ -77,22 +85,27 @@ The path is declared via `/health` (`session.path`).
 - **Hourly rolling backup**: tracked session files are copied hourly into
   `<data_dir>/sessions/backups/` with an ISO-hour suffix; per source file
   the newest 24 backups are retained (pruned oldest-first). A backup pass
-  also runs at boot.
-- **Growth detection on boot** (the emergency-console contract): the store
+  also runs at boot. The slot IS the ISO hour: a second pass in the same
+  hour refreshes that slot (freshest in-slot state wins). Backups copy
+  live files, so a trailing line may be partial — recovery tooling must
+  tolerate a torn tail.
+- **Change detection on boot** (the emergency-console contract): the store
   snapshots session-file sizes at graceful shutdown and after each backup
-  pass. On boot it re-scans; any file that grew (or appeared) while the
+  pass. On boot it re-scans; any file that grew OR shrank while the
   service was down is reported via `/health`
   (`liveness.signals.session_growth`) and a `warn` log line naming the
-  file and byte delta. Resuming re-reads the file, so the console's edits
-  are picked up naturally.
+  file, the kind of change, and the byte delta. A missing snapshot means
+  a first-ever boot; a corrupt snapshot is reported as `corrupt`
+  (degraded — findings run against an empty baseline). Resuming re-reads
+  the file, so the console's edits are picked up naturally.
 
 ### Emergency console (documented workflow)
 
 Stop the service (this releases every session lock — single-writer
 preserved by the stop), open the newest session jsonl under the path
 `/health` declares with the pi CLI (or any editor), edit/inspect, restart
-the service. The boot scan surfaces exactly what changed while you were
-in there.
+the service. The boot scan surfaces files that grew or shrank while you
+were in there.
 
 ## /health liveness (SPEC rulings 5/12)
 

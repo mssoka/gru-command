@@ -15,7 +15,15 @@ if (process.env['GRU_COMMAND_SMOKE'] !== '1') {
     }
   }
   // Known non-suffix-shaped credential variables:
-  for (const key of ['HF_TOKEN', 'ANTHROPIC_API_KEY', 'GOOGLE_API_KEY', 'AWS_ACCESS_KEY_ID']) {
+  for (const key of [
+    'HF_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'GOOGLE_API_KEY',
+    'AWS_ACCESS_KEY_ID',
+    'AWS_SECRET_ACCESS_KEY',
+    'AWS_PROFILE',
+    'GOOGLE_APPLICATION_CREDENTIALS',
+  ]) {
     if (key in process.env) delete process.env[key];
   }
 }

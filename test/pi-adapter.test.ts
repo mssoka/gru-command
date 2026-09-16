@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime } from '../src/runtime/pi-adapter.js';
-import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.js';
 import { SessionStore } from '../src/sessions/store.js';
 import type { RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubTurn } from './helpers/stub-model.js';
@@ -300,6 +300,63 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     });
     expect(fx.runtime.health()).toEqual({ state: 'ok' });
   });
+
+  it('forwards image attachments to the model (capability kept honest)', async () => {
+    const fx = await fixture([{ deltas: ['seen'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      await handle.prompt('look at this', {
+        owner: 'alice',
+        images: [{ mediaType: 'image/png', data: 'aGVsbG8=' }],
+      });
+      expect(fx.script.calls.length).toBe(1);
+      expect(fx.script.calls[0]!.imageCount).toBe(1);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('unnamed steer queues behind a NAMED owner (handle principal is not an alias)', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fx = await fixture([{ deltas: ['a'], hold }, { deltas: ['b'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const alice = handle.prompt('mine', { owner: 'alice' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // An UNNAMED steer while alice's turn is live: not alice's channel.
+      const anon = handle.steer('anonymous nudge');
+      release();
+      await Promise.all([alice, anon]);
+      expect(fx.script.calls.map((c) => c.prompt)).toEqual(['mine', 'anonymous nudge']);
+    } finally {
+      release();
+      await handle.dispose();
+    }
+  });
+
+  it('unnamed steer during the handle OWN turn passes natively (one brain per session)', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fx = await fixture([{ deltas: ['a'], hold }, { deltas: ['steered'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const first = handle.prompt('mine');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await handle.steer('course correct');
+      release();
+      await first;
+      // steered natively — the follow-up arrives as its own model turn
+      expect(fx.script.calls.map((c) => c.prompt)).toContain('course correct');
+    } finally {
+      release();
+      await handle.dispose();
+    }
+  });
 });
 
 describe('RuntimeRegistry', () => {
@@ -350,5 +407,51 @@ describe('RuntimeRegistry', () => {
       store,
     });
     expect(() => registry.runtimeFor('claude-code')).toThrow(/no adapter implementation yet/);
+  });
+
+  it('self-heals: a handle disposed directly leaves the registry set', async () => {
+    const fx = await fixture();
+    const registry = new RuntimeRegistry({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: fx.store,
+      agentDir: fx.agentDir,
+      modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['ok'] }])),
+    });
+    registry.boot();
+    const handle = await registry.spawn('gru');
+    expect(registry.status().activeSessions).toBe(1);
+    await handle.dispose(); // direct dispose, NOT registry.disposeHandle
+    expect(registry.status().activeSessions).toBe(0);
+    expect(registry.status().agentSession.state).toBe('no-session');
+    await registry.dispose();
+  });
+
+  it('thinking fallback: a control-less adapter gets warn + default (ruling 16)', () => {
+    const warns: string[] = [];
+    const fakeAdapter = {
+      id: 'fake',
+      capabilities: {
+        streaming: true,
+        steer: 'queued' as const,
+        resume: 'none' as const,
+        images: false,
+        thinking: false,
+        thinkingLevelControl: false,
+        followUp: false,
+      },
+    };
+    const log = (level: string, msg: string) => {
+      if (level === 'warn') warns.push(msg);
+    };
+    expect(applyThinkingFallback(fakeAdapter as never, 'high', log)).toBe('default');
+    expect(warns.length).toBe(1);
+    expect(warns[0]!).toContain('cannot set thinking level');
+    // The sentinel and capable adapters pass through untouched:
+    expect(applyThinkingFallback(fakeAdapter as never, 'default', log)).toBe('default');
+    const capable = {
+      id: 'capable',
+      capabilities: { ...fakeAdapter.capabilities, thinkingLevelControl: true },
+    };
+    expect(applyThinkingFallback(capable as never, 'max', log)).toBe('max');
   });
 });

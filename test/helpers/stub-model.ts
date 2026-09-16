@@ -29,6 +29,7 @@ export interface StubTurn {
 
 export interface StubCall {
   readonly prompt: string;
+  readonly imageCount: number;
 }
 
 function makeStubModel(): Model<Api> {
@@ -75,20 +76,22 @@ function makeMessage(
   } as AssistantMessage;
 }
 
-function lastUserPrompt(context: Context): string {
+function lastUserPrompt(context: Context): { text: string; imageCount: number } {
   for (let i = context.messages.length - 1; i >= 0; i -= 1) {
     const message = context.messages[i];
     if (message !== undefined && message.role === 'user') {
       const content = message.content;
-      if (typeof content === 'string') return content;
-      // Content blocks: join the text blocks (images ignored for logging).
-      return content
-        .filter((block) => block.type === 'text')
-        .map((block) => block.text)
-        .join('');
+      if (typeof content === 'string') return { text: content, imageCount: 0 };
+      return {
+        text: content
+          .filter((block) => block.type === 'text')
+          .map((block) => block.text)
+          .join(''),
+        imageCount: content.filter((block) => block.type === 'image').length,
+      };
     }
   }
-  return '(no user message)';
+  return { text: '(no user message)', imageCount: 0 };
 }
 
 export class StubScript {
@@ -99,8 +102,8 @@ export class StubScript {
     this.turns = [...turns];
   }
 
-  next(prompt: string): StubTurn {
-    this.calls.push({ prompt });
+  next(prompt: string, imageCount = 0): StubTurn {
+    this.calls.push({ prompt, imageCount });
     return this.turns.shift() ?? { deltas: ['stub: ', 'ok'] };
   }
 }
@@ -128,8 +131,8 @@ export async function makeStubModelRuntime(script: StubScript): Promise<ModelRun
     modelsPath,
   });
   const model = makeStubModel();
-  const streamTurn = (prompt: string): AssistantMessageEventStream => {
-    const turn = script.next(prompt);
+  const streamTurn = (prompt: string, imageCount: number): AssistantMessageEventStream => {
+    const turn = script.next(prompt, imageCount);
     const stream = new AssistantMessageEventStream();
     const text = turn.deltas.join('');
     void (async () => {
@@ -168,9 +171,14 @@ export async function makeStubModelRuntime(script: StubScript): Promise<ModelRun
       },
     },
     getModels: () => [model],
-    stream: (m: Model<Api>, context: Context) => streamTurn(lastUserPrompt(context)),
-    streamSimple: (m: Model<Api>, context: Context, _options?: SimpleStreamOptions) =>
-      streamTurn(lastUserPrompt(context)),
+    stream: (m: Model<Api>, context: Context) => {
+      const { text, imageCount } = lastUserPrompt(context);
+      return streamTurn(text, imageCount);
+    },
+    streamSimple: (m: Model<Api>, context: Context, _options?: SimpleStreamOptions) => {
+      const { text, imageCount } = lastUserPrompt(context);
+      return streamTurn(text, imageCount);
+    },
   };
   runtime.registerNativeProvider(provider);
   // registerNativeProvider does not refresh the synchronous auth-status

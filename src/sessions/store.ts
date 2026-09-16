@@ -12,6 +12,7 @@ import {
   writeFileSync,
   renameSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join, relative, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 
@@ -38,16 +39,33 @@ export class LockBusyError extends Error {
   }
 }
 
+/** The lock file cannot be parsed — refuse to steal; loud, never silent. */
+export class LockUnreadableError extends Error {
+  constructor(
+    readonly file: string,
+    readonly detail: string,
+  ) {
+    super(
+      `session lock ${file} is unreadable (${detail}); refusing to steal — ` +
+        'investigate the lock file (a corrupt lock is never auto-deleted)',
+    );
+    this.name = 'LockUnreadableError';
+  }
+}
+
 export interface GrowthFinding {
   readonly file: string;
+  readonly kind: 'grew' | 'shrunk';
   readonly grewByBytes: number;
   readonly previousBytes: number;
   readonly currentBytes: number;
 }
 
 export interface GrowthReport {
-  /** Files that grew (or appeared) while the service was down. */
+  /** Files that changed (grew or shrank) while the service was down. */
   readonly findings: readonly GrowthFinding[];
+  /** ok = baseline read; missing = first boot ever; corrupt = baseline unreadable (degraded — findings are against an empty baseline). */
+  readonly snapshotState: 'ok' | 'missing' | 'corrupt';
   readonly scannedAt: string;
 }
 
@@ -72,6 +90,8 @@ const BACKUP_SUFFIX = '.bak';
  */
 export class SessionStore {
   readonly sessionsDir: string;
+  /** Identifies locks created by THIS store instance (release safety). */
+  private readonly bootId = `${process.pid}-${Date.now()}`;
   private readonly backupDir: string;
   private readonly stateFile: string;
   private readonly retention: number;
@@ -96,10 +116,14 @@ export class SessionStore {
   /**
    * Role + cwd scoped session dir, mirroring the standard pi pattern
    * (`--<dashed-cwd>--`) under the instance data dir (SPEC rulings 7/12).
+   * An 8-hex cwd-hash suffix makes distinct-but-dash-colliding cwds
+   * (/a-b/c vs /a/b-c) unique while keeping the pi-flavored prefix.
    */
   sessionDirFor(role: string, cwd: string): string {
-    const dashed = `--${resolve(cwd).replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
-    return join(this.sessionsDir, role, dashed);
+    const resolved = resolve(cwd);
+    const dashed = `--${resolved.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+    const hash = createHash('sha256').update(resolved).digest('hex').slice(0, 8);
+    return join(this.sessionsDir, role, `${dashed}-${hash}`);
   }
 
   lockFileFor(sessionFile: string): string {
@@ -118,7 +142,7 @@ export class SessionStore {
     const lockFile = this.lockFileFor(sessionFile);
     const info: SessionLockInfo = {
       pid: process.pid,
-      bootId: `${process.pid}-${Date.now()}`,
+      bootId: this.bootId,
       acquiredAt: new Date().toISOString(),
       heartbeatAt: new Date().toISOString(),
     };
@@ -150,7 +174,7 @@ export class SessionStore {
     const heartbeat = setInterval(() => {
       try {
         const current = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
-        if (current.pid === info.pid) {
+        if (current.pid === info.pid && current.bootId === info.bootId) {
           const next = `${JSON.stringify({ ...current, heartbeatAt: new Date().toISOString() })}\n`;
           // Truncating rewrite keeps the lock file tiny; O_EXCL ownership was
           // already proven above, and the heartbeat interval owns this file.
@@ -171,18 +195,22 @@ export class SessionStore {
     let holder: SessionLockInfo;
     try {
       holder = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
-    } catch {
-      this.log('warn', 'session lock unreadable — stealing', { lockFile });
+    } catch (firstError) {
+      // Transient read failures (racing the holder's own heartbeat rewrite,
+      // momentary I/O) must NOT unlink a live lock — retry once, then
+      // refuse loudly. A corrupt lock is never auto-deleted.
       try {
-        unlinkSync(lockFile);
-      } catch {
-        /* raced away; the retry below sees the winner */
+        holder = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
+      } catch (secondError) {
+        throw new LockUnreadableError(lockFile, String(secondError ?? firstError));
       }
-      return;
     }
     const age = Date.now() - Date.parse(holder.heartbeatAt);
-    const holderAlive = holder.pid === process.pid || processExists(holder.pid);
-    if (Number.isFinite(age) && age > LOCK_STALE_MS && !holderAlive) {
+    // The heartbeat timestamp IS the liveness proof: a heartbeat older
+    // than the steal threshold means the holder is dead or wedged — pid
+    // liveness is irrelevant (pid reuse and frozen-but-alive holders are
+    // both steal cases, not busy cases).
+    if (Number.isFinite(age) && age > LOCK_STALE_MS) {
       this.log('warn', 'stale session lock stolen', {
         lockFile,
         holder_pid: holder.pid,
@@ -205,22 +233,43 @@ export class SessionStore {
       this.heartbeats.delete(sessionFile);
     }
     if (this.heldLocks.delete(sessionFile)) {
+      const lockFile = this.lockFileFor(sessionFile);
+      // Only unlink OUR lock: if the lock was stolen while we were
+      // unresponsive, the file now belongs to the stealer — deleting it
+      // would admit a third writer while the second is active.
+      let ours = false;
       try {
-        unlinkSync(this.lockFileFor(sessionFile));
+        const current = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
+        ours = current.pid === process.pid && current.bootId === this.bootId;
       } catch {
-        // Already gone (stolen while we were unresponsive) — nothing to do.
+        ours = false; // gone or unreadable — nothing safe to delete
+      }
+      if (ours) {
+        try {
+          unlinkSync(lockFile);
+        } catch {
+          // Already gone — nothing to do.
+        }
+      } else {
+        this.log('warn', 'session lock not released: file is no longer ours', { lockFile });
       }
     }
   }
 
   /**
-   * Boot-time growth detection (SPEC ruling 12): compare current session
+   * Boot-time change detection (SPEC ruling 12): compare current session
    * file sizes against the persisted snapshot. Growth means the file was
-   * written while the service was down (emergency console) or by any other
-   * process. New files count as growth from zero.
+   * written while the service was down (emergency console) or by any
+   * other process; a SHRINK means the console truncated or rewrote it.
+   * New files count as growth from zero.
    */
   detectGrowth(): GrowthReport {
-    const previous = this.readSnapshot();
+    const { snapshot: previous, state: snapshotState } = this.readSnapshot();
+    if (snapshotState === 'corrupt') {
+      this.log('warn', 'session store-state.json is corrupt — growth baseline reset', {
+        stateFile: this.stateFile,
+      });
+    }
     const findings: GrowthFinding[] = [];
     for (const file of this.listSessionFiles()) {
       let size: number;
@@ -230,16 +279,33 @@ export class SessionStore {
         continue;
       }
       const prev = previous[file];
-      if (prev === undefined ? size > 0 : size > prev) {
+      if (prev === undefined && size > 0) {
         findings.push({
           file,
-          grewByBytes: size - (prev ?? 0),
-          previousBytes: prev ?? 0,
+          kind: 'grew',
+          grewByBytes: size,
+          previousBytes: 0,
+          currentBytes: size,
+        });
+      } else if (prev !== undefined && size > prev) {
+        findings.push({
+          file,
+          kind: 'grew',
+          grewByBytes: size - prev,
+          previousBytes: prev,
+          currentBytes: size,
+        });
+      } else if (prev !== undefined && size < prev) {
+        findings.push({
+          file,
+          kind: 'shrunk',
+          grewByBytes: size - prev,
+          previousBytes: prev,
           currentBytes: size,
         });
       }
     }
-    return { findings, scannedAt: new Date().toISOString() };
+    return { findings, snapshotState, scannedAt: new Date().toISOString() };
   }
 
   /** Persist the current size snapshot (atomic write). */
@@ -348,12 +414,24 @@ export class SessionStore {
     return out.sort();
   }
 
-  private readSnapshot(): SizeSnapshot {
+  private readSnapshot(): { snapshot: SizeSnapshot; state: 'ok' | 'missing' | 'corrupt' } {
+    let text: string;
     try {
-      const parsed = JSON.parse(readFileSync(this.stateFile, 'utf-8')) as SizeSnapshot;
-      return typeof parsed === 'object' && parsed !== null ? parsed : {};
+      text = readFileSync(this.stateFile, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { snapshot: {}, state: 'missing' };
+      }
+      return { snapshot: {}, state: 'corrupt' };
+    }
+    try {
+      const parsed = JSON.parse(text) as SizeSnapshot;
+      return {
+        snapshot: typeof parsed === 'object' && parsed !== null ? parsed : {},
+        state: 'ok',
+      };
     } catch {
-      return {};
+      return { snapshot: {}, state: 'corrupt' };
     }
   }
 
@@ -365,14 +443,5 @@ export class SessionStore {
       this.backupTimer = null;
     }
     for (const file of [...this.heldLocks.keys()]) this.releaseLock(file);
-  }
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }

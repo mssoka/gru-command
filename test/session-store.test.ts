@@ -2,8 +2,9 @@ import { mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync } from '
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 import { afterAll, describe, expect, it } from 'vitest';
-import { LockBusyError, SessionStore } from '../src/sessions/store.js';
+import { LockBusyError, LockUnreadableError, SessionStore } from '../src/sessions/store.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -29,19 +30,22 @@ describe('SessionStore', () => {
     const dataDir = tmpDataDir();
     const store = new SessionStore(dataDir);
     expect(store.sessionsDir).toBe(join(dataDir, 'sessions'));
-    const dashed = (cwd: string): string =>
-      `--${resolve(cwd).replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+    const dashed = (cwd: string): string => {
+      const resolved = resolve(cwd);
+      const base = `--${resolved.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+      return `${base}-${createHash('sha256').update(resolved).digest('hex').slice(0, 8)}`;
+    };
     expect(store.sessionDirFor('gru', '/tmp/ws')).toBe(
       join(dataDir, 'sessions', 'gru', dashed('/tmp/ws')),
     );
     expect(store.sessionDirFor('minion', '/tmp/ws')).toBe(
       join(dataDir, 'sessions', 'minion', dashed('/tmp/ws')),
     );
-    // Windows-style drive colons and nested slashes stay safe (transform
-    // checked directly — resolve() is platform-dependent and already
-    // covered by the assertions above):
-    const transform = (cwd: string): string => `--${cwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
-    expect(transform('C:\\work\\repos')).toBe('--C--work-repos--');
+    // The hash suffix keeps dash-colliding cwds distinct (pi's own
+    // transform collides these):
+    const a = store.sessionDirFor('gru', '/tmp/a-b/c');
+    const b = store.sessionDirFor('gru', '/tmp/a/b-c');
+    expect(a).not.toBe(b);
   });
 
   it('acquires the exclusive lock and rejects a second writer loudly, naming the holder', () => {
@@ -67,7 +71,7 @@ describe('SessionStore', () => {
     second.releaseLock(file);
   });
 
-  it('steals a stale lock whose holder is dead and logs it', () => {
+  it('steals a stale lock even when the holder pid looks alive (heartbeat is the proof)', () => {
     const logs: string[] = [];
     const store = new SessionStore(tmpDataDir(), {
       log: (level, msg) => {
@@ -87,6 +91,49 @@ describe('SessionStore', () => {
     expect(() => store.acquireLock(file)).not.toThrow();
     expect(logs.some((msg) => msg.includes('stale session lock stolen'))).toBe(true);
     store.releaseLock(file);
+    // A stale heartbeat with a LIVE pid (ours) also steals — pid liveness
+    // is irrelevant to the heartbeat proof.
+    writeFileSync(
+      lockFile,
+      `${JSON.stringify({ ...stale, pid: process.pid, bootId: 'old-boot' })}\n`,
+      'utf-8',
+    );
+    expect(() => store.acquireLock(file)).not.toThrow();
+    store.releaseLock(file);
+  });
+
+  it('refuses to steal an unreadable lock (loud, never auto-deleted)', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSession(store);
+    const lockFile = store.lockFileFor(file);
+    writeFileSync(lockFile, 'not-json-at-all', 'utf-8');
+    expect(() => store.acquireLock(file)).toThrow(LockUnreadableError);
+    // And the corrupt file is left in place for the operator.
+    expect(readFileSync(lockFile, 'utf-8')).toBe('not-json-at-all');
+  });
+
+  it('release does not delete a lock that a stealer has re-created', () => {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSession(store);
+    // Forge OUR-looking stale lock, then a second store steals it.
+    store.acquireLock(file);
+    // Simulate: our heartbeat stalled; the stealer replaced the lock file.
+    const lockFile = store.lockFileFor(file);
+    const stealerInfo = {
+      pid: 424_242,
+      bootId: 'stealer-boot',
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+    };
+    writeFileSync(lockFile, `${JSON.stringify(stealerInfo)}\n`, 'utf-8');
+    // Our release must NOT delete the stealer's lock file.
+    store.releaseLock(file);
+    expect(readFileSync(lockFile, 'utf-8')).toContain('stealer-boot');
+    // And a normal release (own lock intact) still deletes:
+    rmSync(lockFile); // simulated stealer goes away
+    store.acquireLock(file);
+    store.releaseLock(file);
+    expect(() => readFileSync(lockFile, 'utf-8')).toThrow();
   });
 
   it('detects jsonl growth that happened while the service was down', () => {
@@ -113,7 +160,34 @@ describe('SessionStore', () => {
     seedSession(first);
     first.persistSnapshot();
     const second = new SessionStore(dataDir);
-    expect(second.detectGrowth().findings).toEqual([]);
+    const report = second.detectGrowth();
+    expect(report.findings).toEqual([]);
+    expect(report.snapshotState).toBe('ok');
+  });
+
+  it('detects a TRUNCATED file (shrink) written while down', () => {
+    const dataDir = tmpDataDir();
+    const first = new SessionStore(dataDir);
+    const file = seedSession(first, 'gru', 'line-one\nline-two\nline-three\n');
+    first.persistSnapshot();
+    writeFileSync(file, 'line-one\n', 'utf-8');
+    const report = new SessionStore(dataDir).detectGrowth();
+    expect(report.findings.length).toBe(1);
+    expect(report.findings[0]!.kind).toBe('shrunk');
+    expect(report.findings[0]!.grewByBytes).toBeLessThan(0);
+  });
+
+  it('a corrupt snapshot reports state corrupt instead of silently re-baselining', () => {
+    const dataDir = tmpDataDir();
+    const store = new SessionStore(dataDir);
+    seedSession(store);
+    store.persistSnapshot();
+    writeFileSync(join(dataDir, 'sessions', 'store-state.json'), 'corrupted!', 'utf-8');
+    const report = new SessionStore(dataDir).detectGrowth();
+    expect(report.snapshotState).toBe('corrupt');
+    // The existing file IS still reported (against the empty baseline) —
+    // but the corrupt state is what the operator sees first.
+    expect(report.findings.length).toBe(1);
   });
 
   it('treats a new file appearing while down as growth from zero', () => {
