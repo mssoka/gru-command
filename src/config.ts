@@ -23,9 +23,29 @@ export interface AuthConfig {
 export interface RuntimesConfig {
   readonly default: RuntimeId;
   readonly roles: Readonly<Partial<Record<Role, RuntimeId>>>;
+  /** Per-runtime model & thinking policy (SPEC ruling 16). */
+  readonly policies: Readonly<Partial<Record<RuntimeId, RuntimeModelPolicy>>>;
+}
+
+/** Model + thinking overrides scoped to one runtime adapter (SPEC ruling 16). */
+export interface RuntimeModelPolicy {
+  readonly model?: string;
+  readonly thinkingLevel?: string;
+  readonly roles: Readonly<Partial<Record<Role, RuntimeRolePolicyEntry>>>;
+}
+
+/** Per-role overrides inside a runtime policy; at least one field set. */
+export interface RuntimeRolePolicyEntry {
+  readonly model?: string;
+  readonly thinkingLevel?: string;
 }
 
 export interface ModelsConfig {
+  readonly default: string;
+  readonly roles: Readonly<Partial<Record<Role, string>>>;
+}
+
+export interface ThinkingConfig {
   readonly default: string;
   readonly roles: Readonly<Partial<Record<Role, string>>>;
 }
@@ -37,10 +57,57 @@ export interface GruCommandConfig {
   readonly auth: AuthConfig;
   readonly runtimes: RuntimesConfig;
   readonly models: ModelsConfig;
+  readonly thinking: ThinkingConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
   /** Absolute per-instance directory holding config, identity, logs, sessions. */
   readonly instanceDir: string;
+}
+
+/** Fully-resolved model & thinking policy for one spawn (SPEC ruling 16). */
+export interface SpawnPolicy {
+  /** "default" (runtime's own) or an explicit "provider/model" string. */
+  readonly model: string;
+  /** "default" (runtime's own) or an explicit level name. */
+  readonly thinkingLevel: string;
+}
+
+function normalizeSentinel(value: string | undefined): string {
+  if (value === undefined || value.trim() === '') return MODEL_DEFAULT_SENTINEL;
+  return value;
+}
+
+/**
+ * Resolve the spawn policy for a role on a runtime: spawn options beat
+ * per-runtime-per-role, which beats per-role, which beats per-runtime,
+ * which beats the global default (most specific wins). An explicit
+ * "default" SENTINEL at a narrower tier PINS — it shadows wider tiers
+ * (lets you un-set a global per runtime); "" is treated as "default"
+ * (E1 configs with an empty models.default keep booting identically).
+ */
+export function resolveSpawnPolicy(
+  config: GruCommandConfig,
+  runtimeId: RuntimeId,
+  role: Role,
+  overrides: { model?: string; thinkingLevel?: string } = {},
+): SpawnPolicy {
+  const policy = config.runtimes.policies[runtimeId];
+  const runtimeRole = policy?.roles[role];
+  const model =
+    overrides.model !== undefined
+      ? overrides.model
+      : runtimeRole?.model ?? config.models.roles[role] ?? policy?.model ?? config.models.default;
+  const thinkingLevel =
+    overrides.thinkingLevel !== undefined
+      ? overrides.thinkingLevel
+      : runtimeRole?.thinkingLevel ??
+        config.thinking.roles[role] ??
+        policy?.thinkingLevel ??
+        config.thinking.default;
+  return {
+    model: normalizeSentinel(model),
+    thinkingLevel: normalizeSentinel(thinkingLevel),
+  };
 }
 
 export class ConfigError extends Error {
@@ -87,7 +154,11 @@ const TOP_LEVEL_KEYS = [
   'auth',
   'runtimes',
   'models',
+  'thinking',
 ] as const;
+
+/** Sentinel meaning "the runtime harness's own configured default" (SPEC ruling 16). */
+export const MODEL_DEFAULT_SENTINEL = 'default';
 
 function isPlainObject(value: unknown): value is Record<string, TomlPrimitive> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -210,8 +281,9 @@ export function loadConfig(
   let dataDir = instanceDir;
   let server: ServerConfig = { host: '127.0.0.1', port: 7665 };
   let auth: AuthConfig = { token: '' };
-  let runtimes: RuntimesConfig = { default: 'pi', roles: {} };
-  let models: ModelsConfig = { default: '', roles: {} };
+  let runtimes: RuntimesConfig = { default: 'pi', roles: {}, policies: {} };
+  let models: ModelsConfig = { default: MODEL_DEFAULT_SENTINEL, roles: {} };
+  let thinking: ThinkingConfig = { default: MODEL_DEFAULT_SENTINEL, roles: {} };
   let sourceFile: string | null = null;
 
   if (configState(file) === 'present') {
@@ -302,9 +374,11 @@ export function loadConfig(
     if (raw['runtimes'] !== undefined) {
       const table = requireTable(raw['runtimes'], file, 'runtimes');
       for (const key of Object.keys(table)) {
-        if (!['default', 'roles'].includes(key)) {
+        const isMeta = ['default', 'roles'].includes(key);
+        const isRuntimeId = (RUNTIME_IDS as readonly string[]).includes(key);
+        if (!isMeta && !isRuntimeId) {
           throw new ConfigError(
-            `unknown key \`${key}\` in [runtimes] (valid keys: default, roles)`,
+            `unknown key \`${key}\` in [runtimes] (valid keys: default, roles, or a runtime id: ${RUNTIME_IDS.join(', ')})`,
             file,
             `runtimes.${key}`,
           );
@@ -312,13 +386,23 @@ export function loadConfig(
       }
       let def = runtimes.default;
       let roles = runtimes.roles;
+      const policies: Partial<Record<RuntimeId, RuntimeModelPolicy>> = { ...runtimes.policies };
       if (table['default'] !== undefined) {
         def = validateRuntimeId(table['default'], file, 'runtimes.default');
       }
       if (table['roles'] !== undefined) {
         roles = readRoleTable(table['roles'], file, 'runtimes.roles', validateRuntimeId);
       }
-      runtimes = { default: def, roles };
+      for (const runtimeId of RUNTIME_IDS) {
+        if (table[runtimeId] !== undefined) {
+          policies[runtimeId] = readRuntimePolicy(
+            table[runtimeId],
+            file,
+            `runtimes.${runtimeId}`,
+          );
+        }
+      }
+      runtimes = { default: def, roles, policies };
     }
     if (raw['models'] !== undefined) {
       const table = requireTable(raw['models'], file, 'models');
@@ -334,7 +418,8 @@ export function loadConfig(
       let def = models.default;
       let roles = models.roles;
       if (table['default'] !== undefined) {
-        // Empty allowed: models are only meaningful once runtimes arrive (E2).
+        // Empty allowed: an empty value means the same as the "default"
+        // sentinel (runtime's own model) — kept for E1 config compatibility.
         def = requireString(table['default'], file, 'models.default', {
           allowEmpty: true,
         });
@@ -345,6 +430,32 @@ export function loadConfig(
         );
       }
       models = { default: def, roles };
+    }
+    if (raw['thinking'] !== undefined) {
+      const table = requireTable(raw['thinking'], file, 'thinking');
+      for (const key of Object.keys(table)) {
+        if (!['default', 'roles'].includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [thinking] (valid keys: default, roles)`,
+            file,
+            `thinking.${key}`,
+          );
+        }
+      }
+      let def = thinking.default;
+      let roles = thinking.roles;
+      if (table['default'] !== undefined) {
+        // Empty allowed: same as the "default" sentinel (runtime's own level).
+        def = requireString(table['default'], file, 'thinking.default', {
+          allowEmpty: true,
+        });
+      }
+      if (table['roles'] !== undefined) {
+        roles = readRoleTable(table['roles'], file, 'thinking.roles', (v, f, field2) =>
+          requireString(v, f, field2),
+        );
+      }
+      thinking = { default: def, roles };
     }
   }
 
@@ -383,7 +494,89 @@ export function loadConfig(
     auth,
     runtimes,
     models,
+    thinking,
     sourceFile,
     instanceDir,
+  };
+}
+
+/**
+ * Parse one [runtimes.<id>] policy table: optional model + thinking_level,
+ * optional per-role inline tables { model?, thinking_level? } with at
+ * least one field set (SPEC ruling 16).
+ */
+function readRuntimePolicy(
+  value: unknown,
+  file: string,
+  field: string,
+): RuntimeModelPolicy {
+  const table = requireTable(value, file, field);
+  for (const key of Object.keys(table)) {
+    if (!['model', 'thinking_level', 'roles'].includes(key)) {
+      throw new ConfigError(
+        `unknown key \`${key}\` in [${field}] (valid keys: model, thinking_level, roles)`,
+        file,
+        `${field}.${key}`,
+      );
+    }
+  }
+  let model: string | undefined;
+  let thinkingLevel: string | undefined;
+  const roles: Partial<Record<Role, RuntimeRolePolicyEntry>> = {};
+  if (table['model'] !== undefined) {
+    model = requireString(table['model'], file, `${field}.model`);
+  }
+  if (table['thinking_level'] !== undefined) {
+    thinkingLevel = requireString(table['thinking_level'], file, `${field}.thinking_level`);
+  }
+  if (table['roles'] !== undefined) {
+    const rolesTable = requireTable(table['roles'], file, `${field}.roles`);
+    for (const [roleKey, entry] of Object.entries(rolesTable)) {
+      if (!(ROLES as readonly string[]).includes(roleKey)) {
+        throw new ConfigError(
+          `unknown role \`${roleKey}\` (valid roles: ${ROLES.join(', ')})`,
+          file,
+          `${field}.roles.${roleKey}`,
+        );
+      }
+      const entryTable = requireTable(entry, file, `${field}.roles.${roleKey}`);
+      let entryModel: string | undefined;
+      let entryThinking: string | undefined;
+      for (const entryKey of Object.keys(entryTable)) {
+        if (!['model', 'thinking_level'].includes(entryKey)) {
+          throw new ConfigError(
+            `unknown key \`${entryKey}\` in [${field}.roles.${roleKey}] (valid keys: model, thinking_level)`,
+            file,
+            `${field}.roles.${roleKey}.${entryKey}`,
+          );
+        }
+      }
+      if (entryTable['model'] !== undefined) {
+        entryModel = requireString(entryTable['model'], file, `${field}.roles.${roleKey}.model`);
+      }
+      if (entryTable['thinking_level'] !== undefined) {
+        entryThinking = requireString(
+          entryTable['thinking_level'],
+          file,
+          `${field}.roles.${roleKey}.thinking_level`,
+        );
+      }
+      if (entryModel === undefined && entryThinking === undefined) {
+        throw new ConfigError(
+          `[${field}.roles.${roleKey}] must set at least one of model, thinking_level`,
+          file,
+          `${field}.roles.${roleKey}`,
+        );
+      }
+      roles[roleKey as Role] = {
+        ...(entryModel !== undefined ? { model: entryModel } : {}),
+        ...(entryThinking !== undefined ? { thinkingLevel: entryThinking } : {}),
+      };
+    }
+  }
+  return {
+    ...(model !== undefined ? { model } : {}),
+    ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+    roles,
   };
 }

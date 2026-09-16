@@ -1,6 +1,8 @@
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
+import { RuntimeRegistry } from './runtime/registry.js';
+import { SessionStore } from './sessions/store.js';
 import { createService, type ServiceHandle } from './server.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
@@ -41,6 +43,13 @@ async function main(): Promise<number> {
   // the JSON-lines log stays the record even under OS-service restarts.
   process.on('uncaughtException', (error: Error) => {
     logger.error('uncaught exception', { error: String(error), stack: error.stack });
+    // Best-effort: leave the size snapshot honest for the next boot's
+    // growth detection even when the graceful shutdown path never runs.
+    try {
+      state.store?.persistSnapshot();
+    } catch {
+      /* dying anyway */
+    }
     process.exit(1);
   });
   process.on('unhandledRejection', (reason: unknown) => {
@@ -48,7 +57,7 @@ async function main(): Promise<number> {
     process.exit(1);
   });
 
-  const state: { handle?: ServiceHandle } = {};
+  const state: { handle?: ServiceHandle; registry?: RuntimeRegistry; store?: SessionStore } = {};
   let shuttingDown = false;
   const shutdown = (signal: string) => {
     if (shuttingDown) return;
@@ -64,8 +73,30 @@ async function main(): Promise<number> {
       logger.info('shutdown complete', { signal, note: 'signal arrived during boot' });
       process.exit(0);
     }
-    void state.handle
-      .stop()
+    const handle = state.handle;
+    void Promise.resolve()
+      .then(async () => {
+        // Each stage isolated: a failure in one must never skip lock
+        // release or the final snapshot — the next boot's growth detection
+        // depends on the snapshot reflecting what this process last saw
+        // (SPEC ruling 12).
+        if (state.registry !== undefined) {
+          try {
+            await state.registry.dispose();
+          } catch (error) {
+            logger.error('registry dispose failed', { error: String(error) });
+          }
+        }
+        if (state.store !== undefined) {
+          try {
+            state.store.dispose();
+            state.store.persistSnapshot();
+          } catch (error) {
+            logger.error('session store shutdown failed', { error: String(error) });
+          }
+        }
+        await handle.stop();
+      })
       .then(() => {
         clearTimeout(forceExit);
         logger.info('shutdown complete', { signal });
@@ -82,8 +113,28 @@ async function main(): Promise<number> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  const service = createService(config, identity, (level, msg, fields) =>
-    logger.log(level, msg, fields),
+  // Runtime layer (E2): durable session store + adapter registry, booted
+  // BEFORE the server so /health can answer with real signals from the
+  // first request. Growth findings also hit the log (SPEC ruling 12).
+  const store = new SessionStore(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
+  const registry = new RuntimeRegistry({
+    config,
+    store,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const growth = registry.boot();
+  state.store = store;
+  state.registry = registry;
+  logger.info('session store ready', {
+    sessions_dir: store.sessionsDir,
+    growth_findings: growth.findings.length,
+  });
+
+  const service = createService(
+    config,
+    identity,
+    (level, msg, fields) => logger.log(level, msg, fields),
+    () => registry.status(),
   );
   state.handle = await service.start();
   const handle = state.handle;

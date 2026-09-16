@@ -115,6 +115,15 @@ describe('graceful shutdown', () => {
         () => 'unreachable',
       );
       expect(afterStop).toBe('unreachable');
+
+      // W8 (ruling-12 effect): the graceful shutdown persisted the session
+      // size snapshot — the next boot's growth detection has a baseline.
+      const snapshotFile = join(home, 'sessions', 'store-state.json');
+      expect(existsSync(snapshotFile)).toBe(true);
+      expect(JSON.parse(readFileSync(snapshotFile, 'utf-8'))).toEqual({});
+      // And the boot line reported the session store wiring:
+      const storeLine = lines.find((line) => line.msg === 'session store ready');
+      expect(storeLine).toBeDefined();
     } finally {
       if (child.exitCode === null) child.kill('SIGKILL');
     }

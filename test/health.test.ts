@@ -75,6 +75,89 @@ describe('GET /health', () => {
     }
   });
 
+  it('flips liveness REAL when a runtime status is wired (E2)', async () => {
+    const home = tmpHome();
+    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const identity = loadOrCreateIdentity(config.dataDir);
+    const wiredAt = new Date('2026-09-16T00:00:00Z').toISOString();
+    const status = () => ({
+      agentSession: { state: 'idle' as const, lastActivity: wiredAt },
+      sessionGrowth: {
+        findings: [
+          {
+            file: join(home, 'sessions', 'grew.jsonl'),
+            kind: 'grew' as const,
+            grewByBytes: 42,
+            previousBytes: 10,
+            currentBytes: 52,
+          },
+        ],
+        snapshotState: 'ok' as const,
+        scannedAt: wiredAt,
+      },
+      activeSessions: 1,
+      adapters: [],
+    });
+    const service = createService(config, identity, () => {}, status);
+    const handle = await service.start();
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const body = (await res.json()) as Record<string, unknown>;
+      const liveness = body['liveness'] as Record<string, unknown>;
+      const signals = liveness['signals'] as Record<string, Record<string, unknown>>;
+      expect(signals['health_reachable']?.['stubbed']).toBe(false);
+      expect(signals['agent_session']).toEqual({
+        state: 'idle',
+        last_activity: wiredAt,
+        stubbed: false,
+      });
+      const growth = signals['session_growth']?.['value'] as Array<Record<string, unknown>>;
+      expect(signals['session_growth']?.['stubbed']).toBe(false);
+      expect(growth.length).toBe(1);
+      expect(growth[0]).toMatchObject({ grew_by_bytes: 42, current_bytes: 52 });
+      const session = body['session'] as Record<string, unknown>;
+      expect(session['note']).toContain('append-only jsonl');
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it('reports no-session honestly when the registry is empty but wired', async () => {
+    const home = tmpHome();
+    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const identity = loadOrCreateIdentity(config.dataDir);
+    const service = createService(
+      config,
+      identity,
+      () => {},
+      () => ({
+        agentSession: { state: 'no-session' as const, lastActivity: null },
+        sessionGrowth: { findings: [], snapshotState: 'ok' as const, scannedAt: new Date().toISOString() },
+        activeSessions: 0,
+        adapters: [],
+      }),
+    );
+    const handle = await service.start();
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const body = (await res.json()) as Record<string, unknown>;
+      const signals = (body['liveness'] as Record<string, unknown>)['signals'] as Record<
+        string,
+        Record<string, unknown>
+      >;
+      expect(signals['agent_session']).toEqual({
+        state: 'no-session',
+        last_activity: null,
+        stubbed: false,
+      });
+      expect(signals['session_growth']).toEqual({ value: 'none', stubbed: false });
+    } finally {
+      await handle.stop();
+    }
+  });
+
   it('identity.install_id is stable across restarts on the same data dir', async () => {
     const home = tmpHome();
     const first = await bootService(home);
@@ -202,5 +285,51 @@ describe('GET /health', () => {
     // window, so its uptime baseline is provably fresh.
     expect(firstUptime).toBeGreaterThanOrEqual(200);
     expect(secondUptime).toBeLessThan(200);
+  });
+});
+
+describe('Perkins r1 regression pins', () => {
+  it("N14: session_growth reports 'not-scanned' before the store has scanned", async () => {
+    const home = tmpHome();
+    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const identity = loadOrCreateIdentity(config.dataDir);
+    const service = createService(config, identity, () => {}, () => ({
+      agentSession: { state: 'no-session' as const, lastActivity: null },
+      sessionGrowth: null,
+      activeSessions: 0,
+      adapters: [],
+    }));
+    const handle = await service.start();
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const body = (await res.json()) as Record<string, unknown>;
+      const signals = (body['liveness'] as Record<string, unknown>)['signals'] as Record<string, Record<string, unknown>>;
+      expect(signals['session_growth']).toEqual({ value: 'not-scanned', stubbed: false });
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it('W4: liveness.healthy goes false when an adapter is down', async () => {
+    const home = tmpHome();
+    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const identity = loadOrCreateIdentity(config.dataDir);
+    const service = createService(config, identity, () => {}, () => ({
+      agentSession: { state: 'no-session' as const, lastActivity: null },
+      sessionGrowth: { findings: [], snapshotState: 'ok' as const, scannedAt: new Date().toISOString() },
+      activeSessions: 0,
+      adapters: [{ id: 'pi', state: 'down' }],
+    }));
+    const handle = await service.start();
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const body = (await res.json()) as Record<string, unknown>;
+      const liveness = body['liveness'] as Record<string, unknown>;
+      expect(liveness['healthy']).toBe(false);
+    } finally {
+      await handle.stop();
+    }
   });
 });

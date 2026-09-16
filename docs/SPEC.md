@@ -58,6 +58,15 @@ integrated. Other users can install it on their laptops from GitHub.
     minions (workers), Perkins (review waves), Bob (memory
     consolidation) — defined by prompt + skill set + permissions,
     runtime-agnostic.
+16. **Runtime model & thinking policy.** DEFAULT = the runtime
+    harness's own default: a `model = "default"` sentinel means
+    "whatever pi / Claude Code is configured to use" — never hardcode a
+    model in the product. `config.toml` carries per-runtime AND per-role
+    overrides: model AND thinking_level, for both pi and claude-code
+    runtimes. AgentRuntime spawn options accept (model, thinking_level)
+    with the "default" passthrough. Fail-loud on an unknown model string
+    for a runtime that validates models; adapters that cannot set
+    thinking declare the capability gap (fallback: warn + proceed).
 
 ## Sources
 

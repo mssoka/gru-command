@@ -23,7 +23,23 @@ perkins = "pi"
 bob = "pi"
 
 [models]
-default = "provider/model-a"
+# "default" = the runtime harness's own configured model (SPEC ruling 16:
+# the product never hardcodes a model). Explicit: "provider/model".
+default = "default"
 
 [models.roles]                     # optional per-role overrides
 gru = "provider/model-b"
+
+[thinking]                         # thinking level policy, same shape as [models]
+default = "default"                # or a level the runtime accepts
+
+[thinking.roles]
+perkins = "max"
+
+[runtimes.pi]                      # per-runtime model & thinking policy
+model = "default"
+thinking_level = "default"
+
+[runtimes.pi.roles]                # per-runtime per-role (model and/or thinking_level)
+minion = { model = "provider/model-c", thinking_level = "low" }
+bob = { thinking_level = "medium" }

@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -8,6 +8,7 @@ import {
   expandTilde,
   instanceDirFromEnv,
   loadConfig,
+  resolveSpawnPolicy,
 } from '../src/config.js';
 
 const cleanupDirs: string[] = [];
@@ -59,8 +60,9 @@ describe('config defaults', () => {
     expect(config.dataDir).toBe(home);
     expect(config.server).toEqual({ host: '127.0.0.1', port: 7665 });
     expect(config.auth).toEqual({ token: '' });
-    expect(config.runtimes).toEqual({ default: 'pi', roles: {} });
-    expect(config.models).toEqual({ default: '', roles: {} });
+    expect(config.runtimes).toEqual({ default: 'pi', roles: {}, policies: {} });
+    expect(config.models).toEqual({ default: 'default', roles: {} });
+    expect(config.thinking).toEqual({ default: 'default', roles: {} });
     expect(config.instanceDir).toBe(home);
   });
 
@@ -89,11 +91,13 @@ describe('config round-trip', () => {
     expect(config.runtimes).toEqual({
       default: 'claude-code',
       roles: { gru: 'pi', minion: 'claude-code' },
+      policies: {},
     });
     expect(config.models).toEqual({
       default: 'provider/model-a',
       roles: { gru: 'provider/model-b' },
     });
+    expect(config.thinking).toEqual({ default: 'default', roles: {} });
   });
 
   it('a reloaded identical file yields an identical config', () => {
@@ -260,6 +264,162 @@ describe('config fail-loud validation', () => {
     );
     expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(
       /data_dir must not live inside workspace_root/,
+    );
+  });
+});
+
+describe('model & thinking policy (SPEC ruling 16)', () => {
+  const POLICY_CONFIG = `
+[models]
+default = "default"
+
+[models.roles]
+minion = "provider/model-b"
+
+[thinking]
+default = "high"
+
+[thinking.roles]
+perkins = "max"
+
+[runtimes.pi]
+model = "provider/pi-model"
+thinking_level = "default"
+
+[runtimes.pi.roles]
+gru = { model = "provider/gru-model", thinking_level = "low" }
+bob = { thinking_level = "medium" }
+`;
+
+  it('parses the full policy surface with per-runtime tables and role entries', () => {
+    const home = tmpHome();
+    writeConfig(home, POLICY_CONFIG);
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.models).toEqual({
+      default: 'default',
+      roles: { minion: 'provider/model-b' },
+    });
+    expect(config.thinking).toEqual({ default: 'high', roles: { perkins: 'max' } });
+    expect(config.runtimes.policies['pi']).toEqual({
+      model: 'provider/pi-model',
+      thinkingLevel: 'default',
+      roles: {
+        gru: { model: 'provider/gru-model', thinkingLevel: 'low' },
+        bob: { thinkingLevel: 'medium' },
+      },
+    });
+  });
+
+  it('resolves spawn policy most-specific-wins with "default" passthrough', () => {
+    const home = tmpHome();
+    writeConfig(home, POLICY_CONFIG);
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    // per-runtime-per-role beats everything:
+    expect(resolveSpawnPolicy(config, 'pi', 'gru')).toEqual({
+      model: 'provider/gru-model',
+      thinkingLevel: 'low',
+    });
+    // per-role model beats per-runtime model; thinking falls to per-runtime:
+    expect(resolveSpawnPolicy(config, 'pi', 'minion')).toEqual({
+      model: 'provider/model-b',
+      thinkingLevel: 'default',
+    });
+    // thinking-only role entry keeps the runtime model:
+    expect(resolveSpawnPolicy(config, 'pi', 'bob')).toEqual({
+      model: 'provider/pi-model',
+      thinkingLevel: 'medium',
+    });
+    // plain role: per-runtime model, and the runtime's explicit
+    // thinking_level="default" PINS (an explicit sentinel at a narrower
+    // tier shadows wider tiers — you can un-set a global per runtime):
+    expect(resolveSpawnPolicy(config, 'pi', 'silas')).toEqual({
+      model: 'provider/pi-model',
+      thinkingLevel: 'default',
+    });
+    // other runtime (no policy table): globals only:
+    expect(resolveSpawnPolicy(config, 'claude-code', 'silas')).toEqual({
+      model: 'default',
+      thinkingLevel: 'high',
+    });
+    // spawn options override everything; "default" passes through:
+    expect(
+      resolveSpawnPolicy(config, 'pi', 'gru', { model: 'default', thinkingLevel: 'max' }),
+    ).toEqual({ model: 'default', thinkingLevel: 'max' });
+  });
+
+  it('treats empty strings as the default sentinel (E1 configs keep working)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[models]\ndefault = ""\n');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(resolveSpawnPolicy(config, 'pi', 'gru')).toEqual({
+      model: 'default',
+      thinkingLevel: 'default',
+    });
+  });
+
+  it('rejects unknown keys and empty role entries in policy tables', () => {
+    const home = tmpHome();
+    writeConfig(home, '[runtimes.pi]\nbananas = "x"\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /unknown key `bananas` in \[runtimes\.pi\]/,
+    );
+    const home2 = tmpHome();
+    writeConfig(home2, '[runtimes.pi.roles]\ngru = {}\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home2 }, '/home/tester')).toThrow(
+      /must set at least one of model, thinking_level/,
+    );
+    const home3 = tmpHome();
+    writeConfig(home3, '[runtimes.not-a-runtime]\nmodel = "x"\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home3 }, '/home/tester')).toThrow(
+      /unknown key `not-a-runtime` in \[runtimes\]/,
+    );
+    const home4 = tmpHome();
+    writeConfig(home4, '[thinking]\nbananas = "x"\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home4 }, '/home/tester')).toThrow(
+      /unknown key `bananas` in \[thinking\]/,
+    );
+  });
+});
+
+describe('docs/example.config.toml', () => {
+  it('parses and validates through the loader (docs drift guard)', () => {
+    const example = readFileSync(join(import.meta.dirname, '..', 'docs', 'example.config.toml'), 'utf-8');
+    const home = tmpHome();
+    writeConfig(home, example);
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.runtimes.default).toBe('pi');
+    expect(config.models.default).toBe('default');
+    expect(config.thinking.default).toBe('default');
+    expect(config.runtimes.policies['pi']).toEqual({
+      model: 'default',
+      thinkingLevel: 'default',
+      roles: {
+        minion: { model: 'provider/model-c', thinkingLevel: 'low' },
+        bob: { thinkingLevel: 'medium' },
+      },
+    });
+  });
+});
+
+describe('Perkins r1 regression pins', () => {
+  it('rejects empty overrides in [thinking.roles] (N11)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[thinking.roles]\ngru = ""\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /thinking\.roles\.gru must not be empty/,
+    );
+  });
+
+  it('rejects an unknown role and unknown entry key inside [runtimes.<id>.roles] (N18)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[runtimes.pi.roles]\nnot-a-role = { model = "x" }\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /unknown role `not-a-role`/,
+    );
+    const home2 = tmpHome();
+    writeConfig(home2, '[runtimes.pi.roles]\ngru = { model = "x", bananas = "y" }\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home2 }, '/home/tester')).toThrow(
+      /unknown key `bananas` in \[runtimes\.pi\.roles\.gru\]/,
     );
   });
 });
