@@ -1,13 +1,51 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath } from '../src/runtime/pi-adapter.js';
 import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import type { RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubTurn } from './helpers/stub-model.js';
+
+/**
+ * Perkins r3 B1: a gated-twin mock for createAgentSession. Disarmed, it is
+ * a transparent pass-through; armed, twin 0 stalls then FAILS while twin 1
+ * stalls then proceeds — the one interleaving where the winner-ensures-
+ * lock re-acquire leg must fire (the pre-acquiring twin releases in its
+ * catch while the survivor is still in flight).
+ */
+const twinGate = vi.hoisted(() => ({
+  armed: false,
+  fail0: null as null | (() => void),
+  release1: null as null | (() => void),
+}));
+
+vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import('@earendil-works/pi-coding-agent')
+  >();
+  let call = 0;
+  return {
+    ...actual,
+    createAgentSession: async (opts: unknown) => {
+      if (!twinGate.armed) {
+        return actual.createAgentSession(opts as never);
+      }
+      const n = call++;
+      if (n === 0) {
+        await new Promise<never>((_, reject) => {
+          twinGate.fail0 = () => reject(new Error('twin-0 infrastructure failure'));
+        });
+      }
+      await new Promise<void>((resolveGate) => {
+        twinGate.release1 = resolveGate;
+      });
+      return actual.createAgentSession(opts as never);
+    },
+  };
+});
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -708,5 +746,49 @@ describe('Perkins r2: concurrent double-resume race (B4-race)', () => {
     const winner = (fulfilled[0] as PromiseFulfilledResult<Awaited<ReturnType<typeof fx.runtime.spawn>>>).value;
     await winner.dispose();
     expect(existsSync(`${file}.lock`)).toBe(false); // released by the winner
+  });
+});
+
+describe('Perkins r3: gated-twin scenario (winner-ensures-lock leg)', () => {
+  it('the surviving twin re-acquires the released lock before hosting', async () => {
+    // Seed a durable session file.
+    const fx = await fixture([{ deltas: ['one'] }]);
+    const first = await fx.runtime.spawn('gru');
+    await first.prompt('seed', { owner: 'alice' });
+    const file = first.sessionFile!;
+    await first.dispose();
+    expect(existsSync(`${file}.lock`)).toBe(false);
+
+    twinGate.armed = true;
+    try {
+      // Twin 0 (pre-acquirer) stalls inside createAgentSession; twin 1
+      // (skipped the pre-lock — same store already held it) stalls too.
+      const twin0 = fx.runtime.spawn('gru', { resumeFile: file });
+      const twin1 = fx.runtime.spawn('gru', { resumeFile: file });
+      await vi.waitFor(() => expect(twinGate.fail0).not.toBeNull());
+      await vi.waitFor(() => expect(twinGate.release1).not.toBeNull());
+
+      // Twin 0 fails: its catch releases the pre-lock (nobody hosts yet).
+      twinGate.fail0!();
+      await expect(twin0).rejects.toThrow(/twin-0 infrastructure failure/);
+      // THE PRE-LOCK IS GONE — the survivor must re-acquire at registration:
+      expect(existsSync(`${file}.lock`)).toBe(false);
+
+      // Twin 1 proceeds and hosts — the winner-ensures-lock leg fires here.
+      twinGate.release1!();
+      const survivor = await twin1;
+      expect(survivor.sessionFile).toBe(file);
+      expect(existsSync(`${file}.lock`)).toBe(true); // re-acquired
+      // Cross-process single-writer still enforced after the re-acquire:
+      const foreign = new SessionStore(fx.store.dataDir);
+      expect(() => foreign.acquireLock(file)).toThrow(LockBusyError);
+      foreign.dispose();
+      await survivor.dispose();
+      expect(existsSync(`${file}.lock`)).toBe(false);
+    } finally {
+      twinGate.armed = false;
+      twinGate.fail0 = null;
+      twinGate.release1 = null;
+    }
   });
 });
