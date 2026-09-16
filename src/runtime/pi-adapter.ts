@@ -1,0 +1,419 @@
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  getAgentDir,
+  ModelRuntime,
+  SessionManager,
+} from '@earendil-works/pi-coding-agent';
+import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
+import { dirname } from 'node:path';
+import type { GruCommandConfig, Role } from '../config.js';
+import { resolveSpawnPolicy } from '../config.js';
+import type { LogLevel } from '../logger.js';
+import { ROLE_DEFINITIONS } from '../roles.js';
+import type { SessionStore } from '../sessions/store.js';
+import type {
+  AgentCapabilities,
+  AgentHandle,
+  AgentRuntime,
+  AgentState,
+  PromptOptions,
+  RuntimeEvent,
+  RuntimeEventListener,
+  RuntimeHealth,
+  SpawnOptions,
+} from './types.js';
+
+type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+export interface PiRuntimeOptions {
+  readonly config: GruCommandConfig;
+  readonly store: SessionStore;
+  /** pi agent dir (settings/models/auth/skills discovery). Defaults to the user's. */
+  readonly agentDir?: string;
+  /** Tests inject a runtime pre-loaded with a stub provider. */
+  readonly modelRuntime?: ModelRuntime;
+  readonly log?: Log;
+}
+
+interface QueuedMessage {
+  readonly text: string;
+  readonly owner: string;
+  readonly resolve: () => void;
+  readonly reject: (error: Error) => void;
+}
+
+/**
+ * Reference AgentRuntime over the pi SDK (EPICS E2 story 2; SPEC ruling 4).
+ *
+ * One PiRuntime hosts any number of AgentHandles; each handle wraps one
+ * SDK AgentSession persisted as append-only jsonl under the instance data
+ * dir (via SessionStore's dirs) and enforces the single-writer rule
+ * (SPEC ruling 1): while a turn is live, prompt/steer/followUp from
+ * anyone but the turn's owner are queued-until-idle.
+ */
+export class PiRuntime implements AgentRuntime {
+  readonly id = 'pi';
+  readonly capabilities: AgentCapabilities = {
+    streaming: true,
+    steer: 'native',
+    resume: 'file',
+    images: true,
+    thinking: true,
+    thinkingLevelControl: true,
+    followUp: true,
+  };
+
+  private readonly config: GruCommandConfig;
+  private readonly store: SessionStore;
+  private readonly agentDir: string;
+  private readonly log: Log;
+  private readonly handles = new Set<PiAgentHandle>();
+  private modelRuntime: ModelRuntime | undefined;
+  private down: string | undefined;
+
+  constructor(opts: PiRuntimeOptions) {
+    this.config = opts.config;
+    this.store = opts.store;
+    this.agentDir = opts.agentDir ?? getAgentDir();
+    this.log = opts.log ?? (() => {});
+    this.modelRuntime = opts.modelRuntime;
+  }
+
+  private async runtime(): Promise<ModelRuntime> {
+    if (this.modelRuntime === undefined) {
+      // Offline create: built-in catalogs restored from local cache only.
+      this.modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
+    }
+    return this.modelRuntime;
+  }
+
+  /**
+   * Fail-loud model resolution (SPEC ruling 16): "default" (or "") passes
+   * through to pi's own resolution (session restore → settings → first
+   * available); an explicit "provider/model" must resolve or spawn fails
+   * naming the reference.
+   */
+  private async resolveModel(role: Role, override?: string): Promise<Model<Api> | undefined> {
+    const ref =
+      override !== undefined
+        ? override
+        : resolveSpawnPolicy(this.config, 'pi', role).model;
+    if (ref === '' || ref === 'default') return undefined;
+    const slash = ref.indexOf('/');
+    if (slash <= 0 || slash >= ref.length - 1) {
+      throw new Error(`model reference must be "provider/model" or "default", got: ${ref}`);
+    }
+    const provider = ref.slice(0, slash);
+    const modelId = ref.slice(slash + 1);
+    const model = (await this.runtime()).getModel(provider, modelId);
+    if (model === undefined) {
+      throw new Error(`unknown model "${ref}" — no such provider/model is registered`);
+    }
+    return model;
+  }
+
+  /** Thinking levels pi's session API accepts (fail-loud on typos: pi CAN set it). */
+  private static readonly PI_THINKING_LEVELS: readonly ThinkingLevel[] = [
+    'minimal',
+    'low',
+    'medium',
+    'high',
+    'xhigh',
+    'max',
+  ];
+
+  private resolveThinkingLevel(role: Role, override?: string): ThinkingLevel | undefined {
+    const ref =
+      override !== undefined
+        ? override
+        : resolveSpawnPolicy(this.config, 'pi', role).thinkingLevel;
+    if (ref === '' || ref === 'default') return undefined;
+    if (!PiRuntime.PI_THINKING_LEVELS.includes(ref as ThinkingLevel)) {
+      throw new Error(
+        `unknown thinking level "${ref}" for pi (valid: default, ${PiRuntime.PI_THINKING_LEVELS.join(', ')})`,
+      );
+    }
+    return ref as ThinkingLevel;
+  }
+
+  async spawn(role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
+    const roleDef = ROLE_DEFINITIONS[role];
+    const cwd = this.config.workspaceRoot;
+    const model = await this.resolveModel(role, options.model);
+    const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
+    const sessionManager =
+      options.resumeFile !== undefined
+        ? SessionManager.open(options.resumeFile, dirname(options.resumeFile), cwd)
+        : SessionManager.create(cwd, this.store.sessionDirFor(role, cwd));
+    const loader = new DefaultResourceLoader({
+      cwd,
+      agentDir: this.agentDir,
+      systemPromptOverride: () => roleDef.systemPrompt,
+    });
+    await loader.reload();
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir: this.agentDir,
+      model,
+      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+      tools: [...roleDef.tools],
+      resourceLoader: loader,
+      sessionManager,
+      modelRuntime: await this.runtime(),
+    });
+    const sessionFile = session.sessionFile ?? null;
+    if (sessionFile !== null) {
+      this.store.acquireLock(sessionFile);
+    } else {
+      throw new Error('pi session is not persisted to a file — refusing untracked session');
+    }
+    const handle = new PiAgentHandle(role, session, sessionFile, this.store, this.log);
+    this.handles.add(handle);
+    this.down = undefined;
+    return handle;
+  }
+
+  health(): RuntimeHealth {
+    if (this.down !== undefined) {
+      return { state: 'down', note: this.down };
+    }
+    return { state: 'ok' };
+  }
+
+  async dispose(): Promise<void> {
+    for (const handle of [...this.handles]) await handle.dispose();
+  }
+}
+
+/**
+ * Single-writer queue semantics (SPEC ruling 1/3):
+ * - `prompt()` ALWAYS resolves after its own turn completes; if a turn is
+ *   live (any owner), the prompt is queued and delivered when idle.
+ * - `steer()`/`followUp()` from the LIVE TURN'S OWNER pass through to the
+ *   SDK's native mid-turn channels; from anyone else they queue.
+ * - Queued messages deliver in arrival order, one turn each, and emit a
+ *   `queued` event so the surface layer can show honest state.
+ */
+export class PiAgentHandle implements AgentHandle {
+  readonly role: Role;
+  readonly id: string;
+  readonly sessionFile: string;
+
+  private state: AgentState = 'idle';
+  private lastActivity: string | null = null;
+  private stateError: string | undefined;
+  private liveOwner: string | null = null;
+  private liveTurn: Promise<void> | null = null;
+  private readonly queue: QueuedMessage[] = [];
+  private readonly listeners = new Set<RuntimeEventListener>();
+  private disposed = false;
+
+  constructor(
+    role: Role,
+    private readonly session: {
+      prompt(text: string, options?: unknown): Promise<void>;
+      steer(text: string): Promise<void>;
+      followUp(text: string): Promise<void>;
+      subscribe(listener: (event: unknown) => void): () => void;
+      dispose(): void;
+      isStreaming: boolean;
+      readonly sessionId: string;
+      readonly sessionFile: string | undefined;
+    },
+    sessionFile: string,
+    private readonly store: SessionStore,
+    private readonly log: Log,
+  ) {
+    this.role = role;
+    this.id = session.sessionId;
+    this.sessionFile = sessionFile;
+    session.subscribe((event) => this.onPiEvent(event));
+  }
+
+  subscribe(listener: RuntimeEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  health() {
+    return {
+      state: this.state,
+      lastActivity: this.lastActivity,
+      error: this.stateError,
+      sessionFile: this.sessionFile as string | null,
+    };
+  }
+
+  async prompt(text: string, options: PromptOptions = {}): Promise<void> {
+    this.assertLive();
+    const owner = options.owner ?? 'default';
+    if (this.liveTurn !== null) {
+      return this.enqueue(text, owner, 'single-writer');
+    }
+    return this.runTurn(text, owner);
+  }
+
+  async steer(text: string, options: PromptOptions = {}): Promise<void> {
+    this.assertLive();
+    const owner = options.owner ?? 'default';
+    if (this.liveTurn !== null && owner === this.liveOwner) {
+      await this.session.steer(text);
+      return;
+    }
+    if (this.liveTurn !== null) {
+      return this.enqueue(text, owner, 'single-writer');
+    }
+    return this.runTurn(text, owner);
+  }
+
+  async followUp(text: string, options: PromptOptions = {}): Promise<void> {
+    this.assertLive();
+    const owner = options.owner ?? 'default';
+    if (this.liveTurn !== null && owner === this.liveOwner) {
+      await this.session.followUp(text);
+      return;
+    }
+    if (this.liveTurn !== null) {
+      return this.enqueue(text, owner, 'single-writer');
+    }
+    return this.runTurn(text, owner);
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    const drained = this.queue.splice(0);
+    for (const item of drained) {
+      item.reject(new Error('agent session disposed before queued message was delivered'));
+    }
+    try {
+      this.session.dispose();
+    } finally {
+      this.store.releaseLock(this.sessionFile);
+      this.setState('disposed');
+    }
+  }
+
+  private assertLive(): void {
+    if (this.disposed) throw new Error('agent session disposed');
+  }
+
+  private enqueue(
+    text: string,
+    owner: string,
+    reason: 'single-writer' | 'steer-unable',
+  ): Promise<void> {
+    this.emit({ type: 'queued', reason, owner });
+    this.log('info', 'message queued (single-writer)', {
+      role: this.role,
+      session: this.id,
+      owner,
+    });
+    return new Promise<void>((resolve, reject) => {
+      this.queue.push({ text, owner, resolve, reject });
+    });
+  }
+
+  private runTurn(text: string, owner: string): Promise<void> {
+    this.liveOwner = owner;
+    const turn = this.session
+      .prompt(text)
+      .catch((error: unknown) => {
+        this.setState('error', String(error));
+        this.emit({ type: 'error', error: String(error), fatal: false });
+        throw error;
+      })
+      .finally(() => {
+        if (this.liveTurn === turn) {
+          this.liveTurn = null;
+          this.liveOwner = null;
+          if (!this.disposed && this.state !== 'error') this.setState('idle');
+          void this.drain();
+        }
+      });
+    this.liveTurn = turn;
+    return turn;
+  }
+
+  private async drain(): Promise<void> {
+    while (!this.disposed && this.queue.length > 0 && this.liveTurn === null) {
+      const next = this.queue.shift()!;
+      try {
+        await this.runTurn(next.text, next.owner);
+        next.resolve();
+      } catch (error) {
+        next.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+  }
+
+  private setState(state: AgentState, error?: string): void {
+    this.state = state;
+    this.stateError = error;
+    this.lastActivity = new Date().toISOString();
+    this.emit({ type: 'state', state, error });
+  }
+
+  private emit(event: RuntimeEvent): void {
+    this.lastActivity = new Date().toISOString();
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        this.log('warn', 'runtime event listener threw', { error: String(error) });
+      }
+    }
+  }
+
+  /** Map pi SDK events onto the runtime-agnostic event surface. */
+  private onPiEvent(event: unknown): void {
+    const e = event as Record<string, unknown>;
+    switch (e['type']) {
+      case 'agent_start':
+        this.setState('streaming');
+        return;
+      case 'agent_end':
+        if (e['willRetry'] === true) return; // retry keeps the turn live
+        this.setState(this.session.isStreaming ? 'streaming' : 'idle');
+        return;
+      case 'turn_start':
+        this.emit({ type: 'turn_start' });
+        return;
+      case 'turn_end':
+        this.emit({ type: 'turn_end' });
+        return;
+      case 'message_update': {
+        const inner = e['assistantMessageEvent'] as Record<string, unknown> | undefined;
+        if (inner === undefined) return;
+        if (inner['type'] === 'text_delta' && typeof inner['delta'] === 'string') {
+          this.emit({ type: 'text_delta', delta: inner['delta'] });
+        } else if (inner['type'] === 'thinking_delta' && typeof inner['delta'] === 'string') {
+          this.emit({ type: 'thinking_delta', delta: inner['delta'] });
+        }
+        return;
+      }
+      case 'tool_execution_start':
+        this.emit({
+          type: 'tool_start',
+          callId: String(e['toolCallId']),
+          tool: String(e['toolName']),
+        });
+        return;
+      case 'tool_execution_update':
+        this.emit({ type: 'tool_update', callId: String(e['toolCallId']) });
+        return;
+      case 'tool_execution_end':
+        this.emit({
+          type: 'tool_end',
+          callId: String(e['toolCallId']),
+          isError: e['isError'] === true,
+        });
+        return;
+      default:
+        return;
+    }
+  }
+}

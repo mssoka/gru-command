@@ -25,9 +25,11 @@ The config file is always `<instance dir>/config.toml`.
 - All path fields must resolve to absolute paths after expansion.
 - **`data_dir` must not live inside `workspace_root`** (and must not equal
   it) — instance state stays out of the managed-repos tree (SPEC ruling 7).
-- Model policy: `[models].default` may be empty ("unset until the runtime
-  layer ships"), but any `[models.roles]` override must be a non-empty
-  string when present — an empty override is meaningless; omit it instead.
+- Model policy: `[models].default` and `[thinking].default` may be empty
+  or `"default"` (both mean "the runtime harness's own" — SPEC ruling
+  16); any `[models.roles]` / `[thinking.roles]` override must be a
+  non-empty string when present — an empty override is meaningless; omit
+  it instead.
 
 ## Schema
 
@@ -66,13 +68,36 @@ gru = "pi"
 minion = "claude-code"
 
 [models]
-# Default model reference (free-form "provider/model" string).
-# Optional until the runtime layer ships.
-default = "provider/model-a"
+# Default model reference. "default" = the runtime harness's own
+# configured model (SPEC ruling 16 — the product never hardcodes a
+# model). Explicit: "provider/model". Optional; default "default".
+default = "default"
 
 [models.roles]
 # Optional per-role model overrides (same role names as runtimes.roles).
+# "default" here means "runtime's own" for that role.
 gru = "provider/model-b"
+
+[thinking]
+# Thinking level policy, same shape as [models]. "default" = the
+# runtime's own setting. Optional; default "default".
+default = "high"
+
+[thinking.roles]
+# Optional per-role thinking overrides.
+perkins = "max"
+
+[runtimes.pi]
+# Per-runtime model & thinking overrides for pi-hosted sessions
+# (pi accepts thinking levels: minimal, low, medium, high, xhigh, max).
+model = "default"
+thinking_level = "default"
+
+[runtimes.pi.roles]
+# Per-runtime per-role overrides; inline tables with model and/or
+# thinking_level (at least one).
+minion = { model = "provider/model-c", thinking_level = "low" }
+bob = { thinking_level = "medium" }
 ```
 
 See [`example.config.toml`](./example.config.toml) for a complete generic
@@ -90,6 +115,9 @@ example.
 | Unknown runtime id | `unknown runtime \`x\` (valid runtimes: pi, claude-code)` |
 | Unknown role | `unknown role \`x\` (valid roles: gru, silas, minion, perkins, bob)` |
 | Bad port | `server.port must be an integer between 0 and 65535 (0 = ephemeral)` |
+| Unknown runtime policy key | `unknown key \`x\` in [runtimes.pi] (valid keys: model, thinking_level, roles)` |
+| Empty runtime role entry | `[runtimes.pi.roles.gru] must set at least one of model, thinking_level` |
+| Unknown runtime id as a table | `unknown key \`x\` in [runtimes] (valid keys: default, roles, or a runtime id: pi, claude-code)` |
 | Relative `GRU_COMMAND_HOME` | `GRU_COMMAND_HOME must be an absolute path` (an empty value is rejected the same way) |
 | Path not absolute after expansion | `workspace_root must resolve to an absolute path` |
 | `data_dir` inside `workspace_root` | `data_dir must not live inside workspace_root … — SPEC ruling 7` |
@@ -98,7 +126,11 @@ example.
 
 ## What reads the config today
 
-The foundation epic loads and validates the whole schema and exposes a
-summary (`workspace_root`, `data_dir`) via `GET /health`. The runtime,
-model, and auth values are carried for the adapter and UI epics — see
-[EPICS.md](./EPICS.md).
+The foundation epic loads and validates the whole schema. The runtime
+layer (this epic onward) consumes `[runtimes]`, `[models]`, `[thinking]`
+for every spawn: model references resolve fail-loud, thinking levels
+validate per runtime, and the `"default"` sentinel passes through to the
+harness's own configuration. `/health` surfaces a summary
+(`workspace_root`, `data_dir`) plus real liveness. The UI epics consume
+the auth values. See [RUNTIMES.md](./RUNTIMES.md) for the capability
+matrix, fallback semantics, and the session-store contract.

@@ -1,6 +1,8 @@
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
+import { RuntimeRegistry } from './runtime/registry.js';
+import { SessionStore } from './sessions/store.js';
 import { createService, type ServiceHandle } from './server.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
@@ -48,7 +50,7 @@ async function main(): Promise<number> {
     process.exit(1);
   });
 
-  const state: { handle?: ServiceHandle } = {};
+  const state: { handle?: ServiceHandle; registry?: RuntimeRegistry; store?: SessionStore } = {};
   let shuttingDown = false;
   const shutdown = (signal: string) => {
     if (shuttingDown) return;
@@ -64,8 +66,19 @@ async function main(): Promise<number> {
       logger.info('shutdown complete', { signal, note: 'signal arrived during boot' });
       process.exit(0);
     }
-    void state.handle
-      .stop()
+    const handle = state.handle;
+    void Promise.resolve()
+      .then(async () => {
+        // Release session locks and persist the size snapshot BEFORE the
+        // process goes away — the next boot's growth detection depends on
+        // the snapshot reflecting what this process last saw (SPEC ruling 12).
+        if (state.registry !== undefined) await state.registry.dispose();
+        if (state.store !== undefined) {
+          state.store.dispose();
+          state.store.persistSnapshot();
+        }
+        await handle.stop();
+      })
       .then(() => {
         clearTimeout(forceExit);
         logger.info('shutdown complete', { signal });
@@ -82,8 +95,28 @@ async function main(): Promise<number> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  const service = createService(config, identity, (level, msg, fields) =>
-    logger.log(level, msg, fields),
+  // Runtime layer (E2): durable session store + adapter registry, booted
+  // BEFORE the server so /health can answer with real signals from the
+  // first request. Growth findings also hit the log (SPEC ruling 12).
+  const store = new SessionStore(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
+  const registry = new RuntimeRegistry({
+    config,
+    store,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const growth = registry.boot();
+  state.store = store;
+  state.registry = registry;
+  logger.info('session store ready', {
+    sessions_dir: store.sessionsDir,
+    growth_findings: growth.findings.length,
+  });
+
+  const service = createService(
+    config,
+    identity,
+    (level, msg, fields) => logger.log(level, msg, fields),
+    () => registry.status(),
   );
   state.handle = await service.start();
   const handle = state.handle;

@@ -4,14 +4,14 @@ import { randomUUID } from 'node:crypto';
 import type { GruCommandConfig } from './config.js';
 import type { InstallIdentity } from './identity.js';
 import type { LogLevel } from './logger.js';
+import type { RuntimeStatus } from './runtime/registry.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
 /**
  * Three-signal liveness per the approved architecture amendments:
  * (a) /health reachable, (b) agent-session state + last activity,
- * (c) session-jsonl growth. All three carry their structure with
- * `stubbed: true` until the runtime adapter layer (E2) wires real values —
- * declared, not faked.
+ * (c) session-jsonl growth. Since E2 the values are REAL — wired from the
+ * runtime registry and the session store's boot report (SPEC rulings 5/12).
  */
 export interface LivenessSignal {
   readonly value: unknown;
@@ -105,18 +105,45 @@ export function buildHealthPayload(
   identity: InstallIdentity,
   startedAt: bigint,
   requestId: string,
+  runtimeStatus: RuntimeStatus | null = null,
 ): HealthPayload {
-  const liveness: LivenessBlock = {
-    healthy: true,
-    note:
-      'all three signals are stubbed until the runtime adapter layer (E2); ' +
-      'health reachability is self-evident from this response itself',
-    signals: {
-      health_reachable: { value: true, stubbed: true },
-      agent_session: { state: 'no-runtime', last_activity: null, stubbed: true },
-      session_growth: { value: 'no-runtime', stubbed: true },
-    },
-  };
+  const liveness: LivenessBlock =
+    runtimeStatus === null
+      ? {
+          healthy: true,
+          note: 'runtime layer not wired in this process; signals declared, not faked',
+          signals: {
+            health_reachable: { value: true, stubbed: true },
+            agent_session: { state: 'no-runtime', last_activity: null, stubbed: true },
+            session_growth: { value: 'no-runtime', stubbed: true },
+          },
+        }
+      : {
+          healthy: true,
+          note: 'signals are live values from the runtime registry and session store',
+          signals: {
+            health_reachable: { value: true, stubbed: false },
+            agent_session: {
+              state: runtimeStatus.agentSession.state,
+              last_activity: runtimeStatus.agentSession.lastActivity,
+              stubbed: false,
+            },
+            session_growth: {
+              value:
+                runtimeStatus.sessionGrowth === null
+                  ? 'not-scanned'
+                  : runtimeStatus.sessionGrowth.findings.length === 0
+                    ? 'none'
+                    : runtimeStatus.sessionGrowth.findings.map((finding) => ({
+                        file: finding.file,
+                        grew_by_bytes: finding.grewByBytes,
+                        previous_bytes: finding.previousBytes,
+                        current_bytes: finding.currentBytes,
+                      })),
+              stubbed: false,
+            },
+          },
+        };
   return {
     service: SERVICE_NAME,
     version: VERSION,
@@ -134,7 +161,10 @@ export function buildHealthPayload(
     session: {
       path: join(config.dataDir, 'sessions'),
       declared: true,
-      note: 'session store arrives with the runtime adapter layer (E2); path declared per SPEC ruling 12',
+      note:
+        runtimeStatus === null
+          ? 'session store arrives with the runtime adapter layer (E2); path declared per SPEC ruling 12'
+          : 'append-only jsonl under this path; locked while active, hourly rolling backup, boot growth detection',
     },
   };
 }
@@ -149,6 +179,7 @@ export function createService(
   config: GruCommandConfig,
   identity: InstallIdentity,
   onEvent: ServiceEvent = () => {},
+  runtimeStatus: () => RuntimeStatus | null = () => null,
 ): { start(): Promise<ServiceHandle> } {
   const startedAt = process.hrtime.bigint();
   const server: HttpServer = createServer(
@@ -190,7 +221,11 @@ export function createService(
             }
             throw error;
           }
-          jsonBody(res, 200, buildHealthPayload(config, identity, startedAt, requestId));
+          jsonBody(
+            res,
+            200,
+            buildHealthPayload(config, identity, startedAt, requestId, runtimeStatus()),
+          );
           return { status: 200 };
         }
         req.resume();
