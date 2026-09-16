@@ -13,7 +13,7 @@ const PINS: Record<string, number> = {
   'health.test.ts': 12,
   'identity.test.ts': 3,
   'logger.test.ts': 1,
-  'pi-adapter.test.ts': 30,
+  'pi-adapter.test.ts': 31,
   'session-store.test.ts': 14,
   'shutdown.test.ts': 3,
   'smoke-real-model.test.ts': 1,

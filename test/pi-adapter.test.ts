@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath } from '../src/runtime/pi-adapter.js';
 import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.js';
-import { SessionStore } from '../src/sessions/store.js';
+import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import type { RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubTurn } from './helpers/stub-model.js';
 
@@ -667,5 +667,46 @@ describe('path normalization', () => {
     expect(normalizeSessionPath('~/x/s.jsonl')).toBe(join(home, 'x', 's.jsonl'));
     expect(normalizeSessionPath('file:///tmp/a%20b/s.jsonl')).toBe(resolve('/tmp/a b/s.jsonl'));
     expect(normalizeSessionPath('./rel/s.jsonl')).toBe(resolve('./rel/s.jsonl'));
+  });
+});
+
+describe('Perkins r2: concurrent double-resume race (B4-race)', () => {
+  it('the loser never deletes the winner\'s lock; a foreign writer stays locked out; health stays ok', async () => {
+    // Seed one durable session file in the store.
+    const fx = await fixture([{ deltas: ['one'] }]);
+    const first = await fx.runtime.spawn('gru');
+    await first.prompt('write something', { owner: 'alice' });
+    const file = first.sessionFile!;
+    await first.dispose();
+    expect(existsSync(`${file}.lock`)).toBe(false);
+
+    // TWO concurrent resume spawns: both pass the pre-check before either
+    // registers (the r2 race window). Exactly one may win.
+    const results = await Promise.allSettled([
+      fx.runtime.spawn('gru', { resumeFile: file }),
+      fx.runtime.spawn('gru', { resumeFile: file }),
+    ]);
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(Error);
+    expect(String((rejected[0] as PromiseRejectedResult).reason)).toMatch(
+      /already hosted by this process/,
+    );
+
+    // THE R2 BLOCKER: the winner's lock file must SURVIVE the loser's
+    // rejection cleanup.
+    expect(existsSync(`${file}.lock`)).toBe(true);
+    // A foreign store (other bootId) is still locked out:
+    const foreign = new SessionStore(fx.store.dataDir);
+    expect(() => foreign.acquireLock(file)).toThrow(LockBusyError);
+    foreign.dispose();
+    // W1-latch pin: losing a race is a state conflict, not adapter health:
+    expect(fx.runtime.health().state).toBe('ok');
+
+    const winner = (fulfilled[0] as PromiseFulfilledResult<Awaited<ReturnType<typeof fx.runtime.spawn>>>).value;
+    await winner.dispose();
+    expect(existsSync(`${file}.lock`)).toBe(false); // released by the winner
   });
 });

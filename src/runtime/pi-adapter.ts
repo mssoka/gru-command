@@ -12,7 +12,7 @@ import type { GruCommandConfig, Role } from '../config.js';
 import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
-import type { SessionStore } from '../sessions/store.js';
+import { LockBusyError, type SessionStore } from '../sessions/store.js';
 import type {
   AgentCapabilities,
   AgentHandle,
@@ -193,8 +193,14 @@ export class PiRuntime implements AgentRuntime {
     }
     // Resume: lock BEFORE touching the file — a second writer must never
     // even open a session another process holds (single-writer, ruling 1).
-    if (resumeFile !== undefined) {
+    // A concurrent twin spawn may already hold it for THIS process (its
+    // registration is still in flight) — track whether THIS call acquired:
+    // lock removal is bound to acquisition ownership, never mere existence
+    // (Perkins r2 B4-race: the loser must never delete the winner's lock).
+    let lockAcquired = false;
+    if (resumeFile !== undefined && !this.store.isHeld(resumeFile)) {
       this.store.acquireLock(resumeFile);
+      lockAcquired = true;
     }
     try {
       const sessionManager =
@@ -226,8 +232,10 @@ export class PiRuntime implements AgentRuntime {
         session.dispose();
         throw new SessionAlreadyActiveError(sessionFile);
       }
+      // Winner ensures the lock is held: a losing twin that pre-acquired
+      // may have released between our pre-check and here.
       try {
-        if (resumeFile === undefined) {
+        if (!this.store.isHeld(sessionFile)) {
           this.store.acquireLock(sessionFile);
         }
       } catch (error) {
@@ -250,14 +258,22 @@ export class PiRuntime implements AgentRuntime {
       this.down = undefined;
       return handle;
     } catch (error) {
-      if (resumeFile !== undefined) {
+      // Release ONLY a lock THIS call acquired, and ONLY when no winner
+      // hosts the file (a registered twin owns the lock's lifetime now).
+      if (lockAcquired && resumeFile !== undefined && !this.activeFiles.has(resumeFile)) {
         this.store.releaseLock(resumeFile);
       }
       // Infrastructure failure (store, loader, session create) marks the
       // adapter down; the NEXT spawn attempt re-clears it. Caller-facing
-      // validation errors (bad model/thinking references) never latch —
-      // those reject above this try block.
-      this.down = String(error);
+      // errors — bad model/thinking references (rejected above), a foreign
+      // lock holder (LockBusyError), or losing a double-resume race
+      // (SessionAlreadyActiveError) — are state conflicts, never health.
+      if (
+        !(error instanceof SessionAlreadyActiveError) &&
+        !(error instanceof LockBusyError)
+      ) {
+        this.down = String(error);
+      }
       throw error;
     }
   }

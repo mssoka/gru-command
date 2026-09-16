@@ -132,6 +132,11 @@ export class SessionStore {
     return `${sessionFile}.lock`;
   }
 
+  /** Whether THIS store instance currently holds the file's lock. */
+  isHeld(sessionFile: string): boolean {
+    return this.heldLocks.has(sessionFile);
+  }
+
   /**
    * Acquire the exclusive lock for a session file. The lock is a sidecar
    * `.lock` file created with O_EXCL holding pid + heartbeat; a second
