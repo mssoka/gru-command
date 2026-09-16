@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gru Command</title>
+  <meta name="description" content="One window into the whole operation — chat with the single Gru.">
+</head>
+<body>
+  <header class="app-nav">
+    <div class="app-nav__logo" aria-hidden="true">🪐</div>
+    <div>
+      <div class="app-nav__title">Gru Command</div>
+      <div class="lbl">one Gru · one window</div>
+    </div>
+    <span class="conn-dot" id="conn-dot" title="socket: idle" role="status"></span>
+    <div class="app-nav__spacer"></div>
+    <button id="theme-toggle" class="pp-btn pp-btn--secondary pp-btn--icon" title="Toggle theme">🌙</button>
+    <button id="settings-toggle" class="pp-btn pp-btn--secondary pp-btn--icon" title="Settings">⚙️</button>
+  </header>
+
+  <main class="app-main">
+    <div class="banner-stack" id="banners"></div>
+
+    <section id="pairing-view" class="pp-card pairing reveal" hidden>
+      <div>
+        <div class="lbl">Pairing</div>
+        <h1 style="margin:6px 0 4px;font-size:24px;">Pair this browser</h1>
+        <p style="margin:0;color:var(--muted);font-weight:600;font-size:14px;">
+          Scan with a phone on the same network, or paste the pairing token.
+        </p>
+      </div>
+      <div class="pairing__qr"><img id="pair-qr-img" alt="Pairing QR code"></div>
+      <form class="pairing__form" id="pair-form">
+        <input class="pp-input" id="pair-token" type="password" placeholder="pairing token"
+               autocomplete="off" aria-label="Pairing token">
+        <button class="pp-btn" type="submit" id="pair-submit">Pair 🤝</button>
+      </form>
+      <div class="pairing__error" id="pair-error" hidden></div>
+    </section>
+
+    <section id="settings-view" class="pp-card settings reveal" hidden>
+      <div class="lbl">Settings</div>
+      <div class="settings__row">
+        <strong>Theme</strong>
+        <button id="settings-theme" class="pp-btn pp-btn--secondary">☀️ light</button>
+      </div>
+      <div class="settings__row">
+        <strong>Chat socket</strong>
+        <span class="settings__value" id="settings-endpoint">—</span>
+      </div>
+      <div class="settings__row">
+        <strong>Pairing</strong>
+        <button id="settings-unpair" class="pp-btn pp-btn--secondary">Unpair this browser</button>
+      </div>
+      <div class="lbl">More settings land with the board (E6) and notifications (E7).</div>
+    </section>
+
+    <div id="chat-main-mount" class="reveal">
+      <section id="chat-view" class="pp-card chat-panel chat-panel--desktop" hidden>
+        <div class="chat-log" id="chat-log" aria-live="polite"></div>
+        <form class="chat-compose" id="chat-form">
+          <input class="pp-input" id="chat-input" placeholder="Tell Gru what you need, boss…"
+                 autocomplete="off" aria-label="Message Gru">
+          <button class="pp-btn" type="submit" id="chat-send">Send 🚀</button>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <button class="chat-bubble" id="chat-bubble" data-unread="0" aria-label="Open chat">
+    💬<span class="chat-bubble__badge" id="chat-badge">0</span>
+  </button>
+  <div class="chat-sheet" id="chat-sheet" data-open="false">
+    <div class="chat-sheet__grip" id="chat-sheet-grip" role="button" aria-label="Close chat"></div>
+    <div id="chat-sheet-mount"></div>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

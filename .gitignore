@@ -1,11 +1,19 @@
 # Build output
 dist/
+web/dist/
 # Dependencies
 node_modules/
 # Test coverage
 coverage/
+# Playwright / e2e output
+web/playwright-report/
+web/test-results/
 # Logs
 *.log
 # Local env — never commit secrets
 .env
 .env.*
+# Agent scratch (review sessions, render caches)
+.lavish/
+_bmad-output/
+_bmad/render/

@@ -1,0 +1,28 @@
+{
+  "name": "@gru-command/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Gru Command web UI shell (E5) — Playful Planet design system, chat view, and dev-only mock socket.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "test": "tsc --noEmit -p tsconfig.json && vitest run",
+    "e2e": "npm run build && playwright test",
+    "mock": "tsx mock/server.ts"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.0",
+    "@types/node": "^20.17.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.3.5",
+    "vitest": "^2.1.8",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,73 @@
+/**
+ * Playful Planet — design tokens (E5).
+ * Light is the default face; `.dark` on <html> flips the set.
+ * Palette ported from the approved design pages; see docs/UI.md.
+ */
+
+:root {
+  /* Surfaces & ink */
+  --ink: #22304a;
+  --paper: #faf6ef;
+  --card: #ffffff;
+  --soft: #fdf8ee;
+  --muted: #6b7a94;
+  --faint: #8a8678;
+  --line: #22304a;
+
+  /* State colors */
+  --work: #ffd54a;   /* minion yellow — working / Gru bubbles / accents */
+  --done: #7ee08a;
+  --rev: #9ad7f5;
+  --park: #e8e3d8;
+  --alert: #ffb3ba;
+  --perkins: #c9b8ff;
+
+  /* Accent (flips to minion yellow in dark) */
+  --accent: #22304a;
+  --accent-text: #ffffff;
+
+  /* Ink that sits ON state colors (yellow/green/blue stay saturated in
+     both themes, so their text stays dark in both). */
+  --on-state: #22304a;
+
+  /* Shape language: chunky ink outlines + toy-box shadows */
+  --outline: 3px solid var(--line);
+  --outline-thin: 2.5px solid var(--line);
+  --radius-lg: 20px;
+  --radius-md: 16px;
+  --radius-sm: 14px;
+  --radius-bubble: 22px;
+  --shadow-card: 5px 6px 0 rgba(34, 48, 74, 0.13);
+  --shadow-btn: 3px 4px 0 rgba(34, 48, 74, 0.22);
+  --shadow-btn-pressed: 1px 2px 0 rgba(34, 48, 74, 0.22);
+
+  --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+  --ease-pop: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.dark {
+  --ink: #e8ecf4;
+  --paper: #141a2b;
+  --card: #1c2438;
+  --soft: #182033;
+  --muted: #93a0b8;
+  --faint: #6d7890;
+  --line: #313c58;
+
+  --work: #ffd54a;
+  --done: #6fd68a;
+  --rev: #7cc4ef;
+  --park: #2a3350;
+  --alert: #ff8f9c;
+  --perkins: #b7a3ff;
+
+  --accent: #ffd54a;
+  --accent-text: #1a2236;
+
+  --on-state: #1a2236;
+
+  --shadow-card: 5px 6px 0 rgba(0, 0, 0, 0.35);
+  --shadow-btn: 3px 4px 0 rgba(0, 0, 0, 0.4);
+  --shadow-btn-pressed: 1px 2px 0 rgba(0, 0, 0, 0.4);
+}
