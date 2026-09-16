@@ -55,7 +55,7 @@ export class LockUnreadableError extends Error {
 
 export interface GrowthFinding {
   readonly file: string;
-  readonly kind: 'grew' | 'shrunk';
+  readonly kind: 'grew' | 'shrunk' | 'deleted';
   readonly grewByBytes: number;
   readonly previousBytes: number;
   readonly currentBytes: number;
@@ -96,7 +96,7 @@ export class SessionStore {
   private readonly stateFile: string;
   private readonly retention: number;
   private readonly log: StoreLog;
-  private readonly heldLocks = new Map<string, { fd: number }>();
+  private readonly heldLocks = new Set<string>();
   private readonly heartbeats = new Map<string, ReturnType<typeof setInterval>>();
   private backupTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
@@ -110,7 +110,9 @@ export class SessionStore {
     this.stateFile = join(this.sessionsDir, 'store-state.json');
     this.retention = opts.retention ?? 24;
     this.log = opts.log ?? (() => {});
-    mkdirSync(this.sessionsDir, { recursive: true });
+    // Session transcripts carry full prompt/tool content — the sessions
+    // dir is owner-only; nothing else should traverse it.
+    mkdirSync(this.sessionsDir, { recursive: true, mode: 0o700 });
   }
 
   /**
@@ -170,14 +172,15 @@ export class SessionStore {
       }
       break;
     }
-    this.heldLocks.set(sessionFile, { fd: -1 });
+    this.heldLocks.add(sessionFile);
     const heartbeat = setInterval(() => {
       try {
         const current = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
         if (current.pid === info.pid && current.bootId === info.bootId) {
           const next = `${JSON.stringify({ ...current, heartbeatAt: new Date().toISOString() })}\n`;
-          // Truncating rewrite keeps the lock file tiny; O_EXCL ownership was
-          // already proven above, and the heartbeat interval owns this file.
+          // Fixed-length rewrite keeps the lock file tiny (pid, bootId
+          // and ISO heartbeat timestamps are constant width); O_EXCL
+          // ownership was proven above and the heartbeat owns this file.
           const wfd = openSync(lockFile, 'r+');
           writeFileSync(wfd, next, 'utf-8');
           closeSync(wfd);
@@ -305,6 +308,20 @@ export class SessionStore {
         });
       }
     }
+    // Snapshot entries whose file VANISHED while down are findings too —
+    // a console delete must never pass silently.
+    const present = new Set(this.listSessionFiles());
+    for (const [file, prev] of Object.entries(previous)) {
+      if (!present.has(file) && prev > 0) {
+        findings.push({
+          file,
+          kind: 'deleted',
+          grewByBytes: -prev,
+          previousBytes: prev,
+          currentBytes: 0,
+        });
+      }
+    }
     return { findings, snapshotState, scannedAt: new Date().toISOString() };
   }
 
@@ -324,9 +341,10 @@ export class SessionStore {
   }
 
   /**
-   * One backup pass: copy every tracked session file (and the size
-   * snapshot) into the backup dir with an ISO-hour suffix, then prune
-   * oldest beyond retention. Safe to call at boot and hourly.
+   * One backup pass: copy every tracked session file into the backup dir
+   * with an ISO-hour suffix (the slot IS the hour — a second pass in the
+   * same hour refreshes the slot), then prune oldest beyond retention.
+   * Also persists the size snapshot into the sessions dir.
    */
   runBackup(now: Date = new Date()): { created: string[]; pruned: string[] } {
     mkdirSync(this.backupDir, { recursive: true });
@@ -350,11 +368,17 @@ export class SessionStore {
     return { created, pruned };
   }
 
-  /** Start the hourly rolling backup (unref'd — never holds the event loop). */
+  /** Start the hourly rolling backup (unref'd — never holds the event
+   * loop). A transient fs failure inside a pass logs an error; it must
+   * never escape as an uncaughtException and kill the service. */
   startHourlyBackup(): void {
     if (this.backupTimer !== null || this.disposed) return;
     this.backupTimer = setInterval(() => {
-      this.runBackup();
+      try {
+        this.runBackup();
+      } catch (error) {
+        this.log('error', 'hourly session backup pass failed', { error: String(error) });
+      }
     }, BACKUP_INTERVAL_MS);
     this.backupTimer.unref();
   }

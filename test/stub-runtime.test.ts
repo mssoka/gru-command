@@ -22,6 +22,8 @@ class ScriptRuntime implements AgentRuntime {
   deferStateEvents = false;
   /** Optional hold applied to the NEXT prompt-driven turn. */
   nextHold?: Promise<void>;
+  /** When set, the NEXT prompt-driven turn rejects with this error. */
+  nextError?: string;
   readonly capabilities: AgentCapabilities = {
     streaming: true,
     steer: 'queued',
@@ -89,6 +91,12 @@ class ScriptHandle implements AgentHandle {
     const owner = options?.owner ?? 'default';
     const hold = this.runtime.nextHold;
     this.runtime.nextHold = undefined;
+    const error = this.runtime.nextError;
+    this.runtime.nextError = undefined;
+    if (error !== undefined) {
+      this.setState('error');
+      throw new Error(error);
+    }
     await this.simulateTurn(text, owner, hold);
   }
   async steer(text: string, options?: PromptOptions): Promise<void> {
@@ -262,5 +270,52 @@ describe('interface-layer fallbacks (steer-unable → queue-until-idle)', () => 
     await first;
     await steered;
     expect(inner.calls).toContainEqual({ op: 'prompt', text: 'sync-steer', owner: 'bob' });
+  });
+});
+
+describe('Perkins r1 regressions (fallback)', () => {
+  it('B2: a prompt during a PUMPED turn queues too (pump holds busy)', async () => {
+    const inner = new ScriptRuntime('queued');
+    const runtime = withFallbacks(inner);
+    const handle = await runtime.spawn('gru');
+    let release1!: () => void;
+    let release2!: () => void;
+    const hold1 = new Promise<void>((r) => (release1 = r));
+    const hold2 = new Promise<void>((r) => (release2 = r));
+    inner.nextHold = hold1;
+    const first = handle.prompt('turn-one', { owner: 'alice' });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const steered = handle.steer('steer-queued', { owner: 'bob' });
+    // The pumped turn gets its own hold so a fresh prompt lands mid-pump:
+    inner.nextHold = hold2;
+    release1();
+    await first;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    // 'steer-queued' is now being delivered by the pump (busy held):
+    const third = handle.prompt('third', { owner: 'carol' });
+    expect(inner.calls.filter((c) => c.text === 'third')).toEqual([]);
+    release2();
+    await steered;
+    await third;
+    expect(inner.calls.map((c) => c.text)).toEqual(['turn-one', 'steer-queued', 'third']);
+  });
+
+  it('N15: followUp passes through to the inner runtime when idle', async () => {
+    const inner = new ScriptRuntime('queued');
+    const runtime = withFallbacks(inner);
+    const handle = await runtime.spawn('gru');
+    await handle.followUp('ping', { owner: 'alice' });
+    expect(inner.calls).toContainEqual({ op: 'prompt', text: 'ping', owner: 'alice' });
+  });
+
+  it('N15b: a rejecting delivery resets busy and does not strand the queue', async () => {
+    const inner = new ScriptRuntime('queued');
+    const runtime = withFallbacks(inner);
+    const handle = await runtime.spawn('gru');
+    inner.nextError = 'delivery exploded';
+    await expect(handle.steer('fails', { owner: 'alice' })).rejects.toThrow(/delivery exploded/);
+    // busy was reset: the next call delivers normally.
+    await handle.steer('works', { owner: 'alice' });
+    expect(inner.calls).toContainEqual({ op: 'prompt', text: 'works', owner: 'alice' });
   });
 });

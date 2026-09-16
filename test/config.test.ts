@@ -400,3 +400,26 @@ describe('docs/example.config.toml', () => {
     });
   });
 });
+
+describe('Perkins r1 regression pins', () => {
+  it('rejects empty overrides in [thinking.roles] (N11)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[thinking.roles]\ngru = ""\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /thinking\.roles\.gru must not be empty/,
+    );
+  });
+
+  it('rejects an unknown role and unknown entry key inside [runtimes.<id>.roles] (N18)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[runtimes.pi.roles]\nnot-a-role = { model = "x" }\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /unknown role `not-a-role`/,
+    );
+    const home2 = tmpHome();
+    writeConfig(home2, '[runtimes.pi.roles]\ngru = { model = "x", bananas = "y" }\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home2 }, '/home/tester')).toThrow(
+      /unknown key `bananas` in \[runtimes\.pi\.roles\.gru\]/,
+    );
+  });
+});

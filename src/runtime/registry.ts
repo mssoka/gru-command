@@ -1,10 +1,9 @@
 import { RUNTIME_IDS, resolveSpawnPolicy, type Role, type RuntimeId } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
-import type { PiRuntimeOptions } from './pi-adapter.js';
 import { PiRuntime } from './pi-adapter.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
-import type { AgentHandle, AgentRuntime } from './types.js';
+import type { AgentHandle, AgentRuntime, SpawnOptions } from './types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -18,10 +17,24 @@ export interface RuntimeStatus {
   /** Boot-time growth report (null before the store has scanned). */
   readonly sessionGrowth: GrowthReport | null;
   readonly activeSessions: number;
+  /** Per-adapter health — a 'down' adapter flips liveness.healthy false. */
+  readonly adapters: readonly { readonly id: string; readonly state: string }[];
 }
 
-export interface RuntimeRegistryOptions extends PiRuntimeOptions {
+/** pi-adapter-only knobs (test seams) — kept out of the agnostic surface. */
+export interface PiKnobs {
+  readonly agentDir?: string;
+  readonly modelRuntime?: PiRuntimeOptionsModelRuntime;
+}
+
+type PiRuntimeOptionsModelRuntime = ConstructorParameters<typeof PiRuntime>[0]['modelRuntime'];
+
+export interface RuntimeRegistryOptions {
+  readonly config: Parameters<typeof resolveSpawnPolicy>[0];
   readonly store: SessionStore;
+  readonly log?: Log;
+  /** pi adapter overrides (agentDir / model runtime — test seams). */
+  readonly pi?: PiKnobs;
 }
 
 /**
@@ -71,7 +84,17 @@ export class RuntimeRegistry {
     let adapter = this.adapters.get(id);
     if (adapter === undefined) {
       if (id === 'pi') {
-        adapter = withFallbacks(new PiRuntime(this.opts));
+        adapter = withFallbacks(
+          new PiRuntime({
+            config: this.opts.config,
+            store: this.opts.store,
+            ...(this.opts.pi?.agentDir !== undefined ? { agentDir: this.opts.pi.agentDir } : {}),
+            ...(this.opts.pi?.modelRuntime !== undefined
+              ? { modelRuntime: this.opts.pi.modelRuntime }
+              : {}),
+            ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
+          }),
+        );
       } else {
         // E3 lands the claude-code adapter; resolving it before then is a
         // configuration referencing something that cannot host yet.
@@ -82,7 +105,7 @@ export class RuntimeRegistry {
     return adapter;
   }
 
-  async spawn(role: Role, options: { resumeFile?: string; model?: string; thinkingLevel?: string } = {}): Promise<AgentHandle> {
+  async spawn(role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
     const adapter = this.runtimeFor(this.runtimeIdFor(role));
     // SPEC ruling 16: resolve the model & thinking policy from config
     // (most specific wins) with spawn options overriding, "default"
@@ -143,6 +166,10 @@ export class RuntimeRegistry {
       },
       sessionGrowth: this.growth,
       activeSessions: this.handles.size,
+      adapters: [...this.adapters.values()].map((adapter) => ({
+        id: adapter.id,
+        state: adapter.health().state,
+      })),
     };
   }
 

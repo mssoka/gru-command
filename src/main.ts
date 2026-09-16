@@ -43,6 +43,13 @@ async function main(): Promise<number> {
   // the JSON-lines log stays the record even under OS-service restarts.
   process.on('uncaughtException', (error: Error) => {
     logger.error('uncaught exception', { error: String(error), stack: error.stack });
+    // Best-effort: leave the size snapshot honest for the next boot's
+    // growth detection even when the graceful shutdown path never runs.
+    try {
+      state.store?.persistSnapshot();
+    } catch {
+      /* dying anyway */
+    }
     process.exit(1);
   });
   process.on('unhandledRejection', (reason: unknown) => {

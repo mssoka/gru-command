@@ -119,7 +119,7 @@ export function buildHealthPayload(
           },
         }
       : {
-          healthy: true,
+          healthy: !runtimeStatus.adapters.some((adapter) => adapter.state === 'down'),
           note: 'signals are live values from the runtime registry and session store',
           signals: {
             health_reachable: { value: true, stubbed: false },
@@ -136,6 +136,7 @@ export function buildHealthPayload(
                     ? 'none'
                     : runtimeStatus.sessionGrowth.findings.map((finding) => ({
                         file: finding.file,
+                        kind: finding.kind,
                         grew_by_bytes: finding.grewByBytes,
                         previous_bytes: finding.previousBytes,
                         current_bytes: finding.currentBytes,

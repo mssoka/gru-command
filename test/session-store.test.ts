@@ -232,3 +232,31 @@ describe('SessionStore', () => {
     fresh.releaseLock(file);
   });
 });
+
+describe('Perkins r1 regressions', () => {
+  it('W9: a second pass in the same ISO hour refreshes the slot (freshest wins)', () => {
+    const dataDir = tmpDataDir();
+    const store = new SessionStore(dataDir, { retention: 5 });
+    const file = seedSession(store, 'gru', 'early\n');
+    const first = store.runBackup(new Date('2026-09-16T10:05:00Z'));
+    appendFileSync(file, 'later\n', 'utf-8');
+    const second = store.runBackup(new Date('2026-09-16T10:45:00Z'));
+    // Same hour → same slot: no new backup file appears, and its content
+    // is the freshest in-slot state.
+    expect(second.created.length).toBe(1);
+    expect(second.created[0]).toBe(first.created[0]);
+    expect(readFileSync(second.created[0]!, 'utf-8')).toBe('early\nlater\n');
+  });
+
+  it('N28: a session file deleted while down is reported', () => {
+    const dataDir = tmpDataDir();
+    const first = new SessionStore(dataDir);
+    const file = seedSession(first);
+    first.persistSnapshot();
+    rmSync(file);
+    const report = new SessionStore(dataDir).detectGrowth();
+    expect(report.findings.length).toBe(1);
+    expect(report.findings[0]!.kind).toBe('deleted');
+    expect(report.findings[0]!.currentBytes).toBe(0);
+  });
+});

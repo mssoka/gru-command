@@ -25,11 +25,19 @@ export interface StubTurn {
   readonly hold?: Promise<void>;
   /** Fail the turn with an error after the deltas. */
   readonly error?: string;
+  /** Emit a tool call (the session executes the tool, then calls again). */
+  readonly toolCall?: { readonly id: string; readonly name: string; readonly args: Record<string, unknown> };
+}
+
+export interface StubImage {
+  readonly data: string;
+  readonly mimeType: string;
 }
 
 export interface StubCall {
   readonly prompt: string;
   readonly imageCount: number;
+  readonly images: readonly StubImage[];
 }
 
 function makeStubModel(): Model<Api> {
@@ -60,12 +68,23 @@ function zeroUsage() {
 
 function makeMessage(
   text: string,
-  stopReason: 'stop' | 'error',
+  stopReason: 'stop' | 'error' | 'toolUse',
   errorMessage?: string,
+  toolCall?: { id: string; name: string; args: Record<string, unknown> },
 ): AssistantMessage {
+  const content: unknown[] = [];
+  if (toolCall !== undefined) {
+    content.push({
+      type: 'toolCall',
+      id: toolCall.id,
+      name: toolCall.name,
+      arguments: toolCall.args,
+    });
+  }
+  if (text !== '') content.push({ type: 'text', text });
   return {
     role: 'assistant',
-    content: [{ type: 'text', text }],
+    content,
     api: 'gru-stub',
     provider: STUB_PROVIDER_ID,
     model: STUB_MODEL_ID,
@@ -73,25 +92,33 @@ function makeMessage(
     stopReason,
     ...(errorMessage !== undefined ? { errorMessage } : {}),
     timestamp: Date.now(),
-  } as AssistantMessage;
+  } as unknown as AssistantMessage;
 }
 
-function lastUserPrompt(context: Context): { text: string; imageCount: number } {
+function lastUserPrompt(context: Context): {
+  text: string;
+  imageCount: number;
+  images: StubImage[];
+} {
   for (let i = context.messages.length - 1; i >= 0; i -= 1) {
     const message = context.messages[i];
     if (message !== undefined && message.role === 'user') {
       const content = message.content;
-      if (typeof content === 'string') return { text: content, imageCount: 0 };
+      if (typeof content === 'string') return { text: content, imageCount: 0, images: [] };
+      const images = content
+        .filter((block) => block.type === 'image')
+        .map((block) => ({ data: block.data, mimeType: block.mimeType }));
       return {
         text: content
           .filter((block) => block.type === 'text')
           .map((block) => block.text)
           .join(''),
-        imageCount: content.filter((block) => block.type === 'image').length,
+        imageCount: images.length,
+        images,
       };
     }
   }
-  return { text: '(no user message)', imageCount: 0 };
+  return { text: '(no user message)', imageCount: 0, images: [] };
 }
 
 export class StubScript {
@@ -102,8 +129,8 @@ export class StubScript {
     this.turns = [...turns];
   }
 
-  next(prompt: string, imageCount = 0): StubTurn {
-    this.calls.push({ prompt, imageCount });
+  next(prompt: string, images: StubImage[] = []): StubTurn {
+    this.calls.push({ prompt, imageCount: images.length, images });
     return this.turns.shift() ?? { deltas: ['stub: ', 'ok'] };
   }
 }
@@ -131,12 +158,18 @@ export async function makeStubModelRuntime(script: StubScript): Promise<ModelRun
     modelsPath,
   });
   const model = makeStubModel();
-  const streamTurn = (prompt: string, imageCount: number): AssistantMessageEventStream => {
-    const turn = script.next(prompt, imageCount);
+  const streamTurn = (prompt: string, images: StubImage[]): AssistantMessageEventStream => {
+    const turn = script.next(prompt, images);
     const stream = new AssistantMessageEventStream();
     const text = turn.deltas.join('');
     void (async () => {
-      const final = makeMessage(text, turn.error !== undefined ? 'error' : 'stop', turn.error);
+      const isTool = turn.toolCall !== undefined;
+      const final = makeMessage(
+        text,
+        turn.error !== undefined ? 'error' : isTool ? 'toolUse' : 'stop',
+        turn.error,
+        turn.toolCall,
+      );
       stream.push({ type: 'start', partial: final });
       let index = 0;
       for (const delta of turn.thinking ?? []) {
@@ -145,18 +178,39 @@ export async function makeStubModelRuntime(script: StubScript): Promise<ModelRun
         stream.push({ type: 'thinking_end', contentIndex: index, content: delta, partial: final });
         index += 1;
       }
-      stream.push({ type: 'text_start', contentIndex: index, partial: final });
-      for (const delta of turn.deltas) {
-        stream.push({ type: 'text_delta', contentIndex: index, delta, partial: final });
+      if (isTool && turn.toolCall !== undefined) {
+        stream.push({ type: 'toolcall_start', contentIndex: index, partial: final });
+        stream.push({
+          type: 'toolcall_end',
+          contentIndex: index,
+          toolCall: {
+            type: 'toolCall',
+            id: turn.toolCall.id,
+            name: turn.toolCall.name,
+            arguments: turn.toolCall.args,
+          },
+          partial: final,
+        });
+        index += 1;
       }
-      stream.push({ type: 'text_end', contentIndex: index, content: text, partial: final });
+      if (text !== '') {
+        stream.push({ type: 'text_start', contentIndex: index, partial: final });
+        for (const delta of turn.deltas) {
+          stream.push({ type: 'text_delta', contentIndex: index, delta, partial: final });
+        }
+        stream.push({ type: 'text_end', contentIndex: index, content: text, partial: final });
+      }
       if (turn.hold !== undefined) await turn.hold;
       if (turn.error !== undefined) {
         stream.push({ type: 'error', reason: 'error', error: final });
         stream.end(final);
         return;
       }
-      stream.push({ type: 'done', reason: 'stop', message: final });
+      stream.push({
+        type: 'done',
+        reason: isTool ? 'toolUse' : 'stop',
+        message: final,
+      });
       stream.end(final);
     })();
     return stream;
@@ -172,12 +226,12 @@ export async function makeStubModelRuntime(script: StubScript): Promise<ModelRun
     },
     getModels: () => [model],
     stream: (m: Model<Api>, context: Context) => {
-      const { text, imageCount } = lastUserPrompt(context);
-      return streamTurn(text, imageCount);
+      const { text, images } = lastUserPrompt(context);
+      return streamTurn(text, images);
     },
     streamSimple: (m: Model<Api>, context: Context, _options?: SimpleStreamOptions) => {
-      const { text, imageCount } = lastUserPrompt(context);
-      return streamTurn(text, imageCount);
+      const { text, images } = lastUserPrompt(context);
+      return streamTurn(text, images);
     },
   };
   runtime.registerNativeProvider(provider);

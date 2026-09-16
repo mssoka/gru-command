@@ -16,13 +16,16 @@ concrete adapter — the interface is the contract (SPEC ruling 4).
 | `thinkingLevelControl` | ✅ | thinking level settable per spawn |
 | `followUp` | ✅ | native queue-until-idle for the turn owner |
 
-(`claude-code` lands in the next epic; its row ships with its adapter.)
+(`claude-code` lands in the next epic; its column ships with its adapter.)
 
 ## Model & thinking level policy (SPEC ruling 16)
 
 - **Default = the runtime harness's own configuration.** The sentinel
-  `model = "default"` (or an empty value) means "whatever pi / Claude Code
-  is themselves configured to use" — the product never hardcodes a model.
+  `model = "default"` means "whatever pi / Claude Code is themselves
+  configured to use" — the product never hardcodes a model. (An empty
+  value means the same at the `[models].default` / `[thinking].default`
+  tiers only — kept for configs written before the runtime layer shipped;
+  every other tier rejects empty overrides.)
 - Explicit overrides are `"provider/model"` strings (pi) validated
   **fail-loud** at spawn: an unresolvable reference is an error naming the
   reference, never a silent fallback.
@@ -54,18 +57,22 @@ One prompt-owner per live turn:
 - A non-owner's `steer()`/`followUp()` during a live turn queues like a
   prompt. Unnamed callers are attributed to the HANDLE's own principal
   (one chat brain per session); two distinct sessions always attribute
-  differently, so a stranger can never steer natively.
+  differently, so a stranger can never steer natively. Attribution is
+  identity-by-name, not authentication: a caller who knowingly claims the
+  owner's name passes through. (Real auth arrives with pairing, E4/E9.)
 
 ## Fallback semantics (interface layer)
 
 Runtimes declaring `steer: "queued"` (cannot interrupt mid-turn) get
 `withFallbacks()` wrapping (`src/runtime/fallbacks.ts`): the uniform
 never-interleave contract — while a turn is live, prompt() AND steer()
-are held (event `queued`, reason `steer-unable`) and delivered in
-arrival order once the agent reports a non-busy state (idle OR error —
-an error-ended turn never strands the queue). Callers observe the queue
-event and their call resolves after delivery — the same guarantee a
-native-steer runtime offers, implemented above the adapter.
+are held and delivered in arrival order once the agent reports a
+non-busy state (idle OR error — an error-ended turn never strands the
+queue). Held steer calls carry reason `steer-unable`; held prompt/
+followUp calls carry reason `single-writer`. Callers observe the queue
+event and their call resolves after their delivered turn completes —
+the same guarantee a native-steer runtime offers, implemented above the
+adapter.
 
 No session spawns in production until the chat epic (E4) — the registry
 exists, boots, and is health-observable; `agent_session` honestly reads
@@ -74,8 +81,12 @@ exists, boots, and is health-observable; `agent_session` honestly reads
 ## Session store (SPEC ruling 12)
 
 Sessions persist as **append-only jsonl** under `<data_dir>/sessions/`,
-in standard pi patterns: `sessions/<role>/--<dashed-cwd>--/<timestamp>_<uuid>.jsonl`.
-The path is declared via `/health` (`session.path`).
+in standard pi patterns: `sessions/<role>/--<dashed-cwd>--<hash8>/<timestamp>_<uuid>.jsonl`
+where `<hash8>` is an 8-hex sha256 prefix of the resolved cwd (pi's own
+dashed transform collides for `/a-b/c` vs `/a/b-c` — the suffix keeps
+them distinct). The path is declared via `/health` (`session.path`).
+The sessions dir is created owner-only (0700): transcripts carry full
+prompt/tool content, so nothing but the owner should traverse it.
 
 - **Exclusive lock**: the active session file holds an inter-process
   exclusive lock (sidecar `<file>.lock`, pid + heartbeat). A second writer
@@ -92,7 +103,9 @@ The path is declared via `/health` (`session.path`).
 - **Change detection on boot** (the emergency-console contract): the store
   snapshots session-file sizes at graceful shutdown and after each backup
   pass. On boot it re-scans; any file that grew OR shrank while the
-  service was down is reported via `/health`
+  service was down is reported via `/health`, and a file that VANISHED is
+  reported with kind `deleted` (a console delete must never pass
+  silently).
   (`liveness.signals.session_growth`) and a `warn` log line naming the
   file, the kind of change, and the byte delta. A missing snapshot means
   a first-ever boot; a corrupt snapshot is reported as `corrupt`
@@ -104,8 +117,8 @@ The path is declared via `/health` (`session.path`).
 Stop the service (this releases every session lock — single-writer
 preserved by the stop), open the newest session jsonl under the path
 `/health` declares with the pi CLI (or any editor), edit/inspect, restart
-the service. The boot scan surfaces files that grew or shrank while you
-were in there.
+the service. The boot scan surfaces files that grew, shrank, or vanished
+while you were in there.
 
 ## /health liveness (SPEC rulings 5/12)
 
@@ -116,7 +129,12 @@ runtime registry and session store (`stubbed: false`):
 - `agent_session` — aggregate session state (`no-session` / `idle` /
   `streaming`) plus the most recent activity timestamp.
 - `session_growth` — the boot report: `none`, or the list of files that
-  grew while the service was down (file, byte delta).
+  grew, shrank, or were deleted while the service was down (file, kind,
+  byte delta).
+
+Note: `/health` discloses absolute paths (workspace, data dir, session
+files) — stage-consistent with the loopback-only bind of the pre-UI
+epics; the pairing token (and the LAN bind) arrive with the UI epic.
 
 ## Testing
 
@@ -130,5 +148,5 @@ runtime registry and session store (`stubbed: false`):
   GRU_COMMAND_SMOKE=1 npx vitest run test/smoke-real-model.test.ts
   ```
 
-  Uses the real agent dir and the runtime's default model; skipped (and
-  exempt from nothing else) in normal runs.
+  Uses the real agent dir and the runtime's default model; skipped in
+  normal runs (the default suite never touches the network).

@@ -81,7 +81,7 @@ gru = "provider/model-b"
 [thinking]
 # Thinking level policy, same shape as [models]. "default" = the
 # runtime's own setting. Optional; default "default".
-default = "high"
+default = "default"
 
 [thinking.roles]
 # Optional per-role thinking overrides.
@@ -127,8 +127,9 @@ example.
 ## What reads the config today
 
 The foundation epic loads and validates the whole schema. The runtime
-layer (this epic onward) consumes `[runtimes]`, `[models]`, `[thinking]`
-for every spawn: model references resolve fail-loud, thinking levels
+layer consumes `[runtimes]`, `[models]`, `[thinking]` whenever a spawn
+happens (none spawn in production until the chat epic, E4): model
+references resolve fail-loud, thinking levels
 validate per runtime, and the `"default"` sentinel passes through to the
 harness's own configuration. `/health` surfaces a summary
 (`workspace_root`, `data_dir`) plus real liveness. The UI epics consume

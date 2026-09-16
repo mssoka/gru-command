@@ -6,7 +6,8 @@ import {
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { GruCommandConfig, Role } from '../config.js';
 import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
@@ -25,6 +26,34 @@ import type {
 } from './types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+/** Normalize like the SDK (tilde + file:// decode + resolve) so lock keys
+ * and active-session keys always match the session's own path. */
+export function normalizeSessionPath(input: string): string {
+  let p = input;
+  if (p === '~') return process.env['HOME'] ?? p;
+  if (p.startsWith('~/')) p = join(process.env['HOME'] ?? '', p.slice(2));
+  if (/^file:\/\//.test(p)) {
+    try {
+      p = fileURLToPath(p);
+    } catch {
+      /* leave as-is; resolve() will reject a bad path loudly */
+    }
+  }
+  // resolve() is Node's path.resolve — join+normalize against cwd.
+  return resolve(p);
+}
+
+/** A session file already hosted by this process must not be re-opened. */
+export class SessionAlreadyActiveError extends Error {
+  constructor(readonly file: string) {
+    super(
+      `session file ${file} is already hosted by this process — refusing to ` +
+        'double-resume (single-writer rule, SPEC ruling 1/12)',
+    );
+    this.name = 'SessionAlreadyActiveError';
+  }
+}
 
 export interface PiRuntimeOptions {
   readonly config: GruCommandConfig;
@@ -70,6 +99,8 @@ export class PiRuntime implements AgentRuntime {
   private readonly agentDir: string;
   private readonly log: Log;
   private readonly handles = new Set<PiAgentHandle>();
+  /** Normalized session paths currently hosted by this process (B4). */
+  private readonly activeFiles = new Set<string>();
   private modelRuntime: ModelRuntime | undefined;
   private down: string | undefined;
 
@@ -141,62 +172,91 @@ export class PiRuntime implements AgentRuntime {
   async spawn(role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
     const roleDef = ROLE_DEFINITIONS[role];
     const cwd = this.config.workspaceRoot;
+    const model = await this.resolveModel(role, options.model);
+    const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
+    // Normalize like the SDK (tilde + file://) so the lock key, the
+    // active-file key, and the session's own path are one and the same.
+    const resumeFile =
+      options.resumeFile !== undefined ? normalizeSessionPath(options.resumeFile) : undefined;
+    if (resumeFile !== undefined && this.activeFiles.has(resumeFile)) {
+      throw new SessionAlreadyActiveError(resumeFile);
+    }
+    // Confinement: resume only files that live in the session store —
+    // never open (or lock) arbitrary paths handed to the spawn options.
+    if (resumeFile !== undefined) {
+      const rel = relative(this.store.sessionsDir, resumeFile);
+      if (rel === '' || rel.startsWith('..') || rel.includes(':/')) {
+        throw new Error(
+          `resumeFile must live under the session store (${this.store.sessionsDir}), got: ${resumeFile}`,
+        );
+      }
+    }
+    // Resume: lock BEFORE touching the file — a second writer must never
+    // even open a session another process holds (single-writer, ruling 1).
+    if (resumeFile !== undefined) {
+      this.store.acquireLock(resumeFile);
+    }
     try {
-      const model = await this.resolveModel(role, options.model);
-      const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
-      // Normalize so the lock key matches the session's own file path.
-      const resumeFile =
-        options.resumeFile !== undefined ? resolve(options.resumeFile) : undefined;
-      // Resume: lock BEFORE touching the file — a second writer must never
-      // even open a session another process holds (single-writer, ruling 1).
-      if (resumeFile !== undefined) {
-        this.store.acquireLock(resumeFile);
+      const sessionManager =
+        resumeFile !== undefined
+          ? SessionManager.open(resumeFile, dirname(resumeFile), cwd)
+          : SessionManager.create(cwd, this.store.sessionDirFor(role, cwd));
+      const loader = new DefaultResourceLoader({
+        cwd,
+        agentDir: this.agentDir,
+        systemPromptOverride: () => roleDef.systemPrompt,
+      });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd,
+        agentDir: this.agentDir,
+        model,
+        ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+        tools: [...roleDef.tools],
+        resourceLoader: loader,
+        sessionManager,
+        modelRuntime: await this.runtime(),
+      });
+      const sessionFile = session.sessionFile ?? null;
+      if (sessionFile === null) {
+        session.dispose();
+        throw new Error('pi session is not persisted to a file — refusing untracked session');
+      }
+      if (this.activeFiles.has(sessionFile)) {
+        session.dispose();
+        throw new SessionAlreadyActiveError(sessionFile);
       }
       try {
-        const sessionManager =
-          resumeFile !== undefined
-            ? SessionManager.open(resumeFile, dirname(resumeFile), cwd)
-            : SessionManager.create(cwd, this.store.sessionDirFor(role, cwd));
-        const loader = new DefaultResourceLoader({
-          cwd,
-          agentDir: this.agentDir,
-          systemPromptOverride: () => roleDef.systemPrompt,
-        });
-        await loader.reload();
-        const { session } = await createAgentSession({
-          cwd,
-          agentDir: this.agentDir,
-          model,
-          ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
-          tools: [...roleDef.tools],
-          resourceLoader: loader,
-          sessionManager,
-          modelRuntime: await this.runtime(),
-        });
-        const sessionFile = session.sessionFile ?? null;
-        if (sessionFile === null) {
-          session.dispose();
-          throw new Error('pi session is not persisted to a file — refusing untracked session');
+        if (resumeFile === undefined) {
+          this.store.acquireLock(sessionFile);
         }
-        try {
-          if (resumeFile === undefined) {
-            this.store.acquireLock(sessionFile);
-          }
-        } catch (error) {
-          session.dispose();
-          throw error;
-        }
-        const handle = new PiAgentHandle(role, session, sessionFile, this.store, this.log);
-        this.handles.add(handle);
-        this.down = undefined;
-        return handle;
       } catch (error) {
-        if (resumeFile !== undefined) {
-          this.store.releaseLock(resumeFile);
-        }
+        session.dispose();
         throw error;
       }
+      this.activeFiles.add(sessionFile);
+      const handle = new PiAgentHandle(
+        role,
+        session,
+        sessionFile,
+        this.store,
+        this.log,
+        () => {
+          this.handles.delete(handle);
+          this.activeFiles.delete(sessionFile);
+        },
+      );
+      this.handles.add(handle);
+      this.down = undefined;
+      return handle;
     } catch (error) {
+      if (resumeFile !== undefined) {
+        this.store.releaseLock(resumeFile);
+      }
+      // Infrastructure failure (store, loader, session create) marks the
+      // adapter down; the NEXT spawn attempt re-clears it. Caller-facing
+      // validation errors (bad model/thinking references) never latch —
+      // those reject above this try block.
       this.down = String(error);
       throw error;
     }
@@ -223,6 +283,20 @@ export class PiRuntime implements AgentRuntime {
  * - Queued messages deliver in arrival order, one turn each, and emit a
  *   `queued` event so the surface layer can show honest state.
  */
+/**
+ * Map our PromptOptions images to the pi SDK's ImageContent shape
+ * ({type:'image', data, mimeType}) — declared in agent-session.d.ts and
+ * accepted by prompt/steer/followUp alike.
+ */
+function mapImages(images: PromptOptions['images']): unknown[] | undefined {
+  if (images === undefined || images.length === 0) return undefined;
+  return images.map((image) => ({
+    type: 'image',
+    data: image.data,
+    mimeType: image.mediaType,
+  }));
+}
+
 export class PiAgentHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
@@ -243,8 +317,8 @@ export class PiAgentHandle implements AgentHandle {
     role: Role,
     private readonly session: {
       prompt(text: string, options?: unknown): Promise<void>;
-      steer(text: string): Promise<void>;
-      followUp(text: string): Promise<void>;
+      steer(text: string, images?: unknown): Promise<void>;
+      followUp(text: string, images?: unknown): Promise<void>;
       subscribe(listener: (event: unknown) => void): () => void;
       dispose(): void;
       isStreaming: boolean;
@@ -254,6 +328,7 @@ export class PiAgentHandle implements AgentHandle {
     sessionFile: string,
     private readonly store: SessionStore,
     private readonly log: Log,
+    private readonly onDispose: () => void = () => {},
   ) {
     this.role = role;
     this.id = session.sessionId;
@@ -294,7 +369,7 @@ export class PiAgentHandle implements AgentHandle {
     this.assertLive();
     const owner = options.owner ?? this.principal;
     if (this.liveTurn !== null && owner === this.liveOwner) {
-      await this.session.steer(text);
+      await this.session.steer(text, mapImages(options.images));
       return;
     }
     if (this.liveTurn !== null) {
@@ -307,7 +382,7 @@ export class PiAgentHandle implements AgentHandle {
     this.assertLive();
     const owner = options.owner ?? this.principal;
     if (this.liveTurn !== null && owner === this.liveOwner) {
-      await this.session.followUp(text);
+      await this.session.followUp(text, mapImages(options.images));
       return;
     }
     if (this.liveTurn !== null) {
@@ -328,6 +403,7 @@ export class PiAgentHandle implements AgentHandle {
     } finally {
       this.store.releaseLock(this.sessionFile);
       this.setState('disposed');
+      this.onDispose();
     }
   }
 
@@ -361,17 +437,17 @@ export class PiAgentHandle implements AgentHandle {
   private runTurn(text: string, owner: string, images?: PromptOptions['images']): Promise<void> {
     this.liveOwner = owner;
     const promptOptions: Record<string, unknown> = {};
-    if (images !== undefined && images.length > 0) {
-      promptOptions['images'] = images.map((image) => ({
-        type: 'image',
-        source: { type: 'base64', mediaType: image.mediaType, data: image.data },
-      }));
-    }
+    const mapped = mapImages(images);
+    if (mapped !== undefined) promptOptions['images'] = mapped;
     const turn = this.session
       .prompt(text, promptOptions)
       .catch((error: unknown) => {
-        this.setState('error', String(error));
-        this.emit({ type: 'error', error: String(error), fatal: false });
+        // A turn rejected by dispose() must not overwrite the terminal
+        // 'disposed' state with 'error'.
+        if (!this.disposed) {
+          this.setState('error', String(error));
+          this.emit({ type: 'error', error: String(error), fatal: false });
+        }
         throw error;
       })
       .finally(() => {
@@ -425,8 +501,23 @@ export class PiAgentHandle implements AgentHandle {
         return;
       case 'agent_end':
         if (e['willRetry'] === true) return; // retry keeps the turn live
-        this.setState(this.session.isStreaming ? 'streaming' : 'idle');
+        // An errored turn stays 'error' (sticky until the next turn starts);
+        // a clean turn settles to idle (or keeps streaming between turns).
+        if (this.state !== 'error') {
+          this.setState(this.session.isStreaming ? 'streaming' : 'idle');
+        }
         return;
+      case 'message_end': {
+        // pi reports in-band model errors as an assistant message with
+        // stopReason 'error' — surface it as a runtime error event.
+        const msg = e['message'] as Record<string, unknown> | undefined;
+        if (msg !== undefined && msg['role'] === 'assistant' && msg['stopReason'] === 'error') {
+          const detail = String(msg['errorMessage'] ?? 'model error');
+          this.emit({ type: 'error', error: detail, fatal: false });
+          this.setState('error', detail);
+        }
+        return;
+      }
       case 'turn_start':
         this.emit({ type: 'turn_start' });
         return;

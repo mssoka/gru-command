@@ -1,9 +1,9 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
-import { PiRuntime } from '../src/runtime/pi-adapter.js';
+import { PiRuntime, normalizeSessionPath } from '../src/runtime/pi-adapter.js';
 import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.js';
 import { SessionStore } from '../src/sessions/store.js';
 import type { RuntimeEvent } from '../src/runtime/types.js';
@@ -196,9 +196,16 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     await first.dispose();
     const entriesBefore = readFileSync(file, 'utf-8').trim().split('\n').length;
 
-    // "New process": fresh runtime over the same instance data dir.
-    const second = await fixture([{ deltas: ['second'] }]);
-    const resumed = await second.runtime.spawn('gru', { resumeFile: file });
+    // "New process": same instance data dir, fresh store + adapter.
+    const config = loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester');
+    const secondStore = new SessionStore(config.dataDir);
+    const second = new PiRuntime({
+      config,
+      store: secondStore,
+      agentDir: fx.agentDir,
+      modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['second'] }])),
+    });
+    const resumed = await second.spawn('gru', { resumeFile: file });
     try {
       expect(resumed.sessionFile).toBe(file); // same file, no duplicate session
       await resumed.prompt('continue', { owner: 'alice' });
@@ -365,17 +372,21 @@ describe('RuntimeRegistry', () => {
     const registry = new RuntimeRegistry({
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: fx.store,
-      agentDir: fx.agentDir,
-      modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['ok'] }])),
+      pi: {
+        agentDir: fx.agentDir,
+        modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['ok'] }])),
+      },
     });
     const growth = registry.boot();
     expect(growth.findings).toEqual([]);
+    expect(growth.snapshotState).toBe('missing'); // first boot ever
     expect(registry.runtimeIdFor('gru')).toBe('pi');
     expect(registry.runtimeIdFor('minion')).toBe('pi');
 
     const before = registry.status();
     expect(before.agentSession.state).toBe('no-session');
     expect(before.activeSessions).toBe(0);
+    expect(before.adapters).toEqual([]); // adapters are created lazily
 
     const handle = await registry.spawn('gru');
     try {
@@ -384,6 +395,7 @@ describe('RuntimeRegistry', () => {
       expect(after.agentSession.state).toBe('idle');
       expect(after.agentSession.lastActivity).not.toBeNull();
       expect(after.activeSessions).toBe(1);
+      expect(after.adapters).toEqual([{ id: 'pi', state: 'ok' }]);
     } finally {
       await registry.disposeHandle(handle);
     }
@@ -414,8 +426,10 @@ describe('RuntimeRegistry', () => {
     const registry = new RuntimeRegistry({
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: fx.store,
-      agentDir: fx.agentDir,
-      modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['ok'] }])),
+      pi: {
+        agentDir: fx.agentDir,
+        modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['ok'] }])),
+      },
     });
     registry.boot();
     const handle = await registry.spawn('gru');
@@ -453,5 +467,205 @@ describe('RuntimeRegistry', () => {
       capabilities: { ...fakeAdapter.capabilities, thinkingLevelControl: true },
     };
     expect(applyThinkingFallback(capable as never, 'max', log)).toBe('max');
+  });
+});
+
+describe('Perkins r1 regressions', () => {
+  it('B3: images round-trip in the EXACT SDK shape (data + mimeType)', async () => {
+    const fx = await fixture([{ deltas: ['seen'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      await handle.prompt('look', {
+        owner: 'alice',
+        images: [{ mediaType: 'image/png', data: 'aGVsbG8=' }],
+      });
+      expect(fx.script.calls[0]!.images).toEqual([
+        { data: 'aGVsbG8=', mimeType: 'image/png' },
+      ]);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('W6: tool lifecycle events map through (tool_start/tool_end with callId)', async () => {
+    const fx = await fixture([
+      { deltas: [], toolCall: { id: 'call-1', name: 'ls', args: {} } },
+      { deltas: ['listed'] },
+    ]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const events = collect(handle);
+      await handle.prompt('list my files', { owner: 'alice' });
+      const starts = events.filter((e) => e.type === 'tool_start') as {
+        callId: string;
+        tool: string;
+      }[];
+      expect(starts).toEqual([{ type: 'tool_start', callId: 'call-1', tool: 'ls' }] as never);
+      const ends = events.filter((e) => e.type === 'tool_end') as {
+        callId: string;
+        isError: boolean;
+      }[];
+      expect(ends.length).toBe(1);
+      expect(ends[0]!.callId).toBe('call-1');
+      expect(typeof ends[0]!.isError).toBe('boolean');
+      // The second model call (post-tool) delivered the text:
+      expect(fx.script.calls.length).toBe(2);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('W7: error turn — in-band completion: error event + state error, then recovers', async () => {
+    const fx = await fixture([{ deltas: [], error: 'model exploded' }, { deltas: ['recovered'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const events = collect(handle);
+      // The SDK contract: failures AFTER acceptance surface through the
+      // event/message stream, not a rejection — prompt() resolves, the
+      // error is in-band, and the session stays usable (robustness, R3).
+      await handle.prompt('boom', { owner: 'alice' });
+      const errorEvents = events.filter((e) => e.type === 'error');
+      expect(errorEvents.length).toBeGreaterThanOrEqual(1);
+      expect((errorEvents[0] as { error: string }).error).toContain('model exploded');
+      expect(handle.health().state).toBe('error');
+      expect(handle.health().error).toBeTruthy();
+      // The handle recovers: next prompt works and ends idle.
+      await handle.prompt('again', { owner: 'alice' });
+      expect(handle.health().state).toBe('idle');
+      const states = events.filter((e) => e.type === 'state').map((e) => (e as { state: string }).state);
+      expect(states).toContain('error');
+      expect(states[states.length - 1]).toBe('idle');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('W10: registry status aggregates streaming while a turn is live', async () => {
+    let release!: () => void;
+    const fx = await fixture();
+    const registry = new RuntimeRegistry({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: fx.store,
+      pi: {
+        agentDir: fx.agentDir,
+        modelRuntime: await makeStubModelRuntime(
+          new StubScript([{ deltas: ['held'], hold: new Promise<void>((r) => (release = r)) }]),
+        ),
+      },
+    });
+    registry.boot();
+    const handle = await registry.spawn('gru');
+    const p = handle.prompt('hold it', { owner: 'alice' });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(registry.status().agentSession.state).toBe('streaming');
+    expect(registry.status().agentSession.lastActivity).not.toBeNull();
+    release();
+    await p;
+    expect(registry.status().agentSession.state).toBe('idle');
+    await registry.dispose();
+  });
+
+  it('B4: double-resume of one session file in one process is rejected loudly', async () => {
+    const fx = await fixture([{ deltas: ['one'] }]);
+    const first = await fx.runtime.spawn('gru');
+    await first.prompt('write something', { owner: 'alice' });
+    const file = first.sessionFile!;
+    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(
+      /already hosted by this process/,
+    );
+    // After the first handle disposes, the file can be re-hosted.
+    await first.dispose();
+    const resumed = await fx.runtime.spawn('gru', { resumeFile: file });
+    await resumed.dispose();
+  });
+
+  it('N16: resume of a file locked by another process rejects without touching the file', async () => {
+    const fx = await fixture([{ deltas: ['one'] }]);
+    const first = await fx.runtime.spawn('gru');
+    await first.prompt('write', { owner: 'alice' });
+    const file = first.sessionFile!;
+    await first.dispose();
+    // Another "process" (fresh store instance, own bootId) holds the lock:
+    const other = new SessionStore(fx.store.dataDir);
+    other.acquireLock(file);
+    const linesBefore = readFileSync(file, 'utf-8').split('\n').length;
+    try {
+      await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/locked by pid/);
+      expect(readFileSync(file, 'utf-8').split('\n').length).toBe(linesBefore);
+      expect(existsSync(`${file}.lock`)).toBe(true); // theirs, intact
+    } finally {
+      other.releaseLock(file);
+      other.dispose();
+    }
+  });
+
+  it('N24: resumeFile outside the session store is refused', async () => {
+    const fx = await fixture([]);
+    await expect(
+      fx.runtime.spawn('gru', { resumeFile: join(fx.home, 'elsewhere.jsonl') }),
+    ).rejects.toThrow(/must live under the session store/);
+  });
+
+  it('N17: adapter health goes down on infrastructure failure and recovers', async () => {
+    const fx = await fixture([{ deltas: ['ok'] }]);
+    // Poison the sessions dir for the gru role: a FILE where the dir must be.
+    const roleDir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(join(roleDir, '..'), { recursive: true });
+    writeFileSync(roleDir, 'not a dir', 'utf-8');
+    await expect(fx.runtime.spawn('gru')).rejects.toThrow();
+    expect(fx.runtime.health().state).toBe('down');
+    // Next attempt clears it:
+    rmSync(roleDir);
+    const handle = await fx.runtime.spawn('gru');
+    expect(fx.runtime.health().state).toBe('ok');
+    await handle.dispose();
+    // And validation errors (bad model refs) never latch 'down':
+    await expect(fx.runtime.spawn('gru', { model: 'nope/nope' })).rejects.toThrow(/unknown model/);
+    expect(fx.runtime.health().state).toBe('ok');
+  });
+});
+
+describe('Perkins r1 boot-surface pins', () => {
+  it('N12/N13: boot backs up tracked sessions and logs grown files with kind + byte delta', async () => {
+    const fx = await fixture();
+    // Seed a session file, snapshot it, then grow it "while down":
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-09-15T00-00-00-000Z_11111111-1111-1111-1111-111111111111.jsonl');
+    writeFileSync(file, '{"type":"session","version":3}\n', 'utf-8');
+    fx.store.persistSnapshot();
+    writeFileSync(file, '{"type":"session","version":3}\n{"type":"message"}\n', 'utf-8');
+
+    const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+    const registry = new RuntimeRegistry({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: fx.store,
+      log: (level, msg, fields) => logs.push({ level, msg, fields }),
+      pi: { agentDir: fx.agentDir, modelRuntime: await makeStubModelRuntime(new StubScript([])) },
+    });
+    const growth = registry.boot();
+    expect(growth.findings.length).toBe(1);
+    expect(growth.findings[0]!.kind).toBe('grew');
+    // N13: the warn log names file + kind + byte delta:
+    const warn = logs.find((l) => l.level === 'warn' && l.msg.includes('changed while service was down'));
+    expect(warn).toBeDefined();
+    expect(warn!.fields).toMatchObject({ file, kind: 'grew', byte_delta: 19 });
+    // N12: the boot backup pass left a copy in the backups dir:
+    const backupsDir = join(fx.store.sessionsDir, 'backups');
+    const backups = readdirSync(backupsDir).filter((n) => n.endsWith('.bak'));
+    expect(backups.length).toBe(1);
+    expect(readFileSync(join(backupsDir, backups[0]!), 'utf-8')).toContain('"type":"message"');
+    // And the snapshot now covers the grown file (clean next boot):
+    expect(new SessionStore(fx.store.dataDir).detectGrowth().findings).toEqual([]);
+    registry.dispose();
+  });
+});
+
+describe('path normalization', () => {
+  it('W3: resume paths normalize like the SDK (tilde, file://, resolve)', () => {
+    const home = process.env['HOME'] ?? '';
+    expect(normalizeSessionPath('~/x/s.jsonl')).toBe(join(home, 'x', 's.jsonl'));
+    expect(normalizeSessionPath('file:///tmp/a%20b/s.jsonl')).toBe(resolve('/tmp/a b/s.jsonl'));
+    expect(normalizeSessionPath('./rel/s.jsonl')).toBe(resolve('./rel/s.jsonl'));
   });
 });
