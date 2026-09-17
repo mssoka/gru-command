@@ -1,5 +1,8 @@
 import { expect, test, type Page } from '@playwright/test';
 
+/** The mock's token — same env knob the mock itself reads (GRU_MOCK_TOKEN, default 'dev-token'). */
+const MOCK_TOKEN = process.env.GRU_MOCK_TOKEN ?? 'dev-token';
+
 /**
  * Smoke: pair → chat → streamed reply → reconnect keeps history,
  * mobile corner bubble, both themes snapshotted. Runs against the
@@ -9,7 +12,7 @@ import { expect, test, type Page } from '@playwright/test';
 async function pair(page: Page): Promise<void> {
   await page.goto('/');
   await expect(page.locator('#pairing-view')).toBeVisible();
-  // localhost prefills the mock's default token — just press Pair.
+  await page.locator('#pair-token').fill(MOCK_TOKEN);
   await page.locator('#pair-submit').click();
   await expect(page.locator('#chat-view')).toBeVisible();
 }

@@ -172,7 +172,12 @@ To pair a phone: bind `server.host` to the machine's LAN address, open
 the QR shown on an already-paired device). Real-socket exercise: pair a
 second device (or a second browser profile) and confirm it attaches
 read-only while the first holds the pen; close the first and confirm
-the second's sends start working (pen promotion).
+the second's sends start working (pen promotion). The automated
+equivalent (W5, closed with E5c): `test/lan-phone-raw-client.test.ts`
+walks this exact flow with raw `ws` clients against the real service —
+full replay on pair, read-only rejection (ephemeral, unlogged), silent
+pen promotion, send-after-promotion, and incremental `last_seen_seq`
+catch-up.
 
 ## Limits and notes
 

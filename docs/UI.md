@@ -10,20 +10,22 @@ dependency is `qrcode` (pairing screen).
 ```bash
 npm install                 # clean clone: installs root + web workspace
 npm test                    # lint + typecheck + backend build + all vitest
+                            # (incl. the W5 LAN-phone raw-client suite)
 npm run mock                # dev-only mock chat socket on :8787
 npm run dev:web             # vite dev server on :5173 (proxies /ws → mock)
 npm run build:web           # production bundle → web/dist/ (no mock inside)
-npm run e2e                 # playwright smoke (mock + vite preview, serial)
+npm run e2e                 # playwright smoke (mock + real service, serial)
 ```
 
 Open http://localhost:5173 and pair with the mock's default token
-`dev-token` (prefilled automatically on localhost). The mock token is
-configurable via `GRU_MOCK_TOKEN`; its port via `GRU_MOCK_PORT`.
+`dev-token` — typed, never prefilled (the UI never guesses a token). The
+mock token is configurable via `GRU_MOCK_TOKEN`; its port via
+`GRU_MOCK_PORT`.
 
-> **Integration note (E4 landed):** the service now serves this UI in
-> production (`web/dist` on the service port) and hosts the real `/ws`
-> chat socket — see [CHAT.md](./CHAT.md). The mock remains the dev-only
-> socket for `npm run dev:web` and e2e.
+> **Real socket (E5c, converged):** the UI now ships against the REAL
+> `/ws` — see the [real-socket section](#real-socket-e5c) below. The mock
+> remains the dev-only socket for `npm run dev:web` and the mock half of
+> e2e.
 
 ## Design tokens (Playful Planet)
 
@@ -116,7 +118,8 @@ after re-auth; replay ends exactly when the stream reaches the
 - **Pairing** — token field + QR (encodes `{url, token}` JSON payload
   built from `location.origin` + the typed token — the real payload
   against the served UI; the wizard's token generation arrives with E9).
-  Bad token → inline error.
+  Bad token → inline error. The field starts EMPTY everywhere — mock or
+  real, localhost or LAN — the token is per-install, never a guess.
 - **Chat** — desktop: panel; mobile (≤768px): corner bubble that opens a
   bottom sheet (same DOM reparented via matchMedia; unread badge counts
   deltas arriving while closed). Streaming deltas render token-by-token
@@ -132,10 +135,55 @@ after re-auth; replay ends exactly when the stream reaches the
   fallback, and chat-client contract tests against an in-test WS server
   (send/ack, offline queue, reload survival, reconnect replay dedup,
   bad-token fatal, malformed frames).
-- E2E (`npm run e2e`, Playwright, serial): pair → chat → streamed reply,
-  reload keeps history without duplicates, mobile bubble/sheet + unread
-  badge, light+dark theme snapshots (committed under
-  `web/e2e/smoke.spec.ts-snapshots/`). Uses the Playwright chromium
-  already installed on the dev machine (`@playwright/test` 1.58 ↔
-  chromium-1208); on machines without it, `npx playwright install
-  chromium` once.
+- E2E (`npm run e2e`, Playwright, serial, two projects):
+  - **mock** — the dev-only mock via vite preview: pair → chat → streamed
+    reply, reload keeps history, socket-drop recovery, mobile sheet,
+    theme snapshots (committed under `web/e2e/smoke.spec.ts-snapshots/`).
+  - **real** — the REAL service (`test/helpers/real-service.mjs` boots
+    `dist/main.js` with a real token config and the offline claude CLI
+    double as the Gru runtime): pair with the real token, streamed echo
+    reply, reload + service-restart reconnect keeps history and flushes
+    the typed word, mobile sheet + unread badge, wrong-token fatal,
+    theme snapshots (`web/e2e/real-server.spec.ts-snapshots/`).
+  Uses the Playwright chromium already installed on the dev machine
+  (`@playwright/test` 1.58 ↔ chromium-1208); on machines without it,
+  `npx playwright install chromium` once.
+
+## Real socket (E5c)
+
+E5 shipped against the mock; E4 landed the real `/ws`; E5c converged
+them. The UI's socket wiring was already target-agnostic — the client
+builds `ws(s)://location.host/ws` and the service serves both the built
+UI and the socket on one port, so the flip needed **zero client rewiring**.
+
+**What changed:**
+
+- The pairing token field no longer prefills `dev-token` on localhost —
+  that mock convenience leaked the WRONG token into every real install
+  browsed from localhost. Devs against the mock type `dev-token` once.
+- e2e grew the `real` project (above) alongside the kept-green mock
+  smoke; the reconnect case is a REAL service restart (the real server
+  has no test control plane, and network emulation does not cut loopback
+  sockets) — which also proves durable-history-across-restart.
+- `test/lan-phone-raw-client.test.ts` (W5): raw `ws` clients walk the
+  phone-shaped flow against the real token flow — full replay on pair,
+  read-only while another client holds the pen, silent pen promotion,
+  send-after-promotion, incremental `last_seen_seq` catch-up.
+
+**What stayed:**
+
+- The frame contract is one source of truth (`web/src/lib/protocol.ts`);
+  the corpus parity test (`test/chat-frames.test.ts`) still fails on any
+  divergence in either direction.
+- The mock stays as dev tooling (`npm run dev:web`, mock e2e half) —
+  validated against the real server, not replaced.
+- All client behavior (outbox, dedup by `seq`/`client_msg_id`, resync on
+  truncated stores, degraded banners) is unchanged and now proven
+  against the real socket.
+
+**Running against a real service locally:** `npm run build &&
+npm run build:web && npm start`, then open `http://localhost:7665` and
+pair with the `[auth] token` from your `config.toml` (see
+[CONFIG.md](./CONFIG.md)); set `[server] host` to the machine's LAN
+address to pair a phone — the QR on an already-paired device carries the
+real payload.

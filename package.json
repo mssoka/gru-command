@@ -19,7 +19,7 @@
     "test": "npm run lint && npm run typecheck && npm run build && vitest run && npm run test:web",
     "build:web": "npm run build -w web",
     "test:web": "npm run test -w web",
-    "e2e": "npm run e2e -w web",
+    "e2e": "npm run build && npm run e2e -w web",
     "dev:web": "npm run dev -w web",
     "mock": "npm run mock -w web",
     "start": "node dist/main.js"
