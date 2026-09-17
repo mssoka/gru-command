@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import type { Server as HttpServer } from 'node:http';
+import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { GruCommandConfig } from '../config.js';
@@ -386,9 +386,16 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
   wss.on('connection', onConnection);
 
+  /** The bound upgrade handler + its server, so dispose can detach —
+   * otherwise post-shutdown upgrades reach a closed wss as zombies. */
+  let attached: {
+    readonly server: HttpServer;
+    readonly handler: (request: IncomingMessage, socket: Duplex, head: Buffer) => void;
+  } | null = null;
+
   return {
     attach(httpServer: HttpServer): void {
-      httpServer.on('upgrade', (request, socket: Duplex, head) => {
+      const handler = (request: IncomingMessage, socket: Duplex, head: Buffer): void => {
         let path = '';
         try {
           path = new URL(request.url ?? '/', 'http://localhost').pathname;
@@ -403,7 +410,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         wss.handleUpgrade(request, socket, head, (ws) => {
           wss.emit('connection', ws, request);
         });
-      });
+      };
+      httpServer.on('upgrade', handler);
+      attached = { server: httpServer, handler };
     },
 
     warmup(): void {
@@ -414,6 +423,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     },
 
     async dispose(): Promise<void> {
+      if (attached !== null) {
+        attached.server.off('upgrade', attached.handler);
+        attached = null;
+      }
       if (heartbeat !== null) clearInterval(heartbeat);
       for (const client of clients) {
         if (client.authDeadline !== null) clearTimeout(client.authDeadline);

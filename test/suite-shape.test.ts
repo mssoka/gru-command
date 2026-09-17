@@ -9,9 +9,9 @@ import { describe, expect, it } from 'vitest';
  * Adding a test? Bump this pin — that is the point.
  */
 const PINS: Record<string, number> = {
-  'chat-frame-log.test.ts': 11,
+  'chat-frame-log.test.ts': 12,
   'chat-frames.test.ts': 4,
-  'chat-server.test.ts': 15,
+  'chat-server.test.ts': 16,
   'chat-session-state.test.ts': 4,
   'claude-adapter.test.ts': 50,
   'config.test.ts': 31,

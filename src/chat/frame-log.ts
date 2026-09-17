@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import {
@@ -77,10 +77,20 @@ export class ChatFrameLog {
         parsed = JSON.parse(raw);
       } catch (error) {
         if (index === lines.length - 1) {
+          // Torn tail (crash mid-append): drop it AND repair the file —
+          // leaving it on disk would bake it into mid-file corruption the
+          // moment any later frame appends, and the NEXT boot would fail
+          // loud over damage this boot could have healed.
           log('warn', 'dropping torn final line of chat frame log (crash mid-append)', {
             file: log_.file,
             line: index + 1,
           });
+          const validPrefix = lines.slice(0, index);
+          writeFileSync(
+            log_.file,
+            validPrefix.length > 0 ? `${validPrefix.join('\n')}\n` : '',
+            'utf-8',
+          );
           break;
         }
         throw new FrameLogCorruptError(log_.file, index + 1, `unparseable json (${String(error)})`);

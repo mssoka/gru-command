@@ -255,6 +255,9 @@ class TestClient {
     this.socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
     this.closed = new Promise((resolveClose) => {
       this.socket.on('close', (code: number) => resolveClose(code));
+      // A failed handshake (e.g. refused upgrade) errors instead of
+      // closing — resolve -1 so tests can await either death shape.
+      this.socket.on('error', () => resolveClose(-1));
     });
     this.socket.on('message', (data: unknown) => {
       const raw = String(data);
@@ -726,6 +729,29 @@ describe('chat server (real sockets, stub Gru)', () => {
     expect(harness.spawnCalls).toEqual([null, null]); // fresh brain both times
     await client.close();
     await harness.close();
+  });
+
+  it('post-dispose upgrades are refused: the listener detaches, no zombie connections', async () => {
+    const harness = await makeHarness();
+    const client = await authedClient(harness.port);
+    await client.close();
+    await harness.chat.dispose(); // detach the upgrade handler
+
+    const zombie = new TestClient(harness.port);
+    // With no 'upgrade' listener the HTTP server closes the connection:
+    // the client dies without ever reaching auth (no frames, no hang).
+    const code = await Promise.race([
+      zombie.closed,
+      new Promise<number>((_, reject) =>
+        setTimeout(() => reject(new Error('zombie connection lingered')), 3_000),
+      ),
+    ]);
+    expect(typeof code).toBe('number');
+    expect(zombie.frames).toEqual([]);
+    await new Promise<void>((resolveClose) => {
+      harness.http.closeAllConnections();
+      harness.http.close(() => resolveClose());
+    });
   });
 
   it('service restart: seq and history continue, an open turn boot-settles, the same Gru resumes', async () => {

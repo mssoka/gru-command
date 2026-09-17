@@ -132,12 +132,14 @@ history always reads "the turn died here," never an open stream.
 ## Durability across restarts
 
 - **Frame log:** survives restarts by construction (append-only,
-  fsync-per-write discipline via synchronous appends). If the process
-  dies mid-turn, the log ends with an open turn — at boot, before any
-  client attaches, the server appends the closing frames (open tools
-  end in reverse order, then `turn end`). This is the mock's
-  aborted-turn rule, moved to the one place a real multi-client server
-  can see it.
+  synchronous writes — durable across process death via the OS page
+  cache; a power-loss window remains, accepted for v1). If the process
+  dies mid-append, the torn final line is dropped with a warning and
+  the file is repaired to the valid prefix at the next boot. If it dies
+  mid-turn, the log ends with an open turn — at boot, before any client
+  attaches, the server appends the closing frames (open tools end in
+  reverse order, then `turn end`). This is the mock's aborted-turn rule,
+  moved to the one place a real multi-client server can see it.
 - **The Gru brain:** the active session file is recorded at
   `<data_dir>/chat/gru-session.json` (atomic writes). On boot the chat
   server resumes THAT session via the runtime (`resumeFile`) — the same

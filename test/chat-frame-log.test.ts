@@ -103,6 +103,26 @@ describe('ChatFrameLog', () => {
     expect(log.history[1]).toEqual({ type: 'turn', state: 'end', seq: 2 });
   });
 
+  it('repairs a torn tail on load: appends after it and the next load stays green', () => {
+    const dir = fixture();
+    writeFileSync(
+      join(dir, FRAME_LOG_NAME),
+      '{"type":"turn","state":"start","seq":1}\n{"type":"turn","state":"end","seq":2}\n{"type":"delta","te',
+      'utf-8',
+    );
+    const log = ChatFrameLog.load(dir);
+    expect(log.highWaterSeq).toBe(2);
+    // The torn line is gone from disk — an append does not bake it into
+    // mid-file corruption, so the NEXT boot loads clean.
+    log.append({ type: 'delta', text: 'after the crash' });
+    const reloaded = ChatFrameLog.load(dir);
+    expect(reloaded.history).toEqual([
+      { type: 'turn', state: 'start', seq: 1 },
+      { type: 'turn', state: 'end', seq: 2 },
+      { type: 'delta', text: 'after the crash', seq: 3 },
+    ]);
+  });
+
   it('fails loud on mid-file corruption (never silently truncates history)', () => {
     const dir = fixture();
     writeFileSync(
