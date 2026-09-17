@@ -42,7 +42,7 @@ export interface RuntimeRegistryOptions {
   readonly log?: Log;
   /** pi adapter overrides (agentDir / model runtime — test seams). */
   readonly pi?: PiKnobs;
-  /** claude-code adapter overrides (binary path — test seam). */
+  /** claude-code adapter overrides (binary path / kill grace — test seams). */
   readonly claude?: ClaudeKnobs;
 }
 

@@ -15,6 +15,8 @@
  *   "garbage"          — blank/non-JSON lines + a torn final line at EOF
  *   "partial"          — assistant frame written in byte chunks, splitting
  *                        a multi-byte UTF-8 character across writes
+ *   "no-init"          — assistant/result frames WITHOUT an init frame
+ *                        (session identity never announced)
  *   "think"            — thinking deltas + thinking block before text
  *   "tool:<name>"      — a tool_use/tool_result loop before the answer
  *   otherwise          — echo turn: "echo: <prompt>"
@@ -239,6 +241,13 @@ async function run() {
   if (prompt.includes('crash')) {
     process.stderr.write('double crash requested\n');
     process.exit(2);
+  }
+
+  if (prompt.includes('no-init')) {
+    // Frames without the init frame: the session identity never arrives.
+    await emitTextTurn('no init here');
+    out(resultFrame('no init here', false));
+    return;
   }
 
   out(initFrame());

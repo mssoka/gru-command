@@ -76,11 +76,14 @@ function probeOne(binary: string, pathEnv: string, timeoutMs: number): Omit<Runt
   if (resolved === null) {
     return { installed: false, path: null, version: null, versionRaw: null };
   }
-  const probe = spawnSync(binary, ['--version'], {
+  // Spawn the RESOLVED path (no second PATH lookup); on Windows a shell is
+  // required for .cmd/.bat shims (npm-style installs).
+  const probe = spawnSync(resolved, ['--version'], {
     env: { PATH: pathEnv },
     timeout: timeoutMs,
     killSignal: 'SIGTERM',
     encoding: 'utf8',
+    shell: process.platform === 'win32',
   });
   if (probe.error !== undefined || probe.signal !== null || probe.status !== 0) {
     return { installed: false, path: resolved, version: null, versionRaw: null };

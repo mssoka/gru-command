@@ -96,10 +96,23 @@ the flag, which surfaces as a loud transport failure at the first prompt.
 (probed once, cached, re-probed after failure) marks the adapter `down`
 and the error names the binary; a mid-life ENOENT does the same. A turn
 that crashes does NOT mark the adapter down — the binary demonstrably
-worked.
+worked. Caller-facing spawn failures (a stale/foreign/corrupt
+`resumeFile`, a lock conflict, a double-resume) never touch adapter
+health either. A spawned-but-never-prompted transcript (empty file —
+service restart between spawn and first prompt) resumes by adopting the
+session uuid from its FILENAME and re-minting it on the first turn —
+the session never registered CLI-side, so there is nothing to `--resume`.
+
+**Turn liveness** is NOT the adapter's job: there is deliberately no
+turn-duration or frame-silence timeout here (a wedged `claude` process
+pends its prompt until disposed). The supervision epic (E7) owns restart
+ladders and crash-loop breakers; the operator escape is `dispose()`.
 
 Note: piped stdin is capped at 10MB by the CLI — prompts with large image
-sets must stay under it (fine for chat-scale attachments).
+sets must stay under it (fine for chat-scale attachments). The transcript
+append stream ignores backpressure per frame — frame sizes are bounded by
+the CLI's own tool-output truncation, so the buffer stays small in
+practice.
 
 ## Runtime probe (E9 wizard feed)
 

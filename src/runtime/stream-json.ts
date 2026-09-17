@@ -37,6 +37,7 @@ export interface NdjsonParserOptions {
 export class NdjsonParser {
   private readonly decoder = new StringDecoder('utf8');
   private buffer = '';
+  private mode: 'string' | 'bytes' | null = null;
   private readonly onFrame: (frame: StreamFrame) => void;
   private readonly onGarbage: (line: string) => void;
 
@@ -46,6 +47,13 @@ export class NdjsonParser {
   }
 
   push(chunk: Uint8Array | string): void {
+    // Mixed-mode pushes would corrupt ordering (decoder-held bytes flush
+    // after directly-appended strings) — forbid them loudly.
+    const mode = typeof chunk === 'string' ? 'string' : 'bytes';
+    if (this.mode === null) this.mode = mode;
+    if (this.mode !== mode) {
+      throw new Error('NdjsonParser: do not mix string and byte pushes on one parser');
+    }
     this.buffer += typeof chunk === 'string' ? chunk : this.decoder.write(chunk);
     let nl: number;
     while ((nl = this.buffer.indexOf('\n')) >= 0) {
@@ -55,12 +63,16 @@ export class NdjsonParser {
     }
   }
 
-  /** Flush at EOF. Any remaining buffered text is a torn tail: reported, dropped. */
+  /**
+   * Flush at EOF. A non-blank tail that PARSES is a complete frame whose
+   * newline was lost to a kill racing the last flush — deliver it. Only an
+   * unparseable tail is torn: reported as garbage and dropped.
+   */
   end(): void {
     this.buffer += this.decoder.end();
     const tail = this.buffer;
     this.buffer = '';
-    if (tail.trim() !== '') this.onGarbage(tail);
+    if (tail.trim() !== '') this.handleLine(tail);
   }
 
   private handleLine(line: string): void {
@@ -112,9 +124,27 @@ interface OpenBlock {
  * partials gets its text/thinking/tool_start from the complete frames
  * (each exactly once).
  */
+/**
+ * Translates stream-json frames of ONE turn into interface events.
+ * Lifecycle events (state, turn_start/turn_end, errors) are owned by the
+ * turn runner in the adapter; this class owns CONTENT events only.
+ *
+ * Dedupe rule: with --include-partial-messages the CLI emits BOTH
+ * stream_event partials AND the complete assistant frame. Partials win;
+ * the complete blocks are suppressed — PER MESSAGE when the partial stream
+ * carries message ids (message_start events, the real CLI shape), so a
+ * message whose partials never arrived mid-turn is still emitted from its
+ * complete frame. When the partial stream carries no message ids at all
+ * (older/minimal emitters), suppression falls back to per-kind turn-global
+ * flags. Tool calls dedupe precisely by tool_use id either way.
+ */
 export class ClaudeTurnTranslator {
   private sawTextDelta = false;
   private sawThinkingDelta = false;
+  /** message id → content kinds its partials covered (when ids observable). */
+  private readonly messageKinds = new Map<string, Set<'text' | 'thinking'>>();
+  private currentMessageId: string | null = null;
+  private partialsHaveMessageIds = false;
   private readonly announcedTools = new Set<string>();
   private readonly openBlocks = new Map<number, OpenBlock>();
   private initInfo: InitInfo | null = null;
@@ -187,18 +217,33 @@ export class ClaudeTurnTranslator {
     if (typeof message !== 'object' || message === null) return [];
     const content = (message as StreamFrame)['content'];
     if (!Array.isArray(content)) return [];
+    // Dedupe granularity: per message id when partials carry ids, else the
+    // turn-global per-kind flags.
+    const mid = (message as StreamFrame)['id'];
+    const kinds =
+      this.partialsHaveMessageIds && typeof mid === 'string'
+        ? this.messageKinds.get(mid)
+        : undefined;
+    const suppressText =
+      kinds !== undefined ? kinds.has('text') : this.partialsHaveMessageIds ? false : this.sawTextDelta;
+    const suppressThinking =
+      kinds !== undefined
+        ? kinds.has('thinking')
+        : this.partialsHaveMessageIds
+          ? false
+          : this.sawThinkingDelta;
     const events: RuntimeEvent[] = [];
     for (const block of content) {
       if (typeof block !== 'object' || block === null) continue;
       const b = block as StreamFrame;
       if (b['type'] === 'text' && typeof b['text'] === 'string' && b['text'] !== '') {
-        if (!this.sawTextDelta) events.push({ type: 'text_delta', delta: b['text'] });
+        if (!suppressText) events.push({ type: 'text_delta', delta: b['text'] });
       } else if (
         b['type'] === 'thinking' &&
         typeof b['thinking'] === 'string' &&
         b['thinking'] !== ''
       ) {
-        if (!this.sawThinkingDelta) {
+        if (!suppressThinking) {
           events.push({ type: 'thinking_delta', delta: b['thinking'] });
         }
       } else if (b['type'] === 'tool_use') {
@@ -244,6 +289,23 @@ export class ClaudeTurnTranslator {
     const e = event as StreamFrame;
     const index = typeof e['index'] === 'number' ? e['index'] : null;
     switch (e['type']) {
+      case 'message_start': {
+        // The Anthropic SSE envelope: partials for ONE message follow.
+        const message = e['message'];
+        const id =
+          typeof message === 'object' && message !== null
+            ? (message as StreamFrame)['id']
+            : undefined;
+        if (typeof id === 'string' && id !== '') {
+          this.partialsHaveMessageIds = true;
+          this.currentMessageId = id;
+          if (!this.messageKinds.has(id)) this.messageKinds.set(id, new Set());
+        }
+        return [];
+      }
+      case 'message_stop':
+        this.currentMessageId = null;
+        return [];
       case 'content_block_start': {
         const block = e['content_block'];
         if (index === null || typeof block !== 'object' || block === null) return [];
@@ -267,6 +329,9 @@ export class ClaudeTurnTranslator {
         const d = delta as StreamFrame;
         if (d['type'] === 'text_delta' && typeof d['text'] === 'string' && d['text'] !== '') {
           this.sawTextDelta = true;
+          if (this.currentMessageId !== null) {
+            this.messageKinds.get(this.currentMessageId)?.add('text');
+          }
           return [{ type: 'text_delta', delta: d['text'] }];
         }
         if (
@@ -275,6 +340,9 @@ export class ClaudeTurnTranslator {
           d['thinking'] !== ''
         ) {
           this.sawThinkingDelta = true;
+          if (this.currentMessageId !== null) {
+            this.messageKinds.get(this.currentMessageId)?.add('thinking');
+          }
           return [{ type: 'thinking_delta', delta: d['thinking'] }];
         }
         if (d['type'] === 'input_json_delta') {

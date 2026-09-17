@@ -1,9 +1,19 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
+import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { createWriteStream, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  createWriteStream,
+  mkdirSync,
+  openSync,
+  readSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import type { WriteStream } from 'node:fs';
-import { join, relative } from 'node:path';
+import { basename, isAbsolute, join, relative } from 'node:path';
 import type { GruCommandConfig, Role } from '../config.js';
 import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
@@ -82,6 +92,32 @@ const DEFAULT_KILL_GRACE_MS = 2_000;
 const STDERR_TAIL_BYTES = 8_192;
 /** Timeout for the one-shot binary availability probe at spawn. */
 const BINARY_PROBE_TIMEOUT_MS = 5_000;
+/** Resume reads at most this much of the transcript head — the session id
+ * lives in the FIRST frame, so a full read would just tax big files. */
+const RESUME_SCAN_PREFIX_BYTES = 256 * 1024;
+
+const execFileAsync = promisify(execFile);
+
+/** Caller-facing resume problems (bad/stale transcript path or content) —
+ * never adapter health (same exclusion class as LockBusyError). */
+export class ResumeFileError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ResumeFileError';
+  }
+}
+
+/** Read only the first `maxBytes` of a file (bounded resume scan). */
+function readFilePrefix(file: string, maxBytes: number): string {
+  const fd = openSync(file, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(maxBytes);
+    const bytesRead = readSync(fd, buf, 0, maxBytes, 0);
+    return buf.toString('utf8', 0, bytesRead);
+  } finally {
+    closeSync(fd);
+  }
+}
 
 export interface ClaudeCodeRuntimeOptions {
   readonly config: GruCommandConfig;
@@ -110,8 +146,9 @@ export interface ClaudeCodeRuntimeOptions {
  * session store under the standard pi-flavored layout.
  *
  * The raw handle hosts ONE turn at a time and rejects a concurrent prompt
- * loudly — in the product the registry wraps every handle in
- * withFallbacks, which is the serializer (steer-unable → queue-until-idle).
+ * loudly — in the product the registry wraps the RUNTIME in withFallbacks,
+ * whose wrapper handles serialize every turn (steer-unable →
+ * queue-until-idle).
  */
 export class ClaudeCodeRuntime implements AgentRuntime {
   readonly id = 'claude-code';
@@ -140,23 +177,31 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   /**
    * One-shot binary availability probe (cached). A missing/failing binary
    * marks the adapter down and fails spawn naming the binary; a later
-   * successful probe clears it.
+   * successful probe clears it. Async — the event loop is never blocked,
+   * and the probe runs at most once per spawn attempt (never per turn).
    */
-  private ensureBinary(): void {
+  private async ensureBinary(): Promise<void> {
     if (this.binaryOk) return;
-    const probe = spawnSync(this.binary, ['--version'], {
-      timeout: BINARY_PROBE_TIMEOUT_MS,
-      killSignal: 'SIGTERM',
-      encoding: 'utf8',
-    });
-    const detail =
-      probe.error !== undefined
-        ? String((probe.error as NodeJS.ErrnoException).code ?? probe.error)
-        : probe.signal !== null
-          ? `killed by ${probe.signal} (probe timeout ${BINARY_PROBE_TIMEOUT_MS}ms)`
-          : probe.status !== 0
-            ? `exited ${probe.status}: ${String(probe.stderr ?? '').trim().slice(0, 200)}`
-            : null;
+    let detail: string | null = null;
+    try {
+      await execFileAsync(this.binary, ['--version'], {
+        timeout: BINARY_PROBE_TIMEOUT_MS,
+        killSignal: 'SIGTERM',
+        windowsHide: true,
+      });
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException & {
+        killed?: boolean;
+        signal?: string;
+        stderr?: string | Buffer;
+      };
+      detail =
+        err.code === 'ENOENT'
+          ? 'ENOENT (not found on PATH)'
+          : err.killed === true || err.signal != null
+            ? `killed by ${err.signal ?? 'timeout'} (probe timeout ${BINARY_PROBE_TIMEOUT_MS}ms)`
+            : `exited ${String(err.code)}: ${String(err.stderr ?? '').trim().slice(0, 200)}`;
+    }
     if (detail !== null) {
       this.down = `binary "${this.binary}" unavailable: ${detail}`;
       throw new Error(`claude-code runtime cannot spawn: ${this.down}`);
@@ -215,18 +260,31 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     const model = this.resolveModel(role, options.model);
     const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
     const tools = mapRoleTools(role, roleDef.tools);
-    this.ensureBinary();
+    await this.ensureBinary();
 
     const resumeFile =
       options.resumeFile !== undefined ? normalizeSessionPath(options.resumeFile) : undefined;
     if (resumeFile !== undefined && this.activeFiles.has(resumeFile)) {
       throw new SessionAlreadyActiveError(resumeFile);
     }
-    // Confinement: resume only files that live in the session store.
+    // Same-process single-writer, shared-store flavor: the STORE holding the
+    // lock while THIS runtime does not host the file means another runtime
+    // instance in this process hosts it (the cross-process case is caught by
+    // the lock itself below).
+    if (
+      resumeFile !== undefined &&
+      this.store.isHeld(resumeFile) &&
+      !this.activeFiles.has(resumeFile)
+    ) {
+      throw new SessionAlreadyActiveError(resumeFile);
+    }
+    // Confinement: resume only files that live in the session store. The
+    // isAbsolute branch covers Windows cross-drive escapes (relative() then
+    // returns an absolute, backslashed path).
     if (resumeFile !== undefined) {
       const rel = relative(this.store.sessionsDir, resumeFile);
-      if (rel === '' || rel.startsWith('..') || rel.includes(':/')) {
-        throw new Error(
+      if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+        throw new ResumeFileError(
           `resumeFile must live under the session store (${this.store.sessionsDir}), got: ${resumeFile}`,
         );
       }
@@ -239,18 +297,49 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       this.store.acquireLock(resumeFile);
       lockAcquired = true;
     }
+    let createdNewFile: string | null = null;
     try {
       let sessionId: string;
       let sessionFile: string;
+      // A resume of an empty transcript adopts the minted uuid from the
+      // FILENAME and re-mints it on the first turn (the session never
+      // registered CLI-side, so --resume would have nothing to resume).
+      let established = false;
       if (resumeFile !== undefined) {
-        const extracted = extractSessionId(readFileSync(resumeFile, 'utf-8'));
-        if (extracted === null) {
-          throw new Error(
-            `transcript ${resumeFile} has no session id — cannot resume ` +
+        let head: string;
+        try {
+          head = readFilePrefix(resumeFile, RESUME_SCAN_PREFIX_BYTES);
+        } catch (error) {
+          throw new ResumeFileError(
+            `cannot read transcript ${resumeFile}: ${(error as Error).message}`,
+          );
+        }
+        const extracted = extractSessionId(head);
+        if (extracted !== null) {
+          sessionId = extracted;
+          established = true;
+        } else if (statSync(resumeFile).size === 0) {
+          const fromName =
+            /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/.exec(
+              basename(resumeFile),
+            );
+          if (fromName === null) {
+            throw new ResumeFileError(
+              `transcript ${resumeFile} is empty and its name carries no session uuid — ` +
+                'cannot resume (was it written by the claude-code adapter?)',
+            );
+          }
+          sessionId = fromName[1]!;
+          this.log('info', 'resume adopts filename session uuid (empty transcript — re-minting)', {
+            file: resumeFile,
+          });
+        } else {
+          throw new ResumeFileError(
+            `transcript ${resumeFile} has no session id in its first ` +
+              `${RESUME_SCAN_PREFIX_BYTES} bytes — cannot resume ` +
               '(was it written by the claude-code adapter?)',
           );
         }
-        sessionId = extracted;
         sessionFile = resumeFile;
       } else {
         sessionId = randomUUID();
@@ -260,6 +349,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
         sessionFile = join(dir, `${stamp}_${sessionId}.jsonl`);
         writeFileSync(sessionFile, '', { encoding: 'utf-8', flag: 'wx' });
+        createdNewFile = sessionFile;
         if (!this.store.isHeld(sessionFile)) {
           this.store.acquireLock(sessionFile);
         }
@@ -275,7 +365,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           tools,
           systemPrompt: roleDef.systemPrompt,
           killGraceMs: this.killGraceMs,
-          resume: resumeFile !== undefined,
+          resume: established,
           ...(model !== undefined ? { model } : {}),
           ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
         },
@@ -294,9 +384,28 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       if (lockAcquired && resumeFile !== undefined && !this.activeFiles.has(resumeFile)) {
         this.store.releaseLock(resumeFile);
       }
+      // Never leave an orphan empty transcript behind a failed fresh spawn
+      // (it would pollute growth detection and hourly backups forever).
+      if (createdNewFile !== null && !this.activeFiles.has(createdNewFile)) {
+        try {
+          this.store.releaseLock(createdNewFile);
+        } catch {
+          /* not ours (anymore) */
+        }
+        try {
+          unlinkSync(createdNewFile);
+        } catch {
+          /* already gone */
+        }
+      }
+      // Caller-facing errors never touch adapter health: state conflicts
+      // (SessionAlreadyActiveError, LockBusyError) and bad resume input
+      // (ResumeFileError) are the caller's problem; genuine infrastructure
+      // failure (fs, binary) latches the adapter down.
       if (
         !(error instanceof SessionAlreadyActiveError) &&
-        !(error instanceof LockBusyError)
+        !(error instanceof LockBusyError) &&
+        !(error instanceof ResumeFileError)
       ) {
         this.down = String(error);
       }
@@ -437,6 +546,9 @@ export class ClaudeCodeHandle implements AgentHandle {
 
   async prompt(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
+    if (text === '' && (options.images === undefined || options.images.length === 0)) {
+      throw new Error('empty prompt: nothing to send (no text, no images)');
+    }
     if (this.live !== null) {
       throw new Error(
         'claude-code turn in flight — one turn at a time per session ' +
@@ -631,6 +743,11 @@ export class ClaudeCodeHandle implements AgentHandle {
             return;
           }
           const result = translator.result;
+          if (!failed && result !== null && !turnStarted) {
+            // Frames flowed but no init ever arrived: the session identity
+            // was never verified — a protocol violation, not a success.
+            failTurn('claude completed without an init frame — session identity never verified');
+          }
           if (!failed && result !== null) {
             this.emit({ type: 'turn_end' });
             if (result.isError) {

@@ -6,7 +6,7 @@ import {
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
-import { dirname, relative } from 'node:path';
+import { dirname, isAbsolute, relative } from 'node:path';
 import type { GruCommandConfig, Role } from '../config.js';
 import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
@@ -163,9 +163,11 @@ export class PiRuntime implements AgentRuntime {
     }
     // Confinement: resume only files that live in the session store —
     // never open (or lock) arbitrary paths handed to the spawn options.
+    // The isAbsolute branch covers Windows cross-drive escapes (relative()
+    // then returns an absolute, backslashed path).
     if (resumeFile !== undefined) {
       const rel = relative(this.store.sessionsDir, resumeFile);
-      if (rel === '' || rel.startsWith('..') || rel.includes(':/')) {
+      if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
         throw new Error(
           `resumeFile must live under the session store (${this.store.sessionsDir}), got: ${resumeFile}`,
         );

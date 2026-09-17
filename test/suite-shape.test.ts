@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
  * Adding a test? Bump this pin — that is the point.
  */
 const PINS: Record<string, number> = {
-  'claude-adapter.test.ts': 39,
+  'claude-adapter.test.ts': 50,
   'config.test.ts': 31,
   'health.test.ts': 12,
   'identity.test.ts': 3,

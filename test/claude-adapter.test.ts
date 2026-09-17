@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
@@ -98,6 +98,15 @@ function doubleInvocations(fx: Fixture): {
     .trim()
     .split('\n')
     .map((line) => JSON.parse(line) as never);
+}
+
+/** Condition-based wait — never a bare wall-clock sleep (flake doctrine). */
+async function waitFor(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor: condition never became true');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
@@ -281,6 +290,28 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(events.some((e) => e.type === 'turn_end')).toBe(false); // the turn never completed
       // The binary itself works — a turn crash is NOT adapter-down.
       expect(fx.runtime.health().state).toBe('ok');
+      // The retry after a crash that never reached init RE-MINTS with
+      // --session-id (the session never registered CLI-side) — never a
+      // dangling --resume.
+      await handle.prompt('recovered', { owner: 'alice' });
+      expect(handle.health().state).toBe('idle');
+      const invocations = doubleInvocations(fx);
+      expect(invocations.length).toBe(2);
+      expect(invocations[1]!.argv[invocations[1]!.argv.indexOf('--session-id') + 1]).toBe(
+        handle.id,
+      );
+      expect(invocations[1]!.argv).not.toContain('--resume');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('a turn with no init frame is a protocol violation (identity never verified)', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      await expect(handle.prompt('no-init turn')).rejects.toThrow(/without an init frame/);
+      expect(handle.health().state).toBe('error');
     } finally {
       await handle.dispose();
     }
@@ -315,7 +346,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const handle = await fx.runtime.spawn('gru');
     try {
       const first = handle.prompt(`hold:${releaseFile}`, { owner: 'alice' });
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await waitFor(() => handle.health().state === 'streaming');
       await expect(handle.prompt('me too', { owner: 'bob' })).rejects.toThrow(/turn in flight/);
       writeFileSync(releaseFile, 'go', 'utf-8');
       await first;
@@ -331,8 +362,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const handle = await fx.runtime.spawn('gru');
     const events = collect(handle);
     const turn = handle.prompt(`hold:${releaseFile}`, { owner: 'alice' });
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(handle.health().state).toBe('streaming');
+    await waitFor(() => handle.health().state === 'streaming');
     await handle.dispose();
     await expect(turn).rejects.toThrow(/disposed/);
     expect(handle.health().state).toBe('disposed');
@@ -345,7 +375,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const fx = fixture({ killGraceMs: 50 });
     const handle = await fx.runtime.spawn('gru');
     const turn = handle.prompt('hold:never', { owner: 'alice' });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => handle.health().state === 'streaming');
     await handle.dispose();
     // Settles only when the process actually dies — SIGKILL is the only
     // way out here, so this resolving at all proves the escalation fired.
@@ -366,6 +396,49 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     // The same runtime recovers once the binary works (re-probe per spawn).
     const handle = await fx.runtime.spawn('gru');
     expect(fx.runtime.health().state).toBe('ok');
+    await handle.dispose();
+  });
+
+  it('rejects an empty prompt loudly before any process spawns', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      await expect(handle.prompt('')).rejects.toThrow(/empty prompt/);
+      expect(doubleInvocations(fx)).toEqual([]); // nothing spawned
+      // Images-only is a legitimate prompt (blocks without text).
+      await handle.prompt('', { images: [{ mediaType: 'image/png', data: 'aGk=' }] });
+      const invocations = doubleInvocations(fx);
+      expect(invocations.length).toBe(1);
+      expect(invocations[0]!.images).toBe(1);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('a mid-life binary vanish rejects the turn, latches down, and re-probes on recovery', async () => {
+    const fx = fixture();
+    const binary = join(fx.home, 'claude-copy.mjs');
+    copyFileSync(DOUBLE, binary);
+    chmodSync(binary, 0o755);
+    const runtime = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: fx.store,
+      binary,
+    });
+    const handle = await runtime.spawn('gru');
+    await handle.prompt('first turn fine');
+    expect(runtime.health().state).toBe('ok');
+    // The binary vanishes mid-life: the NEXT turn fails, the adapter
+    // latches down, and the next spawn re-probes instead of trusting cache.
+    rmSync(binary);
+    await expect(handle.prompt('second turn')).rejects.toThrow(/failed to spawn/);
+    expect(runtime.health().state).toBe('down');
+    expect(runtime.health().note).toContain('vanished mid-run');
+    copyFileSync(DOUBLE, binary);
+    chmodSync(binary, 0o755);
+    const recovered = await runtime.spawn('gru');
+    expect(runtime.health().state).toBe('ok');
+    await recovered.dispose();
     await handle.dispose();
   });
 
@@ -397,13 +470,19 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     });
     await fancy.prompt('fancy');
     await fancy.dispose();
-    const [first, second] = doubleInvocations(fx);
+    // multi-segment: only the FIRST segment is the provider (Bedrock-style
+    // dotted ids survive — the documented contract).
+    const bedrock = await fx.runtime.spawn('gru', { model: 'bedrock/us.anthropic.claude-x' });
+    await bedrock.prompt('bedrock');
+    await bedrock.dispose();
+    const [first, second, third] = doubleInvocations(fx);
     expect(first!.argv).not.toContain('--model');
     expect(first!.argv).not.toContain('--effort');
     const modelAt = second!.argv.indexOf('--model');
     expect(second!.argv[modelAt + 1]).toBe('claude-x');
     const effortAt = second!.argv.indexOf('--effort');
     expect(second!.argv[effortAt + 1]).toBe('high');
+    expect(third!.argv[third!.argv.indexOf('--model') + 1]).toBe('us.anthropic.claude-x');
   });
 
   it('fails loud on malformed model references', async () => {
@@ -557,6 +636,58 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       /has no session id/,
     );
     expect(existsSync(`${orphan}.lock`)).toBe(false); // released on the way out
+    // Caller-facing input error — adapter health stays ok (never latched).
+    expect(fx.runtime.health().state).toBe('ok');
+  });
+
+  it('resume scan is bounded: a session id beyond the prefix window is not found', async () => {
+    const fx = fixture();
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(dir, { recursive: true });
+    const fat = join(dir, '2026-09-17T00-00-00-000Z_00000000-0000-0000-0000-000000000000.jsonl');
+    // A junk line >256KB pushes the init frame beyond the scan prefix.
+    writeFileSync(
+      fat,
+      `{"pad":"${'x'.repeat(300 * 1024)}"}\n{"type":"system","subtype":"init","session_id":"hidden-id"}\n`,
+      'utf-8',
+    );
+    await expect(fx.runtime.spawn('gru', { resumeFile: fat })).rejects.toThrow(
+      /has no session id in its first/,
+    );
+    expect(fx.runtime.health().state).toBe('ok');
+  });
+
+  it('a spawned-but-never-prompted transcript resumes by adopting the filename uuid', async () => {
+    const fx = fixture();
+    const first = await fx.runtime.spawn('gru');
+    const file = first.sessionFile!;
+    const sessionId = first.id;
+    await first.dispose(); // never prompted: empty transcript on disk
+    expect(readFileSync(file, 'utf-8')).toBe('');
+
+    const secondRuntime = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: new SessionStore(fx.store.dataDir),
+      binary: DOUBLE,
+    });
+    const resumed = await secondRuntime.spawn('gru', { resumeFile: file });
+    try {
+      expect(resumed.id).toBe(sessionId); // adopted from the filename
+      await resumed.prompt('first words', { owner: 'alice' });
+      const invocations = doubleInvocations(fx);
+      const last = invocations[invocations.length - 1]!;
+      // The session never registered CLI-side: the first turn MINTS it.
+      expect(last.argv[last.argv.indexOf('--session-id') + 1]).toBe(sessionId);
+      expect(last.argv).not.toContain('--resume');
+      // And the transcript now holds the frames, keyed to the adopted id.
+      const frames = readFileSync(file, 'utf-8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l) as StreamFrame);
+      expect(frames[0]!['session_id']).toBe(sessionId);
+    } finally {
+      await resumed.dispose();
+    }
   });
 
   it('double-resume of one session file in one process is rejected loudly', async () => {
@@ -612,6 +743,44 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       foreign.dispose();
     }
   });
+
+  it('a second runtime instance sharing one store cannot re-host a live file', async () => {
+    const fx = fixture();
+    const first = await fx.runtime.spawn('gru');
+    await first.prompt('hosted');
+    const file = first.sessionFile!;
+    const sibling = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: fx.store, // SAME store instance — the in-process single-writer hole
+      binary: DOUBLE,
+    });
+    await expect(sibling.spawn('gru', { resumeFile: file })).rejects.toThrow(
+      /already hosted by this process/,
+    );
+    expect(sibling.health().state).toBe('ok'); // caller-facing conflict, never latched
+    await first.dispose();
+    // Once released, the sibling can host it.
+    const resumed = await sibling.spawn('gru', { resumeFile: file });
+    await resumed.dispose();
+  });
+
+  it('a failed fresh spawn leaves no orphan transcript and no lock behind', async () => {
+    const fx = fixture();
+    const poisoned = new SessionStore(fx.store.dataDir);
+    poisoned.acquireLock = () => {
+      throw new Error('staged lock failure');
+    };
+    const runtime = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: poisoned,
+      binary: DOUBLE,
+    });
+    await expect(runtime.spawn('gru')).rejects.toThrow('staged lock failure');
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    const leftovers = readdirSync(dir).filter((n) => n.endsWith('.jsonl') || n.endsWith('.lock'));
+    expect(leftovers).toEqual([]);
+    expect(runtime.health().state).toBe('down'); // genuine infra failure latches
+  });
 });
 
 describe('RuntimeRegistry + claude-code (fallback-wrapped)', () => {
@@ -661,12 +830,14 @@ describe('RuntimeRegistry + claude-code (fallback-wrapped)', () => {
       const events = collect(handle);
       const releaseFile = join(fx.home, 'release-steer');
       const first = handle.prompt(`hold:${releaseFile}`, { owner: 'alice' });
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      // Wait for the first process to be live — condition-based, no sleep.
+      await waitFor(
+        () => handle.health().state === 'streaming' && doubleInvocations(fx).length === 1,
+      );
       const steered = handle.steer('redirect please', { owner: 'bob' });
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      // Held: exactly one process invocation so far, and the queue event.
-      expect(doubleInvocations(fx).length).toBe(1);
+      // Held: the queue event fires synchronously and no second process spawns.
       expect(events.some((e) => e.type === 'queued' && e.reason === 'steer-unable')).toBe(true);
+      expect(doubleInvocations(fx).length).toBe(1);
       writeFileSync(releaseFile, 'go', 'utf-8');
       await first;
       await steered; // resolves only after ITS delivered turn completes
@@ -692,9 +863,10 @@ describe('RuntimeRegistry + claude-code (fallback-wrapped)', () => {
       const events = collect(handle);
       const releaseFile = join(fx.home, 'release-followup');
       const first = handle.prompt(`hold:${releaseFile}`, { owner: 'alice' });
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await waitFor(
+        () => handle.health().state === 'streaming' && doubleInvocations(fx).length === 1,
+      );
       const follow = handle.followUp('and then this', { owner: 'alice' });
-      await new Promise((resolve) => setTimeout(resolve, 50));
       expect(
         events.some((e) => e.type === 'queued' && e.reason === 'single-writer'),
       ).toBe(true);
@@ -705,6 +877,48 @@ describe('RuntimeRegistry + claude-code (fallback-wrapped)', () => {
         `hold:${releaseFile}`,
         'and then this',
       ]);
+    } finally {
+      await registry.dispose();
+    }
+  });
+
+  it('config-driven ruling-16 policy flows through the registry into argv', async () => {
+    const fx = fixture();
+    writeFileSync(
+      configPathFor(fx.home),
+      [
+        `workspace_root = "${fx.workspace}"`,
+        '[runtimes]',
+        'default = "claude-code"',
+        '[runtimes.claude-code]',
+        'model = "anthropic/claude-policy"',
+        'thinking_level = "low"',
+        '[runtimes.claude-code.roles]',
+        'minion = { model = "bedrock/us.anthropic.claude-minion", thinking_level = "max" }',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+    const registry = new RuntimeRegistry({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: fx.store,
+      claude: { binary: DOUBLE },
+    });
+    try {
+      const gru = await registry.spawn('gru');
+      await gru.prompt('policy check');
+      const minion = await registry.spawn('minion');
+      await minion.prompt('role policy check');
+      // Spawn options beat the configured policy (most specific wins).
+      const override = await registry.spawn('bob', { model: 'anthropic/claude-opt' });
+      await override.prompt('override check');
+      const [a, b, c] = doubleInvocations(fx);
+      expect(a!.argv[a!.argv.indexOf('--model') + 1]).toBe('claude-policy');
+      expect(a!.argv[a!.argv.indexOf('--effort') + 1]).toBe('low');
+      expect(b!.argv[b!.argv.indexOf('--model') + 1]).toBe('us.anthropic.claude-minion');
+      expect(b!.argv[b!.argv.indexOf('--effort') + 1]).toBe('max');
+      expect(c!.argv[c!.argv.indexOf('--model') + 1]).toBe('claude-opt');
+      expect(c!.argv[c!.argv.indexOf('--effort') + 1]).toBe('low'); // policy still applies
     } finally {
       await registry.dispose();
     }
@@ -745,6 +959,28 @@ describe('NdjsonParser (pure)', () => {
     expect(garbage).toEqual(['not json', '{"type":"resul']);
   });
 
+  it('delivers a complete-but-unterminated final frame at EOF (kill raced the newline)', () => {
+    const frames: StreamFrame[] = [];
+    const garbage: string[] = [];
+    const parser = new NdjsonParser({
+      onFrame: (f) => frames.push(f),
+      onGarbage: (line) => garbage.push(line),
+    });
+    parser.push('{"type":"assistant"}\n{"type":"result","is_error":false}');
+    parser.end();
+    expect(frames).toEqual([{ type: 'assistant' }, { type: 'result', is_error: false }]);
+    expect(garbage).toEqual([]);
+  });
+
+  it('rejects mixing string and byte pushes on one parser (decoder state would corrupt order)', () => {
+    const parser = new NdjsonParser({ onFrame: () => {} });
+    parser.push(Buffer.from('{"a":1'));
+    expect(() => parser.push('"b":2}\n')).toThrow(/do not mix/);
+    const parser2 = new NdjsonParser({ onFrame: () => {} });
+    parser2.push('{"a":1');
+    expect(() => parser2.push(Buffer.from('}\n'))).toThrow(/do not mix/);
+  });
+
   it('treats non-object JSON lines (arrays, scalars) as garbage', () => {
     const frames: StreamFrame[] = [];
     const garbage: string[] = [];
@@ -761,6 +997,31 @@ describe('NdjsonParser (pure)', () => {
 
 describe('ClaudeTurnTranslator (pure)', () => {
   const init = { type: 'system', subtype: 'init', session_id: 's1', model: 'm', tools: [] };
+
+  it('per-message dedupe: a message whose partials never arrived still emits from its complete frame', () => {
+    const t = new ClaudeTurnTranslator();
+    const events: RuntimeEvent[] = [];
+    const feed = (frame: StreamFrame) => events.push(...t.ingest(frame));
+    feed(init);
+    // Message 1: full SSE chain (message_start carries the id).
+    feed({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { id: 'msg_1' } },
+    });
+    feed({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'one' } },
+    });
+    feed({ type: 'stream_event', event: { type: 'message_stop' } });
+    feed({ type: 'assistant', message: { id: 'msg_1', content: [{ type: 'text', text: 'one' }] } });
+    // Message 2: its partials NEVER arrived (CLI quirk) — the complete frame
+    // must still emit (no turn-global suppression).
+    feed({ type: 'assistant', message: { id: 'msg_2', content: [{ type: 'text', text: 'two' }] } });
+    expect(events).toEqual([
+      { type: 'text_delta', delta: 'one' },
+      { type: 'text_delta', delta: 'two' },
+    ]);
+  });
 
   it('dedupes partials against complete frames (text never emitted twice)', () => {
     const t = new ClaudeTurnTranslator();
