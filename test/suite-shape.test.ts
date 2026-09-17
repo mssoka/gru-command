@@ -17,6 +17,7 @@ const PINS: Record<string, number> = {
   'config.test.ts': 31,
   'health.test.ts': 12,
   'identity.test.ts': 3,
+  'lan-phone-raw-client.test.ts': 5,
   'logger.test.ts': 1,
   'pi-adapter.test.ts': 32,
   'roles-gru.test.ts': 4,

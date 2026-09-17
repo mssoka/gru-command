@@ -1,7 +1,8 @@
 /**
  * Pairing screen: token entry + a QR of the LAN-pairing payload.
- * The QR encodes the mock payload shape ({url, token}) until E4/E9 wire
- * the real pairing-token flow.
+ * The QR payload ({"gru-command":1, url, token}) is built fully client-side
+ * from location.origin + the typed token — the real payload against the
+ * served UI (the mock uses the same shape).
  */
 
 import QRCode from 'qrcode';
@@ -22,10 +23,9 @@ export function initPairing(onPair: (token: string) => void): void {
   const errorBox = mustGet<HTMLElement>('pair-error');
   const qrImg = mustGet<HTMLImageElement>('pair-qr-img');
 
-  // Dev convenience: prefill the mock's default token on localhost only.
-  if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-    input.value = 'dev-token';
-  }
+  // No token prefill: the token is per-install (real service) or the
+  // mock's configured dev token — either way the human pairs with what
+  // THEIR instance runs, never a hardcoded guess.
 
   const renderQr = async (): Promise<void> => {
     const token = input.value.trim();
