@@ -12,12 +12,16 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/ws': { target: `ws://localhost:${mockPort}`, ws: true },
+      '/board/ws': { target: `ws://localhost:${mockPort}`, ws: true },
+      '/api': { target: `http://localhost:${mockPort}` },
     },
   },
   preview: {
     port: 4173,
     proxy: {
       '/ws': { target: `ws://localhost:${mockPort}`, ws: true },
+      '/board/ws': { target: `ws://localhost:${mockPort}`, ws: true },
+      '/api': { target: `http://localhost:${mockPort}` },
     },
   },
   build: {

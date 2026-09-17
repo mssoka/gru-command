@@ -1,0 +1,104 @@
+# Ledger — the durable operational record (E6)
+
+The SQLite ledger is the **API of record** for jobs, review rounds,
+agents, and events. The board, later supervision (E7), and the dispatch
+flow (E8) all read and write through it; the ledger never silently
+coerces state and every mutation is atomic with its event row.
+
+- **Location:** `<data_dir>/ledger/ledger.db` (instance data dir, SPEC
+  ruling 7 — never inside the workspace root). WAL journaling; foreign
+  keys enforced.
+- **Engine:** the built-in `node:sqlite` module — no native compile step
+  for clean clones. Requires Node ≥ 22.13 unflagged (`engines` pins
+  ≥ 22.19). Node prints a one-time `ExperimentalWarning` when the module
+  loads; that is expected and harmless.
+
+## Schema & migrations
+
+Migrations are **numbered, forward-only, contiguous from 1**, applied in
+order inside a transaction, and recorded in `schema_migrations`
+(`id`, `name`, `applied_at`).
+
+- Fresh data dir → all migrations apply in order, exactly once.
+- Up-to-date DB → the runner is a no-op.
+- **Fail-loud guards** (boot refuses rather than guessing):
+  - an applied version unknown to the running binary (older binary vs
+    newer DB — never run backwards),
+  - a numbering gap in the migration list,
+  - a migration whose SQL fails (transaction rolls back; whatever
+    committed earlier stays durable; the handle closes).
+
+Add a migration by appending to `MIGRATIONS` in
+`src/ledger/db.ts` with the next id; never renumber or edit an applied
+one.
+
+### v1 tables (migration 1)
+
+| Table | Purpose | Key columns |
+|---|---|---|
+| `jobs` | one dispatched work item per repo | `id` (slug), `repo`, `title`, `status`, `base_branch`, `pr_url`, `note` |
+| `rounds` | a review round on a job | `id` (`<job>-r<seq>`), `job_id` → jobs, `seq` (unique per job), `status`, `verdict`, `target_ref` |
+| `lens_states` | one chip per (round, lens) | `(round_id, lens)` PK, `state`, `agent_id`, `note` |
+| `agents` | every hosted agent session | `id` (session id), `role`, `label`, `job_id`, `round_id`, `state`, `last_activity`, `session_file` |
+| `events` | append-only history feeding the board | `seq` AUTOINCREMENT, `ts`, `kind`, denormalized `agent_id`/`job_id`/`round_id`/`lens`, JSON `payload` |
+
+Row tables hold **current state**; the `events` table is the
+**append-only history**. The board rebuilds entirely from the rows after
+any restart (the engine's in-memory cache is never the source of truth).
+
+## State machines
+
+Illegal transitions **throw** (`src/ledger/states.ts`); nothing is
+coerced and no event is written for a rejected change.
+
+```text
+job:    dispatched → working → in-review → merged | done
+        (any non-terminal ⇄ blocked / parked as recoverable side-states;
+         merged/done are terminal)
+
+round:  pending → live → verdict-posted | aborted   (terminal: the last two)
+
+lens:   pending → live → done | error               (terminal: the last two)
+```
+
+- `setRoundVerdict` also transitions the round to `verdict-posted` — a
+  posted verdict IS that state.
+- Lens chips derive `live` from their bound agent's turn events
+  (idempotent); `done`/`error` are explicit outcomes (the wave runner or
+  error derivation sets them).
+
+**Default lens set** (`DEFAULT_LENSES`, 7): blind, edge, acceptance,
+security, architecture, codebase, tests — every new round carries all
+seven chips unless created with an explicit list.
+
+## Event kinds
+
+Every mutation appends one event row in the same transaction and
+publishes it on the in-process event bus (`src/events/bus.ts`).
+
+| Kind | Payload (essentials) |
+|---|---|
+| `job.created` | repo, title |
+| `job.status` / `job.note` / `job.pr` / `job.target` | from→to / note / url / ref |
+| `round.created` / `round.status` / `round.verdict` / `round.target` | seq, lenses / from→to / verdict / ref |
+| `lens.bound` / `lens.status` | agentId / from→to (+note) |
+| `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |
+
+`events` rows are queryable (`LedgerApi.listEvents({ limit })`, newest
+first); the notification center derives its feed from recent events.
+
+## The API of record (`src/ledger/api.ts`)
+
+All writes go through `LedgerApi`; every method validates, updates the
+row, appends the event, and (with a bus attached) publishes it:
+
+- jobs: `addJob` · `setJobStatus` · `noteJob` · `setJobPr` · `setJobTargetRef`
+- rounds: `addRound` · `setRoundStatus` · `setRoundVerdict` · `setRoundTarget`
+- lenses: `bindLens` · `setLensOutcome` · `markLensLive`
+- agents: `registerAgent` (upsert) · `setAgentState`
+- events: `appendCustomEvent` · `listEvents`
+- reads: `getJob` · `listJobs(repo?)` · `getRound` · `listRounds` ·
+  `getAgent` · `listAgents`
+
+The thin HTTP write surface (validated, token-authed — the base E8's
+dispatch flow builds on) mirrors these; see [BOARD.md](./BOARD.md).

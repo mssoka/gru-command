@@ -13,8 +13,13 @@
       <div class="app-nav__title">Gru Command</div>
       <div class="lbl">one Gru · one window</div>
     </div>
+    <nav class="app-nav__tabs" aria-label="Views">
+      <button id="tab-chat" class="pp-btn pp-btn--secondary app-nav__tab" type="button">💬 Chat</button>
+      <button id="tab-board" class="pp-btn pp-btn--secondary app-nav__tab" type="button">🗺️ Board</button>
+    </nav>
     <span class="conn-dot" id="conn-dot" title="socket: idle" role="status"></span>
     <div class="app-nav__spacer"></div>
+    <button id="notification-bell" class="pp-btn pp-btn--secondary pp-btn--icon board-bell" title="Notifications" hidden data-unread="0" data-open="false">🔔<span class="board-bell__badge" id="notification-badge">0</span></button>
     <button id="theme-toggle" class="pp-btn pp-btn--secondary pp-btn--icon" title="Toggle theme">🌙</button>
     <button id="settings-toggle" class="pp-btn pp-btn--secondary pp-btn--icon" title="Settings">⚙️</button>
   </header>
@@ -65,6 +70,46 @@
           <button class="pp-btn" type="submit" id="chat-send">Send 🚀</button>
         </form>
       </section>
+    </div>
+
+    <section id="board-view" class="board-view reveal" hidden>
+      <div class="board-layout">
+        <div class="board-main">
+          <div id="board-jobs" class="board-jobs"></div>
+        </div>
+        <aside class="board-side">
+          <section class="pp-soft board-side__section">
+            <div class="lbl">Agents</div>
+            <div id="board-agents" class="board-agents"></div>
+          </section>
+          <section class="pp-soft board-side__section">
+            <div class="lbl">Transcripts</div>
+            <div id="board-transcripts" class="board-agents"></div>
+          </section>
+        </aside>
+      </div>
+      <div id="notification-panel" class="pp-card notification-panel" hidden>
+        <div class="lbl">Notifications</div>
+        <div id="notification-list" class="notification-list"></div>
+      </div>
+    </section>
+
+    <div id="transcript-drawer" class="transcript-drawer" hidden>
+      <div class="pp-card transcript-card">
+        <div class="transcript-head">
+          <strong id="transcript-title">transcript</strong>
+          <div class="transcript-head__actions">
+            <button id="transcript-wrap" class="pp-btn pp-btn--secondary" type="button">wrap: on</button>
+            <button id="transcript-close" class="pp-btn pp-btn--secondary" type="button">Close ✕</button>
+          </div>
+        </div>
+        <input class="pp-input transcript-search" id="transcript-search" type="search"
+               placeholder="search this transcript…" aria-label="Search transcript">
+        <div id="transcript-search-results" class="transcript-search-results"></div>
+        <div class="transcript-body" id="transcript-body"></div>
+        <div class="lbl transcript-loader" id="transcript-loader" hidden>loading…</div>
+        <button id="transcript-older" class="pp-btn pp-btn--secondary transcript-older" type="button" hidden>load older</button>
+      </div>
     </div>
   </main>
 

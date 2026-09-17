@@ -1,9 +1,11 @@
-# UI — Gru Command web shell (E5)
+# UI — Gru Command web shell (E5 + E6)
 
-The browser front-end: Playful Planet design system, app shell, and the
-chat view against the chat WebSocket. Everything lives in `web/` (a npm
-workspace). Framework-free vanilla TypeScript + Vite; the only runtime
-dependency is `qrcode` (pairing screen).
+The browser front-end: Playful Planet design system, app shell, the chat
+view against the chat WebSocket, and (E6) the live board dashboard +
+per-agent transcripts. Everything lives in `web/` (a npm workspace).
+Framework-free vanilla TypeScript + Vite; the only runtime dependency is
+`qrcode` (pairing screen). Board + transcript surfaces:
+[BOARD.md](./BOARD.md).
 
 ## Runbook
 
@@ -11,8 +13,9 @@ dependency is `qrcode` (pairing screen).
 npm install                 # clean clone: installs root + web workspace
 npm test                    # lint + typecheck + backend build + all vitest
                             # (incl. the W5 LAN-phone raw-client suite)
-npm run mock                # dev-only mock chat socket on :8787
-npm run dev:web             # vite dev server on :5173 (proxies /ws → mock)
+npm run mock                # dev-only mock chat socket + board feed on :8787
+npm run dev:web             # vite dev server on :5173 (proxies /ws +
+                            # /board/ws + /api → mock)
 npm run build:web           # production bundle → web/dist/ (no mock inside)
 npm run e2e                 # playwright smoke (mock + real service, serial)
 ```
@@ -120,14 +123,23 @@ after re-auth; replay ends exactly when the stream reaches the
   against the served UI; the wizard's token generation arrives with E9).
   Bad token → inline error. The field starts EMPTY everywhere — mock or
   real, localhost or LAN — the token is per-install, never a guess.
-- **Chat** — desktop: panel; mobile (≤768px): corner bubble that opens a
-  bottom sheet (same DOM reparented via matchMedia; unread badge counts
-  deltas arriving while closed). Streaming deltas render token-by-token
-  with a caret; tool activity is a live status line.
+- **Chat** — desktop: panel (default tab); mobile (≤768px): corner
+  bubble that opens a bottom sheet (same DOM reparented via matchMedia;
+  unread badge counts deltas arriving while closed). Streaming deltas
+  render token-by-token with a caret; tool activity is a live status
+  line.
+- **Board (E6)** — desktop tab `🗺️ Board`: repo-grouped job cards, round
+  rows with 7 per-lens live chips, agent rail, transcripts list,
+  notification center (see [BOARD.md](./BOARD.md)). **Phone:
+  board-first** (SPEC ruling 11) — the board is the landing view, chat
+  stays one tap away via the bubble; the Chat tab opens the sheet.
+- **Transcripts (E6)** — drawer from the agent rail / transcripts list:
+  newest-first paging, server-side search with jump-to-entry, wrap
+  toggle (long lines unwrap, never clip), collapsed thinking.
 - **Degraded modes** — banners for connecting/reconnecting/offline; the
   nav dot mirrors socket state (open/busy/down).
 - **Settings stub** — theme toggle, socket endpoint, unpair. Grows with
-  E6/E7.
+  E7/E9.
 
 ## Tests
 

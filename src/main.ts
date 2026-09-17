@@ -4,9 +4,16 @@ import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
 import { RuntimeRegistry } from './runtime/registry.js';
 import { SessionStore } from './sessions/store.js';
+import { LedgerDb } from './ledger/db.js';
+import { LedgerApi } from './ledger/api.js';
+import { EventBus } from './events/bus.js';
+import { BoardEngine } from './board/engine.js';
+import { createBoardServer } from './board/server.js';
+import { TranscriptService } from './transcripts/service.js';
 import { createService, type ServiceHandle } from './server.js';
 import { ChatFrameLog } from './chat/frame-log.js';
 import { createChatServer, type ChatServer } from './chat/server.js';
+import { BOARD_WS_PATH } from './board/frames.js';
 import { GruSessionPointer } from './chat/session-state.js';
 import { createStaticRoot, defaultStaticRoot } from './static.js';
 import { SERVICE_NAME, VERSION } from './version.js';
@@ -67,6 +74,8 @@ async function main(): Promise<number> {
     registry?: RuntimeRegistry;
     store?: SessionStore;
     chat?: ChatServer;
+    board?: Awaited<ReturnType<typeof createBoardServer>>;
+    ledgerDb?: LedgerDb;
   } = {};
   let shuttingDown = false;
   const shutdown = (signal: string) => {
@@ -90,12 +99,20 @@ async function main(): Promise<number> {
         // release or the final snapshot — the next boot's growth detection
         // depends on the snapshot reflecting what this process last saw
         // (SPEC ruling 12). Chat clients go first (1001 going-away) so
-        // they queue before the runtime turns die (E4).
+        // they queue before the runtime turns die (E4); the board's
+        // clients follow (E6).
         if (state.chat !== undefined) {
           try {
             await state.chat.dispose();
           } catch (error) {
             logger.error('chat server shutdown failed', { error: String(error) });
+          }
+        }
+        if (state.board !== undefined) {
+          try {
+            await state.board.dispose();
+          } catch (error) {
+            logger.error('board server shutdown failed', { error: String(error) });
           }
         }
         if (state.registry !== undefined) {
@@ -111,6 +128,13 @@ async function main(): Promise<number> {
             state.store.persistSnapshot();
           } catch (error) {
             logger.error('session store shutdown failed', { error: String(error) });
+          }
+        }
+        if (state.ledgerDb !== undefined) {
+          try {
+            state.ledgerDb.close();
+          } catch (error) {
+            logger.error('ledger shutdown failed', { error: String(error) });
           }
         }
         await handle.stop();
@@ -161,19 +185,50 @@ async function main(): Promise<number> {
     frameLog,
     pointer: new GruSessionPointer(chatDir, (level, msg, fields) => logger.log(level, msg, fields)),
     spawnGru: (resumeFile) => registry.spawn('gru', resumeFile !== null ? { resumeFile } : {}),
+    siblingUpgradePaths: [BOARD_WS_PATH],
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+
+  // Ledger + board (E6): the SQLite record opens (and migrates) before
+  // the HTTP server so a schema failure refuses boot loudly. The board
+  // engine feeds on the registry tap; the transcript service reads the
+  // session store.
+  const ledgerDb = new LedgerDb(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
+  const bus = new EventBus();
+  const ledger = new LedgerApi(ledgerDb.handle, { bus });
+  const engine = new BoardEngine({
+    ledger,
+    bus,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  registry.onAgentEvent((envelope) => engine.onRuntimeEvent(envelope));
+  const board = createBoardServer({
+    config,
+    engine,
+    ledger,
+    transcripts: new TranscriptService(store.sessionsDir, { ledger }),
+    bus,
+    siblingUpgradePaths: ['/ws'],
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  state.ledgerDb = ledgerDb;
+  state.board = board;
+  logger.info('ledger ready', { db_path: ledgerDb.dbPath });
 
   const service = createService(
     config,
     identity,
     (level, msg, fields) => logger.log(level, msg, fields),
     () => registry.status(),
-    { staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)) },
+    {
+      staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)),
+      requestHook: (req, res, path) => board.requestHook(req, res, path),
+    },
   );
   state.handle = await service.start();
   const handle = state.handle;
   chat.attach(handle.httpServer);
+  board.attach(handle.httpServer); // last: its upgrade handler terminates unclaimed paths
   state.chat = chat;
   chat.warmup();
 

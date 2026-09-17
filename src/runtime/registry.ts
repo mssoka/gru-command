@@ -4,7 +4,7 @@ import type { GrowthReport, SessionStore } from '../sessions/store.js';
 import { PiRuntime } from './pi-adapter.js';
 import { ClaudeCodeRuntime } from './claude-adapter.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
-import type { AgentHandle, AgentRuntime, SpawnOptions } from './types.js';
+import type { AgentHandle, AgentRuntime, RuntimeEvent, SpawnOptions } from './types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -47,6 +47,22 @@ export interface RuntimeRegistryOptions {
 }
 
 /**
+ * A runtime event forwarded through the registry tap (E6): `event` is the
+ * adapter event verbatim; `phase` wraps spawn/dispose boundaries the raw
+ * event stream does not carry. sessionFile is the handle's declared path
+ * at tap time (null before the file exists).
+ */
+export interface AgentEventEnvelope {
+  readonly agentId: string;
+  readonly role: Role;
+  readonly sessionFile: string | null;
+  readonly phase: 'spawned' | 'event' | 'disposed';
+  readonly event?: RuntimeEvent;
+}
+
+export type AgentEventListener = (envelope: AgentEventEnvelope) => void;
+
+/**
  * Runtime registry (EPICS E2 story 4/5; lands E1-deferred N4): resolves
  * which adapter hosts a role from config (default + per-role overrides),
  * creates adapters lazily, applies interface-layer fallbacks, and tracks
@@ -55,6 +71,7 @@ export interface RuntimeRegistryOptions {
 export class RuntimeRegistry {
   private readonly adapters = new Map<RuntimeId, AgentRuntime>();
   private readonly handles = new Set<AgentHandle>();
+  private readonly agentListeners = new Set<AgentEventListener>();
   private readonly opts: RuntimeRegistryOptions;
   private readonly log: Log;
   private growth: GrowthReport | null = null;
@@ -83,6 +100,24 @@ export class RuntimeRegistry {
 
   runtimeIdFor(role: Role): RuntimeId {
     return this.opts.config.runtimes.roles[role] ?? this.opts.config.runtimes.default;
+  }
+
+  /** Subscribe to every spawned handle's events (E6 board feed). Additive. */
+  onAgentEvent(listener: AgentEventListener): () => void {
+    this.agentListeners.add(listener);
+    return () => {
+      this.agentListeners.delete(listener);
+    };
+  }
+
+  private emitAgentEvent(envelope: AgentEventEnvelope): void {
+    for (const listener of this.agentListeners) {
+      try {
+        listener(envelope);
+      } catch (error) {
+        this.log('error', 'agent event listener failed', { error: String(error) });
+      }
+    }
   }
 
   /** The fallback-wrapped adapter for a runtime id (created on first use). */
@@ -149,6 +184,21 @@ export class RuntimeRegistry {
       thinkingLevel,
     });
     this.handles.add(handle);
+    // E6 event tap: surface spawn/dispose + forward every runtime event to
+    // registry-level subscribers (the board engine's feed).
+    this.emitAgentEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+    handle.subscribe((event) => {
+      this.emitAgentEvent({
+        agentId: handle.id,
+        role,
+        sessionFile: handle.sessionFile,
+        phase: 'event',
+        event,
+      });
+      if (event.type === 'state' && event.state === 'disposed') {
+        this.emitAgentEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'disposed' });
+      }
+    });
     // Self-healing membership: a handle disposed by ANY caller leaves the
     // registry set — the status surface must never contradict itself.
     handle.subscribe((event) => {

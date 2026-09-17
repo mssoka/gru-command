@@ -11,7 +11,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { WebSocketServer, type WebSocket } from 'ws';
+import { WebSocket, WebSocketServer } from 'ws';
 import {
   parseClientFrame,
   type ErrorFrame,
@@ -111,7 +111,167 @@ function scriptedReply(socket: WebSocket, userText: string): void {
   }
 }
 
+/**
+ * ── Board feed (E6, dev-only) ──────────────────────────────────────────
+ * A GENERIC sample snapshot (no real project names, ever — hygiene
+ * ruling): two repos, a live round with per-lens chips in mixed states,
+ * the standing crew on the agent rail, one blocked-job notification.
+ * The board WS pushes a fresh copy after auth and on every /__pulse.
+ */
+const LENSES = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'] as const;
+
+function sampleSnapshot(): unknown {
+  return {
+    repos: [
+      {
+        name: 'demo-api',
+        jobs: [
+          {
+            id: 'demo-api-payment-fix',
+            repo: 'demo-api',
+            title: 'Fix the payment retry loop',
+            status: 'in-review',
+            updatedAt: new Date().toISOString(),
+            prUrl: null,
+            baseBranch: 'main',
+            note: 'awaiting review round 2',
+            rounds: [
+              {
+                id: 'demo-api-payment-fix-r2',
+                seq: 2,
+                status: 'live',
+                verdict: null,
+                targetRef: 'abc1234',
+                updatedAt: new Date().toISOString(),
+                lenses: LENSES.map((lens, index) => ({
+                  lens,
+                  state: index < 3 ? 'done' : index === 3 ? 'live' : index === 4 ? 'error' : 'pending',
+                  agentId: `mock-lens-${lens}`,
+                  note: index === 4 ? 'provider cap hit' : null,
+                })),
+              },
+            ],
+          },
+          {
+            id: 'demo-api-docs-pass',
+            repo: 'demo-api',
+            title: 'Docs pass on the public endpoints',
+            status: 'parked',
+            updatedAt: new Date(Date.now() - 3_600_000).toISOString(),
+            prUrl: null,
+            baseBranch: 'main',
+            note: null,
+            rounds: [],
+          },
+        ],
+      },
+      {
+        name: 'sample-site',
+        jobs: [
+          {
+            id: 'sample-site-copy-pass',
+            repo: 'sample-site',
+            title: 'Landing copy refresh',
+            status: 'working',
+            updatedAt: new Date(Date.now() - 600_000).toISOString(),
+            prUrl: 'https://example.invalid/pr/42',
+            baseBranch: 'main',
+            note: null,
+            rounds: [],
+          },
+        ],
+      },
+    ],
+    agents: [
+      { id: 'mock-gru', role: 'gru', label: 'gru · chat', state: 'idle', lastActivity: new Date().toISOString(), sessionFile: 'gru/--demo--aa111111/mock-session.jsonl', jobId: null, roundId: null },
+      { id: 'mock-silas', role: 'silas', label: 'silas · ops', state: 'streaming', lastActivity: new Date().toISOString(), sessionFile: null, jobId: null, roundId: null },
+      { id: 'mock-lens-blind', role: 'perkins', label: 'lens: blind', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: 'demo-api-payment-fix-r2' },
+      { id: 'mock-minion', role: 'minion', label: 'demo-api-payment-fix', state: 'idle', lastActivity: null, sessionFile: null, jobId: 'demo-api-payment-fix', roundId: null },
+      { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: null },
+    ],
+    notifications: [
+      { id: 'mock-n1', ts: new Date().toISOString(), severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync' },
+      { id: 'mock-n2', ts: new Date(Date.now() - 120_000).toISOString(), severity: 'info', title: 'Round r1 verdict', detail: 'approved' },
+    ],
+  };
+}
+
+const SAMPLE_TRANSCRIPT_FILE = 'gru/--demo--aa111111/mock-session.jsonl';
+const SAMPLE_TRANSCRIPT = [
+  { type: 'user', text: 'mock transcript: plan the launch' },
+  { type: 'assistant', text: 'on it, boss — three steps, one review round' },
+  { type: 'user', text: 'what about the secret sauce metric?' },
+  { type: 'assistant', text: 'tracked on the board as a round chip' },
+];
+
 const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+  // Board API (dev-only, generic sample data; token matches the chat token).
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  if (req.method === 'GET' && url.pathname === '/api/board') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(sampleSnapshot()) + '\n');
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/api/transcripts') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        transcripts: [
+          { file: SAMPLE_TRANSCRIPT_FILE, role: 'gru', sizeBytes: 1024, modifiedAt: new Date().toISOString(), agentId: 'mock-gru', agentLabel: 'gru · chat' },
+        ],
+      }) + '\n',
+    );
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/api/transcripts/file') {
+    const file = url.searchParams.get('file') ?? '';
+    const q = url.searchParams.get('q');
+    if (file !== SAMPLE_TRANSCRIPT_FILE) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{"error":"not_found"}\n');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (q !== null && q !== '') {
+      const needle = q.toLowerCase();
+      const matches = SAMPLE_TRANSCRIPT.map((entry, index) => ({ index, kind: entry.type, text: entry.text }))
+        .filter((entry) => entry.text.toLowerCase().includes(needle))
+        .map((entry) => ({ index: entry.index, kind: entry.kind, snippet: `…${entry.text.slice(0, 60)}…` }));
+      res.end(JSON.stringify({ file, query: q, matches, scanned: SAMPLE_TRANSCRIPT.length }) + '\n');
+      return;
+    }
+    const before = url.searchParams.get('before');
+    const upper = before === null ? SAMPLE_TRANSCRIPT.length : Math.min(Number(before), SAMPLE_TRANSCRIPT.length);
+    const lower = Math.max(0, upper - 2);
+    res.end(
+      JSON.stringify({
+        file,
+        total: SAMPLE_TRANSCRIPT.length,
+        entries: SAMPLE_TRANSCRIPT.slice(lower, upper)
+          .map((entry, offset) => ({ index: lower + offset, ts: null, kind: entry.type, role: entry.type, text: entry.text, thinking: null, toolName: null, isError: false }))
+          .reverse(),
+        nextCursor: lower > 0 ? lower : null,
+        skippedTornLines: 0,
+      }) + '\n',
+    );
+    return;
+  }
+  // POST /__pulse nudges board clients with a fresh sample snapshot.
+  if (req.method === 'POST' && req.url === '/__pulse') {
+    for (const client of boardClients) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: 'board', snapshot: sampleSnapshot() }));
+      }
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}\n');
+    return;
+  }
   // Dev control plane (tests): POST /__reset clears the frame log;
   // POST /__drop terminates every connected socket.
   if (req.method === 'POST' && req.url === '/__drop') {
@@ -131,7 +291,62 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   res.end('{"error":"mock: ws endpoint is /ws; POST /__reset clears the log"}\n');
 });
 
-const server = new WebSocketServer({ server: httpServer, path: '/ws' });
+// Two noServer wss instances behind ONE manual upgrade router — two
+// `{server, path}` instances would reject each other's upgrades (the
+// first-attached wss answers 400 for every foreign path).
+const server = new WebSocketServer({ noServer: true });
+const boardClients = new Set<WebSocket>();
+const boardServer = new WebSocketServer({ noServer: true });
+
+httpServer.on('upgrade', (request, socket, head) => {
+  const { pathname } = new URL(request.url ?? '/', 'http://localhost');
+  if (pathname === '/ws') {
+    server.handleUpgrade(request, socket, head, (ws) => server.emit('connection', ws, request));
+    return;
+  }
+  if (pathname === '/board/ws') {
+    boardServer.handleUpgrade(request, socket, head, (ws) => boardServer.emit('connection', ws, request));
+    return;
+  }
+  socket.destroy();
+});
+
+boardServer.on('connection', (socket) => {
+  let authed = false;
+  const deadline = setTimeout(() => {
+    if (!authed) {
+      socket.send(JSON.stringify({ type: 'error', message: 'auth timeout', fatal: true }));
+      socket.close();
+    }
+  }, AUTH_DEADLINE_MS);
+  socket.on('message', (data) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(String(data));
+    } catch {
+      parsed = null;
+    }
+    const token =
+      typeof parsed === 'object' && parsed !== null && (parsed as { token?: unknown }).token;
+    if (authed || typeof token !== 'string' || token !== TOKEN) {
+      if (!authed) {
+        clearTimeout(deadline);
+        socket.send(JSON.stringify({ type: 'error', message: 'unauthorized: bad token', fatal: true }));
+        socket.close();
+      }
+      return;
+    }
+    clearTimeout(deadline);
+    authed = true;
+    boardClients.add(socket);
+    socket.on('close', () => boardClients.delete(socket));
+    socket.send(JSON.stringify({ type: 'auth_ok' }));
+    socket.send(JSON.stringify({ type: 'board', snapshot: sampleSnapshot() }));
+  });
+  socket.on('error', () => {
+    boardClients.delete(socket);
+  });
+});
 
 server.on('connection', (socket) => {
   let authed = false;
@@ -210,11 +425,13 @@ function handleUserFrame(socket: WebSocket, frame: UserFrame): void {
 
 process.stdout.write(
   `gru-command MOCK chat socket (dev-only) listening on ws://localhost:${PORT}/ws ` +
+    `+ board feed on ws://localhost:${PORT}/board/ws + /api/board ` +
     `(token: ${TOKEN === 'dev-token' ? 'dev-token [default]' : 'from GRU_MOCK_TOKEN'})\n`,
 );
 
 const shutdown = (): void => {
   server.close();
+  boardServer.close();
   httpServer.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1_000).unref();
 };
