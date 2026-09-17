@@ -111,10 +111,6 @@ export class NotificationCenter {
     return this.ledger.ackNotification(id, by);
   }
 
-  list(opts: { limit?: number; unackedOnly?: boolean } = {}): readonly NotificationRecord[] {
-    return this.ledger.listNotifications(opts);
-  }
-
   /** Bus derivation: board-worthy events become durable FYI rows, once. */
   private derive(event: BusEvent): void {
     // Ack/shown echoes must never re-derive (no loops, no dupes).

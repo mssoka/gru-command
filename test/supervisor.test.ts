@@ -90,13 +90,15 @@ class FakeRegistry implements SupervisorRegistry {
   private readonly listeners = new Set<(envelope: AgentEventEnvelope) => void>();
   readonly handlesById = new Map<string, FakeHandle>();
   readonly spawnCalls: { role: Role; resumeFile: string | null }[] = [];
+  /** Monotonic: a disposed handle's id is never re-minted. */
+  private nextId = 0;
   /** Replace to control spawn behavior (default: resume keeps the
    * session id — mirroring the real adapters' resume semantics; a fresh
    * spawn mints a new one). */
   spawnImpl: (role: Role, options?: SpawnOptions) => Promise<FakeHandle> = async (role, options) =>
     options?.resumeFile !== undefined && options.resumeFile !== null
-      ? new FakeHandle(role, `${role}-resumed-${this.handlesById.size + 1}`, options.resumeFile)
-      : new FakeHandle(role, `${role}-${this.handlesById.size + 1}`, null);
+      ? new FakeHandle(role, `${role}-resumed-${++this.nextId}`, options.resumeFile)
+      : new FakeHandle(role, `${role}-${++this.nextId}`, null);
 
   private emit(envelope: AgentEventEnvelope): void {
     for (const listener of this.listeners) listener(envelope);
@@ -495,6 +497,127 @@ describe('supervisor — /health status shape', () => {
     expect(status.turnSilenceMs).toBe(50);
     expect(status.maxRestarts).toBe(3);
     expect(status.agents.some((a) => a.agentId === 'gru-status' && a.state === 'watching')).toBe(true);
+    h.dispose();
+  });
+});
+
+describe('supervisor — Perkins r1 fixes', () => {
+  it('BLOCKER r1-1: a dead slot record never shadows the live handle — no duplicate spawns', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-main',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    // Owner teardown (death OUTSIDE a restart rung): disposed envelope,
+    // slot-bound record goes stale with a null handle.
+    await h.registry.disposeHandle(first);
+    // The next ensure spawns a replacement ONCE…
+    const second = (await slot.ensure({})) as FakeHandle;
+    expect(second.id).not.toBe(first.id);
+    expect(h.registry.spawnCalls.length).toBe(2);
+    // …and every LATER ensure returns THAT handle — never a third live
+    // Gru (single-writer, SPEC ruling 1).
+    const third = await slot.ensure({});
+    expect(third.id).toBe(second.id);
+    expect(h.registry.spawnCalls.length).toBe(2);
+    // Exactly one slot-bound record remains, watching the live handle.
+    const bound = [...h.supervisor.status().agents].filter((a) => a.slotId === 'gru-main');
+    expect(bound.length).toBe(1);
+    expect(bound[0]?.state).toBe('watching');
+    h.dispose();
+  });
+
+  it('r1-2: supervision.enabled=false gates EVERY side-effect — pure registry behavior', async () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const center = new NotificationCenter({ ledger: api, bus });
+    const registry = new FakeRegistry();
+    const supervisor = new Supervisor({
+      config: {
+        enabled: false,
+        turnSilenceMs: 30,
+        restartWindowMs: 600_000,
+        maxRestarts: 3,
+        restartBackoffMs: 1,
+      },
+      registry,
+      ledger: api,
+      notifications: center,
+      tickMs: 5,
+    });
+    supervisor.start();
+    const handle = new FakeHandle('gru', 'disabled-gru', null);
+    registry.adopt(handle);
+    // Fatal runtime error: observed, NEVER acted on.
+    handle.emit({ type: 'error', error: 'boom', fatal: true });
+    await sleep(30);
+    expect(registry.spawnCalls.length).toBe(0);
+    expect(handle.disposed).toBe(false);
+    // A hang past the silence window: the tick is inert.
+    hang(handle);
+    await sleep(80);
+    expect(handle.disposed).toBe(false);
+    expect(registry.spawnCalls.length).toBe(0);
+    // No supervision notifications, no supervision events, no breaker.
+    expect(api.listNotifications({ limit: 50 }).filter((n) => n.kind.startsWith('supervision.'))).toEqual([]);
+    expect(api.listEvents({ limit: 100 }).filter((e) => e.kind.startsWith('supervision.'))).toEqual([]);
+    const view = supervisor.viewFor('disabled-gru');
+    expect(view?.state).toBe('watching'); // observed only
+    supervisor.dispose();
+    db.close();
+  });
+
+  it('r1-15: restarts aged OUT of the window do not trip the breaker', async () => {
+    const h = boot();
+    const handle = new FakeHandle('minion', 'window-minion', null);
+    h.registry.adopt(handle);
+    // Two hang-restarts separated by MORE than the window (10 min).
+    for (let round = 0; round < 2; round += 1) {
+      const current = (h.registry.getHandle('window-minion') ?? h.supervisor.status().agents.find((a) => a.agentId.startsWith('minion-resumed'))) as FakeHandle | undefined;
+      const target = current ?? handle;
+      hang(target);
+      h.advance(60);
+      await sleep(30);
+      h.advance(601_000); // age the ring out between incidents
+    }
+    const view = [...h.supervisor.status().agents].find((a) => a.role === 'minion');
+    expect(view?.breakerOpen).toBe(false);
+    expect((view?.restarts ?? 0)).toBeLessThanOrEqual(1); // the aged ring pruned
+    expect(h.notificationsOfKind('supervision.breaker').length).toBe(0);
+    h.dispose();
+  });
+
+  it('r1-17/#24: slot use on an open breaker re-arms supervision AND acks the escalation row', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-main',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    // Burn the ladder to a trip: the handle HANGS and every respawn fails.
+    h.registry.spawnImpl = async () => {
+      throw new Error('spawn exploded');
+    };
+    hang(first);
+    h.advance(60);
+    await sleep(250); // rungs 1-3 fail fast; the 4th need trips
+    const escalation = h.notificationsOfKind('supervision.breaker')[0];
+    expect(escalation).toBeDefined();
+    // Heal spawns; slot use re-arms + acks the escalation row.
+    h.registry.spawnImpl = async (role) => new FakeHandle(role, 'slot-recovered', null);
+    await slot.ensure({});
+    await sleep(20);
+    const acked = h.api.getNotification(escalation!.id);
+    expect(acked?.ackedAt).not.toBeNull();
+    expect(acked?.ackedBy).toBe('slot-use');
+    const view = h.supervisor.viewFor('slot-recovered');
+    expect(view?.state).toBe('watching');
+    expect(view?.breakerOpen).toBe(false);
     h.dispose();
   });
 });

@@ -63,29 +63,43 @@ fi
 # Unit rendering — escape placeholder values for the unit syntax (paths
 # with spaces survive; systemd accepts quoted ExecStart, plists need none).
 # ---------------------------------------------------------------------------
+# Escape sed replacement metacharacters (backslash, ampersand, and the
+# delimiter) so arbitrary install paths render verbatim. Newlines are
+# rejected by the caller — they cannot render into unit fields.
+esc_for_sed() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+}
+
 render_unit() {
   local template="$1"
   local node="$2" repo="$3" home="$4"
-  # Reject the one character that would corrupt sed rendering.
+  # Multi-line paths cannot render into single-line unit fields.
   for value in "$node" "$repo" "$home"; do
-    if [[ "$value" == *'|'* ]]; then
-      err "path contains '|' which the unit renderer cannot escape: $value"
+    if [[ "$value" == *$'\n'* ]]; then
+      err "path contains a newline which the unit renderer cannot escape: $value"
       exit 1
     fi
   done
   # systemd ExecStart quotes args containing spaces; launchd needs none.
-  local node_arg="$node" repo_arg="$repo"
+  local node_arg=""
+  node_arg="$(esc_for_sed "$node")"
+  local repo_arg=""
+  repo_arg="$(esc_for_sed "$repo")"
+  local home_arg=""
+  home_arg="$(esc_for_sed "$home")"
   if [[ "$template" == *.service.template ]]; then
-    [[ "$node_arg" == *" "* ]] && node_arg="\"$node_arg\""
-    [[ "$repo_arg" == *" "* ]] && repo_arg="\"$repo_arg\""
+    [[ "$node" == *" "* ]] && node_arg="\"$node_arg\""
+    [[ "$repo" == *" "* ]] && repo_arg="\"$repo_arg\""
+    [[ "$home" == *" "* ]] && home_arg="\"$home_arg\""
   fi
   # The launchd unit carries the INSTALL-TIME PATH so runtime CLIs the
   # adapters spawn (resolved via PATH, possibly under a version manager
   # like fnm/nvm) stay findable outside any shell.
-  local path_value="$PATH:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
+  local path_value=""
+  path_value="$(esc_for_sed "$PATH:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin")"
   sed -e "s|{{NODE}}|$node_arg|g" \
       -e "s|{{REPO_ROOT}}|$repo_arg|g" \
-      -e "s|{{GRU_COMMAND_HOME}}|$home|g" \
+      -e "s|{{GRU_COMMAND_HOME}}|$home_arg|g" \
       -e "s|{{PATH}}|$path_value|g" "$template"
 }
 

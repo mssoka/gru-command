@@ -94,9 +94,11 @@ export class ChatFrameLog {
       keep: rotation.keep ?? FRAME_LOG_ROTATION_DEFAULTS.keep,
     };
     const log_ = new ChatFrameLog(dir, policy);
-    // Oldest shard first: slot numbers count DOWN toward 1 (newest).
+    // Oldest shard first: slot numbers count DOWN toward 1 (newest). The
+    // scan covers the configured keep (rotation never mints higher slots;
+    // a keep-reduction prunes strays on the next rotation).
     const shardSlots: number[] = [];
-    for (let slot = 1; slot <= 99; slot++) {
+    for (let slot = 1; slot <= policy.keep; slot++) {
       if (!existsSync(frameLogShardFile(dir, slot))) break;
       shardSlots.push(slot);
     }
@@ -266,20 +268,18 @@ export class ChatFrameLog {
   private rotateIfNeeded(incomingBytes: number): void {
     if (this.liveBytes + incomingBytes <= this.rotation.maxBytes) return;
     const dir = join(this.file, '..');
-    // Prune oldest first so the shift never collides.
-    for (let slot = this.rotation.keep; slot >= 1; slot--) {
-      const shard = frameLogShardFile(dir, slot);
-      if (slot === this.rotation.keep) {
-        try {
-          rmSync(shard, { force: true });
-        } catch {
-          /* best effort */
-        }
-        continue;
-      }
-      const nextSlot = frameLogShardFile(dir, slot + 1);
+    // Prune EVERYTHING at/past keep first (a keep-reduction must not
+    // leave strays), then shift the surviving slots up one.
+    for (let slot = this.rotation.keep; slot <= this.rotation.keep + 99; slot++) {
       try {
-        renameSync(shard, nextSlot);
+        rmSync(frameLogShardFile(dir, slot), { force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+    for (let slot = this.rotation.keep - 1; slot >= 1; slot--) {
+      try {
+        renameSync(frameLogShardFile(dir, slot), frameLogShardFile(dir, slot + 1));
       } catch {
         /* best effort */
       }

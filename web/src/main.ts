@@ -72,10 +72,17 @@ function surfaceNotification(notification: { id: string; title: string; detail: 
         window.focus();
         void browserNotification.close();
       });
+      receiptFor(notification.id, 'browser');
     } catch {
       /* some browsers restrict constructor use — the toast already landed */
     }
   }
+}
+
+/** Post a display receipt for a surface this module owns (browser
+ * notifications, chat-side surfaces) — the shown:true doctrine. */
+function receiptFor(id: string, surface: string): void {
+  void boardClient?.markNotificationShown(id, surface);
 }
 /** First fatal wins: chat + board share one token, so both sockets fail
  * together — the user sees ONE pairing error, not two racing rewrites. */

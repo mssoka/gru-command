@@ -176,12 +176,15 @@ export class BoardClient {
     return this.api<TranscriptSearchResult>(`/api/transcripts/file?${params.toString()}`);
   }
 
-  /** E7: display receipt (shown:true doctrine) — idempotent per surface. */
-  async markNotificationShown(id: string, surface: string): Promise<void> {
+  /** E7: display receipt (shown:true doctrine) — idempotent per surface.
+   * Resolves true when the receipt landed; false on failure (the caller
+   * unmarks so a later surface upgrade retries). */
+  async markNotificationShown(id: string, surface: string): Promise<boolean> {
     try {
       await this.postApi(`/api/notifications/${encodeURIComponent(id)}/shown`, { surface });
+      return true;
     } catch {
-      /* a lost receipt never blocks rendering; the next surface upgrade retries */
+      return false; // a lost receipt never blocks rendering
     }
   }
 

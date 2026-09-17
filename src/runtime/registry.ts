@@ -222,10 +222,6 @@ export class RuntimeRegistry {
     return null;
   }
 
-  /** Snapshot of the live handles (defensive copy). */
-  listHandles(): readonly AgentHandle[] {
-    return [...this.handles];
-  }
 
   status(): RuntimeStatus {
     let anySession = false;

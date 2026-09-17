@@ -92,7 +92,12 @@ export class Logger {
     }
     if (size + incomingBytes <= this.maxBytes) return;
     const dir = join(this.logFile, '..');
-    const names = readdirSync(dir).filter((name) => /^service\.log(\.\d+)?$/.test(name));
+    let names: string[];
+    try {
+      names = readdirSync(dir).filter((name) => /^service\.log(\.\d+)?$/.test(name));
+    } catch {
+      return; // a failed rotation NEVER blocks the write — append as-is
+    }
     const shards = names
       .map((name) => /^service\.log\.(\d+)$/.exec(name))
       .filter((match): match is RegExpExecArray => match !== null)

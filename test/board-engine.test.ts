@@ -212,6 +212,34 @@ describe('board engine — adapter events → ledger events → board state', ()
     expect(feed.filter((n) => n.title.includes('old-blocked')).length).toBe(1);
   });
 
+  it('E7 r1-16: a breaker-stopped agent renders its supervision state on the board (degraded board)', () => {
+    engine.onRuntimeEvent({ agentId: 'stopped-minion', role: 'minion', sessionFile: null, phase: 'spawned' });
+    const supervised = new BoardEngine({
+      ledger: api,
+      bus,
+      supervisionFor: (agentId) =>
+        agentId === 'stopped-minion'
+          ? {
+              agentId,
+              role: 'minion',
+              slotId: null,
+              state: 'stopped',
+              restarts: 3,
+              breakerOpen: true,
+              openTurn: false,
+              lastEventAt: '2026-09-18T00:00:00.000Z',
+              lastFileBytes: 0,
+            }
+          : null,
+    });
+    const snapshot = supervised.snapshot();
+    const row = snapshot.agents.find((a) => a.id === 'stopped-minion');
+    expect(row?.supervision).toMatchObject({ state: 'stopped', restarts: 3, breakerOpen: true });
+    // Unsupervised agents carry null — the UI renders no chip for them.
+    const plain = supervised.snapshot().agents.find((a) => a.id === 'gru-main');
+    expect(plain?.supervision).toBeNull();
+  });
+
   it('a ledger hiccup never takes the runtime path down (observer isolation)', () => {
     // Unknown agent + no registration possible is the failure shape; the
     // engine must swallow + continue (logged), not throw upward.

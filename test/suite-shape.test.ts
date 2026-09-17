@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
  * Adding a test? Bump this pin — that is the point.
  */
 const PINS: Record<string, number> = {
-  'board-engine.test.ts': 12,
+  'board-engine.test.ts': 13,
   'board-frames.test.ts': 3,
   'board-server.test.ts': 13,
   'chat-frame-log.test.ts': 18,
@@ -37,7 +37,7 @@ const PINS: Record<string, number> = {
   'static.test.ts': 10,
   'stub-runtime.test.ts': 13,
   'suite-shape.test.ts': 1,
-  'supervisor.test.ts': 9,
+  'supervisor.test.ts': 13,
   'transcripts.test.ts': 13,
 };
 

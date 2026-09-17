@@ -86,10 +86,11 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 - **Notification center (E7):** the bell panel renders the durable
   notification log — FYI rows (blocked jobs, errored agents/lenses,
   verdicts, supervisor events) and action-required rows (crash-loop
-  breaker trips) with ack buttons. The badge counts unseen errors; every
-  displayed row earns a shown receipt (nothing "shown" without an ack
-  record); acking an action-required row clears it and re-arms an open
-  breaker. Live arrivals toast (plus a browser notification when
+  breaker trips) with ack buttons. The badge counts unacked error-severity
+  rows not yet viewed here (an ack from any device clears it); every
+  displayed row earns a shown receipt per surface (nothing "shown" without
+  an ack record); acking an action-required row clears it and re-arms an
+  open breaker. Live arrivals toast (plus a browser notification when
   permission was granted).
 - **Transcripts:** drawer with newest-first pages (`load older` by entry
   cursor), debounced server-side search with snippet matches that

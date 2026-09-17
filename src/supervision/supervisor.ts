@@ -202,37 +202,92 @@ export class Supervisor {
       return await this.waitForSlotHandle(slot);
     }
     if (existing !== null && existing.breakerOpen) {
-      // A caller-driven action (a chat message) is human intent: re-arm
-      // the stopped agent rather than serving it unsupervised.
-      existing.breakerOpen = false;
-      existing.breakerNotificationId = null;
-      existing.restartRing = [];
-      existing.consecutiveFailures = 0;
-      existing.state = 'watching';
-      this.log('info', 'breaker re-armed by slot use — resuming supervision', {
-        agent_id: existing.agentId,
-        slot: slot.id,
-      });
-      this.ledger.appendCustomEvent({
-        kind: 'supervision.rearmed',
-        agentId: existing.agentId,
-        payload: { by: 'slot-use', slot: slot.id },
-      });
+      if (!this.cfg.enabled) {
+        // Supervision off: no re-arm semantics — clear the stale breaker
+        // state so the slot serves again (pure registry behavior).
+        existing.breakerOpen = false;
+        existing.breakerNotificationId = null;
+        existing.restartRing = [];
+      } else {
+        // A caller-driven action (a chat message) is human intent: re-arm
+        // the stopped agent rather than serving it unsupervised — and the
+        // escalation row resolves with it (acked by the re-arm itself).
+        existing.breakerOpen = false;
+        const rearming = existing.breakerNotificationId;
+        existing.breakerNotificationId = null;
+        existing.restartRing = [];
+        existing.consecutiveFailures = 0;
+        existing.state = 'watching';
+        this.log('info', 'breaker re-armed by slot use — resuming supervision', {
+          agent_id: existing.agentId,
+          slot: slot.id,
+        });
+        this.ledger.appendCustomEvent({
+          kind: 'supervision.rearmed',
+          agentId: existing.agentId,
+          payload: { by: 'slot-use', slot: slot.id },
+        });
+        if (rearming !== null) this.notifications.ack(rearming, 'slot-use');
+      }
     }
     const handle = await slot.spawn(options);
     this.adopt(handle, slot, options?.resumeFile ?? null);
+    // A handle death outside a restart rung (owner teardown) can leave a
+    // stale slot-bound record shadowing the fresh one — retire stale
+    // records so the NEXT ensure returns THIS handle (single-writer,
+    // SPEC ruling 1), carrying the restart ring onto the live record.
+    this.retireStaleSlotRecords(slot, handle.id);
     return handle;
   }
 
+  /**
+   * The live record for a slot: one with a live handle wins; a restarting
+   * or breaker-open record outranks a dead idle one (ensure must find the
+   * in-flight state, not spawn duplicates past it).
+   */
   private slotAgent(slot: SupervisedSlotInternal): SupervisedAgent | null {
+    let stale: SupervisedAgent | null = null;
+    let staleRank = -1;
     for (const agent of this.agents.values()) {
-      if (agent.slot === slot) return agent;
+      if (agent.slot !== slot) continue;
+      if (agent.handle !== null) return agent;
+      const rank = agent.inRestart ? 2 : agent.breakerOpen ? 1 : 0;
+      if (rank >= staleRank) {
+        stale = agent;
+        staleRank = rank;
+      }
     }
-    return null;
+    return stale;
+  }
+
+  /** Retire dead (null-handle) slot-bound records other than the live
+   * one, merging their restart history so the breaker stays truthful. */
+  private retireStaleSlotRecords(slot: SupervisedSlotInternal, liveId: string): void {
+    const live = this.agents.get(liveId);
+    for (const agent of [...this.agents.values()]) {
+      if (agent.slot !== slot || agent.handle !== null || agent.agentId === liveId) continue;
+      if (live !== undefined) {
+        live.restartRing = [...live.restartRing, ...agent.restartRing].sort((a, b) => a - b);
+        if (agent.breakerOpen && !live.breakerOpen) {
+          live.breakerOpen = true;
+          live.breakerNotificationId = agent.breakerNotificationId;
+          live.state = 'stopped';
+        }
+      }
+      if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
+      this.agents.delete(agent.agentId);
+      this.log('info', 'retired stale slot-bound supervision record', {
+        agent_id: agent.agentId,
+        slot: slot.id,
+        live: liveId,
+      });
+    }
   }
 
   private async waitForSlotHandle(slot: SupervisedSlotInternal): Promise<AgentHandle> {
-    const deadline = this.now() + 30_000;
+    // Deadline must exceed the backoff cap (60s) so a late rung's respawn
+    // is awaited, not reported as a failure.
+    const deadline = this.now() + 90_000;
     for (;;) {
       const agent = this.slotAgent(slot);
       if (agent === null || agent.handle !== null) {
@@ -290,6 +345,15 @@ export class Supervisor {
           break;
         case 'error':
           if (event.fatal) {
+            if (!this.cfg.enabled) {
+              // Supervision off = pure registry behavior: fatal errors are
+              // the runtime's/owner's business — observed, never acted on.
+              this.log('info', 'fatal runtime error observed — supervision disabled, no restart', {
+                agent_id: agent.agentId,
+                error: event.error,
+              });
+              break;
+            }
             this.log('warn', 'fatal runtime error — climbing restart ladder', {
               agent_id: agent.agentId,
               error: event.error,
@@ -415,7 +479,7 @@ export class Supervisor {
    * caught, logged, and the rung settles. */
   private async restartRung(agentRef: SupervisedAgent, reason: string): Promise<void> {
     const agent = agentRef;
-    if (this.disposed || agent.inRestart || agent.breakerOpen) return;
+    if (this.disposed || !this.cfg.enabled || agent.inRestart || agent.breakerOpen) return;
     agent.inRestart = true;
     agent.state = 'restarting';
     try {
@@ -605,7 +669,7 @@ export class Supervisor {
    * or for a slot deliberately released — are pure records.
    */
   onNotificationAcked(notificationId: string): void {
-    if (this.disposed) return;
+    if (this.disposed || !this.cfg.enabled) return; // off = acks are pure records
     for (const agent of this.agents.values()) {
       if (agent.breakerNotificationId !== notificationId || !agent.breakerOpen) continue;
       agent.breakerOpen = false;

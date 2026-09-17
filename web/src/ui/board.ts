@@ -309,12 +309,17 @@ export class BoardView {
     }
     if (surfaces.has(surface)) return;
     surfaces.add(surface);
-    void this.boardClient?.markNotificationShown(notification.id, surface);
+    void this.boardClient?.markNotificationShown(notification.id, surface).then((landed) => {
+      if (!landed) surfaces.delete(surface); // retry on the next upgrade
+    });
   }
 
-  /** Badge = error-severity items never seen (panel-open marks seen). */
-  private updateBadge(notifications: readonly { id: string; severity: string }[]): void {
-    const unseen = notifications.filter((n) => n.severity === 'error' && !this.seenErrorIds.has(n.id)).length;
+  /** Badge = unacked error-severity items not yet seen here (panel-open
+   * marks seen; an ack from ANY device clears it via ackedAt). */
+  private updateBadge(notifications: readonly { id: string; severity: string; ackedAt: string | null }[]): void {
+    const unseen = notifications.filter(
+      (n) => n.severity === 'error' && n.ackedAt === null && !this.seenErrorIds.has(n.id),
+    ).length;
     this.notificationBell.dataset.unread = String(unseen);
   }
 }
