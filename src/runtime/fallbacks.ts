@@ -55,6 +55,8 @@ interface QueuedTurn {
   options: PromptOptions;
   resolve: () => void;
   reject: (error: Error) => void;
+  /** Opt-in queued-wait cap (E7): rejects THIS caller when it fires. */
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 class FallbackHandle implements AgentHandle {
@@ -120,7 +122,27 @@ class FallbackHandle implements AgentHandle {
       const owner = options.owner ?? 'default';
       this.emit({ type: 'queued', reason, owner });
       return new Promise<void>((resolve, reject) => {
-        this.queue.push({ text, options, resolve, reject });
+        const item: QueuedTurn = {
+          text,
+          options,
+          resolve,
+          reject,
+          timer: null,
+        };
+        // Opt-in queued-wait cap (E7): reject THIS caller only.
+        if (options.timeoutMs !== undefined) {
+          item.timer = setTimeout(() => {
+            const at = this.queue.indexOf(item);
+            if (at !== -1) this.queue.splice(at, 1);
+            reject(
+              new Error(
+                `queued wait timed out after ${options.timeoutMs}ms (turn never went idle)`,
+              ),
+            );
+          }, options.timeoutMs);
+          item.timer.unref?.();
+        }
+        this.queue.push(item);
       });
     }
     return this.deliver(text, options);
@@ -142,6 +164,7 @@ class FallbackHandle implements AgentHandle {
     try {
       while (!this.disposed && this.queue.length > 0 && !this.busy) {
         const next = this.queue.shift()!;
+        if (next.timer !== null) clearTimeout(next.timer);
         try {
           await this.deliver(next.text, next.options);
           next.resolve();
@@ -175,6 +198,7 @@ class FallbackHandle implements AgentHandle {
   private rejectQueue(message: string): void {
     const drained = this.queue.splice(0);
     for (const item of drained) {
+      if (item.timer !== null) clearTimeout(item.timer);
       item.reject(new Error(message));
     }
   }

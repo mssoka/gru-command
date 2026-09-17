@@ -50,6 +50,37 @@ export interface ThinkingConfig {
   readonly roles: Readonly<Partial<Record<Role, string>>>;
 }
 
+/** In-process supervision policy (EPICS E7; SPEC ruling 5 — the OS
+ * service manager is the out-of-band watcher, this is the agent layer). */
+export interface SupervisionConfig {
+  readonly enabled: boolean;
+  /** A streaming/spawning turn with no runtime event AND no session-file
+   * growth for this long is hung (E3's turn-liveness deferral, E7 home). */
+  readonly turnSilenceMs: number;
+  /** Rolling crash-loop window; ≥ max_restarts inside it trips the breaker. */
+  readonly restartWindowMs: number;
+  readonly maxRestarts: number;
+  /** Backoff base between restart rungs; doubles per consecutive failure,
+   * capped at 60 s. */
+  readonly restartBackoffMs: number;
+}
+
+/** Size-based log rotation (E1 deferral, E7 home). */
+export interface LoggingConfig {
+  /** Rotate service.log when it exceeds this many bytes. */
+  readonly maxBytes: number;
+  /** Rotated files retained (oldest pruned first). */
+  readonly keep: number;
+}
+
+/** Chat frame-log rotation (E4 replay-cost deferral — same ruling). */
+export interface ChatConfig {
+  /** Rotate gru.frames.jsonl when it exceeds this many bytes. */
+  readonly frameLogMaxBytes: number;
+  /** Rotated shards retained; replay spans shards oldest→newest. */
+  readonly frameLogKeep: number;
+}
+
 export interface GruCommandConfig {
   readonly workspaceRoot: string;
   readonly dataDir: string;
@@ -58,6 +89,9 @@ export interface GruCommandConfig {
   readonly runtimes: RuntimesConfig;
   readonly models: ModelsConfig;
   readonly thinking: ThinkingConfig;
+  readonly supervision: SupervisionConfig;
+  readonly logging: LoggingConfig;
+  readonly chat: ChatConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
   /** Absolute per-instance directory holding config, identity, logs, sessions. */
@@ -155,6 +189,9 @@ const TOP_LEVEL_KEYS = [
   'runtimes',
   'models',
   'thinking',
+  'supervision',
+  'logging',
+  'chat',
 ] as const;
 
 /** Sentinel meaning "the runtime harness's own configured default" (SPEC ruling 16). */
@@ -232,6 +269,24 @@ function validateRuntimeId(value: unknown, file: string, field: string): Runtime
   return id as RuntimeId;
 }
 
+function requireBool(value: unknown, file: string, field: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new ConfigError(`${field} must be a boolean, got ${typeof value}`, file, field);
+  }
+  return value;
+}
+
+function requirePositiveInt(value: unknown, file: string, field: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new ConfigError(
+      `${field} must be a positive integer, got: ${String(value)}`,
+      file,
+      field,
+    );
+  }
+  return value;
+}
+
 function isInsideOrEqual(outer: string, inner: string): boolean {
   const rel = relative(outer, inner);
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
@@ -284,6 +339,15 @@ export function loadConfig(
   let runtimes: RuntimesConfig = { default: 'pi', roles: {}, policies: {} };
   let models: ModelsConfig = { default: MODEL_DEFAULT_SENTINEL, roles: {} };
   let thinking: ThinkingConfig = { default: MODEL_DEFAULT_SENTINEL, roles: {} };
+  let supervision: SupervisionConfig = {
+    enabled: true,
+    turnSilenceMs: 900_000,
+    restartWindowMs: 600_000,
+    maxRestarts: 3,
+    restartBackoffMs: 2_000,
+  };
+  let logging: LoggingConfig = { maxBytes: 10_485_760, keep: 5 };
+  let chat: ChatConfig = { frameLogMaxBytes: 8_388_608, frameLogKeep: 3 };
   let sourceFile: string | null = null;
 
   if (configState(file) === 'present') {
@@ -457,6 +521,58 @@ export function loadConfig(
       }
       thinking = { default: def, roles };
     }
+    if (raw['supervision'] !== undefined) {
+      const table = requireTable(raw['supervision'], file, 'supervision');
+      const VALID = ['enabled', 'turn_silence_ms', 'restart_window_ms', 'max_restarts', 'restart_backoff_ms'];
+      for (const key of Object.keys(table)) {
+        if (!VALID.includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [supervision] (valid keys: ${VALID.join(', ')})`,
+            file,
+            `supervision.${key}`,
+          );
+        }
+      }
+      supervision = {
+        enabled: table['enabled'] !== undefined ? requireBool(table['enabled'], file, 'supervision.enabled') : supervision.enabled,
+        turnSilenceMs: table['turn_silence_ms'] !== undefined ? requirePositiveInt(table['turn_silence_ms'], file, 'supervision.turn_silence_ms') : supervision.turnSilenceMs,
+        restartWindowMs: table['restart_window_ms'] !== undefined ? requirePositiveInt(table['restart_window_ms'], file, 'supervision.restart_window_ms') : supervision.restartWindowMs,
+        maxRestarts: table['max_restarts'] !== undefined ? requirePositiveInt(table['max_restarts'], file, 'supervision.max_restarts') : supervision.maxRestarts,
+        restartBackoffMs: table['restart_backoff_ms'] !== undefined ? requirePositiveInt(table['restart_backoff_ms'], file, 'supervision.restart_backoff_ms') : supervision.restartBackoffMs,
+      };
+    }
+    if (raw['logging'] !== undefined) {
+      const table = requireTable(raw['logging'], file, 'logging');
+      for (const key of Object.keys(table)) {
+        if (!['max_bytes', 'keep'].includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [logging] (valid keys: max_bytes, keep)`,
+            file,
+            `logging.${key}`,
+          );
+        }
+      }
+      logging = {
+        maxBytes: table['max_bytes'] !== undefined ? requirePositiveInt(table['max_bytes'], file, 'logging.max_bytes') : logging.maxBytes,
+        keep: table['keep'] !== undefined ? requirePositiveInt(table['keep'], file, 'logging.keep') : logging.keep,
+      };
+    }
+    if (raw['chat'] !== undefined) {
+      const table = requireTable(raw['chat'], file, 'chat');
+      for (const key of Object.keys(table)) {
+        if (!['frame_log_max_bytes', 'frame_log_keep'].includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [chat] (valid keys: frame_log_max_bytes, frame_log_keep)`,
+            file,
+            `chat.${key}`,
+          );
+        }
+      }
+      chat = {
+        frameLogMaxBytes: table['frame_log_max_bytes'] !== undefined ? requirePositiveInt(table['frame_log_max_bytes'], file, 'chat.frame_log_max_bytes') : chat.frameLogMaxBytes,
+        frameLogKeep: table['frame_log_keep'] !== undefined ? requirePositiveInt(table['frame_log_keep'], file, 'chat.frame_log_keep') : chat.frameLogKeep,
+      };
+    }
   }
 
   for (const [label, dir] of [
@@ -495,6 +611,9 @@ export function loadConfig(
     runtimes,
     models,
     thinking,
+    supervision,
+    logging,
+    chat,
     sourceFile,
     instanceDir,
   };

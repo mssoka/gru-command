@@ -40,6 +40,7 @@ Every frame except the two fatal/ephemeral classes carries a monotonic
 | `delta` | `text`, `seq` | streamed reply chunk |
 | `tool` | `name`, `state: start\|end`, `seq` | live tool activity |
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |
+| `notice` | `text`, `seq` | product notice surfaced in chat (E7, SPEC ruling 13): action-required notifications ("⚠ Action required: …") and supervisor restart notices. Logged + replayed; never fatal, never a turn |
 | `error` | `message`, `fatal?`, `seq?` | see the error classes below |
 
 The contract has no frames for thinking deltas or in-progress tool

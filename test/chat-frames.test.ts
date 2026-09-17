@@ -64,11 +64,15 @@ const SERVER_CORPUS: readonly unknown[] = [
   { type: 'tool', name: 'bash', state: 'end', seq: 7 },
   { type: 'turn', state: 'start', seq: 8 },
   { type: 'turn', state: 'end', seq: 9 },
+  { type: 'notice', text: '⚠ action required: breaker tripped', seq: 12 }, // E7
   { type: 'error', message: 'boom' },
   { type: 'error', message: 'boom', fatal: true },
   { type: 'error', message: 'boom', seq: 10 },
   { type: 'error', message: 'boom', fatal: false, seq: 11 },
   // invalid
+  { type: 'notice', text: 'no seq' }, // E7: notice REQUIRES seq
+  { type: 'notice', text: '', seq: 13 }, // E7: empty text is malformed
+  { type: 'notice', seq: 14 }, // E7: missing text
   { type: 'auth_ok' },
   { type: 'auth_ok', seq: -1 },
   { type: 'auth_ok', seq: 1.5 },

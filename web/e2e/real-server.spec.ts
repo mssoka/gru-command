@@ -259,6 +259,46 @@ test.describe('board (E6)', () => {
     await expect(drawer).toBeHidden();
   });
 
+  test('notification ack round-trip (E7): a blocked job feeds the bell; ack clears it', async ({ page }) => {
+    // Seed a blocked job through the real API — the FYI derivation posts a
+    // durable notification row server-side.
+    const headers = { authorization: `Bearer ${REAL_TOKEN}` };
+    const job = { id: 'e2e-ack-job', repo: 'e2e-repo', title: 'Ack round-trip job' };
+    await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs`, { headers, data: job });
+    await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs/e2e-ack-job/status`, { headers, data: { status: 'blocked' } });
+
+    await pair(page);
+    await page.locator('#tab-board').click();
+    const bell = page.locator('#notification-bell');
+    await expect(bell).toBeVisible();
+    // The badge shows while an unseen error exists (CSS keys on data-unread).
+    await expect(bell).not.toHaveAttribute('data-unread', '0');
+    await bell.click();
+    const panel = page.locator('#notification-panel');
+    await expect(panel).toBeVisible();
+    const row = panel.locator('.board-notification', { hasText: 'e2e-ack-job blocked' });
+    await expect(row).toBeVisible();
+    // Opening the panel sent the shown receipt (proved on the record).
+    const board = await (await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers })).json();
+    const seededRow = board.notifications.find((n: { title: string }) => n.title.includes('e2e-ack-job blocked'));
+    expect(seededRow.shownAt).not.toBeNull();
+
+    // The ack button clears the row through the human ack.
+    await row.locator('.board-notification__ack').click();
+    await expect(row.locator('.board-notification__ack')).toHaveText('✓');
+    const after = await (await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers })).json();
+    const ackedRow = after.notifications.find((n: { title: string }) => n.title.includes('e2e-ack-job blocked'));
+    expect(ackedRow.ackedAt).not.toBeNull();
+    await bell.click(); // close the panel
+
+    // A NEW notification arriving while paired earns the live toast.
+    const job2 = { id: 'e2e-ack-job-2', repo: 'e2e-repo', title: 'Toast probe job' };
+    await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs`, { headers, data: job2 });
+    await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs/e2e-ack-job-2/status`, { headers, data: { status: 'blocked' } });
+    const toast = page.locator('.toast', { hasText: 'e2e-ack-job-2 blocked' });
+    await expect(toast).toBeVisible();
+  });
+
   test('unauthenticated board API is a locked door', async ({ page }) => {
     const res = await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`);
     expect(res.status()).toBe(401);

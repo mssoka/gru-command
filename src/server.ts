@@ -5,6 +5,7 @@ import type { GruCommandConfig } from './config.js';
 import type { InstallIdentity } from './identity.js';
 import type { LogLevel } from './logger.js';
 import type { RuntimeStatus } from './runtime/registry.js';
+import type { SupervisionStatus } from './supervision/supervisor.js';
 import type { StaticRoot } from './static.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
@@ -46,6 +47,7 @@ export interface HealthPayload {
     readonly created_at: string;
   };
   readonly liveness: LivenessBlock;
+  readonly supervision: SupervisionStatus | null;
   readonly session: {
     readonly path: string;
     readonly declared: boolean;
@@ -109,6 +111,7 @@ export function buildHealthPayload(
   startedAt: bigint,
   requestId: string,
   runtimeStatus: RuntimeStatus | null = null,
+  supervisionStatus: SupervisionStatus | null = null,
 ): HealthPayload {
   const liveness: LivenessBlock =
     runtimeStatus === null
@@ -162,6 +165,7 @@ export function buildHealthPayload(
       created_at: identity.createdAt,
     },
     liveness,
+    supervision: supervisionStatus,
     session: {
       path: join(config.dataDir, 'sessions'),
       declared: true,
@@ -183,6 +187,9 @@ export interface ServiceOptions {
   /** Production static root (built web UI). When omitted, unknown paths
    * keep the JSON 404 — the pre-E4 behavior. */
   readonly staticRoot?: StaticRoot;
+  /** Supervision status feed (E7): answers the /health supervision block.
+   * Null (or omitted) reports `supervision: null` — pre-E7 shape. */
+  readonly supervisionStatus?: () => SupervisionStatus | null;
   /** First claim hook after /health, before static (E6: the board's
    * /api/* routes). Returning true means the request was handled — the
    * service skips static + 404 and does not log it (the hook owns that). */
@@ -239,7 +246,14 @@ export function createService(
           jsonBody(
             res,
             200,
-            buildHealthPayload(config, identity, startedAt, requestId, runtimeStatus()),
+            buildHealthPayload(
+              config,
+              identity,
+              startedAt,
+              requestId,
+              runtimeStatus(),
+              options.supervisionStatus !== undefined ? options.supervisionStatus() : null,
+            ),
           );
           return { status: 200 };
         }

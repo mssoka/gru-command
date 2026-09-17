@@ -5,10 +5,12 @@ import { Logger } from './logger.js';
 import { RuntimeRegistry } from './runtime/registry.js';
 import { SessionStore } from './sessions/store.js';
 import { LedgerDb } from './ledger/db.js';
-import { LedgerApi } from './ledger/api.js';
+import { LedgerApi, type NotificationRecord } from './ledger/api.js';
 import { EventBus } from './events/bus.js';
 import { BoardEngine } from './board/engine.js';
 import { createBoardServer } from './board/server.js';
+import { NotificationCenter } from './notifications/center.js';
+import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
 import { createService, type ServiceHandle } from './server.js';
 import { ChatFrameLog } from './chat/frame-log.js';
@@ -37,7 +39,10 @@ async function main(): Promise<number> {
     throw error;
   }
 
-  const logger = new Logger(config.dataDir);
+  const logger = new Logger(config.dataDir, true, {
+    maxBytes: config.logging.maxBytes,
+    keep: config.logging.keep,
+  });
   const identity = loadOrCreateIdentity(config.dataDir);
   logger.info('boot', {
     service: SERVICE_NAME,
@@ -76,6 +81,7 @@ async function main(): Promise<number> {
     chat?: ChatServer;
     board?: Awaited<ReturnType<typeof createBoardServer>>;
     ledgerDb?: LedgerDb;
+    supervisor?: Supervisor;
   } = {};
   let shuttingDown = false;
   const shutdown = (signal: string) => {
@@ -113,6 +119,13 @@ async function main(): Promise<number> {
             await state.board.dispose();
           } catch (error) {
             logger.error('board server shutdown failed', { error: String(error) });
+          }
+        }
+        if (state.supervisor !== undefined) {
+          try {
+            state.supervisor.dispose();
+          } catch (error) {
+            logger.error('supervisor dispose failed', { error: String(error) });
           }
         }
         if (state.registry !== undefined) {
@@ -172,23 +185,6 @@ async function main(): Promise<number> {
     growth_findings: growth.findings.length,
   });
 
-  // Chat (E4): the single Gru session behind /ws. The durable frame log
-  // loads and boot-settles BEFORE the HTTP server accepts anything (r1
-  // N13): a corrupt log refuses boot without ever having listened, and no
-  // client can attach to an unsettled log. The Gru spawn is lazy-warm
-  // (warmup is best-effort, first message retries) so a model outage can
-  // never keep the service down.
-  const chatDir = join(config.dataDir, 'chat');
-  const frameLog = ChatFrameLog.load(chatDir, (level, msg, fields) => logger.log(level, msg, fields));
-  const chat = createChatServer({
-    config,
-    frameLog,
-    pointer: new GruSessionPointer(chatDir, (level, msg, fields) => logger.log(level, msg, fields)),
-    spawnGru: (resumeFile) => registry.spawn('gru', resumeFile !== null ? { resumeFile } : {}),
-    siblingUpgradePaths: [BOARD_WS_PATH],
-    log: (level, msg, fields) => logger.log(level, msg, fields),
-  });
-
   // Ledger + board (E6): the SQLite record opens (and migrates) before
   // the HTTP server so a schema failure refuses boot loudly. The board
   // engine feeds on the registry tap; the transcript service reads the
@@ -198,18 +194,75 @@ async function main(): Promise<number> {
     onListenerError: (message) => logger.log('error', 'event bus listener failed', { detail: message }),
   });
   const ledger = new LedgerApi(ledgerDb.handle, { bus });
+  // E7: late-bound supervision feed — the engine is constructed before
+  // the supervisor exists; the closure resolves per snapshot.
+  let supervisor: Supervisor | null = null;
   const engine = new BoardEngine({
     ledger,
     bus,
+    supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   registry.onAgentEvent((envelope) => engine.onRuntimeEvent(envelope));
+
+  // Chat (E4): the single Gru session behind /ws. The durable frame log
+  // loads and boot-settles BEFORE the HTTP server accepts anything (r1
+  // N13): a corrupt log refuses boot without ever having listened, and no
+  // client can attach to an unsettled log. The Gru spawn is lazy-warm
+  // (warmup is best-effort, first message retries) so a model outage can
+  // never keep the service down. Since E7 the Gru session runs behind a
+  // SUPERVISED slot: the supervisor adopts it, watches turn liveness,
+  // restarts it up the ladder, and trips the crash-loop breaker.
+  const chatDir = join(config.dataDir, 'chat');
+  const frameLog = ChatFrameLog.load(
+    chatDir,
+    (level, msg, fields) => logger.log(level, msg, fields),
+    { maxBytes: config.chat.frameLogMaxBytes, keep: config.chat.frameLogKeep },
+  );
+  // Action-required notifications surface in chat (SPEC ruling 13) — the
+  // chat server arrives one step below; late-bind the callback.
+  let surfaceInChat: (notification: NotificationRecord) => void = () => {};
+  const notifications = new NotificationCenter({
+    ledger,
+    bus,
+    onActionRequired: (notification) => surfaceInChat(notification),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const supervisorLive = new Supervisor({
+    config: config.supervision,
+    registry,
+    ledger,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  supervisor = supervisorLive;
+  const gruSlot = supervisorLive.declareSlot({
+    id: 'gru-main',
+    role: 'gru',
+    spawn: (spawnOptions) => registry.spawn('gru', spawnOptions ?? {}),
+  });
+  const chat = createChatServer({
+    config,
+    frameLog,
+    pointer: new GruSessionPointer(chatDir, (level, msg, fields) => logger.log(level, msg, fields)),
+    spawnGru: (resumeFile) => gruSlot.ensure(resumeFile !== null ? { resumeFile } : {}),
+    siblingUpgradePaths: [BOARD_WS_PATH],
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  gruSlot.onSwap((handle) => chat.adoptRestartedGru(handle));
+  surfaceInChat = (notification) => {
+    chat.surfaceNotice(`⚠ Action required: ${notification.title}${notification.detail !== null ? ` — ${notification.detail}` : ''}`);
+  };
+  state.supervisor = supervisorLive;
+
   const board = createBoardServer({
     config,
     engine,
     ledger,
     transcripts: new TranscriptService(store.sessionsDir, { ledger }),
     bus,
+    notifications,
+    onNotificationAck: (id) => supervisorLive.onNotificationAcked(id),
     siblingUpgradePaths: ['/ws'],
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -224,6 +277,7 @@ async function main(): Promise<number> {
     () => registry.status(),
     {
       staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)),
+      supervisionStatus: () => supervisorLive.status(),
       requestHook: (req, res, path) => board.requestHook(req, res, path),
     },
   );
@@ -233,6 +287,7 @@ async function main(): Promise<number> {
   board.attach(handle.httpServer); // last: its upgrade handler terminates unclaimed paths
   state.chat = chat;
   chat.warmup();
+  supervisorLive.start();
 
   logger.info('listening', { host: handle.host, port: handle.port });
   return new Promise<number>(() => {

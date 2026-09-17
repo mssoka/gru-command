@@ -43,3 +43,18 @@ thinking_level = "default"
 [runtimes.pi.roles]                # per-runtime per-role (model and/or thinking_level)
 minion = { model = "provider/model-c", thinking_level = "low" }
 bob = { thinking_level = "medium" }
+
+[supervision]                      # in-process supervision (E7) — all optional
+enabled = true
+turn_silence_ms = 900000           # open turn silent this long = hung
+restart_window_ms = 600000         # rolling crash-loop window
+max_restarts = 3                   # >= this many restarts in the window trips the breaker
+restart_backoff_ms = 2000          # base backoff between failed rungs (doubles, 60s cap)
+
+[logging]                          # size-based service.log rotation
+max_bytes = 10485760
+keep = 5
+
+[chat]                             # frame-log rotation; replay spans shards
+frame_log_max_bytes = 8388608
+frame_log_keep = 3

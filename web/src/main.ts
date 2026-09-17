@@ -13,6 +13,7 @@ import { applyTheme, getTheme, setTheme } from './theme.js';
 import { clearBanner, showBanner } from './ui/banner.js';
 import { ChatView, renderConnectionDot } from './ui/chat.js';
 import { BoardView } from './ui/board.js';
+import { ToastStack } from './ui/toast.js';
 import { TranscriptView } from './ui/transcript.js';
 import { mustGet } from './ui/dom.js';
 import { initPairing, showPairingError } from './ui/pairing.js';
@@ -33,6 +34,49 @@ let chatView: ChatView | null = null;
 let boardClient: BoardClient | null = null;
 let boardView: BoardView | null = null;
 let transcriptView: TranscriptView | null = null;
+/** E7: the live toast surface — one stack, reused across re-pairs. */
+const toastStack = new ToastStack(document.getElementById('toasts'));
+/** E7: browser Notification permission — requested on the pair gesture,
+ * used opportunistically when granted (toasts remain the in-app floor). */
+let browserNotifications: NotificationPermission = typeof Notification === 'undefined' ? 'denied' : Notification.permission;
+
+function requestBrowserNotifications(): void {
+  if (typeof Notification === 'undefined') return;
+  browserNotifications = Notification.permission;
+  if (browserNotifications === 'default') {
+    void Notification.requestPermission().then((permission) => {
+      browserNotifications = permission;
+    });
+  }
+}
+
+/** The live notification surface (E7): toast ALWAYS (in-app floor) +
+ * browser notification when permission was granted. */
+function surfaceNotification(notification: { id: string; title: string; detail: string | null; severity: string }): void {
+  toastStack.show({
+    id: notification.id,
+    title: notification.title,
+    detail: notification.detail,
+    severity: notification.severity === 'error' ? 'error' : 'info',
+    onShown: () => {
+      /* the receipt is sent by BoardView.sendShown (it owns the client) */
+    },
+  });
+  if (browserNotifications === 'granted') {
+    try {
+      const browserNotification = new Notification(notification.title, {
+        body: notification.detail ?? undefined,
+        tag: notification.id,
+      });
+      browserNotification.addEventListener('click', () => {
+        window.focus();
+        void browserNotification.close();
+      });
+    } catch {
+      /* some browsers restrict constructor use — the toast already landed */
+    }
+  }
+}
 /** First fatal wins: chat + board share one token, so both sockets fail
  * together — the user sees ONE pairing error, not two racing rewrites. */
 let pairingFailed = false;
@@ -162,16 +206,19 @@ function startChat(token: string): void {
 let transcriptSignature = '';
 
 function startBoard(token: string): void {
-  boardView ??= new BoardView((request) => {
-    void transcriptView?.open({
-      file: request.file,
-      role: '',
-      sizeBytes: 0,
-      modifiedAt: '',
-      agentId: null,
-      agentLabel: request.label,
-    });
-  });
+  boardView ??= new BoardView(
+    (request) => {
+      void transcriptView?.open({
+        file: request.file,
+        role: '',
+        sizeBytes: 0,
+        modifiedAt: '',
+        agentId: null,
+        agentLabel: request.label,
+      });
+    },
+    null, // the client is bound below — one source of truth, rebound per pair
+  );
   boardClient?.stop();
   boardClient = new BoardClient(
     { token, host: location.host, secure },
@@ -194,6 +241,10 @@ function startBoard(token: string): void {
       },
     },
   );
+  // E7: the view gains the live client (receipts + acks) and the toast
+  // surface for newly-arrived notifications.
+  boardView.bindClient(boardClient);
+  boardView.setToastHandler((notification) => surfaceNotification(notification));
   // Rebound on EVERY startBoard: a re-pair mints a fresh client, and a
   // stale view holding the old client would 401-and-bounce valid sessions.
   transcriptView = new TranscriptView(boardClient, mustGet('board-transcripts'));
@@ -202,6 +253,7 @@ function startBoard(token: string): void {
 
 function pair(token: string): void {
   storage.setItem(TOKEN_KEY, token);
+  requestBrowserNotifications();
   startChat(token);
 }
 

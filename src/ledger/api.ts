@@ -92,6 +92,39 @@ export interface EventRecord {
   readonly payload: unknown;
 }
 
+/** Notification routing (SPEC ruling 13): FYI → notification;
+ * action-required → a queued item Gru surfaces in chat. */
+export const NOTIFICATION_ROUTINGS = ['fyi', 'action-required'] as const;
+export type NotificationRouting = (typeof NOTIFICATION_ROUTINGS)[number];
+
+export const NOTIFICATION_SEVERITIES = ['info', 'error'] as const;
+export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number];
+
+export function isNotificationRouting(value: string): value is NotificationRouting {
+  return (NOTIFICATION_ROUTINGS as readonly string[]).includes(value);
+}
+
+export function isNotificationSeverity(value: string): value is NotificationSeverity {
+  return (NOTIFICATION_SEVERITIES as readonly string[]).includes(value);
+}
+
+/** One durable notification row (EPICS E7 story 2 — the notification log
+ * lives in the ledger; ack ids are the proven-ack contract). */
+export interface NotificationRecord {
+  readonly id: string;
+  readonly ts: string;
+  readonly kind: string;
+  readonly routing: NotificationRouting;
+  readonly severity: NotificationSeverity;
+  readonly title: string;
+  readonly detail: string | null;
+  readonly agentId: string | null;
+  readonly shownAt: string | null;
+  readonly shownBy: string | null;
+  readonly ackedAt: string | null;
+  readonly ackedBy: string | null;
+}
+
 /** Marker for not-found failures the HTTP surface maps to 404 (typed —
  * never grepped from error text). */
 export class RecordNotFound extends Error {
@@ -601,6 +634,114 @@ export class LedgerApi {
   }
 
   // ------------------------------------------------------------------
+  // Notifications (EPICS E7 story 2) — the durable notification log.
+  // Every mutation is atomic with its event row and bus-published so all
+  // surfaces (board push, chat notices, toasts) converge on one record.
+  // ------------------------------------------------------------------
+
+  recordNotification(input: {
+    id: string;
+    kind: string;
+    routing: NotificationRouting;
+    severity: NotificationSeverity;
+    title: string;
+    detail?: string | null;
+    agentId?: string | null;
+  }): NotificationRecord {
+    if (input.id === '' || input.title === '') {
+      throw new Error('notification id and title must be non-empty');
+    }
+    return this.transaction(() => {
+      if (this.getNotification(input.id) !== null) {
+        throw new Error(`notification "${input.id}" already exists`);
+      }
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `INSERT INTO notifications (id, ts, kind, routing, severity, title, detail, agent_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.id,
+          ts,
+          input.kind,
+          input.routing,
+          input.severity,
+          input.title,
+          input.detail ?? null,
+          input.agentId ?? null,
+        );
+      this.appendEvent({
+        kind: 'notification.created',
+        agentId: input.agentId ?? null,
+        payload: { id: input.id, routing: input.routing, severity: input.severity, title: input.title },
+      });
+      return this.getNotification(input.id) as NotificationRecord;
+    });
+  }
+
+  getNotification(id: string): NotificationRecord | null {
+    const row = this.db.prepare('SELECT * FROM notifications WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : this.notificationFromRow(row);
+  }
+
+  listNotifications(opts: { limit?: number; unackedOnly?: boolean } = {}): readonly NotificationRecord[] {
+    const limit = opts.limit ?? 50;
+    const sql = opts.unackedOnly
+      ? 'SELECT * FROM notifications WHERE acked_at IS NULL ORDER BY ts DESC, id LIMIT ?'
+      : 'SELECT * FROM notifications ORDER BY ts DESC, id LIMIT ?';
+    return (this.db.prepare(sql).all(limit) as Row[]).map((row) => this.notificationFromRow(row));
+  }
+
+  /**
+   * Record a display receipt (the shown:true doctrine): idempotent per
+   * surface — a repeated receipt for the same surface is a no-op that
+   * appends nothing (receipts must never spam the event log). Returns the
+   * row, or null when the id is unknown.
+   */
+  markNotificationShown(id: string, surface: string): NotificationRecord | null {
+    if (surface === '') throw new Error('surface must be non-empty');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null) return null;
+      const surfaces = new Set(
+        current.shownBy === null ? [] : current.shownBy.split(','),
+      );
+      if (current.shownAt !== null && surfaces.has(surface)) return current;
+      const shownAt = current.shownAt ?? nowIso();
+      const shownBy = [...surfaces, surface].sort().join(',');
+      this.db
+        .prepare('UPDATE notifications SET shown_at = ?, shown_by = ? WHERE id = ?')
+        .run(shownAt, shownBy, id);
+      this.appendEvent({
+        kind: 'notification.shown',
+        agentId: current.agentId,
+        payload: { id, surface },
+      });
+      return this.getNotification(id) as NotificationRecord;
+    });
+  }
+
+  /** Human ack — the action-required clearance. Idempotent. */
+  ackNotification(id: string, by: string): NotificationRecord | null {
+    if (by === '') throw new Error('acked-by must be non-empty');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null) return null;
+      if (current.ackedAt !== null) return current;
+      this.db
+        .prepare('UPDATE notifications SET acked_at = ?, acked_by = ? WHERE id = ?')
+        .run(nowIso(), by, id);
+      this.appendEvent({
+        kind: 'notification.acked',
+        agentId: current.agentId,
+        payload: { id, by, routing: current.routing },
+      });
+      return this.getNotification(id) as NotificationRecord;
+    });
+  }
+
+  // ------------------------------------------------------------------
   // Row mapping
   // ------------------------------------------------------------------
 
@@ -630,6 +771,23 @@ export class LedgerApi {
       sessionFile: nstr(row.session_file),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
+    };
+  }
+
+  private notificationFromRow(row: Row): NotificationRecord {
+    return {
+      id: str(row.id),
+      ts: str(row.ts),
+      kind: str(row.kind),
+      routing: str(row.routing) as NotificationRouting,
+      severity: str(row.severity) as NotificationSeverity,
+      title: str(row.title),
+      detail: nstr(row.detail),
+      agentId: nstr(row.agent_id),
+      shownAt: nstr(row.shown_at),
+      shownBy: nstr(row.shown_by),
+      ackedAt: nstr(row.acked_at),
+      ackedBy: nstr(row.acked_by),
     };
   }
 }

@@ -59,6 +59,8 @@ interface QueuedMessage {
   readonly images?: PromptOptions['images'];
   readonly resolve: () => void;
   readonly reject: (error: Error) => void;
+  /** Opt-in queued-wait cap (E7): rejects THIS caller when it fires. */
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 /**
@@ -358,7 +360,7 @@ export class PiAgentHandle implements AgentHandle {
     this.assertLive();
     const owner = options.owner ?? this.principal;
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer', options.images);
+      return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
     }
     return this.runTurn(text, owner, options.images);
   }
@@ -371,7 +373,7 @@ export class PiAgentHandle implements AgentHandle {
       return;
     }
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer', options.images);
+      return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
     }
     return this.runTurn(text, owner, options.images);
   }
@@ -384,7 +386,7 @@ export class PiAgentHandle implements AgentHandle {
       return;
     }
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer', options.images);
+      return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
     }
     return this.runTurn(text, owner, options.images);
   }
@@ -394,6 +396,7 @@ export class PiAgentHandle implements AgentHandle {
     this.disposed = true;
     const drained = this.queue.splice(0);
     for (const item of drained) {
+      if (item.timer !== null) clearTimeout(item.timer);
       item.reject(new Error('agent session disposed before queued message was delivered'));
     }
     try {
@@ -414,6 +417,7 @@ export class PiAgentHandle implements AgentHandle {
     owner: string,
     reason: 'single-writer' | 'steer-unable',
     images?: PromptOptions['images'],
+    timeoutMs?: number,
   ): Promise<void> {
     this.emit({ type: 'queued', reason, owner });
     this.log('info', 'message queued (single-writer)', {
@@ -422,13 +426,27 @@ export class PiAgentHandle implements AgentHandle {
       owner,
     });
     return new Promise<void>((resolve, reject) => {
-      this.queue.push({
+      const item: QueuedMessage = {
         text,
         owner,
         ...(images !== undefined ? { images } : {}),
         resolve,
         reject,
-      });
+        timer: null,
+      };
+      // Opt-in queued-wait cap (E7): reject THIS caller only — the queue
+      // and the live turn are untouched.
+      if (timeoutMs !== undefined) {
+        item.timer = setTimeout(() => {
+          const at = this.queue.indexOf(item);
+          if (at !== -1) this.queue.splice(at, 1);
+          reject(
+            new Error(`queued wait timed out after ${timeoutMs}ms (turn never went idle)`),
+          );
+        }, timeoutMs);
+        item.timer.unref?.();
+      }
+      this.queue.push(item);
     });
   }
 
@@ -463,6 +481,7 @@ export class PiAgentHandle implements AgentHandle {
   private async drain(): Promise<void> {
     while (!this.disposed && this.queue.length > 0 && this.liveTurn === null) {
       const next = this.queue.shift()!;
+      if (next.timer !== null) clearTimeout(next.timer);
       try {
         await this.runTurn(next.text, next.owner, next.images);
         next.resolve();

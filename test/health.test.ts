@@ -123,6 +123,68 @@ describe('GET /health', () => {
     }
   });
 
+  it('carries the supervision block when a supervisor status is wired (E7)', async () => {
+    const home = tmpHome();
+    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const identity = loadOrCreateIdentity(config.dataDir);
+    const service = createService(
+      config,
+      identity,
+      () => {},
+      () => null,
+      {
+        supervisionStatus: () => ({
+          enabled: true,
+          turnSilenceMs: 900_000,
+          restartWindowMs: 600_000,
+          maxRestarts: 3,
+          agents: [
+            {
+              agentId: 'gru-main',
+              role: 'gru',
+              slotId: 'gru-main',
+              state: 'watching',
+              restarts: 1,
+              breakerOpen: false,
+              openTurn: false,
+              lastEventAt: '2026-09-18T00:00:00.000Z',
+              lastFileBytes: 1024,
+            },
+          ],
+        }),
+      },
+    );
+    const handle = await service.start();
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const body = (await res.json()) as Record<string, unknown>;
+      const supervision = body['supervision'] as Record<string, unknown>;
+      expect(supervision['enabled']).toBe(true);
+      expect(supervision['turnSilenceMs']).toBe(900_000);
+      const agents = supervision['agents'] as Array<Record<string, unknown>>;
+      expect(agents[0]).toMatchObject({ agentId: 'gru-main', state: 'watching', restarts: 1 });
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it('reports supervision: null when no supervisor is wired (pre-E7 shape)', async () => {
+    const home = tmpHome();
+    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const identity = loadOrCreateIdentity(config.dataDir);
+    const service = createService(config, identity, () => {}, () => null);
+    const handle = await service.start();
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body['supervision']).toBeNull();
+    } finally {
+      await handle.stop();
+    }
+  });
+
   it('reports no-session honestly when the registry is empty but wired', async () => {
     const home = tmpHome();
     writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');

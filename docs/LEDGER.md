@@ -111,3 +111,19 @@ row, appends the event, and (with a bus attached) publishes it:
 The thin HTTP write surface (validated, token-authed — the base E8's
 dispatch flow builds on) exposes a SUBSET of these (jobs, rounds,
 agents, lens binding/outcomes); see [BOARD.md](./BOARD.md).
+
+
+### E7: notifications (migration 3)
+
+The `notifications` table is the durable notification log (SPEC ruling
+13): one row per notification, written once at event time. Columns:
+`id` (uuid — the ack contract), `ts`, `kind`, `routing`
+(`fyi` | `action-required`), `severity` (`info` | `error`), `title`,
+`detail`, `agent_id`, and the proven-ack pair: `shown_at`/`shown_by`
+(display receipts, one per surface, idempotent) and `acked_at`/
+`acked_by` (the human clearance). Every mutation appends a
+`notification.created` / `notification.shown` / `notification.acked`
+event and publishes on the bus — the board pushes, the chat surfaces
+action-required items, and the breaker re-arm rides the ack. The
+board's notification center renders this table directly; nothing is
+derived per-snapshot.

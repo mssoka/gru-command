@@ -109,6 +109,31 @@ thinking_level = "default"
 # thinking_level (at least one).
 minion = { model = "provider/model-c", thinking_level = "low" }
 bob = { thinking_level = "medium" }
+
+[supervision]
+# In-process supervision policy (E7 — see SUPERVISION.md). All optional.
+# Watchdog: an open turn with no runtime event AND no session-file
+# growth for this long is hung and climbs the restart ladder.
+enabled = true
+turn_silence_ms = 900000
+# Crash-loop breaker: >= max_restarts within a rolling restart_window_ms
+# trips the breaker (agent stopped, action-required notification; ack
+# re-arms).
+restart_window_ms = 600000
+max_restarts = 3
+# Backoff base between failed restart rungs (doubles, capped at 60s).
+restart_backoff_ms = 2000
+
+[logging]
+# Size-based service.log rotation. Optional.
+max_bytes = 10485760
+keep = 5
+
+[chat]
+# Chat frame-log rotation (E7): rotate gru.frames.jsonl at the cap, keep
+# N shards; reconnect replay spans shards (history intact in-window).
+frame_log_max_bytes = 8388608
+frame_log_keep = 3
 ```
 
 See [`example.config.toml`](./example.config.toml) for a complete generic
@@ -133,6 +158,7 @@ example.
 | Path not absolute after expansion | `workspace_root must resolve to an absolute path` |
 | `data_dir` inside `workspace_root` | `data_dir must not live inside workspace_root … — SPEC ruling 7` |
 | TOML date where a table is expected | `server must be a table` (dates never pass as empty tables) |
+| Non-positive supervision number | `supervision.turn_silence_ms must be a positive integer, got: 0` |
 | Unreadable config file | `cannot read config file: EACCES — check permissions` (distinct from a TOML parse error) |
 
 ## What reads the config today
@@ -146,6 +172,8 @@ session in production: `/ws` authenticates against `[auth].token`, and
 `[server]` host/port bind both the web UI (served from `web/dist` when
 built) and the chat socket. `/health` surfaces a summary
 (`workspace_root`, `data_dir`) plus real liveness. See
-[CHAT.md](./CHAT.md) for the chat protocol and reconnect contract, and
+[CHAT.md](./CHAT.md) for the chat protocol and reconnect contract,
 [RUNTIMES.md](./RUNTIMES.md) for the capability matrix, fallback
-semantics, and the session-store contract.
+semantics, and the session-store contract, and
+[SUPERVISION.md](./SUPERVISION.md) for the supervision policy the
+`[supervision]` table drives plus the log-rotation knobs.

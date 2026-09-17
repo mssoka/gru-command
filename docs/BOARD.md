@@ -34,6 +34,8 @@ record.
 | `POST /api/rounds/:id/status` / `:id/verdict` | `{status}` / `{verdict}` |
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
 | `POST /api/agents/state` | `{id, state}` |
+| `POST /api/notifications/:id/shown` | `{surface}` — display receipt (idempotent per surface; the shown:true doctrine) |
+| `POST /api/notifications/:id/ack` | `{by?}` — human ack; clears the row and re-arms an open breaker |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
 | `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
@@ -81,9 +83,14 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 - **Agent rail:** every ledger agent with a live state chip (🧠 gru ·
   📋 silas · 🔧 minion · 🔍 perkins · 🌙 bob); clicking an agent with a
   session file opens its transcript.
-- **Notification center:** bell badge counts error-severity items;
-  blocked jobs, errored agents/lenses, verdicts. Display surface only —
-  ack/routing arrives with E7.
+- **Notification center (E7):** the bell panel renders the durable
+  notification log — FYI rows (blocked jobs, errored agents/lenses,
+  verdicts, supervisor events) and action-required rows (crash-loop
+  breaker trips) with ack buttons. The badge counts unseen errors; every
+  displayed row earns a shown receipt (nothing "shown" without an ack
+  record); acking an action-required row clears it and re-arms an open
+  breaker. Live arrivals toast (plus a browser notification when
+  permission was granted).
 - **Transcripts:** drawer with newest-first pages (`load older` by entry
   cursor), debounced server-side search with snippet matches that
   scroll+flash the entry, a wrap toggle (default `pre-wrap` — long lines
