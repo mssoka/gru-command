@@ -9,7 +9,7 @@ heist board, per-agent transcripts, notifications). The browser is the
 only required window. No terminal multiplexer anywhere — herdr is not
 integrated. Other users can install it on their laptops from GitHub.
 
-## Locked rulings (all user, 2026-09-15/16)
+## Locked rulings (all user, 2026-09-15/17)
 
 1. **Single Gru.** One chat brain, no clones. The UI is a window, never a
    second brain. Single-writer rule enforced by design.
@@ -68,20 +68,27 @@ integrated. Other users can install it on their laptops from GitHub.
     for a runtime that validates models; adapters that cannot set
     thinking declare the capability gap (fallback: warn + proceed).
 
-17. **bmad/skills live in EACH PROJECT REPO — never at the workspace
+17. **Per-project bmad/skills (`.agents/skills` + `_bmad` folders) — never at the workspace root.** Every managed repo carries its own — never at the workspace
     root.** Every managed repo carries its own `.agents/skills` +
-    `_bmad` folders; the workspace root holds ORCHESTRATION ONLY
-    (extends ruling 8's hygiene canon). Skills discovery follows the
+    `_bmad` folders (the setup wizard scaffolds them when missing, or
+    warns-and-proceeds for repos that opt out); the workspace root carries no `.agents/skills` or
+    `_bmad` — it holds managed repos only (rulings 6/8); bmad/skills
+    live inside each repo. Skills discovery follows the
     PROJECT cwd: the dispatch flow roots minions in the repo they
     serve, and they find that repo's bmad natively — spawn options
     carry the repo root. The global agent-dir keeps generic skills
     unchanged. Per-project `bmad-customize` overrides become possible
-    per repo. This supersedes any workspace-root skills-discovery
-    assumption in the dispatch flow (E8+): the pi-adapter's dispatch
-    cwd is the PROJECT root, never the workspace root.
+    per repo. Fresh worktrees check out tracked files only; discovery
+    inside a worktree resolves via the worktree manager's bootstrap
+    manifest (ruling 18: symlinks/copies), or the folders are tracked
+    by the repo — discovery never falls back to the workspace root. The
+    chat Gru (spawned at the workspace root) discovers the global
+    agent-dir only, by design. This supersedes any workspace-root skills-discovery
+    assumption in the dispatch flow (E8+): all runtime adapters'
+    dispatch cwd is the PROJECT root, never the workspace root.
 
 ## Sources
 
 Approved via structured review rounds (product brief, architecture rev 2,
-and review amendments), 2026-09-15/16. Provenance records live outside
+and review amendments), 2026-09-15/17. Provenance records live outside
 this repo.
