@@ -19,6 +19,7 @@
     "@types/node": "^20.17.0",
     "@types/qrcode": "^1.5.5",
     "@types/ws": "^8.5.10",
+    "happy-dom": "^20.14.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^6.3.5",
