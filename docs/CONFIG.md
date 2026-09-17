@@ -43,16 +43,21 @@ workspace_root = "~/code"
 data_dir = "~/.gru-command"
 
 [server]
-# Bind address. v1 is local-only by default; LAN exposure + pairing
-# arrive with the UI work. Default: "127.0.0.1"
+# Bind address. Default "127.0.0.1" (this machine only). To pair a phone
+# or another device on the LAN, bind the machine's LAN address (or
+# 0.0.0.0 for all interfaces) — the chat socket and the web UI share
+# this port. v1 has no TLS: LAN only, never expose to WAN.
 host = "127.0.0.1"
 # Listen port. 0 = ephemeral (pick a free port; useful in tests).
 # Default: 7665. Must be an integer 0–65535.
 port = 7665
 
 [auth]
-# Pairing token for the web front-end. Optional in the foundation epic;
-# required once the UI ships. Must be a non-empty string when present.
+# Pairing token for the web front-end — LIVE since the chat epic (E4):
+# the /ws chat socket requires it on the first frame. When empty or
+# absent, the chat endpoint rejects EVERY connection ("chat is not
+# configured"); /health stays up either way. Must be a non-empty string
+# when present. Generate one per install (the setup wizard does this).
 token = "a-random-pairing-token"
 
 [runtimes]
@@ -134,10 +139,13 @@ example.
 
 The foundation epic loads and validates the whole schema. The runtime
 layer consumes `[runtimes]`, `[models]`, `[thinking]` whenever a spawn
-happens (none spawn in production until the chat epic, E4): model
-references resolve fail-loud, thinking levels
-validate per runtime, and the `"default"` sentinel passes through to the
-harness's own configuration. `/health` surfaces a summary
-(`workspace_root`, `data_dir`) plus real liveness. The UI epics consume
-the auth values. See [RUNTIMES.md](./RUNTIMES.md) for the capability
-matrix, fallback semantics, and the session-store contract.
+happens: model references resolve fail-loud, thinking levels validate
+per runtime, and the `"default"` sentinel passes through to the
+harness's own configuration. The chat epic (E4) spawns the single Gru
+session in production: `/ws` authenticates against `[auth].token`, and
+`[server]` host/port bind both the web UI (served from `web/dist` when
+built) and the chat socket. `/health` surfaces a summary
+(`workspace_root`, `data_dir`) plus real liveness. See
+[CHAT.md](./CHAT.md) for the chat protocol and reconnect contract, and
+[RUNTIMES.md](./RUNTIMES.md) for the capability matrix, fallback
+semantics, and the session-store contract.
