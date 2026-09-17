@@ -78,7 +78,7 @@ Server → client (every frame carries a monotonic `seq`):
 |---|---|---|
 | `auth_ok` | `seq` | auth accepted; `seq` = log high-water mark |
 | `ack` | `client_msg_id`, `seq` | a user message was received |
-| `user` | `text`, `client_msg_id`, `seq` | replay only — restores own history |
+| `user` | `text`, `client_msg_id`, `seq` | restores own history on replay; the E4 server also broadcasts it live to other attached clients |
 | `delta` | `text`, `seq` | streamed reply chunk |
 | `tool` | `name`, `state: start\|end`, `seq` | live tool status line |
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |

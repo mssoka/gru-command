@@ -53,7 +53,11 @@ interface Client {
   readonly socket: WebSocket;
   authed: boolean;
   writer: boolean;
-  alive: boolean;
+  /** Auth timestamp — the pen promotes to the EARLIEST authenticated
+   * reader (r1 N6), not merely the earliest connection. */
+  authedAt: number;
+  /** Consecutive pings without a pong; two missed → terminate. */
+  pongMisses: number;
   authDeadline: ReturnType<typeof setTimeout> | null;
 }
 
@@ -83,6 +87,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   let handle: AgentHandle | null = null;
   let unsubscribe: (() => void) | null = null;
   let spawning: Promise<AgentHandle> | null = null;
+  /** Set by dispose(): a spawn completing after teardown is released, not
+   * wired into a dead server (r1 N9). */
+  let disposed = false;
   /** True from a prompt delivery until the turn end lands (or the prompt
    * rejects) — the steer-vs-prompt decision for the NEXT message. */
   let turnLive = false;
@@ -95,17 +102,37 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
   function ensureGru(): Promise<AgentHandle> {
     if (handle !== null) return Promise.resolve(handle);
-    spawning ??= spawnGru();
+    if (spawning === null) {
+      const attempt = spawnGru();
+      // Assign the gate BEFORE any settlement callback can run: a
+      // synchronous throw inside spawnGru (corrupt resume pointer) would
+      // otherwise complete its cleanup before the assignment lands —
+      // pinning a rejected promise on the gate forever (r1 W4).
+      spawning = attempt;
+      void attempt
+        .catch(() => {})
+        .finally(() => {
+          if (spawning === attempt) spawning = null;
+        });
+    }
     return spawning;
   }
 
   async function spawnGru(): Promise<AgentHandle> {
-    const resumeFile = options.pointer.resumeCandidate();
-    log('info', 'spawning the single Gru session', {
-      resume: resumeFile !== null,
-    });
     try {
+      // Inside the try (r1 W4): a corrupt resume pointer must surface as
+      // a spawn failure and CLEAR the spawn gate — not wedge it forever.
+      const resumeFile = options.pointer.resumeCandidate();
+      log('info', 'spawning the single Gru session', {
+        resume: resumeFile !== null,
+      });
       const spawned = await options.spawnGru(resumeFile);
+      if (disposed) {
+        // The server went down while the spawn was in flight — release the
+        // session instead of wiring it into a dead server (r1 N9).
+        await spawned.dispose().catch(() => {});
+        throw new Error('chat server disposed during gru spawn');
+      }
       handle = spawned;
       unsubscribe = spawned.subscribe(onRuntimeEvent);
       if (spawned.sessionFile !== null) options.pointer.record(spawned.sessionFile);
@@ -114,8 +141,6 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     } catch (error) {
       log('error', 'gru spawn failed', { error: String(error) });
       throw error;
-    } finally {
-      spawning = null;
     }
   }
 
@@ -170,9 +195,12 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       case 'state':
         if (event.state === 'disposed') {
           // The runtime disposed the session (crash/supervision): the next
-          // message respawns from the resume pointer.
+          // message respawns from the resume pointer, and a mid-flight
+          // turn's event stream just died — settle now so the log never
+          // ends inside an open turn (r1 N7).
           log('warn', 'gru session disposed — next message respawns it', {});
           teardownHandle();
+          settleOpenTurn();
         }
         break;
       case 'queued':
@@ -182,14 +210,13 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         });
         break;
       case 'error':
-        if (event.fatal) {
-          emitLogged({ type: 'error', message: event.error, fatal: true });
-          // Settle AFTER the error frame: history reads "the turn died here"
-          // and never stays open.
-          settleOpenTurn();
-        } else {
-          emitLogged({ type: 'error', message: event.error });
-        }
+        // r1 B2: the shipped client treats ANY fatal:true frame — live OR
+        // replayed — as a pairing-fatal event and closes. Logged runtime
+        // deaths therefore NEVER carry the flag (mock parity: the mock
+        // never persists fatal frames); the settle frames below already
+        // record that the turn died here.
+        emitLogged({ type: 'error', message: event.error });
+        if (event.fatal) settleOpenTurn();
         break;
     }
   }
@@ -215,8 +242,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         send(client, ephemeralError(`gru is unavailable: ${(error as Error).message}`));
         return;
       }
+      const midTurn = turnLive;
       try {
-        if (turnLive) {
+        if (midTurn) {
           await gru.steer(text, { owner: CHAT_OWNER });
         } else {
           turnLive = true; // optimistic: the turn_start event confirms
@@ -224,12 +252,19 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
           turnLive = false;
         }
       } catch (error) {
-        turnLive = false;
         const message = (error as Error).message;
-        if (/disposed/.test(message)) teardownHandle();
+        const dead = /disposed/.test(message);
+        if (dead) teardownHandle();
         // Conversation-relevant (this message failed to deliver) → logged.
         emitLogged({ type: 'error', message: `message delivery failed: ${message}` });
-        settleOpenTurn();
+        // Settle only when the turn is actually over (r1 W2): our prompt
+        // dying, or a disposed session, ends the event stream — close the
+        // log. A rejected STEER leaves the live runtime turn running:
+        // record the failure, never close over it.
+        if (dead || !midTurn) {
+          turnLive = false;
+          settleOpenTurn();
+        }
       }
     })();
   }
@@ -261,7 +296,14 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   }
 
   function onConnection(socket: WebSocket): void {
-    const client: Client = { socket, authed: false, writer: false, alive: true, authDeadline: null };
+    const client: Client = {
+      socket,
+      authed: false,
+      writer: false,
+      authedAt: 0,
+      pongMisses: 0,
+      authDeadline: null,
+    };
     clients.add(client);
     client.authDeadline = setTimeout(() => {
       if (!client.authed) {
@@ -271,12 +313,19 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     }, authDeadlineMs);
 
     socket.on('pong', () => {
-      client.alive = true;
+      client.pongMisses = 0;
     });
     socket.on('message', (data: unknown) => {
       const frame = parseClientFrame(String(data));
       if (frame === null) {
-        sendError(client, ephemeralError('malformed frame'), true);
+        // r1 W1: an UNAUTHENTICATED socket must never write to the durable
+        // log — pre-auth protocol errors are ephemeral (client-visible,
+        // same shape); the auth deadline still bounds the connection.
+        if (client.authed) {
+          sendError(client, ephemeralError('malformed frame'), true);
+        } else {
+          send(client, ephemeralError('malformed frame'));
+        }
         return;
       }
       if (!client.authed) {
@@ -322,6 +371,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       return;
     }
     client.authed = true;
+    client.authedAt = Date.now();
     client.writer = ![...clients].some((other) => other.authed && other.writer);
     const highWater = frameLog.highWaterSeq;
     send(client, { type: 'auth_ok', seq: highWater });
@@ -353,14 +403,18 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     deliver(client, frame.text);
   }
 
-  /** The pen promotes FIFO (earliest authenticated reader) on writer loss. */
+  /** The pen promotes to the earliest AUTHENTICATED reader (r1 N6):
+   * auth order, not connection order — a slow-to-auth early socket must
+   * not jump a later one that paired first. */
   function promotePen(): void {
+    let best: Client | null = null;
     for (const candidate of clients) {
-      if (candidate.authed) {
-        candidate.writer = true;
-        log('info', 'chat pen promoted to the next client', {});
-        return;
-      }
+      if (!candidate.authed) continue;
+      if (best === null || candidate.authedAt < best.authedAt) best = candidate;
+    }
+    if (best !== null) {
+      best.writer = true;
+      log('info', 'chat pen promoted to the next client', {});
     }
   }
 
@@ -372,12 +426,15 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   if (heartbeatMs > 0) {
     heartbeat = setInterval(() => {
       for (const client of clients) {
-        if (!client.alive) {
+        // Two unanswered pings → the socket is silently dead: terminate so
+        // the pen can promote (a live-but-pongless writer would hold it
+        // forever). Doc and code agree on "two misses" (r1 N2).
+        if (client.pongMisses >= 2) {
           log('info', 'chat client missed heartbeats — terminating', {});
           client.socket.terminate();
           continue;
         }
-        client.alive = false;
+        client.pongMisses += 1;
         client.socket.ping();
       }
     }, heartbeatMs);
@@ -416,13 +473,17 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     },
 
     warmup(): void {
-      void ensureGru().catch(() => {
-        // Logged inside spawnGru; warmup is best-effort — a cold brain
-        // spawns on the first message instead.
+      void ensureGru().catch((error: unknown) => {
+        // Logged (r1 W4): a warm boot failure is an ops-visible condition —
+        // the first message retries, but the boot log must say why.
+        log('warn', 'gru warmup failed — first message retries', {
+          error: String(error),
+        });
       });
     },
 
     async dispose(): Promise<void> {
+      disposed = true;
       if (attached !== null) {
         attached.server.off('upgrade', attached.handler);
         attached = null;

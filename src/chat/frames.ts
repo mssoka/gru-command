@@ -194,13 +194,15 @@ export function loggedFrameSeq(frame: LoggedFrame): number {
 // Builders (server side emits valid frames by construction)
 // ---------------------------------------------------------------------------
 
-/** A logged frame before seq assignment (`error.seq` assigned too). */
+/** A logged frame before seq assignment (`error.seq` assigned too;
+ * `fatal?` is retained by the Omit — though logged frames never set it,
+ * see r1 B2). */
 export type UnseqedFrame =
   | Omit<AckFrame, 'seq'>
   | Omit<DeltaFrame, 'seq'>
   | Omit<ToolFrame, 'seq'>
   | Omit<TurnFrame, 'seq'>
-  | (Omit<ErrorFrame, 'seq'> & { readonly fatal?: boolean })
+  | Omit<ErrorFrame, 'seq'>
   | Omit<ReplayedUserFrame, 'seq'>;
 
 export function withSeq(frame: UnseqedFrame, seq: number): LoggedFrame {

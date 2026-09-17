@@ -1,5 +1,7 @@
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { connect as netConnect, type Socket } from 'node:net';
+import { randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +10,7 @@ import { WebSocket } from 'ws';
 import * as web from '../web/src/lib/protocol.js';
 import { ChatFrameLog } from '../src/chat/frame-log.js';
 import { createChatServer, type ChatServer } from '../src/chat/server.js';
-import { GruSessionPointer } from '../src/chat/session-state.js';
+import { GruSessionPointer, SESSION_STATE_NAME } from '../src/chat/session-state.js';
 import type { GruCommandConfig } from '../src/config.js';
 import { withFallbacks } from '../src/runtime/fallbacks.js';
 import type {
@@ -59,6 +61,10 @@ class StubGruHandle implements AgentHandle {
   nextPromptError: string | null = null;
   /** The NEXT prompt emits a fatal runtime error mid-turn (no turn end). */
   nextFatal: string | null = null;
+  /** The NEXT prompt emits a non-fatal runtime error mid-turn (turn completes). */
+  nextSoftError: string | null = null;
+  /** The NEXT steer rejects with this error (W2 leg). */
+  nextSteerError: string | null = null;
   private state: AgentState = 'idle';
   private readonly listeners = new Set<RuntimeEventListener>();
 
@@ -77,12 +83,17 @@ class StubGruHandle implements AgentHandle {
     this.nextHold = null;
     const fatal = this.nextFatal;
     this.nextFatal = null;
+    const softError = this.nextSoftError;
+    this.nextSoftError = null;
     this.setState('streaming');
     this.emit({ type: 'turn_start' });
     if (this.toolName !== null) {
       this.emit({ type: 'tool_start', callId: 'c1', tool: this.toolName });
     }
     for (const delta of this.deltas) this.emit({ type: 'text_delta', delta });
+    if (softError !== null) {
+      this.emit({ type: 'error', error: softError, fatal: false });
+    }
     if (fatal !== null) {
       this.setState('error');
       this.emit({ type: 'error', error: fatal, fatal: true });
@@ -98,6 +109,11 @@ class StubGruHandle implements AgentHandle {
 
   async steer(text: string, options?: PromptOptions): Promise<void> {
     this.calls.push({ op: 'steer', text, owner: options?.owner });
+    if (this.nextSteerError !== null) {
+      const message = this.nextSteerError;
+      this.nextSteerError = null;
+      throw new Error(message);
+    }
   }
 
   async followUp(_text: string, _options?: PromptOptions): Promise<void> {
@@ -118,6 +134,11 @@ class StubGruHandle implements AgentHandle {
   }
 
   async dispose(): Promise<void> {}
+
+  /** Test hook: emit a runtime event directly (lens guards, edge shapes). */
+  fire(event: RuntimeEvent): void {
+    this.emit(event);
+  }
 
   private setState(state: AgentState): void {
     this.state = state;
@@ -143,7 +164,7 @@ class StubGruRuntime implements AgentRuntime {
       images: false,
       thinking: true,
       thinkingLevelControl: true,
-      followUp: true,
+      followUp: false, // honest: the stub's followUp() throws
     };
   }
 
@@ -171,13 +192,13 @@ interface Harness {
   readonly port: number;
   readonly handle: StubGruHandle;
   readonly spawnCalls: (string | null)[];
-  failNextSpawn(error: Error): void;
   close(): Promise<void>;
 }
 
 async function makeHarness(options: {
   readonly token?: string;
   readonly authDeadlineMs?: number;
+  readonly heartbeatMs?: number;
   readonly steer?: 'native' | 'queued';
   readonly reuseDir?: string;
   readonly failFirstSpawn?: Error;
@@ -213,7 +234,7 @@ async function makeHarness(options: {
       return wrapped.spawn('gru');
     },
     authDeadlineMs: options.authDeadlineMs,
-    heartbeatMs: 0, // heartbeat timing is not under test here
+    heartbeatMs: options.heartbeatMs ?? 0, // off by default; the heartbeat test opts in
   });
   const http = createServer((_req, res) => {
     res.writeHead(404);
@@ -231,9 +252,6 @@ async function makeHarness(options: {
     port,
     handle,
     spawnCalls,
-    failNextSpawn(error: Error) {
-      spawnFailure = error;
-    },
     async close() {
       await chat.dispose();
       await new Promise<void>((resolveClose) => {
@@ -251,8 +269,8 @@ class TestClient {
   readonly closed: Promise<number>;
   private readonly socket: WebSocket;
 
-  constructor(port: number) {
-    this.socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  constructor(port: number, path: string = '/ws') {
+    this.socket = new WebSocket(`ws://127.0.0.1:${port}${path}`);
     this.closed = new Promise((resolveClose) => {
       this.socket.on('close', (code: number) => resolveClose(code));
       // A failed handshake (e.g. refused upgrade) errors instead of
@@ -329,6 +347,59 @@ async function pollUntil(pred: () => boolean, label: string, timeoutMs = 5_000):
     if (pred()) return;
     if (Date.now() - started > timeoutMs) throw new Error(`pollUntil(${label}) timed out`);
     await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/** A masked client→server WebSocket text frame (client frames MUST be
+ * masked; payloads here are small, <126 bytes). */
+function maskedTextFrame(payload: string): Buffer {
+  const mask = randomBytes(4);
+  const data = Buffer.from(payload, 'utf-8');
+  const header = Buffer.alloc(2);
+  header[0] = 0x81; // FIN + text opcode
+  header[1] = 0x80 | data.length; // MASK + length
+  const masked = Buffer.from(data);
+  for (let index = 0; index < data.length; index++) {
+    masked[index] = data[index]! ^ mask[index % 4]!;
+  }
+  return Buffer.concat([header, mask, masked]);
+}
+
+/** A raw-socket WS client that NEVER answers pings — the heartbeat
+ * terminate path exercised with a genuinely pong-blind peer. */
+class PongBlindClient {
+  readonly closed: Promise<void>;
+  private readonly socket: Socket;
+  private handshaked = false;
+
+  constructor(port: number) {
+    this.socket = netConnect(port, '127.0.0.1');
+    this.closed = new Promise((resolveClose) => {
+      this.socket.once('close', () => resolveClose());
+    });
+    this.socket.on('error', () => {
+      /* terminate surfaces as close */
+    });
+    this.socket.on('data', (chunk: Buffer) => {
+      if (!this.handshaked && chunk.toString('utf-8').includes(' 101 ')) {
+        this.handshaked = true;
+      }
+      // After the handshake EVERYTHING is ignored — pings go unanswered.
+    });
+    const key = randomBytes(16).toString('base64');
+    this.socket.write(
+      `GET /ws HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\n` +
+        `Connection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+    );
+  }
+
+  /** Auth + one user message, back-to-back (the reader's broadcast is the
+   * observable confirmation — this client parses nothing). */
+  authAndSend(token: string, text: string, clientMsgId: string): void {
+    this.socket.write(maskedTextFrame(JSON.stringify({ type: 'auth', token })));
+    this.socket.write(
+      maskedTextFrame(JSON.stringify({ type: 'user', text, client_msg_id: clientMsgId })),
+    );
   }
 }
 
@@ -682,32 +753,150 @@ describe('chat server (real sockets, stub Gru)', () => {
     await harness.close();
   });
 
-  it('a fatal runtime error mid-turn logs the error and settles the turn', async () => {
+  it('a fatal runtime error mid-turn is logged WITHOUT the fatal flag (replay-safe) and settles the turn', async () => {
     const harness = await makeHarness();
     harness.handle.toolName = 'bash';
     harness.handle.nextFatal = 'the runtime exploded';
     const client = await authedClient(harness.port);
+    const done = nextTurnEnd(client);
     client.send('doomed prompt', 'm1');
-    await client.waitFor(
-      (frame) => frame.type === 'turn' && (frame as web.TurnFrame).state === 'end',
-      'settled turn',
-    );
+    await done;
     const kinds = client.frames.map((frame) => frame.type);
     expect(kinds).toEqual(['auth_ok', 'user', 'ack', 'turn', 'tool', 'delta', 'delta', 'error', 'tool', 'turn']);
-    expect(client.frames[7]).toMatchObject({
-      type: 'error',
-      message: 'the runtime exploded',
-      fatal: true,
-    });
+    // r1 B2: the shipped client closes on ANY fatal:true frame — live or
+    // replayed. Logged runtime deaths carry seq but NEVER the flag.
+    const loggedFatal = client.frames[7] as web.ErrorFrame;
+    expect(loggedFatal.type).toBe('error');
+    expect(loggedFatal.message).toBe('the runtime exploded');
+    expect(loggedFatal.seq).toBe(7);
+    expect(loggedFatal.fatal).toBeUndefined();
     expect(client.frames[8]).toMatchObject({ type: 'tool', name: 'bash', state: 'end' });
     expect(client.frames[9]).toMatchObject({ type: 'turn', state: 'end' });
     // History is settled; the session recovers for the next prompt.
     expect(harness.frameLog.hasOpenTurn).toBe(false);
+
+    // A FRESH page load (full replay) must never hit a poison fatal frame.
+    const fresh = await authedClient(harness.port);
+    await fresh.waitForCount(1 + harness.frameLog.highWaterSeq);
+    const poison = fresh.frames.filter(
+      (frame) => (frame as web.ErrorFrame).type === 'error' && (frame as web.ErrorFrame).fatal === true,
+    );
+    expect(poison).toEqual([]);
+
     harness.handle.toolName = null;
     client.send('recovery prompt', 'm2');
     await pollUntil(() => harness.handle.calls.length === 2, 'recovery delivered');
     await client.waitForCount(16); // + user, ack, turn, delta, delta, turn
     expect(harness.handle.calls[1]).toEqual({ op: 'prompt', text: 'recovery prompt', owner: 'chat' });
+    await client.close();
+    await fresh.close();
+    await harness.close();
+  });
+
+  it('a prompt rejection logs a delivery failure without settling a turn that never opened', async () => {
+    const harness = await makeHarness();
+    harness.handle.nextPromptError = 'model exploded';
+    const client = await authedClient(harness.port);
+    client.send('doomed', 'm1');
+    // The failure is logged (conversation-relevant) and non-fatal.
+    await client.waitFor(
+      (frame) => frame.type === 'error' &&
+        (frame as web.ErrorFrame).message.includes('message delivery failed: model exploded'),
+      'delivery failure',
+    );
+    expect(client.frames.some((frame) => frame.type === 'turn')).toBe(false);
+    expect(client.frames.filter((frame) => frame.type === 'error')).toHaveLength(1);
+    // The log holds exactly user + ack + error — no turn boundary noise.
+    expect(harness.frameLog.history.map((frame) => frame.type)).toEqual(['user', 'ack', 'error']);
+    expect((client.frames.at(-1) as web.ErrorFrame).fatal).toBeUndefined();
+
+    // Recovery: the next message delivers normally on the same session.
+    const done2 = nextTurnEnd(client);
+    client.send('after the failure', 'm2');
+    await done2;
+    expect(harness.handle.calls).toEqual([
+      { op: 'prompt', text: 'doomed', owner: 'chat' },
+      { op: 'prompt', text: 'after the failure', owner: 'chat' },
+    ]);
+    await client.close();
+    await harness.close();
+  });
+
+  it('a steer rejection mid-live-turn logs the failure but never force-settles the running turn', async () => {
+    const harness = await makeHarness();
+    let releaseTurn!: () => void;
+    harness.handle.nextHold = new Promise((resolve) => {
+      releaseTurn = resolve;
+    });
+    harness.handle.nextSteerError = 'steer rejected';
+    const client = await authedClient(harness.port);
+    client.send('start a long turn', 'm1');
+    await client.waitFor(
+      (frame) => frame.type === 'turn' && (frame as web.TurnFrame).state === 'start',
+      'turn start',
+    );
+    client.send('adjust course', 'm2');
+    await client.waitFor(
+      (frame) => frame.type === 'error' &&
+        (frame as web.ErrorFrame).message.includes('message delivery failed: steer rejected'),
+      'steer failure logged',
+    );
+    // The runtime turn is STILL live — no settle frames may appear.
+    expect(
+      client.frames.some((frame) => frame.type === 'turn' && (frame as web.TurnFrame).state === 'end'),
+    ).toBe(false);
+    expect(
+      harness.frameLog.history.some((frame) => frame.type === 'tool' && frame.state === 'end'),
+    ).toBe(false);
+
+    const done = nextTurnEnd(client);
+    releaseTurn();
+    await done;
+    // History reads: user, ack, turn start, delta, delta, then the m2
+    // exchange (user, ack), the steer failure, and the real turn end —
+    // nothing settled early, no deltas after a closed turn.
+    const logKinds = harness.frameLog.history.map((frame) => frame.type);
+    expect(logKinds).toEqual(['user', 'ack', 'turn', 'delta', 'delta', 'user', 'ack', 'error', 'turn']);
+    expect(harness.frameLog.history.at(-1)).toMatchObject({ type: 'turn', state: 'end' });
+    await client.close();
+    await harness.close();
+  });
+
+  it('a non-fatal runtime error mid-turn is logged and the turn completes', async () => {
+    const harness = await makeHarness();
+    harness.handle.nextSoftError = 'soft failure';
+    const client = await authedClient(harness.port);
+    const done = nextTurnEnd(client);
+    client.send('tell me things', 'm1');
+    await done;
+    const kinds = client.frames.map((frame) => frame.type);
+    expect(kinds).toEqual(['auth_ok', 'user', 'ack', 'turn', 'delta', 'delta', 'error', 'turn']);
+    const soft = client.frames[6] as web.ErrorFrame;
+    expect(soft.message).toBe('soft failure');
+    expect(soft.fatal).toBeUndefined();
+    expect(soft.seq).toBe(6);
+    await client.close();
+    await harness.close();
+  });
+
+  it('a duplicate turn_end event is swallowed by the open-turn guard (no dangling boundary)', async () => {
+    const harness = await makeHarness();
+    const client = await authedClient(harness.port);
+    const done = nextTurnEnd(client);
+    client.send('warm up', 'm1');
+    await done;
+    const before = harness.frameLog.highWaterSeq;
+
+    // Adapter misbehavior: turn ends, then a stray turn_end arrives.
+    harness.handle.fire({ type: 'turn_start' });
+    harness.handle.fire({ type: 'turn_end' });
+    harness.handle.fire({ type: 'turn_end' }); // duplicate — must be skipped
+    await pollUntil(
+      () => harness.frameLog.history.filter((frame) => frame.type === 'turn').length === 4,
+      'fired turn frames logged',
+    );
+    expect(harness.frameLog.highWaterSeq).toBe(before + 2); // start + end only
+    expect(harness.frameLog.history.at(-1)).toMatchObject({ type: 'turn', state: 'end' });
     await client.close();
     await harness.close();
   });
@@ -731,11 +920,13 @@ describe('chat server (real sockets, stub Gru)', () => {
     await harness.close();
   });
 
-  it('post-dispose upgrades are refused: the listener detaches, no zombie connections', async () => {
+  it('dispose closes clients with 1001 and refuses later upgrades (no zombies)', async () => {
     const harness = await makeHarness();
     const client = await authedClient(harness.port);
-    await client.close();
-    await harness.chat.dispose(); // detach the upgrade handler
+    const gone = client.closed;
+    await harness.chat.dispose(); // detach the upgrade handler + close clients
+    // The going-away code lets the UI queue before the runtime turns die.
+    await expect(gone).resolves.toBe(1001);
 
     const zombie = new TestClient(harness.port);
     // With no 'upgrade' listener the HTTP server closes the connection:
@@ -748,6 +939,127 @@ describe('chat server (real sockets, stub Gru)', () => {
     ]);
     expect(typeof code).toBe('number');
     expect(zombie.frames).toEqual([]);
+    await new Promise<void>((resolveClose) => {
+      harness.http.closeAllConnections();
+      harness.http.close(() => resolveClose());
+    });
+  });
+
+  it('upgrade requests to a non-/ws path are destroyed without any frames', async () => {
+    const harness = await makeHarness();
+    const stray = new TestClient(harness.port, '/nope');
+    const code = await Promise.race([
+      stray.closed,
+      new Promise<number>((_, reject) =>
+        setTimeout(() => reject(new Error('stray connection lingered')), 3_000),
+      ),
+    ]);
+    expect(typeof code).toBe('number');
+    expect(stray.frames).toEqual([]);
+    expect(harness.frameLog.highWaterSeq).toBe(0);
+    await harness.close();
+  });
+
+  it('pre-auth malformed frames are ephemeral: client-visible, never written to the durable log', async () => {
+    const harness = await makeHarness();
+    const client = new TestClient(harness.port);
+    await client.open();
+    client.sendRaw('garbage before auth');
+    const notice = await client.waitFor(isType('error'), 'ephemeral notice');
+    expect(notice).toEqual({ type: 'error', message: 'malformed frame' });
+    expect(notice).not.toHaveProperty('seq');
+    // The connection survives and can still authenticate.
+    client.auth(TOKEN);
+    await client.waitFor(isType('auth_ok'), 'auth_ok');
+    // Nothing was logged by the unauthenticated socket.
+    expect(harness.frameLog.highWaterSeq).toBe(0);
+    await client.close();
+    await harness.close();
+  });
+
+  it('a corrupt resume pointer surfaces as a spawn failure and never wedges the spawn gate', async () => {
+    const harness = await makeHarness();
+    const client = await authedClient(harness.port);
+    const done = nextTurnEnd(client);
+    client.send('first', 'm1');
+    await done;
+    expect(harness.spawnCalls).toEqual([null]);
+
+    // The session dies (crash) AND the pointer is corrupt: the next spawn
+    // must fail per-send (naming the pointer), not wedge the gate forever.
+    harness.handle.fire({ type: 'state', state: 'disposed' });
+    writeFileSync(join(harness.chatDir, SESSION_STATE_NAME), '{"sessionFile":', 'utf-8');
+    client.send('second', 'm2');
+    const failure = await client.waitFor(isType('error'), 'spawn failure surfaced');
+    expect((failure as web.ErrorFrame).message).toContain('gru is unavailable');
+    expect((failure as web.ErrorFrame).message).toContain('gru session pointer');
+
+    // Repair (remove the corrupt pointer): the gate must be free — the
+    // very next message spawns and delivers. Pre-fix the rejected
+    // `spawning` promise pinned the gate until restart.
+    rmSync(join(harness.chatDir, SESSION_STATE_NAME));
+    const done3 = nextTurnEnd(client);
+    client.send('third', 'm3');
+    await done3;
+    expect(harness.handle.calls.map((call) => call.text)).toEqual(['first', 'third']);
+    expect(harness.spawnCalls).toEqual([null, null]); // fresh brain after repair
+    await client.close();
+    await harness.close();
+  });
+
+  it('heartbeat: a pong-suppressed writer is terminated and the pen promotes to the ponging reader', async () => {
+    const harness = await makeHarness({ heartbeatMs: 40 });
+    // A raw WS client that NEVER answers pings — and holds the pen first.
+    const blind = new PongBlindClient(harness.port);
+    blind.authAndSend(TOKEN, 'hello from the blind writer', 'blind-m1');
+    const reader = await authedClient(harness.port);
+    await reader.waitFor(
+      (frame) => frame.type === 'user' && (frame as web.ReplayedUserFrame).client_msg_id === 'blind-m1',
+      'reader saw the blind writer traffic',
+    );
+    reader.send('trying while blind holds pen', 'r1');
+    await reader.waitFor(isType('error'), 'read-only while blind lives');
+
+    // The blind writer misses pongs → terminated → the reader is promoted.
+    await blind.closed;
+    let promoted = false;
+    for (let attempt = 0; attempt < 25 && !promoted; attempt++) {
+      reader.send('promoted after heartbeat', 'r2');
+      try {
+        await reader.waitFor(
+          (frame) => frame.type === 'ack' && (frame as web.AckFrame).client_msg_id === 'r2',
+          'promoted ack',
+          200,
+        );
+        promoted = true;
+      } catch {
+        /* not promoted yet */
+      }
+    }
+    expect(promoted).toBe(true);
+    const done = nextTurnEnd(reader);
+    reader.send('now streaming', 'r3');
+    await done;
+    // The ponging reader survived every heartbeat interval throughout.
+    expect(reader.frames.filter((frame) => frame.type === 'delta').length).toBeGreaterThanOrEqual(4);
+    await reader.close();
+    await harness.close();
+  });
+
+  it('oversized frames (past the 64 KiB cap) are refused with close 1009', async () => {
+    const harness = await makeHarness();
+    const client = new TestClient(harness.port);
+    await client.open();
+    client.sendRaw('x'.repeat(70 * 1024));
+    const code = await Promise.race([
+      client.closed,
+      new Promise<number>((_, reject) =>
+        setTimeout(() => reject(new Error('oversize frame not refused')), 3_000),
+      ),
+    ]);
+    expect(code).toBe(1009);
+    expect(client.frames).toEqual([]);
+    expect(harness.frameLog.highWaterSeq).toBe(0);
     await new Promise<void>((resolveClose) => {
       harness.http.closeAllConnections();
       harness.http.close(() => resolveClose());

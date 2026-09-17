@@ -42,7 +42,6 @@ export const FRAME_LOG_NAME = 'gru.frames.jsonl';
  */
 export class ChatFrameLog {
   readonly file: string;
-  private readonly log: Log;
   private frames: LoggedFrame[] = [];
   private seq = 0;
   /** client_msg_ids of every logged `user` frame (dedup on re-send). */
@@ -51,9 +50,8 @@ export class ChatFrameLog {
   private readonly openTools: string[] = [];
   private turnOpen = false;
 
-  private constructor(dir: string, log: Log) {
+  private constructor(dir: string) {
     this.file = join(dir, FRAME_LOG_NAME);
-    this.log = log;
   }
 
   /**
@@ -64,7 +62,7 @@ export class ChatFrameLog {
    */
   static load(dir: string, log: Log = () => {}): ChatFrameLog {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const log_ = new ChatFrameLog(dir, log);
+    const log_ = new ChatFrameLog(dir);
     if (!existsSync(log_.file)) return log_;
     const text = readFileSync(log_.file, 'utf-8');
     const lines = text.split('\n');
@@ -145,9 +143,13 @@ export class ChatFrameLog {
    * log — the seq counter never diverges from the high-water mark.
    */
   append(frame: UnseqedFrame): LoggedFrame {
-    this.seq += 1;
-    const seqed = withSeq(frame, this.seq);
+    const next = this.seq + 1;
+    const seqed = withSeq(frame, next);
+    // Persist BEFORE advancing the counter (r1 N11): a failed write
+    // (ENOSPC) must not leave the counter ahead of the file — a gap is
+    // the same unbootable corruption class as the torn-tail (B1).
     appendFileSync(this.file, `${JSON.stringify(seqed)}\n`, 'utf-8');
+    this.seq = next;
     this.track(seqed);
     this.frames.push(seqed);
     return seqed;

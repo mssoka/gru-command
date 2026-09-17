@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest';
 const PINS: Record<string, number> = {
   'chat-frame-log.test.ts': 12,
   'chat-frames.test.ts': 4,
-  'chat-server.test.ts': 16,
+  'chat-server.test.ts': 25,
   'chat-session-state.test.ts': 4,
   'claude-adapter.test.ts': 50,
   'config.test.ts': 31,
@@ -25,7 +25,7 @@ const PINS: Record<string, number> = {
   'shutdown.test.ts': 3,
   'smoke-claude.test.ts': 1,
   'smoke-real-model.test.ts': 1,
-  'static.test.ts': 7,
+  'static.test.ts': 9,
   'stub-runtime.test.ts': 11,
   'suite-shape.test.ts': 1,
 };

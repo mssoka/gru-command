@@ -33,11 +33,11 @@ describe('gru role definition', () => {
     expect(ROLE_DEFINITIONS.gru.cwd).toBe('workspace_root');
   });
 
-  it('the persona is generic: no personal paths, no instance specifics (hygiene ruling)', () => {
+  it('the persona is generic: no personal paths, no instance or runtime specifics (hygiene ruling)', () => {
     const prompt = ROLE_DEFINITIONS.gru.systemPrompt;
-    // Personal paths and instance/tooling specifics never ship in the
-    // product-native role — the persona PATTERN only.
-    const forbidden = /\/Users\/|\/home\/|~\/|herdr|_bmad|ledger|worktree/i;
+    // Personal paths, instance/tooling specifics, and runtime names never
+    // ship in the product-native role — the persona PATTERN only.
+    const forbidden = /\/Users\/|\/home\/|~\/|herdr|_bmad|ledger|worktree|\bpi\b|claude/i;
     expect(forbidden.test(prompt)).toBe(false);
   });
 });

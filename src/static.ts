@@ -91,7 +91,19 @@ export function createStaticRoot(dir: string): StaticRoot {
         res.end();
         return true;
       }
-      createReadStream(resolved).pipe(res);
+      const stream = createReadStream(resolved);
+      // pipe() does not forward stream errors (r1 W3): a vanish/EACCES/EIO
+      // on the file must answer 500 (or tear the response down mid-stream)
+      // — never escalate to an uncaughtException that restarts the service.
+      stream.on('error', (error: Error) => {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(`${JSON.stringify({ error: 'static_read_failed', detail: String(error) })}\n`);
+        } else {
+          res.destroy();
+        }
+      });
+      stream.pipe(res);
       return true;
     },
   };

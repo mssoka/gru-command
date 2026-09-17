@@ -69,16 +69,20 @@ survivable corruption shape.
 - **Empty/absent token = closed door:** every connection gets a fatal
   `chat is not configured` error. There is no localhost bypass.
 - A second `auth` on an authenticated socket is a non-fatal logged
-  error (`already authenticated`); a malformed frame is a non-fatal
-  logged error (`malformed frame`). The connection survives both.
+  error (`already authenticated`); a malformed frame from an
+  authenticated socket is a non-fatal logged error (`malformed frame`).
+  Pre-auth malformed frames get the same client-visible error but are
+  ephemeral — an unauthenticated socket never writes durable history.
+  The connection survives all of these; the auth deadline still bounds
+  the pre-auth window.
 
 ## Error frame classes
 
 | Class | `seq` | Logged | Replays to everyone | Used for |
 |---|---|---|---|---|
-| Fatal | no | no | no | bad/missing/late auth, chat not configured |
-| Logged | yes | yes | yes | malformed frame, already-authenticated, runtime errors, delivery failures |
-| Ephemeral | no | no | no | per-client policy notices: read-only rejection, spawn-failure notice |
+| Fatal | no | never | no | bad/missing/late auth, chat not configured — the only frames that ever carry `fatal: true`, and they are never persisted |
+| Logged | yes | yes | yes | malformed frame (authenticated sockets), already-authenticated, runtime errors + delivery failures — **never `fatal: true`**: the shipped client treats any replayed fatal frame as pairing-fatal, so a logged runtime death must read as history, not poison |
+| Ephemeral | no | no | no | per-client policy notices: read-only rejection, spawn-failure notice, malformed frame before auth |
 
 Ephemeral frames are for conditions that are expected policy (not
 malfunctions) and must not pollute permanent history for every future
@@ -120,6 +124,10 @@ history always reads "the turn died here," never an open stream.
   BEFORE any runtime work, and dedupes re-received frames by
   `client_msg_id` — a re-send gets a fresh `ack`, never a re-delivery,
   never a duplicate `user` frame.
+- A message whose RUNTIME delivery fails (spawn outage, disposed
+  session) stays acked and logged with an error frame recording the
+  failure — there is no automatic redelivery; re-send it. The typed word
+  is never silently lost, and neither is the failure.
 - Reconnecting clients re-auth with `last_seen_seq`; the server sends
   `auth_ok` (high-water), then every logged frame with
   `seq > last_seen_seq` in order, then live traffic. No

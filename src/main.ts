@@ -148,20 +148,12 @@ async function main(): Promise<number> {
     growth_findings: growth.findings.length,
   });
 
-  const service = createService(
-    config,
-    identity,
-    (level, msg, fields) => logger.log(level, msg, fields),
-    () => registry.status(),
-    { staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)) },
-  );
-  state.handle = await service.start();
-  const handle = state.handle;
-
   // Chat (E4): the single Gru session behind /ws. The durable frame log
-  // loads and boot-settles BEFORE any client can attach; the Gru spawn
-  // is lazy-warm (warmup is best-effort, first message retries) so a
-  // model outage can never keep the service down.
+  // loads and boot-settles BEFORE the HTTP server accepts anything (r1
+  // N13): a corrupt log refuses boot without ever having listened, and no
+  // client can attach to an unsettled log. The Gru spawn is lazy-warm
+  // (warmup is best-effort, first message retries) so a model outage can
+  // never keep the service down.
   const chatDir = join(config.dataDir, 'chat');
   const frameLog = ChatFrameLog.load(chatDir, (level, msg, fields) => logger.log(level, msg, fields));
   const chat = createChatServer({
@@ -171,6 +163,16 @@ async function main(): Promise<number> {
     spawnGru: (resumeFile) => registry.spawn('gru', resumeFile !== null ? { resumeFile } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+
+  const service = createService(
+    config,
+    identity,
+    (level, msg, fields) => logger.log(level, msg, fields),
+    () => registry.status(),
+    { staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)) },
+  );
+  state.handle = await service.start();
+  const handle = state.handle;
   chat.attach(handle.httpServer);
   state.chat = chat;
   chat.warmup();

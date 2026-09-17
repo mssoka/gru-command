@@ -1,11 +1,11 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Writable } from 'node:stream';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { createService } from '../src/server.js';
-import { createStaticRoot } from '../src/static.js';
+import { createStaticRoot, defaultStaticRoot } from '../src/static.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { loadOrCreateIdentity } from '../src/identity.js';
 
@@ -109,6 +109,24 @@ describe('createStaticRoot', () => {
     const missing = createStaticRoot(join(makeDist(), 'does-not-exist'));
     const { req, res } = fakeReqRes('GET');
     expect(missing.serve(req, res, '/')).toBe(false);
+  });
+
+  it('answers 500 when the file cannot be read after the stat (stream error)', async () => {
+    const dir = makeDist();
+    const secret = join(dir, 'secret.js');
+    writeFileSync(secret, 'console.log(1);\n');
+    chmodSync(secret, 0o000); // open() fails EACCES — the stream errors
+    const root = createStaticRoot(dir);
+    const { req, res, state, body } = fakeReqRes('GET');
+    expect(root.serve(req, res, '/secret.js')).toBe(true);
+    await new Promise((resolve) => res.once('finish', resolve));
+    expect(state.status).toBe(500);
+    expect(body()).toContain('static_read_failed');
+  });
+
+  it('defaultStaticRoot resolves the package web/dist from either layout', () => {
+    expect(defaultStaticRoot('file:///pkg/src/static.ts')).toBe(join('/pkg', 'web', 'dist'));
+    expect(defaultStaticRoot('file:///pkg/dist/static.js')).toBe(join('/pkg', 'web', 'dist'));
   });
 });
 

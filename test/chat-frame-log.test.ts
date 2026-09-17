@@ -103,23 +103,39 @@ describe('ChatFrameLog', () => {
     expect(log.history[1]).toEqual({ type: 'turn', state: 'end', seq: 2 });
   });
 
-  it('repairs a torn tail on load: appends after it and the next load stays green', () => {
+  it('repairs a torn tail on load: boot-settle appends and the next load stays green', () => {
     const dir = fixture();
+    // The verdict's repro shape: crash mid-append leaves a torn tail OVER
+    // an open turn — boot 1 must repair the file AND append ≥2 closing
+    // frames (boot-settle), and boot 2 must load clean.
     writeFileSync(
       join(dir, FRAME_LOG_NAME),
-      '{"type":"turn","state":"start","seq":1}\n{"type":"turn","state":"end","seq":2}\n{"type":"delta","te',
+      '{"type":"user","text":"go","client_msg_id":"id-1","seq":1}\n' +
+        '{"type":"ack","client_msg_id":"id-1","seq":2}\n' +
+        '{"type":"turn","state":"start","seq":3}\n' +
+        '{"type":"tool","name":"bash","state":"start","seq":4}\n' +
+        '{"type":"delta","te',
       'utf-8',
     );
     const log = ChatFrameLog.load(dir);
-    expect(log.highWaterSeq).toBe(2);
-    // The torn line is gone from disk — an append does not bake it into
-    // mid-file corruption, so the NEXT boot loads clean.
+    // The valid prefix (4 frames) survived; boot-settle appended the two
+    // closing frames AFTER the on-disk repair — high-water is already 6.
+    expect(log.highWaterSeq).toBe(6);
+    expect(log.history.slice(4)).toEqual([
+      { type: 'tool', name: 'bash', state: 'end', seq: 5 },
+      { type: 'turn', state: 'end', seq: 6 },
+    ]);
+    // Post-crash traffic appends normally — and the NEXT boot is green.
     log.append({ type: 'delta', text: 'after the crash' });
     const reloaded = ChatFrameLog.load(dir);
     expect(reloaded.history).toEqual([
-      { type: 'turn', state: 'start', seq: 1 },
-      { type: 'turn', state: 'end', seq: 2 },
-      { type: 'delta', text: 'after the crash', seq: 3 },
+      { type: 'user', text: 'go', client_msg_id: 'id-1', seq: 1 },
+      { type: 'ack', client_msg_id: 'id-1', seq: 2 },
+      { type: 'turn', state: 'start', seq: 3 },
+      { type: 'tool', name: 'bash', state: 'start', seq: 4 },
+      { type: 'tool', name: 'bash', state: 'end', seq: 5 },
+      { type: 'turn', state: 'end', seq: 6 },
+      { type: 'delta', text: 'after the crash', seq: 7 },
     ]);
   });
 
