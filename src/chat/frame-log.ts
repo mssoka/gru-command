@@ -1,4 +1,11 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import {
@@ -64,7 +71,30 @@ export class ChatFrameLog {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const log_ = new ChatFrameLog(dir);
     if (!existsSync(log_.file)) return log_;
-    const text = readFileSync(log_.file, 'utf-8');
+    let text = readFileSync(log_.file, 'utf-8');
+    // r2 B1'': a crash mid-append can cut the write between the final
+    // frame's JSON and its terminator newline. That line LOADS fine — but
+    // the next append merges onto it (reboot drops both frames and
+    // resets the counter, or the merge lands mid-file and bricks boot).
+    // A parseable final line missing only the '\n' is torn-tail-class:
+    // keep the frame, repair the terminator (atomically).
+    if (text.length > 0 && !text.endsWith('\n')) {
+      const tailStart = text.lastIndexOf('\n') + 1;
+      const tail = text.slice(tailStart);
+      const tailFrame = parseServerFrame(safeParse(tail));
+      const repairable =
+        tailFrame !== null &&
+        tailFrame.type !== 'auth_ok' &&
+        !(tailFrame.type === 'error' && tailFrame.fatal === true);
+      if (repairable) {
+        rewriteAtomically(log_.file, `${text}\n`);
+        log('warn', 'final frame line was missing its newline — terminator repaired (crash mid-append)', {
+          file: log_.file,
+        });
+        text = `${text}\n`;
+      }
+      // else: the line loop below drops/raises as its content deserves.
+    }
     const lines = text.split('\n');
     // A trailing newline produces a final empty entry — not a frame.
     if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
@@ -84,10 +114,9 @@ export class ChatFrameLog {
             line: index + 1,
           });
           const validPrefix = lines.slice(0, index);
-          writeFileSync(
+          rewriteAtomically(
             log_.file,
             validPrefix.length > 0 ? `${validPrefix.join('\n')}\n` : '',
-            'utf-8',
           );
           break;
         }
@@ -96,6 +125,17 @@ export class ChatFrameLog {
       const frame = parseServerFrame(parsed);
       if (frame === null || frame.type === 'auth_ok') {
         throw new FrameLogCorruptError(log_.file, index + 1, 'not a logged chat frame');
+      }
+      if (frame.type === 'error' && frame.fatal === true) {
+        // r2 W3': a persisted fatal frame is poison by construction (the
+        // client treats any replayed fatal as pairing-fatal). The writer
+        // cannot produce one (type-narrowed + append-guarded); a file
+        // that carries one is corrupt — refuse, never replay it.
+        throw new FrameLogCorruptError(
+          log_.file,
+          index + 1,
+          'a fatal error frame was persisted — fatal frames are never logged (client poison)',
+        );
       }
       const seq = loggedFrameSeq(frame);
       if (seq !== index + 1) {
@@ -145,9 +185,17 @@ export class ChatFrameLog {
   append(frame: UnseqedFrame): LoggedFrame {
     const next = this.seq + 1;
     const seqed = withSeq(frame, next);
-    // Persist BEFORE advancing the counter (r1 N11): a failed write
-    // (ENOSPC) must not leave the counter ahead of the file — a gap is
-    // the same unbootable corruption class as the torn-tail (B1).
+    // r2 B2'': anything appendable must survive load() — validate BEFORE
+    // writing (and before advancing the counter): an invalid runtime
+    // string (empty message/tool name) or a smuggled fatal flag would
+    // otherwise brick the NEXT boot. Persist before advancing (r1 N11):
+    // a failed write (ENOSPC/EACCES) must not leave a counter/file gap.
+    const check = parseServerFrame(seqed);
+    if (check === null || (check.type === 'error' && check.fatal === true)) {
+      throw new Error(
+        `refusing to persist a frame load() would reject: ${JSON.stringify(frame)}`,
+      );
+    }
     appendFileSync(this.file, `${JSON.stringify(seqed)}\n`, 'utf-8');
     this.seq = next;
     this.track(seqed);
@@ -197,4 +245,21 @@ export class ChatFrameLog {
         break;
     }
   }
+}
+
+/** JSON.parse that yields null instead of throwing (tail probing). */
+function safeParse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/** Rewrite the whole file via tmp + rename: a repair that crashes midway
+ * must never leave a half-written log behind (r2 note). */
+function rewriteAtomically(file: string, contents: string): void {
+  const staging = `${file}.repair-${process.pid}`;
+  writeFileSync(staging, contents, 'utf-8');
+  renameSync(staging, file);
 }

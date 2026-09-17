@@ -130,7 +130,6 @@ describe('chat frame parser parity with the web contract module', () => {
       { type: 'turn', state: 'start' },
       { type: 'turn', state: 'end' },
       { type: 'error', message: 'logged error' },
-      { type: 'error', message: 'fatal logged error', fatal: true },
       { type: 'user', text: 'hi', client_msg_id: 'id-1' },
     ];
     for (const frame of seqed) {
@@ -140,6 +139,11 @@ describe('chat frame parser parity with the web contract module', () => {
         `web validator rejected server-built ${frame.type}`,
       ).toEqual(built);
     }
+    // r2 W3': fatal is UNPERSISTABLE at the type level — the compiler
+    // itself rejects the poison (this line fails typecheck if the
+    // UnseqedFrame narrowing regresses).
+    // @ts-expect-error fatal must never be persistable
+    withSeq({ type: 'error', message: 'poison', fatal: true }, 7);
     // auth_ok + ephemeral (seq-less) errors are built inline at the server.
     expect(web.parseServerFrame({ type: 'auth_ok', seq: 0 })).toEqual({ type: 'auth_ok', seq: 0 });
     expect(web.parseServerFrame(ephemeralError('policy notice'))).toEqual(

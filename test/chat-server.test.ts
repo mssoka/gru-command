@@ -439,17 +439,25 @@ describe('chat server (real sockets, stub Gru)', () => {
     const done = nextTurnEnd(client);
     client.send('hello gru', 'm1');
     await done;
+    // r2 W2': the writer does NOT receive its own user frame live (the
+    // client renders it locally; history restores it on replay).
     const kinds = client.frames.map((frame) => frame.type);
-    expect(kinds).toEqual(['auth_ok', 'user', 'ack', 'turn', 'delta', 'delta', 'turn']);
-    expect(client.frames[1]).toMatchObject({ type: 'user', text: 'hello gru', client_msg_id: 'm1', seq: 1 });
-    expect(client.frames[2]).toMatchObject({ type: 'ack', client_msg_id: 'm1', seq: 2 });
-    expect(client.frames[3]).toMatchObject({ type: 'turn', state: 'start', seq: 3 });
-    expect(client.frames[4]).toMatchObject({ type: 'delta', text: 'Hello', seq: 4 });
-    expect(client.frames[5]).toMatchObject({ type: 'delta', text: ' boss', seq: 5 });
-    expect(client.frames[6]).toMatchObject({ type: 'turn', state: 'end', seq: 6 });
+    expect(kinds).toEqual(['auth_ok', 'ack', 'turn', 'delta', 'delta', 'turn']);
+    expect(client.frames[1]).toMatchObject({ type: 'ack', client_msg_id: 'm1', seq: 2 });
+    expect(client.frames[2]).toMatchObject({ type: 'turn', state: 'start', seq: 3 });
+    expect(client.frames[3]).toMatchObject({ type: 'delta', text: 'Hello', seq: 4 });
+    expect(client.frames[4]).toMatchObject({ type: 'delta', text: ' boss', seq: 5 });
+    expect(client.frames[5]).toMatchObject({ type: 'turn', state: 'end', seq: 6 });
     // Every frame parsed web-valid (no __malformed__) and the seqs are 1..N.
     expect(kinds).not.toContain('__malformed__');
     expect(harness.frameLog.highWaterSeq).toBe(6);
+    // The user frame IS in the durable log (seq 1) for replay.
+    expect(harness.frameLog.history[0]).toMatchObject({
+      type: 'user',
+      text: 'hello gru',
+      client_msg_id: 'm1',
+      seq: 1,
+    });
     expect(harness.handle.calls).toEqual([{ op: 'prompt', text: 'hello gru', owner: 'chat' }]);
     await client.close();
     await harness.close();
@@ -463,9 +471,9 @@ describe('chat server (real sockets, stub Gru)', () => {
     client.send('use a tool', 'm1');
     await done;
     const kinds = client.frames.map((frame) => frame.type);
-    expect(kinds).toEqual(['auth_ok', 'user', 'ack', 'turn', 'tool', 'delta', 'delta', 'tool', 'turn']);
-    expect(client.frames[4]).toMatchObject({ type: 'tool', name: 'read', state: 'start' });
-    expect(client.frames[7]).toMatchObject({ type: 'tool', name: 'read', state: 'end' });
+    expect(kinds).toEqual(['auth_ok', 'ack', 'turn', 'tool', 'delta', 'delta', 'tool', 'turn']);
+    expect(client.frames[3]).toMatchObject({ type: 'tool', name: 'read', state: 'start' });
+    expect(client.frames[6]).toMatchObject({ type: 'tool', name: 'read', state: 'end' });
     await client.close();
     await harness.close();
   });
@@ -481,9 +489,11 @@ describe('chat server (real sockets, stub Gru)', () => {
     await done;
 
     const fresh = await authedClient(harness.port);
-    await fresh.waitForCount(first.frames.length); // auth_ok + replay of the log
+    await fresh.waitForCount(1 + harness.frameLog.highWaterSeq); // auth_ok + the whole log
     const replayed = fresh.frames.slice(1);
-    expect(replayed).toEqual(first.frames.slice(1) as web.ServerFrame[]);
+    expect(replayed).toEqual([...harness.frameLog.history] as web.ServerFrame[]);
+    // Both sides of the conversation restored, in seq order.
+    expect(replayed.filter((frame) => frame.type === 'user')).toHaveLength(2);
     await first.close();
     await fresh.close();
     await harness.close();
@@ -495,7 +505,6 @@ describe('chat server (real sockets, stub Gru)', () => {
     let done = nextTurnEnd(first);
     first.send('one', 'm1');
     await done;
-    const seen = first.frames.length; // auth_ok + logged frames so far
     done = nextTurnEnd(first);
     first.send('two', 'm2');
     await done;
@@ -504,9 +513,10 @@ describe('chat server (real sockets, stub Gru)', () => {
     const reconnected = await authedClient(harness.port, TOKEN, 1);
     await reconnected.waitForCount(1 + (highWater - 1));
     expect(reconnected.frames[0]).toEqual({ type: 'auth_ok', seq: highWater });
+    // Exactly the log frames with seq > 1, in order.
     const replayed = reconnected.frames.slice(1);
-    expect(replayed).toEqual(first.frames.slice(2) as web.ServerFrame[]); // log frames with seq > 1
-    expect(replayed.length).toBe(seen - 2 + (first.frames.length - seen));
+    expect(replayed).toEqual([...harness.frameLog.replayAfter(1)] as web.ServerFrame[]);
+    expect(replayed[0]).toMatchObject({ seq: 2 });
     await first.close();
     await reconnected.close();
     await harness.close();
@@ -719,7 +729,7 @@ describe('chat server (real sockets, stub Gru)', () => {
     );
     expect(harness.handle.calls).toHaveLength(1);
     releaseTurn();
-    await client.waitForCount(13, 10_000); // auth_ok + two full exchanges (6 frames each)
+    await client.waitForCount(11, 10_000); // auth_ok + two exchanges (ack+turn+delta+delta+turn each)
     expect(harness.handle.calls).toEqual([
       { op: 'prompt', text: 'first', owner: 'chat' },
       { op: 'prompt', text: 'second', owner: 'chat' },
@@ -742,9 +752,13 @@ describe('chat server (real sockets, stub Gru)', () => {
     const before = harness.frameLog.highWaterSeq;
 
     client.send('only once', 'dup-1'); // re-send (unacked-across-drop case)
-    await client.waitForCount(1 + before + 1);
-    const reAck = client.frames.at(-1);
-    expect(reAck).toMatchObject({ type: 'ack', client_msg_id: 'dup-1', seq: before + 1 });
+    const reAck = await client.waitFor(
+      (frame) => frame.type === 'ack' &&
+        (frame as web.AckFrame).client_msg_id === 'dup-1' &&
+        (frame as web.AckFrame).seq === before + 1,
+      're-ack',
+    );
+    expect(reAck).toBeDefined();
     expect(harness.handle.calls).toHaveLength(1);
     expect(
       harness.frameLog.history.filter((frame) => frame.type === 'user'),
@@ -762,16 +776,16 @@ describe('chat server (real sockets, stub Gru)', () => {
     client.send('doomed prompt', 'm1');
     await done;
     const kinds = client.frames.map((frame) => frame.type);
-    expect(kinds).toEqual(['auth_ok', 'user', 'ack', 'turn', 'tool', 'delta', 'delta', 'error', 'tool', 'turn']);
+    expect(kinds).toEqual(['auth_ok', 'ack', 'turn', 'tool', 'delta', 'delta', 'error', 'tool', 'turn']);
     // r1 B2: the shipped client closes on ANY fatal:true frame — live or
     // replayed. Logged runtime deaths carry seq but NEVER the flag.
-    const loggedFatal = client.frames[7] as web.ErrorFrame;
+    const loggedFatal = client.frames[6] as web.ErrorFrame;
     expect(loggedFatal.type).toBe('error');
     expect(loggedFatal.message).toBe('the runtime exploded');
     expect(loggedFatal.seq).toBe(7);
     expect(loggedFatal.fatal).toBeUndefined();
-    expect(client.frames[8]).toMatchObject({ type: 'tool', name: 'bash', state: 'end' });
-    expect(client.frames[9]).toMatchObject({ type: 'turn', state: 'end' });
+    expect(client.frames[7]).toMatchObject({ type: 'tool', name: 'bash', state: 'end' });
+    expect(client.frames[8]).toMatchObject({ type: 'turn', state: 'end' });
     // History is settled; the session recovers for the next prompt.
     expect(harness.frameLog.hasOpenTurn).toBe(false);
 
@@ -786,7 +800,7 @@ describe('chat server (real sockets, stub Gru)', () => {
     harness.handle.toolName = null;
     client.send('recovery prompt', 'm2');
     await pollUntil(() => harness.handle.calls.length === 2, 'recovery delivered');
-    await client.waitForCount(16); // + user, ack, turn, delta, delta, turn
+    await client.waitForCount(14); // + ack, turn, delta, delta, turn
     expect(harness.handle.calls[1]).toEqual({ op: 'prompt', text: 'recovery prompt', owner: 'chat' });
     await client.close();
     await fresh.close();
@@ -870,8 +884,8 @@ describe('chat server (real sockets, stub Gru)', () => {
     client.send('tell me things', 'm1');
     await done;
     const kinds = client.frames.map((frame) => frame.type);
-    expect(kinds).toEqual(['auth_ok', 'user', 'ack', 'turn', 'delta', 'delta', 'error', 'turn']);
-    const soft = client.frames[6] as web.ErrorFrame;
+    expect(kinds).toEqual(['auth_ok', 'ack', 'turn', 'delta', 'delta', 'error', 'turn']);
+    const soft = client.frames[5] as web.ErrorFrame;
     expect(soft.message).toBe('soft failure');
     expect(soft.fatal).toBeUndefined();
     expect(soft.seq).toBe(6);
@@ -1064,6 +1078,55 @@ describe('chat server (real sockets, stub Gru)', () => {
       harness.http.closeAllConnections();
       harness.http.close(() => resolveClose());
     });
+  });
+
+  it('runtime-supplied empty strings are clamped before persisting (reload never bricks)', async () => {
+    const harness = await makeHarness();
+    const client = await authedClient(harness.port);
+    const done = nextTurnEnd(client);
+    client.send('degenerate adapter', 'm1');
+    await done;
+
+    // r2 B2'': an adapter emitting '' must not write a frame load()
+    // rejects — clamp first, brick never.
+    harness.handle.fire({ type: 'error', error: '', fatal: false });
+    harness.handle.fire({ type: 'tool_start', callId: 'empty', tool: '' });
+    harness.handle.fire({ type: 'tool_end', callId: 'empty', isError: false });
+    await pollUntil(
+      () => harness.frameLog.history.some((frame) => frame.type === 'tool' && frame.name === 'unknown'),
+      'clamped tool frames',
+    );
+    const clampedError = harness.frameLog.history.find(
+      (frame) => frame.type === 'error' && frame.message === 'unknown runtime error',
+    );
+    expect(clampedError).toBeDefined();
+    // The persisted log reloads clean — the durability invariant holds.
+    const reloaded = ChatFrameLog.load(harness.chatDir);
+    expect(reloaded.highWaterSeq).toBe(harness.frameLog.highWaterSeq);
+    await client.close();
+    await harness.close();
+  });
+
+  it('a disposal mid-turn settles the open turn immediately (no dangling boundary)', async () => {
+    const harness = await makeHarness();
+    let releaseTurn!: () => void;
+    harness.handle.nextHold = new Promise((resolve) => {
+      releaseTurn = resolve;
+    });
+    const client = await authedClient(harness.port);
+    client.send('turn that outlives the session', 'm1');
+    await client.waitFor(
+      (frame) => frame.type === 'turn' && (frame as web.TurnFrame).state === 'start',
+      'turn start',
+    );
+    expect(harness.frameLog.hasOpenTurn).toBe(true);
+
+    harness.handle.fire({ type: 'state', state: 'disposed' });
+    await pollUntil(() => !harness.frameLog.hasOpenTurn, 'settled on disposal');
+    expect(harness.frameLog.history.at(-1)).toMatchObject({ type: 'turn', state: 'end' });
+    releaseTurn(); // the leaked stub turn ends into no listeners
+    await client.close();
+    await harness.close();
   });
 
   it('service restart: seq and history continue, an open turn boot-settles, the same Gru resumes', async () => {

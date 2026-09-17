@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -137,6 +137,70 @@ describe('ChatFrameLog', () => {
       { type: 'turn', state: 'end', seq: 6 },
       { type: 'delta', text: 'after the crash', seq: 7 },
     ]);
+  });
+
+  it('a newline-less parseable final line is repaired, not merged: load→append→load', () => {
+    const dir = fixture();
+    // r2 B1'': crash cut the write between the JSON and its '\n'.
+    writeFileSync(
+      join(dir, FRAME_LOG_NAME),
+      '{"type":"turn","state":"start","seq":1}\n' +
+        '{"type":"turn","state":"end","seq":2}',
+      'utf-8',
+    );
+    const log = ChatFrameLog.load(dir);
+    expect(log.highWaterSeq).toBe(2); // the frame survived, terminator repaired
+    // The next append lands on its OWN line — reload keeps all frames.
+    log.append({ type: 'delta', text: 'after repair' });
+    const reloaded = ChatFrameLog.load(dir);
+    expect(reloaded.history).toEqual([
+      { type: 'turn', state: 'start', seq: 1 },
+      { type: 'turn', state: 'end', seq: 2 },
+      { type: 'delta', text: 'after repair', seq: 3 },
+    ]);
+  });
+
+  it('append() refuses frames load() would reject: empty strings and fatal flags', () => {
+    const dir = fixture();
+    const log = ChatFrameLog.load(dir);
+    log.append({ type: 'delta', text: 'seed' });
+    const before = log.highWaterSeq;
+    // Empty runtime strings are unpersistable (load rejects them).
+    expect(() => log.append({ type: 'error', message: '' })).toThrowError(/refusing to persist/);
+    // A smuggled fatal flag is unpersistable (client poison).
+    expect(() =>
+      log.append({ type: 'error', message: 'poison', fatal: true } as never),
+    ).toThrowError(/refusing to persist/);
+    // Counter + file unchanged — the next append continues without a gap
+    // (closed pair, so the reload's boot-settle stays out of the count).
+    expect(log.highWaterSeq).toBe(before);
+    const next = log.append({ type: 'turn', state: 'start' });
+    expect(next).toMatchObject({ seq: before + 1 });
+    log.append({ type: 'turn', state: 'end' });
+    expect(ChatFrameLog.load(dir).highWaterSeq).toBe(before + 2);
+  });
+
+  it('a persisted fatal line is corruption: load refuses it loud', () => {
+    const dir = fixture();
+    seedFile(dir, [
+      { type: 'turn', state: 'start', seq: 1 },
+      { type: 'error', message: 'poison', fatal: true, seq: 2 },
+    ]);
+    expect(() => ChatFrameLog.load(dir)).toThrowError(/fatal error frame was persisted/);
+  });
+
+  it('a failed write advances neither the counter nor the file (no seq gap)', () => {
+    const dir = fixture();
+    const log = ChatFrameLog.load(dir);
+    log.append({ type: 'delta', text: 'one' });
+    const file = join(dir, FRAME_LOG_NAME);
+    chmodSync(file, 0o444); // append now fails EACCES
+    expect(() => log.append({ type: 'delta', text: 'lost' })).toThrowError();
+    expect(log.highWaterSeq).toBe(1); // counter did NOT advance
+    chmodSync(file, 0o644);
+    const next = log.append({ type: 'delta', text: 'two' });
+    expect(next).toMatchObject({ seq: 2 }); // no gap
+    expect(ChatFrameLog.load(dir).highWaterSeq).toBe(2); // reload clean
   });
 
   it('fails loud on mid-file corruption (never silently truncates history)', () => {

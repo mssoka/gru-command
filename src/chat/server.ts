@@ -180,10 +180,14 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         // The contract has no thinking frame; dropped at the boundary
         // (docs/CHAT.md). E6 transcript views own that surface later.
         break;
-      case 'tool_start':
-        openCalls.set(event.callId, event.tool);
-        emitLogged({ type: 'tool', name: event.tool, state: 'start' });
+      case 'tool_start': {
+        // r2 B2'': runtime-supplied strings are unvalidated upstream —
+        // clamp BEFORE persisting (anything appendable must survive load).
+        const tool = event.tool !== '' ? event.tool : 'unknown';
+        openCalls.set(event.callId, tool);
+        emitLogged({ type: 'tool', name: tool, state: 'start' });
         break;
+      }
       case 'tool_end': {
         const name = openCalls.get(event.callId) ?? 'unknown';
         openCalls.delete(event.callId);
@@ -209,15 +213,18 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
           owner: event.owner,
         });
         break;
-      case 'error':
+      case 'error': {
         // r1 B2: the shipped client treats ANY fatal:true frame — live OR
         // replayed — as a pairing-fatal event and closes. Logged runtime
         // deaths therefore NEVER carry the flag (mock parity: the mock
         // never persists fatal frames); the settle frames below already
-        // record that the turn died here.
-        emitLogged({ type: 'error', message: event.error });
+        // record that the turn died here. r2 B2'': clamp empty messages —
+        // a degenerate adapter string must never brick the next boot.
+        const message = event.error !== '' ? event.error : 'unknown runtime error';
+        emitLogged({ type: 'error', message });
         if (event.fatal) settleOpenTurn();
         break;
+      }
     }
   }
 
@@ -282,6 +289,15 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   function broadcast(frame: LoggedFrame): void {
     for (const client of clients) {
       if (client.authed) send(client, frame);
+    }
+  }
+
+  /** r2 W2': the writer's own `user` frame is NOT echoed back live — the
+   * client renders its message locally at send, the mock never live-sends
+   * user frames, and history restores it on replay for everyone. */
+  function broadcastExceptSender(frame: LoggedFrame, sender: Client): void {
+    for (const client of clients) {
+      if (client.authed && client !== sender) send(client, frame);
     }
   }
 
@@ -398,7 +414,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       send(client, frameLog.append({ type: 'ack', client_msg_id: frame.client_msg_id }));
       return;
     }
-    broadcast(frameLog.append({ type: 'user', text: frame.text, client_msg_id: frame.client_msg_id }));
+    broadcastExceptSender(
+      frameLog.append({ type: 'user', text: frame.text, client_msg_id: frame.client_msg_id }),
+      client,
+    );
     send(client, frameLog.append({ type: 'ack', client_msg_id: frame.client_msg_id }));
     deliver(client, frame.text);
   }

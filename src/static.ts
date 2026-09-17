@@ -97,8 +97,10 @@ export function createStaticRoot(dir: string): StaticRoot {
       // — never escalate to an uncaughtException that restarts the service.
       stream.on('error', (error: Error) => {
         if (!res.headersSent) {
+          // The errno code only — raw error text can echo filesystem paths.
+          const detail = (error as NodeJS.ErrnoException).code ?? 'read_failed';
           res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
-          res.end(`${JSON.stringify({ error: 'static_read_failed', detail: String(error) })}\n`);
+          res.end(`${JSON.stringify({ error: 'static_read_failed', detail })}\n`);
         } else {
           res.destroy();
         }

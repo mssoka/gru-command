@@ -194,15 +194,16 @@ export function loggedFrameSeq(frame: LoggedFrame): number {
 // Builders (server side emits valid frames by construction)
 // ---------------------------------------------------------------------------
 
-/** A logged frame before seq assignment (`error.seq` assigned too;
- * `fatal?` is retained by the Omit — though logged frames never set it,
- * see r1 B2). */
+/** A logged frame before seq assignment. The `error` member is narrowed
+ * WITHOUT `fatal` (r2 W3): fatal frames are never persisted — the
+ * shipped client treats any replayed fatal frame as pairing-fatal, so
+ * the type itself must make the poison unpersistable. */
 export type UnseqedFrame =
   | Omit<AckFrame, 'seq'>
   | Omit<DeltaFrame, 'seq'>
   | Omit<ToolFrame, 'seq'>
   | Omit<TurnFrame, 'seq'>
-  | Omit<ErrorFrame, 'seq'>
+  | { readonly type: 'error'; readonly message: string }
   | Omit<ReplayedUserFrame, 'seq'>;
 
 export function withSeq(frame: UnseqedFrame, seq: number): LoggedFrame {

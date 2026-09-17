@@ -20,10 +20,10 @@ Open http://localhost:5173 and pair with the mock's default token
 `dev-token` (prefilled automatically on localhost). The mock token is
 configurable via `GRU_MOCK_TOKEN`; its port via `GRU_MOCK_PORT`.
 
-> **Integration note (E4 follow-up):** the UI talks to the mock socket
-> until E4's real chat API lands. Production static-serving and the real
-> pairing-token QR wire into the service then — deliberately NOT in this
-> PR (the frontend lane touches only `web/` + build plumbing).
+> **Integration note (E4 landed):** the service now serves this UI in
+> production (`web/dist` on the service port) and hosts the real `/ws`
+> chat socket — see [CHAT.md](./CHAT.md). The mock remains the dev-only
+> socket for `npm run dev:web` and e2e.
 
 ## Design tokens (Playful Planet)
 
@@ -100,11 +100,11 @@ handshaking is abandoned after 10 s; a server whose `auth_ok.seq`
 arrives below the client's high-water mark (truncated store) triggers an
 automatic full-replay resync.
 
-**E4 protocol considerations (deferred, not gates):** no heartbeat/
-keepalive frames yet (a silently dead socket only surfaces via TCP
-timeout — consider ping frames or an activity watchdog in E4); the
-pairing token persists indefinitely in `localStorage` (`gru-pairing-token`)
-— lifetime/rotation belongs to the E4/E9 token flow.
+**E4 status:** transport-level heartbeats landed with the real socket
+(ws ping/pong, two unanswered pongs terminate — no JSON-contract
+frames, see [CHAT.md](./CHAT.md)). The pairing token still persists
+indefinitely in `localStorage` (`gru-pairing-token`) — lifetime/rotation
+belongs to the E9 token flow.
 
 **Never lose a typed word:** unacked messages persist in `localStorage`
 (`gru-outbox`, id + text), render as queued bubbles, and flush in order
@@ -113,8 +113,10 @@ after re-auth; replay ends exactly when the stream reaches the
 
 ## Views
 
-- **Pairing** — token field + QR (encodes `{url, token}` JSON payload;
-  mock payload until E4/E9 wire the real one). Bad token → inline error.
+- **Pairing** — token field + QR (encodes `{url, token}` JSON payload
+  built from `location.origin` + the typed token — the real payload
+  against the served UI; the wizard's token generation arrives with E9).
+  Bad token → inline error.
 - **Chat** — desktop: panel; mobile (≤768px): corner bubble that opens a
   bottom sheet (same DOM reparented via matchMedia; unread badge counts
   deltas arriving while closed). Streaming deltas render token-by-token

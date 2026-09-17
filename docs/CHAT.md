@@ -54,10 +54,13 @@ arithmetic depends on it: `auth_ok.seq` is the high-water mark, and a
 reconnecting client's replay ends exactly when the stream reaches it.
 The log is append-only jsonl at `<data_dir>/chat/gru.frames.jsonl`;
 seqs are exactly `1..N` consecutive. A log that violates this (a seq
-gap, a non-frame line, a logged `auth_ok`) is corruption: the service
-refuses to boot over it — history is never silently truncated. A torn
-FINAL line (crash mid-append) is dropped with a warning, the one
-survivable corruption shape.
+gap, a non-frame line, a logged `auth_ok`, a persisted `fatal` frame)
+is corruption: the service refuses to boot over it — history is never
+silently truncated. A torn FINAL line (crash mid-append) is dropped
+with a warning, and a parseable final line missing only its newline is
+repaired in place (newline-terminated) — the two survivable crash
+tails. The writer is held to the same rule from the other side:
+`append()` refuses any frame `load()` would reject.
 
 ## Auth
 
@@ -175,6 +178,9 @@ the second's sends start working (pen promotion).
 
 - Client messages are capped at 4 000 chars client-side; the server
   caps frame payloads at 64 KiB (a wedged client can't flood memory).
+- A message rejected as read-only is NOT re-delivered when its client
+  is later promoted — the sender re-sends it (the UI keeps it in the
+  outbox only while unacked; a read-only rejection leaves it sent).
 - Shutdown: the service closes chat clients first (1001 going away) so
   the UI queues before the runtime turns die; the next boot's
   boot-settle closes anything left open.
