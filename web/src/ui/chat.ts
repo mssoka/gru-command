@@ -60,6 +60,11 @@ export class ChatView {
     this.sheet.toggleAttribute('inert', this.sheet.dataset.open !== 'true');
   }
 
+  /** Open the phone chat sheet (the nav Chat tab on mobile does this). */
+  openSheet(): void {
+    this.setSheetOpen(true);
+  }
+
   private setSheetOpen(open: boolean): void {
     this.sheet.dataset.open = String(open);
     // A closed sheet is visually hidden AND unfocusable/unannounced.

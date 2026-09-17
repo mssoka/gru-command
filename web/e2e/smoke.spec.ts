@@ -17,6 +17,15 @@ async function pair(page: Page): Promise<void> {
   await expect(page.locator('#chat-view')).toBeVisible();
 }
 
+/** Pair on a phone viewport: the board is the DEFAULT view (SPEC ruling 11). */
+async function pairMobile(page: Page): Promise<void> {
+  await page.goto('/');
+  await expect(page.locator('#pairing-view')).toBeVisible();
+  await page.locator('#pair-token').fill(MOCK_TOKEN);
+  await page.locator('#pair-submit').click();
+  await expect(page.locator('#board-view')).toBeVisible();
+}
+
 async function sendAndWaitReply(page: Page, text: string): Promise<void> {
   await page.locator('#chat-input').fill(text);
   await page.locator('#chat-send').click();
@@ -45,10 +54,11 @@ test('reconnect keeps history after reload (no duplicates)', async ({ page }) =>
   ).toHaveCount(1);
 });
 
-test('mobile viewport: chat is a corner bubble that opens a sheet', async ({ page }) => {
+test('mobile viewport: board-first; chat is a corner bubble that opens a sheet', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await pair(page);
+  await pairMobile(page);
   await expect(page.locator('#chat-bubble')).toBeVisible();
+  await expect(page.locator('#board-view')).toBeVisible();
 
   // Open the sheet, send, close it before the reply streams in.
   await page.locator('#chat-bubble').click();
@@ -91,6 +101,37 @@ test('socket drop shows a degraded banner that clears on recovery', async ({ pag
   await expect(page.locator('#banners .banner')).toBeHidden({ timeout: 15_000 });
   // And chat still works after recovery.
   await sendAndWaitReply(page, 'post-drop message');
+});
+
+test.describe('board (E6, mock feed)', () => {
+  test('repo cards, lens chips, agent rail, notifications render from the mock snapshot', async ({ page }) => {
+    await pair(page);
+    await page.locator('#tab-board').click();
+    await expect(page.locator('#board-view')).toBeVisible();
+    await expect(page.locator('.board-repo', { hasText: 'demo-api' })).toBeVisible();
+    // The sample round carries all 7 lens chips.
+    await expect(page.locator('.board-lens')).toHaveCount(7);
+    // The standing crew is on the rail.
+    await expect(page.locator('#board-agents .board-agent', { hasText: 'silas' })).toBeVisible();
+    // The notification center opens with the sample feed.
+    await page.locator('#notification-bell').click();
+    await expect(page.locator('.board-notification').first()).toBeVisible();
+    await page.locator('#notification-bell').click();
+  });
+
+  test('transcript drawer: mock transcript lists, opens, searches', async ({ page }) => {
+    await pair(page);
+    await page.locator('#tab-board').click();
+    const row = page.locator('#board-transcripts .board-agent', { hasText: 'gru' }).first();
+    await expect(row).toBeVisible();
+    await row.click();
+    await expect(page.locator('#transcript-drawer')).toBeVisible();
+    await expect(page.locator('.transcript-entry__text').first()).toBeVisible();
+    await page.locator('#transcript-search').fill('secret sauce');
+    await expect(page.locator('.transcript-match').first()).toBeVisible();
+    await page.locator('#transcript-close').click();
+    await expect(page.locator('#transcript-drawer')).toBeHidden();
+  });
 });
 
 test.describe('themes', () => {

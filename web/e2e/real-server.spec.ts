@@ -55,6 +55,15 @@ async function pair(page: Page): Promise<void> {
   await expect(page.locator('#chat-view')).toBeVisible();
 }
 
+/** Pair on a phone viewport: the board is the DEFAULT view (SPEC ruling 11). */
+async function pairMobile(page: Page): Promise<void> {
+  await page.goto('/');
+  await expect(page.locator('#pairing-view')).toBeVisible();
+  await page.locator('#pair-token').fill(REAL_TOKEN);
+  await page.locator('#pair-submit').click();
+  await expect(page.locator('#board-view')).toBeVisible();
+}
+
 async function sendAndWaitReply(page: Page, text: string): Promise<void> {
   await page.locator('#chat-input').fill(text);
   await page.locator('#chat-send').click();
@@ -114,10 +123,12 @@ test('service restart drops the socket; reconnect keeps history and flushes the 
   await expect(page.locator('.msg--user', { hasText: 'typed while down' })).toHaveCount(1);
 });
 
-test('mobile viewport: corner bubble, sheet, unread badge over the real socket', async ({ page }) => {
+test('mobile viewport: board-first, corner bubble, sheet, unread badge over the real socket', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await pair(page);
+  await pairMobile(page);
   await expect(page.locator('#chat-bubble')).toBeVisible();
+  // The board (not chat) is the phone's landing view; the bubble opens chat.
+  await expect(page.locator('#board-view')).toBeVisible();
 
   // Stall the reply (double `hold:` sentinel) so deltas arrive only
   // after the sheet is closed — the badge timing is deterministic.
@@ -158,6 +169,104 @@ test('wrong token: fatal inline error, stays on pairing across reload', async ({
   await page.reload();
   await expect(page.locator('#pairing-view')).toBeVisible();
   await expect(page.locator('#chat-view')).toBeHidden();
+});
+
+test.describe('board (E6)', () => {
+  test('seeded jobs render repo-grouped with lens chips; live push updates', async ({ page }) => {
+    // Seed the ledger through the real write API.
+    const base = { authorization: `Bearer ${REAL_TOKEN}` };
+    const job = { id: 'e2e-board-job', repo: 'e2e-repo', title: 'Board e2e job', baseBranch: 'main' };
+    const created = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs`, { headers: base, data: job });
+    expect(created.status()).toBe(201);
+    const round = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/rounds`, { headers: base, data: { jobId: job.id } });
+    expect(round.status()).toBe(201);
+    const lenses = (await round.json()).lenses as { lens: string; state: string }[];
+    expect(lenses.length).toBe(7);
+
+    await pair(page);
+    await page.locator('#tab-board').click();
+    await expect(page.locator('#board-view')).toBeVisible();
+    const repoCard = page.locator('.board-repo', { hasText: 'e2e-repo' });
+    await expect(repoCard).toBeVisible();
+    await expect(repoCard.locator('.board-job', { hasText: 'Board e2e job' })).toBeVisible();
+    // All 7 lens chips render on the round.
+    await expect(repoCard.locator('.board-lens')).toHaveCount(7);
+
+    // A status transition through the API pushes a fresh snapshot live.
+    const blocked = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs/e2e-board-job/status`, { headers: base, data: { status: 'working' } });
+    expect(blocked.status()).toBe(200);
+    await expect(repoCard.locator('.board-job', { hasText: 'Board e2e job' }).locator('.pp-chip', { hasText: 'working' })).toBeVisible();
+  });
+
+  test('agent rail lists the gru session; transcripts open, search, page', async ({ page }) => {
+    await pair(page);
+    await sendAndWaitReply(page, 'board transcript probe');
+    await page.locator('#tab-board').click();
+    // The gru agent row (the live chat session) appears on the rail; its
+    // transcript (claude-code raw-frame forensics) renders the turn.
+    const gruRow = page.locator('#board-agents .board-agent', { hasText: 'gru' }).first();
+    await expect(gruRow).toBeVisible();
+    await gruRow.click();
+    const drawer = page.locator('#transcript-drawer');
+    await expect(drawer).toBeVisible();
+    await expect(
+      page.locator('.transcript-entry__text', { hasText: 'board transcript probe' }).first(),
+    ).toBeVisible();
+    await page.locator('#transcript-close').click();
+    await expect(drawer).toBeHidden();
+
+    // Seed a REAL session transcript (pi jsonl format) into the store and
+    // bind a ledger agent to it — the full surface: list → open → search.
+    const sessionsDir = `${durableHome}/sessions/gru/--e2e-transcript--a1b2c3d4`;
+    mkdirSync(sessionsDir, { recursive: true });
+    const sessionFile = `${sessionsDir}/2026-01-01T00-00-00-000Z_e2eseed.jsonl`;
+    const header = { type: 'session', id: 'e2eseed', timestamp: '2026-01-01T00:00:00.000Z', cwd: '/tmp/e2e' };
+    const userMsg = (id: string, parent: string | null, text: string) => ({
+      type: 'message', id, parentId: parent, timestamp: '2026-01-01T00:00:00.000Z',
+      message: { role: 'user', content: text, timestamp: 1000 },
+    });
+    const asstMsg = (id: string, parent: string, text: string) => ({
+      type: 'message', id, parentId: parent, timestamp: '2026-01-01T00:00:00.000Z',
+      message: {
+        role: 'assistant', content: [{ type: 'text', text }], api: 'demo', provider: 'demo', model: 'demo',
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: 'stop', timestamp: 2000,
+      },
+    });
+    writeFileSync(
+      sessionFile,
+      [header, userMsg('m1', null, 'plan the launch'), asstMsg('m2', 'm1', 'on it, boss'), userMsg('m3', 'm2', 'find the secret sauce'), asstMsg('m4', 'm3', 'tracked on the board')]
+        .map((entry) => JSON.stringify(entry))
+        .join('\n') + '\n',
+    );
+    const headers = { authorization: `Bearer ${REAL_TOKEN}` };
+    const agent = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/agents`, {
+      headers,
+      data: { id: 'e2e-seed-agent', role: 'gru', label: 'seeded transcript', sessionFile },
+    });
+    expect(agent.status()).toBe(201);
+
+    // The seeded transcript appears in the transcripts list; open it.
+    const seedRow = page.locator('#board-transcripts .board-agent', { hasText: 'seeded transcript' });
+    await expect(seedRow).toBeVisible();
+    await seedRow.click();
+    await expect(drawer).toBeVisible();
+    await expect(page.locator('.transcript-entry__text', { hasText: 'plan the launch' }).first()).toBeVisible();
+    // Search narrows with a snippet match.
+    await page.locator('#transcript-search').fill('secret sauce');
+    await expect(page.locator('.transcript-match', { hasText: 'secret sauce' }).first()).toBeVisible();
+    await page.locator('#transcript-close').click();
+    await expect(drawer).toBeHidden();
+  });
+
+  test('unauthenticated board API is a locked door', async ({ page }) => {
+    const res = await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`);
+    expect(res.status()).toBe(401);
+    const bad = await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, {
+      headers: { authorization: 'Bearer nope' },
+    });
+    expect(bad.status()).toBe(401);
+  });
 });
 
 test.describe('themes', () => {

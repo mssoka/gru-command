@@ -182,3 +182,47 @@ describe('static root inside the real service', () => {
     }
   });
 });
+
+
+describe('createService requestHook (E6 board claim)', () => {
+  it('a hook claiming a path wins over static + 404; unclaimed paths fall through', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-e6-hook-'));
+    cleanupDirs.push(home);
+    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const dist = join(home, 'dist');
+    mkdirSync(dist, { recursive: true });
+    writeFileSync(join(dist, 'index.html'), '<html>static</html>\n', 'utf-8');
+    const hooksClaimed: string[] = [];
+    const service = createService(
+      config,
+      loadOrCreateIdentity(config.dataDir),
+      () => {},
+      () => null,
+      {
+        staticRoot: createStaticRoot(dist),
+        requestHook: (req, res, path) => {
+          if (!path.startsWith('/api/')) return false;
+          hooksClaimed.push(path);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('{"hook":true}\n');
+          return true;
+        },
+      },
+    );
+    const handle = await service.start();
+    const port = handle.port;
+    // Hook claims /api/* — even over an existing static file match.
+    const claimed = await fetch(`http://127.0.0.1:${port}/api/board`);
+    expect(claimed.status).toBe(200);
+    expect(await claimed.json()).toEqual({ hook: true });
+    // Static still serves everything else.
+    const root = await fetch(`http://127.0.0.1:${port}/`);
+    expect(root.status).toBe(200);
+    expect(await root.text()).toContain('static');
+    // Unknown non-API paths keep the 404.
+    const missing = await fetch(`http://127.0.0.1:${port}/nope`);
+    expect(missing.status).toBe(404);
+    await handle.stop();
+  });
+});

@@ -1,7 +1,7 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
+import { hashToken, tokenConfigured as isTokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, RuntimeEvent } from '../runtime/types.js';
@@ -37,6 +37,11 @@ export interface ChatServerOptions {
   readonly heartbeatMs?: number;
   /** ws payload cap — the client caps messages at 4 000 chars; 64 KiB is generous. */
   readonly maxPayloadBytes?: number;
+  /** Upgrade paths owned by SIBLING ws surfaces (the board's /board/ws,
+   * E6): the chat handler passes them instead of destroying, so sibling
+   * handlers can claim them. Unlisted non-/ws paths still die (standalone
+   * behavior unchanged). */
+  readonly siblingUpgradePaths?: readonly string[];
 }
 
 export interface ChatServer {
@@ -75,8 +80,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   const frameLog = options.frameLog;
   const authDeadlineMs = options.authDeadlineMs ?? 5_000;
   const heartbeatMs = options.heartbeatMs ?? 30_000;
+  const siblingUpgradePaths = new Set(options.siblingUpgradePaths ?? []);
   const tokenHash = hashToken(options.config.auth.token);
-  const tokenConfigured = options.config.auth.token !== '';
+  const tokenConfigured = isTokenConfigured(options.config.auth.token);
 
   const wss = new WebSocketServer({
     noServer: true,
@@ -380,7 +386,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       socket.close();
       return;
     }
-    if (!timingSafeEqual(hashToken(frame.token), tokenHash)) {
+    if (!tokenMatches(frame.token, tokenHash)) {
       log('warn', 'chat auth rejected: bad token', {});
       send(client, ephemeralError('unauthorized: bad token', true));
       socket.close();
@@ -480,7 +486,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
           return;
         }
         if (path !== WS_PATH) {
-          socket.destroy();
+          // Not ours: a declared sibling surface (the board's /board/ws,
+          // E6) may claim this upgrade — pass it. Anything else is still
+          // destroyed (stray upgrades never linger on a chat-only server).
+          if (!siblingUpgradePaths.has(path)) socket.destroy();
           return;
         }
         wss.handleUpgrade(request, socket, head, (ws) => {
@@ -525,9 +534,4 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       handle = null;
     },
   };
-}
-
-/** Length-agnostic constant-time compare: hash both sides first. */
-function hashToken(token: string): Buffer {
-  return createHash('sha256').update(token, 'utf-8').digest();
 }

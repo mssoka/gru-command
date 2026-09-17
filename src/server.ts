@@ -183,6 +183,10 @@ export interface ServiceOptions {
   /** Production static root (built web UI). When omitted, unknown paths
    * keep the JSON 404 — the pre-E4 behavior. */
   readonly staticRoot?: StaticRoot;
+  /** First claim hook after /health, before static (E6: the board's
+   * /api/* routes). Returning true means the request was handled — the
+   * service skips static + 404 and does not log it (the hook owns that). */
+  readonly requestHook?: (req: IncomingMessage, res: import('node:http').ServerResponse, path: string) => boolean;
 }
 
 export function createService(
@@ -240,13 +244,20 @@ export function createService(
           return { status: 200 };
         }
         req.resume();
+        if (
+          options.requestHook !== undefined &&
+          options.requestHook(req, res, path)
+        ) {
+          return null; // claimed by the hook (board /api/*) — its logs stand
+        }
         if (options.staticRoot !== undefined && options.staticRoot.serve(req, res, path)) {
           return { status: 200 };
         }
         jsonBody(res, 404, { error: 'not_found', path });
         return { status: 404 };
       })()
-        .then((outcome: { status: number }) => {
+        .then((outcome: { status: number } | null) => {
+          if (outcome === null) return; // hook-owned request, hook-owned logs
           onEvent('info', 'request', {
             method: req.method,
             path,
