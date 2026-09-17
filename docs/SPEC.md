@@ -68,6 +68,18 @@ integrated. Other users can install it on their laptops from GitHub.
     for a runtime that validates models; adapters that cannot set
     thinking declare the capability gap (fallback: warn + proceed).
 
+17. **bmad/skills live in EACH PROJECT REPO — never at the workspace
+    root.** Every managed repo carries its own `.agents/skills` +
+    `_bmad` folders; the workspace root holds ORCHESTRATION ONLY
+    (extends ruling 8's hygiene canon). Skills discovery follows the
+    PROJECT cwd: the dispatch flow roots minions in the repo they
+    serve, and they find that repo's bmad natively — spawn options
+    carry the repo root. The global agent-dir keeps generic skills
+    unchanged. Per-project `bmad-customize` overrides become possible
+    per repo. This supersedes any workspace-root skills-discovery
+    assumption in the dispatch flow (E8+): the pi-adapter's dispatch
+    cwd is the PROJECT root, never the workspace root.
+
 ## Sources
 
 Approved via structured review rounds (product brief, architecture rev 2,
