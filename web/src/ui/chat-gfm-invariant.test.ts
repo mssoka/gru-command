@@ -186,4 +186,75 @@ describe('raw-markdown invariant gate (issue #10)', () => {
     expect(log.querySelector('pre')).toBeNull();
     expect(log.querySelector('.msg__body')).toBeNull();
   });
+
+  it('a mid-turn socket drop marks the stream incomplete with no raw pipes/fences; recovery replays clean', () => {
+    // Perkins r1 blocker 7: markStreamIncomplete (the ruling-3 surface — a
+    // dropped socket mid-turn must never expose raw markdown, and the
+    // connection-lost state must be legible). Modeled on the real wiring:
+    // main.ts calls markStreamIncomplete() on disconnect; a full replay
+    // (fresh reconnect) calls reset() then re-delivers every frame.
+    const view = new ChatView(() => {});
+    view.reset();
+    view.addFrame(turn('start'), true);
+    // Stream the reply plus a partial fence marker still growing when the
+    // socket drops: ...stable.\n``  — the `` is held mid-stream.
+    const dropped = REPLY + '\n' + '``';
+    for (let i = 0; i < dropped.length; i += 7) {
+      view.addFrame(delta(dropped.slice(i, i + 7)), true);
+    }
+    const log = document.getElementById('chat-log') as HTMLElement;
+    let text = allText(log);
+    expect(text, 'pre-drop: no raw pipes').not.toContain('|');
+    expect(text, 'pre-drop: no raw fences').not.toContain('```');
+    expect(text, 'pre-drop: partial marker held').not.toContain('``');
+
+    view.markStreamIncomplete();
+
+    const gru = log.querySelector('.msg--gru') as HTMLElement;
+    expect(gru.classList.contains('msg--streaming')).toBe(false);
+    expect(gru.querySelector('.msg__meta')?.textContent).toMatch(/connection lost/i);
+    text = allText(log);
+    expect(text, 'at drop: no raw pipes').not.toContain('|');
+    expect(text, 'at drop: no raw fences').not.toContain('```');
+    expect(text, 'at drop: the text-so-far is final — held fragment materializes as literal text')
+      .toContain('``');
+    expect(gru.querySelector('table.md-table'), 'table intact at drop').not.toBeNull();
+    expect(gru.querySelector('pre.md-code'), 'code block intact at drop').not.toBeNull();
+
+    // Recovery — full replay on reconnect: reset() + re-delivered frames.
+    view.reset();
+    view.addFrame(turn('start'), false);
+    view.addFrame(delta(REPLY), false);
+    view.addFrame(turn('end'), false);
+    expect(log.querySelectorAll('.msg--gru'), 'one clean recovered bubble').toHaveLength(1);
+    const recovered = allText(log);
+    expect(recovered).not.toContain('|');
+    expect(recovered).not.toContain('```');
+    expect(recovered).not.toContain('``');
+    expect(recovered).not.toContain('connection lost');
+    expect(log.querySelector('table.md-table')).not.toBeNull();
+    expect(log.querySelector('pre.md-code')).not.toBeNull();
+  });
+
+  it('a held streaming fragment resolves at turn end (the final render is load-bearing)', () => {
+    // Perkins r1 blocker 8: closeStream's non-streaming final render was
+    // unpinned — deleting it kept every earlier DOM test green. This test
+    // fails if that render goes away: the held fragment must materialize
+    // (as literal text per GFM, never as an empty fence) once the turn ends.
+    const view = new ChatView(() => {});
+    view.reset();
+    view.addFrame(turn('start'), true);
+    view.addFrame(delta('status: ok\n``'), true);
+    const log = document.getElementById('chat-log') as HTMLElement;
+    let text = allText(log);
+    expect(text).toContain('status: ok');
+    expect(text, 'mid-stream: partial marker is held').not.toContain('``');
+
+    view.addFrame(turn('end'), true);
+
+    text = allText(log);
+    expect(text, 'turn end: held fragment materializes as literal text').toContain('``');
+    expect(log.querySelector('pre'), 'a lone `` is text, not a fence').toBeNull();
+    expect(log.querySelector('.msg--gru')?.classList.contains('msg--streaming')).toBe(false);
+  });
 });
