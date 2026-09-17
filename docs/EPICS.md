@@ -80,6 +80,9 @@ gate fails-before-fix where applicable.
 3. Review waves (Perkins): multi-lens agent fleet, per-lens chips,
    verdict records into the ledger.
 4. Tests: end-to-end dispatch on a fixture repo; wave lifecycle.
+   Ruling-17 behaviors: dispatch cwd = project root (all runtimes);
+   per-repo skills discovery inside worktrees via the bootstrap
+   manifest.
 
 ## E9 — Installer, wizard & docs
 1. GitHub one-line installer + setup wizard (runtimes detect, repos

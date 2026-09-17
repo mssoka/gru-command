@@ -33,7 +33,7 @@ const PINS: Record<string, number> = {
   'smoke-real-model.test.ts': 1,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 11,
-  'suite-shape.test.ts': 1,
+  'spec-rulings-drift.test.ts': 4, 'suite-shape.test.ts': 1,
   'transcripts.test.ts': 13,
 };
 

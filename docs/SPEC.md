@@ -9,7 +9,7 @@ heist board, per-agent transcripts, notifications). The browser is the
 only required window. No terminal multiplexer anywhere — herdr is not
 integrated. Other users can install it on their laptops from GitHub.
 
-## Locked rulings (all user, 2026-09-15/16)
+## Locked rulings (all user, 2026-09-15/17)
 
 1. **Single Gru.** One chat brain, no clones. The UI is a window, never a
    second brain. Single-writer rule enforced by design.
@@ -68,8 +68,47 @@ integrated. Other users can install it on their laptops from GitHub.
     for a runtime that validates models; adapters that cannot set
     thinking declare the capability gap (fallback: warn + proceed).
 
+17. **Per-project bmad/skills (`.agents/skills` + `_bmad` folders) —
+    never at the workspace root.** Every managed repo carries its own
+    `.agents/skills` + `_bmad` folders; the workspace root carries
+    neither (it holds managed repos only — rulings 6/8). The setup
+    wizard scaffolds the folders when missing, or warns-and-proceeds
+    for repos that opt out. Skills discovery follows the PROJECT cwd:
+    the dispatch flow roots minions in the repo they serve, and they
+    find that repo's bmad natively — spawn options carry the repo
+    root. The global agent-dir keeps generic skills unchanged; a
+    project-local skill of the same name shadows the global one.
+    Per-project `bmad-customize` overrides become possible per repo.
+    Fresh worktrees check out tracked files only; discovery inside a
+    worktree resolves via the worktree manager's bootstrap manifest
+    (ruling 18: symlinks/copies), or the folders are tracked by the
+    repo — discovery never falls back to the workspace root. The chat
+    Gru (spawned at the workspace root) discovers the global agent-dir
+    only, by design. This supersedes any workspace-root
+    skills-discovery assumption in the dispatch flow (E8+): all
+    runtime adapters' dispatch cwd is the PROJECT root, never the
+    workspace root.
+
+18. **Worktree manager:** the product's dispatch flow manages worktrees
+    as a first-class subsystem. (a) **Bootstrap manifest** — each
+    project repo declares its fresh-worktree needs in-repo at
+    `<repo>/.gru-command/worktree.toml` (symlinks, files-to-copy,
+    one-time setup commands), auto-applied at creation; the file
+    travels with the repo (extends ruling 17). (b) **Registry** — the
+    ledger is the authoritative map job → worktree → branch → panes →
+    spawned processes; creation at a freshly-resolved sha; sweeps match
+    registry paths only, never id-proximity or labels. (c)
+    **Preserve-first ordered sweep** — untracked deliverables preserved
+    first; processes rooted in the tree enumerated BEFORE removal; any
+    live process PAUSES the sweep and ASKS (fail-loud, never a silent
+    kill); then worktree removal + containment-verified branch delete.
+    (d) **Detached-for-reviews, branch-for-jobs** — review rounds run
+    detached worktrees; job minions run branches. (e) **Concurrency** —
+    same-repo worktree creation is sequential; released work
+    re-resolves the fresh head at release.
+
 ## Sources
 
 Approved via structured review rounds (product brief, architecture rev 2,
-and review amendments), 2026-09-15/16. Provenance records live outside
+and review amendments), 2026-09-15/17. Provenance records live outside
 this repo.
