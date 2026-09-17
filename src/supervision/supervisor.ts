@@ -201,6 +201,24 @@ export class Supervisor {
       // A restart rung owns the respawn; wait for it by polling the slot.
       return await this.waitForSlotHandle(slot);
     }
+    if (existing !== null && existing.breakerOpen) {
+      // A caller-driven action (a chat message) is human intent: re-arm
+      // the stopped agent rather than serving it unsupervised.
+      existing.breakerOpen = false;
+      existing.breakerNotificationId = null;
+      existing.restartRing = [];
+      existing.consecutiveFailures = 0;
+      existing.state = 'watching';
+      this.log('info', 'breaker re-armed by slot use — resuming supervision', {
+        agent_id: existing.agentId,
+        slot: slot.id,
+      });
+      this.ledger.appendCustomEvent({
+        kind: 'supervision.rearmed',
+        agentId: existing.agentId,
+        payload: { by: 'slot-use', slot: slot.id },
+      });
+    }
     const handle = await slot.spawn(options);
     this.adopt(handle, slot, options?.resumeFile ?? null);
     return handle;
@@ -246,7 +264,10 @@ export class Supervisor {
         if (agent === undefined) return;
         agent.handle = null;
         agent.openTurn = false;
-        if (agent.slot === null && !agent.inRestart) {
+        // A breaker-STOPPED agent keeps its record: the escalation names
+        // it and the ack must find it to re-arm (deleting here would strand
+        // the stopped agent — same reasoning as inRestart stickiness).
+        if (agent.slot === null && !agent.inRestart && !agent.breakerOpen) {
           this.agents.delete(envelope.agentId); // owner-disposed minion: stop watching
         }
         return;
@@ -389,12 +410,33 @@ export class Supervisor {
   // ------------------------------------------------------------------
 
   /** One restart rung. Single-flight per agent: a later trigger while a
-   * rung is executing is absorbed (the rung's spawn IS the recovery). */
+   * rung is executing is absorbed (the rung's spawn IS the recovery).
+   * Supervision NEVER takes the service down: any internal throw is
+   * caught, logged, and the rung settles. */
   private async restartRung(agentRef: SupervisedAgent, reason: string): Promise<void> {
-    let agent = agentRef;
+    const agent = agentRef;
     if (this.disposed || agent.inRestart || agent.breakerOpen) return;
     agent.inRestart = true;
     agent.state = 'restarting';
+    try {
+      await this.restartRungInner(agent, reason);
+    } catch (error) {
+      // A supervision bug or ledger hiccup must never kill the service
+      // (unhandled rejections are fatal in main). Settle the rung.
+      agent.state = agent.breakerOpen ? 'stopped' : 'watching';
+      this.log('error', 'restart rung threw — settling', {
+        agent_id: agent.agentId,
+        reason,
+        error: String(error),
+      });
+    } finally {
+      agent.inRestart = agent.backoffTimer !== null;
+      if (agent.state === 'restarting' && agent.backoffTimer === null) agent.state = 'watching';
+    }
+  }
+
+  private async restartRungInner(agentRef: SupervisedAgent, reason: string): Promise<void> {
+    let agent = agentRef;
     try {
       const windowStart = this.now() - this.cfg.restartWindowMs;
       agent.restartRing = agent.restartRing.filter((ts) => ts >= windowStart);
@@ -494,8 +536,7 @@ export class Supervisor {
         return;
       }
     } finally {
-      agent.inRestart = agent.backoffTimer !== null;
-      if (agent.state === 'restarting' && agent.backoffTimer === null) agent.state = 'watching';
+      // (the outer restartRung owns inRestart/state settlement)
     }
   }
 

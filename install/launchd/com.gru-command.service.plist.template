@@ -21,7 +21,7 @@
     <key>GRU_COMMAND_HOME</key>
     <string>{{GRU_COMMAND_HOME}}</string>
     <key>PATH</key>
-    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <string>{{PATH}}</string>
   </dict>
 
   <key>RunAtLoad</key>

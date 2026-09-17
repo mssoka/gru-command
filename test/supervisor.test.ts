@@ -386,6 +386,75 @@ describe('supervisor — watchdog + restart ladder', () => {
   });
 });
 
+describe('supervisor — hang-loop breaker flavor (successful restarts that keep dying)', () => {
+  it('the stopped record SURVIVES the trip dispose; the ack re-arms and resumes', async () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const center = new NotificationCenter({ ledger: api, bus });
+    const registry = new FakeRegistry();
+    let nowMs = 3_000_000;
+    // Every respawn SUCCEEDS — and hangs again immediately (the crash
+    // loop is behavioral, not spawn failures).
+    registry.spawnImpl = async (role, options) => {
+      const handle = new FakeHandle(
+        role,
+        `loop-${registry.handlesById.size + 1}`,
+        options?.resumeFile ?? null,
+      );
+      handle.setState('streaming'); // hangs from birth; the tick's health probe sees it
+      return handle;
+    };
+    const supervisor = new Supervisor({
+      config: {
+        enabled: true,
+        turnSilenceMs: 30,
+        restartWindowMs: 600_000,
+        maxRestarts: 3,
+        restartBackoffMs: 1,
+      },
+      registry,
+      ledger: api,
+      notifications: center,
+      tickMs: 5,
+      now: () => nowMs,
+    });
+    supervisor.start();
+    // Seed a session file so the loop agent has a resume target.
+    const sessionFile = join(tmpDir(), 'loop.jsonl');
+    mkdirSync(join(sessionFile, '..'), { recursive: true });
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const first = new FakeHandle('minion', 'loop-first', sessionFile);
+    registry.adopt(first);
+    hang(first);
+    // Rung 1..3: each respawn hangs again (silence 40 > 30); rung 4 trips.
+    for (let round = 0; round < 6; round += 1) {
+      nowMs += 40;
+      await sleep(30);
+    }
+    const escalation = api
+      .listNotifications({ limit: 50 })
+      .find((n) => n.kind === 'supervision.breaker');
+    expect(escalation).toBeDefined();
+    // The STOPPED record (under the carried-over session id) SURVIVED the
+    // trip dispose — breaker-open stickiness keeps it for the ack re-arm.
+    const view = supervisor.viewFor(escalation!.agentId ?? '');
+    expect(view).not.toBeNull();
+    expect(view?.state).toBe('stopped');
+    expect(view?.breakerOpen).toBe(true);
+    // ...and the ack re-arms with a successful resume.
+    registry.spawnImpl = async (role, options) =>
+      new FakeHandle(role, 'loop-recovered', options?.resumeFile ?? null);
+    supervisor.onNotificationAcked(escalation!.id);
+    await sleep(50);
+    expect(supervisor.viewFor('loop-recovered')?.state).toBe('watching');
+    expect(supervisor.viewFor('loop-recovered')?.breakerOpen).toBe(false);
+    supervisor.dispose();
+    db.close();
+  });
+});
+
 describe('supervisor — declared slots (the Gru chat session shape)', () => {
   it('ensure returns the live handle; a supervisor restart swaps it and fires onSwap', async () => {
     const h = boot();

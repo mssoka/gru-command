@@ -66,15 +66,27 @@ fi
 render_unit() {
   local template="$1"
   local node="$2" repo="$3" home="$4"
+  # Reject the one character that would corrupt sed rendering.
+  for value in "$node" "$repo" "$home"; do
+    if [[ "$value" == *'|'* ]]; then
+      err "path contains '|' which the unit renderer cannot escape: $value"
+      exit 1
+    fi
+  done
   # systemd ExecStart quotes args containing spaces; launchd needs none.
   local node_arg="$node" repo_arg="$repo"
   if [[ "$template" == *.service.template ]]; then
     [[ "$node_arg" == *" "* ]] && node_arg="\"$node_arg\""
     [[ "$repo_arg" == *" "* ]] && repo_arg="\"$repo_arg\""
   fi
+  # The launchd unit carries the INSTALL-TIME PATH so runtime CLIs the
+  # adapters spawn (resolved via PATH, possibly under a version manager
+  # like fnm/nvm) stay findable outside any shell.
+  local path_value="$PATH:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
   sed -e "s|{{NODE}}|$node_arg|g" \
       -e "s|{{REPO_ROOT}}|$repo_arg|g" \
-      -e "s|{{GRU_COMMAND_HOME}}|$home|g" "$template"
+      -e "s|{{GRU_COMMAND_HOME}}|$home|g" \
+      -e "s|{{PATH}}|$path_value|g" "$template"
 }
 
 verify_unit() {

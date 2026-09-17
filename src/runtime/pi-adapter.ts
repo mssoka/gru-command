@@ -434,12 +434,13 @@ export class PiAgentHandle implements AgentHandle {
         reject,
         timer: null,
       };
-      // Opt-in queued-wait cap (E7): reject THIS caller only — the queue
-      // and the live turn are untouched.
+      // Opt-in queued-wait cap (E7): reject THIS caller only — and ONLY
+      // while it is still held (never after delivery has started).
       if (timeoutMs !== undefined) {
         item.timer = setTimeout(() => {
           const at = this.queue.indexOf(item);
-          if (at !== -1) this.queue.splice(at, 1);
+          if (at === -1) return; // already delivering — let it settle
+          this.queue.splice(at, 1);
           reject(
             new Error(`queued wait timed out after ${timeoutMs}ms (turn never went idle)`),
           );

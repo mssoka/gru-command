@@ -37,6 +37,7 @@ describe('install.sh --print rendering', () => {
     expect(stdout).not.toContain('{{NODE}}');
     expect(stdout).not.toContain('{{REPO_ROOT}}');
     expect(stdout).not.toContain('{{GRU_COMMAND_HOME}}');
+    expect(stdout).not.toContain('{{PATH}}');
     // The node path is absolute and stable (resolved through any
     // version-manager symlink — no ephemeral multishell path).
     expect(stdout).toMatch(/\/(dist\/main\.js|node)/);

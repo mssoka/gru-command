@@ -129,11 +129,15 @@ class FallbackHandle implements AgentHandle {
           reject,
           timer: null,
         };
-        // Opt-in queued-wait cap (E7): reject THIS caller only.
+        // Opt-in queued-wait cap (E7): reject THIS caller only — and
+        // ONLY while it is still held (a caller whose delivery already
+        // started must never be told it timed out while the message is
+        // in fact delivering).
         if (options.timeoutMs !== undefined) {
           item.timer = setTimeout(() => {
             const at = this.queue.indexOf(item);
-            if (at !== -1) this.queue.splice(at, 1);
+            if (at === -1) return; // already delivering — let it settle
+            this.queue.splice(at, 1);
             reject(
               new Error(
                 `queued wait timed out after ${options.timeoutMs}ms (turn never went idle)`,

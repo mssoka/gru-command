@@ -298,9 +298,10 @@ export class BoardView {
 
   private notificationsInitialized = false;
 
-  /** One display receipt per (id, surface) — receipts never spam. */
+  /** One display receipt per (id, surface) — receipts never spam. The
+   * server upgrades shown_at per surface, so a toast receipt never
+   * suppresses a later panel receipt. */
   private sendShown(notification: NotificationView, surface: string): void {
-    if (notification.shownAt !== null) return; // already proven displayed
     let surfaces = this.sentShown.get(notification.id);
     if (surfaces === undefined) {
       surfaces = new Set<string>();

@@ -94,6 +94,10 @@ Notification API (permission requested at pairing; toasts carry the load
 when denied), the board bell panel, and chat notices for
 action-required items.
 
+The log is append-only by design (the record of what was escalated and
+when). Retention/pruning of very old notification rows is a known
+follow-up — at chat-scale volumes the table stays trivial for years.
+
 ## OS service install
 
 ```bash

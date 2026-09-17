@@ -357,8 +357,13 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           if (suffix === '/shown') {
             // Display receipt (the shown:true doctrine): one per surface,
             // idempotent server-side; the client sends each (id, surface)
-            // once.
-            const row = notifications.markShown(id, strField(body, 'surface'));
+            // once. A surface id is comma-free (shownBy packs a list).
+            const surface = strField(body, 'surface');
+            if (surface.includes(',')) {
+              json(res, 400, { error: 'bad_request', detail: 'surface must not contain commas' });
+              return;
+            }
+            const row = notifications.markShown(id, surface);
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;
