@@ -139,6 +139,8 @@ test('mobile viewport: corner bubble, sheet, unread badge over the real socket',
 test('wrong token: fatal inline error, stays on pairing across reload', async ({ page }) => {
   await page.goto('/');
   await expect(page.locator('#pairing-view')).toBeVisible();
+  // The field starts EMPTY everywhere — no mock-token prefill to un-guess.
+  await expect(page.locator('#pair-token')).toHaveValue('');
   await page.locator('#pair-token').fill('definitely-wrong');
   await page.locator('#pair-submit').click();
   await expect(page.locator('#pair-error')).toBeVisible();
