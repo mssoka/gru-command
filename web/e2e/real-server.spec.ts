@@ -25,22 +25,26 @@ const REAL_TOKEN = process.env.REAL_SERVICE_TOKEN ?? 'e2e-real-pairing-token';
 const REAL_PORT = Number(process.env.REAL_SERVICE_PORT ?? 7790);
 
 let service: RealServiceHandle | null = null;
+// Durable dirs owned by THIS file: captured at boot so afterAll can
+// always clean up, even when a restart fails mid-test (service null).
+let durableHome = '';
+let durableWorkspace = '';
 
 test.beforeAll(async () => {
   // keepHome: the home/workspace must survive stop() so the restart test
   // can reboot on the same durable state; afterAll removes them.
   service = await startRealService({ port: REAL_PORT, token: REAL_TOKEN, keepHome: true });
+  durableHome = service.home;
+  durableWorkspace = service.workspace;
 });
 
 test.afterAll(async () => {
-  if (service !== null) {
-    const home = service.home;
-    const workspace = service.workspace;
-    await service.stop();
-    rmSync(home, { recursive: true, force: true });
-    rmSync(workspace, { recursive: true, force: true });
-    service = null;
-  }
+  await service?.stop();
+  service = null;
+  rmSync(durableHome, { recursive: true, force: true });
+  rmSync(durableWorkspace, { recursive: true, force: true });
+  durableHome = '';
+  durableWorkspace = '';
 });
 
 async function pair(page: Page): Promise<void> {
@@ -84,8 +88,6 @@ test('service restart drops the socket; reconnect keeps history and flushes the 
 
   // Stop the real service: every client socket is closed (1001), the
   // client banners, and a typed word queues locally instead of being lost.
-  const home = service!.home;
-  const workspace = service!.workspace;
   await service!.stop();
   service = null;
 
@@ -98,9 +100,16 @@ test('service restart drops the socket; reconnect keeps history and flushes the 
   // in the home dir): the client re-auths from its high-water mark,
   // replays nothing it already saw, flushes the outbox, and the reply
   // streams. History reads exactly once throughout.
-  service = await startRealService({ port: REAL_PORT, token: REAL_TOKEN, home, workspace });
+  service = await startRealService({
+    port: REAL_PORT,
+    token: REAL_TOKEN,
+    home: durableHome,
+    workspace: durableWorkspace,
+  });
   await expect(page.locator('#banners .banner')).toBeHidden({ timeout: 15_000 });
-  await expect(page.locator('.msg--gru', { hasText: 'echo: typed while down' })).toBeVisible();
+  const flushedReply = page.locator('.msg--gru', { hasText: 'echo: typed while down' });
+  await expect(flushedReply).toBeVisible();
+  await expect(flushedReply).toHaveCount(1);
   await expect(page.locator('.msg--user', { hasText: 'before the restart' })).toHaveCount(1);
   await expect(page.locator('.msg--user', { hasText: 'typed while down' })).toHaveCount(1);
 });

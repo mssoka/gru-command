@@ -12,7 +12,7 @@
  *
  * Two entry points:
  *   import { startRealService } from './helpers/real-service.mjs'
- *   node test/helpers/real-service.mjs            (playwright webServer)
+ *   node test/helpers/real-service.mjs            (manual/standalone boot)
  * CLI knobs: REAL_SERVICE_PORT, REAL_SERVICE_TOKEN (defaults shared with
  * web/playwright.config.ts and web/e2e/real-server.spec.ts).
  */
@@ -49,13 +49,16 @@ function failLoud(message) {
   throw new Error(message);
 }
 
-/** Resolves true once /health answers 2xx (never throws). */
+/** Resolves true once /health answers 2xx (never throws; 1s cap so a
+ *  hung response can never stall the boot loop past its deadline). */
 function healthOk(baseUrl) {
   return new Promise((resolveCheck) => {
-    httpGet(`${baseUrl}/health`, (res) => {
+    const request = httpGet(`${baseUrl}/health`, (res) => {
       res.resume();
       resolveCheck(res.statusCode !== undefined && res.statusCode >= 200 && res.statusCode < 300);
-    }).on('error', () => resolveCheck(false));
+    });
+    request.on('error', () => resolveCheck(false));
+    request.setTimeout(1_000, () => request.destroy(new Error('health check timeout')));
   });
 }
 

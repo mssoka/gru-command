@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 
-/** The mock's default token (web/mock/server.ts; GRU_MOCK_TOKEN). */
-const MOCK_TOKEN = process.env.GRU_MOCK_E2E_TOKEN ?? 'dev-token';
+/** The mock's token — same env knob the mock itself reads (GRU_MOCK_TOKEN, default 'dev-token'). */
+const MOCK_TOKEN = process.env.GRU_MOCK_TOKEN ?? 'dev-token';
 
 /**
  * Smoke: pair → chat → streamed reply → reconnect keeps history,
