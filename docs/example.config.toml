@@ -6,11 +6,11 @@ workspace_root = "~/code"          # where your managed repos live (e.g. repos n
 data_dir = "~/.gru-command"        # per-instance state; never inside workspace_root
 
 [server]
-host = "127.0.0.1"                 # v1 default is local-only; LAN + pairing arrive later
+host = "127.0.0.1"                 # bind your LAN address to pair a phone; LAN only (no TLS in v1)
 port = 7665
 
 [auth]
-token = "replace-with-a-random-string"
+token = "replace-with-a-random-string"   # required for the /ws chat socket (empty = chat rejects all)
 
 [runtimes]
 default = "pi"                     # "pi" | "claude-code"

@@ -1,10 +1,16 @@
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Role } from './config.js';
 
 /**
  * Product-native role definitions (SPEC ruling 15): roles are prompt +
- * tool set + cwd, runtime-agnostic. Full personas, skill mappings, and
- * permissions arrive with E8; these are the minimal definitions the
- * runtime layer needs to host a session per role.
+ * tool set + cwd, runtime-agnostic. The Gru persona — the role users
+ * actually talk to — lives in `roles/gru.md` (E4): the file is the
+ * source of truth, loaded here at module load (fail-loud when missing).
+ * Full personas, skill mappings, and permissions for the remaining roles
+ * arrive with E8; these are the minimal definitions the runtime layer
+ * needs to host a session per role.
  */
 
 export interface RoleDefinition {
@@ -17,6 +23,27 @@ export interface RoleDefinition {
   readonly cwd: 'workspace_root';
 }
 
+/** `<package>/roles/gru.md` — src/ and dist/ both sit one level below the
+ * package root, so one relative path serves dev and built layouts. */
+const GRU_PROMPT_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'roles', 'gru.md');
+
+function loadGruSystemPrompt(): string {
+  let text: string;
+  try {
+    text = readFileSync(GRU_PROMPT_FILE, 'utf-8');
+  } catch (error) {
+    throw new Error(
+      `gru role prompt ${GRU_PROMPT_FILE} is unreadable (${String(error)}); ` +
+        'the product ships roles/gru.md — restore it before hosting a gru session',
+    );
+  }
+  const trimmed = text.trim();
+  if (trimmed === '') {
+    throw new Error(`gru role prompt ${GRU_PROMPT_FILE} is empty — the role needs its persona`);
+  }
+  return trimmed;
+}
+
 const PRODUCT_CONTEXT = [
   'You are an agent hosted by a standalone multi-agent orchestrator service.',
   'The service exposes a web front-end; the browser is the only required window.',
@@ -26,10 +53,7 @@ const PRODUCT_CONTEXT = [
 export const ROLE_DEFINITIONS: Readonly<Record<Role, RoleDefinition>> = {
   gru: {
     role: 'gru',
-    systemPrompt:
-      `${PRODUCT_CONTEXT}\nYou are the single chief agent: the one chat brain users talk to. ` +
-      'You consult before dispatching work, plan before acting, and escalate genuine blockers. ' +
-      'There is exactly one of you — never fork the conversation brain.',
+    systemPrompt: loadGruSystemPrompt(),
     tools: ['read', 'bash', 'grep', 'find', 'ls'],
     cwd: 'workspace_root',
   },

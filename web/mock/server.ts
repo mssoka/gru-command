@@ -145,7 +145,14 @@ server.on('connection', (socket) => {
   socket.on('message', (data) => {
     const frame = parseClientFrame(String(data));
     if (frame === null) {
-      sendError(socket, 'malformed frame', false);
+      // Matches the ruled real-server behavior (r1 W1): an UNAUTHENTICATED
+      // socket never writes durable history — the pre-auth notice is
+      // ephemeral; only authenticated sockets log protocol errors.
+      if (authed) {
+        sendError(socket, 'malformed frame', false);
+      } else {
+        socket.send(JSON.stringify({ type: 'error', message: 'malformed frame' }));
+      }
       return;
     }
 

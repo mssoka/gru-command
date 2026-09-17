@@ -1,9 +1,14 @@
+import { join } from 'node:path';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
 import { RuntimeRegistry } from './runtime/registry.js';
 import { SessionStore } from './sessions/store.js';
 import { createService, type ServiceHandle } from './server.js';
+import { ChatFrameLog } from './chat/frame-log.js';
+import { createChatServer, type ChatServer } from './chat/server.js';
+import { GruSessionPointer } from './chat/session-state.js';
+import { createStaticRoot, defaultStaticRoot } from './static.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
 async function main(): Promise<number> {
@@ -57,7 +62,12 @@ async function main(): Promise<number> {
     process.exit(1);
   });
 
-  const state: { handle?: ServiceHandle; registry?: RuntimeRegistry; store?: SessionStore } = {};
+  const state: {
+    handle?: ServiceHandle;
+    registry?: RuntimeRegistry;
+    store?: SessionStore;
+    chat?: ChatServer;
+  } = {};
   let shuttingDown = false;
   const shutdown = (signal: string) => {
     if (shuttingDown) return;
@@ -79,7 +89,15 @@ async function main(): Promise<number> {
         // Each stage isolated: a failure in one must never skip lock
         // release or the final snapshot — the next boot's growth detection
         // depends on the snapshot reflecting what this process last saw
-        // (SPEC ruling 12).
+        // (SPEC ruling 12). Chat clients go first (1001 going-away) so
+        // they queue before the runtime turns die (E4).
+        if (state.chat !== undefined) {
+          try {
+            await state.chat.dispose();
+          } catch (error) {
+            logger.error('chat server shutdown failed', { error: String(error) });
+          }
+        }
         if (state.registry !== undefined) {
           try {
             await state.registry.dispose();
@@ -130,14 +148,35 @@ async function main(): Promise<number> {
     growth_findings: growth.findings.length,
   });
 
+  // Chat (E4): the single Gru session behind /ws. The durable frame log
+  // loads and boot-settles BEFORE the HTTP server accepts anything (r1
+  // N13): a corrupt log refuses boot without ever having listened, and no
+  // client can attach to an unsettled log. The Gru spawn is lazy-warm
+  // (warmup is best-effort, first message retries) so a model outage can
+  // never keep the service down.
+  const chatDir = join(config.dataDir, 'chat');
+  const frameLog = ChatFrameLog.load(chatDir, (level, msg, fields) => logger.log(level, msg, fields));
+  const chat = createChatServer({
+    config,
+    frameLog,
+    pointer: new GruSessionPointer(chatDir, (level, msg, fields) => logger.log(level, msg, fields)),
+    spawnGru: (resumeFile) => registry.spawn('gru', resumeFile !== null ? { resumeFile } : {}),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+
   const service = createService(
     config,
     identity,
     (level, msg, fields) => logger.log(level, msg, fields),
     () => registry.status(),
+    { staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)) },
   );
   state.handle = await service.start();
   const handle = state.handle;
+  chat.attach(handle.httpServer);
+  state.chat = chat;
+  chat.warmup();
+
   logger.info('listening', { host: handle.host, port: handle.port });
   return new Promise<number>(() => {
     // long-running: exit happens via signal handlers

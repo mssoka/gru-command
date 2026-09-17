@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -74,6 +74,37 @@ async function waitForHealthyPort(home: string, stderr: () => string): Promise<n
 }
 
 describe('graceful shutdown', () => {
+  it('a corrupt chat frame log refuses boot — named, before listening', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-corruptlog-'));
+    cleanupDirs.push(home);
+    writeFileSync(
+      configPathFor(home),
+      '[server]\nhost = "127.0.0.1"\nport = 0\n',
+      'utf-8',
+    );
+    // Mid-file corruption in the durable frame log (garbage BETWEEN two
+    // valid lines): boot must fail loud naming the file, and must never
+    // report listening (r2 W6': the load runs before the server accepts
+    // anything).
+    mkdirSync(join(home, 'chat'), { recursive: true });
+    writeFileSync(
+      join(home, 'chat', 'gru.frames.jsonl'),
+      '{"type":"turn","state":"start","seq":1}\nGARBAGE\n{"type":"turn","state":"end","seq":3}\n',
+      'utf-8',
+    );
+
+    const { child, getStderr } = spawnService(home);
+    const exitCode = await new Promise<number | null>((resolveExit) => {
+      child.on('exit', (code) => resolveExit(code));
+    });
+    expect(exitCode).not.toBe(0);
+    expect(getStderr()).toContain('chat frame log');
+    expect(getStderr()).toContain('gru.frames.jsonl');
+    // Refused BEFORE listening: no listening line was ever logged.
+    const msgs = readLogLines(home).map((line) => line.msg);
+    expect(msgs).not.toContain('listening');
+  });
+
   it('SIGTERM: stop accepting, exit 0, structured shutdown lines in the data dir log', async () => {
     const home = mkdtempSync(join(tmpdir(), 'gru-command-sigterm-'));
     cleanupDirs.push(home);

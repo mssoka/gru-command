@@ -5,6 +5,7 @@ import type { GruCommandConfig } from './config.js';
 import type { InstallIdentity } from './identity.js';
 import type { LogLevel } from './logger.js';
 import type { RuntimeStatus } from './runtime/registry.js';
+import type { StaticRoot } from './static.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
 /**
@@ -55,6 +56,8 @@ export interface HealthPayload {
 export interface ServiceHandle {
   readonly port: number;
   readonly host: string;
+  /** The underlying HTTP server — the chat socket attaches here (E4). */
+  readonly httpServer: HttpServer;
   stop(): Promise<void>;
 }
 
@@ -176,11 +179,18 @@ export type ServiceEvent = (
   fields?: Record<string, unknown>,
 ) => void;
 
+export interface ServiceOptions {
+  /** Production static root (built web UI). When omitted, unknown paths
+   * keep the JSON 404 — the pre-E4 behavior. */
+  readonly staticRoot?: StaticRoot;
+}
+
 export function createService(
   config: GruCommandConfig,
   identity: InstallIdentity,
   onEvent: ServiceEvent = () => {},
   runtimeStatus: () => RuntimeStatus | null = () => null,
+  options: ServiceOptions = {},
 ): { start(): Promise<ServiceHandle> } {
   const startedAt = process.hrtime.bigint();
   const server: HttpServer = createServer(
@@ -230,6 +240,9 @@ export function createService(
           return { status: 200 };
         }
         req.resume();
+        if (options.staticRoot !== undefined && options.staticRoot.serve(req, res, path)) {
+          return { status: 200 };
+        }
         jsonBody(res, 404, { error: 'not_found', path });
         return { status: 404 };
       })()
@@ -279,6 +292,7 @@ export function createService(
       return {
         host: config.server.host,
         port: address.port,
+        httpServer: server,
         stop: async () => {
           await new Promise<void>((resolveClose) => {
             const drainTimeout = setTimeout(() => {
