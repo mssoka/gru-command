@@ -100,6 +100,8 @@ export interface TranscriptSearchResult {
   readonly query: string;
   readonly matches: readonly TranscriptMatch[];
   readonly scanned: number;
+  /** Total entries in the file — scanned < total discloses truncation. */
+  readonly total: number;
 }
 
 export interface BoardAuthOkFrame {
@@ -137,6 +139,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+/** Parse one OUTBOUND client frame (the auth frame clients send); null on
+ * anything malformed. Lives here so server and web share the same rules
+ * (parity-tested in test/board-frames.test.ts). */
+export function parseBoardClientFrame(raw: unknown): { type: 'auth'; token: string } | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const frame = raw as Record<string, unknown>;
+  // Shape-level only: an empty-string token PARSES here and fails token
+  // MATCHING on the server.
+  if (frame.type !== 'auth' || typeof frame.token !== 'string') return null;
+  return { type: 'auth', token: frame.token };
+}
+
 function str(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
@@ -150,6 +164,18 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (!Array.isArray(value.repos) || !Array.isArray(value.agents) || !Array.isArray(value.notifications)) {
     return false;
   }
+  const agentsOk = value.agents.every(
+    (agent) => isRecord(agent) && typeof agent.id === 'string' && typeof agent.role === 'string' && typeof agent.state === 'string',
+  );
+  const notificationsOk = value.notifications.every(
+    (notification) =>
+      isRecord(notification) &&
+      typeof notification.id === 'string' &&
+      typeof notification.ts === 'string' &&
+      (notification.severity === 'info' || notification.severity === 'error') &&
+      typeof notification.title === 'string',
+  );
+  if (!agentsOk || !notificationsOk) return false;
   return value.repos.every(
     (repo) =>
       isRecord(repo) &&

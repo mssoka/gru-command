@@ -16,7 +16,7 @@ coerces state and every mutation is atomic with its event row.
 ## Schema & migrations
 
 Migrations are **numbered, forward-only, contiguous from 1**, applied in
-order inside a transaction, and recorded in `schema_migrations`
+id order inside a transaction, and recorded in `schema_migrations`
 (`id`, `name`, `applied_at`).
 
 - Fresh data dir → all migrations apply in order, exactly once.
@@ -62,7 +62,11 @@ lens:   pending → live → done | error               (terminal: the last two)
 ```
 
 - `setRoundVerdict` also transitions the round to `verdict-posted` — a
-  posted verdict IS that state.
+  posted verdict IS that state (and a verdict on a still-`pending` round
+  fails loud, machine and all, leaving no trace).
+- `bindLens` backfills the agent's round/job wiring — runtime-registered
+  agents (no round context at spawn) connect to their round with this
+  ONE call.
 - Lens chips derive `live` from their bound agent's turn events
   (idempotent); `done`/`error` are explicit outcomes (the wave runner or
   error derivation sets them).
@@ -84,6 +88,10 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
 | `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |
 
+Events are appended for **state changes**; idempotent enrichment writes
+(re-registering an agent, same-state activity refreshes) update rows
+without minting events.
+
 `events` rows are queryable (`LedgerApi.listEvents({ limit })`, newest
 first); the notification center derives its feed from recent events.
 
@@ -101,4 +109,5 @@ row, appends the event, and (with a bus attached) publishes it:
   `getAgent` · `listAgents`
 
 The thin HTTP write surface (validated, token-authed — the base E8's
-dispatch flow builds on) mirrors these; see [BOARD.md](./BOARD.md).
+dispatch flow builds on) exposes a SUBSET of these (jobs, rounds,
+agents, lens binding/outcomes); see [BOARD.md](./BOARD.md).

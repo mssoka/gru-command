@@ -191,18 +191,11 @@ export class BoardEngine {
     }
   }
 
-  /** All (round, lens) chips bound to this agent id. */
+  /** All (round, lens) chips bound to this agent id — indexed query. */
   private lensBindingsFor(agentId: string): { roundId: string; lens: string }[] {
-    const bindings: { roundId: string; lens: string }[] = [];
-    for (const agent of this.ledger.listAgents()) {
-      if (agent.roundId === null || agent.id !== agentId) continue;
-      const round = this.ledger.getRound(agent.roundId);
-      if (round === null) continue;
-      for (const chip of round.lenses) {
-        if (chip.agentId === agentId) bindings.push({ roundId: round.id, lens: chip.lens });
-      }
-    }
-    return bindings;
+    return this.ledger
+      .listLensBindings(agentId)
+      .filter((binding) => this.ledger.getRound(binding.roundId) !== null);
   }
 
   private deriveLensLive(agentId: string): void {
@@ -292,10 +285,28 @@ export class BoardEngine {
     };
   }
 
-  /** Notification center feed: recent board-worthy events, newest first. */
+  /**
+   * Notification center feed: recent board-worthy events, newest first,
+   * PLUS standing conditions read from row state (a blocked job stays in
+   * the feed after its transition event ages out of the window).
+   */
   notifications(limit = 30): readonly NotificationView[] {
     const out: NotificationView[] = [];
+    const seenJobIds = new Set<string>();
+    for (const job of this.ledger.listJobs()) {
+      if (job.status !== 'blocked') continue;
+      seenJobIds.add(job.id);
+      out.push({
+        id: `job-${job.id}`,
+        ts: job.updatedAt,
+        severity: 'error',
+        title: `Job ${job.id} blocked`,
+        detail: job.note,
+      });
+      if (out.length >= limit) return out;
+    }
     for (const event of this.ledger.listEvents({ limit: 200 })) {
+      if (event.kind === 'job.status' && event.jobId !== null && seenJobIds.has(event.jobId)) continue;
       const view = this.notificationFromEvent(event);
       if (view !== null) out.push(view);
       if (out.length >= limit) break;

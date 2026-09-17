@@ -41,6 +41,9 @@ export class BoardView {
   private readonly notificationPanel: HTMLElement;
   private readonly onOpenTranscript: (request: TranscriptOpenRequest) => void;
   private snapshot: BoardSnapshot | null = null;
+  /** Error notification ids the user has already seen (panel opened with
+   * them present) — the badge counts only UNSEEN errors. */
+  private readonly seenErrorIds = new Set<string>();
 
   constructor(onOpenTranscript: (request: TranscriptOpenRequest) => void) {
     this.mount = mustGet('board-jobs');
@@ -50,7 +53,13 @@ export class BoardView {
     this.notificationBell.addEventListener('click', () => {
       this.notificationPanel.hidden = !this.notificationPanel.hidden;
       this.notificationBell.dataset.open = String(!this.notificationPanel.hidden);
-      if (!this.notificationPanel.hidden) this.notificationBell.dataset.unread = '0';
+      if (!this.notificationPanel.hidden) {
+        // Opening the panel marks every current error as seen.
+        for (const notification of this.snapshot?.notifications ?? []) {
+          if (notification.severity === 'error') this.seenErrorIds.add(notification.id);
+        }
+        this.updateBadge(this.snapshot?.notifications ?? []);
+      }
     });
   }
 
@@ -176,8 +185,7 @@ export class BoardView {
   private renderNotifications(notifications: readonly { id: string; ts: string; severity: string; title: string; detail: string | null }[]): void {
     const list = mustGet('notification-list');
     list.replaceChildren();
-    const unread = notifications.filter((n) => n.severity === 'error').length;
-    this.notificationBell.dataset.unread = String(unread);
+    this.updateBadge(notifications);
     this.notificationBell.hidden = false;
     if (notifications.length === 0) {
       list.append(el('div', 'lbl', 'nothing needs attention'));
@@ -191,6 +199,12 @@ export class BoardView {
       );
       list.append(row);
     }
+  }
+
+  /** Badge = error-severity items never seen (panel-open marks seen). */
+  private updateBadge(notifications: readonly { id: string; severity: string }[]): void {
+    const unseen = notifications.filter((n) => n.severity === 'error' && !this.seenErrorIds.has(n.id)).length;
+    this.notificationBell.dataset.unread = String(unseen);
   }
 }
 

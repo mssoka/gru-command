@@ -88,7 +88,7 @@ describe('board frame parity (server parser ↔ web validator)', () => {
   it('client-frame corpus: identical accept/reject verdicts', () => {
     for (const item of CLIENT_CORPUS) {
       const server = parseBoardClientFrame(item);
-      const client = webParseClient(item);
+      const client = web.parseBoardClientFrame(item);
       expect(server === null, `client corpus item ${JSON.stringify(item)}`).toBe(client === null);
       if (server !== null) {
         expect(server.type).toBe('auth');
@@ -117,14 +117,3 @@ describe('board frame parity (server parser ↔ web validator)', () => {
     expect(BOARD_WS_PATH).toBe('/board/ws');
   });
 });
-
-/** The web module has no client-frame parser (clients only SEND auth); the
- * corpus rows above are validated structurally against the same rules. */
-function webParseClient(item: unknown): { type: 'auth'; token: string } | null {
-  if (typeof item !== 'object' || item === null) return null;
-  const frame = item as Record<string, unknown>;
-  // Same rule as the server parser: shape-level validation only — the
-  // empty string parses here and fails token MATCHING later.
-  if (frame.type !== 'auth' || typeof frame.token !== 'string') return null;
-  return { type: 'auth', token: frame.token };
-}

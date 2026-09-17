@@ -2,11 +2,12 @@ import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
 import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
-import type { GruCommandConfig } from '../config.js';
+import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound } from '../ledger/api.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
+import { isAgentState } from '../runtime/types.js';
 import type { TranscriptService } from '../transcripts/service.js';
 import { BOARD_WS_PATH, parseBoardClientFrame, type BoardServerFrame } from './frames.js';
 import type { BoardEngine } from './engine.js';
@@ -36,6 +37,9 @@ export interface BoardServerOptions {
   readonly siblingUpgradePaths?: readonly string[];
   /** Coalesce rapid event bursts into one snapshot push (ms). */
   readonly pushDebounceMs?: number;
+  /** Transport heartbeat interval (chat parity: 30 s, 0 disables) —
+   * half-open connections are terminated after two missed pongs. */
+  readonly heartbeatMs?: number;
 }
 
 export interface BoardServer {
@@ -51,6 +55,7 @@ interface Client {
   readonly socket: WebSocket;
   authed: boolean;
   authDeadline: ReturnType<typeof setTimeout> | null;
+  pongMisses: number;
 }
 
 function json(res: import('node:http').ServerResponse, status: number, body: unknown): void {
@@ -159,8 +164,12 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
   }
 
   function optStrField(body: Record<string, unknown>, field: string): string | undefined {
+    if (!(field in body)) return undefined;
     const value = body[field];
-    return typeof value === 'string' && value !== '' ? value : undefined;
+    // Present-but-wrong-typed input is NEVER silently dropped — the caller
+    // asked for something and must learn it did not land.
+    if (typeof value !== 'string') throw new Error(`field "${field}" must be a string`);
+    return value === '' ? undefined : value;
   }
 
   function handleApi(
@@ -195,10 +204,18 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           }
           const beforeRaw = url.searchParams.get('before');
           const limitRaw = url.searchParams.get('limit');
-          const before = beforeRaw === null ? undefined : Number(beforeRaw);
-          const limit = limitRaw === null ? undefined : Number(limitRaw);
-          if (before !== undefined && (!Number.isInteger(before) || before < 0)) {
+          // Strict integer params: '' or '1.5' or '-2' are REJECTED, never
+          // coerced (Number('') === 0 would silently page nothing).
+          const before =
+            beforeRaw === null ? undefined : /^\d+$/.test(beforeRaw) ? Number(beforeRaw) : NaN;
+          const limit =
+            limitRaw === null ? undefined : /^\d+$/.test(limitRaw) ? Number(limitRaw) : NaN;
+          if (before !== undefined && !Number.isInteger(before)) {
             json(res, 400, { error: 'bad_request', detail: 'before must be a non-negative integer' });
+            return;
+          }
+          if (limit !== undefined && !Number.isInteger(limit)) {
+            json(res, 400, { error: 'bad_request', detail: 'limit must be a positive integer' });
             return;
           }
           json(
@@ -206,7 +223,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             200,
             transcripts.page(file, {
               ...(before !== undefined ? { before } : {}),
-              ...(limit !== undefined && Number.isInteger(limit) ? { limit } : {}),
+              ...(limit !== undefined ? { limit } : {}),
             }),
           );
           return;
@@ -230,11 +247,18 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           }
           if (path === '/api/rounds') {
             const lensesRaw = body['lenses'];
+            if (
+              lensesRaw !== undefined &&
+              (!Array.isArray(lensesRaw) ||
+                lensesRaw.length === 0 ||
+                !lensesRaw.every((l) => typeof l === 'string' && l !== ''))
+            ) {
+              json(res, 400, { error: 'bad_request', detail: 'lenses must be a non-empty array of non-empty strings' });
+              return;
+            }
             const round = ledger.addRound({
               jobId: strField(body, 'jobId'),
-              ...(Array.isArray(lensesRaw) && lensesRaw.every((l) => typeof l === 'string')
-                ? { lenses: lensesRaw as string[] }
-                : {}),
+              ...(Array.isArray(lensesRaw) ? { lenses: lensesRaw as string[] } : {}),
               ...(optStrField(body, 'targetRef') !== undefined
                 ? { targetRef: optStrField(body, 'targetRef') ?? null }
                 : {}),
@@ -243,9 +267,14 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             return;
           }
           if (path === '/api/agents') {
+            const role = strField(body, 'role');
+            if (!(ROLES as readonly string[]).includes(role)) {
+              json(res, 400, { error: 'bad_request', detail: `unknown role "${role}" (valid: ${ROLES.join(', ')})` });
+              return;
+            }
             const agent = ledger.registerAgent({
               id: strField(body, 'id'),
-              role: strField(body, 'role') as never,
+              role: role as never,
               ...(optStrField(body, 'label') !== undefined ? { label: optStrField(body, 'label') ?? null } : {}),
               ...(optStrField(body, 'jobId') !== undefined ? { jobId: optStrField(body, 'jobId') ?? null } : {}),
               ...(optStrField(body, 'roundId') !== undefined ? { roundId: optStrField(body, 'roundId') ?? null } : {}),
@@ -255,7 +284,12 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             return;
           }
           if (path === '/api/agents/state') {
-            const agent = ledger.setAgentState(strField(body, 'id'), strField(body, 'state') as never);
+            const state = strField(body, 'state');
+            if (!isAgentState(state)) {
+              json(res, 400, { error: 'bad_request', detail: `unknown agent state "${state}"` });
+              return;
+            }
+            const agent = ledger.setAgentState(strField(body, 'id'), state as never);
             json(res, 200, agent);
             return;
           }
@@ -264,10 +298,15 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             json(res, 200, round);
             return;
           }
+          const state = strField(body, 'state');
+          if (state !== 'done' && state !== 'error') {
+            json(res, 400, { error: 'bad_request', detail: 'outcome state must be done or error (live derives from agent events)' });
+            return;
+          }
           const round = ledger.setLensOutcome(
             strField(body, 'roundId'),
             strField(body, 'lens'),
-            strField(body, 'state'),
+            state,
             optStrField(body, 'note'),
           );
           json(res, 200, round);
@@ -305,8 +344,13 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         json(res, 404, { error: 'not_found', path });
       } catch (error) {
         const message = String(error instanceof Error ? error.message : error);
-        const status = message.includes('not found') || message.includes('no lens') ? 404 : 400;
-        json(res, status, { error: status === 404 ? 'not_found' : 'bad_request', detail: message });
+        // Typed mapping: the ledger and transcript layers throw
+        // RecordNotFound for missing entities; a missing/unreadable
+        // transcript FILE is also a not-found. Everything else is a 400.
+        const notFound =
+          error instanceof RecordNotFound ||
+          (error instanceof Error && error.message.includes('transcript unreadable'));
+        json(res, notFound ? 404 : 400, { error: notFound ? 'not_found' : 'bad_request', detail: message });
       }
     })().catch((error: unknown) => {
       log('error', 'board api handler failed', { error: String(error) });
@@ -337,17 +381,44 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
     }, options.pushDebounceMs ?? 150);
   }
 
-  options.bus.subscribe(schedulePush);
+  const unsubscribeBus = options.bus.subscribe(schedulePush);
+
+  const heartbeatMs = options.heartbeatMs ?? 30_000;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
+  if (heartbeatMs > 0) {
+    heartbeat = setInterval(() => {
+      for (const client of clients) {
+        if (client.authed) {
+          client.pongMisses += 1;
+          if (client.pongMisses > 2) {
+            // Two unanswered pings: half-open — terminate; the client's
+            // reconnect machinery takes over.
+            client.socket.terminate();
+            continue;
+          }
+          try {
+            client.socket.ping();
+          } catch {
+            client.socket.terminate();
+          }
+        }
+      }
+    }, heartbeatMs);
+    heartbeat.unref();
+  }
 
   function onConnection(socket: WebSocket): void {
-    const client: Client = { socket, authed: false, authDeadline: null };
+    const client: Client = { socket, authed: false, authDeadline: null, pongMisses: 0 };
     clients.add(client);
     client.authDeadline = setTimeout(() => {
       send(socket, { type: 'error', message: 'auth deadline exceeded', fatal: true });
       socket.close(1008, 'auth timeout');
     }, authDeadlineMs);
+    socket.on('pong', () => {
+      client.pongMisses = 0;
+    });
     socket.on('message', (data: unknown) => {
-      if (disposed) return;
+      if (disposed || client.authed) return; // post-auth inbound is ignored (clients only listen)
       let parsed: unknown;
       try {
         parsed = JSON.parse(String(data));
@@ -363,7 +434,6 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         socket.close(1008, 'protocol');
         return;
       }
-      if (client.authed) return; // a second auth is ignored (already live)
       if (!configured || !tokenMatches(frame.token, tokenHash)) {
         send(socket, { type: 'error', message: configured ? 'invalid token' : 'board not configured', fatal: true });
         socket.close(1008, 'unauthorized');
@@ -420,6 +490,8 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
     async dispose(): Promise<void> {
       disposed = true;
       if (pushTimer !== null) clearTimeout(pushTimer);
+      if (heartbeat !== null) clearInterval(heartbeat);
+      unsubscribeBus();
       if (attached !== null) {
         attached.server.off('upgrade', attached.handler);
         attached = null;

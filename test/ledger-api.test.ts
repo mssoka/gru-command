@@ -166,6 +166,45 @@ describe('ledger api — the record of state', () => {
     expect(all.length).toBeGreaterThanOrEqual(4);
   });
 
+  it('rolled-back transactions publish NOTHING on the bus (no phantom events)', () => {
+    const dir2 = tmpDir();
+    const db2 = new LedgerDb(dir2);
+    const bus2 = new EventBus();
+    const seen2: string[] = [];
+    bus2.subscribe((event) => seen2.push(event.kind));
+    const api2 = new LedgerApi(db2.handle, { bus: bus2 });
+    api2.addJob({ id: 'phantom-job', repo: 'r', title: 't' });
+    api2.setJobStatus('phantom-job', 'working');
+    const round = api2.addRound({ jobId: 'phantom-job' }); // pending
+    const kindsBefore = seen2.length;
+    // A verdict on a PENDING round fails loudly (the machine refuses):
+    // the round.verdict event was appended inside the txn, then the
+    // pending→verdict-posted transition throws → FULL rollback.
+    expect(() => api2.setRoundVerdict(round.id, 'approved')).toThrow(
+      /illegal transition pending → verdict-posted/u,
+    );
+    // Nothing published, nothing written — the rollback left no trace.
+    expect(seen2.length).toBe(kindsBefore);
+    expect(api2.getRound(round.id)?.verdict).toBeNull();
+    expect(api2.getRound(round.id)?.status).toBe('pending');
+    expect(
+      api2.listEvents().some((e) => e.kind === 'round.verdict' && e.roundId === round.id),
+    ).toBe(false);
+    db2.close();
+  });
+
+  it('bindLens backfills the agent round/job wiring (the one-call chip↔agent connection)', () => {
+    // A tap-shape registration: no round/job context at spawn time.
+    api.registerAgent({ id: 'wire-agent', role: 'perkins' });
+    const job = api.addJob({ id: 'wire-job', repo: 'demo-repo', title: 'Wiring' });
+    const round = api.addRound({ jobId: job.id, lenses: ['edge'] });
+    api.bindLens(round.id, 'edge', 'wire-agent');
+    const agent = api.getAgent('wire-agent');
+    expect(agent?.roundId).toBe(round.id);
+    expect(agent?.jobId).toBe(job.id);
+    expect(api.listLensBindings('wire-agent')).toEqual([{ roundId: round.id, lens: 'edge' }]);
+  });
+
   it('a restarted ledger (same file) serves the full record — the board rebuilds from it', () => {
     db.close();
     const dataDir = cleanupDirs[0] as string; // the dir from beforeAll

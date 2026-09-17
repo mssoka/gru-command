@@ -194,7 +194,9 @@ async function main(): Promise<number> {
   // engine feeds on the registry tap; the transcript service reads the
   // session store.
   const ledgerDb = new LedgerDb(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
-  const bus = new EventBus();
+  const bus = new EventBus({
+    onListenerError: (message) => logger.log('error', 'event bus listener failed', { detail: message }),
+  });
   const ledger = new LedgerApi(ledgerDb.handle, { bus });
   const engine = new BoardEngine({
     ledger,

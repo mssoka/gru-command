@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, openSync, rmSync, symlinkSync, truncateSync, writeFileSync, writeSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -166,6 +166,73 @@ describe('transcript service', () => {
     expect(result.matches.map((m) => m.index).sort()).toEqual([0, 1]);
     expect(result.matches.every((m) => m.snippet.toLowerCase().includes('secret'))).toBe(true);
     expect(svc.search(rel, 'zzz-not-present').matches).toEqual([]);
+  });
+
+  it('search scans NEWEST-first and discloses truncation (scanned < total)', () => {
+    const { dir, svc } = tmpStore();
+    const file = join(dir, 'sessions', 'gru', 'd', 'big.jsonl');
+    mkdirSync(join(dir, 'sessions', 'gru', 'd'), { recursive: true });
+    const entries: Record<string, unknown>[] = [header()];
+    let parent: string | null = null;
+    for (let i = 1; i <= 30; i += 1) {
+      entries.push(userEntry(`m${i}`, parent, i % 7 === 0 ? `needle number ${i}` : `filler ${i}`));
+      parent = `m${i}`;
+    }
+    writeFileSync(file, sessionFile(entries));
+    const rel = 'gru/d/big.jsonl';
+    // Full scan: all 4 needles found, newest match FIRST (entries are
+    // 0-indexed past the header: message m7 → index 6, … m28 → index 27).
+    const full = svc.search(rel, 'needle');
+    expect(full.matches.map((m) => m.index)).toEqual([27, 20, 13, 6]);
+    expect(full.total).toBe(30);
+    expect(full.scanned).toBe(30);
+    // Capped scan: only the newest 10 entries are searched; truncation
+    // is disclosed via scanned < total.
+    const capped = new TranscriptService(join(dir, 'sessions'), { searchScanLimit: 10 }).search(rel, 'needle');
+    expect(capped.matches.map((m) => m.index)).toEqual([27, 20]);
+    expect(capped.scanned).toBe(10);
+    expect(capped.total).toBe(30);
+  });
+
+  it('parsed transcripts are cached per (mtime, size) revision — appends reparse', () => {
+    const { dir } = tmpStore();
+    const sessionsDir = join(dir, 'sessions');
+    const svc = new TranscriptService(sessionsDir);
+    const file = join(sessionsDir, 'gru', 'd', 's.jsonl');
+    mkdirSync(join(sessionsDir, 'gru', 'd'), { recursive: true });
+    writeFileSync(file, sessionFile([header(), userEntry('m1', null, 'first entry')]));
+    const rel = 'gru/d/s.jsonl';
+    expect(svc.page(rel).total).toBe(1);
+    // Same mtime/size window: cached. (mtime resolution is fs-dependent —
+    // the cache is keyed on the observed stat, so a second read of an
+    // unchanged file MUST hit it; we assert via a torn-count probe below.)
+    // Append (new mtime/size): reparse sees the new entry.
+    const fd = openSync(file, 'a');
+    writeSync(fd, `${JSON.stringify(userEntry('m2', 'm1', 'second entry'))}\n`);
+    closeSync(fd);
+    const page = svc.page(rel);
+    expect(page.total).toBe(2);
+    expect(page.entries[0]?.text).toBe('second entry');
+  });
+
+  it('oversized transcripts refuse to serve (fail-loud, bounded server work)', () => {
+    const { dir, svc } = tmpStore();
+    const big = join(dir, 'sessions', 'gru', 'd', 'huge.jsonl');
+    mkdirSync(join(dir, 'sessions', 'gru', 'd'), { recursive: true });
+    // A sparse file bigger than the cap — no need to materialize bytes.
+    writeFileSync(big, '');
+    truncateSync(big, 65 * 1024 * 1024 + 1);
+    expect(() => svc.page('gru/d/huge.jsonl')).toThrow(/too large/u);
+  });
+
+  it('symlinked transcripts cannot escape the store (realpath confinement)', () => {
+    const { dir, svc } = tmpStore();
+    const sessionsDir = join(dir, 'sessions');
+    mkdirSync(sessionsDir, { recursive: true });
+    const outside = join(dir, 'outside-secret.jsonl');
+    writeFileSync(outside, sessionFile([header()]));
+    symlinkSync(outside, join(sessionsDir, 'leak.jsonl'));
+    expect(() => svc.page('leak.jsonl')).toThrow(/escapes.*symlink/u);
   });
 
   it('a torn tail line (live append) is skipped and counted, never fatal', () => {

@@ -27,7 +27,7 @@ record.
 |---|---|
 | `GET /api/board` | the full snapshot: `repos[]` (grouped jobs + rounds + lens chips), `agents[]`, `notifications[]` |
 | `GET /api/transcripts` | session transcript list (newest first; ledger-bound agents carry ids/labels) |
-| `GET /api/transcripts/file?file=<rel>[&q=&before=&limit=]` | one transcript: paged entries (`before` = exclusive upper index, newest-first, `nextCursor`) or case-insensitive search matches |
+| `GET /api/transcripts/file?file=<rel>[&q=&before=&limit=]` | one transcript: paged entries (`before` = exclusive upper index, newest-first, `nextCursor`) or case-insensitive search — newest-first scan under a bounded cap, `scanned`/`total` disclose truncation |
 | `POST /api/jobs` | `{id, repo, title, baseBranch?}` → job (`dispatched`) |
 | `POST /api/jobs/:id/status` | `{status}` — validated against the [job machine](./LEDGER.md) |
 | `POST /api/rounds` | `{jobId, lenses? (default 7), targetRef?}` → round (`pending`) |
@@ -35,7 +35,7 @@ record.
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
 | `POST /api/agents/state` | `{id, state}` |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
-| `POST /api/lenses/outcome` | `{roundId, lens, state: done|error, note?}` |
+| `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
 401 without/with a bad token; **503 `not_configured`** when no pairing
 token exists (empty token = locked door, never open). Illegal
@@ -45,7 +45,8 @@ transitions and unknown entities are 400/404 with the reason in
 ## Board WebSocket — `/board/ws`
 
 JSON frames; **first frame must be `auth`** (same pairing token, 5 s
-deadline):
+deadline); transport-level ws pings keep half-open connections from
+lingering (two missed pongs terminate → client reconnects):
 
 ```jsonc
 → { "type": "auth", "token": "…" }
@@ -57,9 +58,11 @@ deadline):
 Deliberately simpler than the chat contract: snapshots are **idempotent
 and last-write-wins** — no replay/seq machinery. Rapid changes coalesce
 (~150 ms) into one push. A reconnect starts over (auth → fresh
-snapshot). Bad token / non-auth first frame / timeout → fatal error +
+snapshot). Post-auth inbound frames are ignored (board clients only
+listen). Bad token / non-auth first frame / timeout → fatal error +
 close. The client validators live in `web/src/lib/board-protocol.ts`
-(parity-tested against the server parser in `test/board-frames.test.ts`).
+(parity-tested against the server parser in `test/board-frames.test.ts`
+— both directions).
 
 Upgrade routing on the one HTTP server: the chat handler owns `/ws`
 (passing declared sibling paths), the board handler owns `/board/ws`

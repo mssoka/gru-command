@@ -170,6 +170,39 @@ describe('board engine — adapter events → ledger events → board state', ()
     expect(fired).toBe(1);
   });
 
+  it('E6 r1: a TAP-shape agent (registered WITHOUT roundId) derives its chip after bindLens alone', () => {
+    const job = api.addJob({ id: 'tap-job', repo: 'demo-repo', title: 'Tap wiring' });
+    const round = api.addRound({ jobId: job.id, lenses: ['blind'] });
+    // Exactly what the registry tap produces at spawn time: no round context.
+    engine.onRuntimeEvent({ agentId: 'tap-lens', role: 'perkins', sessionFile: null, phase: 'spawned' });
+    // The documented ONE-call wiring: bind the chip to the agent.
+    api.bindLens(round.id, 'blind', 'tap-lens');
+    // The agent's round row got backfilled — the derivation now finds it.
+    expect(api.getAgent('tap-lens')?.roundId).toBe(round.id);
+    engine.onRuntimeEvent(envelope('tap-lens', 'perkins', { type: 'turn_start' }));
+    expect(api.getRound(round.id)?.lenses.find((c) => c.lens === 'blind')?.state).toBe('live');
+    engine.onRuntimeEvent(
+      envelope('tap-lens', 'perkins', { type: 'state', state: 'error', error: 'boom' }),
+    );
+    expect(api.getRound(round.id)?.lenses.find((c) => c.lens === 'blind')?.state).toBe('error');
+    // listLensBindings drives the derivation directly (indexed, no scans).
+    expect(api.listLensBindings('tap-lens')).toEqual([{ roundId: round.id, lens: 'blind' }]);
+  });
+
+  it('standing blocked jobs stay in the notification feed after their event ages out', () => {
+    api.addJob({ id: 'old-blocked', repo: 'demo-repo', title: 'Blocked long ago' });
+    api.setJobStatus('old-blocked', 'working');
+    api.setJobStatus('old-blocked', 'blocked');
+    // Push 200+ newer events so the blocked transition leaves the window.
+    for (let i = 0; i < 210; i += 1) {
+      api.appendCustomEvent({ kind: 'noise', payload: { i } });
+    }
+    const feed = engine.notifications();
+    expect(feed.some((n) => n.id === 'job-old-blocked' && n.severity === 'error')).toBe(true);
+    // The blocked job is deduped against its (out-of-window) transition event.
+    expect(feed.filter((n) => n.title.includes('old-blocked')).length).toBe(1);
+  });
+
   it('a ledger hiccup never takes the runtime path down (observer isolation)', () => {
     // Unknown agent + no registration possible is the failure shape; the
     // engine must swallow + continue (logged), not throw upward.

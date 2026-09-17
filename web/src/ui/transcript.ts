@@ -6,7 +6,7 @@
  * first; "load older" pages backwards by entry index cursor.
  */
 
-import type { TranscriptInfo, TranscriptMatch, TranscriptPage } from '../lib/board-protocol.js';
+import type { TranscriptInfo, TranscriptPage, TranscriptSearchResult } from '../lib/board-protocol.js';
 import type { BoardClient } from '../lib/board-client.js';
 import { el, mustGet } from './dom.js';
 
@@ -97,9 +97,17 @@ export class TranscriptView {
     try {
       const page = await this.client.pageTranscript(file, { before: cursor, limit: PAGE_SIZE });
       this.renderPage(page, false);
+    } catch {
+      this.body.prepend(el('div', 'lbl', 'could not load older entries'));
     } finally {
       this.olderBtn.disabled = false;
     }
+  }
+
+  /** Oldest loaded entry index (or 0 when everything is loaded). */
+  private oldestLoaded(): number {
+    if (this.nextCursor === null) return 0;
+    return this.nextCursor;
   }
 
   private renderPage(page: TranscriptPage, fresh: boolean): void {
@@ -117,7 +125,8 @@ export class TranscriptView {
     for (const entry of page.entries) frag.append(this.entryNode(entry));
     if (fresh) this.body.replaceChildren(frag);
     else this.body.prepend(frag);
-    if (fresh) this.body.scrollTop = this.body.scrollHeight;
+    // Newest-first rendering: fresh pages land at the TOP (the newest).
+    if (fresh) this.body.scrollTop = 0;
   }
 
   private entryNode(entry: TranscriptPage['entries'][number]): HTMLElement {
@@ -144,31 +153,56 @@ export class TranscriptView {
     if (query === '') return;
     try {
       const result = await this.client.searchTranscript(this.file, query);
-      this.renderSearch(result.matches);
+      this.renderSearch(result);
     } catch {
       this.searchResults.append(el('div', 'lbl', 'search failed'));
     }
   }
 
-  private renderSearch(matches: readonly TranscriptMatch[]): void {
-    if (matches.length === 0) {
+  private renderSearch(result: TranscriptSearchResult): void {
+    if (result.matches.length === 0) {
       this.searchResults.append(el('div', 'lbl', 'no matches'));
-      return;
     }
-    for (const match of matches) {
+    if (result.scanned < result.total) {
+      this.searchResults.append(
+        el('div', 'lbl', `scanned the newest ${result.scanned} of ${result.total} entries`),
+      );
+    }
+    for (const match of result.matches) {
       const row = el('button', 'transcript-match');
       row.type = 'button';
       row.addEventListener('click', () => {
-        const target = this.body.querySelector<HTMLElement>(`[data-entry-index="${match.index}"]`);
-        if (target !== null) {
-          target.scrollIntoView({ block: 'center' });
-          target.classList.add('transcript-entry--flash');
-          setTimeout(() => target.classList.remove('transcript-entry--flash'), 1_200);
-        }
+        void this.jumpTo(match.index);
       });
       row.append(el('span', 'transcript-match__kind lbl', `#${match.index} ${match.kind}`));
       row.append(el('span', 'transcript-match__snippet', match.snippet));
       this.searchResults.append(row);
+    }
+  }
+
+  /** Jump to an entry index, paging older entries in (bounded) until the
+   * index is loaded — search scans the whole file, not just loaded pages. */
+  private async jumpTo(index: number): Promise<void> {
+    const file = this.file;
+    if (file === null) return;
+    let guard = 0;
+    while (index < this.oldestLoaded() && this.nextCursor !== null && guard < 100) {
+      guard += 1;
+      const cursor = this.nextCursor;
+      let page: TranscriptPage;
+      try {
+        page = await this.client.pageTranscript(file, { before: cursor, limit: PAGE_SIZE });
+      } catch {
+        return;
+      }
+      this.renderPage(page, false);
+      if (page.nextCursor === null) break;
+    }
+    const target = this.body.querySelector<HTMLElement>(`[data-entry-index="${index}"]`);
+    if (target !== null) {
+      target.scrollIntoView({ block: 'center' });
+      target.classList.add('transcript-entry--flash');
+      setTimeout(() => target.classList.remove('transcript-entry--flash'), 1_200);
     }
   }
 

@@ -77,13 +77,26 @@ function showPairing(): void {
   mustGet('board-view').hidden = true;
 }
 
-mustGet<HTMLButtonElement>('tab-chat').addEventListener('click', () => {
-  if (mobileQuery.matches) chatView?.openSheet(); // phone: chat IS the bubble
-  else showView('chat');
-});
-mustGet<HTMLButtonElement>('tab-board').addEventListener('click', () => showView('board'));
+let activeView: ViewId = 'chat';
+
+function switchView(id: ViewId): void {
+  activeView = id;
+  if (mobileQuery.matches && id === 'chat') {
+    // Phone: chat lives in the corner bubble/sheet — the tab opens it.
+    chatView?.openSheet();
+    return;
+  }
+  showView(id);
+}
+
+mustGet<HTMLButtonElement>('tab-chat').addEventListener('click', () => switchView('chat'));
+mustGet<HTMLButtonElement>('tab-board').addEventListener('click', () => switchView('board'));
 const initialView: ViewId = mobileQuery.matches ? 'board' : 'chat';
+activeView = initialView;
 showView(initialView);
+// Resizing across the phone/desktop breakpoint re-runs placement so the
+// hidden-state invariants hold in both layouts (ChatView reparents itself).
+mobileQuery.addEventListener('change', () => showView(activeView));
 
 function onConnection(state: ConnectionState): void {
   renderConnectionDot(state);
@@ -144,6 +157,10 @@ function startChat(token: string): void {
   startBoard(token);
 }
 
+/** Transcript refresh is signature-gated: only agent identity/file
+ * changes (not every snapshot push) warrant re-listing transcripts. */
+let transcriptSignature = '';
+
 function startBoard(token: string): void {
   boardView ??= new BoardView((request) => {
     void transcriptView?.open({
@@ -164,14 +181,22 @@ function startBoard(token: string): void {
       },
       snapshot: (snapshot) => {
         boardView?.render(snapshot);
-        transcriptView?.refreshList();
+        const signature = snapshot.agents
+          .map((agent) => `${agent.id}:${agent.sessionFile ?? ''}`)
+          .join('|');
+        if (signature !== transcriptSignature) {
+          transcriptSignature = signature;
+          transcriptView?.refreshList();
+        }
       },
       fatal: (message) => {
         failPairing(message);
       },
     },
   );
-  transcriptView ??= new TranscriptView(boardClient, mustGet('board-transcripts'));
+  // Rebound on EVERY startBoard: a re-pair mints a fresh client, and a
+  // stale view holding the old client would 401-and-bounce valid sessions.
+  transcriptView = new TranscriptView(boardClient, mustGet('board-transcripts'));
   boardClient.connect();
 }
 

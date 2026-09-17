@@ -91,7 +91,10 @@ export class LedgerDb {
     });
 
     let ran = 0;
-    for (const migration of migrations) {
+    // Apply in ID order regardless of array order — contiguity alone does
+    // not pin application order (an out-of-order array must not reorder
+    // history).
+    for (const migration of [...migrations].sort((a, b) => a.id - b.id)) {
       if (applied.has(migration.id)) continue;
       this.log('info', 'ledger migration applying', { id: migration.id, name: migration.name });
       this.db.exec('BEGIN');
@@ -200,5 +203,10 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_events_round ON events(round_id);
       CREATE INDEX idx_events_agent ON events(agent_id);
     `,
+  },
+  {
+    id: 2,
+    name: 'e6-lens-agent-index',
+    sql: 'CREATE INDEX idx_lens_agent ON lens_states(agent_id);',
   },
 ];

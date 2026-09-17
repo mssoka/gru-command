@@ -92,6 +92,15 @@ export interface EventRecord {
   readonly payload: unknown;
 }
 
+/** Marker for not-found failures the HTTP surface maps to 404 (typed —
+ * never grepped from error text). */
+export class RecordNotFound extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RecordNotFound';
+  }
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -118,23 +127,30 @@ export class LedgerApi {
   // Event plumbing — one transaction, row + event, then bus publish.
   // ------------------------------------------------------------------
 
+  private inTransaction = false;
+  /** Events accumulated inside the open transaction, published only
+   * after a successful COMMIT — subscribers never see rolled-back work. */
+  private pendingEvents: BusEvent[] = [];
+
   private transaction<T>(write: () => T): T {
-    if (this.inTransaction) return write(); // re-entrant: the outer txn owns commit/rollback
+    if (this.inTransaction) return write(); // re-entrant: the outer txn owns commit/rollback + publish
     this.inTransaction = true;
     this.db.exec('BEGIN');
+    let result: T;
     try {
-      const result = write();
+      result = write();
       this.db.exec('COMMIT');
-      return result;
     } catch (error) {
+      this.pendingEvents.length = 0; // rolled back — phantom events are never published
       this.db.exec('ROLLBACK');
       throw error;
     } finally {
       this.inTransaction = false;
     }
+    const events = this.pendingEvents.splice(0);
+    for (const event of events) this.bus?.publish(event);
+    return result;
   }
-
-  private inTransaction = false;
 
   private appendEvent(fields: {
     kind: string;
@@ -169,8 +185,17 @@ export class LedgerApi {
       lens: fields.lens ?? null,
       payload: fields.payload ?? {},
     };
-    this.bus?.publish(event);
+    this.pendingEvents.push(event);
     return event;
+  }
+
+  /** All (round, lens) chips bound to an agent — indexed, no table scans. */
+  listLensBindings(agentId: string): { roundId: string; lens: string }[] {
+    return (
+      this.db
+        .prepare('SELECT round_id, lens FROM lens_states WHERE agent_id = ? ORDER BY rowid')
+        .all(agentId) as Row[]
+    ).map((row) => ({ roundId: str(row.round_id), lens: str(row.lens) }));
   }
 
   listEvents(opts: { limit?: number } = {}): readonly EventRecord[] {
@@ -237,7 +262,7 @@ export class LedgerApi {
     if (!isJobStatus(status)) throw new Error(`unknown job status "${status}"`);
     return this.transaction(() => {
       const current = this.getJob(id);
-      if (current === null) throw new Error(`job "${id}" not found`);
+      if (current === null) throw new RecordNotFound(`job "${id}" not found`);
       if (current.status !== status) {
         assertJobTransition(current.status, status);
         this.db
@@ -252,7 +277,7 @@ export class LedgerApi {
   noteJob(id: string, note: string): JobRecord {
     return this.transaction(() => {
       const current = this.getJob(id);
-      if (current === null) throw new Error(`job "${id}" not found`);
+      if (current === null) throw new RecordNotFound(`job "${id}" not found`);
       this.db.prepare('UPDATE jobs SET note = ?, updated_at = ? WHERE id = ?').run(note, nowIso(), id);
       this.appendEvent({ kind: 'job.note', jobId: id, payload: { note } });
       return this.getJob(id) as JobRecord;
@@ -262,7 +287,7 @@ export class LedgerApi {
   setJobPr(id: string, url: string): JobRecord {
     return this.transaction(() => {
       const current = this.getJob(id);
-      if (current === null) throw new Error(`job "${id}" not found`);
+      if (current === null) throw new RecordNotFound(`job "${id}" not found`);
       this.db.prepare('UPDATE jobs SET pr_url = ?, updated_at = ? WHERE id = ?').run(url, nowIso(), id);
       this.appendEvent({ kind: 'job.pr', jobId: id, payload: { url } });
       return this.getJob(id) as JobRecord;
@@ -272,7 +297,7 @@ export class LedgerApi {
   setJobTargetRef(id: string, ref: string): JobRecord {
     return this.transaction(() => {
       const current = this.getJob(id);
-      if (current === null) throw new Error(`job "${id}" not found`);
+      if (current === null) throw new RecordNotFound(`job "${id}" not found`);
       this.db.prepare('UPDATE jobs SET base_branch = ?, updated_at = ? WHERE id = ?').run(ref, nowIso(), id);
       this.appendEvent({ kind: 'job.target', jobId: id, payload: { ref } });
       return this.getJob(id) as JobRecord;
@@ -298,7 +323,7 @@ export class LedgerApi {
     }
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
-      if (job === null) throw new Error(`job "${input.jobId}" not found`);
+      if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
       let seq = input.seq;
       if (seq === undefined) {
         const row = this.db
@@ -360,7 +385,7 @@ export class LedgerApi {
     if (!isRoundStatus(status)) throw new Error(`unknown round status "${status}"`);
     return this.transaction(() => {
       const round = this.getRound(id);
-      if (round === null) throw new Error(`round "${id}" not found`);
+      if (round === null) throw new RecordNotFound(`round "${id}" not found`);
       if (round.status !== status) {
         assertRoundTransition(round.status, status);
         this.db.prepare('UPDATE rounds SET status = ?, updated_at = ? WHERE id = ?').run(status, nowIso(), id);
@@ -379,7 +404,7 @@ export class LedgerApi {
     if (!isRoundVerdict(verdict)) throw new Error(`unknown round verdict "${verdict}"`);
     return this.transaction(() => {
       const round = this.getRound(id);
-      if (round === null) throw new Error(`round "${id}" not found`);
+      if (round === null) throw new RecordNotFound(`round "${id}" not found`);
       this.db.prepare('UPDATE rounds SET verdict = ?, updated_at = ? WHERE id = ?').run(verdict, nowIso(), id);
       this.appendEvent({
         kind: 'round.verdict',
@@ -400,7 +425,7 @@ export class LedgerApi {
   setRoundTarget(id: string, ref: string): RoundRecord {
     return this.transaction(() => {
       const round = this.getRound(id);
-      if (round === null) throw new Error(`round "${id}" not found`);
+      if (round === null) throw new RecordNotFound(`round "${id}" not found`);
       this.db.prepare('UPDATE rounds SET target_ref = ?, updated_at = ? WHERE id = ?').run(ref, nowIso(), id);
       this.appendEvent({ kind: 'round.target', jobId: round.jobId, roundId: id, payload: { ref } });
       return this.getRound(id) as RoundRecord;
@@ -411,12 +436,20 @@ export class LedgerApi {
   bindLens(roundId: string, lens: string, agentId: string): RoundRecord {
     return this.transaction(() => {
       const round = this.getRound(roundId);
-      if (round === null) throw new Error(`round "${roundId}" not found`);
+      if (round === null) throw new RecordNotFound(`round "${roundId}" not found`);
       const chip = round.lenses.find((entry) => entry.lens === lens);
-      if (chip === undefined) throw new Error(`round "${roundId}" has no lens "${lens}"`);
+      if (chip === undefined) throw new RecordNotFound(`round "${roundId}" has no lens "${lens}"`);
       this.db
         .prepare('UPDATE lens_states SET agent_id = ?, updated_at = ? WHERE round_id = ? AND lens = ?')
         .run(agentId, nowIso(), roundId, lens);
+      // Backfill the agent's round/job wiring: runtime-tap registration
+      // (spawn envelopes) carries no round context — binding is the ONE
+      // call that connects chip to agent to round.
+      this.db
+        .prepare(
+          'UPDATE agents SET round_id = ?, job_id = COALESCE(job_id, ?), updated_at = ? WHERE id = ? AND round_id IS NULL',
+        )
+        .run(roundId, round.jobId, nowIso(), agentId);
       this.appendEvent({
         kind: 'lens.bound',
         jobId: round.jobId,
@@ -434,9 +467,9 @@ export class LedgerApi {
     if (!isLensState(state)) throw new Error(`unknown lens state "${state}"`);
     return this.transaction(() => {
       const round = this.getRound(roundId);
-      if (round === null) throw new Error(`round "${roundId}" not found`);
+      if (round === null) throw new RecordNotFound(`round "${roundId}" not found`);
       const chip = round.lenses.find((entry) => entry.lens === lens);
-      if (chip === undefined) throw new Error(`round "${roundId}" has no lens "${lens}"`);
+      if (chip === undefined) throw new RecordNotFound(`round "${roundId}" has no lens "${lens}"`);
       if (chip.state !== state) {
         assertLensTransition(chip.state, state);
         this.db
@@ -458,7 +491,7 @@ export class LedgerApi {
   /** Lens-chip derivation helper: LIVE on turn activity (idempotent). */
   markLensLive(roundId: string, lens: string): RoundRecord {
     const round = this.getRound(roundId);
-    if (round === null) throw new Error(`round "${roundId}" not found`);
+    if (round === null) throw new RecordNotFound(`round "${roundId}" not found`);
     const chip = round.lenses.find((entry) => entry.lens === lens);
     if (chip === undefined || chip.state === 'live' || chip.state === 'done' || chip.state === 'error') {
       return round; // already live or resolved — idempotent, no event
@@ -529,7 +562,7 @@ export class LedgerApi {
   setAgentState(id: string, state: AgentState, error?: string): AgentRecord {
     return this.transaction(() => {
       const agent = this.getAgent(id);
-      if (agent === null) throw new Error(`agent "${id}" not found`);
+      if (agent === null) throw new RecordNotFound(`agent "${id}" not found`);
       const ts = nowIso();
       this.db
         .prepare('UPDATE agents SET state = ?, last_activity = ?, updated_at = ? WHERE id = ?')

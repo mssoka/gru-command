@@ -206,6 +206,73 @@ describe('board server — HTTP API', () => {
     expect(unauth.status).toBe(401);
   });
 
+  it('the write API validates enum vocabularies (role, agent state, lens outcome)', async () => {
+    await postJson(harness.port, '/api/jobs', 'board-test-token', {
+      id: 'enum-job',
+      repo: 'demo-repo',
+      title: 'Enum checks',
+    });
+    const badRole = await postJson(harness.port, '/api/agents', 'board-test-token', {
+      id: 'bad-role',
+      role: 'banana',
+    });
+    expect(badRole.status).toBe(400);
+    const goodRole = await postJson(harness.port, '/api/agents', 'board-test-token', {
+      id: 'good-role',
+      role: 'perkins',
+    });
+    expect(goodRole.status).toBe(201);
+    const badState = await postJson(harness.port, '/api/agents/state', 'board-test-token', {
+      id: 'good-role',
+      state: 'flying',
+    });
+    expect(badState.status).toBe(400);
+    const goodState = await postJson(harness.port, '/api/agents/state', 'board-test-token', {
+      id: 'good-role',
+      state: 'streaming',
+    });
+    expect(goodState.status).toBe(200);
+    const round = await postJson(harness.port, '/api/rounds', 'board-test-token', { jobId: 'enum-job' });
+    const roundId = (round.body as { id: string }).id;
+    const liveOutcome = await postJson(harness.port, '/api/lenses/outcome', 'board-test-token', {
+      roundId,
+      lens: 'blind',
+      state: 'live',
+    });
+    expect(liveOutcome.status).toBe(400); // live derives from agent events, never posted
+    const badLenses = await postJson(harness.port, '/api/rounds', 'board-test-token', {
+      jobId: 'enum-job',
+      lenses: [],
+    });
+    expect(badLenses.status).toBe(400); // an explicit empty list is never silently defaulted
+    const wrongType = await postJson(harness.port, '/api/jobs', 'board-test-token', {
+      id: 'typed',
+      repo: 'r',
+      title: 't',
+      baseBranch: 123,
+    });
+    expect(wrongType.status).toBe(400); // present-but-wrong-typed fields are never dropped
+  });
+
+  it('typed 404s: missing entities AND missing transcript files', async () => {
+    const missingJob = await postJson(harness.port, '/api/jobs/ghost/status', 'board-test-token', {
+      status: 'working',
+    });
+    expect(missingJob.status).toBe(404);
+    const missingTranscript = await getJson(
+      harness.port,
+      '/api/transcripts/file?file=nope/missing.jsonl',
+      'board-test-token',
+    );
+    expect(missingTranscript.status).toBe(404);
+    const badBefore = await getJson(
+      harness.port,
+      '/api/transcripts/file?file=x&before=',
+      'board-test-token',
+    );
+    expect(badBefore.status).toBe(400); // empty-string params are rejected, not coerced
+  });
+
   it('unknown /api paths 404; non-API paths fall through to the service (404 here)', async () => {
     const unknown = await getJson(harness.port, '/api/nope', 'board-test-token');
     expect(unknown.status).toBe(404);
@@ -262,6 +329,20 @@ describe('board server — WS push', () => {
     await wrongFirst.open();
     wrongFirst.send({ type: 'board', snapshot: {} });
     await wrongFirst.closed;
+  });
+
+  it('authed WS clients survive post-auth noise frames (valid JSON or garbage)', async () => {
+    const client = new BoardClient(harness.port);
+    await client.open();
+    client.send({ type: 'auth', token: 'ws-board-token' });
+    await client.waitFor((f) => f.type === 'auth_ok', 'auth_ok');
+    client.frames.length = 0;
+    // Post-auth traffic of any shape is IGNORED — never a fatal close.
+    client.send({ type: 'ping' });
+    client.send('garbage-not-json');
+    harness.api.addJob({ id: 'post-noise', repo: 'r', title: 'still live' });
+    await client.waitFor((f) => f.type === 'board', 'snapshot after noise');
+    await client.close();
   });
 
   it('an unclaimed upgrade path is terminated by the board (the last-attached handler)', async () => {

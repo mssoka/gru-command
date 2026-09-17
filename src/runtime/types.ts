@@ -37,6 +37,13 @@ export interface AgentCapabilities {
 /** Lifecycle state of an agent session, mirrored into /health liveness. */
 export type AgentState = 'spawning' | 'idle' | 'streaming' | 'error' | 'disposed';
 
+const AGENT_STATES: readonly AgentState[] = ['spawning', 'idle', 'streaming', 'error', 'disposed'];
+
+/** Runtime guard for write surfaces (the ledger records what adapters emit). */
+export function isAgentState(value: string): value is AgentState {
+  return (AGENT_STATES as readonly string[]).includes(value);
+}
+
 export interface AgentHealth {
   readonly state: AgentState;
   /** ISO timestamp of the last observed event; null when nothing happened yet. */

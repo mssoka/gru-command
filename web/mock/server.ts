@@ -218,6 +218,11 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     return;
   }
   if (req.method === 'GET' && url.pathname === '/api/transcripts') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(
       JSON.stringify({
@@ -229,6 +234,11 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     return;
   }
   if (req.method === 'GET' && url.pathname === '/api/transcripts/file') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
     const file = url.searchParams.get('file') ?? '';
     const q = url.searchParams.get('q');
     if (file !== SAMPLE_TRANSCRIPT_FILE) {
@@ -242,12 +252,16 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
       const matches = SAMPLE_TRANSCRIPT.map((entry, index) => ({ index, kind: entry.type, text: entry.text }))
         .filter((entry) => entry.text.toLowerCase().includes(needle))
         .map((entry) => ({ index: entry.index, kind: entry.kind, snippet: `…${entry.text.slice(0, 60)}…` }));
-      res.end(JSON.stringify({ file, query: q, matches, scanned: SAMPLE_TRANSCRIPT.length }) + '\n');
+      res.end(
+        JSON.stringify({ file, query: q, matches, scanned: SAMPLE_TRANSCRIPT.length, total: SAMPLE_TRANSCRIPT.length }) + '\n',
+      );
       return;
     }
     const before = url.searchParams.get('before');
+    const limitRaw = url.searchParams.get('limit');
+    const limit = limitRaw === null ? 2 : Math.max(1, Math.min(Number(limitRaw) || 2, 200));
     const upper = before === null ? SAMPLE_TRANSCRIPT.length : Math.min(Number(before), SAMPLE_TRANSCRIPT.length);
-    const lower = Math.max(0, upper - 2);
+    const lower = Math.max(0, upper - limit);
     res.end(
       JSON.stringify({
         file,

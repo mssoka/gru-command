@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { parseSessionEntries } from '@earendil-works/pi-coding-agent';
 import type { LedgerApi } from '../ledger/api.js';
@@ -100,17 +100,46 @@ export interface TranscriptSearchResult {
   readonly matches: readonly TranscriptMatch[];
   /** Search scans at most this many entries (bounded work per request). */
   readonly scanned: number;
+  /** Total entries in the file — scanned < total means the scan was
+   * truncated (oldest entries beyond the cap were not searched). */
+  readonly total: number;
+}
+
+/** Transcripts larger than this refuse to serve (fail-loud) — an
+ * unbounded parse would block the single-threaded server. */
+export const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
+
+/** Parsed-transcript cache entries (parse-once per file revision). */
+const CACHE_LIMIT = 8;
+
+interface CacheEntry {
+  readonly mtimeMs: number;
+  readonly size: number;
+  readonly entries: readonly TranscriptEntry[];
+  readonly tornLines: number;
 }
 
 export class TranscriptService {
   readonly sessionsDir: string;
   private readonly ledger: LedgerApi | null;
   private readonly searchScanLimit: number;
+  private readonly cache = new Map<string, CacheEntry>();
 
   constructor(sessionsDir: string, opts: { ledger?: LedgerApi; searchScanLimit?: number } = {}) {
     this.sessionsDir = resolve(sessionsDir);
     this.ledger = opts.ledger ?? null;
     this.searchScanLimit = opts.searchScanLimit ?? 5_000;
+  }
+
+  /** Canonical sessions dir, resolved lazily per confinement check (the
+   * dir may not exist at construction; macOS temp dirs are themselves
+   * symlinked, so BOTH sides must go through realpath). */
+  private realSessionsDirNow(): string {
+    try {
+      return realpathSync(this.sessionsDir);
+    } catch {
+      return this.sessionsDir;
+    }
   }
 
   /** All session files under the store, newest first. */
@@ -164,8 +193,9 @@ export class TranscriptService {
 
   /**
    * Resolve a client-supplied relative path against the sessions dir and
-   * CONFIRM confinement — traversal attempts throw (rejected loudly, the
-   * caller maps that to 400/404).
+   * CONFIRM confinement — lexically AND through symlinks (realpath): a
+   * link planted inside the store pointing outside must not escape.
+   * Traversal attempts throw (rejected loudly, the caller maps that).
    */
   resolveConfined(relFile: string): string {
     if (relFile === '' || relFile.includes('\0')) {
@@ -176,22 +206,62 @@ export class TranscriptService {
     if (rel === '' || rel.startsWith('..') || rel.includes(`..${sep}`) || rel.includes(`../`) || resolve(full) === this.sessionsDir) {
       throw new Error(`transcript path escapes the session store: ${relFile}`);
     }
+    let real: string;
+    try {
+      real = realpathSync(full);
+    } catch {
+      throw new Error(`transcript unreadable: no such file (${relFile})`);
+    }
+    const realRoot = this.realSessionsDirNow();
+    if (real !== realRoot && !real.startsWith(realRoot + sep)) {
+      throw new Error(`transcript path escapes the session store (symlink): ${relFile}`);
+    }
     return full;
   }
 
   /**
    * Parse the file into transcript entries (server-side; the client only
-   * ever sees bounded pages).
+   * ever sees bounded pages). Parsed once per (mtime, size) revision —
+   * repeated paging/searches hit the cache, and a live-appended file
+   * (mtime change) re-parses.
    */
   read(relFile: string): { entries: readonly TranscriptEntry[]; tornLines: number } {
     const full = this.resolveConfined(relFile);
+    let stat;
+    try {
+      stat = statSync(full);
+    } catch (error) {
+      throw new Error(`transcript unreadable: ${String(error)}`);
+    }
+    if (stat.size > MAX_TRANSCRIPT_BYTES) {
+      throw new Error(
+        `transcript too large to serve (${stat.size} bytes > ${MAX_TRANSCRIPT_BYTES}); archive or split the session file`,
+      );
+    }
+    const cached = this.cache.get(relFile);
+    if (cached !== undefined && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return { entries: cached.entries, tornLines: cached.tornLines };
+    }
     let content: string;
     try {
       content = readFileSync(full, 'utf-8');
     } catch (error) {
       throw new Error(`transcript unreadable: ${String(error)}`);
     }
-    return parseTranscriptContent(content);
+    const parsed = parseTranscriptContent(content);
+    this.cache.delete(relFile);
+    this.cache.set(relFile, {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      entries: parsed.entries,
+      tornLines: parsed.tornLines,
+    });
+    while (this.cache.size > CACHE_LIMIT) {
+      const oldest = this.cache.keys().next().value;
+      if (oldest === undefined) break;
+      this.cache.delete(oldest);
+    }
+    return parsed;
   }
 
   /**
@@ -215,14 +285,19 @@ export class TranscriptService {
     };
   }
 
-  /** Case-insensitive substring search across entry text + thinking. */
+  /**
+   * Case-insensitive substring search across entry text + thinking,
+   * scanning NEWEST-FIRST under the scan cap (recent activity is what
+   * users search for; truncation is disclosed via scanned vs total).
+   */
   search(relFile: string, query: string): TranscriptSearchResult {
     const q = query.toLowerCase();
     const { entries } = this.read(relFile);
-    const scanned = Math.min(entries.length, this.searchScanLimit);
+    const total = entries.length;
+    const scanned = Math.min(total, this.searchScanLimit);
     const matches: TranscriptMatch[] = [];
-    for (let i = 0; i < scanned; i += 1) {
-      const entry = entries[i];
+    for (let offset = 0; offset < scanned; offset += 1) {
+      const entry = entries[total - 1 - offset];
       if (entry === undefined) continue;
       const haystacks = [entry.text, entry.thinking ?? ''];
       for (const hay of haystacks) {
@@ -237,7 +312,7 @@ export class TranscriptService {
         }
       }
     }
-    return { file: relFile, query, matches, scanned };
+    return { file: relFile, query, matches, scanned, total };
   }
 }
 

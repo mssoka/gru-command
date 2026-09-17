@@ -23,7 +23,11 @@ export type BusListener = (event: BusEvent) => void;
 
 export class EventBus {
   private readonly listeners = new Set<BusListener>();
-  private readonly dead: string[] = [];
+  private readonly onListenerError: (message: string) => void;
+
+  constructor(opts: { onListenerError?: (message: string) => void } = {}) {
+    this.onListenerError = opts.onListenerError ?? (() => {});
+  }
 
   subscribe(listener: BusListener): () => void {
     this.listeners.add(listener);
@@ -37,16 +41,10 @@ export class EventBus {
       try {
         listener(event);
       } catch (error) {
-        // Record + continue: a failing subscriber loses THIS event, not
-        // the publisher its write. The list is surfaced for diagnostics.
-        this.dead.push(`${event.kind}: ${String(error)}`);
-        if (this.dead.length > 50) this.dead.splice(0, this.dead.length - 50);
+        // Log + continue: a failing subscriber loses THIS event, never the
+        // publisher its write — and the failure is surfaced, not buffered.
+        this.onListenerError(`bus listener failed on ${event.kind}: ${String(error)}`);
       }
     }
-  }
-
-  /** Listener failures since boot (diagnostics; drains on read). */
-  drainFailures(): readonly string[] {
-    return this.dead.splice(0);
   }
 }

@@ -202,6 +202,7 @@ async function makeHarness(options: {
   readonly steer?: 'native' | 'queued';
   readonly reuseDir?: string;
   readonly failFirstSpawn?: Error;
+  readonly siblingUpgradePaths?: readonly string[];
 } = {}): Promise<Harness> {
   const dir = options.reuseDir ?? mkdtempSync(join(tmpdir(), 'gru-command-e4-'));
   cleanupDirs.push(dir);
@@ -224,6 +225,7 @@ async function makeHarness(options: {
     config: { auth: { token: options.token ?? TOKEN } } as GruCommandConfig,
     frameLog,
     pointer,
+    ...(options.siblingUpgradePaths !== undefined ? { siblingUpgradePaths: options.siblingUpgradePaths } : {}),
     spawnGru: (resumeFile) => {
       spawnCalls.push(resumeFile);
       if (spawnFailure !== null) {
@@ -957,6 +959,34 @@ describe('chat server (real sockets, stub Gru)', () => {
       harness.http.closeAllConnections();
       harness.http.close(() => resolveClose());
     });
+  });
+
+  it('E6: declared sibling upgrade paths pass through (unclaimed paths still die)', async () => {
+    const harness = await makeHarness({ siblingUpgradePaths: ['/board/ws'] } as never);
+    // A sibling wss claims the passed-through path on the same server.
+    const { WebSocketServer: WSS } = await import('ws');
+    const boardWss = new WSS({ noServer: true });
+    const boardConnected = new Promise<void>((resolveConnect) => {
+      boardWss.on('connection', () => resolveConnect());
+    });
+    harness.http.on('upgrade', (request, socket, head) => {
+      if (new URL(request.url ?? '/', 'http://localhost').pathname === '/board/ws') {
+        boardWss.handleUpgrade(request, socket, head, (ws) => boardWss.emit('connection', ws, request));
+      }
+    });
+    const board = new TestClient(harness.port, '/board/ws');
+    await board.open();
+    await boardConnected; // passed through, not destroyed
+    // Unclaimed non-sibling paths still die (standalone semantics kept).
+    const stray = new TestClient(harness.port, '/nope');
+    const code = await Promise.race([
+      stray.closed,
+      new Promise<number>((_, reject) => setTimeout(() => reject(new Error('stray lingered')), 3_000)),
+    ]);
+    expect(typeof code).toBe('number');
+    await board.close();
+    boardWss.close();
+    await harness.close();
   });
 
   it('upgrade requests to a non-/ws path are destroyed without any frames', async () => {
