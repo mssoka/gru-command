@@ -6,13 +6,17 @@ import {
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
-import { dirname, join, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, isAbsolute, relative } from 'node:path';
 import type { GruCommandConfig, Role } from '../config.js';
 import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
+import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths.js';
+
+// E3 extracted the shared session-path helpers; re-export so existing
+// consumers of the pi adapter's surface keep working.
+export { normalizeSessionPath, SessionAlreadyActiveError };
 import type {
   AgentCapabilities,
   AgentHandle,
@@ -27,33 +31,17 @@ import type {
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
-/** Normalize like the SDK (tilde + file:// decode + resolve) so lock keys
- * and active-session keys always match the session's own path. */
-export function normalizeSessionPath(input: string): string {
-  let p = input;
-  if (p === '~') return process.env['HOME'] ?? p;
-  if (p.startsWith('~/')) p = join(process.env['HOME'] ?? '', p.slice(2));
-  if (/^file:\/\//.test(p)) {
-    try {
-      p = fileURLToPath(p);
-    } catch {
-      /* leave as-is; resolve() will reject a bad path loudly */
-    }
-  }
-  // resolve() is Node's path.resolve — join+normalize against cwd.
-  return resolve(p);
-}
-
-/** A session file already hosted by this process must not be re-opened. */
-export class SessionAlreadyActiveError extends Error {
-  constructor(readonly file: string) {
-    super(
-      `session file ${file} is already hosted by this process — refusing to ` +
-        'double-resume (single-writer rule, SPEC ruling 1/12)',
-    );
-    this.name = 'SessionAlreadyActiveError';
-  }
-}
+/** pi adapter capabilities, hoisted so the runtime probe can report them
+ * without constructing the adapter (E3 story 3). */
+export const PI_CAPABILITIES: AgentCapabilities = {
+  streaming: true,
+  steer: 'native',
+  resume: 'file',
+  images: true,
+  thinking: true,
+  thinkingLevelControl: true,
+  followUp: true,
+};
 
 export interface PiRuntimeOptions {
   readonly config: GruCommandConfig;
@@ -84,15 +72,7 @@ interface QueuedMessage {
  */
 export class PiRuntime implements AgentRuntime {
   readonly id = 'pi';
-  readonly capabilities: AgentCapabilities = {
-    streaming: true,
-    steer: 'native',
-    resume: 'file',
-    images: true,
-    thinking: true,
-    thinkingLevelControl: true,
-    followUp: true,
-  };
+  readonly capabilities: AgentCapabilities = PI_CAPABILITIES;
 
   private readonly config: GruCommandConfig;
   private readonly store: SessionStore;
@@ -183,9 +163,11 @@ export class PiRuntime implements AgentRuntime {
     }
     // Confinement: resume only files that live in the session store —
     // never open (or lock) arbitrary paths handed to the spawn options.
+    // The isAbsolute branch covers Windows cross-drive escapes (relative()
+    // then returns an absolute, backslashed path).
     if (resumeFile !== undefined) {
       const rel = relative(this.store.sessionsDir, resumeFile);
-      if (rel === '' || rel.startsWith('..') || rel.includes(':/')) {
+      if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
         throw new Error(
           `resumeFile must live under the session store (${this.store.sessionsDir}), got: ${resumeFile}`,
         );

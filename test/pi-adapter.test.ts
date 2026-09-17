@@ -441,22 +441,21 @@ describe('RuntimeRegistry', () => {
     await registry.dispose();
   });
 
-  it('rejects an unknown runtime id loudly', () => {
+  it('resolves claude-code to a fallback-wrapped adapter and still rejects unknown ids', () => {
     const store = new SessionStore(mkdtempSync(join(tmpdir(), 'gru-command-reg-')));
     cleanupDirs.push(store.dataDir);
     // Minimal config stand-in: the registry only reads runtimes for this
-    // path and must never construct the pi adapter for a claude-code id.
-    const config = { runtimes: { default: 'pi', roles: {} } } as never as Parameters<
-      typeof RuntimeRegistry.prototype.runtimeFor
-    > extends never
-      ? never
-      : never;
-    void config;
+    // path; constructing the claude-code adapter must not touch disk or
+    // probe the binary (that happens lazily at spawn).
     const registry = new RuntimeRegistry({
       config: { runtimes: { default: 'pi', roles: {} } } as never,
       store,
     });
-    expect(() => registry.runtimeFor('claude-code')).toThrow(/no adapter implementation yet/);
+    // Pre-E3 this threw "no adapter implementation yet" (red → green flip):
+    const adapter = registry.runtimeFor('claude-code');
+    expect(adapter.id).toBe('claude-code');
+    expect(adapter.capabilities.steer).toBe('queued'); // fallback-wrapped
+    expect(() => registry.runtimeFor('bogus' as never)).toThrow(/unknown runtime/);
   });
 
   it('self-heals: a handle disposed directly leaves the registry set', async () => {
