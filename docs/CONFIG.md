@@ -56,9 +56,9 @@ port = 7665
 token = "a-random-pairing-token"
 
 [runtimes]
-# Which agent runtime hosts sessions. Implementations arrive in later
-# epics; the names are reserved by the schema now.
-# One of: "pi" | "claude-code". Default: "pi"
+# Which agent runtime hosts sessions. Both adapters are implemented:
+# "pi" (pi SDK reference) and "claude-code" (headless claude -p CLI).
+# Default: "pi"
 default = "pi"
 
 [runtimes.roles]
@@ -92,6 +92,12 @@ perkins = "max"
 # (pi accepts thinking levels: minimal, low, medium, high, xhigh, max).
 model = "default"
 thinking_level = "default"
+
+# [runtimes.claude-code] works the same way for claude-hosted sessions.
+# Thinking levels accepted there: low, medium, high, xhigh, max,
+# ultracode (mapped to the CLI's --effort). An explicit "provider/model"
+# model reference strips the provider segment for the CLI's --model flag.
+# See RUNTIMES.md for the full per-runtime semantics.
 
 [runtimes.pi.roles]
 # Per-runtime per-role overrides; inline tables with model and/or

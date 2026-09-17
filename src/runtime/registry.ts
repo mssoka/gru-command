@@ -2,6 +2,7 @@ import { RUNTIME_IDS, resolveSpawnPolicy, type Role, type RuntimeId } from '../c
 import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
 import { PiRuntime } from './pi-adapter.js';
+import { ClaudeCodeRuntime } from './claude-adapter.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
 import type { AgentHandle, AgentRuntime, SpawnOptions } from './types.js';
 
@@ -29,12 +30,20 @@ export interface PiKnobs {
 
 type PiRuntimeOptionsModelRuntime = ConstructorParameters<typeof PiRuntime>[0]['modelRuntime'];
 
+/** claude-code-adapter-only knobs (test seams). */
+export interface ClaudeKnobs {
+  readonly binary?: string;
+  readonly killGraceMs?: number;
+}
+
 export interface RuntimeRegistryOptions {
   readonly config: Parameters<typeof resolveSpawnPolicy>[0];
   readonly store: SessionStore;
   readonly log?: Log;
   /** pi adapter overrides (agentDir / model runtime — test seams). */
   readonly pi?: PiKnobs;
+  /** claude-code adapter overrides (binary path — test seam). */
+  readonly claude?: ClaudeKnobs;
 }
 
 /**
@@ -96,9 +105,21 @@ export class RuntimeRegistry {
           }),
         );
       } else {
-        // E3 lands the claude-code adapter; resolving it before then is a
-        // configuration referencing something that cannot host yet.
-        throw new Error(`runtime "${id}" has no adapter implementation yet (arrives with the next epic)`);
+        // E3: the claude-code adapter hosts sessions on the headless CLI;
+        // steer-unable, so the interface fallback wrapper serializes it.
+        adapter = withFallbacks(
+          new ClaudeCodeRuntime({
+            config: this.opts.config,
+            store: this.opts.store,
+            ...(this.opts.claude?.binary !== undefined
+              ? { binary: this.opts.claude.binary }
+              : {}),
+            ...(this.opts.claude?.killGraceMs !== undefined
+              ? { killGraceMs: this.opts.claude.killGraceMs }
+              : {}),
+            ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
+          }),
+        );
       }
       this.adapters.set(id, adapter);
     }

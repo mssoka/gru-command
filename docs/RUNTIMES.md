@@ -6,17 +6,109 @@ concrete adapter — the interface is the contract (SPEC ruling 4).
 
 ## Capability matrix
 
-| Capability | `pi` | Meaning |
-|---|---|---|
-| `streaming` | ✅ | text/thinking deltas emitted live |
-| `steer` | `native` | mid-turn steering delivered to the live turn |
-| `resume` | `file` | sessions resume from durable jsonl |
-| `images` | ✅ | image content accepted in prompts |
-| `thinking` | ✅ | thinking output surfaced as events |
-| `thinkingLevelControl` | ✅ | thinking level settable per spawn |
-| `followUp` | ✅ | native queue-until-idle for the turn owner |
+| Capability | `pi` | `claude-code` | Meaning |
+|---|---|---|---|
+| `streaming` | ✅ | ✅ | text/thinking deltas emitted live (claude: `--include-partial-messages`, with a complete-frame fallback) |
+| `steer` | `native` | `queued` | mid-turn steering; claude's `-p` surface has no mid-turn channel → the interface layer queues-until-idle |
+| `resume` | `file` | `file` | sessions resume from durable state (claude: `--session-id`/`--resume` chaining) |
+| `images` | ✅ | ✅ | image content accepted in prompts (claude: base64 blocks in the stdin user frame) |
+| `thinking` | ✅ | ✅ | thinking output surfaced as events |
+| `thinkingLevelControl` | ✅ | ✅ | thinking level settable per spawn (claude: `--effort`) |
+| `followUp` | ✅ | ❌ | claude has no native followUp channel — queued messages deliver as fresh prompt turns |
 
-(`claude-code` lands in the next epic; its column ships with its adapter.)
+## Claude Code adapter (`claude-code`)
+
+Hosts sessions on the Claude Code **headless CLI** — `claude -p` with
+stream-json I/O and session-resume flags (SPEC ruling 4: the CLI surface,
+NOT the SDK/control protocol).
+
+**Process-per-turn.** Every delivered prompt spawns one process:
+
+```
+claude -p --output-format stream-json --input-format stream-json \
+  --verbose --include-partial-messages \
+  (--session-id <uuid> | --resume <uuid>) [--model M] [--effort E] \
+  --permission-mode bypassPermissions --tools <role tools> \
+  --append-system-prompt <role prompt>
+```
+
+fed with ONE stdin user frame (text, or image blocks + text) followed by
+EOF; the turn ends with the `result` frame and the process exits (exit 0).
+There is no long-lived process and no mid-turn channel: `steer` is a
+declared gap (`queued`), served by the interface fallback — a mid-turn
+steer is held and delivered as a fresh prompt turn once the agent is
+idle, never interleaved.
+
+**Session continuity.** The adapter mints the session UUID at spawn
+(`--session-id` on the first turn) and chains later turns with `--resume`
+on the same UUID. Continuity rides claude's own transcript store under
+`~/.claude/` — that is the harness's private resume substrate; the product
+never reads it. The PRODUCT transcript is the raw NDJSON frame stream
+appended verbatim to the session-store file
+(`sessions/<role>/--<dashed-cwd>--<hash8>/<ISO-ts>_<session-uuid>.jsonl`),
+so the lock / hourly backup / boot growth-detection machinery applies
+unchanged (SPEC ruling 12). Resume by `resumeFile` reads the session id
+back out of the transcript's frames, is confined to the store, locks
+before reading, and rejects a file already hosted by this process.
+
+**Emergency console** for a claude-hosted session: stop the service, then
+`claude --resume <session-uuid>` in the workspace (pre-v2.1.223 CLIs only
+search the current project directory for a session id — the adapter always
+spawns with cwd = the configured workspace root, which keeps this working;
+newer CLIs find it from anywhere). The product transcript is not claude's
+format — it is the forensic record, not the console's input.
+
+**Events.** `system/init` starts the turn (state `streaming`, `turn_start`;
+a session-id mismatch kills the process and rejects — never continue a
+foreign session). `stream_event` partials become text/thinking deltas and
+tool input updates; complete `assistant` frames are the no-partials
+fallback (per-kind dedupe: never emitted twice); `tool_use`/`tool_result`
+blocks become `tool_start`/`tool_end` (`is_error` → `isError`);
+`tool_progress` heartbeats become `tool_update`. A `result` frame ends the
+turn: `is_error: true` is an IN-BAND error (error event, sticky `error`
+state, the prompt RESOLVES, the next turn recovers — pi parity); a process
+that exits without any result frame is a transport failure (the prompt
+REJECTS with the stderr tail). Informational frames
+(`rate_limit_event`, hook events, `api_retry`, unknown future types) are
+skipped by design. Dispose SIGTERMs (the CLI aborts and exits 143),
+escalating to SIGKILL after a grace window.
+
+**Permissions and roles.** Headless has no interactive approval channel,
+so sessions run `--permission-mode bypassPermissions` with `--tools`
+restricted to the role's mapped built-ins (read→Read, bash→Bash,
+edit→Edit, write→Write, grep→Grep, find→Glob, ls→LS); the role system
+prompt rides `--append-system-prompt`. MCP tools follow the user's own
+claude configuration (`--tools` restricts built-ins only). The richer
+per-role permission model is E8 territory; LAN bind + pairing token
+(ruling 9) is the v1 security perimeter.
+
+**Model & thinking.** `"default"` omits both flags (claude's own
+configuration decides). An explicit `"provider/model"` reference strips
+the provider segment for `--model` (`anthropic/claude-x` → `claude-x`;
+Bedrock-style dotted ids survive: `bedrock/us.anthropic.claude-x` →
+`us.anthropic.claude-x`). Thinking maps to `--effort`; claude accepts
+`low | medium | high | xhigh | max | ultracode` — anything else (e.g. pi's
+`minimal`) fails loud at spawn naming the valid set. `--effort` is a
+recent CLI flag: a too-old binary fails at startup with a stderr naming
+the flag, which surfaces as a loud transport failure at the first prompt.
+
+**Failure health.** A `claude` binary that is missing/unrunnable at spawn
+(probed once, cached, re-probed after failure) marks the adapter `down`
+and the error names the binary; a mid-life ENOENT does the same. A turn
+that crashes does NOT mark the adapter down — the binary demonstrably
+worked.
+
+Note: piped stdin is capped at 10MB by the CLI — prompts with large image
+sets must stay under it (fine for chat-scale attachments).
+
+## Runtime probe (E9 wizard feed)
+
+`src/runtime/probe.ts` — `probeRuntimes()` detects the installed runtime
+CLIs (`pi`, `claude`): resolves the binary on PATH, runs `--version` with
+a timeout, parses the first semver token (raw line kept), and attaches the
+adapter's declared capability set. Absence/failure/timeout report
+`installed: false` — the probe never throws. Synchronous by design: it
+runs at wizard/boot time, never on a hot path.
 
 ## Model & thinking level policy (SPEC ruling 16)
 
@@ -31,7 +123,9 @@ concrete adapter — the interface is the contract (SPEC ruling 4).
   reference, never a silent fallback.
 - Thinking levels: `"default"` passes through; pi accepts
   `minimal | low | medium | high | xhigh | max` and rejects anything else
-  at spawn (fail-loud — pi CAN set the level). An adapter that CANNOT set
+  at spawn (fail-loud — pi CAN set the level). claude-code accepts
+  `low | medium | high | xhigh | max | ultracode` (mapped to `--effort`)
+  and likewise rejects the rest. An adapter that CANNOT set
   thinking declares `thinkingLevelControl: false`; a non-default request
   against it degrades to **warn + proceed**.
 - Resolution precedence (most specific wins; an explicit `"default"` at a
@@ -139,14 +233,18 @@ epics; the pairing token (and the LAN bind) arrive with the UI epic.
 ## Testing
 
 - The default suite runs fully offline: a stub model provider is
-  registered into a real (offline) pi `ModelRuntime`, and ambient
-  machine credentials are stripped for the test run
-  (`test/helpers/env-setup.ts`).
-- **Opt-in live smoke test** (requires a configured pi install):
+  registered into a real (offline) pi `ModelRuntime`, the claude-code
+  adapter is exercised against a stubbed CLI double (a real child process
+  speaking stream-json, driven by prompt sentinels), the runtime probe
+  runs on fixture PATHs, and ambient machine credentials are stripped for
+  the test run (`test/helpers/env-setup.ts`). The default suite never
+  spawns a real `pi` or `claude`.
+- **Opt-in live smoke tests** (require configured local installs):
 
   ```bash
-  GRU_COMMAND_SMOKE=1 npx vitest run test/smoke-real-model.test.ts
+  GRU_COMMAND_SMOKE=1 npx vitest run test/smoke-real-model.test.ts   # live pi
+  GRU_COMMAND_SMOKE_CLAUDE=1 npx vitest run test/smoke-claude.test.ts # live claude
   ```
 
-  Uses the real agent dir and the runtime's default model; skipped in
-  normal runs (the default suite never touches the network).
+  Skipped in normal runs (the default suite never touches the network).
+  The claude smoke exercises one live round-trip plus one resume turn.
