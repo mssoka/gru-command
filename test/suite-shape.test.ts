@@ -16,8 +16,11 @@ const PINS: Record<string, number> = {
   'chat-frames.test.ts': 4,
   'chat-server.test.ts': 30,
   'chat-session-state.test.ts': 4,
-  'claude-adapter.test.ts': 50,
+  'claude-adapter.test.ts': 52,
   'config.test.ts': 34,
+  'dispatch-e2e.test.ts': 5,
+  'dispatch-server.test.ts': 5,
+  'bob-scheduler.test.ts': 5,
   'health.test.ts': 14,
   'identity.test.ts': 3,
   'install.test.ts': 4,
@@ -26,7 +29,9 @@ const PINS: Record<string, number> = {
   'ledger-db.test.ts': 6,
   'logger.test.ts': 3,
   'notifications.test.ts': 5,
-  'pi-adapter.test.ts': 33,
+  'perkins-wave.test.ts': 13,
+  'pi-adapter.test.ts': 35,
+  'roles-definitions.test.ts': 7,
   'roles-gru.test.ts': 4,
   'runtime-probe.test.ts': 7,
   'session-store.test.ts': 14,
@@ -39,6 +44,8 @@ const PINS: Record<string, number> = {
   'suite-shape.test.ts': 1,
   'supervisor.test.ts': 13,
   'transcripts.test.ts': 13,
+  'worktree-manager.test.ts': 13,
+  'worktree-manifest.test.ts': 6,
 };
 
 describe('suite shape', () => {

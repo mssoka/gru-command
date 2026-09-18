@@ -76,7 +76,8 @@ gate fails-before-fix where applicable.
 1. Silas role (ops) + minion roles (workers) + Perkins wave runner +
    Bob (memory) — prompts, permissions, skill mappings per runtime.
 2. Dispatch flow in-product: briefing authorship (Gru) → ops handoff →
-   minion spawn (git worktree per job) → PR/watch lifecycle on the board.
+   minion spawn (git worktree per job, via the worktree manager — SPEC
+   ruling 18) → PR/watch lifecycle on the board.
 3. Review waves (Perkins): multi-lens agent fleet, per-lens chips,
    verdict records into the ledger.
 4. Tests: end-to-end dispatch on a fixture repo; wave lifecycle.

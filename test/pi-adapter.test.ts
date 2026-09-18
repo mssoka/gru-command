@@ -817,3 +817,31 @@ describe('Perkins r3: gated-twin scenario (winner-ensures-lock leg)', () => {
     }
   });
 });
+
+describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
+  it('hosts the session rooted at an explicit project cwd, not the workspace root', async () => {
+    const fx = await fixture();
+    const project = join(fx.workspace, 'fixture-project');
+    mkdirSync(project, { recursive: true });
+    const handle = await fx.runtime.spawn('minion', { cwd: project });
+    try {
+      const expectedDir = fx.store.sessionDirFor('minion', project);
+      expect(handle.sessionFile).toContain(expectedDir);
+      expect(handle.sessionFile).not.toContain(fx.store.sessionDirFor('minion', fx.workspace));
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('fails loud on a relative or nonexistent cwd (never a silent fallback)', async () => {
+    const fx = await fixture();
+    await expect(fx.runtime.spawn('minion', { cwd: 'relative/path' })).rejects.toThrowError(
+      /absolute path/,
+    );
+    await expect(fx.runtime.spawn('minion', { cwd: join(fx.workspace, 'missing') })).rejects.toThrowError(
+      /does not exist/,
+    );
+    // Neither failure dents adapter health (caller-facing, not infra).
+    expect(fx.runtime.health().state).toBe('ok');
+  });
+});

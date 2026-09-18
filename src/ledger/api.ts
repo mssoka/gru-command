@@ -16,6 +16,8 @@ import {
   type RoundVerdict,
 } from './states.js';
 
+export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
+
 type Row = Record<string, unknown>;
 
 /**
@@ -44,6 +46,8 @@ export interface JobRecord {
   readonly baseBranch: string | null;
   readonly prUrl: string | null;
   readonly note: string | null;
+  /** The briefing this job executes (E8; Gru-authored, Silas-executed). */
+  readonly briefing: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -132,6 +136,43 @@ export class RecordNotFound extends Error {
     super(message);
     this.name = 'RecordNotFound';
   }
+}
+
+// ------------------------------------------------------------------
+// Worktree registry (E8; SPEC ruling 18b — the ledger is the
+// authoritative map job → worktree → branch; sweeps match THESE
+// paths only, never id-proximity or labels).
+// ------------------------------------------------------------------
+
+export const WORKTREE_KINDS = ['job', 'review'] as const;
+export type WorktreeKind = (typeof WORKTREE_KINDS)[number];
+
+export const WORKTREE_STATUSES = ['active', 'paused', 'swept'] as const;
+export type WorktreeStatus = (typeof WORKTREE_STATUSES)[number];
+
+export function isWorktreeKind(value: string): value is WorktreeKind {
+  return (WORKTREE_KINDS as readonly string[]).includes(value);
+}
+
+export function isWorktreeStatus(value: string): value is WorktreeStatus {
+  return (WORKTREE_STATUSES as readonly string[]).includes(value);
+}
+
+export interface WorktreeRecord {
+  /** The owning job id (kind 'job') or round id (kind 'review'). */
+  readonly id: string;
+  readonly kind: WorktreeKind;
+  readonly repoPath: string;
+  readonly repoName: string;
+  readonly path: string;
+  readonly branch: string | null;
+  readonly sha: string;
+  readonly jobId: string | null;
+  readonly roundId: string | null;
+  readonly status: WorktreeStatus;
+  readonly note: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 
 function nowIso(): string {
@@ -258,6 +299,7 @@ export class LedgerApi {
     repo: string;
     title: string;
     baseBranch?: string | null;
+    briefing?: string | null;
   }): JobRecord {
     if (input.id === '' || input.repo === '' || input.title === '') {
       throw new Error('job id, repo, and title must be non-empty');
@@ -269,10 +311,10 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, created_at, updated_at)
-           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?)`,
+          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, created_at, updated_at)
+           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?)`,
         )
-        .run(input.id, input.repo, input.title, input.baseBranch ?? null, ts, ts);
+        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, ts, ts);
       this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title } });
       return this.getJob(input.id) as JobRecord;
     });
@@ -327,13 +369,132 @@ export class LedgerApi {
     });
   }
 
-  setJobTargetRef(id: string, ref: string): JobRecord {
+  setJobBriefing(id: string, briefing: string): JobRecord {
+    if (briefing.trim() === '') throw new Error('job briefing must be non-empty');
     return this.transaction(() => {
       const current = this.getJob(id);
       if (current === null) throw new RecordNotFound(`job "${id}" not found`);
-      this.db.prepare('UPDATE jobs SET base_branch = ?, updated_at = ? WHERE id = ?').run(ref, nowIso(), id);
-      this.appendEvent({ kind: 'job.target', jobId: id, payload: { ref } });
+      this.db.prepare('UPDATE jobs SET briefing = ?, updated_at = ? WHERE id = ?').run(briefing, nowIso(), id);
+      this.appendEvent({ kind: 'job.briefing', jobId: id, payload: { bytes: briefing.length } });
       return this.getJob(id) as JobRecord;
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Worktree registry (E8; SPEC ruling 18b)
+  // ------------------------------------------------------------------
+
+  registerWorktree(input: {
+    id: string;
+    kind: string;
+    repoPath: string;
+    repoName: string;
+    path: string;
+    branch?: string | null;
+    sha: string;
+    jobId?: string | null;
+    roundId?: string | null;
+  }): WorktreeRecord {
+    if (input.id === '' || input.path === '' || input.repoPath === '' || input.sha === '') {
+      throw new Error('worktree id, path, repo path, and sha must be non-empty');
+    }
+    if (!isWorktreeKind(input.kind)) {
+      throw new Error(`unknown worktree kind "${input.kind}" (valid: ${WORKTREE_KINDS.join(', ')})`);
+    }
+    if (input.kind === 'job' && (input.jobId === null || input.jobId === undefined)) {
+      throw new Error(`worktree "${input.id}" of kind 'job' requires its owning job id`);
+    }
+    if (input.kind === 'review' && (input.roundId === null || input.roundId === undefined)) {
+      throw new Error(`worktree "${input.id}" of kind 'review' requires its owning round id`);
+    }
+    if (input.jobId !== null && input.jobId !== undefined && this.getJob(input.jobId) === null) {
+      throw new RecordNotFound(`job "${input.jobId}" not found — a worktree lane belongs to a real job`);
+    }
+    if (input.roundId !== null && input.roundId !== undefined && this.getRound(input.roundId) === null) {
+      throw new RecordNotFound(`round "${input.roundId}" not found — a review worktree belongs to a real round`);
+    }
+    return this.transaction(() => {
+      if (this.getWorktree(input.id) !== null) {
+        throw new Error(`worktree "${input.id}" already exists`);
+      }
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, job_id, round_id, status, note, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.kind,
+          input.repoPath,
+          input.repoName,
+          input.path,
+          input.branch ?? null,
+          input.sha,
+          input.jobId ?? null,
+          input.roundId ?? null,
+          ts,
+          ts,
+        );
+      this.appendEvent({
+        kind: 'worktree.created',
+        jobId: input.jobId ?? null,
+        roundId: input.roundId ?? null,
+        payload: { id: input.id, kind: input.kind, path: input.path, branch: input.branch ?? null, sha: input.sha },
+      });
+      return this.getWorktree(input.id) as WorktreeRecord;
+    });
+  }
+
+  getWorktree(id: string): WorktreeRecord | null {
+    const row = this.db.prepare('SELECT * FROM worktrees WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : this.worktreeFromRow(row);
+  }
+
+  listWorktrees(opts: { status?: string; jobId?: string } = {}): readonly WorktreeRecord[] {
+    let rows: Row[];
+    if (opts.status !== undefined) {
+      if (!isWorktreeStatus(opts.status)) {
+        throw new Error(`unknown worktree status "${opts.status}"`);
+      }
+      rows = this.db.prepare('SELECT * FROM worktrees WHERE status = ? ORDER BY created_at, id').all(opts.status) as Row[];
+    } else {
+      rows = this.db.prepare('SELECT * FROM worktrees ORDER BY created_at, id').all() as Row[];
+    }
+    const all = rows.map((row) => this.worktreeFromRow(row));
+    return opts.jobId === undefined ? all : all.filter((row) => row.jobId === opts.jobId);
+  }
+
+  setWorktreeStatus(id: string, status: string, note?: string): WorktreeRecord {
+    if (!isWorktreeStatus(status)) throw new Error(`unknown worktree status "${status}"`);
+    return this.transaction(() => {
+      const current = this.getWorktree(id);
+      if (current === null) throw new RecordNotFound(`worktree "${id}" not found`);
+      this.db
+        .prepare('UPDATE worktrees SET status = ?, note = COALESCE(?, note), updated_at = ? WHERE id = ?')
+        .run(status, note ?? null, nowIso(), id);
+      this.appendEvent({
+        kind: 'worktree.status',
+        jobId: current.jobId,
+        roundId: current.roundId,
+        payload: { id, from: current.status, to: status, ...(note !== undefined ? { note } : {}) },
+      });
+      return this.getWorktree(id) as WorktreeRecord;
+    });
+  }
+
+  noteWorktree(id: string, note: string): WorktreeRecord {
+    return this.transaction(() => {
+      const current = this.getWorktree(id);
+      if (current === null) throw new RecordNotFound(`worktree "${id}" not found`);
+      this.db.prepare('UPDATE worktrees SET note = ?, updated_at = ? WHERE id = ?').run(note, nowIso(), id);
+      this.appendEvent({
+        kind: 'worktree.note',
+        jobId: current.jobId,
+        roundId: current.roundId,
+        payload: { id, note },
+      });
+      return this.getWorktree(id) as WorktreeRecord;
     });
   }
 
@@ -613,6 +774,36 @@ export class LedgerApi {
     });
   }
 
+  /** Attach a live agent to its job lane (E8 dispatch wiring; the spawn
+   * envelope carries no job context — this is the one call that binds). */
+  attachAgentToJob(agentId: string, jobId: string): AgentRecord {
+    return this.transaction(() => {
+      const agent = this.getAgent(agentId);
+      if (agent === null) throw new RecordNotFound(`agent "${agentId}" not found`);
+      if (this.getJob(jobId) === null) throw new RecordNotFound(`job "${jobId}" not found`);
+      this.db
+        .prepare('UPDATE agents SET job_id = ?, updated_at = ? WHERE id = ?')
+        .run(jobId, nowIso(), agentId);
+      this.appendEvent({ kind: 'agent.attached', agentId, jobId, payload: { jobId } });
+      return this.getAgent(agentId) as AgentRecord;
+    });
+  }
+
+  /** Attach a live agent to a review round (E8 wave wiring). */
+  attachAgentToRound(agentId: string, roundId: string): AgentRecord {
+    return this.transaction(() => {
+      const agent = this.getAgent(agentId);
+      if (agent === null) throw new RecordNotFound(`agent "${agentId}" not found`);
+      const round = this.getRound(roundId);
+      if (round === null) throw new RecordNotFound(`round "${roundId}" not found`);
+      this.db
+        .prepare('UPDATE agents SET round_id = ?, job_id = COALESCE(job_id, ?), updated_at = ? WHERE id = ?')
+        .run(roundId, round.jobId, nowIso(), agentId);
+      this.appendEvent({ kind: 'agent.attached', agentId, jobId: round.jobId, roundId, payload: { roundId } });
+      return this.getAgent(agentId) as AgentRecord;
+    });
+  }
+
   appendCustomEvent(fields: {
     kind: string;
     agentId?: string | null;
@@ -753,6 +944,25 @@ export class LedgerApi {
       status: str(row.status) as JobStatus,
       baseBranch: nstr(row.base_branch),
       prUrl: nstr(row.pr_url),
+      note: nstr(row.note),
+      briefing: nstr(row.briefing),
+      createdAt: str(row.created_at),
+      updatedAt: str(row.updated_at),
+    };
+  }
+
+  private worktreeFromRow(row: Row): WorktreeRecord {
+    return {
+      id: str(row.id),
+      kind: str(row.kind) as WorktreeKind,
+      repoPath: str(row.repo_path),
+      repoName: str(row.repo_name),
+      path: str(row.path),
+      branch: nstr(row.branch),
+      sha: str(row.sha),
+      jobId: nstr(row.job_id),
+      roundId: nstr(row.round_id),
+      status: str(row.status) as WorktreeStatus,
       note: nstr(row.note),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),

@@ -1139,3 +1139,25 @@ describe('ClaudeTurnTranslator (pure)', () => {
     expect(extractSessionId('{"type":"user","message":{}}\n')).toBeNull();
   });
 });
+
+describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
+  it('runs the CLI with the explicit project cwd, not the workspace root', async () => {
+    const fx = fixture();
+    const project = join(fx.workspace, 'fixture-project');
+    mkdirSync(project, { recursive: true });
+    const handle = await fx.runtime.spawn('minion', { cwd: project });
+    await handle.prompt('build this');
+    await handle.dispose();
+    const [invocation] = doubleInvocations(fx);
+    expect(realpathSync(invocation!.cwd)).toBe(realpathSync(project));
+  });
+
+  it('fails loud on a bad cwd before any CLI process exists', async () => {
+    const fx = fixture();
+    await expect(fx.runtime.spawn('minion', { cwd: 'relative' })).rejects.toThrowError(/absolute path/);
+    await expect(fx.runtime.spawn('minion', { cwd: join(fx.workspace, 'nope') })).rejects.toThrowError(
+      /does not exist/,
+    );
+    expect(doubleInvocations(fx)).toHaveLength(0);
+  });
+});

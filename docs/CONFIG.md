@@ -134,6 +134,20 @@ keep = 5
 # N shards; reconnect replay spans shards (history intact in-window).
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
+
+[worktrees]
+# Worktree manager (E8, SPEC ruling 18). All optional.
+# root: where job/review worktrees are created (default:
+# <data_dir>/worktrees).
+# preserve_root: where untracked deliverables land on sweep (default:
+# <data_dir>/worktree-preserves).
+# setup_timeout_ms: budget per one-time bootstrap setup command.
+setup_timeout_ms = 120000
+
+[dispatch]
+# Dispatch flow (E8). Optional.
+# bob_interval_ms: Bob's periodic consolidation interval; 0 disables.
+bob_interval_ms = 3600000
 ```
 
 See [`example.config.toml`](./example.config.toml) for a complete generic

@@ -12,7 +12,14 @@ import { createBoardServer } from './board/server.js';
 import { NotificationCenter } from './notifications/center.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
+import { WorktreeManager } from './worktrees/manager.js';
+import { DispatchService } from './dispatch/service.js';
+import { GhPrPoster, WaveRunner } from './dispatch/perkins.js';
+import { BobScheduler } from './dispatch/bob-scheduler.js';
+import { createDispatchServer } from './dispatch/server.js';
 import { createService, type ServiceHandle } from './server.js';
+import type { Role } from './config.js';
+import type { SpawnOptions } from './runtime/types.js';
 import { ChatFrameLog } from './chat/frame-log.js';
 import { createChatServer, type ChatServer } from './chat/server.js';
 import { BOARD_WS_PATH } from './board/frames.js';
@@ -82,6 +89,7 @@ async function main(): Promise<number> {
     board?: Awaited<ReturnType<typeof createBoardServer>>;
     ledgerDb?: LedgerDb;
     supervisor?: Supervisor;
+    bob?: BobScheduler;
   } = {};
   let shuttingDown = false;
   const shutdown = (signal: string) => {
@@ -126,6 +134,13 @@ async function main(): Promise<number> {
             state.supervisor.dispose();
           } catch (error) {
             logger.error('supervisor dispose failed', { error: String(error) });
+          }
+        }
+        if (state.bob !== undefined) {
+          try {
+            state.bob.stop();
+          } catch (error) {
+            logger.error('bob scheduler stop failed', { error: String(error) });
           }
         }
         if (state.registry !== undefined) {
@@ -272,6 +287,60 @@ async function main(): Promise<number> {
   state.board = board;
   logger.info('ledger ready', { db_path: ledgerDb.dbPath });
 
+  // Dispatch flow (E8): the worktree manager (SPEC ruling 18), the ops
+  // handoff service, the Perkins wave runner, and Bob's periodic
+  // consolidation trigger — all fed by the one ledger + registry.
+  const worktreeManager = new WorktreeManager({
+    ledger,
+    root: config.worktrees.root,
+    preserveRoot: config.worktrees.preserveRoot,
+    setupTimeoutMs: config.worktrees.setupTimeoutMs,
+    onSweepPaused: ({ worktree, processes }) => {
+      notifications.post({
+        kind: 'worktree-sweep-paused',
+        routing: 'action-required',
+        severity: 'info',
+        title: `Worktree sweep paused: live processes in ${worktree.repoName}`,
+        detail: `${processes.length} process(es) rooted in ${worktree.path} ` +
+          `(pids ${processes.map((p) => p.pid).join(', ')}) — acknowledge to confirm removal`,
+      });
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const dispatcher = new DispatchService({
+    ledger,
+    manager: worktreeManager,
+    spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const wave = new WaveRunner({
+    ledger,
+    manager: worktreeManager,
+    spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
+    poster: new GhPrPoster(),
+    escalate: (title, detail) => {
+      notifications.post({ kind: 'review-escalation', routing: 'action-required', severity: 'error', title, detail });
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const bobSlot = supervisorLive.declareSlot({
+    id: 'bob-consolidator',
+    role: 'bob',
+    spawn: (spawnOptions) => registry.spawn('bob', spawnOptions ?? {}),
+  });
+  const bob = new BobScheduler({
+    intervalMs: config.dispatch.bobIntervalMs,
+    slot: bobSlot,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const dispatchServer = createDispatchServer({
+    config,
+    dispatch: dispatcher,
+    wave,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  state.bob = bob;
+
   const service = createService(
     config,
     identity,
@@ -280,7 +349,8 @@ async function main(): Promise<number> {
     {
       staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)),
       supervisionStatus: () => supervisorLive.status(),
-      requestHook: (req, res, path) => board.requestHook(req, res, path),
+      requestHook: (req, res, path) =>
+        dispatchServer.requestHook(req, res, path) || board.requestHook(req, res, path),
     },
   );
   state.handle = await service.start();
@@ -290,6 +360,7 @@ async function main(): Promise<number> {
   state.chat = chat;
   chat.warmup();
   supervisorLive.start();
+  bob.start();
 
   logger.info('listening', { host: handle.host, port: handle.port });
   return new Promise<number>(() => {
