@@ -654,3 +654,118 @@ describe('Perkins r2 B2/B3: confirmed kills hit exactly the acknowledged set, fo
     }
   });
 });
+
+describe('Perkins r3: the kill contract discriminators (recorded set, not the living set)', () => {
+  function cwdChild(cwd: string) {
+    return spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { cwd, stdio: 'ignore' });
+  }
+
+  it('DISCRIMINATOR: confirm kills ONLY the acknowledged pid — a later arrival gets its own ask', async () => {
+    const h = harness(true); // default enumerator, real signals
+    const repo = h.make();
+    ledgerJob(h, 'job-disc', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-disc' });
+    const first = cwdChild(row.path);
+    try {
+      await vi.waitFor(
+        () => {
+          expect(psEnumerator(row.path).some((p) => p.pid === first.pid)).toBe(true);
+        },
+        { timeout: 5_000 },
+      );
+      // Pause records EXACTLY the first process.
+      const paused = await h.manager.release({ worktreeId: 'job-disc' });
+      expect(paused.status).toBe('paused');
+      if (paused.status === 'paused') expect(paused.processes.map((p) => p.pid)).toEqual([first.pid]);
+
+      // A NEWCOMER arrives after the ask was recorded — never acknowledged.
+      const newcomer = cwdChild(row.path);
+      try {
+        await vi.waitFor(
+          () => {
+            expect(psEnumerator(row.path).some((p) => p.pid === newcomer.pid)).toBe(true);
+          },
+          { timeout: 5_000 },
+        );
+        const confirmed = await h.manager.release({ worktreeId: 'job-disc', confirmKill: true });
+        // The acknowledged pid was killed…
+        expect(first.kill(0)).toBe(false);
+        // …and ONLY it: the newcomer survives the first confirm…
+        expect(confirmed.status).toBe('paused');
+        if (confirmed.status === 'paused') {
+          expect(confirmed.processes.map((p) => p.pid)).toEqual([newcomer.pid]);
+          expect(confirmed.note).toMatch(/NEW process/);
+        }
+        expect(newcomer.kill(0)).toBe(true);
+        // …and gets its own ask on the record, answerable in turn.
+        const asked = h.ledger.listWorktreeProcesses('job-disc');
+        expect(asked.find((p) => p.pid === newcomer.pid)?.state).toBe('live');
+        expect(asked.find((p) => p.pid === first.pid)?.state).toBe('killed');
+        const second = await h.manager.release({ worktreeId: 'job-disc', confirmKill: true });
+        expect(second.status).toBe('swept');
+        expect(newcomer.kill(0)).toBe(false);
+      } finally {
+        try {
+          newcomer.kill('SIGKILL');
+        } catch {
+          /* reaped */
+        }
+      }
+    } finally {
+      try {
+        first.kill('SIGKILL');
+      } catch {
+        /* reaped */
+      }
+    }
+  });
+
+  it('DISCRIMINATOR: an acknowledged pid that left on its own kills nothing; the newcomer still re-asks', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-gone', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-gone' });
+    const first = cwdChild(row.path);
+    try {
+      await vi.waitFor(
+        () => {
+          expect(psEnumerator(row.path).some((p) => p.pid === first.pid)).toBe(true);
+        },
+        { timeout: 5_000 },
+      );
+      await expect(h.manager.release({ worktreeId: 'job-gone' })).resolves.toMatchObject({
+        status: 'paused',
+      });
+      // The acknowledged process leaves on its own; a different one arrives.
+      first.kill('SIGKILL');
+      const newcomer = cwdChild(row.path);
+      try {
+        await vi.waitFor(
+          () => {
+            expect(psEnumerator(row.path).some((p) => p.pid === newcomer.pid)).toBe(true);
+          },
+          { timeout: 5_000 },
+        );
+        const confirmed = await h.manager.release({ worktreeId: 'job-gone', confirmKill: true });
+        // Nothing unacknowledged was touched: the newcomer is alive, re-asked.
+        expect(confirmed.status).toBe('paused');
+        expect(newcomer.kill(0)).toBe(true);
+        expect(h.ledger.listWorktreeProcesses('job-gone').find((p) => p.pid === newcomer.pid)?.state).toBe(
+          'live',
+        );
+      } finally {
+        try {
+          newcomer.kill('SIGKILL');
+        } catch {
+          /* reaped */
+        }
+      }
+    } finally {
+      try {
+        first.kill('SIGKILL');
+      } catch {
+        /* reaped */
+      }
+    }
+  });
+});

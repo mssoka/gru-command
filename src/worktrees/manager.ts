@@ -316,7 +316,15 @@ export class WorktreeManager {
    * DETACHED worktree at the ref under review — reviews never grow
    * branch debris.
    */
-  async createReviewWorktree(input: { repoPath: string; roundId: string; ref: string }): Promise<WorktreeRecord> {
+  async createReviewWorktree(input: {
+    repoPath: string;
+    roundId: string;
+    ref: string;
+    /** Perkins r3 B3: the review lane belongs to its job — linkage is
+     * recorded at creation so a paused review tree is answerable through
+     * the job's own release path, never orphanable. */
+    jobId?: string;
+  }): Promise<WorktreeRecord> {
     if (input.roundId === '' || input.ref === '') {
       throw new Error('round id and ref must be non-empty');
     }
@@ -343,6 +351,7 @@ export class WorktreeManager {
         branch: null,
         sha,
         roundId: input.roundId,
+        ...(input.jobId !== undefined ? { jobId: input.jobId } : {}),
       });
       this.log('info', 'review worktree created (detached)', { round: input.roundId, path, ref: input.ref });
       return record;

@@ -172,12 +172,25 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     if (req.method === 'POST' && path === '/api/dispatch/release') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
-      const result = await options.dispatch.release(strField(body, 'job_id'), {
-        ...(optBoolField(body, 'confirm_kill') !== undefined
-          ? { confirmKill: optBoolField(body, 'confirm_kill') }
-          : {}),
-        ...(optStrField(body, 'base_branch') !== undefined ? { baseBranch: optStrField(body, 'base_branch') } : {}),
-      });
+      const roundId = optStrField(body, 'round_id');
+      const result =
+        roundId !== undefined
+          ? // Round-scoped answer path: a paused REVIEW lane is released by
+            // its round id (Perkins r3 B3 — every pause answerable by
+            // construction, no orphanable paused tree).
+            await options.wave.releaseRound(roundId, {
+              ...(optBoolField(body, 'confirm_kill') !== undefined
+                ? { confirmKill: optBoolField(body, 'confirm_kill') }
+                : {}),
+            })
+          : await options.dispatch.release(strField(body, 'job_id'), {
+              ...(optBoolField(body, 'confirm_kill') !== undefined
+                ? { confirmKill: optBoolField(body, 'confirm_kill') }
+                : {}),
+              ...(optStrField(body, 'base_branch') !== undefined
+                ? { baseBranch: optStrField(body, 'base_branch') }
+                : {}),
+            });
       if (result === null) {
         json(res, 404, { error: 'not_found', detail: 'no active worktree for this job' });
         return true;

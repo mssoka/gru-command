@@ -184,6 +184,18 @@ export class WaveRunner {
     return begun.run;
   }
 
+  /**
+   * Round-scoped release (Perkins r3 B3 — the answerable-pause rule): a
+   * paused review lane is answered by its ROUND id, symmetric with the
+   * job's own release path.
+   */
+  async releaseRound(roundId: string, opts: { confirmKill?: boolean } = {}) {
+    return this.opts.manager.release({
+      worktreeId: roundId,
+      ...(opts.confirmKill !== undefined ? { confirmKill: opts.confirmKill } : {}),
+    });
+  }
+
   /** Set the round up (job in review, chips created, detached worktree,
    * fleet LAUNCHED) and return immediately — the outcome promise is the
    * board's to watch, not the HTTP caller's. */
@@ -225,6 +237,7 @@ export class WaveRunner {
         repoPath: jobWorktree.repoPath,
         roundId: round.id,
         ref: targetRef,
+        jobId: job.id,
       });
       this.opts.ledger.setRoundStatus(round.id, 'live');
     } catch (error) {

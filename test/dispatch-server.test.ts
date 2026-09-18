@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +11,8 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { loadConfig } from '../src/config.js';
 import { WorktreeManager } from '../src/worktrees/manager.js';
 import { DispatchService } from '../src/dispatch/service.js';
-import { WaveRunner } from '../src/dispatch/perkins.js';
+import { WaveRunner, type LensDriver } from '../src/dispatch/perkins.js';
+import { psEnumerator } from '../src/worktrees/manager.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 import type { Role } from '../src/config.js';
@@ -40,7 +41,7 @@ interface ServerHarness {
   close: () => Promise<void>;
 }
 
-async function boot(opts: { token?: string } = {}): Promise<ServerHarness> {
+async function boot(opts: { token?: string; driveLens?: LensDriver } = {}): Promise<ServerHarness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
   const token = opts.token ?? TOKEN;
@@ -87,7 +88,9 @@ async function boot(opts: { token?: string } = {}): Promise<ServerHarness> {
     ledger,
     manager,
     spawner,
-    driveLens: async () => ({ state: 'done', verdict: 'clean' }),
+    ...(opts.driveLens !== undefined
+      ? { driveLens: opts.driveLens }
+      : { driveLens: async () => ({ state: 'done' as const, verdict: 'clean' as const }) }),
   });
   const server = createDispatchServer({ config: cfg, dispatch, wave });
   const http: HttpServer = createServer((req, res) => {
@@ -241,6 +244,17 @@ describe('dispatch server (E8)', () => {
         const paused = await call(h.port, 'POST', '/api/dispatch/release', { job_id: 'http-release' }, TOKEN);
         expect(paused.status).toBe(200);
         expect(field<string>(paused.json, 'status')).toBe('paused');
+        // The human acknowledges against THIS payload: the pid list (with
+        // what each process is and how it was tied to the tree) and the ask.
+        const pausedList = field<{ pid: number; command: string; evidence: string }[]>(
+          paused.json,
+          'processes',
+        );
+        expect(pausedList.length).toBe(1);
+        expect(pausedList[0]?.pid).toBe(child.pid);
+        expect(pausedList[0]?.command).toMatch(/node/);
+        expect(pausedList[0]?.evidence).toBe('cwd');
+        expect(field<string>(paused.json, 'note')).toMatch(/acknowledge to proceed/);
         // The tree survives the pause, deliverable included.
         expect(existsSync(worktreePath)).toBe(true);
         const confirmed = await call(
@@ -274,6 +288,88 @@ describe('dispatch server (E8)', () => {
       const bad = await call(h.port, 'POST', '/api/dispatch', { job_id: 'x' }, TOKEN);
       expect(bad.status).toBe(400);
       expect(field<string>(bad.json, 'error')).toBe('bad_request');
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+describe('Perkins r3 B3: every pause is answerable — the review lane included', () => {
+  it('a round whose sweep pauses is answered via round_id (and the review row carries its job)', async () => {
+    // Gate the lens fleet: the round stays LIVE until the test has rooted
+    // a real process in the review tree — then the completion sweep pauses.
+    let releaseFleet: () => void = () => {};
+    const fleetGate = new Promise<void>((resolve) => {
+      releaseFleet = resolve;
+    });
+    const h = await boot({
+      driveLens: async () => {
+        await fleetGate;
+        return { state: 'done' as const, verdict: 'clean' as const };
+      },
+    });
+    const repo = makeFixtureRepo('fixture-http-reviewpause');
+    cleanupRepos.push(repo);
+    try {
+      await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        { job_id: 'http-rp', repo_path: repo.path, title: 'reviewable', briefing: 'ship it' },
+        TOKEN,
+      );
+      await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'http-rp', url: PR_URL }, TOKEN);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'http-rp' }, TOKEN);
+      expect(review.status).toBe(202);
+      const roundId = field<string>(review.json, 'round_id');
+
+      // The review lane exists (fleet still gated); linkage is by construction.
+      const wts = await call(h.port, 'GET', '/api/dispatch/jobs/http-rp/worktrees', undefined, TOKEN);
+      const rows = field<
+        { id: string; kind: string; path: string; jobId: string | null; status: string }[]
+      >(wts.json, 'worktrees');
+      const reviewRow = rows.find((row) => row.kind === 'review');
+      expect(reviewRow).toBeDefined();
+      expect(reviewRow?.jobId).toBe('http-rp');
+
+      const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+        cwd: reviewRow!.path,
+        stdio: 'ignore',
+      });
+      try {
+        await vi.waitFor(
+          () => {
+            expect(psEnumerator(reviewRow!.path).some((p) => p.pid === child.pid)).toBe(true);
+          },
+          { timeout: 5_000 },
+        );
+        releaseFleet(); // fleet finishes → the round's sweep meets the child
+        await vi.waitFor(
+          () => {
+            expect(h.ledger.getWorktree(roundId)?.status).toBe('paused');
+          },
+          { timeout: 10_000 },
+        );
+        // Answer path: the endpoint takes the ROUND id.
+        const answered = await call(
+          h.port,
+          'POST',
+          '/api/dispatch/release',
+          { round_id: roundId, confirm_kill: true },
+          TOKEN,
+        );
+        expect(answered.status).toBe(200);
+        expect(field<string>(answered.json, 'status')).toBe('swept');
+        expect(existsSync(reviewRow!.path)).toBe(false);
+        expect(child.kill(0)).toBe(false);
+      } finally {
+        releaseFleet();
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* reaped by the confirmed kill */
+        }
+      }
     } finally {
       await h.close();
     }

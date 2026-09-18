@@ -20,7 +20,7 @@ const PINS: Record<string, number> = {
   'config.test.ts': 37,
   'dispatch-e2e.test.ts': 5,
   'dispatch-joins.test.ts': 2,
-  'dispatch-server.test.ts': 5,
+  'dispatch-server.test.ts': 6,
   'bob-scheduler.test.ts': 5,
   'health.test.ts': 14,
   'identity.test.ts': 3,
@@ -46,7 +46,7 @@ const PINS: Record<string, number> = {
   'suite-shape.test.ts': 1,
   'supervisor.test.ts': 13,
   'transcripts.test.ts': 13,
-  'worktree-manager.test.ts': 24,
+  'worktree-manager.test.ts': 26,
   'worktree-manifest.test.ts': 6,
 };
 
