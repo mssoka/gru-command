@@ -26,7 +26,12 @@ export function makeFixtureRepo(name = 'fixture-app'): FixtureRepo {
   const path = join(dir, name);
   mkdirSync(path, { recursive: true });
   const git = (args: readonly string[], cwd: string = path): string =>
-    execFileSync('git', args, { cwd, encoding: 'utf-8' }).trim();
+    execFileSync('git', args, {
+      cwd,
+      encoding: 'utf-8',
+      // Captured, never inherited: expected-failure assertions stay quiet.
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
   git(['init', '-b', 'main']);
   writeFileSync(join(path, 'README.md'), `# ${name}\n\nFixture repository for dispatch-flow tests.\n`);
   mkdirSync(join(path, 'src'), { recursive: true });
@@ -53,7 +58,11 @@ export function makeFixtureRepo(name = 'fixture-app'): FixtureRepo {
       // before the temp dir goes away so nothing dangles into tmp.
       try {
         git(['worktree', 'list', '--porcelain']);
-        execFileSync('git', ['worktree', 'prune'], { cwd: path, encoding: 'utf-8' });
+        execFileSync('git', ['worktree', 'prune'], {
+          cwd: path,
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
       } catch {
         /* best effort */
       }

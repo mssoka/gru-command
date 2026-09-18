@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -38,6 +39,18 @@ interface DispatchHarness {
   cleanup(): void;
 }
 
+/** The default minion craft: a stub change COMMITTED inside its assigned
+ * worktree — exercising the real git path a dispatched agent uses. */
+async function defaultMinionSettle(_text: string, cwd: string): Promise<void> {
+  writeFileSync(join(cwd, 'minion-deliverable.txt'), 'stub change delivered\n');
+  execFileSync('git', ['add', 'minion-deliverable.txt'], { cwd });
+  execFileSync(
+    'git',
+    ['-c', 'user.name=Fixture Minion', '-c', 'user.email=minion@example.invalid', 'commit', '-m', 'minion: deliver the stub change'],
+    { cwd },
+  );
+}
+
 function makeHandle(id: string, role: Role, settle: (text: string) => Promise<void>): FakeHandle {
   const prompts: { text: string; owner?: string }[] = [];
   const listeners = new Set<(event: RuntimeEvent) => void>();
@@ -64,7 +77,7 @@ function makeHandle(id: string, role: Role, settle: (text: string) => Promise<vo
 }
 
 function makeDispatchHarness(opts: {
-  minionSettle?: (text: string) => Promise<void>;
+  minionSettle?: (text: string, cwd: string) => Promise<void>;
   lensResult?: (lens: string) => Promise<LensResult>;
 } = {}): DispatchHarness {
   const repo = makeFixtureRepo('fixture-app');
@@ -85,11 +98,12 @@ function makeDispatchHarness(opts: {
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
     const id = `agent-${++n}`;
+    const cwd = options?.cwd ?? '';
     const handle = makeHandle(
       id,
       role,
       role === 'minion'
-        ? opts.minionSettle ?? (async () => {})
+        ? (text: string) => (opts.minionSettle ?? defaultMinionSettle)(text, cwd)
         : async () => {},
     );
     handles.push(handle);
@@ -166,6 +180,16 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     expect(outcome.worktree.branch).toBe('gru/widget-polish');
     expect(outcome.worktree.sha).toBe(h.repo.head());
     expect(existsSync(join(outcome.worktree.path, 'README.md'))).toBe(true);
+
+    // --- The minion's stub change landed on the JOB BRANCH, not main. ---
+    // The deliverable exists in the worktree checkout, and the branch tip
+    // (not main) carries the commit — the lane really is the minion's.
+    expect(existsSync(join(outcome.worktree.path, 'minion-deliverable.txt'))).toBe(true);
+    expect(h.repo.git(['show', `${outcome.worktree.branch}:minion-deliverable.txt`])).toContain(
+      'stub change delivered',
+    );
+    expect(() => h.repo.git(['show', 'main:minion-deliverable.txt'])).toThrow();
+    expect(h.repo.git(['rev-parse', outcome.worktree.branch!])).not.toBe(h.repo.head());
 
     // --- The board shows the arc (repo-grouped, agent attached). ---
     let snapshot = h.engine.snapshot();
