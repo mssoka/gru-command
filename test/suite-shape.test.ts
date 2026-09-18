@@ -17,7 +17,7 @@ const PINS: Record<string, number> = {
   'chat-server.test.ts': 30,
   'chat-session-state.test.ts': 4,
   'claude-adapter.test.ts': 52,
-  'config.test.ts': 34,
+  'config.test.ts': 37,
   'dispatch-e2e.test.ts': 5,
   'dispatch-server.test.ts': 5,
   'bob-scheduler.test.ts': 5,
@@ -29,7 +29,8 @@ const PINS: Record<string, number> = {
   'ledger-db.test.ts': 6,
   'logger.test.ts': 3,
   'notifications.test.ts': 5,
-  'perkins-wave.test.ts': 15,
+  'perkins-driver.test.ts': 2,
+  'perkins-wave.test.ts': 16,
   'pi-adapter.test.ts': 35,
   'roles-definitions.test.ts': 7,
   'roles-gru.test.ts': 4,
@@ -44,7 +45,7 @@ const PINS: Record<string, number> = {
   'suite-shape.test.ts': 1,
   'supervisor.test.ts': 13,
   'transcripts.test.ts': 13,
-  'worktree-manager.test.ts': 13,
+  'worktree-manager.test.ts': 14,
   'worktree-manifest.test.ts': 6,
 };
 

@@ -488,3 +488,53 @@ describe('supervision / logging / chat tables (E7)', () => {
     }
   });
 });
+
+describe('worktrees & dispatch config (E8)', () => {
+  it('defaults: worktrees live under data_dir; Bob runs hourly', () => {
+    const home = tmpHome();
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.worktrees).toEqual({
+      root: join(home, 'worktrees'),
+      preserveRoot: join(home, 'worktree-preserves'),
+      setupTimeoutMs: 120_000,
+    });
+    expect(config.dispatch).toEqual({ bobIntervalMs: 3_600_000 });
+  });
+
+  it('honors custom roots (tilde-expanded), the setup budget, and a disabled Bob trigger', () => {
+    const home = tmpHome();
+    writeConfig(
+      home,
+      [
+        '[worktrees]',
+        'root = "~/wt"',
+        'preserve_root = "~/kept"',
+        'setup_timeout_ms = 5000',
+        '[dispatch]',
+        'bob_interval_ms = 0',
+        '',
+      ].join('\n'),
+    );
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.worktrees.root).toBe('/home/tester/wt');
+    expect(config.worktrees.preserveRoot).toBe('/home/tester/kept');
+    expect(config.worktrees.setupTimeoutMs).toBe(5_000);
+    expect(config.dispatch.bobIntervalMs).toBe(0); // 0 = disabled is legal
+  });
+
+  it('fail-loud: unknown keys, non-positive setup budget, negative/non-integer interval', () => {
+    const bad: readonly string[] = [
+      '[worktrees]\nunknown = 1\n',
+      '[worktrees]\nsetup_timeout_ms = 0\n',
+      '[worktrees]\nroot = ""\n',
+      '[dispatch]\nunknown = 1\n',
+      '[dispatch]\nbob_interval_ms = -1\n',
+      '[dispatch]\nbob_interval_ms = 1.5\n',
+    ];
+    for (const text of bad) {
+      const home = tmpHome();
+      writeFileSync(join(home, 'config.toml'), text, 'utf-8');
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
+});

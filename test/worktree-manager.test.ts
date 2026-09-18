@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
-import { WorktreeManager, type TreeProcess } from '../src/worktrees/manager.js';
+import { psEnumerator, WorktreeManager, type TreeProcess } from '../src/worktrees/manager.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
@@ -302,3 +303,33 @@ describe('worktree manager: sweep (ruling 18c)', () => {
 function ledgerJob(h: Harness, jobId: string, repo: FixtureRepo): void {
   h.ledger.addJob({ id: jobId, repo: repo.path.split('/').pop() ?? 'fixture', title: `job ${jobId}` });
 }
+
+
+describe('default process enumeration (the pause-and-ask mechanism, ruling 18c)', () => {
+  it('finds a live process whose command line references the registered tree, and only that tree', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-ps', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-ps' });
+    // A long-lived process with the worktree path in its argv — exactly
+    // what a dev server or watcher spawned inside the tree looks like.
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)', row.path], {
+      stdio: 'ignore',
+    });
+    try {
+      let found: readonly TreeProcess[] = [];
+      await vi.waitFor(
+        () => {
+          found = psEnumerator(row.path);
+          expect(found.length).toBeGreaterThan(0);
+        },
+        { timeout: 5_000 },
+      );
+      expect(found.some((process) => process.pid === child.pid)).toBe(true);
+      // Registry paths only: a tree path nobody references stays clear.
+      expect(psEnumerator(join(row.path, '..', 'no-such-tree'))).toHaveLength(0);
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+});

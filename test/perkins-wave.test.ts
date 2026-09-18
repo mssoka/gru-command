@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -272,6 +272,41 @@ describe('verdict extraction from lens sessions', () => {
 });
 
 describe('gh poster seam', () => {
+  it('invokes gh with the parsed PR reference and streams the body via stdin', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-ghdouble-'));
+    const script = join(dir, 'gh');
+    // A recording double: gh never runs for real in tests.
+    writeFileSync(
+      script,
+      '#!/bin/sh\nprintf "%s\\n" "$@" > "$GH_ARGS_LOG"\ncat > "$GH_BODY_LOG"\n',
+    );
+    chmodSync(script, 0o755);
+    const argsLog = join(dir, 'args.txt');
+    const bodyLog = join(dir, 'body.txt');
+    const previous = { args: process.env['GH_ARGS_LOG'], body: process.env['GH_BODY_LOG'] };
+    process.env['GH_ARGS_LOG'] = argsLog;
+    process.env['GH_BODY_LOG'] = bodyLog;
+    try {
+      const poster = new GhPrPoster(script);
+      await poster.post({ prUrl: PR_URL, body: 'Perkins verdict body' });
+      expect(readFileSync(argsLog, 'utf-8').trim().split('\n')).toEqual([
+        'pr',
+        'comment',
+        '7',
+        '--repo',
+        'fixture-owner/fixture-app',
+        '--body-file',
+        '-',
+      ]);
+      expect(readFileSync(bodyLog, 'utf-8')).toBe('Perkins verdict body');
+    } finally {
+      if (previous.args === undefined) delete process.env['GH_ARGS_LOG'];
+      else process.env['GH_ARGS_LOG'] = previous.args;
+      if (previous.body === undefined) delete process.env['GH_BODY_LOG'];
+      else process.env['GH_BODY_LOG'] = previous.body;
+    }
+  });
+
   it('parses owner/repo/number and fails loud on garbage URLs', async () => {
     const poster = new GhPrPoster('/nonexistent/gh-binary');
     await expect(poster.post({ prUrl: 'https://x.invalid/a/b/pull/12', body: 'v' })).rejects.toThrowError(
