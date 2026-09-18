@@ -191,6 +191,8 @@ export interface WorktreeManagerOptions {
   readonly preserveRoot: string;
   /** One-time setup command budget per worktree bootstrap. */
   readonly setupTimeoutMs: number;
+  /** Grace between the acknowledged SIGTERM and the SIGKILL (ms). */
+  readonly killGraceMs?: number;
   /** Escalation when a sweep pauses on live processes (fail-loud ask). */
   readonly onSweepPaused?: (input: {
     readonly worktree: WorktreeRecord;
@@ -288,8 +290,10 @@ export class WorktreeManager {
       try {
         this.bootstrap(repo.repoPath, path);
       } catch (error) {
-        // A half-bootstrapped tree is never handed out — roll it back.
-        runGit(repo.repoPath, ['worktree', 'remove', '--force', path]);
+        // A half-bootstrapped tree is never handed out — roll it back ALL
+        // the way (Perkins r2 B1): the worktree AND the branch this call
+        // created; a leftover gru/<job> permanently wedges the job id.
+        this.rollbackPartialLane(repo.repoPath, path, branch, error);
         throw error;
       }
       const record = this.opts.ledger.registerWorktree({
@@ -326,7 +330,7 @@ export class WorktreeManager {
       try {
         this.bootstrap(repo.repoPath, path);
       } catch (error) {
-        runGit(repo.repoPath, ['worktree', 'remove', '--force', path]);
+        this.rollbackPartialLane(repo.repoPath, path, null, error);
         throw error;
       }
       const sha = runGit(path, ['rev-parse', 'HEAD']);
@@ -404,39 +408,24 @@ export class WorktreeManager {
       // (2) Enumerate processes rooted in the tree BEFORE removal.
       const processes = this.enumerate(row.path);
       if (processes.length > 0) {
+        // Perkins r2 B2: confirmKill is answered against the RECORDED set
+        // (ruling 18b rows from a prior pause), never a fresh enumeration
+        // — pids that appeared since were never acknowledged by anyone.
+        // No recorded pause → confirmKill is not honored; the ask comes first.
+        const acknowledged =
+          input.confirmKill === true && row.status === 'paused'
+            ? this.opts.ledger
+                .listWorktreeProcesses(row.id)
+                .filter((proc) => proc.state === 'live')
+                .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence }))
+            : [];
+        if (input.confirmKill === true && acknowledged.length > 0) {
+          return this.killAcknowledgedAndContinue(row, acknowledged, preserved);
+        }
+
         // (3) PAUSE AND ASK — a live process is never silently killed.
         // The evidence lands in the registry (ruling 18b): the ask names
         // exactly what was live, by pid, with how it was tied to the tree.
-        if (input.confirmKill !== true) {
-          this.opts.ledger.recordWorktreeProcesses({
-            worktreeId: row.id,
-            processes: processes.map((proc) => ({
-              pid: proc.pid,
-              command: proc.command,
-              evidence: proc.evidence,
-            })),
-            state: 'live',
-          });
-          const note = `sweep paused: ${processes.length} live process(es) rooted in ${row.path} (pids ${processes
-            .map((p) => p.pid)
-            .join(', ')}) — acknowledge to proceed`;
-          this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
-          this.opts.ledger.appendCustomEvent({
-            kind: 'worktree.paused',
-            jobId: row.jobId,
-            roundId: row.roundId,
-            payload: { id: row.id, path: row.path, processes },
-          });
-          this.opts.onSweepPaused?.({ worktree: row, processes });
-          this.log('warn', 'worktree sweep paused on live processes', {
-            id: row.id,
-            pids: processes.map((p) => p.pid),
-          });
-          return { status: 'paused', processes, preserved, note };
-        }
-        // The ask was answered: kill EXACTLY the enumerated pids, on the
-        // record (ruling 18b registry + event), then re-check. Survivors
-        // pause the sweep again.
         this.opts.ledger.recordWorktreeProcesses({
           worktreeId: row.id,
           processes: processes.map((proc) => ({
@@ -444,60 +433,59 @@ export class WorktreeManager {
             command: proc.command,
             evidence: proc.evidence,
           })),
-          state: 'killed',
+          state: 'live',
         });
+        const note = `sweep paused: ${processes.length} live process(es) rooted in ${row.path} (pids ${processes
+          .map((p) => p.pid)
+          .join(', ')}) — acknowledge to proceed`;
+        this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
         this.opts.ledger.appendCustomEvent({
-          kind: 'worktree.kill-confirmed',
+          kind: 'worktree.paused',
           jobId: row.jobId,
           roundId: row.roundId,
-          payload: { id: row.id, pids: processes.map((p) => p.pid) },
+          payload: { id: row.id, path: row.path, processes },
         });
-        for (const proc of processes) {
-          try {
-            process.kill(proc.pid, 'SIGTERM');
-          } catch (error) {
-            this.log('warn', 'confirmed kill failed for pid', { pid: proc.pid, error: String(error) });
-          }
-        }
-        const survivors = this.enumerate(row.path).filter((p) => processes.some((prev) => prev.pid === p.pid));
-        if (survivors.length > 0) {
-          const note = `sweep paused: pids ${survivors.map((p) => p.pid).join(', ')} survived SIGTERM`;
-          this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
-          return { status: 'paused', processes: survivors, preserved, note };
-        }
-      }
-
-      // (4a) Worktree removal.
-      runGit(row.repoPath, ['worktree', 'remove', '--force', row.path]);
-
-      // (4b) Containment-verified branch delete — job lanes only; a
-      // branch is deleted only when its commits are provably contained
-      // in an existing ref; otherwise it is RETAINED and noted (never
-      // force-deleted on faith).
-      let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
-      if (row.kind === 'job' && row.branch !== null) {
-        branchOutcome = this.deleteBranchContained(row, input.baseBranch);
-      }
-
-      // (5) Release re-resolves the FRESH head (ruling 18e): follow-on
-      // work starts from now, never from the held sha.
-      const freshHead = this.freshHead(row.repoPath);
-      this.opts.ledger.setWorktreeStatus(row.id, 'swept');
-      this.opts.ledger.appendCustomEvent({
-        kind: 'worktree.swept',
-        jobId: row.jobId,
-        roundId: row.roundId,
-        payload: {
+        this.opts.onSweepPaused?.({ worktree: row, processes });
+        this.log('warn', 'worktree sweep paused on live processes', {
           id: row.id,
-          path: row.path,
-          preserved: preserved === null ? 0 : preserved.count,
-          branch: branchOutcome,
-          freshHead,
-        },
-      });
-      this.log('info', 'worktree swept', { id: row.id, branch: branchOutcome, freshHead });
-      return { status: 'swept', preserved, branch: branchOutcome, freshHead };
+          pids: processes.map((p) => p.pid),
+        });
+        return { status: 'paused', processes, preserved, note };
+      }
+
+      // No live processes: straight to the removal tail.
+      return this.finishSweep(row, preserved, input.baseBranch);
     });
+  }
+
+  /** Roll back a failed creation: remove the tree; delete a branch only
+   * when THIS call created it (reviews are detached — nothing to delete).
+   * Rollback failures are logged loudly but never mask the original error. */
+  private rollbackPartialLane(
+    repoPath: string,
+    path: string,
+    branchCreatedByThisCall: string | null,
+    originalError: unknown,
+  ): void {
+    try {
+      runGit(repoPath, ['worktree', 'remove', '--force', path]);
+    } catch (rollbackError) {
+      this.log('error', 'rollback failed to remove the partial worktree', {
+        path,
+        error: String(rollbackError),
+      });
+    }
+    if (branchCreatedByThisCall !== null) {
+      try {
+        runGit(repoPath, ['branch', '-D', branchCreatedByThisCall]);
+      } catch (rollbackError) {
+        this.log('error', 'rollback failed to delete the partial branch (job id may be wedged)', {
+          branch: branchCreatedByThisCall,
+          error: String(rollbackError),
+        });
+      }
+    }
+    void originalError;
   }
 
   /** Copy untracked-not-ignored deliverables into the preserve root.
@@ -565,6 +553,136 @@ export class WorktreeManager {
       destination,
     });
     return { count: preservedCount, destination };
+  }
+
+  /**
+   * The answered ask (Perkins r2 B2): kill EXACTLY the acknowledged pids
+   * — the 18b rows recorded at the pause — with a SIGTERM grace before
+   * SIGKILL. Survivors re-pause; NEW processes (not in the acknowledged
+   * set) get their own ask — every kill is individually acknowledged.
+   */
+  private async killAcknowledgedAndContinue(
+    row: WorktreeRecord,
+    acknowledged: readonly { pid: number; command: string; evidence: string }[],
+    preserved: SweepPreservation | null,
+  ): Promise<SweepResult> {
+    const pids = acknowledged.map((proc) => proc.pid);
+    this.opts.ledger.recordWorktreeProcesses({
+      worktreeId: row.id,
+      processes: acknowledged,
+      state: 'killed',
+    });
+    this.opts.ledger.appendCustomEvent({
+      kind: 'worktree.kill-confirmed',
+      jobId: row.jobId,
+      roundId: row.roundId,
+      payload: { id: row.id, pids },
+    });
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGTERM');
+      } catch (error) {
+        this.log('warn', 'acknowledged SIGTERM failed (already gone?)', { pid, error: String(error) });
+      }
+    }
+    // Grace: give the acknowledged processes time to honor SIGTERM.
+    await new Promise((resolve) => setTimeout(resolve, this.opts.killGraceMs ?? 1_500));
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (const pid of pids) {
+      if (!alive(pid)) continue;
+      try {
+        process.kill(pid, 'SIGKILL'); // grace expired — still the acknowledged pid
+      } catch (error) {
+        this.log('warn', 'acknowledged SIGKILL failed', { pid, error: String(error) });
+      }
+    }
+    // Settle, then decide: a survivor is a pid still alive AND still
+    // enumerated in the tree (zombies die on the enumeration check).
+    await new Promise((resolve) => setTimeout(resolve, Math.min(this.opts.killGraceMs ?? 1_500, 300)));
+    const fresh = this.enumerate(row.path);
+    const survivors = pids.filter((pid) => alive(pid) && fresh.some((proc) => proc.pid === pid));
+    if (survivors.length > 0) {
+      const note = `sweep paused: pids ${survivors.join(', ')} survived the acknowledged kill (SIGTERM + SIGKILL)`;
+      this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
+      return {
+        status: 'paused',
+        processes: fresh.filter((proc) => survivors.includes(proc.pid)),
+        preserved,
+        note,
+      };
+    }
+    // NEW processes since the pause are NOT covered by this ask — they
+    // get their own pause (their own ask), never a ride-along kill.
+    const unacknowledged = fresh.filter((proc) => !pids.includes(proc.pid));
+    if (unacknowledged.length > 0) {
+      this.opts.ledger.recordWorktreeProcesses({
+        worktreeId: row.id,
+        processes: unacknowledged.map((proc) => ({
+          pid: proc.pid,
+          command: proc.command,
+          evidence: proc.evidence,
+        })),
+        state: 'live',
+      });
+      const note = `sweep paused: ${unacknowledged.length} NEW process(es) appeared after the acknowledged kill (pids ${unacknowledged
+        .map((p) => p.pid)
+        .join(', ')}) — each kill needs its own acknowledgment`;
+      this.opts.ledger.setWorktreeStatus(row.id, 'paused', note);
+      this.opts.ledger.appendCustomEvent({
+        kind: 'worktree.paused',
+        jobId: row.jobId,
+        roundId: row.roundId,
+        payload: { id: row.id, path: row.path, processes: unacknowledged, reason: 'post-kill-new-processes' },
+      });
+      this.opts.onSweepPaused?.({ worktree: row, processes: unacknowledged });
+      return { status: 'paused', processes: unacknowledged, preserved, note };
+    }
+    return this.finishSweep(row, preserved, undefined);
+  }
+
+  /** Removal + containment branch delete + fresh head (shared tail). */
+  private finishSweep(
+    row: WorktreeRecord,
+    preserved: SweepPreservation | null,
+    baseBranch: string | undefined,
+  ): SweepResult {
+    // (4a) Worktree removal.
+    runGit(row.repoPath, ['worktree', 'remove', '--force', row.path]);
+
+    // (4b) Containment-verified branch delete — job lanes only; a
+    // branch is deleted only when its commits are provably contained
+    // in an existing ref; otherwise it is RETAINED and noted (never
+    // force-deleted on faith).
+    let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
+    if (row.kind === 'job' && row.branch !== null) {
+      branchOutcome = this.deleteBranchContained(row, baseBranch);
+    }
+
+    // (5) Release re-resolves the FRESH head (ruling 18e): follow-on
+    // work starts from now, never from a held sha.
+    const freshHead = this.freshHead(row.repoPath);
+    this.opts.ledger.setWorktreeStatus(row.id, 'swept');
+    this.opts.ledger.appendCustomEvent({
+      kind: 'worktree.swept',
+      jobId: row.jobId,
+      roundId: row.roundId,
+      payload: {
+        id: row.id,
+        path: row.path,
+        preserved: preserved === null ? 0 : preserved.count,
+        branch: branchOutcome,
+        freshHead,
+      },
+    });
+    this.log('info', 'worktree swept', { id: row.id, branch: branchOutcome, freshHead });
+    return { status: 'swept', preserved, branch: branchOutcome, freshHead };
   }
 
   /**

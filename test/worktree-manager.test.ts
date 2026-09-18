@@ -37,6 +37,7 @@ function makeHarness(useDefaultEnumerator = false): Harness {
     root: mkdtempSync(join(tmpdir(), 'gru-command-wtroot-')),
     preserveRoot: mkdtempSync(join(tmpdir(), 'gru-command-wtpreserve-')),
     setupTimeoutMs: 30_000,
+    killGraceMs: 25, // real-signal tests stay fast; production default is 1.5 s
     onSweepPaused: ({ worktree, processes }) => {
       escalations.push({
         title: `paused: ${worktree.id}`,
@@ -502,6 +503,153 @@ describe('Perkins r1 B4: the pause-and-ask join against the DEFAULT enumerator',
       } catch {
         /* already gone */
       }
+      kill.mockRestore();
+    }
+  });
+});
+
+describe('Perkins r2 B1: failed bootstrap rollback un-wedges the job id', () => {
+  it('a failed setup deletes the branch it created — the SAME job id retries cleanly', async () => {
+    const h = harness();
+    const repo = h.make('fixture-unwedge');
+    const { mkdirSync: mk, writeFileSync: wf } = await import('node:fs');
+    mk(join(repo.path, '.gru-command'), { recursive: true });
+    wf(join(repo.path, '.gru-command', 'worktree.toml'), '[[setup]]\ncommand = "exit 5"');
+    ledgerJob(h, 'job-wedge', repo);
+    await expect(
+      h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-wedge' }),
+    ).rejects.toThrowError(/exited 5/);
+    // No leftover branch wedging the id…
+    expect(repo.git(['branch', '--list', 'gru/job-wedge'])).toBe('');
+    // …so the retry (with the manifest fixed) succeeds on the SAME id.
+    wf(join(repo.path, '.gru-command', 'worktree.toml'), '[[setup]]\ncommand = "true"');
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-wedge' });
+    expect(row.branch).toBe('gru/job-wedge');
+    expect(existsSync(row.path)).toBe(true);
+  });
+});
+
+describe('Perkins r2 B2/B3: confirmed kills hit exactly the acknowledged set, for real', () => {
+  it('kill-confirmed event names the paused pid; the real process dies; the sweep completes', async () => {
+    const h = harness(true); // default enumerator, real signals
+    const repo = h.make();
+    ledgerJob(h, 'job-ack', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-ack' });
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+      cwd: row.path,
+      stdio: 'ignore',
+    });
+    try {
+      await vi.waitFor(
+        () => {
+          expect(psEnumerator(row.path).some((p) => p.pid === child.pid)).toBe(true);
+        },
+        { timeout: 5_000 },
+      );
+      const paused = await h.manager.release({ worktreeId: 'job-ack' });
+      expect(paused.status).toBe('paused');
+      const confirmed = await h.manager.release({ worktreeId: 'job-ack', confirmKill: true });
+      expect(confirmed.status).toBe('swept');
+      // The acknowledged pid — recorded at the pause — is the killed one.
+      const killEvent = h.ledger
+        .listEvents({ limit: 200 })
+        .find((event) => event.kind === 'worktree.kill-confirmed');
+      expect(killEvent?.payload).toMatchObject({ pids: [child.pid] });
+      expect(h.ledger.listWorktreeProcesses('job-ack').find((p) => p.pid === child.pid)?.state).toBe(
+        'killed',
+      );
+      expect(child.kill(0)).toBe(false); // gone for real
+      expect(existsSync(row.path)).toBe(false);
+    } finally {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* reaped by the confirmed kill */
+      }
+    }
+  });
+
+  it('a SIGTERM-trapping process gets the grace escalation: TERM ignored → SIGKILL → swept', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-stubborn', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-stubborn' });
+    // Traps SIGTERM: only SIGKILL ends it — the grace ladder must engage.
+    const child = spawn(
+      process.execPath,
+      ['-e', 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 60000)'],
+      { cwd: row.path, stdio: 'ignore' },
+    );
+    try {
+      await vi.waitFor(
+        () => {
+          expect(psEnumerator(row.path).some((p) => p.pid === child.pid)).toBe(true);
+        },
+        { timeout: 5_000 },
+      );
+      await expect(h.manager.release({ worktreeId: 'job-stubborn' })).resolves.toMatchObject({
+        status: 'paused',
+      });
+      const confirmed = await h.manager.release({
+        worktreeId: 'job-stubborn',
+        confirmKill: true,
+      });
+      expect(confirmed.status).toBe('swept');
+      expect(child.kill(0)).toBe(false);
+    } finally {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* reaped */
+      }
+    }
+  });
+
+  it('survivors of BOTH signals re-pause the sweep (branch leg, OS-failure shape)', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-unkillable', repo);
+    await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-unkillable' });
+    h.enumerator.mockReturnValue([{ pid: 777777, command: 'unkillable watcher', evidence: 'argv' }]);
+    await h.manager.release({ worktreeId: 'job-unkillable' }); // pause, records 777777
+    // Simulate an OS that refuses both signals (kill "succeeds" as a call
+    // but the pid survives every signal — EPERM-flavored reality).
+    const kill = vi.spyOn(process, 'kill').mockImplementation(((target: number, signal?: string) => {
+      void target;
+      void signal;
+      return true;
+    }) as typeof process.kill);
+    try {
+      const result = await h.manager.release({ worktreeId: 'job-unkillable', confirmKill: true });
+      expect(result.status).toBe('paused');
+      if (result.status === 'paused') {
+        expect(result.note).toMatch(/survived the acknowledged kill/);
+        expect(result.processes.map((p) => p.pid)).toContain(777777);
+      }
+      expect(h.ledger.getWorktree('job-unkillable')?.status).toBe('paused');
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it('confirmKill is NEVER honored without a recorded pause — the ask comes first', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-noask', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-noask' });
+    h.enumerator.mockReturnValue([{ pid: 555555, command: 'just appeared', evidence: 'argv' }]);
+    const kill = vi.spyOn(process, 'kill');
+    try {
+      // First-ever release with confirmKill already set: no pause on record.
+      const result = await h.manager.release({ worktreeId: 'job-noask', confirmKill: true });
+      expect(result.status).toBe('paused'); // it asked instead of killing
+      expect(kill).not.toHaveBeenCalled();
+      // The ask is on the record for the NEXT call to answer.
+      expect(
+        h.ledger.listWorktreeProcesses('job-noask').some((p) => p.pid === 555555 && p.state === 'live'),
+      ).toBe(true);
+      expect(existsSync(row.path)).toBe(true);
+    } finally {
       kill.mockRestore();
     }
   });

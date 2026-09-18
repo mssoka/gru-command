@@ -82,8 +82,13 @@ the ordered, preserve-first sweep (ruling 18c):
    the ask always names exactly what was live.
 3. **Pause and ask** — any live process pauses the sweep, records an
    action-required escalation, and touches nothing. `confirm_kill` is
-   the human's answer: it kills exactly the enumerated pids on the
-   record, re-checks, and proceeds. Silent kills do not exist.
+   the human's answer to the RECORDED ask: it kills exactly the pids the
+   pause put on the record (never a fresh enumeration — pids that
+   appeared since were never acknowledged), with a SIGTERM grace before
+   SIGKILL. Processes that survive both signals re-pause; processes that
+   appeared after the acknowledged kill get their own ask.
+   `confirm_kill` without a recorded pause is not honored — the ask
+   always comes first. Silent kills do not exist.
 4. **Remove** the worktree; **containment-verified** branch delete (a
    branch is deleted only when its commits are provably contained in an
    existing ref — otherwise it is retained and noted, never

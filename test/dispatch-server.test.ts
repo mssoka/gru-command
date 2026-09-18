@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { EventBus } from '../src/events/bus.js';
@@ -58,7 +59,9 @@ async function boot(opts: { token?: string } = {}): Promise<ServerHarness> {
     root: join(dir, 'wtroot'),
     preserveRoot: join(dir, 'wtpreserve'),
     setupTimeoutMs: 30_000,
-    enumerateProcesses: () => [],
+    killGraceMs: 25,
+    // DEFAULT enumerator (real ps + cwd resolution): the paused and
+    // confirm_kill arms must answer to the production join, not a stub.
   });
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
@@ -210,12 +213,12 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-  it('releases the lane via the sweep endpoint (paused is an honest 200)', async () => {
+  it('release endpoint: real PAUSE (200) → confirm_kill (200 swept) → nothing left (404)', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http-release');
     cleanupRepos.push(repo);
     try {
-      await call(
+      const dispatch = await call(
         h.port,
         'POST',
         '/api/dispatch',
@@ -227,12 +230,39 @@ describe('dispatch server (E8)', () => {
         },
         TOKEN,
       );
-      const release = await call(h.port, 'POST', '/api/dispatch/release', { job_id: 'http-release' }, TOKEN);
-      expect(release.status).toBe(200);
-      expect(field<string>(release.json, 'status')).toBe('swept');
-      expect(field<string>(release.json, 'branch')).toBe('deleted');
-      const missing = await call(h.port, 'POST', '/api/dispatch/release', { job_id: 'http-release' }, TOKEN);
-      expect(missing.status).toBe(404);
+      expect(dispatch.status).toBe(202);
+      const worktreePath = field<string>(dispatch.json, 'worktree');
+      // A real process rooted in the lane (cwd, clean argv).
+      const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+        cwd: worktreePath,
+        stdio: 'ignore',
+      });
+      try {
+        const paused = await call(h.port, 'POST', '/api/dispatch/release', { job_id: 'http-release' }, TOKEN);
+        expect(paused.status).toBe(200);
+        expect(field<string>(paused.json, 'status')).toBe('paused');
+        // The tree survives the pause, deliverable included.
+        expect(existsSync(worktreePath)).toBe(true);
+        const confirmed = await call(
+          h.port,
+          'POST',
+          '/api/dispatch/release',
+          { job_id: 'http-release', confirm_kill: true },
+          TOKEN,
+        );
+        expect(confirmed.status).toBe(200);
+        expect(field<string>(confirmed.json, 'status')).toBe('swept');
+        expect(field<string>(confirmed.json, 'branch')).toBe('deleted');
+        expect(existsSync(worktreePath)).toBe(false);
+        const missing = await call(h.port, 'POST', '/api/dispatch/release', { job_id: 'http-release' }, TOKEN);
+        expect(missing.status).toBe(404);
+      } finally {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* reaped by the confirmed kill */
+        }
+      }
     } finally {
       await h.close();
     }
