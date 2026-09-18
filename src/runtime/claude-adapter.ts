@@ -19,6 +19,7 @@ import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
+import { resolveSpawnCwd } from './cwd.js';
 import {
   normalizeSessionPath,
   SessionAlreadyActiveError,
@@ -255,7 +256,9 @@ export class ClaudeCodeRuntime implements AgentRuntime {
 
   async spawn(role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
     const roleDef = ROLE_DEFINITIONS[role];
-    const cwd = this.config.workspaceRoot;
+    // SPEC ruling 17: an explicit cwd roots the session in the project it
+    // serves (the dispatch flow's worktree); absent = workspace root.
+    const cwd = resolveSpawnCwd(this.config.workspaceRoot, options.cwd);
     // Validation failures are caller-facing, never adapter health.
     const model = this.resolveModel(role, options.model);
     const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);

@@ -488,3 +488,27 @@ describe('supervision / logging / chat tables (E7)', () => {
     }
   });
 });
+
+describe('dispatch config (E8)', () => {
+  it('Bob runs hourly by default', () => {
+    const home = tmpHome();
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.dispatch).toEqual({ bobIntervalMs: 3_600_000 });
+  });
+
+  it('a disabled Bob trigger is legal; garbage is not', () => {
+    const home = tmpHome();
+    writeConfig(home, '[dispatch]\nbob_interval_ms = 0\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').dispatch.bobIntervalMs).toBe(0);
+    const bad: readonly string[] = [
+      '[dispatch]\nunknown = 1\n',
+      '[dispatch]\nbob_interval_ms = -1\n',
+      '[dispatch]\nbob_interval_ms = 1.5\n',
+    ];
+    for (const text of bad) {
+      const h2 = tmpHome();
+      writeFileSync(join(h2, 'config.toml'), text, 'utf-8');
+      expect(() => loadConfig({ GRU_COMMAND_HOME: h2 }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
+});

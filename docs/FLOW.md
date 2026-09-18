@@ -1,0 +1,133 @@
+# The dispatch flow
+
+The heist arc, in-product (EPICS E8; SPEC rulings 2, 17, 18). Every step
+lands on the ledger — the record of record — and the board renders the
+whole arc live.
+
+```
+ Gru (chat)          ops (Silas role)            minion                  Perkins fleet
+ ──────────          ─────────────────           ───────                 ──────────────
+ consult → plan
+ briefing ─────────► job row (briefing verbatim)
+                      │ fresh worktree + branch
+                      ├─────────────────────────► spawned IN the worktree
+                      │                           briefing turn …
+                      │                           deliverable + PR link ◄─┤
+                      │                                                   round (7 lenses)
+                      │                                                   detached worktree
+                      │                                                   verdict → PR comment
+ release ◄─────────── sweep (preserve-first)                            (chips live on the board)
+```
+
+## 1. Briefing (Gru, chat-side)
+
+The user brings intent; Gru consults and settles the plan
+(plan-before-heist is Gru-side canon). The output is a briefing a
+stranger could execute: goal, boundaries, acceptance, verification.
+
+## 2. Ops handoff (dispatch)
+
+`POST /api/dispatch` `{job_id, repo_path, title, briefing}` — the
+mechanical handoff behind the chat surface:
+
+1. **Job row** — briefing recorded verbatim; status `dispatched`.
+2. **Lane** — one git worktree per job on branch `gru/<job>` at the
+   CURRENT fresh head (worktree manager, below). Status `working`.
+3. **Minion** — a fresh agent session spawned with `cwd` = the worktree
+   (SPEC ruling 17: dispatch cwd is the PROJECT root on every runtime;
+   the minion discovers the project's own skills/bmad from there). The
+   briefing prompt is delivered as the session's first turn.
+
+Failures are loud and leave no half lanes: a spawn failure sweeps the
+fresh worktree back out and blocks the job with a note.
+
+## 3. Lifecycle on the board
+
+The ledger's event stream drives the board: `job.handoff`,
+`job.minion-spawned`, `job.delivered` (or `job.minion-error`), the PR
+link (`POST /api/dispatch/pr`), review rounds with per-lens chips, and
+the sweep. The board groups by repo; the phone is board-first.
+
+## 4. Review waves (Perkins)
+
+`POST /api/dispatch/review` `{job_id, target_ref?, lenses?}` — one
+round = a multi-lens agent fleet:
+
+- A **detached** worktree at the ref under review (reviews never grow
+  branch debris — ruling 18d).
+- One agent per lens (blind, edge, acceptance, security, architecture,
+  codebase, tests), each bound to its live chip on the board, each
+  ending with the strict protocol line `LENS-VERDICT: blocker|warning|note|clean`.
+- **Consolidation is honest arithmetic**: any blocker or warning →
+  `changes-requested`; only notes/clean → `approved`. A lens that could
+  not conclude withholds the verdict and escalates — never softened.
+- The verdict lands in the ledger first, then posts to the PR via `gh
+  pr comment`; a posting failure escalates (action-required) without
+  un-recording the verdict.
+
+## 5. Release (the sweep)
+
+`POST /api/dispatch/release` `{job_id, confirm_kill?, base_branch?}` —
+the ordered, preserve-first sweep (ruling 18c):
+
+1. **Preserve** untracked deliverables into the instance data dir
+   (before anything else; deliverables are never hostages).
+2. **Enumerate** processes rooted in the tree: a process counts when
+   the registered path appears in its ARGV as a whole path
+   (path-boundary match — a sibling lane `job-a-2` is never confused
+   with `job-a`) OR when the process's actual working directory is
+   inside the tree (resolved via lsof on macOS / procfs on Linux; other
+   platforms are argv-only, declared). Every pid a pause or confirmed
+   kill is grounded on lands in the ledger's worktree-process records —
+   the ask always names exactly what was live.
+3. **Pause and ask** — any live process pauses the sweep, records an
+   action-required escalation, and touches nothing. `confirm_kill` is
+   the human's answer to the RECORDED ask: it kills exactly the pids the
+   pause put on the record (never a fresh enumeration — pids that
+   appeared since were never acknowledged), with a SIGTERM grace before
+   SIGKILL. Processes that survive both signals re-pause; processes that
+   appeared after the acknowledged kill get their own ask.
+   `confirm_kill` without a recorded pause is not honored — the ask
+   always comes first. Silent kills do not exist.
+4. **Remove** the worktree; **containment-verified** branch delete (a
+   branch is deleted only when its commits are provably contained in an
+   existing ref — otherwise it is retained and noted, never
+   force-deleted).
+5. **Re-resolve the fresh head** at release: follow-on work always
+   starts from the current head, never a held sha.
+
+## The worktree subsystem (ruling 18)
+
+The dispatch flow rides a **worktree port** (`src/dispatch/worktree-port.ts`)
+whose CONTRACT is documented in the interface and pinned by
+`test/helpers/worktree-port-contract.ts` — lane ids ARE owner ids
+(job/round), discovery is by job scope, statuses are exactly
+active/paused/swept, unknown ids reject. Every implementation (the
+in-memory double here, the manager on its lane) runs the contract:
+the five-subsystem manager — bootstrap manifest, ledger-owned registry
+(sweeps match registry paths only), the preserve-first sweep with
+pause-and-ask, detached-for-reviews/branch-for-jobs, sequential
+fresh-head creation — lands as its OWN review lane (`src/worktrees/`,
+`docs/WORKTREES.md` on that lane). Until it merges, the core's port is
+unavailable and dispatch fails loud, never silent.
+
+
+## Bob (periodic memory)
+
+Bob's consolidation trigger runs on the configured interval
+(`[dispatch] bob_interval_ms`, default hourly; `0` disables): it knocks
+on the bob role's supervised slot with consolidation instructions; the
+role's persona (`roles/bob.md`) governs the craft. Never overlapping,
+never blocking a live operation.
+
+## Configuration
+
+```toml
+[worktrees]
+# root = "/absolute/path"          # default: <data_dir>/worktrees
+# preserve_root = "/absolute/path" # default: <data_dir>/worktree-preserves
+# setup_timeout_ms = 120000
+
+[dispatch]
+# bob_interval_ms = 3600000        # 0 disables Bob's trigger
+```

@@ -68,6 +68,13 @@ export interface SpawnOptions {
    */
   readonly resumeFile?: string;
   /**
+   * Working directory for the session (SPEC ruling 17): the dispatch
+   * flow roots minions and reviewers in the PROJECT they serve. Must be
+   * an absolute path to an existing directory; omitted = the workspace
+   * root (the chat Gru's home, by design).
+   */
+  readonly cwd?: string;
+  /**
    * Model override: "provider/model", or "default" (or "") for the
    * runtime harness's own configured model (SPEC ruling 16 passthrough).
    */

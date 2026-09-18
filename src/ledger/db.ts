@@ -231,4 +231,9 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_notifications_agent ON notifications(agent_id);
     `,
   },
+  {
+    id: 4,
+    name: 'e8-job-briefing',
+    sql: `ALTER TABLE jobs ADD COLUMN briefing TEXT;`,
+  },
 ];

@@ -58,3 +58,7 @@ keep = 5
 [chat]                             # frame-log rotation; replay spans shards
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
+
+
+[dispatch]                        # dispatch flow (E8) — all optional
+bob_interval_ms = 3600000         # Bob's consolidation interval; 0 disables

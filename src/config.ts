@@ -81,6 +81,12 @@ export interface ChatConfig {
   readonly frameLogKeep: number;
 }
 
+/** Dispatch flow policy (E8). */
+export interface DispatchConfig {
+  /** Bob's periodic consolidation interval; 0 disables the trigger. */
+  readonly bobIntervalMs: number;
+}
+
 export interface GruCommandConfig {
   readonly workspaceRoot: string;
   readonly dataDir: string;
@@ -92,6 +98,7 @@ export interface GruCommandConfig {
   readonly supervision: SupervisionConfig;
   readonly logging: LoggingConfig;
   readonly chat: ChatConfig;
+  readonly dispatch: DispatchConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
   /** Absolute per-instance directory holding config, identity, logs, sessions. */
@@ -192,6 +199,7 @@ const TOP_LEVEL_KEYS = [
   'supervision',
   'logging',
   'chat',
+  'dispatch',
 ] as const;
 
 /** Sentinel meaning "the runtime harness's own configured default" (SPEC ruling 16). */
@@ -287,6 +295,17 @@ function requirePositiveInt(value: unknown, file: string, field: string): number
   return value;
 }
 
+function requireNonNegativeInt(value: unknown, file: string, field: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new ConfigError(
+      `${field} must be a non-negative integer, got: ${String(value)}`,
+      file,
+      field,
+    );
+  }
+  return value;
+}
+
 function isInsideOrEqual(outer: string, inner: string): boolean {
   const rel = relative(outer, inner);
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
@@ -348,6 +367,7 @@ export function loadConfig(
   };
   let logging: LoggingConfig = { maxBytes: 10_485_760, keep: 5 };
   let chat: ChatConfig = { frameLogMaxBytes: 8_388_608, frameLogKeep: 3 };
+  let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
   let sourceFile: string | null = null;
 
   if (configState(file) === 'present') {
@@ -573,6 +593,24 @@ export function loadConfig(
         frameLogKeep: table['frame_log_keep'] !== undefined ? requirePositiveInt(table['frame_log_keep'], file, 'chat.frame_log_keep') : chat.frameLogKeep,
       };
     }
+    if (raw['dispatch'] !== undefined) {
+      const table = requireTable(raw['dispatch'], file, 'dispatch');
+      for (const key of Object.keys(table)) {
+        if (!['bob_interval_ms'].includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [dispatch] (valid keys: bob_interval_ms)`,
+            file,
+            `dispatch.${key}`,
+          );
+        }
+      }
+      dispatch = {
+        bobIntervalMs:
+          table['bob_interval_ms'] !== undefined
+            ? requireNonNegativeInt(table['bob_interval_ms'], file, 'dispatch.bob_interval_ms')
+            : dispatch.bobIntervalMs,
+      };
+    }
   }
 
   for (const [label, dir] of [
@@ -614,6 +652,7 @@ export function loadConfig(
     supervision,
     logging,
     chat,
+    dispatch,
     sourceFile,
     instanceDir,
   };

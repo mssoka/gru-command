@@ -16,6 +16,8 @@ import {
   type RoundVerdict,
 } from './states.js';
 
+export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
+
 type Row = Record<string, unknown>;
 
 /**
@@ -44,6 +46,8 @@ export interface JobRecord {
   readonly baseBranch: string | null;
   readonly prUrl: string | null;
   readonly note: string | null;
+  /** The briefing this job executes (E8; Gru-authored, Silas-executed). */
+  readonly briefing: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -258,6 +262,7 @@ export class LedgerApi {
     repo: string;
     title: string;
     baseBranch?: string | null;
+    briefing?: string | null;
   }): JobRecord {
     if (input.id === '' || input.repo === '' || input.title === '') {
       throw new Error('job id, repo, and title must be non-empty');
@@ -269,10 +274,10 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, created_at, updated_at)
-           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?)`,
+          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, created_at, updated_at)
+           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?)`,
         )
-        .run(input.id, input.repo, input.title, input.baseBranch ?? null, ts, ts);
+        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, ts, ts);
       this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title } });
       return this.getJob(input.id) as JobRecord;
     });
@@ -313,6 +318,17 @@ export class LedgerApi {
       if (current === null) throw new RecordNotFound(`job "${id}" not found`);
       this.db.prepare('UPDATE jobs SET note = ?, updated_at = ? WHERE id = ?').run(note, nowIso(), id);
       this.appendEvent({ kind: 'job.note', jobId: id, payload: { note } });
+      return this.getJob(id) as JobRecord;
+    });
+  }
+
+  setJobBriefing(id: string, briefing: string): JobRecord {
+    if (briefing.trim() === '') throw new Error('job briefing must be non-empty');
+    return this.transaction(() => {
+      const current = this.getJob(id);
+      if (current === null) throw new RecordNotFound(`job "${id}" not found`);
+      this.db.prepare('UPDATE jobs SET briefing = ?, updated_at = ? WHERE id = ?').run(briefing, nowIso(), id);
+      this.appendEvent({ kind: 'job.briefing', jobId: id, payload: { bytes: briefing.length } });
       return this.getJob(id) as JobRecord;
     });
   }
@@ -613,6 +629,35 @@ export class LedgerApi {
     });
   }
 
+  /** Attach a live agent to its job lane (E8 dispatch wiring). */
+  attachAgentToJob(agentId: string, jobId: string): AgentRecord {
+    return this.transaction(() => {
+      const agent = this.getAgent(agentId);
+      if (agent === null) throw new RecordNotFound(`agent "${agentId}" not found`);
+      if (this.getJob(jobId) === null) throw new RecordNotFound(`job "${jobId}" not found`);
+      this.db
+        .prepare('UPDATE agents SET job_id = ?, updated_at = ? WHERE id = ?')
+        .run(jobId, nowIso(), agentId);
+      this.appendEvent({ kind: 'agent.attached', agentId, jobId, payload: { jobId } });
+      return this.getAgent(agentId) as AgentRecord;
+    });
+  }
+
+  /** Attach a live agent to a review round (E8 wave wiring). */
+  attachAgentToRound(agentId: string, roundId: string): AgentRecord {
+    return this.transaction(() => {
+      const agent = this.getAgent(agentId);
+      if (agent === null) throw new RecordNotFound(`agent "${agentId}" not found`);
+      const round = this.getRound(roundId);
+      if (round === null) throw new RecordNotFound(`round "${roundId}" not found`);
+      this.db
+        .prepare('UPDATE agents SET round_id = ?, job_id = COALESCE(job_id, ?), updated_at = ? WHERE id = ?')
+        .run(roundId, round.jobId, nowIso(), agentId);
+      this.appendEvent({ kind: 'agent.attached', agentId, jobId: round.jobId, roundId, payload: { roundId } });
+      return this.getAgent(agentId) as AgentRecord;
+    });
+  }
+
   appendCustomEvent(fields: {
     kind: string;
     agentId?: string | null;
@@ -754,6 +799,7 @@ export class LedgerApi {
       baseBranch: nstr(row.base_branch),
       prUrl: nstr(row.pr_url),
       note: nstr(row.note),
+      briefing: nstr(row.briefing),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
     };

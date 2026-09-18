@@ -180,6 +180,7 @@ export class RuntimeRegistry {
     const thinkingLevel = applyThinkingFallback(adapter, policy.thinkingLevel, this.log);
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
+      ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
       model: policy.model,
       thinkingLevel,
     });
