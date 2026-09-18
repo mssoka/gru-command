@@ -56,6 +56,18 @@ export function runWorktreePortContract(name: string, make: () => Promise<PortCo
       expect(review.branch).toBeNull();
       expect(review.roundId).toBe('contract-job-r1');
       expect(review.jobId).toBe('contract-job'); // linkage by construction
+
+      // EXCLUSION (Perkins r6): a FOREIGN job's lane must NEVER leak into
+      // the scoped list. Presence-only assertions let a filter-less
+      // implementation pass (mutation-proven) — assert the ids exactly,
+      // the count, and that the foreign lane answers only to its own scope.
+      await h.seedJob('contract-job-foreign');
+      await h.port.createJobWorktree({ repoPath: h.repoPath, jobId: 'contract-job-foreign' });
+      const scoped = h.port.listWorktrees({ jobId: 'contract-job' });
+      expect(scoped.map((lane) => lane.id).sort()).toEqual(['contract-job', 'contract-job-r1']);
+      expect(scoped.every((lane) => lane.jobId === 'contract-job')).toBe(true);
+      const foreign = h.port.listWorktrees({ jobId: 'contract-job-foreign' });
+      expect(foreign.map((lane) => lane.id)).toEqual(['contract-job-foreign']);
     });
 
     it('RELEASE: sweeps the lane (tree gone, status swept), idempotent on repeat', async () => {

@@ -15,7 +15,9 @@
  *   `getWorktree()` key on exactly these ids.
  * - **Discovery is by job scope, never by id guessing**:
  *   `listWorktrees({ jobId })` returns the job's job-lane AND its linked
- *   review lanes. Consumers select by `kind`.
+ *   review lanes — and NOTHING ELSE (a foreign job's lane never leaks
+ *   into a scoped list; pinned by exclusion in the contract suite).
+ *   Consumers select by `kind`.
  * - **Status values** are exactly 'active' | 'paused' | 'swept':
  *   creation yields 'active'; a successful release yields 'swept'
  *   (idempotent on repeat); 'paused' only ever carries a recorded ask.
