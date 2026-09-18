@@ -45,14 +45,25 @@ export interface AgentView {
   readonly sessionFile: string | null;
   readonly jobId: string | null;
   readonly roundId: string | null;
+  /** E7 supervision view (null when unsupervised). */
+  readonly supervision: {
+    readonly state: 'watching' | 'restarting' | 'stopped';
+    readonly restarts: number;
+    readonly breakerOpen: boolean;
+  } | null;
 }
 
 export interface NotificationView {
   readonly id: string;
   readonly ts: string;
+  readonly kind: string;
+  readonly routing: 'fyi' | 'action-required';
   readonly severity: 'info' | 'error';
   readonly title: string;
   readonly detail: string | null;
+  readonly agentId: string | null;
+  readonly shownAt: string | null;
+  readonly ackedAt: string | null;
 }
 
 export interface BoardSnapshot {
@@ -165,7 +176,15 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
     return false;
   }
   const agentsOk = value.agents.every(
-    (agent) => isRecord(agent) && typeof agent.id === 'string' && typeof agent.role === 'string' && typeof agent.state === 'string',
+    (agent) =>
+      isRecord(agent) &&
+      typeof agent.id === 'string' &&
+      typeof agent.role === 'string' &&
+      typeof agent.state === 'string' &&
+      // supervision is optional (null when the agent is unsupervised)
+      (agent.supervision === null ||
+        agent.supervision === undefined ||
+        (isRecord(agent.supervision) && typeof agent.supervision.state === 'string')),
   );
   const notificationsOk = value.notifications.every(
     (notification) =>
@@ -173,6 +192,7 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       typeof notification.id === 'string' &&
       typeof notification.ts === 'string' &&
       (notification.severity === 'info' || notification.severity === 'error') &&
+      (notification.routing === 'fyi' || notification.routing === 'action-required') &&
       typeof notification.title === 'string',
   );
   if (!agentsOk || !notificationsOk) return false;

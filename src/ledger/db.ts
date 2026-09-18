@@ -209,4 +209,26 @@ export const MIGRATIONS: readonly Migration[] = [
     name: 'e6-lens-agent-index',
     sql: 'CREATE INDEX idx_lens_agent ON lens_states(agent_id);',
   },
+  {
+    id: 3,
+    name: 'e7-notifications',
+    sql: `
+      CREATE TABLE notifications (
+        id         TEXT PRIMARY KEY,
+        ts         TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        routing    TEXT NOT NULL,
+        severity   TEXT NOT NULL,
+        title      TEXT NOT NULL,
+        detail     TEXT,
+        agent_id   TEXT,
+        shown_at   TEXT,
+        shown_by   TEXT,
+        acked_at   TEXT,
+        acked_by   TEXT
+      );
+      CREATE INDEX idx_notifications_ts ON notifications(ts);
+      CREATE INDEX idx_notifications_agent ON notifications(agent_id);
+    `,
+  },
 ];

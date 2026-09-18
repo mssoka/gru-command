@@ -43,7 +43,7 @@ function snapshot(): BoardSnapshot {
       },
     ],
     agents: [
-      { id: 'gru-1', role: 'gru', label: 'gru', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: null },
+      { id: 'gru-1', role: 'gru', label: 'gru', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: null, supervision: null },
     ],
     notifications: [],
   };

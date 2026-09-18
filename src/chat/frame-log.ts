@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -33,6 +34,15 @@ export class FrameLogCorruptError extends Error {
 
 export const FRAME_LOG_NAME = 'gru.frames.jsonl';
 
+/** Default rotation policy: rotate at 8 MB, keep 3 shards (E4 replay-cost
+ * deferral — bounded disk AND bounded replay, history intact in-window). */
+export const FRAME_LOG_ROTATION_DEFAULTS = { maxBytes: 8_388_608, keep: 3 } as const;
+
+/** Shard file for a slot (1 = most recent rotated). */
+export function frameLogShardFile(dir: string, slot: number): string {
+  return join(dir, `${FRAME_LOG_NAME}.${slot}`);
+}
+
 /**
  * Durable chat frame log (EPICS E4 story 3; SPEC ruling 3).
  *
@@ -56,28 +66,76 @@ export class ChatFrameLog {
   /** Open tool names (multiset stack) + whether a turn is open. */
   private readonly openTools: string[] = [];
   private turnOpen = false;
+  private readonly rotation: { maxBytes: number; keep: number };
+  /** Live-file byte count (rotation check without a statSync per append). */
+  private liveBytes = 0;
 
-  private constructor(dir: string) {
+  private constructor(dir: string, rotation: { maxBytes: number; keep: number }) {
     this.file = join(dir, FRAME_LOG_NAME);
+    this.rotation = rotation;
   }
 
   /**
    * Load (or initialize) the log under `dir` and settle any open turn.
    * A torn FINAL line (crash mid-append) is dropped with a warn; any
-   * other corruption fails loud. Seqs must be exactly 1..N consecutive —
-   * replay-end arithmetic depends on the counter === high-water invariant.
+   * other corruption fails loud. Seqs must be exactly 1..N consecutive
+   * ACROSS shards + live — replay-end arithmetic depends on the counter
+   * === high-water invariant. Shards load oldest→newest, then the live
+   * file; rotation (E7) never breaks reconnect history within retention.
    */
-  static load(dir: string, log: Log = () => {}): ChatFrameLog {
+  static load(
+    dir: string,
+    log: Log = () => {},
+    rotation: { maxBytes?: number; keep?: number } = {},
+  ): ChatFrameLog {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const log_ = new ChatFrameLog(dir);
-    if (!existsSync(log_.file)) return log_;
-    let text = readFileSync(log_.file, 'utf-8');
+    const policy = {
+      maxBytes: rotation.maxBytes ?? FRAME_LOG_ROTATION_DEFAULTS.maxBytes,
+      keep: rotation.keep ?? FRAME_LOG_ROTATION_DEFAULTS.keep,
+    };
+    const log_ = new ChatFrameLog(dir, policy);
+    // Oldest shard first: slot numbers count DOWN toward 1 (newest). The
+    // scan covers the configured keep (rotation never mints higher slots;
+    // a keep-reduction prunes strays on the next rotation).
+    const shardSlots: number[] = [];
+    for (let slot = 1; slot <= policy.keep; slot++) {
+      if (!existsSync(frameLogShardFile(dir, slot))) break;
+      shardSlots.push(slot);
+    }
+    shardSlots.reverse(); // highest slot = oldest → load first
+    for (const slot of shardSlots) {
+      log_.loadFile(frameLogShardFile(dir, slot), log, slot === shardSlots[0]);
+    }
+    // The live file always continues the chain — a shard-less live file
+    // starts at 1 (no pruning ever happened there).
+    log_.loadFile(log_.file, log, false);
+    const settled = log_.settleOpenTurn();
+    if (settled.length > 0) {
+      log('warn', 'chat frame log ended mid-turn — closing frames appended at boot', {
+        file: log_.file,
+        closing_frames: settled.length,
+      });
+    }
+    return log_;
+  }
+
+  /** Load one file's lines into the in-memory history (seq continues
+   * across files). Same fail-loud rules as before, scoped per file —
+   * with ONE rotation-aware relaxation: the OLDEST shard may start at
+   * any seq (retention pruned everything before it); every later file
+   * must continue the chain exactly. A shard-less live file still must
+   * start at seq 1 (nothing was ever pruned — a gap is corruption). */
+  private loadFile(file: string, log: Log, isOldestShard: boolean): void {
+    if (!existsSync(file)) {
+      this.liveBytes = 0;
+      return;
+    }
+    let text = readFileSync(file, 'utf-8');
+    this.liveBytes = Buffer.byteLength(text, 'utf-8');
     // r2 B1'': a crash mid-append can cut the write between the final
-    // frame's JSON and its terminator newline. That line LOADS fine — but
-    // the next append merges onto it (reboot drops both frames and
-    // resets the counter, or the merge lands mid-file and bricks boot).
-    // A parseable final line missing only the '\n' is torn-tail-class:
-    // keep the frame, repair the terminator (atomically).
+    // frame's JSON and its terminator newline. A parseable final line
+    // missing only the '\n' is torn-tail-class: keep the frame, repair
+    // the terminator (atomically).
     if (text.length > 0 && !text.endsWith('\n')) {
       const tailStart = text.lastIndexOf('\n') + 1;
       const tail = text.slice(tailStart);
@@ -87,11 +145,12 @@ export class ChatFrameLog {
         tailFrame.type !== 'auth_ok' &&
         !(tailFrame.type === 'error' && tailFrame.fatal === true);
       if (repairable) {
-        rewriteAtomically(log_.file, `${text}\n`);
+        rewriteAtomically(file, `${text}\n`);
         log('warn', 'final frame line was missing its newline — terminator repaired (crash mid-append)', {
-          file: log_.file,
+          file,
         });
         text = `${text}\n`;
+        this.liveBytes = Buffer.byteLength(text, 'utf-8');
       }
       // else: the line loop below drops/raises as its content deserves.
     }
@@ -110,21 +169,18 @@ export class ChatFrameLog {
           // moment any later frame appends, and the NEXT boot would fail
           // loud over damage this boot could have healed.
           log('warn', 'dropping torn final line of chat frame log (crash mid-append)', {
-            file: log_.file,
+            file,
             line: index + 1,
           });
           const validPrefix = lines.slice(0, index);
-          rewriteAtomically(
-            log_.file,
-            validPrefix.length > 0 ? `${validPrefix.join('\n')}\n` : '',
-          );
+          rewriteAtomically(file, validPrefix.length > 0 ? `${validPrefix.join('\n')}\n` : '');
           break;
         }
-        throw new FrameLogCorruptError(log_.file, index + 1, `unparseable json (${String(error)})`);
+        throw new FrameLogCorruptError(file, index + 1, `unparseable json (${String(error)})`);
       }
       const frame = parseServerFrame(parsed);
       if (frame === null || frame.type === 'auth_ok') {
-        throw new FrameLogCorruptError(log_.file, index + 1, 'not a logged chat frame');
+        throw new FrameLogCorruptError(file, index + 1, 'not a logged chat frame');
       }
       if (frame.type === 'error' && frame.fatal === true) {
         // r2 W3': a persisted fatal frame is poison by construction (the
@@ -132,31 +188,28 @@ export class ChatFrameLog {
         // cannot produce one (type-narrowed + append-guarded); a file
         // that carries one is corrupt — refuse, never replay it.
         throw new FrameLogCorruptError(
-          log_.file,
+          file,
           index + 1,
           'a fatal error frame was persisted — fatal frames are never logged (client poison)',
         );
       }
       const seq = loggedFrameSeq(frame);
-      if (seq !== index + 1) {
+      if (this.frames.length === 0 && isOldestShard) {
+        // Retention pruned everything before this shard: adopt the base.
+        this.seq = seq - 1;
+      }
+      const expected = this.seq + 1;
+      if (seq !== expected) {
         throw new FrameLogCorruptError(
-          log_.file,
+          file,
           index + 1,
-          `seq gap: expected ${index + 1}, found ${seq} (counter must equal the high-water mark)`,
+          `seq gap: expected ${expected}, found ${seq} (counter must equal the high-water mark)`,
         );
       }
-      log_.track(frame);
-      log_.frames.push(frame);
+      this.seq = seq;
+      this.track(frame);
+      this.frames.push(frame);
     }
-    log_.seq = log_.frames.length;
-    const settled = log_.settleOpenTurn();
-    if (settled.length > 0) {
-      log('warn', 'chat frame log ended mid-turn — closing frames appended at boot', {
-        file: log_.file,
-        closing_frames: settled.length,
-      });
-    }
-    return log_;
   }
 
   get highWaterSeq(): number {
@@ -196,11 +249,47 @@ export class ChatFrameLog {
         `refusing to persist a frame load() would reject: ${JSON.stringify(frame)}`,
       );
     }
-    appendFileSync(this.file, `${JSON.stringify(seqed)}\n`, 'utf-8');
+    const line = `${JSON.stringify(seqed)}\n`;
+    this.rotateIfNeeded(Buffer.byteLength(line, 'utf-8'));
+    appendFileSync(this.file, line, 'utf-8');
+    this.liveBytes += Buffer.byteLength(line, 'utf-8');
     this.seq = next;
     this.track(seqed);
     this.frames.push(seqed);
     return seqed;
+  }
+
+  /**
+   * Size-based rotation (E7): shift shards up (pruning past keep),
+   * rename the live file to shard 1, and let the append start a fresh
+   * live file. In-memory history (the replay source) is untouched —
+   * reconnect history stays intact within the retention window.
+   */
+  private rotateIfNeeded(incomingBytes: number): void {
+    if (this.liveBytes + incomingBytes <= this.rotation.maxBytes) return;
+    const dir = join(this.file, '..');
+    // Prune EVERYTHING at/past keep first (a keep-reduction must not
+    // leave strays), then shift the surviving slots up one.
+    for (let slot = this.rotation.keep; slot <= this.rotation.keep + 99; slot++) {
+      try {
+        rmSync(frameLogShardFile(dir, slot), { force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+    for (let slot = this.rotation.keep - 1; slot >= 1; slot--) {
+      try {
+        renameSync(frameLogShardFile(dir, slot), frameLogShardFile(dir, slot + 1));
+      } catch {
+        /* best effort */
+      }
+    }
+    try {
+      renameSync(this.file, frameLogShardFile(dir, 1));
+    } catch {
+      /* best effort — the append still lands in the live file */
+    }
+    this.liveBytes = 0;
   }
 
   /** Frames with seq > lastSeenSeq, in order (the reconnect replay). */

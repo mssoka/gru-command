@@ -12,7 +12,9 @@ import {
   type AgentView,
   type BoardSnapshot,
   type JobView,
+  type NotificationView,
 } from '../lib/board-protocol.js';
+import type { BoardClient } from '../lib/board-client.js';
 import { el, mustGet } from './dom.js';
 
 const ROLE_EMOJI: Readonly<Record<string, string>> = {
@@ -40,34 +42,64 @@ export class BoardView {
   private readonly notificationBell: HTMLButtonElement;
   private readonly notificationPanel: HTMLElement;
   private readonly onOpenTranscript: (request: TranscriptOpenRequest) => void;
+  /** E7: notification receipts + acks ride the board client (optional —
+   * the mock feed carries ack-ready rows without a client; rebound on
+   * re-pair). */
+  private boardClient: BoardClient | null;
+  /** Toast + browser-notification surface (E7). */
+  private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
   /** Error notification ids the user has already seen (panel opened with
    * them present) — the badge counts only UNSEEN errors. */
   private readonly seenErrorIds = new Set<string>();
+  /** E7: display receipts already sent (id → surfaces sent). */
+  private readonly sentShown = new Map<string, Set<string>>();
+  /** E7: notification ids previously seen (new arrivals toast). */
+  private knownNotificationIds = new Set<string>();
 
-  constructor(onOpenTranscript: (request: TranscriptOpenRequest) => void) {
+  constructor(
+    onOpenTranscript: (request: TranscriptOpenRequest) => void,
+    boardClient: BoardClient | null = null,
+  ) {
     this.mount = mustGet('board-jobs');
     this.notificationBell = mustGet<HTMLButtonElement>('notification-bell');
     this.notificationPanel = mustGet('notification-panel');
     this.onOpenTranscript = onOpenTranscript;
+    this.boardClient = boardClient;
     this.notificationBell.addEventListener('click', () => {
       this.notificationPanel.hidden = !this.notificationPanel.hidden;
       this.notificationBell.dataset.open = String(!this.notificationPanel.hidden);
       if (!this.notificationPanel.hidden) {
-        // Opening the panel marks every current error as seen.
+        // Opening the panel proves display of every current row: mark
+        // seen (badge) AND send one receipt per surface (shown:true).
         for (const notification of this.snapshot?.notifications ?? []) {
           if (notification.severity === 'error') this.seenErrorIds.add(notification.id);
+          this.sendShown(notification, 'web-panel');
         }
         this.updateBadge(this.snapshot?.notifications ?? []);
       }
     });
   }
 
+  /** E7: wire the live toast surface (main wires toasts + browser
+   * notifications after construction). */
+  setToastHandler(handler: (notification: NotificationView) => void): void {
+    this.onToast = handler;
+  }
+
+  /** E7: bind the board client (receipts + acks) — rebound on re-pair. */
+  bindClient(client: BoardClient): void {
+    this.boardClient = client;
+    this.sentShown.clear();
+  }
+
   render(snapshot: BoardSnapshot): void {
+    const previous = this.snapshot;
     this.snapshot = snapshot;
     this.renderRepos(snapshot);
     this.renderAgents(snapshot.agents);
     this.renderNotifications(snapshot.notifications);
+    this.surfaceNewNotifications(previous, snapshot.notifications);
   }
 
   get current(): BoardSnapshot | null {
@@ -174,6 +206,21 @@ export class BoardView {
         el('span', 'board-agent__name', agentLabel(agent)),
         el('span', `pp-chip board-agent__state ${agentStateTone(agent.state)}`, agent.state),
       );
+      // E7: supervision mark — a stopped (breaker-tripped) or restarting
+      // agent shows its supervision state on the rail.
+      if (agent.supervision !== null && agent.supervision !== undefined) {
+        const supervision = agent.supervision;
+        if (supervision.state === 'stopped' || supervision.state === 'restarting') {
+          row.append(
+            el(
+              'span',
+              `pp-chip board-agent__supervision ${supervision.state === 'stopped' ? 'pp-chip--alert' : 'pp-chip--work'}`,
+              supervision.state === 'stopped' ? '⛔ stopped' : '⏳ restarting',
+            ),
+          );
+          row.title += ` · supervision: ${supervision.state} (${supervision.restarts} restarts)`;
+        }
+      }
       rail.append(row);
     }
   }
@@ -182,7 +229,7 @@ export class BoardView {
   // Notification center
   // ------------------------------------------------------------------
 
-  private renderNotifications(notifications: readonly { id: string; ts: string; severity: string; title: string; detail: string | null }[]): void {
+  private renderNotifications(notifications: readonly NotificationView[]): void {
     const list = mustGet('notification-list');
     list.replaceChildren();
     this.updateBadge(notifications);
@@ -193,17 +240,86 @@ export class BoardView {
     }
     for (const item of notifications) {
       const row = el('div', `board-notification board-notification--${item.severity}`);
+      const icon = item.routing === 'action-required' ? '🔔' : item.severity === 'error' ? '🚨' : 'ℹ️';
       row.append(
-        el('div', 'board-notification__title', `${item.severity === 'error' ? '🚨' : 'ℹ️'} ${item.title}`),
-        el('div', 'board-notification__meta lbl', `${formatTs(item.ts)}${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`),
+        el(
+          'div',
+          'board-notification__title',
+          `${icon} ${item.title}${item.ackedAt !== null ? ' ✓' : ''}`,
+        ),
+        el(
+          'div',
+          'board-notification__meta lbl',
+          `${formatTs(item.ts)} · ${item.routing}${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
+        ),
       );
+      // Ack button: action-required rows clear through a human ack
+      // (acking also re-arms a tripped breaker server-side).
+      if (item.ackedAt === null) {
+        const ack = document.createElement('button');
+        ack.type = 'button';
+        ack.className = 'board-notification__ack';
+        ack.textContent = item.routing === 'action-required' ? 'Ack' : 'Mark seen';
+        ack.addEventListener('click', () => {
+          void this.boardClient
+            ?.ackNotification(item.id)
+            .then(() => {
+              this.seenErrorIds.add(item.id);
+              ack.textContent = '✓';
+              ack.disabled = true;
+            })
+            .catch(() => {
+              /* the row re-renders on the next snapshot push */
+            });
+        });
+        row.append(ack);
+      }
       list.append(row);
     }
   }
 
-  /** Badge = error-severity items never seen (panel-open marks seen). */
-  private updateBadge(notifications: readonly { id: string; severity: string }[]): void {
-    const unseen = notifications.filter((n) => n.severity === 'error' && !this.seenErrorIds.has(n.id)).length;
+  /**
+   * E7: NEWLY-ARRIVED notifications earn the live surface — a toast +
+   * browser notification + a shown receipt (nothing displayed is
+   * unproven). History present at first render never toasts (the badge
+   * + panel carry standing state; reloads must not re-tap the shoulder).
+   */
+  private surfaceNewNotifications(_previous: BoardSnapshot | null, notifications: readonly NotificationView[]): void {
+    const firstRender = !this.notificationsInitialized;
+    this.notificationsInitialized = true;
+    for (const notification of notifications) {
+      if (this.knownNotificationIds.has(notification.id)) continue;
+      this.knownNotificationIds.add(notification.id);
+      if (firstRender) continue; // history load — no toast spam
+      this.onToast?.(notification);
+      this.sendShown(notification, 'web-toast');
+    }
+  }
+
+  private notificationsInitialized = false;
+
+  /** One display receipt per (id, surface) — receipts never spam. The
+   * server upgrades shown_at per surface, so a toast receipt never
+   * suppresses a later panel receipt. */
+  private sendShown(notification: NotificationView, surface: string): void {
+    let surfaces = this.sentShown.get(notification.id);
+    if (surfaces === undefined) {
+      surfaces = new Set<string>();
+      this.sentShown.set(notification.id, surfaces);
+    }
+    if (surfaces.has(surface)) return;
+    surfaces.add(surface);
+    void this.boardClient?.markNotificationShown(notification.id, surface).then((landed) => {
+      if (!landed) surfaces.delete(surface); // retry on the next upgrade
+    });
+  }
+
+  /** Badge = unacked error-severity items not yet seen here (panel-open
+   * marks seen; an ack from ANY device clears it via ackedAt). */
+  private updateBadge(notifications: readonly { id: string; severity: string; ackedAt: string | null }[]): void {
+    const unseen = notifications.filter(
+      (n) => n.severity === 'error' && n.ackedAt === null && !this.seenErrorIds.has(n.id),
+    ).length;
     this.notificationBell.dataset.unread = String(unseen);
   }
 }

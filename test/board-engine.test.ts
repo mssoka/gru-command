@@ -6,6 +6,7 @@ import { EventBus } from '../src/events/bus.js';
 import { BoardEngine, type BoardSnapshot } from '../src/board/engine.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import type { Role } from '../src/config.js';
 
@@ -44,6 +45,9 @@ describe('board engine — adapter events → ledger events → board state', ()
     const db = new LedgerDb(tmpDir());
     bus = new EventBus();
     api = new LedgerApi(db.handle, { bus });
+    // E7: the notification center owns derivation (FYI rows land once,
+    // at event time); the engine renders the durable table.
+    new NotificationCenter({ ledger: api, bus });
     engine = new BoardEngine({ ledger: api, bus });
   });
 
@@ -124,7 +128,11 @@ describe('board engine — adapter events → ledger events → board state', ()
       ),
     ).toBe(true);
     const notifications = engine.notifications();
-    expect(notifications.some((n) => n.severity === 'error' && (n.detail ?? '').includes('connection lost'))).toBe(true);
+    expect(
+      notifications.some(
+        (n) => n.kind === 'agent.error' && n.routing === 'fyi' && (n.detail ?? '').includes('connection lost'),
+      ),
+    ).toBe(true);
   });
 
   it('snapshot is repo-grouped with rounds + lens chips; blocked jobs raise notifications', () => {
@@ -137,7 +145,7 @@ describe('board engine — adapter events → ledger events → board state', ()
     expect(jobIds).toContain('err-job');
     const engineJob = demoRepo?.jobs.find((j) => j.id === 'engine-job');
     expect(engineJob?.rounds[0]?.lenses.filter((c) => c.state === 'done' || c.state === 'live').length).toBe(2);
-    expect(snapshot.notifications.some((n) => n.title.includes('blocked'))).toBe(true);
+    expect(snapshot.notifications.some((n) => n.title.includes('blocked') && n.routing === 'fyi')).toBe(true);
     // Other repos form their own groups.
     api.addJob({ id: 'solo-job', repo: 'website', title: 'Copy pass' });
     expect(engine.snapshot().repos.some((r) => r.name === 'website')).toBe(true);
@@ -189,18 +197,47 @@ describe('board engine — adapter events → ledger events → board state', ()
     expect(api.listLensBindings('tap-lens')).toEqual([{ roundId: round.id, lens: 'blind' }]);
   });
 
-  it('standing blocked jobs stay in the notification feed after their event ages out', () => {
+  it('a blocked job notification row is durable — it outlives the event window', () => {
     api.addJob({ id: 'old-blocked', repo: 'demo-repo', title: 'Blocked long ago' });
     api.setJobStatus('old-blocked', 'working');
     api.setJobStatus('old-blocked', 'blocked');
-    // Push 200+ newer events so the blocked transition leaves the window.
+    // Push 200+ newer events so the blocked transition leaves any event
+    // window — the durable notification ROW keeps the item pinned.
     for (let i = 0; i < 210; i += 1) {
       api.appendCustomEvent({ kind: 'noise', payload: { i } });
     }
     const feed = engine.notifications();
-    expect(feed.some((n) => n.id === 'job-old-blocked' && n.severity === 'error')).toBe(true);
-    // The blocked job is deduped against its (out-of-window) transition event.
+    expect(feed.some((n) => n.title.includes('old-blocked') && n.severity === 'error')).toBe(true);
+    // Derivation fired exactly once at event time.
     expect(feed.filter((n) => n.title.includes('old-blocked')).length).toBe(1);
+  });
+
+  it('E7 r1-16: a breaker-stopped agent renders its supervision state on the board (degraded board)', () => {
+    engine.onRuntimeEvent({ agentId: 'stopped-minion', role: 'minion', sessionFile: null, phase: 'spawned' });
+    const supervised = new BoardEngine({
+      ledger: api,
+      bus,
+      supervisionFor: (agentId) =>
+        agentId === 'stopped-minion'
+          ? {
+              agentId,
+              role: 'minion',
+              slotId: null,
+              state: 'stopped',
+              restarts: 3,
+              breakerOpen: true,
+              openTurn: false,
+              lastEventAt: '2026-09-18T00:00:00.000Z',
+              lastFileBytes: 0,
+            }
+          : null,
+    });
+    const snapshot = supervised.snapshot();
+    const row = snapshot.agents.find((a) => a.id === 'stopped-minion');
+    expect(row?.supervision).toMatchObject({ state: 'stopped', restarts: 3, breakerOpen: true });
+    // Unsupervised agents carry null — the UI renders no chip for them.
+    const plain = supervised.snapshot().agents.find((a) => a.id === 'gru-main');
+    expect(plain?.supervision).toBeNull();
   });
 
   it('a ledger hiccup never takes the runtime path down (observer isolation)', () => {

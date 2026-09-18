@@ -175,4 +175,40 @@ export class BoardClient {
     const params = new URLSearchParams({ file, q: query });
     return this.api<TranscriptSearchResult>(`/api/transcripts/file?${params.toString()}`);
   }
+
+  /** E7: display receipt (shown:true doctrine) — idempotent per surface.
+   * Resolves true when the receipt landed; false on failure (the caller
+   * unmarks so a later surface upgrade retries). */
+  async markNotificationShown(id: string, surface: string): Promise<boolean> {
+    try {
+      await this.postApi(`/api/notifications/${encodeURIComponent(id)}/shown`, { surface });
+      return true;
+    } catch {
+      return false; // a lost receipt never blocks rendering
+    }
+  }
+
+  /** E7: human ack (action-required clearance; re-arms an open breaker). */
+  async ackNotification(id: string): Promise<void> {
+    await this.postApi(`/api/notifications/${encodeURIComponent(id)}/ack`, { by: 'web' });
+  }
+
+  private async postApi(path: string, body: unknown): Promise<unknown> {
+    const doFetch = this.fetchImpl;
+    const res = await doFetch(path, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${this.options.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      if (res.status === 401) {
+        this.events.fatal('unauthorized (board api)');
+      }
+      throw new Error(`board api ${path} → ${res.status}`);
+    }
+    return res.json();
+  }
 }

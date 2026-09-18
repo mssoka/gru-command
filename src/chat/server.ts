@@ -49,6 +49,12 @@ export interface ChatServer {
   attach(httpServer: HttpServer): void;
   /** Best-effort Gru spawn at boot; failures are logged, never fatal. */
   warmup(): void;
+  /** Surface a product notice in the chat stream (E7, SPEC ruling 13 —
+   * action-required items Gru surfaces in chat). Logged + replayed. */
+  surfaceNotice(text: string): void;
+  /** Adopt a supervisor-restarted Gru handle (E7): re-wire subscription
+   * + session pointer onto the new live handle. */
+  adoptRestartedGru(handle: AgentHandle): void;
   /** Close every client and stop timers; the agent handle is NOT disposed
    * here — the registry owns it (shutdown ladder disposes chat first). */
   dispose(): Promise<void>;
@@ -507,6 +513,36 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         log('warn', 'gru warmup failed — first message retries', {
           error: String(error),
         });
+      });
+    },
+
+    surfaceNotice(text: string): void {
+      if (disposed || text === '') return;
+      // Logged first (the log is the source of replay), broadcast second —
+      // the standard emitLogged contract. A notice never opens a turn.
+      emitLogged({ type: 'notice', text });
+    },
+
+    adoptRestartedGru(next: AgentHandle): void {
+      if (disposed) return;
+      // A supervisor restart replaced the handle: re-wire this server's
+      // subscription + pointer. The old handle was disposed by the
+      // supervisor (its pending prompts already rejected).
+      unsubscribe?.();
+      unsubscribe = null;
+      handle = next;
+      unsubscribe = next.subscribe(onRuntimeEvent);
+      if (next.sessionFile !== null) options.pointer.record(next.sessionFile);
+      // The restarted session may have been mid-conversation: close any
+      // turn the OLD handle left open in the frame log so replay stays
+      // settled, then tell the user what happened.
+      settleOpenTurn();
+      emitLogged({
+        type: 'notice',
+        text: 'Gru session restarted by the supervisor — conversation resumed from the durable session file.',
+      });
+      log('info', 'adopted supervisor-restarted gru session', {
+        session_file: next.sessionFile,
       });
     },
 

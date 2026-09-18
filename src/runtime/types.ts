@@ -115,6 +115,13 @@ export interface PromptOptions {
   readonly owner?: PromptOwner;
   /** Images attached to the prompt (capability-checked). */
   readonly images?: ReadonlyArray<{ readonly mediaType: string; readonly data: string }>;
+  /**
+   * Opt-in cap on how long THIS call may wait in a queue-until-idle hold
+   * (E2 deferral, E7 home): when the wait exceeds the budget the call
+   * REJECTS — only this caller, never the queue or the live turn. The
+   * supervision watchdog owns un-hanging the turn itself.
+   */
+  readonly timeoutMs?: number;
 }
 
 /** One live agent session hosted by a runtime. */

@@ -214,6 +214,15 @@ export class RuntimeRegistry {
     await handle.dispose();
   }
 
+  /** Live handle by agent id (E7 supervision feed), or null. */
+  getHandle(agentId: string): AgentHandle | null {
+    for (const handle of this.handles) {
+      if (handle.id === agentId) return handle;
+    }
+    return null;
+  }
+
+
   status(): RuntimeStatus {
     let anySession = false;
     let streaming = false;

@@ -1209,3 +1209,57 @@ describe('chat server (real sockets, stub Gru)', () => {
     await second.close();
   });
 });
+
+describe('chat server — supervision integration (E7)', () => {
+  it('surfaceNotice logs + broadcasts a notice frame the web validator accepts', async () => {
+    const harness = await makeHarness();
+    const client = await authedClient(harness.port);
+    const before = harness.frameLog.highWaterSeq;
+    harness.chat.surfaceNotice('⚠ Action required: breaker tripped');
+    await client.waitForCount(1 + harness.frameLog.highWaterSeq);
+    const notice = client.frames.find((f) => f.type === 'notice');
+    expect(notice).toMatchObject({ type: 'notice', text: '⚠ Action required: breaker tripped', seq: before + 1 });
+    expect(harness.frameLog.history.at(-1)).toMatchObject({ type: 'notice' });
+    // A reconnect replays the notice (durable frame).
+    const clientB = await authedClient(harness.port);
+    await clientB.waitForCount(1 + harness.frameLog.highWaterSeq);
+    expect(clientB.frames.some((f) => f.type === 'notice')).toBe(true);
+    await client.close();
+    await clientB.close();
+    await harness.close();
+  });
+
+  it('adoptRestartedGru rewires a supervisor restart: open turn settles, notice lands, prompts route to the NEW handle', async () => {
+    const harness = await makeHarness();
+    const client = await authedClient(harness.port);
+    // Hold a turn open on the OLD handle (the hang the supervisor killed).
+    let releaseTurn!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    harness.handle.nextHold = hold;
+    const inFlight = nextTurnEnd(client);
+    client.send('about to be restarted', 'm1');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // The supervisor produces a fresh handle over the SAME session file.
+    const replacement = new StubGruHandle(harness.handle.sessionFile);
+    harness.chat.adoptRestartedGru(replacement as unknown as import('../src/runtime/types.js').AgentHandle);
+    releaseTurn();
+    await inFlight;
+
+    // The settle + restart notice are in the stream.
+    expect(client.frames.some((f) => f.type === 'notice' && (f as { text?: string }).text?.includes('restarted'))).toBe(true);
+    expect(harness.frameLog.hasOpenTurn).toBe(false);
+
+    // New prompts reach the REPLACEMENT handle, not the old one.
+    harness.handle.calls.length = 0;
+    const done = nextTurnEnd(client);
+    client.send('hello again', 'm2');
+    await done;
+    expect(replacement.calls.map((c) => c.text)).toContain('hello again');
+    expect(harness.handle.calls).toEqual([]);
+    await client.close();
+    await harness.close();
+  });
+});

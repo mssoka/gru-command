@@ -1,0 +1,25 @@
+# Gru Command — systemd USER unit template. install.sh renders
+# {{NODE}}, {{REPO_ROOT}}, and {{GRU_COMMAND_HOME}} to absolute paths and
+# installs to ~/.config/systemd/user/. Restart=on-failure restarts the
+# service on crash (a clean exit(0) — a manual stop — stays down, SPEC
+# ruling 5: the OS service manager is the out-of-band watcher).
+#
+# Note: a user unit runs while the user is logged in. For an always-on
+# machine enable lingering:  loginctl enable-linger $USER
+
+[Unit]
+Description=Gru Command — multi-agent orchestrator service
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{NODE}} {{REPO_ROOT}}/dist/main.js
+Environment=GRU_COMMAND_HOME={{GRU_COMMAND_HOME}}
+Restart=on-failure
+RestartSec=2
+# The service writes its own structured log under the instance data dir;
+# systemd captures stdout/stderr as a convenience mirror.
+SyslogIdentifier=gru-command
+
+[Install]
+WantedBy=default.target

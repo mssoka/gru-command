@@ -8,6 +8,7 @@ import type { EventBus } from '../events/bus.js';
 import { LedgerApi, RecordNotFound } from '../ledger/api.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
+import type { NotificationCenter } from '../notifications/center.js';
 import type { TranscriptService } from '../transcripts/service.js';
 import { BOARD_WS_PATH, parseBoardClientFrame, type BoardServerFrame } from './frames.js';
 import type { BoardEngine } from './engine.js';
@@ -29,6 +30,11 @@ export interface BoardServerOptions {
   readonly ledger: LedgerApi;
   readonly transcripts: TranscriptService;
   readonly bus: EventBus;
+  /** E7: the notification write path (shown receipts + acks). */
+  readonly notifications: NotificationCenter;
+  /** E7: fired after a successful ack — the supervisor re-arms an open
+   * breaker whose notification was acked. */
+  readonly onNotificationAck?: (id: string) => void;
   readonly log?: Log;
   /** First-frame-must-be-auth deadline (chat parity: 5 s). */
   readonly authDeadlineMs?: number;
@@ -80,6 +86,8 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
   const engine = options.engine;
   const ledger = options.ledger;
   const transcripts = options.transcripts;
+  const notifications = options.notifications;
+  const onNotificationAck = options.onNotificationAck ?? (() => {});
   const siblings = new Set(options.siblingUpgradePaths ?? []);
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
@@ -339,6 +347,40 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             return;
           }
           json(res, 200, suffix === '/status' ? ledger.setRoundStatus(id, value) : ledger.setRoundVerdict(id, value));
+          return;
+        }
+        if (req.method === 'POST' && path.startsWith('/api/notifications/') && (path.endsWith('/shown') || path.endsWith('/ack'))) {
+          if (!authed(req, res)) return;
+          const suffix = path.endsWith('/shown') ? '/shown' : '/ack';
+          const id = decodeURIComponent(path.slice('/api/notifications/'.length, -suffix.length));
+          const body = (await readBody(req)) as Record<string, unknown>;
+          if (suffix === '/shown') {
+            // Display receipt (the shown:true doctrine): one per surface,
+            // idempotent server-side; the client sends each (id, surface)
+            // once. A surface id is comma-free (shownBy packs a list).
+            const surface = strField(body, 'surface');
+            if (surface.includes(',')) {
+              json(res, 400, { error: 'bad_request', detail: 'surface must not contain commas' });
+              return;
+            }
+            const row = notifications.markShown(id, surface);
+            if (row === null) {
+              json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+              return;
+            }
+            json(res, 200, row);
+            return;
+          }
+          const before = ledger.getNotification(id)?.ackedAt ?? null;
+          const row = notifications.ack(id, optStrField(body, 'by') ?? 'web');
+          if (row === null) {
+            json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+            return;
+          }
+          // The hook fires on the FIRST ack (the state change) — a repeat
+          // ack is an idempotent no-op for listeners too.
+          if (before === null && row.ackedAt !== null) onNotificationAck(id);
+          json(res, 200, row);
           return;
         }
         json(res, 404, { error: 'not_found', path });

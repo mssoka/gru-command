@@ -10,6 +10,7 @@ import { BoardEngine } from '../src/board/engine.js';
 import { createBoardServer } from '../src/board/server.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import { TranscriptService } from '../src/transcripts/service.js';
 import { loadConfig } from '../src/config.js';
 
@@ -49,12 +50,14 @@ async function boot(token: string): Promise<{
   const bus = new EventBus();
   const api = new LedgerApi(db.handle, { bus });
   const engine = new BoardEngine({ ledger: api, bus });
+  const notifications = new NotificationCenter({ ledger: api, bus });
   const board = createBoardServer({
     config: cfg,
     engine,
     ledger: api,
     transcripts: new TranscriptService(join(dir, 'sessions'), { ledger: api }),
     bus,
+    notifications,
     pushDebounceMs: 10,
   });
   const http: HttpServer = createServer((req, res) => {
@@ -356,6 +359,83 @@ describe('board server — WS push', () => {
 });
 
 describe('board server — empty token config locks every door', () => {
+  it('notification shown/ack round-trip (E7): receipts idempotent, ack fires the hook, 404 unknown', async () => {
+    const acked: string[] = [];
+    const dir = tmpDir();
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(
+      join(dir, 'config.toml'),
+      '[auth]\ntoken = "ack-token"\n[server]\nhost = "127.0.0.1"\nport = 0\n',
+      'utf-8',
+    );
+    const cfg = loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const engine = new BoardEngine({ ledger: api, bus });
+    const notifications = new NotificationCenter({ ledger: api, bus });
+    const board = createBoardServer({
+      config: cfg,
+      engine,
+      ledger: api,
+      transcripts: new TranscriptService(join(dir, 'sessions'), { ledger: api }),
+      bus,
+      notifications,
+      onNotificationAck: (id) => acked.push(id),
+      pushDebounceMs: 10,
+    });
+    const http: HttpServer = createServer((req, res) => {
+      if (board.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
+      res.writeHead(404);
+      res.end();
+    });
+    board.attach(http);
+    await new Promise<void>((resolveListen) => http.listen(0, '127.0.0.1', resolveListen));
+    const port = (http.address() as AddressInfo).port;
+    try {
+      const row = notifications.post({
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Crash-loop breaker tripped: agent a1 stopped',
+        detail: 'ack to re-arm',
+        agentId: 'a1',
+      });
+      // Auth door on the notification endpoints too.
+      const anon = await postJson(port, `/api/notifications/${row.id}/ack`, null, { by: 'web' });
+      expect(anon.status).toBe(401);
+      // Display receipt (idempotent).
+      const shown1 = await postJson(port, `/api/notifications/${row.id}/shown`, 'ack-token', { surface: 'web-toast' });
+      expect(shown1.status).toBe(200);
+      const shown2 = await postJson(port, `/api/notifications/${row.id}/shown`, 'ack-token', { surface: 'web-toast' });
+      expect(shown2.status).toBe(200);
+      const shownEvents = api
+        .listEvents({ limit: 100 })
+        .filter((e) => e.kind === 'notification.shown' && (e.payload as { id: string }).id === row.id);
+      expect(shownEvents.length).toBe(1);
+      // Missing surface is a 400.
+      const bad = await postJson(port, `/api/notifications/${row.id}/shown`, 'ack-token', {});
+      expect(bad.status).toBe(400);
+      // Ack fires the hook exactly once, idempotently.
+      const ack1 = await postJson(port, `/api/notifications/${row.id}/ack`, 'ack-token', { by: 'web' });
+      expect(ack1.status).toBe(200);
+      expect((ack1.body as { ackedAt: string | null }).ackedAt).not.toBeNull();
+      const ack2 = await postJson(port, `/api/notifications/${row.id}/ack`, 'ack-token', { by: 'web' });
+      expect(ack2.status).toBe(200);
+      expect(acked).toEqual([row.id]);
+      // Unknown id → 404.
+      const missing = await postJson(port, '/api/notifications/nope/ack', 'ack-token', { by: 'web' });
+      expect(missing.status).toBe(404);
+    } finally {
+      await board.dispose();
+      await new Promise<void>((resolveClose) => {
+        http.closeAllConnections();
+        http.close(() => resolveClose());
+      });
+      db.close();
+    }
+  });
+
   it('HTTP returns 503 not_configured; WS rejects with a fatal error', async () => {
     const harness = await boot('');
     const res = await getJson(harness.port, '/api/board', null);

@@ -319,3 +319,43 @@ describe('Perkins r1 regressions (fallback)', () => {
     expect(inner.calls).toContainEqual({ op: 'prompt', text: 'works', owner: 'alice' });
   });
 });
+
+describe('queued-wait timeoutMs (E7 — opt-in caller-side relief)', () => {
+  it('a held caller rejects at timeoutMs; the queue and live turn are untouched', async () => {
+    const inner = new ScriptRuntime('queued');
+    const runtime = withFallbacks(inner);
+    const handle = await runtime.spawn('gru');
+
+    let release!: () => void;
+    const hold = new Promise<void>((resolveHold) => {
+      release = resolveHold;
+    });
+    const innerHandle = inner.handle!;
+    const inFlight = innerHandle.simulateTurn('first', 'alice', hold);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+
+    // Two queued callers: one WITH a timeout, one without.
+    const timedOut = handle.prompt('impatient', { owner: 'bob', timeoutMs: 25 });
+    const patient = handle.prompt('patient', { owner: 'carol' });
+    await expect(timedOut).rejects.toThrow(/queued wait timed out after 25ms/);
+    // The patient caller is still queued (not collateral damage).
+    expect(inner.calls.filter((c) => c.text === 'patient')).toEqual([]);
+
+    release();
+    await inFlight;
+    await patient; // delivered once idle
+    expect(inner.calls).toContainEqual({ op: 'prompt', text: 'patient', owner: 'carol' });
+    // The timed-out caller never delivered.
+    expect(inner.calls.filter((c) => c.text === 'impatient')).toEqual([]);
+  });
+
+  it('a timeoutMs caller that delivers in time resolves normally', async () => {
+    const inner = new ScriptRuntime('queued');
+    const runtime = withFallbacks(inner);
+    const handle = await runtime.spawn('gru');
+    await handle.prompt('quick turn', { owner: 'alice' }); // idle again
+    const fast = handle.prompt('next', { owner: 'bob', timeoutMs: 5_000 });
+    await fast;
+    expect(inner.calls).toContainEqual({ op: 'prompt', text: 'next', owner: 'bob' });
+  });
+});

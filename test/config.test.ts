@@ -423,3 +423,68 @@ describe('Perkins r1 regression pins', () => {
     );
   });
 });
+
+describe('supervision / logging / chat tables (E7)', () => {
+  it('defaults: supervision on, 15-min watchdog, 3-in-10-min breaker; bounded logs', () => {
+    const home = tmpHome();
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.supervision).toEqual({
+      enabled: true,
+      turnSilenceMs: 900_000,
+      restartWindowMs: 600_000,
+      maxRestarts: 3,
+      restartBackoffMs: 2_000,
+    });
+    expect(config.logging).toEqual({ maxBytes: 10_485_760, keep: 5 });
+    expect(config.chat).toEqual({ frameLogMaxBytes: 8_388_608, frameLogKeep: 3 });
+  });
+
+  it('loads explicit [supervision] / [logging] / [chat] values', () => {
+    const home = tmpHome();
+    writeFileSync(
+      join(home, 'config.toml'),
+      [
+        '[supervision]',
+        'enabled = false',
+        'turn_silence_ms = 5000',
+        'restart_window_ms = 120000',
+        'max_restarts = 2',
+        'restart_backoff_ms = 250',
+        '[logging]',
+        'max_bytes = 1024',
+        'keep = 1',
+        '[chat]',
+        'frame_log_max_bytes = 2048',
+        'frame_log_keep = 2',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.supervision).toEqual({
+      enabled: false,
+      turnSilenceMs: 5_000,
+      restartWindowMs: 120_000,
+      maxRestarts: 2,
+      restartBackoffMs: 250,
+    });
+    expect(config.logging).toEqual({ maxBytes: 1_024, keep: 1 });
+    expect(config.chat).toEqual({ frameLogMaxBytes: 2_048, frameLogKeep: 2 });
+  });
+
+  it('fail-loud: unknown keys and non-positive integers are rejected', () => {
+    const bad: readonly string[] = [
+      '[supervision]\nunknown_key = 1\n',
+      '[supervision]\nturn_silence_ms = 0\n',
+      '[supervision]\nmax_restarts = -1\n',
+      '[supervision]\nenabled = "yes"\n',
+      '[logging]\nkeep = 0\n',
+      '[chat]\nframe_log_keep = 1.5\n',
+    ];
+    for (const text of bad) {
+      const home = tmpHome();
+      writeFileSync(join(home, 'config.toml'), text, 'utf-8');
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
+});

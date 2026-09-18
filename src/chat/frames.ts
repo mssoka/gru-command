@@ -75,6 +75,15 @@ export interface ErrorFrame {
   readonly seq?: number;
 }
 
+/** A product notice surfaced in the chat stream (E7, SPEC ruling 13):
+ * action-required items Gru surfaces in chat. Logged + replayed like
+ * every other durable frame; never fatal. */
+export interface NoticeFrame {
+  readonly type: 'notice';
+  readonly text: string;
+  readonly seq: number;
+}
+
 export interface ReplayedUserFrame extends UserFrame {
   readonly seq: number;
 }
@@ -86,6 +95,7 @@ export type ServerFrame =
   | ToolFrame
   | TurnFrame
   | ErrorFrame
+  | NoticeFrame
   | ReplayedUserFrame;
 
 // ---------------------------------------------------------------------------
@@ -150,6 +160,10 @@ export function parseServerFrame(raw: unknown): ServerFrame | null {
       return (value.state === 'start' || value.state === 'end') && isSeq(value.seq)
         ? { type: 'turn', state: value.state, seq: value.seq }
         : null;
+    case 'notice':
+      return isNonEmptyString(value.text) && isSeq(value.seq)
+        ? { type: 'notice', text: value.text, seq: value.seq }
+        : null;
     case 'user':
       // Server→client user frames appear in reconnect replays (they carry
       // seq) so a fresh page restores both sides of the conversation.
@@ -203,6 +217,7 @@ export type UnseqedFrame =
   | Omit<DeltaFrame, 'seq'>
   | Omit<ToolFrame, 'seq'>
   | Omit<TurnFrame, 'seq'>
+  | Omit<NoticeFrame, 'seq'>
   | { readonly type: 'error'; readonly message: string }
   | Omit<ReplayedUserFrame, 'seq'>;
 

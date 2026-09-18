@@ -175,6 +175,32 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('pi queue honors opt-in timeoutMs: the caller rejects, the queue survives', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fx = await fixture([
+      { deltas: ['first'], hold },
+      { deltas: ['later'] },
+    ]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const alice = handle.prompt('q1', { owner: 'alice' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const impatient = handle.prompt('q-impatient', { owner: 'bob', timeoutMs: 20 });
+      const patient = handle.prompt('q-patient', { owner: 'carol' });
+      await expect(impatient).rejects.toThrow(/queued wait timed out after 20ms/);
+      release();
+      await Promise.all([alice, patient]);
+      // The timed-out caller never reached the model; the patient one did.
+      expect(fx.script.calls.map((c) => c.prompt)).toEqual(['q1', 'q-patient']);
+    } finally {
+      release();
+      await handle.dispose();
+    }
+  });
+
   it("owner steer and followUp during the owner's live turn pass through natively", async () => {
     let release!: () => void;
     const hold = new Promise<void>((resolve) => {

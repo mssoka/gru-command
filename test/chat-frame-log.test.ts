@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -278,5 +278,51 @@ describe('ChatFrameLog', () => {
     expect(lines).toHaveLength(2);
     expect(JSON.parse(lines[0]!)).toEqual({ type: 'delta', text: 'a', seq: 1 });
     expect(JSON.parse(lines[1]!)).toEqual({ type: 'delta', text: 'b', seq: 2 });
+  });
+});
+
+describe('ChatFrameLog rotation (E7)', () => {
+  it('rotates at the cap: replay spans shards, seqs stay consecutive, retention prunes', () => {
+    const dir = fixture();
+    const log = ChatFrameLog.load(dir, () => {}, { maxBytes: 300, keep: 2 });
+    // Each delta frame is ~50 bytes on disk; push well past 3 rotations.
+    for (let i = 0; i < 30; i += 1) {
+      log.append({ type: 'delta', text: `beat-${i}-${'y'.repeat(8)}` });
+    }
+    // Shards 1..2 exist; the live file is fresh (small).
+    const shards = readdirSync(dir).filter((n) => /^gru\.frames\.jsonl\.\d+$/.test(n)).sort();
+    expect(shards.length).toBe(2);
+    expect(existsSync(join(dir, FRAME_LOG_NAME))).toBe(true);
+
+    // Reload: history spans shards oldest→newest→live, consecutive WITHIN
+    // the retained window (retention legitimately pruned the oldest).
+    const reloaded = ChatFrameLog.load(dir);
+    expect(reloaded.highWaterSeq).toBe(30);
+    const seqs = reloaded.history.map((f) => (f.type === 'delta' ? f.seq : 0));
+    const firstSeq = seqs[0] ?? 0;
+    expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, i) => firstSeq + i));
+    // Pruning is real: the retained window starts past seq 1.
+    expect(firstSeq).toBeGreaterThan(1);
+    // Replay from zero returns the full RETAINED history.
+    expect(reloaded.replayAfter(0).length).toBe(seqs.length);
+    // Appends continue the counter across the shard boundary.
+    const next = reloaded.append({ type: 'delta', text: 'post-rotation' });
+    expect(next.seq).toBe(31);
+  });
+
+  it('a rotation shard ending mid-turn is settled by the LIVE file continuation (no false close)', () => {
+    const dir = fixture();
+    const log = ChatFrameLog.load(dir, () => {}, { maxBytes: 220, keep: 1 });
+    log.append({ type: 'turn', state: 'start' });
+    for (let i = 0; i < 12; i += 1) {
+      log.append({ type: 'delta', text: `spin-${i}-xxxxxxxx` }); // forces rotation mid-turn
+    }
+    log.append({ type: 'turn', state: 'end' });
+    // Reload mid-shards: the turn-open state is tracked ACROSS files, so
+    // boot-settle must NOT append a bogus turn end.
+    const reloaded = ChatFrameLog.load(dir);
+    expect(reloaded.hasOpenTurn).toBe(false);
+    expect(reloaded.history.at(-1)).toEqual({ type: 'turn', state: 'end', seq: reloaded.highWaterSeq });
+    expect(reloaded.history.filter((f) => f.type === 'turn' && f.state === 'end').length).toBe(1);
   });
 });

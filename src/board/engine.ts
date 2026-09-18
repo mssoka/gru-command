@@ -3,11 +3,13 @@ import type { LogLevel } from '../logger.js';
 import type { AgentState } from '../runtime/types.js';
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { EventBus } from '../events/bus.js';
+import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import {
   DEFAULT_LENSES,
   LedgerApi,
   type AgentRecord,
   type JobRecord,
+  type NotificationRecord,
   type RoundRecord,
 } from '../ledger/api.js';
 import type { JobStatus } from '../ledger/states.js';
@@ -60,14 +62,21 @@ export interface AgentView {
   readonly sessionFile: string | null;
   readonly jobId: string | null;
   readonly roundId: string | null;
+  /** E7 supervision view (null when the agent is unsupervised/not live). */
+  readonly supervision: AgentSupervisionView | null;
 }
 
 export interface NotificationView {
   readonly id: string;
   readonly ts: string;
+  readonly kind: string;
+  readonly routing: 'fyi' | 'action-required';
   readonly severity: 'info' | 'error';
   readonly title: string;
   readonly detail: string | null;
+  readonly agentId: string | null;
+  readonly shownAt: string | null;
+  readonly ackedAt: string | null;
 }
 
 export interface BoardSnapshot {
@@ -83,6 +92,9 @@ export interface BoardEngineOptions {
   readonly ledger: LedgerApi;
   readonly bus: EventBus;
   readonly log?: Log;
+  /** E7: live supervision views per agent id (late-bound — main wires it
+   * to the supervisor after both exist). */
+  readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
 }
 
 export class BoardEngine {
@@ -96,8 +108,11 @@ export class BoardEngine {
     this.ledger = opts.ledger;
     this.bus = opts.bus;
     this.log = opts.log ?? (() => {});
+    this.supervisionFor = opts.supervisionFor ?? (() => null);
     this.bus.subscribe(() => this.notifyChanged());
   }
+
+  private readonly supervisionFor: (agentId: string) => AgentSupervisionView | null;
 
   /** Fired after any event that may have changed the board. */
   onChange(listener: () => void): () => void {
@@ -282,90 +297,31 @@ export class BoardEngine {
       sessionFile: agent.sessionFile,
       jobId: agent.jobId,
       roundId: agent.roundId,
+      supervision: this.supervisionFor(agent.id),
     };
   }
 
   /**
-   * Notification center feed: recent board-worthy events, newest first,
-   * PLUS standing conditions read from row state (a blocked job stays in
-   * the feed after its transition event ages out of the window).
+   * Notification center feed (E7): the durable notification log, newest
+   * first. Since E7 the feed is the LEDGER's notifications table —
+   * FYI rows derive once at event time (the notification center posts
+   * them), action-required rows carry acks; nothing is computed here.
    */
   notifications(limit = 30): readonly NotificationView[] {
-    const out: NotificationView[] = [];
-    const seenJobIds = new Set<string>();
-    for (const job of this.ledger.listJobs()) {
-      if (job.status !== 'blocked') continue;
-      seenJobIds.add(job.id);
-      out.push({
-        id: `job-${job.id}`,
-        ts: job.updatedAt,
-        severity: 'error',
-        title: `Job ${job.id} blocked`,
-        detail: job.note,
-      });
-      if (out.length >= limit) return out;
-    }
-    for (const event of this.ledger.listEvents({ limit: 200 })) {
-      if (event.kind === 'job.status' && event.jobId !== null && seenJobIds.has(event.jobId)) continue;
-      const view = this.notificationFromEvent(event);
-      if (view !== null) out.push(view);
-      if (out.length >= limit) break;
-    }
-    return out;
-  }
-
-  private notificationFromEvent(event: {
-    seq: number;
-    ts: string;
-    kind: string;
-    jobId: string | null;
-    roundId: string | null;
-    agentId: string | null;
-    lens: string | null;
-    payload: unknown;
-  }): NotificationView | null {
-    const payload = (event.payload ?? {}) as Record<string, unknown>;
-    switch (event.kind) {
-      case 'job.status': {
-        const to = String(payload.to ?? '');
-        if (to === 'blocked') {
-          return { id: `e${event.seq}`, ts: event.ts, severity: 'error', title: `Job ${event.jobId ?? ''} blocked`, detail: String(payload.from ?? '') + ' → blocked' };
-        }
-        return null;
-      }
-      case 'agent.state': {
-        const to = String(payload.to ?? '');
-        if (to === 'error') {
-          return { id: `e${event.seq}`, ts: event.ts, severity: 'error', title: `Agent ${event.agentId ?? ''} errored`, detail: String(payload.error ?? '') };
-        }
-        return null;
-      }
-      case 'agent.error':
-        return {
-          id: `e${event.seq}`,
-          ts: event.ts,
-          severity: 'error',
-          title: `Agent ${event.agentId ?? ''} runtime error`,
-          detail: String(payload.error ?? ''),
-        };
-      case 'round.verdict':
-        return {
-          id: `e${event.seq}`,
-          ts: event.ts,
-          severity: 'info',
-          title: `Round ${event.roundId ?? ''} verdict`,
-          detail: String(payload.verdict ?? ''),
-        };
-      case 'lens.status': {
-        const to = String(payload.to ?? '');
-        if (to === 'error') {
-          return { id: `e${event.seq}`, ts: event.ts, severity: 'error', title: `Lens ${event.lens ?? ''} failed`, detail: String(payload.note ?? '') };
-        }
-        return null;
-      }
-      default:
-        return null;
-    }
+    return this.ledger
+      .listNotifications({ limit })
+      .map((row: NotificationRecord) => ({
+        id: row.id,
+        ts: row.ts,
+        kind: row.kind,
+        routing: row.routing,
+        severity: row.severity,
+        title: row.title,
+        detail: row.detail,
+        agentId: row.agentId,
+        shownAt: row.shownAt,
+        ackedAt: row.ackedAt,
+      }));
   }
 
   /** Default lens set (exposed for the write API's docs + tests). */

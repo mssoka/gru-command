@@ -158,6 +158,15 @@ export class ChatView {
         this.scrollToEnd();
         break;
       }
+      case 'notice': {
+        // E7: product notices (action-required escalations) surface in
+        // the chat stream — visually distinct from Gru's own bubbles.
+        const line = el('div', 'notice-line', frame.text);
+        this.log.append(line);
+        if (live) this.bumpUnread();
+        this.scrollToEnd();
+        break;
+      }
     }
   }
 
