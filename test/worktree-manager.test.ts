@@ -977,28 +977,65 @@ describe('Perkins lane-B r2: the sweep-tail catch leg is PINNED (fires on a real
   });
 });
 
-describe('Perkins lane-B r2: crash-window reconciliation (row stranded over a removed tree)', () => {
-  it('DISCRIMINATOR: a tree removed under a non-swept row reconciles swept — never rejects forever', async () => {
+describe('Perkins lane-B r2/r3: crash-window reconciliation (row stranded over a removed tree)', () => {
+  it('DISCRIMINATOR: a CONTAINED lane reconciles swept WITH its branch deleted — no debris, no wedge', async () => {
     const h = harness();
     const repo = h.make('fixture-crashwin');
     ledgerJob(h, 'job-crashwin', repo);
     const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-crashwin' });
-    // Simulate the crash window: the tree is removed OUT of band, the row
-    // never flipped (exactly the state a kill between remove and the
-    // registry write leaves behind).
+    // The lane's work is CONTAINED (merged into main), then the crash
+    // window: the tree is removed out of band, the row never flipped.
+    writeFileSync(join(row.path, 'work.txt'), 'merged work');
+    repo.git(['add', 'work.txt'], row.path);
+    repo.git(['-c', 'user.name=F', '-c', 'user.email=f@example.invalid', 'commit', '-m', 'work'], row.path);
+    repo.git(['merge', row.branch!]);
     repo.git(['worktree', 'remove', '--force', row.path]);
     expect(existsSync(row.path)).toBe(false);
     expect(h.ledger.getWorktree('job-crashwin')?.status).toBe('active');
 
-    // Before reconciliation this rejects on EVERY retry (preserveUntracked
-    // runs git in a missing cwd). It must reconcile: swept + loud event.
-    const result = await h.manager.release({ worktreeId: 'job-crashwin' });
+    // Before this fix the reconcile abandoned the branch ('none' + debris
+    // left) — re-creating the job wedged on 'branch already exists'.
+    const result = await h.manager.release({ worktreeId: 'job-crashwin', baseBranch: 'main' });
     expect(result.status).toBe('swept');
+    if (result.status === 'swept') {
+      expect(result.branch).toBe('deleted'); // the TRUE outcome, not 'none'
+    }
     expect(h.ledger.getWorktree('job-crashwin')?.status).toBe('swept');
+    // NO BRANCH DEBRIS: the containment-verified disposal ran.
+    expect(repo.git(['branch', '--list', row.branch!])).toBe('');
     expect(
       h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.reconciled'),
     ).toBe(true);
+    // The id is immediately reusable — no manual surgery.
+    ledgerJob(h, 'job-crashwin-2', repo);
+    const fresh = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-crashwin-2' });
+    expect(existsSync(fresh.path)).toBe(true);
+    // Retry of the reconciled lane is an idempotent swept.
     const again = await h.manager.release({ worktreeId: 'job-crashwin' });
-    expect(again.status).toBe('swept'); // idempotent
+    expect(again.status).toBe('swept');
+  });
+
+  it('DISCRIMINATOR: an UNCONTAINED lane reconciles swept with its branch RETAINED — never over-deleted', async () => {
+    const h = harness();
+    const repo = h.make('fixture-crashwin-unmerged');
+    ledgerJob(h, 'job-cu', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-cu' });
+    // Unmerged work + the crash window.
+    writeFileSync(join(row.path, 'orphan.txt'), 'unmerged work');
+    repo.git(['add', 'orphan.txt'], row.path);
+    repo.git(['-c', 'user.name=F', '-c', 'user.email=f@example.invalid', 'commit', '-m', 'orphan'], row.path);
+    repo.git(['worktree', 'remove', '--force', row.path]);
+
+    const result = await h.manager.release({ worktreeId: 'job-cu', baseBranch: 'main' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') {
+      expect(result.branch).toBe('retained'); // containment checked, honestly
+    }
+    expect(h.ledger.getWorktree('job-cu')?.status).toBe('swept');
+    // The uncontained branch SURVIVES — nothing force-deleted on faith.
+    expect(repo.git(['branch', '--list', row.branch!])).toContain(row.branch!);
+    expect(
+      h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.branch-retained'),
+    ).toBe(true);
   });
 });

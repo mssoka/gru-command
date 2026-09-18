@@ -425,11 +425,14 @@ export class WorktreeManager {
       // registry write). Reconcile — swept + loud event — instead of
       // rejecting forever in preserveUntracked's missing cwd.
       if (!existsSync(row.path)) {
-        this.reconcileMissingTree(row);
+        // The reconcile disposes the branch exactly like finishSweep
+        // (Perkins lane-B r3): containment-verified delete, or retain +
+        // note — and the response reports the TRUE outcome.
+        const branchOutcome = this.reconcileMissingTree(row, input.baseBranch);
         return {
           status: 'swept',
           preserved: null,
-          branch: 'none',
+          branch: branchOutcome,
           freshHead: this.safeFreshHead(row.repoPath),
         } as const;
       }
@@ -735,8 +738,16 @@ export class WorktreeManager {
     return { status: 'swept', preserved, branch: branchOutcome, freshHead };
   }
 
-  /** The registry follows disk truth for a removed-but-unflipped lane. */
-  private reconcileMissingTree(row: WorktreeRecord): void {
+  /** The registry follows disk truth for a removed-but-unflipped lane —
+   * INCLUDING the branch (Perkins lane-B r3): the same
+   * containment-verified disposal finishSweep runs. Abandoning the
+   * branch here left merged lanes unreusable ('branch already exists')
+   * behind a swept row that early-returns forever. Returns the true
+   * branch outcome for the release response. */
+  private reconcileMissingTree(
+    row: WorktreeRecord,
+    baseBranch: string | undefined,
+  ): 'deleted' | 'retained' | 'none' {
     this.log('warn', 'worktree tree missing under a non-swept row — reconciling swept', {
       id: row.id,
       path: row.path,
@@ -756,6 +767,33 @@ export class WorktreeManager {
         error: String(error),
       });
     }
+    let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
+    if (row.kind === 'job' && row.branch !== null) {
+      try {
+        branchOutcome = this.deleteBranchContained(row, baseBranch);
+      } catch (error) {
+        // Disposal failure must not wedge the reconciliation: the row is
+        // already swept; record the failure loudly for the operator.
+        this.log('error', 'reconciled lane branch disposal failed', {
+          id: row.id,
+          error: String(error),
+        });
+        try {
+          this.opts.ledger.appendCustomEvent({
+            kind: 'worktree.sweep-tail-failed',
+            jobId: row.jobId,
+            roundId: row.roundId,
+            payload: { id: row.id, error: String(error) },
+          });
+        } catch (eventError) {
+          this.log('error', 'sweep-tail-failed event write failed during reconcile', {
+            id: row.id,
+            error: String(eventError),
+          });
+        }
+      }
+    }
+    return branchOutcome;
   }
 
   private safeFreshHead(repoPath: string): string {
