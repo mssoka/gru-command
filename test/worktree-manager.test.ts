@@ -945,3 +945,60 @@ describe('Perkins lane-B r1: the sweep tail can never strand a non-swept row ove
     }
   });
 });
+
+describe('Perkins lane-B r2: the sweep-tail catch leg is PINNED (fires on a real git failure)', () => {
+  it('DISCRIMINATOR: a post-removal branch-delete failure still flips swept + records sweep-tail-failed', async () => {
+    const h = harness();
+    const repo = h.make('fixture-catchleg');
+    ledgerJob(h, 'job-catchleg', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-catchleg' });
+    // Contained work (merged into main) — and a STALE REF LOCK on the
+    // lane's branch: after the lane's removal, `branch -D` genuinely
+    // refuses ("cannot lock ref … File exists"). A real post-removal
+    // tail failure, no mocks.
+    writeFileSync(join(row.path, 'work.txt'), 'contained work');
+    repo.git(['add', 'work.txt'], row.path);
+    repo.git(['-c', 'user.name=F', '-c', 'user.email=f@example.invalid', 'commit', '-m', 'work'], row.path);
+    repo.git(['merge', row.branch!]);
+    const refDir = join(repo.path, '.git', 'refs', 'heads', 'gru');
+    writeFileSync(join(refDir, `${'job-catchleg'}.lock`), '');
+
+    const result = await h.manager.release({ worktreeId: 'job-catchleg', baseBranch: 'main' });
+    expect(result.status).toBe('swept'); // the catch-and-mark held
+    expect(h.ledger.getWorktree('job-catchleg')?.status).toBe('swept');
+    // The catch leg's OWN record — deleting the try/catch must lose this.
+    const events = h.ledger.listEvents({ limit: 200 });
+    expect(events.some((event) => event.kind === 'worktree.sweep-tail-failed')).toBe(true);
+    // The branch survives the failed delete (locked ref).
+    expect(repo.git(['branch', '--list', row.branch!])).toContain(row.branch!);
+    // Retry is an idempotent swept — no wedge.
+    const again = await h.manager.release({ worktreeId: 'job-catchleg' });
+    expect(again.status).toBe('swept');
+  });
+});
+
+describe('Perkins lane-B r2: crash-window reconciliation (row stranded over a removed tree)', () => {
+  it('DISCRIMINATOR: a tree removed under a non-swept row reconciles swept — never rejects forever', async () => {
+    const h = harness();
+    const repo = h.make('fixture-crashwin');
+    ledgerJob(h, 'job-crashwin', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-crashwin' });
+    // Simulate the crash window: the tree is removed OUT of band, the row
+    // never flipped (exactly the state a kill between remove and the
+    // registry write leaves behind).
+    repo.git(['worktree', 'remove', '--force', row.path]);
+    expect(existsSync(row.path)).toBe(false);
+    expect(h.ledger.getWorktree('job-crashwin')?.status).toBe('active');
+
+    // Before reconciliation this rejects on EVERY retry (preserveUntracked
+    // runs git in a missing cwd). It must reconcile: swept + loud event.
+    const result = await h.manager.release({ worktreeId: 'job-crashwin' });
+    expect(result.status).toBe('swept');
+    expect(h.ledger.getWorktree('job-crashwin')?.status).toBe('swept');
+    expect(
+      h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.reconciled'),
+    ).toBe(true);
+    const again = await h.manager.release({ worktreeId: 'job-crashwin' });
+    expect(again.status).toBe('swept'); // idempotent
+  });
+});

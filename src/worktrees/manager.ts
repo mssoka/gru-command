@@ -231,6 +231,8 @@ export class WorktreeManager {
   private readonly enumerate: ProcessEnumerator;
   /** Same-repo serialization (ruling 18e): one creation at a time. */
   private readonly repoLocks = new Map<string, Promise<unknown>>();
+  /** Set by finishSweep's tail guard; drained by recordSweepEvent. */
+  private tailFailure: string | null = null;
 
   constructor(opts: WorktreeManagerOptions) {
     this.opts = opts;
@@ -418,6 +420,19 @@ export class WorktreeManager {
       };
     }
     return this.withRepoLock(row.repoPath, async () => {
+      // (0) Crash-window reconciliation (Perkins lane-B r2 c): the tree is
+      // gone but the row never flipped (a kill between removal and the
+      // registry write). Reconcile — swept + loud event — instead of
+      // rejecting forever in preserveUntracked's missing cwd.
+      if (!existsSync(row.path)) {
+        this.reconcileMissingTree(row);
+        return {
+          status: 'swept',
+          preserved: null,
+          branch: 'none',
+          freshHead: this.safeFreshHead(row.repoPath),
+        } as const;
+      }
       // (1) Preserve untracked deliverables FIRST — before any process
       // decision, before any removal. Deliverables are never hostages.
       const preserved = this.preserveUntracked(row);
@@ -701,28 +716,93 @@ export class WorktreeManager {
         id: row.id,
         error: String(error),
       });
-      this.opts.ledger.appendCustomEvent({
-        kind: 'worktree.sweep-tail-failed',
-        jobId: row.jobId,
-        roundId: row.roundId,
-        payload: { id: row.id, error: String(error) },
+      this.tailFailure = String(error);
+    }
+    // FLIP FIRST (Perkins lane-B r2 a/b): the registry must reflect the
+    // removed tree even if the EVENT writes then fail — and the flip
+    // itself is guarded (a DB-down window reconciles on retry via the
+    // missing-tree path). Events are best-effort, never flip-blockers.
+    try {
+      this.opts.ledger.setWorktreeStatus(row.id, 'swept');
+    } catch (flipError) {
+      this.log('error', 'swept flip failed — retry reconciles over the missing tree', {
+        id: row.id,
+        error: String(flipError),
       });
     }
-    this.opts.ledger.setWorktreeStatus(row.id, 'swept');
-    this.opts.ledger.appendCustomEvent({
-      kind: 'worktree.swept',
-      jobId: row.jobId,
-      roundId: row.roundId,
-      payload: {
-        id: row.id,
-        path: row.path,
-        preserved: preserved === null ? 0 : preserved.count,
-        branch: branchOutcome,
-        freshHead,
-      },
-    });
+    this.recordSweepEvent(row, preserved, branchOutcome, freshHead);
     this.log('info', 'worktree swept', { id: row.id, branch: branchOutcome, freshHead });
     return { status: 'swept', preserved, branch: branchOutcome, freshHead };
+  }
+
+  /** The registry follows disk truth for a removed-but-unflipped lane. */
+  private reconcileMissingTree(row: WorktreeRecord): void {
+    this.log('warn', 'worktree tree missing under a non-swept row — reconciling swept', {
+      id: row.id,
+      path: row.path,
+      status: row.status,
+    });
+    try {
+      this.opts.ledger.setWorktreeStatus(row.id, 'swept');
+      this.opts.ledger.appendCustomEvent({
+        kind: 'worktree.reconciled',
+        jobId: row.jobId,
+        roundId: row.roundId,
+        payload: { id: row.id, path: row.path, priorStatus: row.status },
+      });
+    } catch (error) {
+      this.log('error', 'reconciliation write failed — retry will reconcile again', {
+        id: row.id,
+        error: String(error),
+      });
+    }
+  }
+
+  private safeFreshHead(repoPath: string): string {
+    try {
+      return this.freshHead(repoPath);
+    } catch {
+      return '';
+    }
+  }
+
+  /** Best-effort sweep events (Perkins lane-B r2): a ledger hiccup after
+   * the flip must never wedge the sweep — each write is guarded. */
+  private recordSweepEvent(
+    row: WorktreeRecord,
+    preserved: SweepPreservation | null,
+    branchOutcome: 'deleted' | 'retained' | 'none',
+    freshHead: string,
+  ): void {
+    if (this.tailFailure !== null) {
+      try {
+        this.opts.ledger.appendCustomEvent({
+          kind: 'worktree.sweep-tail-failed',
+          jobId: row.jobId,
+          roundId: row.roundId,
+          payload: { id: row.id, error: this.tailFailure },
+        });
+      } catch (eventError) {
+        this.log('error', 'sweep-tail-failed event write failed', { id: row.id, error: String(eventError) });
+      }
+      this.tailFailure = null;
+    }
+    try {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'worktree.swept',
+        jobId: row.jobId,
+        roundId: row.roundId,
+        payload: {
+          id: row.id,
+          path: row.path,
+          preserved: preserved === null ? 0 : preserved.count,
+          branch: branchOutcome,
+          freshHead,
+        },
+      });
+    } catch (eventError) {
+      this.log('error', 'worktree.swept event write failed', { id: row.id, error: String(eventError) });
+    }
   }
 
   /**
