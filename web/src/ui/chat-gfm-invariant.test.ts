@@ -188,11 +188,15 @@ describe('raw-markdown invariant gate (issue #10)', () => {
   });
 
   it('a mid-turn socket drop marks the stream incomplete with no raw pipes/fences; recovery replays clean', () => {
-    // Perkins r1 blocker 7: markStreamIncomplete (the ruling-3 surface — a
-    // dropped socket mid-turn must never expose raw markdown, and the
-    // connection-lost state must be legible). Modeled on the real wiring:
-    // main.ts calls markStreamIncomplete() on disconnect; a full replay
-    // (fresh reconnect) calls reset() then re-delivers every frame.
+    // Perkins r1 warning 7 (misnumbered "blocker" in the r1 fix commit —
+    // r1's blocker was the reconnect text loss, fixed separately below):
+    // markStreamIncomplete (the ruling-3 surface — a dropped socket
+    // mid-turn must never expose raw markdown, and the connection-lost
+    // state must be legible). The recovery leg here models the
+    // FRESH-PAGE-LOAD path (last_seen_seq=0 → replayStart(true) →
+    // reset() + full frame re-delivery, turn:start included). The
+    // SAME-PAGE reconnect path (partial replay, bare deltas) is pinned
+    // separately in the reconnect test below.
     const view = new ChatView(() => {});
     view.reset();
     view.addFrame(turn('start'), true);
@@ -221,7 +225,8 @@ describe('raw-markdown invariant gate (issue #10)', () => {
     expect(gru.querySelector('table.md-table'), 'table intact at drop').not.toBeNull();
     expect(gru.querySelector('pre.md-code'), 'code block intact at drop').not.toBeNull();
 
-    // Recovery — full replay on reconnect: reset() + re-delivered frames.
+    // Recovery — FRESH PAGE LOAD: full replay (last_seen_seq=0) calls
+    // reset() then re-delivers every frame, turn:start included.
     view.reset();
     view.addFrame(turn('start'), false);
     view.addFrame(delta(REPLY), false);
@@ -236,11 +241,56 @@ describe('raw-markdown invariant gate (issue #10)', () => {
     expect(log.querySelector('pre.md-code')).not.toBeNull();
   });
 
+  it('a same-page reconnect (partial replay: bare deltas, no turn:start) loses NO text', () => {
+    // Perkins r1 blocker / r2 blocker 1 — the REAL reconnect path, as
+    // wired: chat-client re-auths with last_seen_seq > 0, the server
+    // replays ONLY unseen frames (no turn:start re-delivery, no reset),
+    // and the replayed bare deltas arrive with streamingBody === null.
+    // The first one was silently wiped when `streamText +=` ran before
+    // openStream()'s reset — this test was RED until that reorder landed.
+    const view = new ChatView(() => {});
+    view.reset();
+    view.addFrame(turn('start'), true);
+    // Live: the reply's head lands, then the socket drops mid-turn.
+    view.addFrame(delta('| Lane | State |'), true);
+    view.addFrame(delta('\n|---|---|'), true);
+    view.markStreamIncomplete();
+
+    // Same-page reconnect: partial replay delivers ONLY the unseen tail
+    // as bare deltas, then the never-delivered turn:end.
+    const log = document.getElementById('chat-log') as HTMLElement;
+    view.addFrame(delta('| e1 | done |'), false);
+    view.addFrame(delta('\n| e2 | park |'), false);
+    view.addFrame(turn('end'), false);
+
+    // NO TEXT LOST — every chunk of the reply is in the DOM (the first
+    // replayed delta '| e1 | done |' is exactly what the desync wiped).
+    const text = allText(log);
+    expect(text).toContain('Lane');
+    expect(text).toContain('State');
+    expect(text, 'the first replayed delta survives').toContain('e1');
+    expect(text, 'the first replayed delta survives').toContain('done');
+    expect(text).toContain('e2');
+    expect(text).toContain('park');
+    // The drop state is legible and the tail settles (turn:end delivered).
+    expect(text).toMatch(/connection lost/i);
+    const bubbles = [...log.querySelectorAll('.msg--gru')];
+    expect(bubbles.every((b) => !b.classList.contains('msg--streaming'))).toBe(true);
+    // Raw-markdown invariant holds across the split reply's bubbles:
+    // pipe-leading lines render as table rows in BOTH.
+    expect(text).not.toContain('|');
+    expect(text).not.toContain('```');
+    for (const bubble of bubbles) {
+      expect(bubble.querySelector('table.md-table'), 'each bubble renders structure').not.toBeNull();
+    }
+  });
+
   it('a held streaming fragment resolves at turn end (the final render is load-bearing)', () => {
-    // Perkins r1 blocker 8: closeStream's non-streaming final render was
-    // unpinned — deleting it kept every earlier DOM test green. This test
-    // fails if that render goes away: the held fragment must materialize
-    // (as literal text per GFM, never as an empty fence) once the turn ends.
+    // Perkins r1 warning 8 ("blocker" mislabel noted above): closeStream's
+    // non-streaming final render was unpinned — deleting it kept every
+    // earlier DOM test green. This test fails if that render goes away:
+    // the held fragment must materialize (as literal text per GFM, never
+    // as an empty fence) once the turn ends.
     const view = new ChatView(() => {});
     view.reset();
     view.addFrame(turn('start'), true);

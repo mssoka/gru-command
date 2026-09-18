@@ -125,8 +125,14 @@ export class ChatView {
         // Gru replies render as GFM markdown (issue #10: users must never
         // see raw pipes/fences). Accumulate and re-render atomically per
         // delta — one paint, no flicker; incomplete constructs hold stable.
-        this.streamText += frame.text;
+        //
+        // Open the stream BEFORE accumulating: openStream() resets
+        // streamText when it creates fresh state, so resetting after the
+        // `+=` would silently wipe the FIRST replayed delta of a same-page
+        // reconnect (partial replay: bare deltas, no turn:start, no reset —
+        // Perkins r1/r2 blocker). Order is load-bearing.
         const body = this.streamingBody ?? this.openStream();
+        this.streamText += frame.text;
         renderMarkdown(this.streamText, body, { streaming: true });
         if (live) this.bumpUnread();
         this.scrollToEnd();
