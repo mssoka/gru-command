@@ -249,8 +249,6 @@ describe('end-to-end dispatch (E8 story 4)', () => {
 
   it('blocks the job loudly when the minion cannot be spawned (no half lanes)', async () => {
     const h = harness();
-    const failing = harness();
-    failing.cleanup();
     // Build a dispatch whose spawner always fails.
     const dataDir = mkdtempSync(join(tmpdir(), 'gru-command-e2efail-'));
     const ledgerDb = new LedgerDb(dataDir);

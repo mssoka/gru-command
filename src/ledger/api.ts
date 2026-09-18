@@ -775,7 +775,10 @@ export class LedgerApi {
   }
 
   /** Attach a live agent to its job lane (E8 dispatch wiring; the spawn
-   * envelope carries no job context — this is the one call that binds). */
+   * envelope carries no job context — this is the one call that binds).
+   * (Superseded in the dispatch path by registerAgent-with-jobId, which
+   * makes the binding independent of observer ordering; retained as the
+   * API-of-record surface for external surfaces.) */
   attachAgentToJob(agentId: string, jobId: string): AgentRecord {
     return this.transaction(() => {
       const agent = this.getAgent(agentId);

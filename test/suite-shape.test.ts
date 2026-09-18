@@ -29,7 +29,7 @@ const PINS: Record<string, number> = {
   'ledger-db.test.ts': 6,
   'logger.test.ts': 3,
   'notifications.test.ts': 5,
-  'perkins-wave.test.ts': 13,
+  'perkins-wave.test.ts': 14,
   'pi-adapter.test.ts': 35,
   'roles-definitions.test.ts': 7,
   'roles-gru.test.ts': 4,

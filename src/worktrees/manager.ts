@@ -380,7 +380,10 @@ export class WorktreeManager {
     });
   }
 
-  /** Copy untracked-not-ignored deliverables into the preserve root. */
+  /** Copy untracked-not-ignored deliverables into the preserve root.
+   * A file that vanishes mid-sweep (raced against the tree's own
+   * processes) is skipped and logged — never a failed sweep over a
+   * deliverable that stopped existing. */
   private preserveUntracked(row: WorktreeRecord): SweepPreservation | null {
     const status = runGit(row.path, ['status', '--porcelain', '--untracked-files=all']);
     const untracked = status
@@ -391,25 +394,36 @@ export class WorktreeManager {
       .filter((rel) => rel !== '');
     if (untracked.length === 0) return null;
     const destination = join(this.opts.preserveRoot, row.id, new Date().toISOString().replace(/[:.]/g, '-'));
+    let preservedCount = 0;
     for (const rel of untracked) {
       const source = join(row.path, rel);
-      if (!statSync(source).isFile()) continue; // nested oddities: files only
-      const dest = join(destination, rel);
-      mkdirSync(dirname(dest), { recursive: true });
-      copyFileSync(source, dest);
+      try {
+        if (!statSync(source).isFile()) continue; // nested oddities: files only
+        const dest = join(destination, rel);
+        mkdirSync(dirname(dest), { recursive: true });
+        copyFileSync(source, dest);
+        preservedCount += 1;
+      } catch (error) {
+        this.log('warn', 'untracked deliverable vanished before preserve — skipping', {
+          id: row.id,
+          rel,
+          error: String(error),
+        });
+      }
     }
+    if (preservedCount === 0) return null;
     this.opts.ledger.appendCustomEvent({
       kind: 'worktree.preserved',
       jobId: row.jobId,
       roundId: row.roundId,
-      payload: { id: row.id, files: untracked.length, destination },
+      payload: { id: row.id, files: preservedCount, destination },
     });
     this.log('info', 'untracked deliverables preserved before sweep', {
       id: row.id,
-      files: untracked.length,
+      files: preservedCount,
       destination,
     });
-    return { count: untracked.length, destination };
+    return { count: preservedCount, destination };
   }
 
   /**

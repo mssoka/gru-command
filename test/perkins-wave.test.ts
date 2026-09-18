@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -9,6 +9,7 @@ import { WorktreeManager } from '../src/worktrees/manager.js';
 import {
   consolidateVerdict,
   GhPrPoster,
+  LENS_VERDICT_PROTOCOL,
   verdictFromSessionFile,
   WaveRunner,
   type LensResult,
@@ -179,15 +180,33 @@ describe('wave lifecycle', () => {
     expect(h.escalations).toHaveLength(0);
   });
 
-  it('runs the round against a DETACHED review worktree registered to the round', async () => {
+  it('runs the round against a DETACHED review worktree, swept when the round completes', async () => {
+    const heads: string[] = [];
     const h = harness(async () => done('clean'));
+    // Capture the review tree's HEAD ref while the fleet is live.
+    const wave = new WaveRunner({
+      ledger: h.ledger,
+      manager: h.manager,
+      spawner: async () => {
+        throw new Error('driver replaces spawning');
+      },
+      driveLens: async (ctx) => {
+        heads.push(h.repo.git(['rev-parse', '--abbrev-ref', 'HEAD'], ctx.worktreePath));
+        return done('clean');
+      },
+    });
+    h.wave = wave;
     const jobId = await seedJob(h, false);
-    const outcome = await h.wave.runRound({ jobId });
+    const outcome = await wave.runRound({ jobId });
+    // Detached while live: HEAD, never a branch.
+    expect(heads).toHaveLength(7);
+    expect(new Set(heads)).toEqual(new Set(['HEAD']));
+    // The round's worktree row survives as the record; the tree is gone.
     const reviewRow = h.ledger.getWorktree(outcome.round.id);
     expect(reviewRow?.kind).toBe('review');
     expect(reviewRow?.branch).toBeNull();
-    expect(reviewRow?.status).toBe('active');
-    expect(h.repo.git(['rev-parse', '--abbrev-ref', 'HEAD'], reviewRow!.path)).toBe('HEAD');
+    expect(reviewRow?.status).toBe('swept');
+    expect(existsSync(reviewRow!.path)).toBe(false);
   });
 
   it('refuses to review a job without a registered worktree lane', async () => {
@@ -211,6 +230,20 @@ describe('verdict extraction from lens sessions', () => {
     const { appendFileSync } = await import('node:fs');
     appendFileSync(file, JSON.stringify({ role: 'assistant', text: 'looks fine to me' }) + '\n');
     expect(verdictFromSessionFile(file)).toBeNull();
+  });
+
+  it('cannot be forged by the prompt echo: the protocol text names a placeholder, not a verdict word', async () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'gru-command-lens-')), 'session.jsonl');
+    const { appendFileSync } = await import('node:fs');
+    // The user turn carries the protocol instruction VERBATIM (the prompt
+    // lives in the session jsonl too) — it must not read as a verdict.
+    appendFileSync(
+      file,
+      JSON.stringify({ role: 'user', text: `Review lens "edge". ${LENS_VERDICT_PROTOCOL}` }) + '\n',
+    );
+    expect(verdictFromSessionFile(file)).toBeNull();
+    appendFileSync(file, JSON.stringify({ role: 'assistant', text: 'done — LENS-VERDICT: note' }) + '\n');
+    expect(verdictFromSessionFile(file)).toBe('note');
   });
 });
 

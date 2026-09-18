@@ -50,9 +50,12 @@ export const LENS_INSTRUCTIONS: Readonly<Record<string, string>> = {
     'Interrogate the tests: do they prove the claim, what is uncovered, and would they fail before the change? Untested behavior is unproven behavior.',
 };
 
-/** The strict protocol every lens agent ends its turn with. */
+/** The strict protocol every lens agent ends its turn with. Worded so
+ * the PROMPT itself can never match the extraction regex (the protocol
+ * line names a PLACEHOLDER, not a verdict word — a false match would
+ * forge a verdict from the prompt echo). */
 export const LENS_VERDICT_PROTOCOL =
-  'End your final message with a line of exactly this shape — LENS-VERDICT: blocker | warning | note | clean — ' +
+  'End your final message with a line of exactly this shape — LENS-VERDICT: <one of: blocker, warning, note, clean> — ' +
   'where blocker = a defect that must be fixed before merge, warning = a real concern short of blocking, ' +
   'note = an observation worth recording, clean = nothing found.';
 
@@ -191,6 +194,9 @@ export class WaveRunner {
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     const job = this.opts.ledger.getJob(input.jobId);
     if (job === null) throw new Error(`job "${input.jobId}" not found — nothing to review`);
+    if (job.status === 'merged' || job.status === 'done') {
+      throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes do not go back under review`);
+    }
     const jobWorktree = this.opts.ledger.getWorktree(input.jobId);
     if (jobWorktree === null) {
       throw new Error(
@@ -208,12 +214,20 @@ export class WaveRunner {
     const round = this.opts.ledger.addRound({ jobId: job.id, lenses, targetRef });
 
     // Detached-for-reviews (ruling 18d): reviews never grow branch debris.
-    const reviewWorktree = await this.opts.manager.createReviewWorktree({
-      repoPath: jobWorktree.repoPath,
-      roundId: round.id,
-      ref: targetRef,
-    });
-    this.opts.ledger.setRoundStatus(round.id, 'live');
+    // A setup failure aborts the round loudly — never a pending-forever
+    // round with a job stuck in review.
+    let reviewWorktree;
+    try {
+      reviewWorktree = await this.opts.manager.createReviewWorktree({
+        repoPath: jobWorktree.repoPath,
+        roundId: round.id,
+        ref: targetRef,
+      });
+      this.opts.ledger.setRoundStatus(round.id, 'live');
+    } catch (error) {
+      this.opts.ledger.setRoundStatus(round.id, 'aborted');
+      throw error;
+    }
     this.log('info', 'review round live', {
       job: job.id,
       round: round.id,
@@ -279,6 +293,7 @@ export class WaveRunner {
         round: round.id,
         failed,
       });
+      await this.sweepReviewWorktree(round.id);
       return { round: this.opts.ledger.getRound(round.id) as RoundRecord, results: settled, verdict: null, posted: false };
     }
 
@@ -312,7 +327,32 @@ export class WaveRunner {
         this.log('error', 'verdict comment post failed', { round: round.id, error: String(error) });
       }
     }
+    await this.sweepReviewWorktree(round.id);
     return { round: this.opts.ledger.getRound(round.id) as RoundRecord, results: settled, verdict, posted };
+  }
+
+  /**
+   * A finished round releases its DETACHED worktree (ruling 18c sweep —
+   * preserve-first, pause-and-ask if a lens left a live process behind).
+   * Sweep failure is logged + escalated, never fatal to the recorded
+   * round outcome — but rounds never leak worktrees silently.
+   */
+  private async sweepReviewWorktree(roundId: string): Promise<void> {
+    try {
+      const result = await this.opts.manager.release({ worktreeId: roundId });
+      if (result.status === 'paused') {
+        this.opts.escalate?.(
+          `Review worktree for round ${roundId} paused on live processes`,
+          `the sweep found live processes rooted in the review tree — acknowledge to finish the cleanup`,
+        );
+      }
+    } catch (error) {
+      this.log('error', 'review worktree sweep failed', { round: roundId, error: String(error) });
+      this.opts.escalate?.(
+        `Review worktree for round ${roundId} could not be swept`,
+        String(error),
+      );
+    }
   }
 
   /** Production driver: spawn a perkins agent per lens, parse the protocol line. */
