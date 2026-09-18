@@ -1039,3 +1039,67 @@ describe('Perkins lane-B r2/r3: crash-window reconciliation (row stranded over a
     ).toBe(true);
   });
 });
+
+describe('Perkins lane-B r4: a swept row with a surviving branch HEALS on release (no silent debris)', () => {
+  it('DISCRIMINATOR: swept + tree gone + branch present → release disposes it and reports the true outcome', async () => {
+    const h = harness();
+    const repo = h.make('fixture-heal');
+    ledgerJob(h, 'job-heal', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-heal' });
+    // Contained work; then the reconcile's OWN crash window: the row was
+    // flipped swept but the branch disposal never ran (tree gone too).
+    writeFileSync(join(row.path, 'work.txt'), 'merged work');
+    repo.git(['add', 'work.txt'], row.path);
+    repo.git(['-c', 'user.name=F', '-c', 'user.email=f@example.invalid', 'commit', '-m', 'work'], row.path);
+    repo.git(['merge', row.branch!]);
+    repo.git(['worktree', 'remove', '--force', row.path]);
+    h.ledger.setWorktreeStatus('job-heal', 'swept'); // flipped, disposal skipped
+
+    // Before the heal: every retry returned swept/branch:'none' silently
+    // while `git branch --list` still printed the branch → same-id
+    // re-creation wedged. The retry must HEAL: true outcome + no debris.
+    const healed = await h.manager.release({ worktreeId: 'job-heal', baseBranch: 'main' });
+    expect(healed.status).toBe('swept');
+    if (healed.status === 'swept') expect(healed.branch).toBe('deleted');
+    expect(repo.git(['branch', '--list', row.branch!])).toBe('');
+    // The id is reusable immediately.
+    ledgerJob(h, 'job-heal-2', repo);
+    const fresh = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-heal-2' });
+    expect(existsSync(fresh.path)).toBe(true);
+    // A further retry is a clean no-op now (nothing left to heal).
+    const clean = await h.manager.release({ worktreeId: 'job-heal' });
+    expect(clean.status).toBe('swept');
+  });
+
+  it('DISCRIMINATOR: a disposal FAILURE during the heal is loud (tail-failed event) and heals on a later retry', async () => {
+    const h = harness();
+    const repo = h.make('fixture-heal-lock');
+    ledgerJob(h, 'job-hl', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-hl' });
+    writeFileSync(join(row.path, 'work.txt'), 'merged work');
+    repo.git(['add', 'work.txt'], row.path);
+    repo.git(['-c', 'user.name=F', '-c', 'user.email=f@example.invalid', 'commit', '-m', 'work'], row.path);
+    repo.git(['merge', row.branch!]);
+    repo.git(['worktree', 'remove', '--force', row.path]);
+    h.ledger.setWorktreeStatus('job-hl', 'swept');
+    // A stale ref lock makes the heal's disposal genuinely fail.
+    const lockFile = join(repo.path, '.git', 'refs', 'heads', 'gru', 'job-hl.lock');
+    writeFileSync(lockFile, '');
+
+    const failed = await h.manager.release({ worktreeId: 'job-hl', baseBranch: 'main' });
+    expect(failed.status).toBe('swept'); // the heal failure never wedges the release
+    // LOUD, not silent: the failure is on the record (the r4 contract).
+    expect(
+      h.ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'worktree.sweep-tail-failed'),
+    ).toBe(true);
+    expect(repo.git(['branch', '--list', row.branch!])).toContain(row.branch!); // survives
+
+    // The obstruction clears — the NEXT retry heals.
+    const { unlinkSync } = await import('node:fs');
+    unlinkSync(lockFile);
+    const healed = await h.manager.release({ worktreeId: 'job-hl', baseBranch: 'main' });
+    expect(healed.status).toBe('swept');
+    if (healed.status === 'swept') expect(healed.branch).toBe('deleted');
+    expect(repo.git(['branch', '--list', row.branch!])).toBe('');
+  });
+});

@@ -412,12 +412,38 @@ export class WorktreeManager {
       );
     }
     if (row.status === 'swept') {
-      return {
-        status: 'swept',
-        preserved: null,
-        branch: 'none',
-        freshHead: this.freshHead(row.repoPath),
-      };
+      // HEAL (Perkins lane-B r4): a swept row may still carry a surviving
+      // job branch when a dispose-then-flip window crashed between the
+      // two, or when an older build flipped first. Verify-and-dispose on
+      // every swept retry — never early-return 'none' over debris.
+      if (!existsSync(row.repoPath)) {
+        return {
+          status: 'swept',
+          preserved: null,
+          branch: 'none',
+          freshHead: '',
+        };
+      }
+      return this.withRepoLock(row.repoPath, async () => {
+        let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
+        if (row.kind === 'job' && row.branch !== null) {
+          const present = spawnGit(row.repoPath, [
+            'rev-parse',
+            '--verify',
+            '--quiet',
+            `refs/heads/${row.branch}`,
+          ]);
+          if (present.status === 0) {
+            branchOutcome = this.disposeLaneBranch(row, input.baseBranch);
+          }
+        }
+        return {
+          status: 'swept',
+          preserved: null,
+          branch: branchOutcome,
+          freshHead: this.safeFreshHead(row.repoPath),
+        } as const;
+      });
     }
     return this.withRepoLock(row.repoPath, async () => {
       // (0) Crash-window reconciliation (Perkins lane-B r2 c): the tree is
@@ -753,13 +779,17 @@ export class WorktreeManager {
       path: row.path,
       status: row.status,
     });
+    // DISPOSE FIRST, flip second (Perkins lane-B r4: mirror finishSweep —
+    // flipping first re-opened the r3 wedge silently: a crash between the
+    // flip and the disposal left every retry early-returning 'none').
+    const branchOutcome = this.disposeLaneBranch(row, baseBranch);
     try {
       this.opts.ledger.setWorktreeStatus(row.id, 'swept');
       this.opts.ledger.appendCustomEvent({
         kind: 'worktree.reconciled',
         jobId: row.jobId,
         roundId: row.roundId,
-        payload: { id: row.id, path: row.path, priorStatus: row.status },
+        payload: { id: row.id, path: row.path, priorStatus: row.status, branch: branchOutcome },
       });
     } catch (error) {
       this.log('error', 'reconciliation write failed — retry will reconcile again', {
@@ -767,33 +797,40 @@ export class WorktreeManager {
         error: String(error),
       });
     }
-    let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
-    if (row.kind === 'job' && row.branch !== null) {
-      try {
-        branchOutcome = this.deleteBranchContained(row, baseBranch);
-      } catch (error) {
-        // Disposal failure must not wedge the reconciliation: the row is
-        // already swept; record the failure loudly for the operator.
-        this.log('error', 'reconciled lane branch disposal failed', {
-          id: row.id,
-          error: String(error),
-        });
-        try {
-          this.opts.ledger.appendCustomEvent({
-            kind: 'worktree.sweep-tail-failed',
-            jobId: row.jobId,
-            roundId: row.roundId,
-            payload: { id: row.id, error: String(error) },
-          });
-        } catch (eventError) {
-          this.log('error', 'sweep-tail-failed event write failed during reconcile', {
-            id: row.id,
-            error: String(eventError),
-          });
-        }
-      }
-    }
     return branchOutcome;
+  }
+
+  /** Guarded containment-verified disposal for an owner lane's branch.
+   * Shared by the reconcile and the swept-heal paths; a disposal failure
+   * never throws — it is logged and recorded loudly (the branch survives
+   * and a later retry heals). */
+  private disposeLaneBranch(
+    row: WorktreeRecord,
+    baseBranch: string | undefined,
+  ): 'deleted' | 'retained' | 'none' {
+    if (row.kind !== 'job' || row.branch === null) return 'none';
+    try {
+      return this.deleteBranchContained(row, baseBranch);
+    } catch (error) {
+      this.log('error', 'lane branch disposal failed — recorded for retry', {
+        id: row.id,
+        error: String(error),
+      });
+      try {
+        this.opts.ledger.appendCustomEvent({
+          kind: 'worktree.sweep-tail-failed',
+          jobId: row.jobId,
+          roundId: row.roundId,
+          payload: { id: row.id, error: String(error) },
+        });
+      } catch (eventError) {
+        this.log('error', 'sweep-tail-failed event write failed during disposal', {
+          id: row.id,
+          error: String(eventError),
+        });
+      }
+      return 'none';
+    }
   }
 
   private safeFreshHead(repoPath: string): string {
@@ -853,6 +890,10 @@ export class WorktreeManager {
     baseBranch: string | undefined,
   ): 'deleted' | 'retained' {
     const branch = row.branch as string;
+    // Already gone (a healed retry, a prior disposal): disposal is
+    // idempotent — never a misleading 'retained' for a missing branch.
+    const present = spawnGit(row.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
+    if (present.status !== 0) return 'deleted';
     const soft = spawnGit(row.repoPath, ['branch', '-d', branch]);
     if (soft.status === 0) return 'deleted';
     let base: string;
