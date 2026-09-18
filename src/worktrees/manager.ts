@@ -288,25 +288,28 @@ export class WorktreeManager {
       }
       const sha = this.freshHead(repo.repoPath);
       runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, sha]);
+      // Perkins lane-B r1 B1: the guard covers BOOTSTRAP *AND REGISTRATION*
+      // — a registration failure (missing owner row, DB error) used to
+      // leave tree+branch on disk with no registry row: retries wedged on
+      // 'path already exists' and registry-paths-only sweeps never saw
+      // the debris.
+      let record;
       try {
         this.bootstrap(repo.repoPath, path);
+        record = this.opts.ledger.registerWorktree({
+          id: input.jobId,
+          kind: 'job',
+          repoPath: repo.repoPath,
+          repoName: repo.repoName,
+          path,
+          branch,
+          sha,
+          jobId: input.jobId,
+        });
       } catch (error) {
-        // A half-bootstrapped tree is never handed out — roll it back ALL
-        // the way (Perkins r2 B1): the worktree AND the branch this call
-        // created; a leftover gru/<job> permanently wedges the job id.
         this.rollbackPartialLane(repo.repoPath, path, branch, error);
         throw error;
       }
-      const record = this.opts.ledger.registerWorktree({
-        id: input.jobId,
-        kind: 'job',
-        repoPath: repo.repoPath,
-        repoName: repo.repoName,
-        path,
-        branch,
-        sha,
-        jobId: input.jobId,
-      });
       this.log('info', 'job worktree created', { job: input.jobId, path, branch, sha });
       return record;
     });
@@ -336,14 +339,13 @@ export class WorktreeManager {
         throw new Error(`worktree path already exists: ${path}`);
       }
       runGit(repo.repoPath, ['worktree', 'add', '--detach', path, input.ref]);
+      // Same guard as job lanes (Perkins lane-B r1 B1): registration
+      // failures roll the detached tree back — no unregistered debris.
+      let record;
       try {
         this.bootstrap(repo.repoPath, path);
-      } catch (error) {
-        this.rollbackPartialLane(repo.repoPath, path, null, error);
-        throw error;
-      }
-      const sha = runGit(path, ['rev-parse', 'HEAD']);
-      const record = this.opts.ledger.registerWorktree({
+        const sha = runGit(path, ['rev-parse', 'HEAD']);
+        record = this.opts.ledger.registerWorktree({
         id: input.roundId,
         kind: 'review',
         repoPath: repo.repoPath,
@@ -352,8 +354,12 @@ export class WorktreeManager {
         branch: null,
         sha,
         roundId: input.roundId,
-        ...(input.jobId !== undefined ? { jobId: input.jobId } : {}),
-      });
+          ...(input.jobId !== undefined ? { jobId: input.jobId } : {}),
+        });
+      } catch (error) {
+        this.rollbackPartialLane(repo.repoPath, path, null, error);
+        throw error;
+      }
       this.log('info', 'review worktree created (detached)', { round: input.roundId, path, ref: input.ref });
       return record;
     });
@@ -431,7 +437,7 @@ export class WorktreeManager {
                 .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence }))
             : [];
         if (input.confirmKill === true && acknowledged.length > 0) {
-          return this.killAcknowledgedAndContinue(row, acknowledged, preserved);
+          return this.killAcknowledgedAndContinue(row, acknowledged, preserved, input.baseBranch);
         }
 
         // (3) PAUSE AND ASK — a live process is never silently killed.
@@ -582,6 +588,7 @@ export class WorktreeManager {
     row: WorktreeRecord,
     acknowledged: readonly { pid: number; command: string; evidence: string }[],
     preserved: SweepPreservation | null,
+    baseBranch: string | undefined,
   ): Promise<SweepResult> {
     const pids = acknowledged.map((proc) => proc.pid);
     this.opts.ledger.recordWorktreeProcesses({
@@ -661,7 +668,7 @@ export class WorktreeManager {
       this.opts.onSweepPaused?.({ worktree: row, processes: unacknowledged });
       return { status: 'paused', processes: unacknowledged, preserved, note };
     }
-    return this.finishSweep(row, preserved, undefined);
+    return this.finishSweep(row, preserved, baseBranch);
   }
 
   /** Removal + containment branch delete + fresh head (shared tail). */
@@ -670,21 +677,37 @@ export class WorktreeManager {
     preserved: SweepPreservation | null,
     baseBranch: string | undefined,
   ): SweepResult {
-    // (4a) Worktree removal.
+    // (4a) Worktree removal. A failure HERE throws with the tree intact
+    // and the row unchanged — retry-safe.
     runGit(row.repoPath, ['worktree', 'remove', '--force', row.path]);
 
-    // (4b) Containment-verified branch delete — job lanes only; a
-    // branch is deleted only when its commits are provably contained
-    // in an existing ref; otherwise it is RETAINED and noted (never
-    // force-deleted on faith).
+    // (4b/5) POST-REMOVAL TAIL (Perkins lane-B r1 B2): the tree is GONE —
+    // the registry must follow even if the tail hiccups. A stranded
+    // non-swept row over a removed tree wedges every retry
+    // (preserveUntracked dies on the missing tree). Catch-and-mark.
     let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
-    if (row.kind === 'job' && row.branch !== null) {
-      branchOutcome = this.deleteBranchContained(row, baseBranch);
+    let freshHead = '';
+    try {
+      // Containment-verified branch delete — job lanes only; a branch
+      // is deleted only when its commits are provably contained in an
+      // existing ref; otherwise it is RETAINED and noted.
+      if (row.kind === 'job' && row.branch !== null) {
+        branchOutcome = this.deleteBranchContained(row, baseBranch);
+      }
+      // Release re-resolves the FRESH head (ruling 18e).
+      freshHead = this.freshHead(row.repoPath);
+    } catch (error) {
+      this.log('error', 'sweep tail failed after removal — row still flips swept', {
+        id: row.id,
+        error: String(error),
+      });
+      this.opts.ledger.appendCustomEvent({
+        kind: 'worktree.sweep-tail-failed',
+        jobId: row.jobId,
+        roundId: row.roundId,
+        payload: { id: row.id, error: String(error) },
+      });
     }
-
-    // (5) Release re-resolves the FRESH head (ruling 18e): follow-on
-    // work starts from now, never from a held sha.
-    const freshHead = this.freshHead(row.repoPath);
     this.opts.ledger.setWorktreeStatus(row.id, 'swept');
     this.opts.ledger.appendCustomEvent({
       kind: 'worktree.swept',
@@ -714,7 +737,24 @@ export class WorktreeManager {
     const branch = row.branch as string;
     const soft = spawnGit(row.repoPath, ['branch', '-d', branch]);
     if (soft.status === 0) return 'deleted';
-    const base = baseBranch ?? runGit(row.repoPath, ['symbolic-ref', '--short', 'HEAD']);
+    let base: string;
+    if (baseBranch !== undefined) {
+      base = baseBranch;
+    } else {
+      try {
+        base = runGit(row.repoPath, ['symbolic-ref', '--short', 'HEAD']);
+      } catch {
+        // No explicit base and the main checkout is detached: containment
+        // is UNPROVABLE — retain loudly, never throw (Perkins lane-B r1).
+        this.opts.ledger.appendCustomEvent({
+          kind: 'worktree.branch-retained',
+          jobId: row.jobId,
+          payload: { id: row.id, branch, reason: 'base branch unresolvable (detached HEAD, none given)' },
+        });
+        this.opts.ledger.noteWorktree(row.id, `branch ${branch} retained: base branch unresolvable`);
+        return 'retained';
+      }
+    }
     const contained = spawnGit(row.repoPath, ['merge-base', '--is-ancestor', branch, base]);
     if (contained.status === 0) {
       runGit(row.repoPath, ['branch', '-D', branch]);

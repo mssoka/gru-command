@@ -842,3 +842,106 @@ describe('Perkins r4 B1: manifest [[link]] lanes are releasable (the link is a d
     },
   }));
 }
+
+describe('Perkins lane-B r1: creation registration sits INSIDE the rollback guard', () => {
+  it('DISCRIMINATOR: a registration failure rolls back tree AND branch — no unregistered debris', async () => {
+    const h = harness();
+    const repo = h.make('fixture-regfail');
+    // NO job row seeded: registerWorktree will reject AFTER the tree and
+    // branch exist on disk. Before the fix that debris wedged every retry.
+    await expect(
+      h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-never-registered' }),
+    ).rejects.toThrowError(/not found/);
+    // No tree, no branch, no wedge: the rollback guard covered registration.
+    const debris = h.manager.listWorktrees().find((lane) => lane.id === 'job-never-registered');
+    expect(debris).toBeUndefined();
+    expect(repo.git(['branch', '--list', 'gru/job-never-registered'])).toBe('');
+    // And the retry (with the row seeded) is clean.
+    ledgerJob(h, 'job-never-registered', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-never-registered' });
+    expect(row.branch).toBe('gru/job-never-registered');
+  });
+});
+
+describe('Perkins lane-B r1: the sweep tail can never strand a non-swept row over a removed tree', () => {
+  function detachMainHead(repo: FixtureRepo): void {
+    // A detached-HEAD main checkout: symbolic-ref HEAD fails — the exact
+    // post-removal tail hazard.
+    repo.git(['checkout', '--detach']);
+  }
+
+  it('DISCRIMINATOR: a tail failure after removal still flips the row swept — no eternal wedge', async () => {
+    const h = harness();
+    const repo = h.make('fixture-tailfail');
+    ledgerJob(h, 'job-tailfail', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-tailfail' });
+    // An unmerged commit forces the branch-delete leg to resolve a base…
+    writeFileSync(join(row.path, 'orphan.txt'), 'unmerged');
+    repo.git(['add', 'orphan.txt'], row.path);
+    repo.git(
+      ['-c', 'user.name=F', '-c', 'user.email=f@example.invalid', 'commit', '-m', 'orphan'],
+      row.path,
+    );
+    // …and the detached main HEAD makes the fallback resolution fail.
+    detachMainHead(repo);
+
+    // Before the fix: remove succeeds, symbolic-ref throws, the release
+    // REJECTS with the row stranded ACTIVE over a REMOVED tree — and every
+    // retry dies in preserveUntracked. It must resolve swept instead.
+    const result = await h.manager.release({ worktreeId: 'job-tailfail' });
+    expect(result.status).toBe('swept');
+    expect(h.ledger.getWorktree('job-tailfail')?.status).toBe('swept');
+    expect(existsSync(row.path)).toBe(false);
+    // No wedge: the retry is an idempotent swept, never a rejection.
+    const again = await h.manager.release({ worktreeId: 'job-tailfail' });
+    expect(again.status).toBe('swept');
+  });
+
+  it('DISCRIMINATOR: base_branch flows through the confirm-kill tail (no stranded lane on a detached repo)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-basepass');
+    ledgerJob(h, 'job-basepass', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-basepass' });
+    // An UNMERGED lane commit + a detached main HEAD: without the explicit
+    // baseBranch reaching the tail, the symbolic-ref fallback throws AFTER
+    // removal (the stranded-row wedge). With it: containment is checked
+    // against 'main', fails honestly, and the branch is RETAINED.
+    writeFileSync(join(row.path, 'orphan.txt'), 'unmerged work');
+    repo.git(['add', 'orphan.txt'], row.path);
+    repo.git(
+      ['-c', 'user.name=F', '-c', 'user.email=f@example.invalid', 'commit', '-m', 'orphan work'],
+      row.path,
+    );
+    detachMainHead(repo);
+
+    // The process stays "live" for every enumeration until the confirmed
+    // kill lands — the confirm-kill TAIL is the code under test.
+    let killed = false;
+    h.enumerator.mockImplementation(() =>
+      killed ? [] : [{ pid: 111111, command: 'watcher', evidence: 'argv' as const }],
+    );
+    const paused = await h.manager.release({ worktreeId: 'job-basepass' }); // pause (records the ask)
+    expect(paused.status).toBe('paused');
+    const kill = vi
+      .spyOn(process, 'kill')
+      .mockImplementation((() => {
+        killed = true;
+        return true;
+      }) as typeof process.kill);
+    try {
+      const result = await h.manager.release({
+        worktreeId: 'job-basepass',
+        confirmKill: true,
+        baseBranch: 'main',
+      });
+      expect(result.status).toBe('swept');
+      if (result.status === 'swept') {
+        // Containment verified against the GIVEN base — unmerged → retained.
+        expect(result.branch).toBe('retained');
+      }
+      expect(repo.git(['branch', '--list', 'gru/job-basepass'])).toContain('gru/job-basepass');
+    } finally {
+      kill.mockRestore();
+    }
+  });
+});
