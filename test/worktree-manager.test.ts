@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
-import { psEnumerator, WorktreeManager, type TreeProcess } from '../src/worktrees/manager.js';
+import { commandReferencesTree, psEnumerator, WorktreeManager, type TreeProcess } from '../src/worktrees/manager.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
@@ -26,7 +26,7 @@ interface Harness {
   dispose: () => Promise<void>;
 }
 
-function makeHarness(): Harness {
+function makeHarness(useDefaultEnumerator = false): Harness {
   const repos: FixtureRepo[] = [];
   const escalations: { title: string; detail: string }[] = [];
   const ledgerDb = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-command-wtdata-')));
@@ -43,7 +43,7 @@ function makeHarness(): Harness {
         detail: processes.map((p) => p.pid).join(','),
       });
     },
-    enumerateProcesses: (treePath) => enumerator(treePath),
+    ...(useDefaultEnumerator ? {} : { enumerateProcesses: (treePath: string) => enumerator(treePath) }),
   });
   return {
     repos,
@@ -68,8 +68,8 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()!.dispose();
 });
 
-function harness(): Harness {
-  const h = makeHarness();
+function harness(useDefaultEnumerator = false): Harness {
+  const h = makeHarness(useDefaultEnumerator);
   cleanups.push(h);
   return h;
 }
@@ -181,8 +181,8 @@ describe('worktree manager: sweep (ruling 18c)', () => {
     ledgerJob(h, 'job-live', repo);
     const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-live' });
     h.enumerator.mockReturnValue([
-      { pid: 424242, command: `node ${row.path}/server.js` },
-      { pid: 424243, command: `vim ${row.path}/notes.txt` },
+      { pid: 424242, command: `node ${row.path}/server.js`, evidence: 'argv' },
+      { pid: 424243, command: `vim ${row.path}/notes.txt`, evidence: 'argv' },
     ]);
     const kill = vi.spyOn(process, 'kill');
     try {
@@ -211,7 +211,7 @@ describe('worktree manager: sweep (ruling 18c)', () => {
     writeFileSync(join(row.path, 'deliverable.txt'), 'untracked gold');
     let live = true;
     h.enumerator.mockImplementation((treePath: string) =>
-      live ? [{ pid: 999999, command: `watcher ${treePath}` }] : [],
+      live ? [{ pid: 999999, command: `watcher ${treePath}`, evidence: 'argv' as const }] : [],
     );
     const kill = vi.spyOn(process, 'kill').mockImplementation(((target: number) => {
       if (target === 999999) {
@@ -330,6 +330,179 @@ describe('default process enumeration (the pause-and-ask mechanism, ruling 18c)'
       expect(psEnumerator(join(row.path, '..', 'no-such-tree'))).toHaveLength(0);
     } finally {
       child.kill('SIGKILL');
+    }
+  });
+});
+
+describe('Perkins r1 B1: quoted deliverables are never destroyed', () => {
+  it('preserves untracked files with spaces, quotes, and non-ASCII names exactly (--porcelain -z)', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-quoted', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-quoted' });
+    // Names that C-quoting would mangle: spaces, an embedded quote, non-ASCII.
+    const deliverables: readonly [string, string][] = [
+      ['notes with spaces.md', 'space-deliverable'],
+      ["quote's file.txt", 'quote-deliverable'],
+      ['über-deliverable-✓.txt', 'unicode-deliverable'],
+    ];
+    for (const [name, content] of deliverables) {
+      writeFileSync(join(row.path, name), content);
+    }
+    const result = await h.manager.release({ worktreeId: 'job-quoted' });
+    expect(result.status).toBe('swept');
+    expect(result.preserved?.count).toBe(deliverables.length);
+    // Every name preserved VERBATIM — no C-quotes survived into the paths.
+    for (const [name, content] of deliverables) {
+      expect(readFileSync(join(result.preserved!.destination, name), 'utf-8')).toBe(content);
+    }
+  });
+
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
+    'aborts the sweep (tree intact) when a deliverable cannot be preserved — never sacrifices it',
+    async () => {
+      const h = harness();
+      const repo = h.make();
+      ledgerJob(h, 'job-unpreservable', repo);
+      const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-unpreservable' });
+      const guarded = join(row.path, 'guarded.txt');
+      writeFileSync(guarded, 'must not be lost');
+      chmodSync(guarded, 0o000); // copy will fail: present, but unreadable
+      try {
+        await expect(h.manager.release({ worktreeId: 'job-unpreservable' })).rejects.toThrowError(
+          /sweep aborted: deliverable "guarded.txt" could not be preserved/,
+        );
+        // ABORT means the tree is retained and the deliverable still exists.
+        expect(existsSync(guarded)).toBe(true);
+        expect(h.ledger.getWorktree('job-unpreservable')?.status).toBe('active');
+      } finally {
+        chmodSync(guarded, 0o644);
+      }
+    },
+  );
+});
+
+describe('Perkins r1 B2: argv matching is path-boundary, sibling lanes are untouchable', () => {
+  it('commandReferencesTree matches whole paths only', () => {
+    const tree = '/root/repo/job-a';
+    expect(commandReferencesTree(`node ${tree}/server.js`, tree)).toBe(true); // inside the tree
+    expect(commandReferencesTree(`vim ${tree}`, tree)).toBe(true); // exactly the tree
+    expect(commandReferencesTree(`cd "${tree}" && npm run dev`, tree)).toBe(true); // quoted
+    expect(commandReferencesTree(`node --cwd=${tree} x.js`, tree)).toBe(true); // flag value
+    expect(commandReferencesTree(`vim /root/repo/job-a-2/notes`, tree)).toBe(false); // SIBLING LANE
+    expect(commandReferencesTree(`node /root/repo/job-a.tar/x`, tree)).toBe(false); // different name
+    expect(commandReferencesTree(`node /other/root/repo/job-a`, tree)).toBe(false); // longer path
+    expect(commandReferencesTree('node elsewhere.js', tree)).toBe(false);
+  });
+
+  it('a live process rooted in the SIBLING lane is invisible to this lane (real ps)', async () => {
+    const h = harness(true); // default enumerator
+    const repo = h.make();
+    ledgerJob(h, 'job-a', repo);
+    ledgerJob(h, 'job-a-2', repo);
+    const lane = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-a' });
+    const sibling = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-a-2' });
+    // The process's argv names ONLY the sibling tree.
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)', sibling.path], {
+      stdio: 'ignore',
+    });
+    try {
+      await vi.waitFor(
+        () => {
+          expect(psEnumerator(sibling.path).some((p) => p.pid === child.pid)).toBe(true);
+        },
+        { timeout: 5_000 },
+      );
+      // The sibling's process does NOT tie to this lane by substring.
+      const found = psEnumerator(lane.path);
+      expect(found.some((p) => p.pid === child.pid)).toBe(false);
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+});
+
+describe('Perkins r1 B3: cwd-rooted processes are caught even with clean argv', () => {
+  it('finds a process whose working directory is the tree but whose argv names no path', async () => {
+    const h = harness(true);
+    const repo = h.make();
+    ledgerJob(h, 'job-cwd', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-cwd' });
+    // argv is just `node -e <script>` — no path anywhere in it.
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      cwd: row.path,
+      stdio: 'ignore',
+    });
+    try {
+      let found: readonly TreeProcess[] = [];
+      await vi.waitFor(
+        () => {
+          found = psEnumerator(row.path).filter((p) => p.pid === child.pid);
+          expect(found.length).toBe(1);
+        },
+        { timeout: 5_000 },
+      );
+      expect(found[0]?.evidence).toBe('cwd');
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+});
+
+describe('Perkins r1 B4: the pause-and-ask join against the DEFAULT enumerator', () => {
+  it('release() pauses on a real cwd-rooted process: tree intact, no kill, registry evidence', async () => {
+    const h = harness(true); // production enumerator — no injection anywhere in this path
+    const repo = h.make();
+    ledgerJob(h, 'job-join', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-join' });
+    writeFileSync(join(row.path, 'deliverable.txt'), 'present through the pause');
+
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+      cwd: row.path,
+      stdio: 'ignore',
+    });
+    const kill = vi.spyOn(process, 'kill');
+    try {
+      await vi.waitFor(
+        () => {
+          expect(psEnumerator(row.path).some((p) => p.pid === child.pid)).toBe(true);
+        },
+        { timeout: 5_000 },
+      );
+
+      // The join: release with live processes → PAUSE, never remove, never kill.
+      const paused = await h.manager.release({ worktreeId: 'job-join' });
+      expect(paused.status).toBe('paused');
+      expect(existsSync(join(row.path, 'deliverable.txt'))).toBe(true);
+      expect(existsSync(row.path)).toBe(true);
+      expect(kill).not.toHaveBeenCalled();
+      expect(h.escalations).toHaveLength(1);
+      expect(h.ledger.getWorktree('job-join')?.status).toBe('paused');
+      // Ruling 18b arm: the ask is grounded in registry rows, by pid.
+      const recorded = h.ledger.listWorktreeProcesses('job-join');
+      expect(recorded.some((p) => p.pid === child.pid && p.state === 'live')).toBe(true);
+
+      // The process leaving clears the pause — the sweep then completes.
+      child.kill('SIGKILL');
+      await vi.waitFor(
+        () => {
+          expect(psEnumerator(row.path)).toHaveLength(0);
+        },
+        { timeout: 5_000 },
+      );
+      const swept = await h.manager.release({ worktreeId: 'job-join' });
+      expect(swept.status).toBe('swept');
+      expect(swept.preserved?.count).toBe(1);
+      expect(readFileSync(join(swept.preserved!.destination, 'deliverable.txt'), 'utf-8')).toBe(
+        'present through the pause',
+      );
+    } finally {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+      kill.mockRestore();
     }
   });
 });

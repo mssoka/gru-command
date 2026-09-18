@@ -498,6 +498,63 @@ export class LedgerApi {
     });
   }
 
+  /** Observed-process records (SPEC ruling 18b's spawned-processes arm):
+   * every pid a pause or confirmed kill is grounded on lands here — the
+   * registry is the authoritative map job → worktree → branch →
+   * processes, so the ask can always name what was live. */
+  recordWorktreeProcesses(input: {
+    worktreeId: string;
+    processes: readonly { pid: number; command: string; evidence: string }[];
+    state: 'live' | 'killed';
+  }): void {
+    if (input.processes.length === 0) return;
+    if (this.getWorktree(input.worktreeId) === null) {
+      throw new RecordNotFound(`worktree "${input.worktreeId}" not found`);
+    }
+    this.transaction(() => {
+      const ts = nowIso();
+      const upsert = this.db.prepare(
+        `INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (worktree_id, pid) DO UPDATE SET
+           state = excluded.state,
+           command = excluded.command,
+           last_seen = excluded.last_seen`,
+      );
+      for (const proc of input.processes) {
+        upsert.run(input.worktreeId, proc.pid, proc.command, proc.evidence, input.state, ts, ts);
+      }
+      this.appendEvent({
+        kind: 'worktree.processes',
+        payload: {
+          id: input.worktreeId,
+          state: input.state,
+          pids: input.processes.map((proc) => proc.pid),
+        },
+      });
+    });
+  }
+
+  listWorktreeProcesses(worktreeId: string): readonly {
+    readonly pid: number;
+    readonly command: string;
+    readonly evidence: string;
+    readonly state: string;
+    readonly lastSeen: string;
+  }[] {
+    return (
+      this.db
+        .prepare('SELECT pid, command, evidence, state, last_seen FROM worktree_processes WHERE worktree_id = ? ORDER BY first_seen, pid')
+        .all(worktreeId) as Row[]
+    ).map((row) => ({
+      pid: Number(row.pid),
+      command: str(row.command),
+      evidence: str(row.evidence),
+      state: str(row.state),
+      lastSeen: str(row.last_seen),
+    }));
+  }
+
   // ------------------------------------------------------------------
   // Rounds (review waves) + lens chips
   // ------------------------------------------------------------------

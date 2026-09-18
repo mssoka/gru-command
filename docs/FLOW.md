@@ -72,7 +72,14 @@ the ordered, preserve-first sweep (ruling 18c):
 
 1. **Preserve** untracked deliverables into the instance data dir
    (before anything else; deliverables are never hostages).
-2. **Enumerate** processes rooted in the tree.
+2. **Enumerate** processes rooted in the tree: a process counts when
+   the registered path appears in its ARGV as a whole path
+   (path-boundary match — a sibling lane `job-a-2` is never confused
+   with `job-a`) OR when the process's actual working directory is
+   inside the tree (resolved via lsof on macOS / procfs on Linux; other
+   platforms are argv-only, declared). Every pid a pause or confirmed
+   kill is grounded on lands in the ledger's worktree-process records —
+   the ask always names exactly what was live.
 3. **Pause and ask** — any live process pauses the sweep, records an
    action-required escalation, and touches nothing. `confirm_kill` is
    the human's answer: it kills exactly the enumerated pids on the

@@ -257,4 +257,21 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_worktrees_status ON worktrees(status);
     `,
   },
+  {
+    id: 5,
+    name: 'e8-worktree-processes',
+    sql: `
+      CREATE TABLE worktree_processes (
+        worktree_id TEXT NOT NULL REFERENCES worktrees(id),
+        pid         INTEGER NOT NULL,
+        command     TEXT NOT NULL,
+        evidence    TEXT NOT NULL CHECK (evidence IN ('argv','cwd','registry')),
+        state       TEXT NOT NULL CHECK (state IN ('live','killed')),
+        first_seen  TEXT NOT NULL,
+        last_seen   TEXT NOT NULL,
+        PRIMARY KEY (worktree_id, pid)
+      );
+      CREATE INDEX idx_worktree_processes_wt ON worktree_processes(worktree_id);
+    `,
+  },
 ];

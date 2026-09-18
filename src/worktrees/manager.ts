@@ -1,5 +1,15 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import {
+  copyFileSync,
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  readdirSync,
+  realpathSync,
+  type Stats,
+} from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, WorktreeRecord } from '../ledger/api.js';
@@ -33,15 +43,99 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 export interface TreeProcess {
   readonly pid: number;
   readonly command: string;
+  /** How the process was tied to the tree (the pause-and-ask evidence). */
+  readonly evidence: 'argv' | 'cwd';
 }
 
-/** Injectable process enumeration (default: `ps` matched on the
- * REGISTERED path — see ruling 18b/c). */
+/** Injectable process enumeration (default: `ps` argv boundary-match +
+ * per-process cwd resolution — see ruling 18b/c). */
 export type ProcessEnumerator = (treePath: string) => readonly TreeProcess[];
 
-/** The system process table, filtered by a registered worktree path. */
+/**
+ * Path-boundary argv match (Perkins r1 B2): the registered tree path must
+ * appear as a WHOLE path — never as a substring of a longer name. Sweeping
+ * `…/job-a` must find `…/job-a/server.js` but NEVER touch `…/job-a-2` — a
+ * substring match would confirm-kill a sibling lane the human never
+ * acknowledged (the exact silent-kill class ruling 18c forbids).
+ */
+export function commandReferencesTree(command: string, treePath: string): boolean {
+  const escaped = treePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Preceded by a path char (word, '/', '.', '-') → the match is the tail
+  // of a DIFFERENT path; followed by a name-continuation char (word, '.',
+  // '-') → the match is the head of a different name ('job-a-2', 'job-a.c').
+  const pattern = new RegExp(`(?<![\\w./-])${escaped}(?![\\w.-])`);
+  return pattern.test(command);
+}
+
+/** A process cwd belongs to the tree when it IS the tree or sits under it. */
+function cwdInsideTree(cwd: string, treePath: string): boolean {
+  return cwd === treePath || cwd.startsWith(`${treePath}/`);
+}
+
+/** Per-process working directories, or null where the platform cannot
+ * resolve them (argv-only then — the gap is declared, never guessed). */
+function processCwds(): Map<number, string> | null {
+  if (process.platform === 'linux') {
+    const cwds = new Map<number, string>();
+    let entries: string[];
+    try {
+      entries = readdirSync('/proc');
+    } catch {
+      return null;
+    }
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const cwd = readlinkSync(`/proc/${entry}/cwd`);
+        cwds.set(Number(entry), cwd);
+      } catch {
+        // Not ours / gone — unresolvable pids are simply not cwd-evidence.
+      }
+    }
+    return cwds;
+  }
+  if (process.platform === 'darwin') {
+    let out: string;
+    try {
+      out = execFileSync('lsof', ['-w', '-a', '-d', 'cwd', '-Fn'], {
+        encoding: 'utf-8',
+        maxBuffer: 16 * 1024 * 1024,
+      });
+    } catch {
+      return null;
+    }
+    const cwds = new Map<number, string>();
+    let pid: number | null = null;
+    for (const line of out.split('\n')) {
+      if (line.startsWith('p') && /^p\d+$/.test(line)) {
+        pid = Number(line.slice(1));
+      } else if (line.startsWith('n') && pid !== null) {
+        cwds.set(pid, line.slice(1));
+        pid = null;
+      }
+    }
+    return cwds;
+  }
+  return null; // other platforms: argv-boundary only (declared gap)
+}
+
+/** The system process table, tied to a registered worktree by argv
+ * (path-boundary) OR by the process's actual working directory — a
+ * `node server.js` spawned inside the tree carries no path in argv but
+ * its cwd is the tree (Perkins r1 B3: argv-only enumeration removed
+ * trees under live agents). */
 export function psEnumerator(treePath: string): readonly TreeProcess[] {
   const out = execFileSyncGuard('ps', ['-axo', 'pid=,command=']);
+  // Compare against BOTH the registered path and its realpath: the OS
+  // reports resolved paths (/var → /private/var) while argv keeps the
+  // spelling the spawner used.
+  const candidates = new Set([treePath]);
+  try {
+    candidates.add(realpathSync(treePath));
+  } catch {
+    /* the sweep's own guards handle a missing tree */
+  }
+  const cwds = processCwds();
   const processes: TreeProcess[] = [];
   for (const line of out.split('\n')) {
     const trimmed = line.trim();
@@ -51,11 +145,16 @@ export function psEnumerator(treePath: string): readonly TreeProcess[] {
     const pid = Number(trimmed.slice(0, space));
     const command = trimmed.slice(space + 1).trim();
     if (!Number.isInteger(pid) || pid === process.pid) continue;
-    // Registry paths only: a process counts when the registered tree
-    // path appears in its command line (cwd-anchored shells, editors,
-    // watchers spawned inside the tree all reference it).
-    if (command.includes(treePath)) {
-      processes.push({ pid, command });
+    // Registry paths only: every match names the registered tree itself.
+    if ([...candidates].some((candidate) => commandReferencesTree(command, candidate))) {
+      processes.push({ pid, command, evidence: 'argv' });
+      continue;
+    }
+    if (cwds !== null) {
+      const cwd = cwds.get(pid);
+      if (cwd !== undefined && [...candidates].some((candidate) => cwdInsideTree(cwd, candidate))) {
+        processes.push({ pid, command, evidence: 'cwd' });
+      }
     }
   }
   return processes;
@@ -306,7 +405,18 @@ export class WorktreeManager {
       const processes = this.enumerate(row.path);
       if (processes.length > 0) {
         // (3) PAUSE AND ASK — a live process is never silently killed.
+        // The evidence lands in the registry (ruling 18b): the ask names
+        // exactly what was live, by pid, with how it was tied to the tree.
         if (input.confirmKill !== true) {
+          this.opts.ledger.recordWorktreeProcesses({
+            worktreeId: row.id,
+            processes: processes.map((proc) => ({
+              pid: proc.pid,
+              command: proc.command,
+              evidence: proc.evidence,
+            })),
+            state: 'live',
+          });
           const note = `sweep paused: ${processes.length} live process(es) rooted in ${row.path} (pids ${processes
             .map((p) => p.pid)
             .join(', ')}) — acknowledge to proceed`;
@@ -325,7 +435,17 @@ export class WorktreeManager {
           return { status: 'paused', processes, preserved, note };
         }
         // The ask was answered: kill EXACTLY the enumerated pids, on the
-        // record, then re-check. Survivors pause the sweep again.
+        // record (ruling 18b registry + event), then re-check. Survivors
+        // pause the sweep again.
+        this.opts.ledger.recordWorktreeProcesses({
+          worktreeId: row.id,
+          processes: processes.map((proc) => ({
+            pid: proc.pid,
+            command: proc.command,
+            evidence: proc.evidence,
+          })),
+          state: 'killed',
+        });
         this.opts.ledger.appendCustomEvent({
           kind: 'worktree.kill-confirmed',
           jobId: row.jobId,
@@ -381,34 +501,55 @@ export class WorktreeManager {
   }
 
   /** Copy untracked-not-ignored deliverables into the preserve root.
-   * A file that vanishes mid-sweep (raced against the tree's own
-   * processes) is skipped and logged — never a failed sweep over a
-   * deliverable that stopped existing. */
+   *
+   * Perkins r1 B1: paths come from `--porcelain -z` — NUL-delimited and
+   * NEVER C-quoted (a quoted `"my file.txt"` under the old text parser
+   * failed statSync, logged "vanished", and the remove --force deleted
+   * the deliverable). A deliverable that genuinely vanished mid-sweep
+   * (ENOENT) is skipped and logged; ANY OTHER preserve failure ABORTS the
+   * sweep with the tree intact — deliverables are never sacrificed to a
+   * removal step. */
   private preserveUntracked(row: WorktreeRecord): SweepPreservation | null {
-    const status = runGit(row.path, ['status', '--porcelain', '--untracked-files=all']);
+    const status = runGit(row.path, ['status', '--porcelain', '-z', '--untracked-files=all']);
     const untracked = status
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith('?? '))
-      .map((line) => line.slice(3).trim())
+      .split('\0')
+      .filter((entry) => entry !== '')
+      .filter((entry) => entry.startsWith('?? '))
+      .map((entry) => entry.slice(3))
       .filter((rel) => rel !== '');
     if (untracked.length === 0) return null;
     const destination = join(this.opts.preserveRoot, row.id, new Date().toISOString().replace(/[:.]/g, '-'));
     let preservedCount = 0;
     for (const rel of untracked) {
       const source = join(row.path, rel);
+      let info: Stats;
       try {
-        if (!statSync(source).isFile()) continue; // nested oddities: files only
-        const dest = join(destination, rel);
+        info = lstatSync(source);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          this.log('warn', 'untracked deliverable vanished before preserve — skipping', {
+            id: row.id,
+            rel,
+          });
+          continue;
+        }
+        throw new Error(
+          `sweep aborted: deliverable "${rel}" is present but unverifiable (${String(error)}) — the tree is retained; resolve and re-release`,
+        );
+      }
+      const dest = join(destination, rel);
+      try {
         mkdirSync(dirname(dest), { recursive: true });
-        copyFileSync(source, dest);
+        if (info.isDirectory()) {
+          cpSync(source, dest, { recursive: true });
+        } else {
+          copyFileSync(source, dest);
+        }
         preservedCount += 1;
       } catch (error) {
-        this.log('warn', 'untracked deliverable vanished before preserve — skipping', {
-          id: row.id,
-          rel,
-          error: String(error),
-        });
+        throw new Error(
+          `sweep aborted: deliverable "${rel}" could not be preserved (${String(error)}) — the tree is retained; resolve and re-release`,
+        );
       }
     }
     if (preservedCount === 0) return null;
