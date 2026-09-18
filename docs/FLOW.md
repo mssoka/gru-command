@@ -96,24 +96,16 @@ the ordered, preserve-first sweep (ruling 18c):
 5. **Re-resolve the fresh head** at release: follow-on work always
    starts from the current head, never a held sha.
 
-## The worktree manager (ruling 18)
+## The worktree subsystem (ruling 18)
 
-The five subsystems behind the flow:
+The dispatch flow rides a **worktree port** (`src/dispatch/worktree-port.ts`):
+the five-subsystem manager — bootstrap manifest, ledger-owned registry
+(sweeps match registry paths only), the preserve-first sweep with
+pause-and-ask, detached-for-reviews/branch-for-jobs, sequential
+fresh-head creation — lands as its OWN review lane (`src/worktrees/`,
+`docs/WORKTREES.md` on that lane). Until it merges, the core's port is
+unavailable and dispatch fails loud, never silent.
 
-1. **Bootstrap manifest** — `<repo>/.gru-command/worktree.toml` declares
-   what a fresh worktree needs (`[[link]]` symlinks, `[[copy]]` files,
-   `[[setup]]` one-time commands); auto-applied at creation; the file
-   travels with the repo. A missing manifest is a no-op; a malformed one
-   fails loud and rolls the worktree back.
-2. **Registry** — the ledger's worktree rows are the authoritative map
-   job → worktree → branch → sha. Sweeps match registry paths ONLY —
-   never id-proximity, never labels.
-3. **Preserve-first sweep** — the ordered release above.
-4. **Detached-for-reviews, branch-for-jobs** — encoded in the manager's
-   two creation paths.
-5. **Concurrency** — same-repo worktree creation is sequential (git
-   index/refs contention); every creation resolves the fresh head at
-   creation time.
 
 ## Bob (periodic memory)
 

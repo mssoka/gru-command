@@ -45,11 +45,6 @@ function optStrField(body: Record<string, unknown>, field: string): string | und
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
-function optBoolField(body: Record<string, unknown>, field: string): boolean | undefined {
-  const value = body[field];
-  return typeof value === 'boolean' ? value : undefined;
-}
-
 function optStrArray(body: Record<string, unknown>, field: string): readonly string[] | undefined {
   const value = body[field];
   if (value === undefined) return undefined;
@@ -167,35 +162,6 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         status: begun.round.status,
         lenses: begun.round.lenses.map((chip) => chip.lens),
       });
-      return true;
-    }
-    if (req.method === 'POST' && path === '/api/dispatch/release') {
-      if (!authed(req, res)) return true;
-      const body = await readBody(req);
-      const roundId = optStrField(body, 'round_id');
-      const result =
-        roundId !== undefined
-          ? // Round-scoped answer path: a paused REVIEW lane is released by
-            // its round id (Perkins r3 B3 — every pause answerable by
-            // construction, no orphanable paused tree).
-            await options.wave.releaseRound(roundId, {
-              ...(optBoolField(body, 'confirm_kill') !== undefined
-                ? { confirmKill: optBoolField(body, 'confirm_kill') }
-                : {}),
-            })
-          : await options.dispatch.release(strField(body, 'job_id'), {
-              ...(optBoolField(body, 'confirm_kill') !== undefined
-                ? { confirmKill: optBoolField(body, 'confirm_kill') }
-                : {}),
-              ...(optStrField(body, 'base_branch') !== undefined
-                ? { baseBranch: optStrField(body, 'base_branch') }
-                : {}),
-            });
-      if (result === null) {
-        json(res, 404, { error: 'not_found', detail: 'no active worktree for this job' });
-        return true;
-      }
-      json(res, 200, result);
       return true;
     }
     const worktreesMatch = /^\/api\/dispatch\/jobs\/([^/]+)\/worktrees$/.exec(path);

@@ -8,7 +8,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { PiRuntime } from '../src/runtime/pi-adapter.js';
 import { SessionStore } from '../src/sessions/store.js';
-import { WorktreeManager } from '../src/worktrees/manager.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { BobScheduler } from '../src/dispatch/bob-scheduler.js';
 import { StubScript, makeStubModelRuntime, type StubTurn } from './helpers/stub-model.js';
@@ -24,6 +24,7 @@ import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 interface JoinHarness {
   ledger: LedgerApi;
   repo: FixtureRepo;
+  worktrees: InMemoryWorktreePort;
   runtime: PiRuntime;
   store: SessionStore;
   dispatch: DispatchService;
@@ -53,21 +54,16 @@ async function makeJoinHarness(turns: readonly StubTurn[] = []): Promise<JoinHar
   const repo = makeFixtureRepo('fixture-joins');
   const ledgerDb = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-command-joinsdata-')));
   const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
-  const manager = new WorktreeManager({
-    ledger,
-    root: mkdtempSync(join(tmpdir(), 'gru-command-joinsroot-')),
-    preserveRoot: mkdtempSync(join(tmpdir(), 'gru-command-joinspreserve-')),
-    setupTimeoutMs: 30_000,
-    enumerateProcesses: () => [], // no sweep in these joins; enumeration off
-  });
+  const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-joinsroot-')));
   const dispatch = new DispatchService({
     ledger,
-    manager,
+    worktrees,
     spawner: (role, options) => runtime.spawn(role, options ?? {}),
   });
   return {
     ledger,
     repo,
+    worktrees,
     runtime,
     store,
     dispatch,

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { DEFAULT_LENSES } from '../ledger/api.js';
-import type { WorktreeManager } from '../worktrees/manager.js';
+import type { WorktreePort } from './worktree-port.js';
 import type { AgentSpawner } from './service.js';
 import { requireSpawnCwd } from '../roles.js';
 
@@ -148,7 +148,8 @@ function lensPrompt(ctx: LensContext, instruction: string): string {
 
 export interface WaveRunnerOptions {
   readonly ledger: LedgerApi;
-  readonly manager: WorktreeManager;
+  /** The worktree subsystem — a port since the Perkins r4 split. */
+  readonly worktrees: WorktreePort;
   readonly spawner: AgentSpawner;
   readonly poster?: VerdictPoster;
   /** Escalation hook (fail-loud): production wires the notification center. */
@@ -184,18 +185,6 @@ export class WaveRunner {
     return begun.run;
   }
 
-  /**
-   * Round-scoped release (Perkins r3 B3 — the answerable-pause rule): a
-   * paused review lane is answered by its ROUND id, symmetric with the
-   * job's own release path.
-   */
-  async releaseRound(roundId: string, opts: { confirmKill?: boolean } = {}) {
-    return this.opts.manager.release({
-      worktreeId: roundId,
-      ...(opts.confirmKill !== undefined ? { confirmKill: opts.confirmKill } : {}),
-    });
-  }
-
   /** Set the round up (job in review, chips created, detached worktree,
    * fleet LAUNCHED) and return immediately — the outcome promise is the
    * board's to watch, not the HTTP caller's. */
@@ -209,7 +198,7 @@ export class WaveRunner {
     if (job.status === 'merged' || job.status === 'done') {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes do not go back under review`);
     }
-    const jobWorktree = this.opts.ledger.getWorktree(input.jobId);
+    const jobWorktree = this.opts.worktrees.getWorktree(input.jobId);
     if (jobWorktree === null) {
       throw new Error(
         `job "${input.jobId}" has no worktree in the registry — the review reads the repo through its job lane (SPEC ruling 18b)`,
@@ -233,7 +222,7 @@ export class WaveRunner {
     // job stuck in review.
     let reviewWorktree;
     try {
-      reviewWorktree = await this.opts.manager.createReviewWorktree({
+      reviewWorktree = await this.opts.worktrees.createReviewWorktree({
         repoPath: jobWorktree.repoPath,
         roundId: round.id,
         ref: targetRef,
@@ -356,7 +345,7 @@ export class WaveRunner {
    */
   private async sweepReviewWorktree(roundId: string): Promise<void> {
     try {
-      const result = await this.opts.manager.release({ worktreeId: roundId });
+      const result = await this.opts.worktrees.release({ worktreeId: roundId });
       if (result.status === 'paused') {
         this.opts.escalate?.(
           `Review worktree for round ${roundId} paused on live processes`,

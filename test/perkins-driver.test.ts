@@ -8,7 +8,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { PiRuntime } from '../src/runtime/pi-adapter.js';
 import { SessionStore } from '../src/sessions/store.js';
-import { WorktreeManager } from '../src/worktrees/manager.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import {
   makeStubModelRuntime,
@@ -49,7 +49,7 @@ function verdictFor(prompt: string, verdict: string, lens: string): StubTurn {
 interface DriverHarness {
   ledger: LedgerApi;
   repo: FixtureRepo;
-  manager: WorktreeManager;
+  worktrees: InMemoryWorktreePort;
   runtime: PiRuntime;
   store: SessionStore;
   wave: WaveRunner;
@@ -79,17 +79,12 @@ async function makeDriverHarness(script: StubScript): Promise<DriverHarness> {
   const repo = makeFixtureRepo('fixture-driver');
   const ledgerDb = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-command-driverdata-')));
   const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
-  const manager = new WorktreeManager({
-    ledger,
-    root: mkdtempSync(join(tmpdir(), 'gru-command-driverroot-')),
-    preserveRoot: mkdtempSync(join(tmpdir(), 'gru-command-driverpreserve-')),
-    setupTimeoutMs: 30_000,
-  });
+  const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-driverroot-')));
   const poster = { post: vi.fn(async () => {}) };
   const escalations: { title: string; detail: string }[] = [];
   const wave = new WaveRunner({
     ledger,
-    manager,
+    worktrees,
     spawner: (role, options) => runtime.spawn(role, options ?? {}),
     poster,
     escalate: (title, detail) => escalations.push({ title, detail }),
@@ -98,7 +93,7 @@ async function makeDriverHarness(script: StubScript): Promise<DriverHarness> {
   return {
     ledger,
     repo,
-    manager,
+    worktrees,
     runtime,
     store,
     wave,
@@ -129,7 +124,7 @@ async function seed(h: DriverHarness): Promise<string> {
   });
   h.ledger.setJobStatus(job.id, 'working');
   h.ledger.setJobPr(job.id, PR_URL); // posting is gated on the lane's PR link
-  await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: job.id });
+  await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId: job.id });
   return job.id;
 }
 
@@ -158,7 +153,7 @@ describe('Perkins default driver over real pi sessions (stub model)', () => {
     const body = h.poster.post.mock.calls[0]?.[0]?.body as string;
     expect(body).toContain('- edge: warning');
     // The review worktree was released after the round.
-    expect(h.ledger.getWorktree(outcome.round.id)?.status).toBe('swept');
+    expect(h.worktrees.getWorktree(outcome.round.id)?.status).toBe('swept');
   });
 
   it('turns a lens that concludes without the protocol line into an error chip → verdict withheld', async () => {

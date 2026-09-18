@@ -17,10 +17,10 @@ const PINS: Record<string, number> = {
   'chat-server.test.ts': 30,
   'chat-session-state.test.ts': 4,
   'claude-adapter.test.ts': 52,
-  'config.test.ts': 37,
-  'dispatch-e2e.test.ts': 5,
+  'config.test.ts': 36,
+  'dispatch-e2e.test.ts': 3,
   'dispatch-joins.test.ts': 2,
-  'dispatch-server.test.ts': 6,
+  'dispatch-server.test.ts': 4,
   'bob-scheduler.test.ts': 5,
   'health.test.ts': 14,
   'identity.test.ts': 3,
@@ -46,8 +46,6 @@ const PINS: Record<string, number> = {
   'suite-shape.test.ts': 1,
   'supervisor.test.ts': 13,
   'transcripts.test.ts': 13,
-  'worktree-manager.test.ts': 26,
-  'worktree-manifest.test.ts': 6,
 };
 
 describe('suite shape', () => {

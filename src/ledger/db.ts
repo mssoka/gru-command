@@ -233,45 +233,7 @@ export const MIGRATIONS: readonly Migration[] = [
   },
   {
     id: 4,
-    name: 'e8-worktree-registry',
-    sql: `
-      ALTER TABLE jobs ADD COLUMN briefing TEXT;
-
-      CREATE TABLE worktrees (
-        id         TEXT PRIMARY KEY,
-        kind       TEXT NOT NULL CHECK (kind IN ('job','review')),
-        repo_path  TEXT NOT NULL,
-        repo_name  TEXT NOT NULL,
-        path       TEXT NOT NULL UNIQUE,
-        branch     TEXT,
-        sha        TEXT NOT NULL,
-        job_id     TEXT REFERENCES jobs(id),
-        round_id   TEXT REFERENCES rounds(id),
-        status     TEXT NOT NULL CHECK (status IN ('active','paused','swept')),
-        note       TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE INDEX idx_worktrees_job ON worktrees(job_id);
-      CREATE INDEX idx_worktrees_round ON worktrees(round_id);
-      CREATE INDEX idx_worktrees_status ON worktrees(status);
-    `,
-  },
-  {
-    id: 5,
-    name: 'e8-worktree-processes',
-    sql: `
-      CREATE TABLE worktree_processes (
-        worktree_id TEXT NOT NULL REFERENCES worktrees(id),
-        pid         INTEGER NOT NULL,
-        command     TEXT NOT NULL,
-        evidence    TEXT NOT NULL CHECK (evidence IN ('argv','cwd','registry')),
-        state       TEXT NOT NULL CHECK (state IN ('live','killed')),
-        first_seen  TEXT NOT NULL,
-        last_seen   TEXT NOT NULL,
-        PRIMARY KEY (worktree_id, pid)
-      );
-      CREATE INDEX idx_worktree_processes_wt ON worktree_processes(worktree_id);
-    `,
+    name: 'e8-job-briefing',
+    sql: `ALTER TABLE jobs ADD COLUMN briefing TEXT;`,
   },
 ];

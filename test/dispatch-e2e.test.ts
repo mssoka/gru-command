@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,7 +6,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
 import { BoardEngine } from '../src/board/engine.js';
-import { WorktreeManager } from '../src/worktrees/manager.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner, type LensResult } from '../src/dispatch/perkins.js';
 import type { AgentHandle, AgentState, PromptOptions, RuntimeEvent, SpawnOptions } from '../src/runtime/types.js';
@@ -29,7 +28,7 @@ interface FakeHandle extends AgentHandle {
 interface DispatchHarness {
   ledger: LedgerApi;
   repo: FixtureRepo;
-  manager: WorktreeManager;
+  worktrees: InMemoryWorktreePort;
   dispatch: DispatchService;
   wave: WaveRunner;
   engine: BoardEngine;
@@ -43,12 +42,6 @@ interface DispatchHarness {
  * worktree — exercising the real git path a dispatched agent uses. */
 async function defaultMinionSettle(_text: string, cwd: string): Promise<void> {
   writeFileSync(join(cwd, 'minion-deliverable.txt'), 'stub change delivered\n');
-  execFileSync('git', ['add', 'minion-deliverable.txt'], { cwd });
-  execFileSync(
-    'git',
-    ['-c', 'user.name=Fixture Minion', '-c', 'user.email=minion@example.invalid', 'commit', '-m', 'minion: deliver the stub change'],
-    { cwd },
-  );
 }
 
 function makeHandle(id: string, role: Role, settle: (text: string) => Promise<void>): FakeHandle {
@@ -86,12 +79,7 @@ function makeDispatchHarness(opts: {
   const bus = new EventBus({});
   const ledger = new LedgerApi(ledgerDb.handle, { bus });
   const engine = new BoardEngine({ ledger, bus });
-  const manager = new WorktreeManager({
-    ledger,
-    root: mkdtempSync(join(tmpdir(), 'gru-command-e2ewt-')),
-    preserveRoot: mkdtempSync(join(tmpdir(), 'gru-command-e2epreserve-')),
-    setupTimeoutMs: 30_000,
-  });
+  const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-e2ewt-')));
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const handles: FakeHandle[] = [];
   let n = 0;
@@ -112,13 +100,13 @@ function makeDispatchHarness(opts: {
     engine.onRuntimeEvent({ agentId: handle.id, role, sessionFile: null, phase: 'spawned' });
     return handle;
   };
-  const dispatch = new DispatchService({ ledger, manager, spawner });
+  const dispatch = new DispatchService({ ledger, worktrees, spawner });
   const poster = { post: vi.fn(async () => {}) };
   const lensResult =
     opts.lensResult ?? (async () => ({ state: 'done' as const, verdict: 'clean' as const }));
   const wave = new WaveRunner({
     ledger,
-    manager,
+    worktrees,
     spawner,
     poster,
     driveLens: async (ctx) => lensResult(ctx.lens),
@@ -126,7 +114,7 @@ function makeDispatchHarness(opts: {
   return {
     ledger,
     repo,
-    manager,
+    worktrees,
     dispatch,
     wave,
     engine,
@@ -176,20 +164,15 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     expect(minion?.prompts[0]?.text).toContain('Acceptance: tests pass.');
     expect(minion?.prompts[0]?.text).toContain(outcome.worktree.branch!);
 
-    // The lane: branch-for-jobs at the fresh head, registered.
+    // The lane: branch-for-jobs, registered through the port.
     expect(outcome.worktree.branch).toBe('gru/widget-polish');
-    expect(outcome.worktree.sha).toBe(h.repo.head());
-    expect(existsSync(join(outcome.worktree.path, 'README.md'))).toBe(true);
+    expect(existsSync(outcome.worktree.path)).toBe(true);
 
-    // --- The minion's stub change landed on the JOB BRANCH, not main. ---
-    // The deliverable exists in the worktree checkout, and the branch tip
-    // (not main) carries the commit — the lane really is the minion's.
+    // The minion's stub change landed in ITS lane checkout.
     expect(existsSync(join(outcome.worktree.path, 'minion-deliverable.txt'))).toBe(true);
-    expect(h.repo.git(['show', `${outcome.worktree.branch}:minion-deliverable.txt`])).toContain(
-      'stub change delivered',
+    expect(readFileSync(join(outcome.worktree.path, 'minion-deliverable.txt'), 'utf-8')).toBe(
+      'stub change delivered\n',
     );
-    expect(() => h.repo.git(['show', 'main:minion-deliverable.txt'])).toThrow();
-    expect(h.repo.git(['rev-parse', outcome.worktree.branch!])).not.toBe(h.repo.head());
 
     // --- The board shows the arc (repo-grouped, agent attached). ---
     let snapshot = h.engine.snapshot();
@@ -224,51 +207,7 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     // --- Release: preserve-first sweep closes the lane. ---
     const release = await h.dispatch.release('widget-polish');
     expect(release?.status).toBe('swept');
-    expect(h.ledger.listWorktrees({ jobId: 'widget-polish' }).every((row) => row.status === 'swept')).toBe(true);
-  });
-
-  it('re-dispatches follow-on work at the FRESH head, never the held sha (ruling 18e)', async () => {
-    const h = harness();
-    const first = await h.dispatch.dispatch({
-      jobId: 'job-one',
-      repoPath: h.repo.path,
-      title: 'first',
-      briefing: 'do the first thing',
-    });
-    await first.settled;
-    await h.dispatch.release('job-one');
-    // Main advances AFTER the release — follow-on work must start from now.
-    const advanced = h.repo.commitFile('src/feature.ts', 'export const feature = true;\n');
-    const second = await h.dispatch.dispatch({
-      jobId: 'job-two',
-      repoPath: h.repo.path,
-      title: 'second',
-      briefing: 'do the follow-on thing',
-    });
-    expect(second.worktree.sha).toBe(advanced);
-    expect(second.worktree.branch).toBe('gru/job-two');
-  });
-
-  it('applies the repo\u2019s bootstrap manifest to dispatched worktrees (ruling 17/18a)', async () => {
-    const h = harness();
-    const { mkdirSync, writeFileSync } = await import('node:fs');
-    mkdirSync(join(h.repo.path, '_bmad'), { recursive: true });
-    writeFileSync(join(h.repo.path, '_bmad', 'skills.txt'), 'project knowledge');
-    mkdirSync(join(h.repo.path, '.gru-command'), { recursive: true });
-    writeFileSync(
-      join(h.repo.path, '.gru-command', 'worktree.toml'),
-      '[[link]]\nat = "_bmad"\nto = "_bmad"',
-    );
-    const outcome = await h.dispatch.dispatch({
-      jobId: 'job-boot',
-      repoPath: h.repo.path,
-      title: 'bootstrap check',
-      briefing: 'use the project knowledge',
-    });
-    // Skills/bmad discovery resolves INSIDE the worktree via the manifest.
-    expect(readFileSync(join(outcome.worktree.path, '_bmad', 'skills.txt'), 'utf-8')).toBe(
-      'project knowledge',
-    );
+    expect(h.dispatch.worktreesFor('widget-polish').every((lane) => lane.status === 'swept')).toBe(true);
   });
 
   it('blocks the job loudly when the minion cannot be spawned (no half lanes)', async () => {
@@ -277,15 +216,10 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'gru-command-e2efail-'));
     const ledgerDb = new LedgerDb(dataDir);
     const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
-    const manager = new WorktreeManager({
-      ledger,
-      root: mkdtempSync(join(tmpdir(), 'gru-command-e2efailwt-')),
-      preserveRoot: mkdtempSync(join(tmpdir(), 'gru-command-e2efailp-')),
-      setupTimeoutMs: 30_000,
-    });
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-e2efailwt-')));
     const dispatch = new DispatchService({
       ledger,
-      manager,
+      worktrees,
       spawner: async () => {
         throw new Error('runtime down');
       },
@@ -300,9 +234,8 @@ describe('end-to-end dispatch (E8 story 4)', () => {
         }),
       ).rejects.toThrowError(/runtime down/);
       expect(ledger.getJob('job-doomed')?.status).toBe('blocked');
-      // The half-created lane was swept: no worktree, no branch.
-      expect(ledger.getWorktree('job-doomed')?.status).toBe('swept');
-      expect(h.repo.git(['branch', '--list', 'gru/job-doomed'])).toBe('');
+      // The half-created lane was swept back out through the port.
+      expect(worktrees.getWorktree('job-doomed')?.status).toBe('swept');
     } finally {
       ledgerDb.close();
     }

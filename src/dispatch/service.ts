@@ -1,9 +1,9 @@
 import type { LogLevel } from '../logger.js';
-import type { LedgerApi, JobRecord, WorktreeRecord } from '../ledger/api.js';
+import type { LedgerApi, JobRecord } from '../ledger/api.js';
 import type { Role } from '../config.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import { requireSpawnCwd } from '../roles.js';
-import type { WorktreeManager } from '../worktrees/manager.js';
+import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -24,7 +24,7 @@ export type AgentSpawner = (
 
 export interface DispatchOutcome {
   readonly job: JobRecord;
-  readonly worktree: WorktreeRecord;
+  readonly worktree: WorktreeLane;
   readonly agentId: string;
   /** Resolves when the minion's briefing turn settles (ok | error). */
   readonly settled: Promise<{ readonly ok: boolean; readonly error?: string }>;
@@ -32,7 +32,9 @@ export interface DispatchOutcome {
 
 export interface DispatchServiceOptions {
   readonly ledger: LedgerApi;
-  readonly manager: WorktreeManager;
+  /** The worktree subsystem (ruling 18) — a port since the Perkins r4
+   * split: the manager implementation is its own lane. */
+  readonly worktrees: WorktreePort;
   readonly spawner: AgentSpawner;
   readonly log?: Log;
 }
@@ -108,7 +110,7 @@ export class DispatchService {
       const working = this.opts.ledger.setJobStatus(job.id, 'working');
 
       // (3) One worktree per job, fresh head, own branch (ruling 18).
-      const worktree = await this.opts.manager.createJobWorktree({
+      const worktree = await this.opts.worktrees.createJobWorktree({
         repoPath: input.repoPath,
         jobId: job.id,
       });
@@ -203,17 +205,21 @@ export class DispatchService {
     return job;
   }
 
-  /** The job's worktree rows (registry is the map — ruling 18b). */
-  worktreesFor(jobId: string): readonly WorktreeRecord[] {
-    return this.opts.ledger.listWorktrees({ jobId });
+  /** The job's worktree lanes (the registry is the map — ruling 18b). */
+  worktreesFor(jobId: string): readonly WorktreeLane[] {
+    return this.opts.worktrees.listWorktrees({ jobId });
   }
 
-  /** Release the job's lane (preserve-first sweep; see WorktreeManager). */
-  async release(jobId: string, opts: { confirmKill?: boolean; baseBranch?: string } = {}) {
-    const rows = this.opts.ledger.listWorktrees({ jobId });
-    const active = rows.find((row) => row.status !== 'swept');
+  /** Release the job's lane (the port's sweep; the manager lane owns the
+   * preserve-first/pause-and-ask mechanics). */
+  async release(
+    jobId: string,
+    opts: { confirmKill?: boolean; baseBranch?: string } = {},
+  ): Promise<WorktreeSweepResult | null> {
+    const lanes = this.opts.worktrees.listWorktrees({ jobId });
+    const active = lanes.find((lane) => lane.status !== 'swept');
     if (active === undefined) return null;
-    return this.opts.manager.release({
+    return this.opts.worktrees.release({
       worktreeId: active.id,
       ...(opts.confirmKill !== undefined ? { confirmKill: opts.confirmKill } : {}),
       ...(opts.baseBranch !== undefined ? { baseBranch: opts.baseBranch } : {}),
@@ -222,7 +228,7 @@ export class DispatchService {
 
   private async sweepQuietly(worktreeId: string): Promise<void> {
     try {
-      await this.opts.manager.release({ worktreeId });
+      await this.opts.worktrees.release({ worktreeId });
     } catch (error) {
       this.log('error', 'worktree sweep after failed dispatch also failed', {
         worktreeId,

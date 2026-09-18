@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
-import { WorktreeManager } from '../src/worktrees/manager.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import {
   consolidateVerdict,
   GhPrPoster,
@@ -31,9 +31,7 @@ function done(verdict: LensResult extends never ? never : 'blocker' | 'warning' 
 interface WaveHarness {
   ledger: LedgerApi;
   repo: FixtureRepo;
-  manager: WorktreeManager;
-  /** The manager's worktree root (for precise collision fixtures). */
-  root: string;
+  worktrees: InMemoryWorktreePort;
   wave: WaveRunner;
   poster: { post: ReturnType<typeof vi.fn> };
   escalations: { title: string; detail: string }[];
@@ -45,18 +43,12 @@ function makeWaveHarness(results: (lens: string) => Promise<LensResult>): WaveHa
   const dataDir = mkdtempSync(join(tmpdir(), 'gru-command-wavedata-'));
   const ledgerDb = new LedgerDb(dataDir);
   const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
-  const root = mkdtempSync(join(tmpdir(), 'gru-command-waveroot-'));
-  const manager = new WorktreeManager({
-    ledger,
-    root,
-    preserveRoot: mkdtempSync(join(tmpdir(), 'gru-command-wavepreserve-')),
-    setupTimeoutMs: 30_000,
-  });
+  const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-waveroot-')));
   const poster = { post: vi.fn(async () => {}) };
   const escalations: { title: string; detail: string }[] = [];
   const wave = new WaveRunner({
     ledger,
-    manager,
+    worktrees,
     spawner: async () => {
       throw new Error('the injectable driver replaces spawning in this suite');
     },
@@ -67,8 +59,7 @@ function makeWaveHarness(results: (lens: string) => Promise<LensResult>): WaveHa
   const h: WaveHarness = {
     ledger,
     repo,
-    manager,
-    root,
+    worktrees,
     wave,
     poster,
     escalations,
@@ -99,7 +90,7 @@ async function seedJob(h: WaveHarness, withPr: boolean): Promise<string> {
     briefing: 'make the widget ship',
   });
   h.ledger.setJobStatus(job.id, 'working');
-  await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: job.id });
+  await h.worktrees.createJobWorktree({ repoPath: h.repo.path, jobId: job.id });
   if (withPr) h.ledger.setJobPr(job.id, PR_URL);
   return job.id;
 }
@@ -184,31 +175,13 @@ describe('wave lifecycle', () => {
     expect(h.escalations).toHaveLength(0);
   });
 
-  it('runs the round against a DETACHED review worktree, swept when the round completes', async () => {
-    const heads: string[] = [];
+  it('runs the round on a review lane (no branch, ever) swept when the round completes', async () => {
     const h = harness(async () => done('clean'));
-    // Capture the review tree's HEAD ref while the fleet is live.
-    const wave = new WaveRunner({
-      ledger: h.ledger,
-      manager: h.manager,
-      spawner: async () => {
-        throw new Error('driver replaces spawning');
-      },
-      driveLens: async (ctx) => {
-        heads.push(h.repo.git(['rev-parse', '--abbrev-ref', 'HEAD'], ctx.worktreePath));
-        return done('clean');
-      },
-    });
-    h.wave = wave;
     const jobId = await seedJob(h, false);
-    const outcome = await wave.runRound({ jobId });
-    // Detached while live: HEAD, never a branch.
-    expect(heads).toHaveLength(7);
-    expect(new Set(heads)).toEqual(new Set(['HEAD']));
-    // The round's worktree row survives as the record; the tree is gone.
-    const reviewRow = h.ledger.getWorktree(outcome.round.id);
+    const outcome = await h.wave.runRound({ jobId });
+    const reviewRow = h.worktrees.getWorktree(outcome.round.id);
     expect(reviewRow?.kind).toBe('review');
-    expect(reviewRow?.branch).toBeNull();
+    expect(reviewRow?.branch).toBeNull(); // detached-for-reviews: never a branch
     expect(reviewRow?.status).toBe('swept');
     expect(existsSync(reviewRow!.path)).toBe(false);
   });
@@ -232,7 +205,7 @@ describe('wave lifecycle', () => {
     // lane status instead of being stranded in review.
     const fresh = harness(async () => done('clean'));
     const freshJob = await seedJob(fresh, false);
-    mkdirSync(join(fresh.root, 'fixture-wave', `review-${freshJob}-r1`), { recursive: true });
+    mkdirSync(join(fresh.worktrees.root, 'fixture-wave', `review-${freshJob}-r1`), { recursive: true });
     await expect(fresh.wave.runRound({ jobId: freshJob })).rejects.toThrowError(/already exists/);
     const round = fresh.ledger.listRounds(freshJob)[0];
     expect(round?.status).toBe('aborted');
