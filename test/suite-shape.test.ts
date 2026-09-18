@@ -51,7 +51,6 @@ const PINS: Record<string, number> = {
   'worktree-port.test.ts': 4,
   'worktrees-server.test.ts': 3,
 };
-};
 
 describe('suite shape', () => {
   it('every test file is pinned and registers exactly its expected test count', () => {

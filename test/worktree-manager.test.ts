@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -8,6 +8,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
 import { commandReferencesTree, psEnumerator, WorktreeManager, type TreeProcess } from '../src/worktrees/manager.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { runWorktreePortContract } from './helpers/worktree-port-contract.js';
 
 /**
  * Worktree manager (SPEC ruling 18): branch-for-jobs at a fresh sha,
@@ -801,3 +802,43 @@ describe('Perkins r4 B1: manifest [[link]] lanes are releasable (the link is a d
     expect(existsSync(row.path)).toBe(false);
   });
 });
+
+
+// Perkins r5: the REAL manager satisfies the core's WorktreePort contract
+// (same suite the in-memory double runs on PR #12) — the cross-lane
+// handshake. If the manager ever minted its own ids or invented statuses,
+// it fails here, not in the core's flow.
+{
+  const repo = makeFixtureRepo('fixture-manager-contract');
+  const dataDir = mkdtempSync(join(tmpdir(), 'gru-command-mcontract-'));
+  const root = mkdtempSync(join(tmpdir(), 'gru-command-mcontractroot-'));
+  const preserveRoot = mkdtempSync(join(tmpdir(), 'gru-command-mcontractpreserve-'));
+  const ledgerDb = new LedgerDb(dataDir);
+  const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
+  const manager = new WorktreeManager({
+    ledger,
+    root,
+    preserveRoot,
+    setupTimeoutMs: 30_000,
+    killGraceMs: 25,
+  });
+  runWorktreePortContract('the real WorktreeManager', async () => ({
+    port: manager,
+    repoPath: repo.path,
+    async seedJob(jobId: string) {
+      ledger.addJob({ id: jobId, repo: 'fixture-manager-contract', title: 'contract' });
+      ledger.setJobStatus(jobId, 'working');
+    },
+    async seedRound(jobId: string, roundId: string) {
+      ledger.addRound({ jobId, targetRef: 'HEAD' });
+      void roundId; // the round id is the addRound-derived id (<jobId>-rN)
+    },
+    async cleanup() {
+      ledgerDb.close();
+      repo.cleanup();
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+      rmSync(preserveRoot, { recursive: true, force: true });
+    },
+  }));
+}
