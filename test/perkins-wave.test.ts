@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -32,6 +32,8 @@ interface WaveHarness {
   ledger: LedgerApi;
   repo: FixtureRepo;
   manager: WorktreeManager;
+  /** The manager's worktree root (for precise collision fixtures). */
+  root: string;
   wave: WaveRunner;
   poster: { post: ReturnType<typeof vi.fn> };
   escalations: { title: string; detail: string }[];
@@ -43,9 +45,10 @@ function makeWaveHarness(results: (lens: string) => Promise<LensResult>): WaveHa
   const dataDir = mkdtempSync(join(tmpdir(), 'gru-command-wavedata-'));
   const ledgerDb = new LedgerDb(dataDir);
   const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
+  const root = mkdtempSync(join(tmpdir(), 'gru-command-waveroot-'));
   const manager = new WorktreeManager({
     ledger,
-    root: mkdtempSync(join(tmpdir(), 'gru-command-waveroot-')),
+    root,
     preserveRoot: mkdtempSync(join(tmpdir(), 'gru-command-wavepreserve-')),
     setupTimeoutMs: 30_000,
   });
@@ -65,6 +68,7 @@ function makeWaveHarness(results: (lens: string) => Promise<LensResult>): WaveHa
     ledger,
     repo,
     manager,
+    root,
     wave,
     poster,
     escalations,
@@ -213,6 +217,26 @@ describe('wave lifecycle', () => {
     const h = harness(async () => done('clean'));
     h.ledger.addJob({ id: 'job-orphan', repo: 'fixture-wave', title: 'no lane' });
     await expect(h.wave.runRound({ jobId: 'job-orphan' })).rejects.toThrowError(/no worktree in the registry/);
+  });
+
+  it('rejects terminal jobs and aborts the round loudly when setup fails (job restored)', async () => {
+    const h = harness(async () => done('clean'));
+    const jobId = await seedJob(h, false);
+    h.ledger.setJobStatus(jobId, 'in-review');
+    h.ledger.setJobStatus(jobId, 'merged');
+    await expect(h.wave.runRound({ jobId })).rejects.toThrowError(/terminal lanes/);
+    expect(h.ledger.listRounds(jobId)).toHaveLength(0);
+
+    // Setup failure: a stale path already exists exactly where the review
+    // worktree would go — the round aborts and the job returns to its
+    // lane status instead of being stranded in review.
+    const fresh = harness(async () => done('clean'));
+    const freshJob = await seedJob(fresh, false);
+    mkdirSync(join(fresh.root, 'fixture-wave', `review-${freshJob}-r1`), { recursive: true });
+    await expect(fresh.wave.runRound({ jobId: freshJob })).rejects.toThrowError(/already exists/);
+    const round = fresh.ledger.listRounds(freshJob)[0];
+    expect(round?.status).toBe('aborted');
+    expect(fresh.ledger.getJob(freshJob)?.status).toBe('working');
   });
 });
 

@@ -208,14 +208,17 @@ export class WaveRunner {
     const targetRef = input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
 
     // Job enters review; round goes live with its chips.
-    if (job.status === 'working' || job.status === 'blocked') {
+    const flippedFrom =
+      job.status === 'working' || job.status === 'blocked' ? job.status : null;
+    if (flippedFrom !== null) {
       this.opts.ledger.setJobStatus(job.id, 'in-review');
     }
     const round = this.opts.ledger.addRound({ jobId: job.id, lenses, targetRef });
 
     // Detached-for-reviews (ruling 18d): reviews never grow branch debris.
-    // A setup failure aborts the round loudly — never a pending-forever
-    // round with a job stuck in review.
+    // A setup failure aborts the round loudly and restores the job to the
+    // lane status THIS call flipped — never a pending-forever round with a
+    // job stuck in review.
     let reviewWorktree;
     try {
       reviewWorktree = await this.opts.manager.createReviewWorktree({
@@ -226,6 +229,7 @@ export class WaveRunner {
       this.opts.ledger.setRoundStatus(round.id, 'live');
     } catch (error) {
       this.opts.ledger.setRoundStatus(round.id, 'aborted');
+      if (flippedFrom !== null) this.opts.ledger.setJobStatus(job.id, flippedFrom);
       throw error;
     }
     this.log('info', 'review round live', {
