@@ -198,10 +198,14 @@ export class WaveRunner {
     if (job.status === 'merged' || job.status === 'done') {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes do not go back under review`);
     }
-    const jobWorktree = this.opts.worktrees.getWorktree(input.jobId);
+    // Lane discovery by JOB SCOPE + kind (the port contract's robust
+    // lookup) — never by id guessing (Perkins r5 B1).
+    const jobWorktree =
+      this.opts.worktrees.listWorktrees({ jobId: input.jobId }).find((lane) => lane.kind === 'job') ??
+      null;
     if (jobWorktree === null) {
       throw new Error(
-        `job "${input.jobId}" has no worktree in the registry — the review reads the repo through its job lane (SPEC ruling 18b)`,
+        `job "${input.jobId}" has no job worktree lane in the registry — the review reads the repo through its job lane (SPEC ruling 18b)`,
       );
     }
     const lenses =
@@ -241,13 +245,17 @@ export class WaveRunner {
       targetRef,
     });
 
-    return { round, run: this.runFleet(job, round, lenses, reviewWorktree.path, targetRef) };
+    return {
+      round,
+      run: this.runFleet(job, round, lenses, reviewWorktree.id, reviewWorktree.path, targetRef),
+    };
   }
 
   private async runFleet(
     job: { readonly id: string; readonly prUrl: string | null },
     round: RoundRecord,
     lenses: readonly string[],
+    reviewLaneId: string,
     worktreePath: string,
     targetRef: string,
   ): Promise<WaveOutcome> {
@@ -299,7 +307,7 @@ export class WaveRunner {
         round: round.id,
         failed,
       });
-      await this.sweepReviewWorktree(round.id);
+      await this.sweepReviewWorktree(reviewLaneId);
       return { round: this.opts.ledger.getRound(round.id) as RoundRecord, results: settled, verdict: null, posted: false };
     }
 
@@ -333,7 +341,7 @@ export class WaveRunner {
         this.log('error', 'verdict comment post failed', { round: round.id, error: String(error) });
       }
     }
-    await this.sweepReviewWorktree(round.id);
+    await this.sweepReviewWorktree(reviewLaneId);
     return { round: this.opts.ledger.getRound(round.id) as RoundRecord, results: settled, verdict, posted };
   }
 

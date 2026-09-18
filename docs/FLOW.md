@@ -98,7 +98,12 @@ the ordered, preserve-first sweep (ruling 18c):
 
 ## The worktree subsystem (ruling 18)
 
-The dispatch flow rides a **worktree port** (`src/dispatch/worktree-port.ts`):
+The dispatch flow rides a **worktree port** (`src/dispatch/worktree-port.ts`)
+whose CONTRACT is documented in the interface and pinned by
+`test/helpers/worktree-port-contract.ts` — lane ids ARE owner ids
+(job/round), discovery is by job scope, statuses are exactly
+active/paused/swept, unknown ids reject. Every implementation (the
+in-memory double here, the manager on its lane) runs the contract:
 the five-subsystem manager — bootstrap manifest, ledger-owned registry
 (sweeps match registry paths only), the preserve-first sweep with
 pause-and-ask, detached-for-reviews/branch-for-jobs, sequential

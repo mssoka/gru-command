@@ -46,6 +46,7 @@ const PINS: Record<string, number> = {
   'suite-shape.test.ts': 1,
   'supervisor.test.ts': 13,
   'transcripts.test.ts': 13,
+  'worktree-port.test.ts': 4,
 };
 
 describe('suite shape', () => {

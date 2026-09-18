@@ -189,7 +189,7 @@ describe('wave lifecycle', () => {
   it('refuses to review a job without a registered worktree lane', async () => {
     const h = harness(async () => done('clean'));
     h.ledger.addJob({ id: 'job-orphan', repo: 'fixture-wave', title: 'no lane' });
-    await expect(h.wave.runRound({ jobId: 'job-orphan' })).rejects.toThrowError(/no worktree in the registry/);
+    await expect(h.wave.runRound({ jobId: 'job-orphan' })).rejects.toThrowError(/no job worktree lane in the registry/);
   });
 
   it('rejects terminal jobs and aborts the round loudly when setup fails (job restored)', async () => {
