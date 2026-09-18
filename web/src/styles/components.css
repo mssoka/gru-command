@@ -348,6 +348,106 @@ body {
 .msg--gru .msg__meta { color: rgba(34, 48, 74, 0.6); }
 .dark .msg--gru .msg__meta { color: rgba(26, 34, 54, 0.6); }
 
+/* Markdown body inside Gru bubbles (issue #10). A plain single-paragraph
+   reply renders identically to the old raw text: blocks carry no margins
+   except between siblings (the "* + *" rule), so bubble geometry is
+   unchanged. */
+.msg--gru .msg__body {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.msg__body > * { margin: 0; }
+.msg__body > * + * { margin-top: 8px; }
+
+.md-h { font-weight: 800; line-height: 1.3; }
+.md-h1 { font-size: 1.08em; }
+.md-h2 { font-size: 1.02em; }
+.md-h3, .md-h4, .md-h5, .md-h6 { font-size: 0.98em; }
+
+.md-table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-weight: 500;
+  font-size: 0.95em;
+  line-height: 1.4;
+}
+
+.md-table th,
+.md-table td {
+  border: 1.5px solid rgba(34, 48, 74, 0.28);
+  padding: 4px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.md-table th {
+  background: rgba(255, 255, 255, 0.45);
+  font-weight: 800;
+}
+
+.md-table tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.18); }
+
+.md-code {
+  position: relative;
+  max-width: 100%;
+  overflow-x: auto;
+  background: rgba(34, 48, 74, 0.09);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.5;
+  white-space: pre;
+  tab-size: 2;
+}
+
+.md-code__lang {
+  position: absolute;
+  top: 5px;
+  right: 9px;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(34, 48, 74, 0.7);
+}
+
+.md-code-inline {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  background: rgba(34, 48, 74, 0.12);
+  border-radius: 5px;
+  padding: 0 4px;
+}
+
+.md-list { padding-left: 1.25em; }
+.md-item { margin: 0; }
+.md-item + .md-item { margin-top: 3px; }
+.md-item > * + * { margin-top: 3px; }
+
+.md-quote {
+  border-left: 3px solid rgba(34, 48, 74, 0.4);
+  padding-left: 10px;
+  opacity: 0.92;
+}
+
+.md-hr {
+  border: none;
+  border-top: 2px solid rgba(34, 48, 74, 0.3);
+}
+
+.md-a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.md-strike { opacity: 0.75; }
+
 .tool-line {
   align-self: center;
   font-size: 12px;

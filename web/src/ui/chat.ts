@@ -6,6 +6,7 @@
 
 import type { ChatMessage, ConnectionState } from '../lib/chat-client.js';
 import type { LoggedFrame } from '../lib/protocol.js';
+import { renderMarkdown } from '../lib/markdown.js';
 import { el, mustGet } from './dom.js';
 
 const MOBILE_QUERY = '(max-width: 768px)';
@@ -20,6 +21,8 @@ export class ChatView {
   private readonly mainMount = mustGet<HTMLElement>('chat-main-mount');
   private readonly bubbles = new Map<string, HTMLElement>();
   private streamingBubble: HTMLElement | null = null;
+  private streamingBody: HTMLElement | null = null;
+  private streamText = '';
   private activeTool: HTMLElement | null = null;
   private unread = 0;
   private mobile = window.matchMedia(MOBILE_QUERY);
@@ -82,6 +85,8 @@ export class ChatView {
     this.log.replaceChildren();
     this.bubbles.clear();
     this.streamingBubble = null;
+    this.streamingBody = null;
+    this.streamText = '';
     this.activeTool = null;
   }
 
@@ -117,8 +122,18 @@ export class ChatView {
         break;
       }
       case 'delta': {
-        const bubble = this.streamingBubble ?? this.openStream();
-        bubble.appendChild(document.createTextNode(frame.text));
+        // Gru replies render as GFM markdown (issue #10: users must never
+        // see raw pipes/fences). Accumulate and re-render atomically per
+        // delta — one paint, no flicker; incomplete constructs hold stable.
+        //
+        // Open the stream BEFORE accumulating: openStream() resets
+        // streamText when it creates fresh state, so resetting after the
+        // `+=` would silently wipe the FIRST replayed delta of a same-page
+        // reconnect (partial replay: bare deltas, no turn:start, no reset —
+        // Perkins r1/r2 blocker). Order is load-bearing.
+        const body = this.streamingBody ?? this.openStream();
+        this.streamText += frame.text;
+        renderMarkdown(this.streamText, body, { streaming: true });
         if (live) this.bumpUnread();
         this.scrollToEnd();
         break;
@@ -171,16 +186,25 @@ export class ChatView {
   }
 
   private openStream(): HTMLElement {
-    if (this.streamingBubble !== null) return this.streamingBubble;
+    if (this.streamingBody !== null) return this.streamingBody;
     const bubble = el('div', 'msg msg--gru msg--streaming');
+    const body = el('div', 'msg__body');
+    bubble.append(body);
     this.streamingBubble = bubble;
+    this.streamingBody = body;
+    this.streamText = '';
     this.log.append(bubble);
-    return bubble;
+    return body;
   }
 
   private closeStream(): void {
+    // Turn end = the document is complete: finalize the render so held
+    // streaming fragments (partial fence markers etc.) resolve per GFM.
+    if (this.streamingBody !== null) renderMarkdown(this.streamText, this.streamingBody);
     this.streamingBubble?.classList.remove('msg--streaming');
     this.streamingBubble = null;
+    this.streamingBody = null;
+    this.streamText = '';
   }
 
   /** A dropped socket mid-turn leaves the bubble marked incomplete. */

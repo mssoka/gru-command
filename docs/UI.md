@@ -116,6 +116,46 @@ belongs to the E9 token flow.
 after re-auth; replay ends exactly when the stream reaches the
 `auth_ok` high-water mark.
 
+## Message rendering (GFM contract — issue #10)
+
+**USER CANON: users must never see raw markdown output** — especially
+when chatting with Gru. Assistant replies render through the GFM-subset
+renderer (`web/src/lib/markdown.ts`, wired into the existing chat delta
+path in `web/src/ui/chat.ts`); user messages stay plain text.
+
+| Construct | Behavior |
+|---|---|
+| Headers (`#`…`######`) | real `h1`–`h6` elements, scaled for bubble context |
+| GFM tables | real `<table>` with `thead`/`tbody`; `:--:` alignments honored; `\|` escapes; header-only rows (separator still streaming) still render as a table |
+| Fenced code (``` and ~~~) | `<pre class="md-code"><code>` + language label; unclosed fences render as a growing block |
+| Lists | ordered/unordered, nesting by indentation |
+| Blockquotes, `---` rules | bordered quote, `<hr>` |
+| Inline | `**bold**`, `*italic*`, `~~strike~~`, `` `code` ``, `[links](https://…)` |
+| Links | only `http(s):`, `mailto:`, and site-relative hrefs are linkable; other schemes render as literal text. Images render as labelled links (no remote loading in v1) |
+| Raw HTML | NEVER parsed — displayed literally. The renderer builds DOM via `textContent`/`createTextNode` only (no `innerHTML` anywhere), so XSS-safety is structural |
+| Emoji | Unicode passthrough |
+
+**Streaming safety:** each delta re-renders the accumulated reply atomically
+(`replaceChildren` — one paint per delta, no flicker). Incomplete constructs
+hold stable: an open fence grows as a code block, a table streams row by
+row, and a trailing partial marker (1–2 backticks, a bare `#`, a growing
+`---`) is held back until more deltas arrive or the turn ends (turn end
+re-renders once in final mode). Soft newlines inside paragraphs render as
+`<br>` (chat convention).
+
+**The invariant gate (hard v1 acceptance):**
+`web/src/ui/chat-gfm-invariant.test.ts` streams a Gru reply containing a
+table + code block through the real `ChatView.addFrame` path and FAILS if
+raw pipes/fences reach the DOM — asserted at every streaming prefix, not
+just at rest. Mutation-proven: disabling the renderer (raw text-node path)
+turns the gate red (both delta-only and full disable — run the mutation
+yourself when touching the renderer; the recipe is in the test header).
+Renderer construct coverage is pinned in `web/src/lib/markdown.test.ts`.
+
+**Boundary:** the E6 transcript drawer (`web/src/ui/transcript.ts`) still
+shows entry text as plain text — a different surface; GFM there is a
+follow-up lane, not part of this contract.
+
 ## Views
 
 - **Pairing** — token field + QR (encodes `{url, token}` JSON payload
@@ -125,9 +165,10 @@ after re-auth; replay ends exactly when the stream reaches the
   real, localhost or LAN — the token is per-install, never a guess.
 - **Chat** — desktop: panel (default tab); mobile (≤768px): corner
   bubble that opens a bottom sheet (same DOM reparented via matchMedia;
-  unread badge counts deltas arriving while closed). Streaming deltas
-  render token-by-token with a caret; tool activity is a live status
-  line.
+  unread badge counts deltas arriving while closed). Gru replies render as
+  GFM markdown (see the [rendering contract](#message-rendering-gfm-contract--issue-10));
+  streaming deltas re-render token-by-token with a caret; tool activity is
+  a live status line. User messages stay plain text.
 - **Board (E6)** — desktop tab `🗺️ Board`: repo-grouped job cards, round
   rows with 7 per-lens live chips, agent rail, transcripts list,
   notification center (see [BOARD.md](./BOARD.md)). **Phone:
@@ -144,9 +185,10 @@ after re-auth; replay ends exactly when the stream reaches the
 ## Tests
 
 - Unit (`npm run test:web`, vitest): protocol validators, theme
-  fallback, and chat-client contract tests against an in-test WS server
+  fallback, chat-client contract tests against an in-test WS server
   (send/ack, offline queue, reload survival, reconnect replay dedup,
-  bad-token fatal, malformed frames).
+  bad-token fatal, malformed frames), the GFM markdown renderer suite,
+  and the raw-markdown invariant gate (issue #10 — happy-dom DOM tests).
 - E2E (`npm run e2e`, Playwright, serial, two projects):
   - **mock** — the dev-only mock via vite preview: pair → chat → streamed
     reply, reload keeps history, socket-drop recovery, mobile sheet,
