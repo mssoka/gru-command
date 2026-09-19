@@ -13,7 +13,8 @@ import { NotificationCenter } from './notifications/center.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
 import { DispatchService } from './dispatch/service.js';
-import { UnavailableWorktreePort } from './dispatch/worktree-port.js';
+import { WorktreeManager } from './worktrees/manager.js';
+import { createWorktreeServer } from './worktrees/server.js';
 import { GhPrPoster, WaveRunner } from './dispatch/perkins.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { createDispatchServer } from './dispatch/server.js';
@@ -287,19 +288,40 @@ async function main(): Promise<number> {
   state.board = board;
   logger.info('ledger ready', { db_path: ledgerDb.dbPath });
 
-  // Dispatch flow (E8): the worktree subsystem is a PORT. The manager
-  // implementation lands as its own lane (Perkins r4 split); until it
-  // merges, the port is unavailable and dispatch fails loud, never silent.
-  const worktreePort = new UnavailableWorktreePort();
+  // Worktree manager (SPEC ruling 18; its own review lane): the port the
+  // dispatch flow rides on, plus the release/answer endpoints it owns.
+  const worktreeManager = new WorktreeManager({
+    ledger,
+    root: config.worktrees.root,
+    preserveRoot: config.worktrees.preserveRoot,
+    setupTimeoutMs: config.worktrees.setupTimeoutMs,
+    onSweepPaused: ({ worktree, processes }) => {
+      notifications.post({
+        kind: 'worktree-sweep-paused',
+        routing: 'action-required',
+        severity: 'info',
+        title: `Worktree sweep paused: live processes in ${worktree.repoName}`,
+        detail:
+          `${processes.length} process(es) rooted in ${worktree.path} ` +
+          `(pids ${processes.map((p) => p.pid).join(', ')}) — acknowledge to confirm removal`,
+      });
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const worktreeServer = createWorktreeServer({
+    config,
+    manager: worktreeManager,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   const dispatcher = new DispatchService({
     ledger,
-    worktrees: worktreePort,
+    worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const wave = new WaveRunner({
     ledger,
-    worktrees: worktreePort,
+    worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
     poster: new GhPrPoster(),
     escalate: (title, detail) => {
@@ -334,7 +356,9 @@ async function main(): Promise<number> {
       staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)),
       supervisionStatus: () => supervisorLive.status(),
       requestHook: (req, res, path) =>
-        dispatchServer.requestHook(req, res, path) || board.requestHook(req, res, path),
+        worktreeServer.requestHook(req, res, path) ||
+        dispatchServer.requestHook(req, res, path) ||
+        board.requestHook(req, res, path),
     },
   );
   state.handle = await service.start();

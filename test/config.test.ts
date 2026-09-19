@@ -489,6 +489,43 @@ describe('supervision / logging / chat tables (E7)', () => {
   });
 });
 
+describe('worktrees config (E8, manager lane)', () => {
+  it('defaults: worktrees live under data_dir', () => {
+    const home = tmpHome();
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.worktrees).toEqual({
+      root: join(home, 'worktrees'),
+      preserveRoot: join(home, 'worktree-preserves'),
+      setupTimeoutMs: 120_000,
+    });
+  });
+
+  it('honors custom roots (tilde-expanded) and the setup budget', () => {
+    const home = tmpHome();
+    writeConfig(
+      home,
+      ['[worktrees]', 'root = "~/wt"', 'preserve_root = "~/kept"', 'setup_timeout_ms = 5000', ''].join('\n'),
+    );
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.worktrees.root).toBe('/home/tester/wt');
+    expect(config.worktrees.preserveRoot).toBe('/home/tester/kept');
+    expect(config.worktrees.setupTimeoutMs).toBe(5_000);
+  });
+
+  it('fail-loud: unknown keys, empty root, non-positive budget', () => {
+    const bad: readonly string[] = [
+      '[worktrees]\nunknown = 1\n',
+      '[worktrees]\nsetup_timeout_ms = 0\n',
+      '[worktrees]\nroot = ""\n',
+    ];
+    for (const text of bad) {
+      const home = tmpHome();
+      writeFileSync(join(home, 'config.toml'), text, 'utf-8');
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
+});
+
 describe('dispatch config (E8)', () => {
   it('Bob runs hourly by default', () => {
     const home = tmpHome();

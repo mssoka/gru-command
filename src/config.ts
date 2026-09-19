@@ -81,6 +81,16 @@ export interface ChatConfig {
   readonly frameLogKeep: number;
 }
 
+/** Worktree manager policy (E8; SPEC ruling 18). */
+export interface WorktreesConfig {
+  /** Root under which job/review worktrees are created. */
+  readonly root: string;
+  /** Where preserved untracked deliverables land on sweep. */
+  readonly preserveRoot: string;
+  /** Budget per one-time bootstrap setup command (ms). */
+  readonly setupTimeoutMs: number;
+}
+
 /** Dispatch flow policy (E8). */
 export interface DispatchConfig {
   /** Bob's periodic consolidation interval; 0 disables the trigger. */
@@ -98,6 +108,7 @@ export interface GruCommandConfig {
   readonly supervision: SupervisionConfig;
   readonly logging: LoggingConfig;
   readonly chat: ChatConfig;
+  readonly worktrees: WorktreesConfig;
   readonly dispatch: DispatchConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
@@ -199,6 +210,7 @@ const TOP_LEVEL_KEYS = [
   'supervision',
   'logging',
   'chat',
+  'worktrees',
   'dispatch',
 ] as const;
 
@@ -367,6 +379,7 @@ export function loadConfig(
   };
   let logging: LoggingConfig = { maxBytes: 10_485_760, keep: 5 };
   let chat: ChatConfig = { frameLogMaxBytes: 8_388_608, frameLogKeep: 3 };
+  let worktrees: WorktreesConfig | null = null;
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
   let sourceFile: string | null = null;
 
@@ -593,6 +606,23 @@ export function loadConfig(
         frameLogKeep: table['frame_log_keep'] !== undefined ? requirePositiveInt(table['frame_log_keep'], file, 'chat.frame_log_keep') : chat.frameLogKeep,
       };
     }
+    if (raw['worktrees'] !== undefined) {
+      const table = requireTable(raw['worktrees'], file, 'worktrees');
+      for (const key of Object.keys(table)) {
+        if (!['root', 'preserve_root', 'setup_timeout_ms'].includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [worktrees] (valid keys: root, preserve_root, setup_timeout_ms)`,
+            file,
+            `worktrees.${key}`,
+          );
+        }
+      }
+      worktrees = {
+        root: table['root'] !== undefined ? expandTilde(requireString(table['root'], file, 'worktrees.root'), home) : '',
+        preserveRoot: table['preserve_root'] !== undefined ? expandTilde(requireString(table['preserve_root'], file, 'worktrees.preserve_root'), home) : '',
+        setupTimeoutMs: table['setup_timeout_ms'] !== undefined ? requirePositiveInt(table['setup_timeout_ms'], file, 'worktrees.setup_timeout_ms') : 120_000,
+      };
+    }
     if (raw['dispatch'] !== undefined) {
       const table = requireTable(raw['dispatch'], file, 'dispatch');
       for (const key of Object.keys(table)) {
@@ -652,6 +682,13 @@ export function loadConfig(
     supervision,
     logging,
     chat,
+    worktrees: {
+      root: resolve(worktrees !== null && worktrees.root !== '' ? worktrees.root : join(dataDir, 'worktrees')),
+      preserveRoot: resolve(
+        worktrees !== null && worktrees.preserveRoot !== '' ? worktrees.preserveRoot : join(dataDir, 'worktree-preserves'),
+      ),
+      setupTimeoutMs: worktrees?.setupTimeoutMs ?? 120_000,
+    },
     dispatch,
     sourceFile,
     instanceDir,
