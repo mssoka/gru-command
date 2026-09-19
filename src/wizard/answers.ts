@@ -13,6 +13,8 @@ import { expandTilde, ROLES, RUNTIME_IDS, type Role, type RuntimeId } from '../c
  * nothing written.
  */
 
+export type BmadRepoAction = 'install' | 'reuse' | 'skip';
+
 export interface WizardAnswers {
   /** Raw workspace-root string as answered (`~`-form preserved in output). */
   readonly workspaceRoot: string;
@@ -31,6 +33,12 @@ export interface WizardAnswers {
   readonly token: string;
   readonly registerService: boolean;
   readonly smoke: boolean;
+  /** Jev remains opt-in; provider credentials are never valid answer fields. */
+  readonly jevEnabled: boolean;
+  /** Explicit consent to persist OPENROUTER_API_KEY through child stdin. */
+  readonly persistEnvCredential: boolean;
+  /** Per-selected-repo BMAD action. Fresh defaults to install; existing to reuse. */
+  readonly bmad: Readonly<Record<string, BmadRepoAction>>;
 }
 
 /** Error class for answers validation — message is the whole UX. */
@@ -53,6 +61,9 @@ const ANSWER_KEYS = [
   'token',
   'register_service',
   'smoke',
+  'jev_enabled',
+  'persist_env_credential',
+  'bmad',
 ] as const;
 
 export const DEFAULT_WORKSPACE_ROOT = '~/code';
@@ -193,6 +204,9 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
       }
       return name;
     });
+    if (new Set(repos).size !== repos.length) {
+      throw new AnswersError('answers.repos must not contain duplicate repo names');
+    }
     const workspaceAbs = expandTilde(workspaceRoot, home);
     for (const name of repos) {
       const repoDir = join(workspaceAbs, name);
@@ -263,10 +277,42 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
   for (const [field, value] of [
     ['register_service', raw['register_service']],
     ['smoke', raw['smoke']],
+    ['jev_enabled', raw['jev_enabled']],
+    ['persist_env_credential', raw['persist_env_credential']],
   ] as const) {
     if (value !== undefined && typeof value !== 'boolean') {
       throw new AnswersError(`answers.${field} must be a boolean, got ${typeof value}`);
     }
+  }
+
+  const bmad: Record<string, BmadRepoAction> = {};
+  const workspaceAbs = expandTilde(workspaceRoot, home);
+  for (const repo of repos) {
+    bmad[repo] = existsSync(join(workspaceAbs, repo, '_bmad', '_config', 'manifest.yaml'))
+      ? 'reuse'
+      : 'install';
+  }
+  if (raw['bmad'] !== undefined) {
+    if (!isPlainObject(raw['bmad'])) {
+      throw new AnswersError('answers.bmad must be an object of selected repo → install | reuse | skip');
+    }
+    for (const [repo, action] of Object.entries(raw['bmad'])) {
+      if (!repos.includes(repo)) {
+        throw new AnswersError(`answers.bmad names unselected repo \`${repo}\``);
+      }
+      if (!['install', 'reuse', 'skip'].includes(String(action))) {
+        throw new AnswersError(
+          `answers.bmad.${repo} must be "install", "reuse", or "skip", got: ${JSON.stringify(action)}`,
+        );
+      }
+      bmad[repo] = action as BmadRepoAction;
+    }
+  }
+
+  const jevEnabled = raw['jev_enabled'] === true;
+  const persistEnvCredential = raw['persist_env_credential'] === true;
+  if (persistEnvCredential && !jevEnabled) {
+    throw new AnswersError('answers.persist_env_credential requires answers.jev_enabled=true');
   }
 
   return {
@@ -281,5 +327,8 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     token,
     registerService: raw['register_service'] === true,
     smoke: raw['smoke'] !== false,
+    jevEnabled,
+    persistEnvCredential,
+    bmad,
   };
 }

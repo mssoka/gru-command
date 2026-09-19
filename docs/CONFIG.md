@@ -16,16 +16,29 @@ The config file is always `<instance dir>/config.toml`.
 ## The setup wizard
 
 The setup wizard (`npm run wizard`, or `node dist/wizard/main.js`) is
-the supported way to create this file: it probes installed runtime
-CLIs, asks for the workspace root and managed repos, and writes a
-config that matches this schema exactly — the `"default"` sentinel for
-models/thinking (SPEC ruling 16), a generated `[auth]` token, and the
-bind host/port. Non-interactive runs take `--answers '<json>'`
-(unspecified answers = documented defaults; invalid answers fail loud
-with NOTHING written). Re-running the wizard over an existing
-`config.toml` copies it to `config.toml.backup-<timestamp>` first; a
-failed backup aborts before any write. Hand edits are first-class: the
-wizard never rewrites a file you did not point it at.
+the supported installation path. It reads prompts from `/dev/tty`, so a
+`curl | bash` install remains one invocation, probes runtime CLIs, asks
+for managed repos, offers per-repo BMAD onboarding, and writes the same
+**complete teaching config** as the generator below. Every concrete
+default is active; optional role/runtime overrides are shown commented
+because activating a placeholder would change precedence.
+
+True headless use is explicit: `--no-interact` accepts documented
+defaults, and optional `--answers '<json>'` may contain only non-secret
+choices. Invalid answers fail before config writes. Neither path
+replaces an existing config without `--force`; force first creates a
+timestamped 0600 backup and aborts if backup creation fails.
+
+Generate without the rest of onboarding using:
+
+```bash
+npm run config:generate                 # writes <instance>/config.toml
+npm run config:generate -- --force      # backup, then atomic replacement
+npm run config:generate -- --enable-jev # explicit opt-in + visible check
+```
+
+`docs/example.config.toml` is copy-only documentation. Editing it never
+changes the running application.
 
 The instance dir also carries state that is NOT config and has no keys
 here: `sessions/`, `chat/`, `logs/`, `ledger/`, `worktrees/` and
@@ -59,7 +72,8 @@ created at boot — SPEC ruling 19).
 workspace_root = "~/code"
 
 # Root: the per-instance data directory (config, identity, logs, sessions).
-# Default: ~/.gru-command  (i.e. the instance dir itself)
+# Default: the active instance dir (`~/.gru-command` normally; the exact
+# absolute GRU_COMMAND_HOME when generating a test/multi-instance config).
 data_dir = "~/.gru-command"
 
 [server]
@@ -222,4 +236,10 @@ built) and the chat socket. `/health` surfaces a summary
 [RUNTIMES.md](./RUNTIMES.md) for the capability matrix, fallback
 semantics, and the session-store contract, and
 [SUPERVISION.md](./SUPERVISION.md) for the supervision policy the
-`[supervision]` table drives plus the log-rotation knobs.
+`[supervision]` table drives plus the log-rotation knobs. The optional
+DecisionService consumes `[decisions.*]`; `enabled = false` performs no
+credential resolution or provider request. Provision a restart-safe key
+locally with masked wizard entry or `node dist/decisions/cli.js
+credentials set --stdin`, then verify with `check --json`. The protected
+credential file is owner-only plaintext-at-rest under the instance
+`credentials/` directory; it is never copied into config or backups.

@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { writeDecisionsCliFixture } from './helpers/decisions-cli.js';
 
 /**
  * Interactive wizard under a REAL PTY (Perkins r2 T1): the documented
@@ -24,6 +25,8 @@ function tempDir(prefix: string): string {
   cleanupDirs.push(dir);
   return dir;
 }
+
+const decisionsCliPath = writeDecisionsCliFixture(tempDir('gru-command-pty-decisions-'));
 
 function fixtureWorkspace(): string {
   const workspace = tempDir('gru-command-pty-ws-');
@@ -68,7 +71,11 @@ function ptyWizard(
   let status = 0;
   try {
     out = execFileSync('expect', ['-c', script.join('\n')], {
-      env: { ...process.env, ...env },
+      env: {
+        ...process.env,
+        GRU_COMMAND_TEST_DECISIONS_CLI: decisionsCliPath,
+        ...env,
+      },
       encoding: 'utf-8',
       timeout: 110_000,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -92,12 +99,17 @@ function expectAvailable(): boolean {
 
 const WS_PROMPT = 'Workspace root (holds ONLY your managed repos)';
 const REPOS_PROMPT = 'Managed repos — comma-separated numbers or names';
+const BMAD_A_PROMPT = 'BMAD in repo-a';
+const BMAD_B_PROMPT = 'BMAD in repo-b';
 const RUNTIME_PROMPT = 'Default runtime — ';
 const MODEL_PROMPT = 'Model reference';
 const THINKING_PROMPT = 'Thinking level';
 const HOST_PROMPT = 'Bind host';
 const PORT_PROMPT = 'Bind port';
 const TOKEN_PROMPT = 'Pairing token';
+const JEV_PROMPT = 'Enable optional Jev decisions provider';
+const JEV_LOCAL_PROMPT = 'Enter and persist an OpenRouter key locally';
+const JEV_MASKED_PROMPT = 'OpenRouter key (input hidden)';
 const REGISTER_PROMPT = 'Register the OS service';
 const SMOKE_PROMPT = 'first-boot smoke test now';
 
@@ -113,12 +125,15 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       [
         { expect: WS_PROMPT, send: workspace },
         { expect: REPOS_PROMPT, send: '' }, // default = all found
+        { expect: BMAD_A_PROMPT, send: 'n' },
+        { expect: BMAD_B_PROMPT, send: 'n' },
         { expect: RUNTIME_PROMPT, send: '' }, // default runtime
         { expect: MODEL_PROMPT, send: '' }, // "default" sentinel
         { expect: THINKING_PROMPT, send: '' }, // "default" sentinel
         { expect: HOST_PROMPT, send: '' }, // 127.0.0.1
         { expect: PORT_PROMPT, send: '0' }, // ephemeral: smoke-safe on a busy machine
         { expect: TOKEN_PROMPT, send: '' }, // generated
+        { expect: JEV_PROMPT, send: 'n' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: '' }, // yes (default) — real smoke
       ],
@@ -128,12 +143,93 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(output).toContain('Repos under the workspace root:');
     expect(output).toContain('1. repo-a');
     expect(output).toContain('2. repo-b');
-    expect(output).toContain('Managed repos (board grouping): repo-a, repo-b');
+    expect(output).toContain('Selected repos for BMAD onboarding: repo-a, repo-b');
     expect(output).toContain('Smoke green');
     expect(output).toContain('Setup complete');
     const config = readFileSync(join(instance, 'config.toml'), 'utf-8');
     expect(config).toContain('port = 0');
     expect(config).toContain(`workspace_root = "${workspace}"`);
+  }, 120_000);
+
+  it('Enter accepts the default-on fresh BMAD action and reaches ready state', () => {
+    const workspace = fixtureWorkspace();
+    execFileSync('git', ['-C', join(workspace, 'repo-a'), 'init', '-q']);
+    const instance = tempDir('gru-command-pty-bmad-default-');
+    const bin = tempDir('gru-command-pty-bmad-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(
+      join(bin, 'npx'),
+      [
+        '#!/usr/bin/env node',
+        "const { mkdirSync, writeFileSync } = require('node:fs');",
+        "const { join } = require('node:path');",
+        "if (process.argv.includes('--version')) { console.log('10.0.0'); process.exit(0); }",
+        "const root = process.cwd();",
+        "const manifest = ['installation:', '  version: 6.12.0', 'modules:', '  - name: core', '    version: 6.12.0', '  - name: bmm', '    version: 6.12.0', '  - name: cis', '    version: v0.3.2', '  - name: tea', '    version: v1.27.2', '  - name: gds', '    version: v0.7.2', 'ides:', '  - pi', ''].join('\\n');",
+        "for (const module of ['core','bmm','cis','tea','gds']) { mkdirSync(join(root, '_bmad', module), { recursive: true }); writeFileSync(join(root, '_bmad', module, 'marker.txt'), module + '\\n'); }",
+        "mkdirSync(join(root, '_bmad', '_config'), { recursive: true }); writeFileSync(join(root, '_bmad', '_config', 'manifest.yaml'), manifest);",
+        "for (const skill of ['bmad-build','bmad-help','gds-quick-dev']) { const dir=join(root,'.agents','skills',skill); mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,'SKILL.md'),'# skill\\n'); writeFileSync(join(dir,'workflow.md'),'{{.implementation_artifacts}}\\n'); }",
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const { output, status } = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '1' },
+        { expect: BMAD_A_PROMPT, send: '' },
+        { expect: RUNTIME_PROMPT, send: '' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: '' },
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: JEV_PROMPT, send: 'n' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+      ],
+      {
+        GRU_COMMAND_HOME: instance,
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+      },
+    );
+    expect(status, output).toBe(0);
+    expect(output).toContain('  repo-a: install');
+    expect(output).toContain('BMAD ready in repo-a');
+    expect(existsSync(join(workspace, 'repo-a', '.gru-command', 'bmad-install.json'))).toBe(true);
+  }, 120_000);
+
+  it('Jev local credential entry is masked and reaches only the protected child-stdin store', () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-jev-');
+    const secret = 'sk-or-v1-masked-fixture';
+    const { output, status } = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '' },
+        { expect: BMAD_A_PROMPT, send: 'n' },
+        { expect: BMAD_B_PROMPT, send: 'n' },
+        { expect: RUNTIME_PROMPT, send: '' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: '' },
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: JEV_PROMPT, send: 'y' },
+        { expect: JEV_LOCAL_PROMPT, send: 'y' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+        { expect: JEV_MASKED_PROMPT, send: secret },
+      ],
+      { GRU_COMMAND_HOME: instance, JEV_FIXTURE_READY: '1' },
+    );
+    expect(status, output).toBe(0);
+    expect(output).toContain('Jev readiness: ready');
+    expect(output).not.toContain(secret);
+    expect(readFileSync(join(instance, 'credentials', 'openrouter.key'), 'utf-8')).toBe(
+      `${secret}\n`,
+    );
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).not.toContain(secret);
   }, 120_000);
 
   it('every prompt loop retries on invalid input, then accepts the valid answer', () => {
@@ -144,6 +240,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: WS_PROMPT, send: 'code' }, // ✗ relative
         { expect: WS_PROMPT, send: workspace }, // retried, valid
         { expect: REPOS_PROMPT, send: '' },
+        { expect: BMAD_A_PROMPT, send: 'n' },
+        { expect: BMAD_B_PROMPT, send: 'n' },
         { expect: RUNTIME_PROMPT, send: 'vim' }, // ✗ unknown runtime
         { expect: RUNTIME_PROMPT, send: '' }, // retried, default
         { expect: MODEL_PROMPT, send: '' },
@@ -153,6 +251,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: PORT_PROMPT, send: '99999' }, // ✗ out of range
         { expect: PORT_PROMPT, send: '0' }, // retried, ephemeral
         { expect: TOKEN_PROMPT, send: '' },
+        { expect: JEV_PROMPT, send: 'n' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: 'n' }, // this leg is about the prompts
       ],
@@ -176,20 +275,22 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       [
         { expect: WS_PROMPT, send: workspace },
         { expect: REPOS_PROMPT, send: '1' }, // by index → repo-a
+        { expect: BMAD_A_PROMPT, send: 'n' },
         { expect: RUNTIME_PROMPT, send: '' },
         { expect: MODEL_PROMPT, send: '' },
         { expect: THINKING_PROMPT, send: '' },
         { expect: HOST_PROMPT, send: '' },
         { expect: PORT_PROMPT, send: '0' },
         { expect: TOKEN_PROMPT, send: '' },
+        { expect: JEV_PROMPT, send: 'n' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: 'n' },
       ],
       { GRU_COMMAND_HOME: instance },
     );
     expect(status, output).toBe(0);
-    expect(output).toContain('Managed repos (board grouping): repo-a');
-    expect(output).not.toContain('board grouping): repo-a, repo-b');
+    expect(output).toContain('Selected repos for BMAD onboarding: repo-a');
+    expect(output).not.toContain('BMAD onboarding: repo-a, repo-b');
   }, 120_000);
 
   it('managed-repo multi-pick by NAME (comma-separated) selects exactly those repos', () => {
@@ -199,12 +300,15 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       [
         { expect: WS_PROMPT, send: workspace },
         { expect: REPOS_PROMPT, send: 'repo-b, repo-a' }, // by name, comma-separated
+        { expect: BMAD_B_PROMPT, send: 'n' },
+        { expect: BMAD_A_PROMPT, send: 'n' },
         { expect: RUNTIME_PROMPT, send: '' },
         { expect: MODEL_PROMPT, send: '' },
         { expect: THINKING_PROMPT, send: '' },
         { expect: HOST_PROMPT, send: '' },
         { expect: PORT_PROMPT, send: '0' },
         { expect: TOKEN_PROMPT, send: '' },
+        { expect: JEV_PROMPT, send: 'n' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: 'n' },
       ],
@@ -213,7 +317,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(status, output).toBe(0);
     // The grouping line preserves the ANSWERED order (the discovery list
     // is sorted; the pick is the user's sequence).
-    expect(output).toContain('Managed repos (board grouping): repo-b, repo-a');
+    expect(output).toContain('Selected repos for BMAD onboarding: repo-b, repo-a');
   }, 120_000);
 });
 

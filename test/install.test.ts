@@ -44,10 +44,12 @@ describe('install.sh --print rendering', () => {
     if (process.platform === 'darwin') {
       expect(stdout).toContain('<key>Label</key>');
       expect(stdout).toContain('<string>com.gru-command.service</string>');
+      expect(stdout).toContain('<string>gru-command-install-v2</string>');
       expect(stdout).toContain('<key>KeepAlive</key>');
       expect(stdout).toContain('<key>SuccessfulExit</key>');
     } else {
       expect(stdout).toContain('[Unit]');
+      expect(stdout).toContain('X-GruCommandManagedBy=gru-command-install-v2');
       expect(stdout).toContain('Restart=on-failure');
       expect(stdout).toContain('WantedBy=default.target');
     }

@@ -9,6 +9,8 @@
 <dict>
   <key>Label</key>
   <string>com.gru-command.service</string>
+  <key>GruCommandManagedBy</key>
+  <string>gru-command-install-v2</string>
 
   <key>ProgramArguments</key>
   <array>

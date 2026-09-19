@@ -52,20 +52,14 @@ One line (macOS + Linux, Node ≥ 22.19, git):
 curl -fsSL https://raw.githubusercontent.com/mssoka/gru-command/main/install.sh | bash
 ```
 
-That clones the repo to `~/gru-command`, installs dependencies, and
-builds. A piped shell has no terminal, so it stops there and prints the
-exact command that finishes setup — run it in your terminal:
-
-```bash
-bash ~/gru-command/install.sh
-```
-
-That runs the interactive **setup wizard**: it detects your installed
-agent runtimes (`pi`, Claude Code), asks for your workspace root and
-which repos live in it, picks runtime/model/thinking defaults, writes
-`~/.gru-command/config.toml` (backing up any previous one), shows the
-pairing QR for your phone, smoke-tests first boot, and can register the
-OS service — the wizard fails loud rather than guessing.
+That single invocation clones to `~/gru-command`, installs dependencies,
+builds the service and web UI, and runs the setup wizard through
+`/dev/tty` even though the script itself is piped. The wizard detects
+`pi`/Claude Code, selects managed repos, writes the complete commented
+live config at `~/.gru-command/config.toml`, smoke-tests first boot, and
+can register/start the owned OS service. A truly headless environment
+fails immediately with the exact `--no-interact` command instead of
+hanging.
 
 Or clone it yourself and run the wizard in one go:
 
@@ -75,15 +69,56 @@ cd gru-command
 ./install.sh            # deps + build, then the wizard
 ```
 
-Non-interactive (every answer defaults; the JSON may omit anything):
+Explicit non-interactive defaults (the JSON is optional; provider credentials
+are rejected and must never be placed in it). Omit `token` to generate the
+pairing token privately in-process; an explicitly supplied token is an ordinary
+command-line argument and may be visible to local process inspection:
 
 ```bash
-./install.sh --answers '{}'
+./install.sh --no-interact
+./install.sh --no-interact --answers '{}'
 ```
 
-You need one agent-runtime CLI installed for agents to actually spawn
-(`pi` or `claude`) — the wizard warns and proceeds without one, and the
-adapters fail loud at spawn time until it exists.
+Re-running the one-liner or `./install.sh` for a configured instance is
+a safe updater: it refuses a dirty/diverged clone, uses
+`git pull --ff-only`, installs dependencies, rebuilds, preserves the
+config, and restarts only a service unit that names this exact
+repo/instance. Generate a fresh complete config separately with:
+
+```bash
+npm run config:generate                 # refuses an existing file
+npm run config:generate -- --force      # timestamped 0600 backup first
+```
+
+The wizard can enable optional Jev decisions (default off). Credential
+status is offline and sanitized; masked local entry is sent only to
+`dist/decisions/cli.js credentials set --stdin`. An environment key is
+never copied without explicit consent, and environment-only use warns
+that launchd/systemd may not inherit it.
+
+### Project-local BMAD setup
+
+For each selected managed repo—not the workspace root and never every
+discovered directory—the wizard offers official BMAD setup, default on
+for fresh repos. This release pins `bmad-method@6.12.0` and installs all
+four approved defaults: `bmm,cis,tea,gds` (core is implicit), with
+external pins `cis=v0.3.2`, `tea=v1.27.2`, `gds=v0.7.2`. Runtime bindings
+follow the selected `pi`/Claude tools. Existing/customized installs
+default to **reuse unchanged**; per-repo skip is always available.
+
+Successful setup records exact versions in
+`.gru-command/bmad-install.json`, adds an idempotent owned bootstrap
+block to `.gru-command/worktree.toml`, and uses narrow Git-local excludes
+for generated paths. It does not blanket-ignore `.agents/`, `.claude/`,
+or `_bmad-output/`, and never untracks files. Commit the three
+`.gru-command/` bootstrap files so newly-created worktrees can copy an
+isolated project-local BMAD install and discover `bmad-build`; generated
+skills/output remain local. Network/prerequisite/partial failures name
+the repo and require retry or explicit skip—no false-ready state.
+
+You need the selected runtime CLI (`pi` or `claude`) for agents and `uv`
+for BMAD workflows. Missing prerequisites are reported before a repo is
+marked BMAD-ready.
 
 ## Run
 
@@ -127,7 +162,7 @@ console, forensics and backups:
 ```bash
 npm install
 npm test        # lint + typecheck + build + full offline suite
-npm run wizard  # re-run the setup wizard (interactive; backs up config.toml)
+npm run wizard  # fresh wizard; use -- --force to replace config with backup
 ```
 
 The default test suite runs fully offline (stub model provider, stubbed

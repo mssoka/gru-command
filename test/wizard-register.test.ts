@@ -3,6 +3,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symli
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { writeDecisionsCliFixture } from './helpers/decisions-cli.js';
 
 /**
  * Wizard OS-service registration step (Perkins r1 W9): the REAL built
@@ -52,11 +53,16 @@ function buildFixture(exitCode: number): { fixture: string; marker: string; inst
 }
 
 function runWizard(fixture: string, instance: string, answers: string) {
+  const decisionsCli = writeDecisionsCliFixture(join(fixture, 'test-decisions'));
   return spawnSync(
     process.execPath,
     [join(fixture, 'dist', 'wizard', 'main.js'), '--answers', answers],
     {
-      env: { ...process.env, GRU_COMMAND_HOME: instance },
+      env: {
+        ...process.env,
+        GRU_COMMAND_HOME: instance,
+        GRU_COMMAND_TEST_DECISIONS_CLI: decisionsCli,
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 60_000,
     },

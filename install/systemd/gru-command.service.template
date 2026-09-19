@@ -9,6 +9,7 @@
 
 [Unit]
 Description=Gru Command — multi-agent orchestrator service
+X-GruCommandManagedBy=gru-command-install-v2
 After=network-online.target
 
 [Service]

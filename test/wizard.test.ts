@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig, configPathFor } from '../src/config.js';
 import { probeRuntimes } from '../src/runtime/probe.js';
 import { formatHostForUrl, runFirstBootSmoke } from '../src/wizard/main.js';
+import { writeDecisionsCliFixture } from './helpers/decisions-cli.js';
 import {
   AnswersError,
   generateToken,
@@ -18,6 +19,7 @@ import {
   buildQrPayload,
   discoverManagedRepos,
   generateConfigToml,
+  writeConfigText,
   writeInstanceConfig,
 } from '../src/wizard/steps.js';
 
@@ -28,6 +30,7 @@ import {
  * screen, managed-repo discovery, and no-runtime warn-and-proceed data.
  */
 
+const repoRoot = join(import.meta.dirname, '..');
 const cleanupDirs: string[] = [];
 afterAll(() => {
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
@@ -37,6 +40,29 @@ function tempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   cleanupDirs.push(dir);
   return dir;
+}
+
+const decisionsFixtureRoot = tempDir('gru-command-decisions-fixture-');
+const decisionsCliPath = writeDecisionsCliFixture(decisionsFixtureRoot);
+
+function writeWizardConfig(
+  instanceDir: string,
+  answers = parseAnswers('{}'),
+  home?: string,
+  force = false,
+) {
+  return writeInstanceConfig({
+    instanceDir,
+    answers,
+    repoRoot,
+    home,
+    force,
+    decisionsCliPath,
+  });
+}
+
+function generateWizardConfig(instanceDir: string, answers = parseAnswers('{}')): string {
+  return generateConfigToml({ answers, instanceDir, repoRoot, decisionsCliPath });
 }
 
 describe('wizard answers', () => {
@@ -53,6 +79,9 @@ describe('wizard answers', () => {
     expect(answers.token).not.toBe('');
     expect(answers.registerService).toBe(false);
     expect(answers.smoke).toBe(true);
+    expect(answers.jevEnabled).toBe(false);
+    expect(answers.persistEnvCredential).toBe(false);
+    expect(answers.bmad).toEqual({});
   });
 
   it('invalid answers fail loud, naming the field — nothing written anywhere', () => {
@@ -72,6 +101,8 @@ describe('wizard answers', () => {
       ['{"host":"1:2"}', /answers.host is not a valid IPv6/],
       ['{"host":"::ffff:999.1.1.1"}', /answers.host is not a valid IPv6/],
       ['{"token":""}', /answers.token must not be empty/],
+      ['{"persist_env_credential":true}', /requires answers.jev_enabled=true/],
+      ['{"openrouter_api_key":"secret"}', /unknown answers key `openrouter_api_key`/],
       ['{"frobnicate":1}', /unknown answers key `frobnicate`/],
       ['not json', /--answers is not valid JSON/],
     ];
@@ -101,6 +132,16 @@ describe('wizard answers', () => {
       JSON.stringify({ workspace_root: workspace, repos: ['repo-a', 'repo-b'] }),
     );
     expect(ok.repos).toEqual(['repo-a', 'repo-b']);
+    expect(ok.bmad).toEqual({ 'repo-a': 'install', 'repo-b': 'install' });
+    mkdirSync(join(workspace, 'repo-b', '_bmad', '_config'), { recursive: true });
+    writeFileSync(join(workspace, 'repo-b', '_bmad', '_config', 'manifest.yaml'), 'existing\n');
+    const defaultsByState = parseAnswers(
+      JSON.stringify({ workspace_root: workspace, repos: ['repo-a', 'repo-b'] }),
+    );
+    expect(defaultsByState.bmad).toEqual({ 'repo-a': 'install', 'repo-b': 'reuse' });
+    expect(() =>
+      parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['repo-a', 'repo-a'] })),
+    ).toThrow(/duplicate repo names/);
     // .git FILE (worktree pointer) counts; a plain directory does not.
     expect(() => parseAnswers(`{"workspace_root":"${workspace}","repos":["not-repo"]}`)).toThrow(
       /not a git repo under the workspace root/,
@@ -124,7 +165,7 @@ describe('wizard config generation', () => {
         token: 'wizard-test-token',
       }),
     );
-    const { configPath, backupPath } = writeInstanceConfig(instanceDir, answers, home);
+    const { configPath, backupPath } = writeWizardConfig(instanceDir, answers, home);
     expect(backupPath).toBeNull(); // first write: nothing to back up
     const config = loadConfig({ GRU_COMMAND_HOME: instanceDir }, home);
     expect(config.sourceFile).toBe(configPath);
@@ -141,28 +182,36 @@ describe('wizard config generation', () => {
 
   it('config, backup, and hardened rewrite are 0600 — the pairing token is never world-readable (Perkins r1 W5)', () => {
     const instanceDir = tempDir('gru-command-wizard-mode-');
-    const first = writeInstanceConfig(instanceDir, parseAnswers('{"token":"mode-one"}'), home);
+    const first = writeWizardConfig(instanceDir, parseAnswers('{"token":"mode-one"}'), home);
     // First write: 0600 by construction.
     expect(statSync(first.configPath).mode & 0o777).toBe(0o600);
-    // A pre-existing 0644 config (older install) is HARDENED by the rewrite.
+    // A pre-existing 0644 config (older install) is HARDENED only after explicit force.
     chmodSync(first.configPath, 0o644);
-    const second = writeInstanceConfig(instanceDir, parseAnswers('{"token":"mode-two"}'), home);
+    expect(() =>
+      writeWizardConfig(instanceDir, parseAnswers('{"token":"mode-two"}'), home),
+    ).toThrow(/without --force/);
+    const second = writeWizardConfig(
+      instanceDir,
+      parseAnswers('{"token":"mode-two"}'),
+      home,
+      true,
+    );
     expect(statSync(second.configPath).mode & 0o777).toBe(0o600);
     // The backup carries the token too — also owner-only.
     expect(second.backupPath).not.toBeNull();
     expect(statSync(second.backupPath!).mode & 0o777).toBe(0o600);
-    // No tmp file survives.
-    expect(existsSync(`${second.configPath}.tmp`)).toBe(false);
+    // No PID-suffixed tmp file survives.
+    expect(existsSync(`${second.configPath}.tmp-${process.pid}`)).toBe(false);
   });
 
   it('write-failure contracts: backup failure aborts with the original intact; write failure is named (Perkins r1 W12)', () => {
     // (a) Backup failure aborts BEFORE any write — the original stands.
     const instanceDir = tempDir('gru-command-wizard-wfail-');
-    writeInstanceConfig(instanceDir, parseAnswers('{"token":"original"}'), home);
+    writeWizardConfig(instanceDir, parseAnswers('{"token":"original"}'), home);
     chmodSync(instanceDir, 0o555); // read-only: the backup copy must fail
     try {
       expect(() =>
-        writeInstanceConfig(instanceDir, parseAnswers('{"token":"intruder"}'), home),
+        writeWizardConfig(instanceDir, parseAnswers('{"token":"intruder"}'), home, true),
       ).toThrow();
       expect(readFileSync(join(instanceDir, 'config.toml'), 'utf-8')).toContain('original');
     } finally {
@@ -173,11 +222,11 @@ describe('wizard config generation', () => {
     mkdirSync(emptyDir, { recursive: true });
     chmodSync(emptyDir, 0o555);
     try {
-      expect(() => writeInstanceConfig(emptyDir, parseAnswers('{}'), home)).toThrow(
+      expect(() => writeWizardConfig(emptyDir, parseAnswers('{}'), home)).toThrow(
         /failed to write .* atomically/,
       );
       expect(existsSync(join(emptyDir, 'config.toml'))).toBe(false);
-      expect(existsSync(join(emptyDir, 'config.toml.tmp'))).toBe(false);
+      expect(existsSync(join(emptyDir, `config.toml.tmp-${process.pid}`))).toBe(false);
     } finally {
       chmodSync(emptyDir, 0o755);
     }
@@ -187,9 +236,10 @@ describe('wizard config generation', () => {
     const instanceDir = tempDir('gru-command-wizard-cfg2-');
     const first = parseAnswers('{"token":"first-token"}');
     const second = parseAnswers('{"token":"second-token"}');
-    const w1 = writeInstanceConfig(instanceDir, first, home);
+    const w1 = writeWizardConfig(instanceDir, first, home);
     expect(w1.backupPath).toBeNull();
-    const w2 = writeInstanceConfig(instanceDir, second, home);
+    expect(() => writeWizardConfig(instanceDir, second, home)).toThrow(/without --force/);
+    const w2 = writeWizardConfig(instanceDir, second, home, true);
     expect(w2.backupPath).not.toBeNull();
     // Millisecond precision (Perkins r2 note): same-second reruns must
     // not clobber — the name carries ms.
@@ -200,23 +250,49 @@ describe('wizard config generation', () => {
     expect(backupTimestamp()).not.toContain(':');
   });
 
+  it('same-millisecond forced rewrites retain distinct exclusive backups', () => {
+    const instanceDir = tempDir('gru-command-wizard-backup-collision-');
+    writeWizardConfig(instanceDir, parseAnswers('{"token":"first"}'), home);
+    const now = new Date('2026-09-19T12:34:56.789Z');
+    const second = writeConfigText(
+      instanceDir,
+      generateWizardConfig(instanceDir, parseAnswers('{"token":"second"}')),
+      { force: true, now },
+    );
+    const third = writeConfigText(
+      instanceDir,
+      generateWizardConfig(instanceDir, parseAnswers('{"token":"third"}')),
+      { force: true, now },
+    );
+    expect(second.backupPath).not.toBe(third.backupPath);
+    expect(third.backupPath).toBe(`${second.backupPath}-1`);
+    expect(readFileSync(second.backupPath!, 'utf-8')).toContain('first');
+    expect(readFileSync(third.backupPath!, 'utf-8')).toContain('second');
+  });
+
   it('generated TOML carries only documented top-level keys (the loader reads THE generated file)', () => {
     const instanceDir = tempDir('gru-command-wizard-cfg3-');
     const answers = parseAnswers('{"token":"keys-probe"}');
-    const text = generateConfigToml(answers);
+    const text = generateWizardConfig(instanceDir, answers);
     expect(text).toContain('workspace_root');
     expect(text).toContain('[server]');
     expect(text).toContain('[auth]');
     expect(text).toContain('[runtimes]');
     expect(text).toContain('[models]');
     expect(text).toContain('[thinking]');
-    // NO data_dir line (Perkins r2 H3): the loader defaults it to the
-    // instance dir — an absolute baked path breaks restore-on-a-new-machine.
-    expect(text).not.toContain('data_dir =');
+    // Install-v2 full-set ruling: every concrete default is editable in the
+    // live file, including the actual per-instance data directory.
+    expect(text).toContain(`data_dir = "${instanceDir}"`);
+    expect(text).toContain('[supervision]');
+    expect(text).toContain('[logging]');
+    expect(text).toContain('[chat]');
+    expect(text).toContain('[worktrees]');
+    expect(text).toContain('[dispatch]');
+    expect(text).toContain('[decisions.jev]');
     // The vacuous version loaded an EMPTY instance dir (pure defaults);
     // the real check writes the generated text and loads THAT file —
     // loadConfig throws on unknown keys, so passing IS the assertion.
-    const { configPath } = writeInstanceConfig(instanceDir, answers, home);
+    const { configPath } = writeWizardConfig(instanceDir, answers, home);
     const config = loadConfig({ GRU_COMMAND_HOME: instanceDir }, home);
     expect(config.sourceFile).toBe(configPath);
     expect(config.auth.token).toBe('keys-probe');
@@ -274,16 +350,17 @@ describe('wizard CLI surface', () => {
     const repoRoot = join(import.meta.dirname, '..');
     // stdin: 'ignore' = not a TTY — exactly the piped one-liner's world.
     const res = spawnSync(process.execPath, [join(repoRoot, 'dist', 'wizard', 'main.js')], {
+      env: { ...process.env, GRU_COMMAND_TEST_NO_TTY: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 30_000,
     });
     expect(res.status).toBe(2);
     const err = res.stderr?.toString('utf-8') ?? '';
-    expect(err).toContain('no terminal for interactive setup');
+    expect(err).toContain('no controlling terminal for interactive setup');
     // The recovery command names THIS checkout's install.sh — the user
     // copies it straight into a terminal.
     expect(err).toContain(`bash ${repoRoot}/install.sh`);
-    expect(err).toContain("--answers '<json>'");
+    expect(err).toContain('--no-interact');
   });
 
   it('host validation accepts every VALID IPv6 form (Perkins r2 note)', () => {
@@ -323,7 +400,15 @@ describe('wizard CLI surface', () => {
           '--answers',
           JSON.stringify({ port: heldPort, smoke: false, token: 'h2-token' }),
         ],
-        { env: { ...process.env, GRU_COMMAND_HOME: instance }, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 },
+        {
+          env: {
+            ...process.env,
+            GRU_COMMAND_HOME: instance,
+            GRU_COMMAND_TEST_DECISIONS_CLI: decisionsCliPath,
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 30_000,
+        },
       );
       const text = `${res.stdout?.toString('utf-8') ?? ''}\n${res.stderr?.toString('utf-8') ?? ''}`;
       expect(res.status, text).toBe(1);
@@ -374,6 +459,35 @@ describe('wizard first-boot smoke — failure modes (I/O matrix)', () => {
         token: 'wizard-test-token',
       }),
     ).rejects.toThrow(/health_reachable.*never came|never came.*health_reachable/);
+  });
+
+  it('scrubs OPENROUTER_API_KEY from the smoke child environment', async () => {
+    const stage = tempDir('gru-command-smoke-scrub-');
+    const marker = join(stage, 'child-env.txt');
+    mkdirSync(join(stage, 'dist'), { recursive: true });
+    writeFileSync(
+      join(stage, 'dist', 'main.js'),
+      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, process.env.OPENROUTER_API_KEY ? 'present' : 'absent'); process.exit(4);`,
+      'utf-8',
+    );
+    const previous = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = 'parent-only-secret';
+    try {
+      await expect(
+        runFirstBootSmoke({
+          repoRoot: stage,
+          instanceDir: tempDir('gru-command-smoke-scrub-home-'),
+          host: '127.0.0.1',
+          port: 0,
+          timeoutMs: 5_000,
+          token: 'wizard-test-token',
+        }),
+      ).rejects.toThrow(/exit code 4/);
+      expect(readFileSync(marker, 'utf-8')).toBe('absent');
+    } finally {
+      if (previous === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = previous;
+    }
   });
 
   it('a service that exits before listening fails loud naming the exit', async () => {

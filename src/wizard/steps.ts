@@ -1,9 +1,24 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'smol-toml';
 import { homedir } from 'node:os';
-import { expandTilde, ROLES } from '../config.js';
+import { expandTilde } from '../config.js';
+import { renderCompleteConfig, tomlString } from '../config-template.js';
 import type { WizardAnswers } from './answers.js';
+
+export { tomlString };
 
 /**
  * Wizard steps (E9): the pure, testable half of the setup wizard —
@@ -42,73 +57,29 @@ export function discoverManagedRepos(workspaceRoot: string): string[] {
     .sort();
 }
 
-/** Escape a string for a TOML basic string literal. */
-export function tomlString(value: string): string {
-  let out = '';
-  for (const ch of value) {
-    switch (ch) {
-      case '\\': out += '\\\\'; break;
-      case '"': out += '\\"'; break;
-      case '\b': out += '\\b'; break;
-      case '\t': out += '\\t'; break;
-      case '\n': out += '\\n'; break;
-      case '\f': out += '\\f'; break;
-      case '\r': out += '\\r'; break;
-      default:
-        if (ch < ' ' || ch === '\u007f') {
-          out += `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
-        } else {
-          out += ch;
-        }
-    }
-  }
-  return `"${out}"`;
-}
-
-/**
- * Generate the instance `config.toml` — EXACTLY the documented schema
- * (docs/CONFIG.md); no invented keys, no omitted required semantics. The
- * model/thinking defaults ride the "default" sentinel (SPEC ruling 16:
- * the product never hardcodes a model).
- */
-export function generateConfigToml(answers: WizardAnswers): string {
-  const lines: string[] = [
-    '# Gru Command configuration — written by the setup wizard.',
-    '# Schema reference: docs/CONFIG.md (validation is fail-loud at boot).',
-    '',
-    `workspace_root = ${tomlString(answers.workspaceRoot)}`,
-    // NO data_dir line (Perkins r2 H3): the loader defaults it to the
-    // instance dir. An absolute data_dir baked in by the wizard would
-    // silently redirect ALL restored state to the OLD machine's path —
-    // breaking the documented restore-on-a-new-machine flow.
-    '',
-    '[server]',
-    `host = ${tomlString(answers.host)}`,
-    `port = ${answers.port}`,
-    '',
-    '[auth]',
-    `token = ${tomlString(answers.token)}`,
-    '',
-    '[runtimes]',
-    `default = ${tomlString(answers.runtime)}`,
-  ];
-  if (Object.keys(answers.roles).length > 0) {
-    lines.push('', '[runtimes.roles]');
-    for (const role of ROLES) {
-      const runtime = answers.roles[role];
-      if (runtime !== undefined) lines.push(`${role} = ${tomlString(runtime)}`);
-    }
-  }
-  lines.push(
-    '',
-    '[models]',
-    `default = ${tomlString(answers.model)}`,
-    '',
-    '[thinking]',
-    `default = ${tomlString(answers.thinkingLevel)}`,
-    '',
+/** Render the same complete configuration used by config-generate. */
+export function generateConfigToml(options: {
+  readonly answers: WizardAnswers;
+  readonly instanceDir: string;
+  readonly repoRoot: string;
+  readonly decisionsCliPath?: string;
+}): string {
+  const { answers } = options;
+  return renderCompleteConfig(
+    {
+      instanceDir: options.instanceDir,
+      workspaceRoot: answers.workspaceRoot,
+      host: answers.host,
+      port: answers.port,
+      token: answers.token,
+      runtime: answers.runtime,
+      model: answers.model,
+      thinkingLevel: answers.thinkingLevel,
+      roles: answers.roles,
+      jevEnabled: answers.jevEnabled,
+    },
+    { repoRoot: options.repoRoot, cliPath: options.decisionsCliPath },
   );
-  return lines.join('\n');
 }
 
 /**
@@ -134,6 +105,11 @@ export interface ConfigWriteResult {
   readonly backupPath: string | null;
 }
 
+export interface ConfigWriteOptions {
+  readonly force?: boolean;
+  readonly now?: Date;
+}
+
 /**
  * Write the instance config with the backup-first contract: an existing
  * `config.toml` is copied to `config.toml.backup-<timestamp>` BEFORE the
@@ -143,42 +119,67 @@ export interface ConfigWriteResult {
  * config: either the old file stands or the new one is complete. The
  * generated TOML is parse-self-checked before anything touches disk.
  */
-export function writeInstanceConfig(
+export function writeConfigText(
   instanceDir: string,
-  answers: WizardAnswers,
-  home: string = homedir(),
+  text: string,
+  options: ConfigWriteOptions = {},
 ): ConfigWriteResult {
-  // Cross-check the answers one more time against the workspace-root rule
-  // (a relative path must never reach a generated file).
-  const workspaceAbs = expandTilde(answers.workspaceRoot, home);
-  if (!workspaceAbs.startsWith('/') ) {
-    throw new Error(`workspace_root must resolve to an absolute path, got: ${answers.workspaceRoot}`);
-  }
-
-  const text = generateConfigToml(answers);
   try {
-    parse(text); // self-check: escaping bugs fail here, not at first boot
+    parse(text); // self-check: escaping/schema-fragment syntax fails before disk mutation
   } catch (error) {
     throw new Error(`generated config failed its TOML self-check: ${(error as Error).message}`);
   }
 
-  mkdirSync(instanceDir, { recursive: true });
+  mkdirSync(instanceDir, { recursive: true, mode: 0o700 });
   const configPath = join(instanceDir, 'config.toml');
   let backupPath: string | null = null;
+  let originalIdentity: string | null = null;
+  const identity = (): string => {
+    const info = statSync(configPath);
+    return `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+  };
   if (existsSync(configPath)) {
-    backupPath = `${configPath}.backup-${backupTimestamp()}`;
-    copyFileSync(configPath, backupPath); // throws → abort BEFORE the write
-    // The backup carries the pairing token too — never world-readable
-    // (a copied 0644 from an older install would ship the secret).
-    chmodSync(backupPath, 0o600);
+    if (options.force !== true) {
+      throw new Error(`refusing to overwrite existing ${configPath} without --force`);
+    }
+    const stem = `${configPath}.backup-${backupTimestamp(options.now)}`;
+    originalIdentity = identity();
+    const previous = readFileSync(configPath);
+    if (identity() !== originalIdentity) {
+      throw new Error(`config changed while preparing backup: ${configPath}; no replacement was attempted`);
+    }
+    for (let suffix = 0; ; suffix += 1) {
+      const candidate = suffix === 0 ? stem : `${stem}-${suffix}`;
+      try {
+        writeFileSync(candidate, previous, { mode: 0o600, flag: 'wx' });
+        chmodSync(candidate, 0o600);
+        backupPath = candidate;
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue;
+        rmSync(candidate, { force: true });
+        throw error;
+      }
+    }
   }
-  const tmpPath = `${configPath}.tmp`;
+  const tmpPath = `${configPath}.tmp-${process.pid}`;
   try {
-    // 0600: config.toml carries the pairing token — the file, and any
-    // backup, are owner-only (W5; the tmp never survives as 0644 either).
-    writeFileSync(tmpPath, text, { encoding: 'utf-8', mode: 0o600 });
-    renameSync(tmpPath, configPath); // atomic: never a half-written config
-    chmodSync(configPath, 0o600); // belt: a pre-existing file's mode dies with the rename
+    writeFileSync(tmpPath, text, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
+    if (options.force === true) {
+      if (originalIdentity === null || identity() !== originalIdentity) {
+        throw new Error(
+          `config changed after backup: ${configPath}; refusing to overwrite the newer file`,
+        );
+      }
+      renameSync(tmpPath, configPath);
+    } else {
+      // A hard link publishes the completed same-directory temp file only
+      // if config.toml is still absent. Concurrent no-force writers cannot
+      // replace one another between the earlier check and this operation.
+      linkSync(tmpPath, configPath);
+      unlinkSync(tmpPath);
+    }
+    chmodSync(configPath, 0o600);
   } catch (error) {
     rmSync(tmpPath, { force: true });
     throw new Error(
@@ -187,4 +188,23 @@ export function writeInstanceConfig(
     );
   }
   return { configPath, backupPath };
+}
+
+export function writeInstanceConfig(options: {
+  readonly instanceDir: string;
+  readonly answers: WizardAnswers;
+  readonly repoRoot: string;
+  readonly home?: string;
+  readonly force?: boolean;
+  readonly decisionsCliPath?: string;
+}): ConfigWriteResult {
+  const home = options.home ?? homedir();
+  const workspaceAbs = expandTilde(options.answers.workspaceRoot, home);
+  if (!workspaceAbs.startsWith('/')) {
+    throw new Error(
+      `workspace_root must resolve to an absolute path, got: ${options.answers.workspaceRoot}`,
+    );
+  }
+  const text = generateConfigToml(options);
+  return writeConfigText(options.instanceDir, text, { force: options.force });
 }

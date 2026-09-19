@@ -18,12 +18,14 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline/promises';
-import { stdin, stdout } from 'node:process';
+import { emitKeypressEvents } from 'node:readline';
+import { stdout } from 'node:process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { realpathSync } from 'node:fs';
+import { existsSync, openSync, realpathSync } from 'node:fs';
+import { ReadStream, WriteStream } from 'node:tty';
 import { fileURLToPath } from 'node:url';
 import * as QRCode from 'qrcode';
-import { instanceDirFromEnv, RUNTIME_IDS } from '../config.js';
+import { configPathFor, expandTilde, instanceDirFromEnv, RUNTIME_IDS } from '../config.js';
 import { probeRuntimes, type RuntimeProbeResult } from '../runtime/probe.js';
 import {
   AnswersError,
@@ -36,10 +38,19 @@ import {
 import {
   buildQrPayload,
   discoverManagedRepos,
-  writeInstanceConfig,
+  generateConfigToml,
+  writeConfigText,
 } from './steps.js';
+import { onboardBmadRepo } from './bmad-onboarding.js';
+import {
+  checkJev,
+  persistJevCredential,
+  readJevStatus,
+  type JevStatus,
+} from './jev-setup.js';
 
-const WIZARD_USAGE = 'usage: node dist/wizard/main.js [--answers <json>]';
+const WIZARD_USAGE =
+  'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
 
 function fail(message: string, code = 1): never {
   process.stderr.write(`wizard: ${message}\n`);
@@ -74,31 +85,95 @@ function defaultRuntimeId(results: readonly RuntimeProbeResult[]): string {
   return installed !== undefined ? installed.id : 'pi';
 }
 
+interface WizardTerminal {
+  readonly input: ReadStream;
+  readonly output: WriteStream;
+}
+
+interface InteractivePlan {
+  readonly answers: WizardAnswers;
+  readonly localJevCredential: string | null;
+}
+
+function openWizardTerminal(repoRoot: string): WizardTerminal {
+  if (process.env.GRU_COMMAND_TEST_NO_TTY === '1') {
+    fail(
+      'no controlling terminal for interactive setup (/dev/tty is unavailable).\n' +
+        `Run in a terminal: bash ${repoRoot}/install.sh\n` +
+        "or use explicit defaults: bash install.sh --no-interact [--answers '<json>']",
+      2,
+    );
+  }
+  try {
+    return {
+      input: new ReadStream(openSync('/dev/tty', 'r')),
+      output: new WriteStream(openSync('/dev/tty', 'w')),
+    };
+  } catch {
+    fail(
+      'no controlling terminal for interactive setup (/dev/tty is unavailable).\n' +
+        `Run in a terminal: bash ${repoRoot}/install.sh\n` +
+        "or use explicit defaults: bash install.sh --no-interact [--answers '<json>']",
+      2,
+    );
+  }
+}
+
 async function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return (await rl.question(question)).trim();
+}
+
+async function askMasked(terminal: WizardTerminal, question: string): Promise<string> {
+  // Arm raw mode and the key handler before exposing the prompt. A PTY
+  // driver (or a very fast paste) may answer as soon as it sees the prompt;
+  // writing first creates a race where the terminal itself echoes the secret.
+  emitKeypressEvents(terminal.input);
+  terminal.input.setRawMode(true);
+  terminal.input.resume();
+  return new Promise<string>((resolveValue, reject) => {
+    const chars: string[] = [];
+    const finish = (error?: Error): void => {
+      terminal.input.off('keypress', onKey);
+      terminal.input.setRawMode(false);
+      terminal.output.write('\n');
+      if (error !== undefined) reject(error);
+      else resolveValue(chars.join(''));
+    };
+    const onKey = (
+      text: string,
+      key: { name?: string; ctrl?: boolean; meta?: boolean },
+    ): void => {
+      if (key.ctrl === true && key.name === 'c') {
+        finish(new Error('credential entry cancelled'));
+      } else if (key.name === 'return' || key.name === 'enter') {
+        finish();
+      } else if (key.name === 'backspace') {
+        if (chars.pop() !== undefined) terminal.output.write('\b \b');
+      } else if (text !== '' && key.ctrl !== true && key.meta !== true) {
+        chars.push(text);
+        terminal.output.write('*');
+      }
+    };
+    terminal.input.on('keypress', onKey);
+    terminal.output.write(question);
+  });
+}
+
+function yn(value: string): boolean {
+  return value.toLowerCase() === 'y' || value.toLowerCase() === 'yes';
 }
 
 async function interactiveAnswers(
   probe: readonly RuntimeProbeResult[],
   repoRoot: string,
-): Promise<WizardAnswers> {
-  // The piped one-liner re-execs this wizard on an EXHAUSTED pipe: readline
-  // would wait on an EOF'd stdin forever. Interactive mode needs a TTY;
-  // anything else must say so loud and point at --answers.
-  if (stdin.isTTY !== true) {
-    fail(
-      'no terminal for interactive setup (stdin is not a TTY — a piped\n' +
-        'install cannot ask questions). Finish setup in a terminal:\n' +
-        `  bash ${repoRoot}/install.sh\n` +
-        "or run non-interactively with --answers '<json>'",
-      2,
-    );
-  }
-  const rl = createInterface({ input: stdin, output: stdout });
+  instanceDir: string,
+  terminal: WizardTerminal,
+  decisionsCliPath?: string,
+): Promise<InteractivePlan> {
+  const rl = createInterface({ input: terminal.input, output: terminal.output });
+  const out = terminal.output;
+  out.write('\nGru Command setup — press Enter to accept every [default].\n');
 
-  stdout.write('\nGru Command setup — press Enter to accept every [default].\n');
-
-  // Workspace root (ruling 6: config, never hardcoded).
   let workspaceRoot = '~/code';
   for (;;) {
     const answer = await ask(rl, '\nWorkspace root (holds ONLY your managed repos) [~/code]: ');
@@ -107,19 +182,16 @@ async function interactiveAnswers(
       validateWorkspaceRoot(workspaceRoot);
       break;
     } catch (error) {
-      stdout.write(`  ✗ ${(error as Error).message}\n`);
+      out.write(`  ✗ ${(error as Error).message}\n`);
     }
   }
 
-  // Managed-repo multi-pick: scan for .git; default = all found. The pick
-  // is informational (the config schema has no repos key — the board
-  // discovers repos live); it exists to show the user what will land on
-  // their board.
-  const found = discoverManagedRepos(workspaceRoot.replace(/^~(?=\/|$)/, homedir()));
+  const workspaceAbs = workspaceRoot.replace(/^~(?=\/|$)/, homedir());
+  const found = discoverManagedRepos(workspaceAbs);
   let repos: string[] = [];
   if (found.length > 0) {
-    stdout.write('\nRepos under the workspace root:\n');
-    found.forEach((name, index) => stdout.write(`  ${index + 1}. ${name}\n`));
+    out.write('\nRepos under the workspace root:\n');
+    found.forEach((name, index) => out.write(`  ${index + 1}. ${name}\n`));
     for (;;) {
       const answer = await ask(
         rl,
@@ -130,30 +202,56 @@ async function interactiveAnswers(
         break;
       }
       const picks = answer.split(',').map((part) => part.trim()).filter((part) => part !== '');
-      const resolved: string[] = [];
+      const resolvedRepos: string[] = [];
       let bad: string | null = null;
       for (const pick of picks) {
         const byIndex = /^\d+$/.test(pick) ? found[Number(pick) - 1] : undefined;
         const name = byIndex ?? pick;
         if (!found.includes(name)) bad = pick;
-        else if (!resolved.includes(name)) resolved.push(name);
+        else if (!resolvedRepos.includes(name)) resolvedRepos.push(name);
       }
       if (bad !== null) {
-        stdout.write(`  ✗ not a discovered repo: ${bad}\n`);
+        out.write(`  ✗ not a discovered repo: ${bad}\n`);
         continue;
       }
-      repos = resolved;
+      repos = resolvedRepos;
       break;
     }
   } else {
-    stdout.write(
+    out.write(
       `\nNo git repos found under ${workspaceRoot} yet — the board will be empty\n` +
-      'until you add repos there.\n',
+        'until you add repos there.\n',
     );
   }
 
-  // Runtime / model / thinking (ruling 16: the "default" sentinel is the
-  // recommended pick — the product never hardcodes a model).
+  const bmad: Record<string, 'install' | 'reuse' | 'skip'> = {};
+  for (const repo of repos) {
+    const hasBmad = existsSync(join(workspaceAbs, repo, '_bmad', '_config', 'manifest.yaml'));
+    for (;;) {
+      const answer = (
+        await ask(
+          rl,
+          hasBmad
+            ? `BMAD in ${repo}: existing install found; reuse unchanged or skip? [reuse]: `
+            : `BMAD in ${repo}: install official bmm,cis,tea,gds (core implicit)? [Y/n]: `,
+        )
+      ).toLowerCase();
+      if (hasBmad && ['', 'reuse'].includes(answer)) {
+        bmad[repo] = 'reuse';
+        break;
+      }
+      if (!hasBmad && ['', 'y', 'yes'].includes(answer)) {
+        bmad[repo] = 'install';
+        break;
+      }
+      if (['skip', 'n', 'no'].includes(answer)) {
+        bmad[repo] = 'skip';
+        break;
+      }
+      out.write(`  ✗ enter ${hasBmad ? 'reuse or skip' : 'yes or no'}\n`);
+    }
+  }
+
   const runtimeDefault = defaultRuntimeId(probe);
   let runtime = runtimeDefault;
   for (;;) {
@@ -163,7 +261,7 @@ async function interactiveAnswers(
     );
     runtime = answer === '' ? runtimeDefault : answer;
     if ((RUNTIME_IDS as readonly string[]).includes(runtime)) break;
-    stdout.write(`  ✗ valid runtimes: ${RUNTIME_IDS.join(', ')}\n`);
+    out.write(`  ✗ valid runtimes: ${RUNTIME_IDS.join(', ')}\n`);
   }
 
   const model =
@@ -182,10 +280,10 @@ async function interactiveAnswers(
     const answer = await ask(rl, '\nBind host — your LAN address to pair a phone [127.0.0.1]: ');
     host = answer === '' ? '127.0.0.1' : answer;
     try {
-      validateHost(host); // same rule as --answers — invalid input retries, never aborts the run (Perkins r2 H1)
+      validateHost(host);
       break;
     } catch (error) {
-      stdout.write(`  ✗ ${(error as Error).message}\n`);
+      out.write(`  ✗ ${(error as Error).message}\n`);
     }
   }
 
@@ -198,36 +296,71 @@ async function interactiveAnswers(
       port = parsed;
       break;
     }
-    stdout.write('  ✗ port must be an integer 0–65535\n');
+    out.write('  ✗ port must be an integer 0–65535\n');
   }
 
   const generated = generateToken();
   const tokenAnswer = await ask(rl, `\nPairing token [${generated}]: `);
   const token = tokenAnswer === '' ? generated : tokenAnswer;
 
-  const registerAnswer =
-    (await ask(rl, '\nRegister the OS service (launchd/systemd, starts at login)? [y/N]: ')).toLowerCase();
-  const registerService = registerAnswer === 'y' || registerAnswer === 'yes';
+  const jevEnabled = yn(await ask(rl, '\nEnable optional Jev decisions provider? [y/N]: '));
+  let persistEnvCredential = false;
+  let requestLocalCredential = false;
+  if (jevEnabled) {
+    let status: JevStatus;
+    try {
+      status = readJevStatus({ repoRoot, instanceDir, cliPath: decisionsCliPath });
+      out.write(
+        `Jev credential status: ${status.credential_present ? 'present' : 'absent'} ` +
+          `(${status.credential_source}).\n`,
+      );
+    } catch (error) {
+      out.write(`Jev offline status unavailable: ${(error as Error).message}\n`);
+      status = { enabled: false, credential_present: false, credential_source: 'none' };
+    }
+    if (status.credential_source === 'environment') {
+      out.write(
+        'Environment-only credentials may disappear when launchd/systemd starts the service.\n',
+      );
+      persistEnvCredential = yn(
+        await ask(rl, 'Persist the environment key to the protected instance store? [y/N]: '),
+      );
+    } else if (!status.credential_present) {
+      requestLocalCredential = yn(
+        await ask(rl, 'Enter and persist an OpenRouter key locally (masked)? [y/N]: '),
+      );
+    }
+  }
 
+  const registerService = yn(
+    await ask(rl, '\nRegister the OS service (launchd/systemd, starts at login)? [y/N]: '),
+  );
   const smokeAnswer =
     (await ask(rl, 'Run the first-boot smoke test now? [Y/n]: ')).toLowerCase();
   const smoke = smokeAnswer !== 'n' && smokeAnswer !== 'no';
-
   rl.close();
-  return parseAnswers(
+
+  const localJevCredential = requestLocalCredential
+    ? await askMasked(terminal, 'OpenRouter key (input hidden): ')
+    : null;
+  const answers = parseAnswers(
     JSON.stringify({
       workspace_root: workspaceRoot,
       repos,
+      bmad,
       runtime,
       model,
       thinking_level: thinkingLevel,
       host,
       port,
       token,
+      jev_enabled: jevEnabled,
+      persist_env_credential: persistEnvCredential,
       register_service: registerService,
       smoke,
     }),
   );
+  return { answers, localJevCredential };
 }
 
 // ---------------------------------------------------------------------------
@@ -340,8 +473,15 @@ export async function runFirstBootSmoke(options: {
 }): Promise<SmokeOutcome> {
   const timeoutMs = options.timeoutMs ?? 45_000;
   const distMain = join(options.repoRoot, 'dist', 'main.js');
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    GRU_COMMAND_HOME: options.instanceDir,
+  };
+  // Never leak the shell credential to a service child. Smoke must prove
+  // restart-safe instance-store resolution or deterministic fallback.
+  delete childEnv.OPENROUTER_API_KEY;
   const child = spawn(process.execPath, [distMain], {
-    env: { ...process.env, GRU_COMMAND_HOME: options.instanceDir },
+    env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stderr = '';
@@ -434,6 +574,8 @@ export async function runFirstBootSmoke(options: {
 
 async function main(argv: readonly string[]): Promise<number> {
   let answersJson: string | null = null;
+  let noInteract = false;
+  let force = false;
   const rest = [...argv];
   while (rest.length > 0) {
     const arg = rest.shift();
@@ -442,6 +584,11 @@ async function main(argv: readonly string[]): Promise<number> {
       const value = rest.shift();
       if (value === undefined) fail('--answers requires a JSON argument\n' + WIZARD_USAGE, 2);
       answersJson = value;
+      noInteract = true;
+    } else if (arg === '--no-interact') {
+      noInteract = true;
+    } else if (arg === '--force') {
+      force = true;
     } else {
       fail(`unknown argument: ${arg}\n${WIZARD_USAGE}`, 2);
     }
@@ -456,31 +603,56 @@ async function main(argv: readonly string[]): Promise<number> {
   if (!isAbsolute(instanceDir)) fail(`instance dir must be absolute: ${instanceDir}`);
 
   const repoRoot = repoRootFrom(import.meta.url);
-
+  const decisionsCliPath = process.env.GRU_COMMAND_TEST_DECISIONS_CLI;
   stdout.write('Gru Command setup wizard\n=========================');
   const probe = probeRuntimes();
   printProbe(probe);
 
   let answers: WizardAnswers;
-  if (answersJson !== null) {
+  let localJevCredential: string | null = null;
+  let terminal: WizardTerminal | null = null;
+  if (noInteract) {
     try {
-      answers = parseAnswers(answersJson);
+      answers = parseAnswers(answersJson ?? '{}');
     } catch (error) {
-      if (error instanceof AnswersError) {
-        fail(String(error.message), 1); // nothing written — by construction
-      }
+      if (error instanceof AnswersError) fail(String(error.message), 1);
       throw error;
     }
-    stdout.write('\nNon-interactive mode (answers applied; unspecified = defaults).\n');
+    stdout.write('\nNon-interactive mode (unspecified answers = documented defaults).\n');
   } else {
-    answers = await interactiveAnswers(probe, repoRoot);
+    terminal = openWizardTerminal(repoRoot);
+    const plan = await interactiveAnswers(
+      probe,
+      repoRoot,
+      instanceDir,
+      terminal,
+      decisionsCliPath,
+    );
+    answers = plan.answers;
+    localJevCredential = plan.localJevCredential;
   }
 
-  stdout.write(`\nManaged repos (board grouping): ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none yet)'}\n`);
+  const configPath = configPathFor(instanceDir);
+  if (existsSync(configPath) && !force) {
+    fail(`refusing to overwrite existing ${configPath} without --force`);
+  }
+  const configText = generateConfigToml({
+    answers,
+    instanceDir,
+    repoRoot,
+    decisionsCliPath,
+  });
 
-  // Pre-flight port check (Perkins r2 H2): a fixed port already held by
-  // the still-running OLD service would fail the smoke AFTER the new
-  // config is written — half-installed. Stop-before-rerun guidance first.
+  stdout.write(
+    `\nSelected repos for BMAD onboarding: ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none)'}\n`,
+  );
+  if (answers.repos.length > 0) {
+    stdout.write('BMAD per-repo plan (no workspace-root or unselected-repo writes):\n');
+    for (const repo of answers.repos) {
+      stdout.write(`  ${repo}: ${answers.bmad[repo] ?? 'skip'}\n`);
+    }
+  }
+
   if (answers.port !== 0) {
     const holder = await findPortHolder(answers.host, answers.port);
     if (holder !== null) {
@@ -493,13 +665,99 @@ async function main(argv: readonly string[]): Promise<number> {
     }
   }
 
-  const { configPath, backupPath } = writeInstanceConfig(instanceDir, answers);
-  stdout.write(`\nWrote ${configPath}\n`);
-  if (backupPath !== null) stdout.write(`Previous config backed up: ${backupPath}\n`);
+  const workspaceAbs = expandTilde(answers.workspaceRoot, homedir());
+  for (const repo of answers.repos) {
+    let action = answers.bmad[repo] ?? 'skip';
+    for (;;) {
+      const result = onboardBmadRepo(repo, action, { workspaceRoot: workspaceAbs, answers });
+      if (result.ready) {
+        stdout.write(`BMAD ready in ${repo}: ${result.message}\n`);
+        stdout.write(
+          `  Commit ${repo}/.gru-command/{worktree.toml,bmad-bootstrap.mjs,bmad-install.json} ` +
+            'so fresh worktrees receive the project-local binding.\n',
+        );
+        break;
+      }
+      if (action === 'skip') {
+        stdout.write(`BMAD not ready in ${repo}: ${result.message}; repo remains managed.\n`);
+        break;
+      }
+      if (terminal === null) {
+        fail(
+          `BMAD setup for ${repo} is not ready: ${result.message}\n` +
+            `Retry after fixing it, or explicitly set answers.bmad.${repo}="skip".`,
+        );
+      }
+      terminal.output.write(`BMAD setup for ${repo} failed: ${result.message}\n`);
+      const retryRl = createInterface({ input: terminal.input, output: terminal.output });
+      const choice = (await ask(retryRl, 'Retry or skip this repo? [retry/skip]: ')).toLowerCase();
+      retryRl.close();
+      action = choice === 'skip' ? 'skip' : action;
+    }
+  }
 
-  // First-boot smoke BEFORE anything registers a service: a failed smoke
-  // must not leave a broken unit behind, and a registered fixed-port
-  // service would make the smoke's spawn hit EADDRINUSE.
+  // BMAD setup may take minutes. Recheck the fixed port immediately
+  // before writing config so a late listener cannot turn a completed
+  // setup into a knowingly unbootable instance.
+  if (answers.port !== 0) {
+    const holder = await findPortHolder(answers.host, answers.port);
+    if (holder !== null) {
+      fail(`port ${answers.port} on ${answers.host} became occupied during setup; config was not written`);
+    }
+  }
+
+  // Validate and persist an explicitly approved key before replacing any
+  // config. The Jev child receives the value only on stdin.
+  if (answers.jevEnabled && answers.persistEnvCredential) {
+    const key = process.env.OPENROUTER_API_KEY;
+    if (key === undefined || key.trim() === '') {
+      fail(
+        'Jev environment persistence was approved, but OPENROUTER_API_KEY is unavailable; ' +
+          'config was not written',
+      );
+    }
+    persistJevCredential({ repoRoot, instanceDir, cliPath: decisionsCliPath }, key);
+    stdout.write('Jev credential persisted to the protected instance store (value not displayed).\n');
+  } else if (answers.jevEnabled && localJevCredential !== null) {
+    persistJevCredential(
+      { repoRoot, instanceDir, cliPath: decisionsCliPath },
+      localJevCredential,
+    );
+    localJevCredential = null;
+    stdout.write('Jev credential persisted to the protected instance store (value not displayed).\n');
+  }
+
+  const write = writeConfigText(instanceDir, configText, { force });
+  stdout.write(`\nWrote ${write.configPath}\n`);
+  if (write.backupPath !== null) stdout.write(`Previous config backed up: ${write.backupPath}\n`);
+
+  if (answers.jevEnabled) {
+    try {
+      const status = readJevStatus({ repoRoot, instanceDir, cliPath: decisionsCliPath });
+      if (status.credential_source === 'environment' && !answers.persistEnvCredential) {
+        stdout.write(
+          'WARNING: Jev is using an environment-only key; an OS service restart may not receive it.\n',
+        );
+      }
+      const check = checkJev({ repoRoot, instanceDir, cliPath: decisionsCliPath });
+      if (check.status === 'ready') {
+        stdout.write('Jev readiness: ready.\n');
+      } else {
+        stdout.write(
+          `Jev readiness: degraded (${check.reason ?? 'unknown'}). ` +
+            'Gru Command remains usable with deterministic fallback.\n' +
+            'Correct it, then run: node dist/decisions/cli.js check --json\n',
+        );
+      }
+    } catch {
+      stdout.write(
+        'Jev readiness: degraded (local CLI unavailable or malformed). ' +
+          'Gru Command remains usable with deterministic fallback.\n' +
+          'Correct it, then run: node dist/decisions/cli.js check --json\n',
+      );
+    }
+  }
+
   let smokePort: number | null = null;
   if (answers.smoke) {
     stdout.write('\nFirst-boot smoke: spawning the service and polling /health…\n');
@@ -520,10 +778,6 @@ async function main(argv: readonly string[]): Promise<number> {
     }
   }
 
-  // Terminal pairing QR — same payload shape the web pairing screen
-  // encodes ({"gru-command":1,url,token}); scan it from the phone. With
-  // port 0 the URL is only useful AFTER the smoke discovered the real
-  // port (and it changes on every boot — say so).
   const displayPort = answers.port === 0 ? (smokePort ?? 0) : answers.port;
   const url = `http://${formatHostForUrl(answers.host)}:${displayPort}`;
   stdout.write(`\nPairing QR (payload ${buildQrPayload(url, answers.token)}):\n`);
@@ -553,7 +807,10 @@ async function main(argv: readonly string[]): Promise<number> {
 
   if (answers.registerService) {
     stdout.write('\nRegistering the OS service (install.sh --service)…\n');
+    const serviceEnv = { ...process.env };
+    delete serviceEnv.OPENROUTER_API_KEY;
     const result = spawnSync('bash', [join(repoRoot, 'install.sh'), '--service'], {
+      env: serviceEnv,
       stdio: 'inherit',
     });
     if (result.status !== 0) {
