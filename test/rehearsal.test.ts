@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { copyFileSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -224,10 +224,12 @@ describe.skipIf(process.env['GRU_COMMAND_REHEARSAL'] !== '1')(
         // The clone landed fully built — the one-liner did its job.
         expect(existsSync(join(target, 'dist', 'main.js'))).toBe(true);
         expect(existsSync(join(target, 'dist', 'wizard', 'main.js'))).toBe(true);
-        // The recovery command names the clone's installer.
+        // The recovery command names the clone's installer (realpath-
+        // normalized: the wizard's file-URL resolution yields /private/var
+        // on macOS while mktmpath strings carry /var).
         const text = `${res.stdout}\n${res.stderr}`;
         expect(text).toContain('no terminal for interactive setup');
-        expect(text).toContain(`bash ${target}/install.sh`);
+        expect(text).toContain(`bash ${realpathSync(target)}/install.sh`);
         // The wizard never wrote a config — setup is not half-done.
         expect(existsSync(join(instance, 'config.toml'))).toBe(false);
       },
