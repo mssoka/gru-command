@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -80,7 +80,14 @@ describe.skipIf(process.env['GRU_COMMAND_REHEARSAL'] !== '1')(
           ]);
         }
 
-        // Non-interactive install against the fresh clone path.
+        // Non-interactive install against the fresh clone path. The
+        // one-liner runs the script from a BARE location (no checkout
+        // around it — curl | bash has no repo context), so copy
+        // install.sh out and run THAT; the clone-when-absent path is
+        // what executes.
+        const bare = join(stage, 'bare');
+        mkdirSync(bare, { recursive: true });
+        copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
         const answers = JSON.stringify({
           workspace_root: workspace,
           repos: ['repo-alpha', 'repo-beta'],
@@ -90,7 +97,7 @@ describe.skipIf(process.env['GRU_COMMAND_REHEARSAL'] !== '1')(
         });
         const stdout = execFileSync(
           'bash',
-          [join(repoRoot, 'install.sh'), '--answers', answers],
+          [join(bare, 'install.sh'), '--answers', answers],
           {
             encoding: 'utf-8',
             timeout: 600_000,

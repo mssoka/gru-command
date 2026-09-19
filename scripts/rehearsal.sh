@@ -39,6 +39,12 @@ echo "home:     $HOME_FIXTURE (empty)"
 echo "workspace: $WORKSPACE ($(ls "$WORKSPACE" | tr '\n' ' '))"
 
 step "install: one-line path against the fresh clone (non-interactive)"
+# Simulate the actual one-liner: the script runs from a bare location
+# with NO checkout around it (curl | bash has no repo context), so the
+# clone-when-absent path is what executes.
+BARE="$STAGE/bare"
+mkdir -p "$BARE"
+cp "$REPO_ROOT/install.sh" "$BARE/install.sh"
 ANSWERS="$(printf '{"workspace_root":"%s","repos":["repo-alpha","repo-beta"],"port":0,"token":"rehearsal-pairing-token","register_service":false}' "$WORKSPACE")"
 echo "answers: $ANSWERS"
 env -u GRU_COMMAND_HOME \
@@ -46,7 +52,7 @@ env -u GRU_COMMAND_HOME \
   GRU_COMMAND_ORIGIN="file://$REPO_ROOT" \
   GRU_COMMAND_TARGET="$TARGET" \
   GRU_COMMAND_HOME="$INSTANCE" \
-  bash "$REPO_ROOT/install.sh" --answers "$ANSWERS"
+  bash "$BARE/install.sh" --answers "$ANSWERS"
 
 step "verify: clone landed, wizard wrote a schema-valid config"
 [[ -f "$TARGET/dist/main.js" ]] || { echo "FAIL: no dist/main.js in the clone"; exit 1; }
