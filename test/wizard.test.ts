@@ -2,6 +2,7 @@ import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createServer } from 'node:net';
 import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig, configPathFor } from '../src/config.js';
 import { probeRuntimes } from '../src/runtime/probe.js';
@@ -65,6 +66,11 @@ describe('wizard answers', () => {
       ['{"host":"not a host!"}', /answers.host must be an IPv4\/IPv6 literal or a hostname, got: not a host!/],
       ['{"host":"999.1.1.1"}', /answers.host is not a valid IPv4/],
       ['{"host":":::"}', /answers.host is not a valid IPv6/],
+      // Perkins r2 note — the validator was wrong BOTH ways: it accepted
+      // 'a:b' (2 groups ≠ 8) and rejected the valid '::'. Both pinned.
+      ['{"host":"a:b"}', /answers.host is not a valid IPv6/],
+      ['{"host":"1:2"}', /answers.host is not a valid IPv6/],
+      ['{"host":"::ffff:999.1.1.1"}', /answers.host is not a valid IPv6/],
       ['{"token":""}', /answers.token must not be empty/],
       ['{"frobnicate":1}', /unknown answers key `frobnicate`/],
       ['not json', /--answers is not valid JSON/],
@@ -185,7 +191,9 @@ describe('wizard config generation', () => {
     expect(w1.backupPath).toBeNull();
     const w2 = writeInstanceConfig(instanceDir, second, home);
     expect(w2.backupPath).not.toBeNull();
-    expect(w2.backupPath).toMatch(/config\.toml\.backup-\d{8}T\d{6}Z$/);
+    // Millisecond precision (Perkins r2 note): same-second reruns must
+    // not clobber — the name carries ms.
+    expect(w2.backupPath).toMatch(/config\.toml\.backup-\d{8}T\d{6}\d{3}Z$/);
     expect(readFileSync(w2.backupPath!, 'utf-8')).toContain('first-token');
     expect(readFileSync(w2.configPath, 'utf-8')).toContain('second-token');
     // The backup timestamp is filesystem-safe (no colons).
@@ -195,13 +203,16 @@ describe('wizard config generation', () => {
   it('generated TOML carries only documented top-level keys (the loader reads THE generated file)', () => {
     const instanceDir = tempDir('gru-command-wizard-cfg3-');
     const answers = parseAnswers('{"token":"keys-probe"}');
-    const text = generateConfigToml(answers, instanceDir);
+    const text = generateConfigToml(answers);
     expect(text).toContain('workspace_root');
     expect(text).toContain('[server]');
     expect(text).toContain('[auth]');
     expect(text).toContain('[runtimes]');
     expect(text).toContain('[models]');
     expect(text).toContain('[thinking]');
+    // NO data_dir line (Perkins r2 H3): the loader defaults it to the
+    // instance dir — an absolute baked path breaks restore-on-a-new-machine.
+    expect(text).not.toContain('data_dir =');
     // The vacuous version loaded an EMPTY instance dir (pure defaults);
     // the real check writes the generated text and loads THAT file —
     // loadConfig throws on unknown keys, so passing IS the assertion.
@@ -275,6 +286,12 @@ describe('wizard CLI surface', () => {
     expect(err).toContain("--answers '<json>'");
   });
 
+  it('host validation accepts every VALID IPv6 form (Perkins r2 note)', () => {
+    for (const good of ['::', '::1', 'fe80::1', 'fe80::1%en0', '1:2:3:4:5:6:7:8', '::ffff:127.0.0.1']) {
+      expect(parseAnswers(JSON.stringify({ host: good })).host, good).toBe(good);
+    }
+  });
+
   it('--answers without a JSON argument exits 2 with usage', () => {
     const repoRoot = join(import.meta.dirname, '..');
     let status = 0;
@@ -288,6 +305,35 @@ describe('wizard CLI surface', () => {
       status = (error as { status?: number }).status ?? 1;
     }
     expect(status).toBe(2);
+  });
+
+  it('pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)', async () => {
+    const repoRoot2 = join(import.meta.dirname, '..');
+    const instance = tempDir('gru-command-pty-h2-');
+    // Hold a real port so the pre-flight sees a live listener.
+    const holder = createServer();
+    holder.listen(0, '127.0.0.1');
+    await new Promise<void>((ready) => holder.once('listening', ready));
+    const heldPort = (holder.address() as { port: number }).port;
+    try {
+      const res = spawnSync(
+        process.execPath,
+        [
+          join(repoRoot2, 'dist', 'wizard', 'main.js'),
+          '--answers',
+          JSON.stringify({ port: heldPort, smoke: false, token: 'h2-token' }),
+        ],
+        { env: { ...process.env, GRU_COMMAND_HOME: instance }, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 },
+      );
+      const text = `${res.stdout?.toString('utf-8') ?? ''}\n${res.stderr?.toString('utf-8') ?? ''}`;
+      expect(res.status, text).toBe(1);
+      expect(text).toContain(`port ${heldPort} on 127.0.0.1 is already in use`);
+      expect(text).toContain('--uninstall');
+      // Failed BEFORE the write: no config, no half-install.
+      expect(existsSync(join(instance, 'config.toml'))).toBe(false);
+    } finally {
+      holder.close();
+    }
   });
 
   it('validateWorkspaceRoot rejects relative paths regardless of platform quirks', () => {

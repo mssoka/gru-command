@@ -30,14 +30,17 @@ describe('hygiene grep (always-on)', () => {
     expect(stdout).toContain('clean');
   });
 
-  it('the gate has teeth: a planted personal path fails it', () => {
+  it('the gate has teeth: planted personal paths fail it — including allowlist lookalikes (Perkins r2 note)', () => {
     // Untracked-but-not-ignored files ARE scanned (that is how the gate
-    // works in a dirty worktree) — plant one, expect failure, remove it.
-    // (The planted path is assembled at runtime so this file itself
-    // stays hygiene-clean.)
+    // works in a dirty worktree) — plant violations, expect failure,
+    // remove. (Paths assembled at runtime so THIS file stays clean.)
+    // The second plant is the boundary-anchoring teeth: the OLD
+    // per-line substring allowlist let a tester lookalike through
+    // (the evil path is fragment-assembled so THIS file stays clean).
     const plant = join(repoRoot, 'hygiene-probe.tmp');
     const personalPath = ['/Use', 'rs/', 'mos', 'es'].join('');
-    writeFileSync(plant, `see ${personalPath}/somewhere/personal\n`, 'utf-8');
+    const evil = ['/ho', 'me/te', 'ster', '-ev', 'il'].join('');
+    writeFileSync(plant, `see ${personalPath}/somewhere/personal and ${evil}/thing\n`, 'utf-8');
     try {
       let status = 0;
       try {

@@ -35,6 +35,7 @@ CLONE_ORIGIN="${GRU_COMMAND_ORIGIN:-https://github.com/mssoka/gru-command.git}"
 CLONE_TARGET="${GRU_COMMAND_TARGET:-$HOME/gru-command}"
 MODE="setup"
 ANSWERS=""
+ANSWERS_SET=0
 
 err() { echo "install.sh: $*" >&2; }
 # The range MUST cover the whole header block through the seam lines
@@ -50,9 +51,9 @@ while [[ $# -gt 0 ]]; do
     --service) MODE="service" ; shift ;;
     --answers)
       [[ $# -ge 2 ]] || { err "--answers requires a JSON argument"; exit 2; }
-      ANSWERS="$2"; shift 2 ;;
+      ANSWERS="$2"; ANSWERS_SET=1; shift 2 ;;
     --answers=*)
-      ANSWERS="${1#--answers=}"; shift ;;
+      ANSWERS="${1#--answers=}"; ANSWERS_SET=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) err "unknown flag: $1 (valid: --answers <json>, --service, --print, --uninstall, -h|--help)"; exit 2 ;;
   esac
@@ -62,6 +63,12 @@ done
 # is a SETUP-mode argument; pairing it with another mode drops one of them.
 if [[ -n "$ANSWERS" && "$MODE" != "setup" ]]; then
   err "--answers is only valid with setup mode, but mode is --$MODE — pass --answers alone (setup is the default)"
+  exit 2
+fi
+# An explicitly-empty --answers must not silently flip to interactive mode
+# (Perkins r2 note) — the flag was GIVEN; an empty JSON object is '{}'.
+if [[ "$ANSWERS_SET" -eq 1 && -z "$ANSWERS" ]]; then
+  err "--answers was given an empty value — for full defaults pass --answers '{}'"
   exit 2
 fi
 

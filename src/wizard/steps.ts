@@ -71,13 +71,16 @@ export function tomlString(value: string): string {
  * model/thinking defaults ride the "default" sentinel (SPEC ruling 16:
  * the product never hardcodes a model).
  */
-export function generateConfigToml(answers: WizardAnswers, instanceDir: string): string {
+export function generateConfigToml(answers: WizardAnswers): string {
   const lines: string[] = [
     '# Gru Command configuration — written by the setup wizard.',
     '# Schema reference: docs/CONFIG.md (validation is fail-loud at boot).',
     '',
     `workspace_root = ${tomlString(answers.workspaceRoot)}`,
-    `data_dir = ${tomlString(instanceDir)}`,
+    // NO data_dir line (Perkins r2 H3): the loader defaults it to the
+    // instance dir. An absolute data_dir baked in by the wizard would
+    // silently redirect ALL restored state to the OLD machine's path —
+    // breaking the documented restore-on-a-new-machine flow.
     '',
     '[server]',
     `host = ${tomlString(answers.host)}`,
@@ -120,7 +123,9 @@ export function buildQrPayload(url: string, token: string): string {
 
 /** Filesystem-safe ISO timestamp for backup names (no colons, compact). */
 export function backupTimestamp(now: Date = new Date()): string {
-  return now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  // Millisecond precision: second-resolution names clobber on same-second
+  // reruns (Perkins r2 note) — two backups within one second must both live.
+  return now.toISOString().replace(/[-:]/g, '').replace('.', '');
 }
 
 export interface ConfigWriteResult {
@@ -150,7 +155,7 @@ export function writeInstanceConfig(
     throw new Error(`workspace_root must resolve to an absolute path, got: ${answers.workspaceRoot}`);
   }
 
-  const text = generateConfigToml(answers, instanceDir);
+  const text = generateConfigToml(answers);
   try {
     parse(text); // self-check: escaping bugs fail here, not at first boot
   } catch (error) {

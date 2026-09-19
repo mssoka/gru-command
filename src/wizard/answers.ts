@@ -97,21 +97,37 @@ const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
 const HOSTNAME_RE =
   /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
 
-/** Structural IPv6 check: hex groups of 1–4 digits, at most one '::',
- * group count ≤ 8 (≤ 7 when '::' is present). Zone ids are tolerated. */
-function isIpv6Literal(value: string): boolean {
+/** Structural IPv6 check. Rules: hex groups of 1–4 digits; at most one
+ * '::'; WITHOUT '::' EXACTLY 8 groups; WITH '::' at most 7 total
+ * groups (0 for the bare '::'); an IPv4 dotted tail counts as 2 groups
+ * ("::ffff:127.0.0.1"); zone ids tolerated. Perkins r2 note: the old
+ * form accepted 'a:b' (2 ≠ 8 groups) and rejected the valid '::'. */
+export function isIpv6Literal(value: string): boolean {
   const zoneless = value.split('%')[0] ?? '';
-  if (zoneless === '' || !/^[0-9A-Fa-f:]+$/.test(zoneless)) return false;
+  if (zoneless === '' || !/^[0-9A-Fa-f:.]+$/.test(zoneless)) return false;
   const sides = zoneless.split('::');
   if (sides.length > 2) return false; // more than one '::'
   const left = sides[0] ?? '';
   const right = sides.length === 2 ? (sides[1] ?? '') : null;
-  const groups =
+  const rawGroups =
     right !== null
       ? [...(left === '' ? [] : left.split(':')), ...(right === '' ? [] : right.split(':'))]
       : zoneless.split(':');
-  if (groups.some((group) => group === '' || group.length > 4)) return false;
-  return groups.length >= 1 && groups.length <= (sides.length === 2 ? 7 : 8);
+  let groups = 0;
+  for (const group of rawGroups) {
+    const ipv4Tail = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(group);
+    if (ipv4Tail !== null) {
+      // A dotted tail is legal only as the LAST group and counts as two.
+      if (group !== rawGroups[rawGroups.length - 1]) return false;
+      if (ipv4Tail.slice(1).some((octet) => Number(octet) > 255)) return false;
+      groups += 2;
+      continue;
+    }
+    if (group === '' || group.length > 4 || !/^[0-9A-Fa-f]+$/.test(group)) return false;
+    groups += 1;
+  }
+  if (sides.length === 2) return groups <= 7; // '::' absorbs ≥1 zero group
+  return groups === 8; // full form
 }
 
 /** Bind-host validation: an IPv4/IPv6 literal or a plausible hostname —

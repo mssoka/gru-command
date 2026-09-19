@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -72,9 +72,11 @@ describe('uploads dir scaffolding (SPEC ruling 19)', () => {
       expect(stderr).toContain(join(home, 'uploads'));
 
       // The scaffolding itself: directory creation only, instance state
-      // under the data dir (ruling 7).
+      // under the data dir (ruling 7) — owner-only like every instance dir
+      // (Perkins r2 note: was 0755).
       expect(existsSync(join(home, 'uploads'))).toBe(true);
       expect(existsSync(join(home, 'logs'))).toBe(true);
+      expect((statSync(join(home, 'uploads')).mode & 0o777) & 0o077).toBe(0); // no group/world bits
 
       const exitCode = await new Promise<number | null>((resolveExit) => {
         child.on('exit', (code) => resolveExit(code));

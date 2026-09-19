@@ -71,7 +71,9 @@ async function main(): Promise<number> {
   // loud and named (EACCES/ENOSPC never surface as a raw stack).
   const uploadsDir = join(config.dataDir, 'uploads');
   try {
-    mkdirSync(uploadsDir, { recursive: true });
+    // 0700 like every other instance dir (chat/, sessions/, ledger/) —
+    // uploads will carry user material; not group/world traversable.
+    mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
     logger.info('uploads_dir', { path: uploadsDir });
   } catch (error) {
     logger.error('uploads dir creation failed — refusing to start (SPEC ruling 19)', {

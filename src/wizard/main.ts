@@ -29,6 +29,7 @@ import {
   AnswersError,
   generateToken,
   parseAnswers,
+  validateHost,
   validateWorkspaceRoot,
   type WizardAnswers,
 } from './answers.js';
@@ -176,8 +177,17 @@ async function interactiveAnswers(
       "\nThinking level — Enter = the runtime's own (\"default\")\n  [default]: ",
     )) || 'default';
 
-  const host =
-    (await ask(rl, '\nBind host — your LAN address to pair a phone [127.0.0.1]: ')) || '127.0.0.1';
+  let host = '127.0.0.1';
+  for (;;) {
+    const answer = await ask(rl, '\nBind host — your LAN address to pair a phone [127.0.0.1]: ');
+    host = answer === '' ? '127.0.0.1' : answer;
+    try {
+      validateHost(host); // same rule as --answers — invalid input retries, never aborts the run (Perkins r2 H1)
+      break;
+    } catch (error) {
+      stdout.write(`  ✗ ${(error as Error).message}\n`);
+    }
+  }
 
   let port = 7665;
   for (;;) {
@@ -257,6 +267,23 @@ export function parseListeningPort(stderrText: string): number | null {
  * fetch() throw on every iteration. */
 export function formatHostForUrl(host: string): string {
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
+/** Pre-flight port check (Perkins r2 H2): who holds host:port? Returns
+ * 'unknown' when something accepts the connection, null when nothing
+ * listens (free), never hangs (short timeout). */
+export async function findPortHolder(host: string, port: number): Promise<string | null> {
+  const { createConnection } = await import('node:net');
+  return new Promise((resolve) => {
+    const socket = createConnection({ host, port });
+    const done = (value: string | null): void => {
+      socket.destroy();
+      resolve(value);
+    };
+    socket.setTimeout(1_500, () => done('unknown'));
+    socket.on('connect', () => done(socket.remoteAddress ?? 'unknown'));
+    socket.on('error', () => done(null)); // ECONNREFUSED etc. — the port is free
+  });
 }
 
 async function fetchHealth(
@@ -436,6 +463,21 @@ async function main(argv: readonly string[]): Promise<number> {
   }
 
   stdout.write(`\nManaged repos (board grouping): ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none yet)'}\n`);
+
+  // Pre-flight port check (Perkins r2 H2): a fixed port already held by
+  // the still-running OLD service would fail the smoke AFTER the new
+  // config is written — half-installed. Stop-before-rerun guidance first.
+  if (answers.port !== 0) {
+    const holder = await findPortHolder(answers.host, answers.port);
+    if (holder !== null) {
+      fail(
+        `port ${answers.port} on ${answers.host} is already in use — if the previous\n` +
+          '  service still runs, stop it first (./install.sh --uninstall, or\n' +
+          '  systemctl --user stop gru-command / launchctl unload …), then re-run.\n' +
+          `  (listener detected${holder === 'unknown' ? '' : ` at ${holder}`})`,
+      );
+    }
+  }
 
   const { configPath, backupPath } = writeInstanceConfig(instanceDir, answers);
   stdout.write(`\nWrote ${configPath}\n`);

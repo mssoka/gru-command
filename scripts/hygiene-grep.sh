@@ -56,13 +56,24 @@ while IFS= read -r file; do
   fi
   while IFS= read -r match; do
     [[ -z "$match" ]] && continue                   # heredoc tail newline
-    # Line format: <file>:<line>:<text> (grep -n over one file at a time)
-    case "$match" in
-      *"/home/tester"*) continue ;;                       # generic fixture home
-      *"/root/repo/"*) continue ;;                       # generic fixture path
-      *"mssoka/gru-command"*) continue ;;                 # install/clone URL
-      *"herdr is not"*) continue ;;                       # frozen SPEC statement
-    esac
+    # Allowlist semantics (Perkins r2 note): slash-terminated PATH
+    # PREFIXES ('/home/tester/', '/root/repo/') strip unconditionally —
+    # the trailing slash IS the boundary, so '/home/tester-evil' never
+    # matches them. COMPLETE TOKENS ('mssoka/gru-command', 'herdr is
+    # not', and the bare fixture-home token) strip only when followed by
+    # end-of-line or a NON-identifier char — a lookalike with more
+    # identifier chars is a different token and stays a violation. The
+    # RESIDUAL after stripping is re-checked: anything still matching the
+    # personal-pattern set is a real finding.
+    residual="$(printf '%s\n' "$match" | sed -E \
+      -e 's#/home/tester/##g' \
+      -e 's#/root/repo/##g' \
+      -e 's#/home/tester([^A-Za-z0-9_-]|$)#\1#g' \
+      -e 's#mssoka/gru-command([^A-Za-z0-9_-]|$)#\1#g' \
+      -e 's#herdr is not([^A-Za-z0-9_-]|$)#\1#g')"
+    if ! printf '%s\n' "$residual" | grep -qE "$PATTERNS"; then
+      continue # the allowlisted token was the whole story
+    fi
     echo "hygiene violation: ${file}:${match#"${file}:"}"
     hits=$((hits + 1))
   done <<< "${grep_out}"

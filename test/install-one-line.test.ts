@@ -264,6 +264,13 @@ describe('install.sh E7 flag contracts (re-pinned)', () => {
     expect(status).toBe(1);
     expect(stderr).toContain('dist/main.js not found');
   });
+
+  it('--answers= (empty) exits 2 — never a silent flip to interactive (Perkins r2 note)', () => {
+    const { status, stderr } = run(join(repoRoot, 'install.sh'), ['--answers='], {});
+    expect(status).toBe(2);
+    expect(stderr).toContain("--answers was given an empty value");
+    expect(stderr).toContain("--answers '{}'");
+  });
 });
 
 describe('node version gate (>= 22.19) — Perkins r1 W11', () => {
