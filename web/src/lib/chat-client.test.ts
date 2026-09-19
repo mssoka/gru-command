@@ -415,6 +415,41 @@ describe('attachments ride the outbox (SPEC ruling 19)', () => {
     ).toThrow(/invalid attachments/);
   });
 
+  it('restores outbox entries independently: non-array chips cannot drop siblings or create an immortal empty frame', async () => {
+    const storage = memStorage();
+    const validChips = [{ path: '/data/uploads/ok.png', name: 'ok.png', kind: 'image' as const }];
+    storage.setItem(
+      'gru-outbox',
+      JSON.stringify([
+        { client_msg_id: 'corrupt-text', text: 'keep my text', attachments: { length: 1 } },
+        { client_msg_id: 'corrupt-empty', text: '', attachments: { length: 1 } },
+        { client_msg_id: 'valid-chip', text: '', attachments: validChips },
+        { client_msg_id: 'overlong-with-chip', text: 'x'.repeat(4_001), attachments: validChips },
+        { client_msg_id: 'healthy-after', text: 'still here' },
+      ]),
+    );
+    const h = makeClient(server, storage);
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.statuses.some((m) => m.client_msg_id === 'healthy-after' && m.status === 'acked'));
+    await waitFor(() => h.statuses.some((m) => m.client_msg_id === 'valid-chip' && m.status === 'acked'));
+    await waitFor(() => h.statuses.some((m) => m.client_msg_id === 'overlong-with-chip' && m.status === 'acked'));
+    await waitFor(() => h.statuses.some((m) => m.client_msg_id === 'corrupt-text' && m.status === 'acked'));
+
+    expect(h.client.getMessages().some((m) => m.client_msg_id === 'corrupt-empty')).toBe(false);
+    expect(server.log.find((f) => f.type === 'user' && f.client_msg_id === 'corrupt-empty')).toBeUndefined();
+    expect(server.log.find((f) => f.type === 'user' && f.client_msg_id === 'corrupt-text')).toMatchObject({
+      text: 'keep my text',
+    });
+    expect(server.log.find((f) => f.type === 'user' && f.client_msg_id === 'valid-chip')).toMatchObject({
+      attachments: validChips,
+    });
+    expect(server.log.find((f) => f.type === 'user' && f.client_msg_id === 'overlong-with-chip')).toMatchObject({
+      text: '',
+      attachments: validChips,
+    });
+  });
+
   it('attachment-only sends are legal; empty sends still throw', async () => {
     const h = makeClient(server, memStorage());
     clients.push(h.client);

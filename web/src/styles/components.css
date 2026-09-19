@@ -545,6 +545,7 @@ body {
     position: fixed;
     inset: auto 0 0 0;
     z-index: 30;
+    height: 82vh;
     max-height: 82vh;
     background: var(--paper);
     border-top: var(--outline);
@@ -1286,10 +1287,16 @@ body {
 }
 
 .attach-picker__loading,
-.attach-picker__empty {
+.attach-picker__empty,
+.attach-picker__truncated {
   padding: 10px 12px;
   color: var(--muted, #888);
   font-size: 13px;
+}
+
+.attach-picker__truncated {
+  border-top: 1px dashed var(--border, #ccc);
+  font-weight: 700;
 }
 
 .attach-row {
@@ -1308,6 +1315,11 @@ body {
 
 .attach-row:hover {
   background: var(--soft, #f3f4f6);
+}
+
+.attach-row:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .attach-row__icon {

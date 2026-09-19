@@ -55,10 +55,13 @@ export class ChatView {
   private mobile = window.matchMedia(MOBILE_QUERY);
   /** Ready-to-send chips (SPEC ruling 19). */
   private pending: AttachmentChip[] = [];
-  /** Uploads in flight (busy chips). */
-  private readonly uploading = new Set<string>();
+  /** Uploads in flight, keyed by gesture identity (same-name files may overlap). */
+  private readonly uploading = new Map<number, string>();
+  private nextUploadId = 0;
   private attach: AttachSurface | null = null;
   private pickerAt = '';
+  /** Latest browse request/close generation; stale responses never repaint. */
+  private browseGeneration = 0;
   /** Absolute workspace root from the current browse (chip paths). */
   private browseRoot = '';
 
@@ -171,18 +174,21 @@ export class ChatView {
 
   private async openPicker(path: string): Promise<void> {
     if (this.attach === null) return;
+    const generation = ++this.browseGeneration;
     this.picker.hidden = false;
     this.attachButton.setAttribute('aria-expanded', 'true');
     this.pickerError.hidden = true;
     this.pickerList.replaceChildren(el('div', 'attach-picker__loading', 'browsing…'));
     try {
       const result = await this.attach.browse(path);
+      if (generation !== this.browseGeneration) return;
       this.pickerAt = result.path;
       this.browseRoot = result.root;
       this.picker.dataset.parent = result.parent ?? '';
       this.pickerPath.textContent = `/${result.path}`;
       this.renderBrowse(result);
     } catch (error) {
+      if (generation !== this.browseGeneration) return;
       this.pickerList.replaceChildren();
       this.pickerError.textContent = String(error instanceof Error ? error.message : error);
       this.pickerError.hidden = false;
@@ -194,7 +200,6 @@ export class ChatView {
     list.replaceChildren();
     if (result.entries.length === 0) {
       list.append(el('div', 'attach-picker__empty', 'nothing pickable here'));
-      return;
     }
     for (const entry of result.entries) {
       const row = el('button', `attach-row attach-row--${entry.kind}`);
@@ -204,7 +209,10 @@ export class ChatView {
       const icon = el('span', 'attach-row__icon', entry.kind === 'dir' ? '📁' : entry.image ? '🖼️' : '📄');
       const label = el('span', 'attach-row__name', entry.name);
       row.append(icon, label);
-      if (entry.kind === 'dir') {
+      if (!entry.pickable) {
+        row.disabled = true;
+        row.title = 'Unavailable: target is outside the workspace';
+      } else if (entry.kind === 'dir') {
         row.addEventListener('click', () => void this.openPicker(joinRel(result.path, entry.name)));
       } else {
         row.addEventListener('click', () => {
@@ -220,9 +228,19 @@ export class ChatView {
       }
       list.append(row);
     }
+    if (result.truncated) {
+      list.append(
+        el(
+          'div',
+          'attach-picker__truncated',
+          'Showing the first 500 entries — narrow this folder to see more.',
+        ),
+      );
+    }
   }
 
   private closePicker(): void {
+    this.browseGeneration += 1;
     this.picker.hidden = true;
     this.attachButton.setAttribute('aria-expanded', 'false');
   }
@@ -234,7 +252,8 @@ export class ChatView {
       this.ephemeralNote(`attachment cap reached (${MAX_ATTACHMENTS_PER_MESSAGE})`);
       return;
     }
-    this.uploading.add(file.name);
+    const uploadId = ++this.nextUploadId;
+    this.uploading.set(uploadId, file.name);
     this.renderChips();
     try {
       const uploaded = await this.attach.upload(file);
@@ -244,7 +263,7 @@ export class ChatView {
         `could not attach ${file.name}: ${error instanceof Error ? error.message : String(error)}`,
       );
     } finally {
-      this.uploading.delete(file.name);
+      this.uploading.delete(uploadId);
       this.renderChips();
     }
   }
@@ -276,7 +295,7 @@ export class ChatView {
 
   private renderChips(): void {
     this.chipsRow.replaceChildren();
-    for (const name of this.uploading) {
+    for (const name of this.uploading.values()) {
       const chip = el('span', 'attach-chip attach-chip--busy', `⏳ ${name}`);
       this.chipsRow.append(chip);
     }

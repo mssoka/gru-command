@@ -34,6 +34,15 @@ export interface AgentCapabilities {
   readonly followUp: boolean;
 }
 
+/** Project adapter transport support onto one resolved model. Unknown model
+ * metadata is conservative: callers decline vision rather than guessing. */
+export function capabilitiesForModelInput(
+  adapter: AgentCapabilities,
+  input: readonly ('text' | 'image')[] | undefined,
+): AgentCapabilities {
+  return { ...adapter, images: adapter.images && input?.includes('image') === true };
+}
+
 /** Lifecycle state of an agent session, mirrored into /health liveness. */
 export type AgentState = 'spawning' | 'idle' | 'streaming' | 'error' | 'disposed';
 

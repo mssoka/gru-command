@@ -83,8 +83,9 @@ export type WebSocketCtor = new (url: string) => SocketLike;
 /** Chip shape check shared by send() and the outbox restore (review r1:
  * an unvalidated restore could wedge the outbox on a malformed frame the
  * server would reject forever). */
-export function chipsValid(chips: readonly AttachmentChip[] | undefined): chips is readonly AttachmentChip[] {
+export function chipsValid(chips: unknown): chips is readonly AttachmentChip[] {
   if (chips === undefined) return true;
+  if (!Array.isArray(chips)) return false;
   if (chips.length === 0 || chips.length > MAX_ATTACHMENTS_PER_MESSAGE) return false;
   for (const chip of chips) {
     if (
@@ -410,14 +411,24 @@ export class ChatClient {
           const record = entry as {
             client_msg_id: string;
             text: string;
-            attachments?: readonly AttachmentChip[];
+            attachments?: unknown;
           };
-          // Corrupted storage must never wedge the outbox (review r1):
-          // invalid chips drop to the text alone; the entry survives.
+          // Validate EACH record independently: one hostile attachments
+          // value must not throw away healthy siblings. Invalid chips
+          // degrade to text-only and overlong text to attachments-only;
+          // if that leaves no content, drop the record so it cannot
+          // become an unackable immortal frame.
+          const trimmedText = record.text.trim();
+          const text = trimmedText.length <= MAX_MESSAGE_CHARS ? trimmedText : '';
+          const attachments =
+            record.attachments !== undefined && chipsValid(record.attachments)
+              ? record.attachments
+              : undefined;
+          if (text === '' && attachments === undefined) continue;
           out.push({
             client_msg_id: record.client_msg_id,
-            text: record.text,
-            ...(chipsValid(record.attachments) ? { attachments: record.attachments } : {}),
+            text,
+            ...(attachments !== undefined ? { attachments } : {}),
           });
         }
       }

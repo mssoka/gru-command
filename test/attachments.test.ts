@@ -1,11 +1,11 @@
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, chmodSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { hashToken } from '../src/auth.js';
 import type { GruCommandConfig } from '../src/config.js';
-import { createAttachmentsServer } from '../src/attachments/server.js';
+import { createAttachmentsServer, MAX_UPLOAD_BODY_BYTES } from '../src/attachments/server.js';
 import {
   browseWorkspace,
   chipPathAllowed,
@@ -45,11 +45,18 @@ describe('sanitizeUploadName', () => {
     expect(sanitizeUploadName('..')).toBe('upload');
   });
 
-  it('bounds the length while preserving the extension tail', () => {
+  it('bounds both characters and UTF-8 bytes while preserving the extension tail', () => {
     const long = `${'a'.repeat(300)}.png`;
     const sanitized = sanitizeUploadName(long);
     expect(sanitized.length).toBeLessThanOrEqual(200);
+    expect(Buffer.byteLength(sanitized)).toBeLessThanOrEqual(200);
     expect(sanitized.endsWith('.png')).toBe(true);
+
+    // Fails pre-fix: 200 non-ASCII characters fit the old char cap but
+    // exceed NAME_MAX once the timestamp prefix is added (ENAMETOOLONG).
+    const multibyte = sanitizeUploadName(`${'界'.repeat(200)}.png`);
+    expect(Buffer.byteLength(multibyte)).toBeLessThanOrEqual(200);
+    expect(multibyte.endsWith('.png')).toBe(true);
   });
 });
 
@@ -74,6 +81,51 @@ describe('materializeUpload (ruling 19(c): bytes → uploads dir → THAT path)'
     chmodSync(dir, 0o755);
     materializeUpload(dir, { filename: 'x.txt', bytes: new TextEncoder().encode('x') });
     expect(statSync(dir).mode & 0o777).toBe(0o700);
+  });
+
+  it('a multibyte client name remains below filesystem NAME_MAX after stamping', () => {
+    const dir = tempDir('gru-command-uploads-utf8-');
+    const stored = materializeUpload(dir, {
+      filename: `${'界'.repeat(200)}.png`,
+      bytes: new TextEncoder().encode('x'),
+    });
+    expect(Buffer.byteLength(basename(stored.path))).toBeLessThanOrEqual(255);
+    expect(readFileSync(stored.path, 'utf-8')).toBe('x');
+  });
+
+  it('serializes quota allocation so a concurrent writer cannot pass the count check', () => {
+    const dir = tempDir('gru-command-uploads-lock-');
+    mkdirSync(`${dir}.allocation-lock`, { mode: 0o700 });
+    try {
+      expect(() =>
+        materializeUpload(dir, { filename: 'racing.txt', bytes: new TextEncoder().encode('x') }),
+      ).toThrow(/allocation is busy/);
+    } finally {
+      rmSync(`${dir}.allocation-lock`, { recursive: true, force: true });
+    }
+  });
+
+  it('reclaims a stale dead-owner lock but never steals an old lock from a live owner', () => {
+    const dir = tempDir('gru-command-uploads-stale-lock-');
+    const lock = `${dir}.allocation-lock`;
+    const old = new Date(Date.now() - 60_000);
+
+    mkdirSync(lock, { mode: 0o700 });
+    writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: 2_147_483_647, token: 'dead' }));
+    utimesSync(lock, old, old);
+    expect(
+      materializeUpload(dir, { filename: 'after-crash.txt', bytes: new TextEncoder().encode('x') }),
+    ).toMatchObject({ name: 'after-crash.txt' });
+    expect(() => statSync(lock)).toThrow();
+
+    mkdirSync(lock, { mode: 0o700 });
+    writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, token: 'live' }));
+    utimesSync(lock, old, old);
+    expect(() =>
+      materializeUpload(dir, { filename: 'do-not-steal.txt', bytes: new TextEncoder().encode('x') }),
+    ).toThrow(/allocation is busy/);
+    expect(statSync(lock).isDirectory()).toBe(true);
+    rmSync(lock, { recursive: true, force: true });
   });
 
   it('never clobbers: same-name collisions materialize side-by-side', () => {
@@ -153,20 +205,23 @@ describe('browseWorkspace (ruling 19(c): on-disk = PATH, metadata only)', () => 
     expect(() => browseWorkspace(root, 'tunnel')).toThrow(/escapes/);
   });
 
-  it('lists SYMLINKS by their target type; broken ones drop out (review r1)', () => {
+  it('lists symlinks by target type but marks out-of-workspace targets non-pickable', () => {
     const root = tempDir('gru-command-ws-symlink-');
-    const realDir = tempDir('gru-command-ws-symlink-real-');
+    const outside = tempDir('gru-command-ws-symlink-real-');
     mkdirSync(join(root, 'plain'));
-    writeFileSync(join(realDir, 'linked.md'), 'through the link');
-    symlinkSync(join(realDir, 'linked.md'), join(root, 'linked.md'));
-    symlinkSync(realDir, join(root, 'dirlink')); // target IS a directory
+    writeFileSync(join(root, 'inside.md'), 'inside');
+    writeFileSync(join(outside, 'linked.md'), 'through the link');
+    symlinkSync(join(root, 'inside.md'), join(root, 'inside-link.md'));
+    symlinkSync(join(outside, 'linked.md'), join(root, 'linked.md'));
+    symlinkSync(outside, join(root, 'dirlink')); // external directory target
     symlinkSync(join(root, 'nowhere'), join(root, 'broken')); // broken (target absent)
     const result = browseWorkspace(root, '');
-    const names = result.entries.map((e) => `${e.kind}:${e.name}`);
-    expect(names).toContain('dir:plain');
-    expect(names).toContain('dir:dirlink');
-    expect(names).toContain('file:linked.md');
-    expect(names).not.toContain('file:broken');
+    const byName = new Map(result.entries.map((entry) => [entry.name, entry]));
+    expect(byName.get('plain')).toMatchObject({ kind: 'dir', pickable: true });
+    expect(byName.get('inside-link.md')).toMatchObject({ kind: 'file', pickable: true });
+    expect(byName.get('dirlink')).toMatchObject({ kind: 'dir', pickable: false });
+    expect(byName.get('linked.md')).toMatchObject({ kind: 'file', pickable: false });
+    expect(byName.has('broken')).toBe(false);
     expect(result.truncated).toBe(false);
   });
 
@@ -180,18 +235,29 @@ describe('browseWorkspace (ruling 19(c): on-disk = PATH, metadata only)', () => 
     expect(result.truncated).toBe(true);
   });
 
-  it('chipPathAllowed: workspace + uploads homes pass; outsiders and absent paths fail', () => {
+  it('chipPathAllowed realpaths BOTH homes: valid files pass; missing and symlink escapes fail', () => {
     const root = tempDir('gru-command-ws-prov-');
     const uploads = tempDir('gru-command-uploads-prov-');
     writeFileSync(join(root, 'in-ws.md'), 'x');
     writeFileSync(join(uploads, '1-shot.png'), 'x');
     const outside = tempDir('gru-command-outside-prov-');
     writeFileSync(join(outside, 'secret.txt'), 'x');
+    symlinkSync(join(outside, 'secret.txt'), join(uploads, 'escape.txt'));
     expect(chipPathAllowed(root, uploads, join(root, 'in-ws.md'))).toBe(true);
     expect(chipPathAllowed(root, uploads, join(uploads, '1-shot.png'))).toBe(true);
+    expect(chipPathAllowed(root, uploads, join(uploads, 'escape.txt'))).toBe(false);
+    expect(chipPathAllowed(root, uploads, join(uploads, 'does-not-exist.png'))).toBe(false);
     expect(chipPathAllowed(root, uploads, join(outside, 'secret.txt'))).toBe(false);
     expect(chipPathAllowed(root, uploads, join(root, 'does-not-exist.md'))).toBe(false);
     expect(chipPathAllowed(root, uploads, 'relative/path.md')).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32')('preserves a literal backslash in POSIX directory names', () => {
+    const root = tempDir('gru-command-ws-backslash-');
+    const name = 'literal\\backslash';
+    mkdirSync(join(root, name));
+    const result = browseWorkspace(root, name);
+    expect(result.path).toBe(name);
   });
 
   it('unknown paths and non-directories are 404s, null bytes are 400s', () => {
@@ -247,7 +313,7 @@ describe('attachments HTTP surface (/api/attach)', () => {
       entries: Array<{ name: string; kind: string; size: number | null }>;
     };
     expect(body.root).toBe(realpathSync(workspaceRoot));
-    expect(body.entries).toEqual([{ name: 'readme.md', kind: 'file', size: 7, image: false }]);
+    expect(body.entries).toEqual([{ name: 'readme.md', kind: 'file', size: 7, image: false, pickable: true }]);
   });
 
   it('uploads materialize under <data_dir>/uploads/ and return THAT path', async () => {
@@ -279,6 +345,45 @@ describe('attachments HTTP surface (/api/attach)', () => {
     expect(bad.status).toBe(400);
     const res = (await bad.json()) as { detail: string };
     expect(res.detail).toContain('content_base64');
+  });
+
+  it('maps decoded oversize and raw-body overflow to observable HTTP 413 responses', async () => {
+    const decoded = await fetch(`http://127.0.0.1:${port}/api/attach/uploads`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        filename: 'too-big.bin',
+        content_base64: Buffer.alloc(MAX_UPLOAD_BYTES + 1).toString('base64'),
+      }),
+    });
+    expect(decoded.status).toBe(413);
+    expect(((await decoded.json()) as { detail: string }).detail).toContain('upload exceeds');
+
+    // Fails pre-fix on some clients: req.destroy() races the 413 write and
+    // fetch sees a reset instead of the promised status. Drain, never destroy.
+    const overflow = await fetch(`http://127.0.0.1:${port}/api/attach/uploads`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: 'x'.repeat(MAX_UPLOAD_BODY_BYTES + 1),
+    });
+    expect(overflow.status).toBe(413);
+    expect(((await overflow.json()) as { detail: string }).detail).toContain('request body exceeds');
+  }, 30_000);
+
+  it('maps the uploads file-count quota to HTTP 507', async () => {
+    const uploads = join(dataDir, 'uploads');
+    mkdirSync(uploads, { recursive: true });
+    const present = readdirSync(uploads).length;
+    for (let i = present; i < MAX_UPLOAD_FILES; i += 1) {
+      writeFileSync(join(uploads, `quota-${i}.txt`), 'x');
+    }
+    const response = await fetch(`http://127.0.0.1:${port}/api/attach/uploads`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ filename: 'one-too-many.txt', content_base64: 'eA==' }),
+    });
+    expect(response.status).toBe(507);
+    expect(((await response.json()) as { detail: string }).detail).toContain('quota exceeded');
   });
 
   it('unknown attach routes 404 under the hook', async () => {

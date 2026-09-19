@@ -1,3 +1,4 @@
+import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -50,7 +51,7 @@ interface Fixture {
   runtime: ClaudeCodeRuntime;
 }
 
-function fixture(knobs: { killGraceMs?: number } = {}): Fixture {
+function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime } = {}): Fixture {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
   const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
   cleanupDirs.push(home, workspace);
@@ -65,6 +66,7 @@ function fixture(knobs: { killGraceMs?: number } = {}): Fixture {
     store,
     binary: DOUBLE,
     ...(knobs.killGraceMs !== undefined ? { killGraceMs: knobs.killGraceMs } : {}),
+    ...(knobs.modelRuntime !== undefined ? { modelRuntime: knobs.modelRuntime } : {}),
     log: (level, msg, fields) => logs.push({ level, msg, fields }),
   });
   return { home, workspace, store, logs, doubleLog, runtime };
@@ -455,6 +457,24 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const fx = fixture();
     expect(fx.runtime.id).toBe('claude-code');
     expect(fx.runtime.capabilities).toEqual(CLAUDE_CODE_CAPABILITIES);
+  });
+
+  it('a model-metadata cache failure declines vision but does not block the Claude CLI spawn', async () => {
+    const brokenMetadata = {
+      getModel: () => {
+        throw new Error('torn model cache');
+      },
+    } as unknown as ModelRuntime;
+    const fx = fixture({ modelRuntime: brokenMetadata });
+    const handle = await fx.runtime.spawn('gru', { model: 'anthropic/claude-x' });
+    try {
+      expect(handle.capabilities.images).toBe(false);
+      await handle.prompt('metadata is optional');
+      expect(doubleInvocations(fx)).toHaveLength(1);
+      expect(fx.logs.some((entry) => entry.msg.includes('declines conservatively'))).toBe(true);
+    } finally {
+      await handle.dispose();
+    }
   });
 
   it('maps "default" to no flags and "provider/model" + level to --model/--effort', async () => {

@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type FileChooser, type Page } from '@playwright/test';
 import { startRealService, type RealServiceHandle } from '../../test/helpers/real-service.mjs';
 
 /**
@@ -403,15 +403,46 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
     expect(readdirSync(join(durableHome, 'uploads'))).toEqual([]);
   });
 
-  test('phone-origin device file: file input → materializes under <data_dir>/uploads/ → chip → send → agent receives THAT path', async ({ page }) => {
-    await pair(page);
-    // The phone surface: the same file input the picker's "from this
-    // device" button drives (camera roll / gallery origin).
-    await page.locator('#chat-attach-file').setInputFiles({
-      name: 'camera-roll.png',
-      mimeType: 'image/png',
-      buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]),
+  test('B2 fails-pre-fix discriminator — PHONE full gesture: attach → device button → chooser → chip → send → agent receives THAT path', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await pairMobile(page);
+    await page.locator('#chat-bubble').click();
+    await page.locator('#chat-attach').click();
+    await expect(page.locator('#attach-picker')).toBeVisible();
+
+    // FULL PHONE ENTRY GESTURE: the visible device button must open the
+    // chooser. Deleting its listener makes this promise time out and the
+    // named B2 discriminator RED; driving the hidden input directly would
+    // be the dock-drag-drop false green this lane exists to prevent.
+    const chooserHandled = new Promise<void>((resolve, reject) => {
+      const onChooser = (chooser: FileChooser): void => {
+        page.off('filechooser', onChooser);
+        void chooser
+          .setFiles({
+            name: 'camera-roll.png',
+            mimeType: 'image/png',
+            buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]),
+          })
+          .then(
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            (error: unknown) => {
+              clearTimeout(timer);
+              reject(error instanceof Error ? error : new Error(String(error)));
+            },
+          );
+      };
+      const timer = setTimeout(() => {
+        page.off('filechooser', onChooser);
+        reject(new Error('device button did not open a file chooser'));
+      }, 5_000);
+      page.on('filechooser', onChooser);
     });
+    await page.locator('#attach-picker-device').click();
+    await chooserHandled;
+
     const chip = page.locator('#chat-chips .attach-chip', { hasText: 'camera-roll.png' });
     await expect(chip).toBeVisible();
 

@@ -1,3 +1,4 @@
+import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { execFile, spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -30,6 +31,7 @@ import {
   NdjsonParser,
   type StreamFrame,
 } from './stream-json.js';
+import { capabilitiesForModelInput } from './types.js';
 import type {
   AgentCapabilities,
   AgentHandle,
@@ -127,6 +129,8 @@ export interface ClaudeCodeRuntimeOptions {
   readonly binary?: string;
   /** Test seam: grace before SIGKILL on dispose. Default 2000ms. */
   readonly killGraceMs?: number;
+  /** Tests may inject an offline catalog; production restores pi's cached model metadata. */
+  readonly modelRuntime?: ModelRuntime;
   readonly log?: Log;
 }
 
@@ -161,6 +165,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   private readonly killGraceMs: number;
   private readonly log: Log;
   private readonly handles = new Set<ClaudeCodeHandle>();
+  private modelRuntime: ModelRuntime | undefined;
   /** Normalized session paths currently hosted by this process. */
   private readonly activeFiles = new Set<string>();
   /** Cached binary availability (probed once; re-probed after a failure). */
@@ -173,6 +178,14 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     this.binary = opts.binary ?? 'claude';
     this.killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     this.log = opts.log ?? (() => {});
+    this.modelRuntime = opts.modelRuntime;
+  }
+
+  private async runtime(): Promise<ModelRuntime> {
+    if (this.modelRuntime === undefined) {
+      this.modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
+    }
+    return this.modelRuntime;
   }
 
   /**
@@ -226,17 +239,40 @@ export class ClaudeCodeRuntime implements AgentRuntime {
    * bare model id (Bedrock-style dotted ids survive: provider is the
    * FIRST segment only).
    */
-  private resolveModel(role: Role, override?: string): string | undefined {
+  private async resolveModel(
+    role: Role,
+    override?: string,
+  ): Promise<{ readonly cliModel?: string; readonly input?: readonly ('text' | 'image')[] }> {
     const ref =
       override !== undefined
         ? override
         : resolveSpawnPolicy(this.config, 'claude-code', role).model;
-    if (ref === '' || ref === 'default') return undefined;
+    if (ref === '' || ref === 'default') return {};
     const slash = ref.indexOf('/');
     if (slash <= 0 || slash >= ref.length - 1) {
       throw new Error(`model reference must be "provider/model" or "default", got: ${ref}`);
     }
-    return ref.slice(slash + 1);
+    const provider = ref.slice(0, slash);
+    const modelId = ref.slice(slash + 1);
+    let declared: ReturnType<ModelRuntime['getModel']> = undefined;
+    let metadataError: unknown;
+    try {
+      declared = (await this.runtime()).getModel(provider, modelId);
+    } catch (error) {
+      // Metadata enriches the CLI spawn but is not its transport. A torn
+      // cache must decline vision conservatively, not take Claude offline.
+      metadataError = error;
+    }
+    if (declared === undefined) {
+      this.log('warn', 'claude-code model has no declared input metadata; vision declines conservatively', {
+        model: ref,
+        ...(metadataError !== undefined ? { error: String(metadataError) } : {}),
+      });
+    }
+    return {
+      cliModel: modelId,
+      ...(declared !== undefined ? { input: declared.input } : {}),
+    };
   }
 
   /** Thinking level → --effort value (fail-loud: claude CAN set the level). */
@@ -260,7 +296,12 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     // serves (the dispatch flow's worktree); absent = workspace root.
     const cwd = resolveSpawnCwd(this.config.workspaceRoot, options.cwd);
     // Validation failures are caller-facing, never adapter health.
-    const model = this.resolveModel(role, options.model);
+    const resolvedModel = await this.resolveModel(role, options.model);
+    const model = resolvedModel.cliModel;
+    const handleCapabilities = capabilitiesForModelInput(
+      CLAUDE_CODE_CAPABILITIES,
+      resolvedModel.input,
+    );
     const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
     const tools = mapRoleTools(role, roleDef.tools);
     await this.ensureBinary();
@@ -372,6 +413,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           ...(model !== undefined ? { model } : {}),
           ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
         },
+        handleCapabilities,
         this.store,
         this.log,
         () => {
@@ -496,7 +538,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string;
-  readonly capabilities: AgentCapabilities = CLAUDE_CODE_CAPABILITIES;
+  readonly capabilities: AgentCapabilities;
 
   private readonly params: HandleParams;
   private readonly store: SessionStore;
@@ -516,6 +558,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   constructor(
     role: Role,
     params: HandleParams,
+    capabilities: AgentCapabilities,
     store: SessionStore,
     log: Log = () => {},
     onDispose: () => void = () => {},
@@ -523,6 +566,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   ) {
     this.role = role;
     this.params = params;
+    this.capabilities = capabilities;
     this.id = params.sessionId;
     this.sessionFile = params.sessionFile;
     this.sessionEstablished = params.resume;

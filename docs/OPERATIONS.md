@@ -14,7 +14,7 @@ schema), and [CHAT.md](./CHAT.md) (the chat contract).
 | `<data_dir>/logs/service.log` | structured JSON-lines service log (rotated, 10 MB × 5) |
 | `<data_dir>/sessions/` | append-only agent transcripts (jsonl), locks, hourly backups |
 | `<data_dir>/chat/` | chat frame log (`gru.frames.jsonl`) + the Gru session pointer |
-| `<data_dir>/uploads/` | attach-flow storage home: materialized clipboard/phone content (SPEC ruling 19). 0700, hardened at every boot and on every write; capped at 1 000 files (507 beyond) — prune manually, nothing deletes user material on its own |
+| `<data_dir>/uploads/` | attach-flow storage home: materialized clipboard/phone content (SPEC ruling 19). 0700, hardened at every boot and on every write; 8 MiB per file (413 beyond), capped at 1 000 files (507 beyond). Allocation is serialized across service processes; names are UTF-8 byte-bounded and never overwrite. Prune manually — nothing deletes user material on its own |
 | `<data_dir>/ledger/ledger.db` | the SQLite record of record (jobs, rounds, agents, events, notifications) |
 | workspace root | YOUR managed repos only (default `~/code`) — never instance state |
 

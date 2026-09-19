@@ -95,7 +95,9 @@ test('wrong token: inline error, stays on pairing across reload', async ({ page 
 
 test('socket drop shows a degraded banner that clears on recovery', async ({ page }) => {
   await pair(page);
-  await page.request.post('http://localhost:8788/__drop');
+  await page.request.post('http://localhost:8788/__drop', {
+    headers: { authorization: 'Bearer dev-token' },
+  });
   await expect(page.locator('#banners .banner')).toBeVisible();
   // The client reconnects by itself; the banner clears when the socket opens.
   await expect(page.locator('#banners .banner')).toBeHidden({ timeout: 15_000 });
@@ -138,7 +140,9 @@ test.describe('themes', () => {
   // Hermetic snapshots: reset the mock log so prior tests' history
   // cannot leak into the frame.
   test.beforeEach(async ({ request }) => {
-    await request.post('http://localhost:8788/__reset');
+    await request.post('http://localhost:8788/__reset', {
+      headers: { authorization: 'Bearer dev-token' },
+    });
   });
 
   test('light default, dark toggle persists, both snapshotted', async ({ page }) => {

@@ -22,8 +22,11 @@ npm run e2e                 # playwright smoke (mock + real service, serial)
 
 Open http://localhost:5173 and pair with the mock's default token
 `dev-token` — typed, never prefilled (the UI never guesses a token). The
-mock token is configurable via `GRU_MOCK_TOKEN`; its port via
-`GRU_MOCK_PORT`.
+mock binds `127.0.0.1` by default and warns loudly while using that
+development-only token. Its token is configurable via `GRU_MOCK_TOKEN`,
+its port via `GRU_MOCK_PORT`, and its bind via `GRU_MOCK_HOST`. A
+non-loopback mock bind is refused unless `GRU_MOCK_TOKEN` is explicitly
+set to at least 16 characters.
 
 > **Real socket (E5c, converged):** the UI now ships against the REAL
 > `/ws` — see the [real-socket section](#real-socket-e5c) below. The mock
@@ -95,9 +98,10 @@ resumes live. Omitting `last_seen_seq` (fresh page load) replays
 everything. The client dedupes by `seq`/`client_msg_id`; re-sent user
 frames (unacked across a drop) are deduped server-side and re-acked.
 
-**Mock control plane (tests):** `POST /__reset` on the mock port clears
-the frame log and sequence — keeps e2e snapshots hermetic. `POST
-/__drop` terminates every connected socket — drives degraded-mode e2e.
+**Mock control plane (tests):** token-authenticated `POST /__reset` on
+the mock port clears the frame log and sequence — keeps e2e snapshots
+hermetic. Token-authenticated `POST /__drop` terminates every connected
+socket — drives degraded-mode e2e.
 
 **Client guards:** messages are capped at 4 000 chars (`MAX_MESSAGE_CHARS`,
 mirrored by the composer's `maxlength`); a socket that never finishes
@@ -125,11 +129,14 @@ material into a conversation. **The user never types or pastes paths.**
   service's workspace root (the canonical namespace) over
   `/api/attach/browse` — directories navigate, files pick. The picked
   file becomes a ready-to-send chip carrying its ABSOLUTE path; no
-  bytes ever move (no byte copy).
+  bytes ever move (no byte copy). Out-of-workspace symlink targets are
+  shown disabled. Listings say when only the first 500 entries are
+  shown, and a late response cannot overwrite newer navigation.
 - **Device files (phone camera/gallery, desktop picks):** "📁 from this
-  device…" opens the file input; bytes POST to `/api/attach/uploads`
-  and MATERIALIZE into `<data_dir>/uploads/`; the chip carries that
-  path.
+  device…" opens the browser's real file chooser; bytes POST to
+  `/api/attach/uploads` and MATERIALIZE into `<data_dir>/uploads/`; the
+  chip carries that path. The UI rejects a file over 8 MiB from its
+  metadata **before reading it into memory**.
 - **Clipboard paste:** pasting a file/image into the composer
   materializes it the same way (Mac-screenshot class).
 - **Chips:** ready-to-send pills above the input (🖼️ image / 📎 file,
@@ -138,8 +145,9 @@ material into a conversation. **The user never types or pastes paths.**
   legal. Cap: 8 chips per message.
 - The picker closes on pick, ✕, or Escape; upload failures surface as
   ephemeral in-log notices (never modal). Device uploads cap at 8 MiB
-  per file and 8 chips per message; sending holds while an upload is
-  still in flight (nothing slips silently into a later message).
+  per file and 8 chips per message; sending holds until **every** upload
+  gesture settles, including concurrent files with the same name
+  (nothing slips silently into a later message).
 - Attach requests time out after 10 s — a hung service surfaces as the
   picker's inline error, never a stuck "browsing…" state.
 - History replay (chips included) is bounded by the chat frame log's

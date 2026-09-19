@@ -227,24 +227,44 @@ uninstall_systemd() {
 # from a download/pipe (no checkout around it), clone first and re-exec
 # inside the clone; inside a checkout, deps+build if needed, then wizard.
 # ---------------------------------------------------------------------------
+checkout_package_name() {
+  # Parse JSON instead of grepping text: formatting and nested "name"
+  # fields cannot spoof the top-level package identity.
+  "$NODE_BIN" -e '
+    const fs = require("node:fs");
+    try {
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      if (typeof value.name !== "string") process.exit(1);
+      process.stdout.write(value.name);
+    } catch { process.exit(1); }
+  ' "$1/package.json"
+}
+
+is_product_checkout() {
+  local root="$1" top canonical_root canonical_top
+  [[ -f "$root/package.json" && -d "$root/src" && -f "$root/install.sh" ]] || return 1
+  [[ "$(checkout_package_name "$root")" == "gru-command" ]] || return 1
+  command -v git >/dev/null 2>&1 || return 1
+  # Ask Git to validate its own metadata. This accepts real linked
+  # worktrees but rejects empty directories and stale .git pointer files.
+  top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  git -C "$root" rev-parse --verify HEAD >/dev/null 2>&1 || return 1
+  canonical_root="$(cd "$root" && pwd -P)" || return 1
+  canonical_top="$(cd "$top" && pwd -P)" || return 1
+  [[ "$canonical_root" == "$canonical_top" ]]
+}
+
 inside_checkout() {
-  # W-B (E9 r3 carry): repo-SHAPE alone accepted any repo-shaped dir — a
-  # saved copy of this repo dropped inside a FOREIGN repo passed and got
-  # npm-installed + built before a later guard killed it. Tighten: the
-  # package must BE Gru Command (name field), the checkout layout must
-  # hold (src/, install.sh), AND it must be a real git checkout. The
-  # one-liner's own clone satisfies all three by construction.
-  [[ -f "$REPO_ROOT/package.json" && -d "$REPO_ROOT/src" && -f "$REPO_ROOT/install.sh" ]] || return 1
-  # A git WORKTREE carries .git as a FILE pointing at the real git dir —
-  # both shapes are genuine checkouts; a saved copy carries neither.
-  [[ -e "$REPO_ROOT/.git" ]] || return 1
-  # Anchored to a name KEY on its own line (review r1): arbitrary
-  # substrings no longer match; a deliberately-crafted nested "name"
-  # still could — the .git+src+install.sh gates carry the rest.
-  grep -Eq '^(\{[[:space:]]*)?[[:space:]]*"name"[[:space:]]*:[[:space:]]*"gru-command"' "$REPO_ROOT/package.json"
+  is_product_checkout "$REPO_ROOT"
 }
 
 run_setup() {
+  # The identity predicate parses package.json with Node, so enforce the
+  # installer prerequisite before asking it to distinguish pipe vs clone.
+  if ! node_ok; then
+    err "node >= 22.19 required, found $("$NODE_BIN" --version) — upgrade Node.js first"
+    exit 1
+  fi
   if ! inside_checkout; then
     # One-liner case (e.g. curl | bash): clone to the target dir.
     # A re-exec guard: if we already re-executed once and STILL are not
@@ -256,8 +276,7 @@ run_setup() {
     fi
     command -v git >/dev/null 2>&1 || { err "git not found on PATH — install git first"; exit 1; }
     if [[ -e "$CLONE_TARGET" ]]; then
-      if [[ -d "$CLONE_TARGET" && -f "$CLONE_TARGET/package.json" && -e "$CLONE_TARGET/.git" ]] && \
-         grep -Eq '^(\{[[:space:]]*)?[[:space:]]*"name"[[:space:]]*:[[:space:]]*"gru-command"' "$CLONE_TARGET/package.json"; then
+      if is_product_checkout "$CLONE_TARGET"; then
         echo "reusing existing checkout: $CLONE_TARGET"
         echo "notice: not updating the checkout — run git pull yourself"
       else
@@ -277,10 +296,6 @@ run_setup() {
   fi
 
   # Inside the checkout.
-  if ! node_ok; then
-    err "node >= 22.19 required, found $("$NODE_BIN" --version) — upgrade Node.js first"
-    exit 1
-  fi
   cd "$REPO_ROOT"
   # ALWAYS install deps: a pulled checkout with new dependencies must not
   # crash at wizard exec — npm install is a no-op when already satisfied.
