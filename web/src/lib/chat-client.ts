@@ -10,8 +10,12 @@
  */
 
 import {
+  MAX_ATTACHMENTS_PER_MESSAGE,
+  MAX_ATTACHMENT_NAME_CHARS,
+  MAX_ATTACHMENT_PATH_CHARS,
   WS_PATH,
   parseServerFrame,
+  type AttachmentChip,
   type LoggedFrame,
   type ServerFrame,
   type UserFrame,
@@ -31,6 +35,8 @@ export type MessageStatus = 'queued' | 'sent' | 'acked';
 export interface ChatMessage {
   readonly client_msg_id: string;
   readonly text: string;
+  /** Attach chips (SPEC ruling 19): paths the agent reads itself. */
+  readonly attachments?: readonly AttachmentChip[];
   status: MessageStatus;
 }
 
@@ -73,6 +79,28 @@ export interface SocketLike {
 }
 
 export type WebSocketCtor = new (url: string) => SocketLike;
+
+/** Chip shape check shared by send() and the outbox restore (review r1:
+ * an unvalidated restore could wedge the outbox on a malformed frame the
+ * server would reject forever). */
+export function chipsValid(chips: readonly AttachmentChip[] | undefined): chips is readonly AttachmentChip[] {
+  if (chips === undefined) return true;
+  if (chips.length === 0 || chips.length > MAX_ATTACHMENTS_PER_MESSAGE) return false;
+  for (const chip of chips) {
+    if (
+      typeof chip.path !== 'string' ||
+      chip.path === '' ||
+      chip.path.length > MAX_ATTACHMENT_PATH_CHARS ||
+      typeof chip.name !== 'string' ||
+      chip.name === '' ||
+      chip.name.length > MAX_ATTACHMENT_NAME_CHARS ||
+      (chip.kind !== 'file' && chip.kind !== 'image')
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
 
 const OUTBOX_KEY = 'gru-outbox';
 const SOCKET_OPEN = 1;
@@ -145,16 +173,21 @@ export class ChatClient {
     this.setState('idle');
   }
 
-  /** Queue-or-send a user message. Throws on empty/oversized text. */
-  send(text: string): ChatMessage {
+  /** Queue-or-send a user message. An attachment-only message is legal
+   * (chips carry the content); text alone or with chips is too. Throws
+   * when there is neither text nor attachments, or oversized text. */
+  send(text: string, attachments?: readonly AttachmentChip[]): ChatMessage {
     const trimmed = text.trim();
-    if (trimmed === '') throw new Error('empty message');
+    const chips = attachments === undefined || attachments.length === 0 ? undefined : attachments;
+    if (!chipsValid(chips)) throw new Error('invalid attachments (bad shape, kind, count, or length)');
+    if (trimmed === '' && chips === undefined) throw new Error('empty message');
     if (trimmed.length > MAX_MESSAGE_CHARS) {
       throw new Error(`message too long (${trimmed.length} > ${MAX_MESSAGE_CHARS} chars)`);
     }
     const message: ChatMessage = {
       client_msg_id: this.id(),
       text: trimmed,
+      ...(chips !== undefined ? { attachments: chips } : {}),
       status: 'queued',
     };
     this.messages.set(message.client_msg_id, message);
@@ -328,6 +361,7 @@ export class ChatClient {
         type: 'user',
         text: message.text,
         client_msg_id: message.client_msg_id,
+        ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       };
       socket.send(JSON.stringify(frame));
       message.status = 'sent';
@@ -354,13 +388,18 @@ export class ChatClient {
     this.timers.add(timer);
   }
 
-  private readOutbox(): Array<{ client_msg_id: string; text: string }> {
+  private readOutbox(): Array<{
+    client_msg_id: string;
+    text: string;
+    attachments?: readonly AttachmentChip[];
+  }> {
     try {
       const raw = this.options.storage.getItem(OUTBOX_KEY);
       if (raw === null) return [];
       const parsed: unknown = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [];
-      const out: Array<{ client_msg_id: string; text: string }> = [];
+      const out: Array<{ client_msg_id: string; text: string; attachments?: readonly AttachmentChip[] }> =
+        [];
       for (const entry of parsed) {
         if (
           typeof entry === 'object' &&
@@ -368,8 +407,18 @@ export class ChatClient {
           typeof (entry as Record<string, unknown>).client_msg_id === 'string' &&
           typeof (entry as Record<string, unknown>).text === 'string'
         ) {
-          const record = entry as { client_msg_id: string; text: string };
-          out.push({ client_msg_id: record.client_msg_id, text: record.text });
+          const record = entry as {
+            client_msg_id: string;
+            text: string;
+            attachments?: readonly AttachmentChip[];
+          };
+          // Corrupted storage must never wedge the outbox (review r1):
+          // invalid chips drop to the text alone; the entry survives.
+          out.push({
+            client_msg_id: record.client_msg_id,
+            text: record.text,
+            ...(chipsValid(record.attachments) ? { attachments: record.attachments } : {}),
+          });
         }
       }
       return out;
@@ -383,7 +432,11 @@ export class ChatClient {
       const entries = this.outbox
         .map((id) => this.messages.get(id))
         .filter((m): m is ChatMessage => m !== undefined && m.status !== 'acked')
-        .map((m) => ({ client_msg_id: m.client_msg_id, text: m.text }));
+        .map((m) => ({
+          client_msg_id: m.client_msg_id,
+          text: m.text,
+          ...(m.attachments !== undefined ? { attachments: m.attachments } : {}),
+        }));
       // Drop ids whose messages vanished or got acked.
       this.outbox.length = 0;
       this.outbox.push(...entries.map((e) => e.client_msg_id));

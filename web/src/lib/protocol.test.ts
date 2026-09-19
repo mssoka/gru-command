@@ -103,3 +103,60 @@ describe('loggedFrameSeq', () => {
     expect(loggedFrameSeq({ type: 'error', message: 'm' })).toBe(0);
   });
 });
+
+describe('attachment chips on user frames (SPEC ruling 19)', () => {
+  const chips = [
+    { path: '/ws/repo/notes.md', name: 'notes.md', kind: 'file' as const },
+    { path: '/data/uploads/1-shot.png', name: 'shot.png', kind: 'image' as const },
+  ];
+
+  it('accepts a user frame carrying valid chips', () => {
+    const frame = parseClientFrame({ type: 'user', text: 'look', client_msg_id: 'a1', attachments: chips });
+    expect(frame).toEqual({ type: 'user', text: 'look', client_msg_id: 'a1', attachments: chips });
+  });
+
+  it('accepts an attachment-ONLY frame (empty text, chips present)', () => {
+    const frame = parseClientFrame({
+      type: 'user',
+      text: '',
+      client_msg_id: 'a2',
+      attachments: [{ path: '/x.png', name: 'x.png', kind: 'image' }],
+    });
+    expect(frame?.type).toBe('user');
+  });
+
+  it('rejects empty-text frames WITHOUT chips (still malformed)', () => {
+    expect(parseClientFrame({ type: 'user', text: '', client_msg_id: 'a3' })).toBeNull();
+  });
+
+  it('rejects bad chip kinds, empty arrays, and over-cap arrays', () => {
+    expect(
+      parseClientFrame({
+        type: 'user',
+        text: 'x',
+        client_msg_id: 'a4',
+        attachments: [{ path: '/v', name: 'v', kind: 'video' }],
+      }),
+    ).toBeNull();
+    expect(parseClientFrame({ type: 'user', text: 'x', client_msg_id: 'a5', attachments: [] })).toBeNull();
+    expect(
+      parseClientFrame({
+        type: 'user',
+        text: 'x',
+        client_msg_id: 'a6',
+        attachments: Array.from({ length: 9 }, (_, i) => ({ path: `/f${i}`, name: `f${i}`, kind: 'file' as const })),
+      }),
+    ).toBeNull();
+  });
+
+  it('replayed user frames keep their chips (history restores them)', () => {
+    const frame = parseServerFrame({
+      type: 'user',
+      text: 'look',
+      client_msg_id: 'a1',
+      seq: 3,
+      attachments: chips,
+    });
+    expect(frame).toMatchObject({ type: 'user', seq: 3, attachments: chips });
+  });
+});

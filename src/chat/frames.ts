@@ -27,10 +27,27 @@ export interface AuthFrame {
   readonly last_seen_seq?: number;
 }
 
+/** An attachment chip (SPEC ruling 19): a PATH reference the agent
+ * reads itself — never a byte payload. Mirrored exactly from the web
+ * protocol module (the contract's source of truth); parity-tested. */
+export interface AttachmentChip {
+  readonly path: string;
+  readonly name: string;
+  readonly kind: 'file' | 'image';
+}
+
+/** Composer caps mirrored from src/attachments/resolver.ts. */
+export const MAX_ATTACHMENTS_PER_MESSAGE = 8;
+export const MAX_ATTACHMENT_PATH_CHARS = 1024;
+export const MAX_ATTACHMENT_NAME_CHARS = 200;
+
 export interface UserFrame {
   readonly type: 'user';
   readonly text: string;
   readonly client_msg_id: string;
+  /** Ready-to-send chips from the ONE attach flow (SPEC ruling 19).
+   * Optional + absent on legacy frames; validated chip-by-chip. */
+  readonly attachments?: readonly AttachmentChip[];
 }
 
 export type ClientFrame = AuthFrame | UserFrame;
@@ -114,6 +131,34 @@ function isSeq(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
+/** Validate an optional attachments array (SPEC ruling 19 chips).
+ * undefined (absent) and a valid array pass; anything malformed is null.
+ * Mirrored exactly from the web protocol module — the parity corpus
+ * pins it. */
+function parseAttachments(
+  value: unknown,
+): readonly AttachmentChip[] | undefined | null {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+    return null;
+  }
+  const chips: AttachmentChip[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) return null;
+    if (
+      !isNonEmptyString(entry.path) ||
+      entry.path.length > MAX_ATTACHMENT_PATH_CHARS ||
+      !isNonEmptyString(entry.name) ||
+      entry.name.length > MAX_ATTACHMENT_NAME_CHARS ||
+      (entry.kind !== 'file' && entry.kind !== 'image')
+    ) {
+      return null;
+    }
+    chips.push({ path: entry.path, name: entry.name, kind: entry.kind });
+  }
+  return chips;
+}
+
 /** Parse a raw client→server frame; returns null when malformed. */
 export function parseClientFrame(raw: unknown): ClientFrame | null {
   const value = typeof raw === 'string' ? safeJson(raw) : raw;
@@ -127,8 +172,15 @@ export function parseClientFrame(raw: unknown): ClientFrame | null {
       return frame;
     }
     case 'user': {
-      if (!isNonEmptyString(value.text) || !isNonEmptyString(value.client_msg_id)) return null;
-      return { type: 'user', text: value.text, client_msg_id: value.client_msg_id };
+      if (typeof value.text !== 'string' || !isNonEmptyString(value.client_msg_id)) return null;
+      const attachments = parseAttachments(value.attachments);
+      if (attachments === null) return null;
+      // Attachment-only messages are legal (chips carry the content);
+      // a frame with neither text nor chips is malformed (ruling 19).
+      if (value.text.trim() === '' && attachments === undefined) return null;
+      return attachments === undefined
+        ? { type: 'user', text: value.text, client_msg_id: value.client_msg_id }
+        : { type: 'user', text: value.text, client_msg_id: value.client_msg_id, attachments };
     }
     default:
       return null;
@@ -166,12 +218,25 @@ export function parseServerFrame(raw: unknown): ServerFrame | null {
         : null;
     case 'user':
       // Server→client user frames appear in reconnect replays (they carry
-      // seq) so a fresh page restores both sides of the conversation.
-      return isNonEmptyString(value.text) &&
-        isNonEmptyString(value.client_msg_id) &&
-        isSeq(value.seq)
-        ? { type: 'user', text: value.text, client_msg_id: value.client_msg_id, seq: value.seq }
-        : null;
+      // seq) so a fresh page restores both sides of the conversation —
+      // attachment chips included (SPEC ruling 19).
+      {
+        if (typeof value.text !== 'string' ||
+          !isNonEmptyString(value.client_msg_id) ||
+          !isSeq(value.seq)) return null;
+        const attachments = parseAttachments(value.attachments);
+        if (attachments === null) return null;
+        if (value.text.trim() === '' && attachments === undefined) return null;
+        return attachments === undefined
+          ? { type: 'user', text: value.text, client_msg_id: value.client_msg_id, seq: value.seq }
+          : {
+              type: 'user',
+              text: value.text,
+              client_msg_id: value.client_msg_id,
+              seq: value.seq,
+              attachments,
+            };
+      }
     case 'error': {
       if (!isNonEmptyString(value.message)) return null;
       const frame: ErrorFrame = { type: 'error', message: value.message };

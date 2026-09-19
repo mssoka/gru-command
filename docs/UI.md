@@ -112,9 +112,39 @@ indefinitely in `localStorage` (`gru-pairing-token`) — lifetime/rotation
 belongs to the E9 token flow.
 
 **Never lose a typed word:** unacked messages persist in `localStorage`
-(`gru-outbox`, id + text), render as queued bubbles, and flush in order
-after re-auth; replay ends exactly when the stream reaches the
+(`gru-outbox`, id + text + chips), render as queued bubbles, and flush
+in order after re-auth; replay ends exactly when the stream reaches the
 `auth_ok` high-water mark.
+
+## The composer attach flow (SPEC ruling 19)
+
+The composer carries an attach button (📎) — the ONE flow for bringing
+material into a conversation. **The user never types or pastes paths.**
+
+- **On-disk files:** the button opens a picker that browses the
+  service's workspace root (the canonical namespace) over
+  `/api/attach/browse` — directories navigate, files pick. The picked
+  file becomes a ready-to-send chip carrying its ABSOLUTE path; no
+  bytes ever move (no byte copy).
+- **Device files (phone camera/gallery, desktop picks):** "📁 from this
+  device…" opens the file input; bytes POST to `/api/attach/uploads`
+  and MATERIALIZE into `<data_dir>/uploads/`; the chip carries that
+  path.
+- **Clipboard paste:** pasting a file/image into the composer
+  materializes it the same way (Mac-screenshot class).
+- **Chips:** ready-to-send pills above the input (🖼️ image / 📎 file,
+  ✕ removes); they ride the `user` frame, render on the sent bubble,
+  and replay with history. An attachment-only send (no typed text) is
+  legal. Cap: 8 chips per message.
+- The picker closes on pick, ✕, or Escape; upload failures surface as
+  ephemeral in-log notices (never modal). Device uploads cap at 8 MiB
+  per file and 8 chips per message; sending holds while an upload is
+  still in flight (nothing slips silently into a later message).
+- Attach requests time out after 10 s — a hung service surfaces as the
+  picker's inline error, never a stuck "browsing…" state.
+- History replay (chips included) is bounded by the chat frame log's
+  rotation window (3 × 8 MB shards) — the same bound every message
+  shares.
 
 ## Message rendering (GFM contract — issue #10)
 

@@ -1,4 +1,6 @@
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
 import { startRealService, type RealServiceHandle } from '../../test/helpers/real-service.mjs';
 
@@ -23,6 +25,23 @@ import { startRealService, type RealServiceHandle } from '../../test/helpers/rea
 /** Shared with test/helpers/real-service.mjs. */
 const REAL_TOKEN = process.env.REAL_SERVICE_TOKEN ?? 'e2e-real-pairing-token';
 const REAL_PORT = Number(process.env.REAL_SERVICE_PORT ?? 7790);
+
+/** SPEC ruling 19 proof oracle: the claude double records the EXACT
+ * prompt the agent received ({prompt, images}) — the agent-side receipt
+ * for the full-gesture attach tests. Set before the service spawns. */
+const DOUBLE_LOG = join(tmpdir(), `gru-e2e-double-${Date.now()}.jsonl`);
+process.env.CLAUDE_DOUBLE_LOG = DOUBLE_LOG;
+
+/** Last {prompt, images} the agent-side double received. */
+function lastAgentPrompt(): { prompt: string; images: number } | null {
+  try {
+    const lines = readFileSync(DOUBLE_LOG, 'utf-8').trim().split('\n');
+    const last = lines.at(-1);
+    return last === undefined || last === '' ? null : (JSON.parse(last) as { prompt: string; images: number });
+  } catch {
+    return null;
+  }
+}
 
 let service: RealServiceHandle | null = null;
 // Durable dirs owned by THIS file: captured at boot so afterAll can
@@ -323,5 +342,151 @@ test.describe('themes', () => {
 
     await page.reload();
     await expect(page.locator('html')).toHaveClass(/dark/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The ONE attach flow (SPEC ruling 19) — FULL-GESTURE proof. The briefing
+// rule: a UI flow that is green in the suite but dead in a real hand is
+// the failure mode this lane must not repeat. Each leg performs the WHOLE
+// gesture in a real browser against the real service: press attach →
+// pick real material → chip appears → send → the AGENT receives a PATH
+// (verified on the agent side via the double's prompt log, not just the
+// UI). The on-disk leg carries the fails-pre-fix discriminator: a
+// byte-copying implementation would land the file in uploads/ — it MUST
+// stay empty.
+// ---------------------------------------------------------------------------
+
+test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
+  test('on-disk pick: attach → browse → pick a real file → chip → send → agent receives the PATH; uploads dir stays EMPTY (no byte copy)', async ({ page }) => {
+    // Real material in the service's real workspace, on disk.
+    mkdirSync(join(durableWorkspace, 'plans'), { recursive: true });
+    const wsFile = join(durableWorkspace, 'plans', 'heist-plan.md');
+    writeFileSync(wsFile, '# the plan\nsteal the moon\n', 'utf-8');
+    // Browse resolves REALPATHS (containment) — macOS /var → /private/var.
+    const realWsFile = realpathSync(wsFile);
+
+    await pair(page);
+    await page.locator('#chat-attach').click();
+    await expect(page.locator('#attach-picker')).toBeVisible();
+    await expect(page.locator('#attach-picker-path')).toHaveText('/'); // workspace root
+
+    // FULL GESTURE: navigate into plans/, pick the real file.
+    await page.locator('.attach-row--dir', { hasText: 'plans' }).click();
+    const pick = page.locator('.attach-row--file', { hasText: 'heist-plan.md' });
+    await expect(pick).toBeVisible();
+    await pick.click();
+
+    // The chip is ready-to-send.
+    const chip = page.locator('#chat-chips .attach-chip', { hasText: 'heist-plan.md' });
+    await expect(chip).toBeVisible();
+    await expect(chip).toHaveAttribute('title', realWsFile);
+
+    await page.locator('#chat-input').fill('read the plan');
+    await page.locator('#chat-send').click();
+
+    // Own bubble carries the chip; the reply echoes the delivered prompt.
+    await expect(page.locator('.msg--user .attach-chip', { hasText: 'heist-plan.md' })).toBeVisible();
+    await expect(page.locator('.msg--gru', { hasText: realWsFile })).toBeVisible();
+
+    // AGENT-SIDE receipt (not just UI): the double's prompt log carries
+    // the manifest with the absolute workspace path…
+    const agentPrompt = lastAgentPrompt();
+    expect(agentPrompt?.prompt).toContain('[attached files — read them yourself at these paths]');
+    expect(agentPrompt?.prompt).toContain(realWsFile);
+    // …and NO image bytes were ever attached through the runtime.
+    expect(agentPrompt?.images ?? -1).toBe(0);
+
+    // FAILS-PRE-FIX DISCRIMINATOR (no byte copy): an implementation that
+    // copied bytes would materialize the pick into uploads/ — it must
+    // hold NOTHING for an on-disk attach.
+    expect(readdirSync(join(durableHome, 'uploads'))).toEqual([]);
+  });
+
+  test('phone-origin device file: file input → materializes under <data_dir>/uploads/ → chip → send → agent receives THAT path', async ({ page }) => {
+    await pair(page);
+    // The phone surface: the same file input the picker's "from this
+    // device" button drives (camera roll / gallery origin).
+    await page.locator('#chat-attach-file').setInputFiles({
+      name: 'camera-roll.png',
+      mimeType: 'image/png',
+      buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]),
+    });
+    const chip = page.locator('#chat-chips .attach-chip', { hasText: 'camera-roll.png' });
+    await expect(chip).toBeVisible();
+
+    await page.locator('#chat-input').fill('what did I just shoot');
+    await page.locator('#chat-send').click();
+    await expect(page.locator('.msg--user .attach-chip', { hasText: 'camera-roll.png' })).toBeVisible();
+
+    // The file EXISTS under the instance uploads dir (materialized).
+    const uploadsDir = join(durableHome, 'uploads');
+    const stored = readdirSync(uploadsDir).filter((name) => name.endsWith('camera-roll.png'));
+    expect(stored).toHaveLength(1);
+    const storedPath = join(uploadsDir, stored[0]!);
+
+    // The sent path points AT it — the agent received THAT path.
+    await expect(page.locator('.msg--gru', { hasText: storedPath })).toBeVisible();
+    const agentPrompt = lastAgentPrompt();
+    expect(agentPrompt?.prompt).toContain(storedPath);
+    expect(agentPrompt?.prompt).toContain('(image)');
+    expect(agentPrompt?.images ?? -1).toBe(0); // paths only, never bytes
+    // Vision-capable runtime (claude declares images): no decline notice.
+    await expect(page.locator('.notice-line', { hasText: 'Vision is unavailable' })).toHaveCount(0);
+  });
+
+  test('clipboard paste (Mac-screenshot class): paste bytes into the composer → materialized → chip → send', async ({ page }) => {
+    await pair(page);
+    await page.locator('#chat-input').click();
+    await page.evaluate(() => {
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 9, 9, 9]);
+      const file = new File([bytes], 'paste-shot.png', { type: 'image/png' });
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      document
+        .getElementById('chat-input')!
+        .dispatchEvent(
+          new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }),
+        );
+    });
+    const chip = page.locator('#chat-chips .attach-chip', { hasText: 'paste-shot.png' });
+    await expect(chip).toBeVisible();
+
+    // Attachment-only send: no typed words needed (empty text + chips).
+    await page.locator('#chat-send').click();
+    const uploadsDir = join(durableHome, 'uploads');
+    const stored = readdirSync(uploadsDir).filter((name) => name.endsWith('paste-shot.png'));
+    expect(stored).toHaveLength(1);
+    await expect(
+      page.locator('.msg--gru', { hasText: join(uploadsDir, stored[0]!) }),
+    ).toBeVisible();
+  });
+
+  test('chips replay with history after reload (the durable log carries them)', async ({ page }) => {
+    // Self-contained (review r1): no coupling to the earlier legs — this
+    // test mints its own chip, reloads, and expects it back.
+    mkdirSync(join(durableWorkspace, 'replay'), { recursive: true });
+    writeFileSync(join(durableWorkspace, 'replay', 'replay-note.md'), 'replay me\n', 'utf-8');
+    await pair(page);
+    await page.locator('#chat-attach').click();
+    await page.locator('.attach-row--dir', { hasText: 'replay' }).click();
+    await page.locator('.attach-row--file', { hasText: 'replay-note.md' }).click();
+    await expect(
+      page.locator('#chat-chips .attach-chip', { hasText: 'replay-note.md' }),
+    ).toBeVisible();
+    await page.locator('#chat-input').fill('keep this chip');
+    await page.locator('#chat-send').click();
+    await expect(
+      page.locator('.msg--user .attach-chip', { hasText: 'replay-note.md' }),
+    ).toBeVisible();
+
+    await page.reload();
+    await expect(page.locator('#chat-view')).toBeVisible();
+    // The chip replays on its user bubble from the durable frame log.
+    // (History also legitimately carries earlier legs' chips — the
+    // shared serial frame log — so no count assertions on those.)
+    await expect(
+      page.locator('.msg--user .attach-chip', { hasText: 'replay-note.md' }),
+    ).toBeVisible();
   });
 });

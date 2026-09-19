@@ -87,8 +87,12 @@ npm start               # serve the web UI + /health on the configured bind
 Open `http://127.0.0.1:7665`, enter the pairing token from the wizard
 (or scan the QR from an already-paired device). To pair a phone, bind
 the machine's LAN address (v1 is LAN + token only — no TLS, never
-expose it to the WAN). Service management, supervision behavior, the
-emergency console, forensics and backups:
+expose it to the WAN). Unauthenticated `GET /health` answers liveness
+only (service/version/health signal); the full operator payload
+(workspace paths, install fingerprint, supervision detail) requires
+the pairing token — a deliberate disclosure limit on the pairing
+surface. Service management, supervision behavior, the emergency
+console, forensics and backups:
 [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Documentation

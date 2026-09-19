@@ -9,7 +9,17 @@ import { BoardEngine } from '../src/board/engine.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner, type LensResult } from '../src/dispatch/perkins.js';
-import type { AgentHandle, AgentState, PromptOptions, RuntimeEvent, SpawnOptions } from '../src/runtime/types.js';
+import type { AgentCapabilities, AgentHandle, AgentState, PromptOptions, RuntimeEvent, SpawnOptions } from '../src/runtime/types.js';
+
+const FAKE_CAPABILITIES: AgentCapabilities = {
+  streaming: true,
+  steer: 'native',
+  resume: 'file',
+  images: false,
+  thinking: false,
+  thinkingLevelControl: false,
+  followUp: false,
+};
 import type { Role } from '../src/config.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
@@ -51,6 +61,7 @@ function makeHandle(id: string, role: Role, settle: (text: string) => Promise<vo
     role,
     id,
     sessionFile: null,
+    capabilities: FAKE_CAPABILITIES,
     prompts,
     prompt(text: string, options?: PromptOptions) {
       prompts.push({ text, owner: options?.owner });

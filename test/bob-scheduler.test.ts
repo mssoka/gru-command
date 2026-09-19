@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BobScheduler, BOB_CONSOLIDATION_PROMPT, type BobSlot } from '../src/dispatch/bob-scheduler.js';
-import type { AgentHandle } from '../src/runtime/types.js';
+import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
+
+const FAKE_CAPABILITIES: AgentCapabilities = {
+  streaming: true,
+  steer: 'native',
+  resume: 'file',
+  images: false,
+  thinking: false,
+  thinkingLevelControl: false,
+  followUp: false,
+};
 
 /**
  * Bob's periodic consolidation trigger (EPICS E8 story 4): interval-driven,
@@ -14,6 +24,7 @@ function makeSlot(): { slot: BobSlot; prompts: { text: string; owner?: string }[
     role: 'bob',
     id: 'bob-1',
     sessionFile: null,
+    capabilities: FAKE_CAPABILITIES,
     prompt(text: string, options?: { owner?: string }) {
       prompts.push({ text, owner: options?.owner });
       if (state.failWith !== undefined) return Promise.reject(state.failWith);

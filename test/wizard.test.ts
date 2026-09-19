@@ -371,6 +371,7 @@ describe('wizard first-boot smoke — failure modes (I/O matrix)', () => {
         host: '127.0.0.1',
         port: 0,
         timeoutMs: 1_500,
+        token: 'wizard-test-token',
       }),
     ).rejects.toThrow(/health_reachable.*never came|never came.*health_reachable/);
   });
@@ -391,6 +392,7 @@ describe('wizard first-boot smoke — failure modes (I/O matrix)', () => {
         host: '127.0.0.1',
         port: 0,
         timeoutMs: 5_000,
+        token: 'wizard-test-token',
       }),
     ).rejects.toThrow(/exited before listening \(exit code 3, signal none\)/);
   });

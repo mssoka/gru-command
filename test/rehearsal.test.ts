@@ -156,6 +156,7 @@ describe.skipIf(process.env['GRU_COMMAND_REHEARSAL'] !== '1')(
           while (health === null) {
             try {
               const res = await fetch(`http://127.0.0.1:${port}/health`, {
+                headers: { authorization: 'Bearer rehearsal-pairing-token' },
                 signal: AbortSignal.timeout(2_000),
               });
               if (res.ok) health = (await res.json()) as HealthShape;

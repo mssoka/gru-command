@@ -290,6 +290,7 @@ async function fetchHealth(
   host: string,
   port: number,
   timeoutMs: number,
+  token: string,
   /** Returns a named death message when the child is gone, else null —
    * a service that dies mid-poll must fail loud, not poll to timeout. */
   describeDeath: () => string | null = () => null,
@@ -299,7 +300,12 @@ async function fetchHealth(
     try {
       const res = await fetch(
         `http://${formatHostForUrl(host === '0.0.0.0' ? '127.0.0.1' : host)}:${port}/health`,
-        { signal: AbortSignal.timeout(2_000) },
+        {
+          signal: AbortSignal.timeout(2_000),
+          // W-C: the FULL smoke oracle (identity + all three signals)
+          // lives behind the pairing token the wizard itself just wrote.
+          headers: { authorization: `Bearer ${token}` },
+        },
       );
       if (res.ok) return (await res.json()) as unknown;
     } catch {
@@ -329,6 +335,8 @@ export async function runFirstBootSmoke(options: {
   host: string;
   port: number;
   timeoutMs?: number;
+  /** Pairing token (W-C): the full oracle rides the authed surface. */
+  token: string;
 }): Promise<SmokeOutcome> {
   const timeoutMs = options.timeoutMs ?? 45_000;
   const distMain = join(options.repoRoot, 'dist', 'main.js');
@@ -372,7 +380,13 @@ export async function runFirstBootSmoke(options: {
       }
     }
 
-    const health = (await fetchHealth(options.host, port, timeoutMs, describeDeath)) as HealthShape | null;
+    const health = (await fetchHealth(
+      options.host,
+      port,
+      timeoutMs,
+      options.token,
+      describeDeath,
+    )) as HealthShape | null;
     if (health === null) {
       throw new Error(
         `first-boot smoke: the 'health_reachable' signal never came within ${timeoutMs}ms (http://${formatHostForUrl(options.host)}:${port}/health)`,
@@ -495,6 +509,7 @@ async function main(argv: readonly string[]): Promise<number> {
         instanceDir,
         host: answers.host,
         port: answers.port,
+        token: answers.token,
       });
       smokePort = outcome.port;
       stdout.write(

@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
@@ -20,6 +20,8 @@ import { GhPrPoster, WaveRunner } from './dispatch/perkins.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { createService, type ServiceHandle } from './server.js';
+import { createAttachmentsServer } from './attachments/server.js';
+import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import type { Role } from './config.js';
 import type { SpawnOptions } from './runtime/types.js';
 import { ChatFrameLog } from './chat/frame-log.js';
@@ -65,15 +67,27 @@ async function main(): Promise<number> {
     install_id: identity.installId,
   });
   // E9 / SPEC ruling 19: uploads-dir scaffolding next to the other
-  // instance dirs (logs/, chat/) — DIRECTORY CREATION ONLY; the attach
-  // flow itself lands in its own lane. Instance state stays under the
-  // data dir, never inside the workspace root (ruling 7). Failure is
-  // loud and named (EACCES/ENOSPC never surface as a raw stack).
+  // instance dirs (logs/, chat/) — DIRECTORY CREATION ONLY in E9; the
+  // attach flow (this lane) rides it for clipboard/phone material.
+  // Instance state stays under the data dir, never inside the workspace
+  // root (ruling 7). Failure is loud and named (EACCES/ENOSPC never
+  // surface as a raw stack).
   const uploadsDir = join(config.dataDir, 'uploads');
   try {
     // 0700 like every other instance dir (chat/, sessions/, ledger/) —
     // uploads will carry user material; not group/world traversable.
     mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
+    // W-D (E9 r3 carry): creation-only 0700 left a pre-existing 0755
+    // uploads dir loose forever — harden at EVERY boot, refuse to start
+    // when the chmod fails (a perms regression must never boot quiet).
+    if (uploadsDirNeedsHardening(uploadsDir)) {
+      const previousMode = statSync(uploadsDir).mode & 0o777;
+      chmodSync(uploadsDir, 0o700);
+      logger.info('uploads_dir hardened to 0700 (was loose)', {
+        path: uploadsDir,
+        previous_mode: previousMode.toString(8),
+      });
+    }
     logger.info('uploads_dir', { path: uploadsDir });
   } catch (error) {
     logger.error('uploads dir creation failed — refusing to start (SPEC ruling 19)', {
@@ -364,6 +378,14 @@ async function main(): Promise<number> {
     wave,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
+  // same seam chat and dispatch both ride — workspace browse (on-disk
+  // picks send paths, never bytes) + uploads materialization
+  // (clipboard/phone bytes → <data_dir>/uploads/ → that path).
+  const attachmentsServer = createAttachmentsServer({
+    config,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   state.bob = bob;
 
   const service = createService(
@@ -375,6 +397,7 @@ async function main(): Promise<number> {
       staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)),
       supervisionStatus: () => supervisorLive.status(),
       requestHook: (req, res, path) =>
+        attachmentsServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||
         dispatchServer.requestHook(req, res, path) ||
         board.requestHook(req, res, path),

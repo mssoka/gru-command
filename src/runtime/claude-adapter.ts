@@ -496,6 +496,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string;
+  readonly capabilities: AgentCapabilities = CLAUDE_CODE_CAPABILITIES;
 
   private readonly params: HandleParams;
   private readonly store: SessionStore;

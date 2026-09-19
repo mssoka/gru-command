@@ -1,10 +1,13 @@
 import type { IncomingMessage, Server as HttpServer } from 'node:http';
+import { join } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
 import { hashToken, tokenConfigured as isTokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, RuntimeEvent } from '../runtime/types.js';
+import { chipPathAllowed } from '../attachments/resolver.js';
+import type { AttachmentChip } from '../attachments/resolver.js';
 import type { ChatFrameLog } from './frame-log.js';
 import {
   WS_PATH,
@@ -22,6 +25,28 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 
 /** Prompts from the chat surface share one owner — the single user (SPEC ruling 1). */
 const CHAT_OWNER = 'chat';
+
+/**
+ * Compose the delivered prompt (SPEC ruling 19(d)): the composer text
+ * plus a path manifest the AGENT reads itself. No bytes, no inline
+ * content — paths only. `visionUnavailable` (runtime cannot host
+ * vision) adds the never-guess instruction so a blind model declines
+ * gracefully instead of hallucinating image contents.
+ */
+export function composeDeliveredPrompt(
+  text: string,
+  attachments?: readonly AttachmentChip[],
+  visionUnavailable = false,
+): string {
+  if (attachments === undefined || attachments.length === 0) return text;
+  const lines = attachments.map(
+    (chip) => `- ${chip.path}${chip.kind === 'image' ? ' (image)' : ''}`,
+  );
+  const gate = visionUnavailable
+    ? '\nVision is unavailable on the current model: do NOT guess at any image\'s contents — state plainly that you cannot view it.'
+    : '';
+  return `${text}\n\n[attached files — read them yourself at these paths]\n${lines.join('\n')}${gate}`;
+}
 
 export interface ChatServerOptions {
   readonly config: GruCommandConfig;
@@ -251,7 +276,14 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   // Delivery (prompt when idle, steer mid-turn)
   // -----------------------------------------------------------------------
 
-  function deliver(client: Client, text: string): void {
+  /** SPEC ruling 19(d): the agent ALWAYS receives paths and reads the
+   * files itself. The manifest appends the chip paths to the prompt
+   * text — no bytes ever ride the prompt in the attach flow. When the
+   * runtime cannot host vision (capabilities.images false, SPEC ruling
+   * 4) an image chip triggers the GRACEFUL DECLINE: a visible notice for
+   * the user + a never-guess instruction for the agent — never an error
+   * frame, never a silent drop. */
+  function deliver(client: Client, text: string, attachments?: readonly AttachmentChip[]): void {
     void (async () => {
       let gru: AgentHandle;
       try {
@@ -261,13 +293,44 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         send(client, ephemeralError(`gru is unavailable: ${(error as Error).message}`));
         return;
       }
+      // Chip-path provenance (review r1): only workspace/uploads paths
+      // ride the manifest — a handcrafted chip pointing elsewhere drops
+      // GRACEFULLY: a visible notice, never a silent pass, never an error.
+      const allowed: AttachmentChip[] = [];
+      const rejected: string[] = [];
+      for (const chip of attachments ?? []) {
+        if (chipPathAllowed(options.config.workspaceRoot, join(options.config.dataDir, 'uploads'), chip.path)) {
+          allowed.push(chip);
+        } else {
+          rejected.push(chip.path);
+        }
+      }
+      if (rejected.length > 0) {
+        emitLogged({
+          type: 'notice',
+          text:
+            `Attachment path not allowed (outside the workspace and uploads): ${rejected.join(', ')} — ` +
+            'dropped from the message Gru receives.',
+        });
+      }
+      const imageChips = allowed.filter((chip) => chip.kind === 'image');
+      const visionUnavailable = imageChips.length > 0 && !gru.capabilities.images;
+      if (visionUnavailable) {
+        emitLogged({
+          type: 'notice',
+          text:
+            `Vision is unavailable on this runtime — ${imageChips.length} image attachment(s) ` +
+            'sent as paths only; Gru is instructed not to guess at their contents.',
+        });
+      }
+      const prompt = composeDeliveredPrompt(text, allowed.length > 0 ? allowed : undefined, visionUnavailable);
       const midTurn = turnLive;
       try {
         if (midTurn) {
-          await gru.steer(text, { owner: CHAT_OWNER });
+          await gru.steer(prompt, { owner: CHAT_OWNER });
         } else {
           turnLive = true; // optimistic: the turn_start event confirms
-          await gru.prompt(text, { owner: CHAT_OWNER });
+          await gru.prompt(prompt, { owner: CHAT_OWNER });
           turnLive = false;
         }
       } catch (error) {
@@ -427,11 +490,16 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       return;
     }
     broadcastExceptSender(
-      frameLog.append({ type: 'user', text: frame.text, client_msg_id: frame.client_msg_id }),
+      frameLog.append({
+        type: 'user',
+        text: frame.text,
+        client_msg_id: frame.client_msg_id,
+        ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
+      }),
       client,
     );
     send(client, frameLog.append({ type: 'ack', client_msg_id: frame.client_msg_id }));
-    deliver(client, frame.text);
+    deliver(client, frame.text, frame.attachments);
   }
 
   /** The pen promotes to the earliest AUTHENTICATED reader (r1 N6):

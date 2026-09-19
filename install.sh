@@ -228,7 +228,20 @@ uninstall_systemd() {
 # inside the clone; inside a checkout, deps+build if needed, then wizard.
 # ---------------------------------------------------------------------------
 inside_checkout() {
-  [[ -f "$REPO_ROOT/package.json" && -d "$REPO_ROOT/src" && -f "$REPO_ROOT/install.sh" ]]
+  # W-B (E9 r3 carry): repo-SHAPE alone accepted any repo-shaped dir — a
+  # saved copy of this repo dropped inside a FOREIGN repo passed and got
+  # npm-installed + built before a later guard killed it. Tighten: the
+  # package must BE Gru Command (name field), the checkout layout must
+  # hold (src/, install.sh), AND it must be a real git checkout. The
+  # one-liner's own clone satisfies all three by construction.
+  [[ -f "$REPO_ROOT/package.json" && -d "$REPO_ROOT/src" && -f "$REPO_ROOT/install.sh" ]] || return 1
+  # A git WORKTREE carries .git as a FILE pointing at the real git dir —
+  # both shapes are genuine checkouts; a saved copy carries neither.
+  [[ -e "$REPO_ROOT/.git" ]] || return 1
+  # Anchored to a name KEY on its own line (review r1): arbitrary
+  # substrings no longer match; a deliberately-crafted nested "name"
+  # still could — the .git+src+install.sh gates carry the rest.
+  grep -Eq '^(\{[[:space:]]*)?[[:space:]]*"name"[[:space:]]*:[[:space:]]*"gru-command"' "$REPO_ROOT/package.json"
 }
 
 run_setup() {
@@ -238,12 +251,13 @@ run_setup() {
     # inside a checkout, fail loud — never loop.
     if [[ -n "${GRU_COMMAND_REEXEC:-}" ]]; then
       err "re-exec landed outside a product checkout: $REPO_ROOT"
-      err "(the clone target must contain package.json + src/ + install.sh)"
+      err "(the clone target must be a Gru Command checkout: package.json named gru-command + src/ + install.sh + .git)"
       exit 1
     fi
     command -v git >/dev/null 2>&1 || { err "git not found on PATH — install git first"; exit 1; }
     if [[ -e "$CLONE_TARGET" ]]; then
-      if [[ -d "$CLONE_TARGET" && -f "$CLONE_TARGET/package.json" && -d "$CLONE_TARGET/.git" ]]; then
+      if [[ -d "$CLONE_TARGET" && -f "$CLONE_TARGET/package.json" && -e "$CLONE_TARGET/.git" ]] && \
+         grep -Eq '^(\{[[:space:]]*)?[[:space:]]*"name"[[:space:]]*:[[:space:]]*"gru-command"' "$CLONE_TARGET/package.json"; then
         echo "reusing existing checkout: $CLONE_TARGET"
         echo "notice: not updating the checkout — run git pull yourself"
       else

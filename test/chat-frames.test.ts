@@ -24,6 +24,17 @@ const CLIENT_CORPUS: readonly unknown[] = [
   { type: 'auth', token: 'tok', last_seen_seq: 0 },
   { type: 'auth', token: 'tok', last_seen_seq: 42 },
   { type: 'user', text: 'hello', client_msg_id: 'id-1' },
+  // valid: SPEC ruling 19 attachment chips (both kinds, absent optional)
+  {
+    type: 'user',
+    text: 'look',
+    client_msg_id: 'id-2',
+    attachments: [
+      { path: '/ws/repo/notes.md', name: 'notes.md', kind: 'file' },
+      { path: '/data/uploads/1-shot.png', name: 'shot.png', kind: 'image' },
+    ],
+  },
+  { type: 'user', text: '', client_msg_id: 'id-3', attachments: [{ path: '/x.png', name: 'x.png', kind: 'image' }] },
   // valid: extra keys are ignored
   { type: 'auth', token: 'tok', extra: true },
   { type: 'user', text: 'x', client_msg_id: 'id', future: 'field' },
@@ -35,7 +46,26 @@ const CLIENT_CORPUS: readonly unknown[] = [
   { type: 'auth', token: 'tok', last_seen_seq: 1.5 },
   { type: 'auth', token: 'tok', last_seen_seq: '7' },
   { type: 'auth', token: 'tok', last_seen_seq: null },
-  { type: 'user', text: '', client_msg_id: 'id' },
+  { type: 'user', text: '', client_msg_id: 'id' }, // no text AND no chips
+  // invalid: SPEC ruling 19 chip shapes (empty array, bad kind, too many,
+  // empty fields, oversized path)
+  { type: 'user', text: 'hi', client_msg_id: 'id', attachments: [] },
+  { type: 'user', text: 'hi', client_msg_id: 'id', attachments: [{ path: '/x', name: 'x', kind: 'video' }] },
+  {
+    type: 'user',
+    text: 'hi',
+    client_msg_id: 'id',
+    attachments: Array.from({ length: 9 }, (_, i) => ({ path: `/f${i}`, name: `f${i}`, kind: 'file' })),
+  },
+  { type: 'user', text: 'hi', client_msg_id: 'id', attachments: [{ path: '', name: 'x', kind: 'file' }] },
+  { type: 'user', text: 'hi', client_msg_id: 'id', attachments: [{ path: '/x', name: '', kind: 'file' }] },
+  {
+    type: 'user',
+    text: 'hi',
+    client_msg_id: 'id',
+    attachments: [{ path: `/long/${'a'.repeat(1100)}`, name: 'a', kind: 'file' }],
+  },
+  { type: 'user', text: 'hi', client_msg_id: 'id', attachments: 'nope' },
   { type: 'user', text: 'hi' },
   { type: 'user', text: 'hi', client_msg_id: '' },
   { type: 'user', text: 'hi', client_msg_id: 3 },
@@ -58,6 +88,15 @@ const SERVER_CORPUS: readonly unknown[] = [
   { type: 'auth_ok', seq: 99 },
   { type: 'ack', client_msg_id: 'id-1', seq: 3 },
   { type: 'user', text: 'hi', client_msg_id: 'id-1', seq: 2 },
+  // valid: replays carry the SPEC ruling 19 chips
+  {
+    type: 'user',
+    text: 'look',
+    client_msg_id: 'id-2',
+    seq: 15,
+    attachments: [{ path: '/data/uploads/1-shot.png', name: 'shot.png', kind: 'image' }],
+  },
+  { type: 'user', text: '', client_msg_id: 'id-3', seq: 16, attachments: [{ path: '/x.png', name: 'x.png', kind: 'image' }] },
   { type: 'delta', text: 'chunk', seq: 4 },
   { type: 'delta', text: '', seq: 5 }, // empty delta text is valid
   { type: 'tool', name: 'bash', state: 'start', seq: 6 },
@@ -79,6 +118,8 @@ const SERVER_CORPUS: readonly unknown[] = [
   { type: 'ack', client_msg_id: '', seq: 1 },
   { type: 'ack', client_msg_id: 'id' },
   { type: 'user', text: 'hi', client_msg_id: 'id' }, // replay user needs seq
+  { type: 'user', text: 'hi', client_msg_id: 'id', seq: 1, attachments: [] }, // empty chip array
+  { type: 'user', text: 'hi', client_msg_id: 'id', seq: 1, attachments: [{ path: '/x', name: 'x', kind: 'folder' }] },
   { type: 'delta', seq: 1 },
   { type: 'tool', name: 'bash', state: 'middle', seq: 1 },
   { type: 'tool', name: '', state: 'start', seq: 1 },
@@ -135,6 +176,19 @@ describe('chat frame parser parity with the web contract module', () => {
       { type: 'turn', state: 'end' },
       { type: 'error', message: 'logged error' },
       { type: 'user', text: 'hi', client_msg_id: 'id-1' },
+      // SPEC ruling 19: user frames with chips + attachment-only frames.
+      {
+        type: 'user',
+        text: 'hi',
+        client_msg_id: 'id-2',
+        attachments: [{ path: '/ws/repo/shot.png', name: 'shot.png', kind: 'image' }],
+      },
+      {
+        type: 'user',
+        text: '',
+        client_msg_id: 'id-3',
+        attachments: [{ path: '/data/uploads/1-x.png', name: 'x.png', kind: 'image' }],
+      },
     ];
     for (const frame of seqed) {
       const built = withSeq(frame, 7);

@@ -53,15 +53,16 @@ function buildFixtureRepo(): { fixture: string; home: string } {
   const fixture = tempDir('gru-command-fixture-src-');
   const home = tempDir('gru-command-fixture-home-');
   copyFileSync(join(repoRoot, 'install.sh'), join(fixture, 'install.sh'));
-  // A product checkout is package.json + src/ + install.sh — the src
-  // marker is what tells install.sh it is INSIDE a checkout (no clone).
+  // A product checkout is a Gru Command checkout: package.json NAMED
+  // gru-command + src/ + install.sh + .git (W-B tightened the heuristic —
+  // repo shape alone no longer passes).
   mkdirSync(join(fixture, 'src'), { recursive: true });
   writeFileSync(join(fixture, 'src', 'marker.ts'), 'export {};\n', 'utf-8');
   writeFileSync(
     join(fixture, 'package.json'),
     JSON.stringify(
       {
-        name: 'gru-command-fixture',
+        name: 'gru-command',
         version: '0.0.0',
         private: true,
         type: 'module',

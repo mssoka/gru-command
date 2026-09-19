@@ -2,14 +2,33 @@
  * Chat view: desktop panel + mobile corner-bubble sheet over one DOM tree.
  * A matchMedia listener reparents the panel into the sheet on small
  * screens, so there is exactly one message log to keep in sync.
+ *
+ * The composer owns the ONE attach flow (SPEC ruling 19): an attach
+ * button opens a picker that browses the service's workspace root
+ * (on-disk picks become PATH chips — no bytes) or takes device files
+ * (phone/camera; bytes materialize into the instance uploads dir and
+ * THAT path becomes the chip). Clipboard image paste materializes the
+ * same way. The user NEVER types or pastes paths.
  */
 
 import type { ChatMessage, ConnectionState } from '../lib/chat-client.js';
-import type { LoggedFrame } from '../lib/protocol.js';
+import type { AttachmentChip, LoggedFrame } from '../lib/protocol.js';
+import { imageKindFor, type BrowseResult, type UploadedFile } from '../lib/attach-client.js';
+import { MAX_ATTACHMENTS_PER_MESSAGE } from '../lib/protocol.js';
 import { renderMarkdown } from '../lib/markdown.js';
 import { el, mustGet } from './dom.js';
 
 const MOBILE_QUERY = '(max-width: 768px)';
+
+/** The attach resolution surface main.ts binds per pair (token rotates). */
+export interface AttachSurface {
+  browse(path: string): Promise<BrowseResult>;
+  upload(file: File): Promise<UploadedFile>;
+}
+
+/** The composer's send seam returns false when the message was NOT
+ * queued (no client / rejected) — the composer keeps the typed words and
+ * chips (review r1: clearing first violated "never lose a typed word"). */
 
 export class ChatView {
   private readonly log = mustGet<HTMLElement>('chat-log');
@@ -19,6 +38,14 @@ export class ChatView {
   private readonly bubble = mustGet<HTMLButtonElement>('chat-bubble');
   private readonly badge = mustGet<HTMLElement>('chat-badge');
   private readonly mainMount = mustGet<HTMLElement>('chat-main-mount');
+  private readonly input = mustGet<HTMLInputElement>('chat-input');
+  private readonly chipsRow = mustGet<HTMLElement>('chat-chips');
+  private readonly attachButton = mustGet<HTMLButtonElement>('chat-attach');
+  private readonly fileInput = mustGet<HTMLInputElement>('chat-attach-file');
+  private readonly picker = mustGet<HTMLElement>('attach-picker');
+  private readonly pickerList = mustGet<HTMLElement>('attach-picker-list');
+  private readonly pickerPath = mustGet<HTMLElement>('attach-picker-path');
+  private readonly pickerError = mustGet<HTMLElement>('attach-picker-error');
   private readonly bubbles = new Map<string, HTMLElement>();
   private streamingBubble: HTMLElement | null = null;
   private streamingBody: HTMLElement | null = null;
@@ -26,16 +53,47 @@ export class ChatView {
   private activeTool: HTMLElement | null = null;
   private unread = 0;
   private mobile = window.matchMedia(MOBILE_QUERY);
+  /** Ready-to-send chips (SPEC ruling 19). */
+  private pending: AttachmentChip[] = [];
+  /** Uploads in flight (busy chips). */
+  private readonly uploading = new Set<string>();
+  private attach: AttachSurface | null = null;
+  private pickerAt = '';
+  /** Absolute workspace root from the current browse (chip paths). */
+  private browseRoot = '';
 
-  constructor(onSend: (text: string) => void) {
+  constructor(
+    private readonly onSend: (
+      text: string,
+      attachments?: readonly AttachmentChip[],
+    ) => boolean,
+  ) {
     mustGet<HTMLFormElement>('chat-form').addEventListener('submit', (event) => {
       event.preventDefault();
-      const input = mustGet<HTMLInputElement>('chat-input');
-      const text = input.value.trim();
-      if (text === '') return;
-      input.value = '';
-      onSend(text);
+      const text = this.input.value.trim();
+      if (text === '' && this.pending.length === 0) return;
+      // Review r1: uploads still in flight must not silently miss the
+      // send — hold the gesture until they land (or fail).
+      if (this.uploading.size > 0) {
+        this.ephemeralNote('an upload is still on its way — one moment…');
+        return;
+      }
+      const chips = this.pending.length === 0 ? undefined : [...this.pending];
+      let queued = false;
+      try {
+        queued = this.onSend(text, chips);
+      } catch (error) {
+        this.ephemeralNote(
+          `could not send: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (!queued) return; // keep the typed words + chips
+      this.input.value = '';
+      this.clearChips();
+      this.closePicker();
     });
+
+    this.wireAttachFlow();
 
     this.bubble.addEventListener('click', () => this.setSheetOpen(true));
     const grip = mustGet<HTMLElement>('chat-sheet-grip');
@@ -61,6 +119,190 @@ export class ChatView {
     place();
     // Sheet starts closed: inert until first opened.
     this.sheet.toggleAttribute('inert', this.sheet.dataset.open !== 'true');
+  }
+
+  // -----------------------------------------------------------------------
+  // The ONE attach flow (SPEC ruling 19)
+  // -----------------------------------------------------------------------
+
+  /** Bind (or rebind) the resolution surface — main.ts calls per pair. */
+  bindAttach(surface: AttachSurface | null): void {
+    this.attach = surface;
+    this.attachButton.disabled = surface === null;
+    this.attachButton.title = surface === null ? 'Attach (pairing required)' : 'Attach files';
+    if (surface === null) this.closePicker();
+  }
+
+  private wireAttachFlow(): void {
+    this.attachButton.addEventListener('click', () => this.openPicker(''));
+    this.fileInput.addEventListener('change', () => {
+      const files = [...this.fileInput.files ?? []];
+      this.fileInput.value = ''; // allow re-picking the same file
+      for (const file of files) void this.takeDeviceFile(file);
+    });
+
+    mustGet<HTMLButtonElement>('attach-picker-close').addEventListener('click', () =>
+      this.closePicker(),
+    );
+    mustGet<HTMLButtonElement>('attach-picker-up').addEventListener('click', () => {
+      void this.openPicker(this.pickerAt === '' ? '' : (this.picker.dataset.parent ?? ''));
+    });
+    mustGet<HTMLButtonElement>('attach-picker-device').addEventListener('click', () => {
+      this.fileInput.click();
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !this.picker.hidden) this.closePicker();
+    });
+
+    // Clipboard paste of files/images (Mac-screenshot class): bytes →
+    // materialize into the uploads dir → chip (never a pasted path).
+    this.input.addEventListener('paste', (event) => {
+      const files: File[] = [];
+      for (const item of event.clipboardData?.items ?? []) {
+        if (item.kind !== 'file') continue;
+        const file = item.getAsFile();
+        if (file !== null) files.push(file);
+      }
+      if (files.length === 0) return; // plain text paste flows untouched
+      event.preventDefault();
+      for (const file of files) void this.takeDeviceFile(file);
+    });
+  }
+
+  private async openPicker(path: string): Promise<void> {
+    if (this.attach === null) return;
+    this.picker.hidden = false;
+    this.attachButton.setAttribute('aria-expanded', 'true');
+    this.pickerError.hidden = true;
+    this.pickerList.replaceChildren(el('div', 'attach-picker__loading', 'browsing…'));
+    try {
+      const result = await this.attach.browse(path);
+      this.pickerAt = result.path;
+      this.browseRoot = result.root;
+      this.picker.dataset.parent = result.parent ?? '';
+      this.pickerPath.textContent = `/${result.path}`;
+      this.renderBrowse(result);
+    } catch (error) {
+      this.pickerList.replaceChildren();
+      this.pickerError.textContent = String(error instanceof Error ? error.message : error);
+      this.pickerError.hidden = false;
+    }
+  }
+
+  private renderBrowse(result: BrowseResult): void {
+    const list = this.pickerList;
+    list.replaceChildren();
+    if (result.entries.length === 0) {
+      list.append(el('div', 'attach-picker__empty', 'nothing pickable here'));
+      return;
+    }
+    for (const entry of result.entries) {
+      const row = el('button', `attach-row attach-row--${entry.kind}`);
+      row.type = 'button';
+      row.dataset.name = entry.name;
+      row.dataset.kind = entry.kind;
+      const icon = el('span', 'attach-row__icon', entry.kind === 'dir' ? '📁' : entry.image ? '🖼️' : '📄');
+      const label = el('span', 'attach-row__name', entry.name);
+      row.append(icon, label);
+      if (entry.kind === 'dir') {
+        row.addEventListener('click', () => void this.openPicker(joinRel(result.path, entry.name)));
+      } else {
+        row.addEventListener('click', () => {
+          this.addChip({
+            // ABSOLUTE path: the agent reads the file at this path
+            // (ruling 19(c) — the pick is a reference, never a copy).
+            path: `${result.root}/${joinRel(result.path, entry.name)}`,
+            name: entry.name,
+            kind: entry.image ? 'image' : 'file',
+          });
+          this.closePicker();
+        });
+      }
+      list.append(row);
+    }
+  }
+
+  private closePicker(): void {
+    this.picker.hidden = true;
+    this.attachButton.setAttribute('aria-expanded', 'false');
+  }
+
+  /** Device files (phone camera/gallery, desktop picks): bytes → uploads. */
+  private async takeDeviceFile(file: File): Promise<void> {
+    if (this.attach === null) return;
+    if (this.pending.length + this.uploading.size >= MAX_ATTACHMENTS_PER_MESSAGE) {
+      this.ephemeralNote(`attachment cap reached (${MAX_ATTACHMENTS_PER_MESSAGE})`);
+      return;
+    }
+    this.uploading.add(file.name);
+    this.renderChips();
+    try {
+      const uploaded = await this.attach.upload(file);
+      this.addChip({ path: uploaded.path, name: uploaded.name, kind: imageKindFor(uploaded.name) });
+    } catch (error) {
+      this.ephemeralNote(
+        `could not attach ${file.name}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      this.uploading.delete(file.name);
+      this.renderChips();
+    }
+  }
+
+  private addChip(chip: AttachmentChip): void {
+    if (this.pending.length >= MAX_ATTACHMENTS_PER_MESSAGE) {
+      this.ephemeralNote(`attachment cap reached (${MAX_ATTACHMENTS_PER_MESSAGE})`);
+      return;
+    }
+    // Same path twice adds nothing (review r1: duplicate chips duplicated
+    // the manifest lines).
+    if (this.pending.some((existing) => existing.path === chip.path)) {
+      this.ephemeralNote(`${chip.name} is already attached`);
+      return;
+    }
+    this.pending.push(chip);
+    this.renderChips();
+  }
+
+  private removeChip(index: number): void {
+    this.pending.splice(index, 1);
+    this.renderChips();
+  }
+
+  private clearChips(): void {
+    this.pending = [];
+    this.renderChips();
+  }
+
+  private renderChips(): void {
+    this.chipsRow.replaceChildren();
+    for (const name of this.uploading) {
+      const chip = el('span', 'attach-chip attach-chip--busy', `⏳ ${name}`);
+      this.chipsRow.append(chip);
+    }
+    this.pending.forEach((chipData, index) => {
+      const chip = el('span', 'attach-chip');
+      chip.title = chipData.path;
+      chip.append(
+        el('span', 'attach-chip__icon', chipData.kind === 'image' ? '🖼️' : '📎'),
+        el('span', 'attach-chip__name', chipData.name),
+      );
+      const remove = el('button', 'attach-chip__remove', '✕');
+      remove.type = 'button';
+      remove.setAttribute('aria-label', `Remove ${chipData.name}`);
+      remove.addEventListener('click', () => this.removeChip(index));
+      chip.append(remove);
+      this.chipsRow.append(chip);
+    });
+    this.chipsRow.hidden = this.chipsRow.childElementCount === 0;
+  }
+
+  /** Ephemeral, UI-only notice (never enters the durable log). */
+  private ephemeralNote(text: string): void {
+    const line = el('div', 'notice-line notice-line--ephemeral', `⚠️ ${text}`);
+    this.log.append(line);
+    this.scrollToEnd();
+    setTimeout(() => line.remove(), 6_000);
   }
 
   /** Open the phone chat sheet (the nav Chat tab on mobile does this). */
@@ -98,7 +340,9 @@ export class ChatView {
       this.bubbles.set(message.client_msg_id, bubble);
       this.log.append(bubble);
     }
-    bubble.textContent = message.text;
+    bubble.replaceChildren();
+    if (message.text !== '') bubble.append(el('div', 'msg__text', message.text));
+    for (const chip of message.attachments ?? []) bubble.append(renderBubbleChip(chip));
     bubble.classList.toggle('msg--queued', message.status === 'queued');
     const meta =
       message.status === 'queued'
@@ -118,6 +362,7 @@ export class ChatView {
           client_msg_id: frame.client_msg_id,
           text: frame.text,
           status: 'acked',
+          ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
         });
         break;
       }
@@ -226,6 +471,21 @@ export class ChatView {
   private scrollToEnd(): void {
     this.log.scrollTop = this.log.scrollHeight;
   }
+}
+
+/** A chip pill inside a sent bubble (path on hover/title). */
+function renderBubbleChip(chip: AttachmentChip): HTMLElement {
+  const pill = el('span', `attach-chip attach-chip--sent attach-chip--${chip.kind}`);
+  pill.title = chip.path;
+  pill.append(
+    el('span', 'attach-chip__icon', chip.kind === 'image' ? '🖼️' : '📎'),
+    el('span', 'attach-chip__name', chip.name),
+  );
+  return pill;
+}
+
+function joinRel(base: string, name: string): string {
+  return base === '' ? name : `${base}/${name}`;
 }
 
 /** Map connection state onto the nav dot. */

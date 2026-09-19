@@ -101,9 +101,11 @@ const TOKEN_PROMPT = 'Pairing token';
 const REGISTER_PROMPT = 'Register the OS service';
 const SMOKE_PROMPT = 'first-boot smoke test now';
 
-const ptyCapable = expectAvailable() && (process.platform === 'darwin' || process.platform === 'linux');
+const ptyPlatform = process.platform === 'darwin' || process.platform === 'linux';
+const ptySkipOptOut = process.env['GRU_TEST_SKIP_PTY'] === '1';
+const ptyCapable = expectAvailable() && ptyPlatform;
 
-describe.skipIf(!ptyCapable)('interactive wizard under a pty (Perkins r2 T1)', () => {
+describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (Perkins r2 T1)', () => {
   it('all-defaults happy path: prompts answered, config written, smoke green', () => {
     const workspace = fixtureWorkspace();
     const instance = tempDir('gru-command-pty-home-');
@@ -213,4 +215,22 @@ describe.skipIf(!ptyCapable)('interactive wizard under a pty (Perkins r2 T1)', (
     // is sorted; the pick is the user's sequence).
     expect(output).toContain('Managed repos (board grouping): repo-b, repo-a');
   }, 120_000);
+});
+
+// W-A (E9 r3 carry): the PTY legs were expect(1)-conditional with NO
+// gate — a machine without `expect` silently skipped them and nothing
+// failed (suite-shape pins counts statically, not execution). This gate
+// is FAIL-SHAPED: on a pty platform without `expect` the suite FAILS
+// unless the run EXPLICITLY opts out via GRU_TEST_SKIP_PTY=1.
+describe('pty gate (W-A — no silent PTY skips)', () => {
+  it('expect(1) is present on pty platforms, or the run explicitly opts out', () => {
+    if (!ptyPlatform) return; // non-pty platform — nothing to gate
+    if (ptySkipOptOut) return; // explicit, annotated opt-out
+    expect(
+      expectAvailable(),
+      'expect(1) is missing — the PTY-driven wizard legs would silently skip. ' +
+        'Install expect (brew install expect / apt-get install expect) ' +
+        'or set GRU_TEST_SKIP_PTY=1 to opt out explicitly.',
+    ).toBe(true);
+  });
 });

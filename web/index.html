@@ -65,10 +65,30 @@
       <section id="chat-view" class="pp-card chat-panel chat-panel--desktop" hidden>
         <div class="chat-log" id="chat-log"></div>
         <form class="chat-compose" id="chat-form">
-          <input class="pp-input" id="chat-input" placeholder="Tell Gru what you need, boss…"
-                 autocomplete="off" maxlength="4000" aria-label="Message Gru">
-          <button class="pp-btn" type="submit" id="chat-send">Send 🚀</button>
+          <div class="chat-chips" id="chat-chips" hidden></div>
+          <div class="chat-compose__row">
+            <button class="pp-btn pp-btn--icon chat-attach-btn" type="button" id="chat-attach"
+                    title="Attach files" aria-haspopup="dialog" aria-expanded="false">📎</button>
+            <input class="pp-input" id="chat-input" placeholder="Tell Gru what you need, boss…"
+                   autocomplete="off" maxlength="4000" aria-label="Message Gru">
+            <button class="pp-btn" type="submit" id="chat-send">Send 🚀</button>
+          </div>
+          <!-- The ONE attach flow (SPEC ruling 19): device files (phone
+               camera/gallery, clipboard materialization) — bytes → the
+               instance uploads dir → that path. On-disk workspace picks
+               ride the browse picker below. The user never types paths. -->
+          <input type="file" id="chat-attach-file" multiple hidden aria-label="Pick files from this device">
         </form>
+        <div class="attach-picker" id="attach-picker" role="dialog" aria-label="Attach files" hidden>
+          <div class="attach-picker__head">
+            <button id="attach-picker-up" class="pp-btn pp-btn--secondary" type="button" title="Up one directory">⬆</button>
+            <div class="attach-picker__path" id="attach-picker-path" title="Current directory">/</div>
+            <button id="attach-picker-device" class="pp-btn pp-btn--secondary" type="button">📁 from this device…</button>
+            <button id="attach-picker-close" class="pp-btn pp-btn--secondary" type="button" aria-label="Close picker">✕</button>
+          </div>
+          <div class="attach-picker__error" id="attach-picker-error" hidden></div>
+          <div class="attach-picker__list" id="attach-picker-list"></div>
+        </div>
       </section>
     </div>
 

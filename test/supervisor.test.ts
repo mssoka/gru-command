@@ -13,6 +13,7 @@ import {
 } from '../src/supervision/supervisor.js';
 import type { Role } from '../src/config.js';
 import type {
+  AgentCapabilities,
   AgentHandle,
   AgentState,
   RuntimeEvent,
@@ -41,6 +42,15 @@ class FakeHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string | null;
+  readonly capabilities: AgentCapabilities = {
+    streaming: true,
+    steer: 'native',
+    resume: 'file',
+    images: false,
+    thinking: false,
+    thinkingLevelControl: false,
+    followUp: false,
+  };
   state: AgentState = 'idle';
   disposed = false;
   promptCount = 0;
