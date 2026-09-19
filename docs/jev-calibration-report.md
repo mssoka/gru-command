@@ -32,12 +32,27 @@ resolve on OpenRouter: `typesafe/jev-1.13` and the alias
 | 3 | documented shape inside the `messages` envelope                | 400 **"typesafe/jev-1.13 is a decisions model and cannot be used with the chat/completions endpoint. Use the /api/alpha/decisions endpoint instead."** |
 | 4 | `/api/alpha/decisions`, raw shape                              | 400 Zod validation — exact schema revealed (see below)                                              |
 | 5 | `/api/alpha/decisions`, schema-correct shape                   | **200 — real completion** ✅                                                                         |
+| 6 | `~typesafe/jev-latest` alias + noul-criteria record             | **200 — real completion** ✅ (served the same snapshot)                                               |
+| 7 | post-r1 receipted demo (evidence completeness)                  | **200 — real completion** ✅ (chatty_ok again, noul 0.98, 534 ms)                                      |
+| 8 | probe-script verify run during r1 fixes                          | **200 — real completion** ✅ (script exit-0 gate; see REPAIR_LOG for the clobber incident it exposed)  |
 
 Raw evidence: [`tools/jev-pilot/evidence/access-probe.json`](../tools/jev-pilot/evidence/access-probe.json)
 (bundle: request bodies, HTTP status, raw response bodies, latency, cost,
-attempt ladder), plus per-attempt `.headers`/`.body`/`.meta` files alongside
-it. Reproduce with one command:
-`node tools/jev-pilot/decisions-client.mjs --demo` (~$0.00003/run).
+attempt ladder incl. a post-r1 receipted demo), plus per-attempt
+`.headers`/`.body` (and `.meta` for the curl-metered attempts) files
+alongside it. Reproduce with one command:
+`node tools/jev-pilot/decisions-client.mjs --demo` (~$0.00003/run);
+receipt-capturing probe: `bash tools/jev-pilot/probe-access.sh`
+(writes tagged `rsp-decisions-$OUT_TAG.*` files, exits non-zero on any
+non-200/error body, never clobbers prior runs).
+
+Evidence hygiene (Perkins r1): `user_id` values and `set-cookie` lines are
+redacted in place across raw receipts (non-credential identifiers; counts
+in the bundle's `redaction_log`) — every other byte is as-received. One
+repair is logged in the bundle's `REPAIR_LOG`: the original bundle's
+attempt-4 entry had mis-paired the Zod-400 response with the post-hoc
+corrected request body; it now carries the bytes actually sent
+(`req-jev-1-13.json`, unchanged on disk since attempt 1).
 
 ## The receipts (raw, unedited)
 
@@ -74,9 +89,10 @@ Missing `instructions`, a record-where-array `criteria` (or vice versa)
 yields a 400 Zod validation error whose payload handily spells out the
 expected schema (receipt: attempt 4).
 
-Measured envelope: **~330–520 ms**, **~$0.00003 per call** (~660 input
-tokens). Sub-second, effectively free at pilot scale — consistent with the
-edge-analysis doc's claims.
+Measured envelope (receipted runs): **330–534 ms**, **~$0.00003 per call**
+(~660 input tokens) — 328 ms (attempt 5, `rsp-decisions-final.meta`) and
+534 ms (post-r1 demo, `rsp-demo-post-r1.meta`). Sub-second, effectively
+free at pilot scale — consistent with the edge-analysis doc's claims.
 
 ## Amendment 2 — docs kit verified and encoded at the interface level
 
@@ -114,9 +130,11 @@ with our own receipts as primary evidence:
   ~$0.00003 total.
 
 Interface encoding: `tools/jev-pilot/decisions-client.mjs` +
-`tools/jev-pilot/decisions-client.test.mjs` — **11 offline tests on the
-real receipt fixtures** (`node --test tools/jev-pilot/decisions-client.test.mjs`),
-zero paid calls needed.
+`tools/jev-pilot/decisions-client.test.mjs` — **23 offline tests on the
+real receipt fixtures** (`node --test tools/jev-pilot/decisions-client.test.mjs`
+— file-path form; the directory form MODULE_NOT_FOUNDs on Node 22),
+covering the transport too (fetch-stubbed happy path, HTTP-error throw,
+timeout abort, envelope validation), zero paid calls needed.
 
 ## Honest money ledger
 
@@ -126,23 +144,29 @@ zero paid calls needed.
 | `~jev-latest` receipt call          | $0.000027636 |
 | `decisions-client.mjs --demo` run #1| $0.000027636 |
 | `decisions-client.mjs --demo` run #2 (post-Amendment-2 smoke) | $0.000027636 |
-| **Total lane spend**                | **$0.000109** |
+| Post-r1 receipted demo run (evidence completeness) | $0.000027636 |
+| Probe-script verify run during r1 fixes (attempt 8) | $0.000026292 |
+| **Total lane spend**                | **$0.000163** |
 
-Ceiling was $10; actual **$0.000109** (attempts 1–4 were free 400s;
-Amendment-2 tests run offline on receipt fixtures). The economics claim in
-the edge-analysis doc ("thousands of probes/month ≈ still zero") holds as
-measured.
+Ceiling was $10; actual **$0.000163** (attempts 1–4 were free 400s;
+the r1 test suite runs offline on receipt fixtures). The economics claim
+in the edge-analysis doc ("thousands of probes/month ≈ still zero") holds
+as measured.
 
 ## Lane residue (what ships in this PR)
 
 - `tools/jev-pilot/decisions-client.mjs` — minimal zero-dep decisions
-  client: key resolution (env → factory keychain), pre-flight question
-  validation against the live schema, batched `decide()` + `--demo`, and
-  the Amendment-2 interface encoding (`decisionMetric`, three-path
-  `routeDecision`, `RISK_CLASSES`, `QUESTION_DESIGN_RULES`, batch warn).
-- `tools/jev-pilot/decisions-client.test.mjs` — 11 offline interface tests
-  on the real receipt fixtures (confidence semantics, three-path
-  boundaries, destructive confirm, batching warn, no-composition surface).
+  client: key resolution (env → factory keychain, endpoint-restricted),
+  pre-flight question/state validation against the live schema, batched
+  `decide()` with envelope validation + `--demo`, and the Amendment-2
+  interface encoding (`decisionMetric`, three-path `routeDecision` with
+  REQUIRED explicit risk class, `RISK_CLASSES`, `QUESTION_DESIGN_RULES`,
+  batch warn).
+- `tools/jev-pilot/decisions-client.test.mjs` — 23 offline tests: the
+  Amendment-2 semantics on real receipt fixtures, plus fetch-stubbed
+  transport coverage (happy path, HTTP error, timeout abort, envelope
+  rejection, endpoint allowlist, key precedence, adversarial
+  byte-identical passthrough asserted on the captured request).
 - `tools/jev-pilot/config-flag-schema-sketch.md` — the `[decisions.jev]`
   TOML flag sketch in the repo's config idiom + the fail-open behavior
   matrix + fold-in wiring notes. Sketch only; **no provider implementation

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* global process, console, fetch, setTimeout, clearTimeout, performance, AbortController, URL */
 /**
  * Minimal Jev decisions client — Pilot 1 lane residue (gru-command-jev-pilot).
  * Amendment 2 (2026-09-19): encodes the JEV DOCS KIT as interface-level
@@ -24,19 +25,23 @@
  *    vendor does NOT treat state as hostile (adversarial caveat on the
  *    destructive gate); NO cross-question invariants (never compose a noul
  *    answer with a choice answer). Encoded in QUESTION_DESIGN_RULES +
- *    validateQuestions + routeDecision(single answer).
+ *    validateQuestions + routeDecision(single answer, explicit risk class).
  * C. BATCHING: parallel questions in ONE call are ~12x cheaper — the
  *    client's default shape is the batched QuestionSet; single-question
  *    calls warn.
  *
  * Usage:
  *   node tools/jev-pilot/decisions-client.mjs --demo   # re-run access probe (~$0.00003)
- *   node --test tools/jev-pilot/                       # offline interface tests
+ *   node --test tools/jev-pilot/decisions-client.test.mjs   # offline interface tests (file-path form;
+ *                                                          # the directory form MODULE_NOT_FOUNDs on Node 22)
  *   import { decide, routeDecision, RISK_CLASSES } from './decisions-client.mjs'
  */
 
+import { pathToFileURL } from 'node:url';
+
 const DEFAULT_ENDPOINT = 'https://openrouter.ai/api/alpha/decisions';
 const DEFAULT_MODEL = '~typesafe/jev-latest'; // user-confirmed slug; resolves to the pinned jev-1.13 snapshot
+const DEFAULT_TIMEOUT_MS = 2000; // aligned with the fold-in sketch's timeout_ms (the authoritative figure)
 
 /* ------------------------------------------------------------------ */
 /* A. Answer types — confidence ONLY on Choice/Score.                  */
@@ -61,7 +66,7 @@ export const QUESTION_DESIGN_RULES = Object.freeze([
   { id: 'adversarial-caveat', rule: 'The vendor does NOT treat state as hostile. Any gate over untrusted text (esp. destructive-call) must be tested against adversarial command text.', source: 'model-jaggedness/jev-1.13.md #6' },
   { id: 'aligned-criteria', rule: 'instructions and criteria must ask for the same thing; inverted true/false mappings degrade accuracy.', source: 'model-jaggedness/jev-1.13.md #7' },
   { id: 'no-cross-invariants', rule: 'No cross-question invariants: never compose a noul answer with a choice answer; enforce identities in code.', source: 'model-jaggedness/jev-1.13.md #8' },
-  { id: 'atomic-questions', rule: 'One gut-check judgment per question; decompose multi-factor judgments and combine in code.', source: 'vendor discipline + lane doctrine' },
+  { id: 'atomic-questions', rule: 'One gut-check judgment per question; decompose multi-factor judgments and combine in code.', source: 'model-jaggedness/jev-1.13.md (reminders: "hiding several judgments inside one question")' },
 ]);
 
 /**
@@ -80,16 +85,39 @@ export const RISK_CLASSES = Object.freeze({
   destructive: Object.freeze({ act: 0.85, confirm: 0.7, requireConfirmOnAct: true }),
 });
 
-/** Resolve the OpenRouter key: env first, then the factory keychain slot (macOS). */
-async function resolveKey() {
+/**
+ * Resolve the OpenRouter key: env first, then the factory keychain slot
+ * (macOS). `exec` is injectable for offline tests of the precedence chain.
+ */
+export async function resolveKey(exec) {
   if (process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
-  const { execFileSync } = await import('node:child_process');
-  try {
+  const run = exec ?? (async () => {
+    const { execFileSync } = await import('node:child_process');
     return execFileSync('security', [
       'find-generic-password', '-s', 'omnigent', '-a', 'openrouter', '-w',
     ], { encoding: 'utf8' }).trim();
+  })();
+  try {
+    const k = await run();
+    const trimmed = typeof k === 'string' ? k.trim() : '';
+    if (trimmed.length > 0) return trimmed;
+    throw new Error('empty');
   } catch {
     throw new Error('no OpenRouter key: set OPENROUTER_API_KEY or provision keychain omnigent/openrouter');
+  }
+}
+
+/**
+ * The auto-resolved keychain key is only ever sent to OpenRouter: a caller
+ * cannot point the factory credential at an arbitrary endpoint. Explicitly
+ * caller-supplied keys (`key` param) may target anything (tests, proxies).
+ */
+function assertEndpointAllowed(endpoint, autoResolvedKey) {
+  if (!autoResolvedKey) return;
+  let host = '';
+  try { host = new URL(endpoint).hostname; } catch { throw new Error(`invalid endpoint URL: ${endpoint}`); }
+  if (host !== 'openrouter.ai' && !host.endsWith('.openrouter.ai')) {
+    throw new Error('auto-resolved key is endpoint-restricted to openrouter.ai; pass an explicit key for other endpoints');
   }
 }
 
@@ -99,7 +127,10 @@ async function resolveKey() {
  * encoding of the jaggedness rules that are mechanically checkable.
  */
 export function validateQuestions(questions) {
-  const entries = Object.entries(questions ?? {});
+  if (questions === null || typeof questions !== 'object' || Array.isArray(questions)) {
+    throw new Error('questions must be a record of question objects (the endpoint schema is a record, not an array)');
+  }
+  const entries = Object.entries(questions);
   if (entries.length === 0) throw new Error('questions must carry at least one question');
   for (const [id, q] of entries) {
     if (!q?.type) throw new Error(`question ${id}: missing type`);
@@ -108,12 +139,17 @@ export function validateQuestions(questions) {
       if (!Array.isArray(q.options) || q.options.length < 2) throw new Error(`question ${id}: choice needs options[]`);
       if (!q.criteria || typeof q.criteria !== 'object' || Array.isArray(q.criteria))
         throw new Error(`question ${id}: choice criteria must be a per-option record`);
-      const missing = q.options.filter((o) => !(o in q.criteria));
+      const missing = q.options.filter((o) => !Object.hasOwn(q.criteria, o));
       if (missing.length) throw new Error(`question ${id}: criteria missing for option(s): ${missing.join(', ')}`);
     } else if (q.type === 'score') {
       if (!Array.isArray(q.criteria) || q.criteria.length < 2)
         throw new Error(`question ${id}: score criteria must be an ordered rubric array`);
-    } else if (q.type !== 'noul') {
+    } else if (q.type === 'noul') {
+      // noul criteria are OPTIONAL (our 200 receipt sent noul without) — but
+      // if present they must be a record of descriptions, not an array.
+      if (q.criteria !== undefined && (typeof q.criteria !== 'object' || Array.isArray(q.criteria)))
+        throw new Error(`question ${id}: noul criteria must be a record (e.g. {true: "...", false: "..."})`);
+    } else {
       throw new Error(`question ${id}: unknown type ${q.type} (noul|choice|score)`);
     }
   }
@@ -128,15 +164,32 @@ export function validateQuestions(questions) {
  * A. The semantically valid gate metric for one answer. Noul → probability;
  * Choice/Score → confidence. Exposing BOTH (never collapsing) is the
  * caller's right via the answer object itself; this returns only the field
- * that is VALID to threshold on for that answer type.
+ * that is VALID to threshold on for that answer type. Both fields are
+ * guarded: a malformed answer is loud, never silently routed.
  */
 export function decisionMetric(answer) {
-  if (answer?.type === 'noul') return { metric: answer.noul, metricKind: 'probability' };
+  if (answer?.type === 'noul') {
+    if (typeof answer.noul !== 'number' || !Number.isFinite(answer.noul)) {
+      throw new Error('noul answer missing finite probability (noul field)');
+    }
+    return { metric: answer.noul, metricKind: 'probability' };
+  }
   if (answer?.type === 'choice' || answer?.type === 'score') {
-    if (typeof answer.confidence !== 'number') throw new Error(`${answer.type} answer missing confidence`);
+    if (typeof answer.confidence !== 'number' || !Number.isFinite(answer.confidence)) {
+      throw new Error(`${answer.type} answer missing finite confidence`);
+    }
     return { metric: answer.confidence, metricKind: 'confidence' };
   }
   throw new Error(`unknown answer type: ${answer?.type}`);
+}
+
+/** Validate a risk-class threshold table: bad config must be loud, never silent. */
+export function validateThresholds(t) {
+  if (!t || typeof t !== 'object') throw new Error('thresholds object required (pick an explicit RISK_CLASSES entry — risk class is not optional)');
+  for (const f of ['act', 'confirm']) {
+    if (typeof t[f] !== 'number' || !Number.isFinite(t[f])) throw new Error(`thresholds.${f} must be a finite number`);
+  }
+  if (!(t.confirm < t.act)) throw new Error(`thresholds inverted: confirm (${t.confirm}) must be < act (${t.act})`);
 }
 
 /**
@@ -144,9 +197,12 @@ export function decisionMetric(answer) {
  *   high  → 'act'      (automatic; destructive still carries confirm)
  *   medium→ 'confirm'  (flag / ask a human / gather more)
  *   low   → 'fallback' (deterministic default — the seam's fail-open path)
- * B. Takes exactly ONE answer: no cross-question composition here, ever.
+ * B. Takes exactly ONE answer and an EXPLICIT risk class: no cross-question
+ * composition, and no silent default to the loosest thresholds (N26) —
+ * omitting the class is a programmer error and throws.
  */
-export function routeDecision(answer, thresholds = RISK_CLASSES.read_only) {
+export function routeDecision(answer, thresholds) {
+  validateThresholds(thresholds);
   const { metric, metricKind } = decisionMetric(answer);
   let path;
   if (metric >= thresholds.act) path = 'act';
@@ -158,14 +214,34 @@ export function routeDecision(answer, thresholds = RISK_CLASSES.read_only) {
 }
 
 /**
+ * Validate the response envelope before it flows to callers: a 200 without
+ * answers for EVERY asked question id is a contract break, not an empty
+ * result. Returns the answers record.
+ */
+function requireAnswers(raw, questions) {
+  if (!raw || typeof raw !== 'object' || !raw.answers || typeof raw.answers !== 'object') {
+    throw new Error('response envelope invalid: missing answers object');
+  }
+  const asked = Object.keys(questions);
+  const missing = asked.filter((id) => !Object.hasOwn(raw.answers, id));
+  if (missing.length) throw new Error(`response envelope invalid: no answer for question(s): ${missing.join(', ')}`);
+  return raw.answers;
+}
+
+/**
  * One BATCHED decisions call (C: the default shape — all questions ride in
  * a single request). Returns { model, answers, usage, latencyMs, raw }.
- * Throws on HTTP/validation error; callers fall back to deterministic
- * defaults (fail-open, per the config sketch).
+ * Throws on HTTP/validation/envelope error; callers fall back to
+ * deterministic defaults (fail-open, per the config sketch).
  */
-export async function decide({ state, questions, model = DEFAULT_MODEL, endpoint = DEFAULT_ENDPOINT, timeoutMs = 5000, key }) {
+export async function decide({ state, questions, model = DEFAULT_MODEL, endpoint = DEFAULT_ENDPOINT, timeoutMs = DEFAULT_TIMEOUT_MS, key }) {
+  if (typeof state !== 'string' || state.length === 0) {
+    throw new Error('state must be a non-empty string (filter it first — context rot, jaggedness #5)');
+  }
   validateQuestions(questions);
-  const apiKey = key ?? (await resolveKey());
+  const explicitKey = typeof key === 'string' && key.length > 0;
+  const apiKey = explicitKey ? key : await resolveKey();
+  assertEndpointAllowed(endpoint, !explicitKey);
   const body = JSON.stringify({ model, state, questions });
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -185,6 +261,7 @@ export async function decide({ state, questions, model = DEFAULT_MODEL, endpoint
     const text = await res.text();
     if (!res.ok) throw new Error(`decisions HTTP ${res.status}: ${text.slice(0, 400)}`);
     const raw = JSON.parse(text);
+    requireAnswers(raw, questions);
     return {
       model: raw.model,
       answers: raw.answers,
@@ -230,7 +307,10 @@ export const DEMO = {
   },
 };
 
-if (process.argv[1].endsWith('decisions-client.mjs') && process.argv.includes('--demo')) {
+const invokedDirectly = process.argv[1]
+  && process.argv.includes('--demo')
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
   decide(DEMO)
     .then((r) => {
       const routes = {};

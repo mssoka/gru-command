@@ -21,12 +21,15 @@ per-risk-class thresholds, batching, and the jev-1.13 jaggedness rules are
 ## The flag (TOML, in the repo's config idiom)
 
 ```toml
-# gru.toml — decisions service (System One classifier seam; default OFF)
+# config.toml — decisions service (System One classifier seam; default OFF)
+# (the repo's config file is config.toml — see src/config.ts configPathFor
+#  and docs/example.config.toml)
 [decisions.jev]
 enabled = false                    # THE flag. false = deterministic defaults, no network.
 model = "~typesafe/jev-latest"     # user-confirmed slug; resolves to the pinned snapshot
 endpoint = "https://openrouter.ai/api/alpha/decisions"  # alpha namespace, NOT chat/completions
-timeout_ms = 2000                  # decisions must be fast; slow = fallback
+timeout_ms = 2000                  # AUTHORITATIVE figure (the reference client default matches)
+                                   # decisions must be fast; slow = fallback
 
 # Amendment 2 — per-risk-class routing thresholds (three-path).
 # metric: noul → probability; choice/score → confidence (confidence.md:
@@ -64,20 +67,26 @@ interface Route { path: RoutePath; metric: number;
                   metricKind: 'probability' | 'confidence';
                   requiresConfirm: boolean }
 
+// N26: the risk class is REQUIRED at the call site — an omitted class must
+// never silently inherit the loosest thresholds (destructive answers
+// routed without a class would act at read_only's 0.6 with no confirm).
 // C. batched default shape: one call carries ALL questions (~12.2x cheaper,
 //    ~10x faster — cookbooks/parallel_questions.md).
 interface DecisionService {
   decide(state: string, questions: QuestionSet): Promise<{
     answers: Record<string, Answer>;      // per-question, typed
-    route(qId: string, riskClass: keyof ThresholdsConfig): Route;  // A
+    route(qId: string, riskClass: keyof ThresholdsConfig): Route;  // A (class required)
     source: 'deterministic' | 'jev';      // fail-open: errors → 'deterministic'
   }>;
 }
 ```
 
 Reference implementation of the routing semantics (types, field dispatch,
-risk classes, batch warn): `tools/jev-pilot/decisions-client.mjs` +
-`decisions-client.test.mjs` (11 offline tests on receipt fixtures).
+risk classes, batch warn, endpoint-restricted auto-key, envelope
+validation): `tools/jev-pilot/decisions-client.mjs` +
+`decisions-client.test.mjs` (23 offline tests on receipt fixtures — run
+with `node --test tools/jev-pilot/decisions-client.test.mjs`; the
+directory form MODULE_NOT_FOUNDs on Node 22).
 
 ## Behavior matrix (the whole mechanism, per Amendment 1 + 2)
 

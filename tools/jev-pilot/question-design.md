@@ -51,9 +51,12 @@ state = alert payload + pane id + last 3 transcript lines + row status
 
 **risk class: `destructive`** — act bar 0.85 **AND `require_confirm_on_act`
 true**: every passable band carries the human pause-and-ask. `needs_human`
-medium/high band alone must force the pause regardless of the other answers
-(combine the THREE nouls in code — they are absolute judgments; never
-compose them with each other per jaggedness #8).
+medium/high band alone must force the pause regardless of the other answers.
+Composition rule (jaggedness #8, both sides): combine the three noul
+ANSWERS in code — code-side composition of separate answers is REQUIRED
+(each noul is an absolute, independent judgment) — but never ask the model
+to enforce relations BETWEEN questions (model-side composition is
+forbidden: no expected agreement, summation, or negation across answers).
 
 state = exact command + targets (paths, pane ids, PIDs) + owning row + lsof output
 
@@ -92,10 +95,12 @@ round; nothing auto-verdicts (kill-switch doctrine).
 absolute, independent judgments — `likely_real` and `is_vacuous` are NOT
 expected to sum, agree, or negate each other; combine in code only.
 
-## Schema reminders (live-verified; enforced by the endpoint's Zod layer)
+## Schema reminders (live-verified; endpoint-rejected shapes 400 via Zod)
 
-- every question needs `instructions`
-- `noul` → `criteria: { true: "...", false: "..." }`
+- every question needs `instructions` (Zod-enforced: attempt 4's 400)
+- `noul` → `criteria: { true: "...", false: "..." }` **OPTIONAL** — our 200
+  receipt (attempt 5) sent `provider_alive` without criteria and it passed;
+  the client keeps the record-shape check for when criteria are present
 - `choice` → `options: [...]` + `criteria: { <option>: "..." }` (record)
 - `score` → `criteria: ["low: ...", "high: ..."]` (ordered array)
 - answers: `noul` probability ONLY (no confidence — vendor contract, seen
@@ -106,4 +111,6 @@ expected to sum, agree, or negate each other; combine in code only.
 - **batch:** all questions ride in ONE call (~12.2x cheaper, ~10x faster —
   cookbooks/parallel_questions.md); the client warns on single-question calls
 - reference client: `decisions-client.mjs` (validates before spending a
-  call; 11 offline interface tests in `decisions-client.test.mjs`)
+  call; 23 offline interface tests — run with the FILE-PATH form:
+  `node --test tools/jev-pilot/decisions-client.test.mjs`; the directory
+  form MODULE_NOT_FOUNDs on Node 22)

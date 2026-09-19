@@ -5,7 +5,7 @@ access-control-allow-origin: *
 access-control-expose-headers: X-Generation-Id,X-Provider-Name,request-id,cf-ray
 x-generation-id: gen-dec-1789778187-JSlrW6U18kWg5kMbx6qu
 x-provider-name: TypeSafe
-set-cookie: __cf_bm=r4Sitm1CkQyUZl3OwCvFb2szzbE4LkYQm0tgfTRLw70-1789778187.3174016-1.0.1.1-yvMOFFKOjiKdt.L_ETLRAg5tuVTXqg_JXHRz_PoQE1XUPaSi98gAqPeZAcqKlUpuWVgM.IrglfZJt_lR69oWmwczs4eHN77GuD.64V8FlGc6v_IjYxtthgLpY0LMh5W8; HttpOnly; SameSite=None; Secure; Path=/; Domain=openrouter.ai; Expires=Sat, 19 Sep 2026 01:06:27 GMT
+set-cookie: [redacted]
 permissions-policy: payment=(self "https://checkout.stripe.com" "https://connect-js.stripe.com" "https://js.stripe.com" "https://*.js.stripe.com" "https://hooks.stripe.com")
 referrer-policy: no-referrer, strict-origin-when-cross-origin
 x-content-type-options: nosniff

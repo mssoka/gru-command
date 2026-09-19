@@ -32,6 +32,12 @@ fi
 if [ -z "$KEY" ]; then echo "FATAL: no OpenRouter key (env OPENROUTER_API_KEY or keychain omnigent/openrouter)" >&2; exit 2; fi
 
 URL="https://openrouter.ai/api/alpha/decisions"
+# Response outputs carry a UNIQUE run tag so a rerun never clobbers prior
+# receipts (the historical pre-fix default of "final" caused exactly that
+# once during r1 fixes — see the bundle REPAIR_LOG). Override with OUT_TAG=…
+OUT_TAG="${OUT_TAG:-probe-$(date +%Y%m%dT%H%M%S)}"
+REQ="$EVID/req-decisions.json"
+RSP="$EVID/rsp-decisions-$OUT_TAG"
 
 # Trivial payload in the documented Jev shape (edge-analysis doc, Play A),
 # schema-corrected per the /api/alpha/decisions Zod validation receipts:
@@ -73,17 +79,29 @@ cat > "$EVID/req-decisions.json" <<'JSON'
 }
 JSON
 
+# The key rides a curl config over stdin — never on the argv (ps-visible).
 curl -sS "$URL" \
-  -H "Authorization: Bearer $KEY" \
+  -K - \
   -H "Content-Type: application/json" \
   -H "HTTP-Referer: https://github.com/mssoka/gru-command" \
   -H "X-Title: gru-command-jev-pilot" \
-  --data @"$EVID/req-decisions.json" \
-  -o "$EVID/rsp-decisions-final.body" \
-  -D "$EVID/rsp-decisions-final.headers" \
+  --data @"$REQ" \
+  -o "$RSP.body" \
+  -D "$RSP.headers" \
   -w 'http_code=%{http_code} time_total=%{time_total} time_connect=%{time_connect}\n' \
-  > "$EVID/rsp-decisions-final.meta" 2>&1 || true
+  > "$RSP.meta" 2>&1 <<CURLCFG
+header = "Authorization: Bearer $KEY"
+CURLCFG
 
-cat "$EVID/rsp-decisions-final.meta"
-echo "--- response body ---"
-cat "$EVID/rsp-decisions-final.body"; echo
+cat "$RSP.meta"
+echo "--- response body ($RSP.body) ---"
+cat "$RSP.body"; echo
+
+# Fail loudly on anything but a clean 200: a masked failure would leave a
+# stale prior-run body paired with a fresh error meta (Perkins r1 W10).
+CODE="$(grep -o 'http_code=[0-9]*' "$RSP.meta" | cut -d= -f2)"
+if [ -z "$CODE" ]; then echo "FATAL: curl failed before a response (see $RSP.meta)" >&2; exit 1; fi
+if [ "$CODE" != "200" ]; then echo "FATAL: HTTP $CODE — receipts preserved at $RSP.* (NOT overwriting other runs)" >&2; exit 1; fi
+if grep -q '"error"' "$RSP.body"; then echo "FATAL: 200 carried an error object — see $RSP.body" >&2; exit 1; fi
+echo "ACCESS OK — receipts at $RSP.{body,headers,meta}"
+exit 0
