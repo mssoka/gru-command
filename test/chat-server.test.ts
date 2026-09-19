@@ -49,6 +49,16 @@ interface StubCall {
 class StubGruHandle implements AgentHandle {
   readonly role = 'gru' as const;
   readonly id = 'stub-gru';
+  /** Vision-capable by default; the SPEC ruling 19 gate tests flip it. */
+  capabilities: AgentCapabilities = {
+    streaming: true,
+    steer: 'native',
+    resume: 'file',
+    images: true,
+    thinking: true,
+    thinkingLevelControl: true,
+    followUp: true,
+  };
   sessionFile: string | null;
   readonly calls: StubCall[] = [];
   /** Deltas emitted per prompt turn. */
@@ -185,6 +195,10 @@ class StubGruRuntime implements AgentRuntime {
 
 interface Harness {
   readonly dir: string;
+  /** Real workspace fixture (ruling 19 provenance): ws/repo-a/*. */
+  readonly workspaceRoot: string;
+  /** Real uploads fixture (ruling 19 provenance): <dir>/uploads. */
+  readonly uploadsDir: string;
   readonly chatDir: string;
   readonly frameLog: ChatFrameLog;
   readonly chat: ChatServer;
@@ -214,6 +228,15 @@ async function makeHarness(options: {
   const sessionFile = join(sessionsDir, 'stub-gru-session.jsonl');
   writeFileSync(sessionFile, '', { flag: 'a' });
 
+  // Ruling 19 provenance fixtures: chip paths must REALLY live under the
+  // workspace root or the uploads dir (the delivery gate realpaths them).
+  const workspaceRoot = join(dir, 'ws');
+  const uploadsDir = join(dir, 'uploads');
+  mkdirSync(join(workspaceRoot, 'repo-a'), { recursive: true });
+  writeFileSync(join(workspaceRoot, 'repo-a', 'notes.md'), 'notes', 'utf-8');
+  writeFileSync(join(workspaceRoot, 'repo-a', 'shot.png'), 'png', 'utf-8');
+  mkdirSync(uploadsDir, { recursive: true });
+
   const frameLog = ChatFrameLog.load(chatDir);
   const pointer = new GruSessionPointer(chatDir);
   const handle = new StubGruHandle(sessionFile);
@@ -222,7 +245,11 @@ async function makeHarness(options: {
   const spawnCalls: (string | null)[] = [];
   let spawnFailure: Error | null = options.failFirstSpawn ?? null;
   const chat = createChatServer({
-    config: { auth: { token: options.token ?? TOKEN } } as GruCommandConfig,
+    config: {
+      auth: { token: options.token ?? TOKEN },
+      workspaceRoot,
+      dataDir: dir,
+    } as GruCommandConfig,
     frameLog,
     pointer,
     ...(options.siblingUpgradePaths !== undefined ? { siblingUpgradePaths: options.siblingUpgradePaths } : {}),
@@ -247,6 +274,8 @@ async function makeHarness(options: {
   const port = (http.address() as AddressInfo).port;
   return {
     dir,
+    workspaceRoot,
+    uploadsDir,
     chatDir,
     frameLog,
     chat,
@@ -1261,5 +1290,212 @@ describe('chat server — supervision integration (E7)', () => {
     expect(harness.handle.calls).toEqual([]);
     await client.close();
     await harness.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC ruling 19 — the ONE attach flow: chips on the wire, PATHS to the
+// agent, graceful vision decline (this lane).
+// ---------------------------------------------------------------------------
+
+describe('chat server — attach flow (SPEC ruling 19)', () => {
+  it('chips ride the logged user frame and the delivered prompt is a PATH manifest (no bytes)', async () => {
+    const h = await makeHarness();
+    try {
+      const client = new TestClient(h.port);
+      await client.open();
+      client.auth(TOKEN);
+      await client.waitFor(isType('auth_ok'), 'auth_ok');
+      client.sendRaw({
+        type: 'user',
+        text: 'look at these',
+        client_msg_id: 'attach-1',
+        attachments: [
+          { path: join(h.workspaceRoot, 'repo-a', 'notes.md'), name: 'notes.md', kind: 'file' },
+          { path: join(h.workspaceRoot, 'repo-a', 'shot.png'), name: 'shot.png', kind: 'image' },
+        ],
+      });
+      await client.waitFor((f) => f.type === 'ack', 'ack');
+      // Delivery landed on the Gru handle as a manifest prompt.
+      await pollUntil(() => h.handle.calls.length === 1, 'prompt delivered');
+      const prompt = h.handle.calls[0]!.text;
+      expect(prompt).toContain('look at these');
+      expect(prompt).toContain('[attached files — read them yourself at these paths]');
+      expect(prompt).toContain(`- ${join(h.workspaceRoot, 'repo-a', 'notes.md')}`);
+      expect(prompt).toContain(`- ${join(h.workspaceRoot, 'repo-a', 'shot.png')} (image)`);
+      // NO bytes anywhere: the manifest is paths only (ruling 19(c)).
+      expect(prompt).not.toContain('base64');
+      // The logged user frame carries the chips (replay renders them).
+      const logged = h.frameLog.history.find((f) => f.type === 'user');
+      expect(logged).toMatchObject({
+        type: 'user',
+        attachments: [
+          { path: join(h.workspaceRoot, 'repo-a', 'notes.md'), kind: 'file' },
+          { path: join(h.workspaceRoot, 'repo-a', 'shot.png'), kind: 'image' },
+        ],
+      });
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('vision gate: an image chip on an images-incapable runtime DECLINES gracefully — notice + never-guess line, never an error, never a drop', async () => {
+    const h = await makeHarness();
+    h.handle.capabilities = { ...h.handle.capabilities, images: false };
+    try {
+      const client = new TestClient(h.port);
+      await client.open();
+      client.auth(TOKEN);
+      await client.waitFor(isType('auth_ok'), 'auth_ok');
+      client.sendRaw({
+        type: 'user',
+        text: 'what is in this picture',
+        client_msg_id: 'attach-decline-1',
+        attachments: [{ path: join(h.uploadsDir, '1-shot.png'), name: 'shot.png', kind: 'image' }],
+      });
+      // The decline is VISIBLE: a logged notice frame (not an error frame).
+      const notice = await client.waitFor(
+        (f) => f.type === 'notice' && String((f as { text?: string }).text).includes('Vision is unavailable'),
+        'vision decline notice',
+      );
+      expect((notice as { seq: number }).seq).toBeGreaterThan(0);
+      await client.waitFor(isType('ack'), 'ack');
+      // The path STILL delivered (never a silent drop)…
+      await pollUntil(() => h.handle.calls.length === 1, 'prompt delivered despite gate');
+      const prompt = h.handle.calls[0]!.text;
+      expect(prompt).toContain(join(h.uploadsDir, '1-shot.png'));
+      // …with the never-guess instruction for the blind model.
+      expect(prompt).toContain('do NOT guess');
+      // And NO error frame was logged for the gated attach.
+      expect(h.frameLog.history.some((f) => f.type === 'error')).toBe(false);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('an attachment-only message (empty text, chips) is legal end-to-end', async () => {
+    const h = await makeHarness();
+    try {
+      const client = new TestClient(h.port);
+      await client.open();
+      client.auth(TOKEN);
+      await client.waitFor(isType('auth_ok'), 'auth_ok');
+      client.sendRaw({
+        type: 'user',
+        text: '',
+        client_msg_id: 'attach-only-1',
+        attachments: [{ path: join(h.workspaceRoot, 'repo-a', 'notes.md'), name: 'notes.md', kind: 'file' }],
+      });
+      await client.waitFor(isType('ack'), 'ack for attachment-only');
+      await pollUntil(() => h.handle.calls.length === 1, 'prompt delivered');
+      expect(h.handle.calls[0]!.text).toContain(join(h.workspaceRoot, 'repo-a', 'notes.md'));
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('re-sent frames (dedup) re-ack without re-delivering chips', async () => {
+    const h = await makeHarness();
+    try {
+      const client = new TestClient(h.port);
+      await client.open();
+      client.auth(TOKEN);
+      await client.waitFor(isType('auth_ok'), 'auth_ok');
+      const frame = {
+        type: 'user' as const,
+        text: 'once only',
+        client_msg_id: 'attach-dedupe-1',
+        attachments: [
+          { path: join(h.workspaceRoot, 'one.txt'), name: 'one.txt', kind: 'file' as const },
+        ],
+      };
+      client.sendRaw(frame);
+      await client.waitFor(isType('ack'), 'first ack');
+      await pollUntil(() => h.handle.calls.length === 1, 'delivered');
+      client.sendRaw(frame);
+      await client.waitFor(
+        () => client.frames.filter(isType('ack')).length >= 2,
+        'second ack (dedup re-ack)',
+      );
+      expect(h.handle.calls.length).toBe(1);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('provenance: chips outside the workspace and uploads drop GRACEFULLY — notice, no manifest entry, no error frame', async () => {
+    const h = await makeHarness();
+    try {
+      const client = new TestClient(h.port);
+      await client.open();
+      client.auth(TOKEN);
+      await client.waitFor(isType('auth_ok'), 'auth_ok');
+      const outside = join(h.dir, 'outside-secret.txt'); // real file, OUTSIDE both homes
+      writeFileSync(outside, 'shh', 'utf-8');
+      client.sendRaw({
+        type: 'user',
+        text: 'read this too',
+        client_msg_id: 'attach-prov-1',
+        attachments: [
+          { path: join(h.workspaceRoot, 'repo-a', 'notes.md'), name: 'notes.md', kind: 'file' },
+          { path: outside, name: 'outside-secret.txt', kind: 'file' },
+        ],
+      });
+      const notice = await client.waitFor(
+        (f) =>
+          f.type === 'notice' && String((f as { text?: string }).text).includes('Attachment path not allowed'),
+        'provenance notice',
+      );
+      expect((notice as { text?: string }).text).toContain('outside-secret.txt');
+      await pollUntil(() => h.handle.calls.length === 1, 'prompt delivered');
+      const prompt = h.handle.calls[0]!.text;
+      // The allowed chip delivered; the rejected one never reached the agent.
+      expect(prompt).toContain(join(h.workspaceRoot, 'repo-a', 'notes.md'));
+      expect(prompt).not.toContain('outside-secret.txt');
+      expect(h.frameLog.history.some((f) => f.type === 'error')).toBe(false);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('malformed chips (bad kind / too many) are rejected as malformed frames, never delivered', async () => {
+    const h = await makeHarness();
+    try {
+      const client = new TestClient(h.port);
+      await client.open();
+      client.auth(TOKEN);
+      await client.waitFor(isType('auth_ok'), 'auth_ok');
+      client.sendRaw({
+        type: 'user',
+        text: 'bad kind',
+        client_msg_id: 'attach-bad-1',
+        attachments: [{ path: '/x', name: 'x', kind: 'video' }],
+      });
+      const err = await client.waitFor(isType('error'), 'malformed error');
+      expect((err as { message?: string }).message).toContain('malformed frame');
+      client.sendRaw({
+        type: 'user',
+        text: 'too many',
+        client_msg_id: 'attach-bad-2',
+        attachments: Array.from({ length: 9 }, (_, i) => ({
+          path: join(h.workspaceRoot, `f${i}`),
+          name: `f${i}`,
+          kind: 'file' as const,
+        })),
+      });
+      await client.waitFor(
+        (f) => f.type === 'error' && String((f as { message?: string }).message).includes('malformed'),
+        'second malformed error',
+      );
+      expect(h.handle.calls.length).toBe(0);
+      await client.close();
+    } finally {
+      await h.close();
+    }
   });
 });

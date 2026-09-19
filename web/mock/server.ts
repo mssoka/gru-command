@@ -11,9 +11,13 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
   parseClientFrame,
+  type AttachmentChip,
   type ErrorFrame,
   type LoggedFrame,
   type ServerFrame,
@@ -57,9 +61,13 @@ function sendError(socket: WebSocket, message: string, fatal: boolean): void {
 }
 
 /** Deterministic scripted Gru reply: turn → tool activity → deltas → end. */
-function scriptedReply(socket: WebSocket, userText: string): void {
+function scriptedReply(socket: WebSocket, userText: string, attachments?: readonly AttachmentChip[]): void {
+  // Attach chips echo as PATH lines (SPEC ruling 19 parity: the mock is
+  // the executable spec — paths, never pasted bytes).
+  const chipLines = (attachments ?? []).map((chip) => `📎 ${chip.name} → ${chip.path}`).join(' ');
   const reply =
     `Mock Gru here, boss! You said: "${userText}". ` +
+    (chipLines === '' ? '' : `${chipLines}. `) +
     'The real brain plugs in when E4 lands — until then I echo with pride. 🪐';
   const tokens = reply.split(/(?<=\s)/); // word-sized chunks, spaces kept
 
@@ -205,6 +213,26 @@ const SAMPLE_TRANSCRIPT = [
   { type: 'assistant', text: 'tracked on the board as a round chip' },
 ];
 
+/** Mock attach surface (review r1: the one flow must work in dev/mock
+ * mode too). Browse serves a small generic sample tree; uploads
+ * materialize into a throwaway dir so chips carry a REAL path shape. */
+const MOCK_UPLOADS_DIR = mkdtempSync(join(tmpdir(), 'gru-mock-uploads-'));
+const MOCK_BROWSE_ROOT = '/workspace';
+
+function mockBrowse(path: string): unknown {
+  const tree: Record<string, Array<{ name: string; kind: 'dir' | 'file'; size: number | null; image: boolean }>> = {
+    '': [
+      { name: 'sample-repo', kind: 'dir', size: null, image: false },
+      { name: 'mock-notes.md', kind: 'file', size: 128, image: false },
+      { name: 'mock-shot.png', kind: 'file', size: 2048, image: true },
+    ],
+    'sample-repo': [{ name: 'README.md', kind: 'file', size: 64, image: false }],
+  };
+  const entries = tree[path] ?? [];
+  const parent = path === '' ? null : (path.split('/').slice(0, -1).join('/') || '');
+  return { root: MOCK_BROWSE_ROOT, path, parent, truncated: false, entries };
+}
+
 const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   // Board API (dev-only, generic sample data; token matches the chat token).
   const url = new URL(req.url ?? '/', 'http://localhost');
@@ -277,6 +305,47 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     return;
   }
   // POST /__pulse nudges board clients with a fresh sample snapshot.
+  if (req.method === 'GET' && url.pathname === '/api/attach/browse') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(mockBrowse(url.searchParams.get('path') ?? '')) + '\n');
+    return;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/attach/uploads') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    let body = '';
+    req.on('data', (chunk: Buffer) => {
+      body += chunk.toString('utf-8');
+    });
+    req.on('end', () => {
+      try {
+        const parsed = JSON.parse(body) as { filename?: string; content_base64?: string };
+        const filename = typeof parsed.filename === 'string' && parsed.filename !== '' ? parsed.filename : 'upload';
+        const bytes = Buffer.from(parsed.content_base64 ?? '', 'base64');
+        if (bytes.byteLength === 0) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end('{"error":"attach_failed","detail":"content_base64 must be a non-empty string"}\n');
+          return;
+        }
+        const target = join(MOCK_UPLOADS_DIR, `${Date.now()}-${filename.replace(/[^\p{L}\p{N}._ +-]/gu, '_')}`);
+        writeFileSync(target, bytes);
+        res.writeHead(201, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ path: target, name: filename, bytes: bytes.byteLength }) + '\n');
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end('{"error":"attach_failed","detail":"bad upload body"}\n');
+      }
+    });
+    return;
+  }
   if (req.method === 'POST' && req.url === '/__pulse') {
     for (const client of boardClients) {
       if (client.readyState === WebSocket.OPEN) {
@@ -433,9 +502,15 @@ function handleUserFrame(socket: WebSocket, frame: UserFrame): void {
     send(socket, record({ type: 'ack', client_msg_id: frame.client_msg_id, seq: nextSeq() }));
     return;
   }
-  record({ type: 'user', text: frame.text, client_msg_id: frame.client_msg_id, seq: nextSeq() });
+  record({
+    type: 'user',
+    text: frame.text,
+    client_msg_id: frame.client_msg_id,
+    ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
+    seq: nextSeq(),
+  });
   send(socket, record({ type: 'ack', client_msg_id: frame.client_msg_id, seq: nextSeq() }));
-  scriptedReply(socket, frame.text);
+  scriptedReply(socket, frame.text, frame.attachments);
 }
 
 process.stdout.write(

@@ -12,7 +12,17 @@ import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner, type LensDriver } from '../src/dispatch/perkins.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
-import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+
+const FAKE_CAPABILITIES: AgentCapabilities = {
+  streaming: true,
+  steer: 'native',
+  resume: 'file',
+  images: false,
+  thinking: false,
+  thinkingLevelControl: false,
+  followUp: false,
+};
 import type { Role } from '../src/config.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
@@ -61,6 +71,7 @@ async function boot(opts: { token?: string; driveLens?: LensDriver } = {}): Prom
       role,
       id: `agent-${spawns.length}`,
       sessionFile: null,
+      capabilities: FAKE_CAPABILITIES,
       async prompt() {},
       async steer() {},
       async followUp() {},

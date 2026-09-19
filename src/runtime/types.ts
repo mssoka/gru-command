@@ -136,6 +136,10 @@ export interface AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string | null;
+  /** The hosting runtime's capability declaration (SPEC ruling 4):
+   * surfaces read the SAME gaps the adapter declared — the chat surface
+   * gates vision on it (SPEC ruling 19: graceful decline, never a guess). */
+  readonly capabilities: AgentCapabilities;
   /**
    * Send a prompt and resolve when the resulting turn completes. A prompt
    * from a second owner while a turn is live is QUEUED (single-writer, SPEC

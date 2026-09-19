@@ -304,6 +304,7 @@ export class PiAgentHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string;
+  readonly capabilities: AgentCapabilities = PI_CAPABILITIES;
 
   /** The principal unnamed callers are attributed to (single-writer). */
   private readonly principal: string;

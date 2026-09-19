@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import type { GruCommandConfig } from './config.js';
 import type { InstallIdentity } from './identity.js';
 import type { LogLevel } from './logger.js';
+import { hashToken, tokenConfigured, tokenMatches } from './auth.js';
 import type { RuntimeStatus } from './runtime/registry.js';
 import type { SupervisionStatus } from './supervision/supervisor.js';
 import type { StaticRoot } from './static.js';
@@ -52,6 +53,43 @@ export interface HealthPayload {
     readonly path: string;
     readonly declared: boolean;
     readonly note: string;
+  };
+}
+
+/**
+ * The UNAUTHENTICATED /health shape (W-C, E9 r3 carry): the pairing
+ * surface (LAN, pre-token) gets liveness ONLY. workspace_root,
+ * data_dir, the install fingerprint, session paths, and supervision
+ * detail are operator material — they move behind the pairing token
+ * (full HealthPayload via `Authorization: Bearer <token>`).
+ */
+export interface PublicHealthPayload {
+  readonly service: string;
+  readonly version: string;
+  readonly request_id: string;
+  readonly uptime_ms: number;
+  readonly liveness: {
+    readonly healthy: boolean;
+    readonly note: string;
+    readonly signals: {
+      readonly health_reachable: LivenessSignal;
+    };
+  };
+}
+
+/** Reduce the full payload to its public shape (W-C): identity, config
+ * paths, session paths, and supervision detail never leave unauthed. */
+export function toPublicHealth(full: HealthPayload): PublicHealthPayload {
+  return {
+    service: full.service,
+    version: full.version,
+    request_id: full.request_id,
+    uptime_ms: full.uptime_ms,
+    liveness: {
+      healthy: full.liveness.healthy,
+      note: full.liveness.note,
+      signals: { health_reachable: full.liveness.signals.health_reachable },
+    },
   };
 }
 
@@ -204,6 +242,10 @@ export function createService(
   options: ServiceOptions = {},
 ): { start(): Promise<ServiceHandle> } {
   const startedAt = process.hrtime.bigint();
+  // W-C gate inputs, resolved once (review r1: per-request hashing was
+  // needless work; a missing header short-circuits before any match).
+  const tokenHash = hashToken(config.auth.token);
+  const tokenConfigured_ = tokenConfigured(config.auth.token);
   const server: HttpServer = createServer(
     (req: IncomingMessage, res: import('node:http').ServerResponse) => {
       const requestStarted = process.hrtime.bigint();
@@ -243,18 +285,25 @@ export function createService(
             }
             throw error;
           }
-          jsonBody(
-            res,
-            200,
-            buildHealthPayload(
-              config,
-              identity,
-              startedAt,
-              requestId,
-              runtimeStatus(),
-              options.supervisionStatus !== undefined ? options.supervisionStatus() : null,
-            ),
+          const full = buildHealthPayload(
+            config,
+            identity,
+            startedAt,
+            requestId,
+            runtimeStatus(),
+            options.supervisionStatus !== undefined ? options.supervisionStatus() : null,
           );
+          // W-C (E9 r3 carry): the pairing surface gets LIVENESS ONLY —
+          // workspace_root / data_dir / install fingerprint / session
+          // paths / supervision detail are operator material behind the
+          // pairing token. A missing or wrong token still answers 200:
+          // /health is the liveness oracle, not an auth gate.
+          const bearer = /^Bearer (.+)$/.exec((req.headers.authorization ?? '').trim());
+          const tokenKnown =
+            tokenConfigured_ &&
+            bearer !== null &&
+            tokenMatches(bearer[1] ?? '', tokenHash);
+          jsonBody(res, 200, tokenKnown ? full : toPublicHealth(full));
           return { status: 200 };
         }
         req.resume();

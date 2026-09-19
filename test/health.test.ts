@@ -20,12 +20,25 @@ function tmpHome(): string {
 
 async function bootService(home: string): Promise<ServiceHandle> {
   // Ephemeral port: the suite must never collide with a dev instance on
-  // the configured default port.
-  writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+  // the configured default port. A pairing token ships in the fixture —
+  // /health's full payload is token-gated (W-C) and the suite proves
+  // both sides of that gate.
+  writeFileSync(
+    configPathFor(home),
+    '[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "health-test-token"\n',
+    'utf-8',
+  );
   const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
   const identity = loadOrCreateIdentity(config.dataDir);
   const service = createService(config, identity);
   return service.start();
+}
+
+/** The authed fetch (full HealthPayload; W-C gates it behind the token). */
+async function authedHealth(port: number): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/health`, {
+    headers: { authorization: 'Bearer health-test-token' },
+  });
 }
 
 const UUID_RE =
@@ -36,7 +49,7 @@ describe('GET /health', () => {
     const home = tmpHome();
     const handle = await bootService(home);
     try {
-      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const res = await authedHealth(handle.port);
       expect(res.status).toBe(200);
       expect(res.headers.get('content-type')).toContain('application/json');
       const body = (await res.json()) as Record<string, unknown>;
@@ -77,7 +90,11 @@ describe('GET /health', () => {
 
   it('flips liveness REAL when a runtime status is wired (E2)', async () => {
     const home = tmpHome();
-    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    writeFileSync(
+      configPathFor(home),
+      '[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "health-test-token"\n',
+      'utf-8',
+    );
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     const identity = loadOrCreateIdentity(config.dataDir);
     const wiredAt = new Date('2026-09-16T00:00:00Z').toISOString();
@@ -102,7 +119,7 @@ describe('GET /health', () => {
     const service = createService(config, identity, () => {}, status);
     const handle = await service.start();
     try {
-      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const res = await authedHealth(handle.port);
       const body = (await res.json()) as Record<string, unknown>;
       const liveness = body['liveness'] as Record<string, unknown>;
       const signals = liveness['signals'] as Record<string, Record<string, unknown>>;
@@ -125,7 +142,11 @@ describe('GET /health', () => {
 
   it('carries the supervision block when a supervisor status is wired (E7)', async () => {
     const home = tmpHome();
-    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    writeFileSync(
+      configPathFor(home),
+      '[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "health-test-token"\n',
+      'utf-8',
+    );
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     const identity = loadOrCreateIdentity(config.dataDir);
     const service = createService(
@@ -157,7 +178,7 @@ describe('GET /health', () => {
     );
     const handle = await service.start();
     try {
-      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const res = await authedHealth(handle.port);
       const body = (await res.json()) as Record<string, unknown>;
       const supervision = body['supervision'] as Record<string, unknown>;
       expect(supervision['enabled']).toBe(true);
@@ -171,13 +192,17 @@ describe('GET /health', () => {
 
   it('reports supervision: null when no supervisor is wired (pre-E7 shape)', async () => {
     const home = tmpHome();
-    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    writeFileSync(
+      configPathFor(home),
+      '[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "health-test-token"\n',
+      'utf-8',
+    );
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     const identity = loadOrCreateIdentity(config.dataDir);
     const service = createService(config, identity, () => {}, () => null);
     const handle = await service.start();
     try {
-      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const res = await authedHealth(handle.port);
       const body = (await res.json()) as Record<string, unknown>;
       expect(body['supervision']).toBeNull();
     } finally {
@@ -187,7 +212,11 @@ describe('GET /health', () => {
 
   it('reports no-session honestly when the registry is empty but wired', async () => {
     const home = tmpHome();
-    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    writeFileSync(
+      configPathFor(home),
+      '[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "health-test-token"\n',
+      'utf-8',
+    );
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     const identity = loadOrCreateIdentity(config.dataDir);
     const service = createService(
@@ -203,7 +232,7 @@ describe('GET /health', () => {
     );
     const handle = await service.start();
     try {
-      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const res = await authedHealth(handle.port);
       const body = (await res.json()) as Record<string, unknown>;
       const signals = (body['liveness'] as Record<string, unknown>)['signals'] as Record<
         string,
@@ -224,13 +253,13 @@ describe('GET /health', () => {
     const home = tmpHome();
     const first = await bootService(home);
     const firstBody = (await (
-      await fetch(`http://127.0.0.1:${first.port}/health`)
+      await authedHealth(first.port)
     ).json()) as Record<string, Record<string, string>>;
     await first.stop();
 
     const second = await bootService(home);
     const secondBody = (await (
-      await fetch(`http://127.0.0.1:${second.port}/health`)
+      await authedHealth(second.port)
     ).json()) as Record<string, Record<string, string>>;
     await second.stop();
 
@@ -353,7 +382,11 @@ describe('GET /health', () => {
 describe('Perkins r1 regression pins', () => {
   it("N14: session_growth reports 'not-scanned' before the store has scanned", async () => {
     const home = tmpHome();
-    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    writeFileSync(
+      configPathFor(home),
+      '[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "health-test-token"\n',
+      'utf-8',
+    );
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     const identity = loadOrCreateIdentity(config.dataDir);
     const service = createService(config, identity, () => {}, () => ({
@@ -364,7 +397,7 @@ describe('Perkins r1 regression pins', () => {
     }));
     const handle = await service.start();
     try {
-      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      const res = await authedHealth(handle.port);
       const body = (await res.json()) as Record<string, unknown>;
       const signals = (body['liveness'] as Record<string, unknown>)['signals'] as Record<string, Record<string, unknown>>;
       expect(signals['session_growth']).toEqual({ value: 'not-scanned', stubbed: false });
@@ -375,7 +408,11 @@ describe('Perkins r1 regression pins', () => {
 
   it('W4: liveness.healthy goes false when an adapter is down', async () => {
     const home = tmpHome();
-    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    writeFileSync(
+      configPathFor(home),
+      '[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "health-test-token"\n',
+      'utf-8',
+    );
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     const identity = loadOrCreateIdentity(config.dataDir);
     const service = createService(config, identity, () => {}, () => ({
@@ -390,6 +427,68 @@ describe('Perkins r1 regression pins', () => {
       const body = (await res.json()) as Record<string, unknown>;
       const liveness = body['liveness'] as Record<string, unknown>;
       expect(liveness['healthy']).toBe(false);
+    } finally {
+      await handle.stop();
+    }
+  });
+});
+
+describe('W-C (E9 r3 carry): /health disclosure split', () => {
+  it('unauthenticated /health answers 200 with LIVENESS ONLY — no paths, no fingerprint', async () => {
+    const home = tmpHome();
+    const handle = await bootService(home);
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      // Public shape: service/version/uptime + health_reachable liveness.
+      expect(body['service']).toBe('gru-command');
+      expect(body['version']).toBe(VERSION);
+      expect(typeof body['uptime_ms']).toBe('number');
+      const liveness = body['liveness'] as Record<string, unknown>;
+      expect(liveness['healthy']).toBe(true);
+      const signals = liveness['signals'] as Record<string, unknown>;
+      expect(signals['health_reachable']).toEqual({ value: true, stubbed: true });
+      // Operator material NEVER leaves unauthenticated (W-C):
+      expect(body['config']).toBeUndefined();
+      expect(body['identity']).toBeUndefined();
+      expect(body['session']).toBeUndefined();
+      expect(body['supervision']).toBeUndefined();
+      expect(signals['agent_session']).toBeUndefined();
+      expect(signals['session_growth']).toBeUndefined();
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it('a WRONG token still answers 200 with the public shape (health is the liveness oracle, not an auth gate)', async () => {
+    const home = tmpHome();
+    const handle = await bootService(home);
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/health`, {
+        headers: { authorization: 'Bearer definitely-not-it' },
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body['identity']).toBeUndefined();
+      expect(body['config']).toBeUndefined();
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it('the pairing token unlocks the FULL payload (operator view)', async () => {
+    const home = tmpHome();
+    const handle = await bootService(home);
+    try {
+      const res = await authedHealth(handle.port);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      const config = body['config'] as Record<string, string>;
+      expect(config['workspace_root']).toBe('/home/tester/code');
+      expect(config['data_dir']).toBe(home);
+      expect((body['identity'] as Record<string, string>)['install_id']).toMatch(UUID_RE);
+      expect(body['supervision']).toBeNull();
     } finally {
       await handle.stop();
     }

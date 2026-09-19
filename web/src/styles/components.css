@@ -276,6 +276,7 @@ body {
   display: grid;
   grid-template-rows: minmax(240px, 52vh) auto;
   overflow: hidden;
+  position: relative;
 }
 
 .chat-log {
@@ -1151,4 +1152,174 @@ body {
 
 .board-agent__supervision {
   font-size: 11px;
+}
+
+/* -------------------------------------------------------------------------
+ * The ONE attach flow (SPEC ruling 19): chips/preview + workspace picker.
+ * ------------------------------------------------------------------------- */
+
+.chat-compose {
+  flex-direction: column;
+}
+
+.chat-compose__row {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  align-items: center;
+}
+
+.chat-attach-btn {
+  flex: none;
+}
+
+/* Ready-to-send chips above the input (composer) and inside sent bubbles */
+.chat-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: 100%;
+  margin-bottom: 2px;
+}
+
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--card, #fff);
+  border: var(--outline-width, 1px) solid var(--border, #ccc);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.attach-chip__icon {
+  flex: none;
+}
+
+.attach-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 22ch;
+}
+
+.attach-chip__remove {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.attach-chip__remove:hover {
+  color: var(--danger, #c0392b);
+}
+
+.attach-chip--busy {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.msg--user .attach-chip {
+  background: transparent;
+  border-style: dashed;
+}
+
+.msg__text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The workspace browse picker (on-disk picks send PATHS, never bytes) */
+.attach-picker {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 96px;
+  max-height: min(52vh, 380px);
+  display: flex;
+  flex-direction: column;
+  background: var(--card, #fff);
+  border: var(--outline-width, 1px) solid var(--border, #ccc);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
+  z-index: 30;
+  overflow: hidden;
+}
+
+.attach-picker__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: var(--outline-width, 1px) solid var(--border, #ccc);
+}
+
+.attach-picker__path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 700;
+  direction: rtl;
+  text-align: left;
+}
+
+.attach-picker__error {
+  padding: 8px 12px;
+  color: var(--danger, #c0392b);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.attach-picker__list {
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.attach-picker__loading,
+.attach-picker__empty {
+  padding: 10px 12px;
+  color: var(--muted, #888);
+  font-size: 13px;
+}
+
+.attach-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  text-align: left;
+}
+
+.attach-row:hover {
+  background: var(--soft, #f3f4f6);
+}
+
+.attach-row__icon {
+  flex: none;
+}
+
+.attach-row__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notice-line--ephemeral {
+  opacity: 0.85;
 }

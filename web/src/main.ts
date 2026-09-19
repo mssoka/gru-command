@@ -7,6 +7,7 @@ import './styles/tokens.css';
 import './styles/components.css';
 
 import { ChatClient, type ConnectionState } from './lib/chat-client.js';
+import { AttachClient, readFileBytes } from './lib/attach-client.js';
 import { WS_PATH, type LoggedFrame } from './lib/protocol.js';
 import { BoardClient } from './lib/board-client.js';
 import { applyTheme, getTheme, setTheme } from './theme.js';
@@ -176,7 +177,18 @@ function startChat(token: string): void {
   mustGet('chat-view').hidden = false;
   if (!mobileQuery.matches) showView('chat');
   else showView('board');
-  chatView ??= new ChatView((text) => client?.send(text));
+  chatView ??= new ChatView((text, attachments) => {
+    if (client === null) return false;
+    client.send(text, attachments); // throws surface in the composer's guard
+    return true;
+  });
+  // The ONE attach flow's resolution surface (SPEC ruling 19): bound per
+  // pair — the token rotates with re-pairing, the view stays.
+  const attachClient = new AttachClient({ token, host: location.host, secure });
+  chatView.bindAttach({
+    browse: (path) => attachClient.browse(path),
+    upload: async (file) => attachClient.upload(file.name, await readFileBytes(file)),
+  });
   client?.stop();
   let replaying = false;
   client = new ChatClient(

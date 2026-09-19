@@ -25,7 +25,7 @@ configuration in production.
 | Frame | Fields | Notes |
 |---|---|---|
 | `auth` | `token`, `last_seen_seq?` | MUST be the first frame, within 5 s of connect |
-| `user` | `text`, `client_msg_id` | a chat message; `client_msg_id` dedupes re-sends |
+| `user` | `text`, `client_msg_id`, `attachments?` | a chat message; `client_msg_id` dedupes re-sends. `attachments` (SPEC ruling 19): 1–8 chips `{path, name, kind: file\|image}` — PATH references from the one attach flow; an attachment-only frame (empty `text` + chips) is legal, a frame with neither is malformed |
 
 ### Server → client
 
@@ -36,7 +36,7 @@ Every frame except the two fatal/ephemeral classes carries a monotonic
 |---|---|---|
 | `auth_ok` | `seq` | auth accepted; `seq` = the log high-water mark |
 | `ack` | `client_msg_id`, `seq` | a user message was received (precedes any runtime work) |
-| `user` | `text`, `client_msg_id`, `seq` | a message the writer sent — live to other clients, replayed on reconnect |
+| `user` | `text`, `client_msg_id`, `attachments?`, `seq` | a message the writer sent — live to other clients, replayed on reconnect (chips replay with it) |
 | `delta` | `text`, `seq` | streamed reply chunk |
 | `tool` | `name`, `state: start\|end`, `seq` | live tool activity |
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |
@@ -46,6 +46,36 @@ Every frame except the two fatal/ephemeral classes carries a monotonic
 The contract has no frames for thinking deltas or in-progress tool
 updates: both are dropped at the socket boundary (transcript views own
 those surfaces in a later epic).
+
+## Attachments (SPEC ruling 19 — the ONE attach flow)
+
+Exactly one flow brings non-repo material into a conversation, and it
+resolves to PATHS, never pasted bytes:
+
+- **On-disk picks** browse the workspace root over
+  `GET /api/attach/browse?path=<rel>` (token-authed, metadata only —
+  no file bytes ever move) and send the picked file's absolute path.
+  **No byte copy**: the source file is referenced where it lies.
+- **Clipboard paste and phone-origin content** materialize over
+  `POST /api/attach/uploads` (JSON `{filename, content_base64}`) into
+  `<data_dir>/uploads/` (0700; hardened at boot and on every write)
+  and send THAT path.
+- **Delivery** composes the chips into the prompt as a path manifest
+  (`[attached files — read them yourself at these paths]`) — the agent
+  always receives paths and reads the files itself. No image bytes ride
+  the prompt in this flow.
+- **Vision gating**: an `image` chip on a runtime whose capabilities
+  declare `images: false` (SPEC ruling 4) DECLINES GRACEFULLY — the
+  paths still deliver, a logged `notice` frame tells the user vision is
+  unavailable, and the prompt instructs the agent never to guess at
+  image contents. Never an error frame, never a silent drop.
+- ONE seam (`/api/attach/*`) serves every surface: the chat composer
+  rides it today; the dispatch surface rides the same endpoints when its
+  composer lands — no per-surface side doors exist.
+- **Chip-path provenance**: the delivery layer realpaths each chip and
+  only workspace-root or uploads-dir paths reach the agent's manifest —
+  anything else drops GRACEFULLY (a logged notice names the rejected
+  path; the message still delivers).
 
 ## The seq invariant (load-bearing)
 

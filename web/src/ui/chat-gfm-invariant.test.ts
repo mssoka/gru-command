@@ -60,14 +60,38 @@ beforeEach(() => {
   log.id = 'chat-log';
   const form = document.createElement('form');
   form.id = 'chat-form';
+  const chips = document.createElement('div');
+  chips.id = 'chat-chips';
+  const composeRow = document.createElement('div');
+  composeRow.className = 'chat-compose__row';
+  const attachButton = document.createElement('button');
+  attachButton.id = 'chat-attach';
   const input = document.createElement('input');
   input.id = 'chat-input';
   const send = document.createElement('button');
   send.id = 'chat-send';
-  form.append(input, send);
+  const fileInput = document.createElement('input');
+  fileInput.id = 'chat-attach-file';
+  composeRow.append(attachButton, input, send);
+  form.append(chips, composeRow, fileInput);
+  const picker = document.createElement('div');
+  picker.id = 'attach-picker';
+  const pickerList = document.createElement('div');
+  pickerList.id = 'attach-picker-list';
+  const pickerPath = document.createElement('div');
+  pickerPath.id = 'attach-picker-path';
+  const pickerError = document.createElement('div');
+  pickerError.id = 'attach-picker-error';
+  const pickerUp = document.createElement('button');
+  pickerUp.id = 'attach-picker-up';
+  const pickerClose = document.createElement('button');
+  pickerClose.id = 'attach-picker-close';
+  const pickerDevice = document.createElement('button');
+  pickerDevice.id = 'attach-picker-device';
+  picker.append(pickerUp, pickerPath, pickerDevice, pickerClose, pickerError, pickerList);
   const view = document.createElement('section');
   view.id = 'chat-view';
-  view.append(log, form);
+  view.append(log, form, picker);
   const bubble = document.createElement('button');
   bubble.id = 'chat-bubble';
   const badge = document.createElement('span');
@@ -95,7 +119,7 @@ beforeEach(() => {
 
 describe('raw-markdown invariant gate (issue #10)', () => {
   it('a streamed Gru reply renders table + code block with NO raw pipes/fences in the DOM', () => {
-    const view = new ChatView(() => {});
+    const view = new ChatView(() => true);
     view.reset();
     view.addFrame(turn('start'), true);
     // Stream in awkward chunks — boundaries land mid-construct on purpose.
@@ -143,7 +167,7 @@ describe('raw-markdown invariant gate (issue #10)', () => {
   });
 
   it('the invariant holds at EVERY streaming prefix (no mid-stream flicker of raw markdown)', () => {
-    const view = new ChatView(() => {});
+    const view = new ChatView(() => true);
     view.reset();
     view.addFrame(turn('start'), true);
     for (let i = 0; i < REPLY.length; i += 3) {
@@ -156,7 +180,7 @@ describe('raw-markdown invariant gate (issue #10)', () => {
   });
 
   it('replayed history (fresh page load) renders the reply, not raw markdown', () => {
-    const view = new ChatView(() => {});
+    const view = new ChatView(() => true);
     view.reset();
     view.addFrame(turn('start'), false);
     view.addFrame(delta(REPLY), false);
@@ -169,7 +193,7 @@ describe('raw-markdown invariant gate (issue #10)', () => {
   });
 
   it('user messages stay PLAIN TEXT even when they contain markdown', () => {
-    const view = new ChatView(() => {});
+    const view = new ChatView(() => true);
     view.reset();
     view.upsertMessage({
       client_msg_id: 'u1',
@@ -197,7 +221,7 @@ describe('raw-markdown invariant gate (issue #10)', () => {
     // reset() + full frame re-delivery, turn:start included). The
     // SAME-PAGE reconnect path (partial replay, bare deltas) is pinned
     // separately in the reconnect test below.
-    const view = new ChatView(() => {});
+    const view = new ChatView(() => true);
     view.reset();
     view.addFrame(turn('start'), true);
     // Stream the reply plus a partial fence marker still growing when the
@@ -248,7 +272,7 @@ describe('raw-markdown invariant gate (issue #10)', () => {
     // and the replayed bare deltas arrive with streamingBody === null.
     // The first one was silently wiped when `streamText +=` ran before
     // openStream()'s reset — this test was RED until that reorder landed.
-    const view = new ChatView(() => {});
+    const view = new ChatView(() => true);
     view.reset();
     view.addFrame(turn('start'), true);
     // Live: the reply's head lands, then the socket drops mid-turn.
@@ -291,7 +315,7 @@ describe('raw-markdown invariant gate (issue #10)', () => {
     // earlier DOM test green. This test fails if that render goes away:
     // the held fragment must materialize (as literal text per GFM, never
     // as an empty fence) once the turn ends.
-    const view = new ChatView(() => {});
+    const view = new ChatView(() => true);
     view.reset();
     view.addFrame(turn('start'), true);
     view.addFrame(delta('status: ok\n``'), true);

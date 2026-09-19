@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -22,7 +22,7 @@ describe('uploads dir scaffolding (SPEC ruling 19)', () => {
   it('boot creates <data_dir>/uploads/ and logs an uploads_dir boot line', async () => {
     const home = mkdtempSync(join(tmpdir(), 'gru-command-uploads-'));
     cleanupDirs.push(home);
-    writeFileSync(join(home, 'config.toml'), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    writeFileSync(join(home, 'config.toml'), '[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "uploads-test-token"\n', 'utf-8');
 
     const child = spawn(process.execPath, [join(repoRoot, 'dist', 'main.js')], {
       env: { ...process.env, GRU_COMMAND_HOME: home },
@@ -48,6 +48,7 @@ describe('uploads dir scaffolding (SPEC ruling 19)', () => {
       // Liveness briefly (the boot completed far enough to serve /health)
       // and the structured uploads_dir boot line is on the log stream.
       const res = await fetch(`http://127.0.0.1:${port}/health`, {
+        headers: { authorization: 'Bearer uploads-test-token' },
         signal: AbortSignal.timeout(2_000),
       });
       expect(res.ok).toBe(true);
@@ -109,5 +110,50 @@ describe('uploads dir scaffolding (SPEC ruling 19)', () => {
     expect(exitCode).toBe(1);
     expect(stderr).toContain('uploads dir creation failed');
     expect(stderr).toContain(join(home, 'uploads'));
+  }, 30_000);
+
+  it('W-D (E9 r3 carry): a PRE-EXISTING 0755 uploads dir is hardened to 0700 at boot', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-uploads-harden-'));
+    cleanupDirs.push(home);
+    writeFileSync(join(home, 'config.toml'), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    // The incident shape: an older instance (or a stray mkdir) left the
+    // uploads dir group/world traversable — creation-only 0700 never
+    // touched it. THIS boot must harden it (fail-loud on chmod failure).
+    const loose = join(home, 'uploads');
+    mkdirSync(loose, { mode: 0o755 });
+    chmodSync(loose, 0o755);
+    expect(statSync(loose).mode & 0o777).toBe(0o755);
+
+    const child = spawn(process.execPath, [join(repoRoot, 'dist', 'main.js')], {
+      env: { ...process.env, GRU_COMMAND_HOME: home },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf-8');
+    });
+    try {
+      const deadline = Date.now() + 20_000;
+      let port: number | null = null;
+      while (port === null) {
+        port = parseListeningPort(stderr);
+        if (port !== null) break;
+        if (child.exitCode !== null || child.signalCode !== null) {
+          throw new Error(`service exited early — stderr:\n${stderr.slice(-1_000)}`);
+        }
+        if (Date.now() > deadline) throw new Error(`service never listened — stderr:\n${stderr.slice(-1_000)}`);
+        await new Promise((wake) => setTimeout(wake, 150));
+      }
+      // Hardened in place: exactly 0700, and the boot log names it.
+      expect(statSync(loose).mode & 0o777).toBe(0o700);
+      expect(stderr).toContain('uploads_dir hardened');
+      const exitCode = await new Promise<number | null>((resolveExit) => {
+        child.on('exit', (code) => resolveExit(code));
+        child.kill('SIGTERM');
+      });
+      expect(exitCode).toBe(0);
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+    }
   }, 30_000);
 });

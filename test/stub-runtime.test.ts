@@ -54,6 +54,15 @@ class ScriptRuntime implements AgentRuntime {
 class ScriptHandle implements AgentHandle {
   readonly role = 'gru' as const;
   readonly id = 'script-1';
+  readonly capabilities: AgentCapabilities = {
+    streaming: true,
+    steer: 'native',
+    resume: 'file',
+    images: false,
+    thinking: false,
+    thinkingLevelControl: false,
+    followUp: false,
+  };
   readonly sessionFile = '/tmp/does-not-matter/script-1.jsonl';
   private state: AgentState = 'idle';
   private last: string | null = null;

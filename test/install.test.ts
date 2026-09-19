@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -90,5 +90,76 @@ mkdirSync(join(spaced, 'install'), { recursive: true });
       // systemd ExecStart quotes arguments containing spaces.
       expect(stdout).toMatch(/ExecStart=.*".*gru command install-.*"/);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W-B (E9 r3 carry): inside_checkout must accept ONLY a real Gru Command
+// checkout — repo SHAPE alone let a saved copy inside a foreign repo get
+// npm-installed + built before a later guard killed it.
+// ---------------------------------------------------------------------------
+
+describe('inside_checkout heuristic (W-B)', () => {
+  function insideCheckout(repoRoot: string): number {
+    // Extract exactly the function from install.sh and run it against a
+    // controlled REPO_ROOT — no installer side effects ever run.
+    const script = [
+      `REPO_ROOT=${JSON.stringify(repoRoot)}`,
+      `eval "$(sed -n '/^inside_checkout()/,/^}/p' ${JSON.stringify(join(repoRoot, 'install.sh'))} || true)"`,
+      'if inside_checkout; then exit 0; else exit 1; fi',
+    ].join('\n');
+    try {
+      execFileSync('bash', ['-c', script], { stdio: 'pipe' });
+      return 0;
+    } catch (error) {
+      return (error as { status?: number }).status ?? 1;
+    }
+  }
+
+  function stageShape(name: string, opts: { packageName: string; git: boolean; withSrc?: boolean; withScript?: boolean }): string {
+    const dir = join(tempInstallDir(name), 'root');
+    mkdirSync(dir, { recursive: true });
+    // npm's real shape: pretty-printed, name on its own line (the
+    // anchored heuristic keys on exactly that).
+    writeFileSync(
+      join(dir, 'package.json'),
+      `{\n  "name": "${opts.packageName}",\n  "version": "1.0.0"\n}\n`,
+    );
+    if (opts.withSrc !== false) mkdirSync(join(dir, 'src'));
+    if (opts.withScript !== false) copyFileSync(join(repoRoot, 'install.sh'), join(dir, 'install.sh'));
+    if (opts.git) mkdirSync(join(dir, '.git'));
+    return dir;
+  }
+
+  function tempInstallDir(name: string): string {
+    const dir = mkdtempSync(join(tmpdir(), name));
+    cleanupDirs.push(dir);
+    return dir;
+  }
+
+  it('accepts a full Gru Command checkout (positive control)', () => {
+    const dir = stageShape('gru-command-inside-real-', { packageName: 'gru-command', git: true });
+    expect(insideCheckout(dir)).toBe(0);
+  });
+
+  it('accepts a git WORKTREE shape (.git is a file, not a dir)', () => {
+    const dir = stageShape('gru-command-inside-worktree-', { packageName: 'gru-command', git: false });
+    writeFileSync(join(dir, '.git'), 'gitdir: /elsewhere/main/.git/worktrees/one\n');
+    expect(insideCheckout(dir)).toBe(0);
+  });
+
+  it('rejects a foreign repo with the same shape (own package name, has .git)', () => {
+    const dir = stageShape('gru-command-inside-foreign-', { packageName: 'someone-elses-app', git: true });
+    expect(insideCheckout(dir)).toBe(1);
+  });
+
+  it('rejects a saved copy WITHOUT .git ( Gru Command name, tarball/download shape)', () => {
+    const dir = stageShape('gru-command-inside-nogit-', { packageName: 'gru-command', git: false });
+    expect(insideCheckout(dir)).toBe(1);
+  });
+
+  it('rejects the name+git combo without the checkout layout (no src/)', () => {
+    const dir = stageShape('gru-command-inside-nosrc-', { packageName: 'gru-command', git: true, withSrc: false });
+    expect(insideCheckout(dir)).toBe(1);
   });
 });

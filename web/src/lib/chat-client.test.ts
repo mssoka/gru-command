@@ -49,7 +49,13 @@ class TestServer {
           this.send(socket, { type: 'ack', client_msg_id: frame.client_msg_id, seq: ++this.seq });
           return;
         }
-        this.record({ type: 'user', text: frame.text, client_msg_id: frame.client_msg_id, seq: ++this.seq });
+        this.record({
+          type: 'user',
+          text: frame.text,
+          client_msg_id: frame.client_msg_id,
+          ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
+          seq: ++this.seq,
+        });
         this.send(socket, { type: 'ack', client_msg_id: frame.client_msg_id, seq: ++this.seq });
         this.reply(socket, frame.text);
       });
@@ -350,5 +356,74 @@ describe('ChatClient', () => {
     expect(h.client.getState()).toBe('open');
     h.client.send('still alive');
     await waitFor(() => h.statuses.some((m) => m.status === 'acked'));
+  });
+});
+
+describe('attachments ride the outbox (SPEC ruling 19)', () => {
+  let server: TestServer;
+  let clients: ChatClient[];
+
+  beforeEach(async () => {
+    server = new TestServer();
+    await server.start();
+    clients = [];
+  });
+
+  afterEach(async () => {
+    for (const client of clients) client.stop();
+    await server.stop();
+  });
+
+  it('send(text, chips) queues a message carrying the chips and ships them on the wire', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open');
+    const chips = [{ path: '/ws/repo/notes.md', name: 'notes.md', kind: 'file' as const }];
+    const message = h.client.send('read this', chips);
+    expect(message.attachments).toEqual(chips);
+    await waitFor(() => server.log.some((f) => f.type === 'user' && 'attachments' in f));
+    const shipped = server.log.find((f) => f.type === 'user' && 'attachments' in f);
+    expect(shipped).toMatchObject({ type: 'user', client_msg_id: message.client_msg_id, attachments: chips });
+    await waitFor(() => h.statuses.some((m) => m.status === 'acked'));
+  });
+
+  it('invalid chips throw at send(); a corrupted outbox restore degrades to text-only (review r1)', async () => {
+    const storage = memStorage();
+    storage.setItem(
+      'gru-outbox',
+      JSON.stringify([
+        {
+          client_msg_id: 'corrupt-1',
+          text: 'survives with chips dropped',
+          attachments: [{ path: '/ok.png', name: 'ok.png', kind: 'image' }, { path: '', name: 'bad', kind: 'video' }],
+        },
+      ]),
+    );
+    const h = makeClient(server, storage);
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open');
+    // The corrupted entry restored WITHOUT its chips (still sends).
+    await waitFor(() => h.statuses.some((m) => m.client_msg_id === 'corrupt-1'));
+    const restored = h.client.getMessages().find((m) => m.client_msg_id === 'corrupt-1');
+    expect(restored?.attachments).toBeUndefined();
+
+    // Over-cap chips are refused at the seam, never queued.
+    expect(() =>
+      h.client.send('too many', Array.from({ length: 9 }, (_, i) => ({ path: `/f${i}`, name: `f${i}`, kind: 'file' as const }))),
+    ).toThrow(/invalid attachments/);
+  });
+
+  it('attachment-only sends are legal; empty sends still throw', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open');
+    const chips = [{ path: '/data/uploads/1-shot.png', name: 'shot.png', kind: 'image' as const }];
+    const message = h.client.send('', chips);
+    expect(message.text).toBe('');
+    await waitFor(() => h.statuses.some((m) => m.client_msg_id === message.client_msg_id && m.status === 'acked'));
+    expect(() => h.client.send('   ')).toThrow(/empty message/);
   });
 });

@@ -45,3 +45,8 @@ getting the right work dispatched to the right hands.
    alone; the review loop runs and its verdict is honored.
 5. Durable state over clever state. If it is not written down, it did
    not happen.
+6. Attached material arrives as PATHS, never as pasted bytes. When a
+   message carries attached files, read each one yourself at its path
+   with a type-appropriate read. Never guess at a file's contents — if
+   you cannot read it (an image your model cannot view, an unreadable
+   encoding), say so plainly and continue with what you do have.

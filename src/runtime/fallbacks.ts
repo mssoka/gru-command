@@ -63,6 +63,8 @@ class FallbackHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string | null;
+  /** The wrapped handle's declared gaps surface unchanged (SPEC ruling 4). */
+  readonly capabilities: AgentRuntime['capabilities'];
 
   /** A turn is being delivered by THIS pipeline (set+clear per-path only). */
   private inFlight = false;
@@ -77,6 +79,7 @@ class FallbackHandle implements AgentHandle {
     this.role = inner.role;
     this.id = inner.id;
     this.sessionFile = inner.sessionFile;
+    this.capabilities = inner.capabilities;
     inner.subscribe((event) => this.onInnerEvent(event));
   }
 
