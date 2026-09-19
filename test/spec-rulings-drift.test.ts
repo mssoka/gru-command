@@ -44,11 +44,31 @@ describe('SPEC locked-rulings numbering drift pin', () => {
 
   it('ruling 18 exists and is the worktree manager', () => {
     const nums = rulingNumbers(spec);
-    expect(nums.at(-1)).toBe(18);
-    const block = spec.slice(spec.indexOf('18. **'), spec.indexOf('## Sources'));
+    expect(nums).toContain(18);
+    const block = spec.slice(spec.indexOf('18. **'), spec.indexOf('19. **'));
     expect(block).toContain('.gru-command/worktree.toml');
     expect(block).toContain('PAUSES the sweep and ASKS');
     expect(block).toContain('Detached-for-reviews, branch-for-jobs');
+  });
+
+  it('rulings 19 and 20 are the attach/uploads and DecisionService canon (E9)', () => {
+    const nums = rulingNumbers(spec);
+    expect(nums.at(-1)).toBe(20);
+    const block19 = spec.slice(spec.indexOf('19. **'), spec.indexOf('20. **'));
+    expect(block19).toContain('by PATH');
+    expect(block19).toContain('gru-command-attach1');
+    expect(block19).toContain('<data_dir>/uploads/');
+    expect(block19).toContain('DIRECTORY CREATION ONLY');
+    const block20 = spec.slice(spec.indexOf('20. **'), spec.indexOf('## Sources'));
+    expect(block20).toContain('DecisionService');
+    expect(block20).toContain('src/events/bus.ts');
+    expect(block20).toContain('src/supervision/supervisor.ts');
+    expect(block20).toContain('src/worktrees/manager.ts');
+    expect(block20).toContain('src/dispatch/perkins.ts');
+    expect(block20).toContain('CONFIG-GATED,\n    DEFAULT-OFF');
+    expect(block20).toContain('~12× cheaper');
+    expect(block20).toContain('openrouter.ai/api/alpha/decisions');
+    expect(block20).toContain('docs.typesafe.ai/confidence.md');
   });
 
   it('load-bearing cross-references still cite the right numbers', () => {

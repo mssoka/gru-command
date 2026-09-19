@@ -107,6 +107,54 @@ integrated. Other users can install it on their laptops from GitHub.
     same-repo worktree creation is sequential; released work
     re-resolves the fresh head at release.
 
+19. **Path references, one attach flow, uploads dir.** (a)
+    Conversations and briefings reference workspace material by PATH —
+    repo-relative inside a managed repo, workspace-relative otherwise:
+    the workspace root is the canonical namespace and nothing is copied
+    into the product repo (ruling 8). (b) Exactly ONE attach flow exists
+    for bringing non-repo material (images, snippets, logs) into a
+    conversation; chat and dispatch both ride it — no per-surface side
+    doors. The attach flow itself lands as its own lane
+    (`gru-command-attach1`) before the v1.0.0 tag; E9 ships only (c).
+    (c) The attach flow's storage home is `<data_dir>/uploads/`; the
+    service scaffolds the directory at boot next to the other instance
+    dirs (logs/, chat/) — DIRECTORY CREATION ONLY, instance state per
+    ruling 7, never inside the workspace root.
+
+20. **DecisionService seam (canon — text only; the client rides the
+    jev-pilot PR).** Routing decisions, gates, and escalation calls flow
+    through ONE typed seam fed by the product's four judgment-adjacent
+    subsystems — the event bus (`src/events/bus.ts`), the supervisor
+    (`src/supervision/supervisor.ts`), the worktree manager
+    (`src/worktrees/manager.ts`), and the Perkins wave runner
+    (`src/dispatch/perkins.ts`). Deterministic code is the
+    always-available implementation; a decision provider may answer
+    specific question sets, per the following canon (user ruling via
+    Gru/Silas, 2026-09-19): (1) the Jev provider is CONFIG-GATED,
+    DEFAULT-OFF — disabled or unreachable falls back to deterministic
+    defaults, always reversible, one flag for end users. (2) Confidence
+    semantics: confidence ships on Choice and Score questions ONLY; Noul
+    (true/false) carries probability ONLY — noul gates use probability
+    thresholds, choice/score gates use confidence; three-path routing
+    (high = act, medium = flag/confirm, low = deterministic fallback);
+    the interface exposes BOTH probabilities and confidence; thresholds
+    are per-risk-class config — read-only low, destructive high (~0.85)
+    WITH confirm. (3) Question design for JEVi-1.13 jaggedness: literal
+    criteria with boundary cases; arithmetic/counting/dates stay in
+    code, never the model; filter state before sending (context rot); no
+    cross-question invariants; destructive gates tested against
+    adversarial command text. (4) Batching economics: parallel questions
+    in one call are ~12× cheaper — question sets batch. (5) API shape
+    for the record: POST `https://openrouter.ai/api/alpha/decisions`
+    (alpha namespace), slug `~typesafe/jev-latest`; questions carry
+    criteria objects (noul true/false, choice per-option, score ordered
+    rubric); answers = noul probability, choice pick + probabilities,
+    score + distribution. Access verified 2026-09-19
+    (`typesafe/jev-1.13-20260917`, HTTP 200, 328 ms, ~$0.000026/call).
+    See docs.typesafe.ai/confidence.md,
+    docs.typesafe.ai/model-jaggedness/jev-1.13.md,
+    docs.typesafe.ai/patterns/confidence-routing.md.
+
 ## Sources
 
 Approved via structured review rounds (product brief, architecture rev 2,

@@ -1,25 +1,61 @@
 #!/usr/bin/env bash
-# Gru Command — OS service installer (EPICS E7 story 3; SPEC rulings 5/10).
+# Gru Command — installer (EPICS E7 story 3 + E9 story 1; SPEC rulings 5/10/14).
 #
-# Registers the service with the platform service manager so it starts at
-# login and restarts on crash (KeepAlive / Restart=on-failure — the OS is
-# the out-of-band watcher; the in-process supervisor handles agent
-# liveness, never the service's own).
+# The GitHub ONE-LINE INSTALLER entry:
+#   curl -fsSL https://raw.githubusercontent.com/mssoka/gru-command/main/install.sh | bash
+# (no clone present → clone → deps → build → setup wizard → first-boot smoke)
 #
 # Usage:
-#   ./install.sh              install (or refresh) + start the service
-#   ./install.sh --print      render the unit to stdout; change nothing
-#   ./install.sh --uninstall  stop the service and remove the unit
+#   ./install.sh                     full setup: deps + build if needed →
+#                                    setup wizard (clone-when-absent when
+#                                    piped from the one-liner)
+#   ./install.sh --answers '<json>'  same setup, non-interactive wizard
+#                                    (unspecified answers = defaults)
+#   ./install.sh --service           register + start the OS service only
+#                                    (the E7 path; also how the wizard
+#                                    registers the service — one mechanism)
+#   ./install.sh --print             render the unit to stdout; change nothing
+#   ./install.sh --uninstall         stop the service and remove the unit
 #
 # Everything is resolved ABSOLUTELY at install time (repo root, node
 # binary, instance dir) — service managers do not inherit your shell
 # environment. No personal or project specifics belong in the templates.
+#
+# Test/install seams (also handy for real users):
+#   GRU_COMMAND_ORIGIN   clone URL when piped (default: the GitHub repo)
+#   GRU_COMMAND_TARGET   clone destination    (default: ~/gru-command)
 
 set -euo pipefail
 
 LABEL="com.gru-command.service"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+REPO_ROOT="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 INSTANCE_DIR="${GRU_COMMAND_HOME:-$HOME/.gru-command}"
+CLONE_ORIGIN="${GRU_COMMAND_ORIGIN:-https://github.com/mssoka/gru-command.git}"
+CLONE_TARGET="${GRU_COMMAND_TARGET:-$HOME/gru-command}"
+MODE="setup"
+ANSWERS=""
+
+err() { echo "install.sh: $*" >&2; }
+usage() {
+  sed -n '2,25p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//' >&2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --print) MODE="print" ; shift ;;
+    --uninstall) MODE="uninstall" ; shift ;;
+    --service) MODE="service" ; shift ;;
+    --answers)
+      [[ $# -ge 2 ]] || { err "--answers requires a JSON argument"; exit 2; }
+      ANSWERS="$2"; MODE="setup"; shift 2 ;;
+    --answers=*)
+      ANSWERS="${1#--answers=}"; MODE="setup"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) err "unknown flag: $1 (valid: --answers <json>, --service, --print, --uninstall)"; exit 2 ;;
+  esac
+done
+
 # Resolve node to its REAL path: version managers (fnm/nvm/asdf) put
 # ephemeral per-shell symlinks on PATH — a service unit pointing at one
 # breaks on the next shell. The resolved install path is stable.
@@ -28,22 +64,16 @@ if [[ -n "$NODE_BIN" ]]; then
   resolved="$(cd "$(dirname "$NODE_BIN")" && pwd -P)/$(basename "$NODE_BIN")"
   [[ -x "$resolved" ]] && NODE_BIN="$resolved"
 fi
-MODE="install"
-
-for arg in "$@"; do
-  case "$arg" in
-    --print) MODE="print" ;;
-    --uninstall) MODE="uninstall" ;;
-    *) echo "unknown flag: $arg (valid: --print, --uninstall)" >&2; exit 2 ;;
-  esac
-done
-
-err() { echo "install.sh: $*" >&2; }
 
 if [[ -z "$NODE_BIN" ]]; then
   err "node was not found on PATH — install Node.js >= 22.19 first (https://nodejs.org)"
   exit 1
 fi
+
+node_ok() {
+  "$NODE_BIN" -e 'const [M,m]=process.versions.node.split(".").map(Number);
+    if (M < 22 || (M === 22 && m < 19)) process.exit(1)' 2>/dev/null
+}
 
 detect_os() {
   case "$(uname -s)" in
@@ -118,7 +148,8 @@ verify_unit() {
 }
 
 # ---------------------------------------------------------------------------
-# Platform installers
+# Platform installers (E7 — reached via --service, and by the wizard's
+# optional service-registration step)
 # ---------------------------------------------------------------------------
 install_launchd() {
   local target_dir="$HOME/Library/LaunchAgents"
@@ -154,7 +185,7 @@ install_systemd() {
   local rendered
   rendered="$(render_unit "$REPO_ROOT/install/systemd/gru-command.service.template" "$NODE_BIN" "$REPO_ROOT" "$INSTANCE_DIR")"
   mkdir -p "$target_dir" "$INSTANCE_DIR/logs"
-  printf '%s\n' "$rendered" > "$target.r"
+  printf '%s' "$rendered" > "$target.r"
   verify_unit "$target.r" "$target"
   mv "$target.r" "$target"
   systemctl --user daemon-reload
@@ -175,6 +206,69 @@ uninstall_systemd() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Full setup (E9): the one-line-install pipeline. When this script runs
+# from a download/pipe (no checkout around it), clone first and re-exec
+# inside the clone; inside a checkout, deps+build if needed, then wizard.
+# ---------------------------------------------------------------------------
+inside_checkout() {
+  [[ -f "$REPO_ROOT/package.json" && -d "$REPO_ROOT/src" && -f "$REPO_ROOT/install.sh" ]]
+}
+
+run_setup() {
+  if ! inside_checkout; then
+    # One-liner case (e.g. curl | bash): clone to the target dir.
+    # A re-exec guard: if we already re-executed once and STILL are not
+    # inside a checkout, fail loud — never loop.
+    if [[ -n "${GRU_COMMAND_REEXEC:-}" ]]; then
+      err "re-exec landed outside a product checkout: $REPO_ROOT"
+      err "(the clone target must contain package.json + src/ + install.sh)"
+      exit 1
+    fi
+    command -v git >/dev/null 2>&1 || { err "git not found on PATH — install git first"; exit 1; }
+    if [[ -e "$CLONE_TARGET" ]]; then
+      if [[ -d "$CLONE_TARGET" && -f "$CLONE_TARGET/package.json" && -d "$CLONE_TARGET/.git" ]]; then
+        echo "reusing existing checkout: $CLONE_TARGET"
+      else
+        err "clone target exists and is not a Gru Command checkout: $CLONE_TARGET"
+        err "move it, or set GRU_COMMAND_TARGET to another path"
+        exit 1
+      fi
+    else
+      echo "cloning $CLONE_ORIGIN → $CLONE_TARGET"
+      git clone "$CLONE_ORIGIN" "$CLONE_TARGET"
+    fi
+    # Re-exec INSIDE the clone: absolute re-resolution, one code path.
+    if [[ -n "$ANSWERS" ]]; then
+      GRU_COMMAND_REEXEC=1 exec bash "$CLONE_TARGET/install.sh" --answers "$ANSWERS"
+    fi
+    GRU_COMMAND_REEXEC=1 exec bash "$CLONE_TARGET/install.sh"
+  fi
+
+  # Inside the checkout.
+  if ! node_ok; then
+    err "node >= 22.19 required, found $("$NODE_BIN" --version) — upgrade Node.js first"
+    exit 1
+  fi
+  cd "$REPO_ROOT"
+  if [[ ! -d node_modules ]]; then
+    echo "installing dependencies…"
+    npm install --no-audit --no-fund
+  fi
+  if [[ ! -f dist/main.js || ! -f dist/wizard/main.js ]]; then
+    echo "building…"
+    npm run build
+  fi
+  if [[ ! -f dist/main.js ]]; then
+    err "build did not produce dist/main.js"
+    exit 1
+  fi
+  if [[ -n "$ANSWERS" ]]; then
+    exec "$NODE_BIN" dist/wizard/main.js --answers "$ANSWERS"
+  fi
+  exec "$NODE_BIN" dist/wizard/main.js
+}
+
 case "$MODE" in
   print)
     case "$OS" in
@@ -188,8 +282,8 @@ case "$MODE" in
       *) uninstall_systemd ;;
     esac
     ;;
-  install)
-    # dist/ must exist — the service runs node dist/main.js.
+  service)
+    # E7 contract: dist/ must exist — the service runs node dist/main.js.
     if [[ ! -f "$REPO_ROOT/dist/main.js" ]]; then
       err "dist/main.js not found — run 'npm install && npm run build' in $REPO_ROOT first"
       exit 1
@@ -198,5 +292,8 @@ case "$MODE" in
       darwin) install_launchd ;;
       linux) install_systemd ;;
     esac
+    ;;
+  setup)
+    run_setup
     ;;
 esac

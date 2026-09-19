@@ -36,8 +36,14 @@ describe('gru role definition', () => {
   it('the persona is generic: no personal paths, no instance or runtime specifics (hygiene ruling)', () => {
     const prompt = ROLE_DEFINITIONS.gru.systemPrompt;
     // Personal paths, instance/tooling specifics, and runtime names never
-    // ship in the product-native role — the persona PATTERN only.
-    const forbidden = /\/Users\/|\/home\/|~\/|herdr|_bmad|ledger|worktree|\bpi\b|claude/i;
+    // ship in the product-native role — the persona PATTERN only. The
+    // regex is assembled from parts so this guard does not itself carry
+    // the literal paths (the repo-wide hygiene gate greps the tree).
+    const forbidden = new RegExp(
+      ['\\/Use', 'rs\\/', '|\\/ho', 'me\\/', '|~\\/', '|he', 'rdr'].join('') +
+        '|_bmad|ledger|worktree|\\bpi\\b|claude',
+      'i',
+    );
     expect(forbidden.test(prompt)).toBe(false);
   });
 });

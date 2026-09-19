@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
@@ -51,6 +52,11 @@ async function main(): Promise<number> {
     maxBytes: config.logging.maxBytes,
     keep: config.logging.keep,
   });
+  // E9 / SPEC ruling 19: uploads-dir scaffolding next to the other
+  // instance dirs (logs/, chat/) — DIRECTORY CREATION ONLY; the attach
+  // flow itself lands in its own lane. Instance state stays under the
+  // data dir, never inside the workspace root (ruling 7).
+  mkdirSync(join(config.dataDir, 'uploads'), { recursive: true });
   const identity = loadOrCreateIdentity(config.dataDir);
   logger.info('boot', {
     service: SERVICE_NAME,
