@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
@@ -36,6 +36,71 @@ function tempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   cleanupDirs.push(dir);
   return dir;
+}
+
+function fillUploadPayloads(dir: string, count: number): void {
+  for (let index = 0; index < count; index += 1) {
+    writeFileSync(join(dir, `existing-${index}.txt`), 'x');
+  }
+}
+
+interface UploadRacer {
+  child: ChildProcess;
+  result: string;
+  done: Promise<void>;
+}
+
+function spawnUploadRacer(
+  dir: string,
+  coordination: string,
+  index: number,
+  schedule: 'natural' | 'barrier' | 'miss',
+): UploadRacer {
+  const worker = fileURLToPath(new URL('./helpers/materialize-upload-worker.mjs', import.meta.url));
+  const result = join(coordination, `result-${index}.json`);
+  let stderr = '';
+  const child = spawn(
+    process.execPath,
+    ['--import', 'tsx', worker, dir, coordination, String(index), schedule],
+    { cwd: process.cwd(), stdio: ['ignore', 'ignore', 'pipe'] },
+  );
+  child.stderr.setEncoding('utf-8');
+  child.stderr.on('data', (chunk: string) => {
+    stderr += chunk;
+  });
+  const done = new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      // Signal death is a settled exit too (r2 W6): never wait on an
+      // event that already fired.
+      if (code === 0 || signal !== null) resolve();
+      else reject(new Error(`upload racer ${index} exited ${String(code)}: ${stderr}`));
+    });
+  });
+  return { child, result, done };
+}
+
+async function waitCoordFiles(coordination: string, names: string[]): Promise<void> {
+  const started = Date.now();
+  while (!names.every((name) => existsSync(join(coordination, name)))) {
+    if (Date.now() - started > 20_000) {
+      throw new Error(`racer coordination timeout: ${names.join(',')}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/** r2 W5: racers are always terminated and awaited from finally — a
+ * failed parent path can never orphan a waiting helper process. */
+async function terminateUploadRacer(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  child.kill('SIGTERM');
+  await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 5_000))]);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill('SIGKILL');
+    await exited;
+  }
 }
 
 describe('sanitizeUploadName', () => {
@@ -96,70 +161,195 @@ describe('materializeUpload (ruling 19(c): bytes → uploads dir → THAT path)'
     expect(readFileSync(stored.path, 'utf-8')).toBe('x');
   });
 
-  it('preserves an aged reservation owned by a live process', () => {
-    const dir = tempDir('gru-command-uploads-live-reservation-');
-    const reservation = join(dir, `.gru-upload-reservation-live-${randomUUID()}.json`);
-    const old = new Date(Date.now() - 60_000);
-    writeFileSync(reservation, JSON.stringify({ pid: process.pid }));
-    utimesSync(reservation, old, old);
-
-    expect(
-      materializeUpload(dir, { filename: 'do-not-steal.txt', bytes: new TextEncoder().encode('x') }),
-    ).toMatchObject({ name: 'do-not-steal.txt' });
-    expect(readFileSync(reservation, 'utf-8')).toContain(String(process.pid));
-  });
-
-  it('atomically reserves the final quota slot across processes while concurrent reclaimers inspect one stale generation', async () => {
-    const dir = tempDir('gru-command-uploads-process-race-');
-    const coordination = tempDir('gru-command-uploads-process-race-coord-');
-    for (let index = 0; index < MAX_UPLOAD_FILES - 1; index += 1) {
-      writeFileSync(join(dir, `existing-${index}.txt`), 'x');
-    }
-    const stale = join(dir, `.gru-upload-reservation-stale-${randomUUID()}.json`);
-    writeFileSync(stale, JSON.stringify({ pid: 2_147_483_647 }));
-    const old = new Date(Date.now() - 60_000);
-    utimesSync(stale, old, old);
-
-    const worker = fileURLToPath(new URL('./helpers/materialize-upload-worker.mjs', import.meta.url));
-    const barrier = join(coordination, 'go');
-    const children = [0, 1].map((index) => {
-      const ready = join(coordination, `ready-${index}`);
-      const result = join(coordination, `result-${index}.json`);
-      let stderr = '';
-      const child = spawn(
-        process.execPath,
-        ['--import', 'tsx', worker, dir, ready, barrier, result, `racer-${index}.txt`, String(index)],
-        { cwd: process.cwd(), stdio: ['ignore', 'ignore', 'pipe'] },
+  it('a hung FOREIGN writer keeps its claimed slot while alive; the slot returns once it dies (r2 W1)', async () => {
+    const dir = tempDir('gru-command-uploads-live-claim-');
+    fillUploadPayloads(dir, MAX_UPLOAD_FILES - 1);
+    const sleeper = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    try {
+      if (sleeper.pid === undefined) {
+        await new Promise<void>((resolve) => sleeper.once('spawn', () => resolve()));
+      }
+      const claim = join(
+        dir,
+        `.gru-upload-claim-${Date.now() - 60_000}-${sleeper.pid}-${randomUUID()}.claim`,
       );
-      child.stderr.setEncoding('utf-8');
-      child.stderr.on('data', (chunk: string) => { stderr += chunk; });
-      const done = new Promise<void>((resolve, reject) => {
-        child.once('error', reject);
-        child.once('exit', (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`upload worker ${index} exited ${String(code)}: ${stderr}`));
-        });
-      });
-      return { ready, result, done };
-    });
+      writeFileSync(claim, 'pending bytes', { mode: 0o600 });
+      // Ownership lives in the FILENAME (atomic at creation): an aged
+      // claim whose owner is verifiably alive is never reclaimed.
+      expect(() =>
+        materializeUpload(dir, { filename: 'no-slot.txt', bytes: new TextEncoder().encode('x') }),
+      ).toThrow(/quota exceeded/);
+      expect(existsSync(claim)).toBe(true);
 
-    const started = Date.now();
-    while (!children.every(({ ready }) => existsSync(ready))) {
-      if (Date.now() - started > 10_000) throw new Error('upload workers did not reach barrier');
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      const exited = new Promise<void>((resolve) => sleeper.once('exit', () => resolve()));
+      sleeper.kill('SIGKILL');
+      await exited;
+      await new Promise((resolve) => setTimeout(resolve, 50)); // reap → ESRCH
+      expect(
+        materializeUpload(dir, { filename: 'slot-back.txt', bytes: new TextEncoder().encode('x') }),
+      ).toMatchObject({ name: 'slot-back.txt' });
+      expect(existsSync(claim)).toBe(false);
+    } finally {
+      await terminateUploadRacer(sleeper);
     }
-    writeFileSync(barrier, 'go');
-    await Promise.all(children.map(({ done }) => done));
+  }, 30_000);
 
-    const results = children.map(({ result }) => JSON.parse(readFileSync(result, 'utf-8')) as {
-      ok: boolean;
-      status?: number;
-    });
-    expect(results.filter(({ ok }) => ok)).toHaveLength(1);
-    expect(results.filter(({ status }) => status === 507)).toHaveLength(1);
-    const finalEntries = readdirSync(dir);
-    expect(finalEntries.filter((entry) => entry.startsWith('.gru-upload-reservation-'))).toEqual([]);
-    expect(finalEntries).toHaveLength(MAX_UPLOAD_FILES);
+  it('self-owned claim residue is reclaimed immediately — a failed release cannot strand the slot (r2 W2)', () => {
+    const dir = tempDir('gru-command-uploads-self-residue-');
+    fillUploadPayloads(dir, MAX_UPLOAD_FILES - 1);
+    const residue = join(
+      dir,
+      `.gru-upload-claim-${Date.now() - 1_000}-${process.pid}-${randomUUID()}.claim`,
+    );
+    writeFileSync(residue, 'stranded bytes', { mode: 0o600 });
+    expect(
+      materializeUpload(dir, { filename: 'next.txt', bytes: new TextEncoder().encode('x') }),
+    ).toMatchObject({ name: 'next.txt' });
+    expect(existsSync(residue)).toBe(false);
+    expect(readdirSync(dir)).toHaveLength(MAX_UPLOAD_FILES);
+  }, 30_000);
+
+  it('an abandoned claim (dead owner, aged) is reclaimed and its slot reused', () => {
+    const dir = tempDir('gru-command-uploads-dead-claim-');
+    fillUploadPayloads(dir, MAX_UPLOAD_FILES - 1);
+    const claim = join(
+      dir,
+      `.gru-upload-claim-${Date.now() - 60_000}-${2_147_483_647}-${randomUUID()}.claim`,
+    );
+    writeFileSync(claim, 'abandoned bytes', { mode: 0o600 });
+    expect(
+      materializeUpload(dir, { filename: 'reused.txt', bytes: new TextEncoder().encode('x') }),
+    ).toMatchObject({ name: 'reused.txt' });
+    expect(existsSync(claim)).toBe(false);
+    expect(readdirSync(dir)).toHaveLength(MAX_UPLOAD_FILES);
+  }, 30_000);
+
+  it('legacy reservation markers count until aged, then only dead owners are reclaimed', () => {
+    const dir = tempDir('gru-command-uploads-legacy-');
+    fillUploadPayloads(dir, MAX_UPLOAD_FILES - 1);
+    const old = new Date(Date.now() - 60_000);
+    const dead = join(dir, `.gru-upload-reservation-dead-${randomUUID()}.json`);
+    writeFileSync(dead, JSON.stringify({ pid: 2_147_483_647 }));
+    utimesSync(dead, old, old);
+    expect(
+      materializeUpload(dir, { filename: 'reuses-dead.txt', bytes: new TextEncoder().encode('x') }),
+    ).toMatchObject({ name: 'reuses-dead.txt' });
+    expect(existsSync(dead)).toBe(false);
+    expect(readdirSync(dir)).toHaveLength(MAX_UPLOAD_FILES);
+
+    const live = join(dir, `.gru-upload-reservation-live-${randomUUID()}.json`);
+    writeFileSync(live, JSON.stringify({ pid: process.pid }));
+    utimesSync(live, old, old);
+    expect(() =>
+      materializeUpload(dir, { filename: 'blocked.txt', bytes: new TextEncoder().encode('x') }),
+    ).toThrow(/quota exceeded/);
+    expect(existsSync(live)).toBe(true);
+  }, 30_000);
+
+  it('S1 — two real racers at the last slot: exactly one winner (both claims visible to both election scans)', async () => {
+    const dir = tempDir('gru-command-uploads-s1-');
+    const coordination = tempDir('gru-command-uploads-s1-coord-');
+    fillUploadPayloads(dir, MAX_UPLOAD_FILES - 1);
+    const racers = [0, 1].map((index) => spawnUploadRacer(dir, coordination, index, 'barrier'));
+    try {
+      await waitCoordFiles(coordination, ['claimed-0', 'claimed-1']);
+      writeFileSync(join(coordination, 'scan-go'), 'go');
+      await waitCoordFiles(coordination, ['scanned-0', 'scanned-1']);
+      writeFileSync(join(coordination, 'commit-go'), 'go');
+      await Promise.all(racers.map((racer) => racer.done));
+    } finally {
+      await Promise.all(racers.map((racer) => terminateUploadRacer(racer.child)));
+    }
+    const results = racers.map((racer) =>
+      JSON.parse(readFileSync(racer.result, 'utf-8')) as {
+        ok: boolean;
+        status?: number;
+        fatal?: string;
+        path?: string;
+      },
+    );
+    expect(results.map((result) => result.fatal ?? null)).toEqual([null, null]);
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(results.filter((result) => result.status === 507)).toHaveLength(1);
+    const entries = readdirSync(dir);
+    expect(entries.filter((entry) => entry.startsWith('.gru-upload-'))).toEqual([]);
+    expect(entries).toHaveLength(MAX_UPLOAD_FILES);
+  }, 60_000);
+
+  it('S2 — natural, uninstrumented races keep the hard invariants on every run', async () => {
+    for (let run = 0; run < 3; run += 1) {
+      const dir = tempDir(`gru-command-uploads-s2-${run}-`);
+      const coordination = tempDir(`gru-command-uploads-s2-${run}-coord-`);
+      fillUploadPayloads(dir, MAX_UPLOAD_FILES - 1);
+      const racers = [0, 1].map((index) => spawnUploadRacer(dir, coordination, index, 'natural'));
+      try {
+        await waitCoordFiles(coordination, ['ready-0', 'ready-1']);
+        writeFileSync(join(coordination, 'go'), 'go');
+        await Promise.all(racers.map((racer) => racer.done));
+      } finally {
+        await Promise.all(racers.map((racer) => terminateUploadRacer(racer.child)));
+      }
+      const results = racers.map((racer) =>
+        JSON.parse(readFileSync(racer.result, 'utf-8')) as {
+          ok: boolean;
+          status?: number;
+          fatal?: string;
+          path?: string;
+        },
+      );
+      expect(results.map((result) => result.fatal ?? null)).toEqual([null, null]);
+      const winners = results.filter((result) => result.ok);
+      // Invariants that hold under EVERY interleaving (the audit makes
+      // over-admission impossible; the election makes double-admission
+      // of one slot impossible without a readdir anomaly):
+      expect(winners.length).toBeLessThanOrEqual(1);
+      expect(results.filter((result) => !result.ok && result.status !== 507)).toEqual([]);
+      for (const winner of winners) expect(existsSync(winner.path!)).toBe(true);
+      const entries = readdirSync(dir);
+      expect(entries.filter((entry) => entry.startsWith('.gru-upload-'))).toEqual([]);
+      expect(entries).toHaveLength(MAX_UPLOAD_FILES - 1 + winners.length);
+      expect(entries.length).toBeLessThanOrEqual(MAX_UPLOAD_FILES);
+    }
+  }, 120_000);
+
+  it('S3 — an election scan that misses the peer claim still never overbooks (audit discriminator)', async () => {
+    const dir = tempDir('gru-command-uploads-s3-');
+    const coordination = tempDir('gru-command-uploads-s3-coord-');
+    fillUploadPayloads(dir, MAX_UPLOAD_FILES - 1);
+    const racers = [0, 1].map((index) => spawnUploadRacer(dir, coordination, index, 'miss'));
+    try {
+      await waitCoordFiles(coordination, ['claimed-0', 'claimed-1']);
+      writeFileSync(join(coordination, 'scan-go'), 'go');
+      await waitCoordFiles(coordination, ['scanned-0', 'scanned-1']);
+      writeFileSync(join(coordination, 'commit-go'), 'go');
+      await waitCoordFiles(coordination, ['committed-0', 'committed-1']);
+      writeFileSync(join(coordination, 'audit-go'), 'go');
+      await Promise.all(racers.map((racer) => racer.done));
+    } finally {
+      await Promise.all(racers.map((racer) => terminateUploadRacer(racer.child)));
+    }
+    const results = racers.map((racer) =>
+      JSON.parse(readFileSync(racer.result, 'utf-8')) as {
+        ok: boolean;
+        status?: number;
+        fatal?: string;
+      },
+    );
+    expect(results.map((result) => result.fatal ?? null)).toEqual([null, null]);
+    // Both writers believed they won the missed-claim election and both
+    // committed. The audits then raced: each shed its own payload upon
+    // observing the over-capacity dir — the audits themselves race, so
+    // the settled outcome is 0 or 1 winners (never 2, never 1001 files).
+    // Conservative (retryable 507s), never an overbook.
+    const winners = results.filter((result) => result.ok);
+    expect(winners.length).toBeLessThanOrEqual(1);
+    expect(results.filter((result) => !result.ok && result.status !== 507)).toEqual([]);
+    const entries = readdirSync(dir);
+    expect(entries.filter((entry) => entry.startsWith('.gru-upload-'))).toEqual([]);
+    expect(entries).toHaveLength(MAX_UPLOAD_FILES - 1 + winners.length);
+    expect(entries.length).toBeLessThanOrEqual(MAX_UPLOAD_FILES);
   }, 60_000);
 
   it('never clobbers: same-name collisions materialize side-by-side', () => {

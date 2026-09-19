@@ -15,7 +15,7 @@ const PINS: Record<string, number> = {
   'bob-scheduler.test.ts': 5,
   'chat-frame-log.test.ts': 18,
   'chat-frames.test.ts': 4,
-  'attachments.test.ts': 23,
+  'attachments.test.ts': 28,
   'chat-server.test.ts': 37,
   'chat-session-state.test.ts': 4,
   'claude-adapter.test.ts': 53,

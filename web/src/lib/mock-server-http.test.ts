@@ -77,10 +77,17 @@ async function upload(baseUrl: string, filename: string, bytes: Uint8Array): Pro
 
 afterEach(async () => {
   for (const child of children.splice(0)) {
-    if (child.exitCode === null) {
+    // A signal death leaves exitCode null (r2 W6): treat signalCode as a
+    // settled exit too, and bound every wait so teardown cannot hang on
+    // an event that already fired or a child that refuses to die.
+    if (child.exitCode === null && child.signalCode === null) {
       const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
       child.kill('SIGTERM');
-      await exited;
+      await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 5_000))]);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+        await exited;
+      }
     }
   }
   for (const dir of cleanupDirs.splice(0)) rmSync(dir, { recursive: true, force: true });

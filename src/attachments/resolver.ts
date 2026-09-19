@@ -5,6 +5,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -142,15 +143,35 @@ export interface MaterializedUpload {
   readonly bytes: number;
 }
 
-const UPLOAD_RESERVATION_STALE_MS = 30_000;
-const UPLOAD_RESERVATION_PREFIX = '.gru-upload-reservation-';
+const UPLOAD_CLAIM_PREFIX = '.gru-upload-claim-';
+const UPLOAD_CLAIM_SUFFIX = '.claim';
+const UPLOAD_LEGACY_RESERVATION_PREFIX = '.gru-upload-reservation-';
+const UPLOAD_CLAIM_STALE_MS = 30_000;
 
-/** Upload quota is coordinated with uniquely named reservation files.
- * Each live reservation counts as one future payload, so competing
- * processes cannot both consume the final slot. Unlike a shared lock
- * pathname, a stale reservation generation is never reused: reclaimers
- * can unlink only the exact UUID-named generation they inspected and can
- * never evict a successor's live allocation. */
+/** Upload quota admission (Perkins r2 B1/W1/W2).
+ *
+ * A writer's payload bytes land FIRST in a uniquely named claim file
+ * (`.gru-upload-claim-<ts>-<pid>-<uuid>.claim`); ownership lives in the
+ * FILENAME, so a claim is never observed half-initialized (r2 W1: a
+ * torn marker body was reclaimed as dead while its writer lived and
+ * admitted 1,001 payloads). Claims plus payloads are the committed
+ * count; writers elect FIFO by claim timestamp so two racers at the
+ * last slot deterministically produce ONE winner (r2 B1: both-writer
+ * rejection left the final slot unused). Commit is a rename of the
+ * claim onto its final name — capacity-neutral, so admission cannot be
+ * lost between check and write. A post-commit audit re-counts payloads
+ * and sheds this writer's file if a readdir anomaly let two writers
+ * commit into the last slot: conservative (a retryable 507), never an
+ * overbook. Generation safety (r1 lock-race): every claim name is
+ * unique; a stale generation is never reused, reclaimers unlink only
+ * the exact UUID file they inspected, and no successor's claim can be
+ * evicted by a late observation. Cleanup reclaims a claim only when its
+ * owner pid is dead and it has aged, or immediately when it is residue
+ * of THIS process (materialize is synchronous, so a self-owned claim
+ * visible at entry is never mid-flight — r2 W2: a failed release must
+ * not strand a slot for the process lifetime). Legacy
+ * `.gru-upload-reservation-*.json` markers from the prior scheme count
+ * as claims and are reclaimed once aged and not provably live. */
 function processIsAlive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
@@ -162,85 +183,96 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-function isUploadReservation(name: string): boolean {
-  return name.startsWith(UPLOAD_RESERVATION_PREFIX) && name.endsWith('.json');
+function isUploadClaim(name: string): boolean {
+  return name.startsWith(UPLOAD_CLAIM_PREFIX) && name.endsWith(UPLOAD_CLAIM_SUFFIX);
 }
 
-function cleanupStaleUploadReservations(uploadsDir: string): void {
+function isLegacyUploadReservation(name: string): boolean {
+  return name.startsWith(UPLOAD_LEGACY_RESERVATION_PREFIX) && name.endsWith('.json');
+}
+
+function parseUploadClaim(name: string): { ts: number; pid: number } | null {
+  const body = name.slice(UPLOAD_CLAIM_PREFIX.length, name.length - UPLOAD_CLAIM_SUFFIX.length);
+  const [tsRaw, pidRaw] = body.split('-');
+  const ts = Number(tsRaw);
+  const pid = Number(pidRaw);
+  if (!Number.isSafeInteger(ts) || ts <= 0) return null;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  return { ts, pid };
+}
+
+function scanUploadsDir(uploadsDir: string): { payloads: string[]; claims: string[] } {
   let entries: string[];
   try {
     entries = readdirSync(uploadsDir);
   } catch (error) {
     throw new AttachError(500, `uploads quota scan failed: ${String(error)}`);
   }
+  const payloads: string[] = [];
+  const claims: string[] = [];
   for (const entry of entries) {
-    if (!isUploadReservation(entry)) continue;
-    const reservation = join(uploadsDir, entry);
-    let stale = false;
-    try {
-      stale = Date.now() - statSync(reservation).mtimeMs > UPLOAD_RESERVATION_STALE_MS;
-    } catch {
-      continue;
-    }
-    if (!stale) continue;
+    if (isUploadClaim(entry) || isLegacyUploadReservation(entry)) claims.push(entry);
+    else payloads.push(entry);
+  }
+  return { payloads, claims };
+}
 
-    let liveOwner = false;
-    try {
-      const owner = JSON.parse(readFileSync(reservation, 'utf-8')) as { pid?: unknown };
-      liveOwner = typeof owner.pid === 'number' && processIsAlive(owner.pid);
-    } catch {
-      // A torn marker is reclaimable after the age threshold. The unique
-      // filename is never reused, so this cannot target a newer owner.
-    }
-    if (liveOwner) continue;
-    try {
-      unlinkSync(reservation);
-    } catch (error) {
-      // Concurrent reclaimers may both inspect the same dead generation;
-      // one wins and the other observes ENOENT. No replacement can appear
-      // at this UUID path, so there is no check/rename race.
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw new AttachError(500, `stale uploads reservation cleanup failed: ${String(error)}`);
-      }
+/** FIFO by creation stamp (filename ts; name breaks same-ms ties so every
+ * racer computes the identical order from the same snapshot). Malformed
+ * or legacy claim names rank last: they consume capacity but never steal
+ * an earlier slot. */
+function rankUploadClaims(claims: readonly string[]): Array<{ name: string; ts: number }> {
+  return claims
+    .map((name) => ({ name, ts: parseUploadClaim(name)?.ts ?? Number.MAX_SAFE_INTEGER }))
+    .sort((a, b) => (a.ts !== b.ts ? a.ts - b.ts : a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+function reclaimAbandonedClaim(uploadsDir: string, entry: string): void {
+  try {
+    unlinkSync(join(uploadsDir, entry));
+  } catch (error) {
+    // A concurrent reclaimer may have removed this exact generation.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new AttachError(500, `stale uploads claim cleanup failed: ${String(error)}`);
     }
   }
 }
 
-function reserveUploadQuota(uploadsDir: string): string {
-  cleanupStaleUploadReservations(uploadsDir);
-  const reservation = join(
-    uploadsDir,
-    `${UPLOAD_RESERVATION_PREFIX}${Date.now()}-${process.pid}-${randomUUID()}.json`,
-  );
-  try {
-    writeFileSync(reservation, JSON.stringify({ pid: process.pid }), {
-      flag: 'wx',
-      mode: 0o600,
-    });
-  } catch (error) {
-    throw new AttachError(500, `uploads quota reservation failed: ${String(error)}`);
-  }
-
-  try {
-    // Payloads plus active reservations are the committed future count.
-    // The caller's own reservation is included in this observation.
-    const committed = readdirSync(uploadsDir).length;
-    if (committed > MAX_UPLOAD_FILES) {
-      throw new AttachError(
-        507,
-        `uploads quota exceeded (${MAX_UPLOAD_FILES} files) — prune ${uploadsDir}`,
-      );
+function cleanupAbandonedUploadClaims(uploadsDir: string): void {
+  const { claims } = scanUploadsDir(uploadsDir);
+  for (const entry of claims) {
+    if (isUploadClaim(entry)) {
+      const owner = parseUploadClaim(entry);
+      if (owner === null) continue; // foreign/malformed name — leave it
+      // Self-owned residue is never mid-flight (materialize is
+      // synchronous): reclaim immediately (r2 W2). Foreign claims need
+      // age AND a dead owner — a live hung writer keeps its slot (r2 W1).
+      const isSelfResidue = owner.pid === process.pid;
+      if (!isSelfResidue) {
+        if (Date.now() - owner.ts <= UPLOAD_CLAIM_STALE_MS) continue;
+        if (processIsAlive(owner.pid)) continue;
+      }
+      reclaimAbandonedClaim(uploadsDir, entry);
+      continue;
     }
-    return reservation;
-  } catch (error) {
+    // Legacy marker from the previous scheme: aged and not provably live.
+    const marker = join(uploadsDir, entry);
+    let aged = false;
     try {
-      unlinkSync(reservation);
+      aged = Date.now() - statSync(marker).mtimeMs > UPLOAD_CLAIM_STALE_MS;
     } catch {
-      // Preserve the original quota/scan error. A stranded UUID reservation
-      // is safely reclaimed after the age/PID threshold.
+      continue;
     }
-    if (error instanceof AttachError) throw error;
-    throw new AttachError(500, `uploads quota scan failed: ${String(error)}`);
+    if (!aged) continue;
+    let live = false;
+    try {
+      const owner = JSON.parse(readFileSync(marker, 'utf-8')) as { pid?: unknown };
+      live = typeof owner.pid === 'number' && processIsAlive(owner.pid);
+    } catch {
+      // Torn legacy marker: its creating build is gone once upgraded.
+    }
+    if (live) continue;
+    reclaimAbandonedClaim(uploadsDir, entry);
   }
 }
 
@@ -266,26 +298,60 @@ export function materializeUpload(
   mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
   hardenUploadsDir(uploadsDir);
   const name = sanitizeUploadName(input.filename);
-  const reservation = reserveUploadQuota(uploadsDir);
+  cleanupAbandonedUploadClaims(uploadsDir);
+  const stamp = Date.now();
+  const claimName = `${UPLOAD_CLAIM_PREFIX}${stamp}-${process.pid}-${randomUUID()}${UPLOAD_CLAIM_SUFFIX}`;
+  const claim = join(uploadsDir, claimName);
   try {
-    // The UUID makes collision impossible across processes while `wx`
-    // remains the final no-clobber boundary.
-    const target = join(uploadsDir, `${Date.now()}-${randomUUID()}-${name}`);
-    try {
-      writeFileSync(target, input.bytes, { flag: 'wx', mode: 0o600 });
-    } catch (error) {
-      throw new AttachError(500, `uploads write failed: ${String(error)}`);
-    }
-    return { path: target, name, bytes: input.bytes.byteLength };
-  } finally {
-    try {
-      unlinkSync(reservation);
-    } catch {
-      // The payload already represents this reservation. A stranded marker
-      // is conservative (temporarily consumes one extra slot) and is later
-      // reclaimed by exact UUID generation, never by shared pathname.
-    }
+    // The claim carries the payload bytes themselves: admission, content,
+    // and ownership (pid in the filename) publish atomically at dirent
+    // creation — there is no initializing window a peer can misread.
+    writeFileSync(claim, input.bytes, { flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    throw new AttachError(500, `uploads quota claim failed: ${String(error)}`);
   }
+  let target: string;
+  try {
+    const { payloads, claims } = scanUploadsDir(uploadsDir);
+    const free = MAX_UPLOAD_FILES - payloads.length;
+    const mine = rankUploadClaims(claims).findIndex((ranked) => ranked.name === claimName);
+    if (free <= 0 || mine < 0 || mine >= free) {
+      throw new AttachError(
+        507,
+        `uploads quota exceeded (${MAX_UPLOAD_FILES} files) — prune ${uploadsDir}`,
+      );
+    }
+    target = join(uploadsDir, `${stamp}-${randomUUID()}-${name}`);
+    // Commit = rename of the claim onto its final name: capacity-neutral
+    // (claim and payload each count one), and ENOENT would prove the
+    // claim was reclaimed from us — the reservation is verified by the
+    // commit itself, never assumed (r2 W1).
+    renameSync(claim, target);
+  } catch (error) {
+    try {
+      unlinkSync(claim);
+    } catch {
+      // Residue is owned by stale/self cleanup; never widen the fault.
+    }
+    if (error instanceof AttachError) throw error;
+    throw new AttachError(500, `uploads materialization failed: ${String(error)}`);
+  }
+  // Hard invariant audit: if a readdir anomaly let two writers each win
+  // an election that missed the other's claim, the committed count can
+  // exceed the cap. Shed THIS writer's payload — conservative (a
+  // retryable 507), never an overbook.
+  if (scanUploadsDir(uploadsDir).payloads.length > MAX_UPLOAD_FILES) {
+    try {
+      unlinkSync(target);
+    } catch (error) {
+      throw new AttachError(500, `uploads quota audit rollback failed: ${String(error)}`);
+    }
+    throw new AttachError(
+      507,
+      `uploads quota exceeded (${MAX_UPLOAD_FILES} files) — prune ${uploadsDir}`,
+    );
+  }
+  return { path: target, name, bytes: input.bytes.byteLength };
 }
 
 // ---------------------------------------------------------------------------
