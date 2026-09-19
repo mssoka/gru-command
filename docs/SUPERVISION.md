@@ -102,7 +102,7 @@ follow-up — at chat-scale volumes the table stays trivial for years.
 
 ```bash
 npm install && npm run build   # dist/main.js must exist
-./install.sh                   # detect OS, render + install + start the unit
+./install.sh --service        # detect OS, render + install + start the unit
 ./install.sh --print           # render the unit to stdout, change nothing
 ./install.sh --uninstall       # stop + remove
 ```

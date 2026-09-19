@@ -13,6 +13,26 @@ Gru Command keeps all instance state in one per-user directory — by default
 
 The config file is always `<instance dir>/config.toml`.
 
+## The setup wizard
+
+The setup wizard (`npm run wizard`, or `node dist/wizard/main.js`) is
+the supported way to create this file: it probes installed runtime
+CLIs, asks for the workspace root and managed repos, and writes a
+config that matches this schema exactly — the `"default"` sentinel for
+models/thinking (SPEC ruling 16), a generated `[auth]` token, and the
+bind host/port. Non-interactive runs take `--answers '<json>'`
+(unspecified answers = documented defaults; invalid answers fail loud
+with NOTHING written). Re-running the wizard over an existing
+`config.toml` copies it to `config.toml.backup-<timestamp>` first; a
+failed backup aborts before any write. Hand edits are first-class: the
+wizard never rewrites a file you did not point it at.
+
+The instance dir also carries state that is NOT config and has no keys
+here: `sessions/`, `chat/`, `logs/`, `ledger/`, `worktrees/` and
+`worktree-preserves/` (job lanes and swept-out deliverables —
+[WORKTREES.md](./WORKTREES.md)), and `uploads/` (the attach-flow home,
+created at boot — SPEC ruling 19).
+
 ## Load & validation behavior
 
 - **No config file** → the service boots on the documented defaults below.

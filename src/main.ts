@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
@@ -63,6 +64,24 @@ async function main(): Promise<number> {
     default_runtime: config.runtimes.default,
     install_id: identity.installId,
   });
+  // E9 / SPEC ruling 19: uploads-dir scaffolding next to the other
+  // instance dirs (logs/, chat/) — DIRECTORY CREATION ONLY; the attach
+  // flow itself lands in its own lane. Instance state stays under the
+  // data dir, never inside the workspace root (ruling 7). Failure is
+  // loud and named (EACCES/ENOSPC never surface as a raw stack).
+  const uploadsDir = join(config.dataDir, 'uploads');
+  try {
+    // 0700 like every other instance dir (chat/, sessions/, ledger/) —
+    // uploads will carry user material; not group/world traversable.
+    mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
+    logger.info('uploads_dir', { path: uploadsDir });
+  } catch (error) {
+    logger.error('uploads dir creation failed — refusing to start (SPEC ruling 19)', {
+      path: uploadsDir,
+      error: String(error),
+    });
+    return 1;
+  }
 
   // Crash forensics: structured fatal lines for anything that escapes, so
   // the JSON-lines log stays the record even under OS-service restarts.

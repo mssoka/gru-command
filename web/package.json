@@ -1,6 +1,6 @@
 {
   "name": "@gru-command/web",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "Gru Command web UI shell (E5) — Playful Planet design system, chat view, and dev-only mock socket.",
