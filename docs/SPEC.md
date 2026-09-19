@@ -107,16 +107,26 @@ integrated. Other users can install it on their laptops from GitHub.
     same-repo worktree creation is sequential; released work
     re-resolves the fresh head at release.
 
-19. **Path references, one attach flow, uploads dir.** (a)
-    Conversations and briefings reference workspace material by PATH —
-    repo-relative inside a managed repo, workspace-relative otherwise:
-    the workspace root is the canonical namespace and nothing is copied
-    into the product repo (ruling 8). (b) Exactly ONE attach flow exists
-    for bringing non-repo material (images, snippets, logs) into a
-    conversation; chat and dispatch both ride it — no per-surface side
-    doors. The attach flow itself lands as its own lane
-    (`gru-command-attach1`) before the v1.0.0 tag; E9 ships only (c).
-    (c) The attach flow's storage home is `<data_dir>/uploads/`; the
+19. **Path references, not attachments — one attach flow, uploads
+    dir.** (a) Conversations and briefings reference workspace material
+    by PATH — repo-relative inside a managed repo, workspace-relative
+    otherwise: the workspace root is the canonical namespace and nothing
+    is copied into the product repo (ruling 8). (b) Exactly ONE attach
+    flow exists for bringing non-repo material (images, snippets, logs)
+    into a conversation; chat and dispatch both ride it — no
+    per-surface side doors. The composer gets an attach/add button:
+    picked files/images show as ready-to-send chips/preview, and the
+    user NEVER types or pastes paths. (c) Resolution semantics — one
+    mechanism for desktop, phone, and clipboard: an on-disk local file
+    sends its PATH with NO byte copy; clipboard paste (Mac-screenshot
+    class) AND phone-origin content materialize into the instance
+    uploads dir (`<data_dir>/uploads/`) and send THAT path. (d) The
+    agent ALWAYS receives a path and reads the file itself —
+    text/code/image with a type-appropriate read; vision gated on
+    model capability with a graceful decline (never a guess). The
+    attach flow itself lands as its own lane (`gru-command-attach1`)
+    before the v1.0.0 tag; E9 ships the ruling text plus (e) only.
+    (e) The attach flow's storage home is `<data_dir>/uploads/`; the
     service scaffolds the directory at boot next to the other instance
     dirs (logs/, chat/) — DIRECTORY CREATION ONLY, instance state per
     ruling 7, never inside the workspace root.
@@ -132,7 +142,10 @@ integrated. Other users can install it on their laptops from GitHub.
     specific question sets, per the following canon (user ruling via
     Gru/Silas, 2026-09-19): (1) the Jev provider is CONFIG-GATED,
     DEFAULT-OFF — disabled or unreachable falls back to deterministic
-    defaults, always reversible, one flag for end users. (2) Confidence
+    defaults, always reversible, one flag for end users; it is
+    PROBE-VERIFIED before any real routing (a live check on the
+    configured endpoint — the probe-first discipline, never a trusted
+    assumption). (2) Confidence
     semantics: confidence ships on Choice and Score questions ONLY; Noul
     (true/false) carries probability ONLY — noul gates use probability
     thresholds, choice/score gates use confidence; three-path routing

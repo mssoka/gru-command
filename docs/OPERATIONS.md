@@ -29,7 +29,7 @@ The OS service manager is the SERVICE's out-of-band watcher (SPEC ruling
 `install.sh`.
 
 ```bash
-./install.sh              # full setup (deps+build if needed → wizard)
+./install.sh              # full setup (deps + build → wizard)
 ./install.sh --service    # register + start the service (launchd/systemd)
 ./install.sh --print      # render the platform unit; change nothing
 ./install.sh --uninstall  # stop the service and remove the unit

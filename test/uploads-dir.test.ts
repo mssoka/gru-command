@@ -51,6 +51,23 @@ describe('uploads dir scaffolding (SPEC ruling 19)', () => {
         signal: AbortSignal.timeout(2_000),
       });
       expect(res.ok).toBe(true);
+      // The FULL smoke oracle, not just res.ok (Perkins r1 W8): the
+      // default suite boots the real service, so it asserts the same
+      // three liveness signals + fingerprint the wizard's smoke does.
+      const health = (await res.json()) as {
+        identity?: { install_id?: unknown };
+        liveness?: {
+          signals?: {
+            health_reachable?: { value?: unknown };
+            agent_session?: { state?: unknown };
+            session_growth?: { value?: unknown };
+          };
+        };
+      };
+      expect(health.liveness?.signals?.health_reachable?.value).toBe(true);
+      expect(typeof health.liveness?.signals?.agent_session?.state).toBe('string');
+      expect(health.liveness?.signals?.session_growth?.value).toBeDefined();
+      expect(typeof health.identity?.install_id).toBe('string');
       expect(stderr).toContain('"msg":"uploads_dir"');
       expect(stderr).toContain(join(home, 'uploads'));
 
@@ -67,5 +84,28 @@ describe('uploads dir scaffolding (SPEC ruling 19)', () => {
     } finally {
       if (child.exitCode === null) child.kill('SIGKILL');
     }
+  }, 30_000);
+
+  it('uploads-path obstruction fails boot LOUD and named (exit 1, no raw stack) — Perkins r1 W14', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-uploads-block-'));
+    cleanupDirs.push(home);
+    writeFileSync(join(home, 'config.toml'), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    // A FILE named uploads blocks the directory scaffolding.
+    writeFileSync(join(home, 'uploads'), 'not a directory', 'utf-8');
+
+    const child = spawn(process.execPath, [join(repoRoot, 'dist', 'main.js')], {
+      env: { ...process.env, GRU_COMMAND_HOME: home },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf-8');
+    });
+    const exitCode = await new Promise<number | null>((resolveExit) => {
+      child.on('exit', (code) => resolveExit(code));
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('uploads dir creation failed');
+    expect(stderr).toContain(join(home, 'uploads'));
   }, 30_000);
 });

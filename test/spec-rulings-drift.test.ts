@@ -59,6 +59,18 @@ describe('SPEC locked-rulings numbering drift pin', () => {
     expect(block19).toContain('gru-command-attach1');
     expect(block19).toContain('<data_dir>/uploads/');
     expect(block19).toContain('DIRECTORY CREATION ONLY');
+    // The amendment's operative attach semantics (user ruling 2026-09-18;
+    // the attach1 lane splits only the IMPLEMENTATION — the ruling text
+    // lives here): composer chips/preview with the user never typing
+    // paths, path-sends with no byte copy, clipboard/phone materializing
+    // into uploads, and the agent always receiving + reading a path.
+    expect(block19).toContain('ready-to-send chips/preview');
+    expect(block19).toContain('NEVER types or pastes paths');
+    expect(block19).toContain('PATH with NO byte copy');
+    expect(block19).toContain('materialize into the instance');
+    expect(block19).toContain('ALWAYS receives a path and reads the file itself');
+    expect(block19).toContain('vision gated on');
+    expect(block19).toContain('graceful decline');
     const block20 = spec.slice(spec.indexOf('20. **'), spec.indexOf('## Sources'));
     expect(block20).toContain('DecisionService');
     expect(block20).toContain('src/events/bus.ts');
@@ -66,6 +78,7 @@ describe('SPEC locked-rulings numbering drift pin', () => {
     expect(block20).toContain('src/worktrees/manager.ts');
     expect(block20).toContain('src/dispatch/perkins.ts');
     expect(block20).toContain('CONFIG-GATED,\n    DEFAULT-OFF');
+    expect(block20).toContain('PROBE-VERIFIED before any real routing');
     expect(block20).toContain('~12× cheaper');
     expect(block20).toContain('openrouter.ai/api/alpha/decisions');
     expect(block20).toContain('docs.typesafe.ai/confidence.md');

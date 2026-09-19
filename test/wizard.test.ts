@@ -1,11 +1,11 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig, configPathFor } from '../src/config.js';
 import { probeRuntimes } from '../src/runtime/probe.js';
-import { runFirstBootSmoke } from '../src/wizard/main.js';
+import { formatHostForUrl, runFirstBootSmoke } from '../src/wizard/main.js';
 import {
   AnswersError,
   generateToken,
@@ -133,6 +133,50 @@ describe('wizard config generation', () => {
     expect(config.dataDir).toBe(instanceDir);
   });
 
+  it('config, backup, and hardened rewrite are 0600 — the pairing token is never world-readable (Perkins r1 W5)', () => {
+    const instanceDir = tempDir('gru-command-wizard-mode-');
+    const first = writeInstanceConfig(instanceDir, parseAnswers('{"token":"mode-one"}'), home);
+    // First write: 0600 by construction.
+    expect(statSync(first.configPath).mode & 0o777).toBe(0o600);
+    // A pre-existing 0644 config (older install) is HARDENED by the rewrite.
+    chmodSync(first.configPath, 0o644);
+    const second = writeInstanceConfig(instanceDir, parseAnswers('{"token":"mode-two"}'), home);
+    expect(statSync(second.configPath).mode & 0o777).toBe(0o600);
+    // The backup carries the token too — also owner-only.
+    expect(second.backupPath).not.toBeNull();
+    expect(statSync(second.backupPath!).mode & 0o777).toBe(0o600);
+    // No tmp file survives.
+    expect(existsSync(`${second.configPath}.tmp`)).toBe(false);
+  });
+
+  it('write-failure contracts: backup failure aborts with the original intact; write failure is named (Perkins r1 W12)', () => {
+    // (a) Backup failure aborts BEFORE any write — the original stands.
+    const instanceDir = tempDir('gru-command-wizard-wfail-');
+    writeInstanceConfig(instanceDir, parseAnswers('{"token":"original"}'), home);
+    chmodSync(instanceDir, 0o555); // read-only: the backup copy must fail
+    try {
+      expect(() =>
+        writeInstanceConfig(instanceDir, parseAnswers('{"token":"intruder"}'), home),
+      ).toThrow();
+      expect(readFileSync(join(instanceDir, 'config.toml'), 'utf-8')).toContain('original');
+    } finally {
+      chmodSync(instanceDir, 0o755); // cleanup needs a writable dir
+    }
+    // (b) Write failure (no prior config): named error, nothing left behind.
+    const emptyDir = tempDir('gru-command-wizard-wfail2-');
+    mkdirSync(emptyDir, { recursive: true });
+    chmodSync(emptyDir, 0o555);
+    try {
+      expect(() => writeInstanceConfig(emptyDir, parseAnswers('{}'), home)).toThrow(
+        /failed to write .* atomically/,
+      );
+      expect(existsSync(join(emptyDir, 'config.toml'))).toBe(false);
+      expect(existsSync(join(emptyDir, 'config.toml.tmp'))).toBe(false);
+    } finally {
+      chmodSync(emptyDir, 0o755);
+    }
+  });
+
   it('re-run over an existing config backs it up (timestamped) before rewriting', () => {
     const instanceDir = tempDir('gru-command-wizard-cfg2-');
     const first = parseAnswers('{"token":"first-token"}');
@@ -169,6 +213,14 @@ describe('wizard config generation', () => {
 });
 
 describe('wizard pairing QR + repo discovery + runtime probe', () => {
+  it('formatHostForUrl bracket-wraps IPv6 literals only (Perkins r1 W10)', () => {
+    expect(formatHostForUrl('::')).toBe('[::]');
+    expect(formatHostForUrl('fe80::1')).toBe('[fe80::1]');
+    expect(formatHostForUrl('fe80::1%en0')).toBe('[fe80::1%en0]');
+    expect(formatHostForUrl('[::1]')).toBe('[::1]'); // already bracketed
+    expect(formatHostForUrl('127.0.0.1')).toBe('127.0.0.1');
+    expect(formatHostForUrl('localhost')).toBe('localhost');
+  });
   it('QR payload is byte-identical in shape to the web pairing screen', () => {
     // web/src/ui/pairing.ts builds JSON.stringify({'gru-command':1,url,token})
     expect(buildQrPayload('http://127.0.0.1:7665', 'tok')).toBe(
@@ -207,6 +259,22 @@ describe('wizard pairing QR + repo discovery + runtime probe', () => {
 });
 
 describe('wizard CLI surface', () => {
+  it('interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    // stdin: 'ignore' = not a TTY — exactly the piped one-liner's world.
+    const res = spawnSync(process.execPath, [join(repoRoot, 'dist', 'wizard', 'main.js')], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30_000,
+    });
+    expect(res.status).toBe(2);
+    const err = res.stderr?.toString('utf-8') ?? '';
+    expect(err).toContain('no terminal for interactive setup');
+    // The recovery command names THIS checkout's install.sh — the user
+    // copies it straight into a terminal.
+    expect(err).toContain(`bash ${repoRoot}/install.sh`);
+    expect(err).toContain("--answers '<json>'");
+  });
+
   it('--answers without a JSON argument exits 2 with usage', () => {
     const repoRoot = join(import.meta.dirname, '..');
     let status = 0;

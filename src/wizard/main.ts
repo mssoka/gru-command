@@ -20,6 +20,7 @@ import { homedir } from 'node:os';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import * as QRCode from 'qrcode';
 import { instanceDirFromEnv, RUNTIME_IDS } from '../config.js';
@@ -76,13 +77,19 @@ async function ask(rl: ReturnType<typeof createInterface>, question: string): Pr
   return (await rl.question(question)).trim();
 }
 
-async function interactiveAnswers(probe: readonly RuntimeProbeResult[]): Promise<WizardAnswers> {
+async function interactiveAnswers(
+  probe: readonly RuntimeProbeResult[],
+  repoRoot: string,
+): Promise<WizardAnswers> {
   // The piped one-liner re-execs this wizard on an EXHAUSTED pipe: readline
   // would wait on an EOF'd stdin forever. Interactive mode needs a TTY;
   // anything else must say so loud and point at --answers.
   if (stdin.isTTY !== true) {
     fail(
-      "no terminal for interactive setup (stdin is not a TTY) — pass --answers '<json>' for non-interactive setup",
+      'no terminal for interactive setup (stdin is not a TTY — a piped\n' +
+        'install cannot ask questions). Finish setup in a terminal:\n' +
+        `  bash ${repoRoot}/install.sh\n` +
+        "or run non-interactively with --answers '<json>'",
       2,
     );
   }
@@ -425,7 +432,7 @@ async function main(argv: readonly string[]): Promise<number> {
     }
     stdout.write('\nNon-interactive mode (answers applied; unspecified = defaults).\n');
   } else {
-    answers = await interactiveAnswers(probe);
+    answers = await interactiveAnswers(probe, repoRoot);
   }
 
   stdout.write(`\nManaged repos (board grouping): ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none yet)'}\n`);
@@ -503,9 +510,19 @@ async function main(argv: readonly string[]): Promise<number> {
 
 // ESM main guard: run as a CLI (`node dist/wizard/main.js`), stay
 // importable under test (vitest's argv[1] is the runner, not this file).
+// Compare through realpathSync on BOTH sides: on macOS an absolute
+// argv[1] under /var/… resolves against a file:// URL under
+// /private/var/… — a raw string compare silently no-ops the wizard.
+function sameFileAfterRealpath(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return a === b; // one side vanished — fall back to the raw compare
+  }
+}
 const invokedAsCli =
   process.argv[1] !== undefined &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  sameFileAfterRealpath(resolve(process.argv[1]), fileURLToPath(import.meta.url));
 
 if (invokedAsCli) {
   main(process.argv.slice(2))

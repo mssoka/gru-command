@@ -265,3 +265,41 @@ describe('install.sh E7 flag contracts (re-pinned)', () => {
     expect(stderr).toContain('dist/main.js not found');
   });
 });
+
+describe('node version gate (>= 22.19) — Perkins r1 W11', () => {
+  /** A PATH shim that claims v18 and fails every -e probe: node_ok must
+   * trip in BOTH --service and setup modes, before any registration or
+   * install runs. */
+  function oldNodeShim(): string {
+    const dir = tempDir('gru-command-oldnode-bin-');
+    writeFileSync(
+      join(dir, 'node'),
+      '#!/usr/bin/env bash\nif [[ "${1:-}" == "--version" ]]; then echo "v18.20.0"; fi\nexit 1\n',
+      { encoding: 'utf-8', mode: 0o755 },
+    );
+    return dir;
+  }
+
+  it('--service mode gates before unit registration', () => {
+    const shim = oldNodeShim();
+    const { stderr, status } = run(join(repoRoot, 'install.sh'), ['--service'], {
+      PATH: `${shim}:${process.env.PATH ?? ''}`,
+    });
+    expect(status).toBe(1);
+    expect(stderr).toContain('node >= 22.19 required');
+    expect(stderr).toContain('v18.20.0');
+  });
+
+  it('setup mode (inside a checkout) gates before deps/build', () => {
+    const shim = oldNodeShim();
+    const { stderr, status } = run(join(repoRoot, 'install.sh'), [], {
+      PATH: `${shim}:${process.env.PATH ?? ''}`,
+      // A answers-free run would exec the wizard after the gate — the
+      // gate must stop it long before that.
+      GRU_COMMAND_HOME: join(shim, '..', 'never-created'),
+    });
+    expect(status).toBe(1);
+    expect(stderr).toContain('node >= 22.19 required');
+    expect(existsSync(join(shim, '..', 'never-created'))).toBe(false);
+  });
+});

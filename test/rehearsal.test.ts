@@ -183,5 +183,55 @@ describe.skipIf(process.env['GRU_COMMAND_REHEARSAL'] !== '1')(
       },
       600_000,
     );
+
+    it(
+      'piped one-liner WITHOUT --answers: clone+build, then the loud non-TTY exit printing the recovery command (Perkins r1 B1)',
+      () => {
+        const stage = mkdtempSync(join(tmpdir(), 'gru-command-rehearsal-piped-'));
+        cleanupDirs.push(stage);
+        const home = join(stage, 'home');
+        const target = join(home, 'gru-command');
+        const instance = join(home, '.gru-command');
+        mkdirSync(home, { recursive: true });
+        const bare = join(stage, 'bare');
+        mkdirSync(bare, { recursive: true });
+        copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+
+        // execFileSync stdin is a pipe — the exact non-TTY world of
+        // `curl … | bash`. The promised path: clone + deps + build all
+        // succeed, then the wizard refuses LOUD with the exact command
+        // the user runs next in a terminal.
+        let res: { stdout: string; stderr: string; status: number };
+        try {
+          const stdout = execFileSync('bash', [join(bare, 'install.sh')], {
+            encoding: 'utf-8',
+            timeout: 600_000,
+            env: {
+              ...process.env,
+              HOME: home,
+              GRU_COMMAND_HOME: instance,
+              GRU_COMMAND_ORIGIN: `file://${repoRoot}`,
+              GRU_COMMAND_TARGET: target,
+            },
+          });
+          res = { stdout, stderr: '', status: 0 };
+        } catch (error) {
+          const err = error as { stdout?: string; stderr?: string; status?: number };
+          res = { stdout: err.stdout ?? '', stderr: err.stderr ?? '', status: err.status ?? 1 };
+        }
+        expect(res.status).toBe(2);
+        expect(res.stdout).toContain('cloning');
+        // The clone landed fully built — the one-liner did its job.
+        expect(existsSync(join(target, 'dist', 'main.js'))).toBe(true);
+        expect(existsSync(join(target, 'dist', 'wizard', 'main.js'))).toBe(true);
+        // The recovery command names the clone's installer.
+        const text = `${res.stdout}\n${res.stderr}`;
+        expect(text).toContain('no terminal for interactive setup');
+        expect(text).toContain(`bash ${target}/install.sh`);
+        // The wizard never wrote a config — setup is not half-done.
+        expect(existsSync(join(instance, 'config.toml'))).toBe(false);
+      },
+      600_000,
+    );
   },
 );

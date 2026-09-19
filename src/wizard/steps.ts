@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'smol-toml';
 import { homedir } from 'node:os';
@@ -163,11 +163,17 @@ export function writeInstanceConfig(
   if (existsSync(configPath)) {
     backupPath = `${configPath}.backup-${backupTimestamp()}`;
     copyFileSync(configPath, backupPath); // throws → abort BEFORE the write
+    // The backup carries the pairing token too — never world-readable
+    // (a copied 0644 from an older install would ship the secret).
+    chmodSync(backupPath, 0o600);
   }
   const tmpPath = `${configPath}.tmp`;
   try {
-    writeFileSync(tmpPath, text, 'utf-8');
+    // 0600: config.toml carries the pairing token — the file, and any
+    // backup, are owner-only (W5; the tmp never survives as 0644 either).
+    writeFileSync(tmpPath, text, { encoding: 'utf-8', mode: 0o600 });
     renameSync(tmpPath, configPath); // atomic: never a half-written config
+    chmodSync(configPath, 0o600); // belt: a pre-existing file's mode dies with the rename
   } catch (error) {
     rmSync(tmpPath, { force: true });
     throw new Error(

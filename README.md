@@ -43,26 +43,33 @@ One line (macOS + Linux, Node ≥ 22.19, git):
 curl -fsSL https://raw.githubusercontent.com/mssoka/gru-command/main/install.sh | bash
 ```
 
-That clones the repo to `~/gru-command`, installs dependencies, builds,
-and runs the terminal **setup wizard**: it detects your installed agent
-runtimes (`pi`, Claude Code), asks for your workspace root and which
-repos live in it, picks runtime/model/thinking defaults, writes
-`~/.gru-command/config.toml` (backing up any previous one), shows the
-pairing QR for your phone, optionally registers the OS service, and
-smoke-tests first boot — the wizard fails loud rather than guessing.
+That clones the repo to `~/gru-command`, installs dependencies, and
+builds. A piped shell has no terminal, so it stops there and prints the
+exact command that finishes setup — run it in your terminal:
 
-Or clone it yourself:
+```bash
+bash ~/gru-command/install.sh
+```
+
+That runs the interactive **setup wizard**: it detects your installed
+agent runtimes (`pi`, Claude Code), asks for your workspace root and
+which repos live in it, picks runtime/model/thinking defaults, writes
+`~/.gru-command/config.toml` (backing up any previous one), shows the
+pairing QR for your phone, smoke-tests first boot, and can register the
+OS service — the wizard fails loud rather than guessing.
+
+Or clone it yourself and run the wizard in one go:
 
 ```bash
 git clone https://github.com/mssoka/gru-command.git
 cd gru-command
-./install.sh            # deps + build if needed, then the wizard
+./install.sh            # deps + build, then the wizard
 ```
 
 Non-interactive (every answer defaults; the JSON may omit anything):
 
 ```bash
-./install.sh --answers '{"workspace_root":"~/code","repos":["alpha","beta"],"port":7665}'
+./install.sh --answers '{}'
 ```
 
 You need one agent-runtime CLI installed for agents to actually spawn
