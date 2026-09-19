@@ -74,9 +74,49 @@ Missing `instructions`, a record-where-array `criteria` (or vice versa)
 yields a 400 Zod validation error whose payload handily spells out the
 expected schema (receipt: attempt 4).
 
-Measured envelope: **~330–370 ms**, **~$0.00003 per call** (~660 input
+Measured envelope: **~330–520 ms**, **~$0.00003 per call** (~660 input
 tokens). Sub-second, effectively free at pilot scale — consistent with the
 edge-analysis doc's claims.
+
+## Amendment 2 — docs kit verified and encoded at the interface level
+
+The vendor docs Silas relayed were fetched and verified verbatim
+(2026-09-19): [confidence.md](https://docs.typesafe.ai/confidence.md),
+[jev-1.13 jaggedness](https://docs.typesafe.ai/model-jaggedness/jev-1.13.md),
+[confidence-routing.md](https://docs.typesafe.ai/patterns/confidence-routing.md),
+plus [parallel_questions](https://docs.typesafe.ai/cookbooks/parallel_questions.md)
+for the batching figure (12.2x cheaper, 10.0x faster). Key confirmations,
+with our own receipts as primary evidence:
+
+- **Confidence semantics (A):** our raw receipts show noul answers ship
+  `{type, noul}` — **no confidence field** — while choice/score carry both
+  `probabilities` and `confidence`. The client encodes this as types + a
+  `decisionMetric()` dispatcher: noul gates threshold on probability,
+  choice/score on confidence; both stay exposed, never collapsed (a test
+  proves noul routing is invariant to a bogus confidence field).
+- **Three-path routing (A):** `routeDecision(answer, riskClass)` →
+  act / confirm / fallback-to-deterministic, thresholds **per risk class**:
+  `read_only` (low bar), `operational`, `destructive` (act ≥ 0.85 **and**
+  `require_confirm_on_act` — every passable band carries the human
+  pause-and-ask; "Jev triages, never verdicts" made mechanical).
+- **Jev-1.13 jaggedness (B):** encoded as the machine-readable
+  `QUESTION_DESIGN_RULES` export (literal criteria, math/dates in code,
+  filter state, adversarial caveat, aligned criteria, no cross-question
+  invariants, atomic questions — each citing its vendor doc section).
+  `routeDecision` deliberately takes ONE answer; an answers bag is a type
+  error. **Adversarial caveat flagged hard:** the vendor does NOT treat
+  state as hostile — the destructive-call gate must be tested against
+  adversarial command text before anything load-bearing routes on it
+  (test requirement written into Play C's question design).
+- **Batching economics (C):** batched question sets are the client's
+  default shape; single-question calls trigger a warning citing the
+  cookbook figure. Our receipts back the shape: 3 questions, one call,
+  ~$0.00003 total.
+
+Interface encoding: `tools/jev-pilot/decisions-client.mjs` +
+`tools/jev-pilot/decisions-client.test.mjs` — **11 offline tests on the
+real receipt fixtures** (`node --test tools/jev-pilot/decisions-client.test.mjs`),
+zero paid calls needed.
 
 ## Honest money ledger
 
@@ -84,18 +124,25 @@ edge-analysis doc's claims.
 | ----------------------------------- | ------------ |
 | Attempt 5 (schema-correct first 200)| $0.000026292 |
 | `~jev-latest` receipt call          | $0.000027636 |
-| `decisions-client.mjs --demo` run   | $0.000027636 |
-| **Total lane spend**                | **$0.000082** |
+| `decisions-client.mjs --demo` run #1| $0.000027636 |
+| `decisions-client.mjs --demo` run #2 (post-Amendment-2 smoke) | $0.000027636 |
+| **Total lane spend**                | **$0.000109** |
 
-Ceiling was $10; actual $0.000082 (attempts 1–4 were free 400s). The
-economics claim in the edge-analysis doc ("thousands of probes/month ≈
-still zero") holds as measured.
+Ceiling was $10; actual **$0.000109** (attempts 1–4 were free 400s;
+Amendment-2 tests run offline on receipt fixtures). The economics claim in
+the edge-analysis doc ("thousands of probes/month ≈ still zero") holds as
+measured.
 
 ## Lane residue (what ships in this PR)
 
 - `tools/jev-pilot/decisions-client.mjs` — minimal zero-dep decisions
   client: key resolution (env → factory keychain), pre-flight question
-  validation against the live schema, `decide()` + `--demo`.
+  validation against the live schema, batched `decide()` + `--demo`, and
+  the Amendment-2 interface encoding (`decisionMetric`, three-path
+  `routeDecision`, `RISK_CLASSES`, `QUESTION_DESIGN_RULES`, batch warn).
+- `tools/jev-pilot/decisions-client.test.mjs` — 11 offline interface tests
+  on the real receipt fixtures (confidence semantics, three-path
+  boundaries, destructive confirm, batching warn, no-composition surface).
 - `tools/jev-pilot/config-flag-schema-sketch.md` — the `[decisions.jev]`
   TOML flag sketch in the repo's config idiom + the fail-open behavior
   matrix + fold-in wiring notes. Sketch only; **no provider implementation
@@ -114,12 +161,16 @@ experiment. What the fold-in needs (scoped follow-up, NOT this lane):
    default implementations (the shipped path), behind the existing seam
    ruling (event bus / supervisor / sweep pipeline / review-wave).
 2. `[decisions.jev]` config section per the sketch (`enabled = false`
-   default; endpoint/model/timeout/min_confidence).
+   default; endpoint/model/timeout + **per-risk-class `[decisions.thresholds.*]`
+   with three-path routing and `require_confirm_on_act` on destructive**).
 3. Jev-backed implementation using the reference client's semantics:
-   fail-open on any error/timeout, `min_confidence` escalates to System 2,
-   one probe-gate call at boot when enabled.
+   fail-open on any error/timeout, type-dispatched gate metrics (noul →
+   probability, choice/score → confidence), batched question sets, one
+   probe-gate call at boot when enabled.
 4. The installer's runtime-detect offering the OpenRouter key checkbox
    (per the edge-analysis doc §3).
+5. An adversarial-command-text test corpus for the destructive-call gate
+   (Play C) — the vendor does not treat state as hostile (jaggedness #6).
 
 Kill-switch doctrine stands: Jev triages, never verdicts; low confidence ⇒
 escalate; probe before anything real depends on it.
