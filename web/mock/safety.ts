@@ -8,15 +8,23 @@ export interface MockExposure {
   readonly warning: string | null;
 }
 
+function normalizeBindHost(host: string): string {
+  // URL authorities bracket IPv6 literals; node:http.listen expects the
+  // bare address. Only strip a complete bracket pair so malformed values
+  // still fail closed at the exposure check or bind boundary.
+  return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+}
+
 function isLoopbackHost(host: string): boolean {
-  const normalized = host.toLowerCase().replace(/^\[|\]$/g, '');
+  const normalized = normalizeBindHost(host).toLowerCase();
   return normalized === 'localhost' || normalized === '::1' || /^127(?:\.\d{1,3}){3}$/.test(normalized);
 }
 
 export function resolveMockExposure(
   env: Readonly<Record<string, string | undefined>>,
 ): MockExposure {
-  const host = env.GRU_MOCK_HOST?.trim() || '127.0.0.1';
+  const configuredHost = env.GRU_MOCK_HOST?.trim() || '127.0.0.1';
+  const host = normalizeBindHost(configuredHost);
   const token = env.GRU_MOCK_TOKEN?.trim() || DEFAULT_MOCK_TOKEN;
   const loopback = isLoopbackHost(host);
 

@@ -389,10 +389,11 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
-  it('forwards image attachments to an image-capable model (capability kept honest)', async () => {
+  it('B1 positive discriminator: an image-capable resolved model keeps vision enabled and transports images', async () => {
     const fx = await fixture([{ deltas: ['seen'] }], ['text', 'image']);
     const handle = await fx.runtime.spawn('gru');
     try {
+      expect(handle.capabilities.images).toBe(true);
       await handle.prompt('look at this', {
         owner: 'alice',
         images: [{ mediaType: 'image/png', data: 'aGVsbG8=' }],

@@ -1,3 +1,4 @@
+import { createServer } from 'node:http';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_MOCK_TOKEN, resolveMockExposure } from '../../mock/safety.js';
 
@@ -26,10 +27,28 @@ describe('mock server exposure safety', () => {
     ).toMatchObject({ host: '0.0.0.0', token: 'mock-only-secret-1234', warning: null });
   });
 
-  it.each(['127.0.0.1', '127.7.8.9', 'localhost', '::1', '[::1]'])(
-    'recognizes loopback host %s',
-    (host) => {
-      expect(resolveMockExposure({ GRU_MOCK_HOST: host }).host).toBe(host);
-    },
-  );
+  it.each([
+    ['127.0.0.1', '127.0.0.1'],
+    ['127.7.8.9', '127.7.8.9'],
+    ['localhost', 'localhost'],
+    ['::1', '::1'],
+    ['[::1]', '::1'],
+  ])('recognizes and normalizes loopback host %s', (configured, bindHost) => {
+    expect(resolveMockExposure({ GRU_MOCK_HOST: configured }).host).toBe(bindHost);
+  });
+
+  it('binds the accepted bracketed IPv6 loopback through node:http.listen', async () => {
+    const { host } = resolveMockExposure({ GRU_MOCK_HOST: '[::1]' });
+    const server = createServer((_req, res) => res.end('ok'));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, host, resolve);
+      });
+      const address = server.address();
+      expect(address).toMatchObject({ family: 'IPv6', address: '::1' });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
 });

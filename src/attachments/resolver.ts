@@ -5,9 +5,8 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
-  renameSync,
-  rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -143,11 +142,15 @@ export interface MaterializedUpload {
   readonly bytes: number;
 }
 
-const UPLOAD_LOCK_STALE_MS = 30_000;
+const UPLOAD_RESERVATION_STALE_MS = 30_000;
+const UPLOAD_RESERVATION_PREFIX = '.gru-upload-reservation-';
 
-/** Serialize count+create across processes. JavaScript's sync section is
- * atomic only inside one process; the directory mutex closes the quota
- * TOCTOU for a second service process sharing the data dir. */
+/** Upload quota is coordinated with uniquely named reservation files.
+ * Each live reservation counts as one future payload, so competing
+ * processes cannot both consume the final slot. Unlike a shared lock
+ * pathname, a stale reservation generation is never reused: reclaimers
+ * can unlink only the exact UUID-named generation they inspected and can
+ * never evict a successor's live allocation. */
 function processIsAlive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
@@ -159,70 +162,85 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-function withUploadAllocationLock<T>(uploadsDir: string, allocate: () => T): T {
-  const lockDir = `${uploadsDir}.allocation-lock`;
-  const ownerFile = join(lockDir, 'owner.json');
-  const token = randomUUID();
-  let acquired = false;
-  for (let attempt = 0; attempt < 2 && !acquired; attempt += 1) {
+function isUploadReservation(name: string): boolean {
+  return name.startsWith(UPLOAD_RESERVATION_PREFIX) && name.endsWith('.json');
+}
+
+function cleanupStaleUploadReservations(uploadsDir: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(uploadsDir);
+  } catch (error) {
+    throw new AttachError(500, `uploads quota scan failed: ${String(error)}`);
+  }
+  for (const entry of entries) {
+    if (!isUploadReservation(entry)) continue;
+    const reservation = join(uploadsDir, entry);
+    let stale = false;
     try {
-      mkdirSync(lockDir, { mode: 0o700 });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        throw new AttachError(500, `uploads allocation lock failed: ${String(error)}`);
-      }
-      let stale = false;
-      let liveOwner = false;
-      try {
-        stale = Date.now() - statSync(lockDir).mtimeMs > UPLOAD_LOCK_STALE_MS;
-        if (stale) {
-          const owner = JSON.parse(readFileSync(ownerFile, 'utf-8')) as { pid?: unknown };
-          liveOwner = typeof owner.pid === 'number' && processIsAlive(owner.pid);
-        }
-      } catch {
-        // A missing/torn owner marker is reclaimable only after the age
-        // threshold; a newly-created lock may not have written it yet.
-      }
-      if (!stale || liveOwner) {
-        throw new AttachError(503, 'uploads allocation is busy — retry');
-      }
-      const tombstone = `${lockDir}.stale-${process.pid}-${randomUUID()}`;
-      try {
-        // Rename, rather than recursively deleting the shared name: only
-        // one waiter can claim the stale generation, and its old owner can
-        // never remove a replacement lock in its finally block.
-        renameSync(lockDir, tombstone);
-        rmSync(tombstone, { recursive: true, force: true });
-      } catch (reclaimError) {
-        if ((reclaimError as NodeJS.ErrnoException).code === 'ENOENT') continue;
-        throw new AttachError(500, `stale uploads lock cleanup failed: ${String(reclaimError)}`);
-      }
+      stale = Date.now() - statSync(reservation).mtimeMs > UPLOAD_RESERVATION_STALE_MS;
+    } catch {
       continue;
     }
+    if (!stale) continue;
+
+    let liveOwner = false;
     try {
-      writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, token }), {
-        flag: 'wx',
-        mode: 0o600,
-      });
-      acquired = true;
+      const owner = JSON.parse(readFileSync(reservation, 'utf-8')) as { pid?: unknown };
+      liveOwner = typeof owner.pid === 'number' && processIsAlive(owner.pid);
+    } catch {
+      // A torn marker is reclaimable after the age threshold. The unique
+      // filename is never reused, so this cannot target a newer owner.
+    }
+    if (liveOwner) continue;
+    try {
+      unlinkSync(reservation);
     } catch (error) {
-      rmSync(lockDir, { recursive: true, force: true });
-      throw new AttachError(500, `uploads allocation owner write failed: ${String(error)}`);
+      // Concurrent reclaimers may both inspect the same dead generation;
+      // one wins and the other observes ENOENT. No replacement can appear
+      // at this UUID path, so there is no check/rename race.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new AttachError(500, `stale uploads reservation cleanup failed: ${String(error)}`);
+      }
     }
   }
-  if (!acquired) throw new AttachError(503, 'uploads allocation is busy — retry');
+}
+
+function reserveUploadQuota(uploadsDir: string): string {
+  cleanupStaleUploadReservations(uploadsDir);
+  const reservation = join(
+    uploadsDir,
+    `${UPLOAD_RESERVATION_PREFIX}${Date.now()}-${process.pid}-${randomUUID()}.json`,
+  );
   try {
-    return allocate();
-  } finally {
-    // Ownership check prevents a delayed old holder from deleting a lock
-    // generation that another process acquired after stale recovery.
-    try {
-      const owner = JSON.parse(readFileSync(ownerFile, 'utf-8')) as { token?: unknown };
-      if (owner.token === token) rmSync(lockDir, { recursive: true, force: true });
-    } catch {
-      // Preserve an ambiguous lock for age/PID-based recovery; never delete
-      // another process's mutex merely because the marker is unreadable.
+    writeFileSync(reservation, JSON.stringify({ pid: process.pid }), {
+      flag: 'wx',
+      mode: 0o600,
+    });
+  } catch (error) {
+    throw new AttachError(500, `uploads quota reservation failed: ${String(error)}`);
+  }
+
+  try {
+    // Payloads plus active reservations are the committed future count.
+    // The caller's own reservation is included in this observation.
+    const committed = readdirSync(uploadsDir).length;
+    if (committed > MAX_UPLOAD_FILES) {
+      throw new AttachError(
+        507,
+        `uploads quota exceeded (${MAX_UPLOAD_FILES} files) — prune ${uploadsDir}`,
+      );
     }
+    return reservation;
+  } catch (error) {
+    try {
+      unlinkSync(reservation);
+    } catch {
+      // Preserve the original quota/scan error. A stranded UUID reservation
+      // is safely reclaimed after the age/PID threshold.
+    }
+    if (error instanceof AttachError) throw error;
+    throw new AttachError(500, `uploads quota scan failed: ${String(error)}`);
   }
 }
 
@@ -248,35 +266,26 @@ export function materializeUpload(
   mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
   hardenUploadsDir(uploadsDir);
   const name = sanitizeUploadName(input.filename);
-  return withUploadAllocationLock(uploadsDir, () => {
-    // Count and exclusive create happen under one cross-process mutex: a
-    // second writer cannot pass the same MAX_UPLOAD_FILES observation.
-    let existing = 0;
+  const reservation = reserveUploadQuota(uploadsDir);
+  try {
+    // The UUID makes collision impossible across processes while `wx`
+    // remains the final no-clobber boundary.
+    const target = join(uploadsDir, `${Date.now()}-${randomUUID()}-${name}`);
     try {
-      existing = readdirSync(uploadsDir).length;
-    } catch {
-      /* fresh dir — the count is zero */
-    }
-    if (existing >= MAX_UPLOAD_FILES) {
-      throw new AttachError(507, `uploads quota exceeded (${MAX_UPLOAD_FILES} files) — prune ${uploadsDir}`);
-    }
-    const stamped = `${Date.now()}-${name}`;
-    let target = join(uploadsDir, stamped);
-    for (let n = 2; ; n++) {
-      try {
-        // Exclusive create: never clobber an existing materialized file.
-        writeFileSync(target, input.bytes, { flag: 'wx', mode: 0o600 });
-        break;
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'EEXIST') {
-          throw new AttachError(500, `uploads write failed: ${String(error)}`);
-        }
-        target = join(uploadsDir, `${Date.now()}-${n}-${name}`);
-      }
+      writeFileSync(target, input.bytes, { flag: 'wx', mode: 0o600 });
+    } catch (error) {
+      throw new AttachError(500, `uploads write failed: ${String(error)}`);
     }
     return { path: target, name, bytes: input.bytes.byteLength };
-  });
+  } finally {
+    try {
+      unlinkSync(reservation);
+    } catch {
+      // The payload already represents this reservation. A stranded marker
+      // is conservative (temporarily consumes one extra slot) and is later
+      // reclaimed by exact UUID generation, never by shared pathname.
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

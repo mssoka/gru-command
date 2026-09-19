@@ -194,6 +194,52 @@ describe('composer attach consumer paths', () => {
     expect(document.getElementById('attach-picker-path')!.textContent).toBe('/');
   });
 
+  it('ignores a stale rejected browse after newer navigation has rendered', async () => {
+    let rejectSlow!: (reason: Error) => void;
+    const slow = new Promise<BrowseResult>((_resolve, reject) => {
+      rejectSlow = reject;
+    });
+    const view = new ChatView(() => true);
+    view.bindAttach(
+      surface({
+        browse: async (path) => {
+          if (path === 'slow') return slow;
+          return result('', [
+            { name: 'slow', kind: 'dir', size: null, image: false, pickable: true },
+            { name: 'current.md', kind: 'file', size: 4, image: false, pickable: true },
+          ] as BrowseResult['entries']);
+        },
+      }),
+    );
+    document.getElementById('chat-attach')!.click();
+    await settle();
+    (document.querySelector('.attach-row--dir') as HTMLButtonElement).click();
+    document.getElementById('attach-picker-up')!.click();
+    await settle();
+
+    rejectSlow(new Error('stale browse failed'));
+    await settle();
+    expect(document.getElementById('attach-picker-path')!.textContent).toBe('/');
+    expect(document.querySelector('.attach-row--file')?.textContent).toContain('current.md');
+    expect((document.getElementById('attach-picker-error') as HTMLElement).hidden).toBe(true);
+  });
+
+  it('ignores a pending browse rejection after the picker closes', async () => {
+    let rejectBrowse!: (reason: Error) => void;
+    const pending = new Promise<BrowseResult>((_resolve, reject) => {
+      rejectBrowse = reject;
+    });
+    const view = new ChatView(() => true);
+    view.bindAttach(surface({ browse: async () => pending }));
+    document.getElementById('chat-attach')!.click();
+    document.getElementById('attach-picker-close')!.click();
+    rejectBrowse(new Error('closed request failed'));
+    await settle();
+
+    expect((document.getElementById('attach-picker') as HTMLElement).hidden).toBe(true);
+    expect((document.getElementById('attach-picker-error') as HTMLElement).hidden).toBe(true);
+  });
+
   it('shows capped-listing state and disables out-of-workspace symlink targets', async () => {
     const view = new ChatView(() => true);
     view.bindAttach(

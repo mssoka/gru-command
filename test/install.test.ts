@@ -161,10 +161,24 @@ describe('inside_checkout heuristic (W-B)', () => {
 
   it('rejects a foreign manifest even when a nested name says gru-command', () => {
     const dir = stageShape('gru-command-inside-foreign-', { packageName: 'someone-elses-app', git: true });
+    // Keep the nested key on its own line: the pre-fix anchored grep
+    // accepted this foreign package because it could not distinguish
+    // top-level JSON keys from nested ones.
     writeFileSync(
       join(dir, 'package.json'),
-      '{"name":"someone-elses-app","metadata":{"name":"gru-command"},"version":"1.0.0"}\n',
+      `{
+  "name": "someone-elses-app",
+  "metadata": {
+    "name": "gru-command"
+  },
+  "version": "1.0.0"
+}
+`,
     );
+    const manifest = readFileSync(join(dir, 'package.json'), 'utf-8');
+    // The original grep accepted this nested line; this assertion makes
+    // the fixture a real pre-fix discriminator rather than mere prose.
+    expect(/^(?:\{\s*)?\s*"name"\s*:\s*"gru-command"/m.test(manifest)).toBe(true);
     expect(insideCheckout(dir)).toBe(1);
   });
 

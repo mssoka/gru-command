@@ -1,7 +1,10 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { hashToken } from '../src/auth.js';
 import type { GruCommandConfig } from '../src/config.js';
@@ -93,40 +96,71 @@ describe('materializeUpload (ruling 19(c): bytes → uploads dir → THAT path)'
     expect(readFileSync(stored.path, 'utf-8')).toBe('x');
   });
 
-  it('serializes quota allocation so a concurrent writer cannot pass the count check', () => {
-    const dir = tempDir('gru-command-uploads-lock-');
-    mkdirSync(`${dir}.allocation-lock`, { mode: 0o700 });
-    try {
-      expect(() =>
-        materializeUpload(dir, { filename: 'racing.txt', bytes: new TextEncoder().encode('x') }),
-      ).toThrow(/allocation is busy/);
-    } finally {
-      rmSync(`${dir}.allocation-lock`, { recursive: true, force: true });
-    }
-  });
-
-  it('reclaims a stale dead-owner lock but never steals an old lock from a live owner', () => {
-    const dir = tempDir('gru-command-uploads-stale-lock-');
-    const lock = `${dir}.allocation-lock`;
+  it('preserves an aged reservation owned by a live process', () => {
+    const dir = tempDir('gru-command-uploads-live-reservation-');
+    const reservation = join(dir, `.gru-upload-reservation-live-${randomUUID()}.json`);
     const old = new Date(Date.now() - 60_000);
+    writeFileSync(reservation, JSON.stringify({ pid: process.pid }));
+    utimesSync(reservation, old, old);
 
-    mkdirSync(lock, { mode: 0o700 });
-    writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: 2_147_483_647, token: 'dead' }));
-    utimesSync(lock, old, old);
     expect(
-      materializeUpload(dir, { filename: 'after-crash.txt', bytes: new TextEncoder().encode('x') }),
-    ).toMatchObject({ name: 'after-crash.txt' });
-    expect(() => statSync(lock)).toThrow();
-
-    mkdirSync(lock, { mode: 0o700 });
-    writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, token: 'live' }));
-    utimesSync(lock, old, old);
-    expect(() =>
       materializeUpload(dir, { filename: 'do-not-steal.txt', bytes: new TextEncoder().encode('x') }),
-    ).toThrow(/allocation is busy/);
-    expect(statSync(lock).isDirectory()).toBe(true);
-    rmSync(lock, { recursive: true, force: true });
+    ).toMatchObject({ name: 'do-not-steal.txt' });
+    expect(readFileSync(reservation, 'utf-8')).toContain(String(process.pid));
   });
+
+  it('atomically reserves the final quota slot across processes while concurrent reclaimers inspect one stale generation', async () => {
+    const dir = tempDir('gru-command-uploads-process-race-');
+    const coordination = tempDir('gru-command-uploads-process-race-coord-');
+    for (let index = 0; index < MAX_UPLOAD_FILES - 1; index += 1) {
+      writeFileSync(join(dir, `existing-${index}.txt`), 'x');
+    }
+    const stale = join(dir, `.gru-upload-reservation-stale-${randomUUID()}.json`);
+    writeFileSync(stale, JSON.stringify({ pid: 2_147_483_647 }));
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(stale, old, old);
+
+    const worker = fileURLToPath(new URL('./helpers/materialize-upload-worker.mjs', import.meta.url));
+    const barrier = join(coordination, 'go');
+    const children = [0, 1].map((index) => {
+      const ready = join(coordination, `ready-${index}`);
+      const result = join(coordination, `result-${index}.json`);
+      let stderr = '';
+      const child = spawn(
+        process.execPath,
+        ['--import', 'tsx', worker, dir, ready, barrier, result, `racer-${index}.txt`, String(index)],
+        { cwd: process.cwd(), stdio: ['ignore', 'ignore', 'pipe'] },
+      );
+      child.stderr.setEncoding('utf-8');
+      child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+      const done = new Promise<void>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('exit', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`upload worker ${index} exited ${String(code)}: ${stderr}`));
+        });
+      });
+      return { ready, result, done };
+    });
+
+    const started = Date.now();
+    while (!children.every(({ ready }) => existsSync(ready))) {
+      if (Date.now() - started > 10_000) throw new Error('upload workers did not reach barrier');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    writeFileSync(barrier, 'go');
+    await Promise.all(children.map(({ done }) => done));
+
+    const results = children.map(({ result }) => JSON.parse(readFileSync(result, 'utf-8')) as {
+      ok: boolean;
+      status?: number;
+    });
+    expect(results.filter(({ ok }) => ok)).toHaveLength(1);
+    expect(results.filter(({ status }) => status === 507)).toHaveLength(1);
+    const finalEntries = readdirSync(dir);
+    expect(finalEntries.filter((entry) => entry.startsWith('.gru-upload-reservation-'))).toEqual([]);
+    expect(finalEntries).toHaveLength(MAX_UPLOAD_FILES);
+  }, 60_000);
 
   it('never clobbers: same-name collisions materialize side-by-side', () => {
     const dir = tempDir('gru-command-uploads-collide-');

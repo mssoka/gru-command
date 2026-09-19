@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { WebSocket, type RawData } from 'ws';
 
 /** The mock's token — same env knob the mock itself reads (GRU_MOCK_TOKEN, default 'dev-token'). */
 const MOCK_TOKEN = process.env.GRU_MOCK_TOKEN ?? 'dev-token';
@@ -93,11 +94,81 @@ test('wrong token: inline error, stays on pairing across reload', async ({ page 
   await expect(page.locator('#chat-view')).toBeHidden();
 });
 
+test('mock controls reject missing/wrong tokens without state changes and valid controls act', async ({ page }) => {
+  const initialReset = await page.request.post('http://localhost:8788/__reset', {
+    headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+  });
+  expect(initialReset.ok()).toBe(true);
+  await pair(page);
+  await sendAndWaitReply(page, 'control-state-survives');
+
+  for (const route of ['__pulse', '__drop', '__reset']) {
+    const missing = await page.request.post(`http://localhost:8788/${route}`);
+    expect(missing.status(), `${route} missing token`).toBe(401);
+    const wrong = await page.request.post(`http://localhost:8788/${route}`, {
+      headers: { authorization: 'Bearer definitely-wrong' },
+    });
+    expect(wrong.status(), `${route} wrong token`).toBe(401);
+  }
+
+  // A denied drop did not touch the live socket, and a denied reset did not
+  // clear durable mock history.
+  await expect(page.locator('#banners .banner')).toBeHidden();
+  await sendAndWaitReply(page, 'still-connected-after-denials');
+  await page.reload();
+  await expect(page.locator('.msg--user', { hasText: 'control-state-survives' })).toHaveCount(1);
+  await expect(page.locator('.msg--user', { hasText: 'still-connected-after-denials' })).toHaveCount(1);
+
+  const board = new WebSocket('ws://localhost:8788/board/ws');
+  const nextBoardSnapshot = (): Promise<void> => new Promise((resolve, reject) => {
+    const onMessage = (data: RawData): void => {
+      const frame = JSON.parse(String(data)) as { type?: string };
+      if (frame.type !== 'board') return;
+      board.off('message', onMessage);
+      resolve();
+    };
+    board.on('message', onMessage);
+    board.once('error', reject);
+  });
+  const initialSnapshot = nextBoardSnapshot();
+  await new Promise<void>((resolve, reject) => {
+    board.once('open', () => {
+      board.send(JSON.stringify({ type: 'auth', token: MOCK_TOKEN }));
+      resolve();
+    });
+    board.once('error', reject);
+  });
+  await initialSnapshot;
+  const pushed = nextBoardSnapshot();
+  const pulse = await page.request.post('http://localhost:8788/__pulse', {
+    headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+  });
+  expect(pulse.ok()).toBe(true);
+  await pushed;
+  board.close();
+
+  const reset = await page.request.post('http://localhost:8788/__reset', {
+    headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+  });
+  expect(reset.ok()).toBe(true);
+  await page.reload();
+  await expect(page.locator('#chat-view')).toBeVisible();
+  await expect(page.locator('.msg--user', { hasText: 'control-state-survives' })).toHaveCount(0);
+
+  const drop = await page.request.post('http://localhost:8788/__drop', {
+    headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+  });
+  expect(drop.ok()).toBe(true);
+  await expect(page.locator('#banners .banner')).toBeVisible();
+  await expect(page.locator('#banners .banner')).toBeHidden({ timeout: 15_000 });
+});
+
 test('socket drop shows a degraded banner that clears on recovery', async ({ page }) => {
   await pair(page);
-  await page.request.post('http://localhost:8788/__drop', {
-    headers: { authorization: 'Bearer dev-token' },
+  const dropped = await page.request.post('http://localhost:8788/__drop', {
+    headers: { authorization: `Bearer ${MOCK_TOKEN}` },
   });
+  expect(dropped.ok()).toBe(true);
   await expect(page.locator('#banners .banner')).toBeVisible();
   // The client reconnects by itself; the banner clears when the socket opens.
   await expect(page.locator('#banners .banner')).toBeHidden({ timeout: 15_000 });
@@ -140,9 +211,10 @@ test.describe('themes', () => {
   // Hermetic snapshots: reset the mock log so prior tests' history
   // cannot leak into the frame.
   test.beforeEach(async ({ request }) => {
-    await request.post('http://localhost:8788/__reset', {
-      headers: { authorization: 'Bearer dev-token' },
+    const reset = await request.post('http://localhost:8788/__reset', {
+      headers: { authorization: `Bearer ${MOCK_TOKEN}` },
     });
+    expect(reset.ok()).toBe(true);
   });
 
   test('light default, dark toggle persists, both snapshotted', async ({ page }) => {

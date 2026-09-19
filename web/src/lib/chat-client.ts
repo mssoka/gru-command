@@ -89,6 +89,9 @@ export function chipsValid(chips: unknown): chips is readonly AttachmentChip[] {
   if (chips.length === 0 || chips.length > MAX_ATTACHMENTS_PER_MESSAGE) return false;
   for (const chip of chips) {
     if (
+      typeof chip !== 'object' ||
+      chip === null ||
+      Array.isArray(chip) ||
       typeof chip.path !== 'string' ||
       chip.path === '' ||
       chip.path.length > MAX_ATTACHMENT_PATH_CHARS ||
@@ -406,6 +409,7 @@ export class ChatClient {
           typeof entry === 'object' &&
           entry !== null &&
           typeof (entry as Record<string, unknown>).client_msg_id === 'string' &&
+          (entry as Record<string, unknown>).client_msg_id !== '' &&
           typeof (entry as Record<string, unknown>).text === 'string'
         ) {
           const record = entry as {

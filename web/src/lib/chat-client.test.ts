@@ -415,14 +415,17 @@ describe('attachments ride the outbox (SPEC ruling 19)', () => {
     ).toThrow(/invalid attachments/);
   });
 
-  it('restores outbox entries independently: non-array chips cannot drop siblings or create an immortal empty frame', async () => {
+  it('restores outbox records independently: null chips and empty IDs cannot poison healthy siblings', async () => {
     const storage = memStorage();
     const validChips = [{ path: '/data/uploads/ok.png', name: 'ok.png', kind: 'image' as const }];
     storage.setItem(
       'gru-outbox',
       JSON.stringify([
+        { client_msg_id: 'healthy-before', text: 'first healthy record' },
         { client_msg_id: 'corrupt-text', text: 'keep my text', attachments: { length: 1 } },
-        { client_msg_id: 'corrupt-empty', text: '', attachments: { length: 1 } },
+        { client_msg_id: 'null-chip-text', text: 'null chip degrades', attachments: [null] },
+        { client_msg_id: 'null-chip-empty', text: '', attachments: [null] },
+        { client_msg_id: '', text: 'never acknowledgeable' },
         { client_msg_id: 'valid-chip', text: '', attachments: validChips },
         { client_msg_id: 'overlong-with-chip', text: 'x'.repeat(4_001), attachments: validChips },
         { client_msg_id: 'healthy-after', text: 'still here' },
@@ -431,13 +434,24 @@ describe('attachments ride the outbox (SPEC ruling 19)', () => {
     const h = makeClient(server, storage);
     clients.push(h.client);
     h.client.connect();
-    await waitFor(() => h.statuses.some((m) => m.client_msg_id === 'healthy-after' && m.status === 'acked'));
-    await waitFor(() => h.statuses.some((m) => m.client_msg_id === 'valid-chip' && m.status === 'acked'));
-    await waitFor(() => h.statuses.some((m) => m.client_msg_id === 'overlong-with-chip' && m.status === 'acked'));
-    await waitFor(() => h.statuses.some((m) => m.client_msg_id === 'corrupt-text' && m.status === 'acked'));
+    for (const id of [
+      'healthy-before',
+      'corrupt-text',
+      'null-chip-text',
+      'valid-chip',
+      'overlong-with-chip',
+      'healthy-after',
+    ]) {
+      await waitFor(() => h.statuses.some((m) => m.client_msg_id === id && m.status === 'acked'));
+    }
 
-    expect(h.client.getMessages().some((m) => m.client_msg_id === 'corrupt-empty')).toBe(false);
-    expect(server.log.find((f) => f.type === 'user' && f.client_msg_id === 'corrupt-empty')).toBeUndefined();
+    expect(h.client.getMessages().some((m) => m.client_msg_id === 'null-chip-empty')).toBe(false);
+    expect(h.client.getMessages().some((m) => m.client_msg_id === '')).toBe(false);
+    expect(server.log.find((f) => f.type === 'user' && f.client_msg_id === 'null-chip-empty')).toBeUndefined();
+    expect(server.log.find((f) => f.type === 'user' && f.client_msg_id === '')).toBeUndefined();
+    expect(server.log.find((f) => f.type === 'user' && f.client_msg_id === 'null-chip-text')).toMatchObject({
+      text: 'null chip degrades',
+    });
     expect(server.log.find((f) => f.type === 'user' && f.client_msg_id === 'corrupt-text')).toMatchObject({
       text: 'keep my text',
     });
@@ -448,6 +462,44 @@ describe('attachments ride the outbox (SPEC ruling 19)', () => {
       text: '',
       attachments: validChips,
     });
+    expect(server.log.filter((f) => f.type === 'user').map((f) => f.client_msg_id)).toEqual([
+      'healthy-before',
+      'corrupt-text',
+      'null-chip-text',
+      'valid-chip',
+      'overlong-with-chip',
+      'healthy-after',
+    ]);
+  });
+
+  it('persists offline attachment messages and restores their exact chips after reload', async () => {
+    const storage = memStorage();
+    const first = makeClient(server, storage);
+    clients.push(first.client);
+    const textChips = [{ path: '/workspace/spec.md', name: 'spec.md', kind: 'file' as const }];
+    const imageChips = [{ path: '/data/uploads/shot.png', name: 'shot.png', kind: 'image' as const }];
+    const withText = first.client.send('review this', textChips);
+    const attachmentOnly = first.client.send('', imageChips);
+
+    const persisted = JSON.parse(storage.map.get('gru-outbox') ?? '[]') as Array<Record<string, unknown>>;
+    expect(persisted).toEqual([
+      { client_msg_id: withText.client_msg_id, text: 'review this', attachments: textChips },
+      { client_msg_id: attachmentOnly.client_msg_id, text: '', attachments: imageChips },
+    ]);
+
+    const second = makeClient(server, storage);
+    clients.push(second.client);
+    second.client.connect();
+    await waitFor(() => second.statuses.some((m) => m.client_msg_id === withText.client_msg_id && m.status === 'acked'));
+    await waitFor(() => second.statuses.some((m) => m.client_msg_id === attachmentOnly.client_msg_id && m.status === 'acked'));
+
+    expect(server.log.filter((f) => f.type === 'user' && f.client_msg_id === withText.client_msg_id)).toEqual([
+      expect.objectContaining({ text: 'review this', attachments: textChips }),
+    ]);
+    expect(server.log.filter((f) => f.type === 'user' && f.client_msg_id === attachmentOnly.client_msg_id)).toEqual([
+      expect.objectContaining({ text: '', attachments: imageChips }),
+    ]);
+    expect(storage.map.has('gru-outbox')).toBe(false);
   });
 
   it('attachment-only sends are legal; empty sends still throw', async () => {

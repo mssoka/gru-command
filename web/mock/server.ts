@@ -221,9 +221,20 @@ const SAMPLE_TRANSCRIPT = [
  * materialize into a throwaway dir so chips carry a REAL path shape. */
 const MOCK_UPLOADS_DIR = mkdtempSync(join(tmpdir(), 'gru-mock-uploads-'));
 const MOCK_BROWSE_ROOT = '/workspace';
-const MOCK_MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+
+/** Keep dev defaults fixed and bounded. NODE_ENV=test may only LOWER the
+ * limits so endpoint tests exercise every boundary without multi-megabyte
+ * fixtures or a thousand writes. */
+function mockTestLimit(name: string, productionLimit: number): number {
+  if (process.env.NODE_ENV !== 'test') return productionLimit;
+  const parsed = Number(process.env[name]);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) return productionLimit;
+  return Math.min(parsed, productionLimit);
+}
+
+const MOCK_MAX_UPLOAD_BYTES = mockTestLimit('GRU_MOCK_TEST_MAX_UPLOAD_BYTES', 8 * 1024 * 1024);
 const MOCK_MAX_UPLOAD_BODY_BYTES = Math.ceil((MOCK_MAX_UPLOAD_BYTES * 4) / 3) + 4096;
-const MOCK_MAX_UPLOAD_FILES = 1_000;
+const MOCK_MAX_UPLOAD_FILES = mockTestLimit('GRU_MOCK_TEST_MAX_UPLOAD_FILES', 1_000);
 let mockUploadCount = 0;
 
 function mockUploadName(value: string): string {
@@ -373,7 +384,12 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
         }
         if (bytes.byteLength > MOCK_MAX_UPLOAD_BYTES) {
           res.writeHead(413, { 'content-type': 'application/json' });
-          res.end('{"error":"attach_failed","detail":"upload exceeds 8 MiB"}\n');
+          res.end(
+            JSON.stringify({
+              error: 'attach_failed',
+              detail: `upload exceeds ${MOCK_MAX_UPLOAD_BYTES} byte mock limit`,
+            }) + '\n',
+          );
           return;
         }
         if (mockUploadCount >= MOCK_MAX_UPLOAD_FILES) {
