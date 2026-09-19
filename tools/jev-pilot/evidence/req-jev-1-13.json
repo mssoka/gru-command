@@ -1,0 +1,9 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": "Orchestrator health probe: minion pane replied to a 1-word liveness probe with: OK — I am here and working! (probe exit code 0, model id glm-5.3, last 3 dispatch outcomes: ok / ok / ok)",
+  "questions": {
+    "provider_alive": { "type": "noul", "instructions": "The provider responded and can serve requests" },
+    "read_class": { "type": "choice", "options": ["clean_ok", "chatty_ok", "quota_403_monthly", "quota_403_5h", "balance_402", "burst_1302", "wall_1308", "network_error"] },
+    "severity": { "type": "score", "levels": ["low", "high"] }
+  }
+}
