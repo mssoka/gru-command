@@ -28,8 +28,10 @@ failed backup aborts before any write. Hand edits are first-class: the
 wizard never rewrites a file you did not point it at.
 
 The instance dir also carries state that is NOT config and has no keys
-here: `sessions/`, `chat/`, `logs/`, `ledger/`, and `uploads/` (the
-attach-flow home, created at boot — SPEC ruling 19).
+here: `sessions/`, `chat/`, `logs/`, `ledger/`, `worktrees/` and
+`worktree-preserves/` (job lanes and swept-out deliverables —
+[WORKTREES.md](./WORKTREES.md)), and `uploads/` (the attach-flow home,
+created at boot — SPEC ruling 19).
 
 ## Load & validation behavior
 

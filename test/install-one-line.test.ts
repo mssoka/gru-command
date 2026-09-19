@@ -26,6 +26,8 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
+let lastStderr = '';
+
 function run(
   script: string,
   args: string[],
@@ -37,9 +39,11 @@ function run(
       env: { ...process.env, ...env },
       timeout: 120_000,
     });
+    lastStderr = '';
     return { stdout, stderr: '', status: 0 };
   } catch (error) {
     const err = error as { stdout?: string; stderr?: string; status?: number };
+    lastStderr = err.stderr ?? '';
     return { stdout: err.stdout ?? '', stderr: err.stderr ?? '', status: err.status ?? 1 };
   }
 }
@@ -170,6 +174,63 @@ describe('install.sh setup mode (one-line path)', () => {
     // No re-clone happened: the target dir was never created.
     expect(existsSync(elsewhere)).toBe(false);
     expect(existsSync(join(home, '.gru-command', 'config.toml'))).toBe(true);
+  });
+
+  it('--answers=<json> equals-form parses identically (wizard marker written)', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const { stdout, status } = run(join(fixture, 'install.sh'), ['--answers={}'], {
+      HOME: home,
+      GRU_COMMAND_HOME: join(home, '.gru-command'),
+    });
+    expect(status, stdout).toBe(0);
+    expect(stdout).toContain('WIZARD-RAN');
+    expect(existsSync(join(home, '.gru-command', 'config.toml'))).toBe(true);
+  });
+
+  it('--answers combined with --print exits 2 with a named mode-conflict error', () => {
+    for (const args of [['--answers', '{}', '--print'], ['--print', '--answers', '{}']]) {
+      const { status, stderr } = run(join(repoRoot, 'install.sh'), args, {});
+      expect(status, String(args)).toBe(2);
+      expect(stderr).toContain('--answers is only valid with setup mode');
+      expect(stderr).toContain('--print');
+    }
+  });
+
+  it('clone failure (bad GRU_COMMAND_ORIGIN) exits non-zero with a named error', () => {
+    const home = tempDir('gru-command-clonefail-home-');
+    const bare = tempDir('gru-command-clonefail-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const { stdout, status } = run(
+      join(bare, 'install.sh'),
+      ['--answers', '{}'],
+      {
+        HOME: home,
+        GRU_COMMAND_HOME: join(home, '.gru-command'),
+        GRU_COMMAND_ORIGIN: `file://${join(home, 'no-such-origin-repo')}`,
+        GRU_COMMAND_TARGET: join(home, 'gru-command'),
+      },
+    );
+    expect(status, stdout).not.toBe(0);
+    expect(stdout).toMatch(/cloning/);
+    // git names the failure (fatal: repository … does not exist) — loud,
+    // never a silent no-op.
+    expect(lastStderr).toMatch(/fatal|repository|clone/i);
+    expect(existsSync(join(home, 'gru-command'))).toBe(false);
+  });
+
+  it('re-exec guard: GRU_COMMAND_REEXEC=1 outside a checkout exits 1, named', () => {
+    const home = tempDir('gru-command-reexec-home-');
+    const bare = tempDir('gru-command-reexec-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const { stderr, status } = run(join(bare, 'install.sh'), ['--answers', '{}'], {
+      HOME: home,
+      GRU_COMMAND_HOME: join(home, '.gru-command'),
+      GRU_COMMAND_REEXEC: '1',
+    });
+    expect(status).toBe(1);
+    expect(stderr).toContain('re-exec landed outside a product checkout');
+    expect(existsSync(join(home, '.gru-command', 'config.toml'))).toBe(false);
   });
 });
 

@@ -52,11 +52,6 @@ async function main(): Promise<number> {
     maxBytes: config.logging.maxBytes,
     keep: config.logging.keep,
   });
-  // E9 / SPEC ruling 19: uploads-dir scaffolding next to the other
-  // instance dirs (logs/, chat/) — DIRECTORY CREATION ONLY; the attach
-  // flow itself lands in its own lane. Instance state stays under the
-  // data dir, never inside the workspace root (ruling 7).
-  mkdirSync(join(config.dataDir, 'uploads'), { recursive: true });
   const identity = loadOrCreateIdentity(config.dataDir);
   logger.info('boot', {
     service: SERVICE_NAME,
@@ -69,6 +64,22 @@ async function main(): Promise<number> {
     default_runtime: config.runtimes.default,
     install_id: identity.installId,
   });
+  // E9 / SPEC ruling 19: uploads-dir scaffolding next to the other
+  // instance dirs (logs/, chat/) — DIRECTORY CREATION ONLY; the attach
+  // flow itself lands in its own lane. Instance state stays under the
+  // data dir, never inside the workspace root (ruling 7). Failure is
+  // loud and named (EACCES/ENOSPC never surface as a raw stack).
+  const uploadsDir = join(config.dataDir, 'uploads');
+  try {
+    mkdirSync(uploadsDir, { recursive: true });
+    logger.info('uploads_dir', { path: uploadsDir });
+  } catch (error) {
+    logger.error('uploads dir creation failed — refusing to start (SPEC ruling 19)', {
+      path: uploadsDir,
+      error: String(error),
+    });
+    return 1;
+  }
 
   // Crash forensics: structured fatal lines for anything that escapes, so
   // the JSON-lines log stays the record even under OS-service restarts.

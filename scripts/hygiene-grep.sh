@@ -10,11 +10,13 @@
 #                                              install one-liner / clone
 #                                              command (the sole sanctioned
 #                                              owner reference)
-#   allowlisted  "herdr is not integrated"     SPEC.md's explicit
+#   allowlisted  "herdr is not"                SPEC.md's explicit
 #                                              non-integration statement
 #                                              (frozen constitution text)
 #   allowlisted  /home/tester                  generic fixture home used by
 #                                              the test suite
+#   allowlisted  /root/repo/                   generic fixture paths in the
+#                                              worktree-manager tests
 #
 # Usage: bash scripts/hygiene-grep.sh   (exit 0 clean, 1 with findings)
 
@@ -32,27 +34,38 @@ if [[ -z "$FILES" ]]; then
   exit 0
 fi
 
-# Patterns: personal home paths, the builder's name, the multiplexer
+# Patterns: personal home paths (any /Users/, any /home/, /root/ —
+# capitalized usernames included), the builder's name, the multiplexer
 # project name, this lane's worktree suffix, and the GitHub owner (the
 # owner has its own URL allowlist above). Epic-numbered test tmpdir
 # prefixes (e.g. gru-command-e4-) are product numbering, not personal.
-PATTERNS='/Users/|/home/[a-z]|moses|herdr|gru-command-e9|mssoka'
+PATTERNS='/Users/|/home/|/root/|moses|herdr|gru-command-e9|mssoka'
 GATE_SELF="scripts/hygiene-grep.sh"
 
 hits=0
 while IFS= read -r file; do
   [[ -f "$file" ]] || continue
   [[ "$file" == "$GATE_SELF" ]] && continue   # the gate's own pattern list
+  # grep exit 0 = match, 1 = no match, 2 = real error (unreadable etc.) —
+  # exit 2 must fail loud, never be swallowed like a clean no-match.
+  rc=0
+  grep_out="$(grep -IEn "$PATTERNS" -- "$file" 2>/dev/null)" || rc=$?
+  if [[ "$rc" -eq 2 ]]; then
+    echo "hygiene-grep: grep failed (exit 2) while scanning: $file" >&2
+    exit 1
+  fi
   while IFS= read -r match; do
+    [[ -z "$match" ]] && continue                   # heredoc tail newline
     # Line format: <file>:<line>:<text> (grep -n over one file at a time)
     case "$match" in
       *"/home/tester"*) continue ;;                       # generic fixture home
+      *"/root/repo/"*) continue ;;                       # generic fixture path
       *"mssoka/gru-command"*) continue ;;                 # install/clone URL
-      *"— herdr is not"*) continue ;;                     # frozen SPEC statement
+      *"herdr is not"*) continue ;;                       # frozen SPEC statement
     esac
     echo "hygiene violation: ${file}:${match#"${file}:"}"
     hits=$((hits + 1))
-  done < <(grep -IEn "$PATTERNS" -- "$file" 2>/dev/null || true)
+  done <<< "${grep_out}"
 done <<< "$FILES"
 
 if [[ "$hits" -gt 0 ]]; then

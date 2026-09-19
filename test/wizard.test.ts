@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -62,6 +62,9 @@ describe('wizard answers', () => {
       ['{"roles":{"gru":"vim"}}', /unknown runtime `vim` in answers.roles.gru/],
       ['{"port":"seven"}', /answers.port must be an integer between 0 and 65535/],
       ['{"port":70000}', /answers.port must be an integer between 0 and 65535/],
+      ['{"host":"not a host!"}', /answers.host must be an IPv4\/IPv6 literal or a hostname, got: not a host!/],
+      ['{"host":"999.1.1.1"}', /answers.host is not a valid IPv4/],
+      ['{"host":":::"}', /answers.host is not a valid IPv6/],
       ['{"token":""}', /answers.token must not be empty/],
       ['{"frobnicate":1}', /unknown answers key `frobnicate`/],
       ['not json', /--answers is not valid JSON/],
@@ -145,7 +148,7 @@ describe('wizard config generation', () => {
     expect(backupTimestamp()).not.toContain(':');
   });
 
-  it('generated TOML carries only documented top-level keys', () => {
+  it('generated TOML carries only documented top-level keys (the loader reads THE generated file)', () => {
     const instanceDir = tempDir('gru-command-wizard-cfg3-');
     const answers = parseAnswers('{"token":"keys-probe"}');
     const text = generateConfigToml(answers, instanceDir);
@@ -155,9 +158,13 @@ describe('wizard config generation', () => {
     expect(text).toContain('[runtimes]');
     expect(text).toContain('[models]');
     expect(text).toContain('[thinking]');
-    // No invented keys: run the loader's unknown-key rejection over it
-    // (loadConfig throws on unknown keys — this passing IS the check).
-    expect(() => loadConfig({ GRU_COMMAND_HOME: instanceDir }, home)).not.toThrow();
+    // The vacuous version loaded an EMPTY instance dir (pure defaults);
+    // the real check writes the generated text and loads THAT file —
+    // loadConfig throws on unknown keys, so passing IS the assertion.
+    const { configPath } = writeInstanceConfig(instanceDir, answers, home);
+    const config = loadConfig({ GRU_COMMAND_HOME: instanceDir }, home);
+    expect(config.sourceFile).toBe(configPath);
+    expect(config.auth.token).toBe('keys-probe');
   });
 });
 
@@ -170,14 +177,20 @@ describe('wizard pairing QR + repo discovery + runtime probe', () => {
     expect(generateToken()).not.toBe(generateToken());
   });
 
-  it('repo discovery: depth-1 .git scan, sorted, dot-dirs skipped', () => {
+  it('repo discovery: depth-1 .git scan, sorted, dot-dirs skipped, symlinked repos included', () => {
     const workspace = tempDir('gru-command-wizard-scan-');
     mkdirSync(join(workspace, 'repo-a', '.git'), { recursive: true });
     mkdirSync(join(workspace, 'repo-b'), { recursive: true });
     writeFileSync(join(workspace, 'repo-b', '.git'), 'gitdir: x\n', 'utf-8');
     mkdirSync(join(workspace, 'plain'), { recursive: true });
     mkdirSync(join(workspace, '.hidden', '.git'), { recursive: true });
-    expect(discoverManagedRepos(workspace)).toEqual(['repo-a', 'repo-b']);
+    // A symlinked repo directory counts (statSync follows the link); a
+    // broken symlink is skipped, not fatal.
+    const realRepo = tempDir('gru-command-wizard-scan-real-');
+    mkdirSync(join(realRepo, '.git'), { recursive: true });
+    symlinkSync(realRepo, join(workspace, 'repo-link'));
+    symlinkSync(join(workspace, 'nowhere'), join(workspace, 'broken-link'));
+    expect(discoverManagedRepos(workspace)).toEqual(['repo-a', 'repo-b', 'repo-link']);
     expect(discoverManagedRepos(join(workspace, 'does-not-exist'))).toEqual([]);
   });
 
@@ -265,6 +278,6 @@ describe('wizard first-boot smoke — failure modes (I/O matrix)', () => {
         port: 0,
         timeoutMs: 5_000,
       }),
-    ).rejects.toThrow(/exited \(code 3\) before listening/);
+    ).rejects.toThrow(/exited before listening \(exit code 3, signal none\)/);
   });
 });

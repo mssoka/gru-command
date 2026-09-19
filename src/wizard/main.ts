@@ -7,11 +7,12 @@
  * `'{}'` completes headlessly). Pipeline: runtime probe (warn-and-proceed
  * when no runtime CLI is found) → workspace root → managed-repo pick →
  * runtime/model/thinking picks ("default" sentinel, ruling 16) → bind
- * host → token → config write (timestamped backup first) → terminal
- * pairing QR (byte-identical payload shape to the web pairing screen) →
- * optional OS-service registration (install.sh --service — one
- * mechanism) → first-boot smoke (spawn dist/main.js, poll /health for
- * the 3 liveness signals + identity fingerprint, clean shutdown).
+ * host → token → config write (timestamped backup first) → first-boot
+ * smoke (spawn dist/main.js, poll /health for the 3 liveness signals +
+ * identity fingerprint, clean shutdown) → terminal pairing QR
+ * (byte-identical payload shape to the web pairing screen; the smoke's
+ * discovered port when ephemeral) → optional OS-service registration
+ * (install.sh --service — one mechanism, only after a green smoke).
  */
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -21,7 +22,7 @@ import { stdin, stdout } from 'node:process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as QRCode from 'qrcode';
-import { instanceDirFromEnv } from '../config.js';
+import { instanceDirFromEnv, RUNTIME_IDS } from '../config.js';
 import { probeRuntimes, type RuntimeProbeResult } from '../runtime/probe.js';
 import {
   AnswersError,
@@ -76,6 +77,15 @@ async function ask(rl: ReturnType<typeof createInterface>, question: string): Pr
 }
 
 async function interactiveAnswers(probe: readonly RuntimeProbeResult[]): Promise<WizardAnswers> {
+  // The piped one-liner re-execs this wizard on an EXHAUSTED pipe: readline
+  // would wait on an EOF'd stdin forever. Interactive mode needs a TTY;
+  // anything else must say so loud and point at --answers.
+  if (stdin.isTTY !== true) {
+    fail(
+      "no terminal for interactive setup (stdin is not a TTY) — pass --answers '<json>' for non-interactive setup",
+      2,
+    );
+  }
   const rl = createInterface({ input: stdin, output: stdout });
 
   stdout.write('\nGru Command setup — press Enter to accept every [default].\n');
@@ -139,10 +149,13 @@ async function interactiveAnswers(probe: readonly RuntimeProbeResult[]): Promise
   const runtimeDefault = defaultRuntimeId(probe);
   let runtime = runtimeDefault;
   for (;;) {
-    const answer = await ask(rl, `\nDefault runtime — pi | claude-code [${runtimeDefault}]: `);
+    const answer = await ask(
+      rl,
+      `\nDefault runtime — ${RUNTIME_IDS.join(' | ')} [${runtimeDefault}]: `,
+    );
     runtime = answer === '' ? runtimeDefault : answer;
-    if (runtime === 'pi' || runtime === 'claude-code') break;
-    stdout.write('  ✗ valid runtimes: pi, claude-code\n');
+    if ((RUNTIME_IDS as readonly string[]).includes(runtime)) break;
+    stdout.write(`  ✗ valid runtimes: ${RUNTIME_IDS.join(', ')}\n`);
   }
 
   const model =
@@ -211,7 +224,13 @@ interface SmokeOutcome {
   readonly installId: string;
 }
 
-function parseListeningPort(stderrText: string): number | null {
+/** Last ~2 KB of captured stderr — the tail carries the actual crash. */
+function stderrTail(stderrText: string): string {
+  return stderrText.slice(-2_000);
+}
+
+/** Extract the listening port from the service's JSON log stream. */
+export function parseListeningPort(stderrText: string): number | null {
   for (const line of stderrText.split('\n')) {
     if (line.trim() === '') continue;
     try {
@@ -226,17 +245,34 @@ function parseListeningPort(stderrText: string): number | null {
   return null;
 }
 
-async function fetchHealth(host: string, port: number, timeoutMs: number): Promise<unknown | null> {
+/** Bracket-wrap a bare IPv6 literal for a URL host ([::1]); IPv4 and
+ * hostnames pass through unchanged — an unbracketed IPv6 host makes
+ * fetch() throw on every iteration. */
+export function formatHostForUrl(host: string): string {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
+async function fetchHealth(
+  host: string,
+  port: number,
+  timeoutMs: number,
+  /** Returns a named death message when the child is gone, else null —
+   * a service that dies mid-poll must fail loud, not poll to timeout. */
+  describeDeath: () => string | null = () => null,
+): Promise<unknown | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      const res = await fetch(`http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}/health`, {
-        signal: AbortSignal.timeout(2_000),
-      });
+      const res = await fetch(
+        `http://${formatHostForUrl(host === '0.0.0.0' ? '127.0.0.1' : host)}:${port}/health`,
+        { signal: AbortSignal.timeout(2_000) },
+      );
       if (res.ok) return (await res.json()) as unknown;
     } catch {
       /* not up yet */
     }
+    const death = describeDeath();
+    if (death !== null) throw new Error(death);
     if (Date.now() > deadline) return null;
     await new Promise((wake) => setTimeout(wake, 250));
   }
@@ -273,6 +309,13 @@ export async function runFirstBootSmoke(options: {
   const kill = (): void => {
     if (child.exitCode === null) child.kill('SIGKILL');
   };
+  // A child is dead when it exited (code) OR was killed (signal) — either
+  // means the service is gone; polling further would only ever time out.
+  const isDead = (): boolean => child.exitCode !== null || child.signalCode !== null;
+  const describeDeath = (): string | null =>
+    isDead()
+      ? `first-boot smoke: the service exited during /health polling (exit code ${child.exitCode}, signal ${child.signalCode ?? 'none'}) — stderr:\n${stderrTail(stderr)}`
+      : null;
 
   try {
     // Resolve the port: fixed when configured, parsed from the listening
@@ -283,8 +326,10 @@ export async function runFirstBootSmoke(options: {
       while (port === 0) {
         port = parseListeningPort(stderr) ?? 0;
         if (port !== 0) break;
-        if (child.exitCode !== null) {
-          throw new Error(`first-boot smoke: the service exited (code ${child.exitCode}) before listening — stderr:\n${stderr}`);
+        if (isDead()) {
+          throw new Error(
+            `first-boot smoke: the service exited before listening (exit code ${child.exitCode}, signal ${child.signalCode ?? 'none'}) — stderr:\n${stderrTail(stderr)}`,
+          );
         }
         if (Date.now() > deadline) {
           throw new Error(`first-boot smoke: the 'listening' signal never came within ${timeoutMs}ms`);
@@ -293,10 +338,10 @@ export async function runFirstBootSmoke(options: {
       }
     }
 
-    const health = (await fetchHealth(options.host, port, timeoutMs)) as HealthShape | null;
+    const health = (await fetchHealth(options.host, port, timeoutMs, describeDeath)) as HealthShape | null;
     if (health === null) {
       throw new Error(
-        `first-boot smoke: the 'health_reachable' signal never came within ${timeoutMs}ms (http://${options.host}:${port}/health)`,
+        `first-boot smoke: the 'health_reachable' signal never came within ${timeoutMs}ms (http://${formatHostForUrl(options.host)}:${port}/health)`,
       );
     }
     const signals = health.liveness?.signals;
@@ -389,9 +434,34 @@ async function main(argv: readonly string[]): Promise<number> {
   stdout.write(`\nWrote ${configPath}\n`);
   if (backupPath !== null) stdout.write(`Previous config backed up: ${backupPath}\n`);
 
+  // First-boot smoke BEFORE anything registers a service: a failed smoke
+  // must not leave a broken unit behind, and a registered fixed-port
+  // service would make the smoke's spawn hit EADDRINUSE.
+  let smokePort: number | null = null;
+  if (answers.smoke) {
+    stdout.write('\nFirst-boot smoke: spawning the service and polling /health…\n');
+    try {
+      const outcome = await runFirstBootSmoke({
+        repoRoot,
+        instanceDir,
+        host: answers.host,
+        port: answers.port,
+      });
+      smokePort = outcome.port;
+      stdout.write(
+        `Smoke green: 3-signal liveness + fingerprint ${outcome.installId} on port ${outcome.port}, clean shutdown.\n`,
+      );
+    } catch (error) {
+      fail(String((error as Error).message));
+    }
+  }
+
   // Terminal pairing QR — same payload shape the web pairing screen
-  // encodes ({"gru-command":1,url,token}); scan it from the phone.
-  const url = `http://${answers.host}:${answers.port}`;
+  // encodes ({"gru-command":1,url,token}); scan it from the phone. With
+  // port 0 the URL is only useful AFTER the smoke discovered the real
+  // port (and it changes on every boot — say so).
+  const displayPort = answers.port === 0 ? (smokePort ?? 0) : answers.port;
+  const url = `http://${formatHostForUrl(answers.host)}:${displayPort}`;
   stdout.write(`\nPairing QR (payload ${buildQrPayload(url, answers.token)}):\n`);
   try {
     stdout.write(
@@ -404,6 +474,15 @@ async function main(argv: readonly string[]): Promise<number> {
     stdout.write('(terminal QR unavailable — pair by opening the web UI and typing the token)\n');
   }
   stdout.write(`Pair at ${url} (token: ${answers.token})\n`);
+  if (answers.port === 0) {
+    stdout.write(
+      `Note: port 0 = ephemeral — the port changes each boot ${
+        smokePort !== null
+          ? '(this one is from the smoke run)'
+          : '(the smoke did not run — no port discovered)'
+      }; set a fixed [server] port in config.toml for a stable pairing URL.\n`,
+    );
+  }
   if (answers.host === '127.0.0.1') {
     stdout.write('Loopback-bound: to pair a phone, re-run and bind your LAN address.\n');
   }
@@ -415,23 +494,6 @@ async function main(argv: readonly string[]): Promise<number> {
     });
     if (result.status !== 0) {
       fail(`service registration failed (exit ${result.status ?? 'signal'})`);
-    }
-  }
-
-  if (answers.smoke) {
-    stdout.write('\nFirst-boot smoke: spawning the service and polling /health…\n');
-    try {
-      const outcome = await runFirstBootSmoke({
-        repoRoot,
-        instanceDir,
-        host: answers.host,
-        port: answers.port,
-      });
-      stdout.write(
-        `Smoke green: 3-signal liveness + fingerprint ${outcome.installId} on port ${outcome.port}, clean shutdown.\n`,
-      );
-    } catch (error) {
-      fail(String((error as Error).message));
     }
   }
 

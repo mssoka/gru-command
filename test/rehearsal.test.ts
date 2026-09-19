@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { parseListeningPort } from '../src/wizard/main.js';
 
 /**
  * Install rehearsal (E9 acceptance): the always-on hygiene gate (zero
@@ -131,16 +132,7 @@ describe.skipIf(process.env['GRU_COMMAND_REHEARSAL'] !== '1')(
           let port: number | null = null;
           const deadline = Date.now() + 30_000;
           while (port === null) {
-            for (const line of stderr.split('\n')) {
-              try {
-                const record = JSON.parse(line) as { msg?: string; port?: unknown };
-                if (record.msg === 'listening' && typeof record.port === 'number') {
-                  port = record.port;
-                }
-              } catch {
-                /* skip non-JSON lines */
-              }
-            }
+            port = parseListeningPort(stderr);
             if (port !== null) break;
             if (Date.now() > deadline) throw new Error('service never listened');
             await new Promise((wake) => setTimeout(wake, 200));

@@ -6,7 +6,7 @@
 # (no clone present → clone → deps → build → setup wizard → first-boot smoke)
 #
 # Usage:
-#   ./install.sh                     full setup: deps + build if needed →
+#   ./install.sh                     full setup: deps + build →
 #                                    setup wizard (clone-when-absent when
 #                                    piped from the one-liner)
 #   ./install.sh --answers '<json>'  same setup, non-interactive wizard
@@ -37,8 +37,10 @@ MODE="setup"
 ANSWERS=""
 
 err() { echo "install.sh: $*" >&2; }
+# The range MUST cover the whole header block through the seam lines
+# (GRU_COMMAND_ORIGIN / GRU_COMMAND_TARGET) — --help shows all of it.
 usage() {
-  sed -n '2,25p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,26p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//' >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -48,13 +50,20 @@ while [[ $# -gt 0 ]]; do
     --service) MODE="service" ; shift ;;
     --answers)
       [[ $# -ge 2 ]] || { err "--answers requires a JSON argument"; exit 2; }
-      ANSWERS="$2"; MODE="setup"; shift 2 ;;
+      ANSWERS="$2"; shift 2 ;;
     --answers=*)
-      ANSWERS="${1#--answers=}"; MODE="setup"; shift ;;
+      ANSWERS="${1#--answers=}"; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) err "unknown flag: $1 (valid: --answers <json>, --service, --print, --uninstall)"; exit 2 ;;
+    *) err "unknown flag: $1 (valid: --answers <json>, --service, --print, --uninstall, -h|--help)"; exit 2 ;;
   esac
 done
+
+# Contradicting combos fail loud instead of resolving silently: --answers
+# is a SETUP-mode argument; pairing it with another mode drops one of them.
+if [[ -n "$ANSWERS" && "$MODE" != "setup" ]]; then
+  err "--answers is only valid with setup mode, but mode is --$MODE — pass --answers alone (setup is the default)"
+  exit 2
+fi
 
 # Resolve node to its REAL path: version managers (fnm/nvm/asdf) put
 # ephemeral per-shell symlinks on PATH — a service unit pointing at one
@@ -229,6 +238,7 @@ run_setup() {
     if [[ -e "$CLONE_TARGET" ]]; then
       if [[ -d "$CLONE_TARGET" && -f "$CLONE_TARGET/package.json" && -d "$CLONE_TARGET/.git" ]]; then
         echo "reusing existing checkout: $CLONE_TARGET"
+        echo "notice: not updating the checkout — run git pull yourself"
       else
         err "clone target exists and is not a Gru Command checkout: $CLONE_TARGET"
         err "move it, or set GRU_COMMAND_TARGET to another path"
@@ -251,18 +261,21 @@ run_setup() {
     exit 1
   fi
   cd "$REPO_ROOT"
-  if [[ ! -d node_modules ]]; then
-    echo "installing dependencies…"
-    npm install --no-audit --no-fund
-  fi
+  # ALWAYS install deps: a pulled checkout with new dependencies must not
+  # crash at wizard exec — npm install is a no-op when already satisfied.
+  echo "installing dependencies…"
+  npm install --no-audit --no-fund
   if [[ ! -f dist/main.js || ! -f dist/wizard/main.js ]]; then
     echo "building…"
     npm run build
   fi
-  if [[ ! -f dist/main.js ]]; then
-    err "build did not produce dist/main.js"
-    exit 1
-  fi
+  # A partial build must die HERE, named — not as MODULE_NOT_FOUND at exec.
+  for artifact in dist/main.js dist/wizard/main.js; do
+    if [[ ! -f "$artifact" ]]; then
+      err "build did not produce $artifact"
+      exit 1
+    fi
+  done
   if [[ -n "$ANSWERS" ]]; then
     exec "$NODE_BIN" dist/wizard/main.js --answers "$ANSWERS"
   fi
@@ -283,6 +296,10 @@ case "$MODE" in
     esac
     ;;
   service)
+    if ! node_ok; then
+      err "node >= 22.19 required, found $("$NODE_BIN" --version) — upgrade Node.js first"
+      exit 1
+    fi
     # E7 contract: dist/ must exist — the service runs node dist/main.js.
     if [[ ! -f "$REPO_ROOT/dist/main.js" ]]; then
       err "dist/main.js not found — run 'npm install && npm run build' in $REPO_ROOT first"

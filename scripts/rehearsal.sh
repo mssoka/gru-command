@@ -15,6 +15,15 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The clone rehearses HEAD, not the working tree — a dirty tree would
+# silently rehearse stale code. Commit first.
+if ! (git -C "$REPO_ROOT" diff --quiet && git -C "$REPO_ROOT" diff --cached --quiet); then
+  echo "rehearsal.sh: working tree is dirty — the fresh clone would rehearse HEAD, not your edits." >&2
+  echo "commit first (git add -A && git commit), then re-run." >&2
+  exit 1
+fi
+
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/gru-command-rehearsal-XXXXXX")"
 HOME_FIXTURE="$STAGE/home"
 WORKSPACE="$STAGE/workspace"

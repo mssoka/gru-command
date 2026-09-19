@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'smol-toml';
 import { homedir } from 'node:os';
@@ -15,7 +15,9 @@ import type { WizardAnswers } from './answers.js';
 /**
  * Scan the workspace root (ruling 6) for managed repos: depth-1 entries
  * carrying a `.git` (directory OR worktree-pointer file). Dot-directories
- * are skipped; the result is sorted for stable display.
+ * are skipped; symlinked repo directories count (statSync follows the
+ * link — a symlink to a repo is a managed repo); the result is sorted
+ * for stable display.
  */
 export function discoverManagedRepos(workspaceRoot: string): string[] {
   let entries;
@@ -25,7 +27,16 @@ export function discoverManagedRepos(workspaceRoot: string): string[] {
     return []; // missing/unreadable workspace root: no repos yet, not an error
   }
   return entries
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+    .filter((entry) => {
+      if (entry.name.startsWith('.')) return false;
+      if (entry.isDirectory()) return true;
+      if (!entry.isSymbolicLink()) return false;
+      try {
+        return statSync(join(workspaceRoot, entry.name)).isDirectory();
+      } catch {
+        return false; // broken symlink — skip
+      }
+    })
     .filter((entry) => existsSync(join(workspaceRoot, entry.name, '.git')))
     .map((entry) => entry.name)
     .sort();
@@ -122,8 +133,10 @@ export interface ConfigWriteResult {
  * Write the instance config with the backup-first contract: an existing
  * `config.toml` is copied to `config.toml.backup-<timestamp>` BEFORE the
  * rewrite, and a backup failure aborts with the original untouched —
- * never a silent clobber. The generated TOML is parse-self-checked
- * before anything touches disk.
+ * never a silent clobber. The new content lands via write-tmp + ATOMIC
+ * rename, so a mid-write failure (ENOSPC) can never truncate a valid
+ * config: either the old file stands or the new one is complete. The
+ * generated TOML is parse-self-checked before anything touches disk.
  */
 export function writeInstanceConfig(
   instanceDir: string,
@@ -151,6 +164,16 @@ export function writeInstanceConfig(
     backupPath = `${configPath}.backup-${backupTimestamp()}`;
     copyFileSync(configPath, backupPath); // throws → abort BEFORE the write
   }
-  writeFileSync(configPath, text, 'utf-8');
+  const tmpPath = `${configPath}.tmp`;
+  try {
+    writeFileSync(tmpPath, text, 'utf-8');
+    renameSync(tmpPath, configPath); // atomic: never a half-written config
+  } catch (error) {
+    rmSync(tmpPath, { force: true });
+    throw new Error(
+      `failed to write ${configPath} atomically: ${(error as Error).message}` +
+        (backupPath !== null ? ` — the previous config is intact and backed up at ${backupPath}` : ''),
+    );
+  }
   return { configPath, backupPath };
 }

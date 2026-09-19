@@ -93,6 +93,46 @@ export function validateWorkspaceRoot(value: string): string {
   return value;
 }
 
+const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+const HOSTNAME_RE =
+  /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+/** Structural IPv6 check: hex groups of 1–4 digits, at most one '::',
+ * group count ≤ 8 (≤ 7 when '::' is present). Zone ids are tolerated. */
+function isIpv6Literal(value: string): boolean {
+  const zoneless = value.split('%')[0] ?? '';
+  if (zoneless === '' || !/^[0-9A-Fa-f:]+$/.test(zoneless)) return false;
+  const sides = zoneless.split('::');
+  if (sides.length > 2) return false; // more than one '::'
+  const left = sides[0] ?? '';
+  const right = sides.length === 2 ? (sides[1] ?? '') : null;
+  const groups =
+    right !== null
+      ? [...(left === '' ? [] : left.split(':')), ...(right === '' ? [] : right.split(':'))]
+      : zoneless.split(':');
+  if (groups.some((group) => group === '' || group.length > 4)) return false;
+  return groups.length >= 1 && groups.length <= (sides.length === 2 ? 7 : 8);
+}
+
+/** Bind-host validation: an IPv4/IPv6 literal or a plausible hostname —
+ * anything else ("not a host!") would write a config that dies at boot. */
+export function validateHost(value: string): string {
+  const ipv4 = IPV4_RE.exec(value);
+  if (ipv4 !== null) {
+    const octetsOk = ipv4.slice(1).every((octet) => Number(octet) <= 255);
+    if (octetsOk) return value;
+    throw new AnswersError(`answers.host is not a valid IPv4 address: ${value}`);
+  }
+  if (value.includes(':')) {
+    if (isIpv6Literal(value)) return value;
+    throw new AnswersError(`answers.host is not a valid IPv6 address: ${value}`);
+  }
+  if (value.length <= 253 && HOSTNAME_RE.test(value)) return value;
+  throw new AnswersError(
+    `answers.host must be an IPv4/IPv6 literal or a hostname, got: ${value}`,
+  );
+}
+
 /**
  * Parse and validate the `--answers` JSON against the wizard contract.
  * Throws {@link AnswersError} with a field-naming message on any
@@ -187,7 +227,8 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     }
   }
 
-  const host = raw['host'] !== undefined ? requireString(raw['host'], 'host') : DEFAULT_HOST;
+  const host =
+    raw['host'] !== undefined ? validateHost(requireString(raw['host'], 'host')) : DEFAULT_HOST;
 
   let port = DEFAULT_PORT;
   if (raw['port'] !== undefined) {
