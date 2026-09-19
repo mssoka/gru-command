@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig, configPathFor } from '../src/config.js';
 import { probeRuntimes } from '../src/runtime/probe.js';
+import { runFirstBootSmoke } from '../src/wizard/main.js';
 import {
   AnswersError,
   generateToken,
@@ -214,5 +215,56 @@ describe('wizard CLI surface', () => {
     expect(() => validateWorkspaceRoot('code')).toThrow(AnswersError);
     expect(() => validateWorkspaceRoot('./code')).toThrow(AnswersError);
     expect(() => validateWorkspaceRoot('~')).not.toThrow(); // bare ~ = home
+  });
+});
+
+describe('wizard first-boot smoke — failure modes (I/O matrix)', () => {
+  it('a service that never answers /health fails loud NAMING the missing signal', async () => {
+    // A stub "service": prints the real 'listening' JSON line, accepts
+    // TCP connections, but never serves /health — the smoke must time
+    // out and name 'health_reachable' (the signal that never came).
+    const stage = tempDir('gru-command-smoke-deaf-');
+    mkdirSync(join(stage, 'dist'), { recursive: true });
+    writeFileSync(
+      join(stage, 'dist', 'main.js'),
+      [
+        "const { createServer } = require('node:net');",
+        "const srv = createServer((s) => { s.on('data', () => {}); });",
+        'srv.listen(0, () => {',
+        "  process.stderr.write(JSON.stringify({ msg: 'listening', port: srv.address().port }) + '\\n');",
+        '});',
+      ].join('\n'),
+      'utf-8',
+    );
+    const instanceDir = tempDir('gru-command-smoke-deaf-home-');
+    await expect(
+      runFirstBootSmoke({
+        repoRoot: stage,
+        instanceDir,
+        host: '127.0.0.1',
+        port: 0,
+        timeoutMs: 1_500,
+      }),
+    ).rejects.toThrow(/health_reachable.*never came|never came.*health_reachable/);
+  });
+
+  it('a service that exits before listening fails loud naming the exit', async () => {
+    const stage = tempDir('gru-command-smoke-die-');
+    mkdirSync(join(stage, 'dist'), { recursive: true });
+    writeFileSync(
+      join(stage, 'dist', 'main.js'),
+      "process.stderr.write('boom\\n'); process.exit(3);",
+      'utf-8',
+    );
+    const instanceDir = tempDir('gru-command-smoke-die-home-');
+    await expect(
+      runFirstBootSmoke({
+        repoRoot: stage,
+        instanceDir,
+        host: '127.0.0.1',
+        port: 0,
+        timeoutMs: 5_000,
+      }),
+    ).rejects.toThrow(/exited \(code 3\) before listening/);
   });
 });

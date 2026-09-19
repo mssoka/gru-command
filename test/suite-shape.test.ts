@@ -48,7 +48,7 @@ const PINS: Record<string, number> = {
   'suite-shape.test.ts': 1,
   'supervisor.test.ts': 13,
   'transcripts.test.ts': 13,
-  'wizard.test.ts': 11,
+  'wizard.test.ts': 13,
   'worktree-manager.test.ts': 35,
   'worktree-manifest.test.ts': 6,
   'worktree-port.test.ts': 4,

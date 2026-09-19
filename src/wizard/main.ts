@@ -439,9 +439,17 @@ async function main(argv: readonly string[]): Promise<number> {
   return 0;
 }
 
-main(process.argv.slice(2))
-  .then((code) => process.exit(code))
-  .catch((error: unknown) => {
-    process.stderr.write(`wizard: fatal: ${String(error)}\n`);
-    process.exit(1);
-  });
+// ESM main guard: run as a CLI (`node dist/wizard/main.js`), stay
+// importable under test (vitest's argv[1] is the runner, not this file).
+const invokedAsCli =
+  process.argv[1] !== undefined &&
+  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (invokedAsCli) {
+  main(process.argv.slice(2))
+    .then((code) => process.exit(code))
+    .catch((error: unknown) => {
+      process.stderr.write(`wizard: fatal: ${String(error)}\n`);
+      process.exit(1);
+    });
+}
