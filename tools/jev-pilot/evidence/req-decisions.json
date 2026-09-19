@@ -1,0 +1,33 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": "Orchestrator health probe: minion pane replied to a 1-word liveness probe with: OK — I am here and working! (probe exit code 0, model id glm-5.3, last 3 dispatch outcomes: ok / ok / ok)",
+  "questions": {
+    "provider_alive": {
+      "type": "noul",
+      "instructions": "The provider responded and can serve requests"
+    },
+    "read_class": {
+      "type": "choice",
+      "instructions": "Classify the probe reply text into exactly one class",
+      "options": ["clean_ok", "chatty_ok", "quota_403_monthly", "quota_403_5h", "balance_402", "burst_1302", "wall_1308", "network_error"],
+      "criteria": {
+        "clean_ok": "A bare OK or minimal acknowledgement, nothing more",
+        "chatty_ok": "A clearly-alive reply with extra words, emojis or enthusiasm",
+        "quota_403_monthly": "HTTP 403 wording indicating a monthly quota is exhausted",
+        "quota_403_5h": "HTTP 403 wording indicating a 5-hour window quota is exhausted",
+        "balance_402": "HTTP 402 payment-required / insufficient balance wording",
+        "burst_1302": "HTTP 1302 burst/short-window rate limit wording",
+        "wall_1308": "HTTP 1308 hard cap / quota wall wording",
+        "network_error": "Connection failure, timeout or DNS error instead of a reply"
+      }
+    },
+    "severity": {
+      "type": "score",
+      "instructions": "How severe is this probe outcome for orchestration routing",
+      "criteria": [
+        "low: routine probe, no action needed",
+        "high: provider dead or misrouted; action required now"
+      ]
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"error":{"message":"typesafe/jev-1.13 is a decisions model and cannot be used with the chat/completions endpoint. Use the /api/alpha/decisions endpoint instead.","code":400},"user_id":"user_3FV1XxNatS6eKwOLyx0knE7vUBJ"}
