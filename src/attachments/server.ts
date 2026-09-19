@@ -30,7 +30,7 @@ export interface AttachmentsServer {
 }
 
 /** Base64 body cap: MAX_UPLOAD_BYTES inflates 4/3 over JSON + headers. */
-const MAX_UPLOAD_BODY_BYTES = Math.ceil((8 * 1024 * 1024 * 4) / 3) + 4096;
+export const MAX_UPLOAD_BODY_BYTES = Math.ceil((8 * 1024 * 1024 * 4) / 3) + 4096;
 
 export function createAttachmentsServer(options: AttachmentsServerOptions): AttachmentsServer {
   const log = options.log ?? (() => {});
@@ -68,8 +68,10 @@ export function createAttachmentsServer(options: AttachmentsServerOptions): Atta
         seen += chunk.length;
         if (seen > MAX_UPLOAD_BODY_BYTES) {
           rejected = true;
+          chunks.length = 0;
           rejectBody(new AttachError(413, `request body exceeds ${MAX_UPLOAD_BODY_BYTES} bytes`));
-          req.destroy();
+          // Keep draining. Destroying races the response write, so real
+          // clients observe ECONNRESET instead of the promised HTTP 413.
           return;
         }
         chunks.push(chunk);

@@ -1348,11 +1348,13 @@ describe('chat server — attach flow (SPEC ruling 19)', () => {
       await client.open();
       client.auth(TOKEN);
       await client.waitFor(isType('auth_ok'), 'auth_ok');
+      const uploadedImage = join(h.uploadsDir, '1-shot.png');
+      writeFileSync(uploadedImage, 'real provenance fixture', 'utf-8');
       client.sendRaw({
         type: 'user',
         text: 'what is in this picture',
         client_msg_id: 'attach-decline-1',
-        attachments: [{ path: join(h.uploadsDir, '1-shot.png'), name: 'shot.png', kind: 'image' }],
+        attachments: [{ path: uploadedImage, name: 'shot.png', kind: 'image' }],
       });
       // The decline is VISIBLE: a logged notice frame (not an error frame).
       const notice = await client.waitFor(
@@ -1364,7 +1366,7 @@ describe('chat server — attach flow (SPEC ruling 19)', () => {
       // The path STILL delivered (never a silent drop)…
       await pollUntil(() => h.handle.calls.length === 1, 'prompt delivered despite gate');
       const prompt = h.handle.calls[0]!.text;
-      expect(prompt).toContain(join(h.uploadsDir, '1-shot.png'));
+      expect(prompt).toContain(uploadedImage);
       // …with the never-guess instruction for the blind model.
       expect(prompt).toContain('do NOT guess');
       // And NO error frame was logged for the gated attach.
@@ -1404,12 +1406,14 @@ describe('chat server — attach flow (SPEC ruling 19)', () => {
       await client.open();
       client.auth(TOKEN);
       await client.waitFor(isType('auth_ok'), 'auth_ok');
+      const dedupFile = join(h.workspaceRoot, 'one.txt');
+      writeFileSync(dedupFile, 'exists so the provenance leg is non-vacuous', 'utf-8');
       const frame = {
         type: 'user' as const,
         text: 'once only',
         client_msg_id: 'attach-dedupe-1',
         attachments: [
-          { path: join(h.workspaceRoot, 'one.txt'), name: 'one.txt', kind: 'file' as const },
+          { path: dedupFile, name: 'one.txt', kind: 'file' as const },
         ],
       };
       client.sendRaw(frame);
@@ -1421,6 +1425,7 @@ describe('chat server — attach flow (SPEC ruling 19)', () => {
         'second ack (dedup re-ack)',
       );
       expect(h.handle.calls.length).toBe(1);
+      expect(h.handle.calls[0]!.text).toContain(dedupFile);
       await client.close();
     } finally {
       await h.close();
@@ -1463,6 +1468,35 @@ describe('chat server — attach flow (SPEC ruling 19)', () => {
     }
   });
 
+  it('all rejected chips plus empty text are acked and noticed but NEVER delivered as an empty prompt', async () => {
+    const h = await makeHarness();
+    try {
+      const client = new TestClient(h.port);
+      await client.open();
+      client.auth(TOKEN);
+      await client.waitFor(isType('auth_ok'), 'auth_ok');
+      const outside = join(h.dir, 'outside-only.png');
+      writeFileSync(outside, 'x', 'utf-8');
+      client.sendRaw({
+        type: 'user',
+        text: '',
+        client_msg_id: 'attach-empty-after-filter',
+        attachments: [{ path: outside, name: 'outside-only.png', kind: 'image' }],
+      });
+      await client.waitFor(isType('ack'), 'ack');
+      await client.waitFor(
+        (f) => f.type === 'notice' && String((f as { text?: string }).text).includes('No deliverable content'),
+        'empty delivery skipped notice',
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(h.handle.calls).toHaveLength(0);
+      expect(h.frameLog.history.some((f) => f.type === 'error')).toBe(false);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
   it('malformed chips (bad kind / too many) are rejected as malformed frames, never delivered', async () => {
     const h = await makeHarness();
     try {
@@ -1478,6 +1512,7 @@ describe('chat server — attach flow (SPEC ruling 19)', () => {
       });
       const err = await client.waitFor(isType('error'), 'malformed error');
       expect((err as { message?: string }).message).toContain('malformed frame');
+      const errorsBeforeNineChipFrame = client.frames.filter(isType('error')).length;
       client.sendRaw({
         type: 'user',
         text: 'too many',
@@ -1488,9 +1523,11 @@ describe('chat server — attach flow (SPEC ruling 19)', () => {
           kind: 'file' as const,
         })),
       });
+      // Count must advance: a generic predicate would consume the earlier
+      // bad-kind error and leave this nine-chip leg vacuously green.
       await client.waitFor(
-        (f) => f.type === 'error' && String((f as { message?: string }).message).includes('malformed'),
-        'second malformed error',
+        () => client.frames.filter(isType('error')).length === errorsBeforeNineChipFrame + 1,
+        'distinct nine-chip malformed error',
       );
       expect(h.handle.calls.length).toBe(0);
       await client.close();

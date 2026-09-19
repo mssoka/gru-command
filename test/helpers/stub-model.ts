@@ -40,7 +40,7 @@ export interface StubCall {
   readonly images: readonly StubImage[];
 }
 
-function makeStubModel(): Model<Api> {
+function makeStubModel(input: readonly ('text' | 'image')[] = ['text']): Model<Api> {
   return {
     id: STUB_MODEL_ID,
     name: 'Stub Model',
@@ -48,7 +48,7 @@ function makeStubModel(): Model<Api> {
     provider: STUB_PROVIDER_ID,
     baseUrl: 'stub://local',
     reasoning: true,
-    input: ['text'],
+    input: [...input],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 100_000,
     maxTokens: 4_096,
@@ -150,14 +150,17 @@ export async function makeIsolatedModelRuntime(): Promise<ModelRuntime> {
   });
 }
 
-export async function makeStubModelRuntime(script: StubScript): Promise<ModelRuntime> {
+export async function makeStubModelRuntime(
+  script: StubScript,
+  options: { readonly input?: readonly ('text' | 'image')[] } = {},
+): Promise<ModelRuntime> {
   const { authPath, modelsPath } = isolatedPaths();
   const runtime = await ModelRuntime.create({
     refreshOnCreate: false,
     authPath,
     modelsPath,
   });
-  const model = makeStubModel();
+  const model = makeStubModel(options.input);
   const streamTurn = (prompt: string, images: StubImage[]): AssistantMessageEventStream => {
     const turn = script.next(prompt, images);
     const stream = new AssistantMessageEventStream();

@@ -79,6 +79,7 @@ export async function startRealService({
   requireWebDist = true,
   home: existingHome,
   workspace: existingWorkspace,
+  model = 'anthropic/claude-sonnet-4-5',
 } = {}) {
   const mainJs = join(REPO_ROOT, 'dist', 'main.js');
   if (!existsSync(mainJs)) {
@@ -112,6 +113,11 @@ export async function startRealService({
       `token = "${token}"`,
       '[runtimes]',
       'default = "claude-code"',
+      '[models]',
+      // Model capability comes from the same cached Model.input metadata
+      // production uses (B1). Tests can select an unknown/text-only ref to
+      // exercise the conservative decline through the real service.
+      `default = "${model}"`,
       '',
     ].join('\n'),
     'utf-8',

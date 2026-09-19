@@ -285,14 +285,6 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
    * frame, never a silent drop. */
   function deliver(client: Client, text: string, attachments?: readonly AttachmentChip[]): void {
     void (async () => {
-      let gru: AgentHandle;
-      try {
-        gru = await ensureGru();
-      } catch (error) {
-        // Ephemeral: a transient spawn failure must not replay forever.
-        send(client, ephemeralError(`gru is unavailable: ${(error as Error).message}`));
-        return;
-      }
       // Chip-path provenance (review r1): only workspace/uploads paths
       // ride the manifest — a handcrafted chip pointing elsewhere drops
       // GRACEFULLY: a visible notice, never a silent pass, never an error.
@@ -313,13 +305,28 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             'dropped from the message Gru receives.',
         });
       }
+      if (text.trim() === '' && allowed.length === 0) {
+        emitLogged({
+          type: 'notice',
+          text: 'No deliverable content remained after attachment validation — empty prompt skipped.',
+        });
+        return;
+      }
+      let gru: AgentHandle;
+      try {
+        gru = await ensureGru();
+      } catch (error) {
+        // Ephemeral: a transient spawn failure must not replay forever.
+        send(client, ephemeralError(`gru is unavailable: ${(error as Error).message}`));
+        return;
+      }
       const imageChips = allowed.filter((chip) => chip.kind === 'image');
       const visionUnavailable = imageChips.length > 0 && !gru.capabilities.images;
       if (visionUnavailable) {
         emitLogged({
           type: 'notice',
           text:
-            `Vision is unavailable on this runtime — ${imageChips.length} image attachment(s) ` +
+            `Vision is unavailable on the current model — ${imageChips.length} image attachment(s) ` +
             'sent as paths only; Gru is instructed not to guess at their contents.',
         });
       }

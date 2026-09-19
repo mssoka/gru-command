@@ -55,27 +55,37 @@ resolves to PATHS, never pasted bytes:
 - **On-disk picks** browse the workspace root over
   `GET /api/attach/browse?path=<rel>` (token-authed, metadata only —
   no file bytes ever move) and send the picked file's absolute path.
-  **No byte copy**: the source file is referenced where it lies.
+  **No byte copy**: the source file is referenced where it lies. Listings
+  cap at 500 entries and return `truncated: true`; entries whose symlink
+  target escapes the canonical workspace return `pickable: false`.
 - **Clipboard paste and phone-origin content** materialize over
   `POST /api/attach/uploads` (JSON `{filename, content_base64}`) into
   `<data_dir>/uploads/` (0700; hardened at boot and on every write)
-  and send THAT path.
+  and send THAT path. An upload is capped at 8 MiB; the directory is
+  capped at 1,000 files. Those limits return HTTP 413 and 507,
+  respectively. Names are bounded by UTF-8 bytes and collisions never
+  overwrite an earlier upload.
 - **Delivery** composes the chips into the prompt as a path manifest
   (`[attached files — read them yourself at these paths]`) — the agent
   always receives paths and reads the files itself. No image bytes ride
   the prompt in this flow.
-- **Vision gating**: an `image` chip on a runtime whose capabilities
-  declare `images: false` (SPEC ruling 4) DECLINES GRACEFULLY — the
-  paths still deliver, a logged `notice` frame tells the user vision is
-  unavailable, and the prompt instructs the agent never to guess at
-  image contents. Never an error frame, never a silent drop.
+- **Vision gating**: each spawned handle projects `images` from the
+  **resolved model's declared input types**, not from a runtime-wide
+  constant. An `image` chip on a handle whose resolved model does not
+  declare image input DECLINES GRACEFULLY — the paths still deliver, a
+  logged `notice` tells the user vision is unavailable, and the prompt
+  instructs the agent never to guess at image contents. Missing model
+  metadata is conservative (`images: false`). Never an error frame,
+  never a silent drop.
 - ONE seam (`/api/attach/*`) serves every surface: the chat composer
   rides it today; the dispatch surface rides the same endpoints when its
   composer lands — no per-surface side doors exist.
 - **Chip-path provenance**: the delivery layer realpaths each chip and
   only workspace-root or uploads-dir paths reach the agent's manifest —
   anything else drops GRACEFULLY (a logged notice names the rejected
-  path; the message still delivers).
+  path). If validation rejects every chip and the typed text is empty,
+  the frame remains acknowledged and noticed but no empty prompt is
+  delivered to the agent.
 
 ## The seq invariant (load-bearing)
 

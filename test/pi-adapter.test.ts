@@ -6,7 +6,7 @@ import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath } from '../src/runtime/pi-adapter.js';
 import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
-import type { RuntimeEvent } from '../src/runtime/types.js';
+import { capabilitiesForModelInput, type RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubTurn } from './helpers/stub-model.js';
 
 /**
@@ -60,7 +60,10 @@ interface Fixture {
   script: StubScript;
 }
 
-async function fixture(turns: readonly StubTurn[] = []): Promise<Fixture & { runtime: PiRuntime }> {
+async function fixture(
+  turns: readonly StubTurn[] = [],
+  modelInput: readonly ('text' | 'image')[] = ['text'],
+): Promise<Fixture & { runtime: PiRuntime }> {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-pi-'));
   const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
   const agentDir = mkdtempSync(join(tmpdir(), 'gru-command-agentdir-'));
@@ -73,7 +76,7 @@ async function fixture(turns: readonly StubTurn[] = []): Promise<Fixture & { run
   const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
   const store = new SessionStore(config.dataDir);
   const script = new StubScript(turns);
-  const modelRuntime = await makeStubModelRuntime(script);
+  const modelRuntime = await makeStubModelRuntime(script, { input: modelInput });
   const runtime = new PiRuntime({ config, store, agentDir, modelRuntime });
   return { home, workspace, agentDir, store, script, runtime };
 }
@@ -370,12 +373,27 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       followUp: true,
     });
     expect(fx.runtime.health()).toEqual({ state: 'ok' });
+    // Model metadata cannot grant a modality the adapter transport lacks.
+    expect(
+      capabilitiesForModelInput({ ...fx.runtime.capabilities, images: false }, ['text', 'image']).images,
+    ).toBe(false);
   });
 
-  it('forwards image attachments to the model (capability kept honest)', async () => {
-    const fx = await fixture([{ deltas: ['seen'] }]);
+  it('B1 fails-pre-fix discriminator: a text-only resolved model makes the spawned handle vision-incapable', async () => {
+    const fx = await fixture();
     const handle = await fx.runtime.spawn('gru');
     try {
+      expect(handle.capabilities.images).toBe(false);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('B1 positive discriminator: an image-capable resolved model keeps vision enabled and transports images', async () => {
+    const fx = await fixture([{ deltas: ['seen'] }], ['text', 'image']);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      expect(handle.capabilities.images).toBe(true);
       await handle.prompt('look at this', {
         owner: 'alice',
         images: [{ mediaType: 'image/png', data: 'aGVsbG8=' }],
@@ -535,7 +553,7 @@ describe('RuntimeRegistry', () => {
 
 describe('Perkins r1 regressions', () => {
   it('B3: images round-trip in the EXACT SDK shape (data + mimeType)', async () => {
-    const fx = await fixture([{ deltas: ['seen'] }]);
+    const fx = await fixture([{ deltas: ['seen'] }], ['text', 'image']);
     const handle = await fx.runtime.spawn('gru');
     try {
       await handle.prompt('look', {

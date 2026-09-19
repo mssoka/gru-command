@@ -31,7 +31,10 @@ export default defineConfig({
   webServer: [
     {
       command: 'npm run mock',
-      env: { GRU_MOCK_PORT: String(MOCK_PORT) },
+      env: {
+        GRU_MOCK_PORT: String(MOCK_PORT),
+        GRU_MOCK_TOKEN: process.env.GRU_MOCK_TOKEN ?? 'dev-token',
+      },
       port: MOCK_PORT,
       reuseExistingServer: false,
     },

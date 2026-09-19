@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -101,11 +101,12 @@ mkdirSync(join(spaced, 'install'), { recursive: true });
 
 describe('inside_checkout heuristic (W-B)', () => {
   function insideCheckout(repoRoot: string): number {
-    // Extract exactly the function from install.sh and run it against a
+    // Extract the shared identity helpers + wrapper and run them against a
     // controlled REPO_ROOT — no installer side effects ever run.
     const script = [
       `REPO_ROOT=${JSON.stringify(repoRoot)}`,
-      `eval "$(sed -n '/^inside_checkout()/,/^}/p' ${JSON.stringify(join(repoRoot, 'install.sh'))} || true)"`,
+      `NODE_BIN=${JSON.stringify(process.execPath)}`,
+      `eval "$(sed -n '/^checkout_package_name()/,/^run_setup()/p' ${JSON.stringify(join(repoRoot, 'install.sh'))} | sed '$d')"`,
       'if inside_checkout; then exit 0; else exit 1; fi',
     ].join('\n');
     try {
@@ -125,9 +126,18 @@ describe('inside_checkout heuristic (W-B)', () => {
       join(dir, 'package.json'),
       `{\n  "name": "${opts.packageName}",\n  "version": "1.0.0"\n}\n`,
     );
-    if (opts.withSrc !== false) mkdirSync(join(dir, 'src'));
+    if (opts.withSrc !== false) {
+      mkdirSync(join(dir, 'src'));
+      writeFileSync(join(dir, 'src', '.keep'), 'checkout-shape fixture\n');
+    }
     if (opts.withScript !== false) copyFileSync(join(repoRoot, 'install.sh'), join(dir, 'install.sh'));
-    if (opts.git) mkdirSync(join(dir, '.git'));
+    if (opts.git) {
+      execFileSync('git', ['init', '-q', '-b', 'main', dir]);
+      execFileSync('git', ['-C', dir, 'config', 'user.email', 'test@example.invalid']);
+      execFileSync('git', ['-C', dir, 'config', 'user.name', 'Install Test']);
+      execFileSync('git', ['-C', dir, 'add', '.']);
+      execFileSync('git', ['-C', dir, 'commit', '-q', '-m', 'fixture']);
+    }
     return dir;
   }
 
@@ -142,15 +152,44 @@ describe('inside_checkout heuristic (W-B)', () => {
     expect(insideCheckout(dir)).toBe(0);
   });
 
-  it('accepts a git WORKTREE shape (.git is a file, not a dir)', () => {
-    const dir = stageShape('gru-command-inside-worktree-', { packageName: 'gru-command', git: false });
-    writeFileSync(join(dir, '.git'), 'gitdir: /elsewhere/main/.git/worktrees/one\n');
+  it('accepts a real git WORKTREE (.git is a valid gitdir file)', () => {
+    const source = stageShape('gru-command-inside-worktree-source-', { packageName: 'gru-command', git: true });
+    const dir = join(tempInstallDir('gru-command-inside-worktree-'), 'worktree');
+    execFileSync('git', ['-C', source, 'worktree', 'add', '-b', 'fixture-worktree', dir]);
     expect(insideCheckout(dir)).toBe(0);
   });
 
-  it('rejects a foreign repo with the same shape (own package name, has .git)', () => {
+  it('rejects a foreign manifest even when a nested name says gru-command', () => {
     const dir = stageShape('gru-command-inside-foreign-', { packageName: 'someone-elses-app', git: true });
+    // Keep the nested key on its own line: the pre-fix anchored grep
+    // accepted this foreign package because it could not distinguish
+    // top-level JSON keys from nested ones.
+    writeFileSync(
+      join(dir, 'package.json'),
+      `{
+  "name": "someone-elses-app",
+  "metadata": {
+    "name": "gru-command"
+  },
+  "version": "1.0.0"
+}
+`,
+    );
+    const manifest = readFileSync(join(dir, 'package.json'), 'utf-8');
+    // The original grep accepted this nested line; this assertion makes
+    // the fixture a real pre-fix discriminator rather than mere prose.
+    expect(/^(?:\{\s*)?\s*"name"\s*:\s*"gru-command"/m.test(manifest)).toBe(true);
     expect(insideCheckout(dir)).toBe(1);
+  });
+
+  it('rejects empty and stale .git shapes that are not a checkout with HEAD', () => {
+    const empty = stageShape('gru-command-inside-empty-git-', { packageName: 'gru-command', git: false });
+    mkdirSync(join(empty, '.git'));
+    expect(insideCheckout(empty)).toBe(1);
+
+    const stale = stageShape('gru-command-inside-stale-git-', { packageName: 'gru-command', git: false });
+    writeFileSync(join(stale, '.git'), 'gitdir: /definitely/missing/worktree\n');
+    expect(insideCheckout(stale)).toBe(1);
   });
 
   it('rejects a saved copy WITHOUT .git ( Gru Command name, tarball/download shape)', () => {
@@ -161,5 +200,12 @@ describe('inside_checkout heuristic (W-B)', () => {
   it('rejects the name+git combo without the checkout layout (no src/)', () => {
     const dir = stageShape('gru-command-inside-nosrc-', { packageName: 'gru-command', git: true, withSrc: false });
     expect(insideCheckout(dir)).toBe(1);
+  });
+
+  it('reuses one product-checkout predicate for the current root and clone target', () => {
+    const source = readFileSync(join(repoRoot, 'install.sh'), 'utf-8');
+    expect(source).toContain('is_product_checkout "$REPO_ROOT"');
+    expect(source).toContain('is_product_checkout "$CLONE_TARGET"');
+    expect((source.match(/grep -Eq/g) ?? [])).toHaveLength(0);
   });
 });

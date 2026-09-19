@@ -7,13 +7,12 @@
  * Same token as the chat socket; rebuilt per pair (tokens rotate).
  */
 
-import type { AttachmentChip } from './protocol.js';
-
 export interface BrowseEntry {
   readonly name: string;
   readonly kind: 'dir' | 'file';
   readonly size: number | null;
   readonly image: boolean;
+  readonly pickable: boolean;
 }
 
 export interface BrowseResult {
@@ -22,6 +21,7 @@ export interface BrowseResult {
   readonly path: string;
   readonly parent: string | null;
   readonly entries: readonly BrowseEntry[];
+  readonly truncated: boolean;
 }
 
 export interface UploadedFile {
@@ -34,6 +34,8 @@ export interface AttachClientOptions {
   readonly token: string;
   readonly host: string;
   readonly secure?: boolean;
+  /** Test seam and advanced dev override; production defaults to 10 s. */
+  readonly timeoutMs?: number;
 }
 
 /** Uploads cap mirrored from src/attachments/resolver.ts. */
@@ -104,7 +106,7 @@ export class AttachClient {
     try {
       res = await fetch(`${base}${path}`, {
         ...init,
-        signal: AbortSignal.timeout(ATTACH_TIMEOUT_MS),
+        signal: AbortSignal.timeout(this.options.timeoutMs ?? ATTACH_TIMEOUT_MS),
         headers: {
           authorization: `Bearer ${this.options.token}`,
           ...(init?.headers ?? {}),
@@ -128,8 +130,17 @@ export class AttachClient {
   }
 }
 
-/** File → bytes (browser FileReader; ArrayBuffer). */
+/** File → bytes (browser FileReader; ArrayBuffer). The size preflight is
+ * load-bearing on phones: reject before an oversized blob is allocated. */
 export function readFileBytes(file: File): Promise<Uint8Array> {
+  if (file.size > MAX_UPLOAD_BYTES) {
+    return Promise.reject(
+      new AttachError(
+        413,
+        `file exceeds the ${MAX_UPLOAD_BYTES} byte cap (${file.size} bytes)`,
+      ),
+    );
+  }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.addEventListener('load', () => {
@@ -138,9 +149,4 @@ export function readFileBytes(file: File): Promise<Uint8Array> {
     reader.addEventListener('error', () => reject(new Error(`could not read ${file.name}`)));
     reader.readAsArrayBuffer(file);
   });
-}
-
-/** Build a chip from an uploaded file (kind from the shared test). */
-export function uploadedChip(uploaded: UploadedFile): AttachmentChip {
-  return { path: uploaded.path, name: uploaded.name, kind: imageKindFor(uploaded.name) };
 }

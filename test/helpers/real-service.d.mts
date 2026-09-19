@@ -31,4 +31,6 @@ export declare function startRealService(options?: {
   home?: string;
   /** Reuse a prior boot's workspace. */
   workspace?: string;
+  /** Model ref written to config; unknown metadata declines vision conservatively. */
+  model?: string;
 }): Promise<RealServiceHandle>;

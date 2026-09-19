@@ -1,3 +1,4 @@
+import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { WebSocket } from 'ws';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { pickFreePort, startRealService, type RealServiceHandle } from './helpers/real-service.mjs';
@@ -57,6 +58,16 @@ class RawClient {
 
   send(text: string, clientMsgId: string): void {
     this.socket.send(JSON.stringify({ type: 'user', text, client_msg_id: clientMsgId }));
+  }
+
+  sendWithAttachments(
+    text: string,
+    clientMsgId: string,
+    attachments: readonly { readonly path: string; readonly name: string; readonly kind: 'file' | 'image' }[],
+  ): void {
+    this.socket.send(
+      JSON.stringify({ type: 'user', text, client_msg_id: clientMsgId, attachments }),
+    );
   }
 
   async waitFor(match: (frame: RawFrame) => boolean, what: string, timeoutMs = 10_000): Promise<RawFrame> {
@@ -239,5 +250,59 @@ describe('W5 — LAN-phone send path over the real socket', () => {
 
     away.close();
     back.close();
+  });
+});
+
+describe('B1 — resolved model inputs drive the real-service vision gate', () => {
+  it('an image sent to a declared text-only model emits the decline and never-guess prompt', async () => {
+    const port = await pickFreePort();
+    const token = 'b1-text-only-model-token';
+    const model = 'amazon-bedrock/amazon.nova-micro-v1:0';
+    const catalog = await ModelRuntime.create({ refreshOnCreate: false });
+    expect(catalog.getModel('amazon-bedrock', 'amazon.nova-micro-v1:0')?.input).toEqual(['text']);
+    const service = await startRealService({
+      port,
+      token,
+      requireWebDist: false,
+      model,
+    });
+    const client = await new RawClient(new WebSocket(`ws://127.0.0.1:${port}/ws`), token).ready();
+    try {
+      await client.waitFor((frame) => frame.type === 'auth_ok', 'auth_ok');
+      const upload = await fetch(`${service.baseUrl}/api/attach/uploads`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          filename: 'text-only-proof.png',
+          content_base64: Buffer.from('real image-path fixture').toString('base64'),
+        }),
+      });
+      expect(upload.status).toBe(201);
+      const stored = (await upload.json()) as { path: string; name: string };
+
+      client.sendWithAttachments('describe this', 'b1-real-decline', [
+        { path: stored.path, name: stored.name, kind: 'image' },
+      ]);
+      const notice = await client.waitFor(
+        (frame) => frame.type === 'notice' && (frame.text ?? '').includes('Vision is unavailable'),
+        'model-derived vision decline',
+      );
+      expect(notice.text).toContain('current model');
+      await client.waitFor(
+        (frame) => frame.type === 'ack' && frame.client_msg_id === 'b1-real-decline',
+        'attach ack',
+      );
+      await client.waitFor(
+        (frame) => frame.type === 'turn' && frame.state === 'end',
+        'declined-image turn end',
+      );
+      const delivered = deltaText(client.frames);
+      expect(delivered).toContain(stored.path);
+      expect(delivered).toContain('do NOT guess');
+      expect(client.frames.some((frame) => frame.type === 'error')).toBe(false);
+    } finally {
+      client.close();
+      await service.stop();
+    }
   });
 });

@@ -15,6 +15,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
+import { DEFAULT_MOCK_TOKEN, resolveMockExposure } from './safety.js';
 import {
   parseClientFrame,
   type AttachmentChip,
@@ -25,7 +26,9 @@ import {
 } from '../src/lib/protocol.js';
 
 const PORT = Number(process.env.GRU_MOCK_PORT ?? 8787);
-const TOKEN = process.env.GRU_MOCK_TOKEN ?? 'dev-token';
+const EXPOSURE = resolveMockExposure(process.env);
+const HOST = EXPOSURE.host;
+const TOKEN = EXPOSURE.token;
 const AUTH_DEADLINE_MS = 5_000;
 const DELTA_INTERVAL_MS = 45;
 
@@ -219,14 +222,43 @@ const SAMPLE_TRANSCRIPT = [
 const MOCK_UPLOADS_DIR = mkdtempSync(join(tmpdir(), 'gru-mock-uploads-'));
 const MOCK_BROWSE_ROOT = '/workspace';
 
+/** Keep dev defaults fixed and bounded. NODE_ENV=test may only LOWER the
+ * limits so endpoint tests exercise every boundary without multi-megabyte
+ * fixtures or a thousand writes. */
+function mockTestLimit(name: string, productionLimit: number): number {
+  if (process.env.NODE_ENV !== 'test') return productionLimit;
+  const parsed = Number(process.env[name]);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) return productionLimit;
+  return Math.min(parsed, productionLimit);
+}
+
+const MOCK_MAX_UPLOAD_BYTES = mockTestLimit('GRU_MOCK_TEST_MAX_UPLOAD_BYTES', 8 * 1024 * 1024);
+const MOCK_MAX_UPLOAD_BODY_BYTES = Math.ceil((MOCK_MAX_UPLOAD_BYTES * 4) / 3) + 4096;
+const MOCK_MAX_UPLOAD_FILES = mockTestLimit('GRU_MOCK_TEST_MAX_UPLOAD_FILES', 1_000);
+let mockUploadCount = 0;
+
+function mockUploadName(value: string): string {
+  const basename = value.split(/[\\/]/).pop() ?? '';
+  const cleaned = basename.replace(/[^\p{L}\p{N}._ +-]/gu, '_').replace(/^\.+/, '') || 'upload';
+  let bounded = '';
+  let bytes = 0;
+  for (const char of cleaned) {
+    const width = Buffer.byteLength(char);
+    if (bytes + width > 200) break;
+    bounded += char;
+    bytes += width;
+  }
+  return bounded || 'upload';
+}
+
 function mockBrowse(path: string): unknown {
-  const tree: Record<string, Array<{ name: string; kind: 'dir' | 'file'; size: number | null; image: boolean }>> = {
+  const tree: Record<string, Array<{ name: string; kind: 'dir' | 'file'; size: number | null; image: boolean; pickable: boolean }>> = {
     '': [
-      { name: 'sample-repo', kind: 'dir', size: null, image: false },
-      { name: 'mock-notes.md', kind: 'file', size: 128, image: false },
-      { name: 'mock-shot.png', kind: 'file', size: 2048, image: true },
+      { name: 'sample-repo', kind: 'dir', size: null, image: false, pickable: true },
+      { name: 'mock-notes.md', kind: 'file', size: 128, image: false, pickable: true },
+      { name: 'mock-shot.png', kind: 'file', size: 2048, image: true, pickable: true },
     ],
-    'sample-repo': [{ name: 'README.md', kind: 'file', size: 64, image: false }],
+    'sample-repo': [{ name: 'README.md', kind: 'file', size: 64, image: false, pickable: true }],
   };
   const entries = tree[path] ?? [];
   const parent = path === '' ? null : (path.split('/').slice(0, -1).join('/') || '');
@@ -322,21 +354,55 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
       return;
     }
     let body = '';
+    let bodyBytes = 0;
+    let rejected = false;
     req.on('data', (chunk: Buffer) => {
+      bodyBytes += chunk.byteLength;
+      if (bodyBytes > MOCK_MAX_UPLOAD_BODY_BYTES) {
+        if (!rejected) {
+          rejected = true;
+          body = '';
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end('{"error":"attach_failed","detail":"request body exceeds mock upload limit"}\n');
+        }
+        return;
+      }
       body += chunk.toString('utf-8');
     });
     req.on('end', () => {
+      if (rejected) return;
       try {
         const parsed = JSON.parse(body) as { filename?: string; content_base64?: string };
-        const filename = typeof parsed.filename === 'string' && parsed.filename !== '' ? parsed.filename : 'upload';
+        const filename = mockUploadName(
+          typeof parsed.filename === 'string' && parsed.filename !== '' ? parsed.filename : 'upload',
+        );
         const bytes = Buffer.from(parsed.content_base64 ?? '', 'base64');
         if (bytes.byteLength === 0) {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end('{"error":"attach_failed","detail":"content_base64 must be a non-empty string"}\n');
           return;
         }
-        const target = join(MOCK_UPLOADS_DIR, `${Date.now()}-${filename.replace(/[^\p{L}\p{N}._ +-]/gu, '_')}`);
-        writeFileSync(target, bytes);
+        if (bytes.byteLength > MOCK_MAX_UPLOAD_BYTES) {
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: 'attach_failed',
+              detail: `upload exceeds ${MOCK_MAX_UPLOAD_BYTES} byte mock limit`,
+            }) + '\n',
+          );
+          return;
+        }
+        if (mockUploadCount >= MOCK_MAX_UPLOAD_FILES) {
+          res.writeHead(507, { 'content-type': 'application/json' });
+          res.end('{"error":"attach_failed","detail":"mock upload quota exceeded"}\n');
+          return;
+        }
+        const target = join(
+          MOCK_UPLOADS_DIR,
+          `${Date.now()}-${mockUploadCount}-${filename}`,
+        );
+        writeFileSync(target, bytes, { flag: 'wx' });
+        mockUploadCount += 1;
         res.writeHead(201, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ path: target, name: filename, bytes: bytes.byteLength }) + '\n');
       } catch {
@@ -347,6 +413,11 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     return;
   }
   if (req.method === 'POST' && req.url === '/__pulse') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
     for (const client of boardClients) {
       if (client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify({ type: 'board', snapshot: sampleSnapshot() }));
@@ -359,12 +430,22 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   // Dev control plane (tests): POST /__reset clears the frame log;
   // POST /__drop terminates every connected socket.
   if (req.method === 'POST' && req.url === '/__drop') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
     for (const socket of server.clients) socket.terminate();
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}\n');
     return;
   }
   if (req.method === 'POST' && req.url === '/__reset') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
     log.length = 0;
     seq = 0;
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -513,12 +594,6 @@ function handleUserFrame(socket: WebSocket, frame: UserFrame): void {
   scriptedReply(socket, frame.text, frame.attachments);
 }
 
-process.stdout.write(
-  `gru-command MOCK chat socket (dev-only) listening on ws://localhost:${PORT}/ws ` +
-    `+ board feed on ws://localhost:${PORT}/board/ws + /api/board ` +
-    `(token: ${TOKEN === 'dev-token' ? 'dev-token [default]' : 'from GRU_MOCK_TOKEN'})\n`,
-);
-
 const shutdown = (): void => {
   server.close();
   boardServer.close();
@@ -528,4 +603,12 @@ const shutdown = (): void => {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-httpServer.listen(PORT);
+httpServer.listen(PORT, HOST, () => {
+  const urlHost = HOST.includes(':') && !HOST.startsWith('[') ? `[${HOST}]` : HOST;
+  if (EXPOSURE.warning !== null) process.stderr.write(`${EXPOSURE.warning}\n`);
+  process.stdout.write(
+    `gru-command MOCK chat socket (dev-only) listening on ws://${urlHost}:${PORT}/ws ` +
+      `+ board feed on ws://${urlHost}:${PORT}/board/ws + /api/board ` +
+      `(token: ${TOKEN === DEFAULT_MOCK_TOKEN ? 'dev-token [default]' : 'from GRU_MOCK_TOKEN'})\n`,
+  );
+});

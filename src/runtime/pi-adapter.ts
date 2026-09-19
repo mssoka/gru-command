@@ -18,6 +18,7 @@ import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths
 // E3 extracted the shared session-path helpers; re-export so existing
 // consumers of the pi adapter's surface keep working.
 export { normalizeSessionPath, SessionAlreadyActiveError };
+import { capabilitiesForModelInput } from './types.js';
 import type {
   AgentCapabilities,
   AgentHandle,
@@ -38,6 +39,8 @@ export const PI_CAPABILITIES: AgentCapabilities = {
   streaming: true,
   steer: 'native',
   resume: 'file',
+  // Adapter transport support. A spawned handle overrides this from the
+  // resolved model's declared input modalities (B1).
   images: true,
   thinking: true,
   thinkingLevelControl: true,
@@ -234,6 +237,7 @@ export class PiRuntime implements AgentRuntime {
         role,
         session,
         sessionFile,
+        capabilitiesForModelInput(PI_CAPABILITIES, session.model?.input),
         this.store,
         this.log,
         () => {
@@ -304,7 +308,7 @@ export class PiAgentHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string;
-  readonly capabilities: AgentCapabilities = PI_CAPABILITIES;
+  readonly capabilities: AgentCapabilities;
 
   /** The principal unnamed callers are attributed to (single-writer). */
   private readonly principal: string;
@@ -330,6 +334,7 @@ export class PiAgentHandle implements AgentHandle {
       readonly sessionFile: string | undefined;
     },
     sessionFile: string,
+    capabilities: AgentCapabilities,
     private readonly store: SessionStore,
     private readonly log: Log,
     private readonly onDispose: () => void = () => {},
@@ -337,6 +342,7 @@ export class PiAgentHandle implements AgentHandle {
     this.role = role;
     this.id = session.sessionId;
     this.sessionFile = sessionFile;
+    this.capabilities = capabilities;
     // Unnamed callers share one principal PER HANDLE — one chat brain per
     // session (SPEC ruling 1). Two distinct sessions always differ, so a
     // stranger's steer/followUp queues instead of passing natively.

@@ -1,13 +1,16 @@
+import { randomUUID } from 'node:crypto';
 import {
   chmodSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
-import { relative } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 /**
  * The ONE attach flow's resolution seam (SPEC ruling 19, this lane).
@@ -78,6 +81,33 @@ function isInsideOrEqual(outer: string, inner: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
+/** Keep materialized basenames below filesystem NAME_MAX even when the
+ * client supplied multi-byte Unicode (the protocol's 200-char cap alone
+ * is not a byte cap). The timestamp/collision prefix gets the remaining
+ * 55+ bytes on common filesystems. */
+const MAX_UPLOAD_NAME_BYTES = 200;
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  let out = '';
+  let used = 0;
+  for (const char of value) {
+    const bytes = Buffer.byteLength(char);
+    if (used + bytes > maxBytes) break;
+    out += char;
+    used += bytes;
+  }
+  return out;
+}
+
+function fitUploadNameBytes(value: string): string {
+  if (Buffer.byteLength(value) <= MAX_UPLOAD_NAME_BYTES) return value;
+  const dot = value.lastIndexOf('.');
+  if (dot <= 0) return truncateUtf8(value, MAX_UPLOAD_NAME_BYTES);
+  const extension = truncateUtf8(value.slice(dot), 32);
+  const stemBudget = MAX_UPLOAD_NAME_BYTES - Buffer.byteLength(extension);
+  return `${truncateUtf8(value.slice(0, dot), stemBudget)}${extension}`;
+}
+
 // ---------------------------------------------------------------------------
 // Materialization (clipboard + phone origin → uploads dir → that path)
 // ---------------------------------------------------------------------------
@@ -104,13 +134,146 @@ export function sanitizeUploadName(name: string): string {
     cleaned = `${cleaned.slice(0, MAX_ATTACHMENT_NAME_CHARS - ext.length)}${ext}`;
   }
   if (cleaned === '' || cleaned === '.' || cleaned === '..') cleaned = 'upload';
-  return cleaned;
+  return fitUploadNameBytes(cleaned);
 }
 
 export interface MaterializedUpload {
   readonly path: string;
   readonly name: string;
   readonly bytes: number;
+}
+
+const UPLOAD_CLAIM_PREFIX = '.gru-upload-claim-';
+const UPLOAD_CLAIM_SUFFIX = '.claim';
+const UPLOAD_LEGACY_RESERVATION_PREFIX = '.gru-upload-reservation-';
+const UPLOAD_CLAIM_STALE_MS = 30_000;
+
+/** Upload quota admission (Perkins r2 B1/W1/W2).
+ *
+ * A writer's payload bytes land FIRST in a uniquely named claim file
+ * (`.gru-upload-claim-<ts>-<pid>-<uuid>.claim`); ownership lives in the
+ * FILENAME, so a claim is never observed half-initialized (r2 W1: a
+ * torn marker body was reclaimed as dead while its writer lived and
+ * admitted 1,001 payloads). Claims plus payloads are the committed
+ * count; writers elect FIFO by claim timestamp so two racers at the
+ * last slot deterministically produce ONE winner (r2 B1: both-writer
+ * rejection left the final slot unused). Commit is a rename of the
+ * claim onto its final name — capacity-neutral, so admission cannot be
+ * lost between check and write. A post-commit audit re-counts payloads
+ * and sheds this writer's file if a readdir anomaly let two writers
+ * commit into the last slot: conservative (a retryable 507), never an
+ * overbook. Generation safety (r1 lock-race): every claim name is
+ * unique; a stale generation is never reused, reclaimers unlink only
+ * the exact UUID file they inspected, and no successor's claim can be
+ * evicted by a late observation. Cleanup reclaims a claim only when its
+ * owner pid is dead and it has aged, or immediately when it is residue
+ * of THIS process (materialize is synchronous, so a self-owned claim
+ * visible at entry is never mid-flight — r2 W2: a failed release must
+ * not strand a slot for the process lifetime). Legacy
+ * `.gru-upload-reservation-*.json` markers from the prior scheme count
+ * as claims and are reclaimed once aged and not provably live. */
+function processIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but is owned by another account.
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function isUploadClaim(name: string): boolean {
+  return name.startsWith(UPLOAD_CLAIM_PREFIX) && name.endsWith(UPLOAD_CLAIM_SUFFIX);
+}
+
+function isLegacyUploadReservation(name: string): boolean {
+  return name.startsWith(UPLOAD_LEGACY_RESERVATION_PREFIX) && name.endsWith('.json');
+}
+
+function parseUploadClaim(name: string): { ts: number; pid: number } | null {
+  const body = name.slice(UPLOAD_CLAIM_PREFIX.length, name.length - UPLOAD_CLAIM_SUFFIX.length);
+  const [tsRaw, pidRaw] = body.split('-');
+  const ts = Number(tsRaw);
+  const pid = Number(pidRaw);
+  if (!Number.isSafeInteger(ts) || ts <= 0) return null;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  return { ts, pid };
+}
+
+function scanUploadsDir(uploadsDir: string): { payloads: string[]; claims: string[] } {
+  let entries: string[];
+  try {
+    entries = readdirSync(uploadsDir);
+  } catch (error) {
+    throw new AttachError(500, `uploads quota scan failed: ${String(error)}`);
+  }
+  const payloads: string[] = [];
+  const claims: string[] = [];
+  for (const entry of entries) {
+    if (isUploadClaim(entry) || isLegacyUploadReservation(entry)) claims.push(entry);
+    else payloads.push(entry);
+  }
+  return { payloads, claims };
+}
+
+/** FIFO by creation stamp (filename ts; name breaks same-ms ties so every
+ * racer computes the identical order from the same snapshot). Malformed
+ * or legacy claim names rank last: they consume capacity but never steal
+ * an earlier slot. */
+function rankUploadClaims(claims: readonly string[]): Array<{ name: string; ts: number }> {
+  return claims
+    .map((name) => ({ name, ts: parseUploadClaim(name)?.ts ?? Number.MAX_SAFE_INTEGER }))
+    .sort((a, b) => (a.ts !== b.ts ? a.ts - b.ts : a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+function reclaimAbandonedClaim(uploadsDir: string, entry: string): void {
+  try {
+    unlinkSync(join(uploadsDir, entry));
+  } catch (error) {
+    // A concurrent reclaimer may have removed this exact generation.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new AttachError(500, `stale uploads claim cleanup failed: ${String(error)}`);
+    }
+  }
+}
+
+function cleanupAbandonedUploadClaims(uploadsDir: string): void {
+  const { claims } = scanUploadsDir(uploadsDir);
+  for (const entry of claims) {
+    if (isUploadClaim(entry)) {
+      const owner = parseUploadClaim(entry);
+      if (owner === null) continue; // foreign/malformed name — leave it
+      // Self-owned residue is never mid-flight (materialize is
+      // synchronous): reclaim immediately (r2 W2). Foreign claims need
+      // age AND a dead owner — a live hung writer keeps its slot (r2 W1).
+      const isSelfResidue = owner.pid === process.pid;
+      if (!isSelfResidue) {
+        if (Date.now() - owner.ts <= UPLOAD_CLAIM_STALE_MS) continue;
+        if (processIsAlive(owner.pid)) continue;
+      }
+      reclaimAbandonedClaim(uploadsDir, entry);
+      continue;
+    }
+    // Legacy marker from the previous scheme: aged and not provably live.
+    const marker = join(uploadsDir, entry);
+    let aged = false;
+    try {
+      aged = Date.now() - statSync(marker).mtimeMs > UPLOAD_CLAIM_STALE_MS;
+    } catch {
+      continue;
+    }
+    if (!aged) continue;
+    let live = false;
+    try {
+      const owner = JSON.parse(readFileSync(marker, 'utf-8')) as { pid?: unknown };
+      live = typeof owner.pid === 'number' && processIsAlive(owner.pid);
+    } catch {
+      // Torn legacy marker: its creating build is gone once upgraded.
+    }
+    if (live) continue;
+    reclaimAbandonedClaim(uploadsDir, entry);
+  }
 }
 
 /**
@@ -134,32 +297,59 @@ export function materializeUpload(
   }
   mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
   hardenUploadsDir(uploadsDir);
-  // Count quota (review r1): unbounded writes could fill the data dir —
-  // fail loud with a 507-class error instead of an ENOSPC boot later.
-  let existing = 0;
-  try {
-    existing = readdirSync(uploadsDir).length;
-  } catch {
-    /* fresh dir — the count is zero */
-  }
-  if (existing >= MAX_UPLOAD_FILES) {
-    throw new AttachError(507, `uploads quota exceeded (${MAX_UPLOAD_FILES} files) — prune ${uploadsDir}`);
-  }
   const name = sanitizeUploadName(input.filename);
-  const stamped = `${Date.now()}-${name}`;
-  let target = join(uploadsDir, stamped);
-  for (let n = 2; ; n++) {
-    try {
-      // Exclusive create: never clobber an existing materialized file.
-      writeFileSync(target, input.bytes, { flag: 'wx', mode: 0o600 });
-      break;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'EEXIST') {
-        throw new AttachError(500, `uploads write failed: ${String(error)}`);
-      }
-      target = join(uploadsDir, `${Date.now()}-${n}-${name}`);
+  cleanupAbandonedUploadClaims(uploadsDir);
+  const stamp = Date.now();
+  const claimName = `${UPLOAD_CLAIM_PREFIX}${stamp}-${process.pid}-${randomUUID()}${UPLOAD_CLAIM_SUFFIX}`;
+  const claim = join(uploadsDir, claimName);
+  try {
+    // The claim carries the payload bytes themselves: admission, content,
+    // and ownership (pid in the filename) publish atomically at dirent
+    // creation — there is no initializing window a peer can misread.
+    writeFileSync(claim, input.bytes, { flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    throw new AttachError(500, `uploads quota claim failed: ${String(error)}`);
+  }
+  let target: string;
+  try {
+    const { payloads, claims } = scanUploadsDir(uploadsDir);
+    const free = MAX_UPLOAD_FILES - payloads.length;
+    const mine = rankUploadClaims(claims).findIndex((ranked) => ranked.name === claimName);
+    if (free <= 0 || mine < 0 || mine >= free) {
+      throw new AttachError(
+        507,
+        `uploads quota exceeded (${MAX_UPLOAD_FILES} files) — prune ${uploadsDir}`,
+      );
     }
+    target = join(uploadsDir, `${stamp}-${randomUUID()}-${name}`);
+    // Commit = rename of the claim onto its final name: capacity-neutral
+    // (claim and payload each count one), and ENOENT would prove the
+    // claim was reclaimed from us — the reservation is verified by the
+    // commit itself, never assumed (r2 W1).
+    renameSync(claim, target);
+  } catch (error) {
+    try {
+      unlinkSync(claim);
+    } catch {
+      // Residue is owned by stale/self cleanup; never widen the fault.
+    }
+    if (error instanceof AttachError) throw error;
+    throw new AttachError(500, `uploads materialization failed: ${String(error)}`);
+  }
+  // Hard invariant audit: if a readdir anomaly let two writers each win
+  // an election that missed the other's claim, the committed count can
+  // exceed the cap. Shed THIS writer's payload — conservative (a
+  // retryable 507), never an overbook.
+  if (scanUploadsDir(uploadsDir).payloads.length > MAX_UPLOAD_FILES) {
+    try {
+      unlinkSync(target);
+    } catch (error) {
+      throw new AttachError(500, `uploads quota audit rollback failed: ${String(error)}`);
+    }
+    throw new AttachError(
+      507,
+      `uploads quota exceeded (${MAX_UPLOAD_FILES} files) — prune ${uploadsDir}`,
+    );
   }
   return { path: target, name, bytes: input.bytes.byteLength };
 }
@@ -173,6 +363,8 @@ export interface BrowseEntry {
   readonly kind: 'dir' | 'file';
   readonly size: number | null;
   readonly image: boolean;
+  /** False for a symlink whose real target leaves the workspace root. */
+  readonly pickable: boolean;
 }
 
 export interface BrowseResult {
@@ -212,33 +404,40 @@ export function browseWorkspace(workspaceRoot: string, relPath: string): BrowseR
   for (const dirent of dirents) {
     // Dot entries (.git, .env) never show on the pick surface.
     if (dirent.name.startsWith('.')) continue;
-    if (entries.length >= MAX_BROWSE_ENTRIES) {
-      truncated = true;
-      break;
-    }
     // Symlinks are part of the namespace (review r1: silently hiding
     // them made symlinked repos/dirs invisible): resolve the TARGET's
     // type; broken targets drop out. The PATH sent on pick is the
     // lexical in-workspace path — containment holds on the reference.
     let isDir: boolean;
     let isFile: boolean;
+    let pickable = true;
     if (dirent.isSymbolicLink()) {
       try {
-        const target = statSync(join(wantedReal, dirent.name));
+        const entryPath = join(wantedReal, dirent.name);
+        const targetReal = realpathSync(entryPath);
+        const target = statSync(targetReal);
         isDir = target.isDirectory();
         isFile = target.isFile();
+        pickable = isInsideOrEqual(rootReal, targetReal);
       } catch {
-        continue; // broken symlink — not pickable
+        continue; // broken symlink — not listable
       }
     } else {
       isDir = dirent.isDirectory();
       isFile = dirent.isFile();
     }
+    if (!isDir && !isFile) continue; // sockets/fifos are not pickable
+    // Count only entries the picker could render. Dot entries, broken
+    // symlinks, and sockets beyond item 500 must not create a false
+    // "listing truncated" warning.
+    if (entries.length >= MAX_BROWSE_ENTRIES) {
+      truncated = true;
+      break;
+    }
     if (isDir) {
-      entries.push({ name: dirent.name, kind: 'dir', size: null, image: false });
+      entries.push({ name: dirent.name, kind: 'dir', size: null, image: false, pickable });
       continue;
     }
-    if (!isFile) continue; // sockets/fifos are not pickable
     let size: number | null = null;
     try {
       size = statSync(join(wantedReal, dirent.name)).size;
@@ -250,6 +449,7 @@ export function browseWorkspace(workspaceRoot: string, relPath: string): BrowseR
       kind: 'file',
       size,
       image: attachmentKindFor(dirent.name) === 'image',
+      pickable,
     });
   }
   entries.sort((a, b) => {
@@ -291,16 +491,20 @@ export function chipPathAllowed(
   chipPath: string,
 ): boolean {
   if (isAbsolute(chipPath) !== true) return false;
-  if (isInsideOrEqual(uploadsDir, chipPath)) return true;
+  let chipReal: string;
   try {
-    const rootReal = realpathSync(workspaceRoot);
-    const chipReal = realpathSync(chipPath);
-    return isInsideOrEqual(rootReal, chipReal);
+    chipReal = realpathSync(chipPath);
   } catch {
-    // Workspace unreachable or the path does not resolve — not provably
-    // one of ours.
-    return false;
+    return false; // nonexistent is never a deliverable path
   }
+  for (const home of [workspaceRoot, uploadsDir]) {
+    try {
+      if (isInsideOrEqual(realpathSync(home), chipReal)) return true;
+    } catch {
+      // One home may not exist yet (fresh uploads dir); check the other.
+    }
+  }
+  return false;
 }
 
 function realpathOrThrow(path: string, status: number, message: string): string {
@@ -313,5 +517,7 @@ function realpathOrThrow(path: string, status: number, message: string): string 
 
 function safeRelative(from: string, to: string): string {
   const rel = relative(from, to);
-  return rel.split('\\').join('/');
+  // Normalize only the host separator. On POSIX, a literal backslash is a
+  // valid filename character and must not be rewritten into navigation.
+  return rel.split(sep).join('/');
 }

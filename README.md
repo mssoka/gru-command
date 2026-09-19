@@ -15,8 +15,10 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
 ## What's inside
 
 - **Chat with one brain** — a single Gru session behind an authenticated
-  WebSocket; reconnect-safe history, never lose a typed word
-  ([CHAT.md](docs/CHAT.md)).
+  WebSocket; reconnect-safe history, never lose a typed word. Attach
+  workspace files, phone camera/gallery files, or clipboard images through
+  one path-based flow; text-only models decline image interpretation
+  visibly instead of guessing ([CHAT.md](docs/CHAT.md)).
 - **The live board** — repo-grouped job cards, per-agent state chips,
   review rounds with per-lens live chips, notification center
   ([BOARD.md](docs/BOARD.md)).
