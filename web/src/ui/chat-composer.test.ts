@@ -83,12 +83,34 @@ function installChatDom(): void {
   document.body.append(mainMount, view, bubble, sheet);
   Object.defineProperty(window, 'matchMedia', {
     configurable: true,
-    value: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }),
+    value: (query: string) => ({
+      // LIVE view: ChatView captured this object at construction — the
+      // flip test needs matches to evaluate at READ time, not creation.
+      get matches() {
+        return query === '(pointer: coarse)' ? coarsePointer : false;
+      },
+      addEventListener: (_type: string, listener: () => void) => {
+        if (query === '(pointer: coarse)') coarseListeners.push(listener);
+      },
+      removeEventListener: (_type: string, listener: () => void) => {
+        coarseListeners = coarseListeners.filter((candidate) => candidate !== listener);
+      },
+    }),
   });
 }
 
 function input(): HTMLTextAreaElement {
   return document.getElementById('chat-input') as HTMLTextAreaElement;
+}
+
+/** Coarse-pointer state for the matchMedia stub; flip + fire the
+ * captured change listeners to simulate a touch environment live. */
+let coarsePointer = false;
+let coarseListeners: Array<() => void> = [];
+
+function setCoarsePointer(coarse: boolean): void {
+  coarsePointer = coarse;
+  for (const listener of coarseListeners) listener();
 }
 
 /** Pin layout numbers happy-dom cannot compute, so the autosize math
@@ -113,7 +135,11 @@ function countedSubmit(form: HTMLFormElement): () => number {
   return () => count;
 }
 
-beforeEach(() => installChatDom());
+beforeEach(() => {
+  coarsePointer = false;
+  coarseListeners = [];
+  installChatDom();
+});
 
 describe('multi-line composer', () => {
   it('Enter sends; Shift+Enter and IME composition never send', () => {
@@ -121,6 +147,7 @@ describe('multi-line composer', () => {
     view.bindAttach(null);
     const form = document.getElementById('chat-form') as HTMLFormElement;
     const submits = countedSubmit(form);
+    expect(input().getAttribute('enterkeyhint')).toBe('send');
 
     input().value = 'one line only';
     input().dispatchEvent(
@@ -145,6 +172,38 @@ describe('multi-line composer', () => {
         bubbles: true,
         cancelable: true,
       }),
+    );
+    expect(submits()).toBe(1);
+  });
+
+  it('coarse pointer (touch): Enter never sends and enterkeyhint flips to "enter"', () => {
+    setCoarsePointer(true);
+    const view = new ChatView(() => true);
+    view.bindAttach(null);
+    expect(input().getAttribute('enterkeyhint')).toBe('enter');
+    const form = document.getElementById('chat-form') as HTMLFormElement;
+    const submits = countedSubmit(form);
+    input().value = 'touch draft';
+
+    input().dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+    );
+    input().dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Enter',
+        repeat: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(submits()).toBe(0); // the return key's job on touch is a NEWLINE
+
+    // A live flip (keyboard attach/detach) re-labels the key and restores
+    // desktop semantics with the pointer.
+    setCoarsePointer(false);
+    expect(input().getAttribute('enterkeyhint')).toBe('send');
+    input().dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
     );
     expect(submits()).toBe(1);
   });

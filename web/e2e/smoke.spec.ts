@@ -43,7 +43,7 @@ test('pair, send, streamed reply with tool line', async ({ page }) => {
   await expect(page.locator('.tool-line', { hasText: 'mock-echo' })).toBeVisible();
 });
 
-test('multi-line composer: Shift+Enter newlines, grows without horizontal overflow, Enter sends intact', async ({ page }) => {
+test('multi-line composer (desktop, fine pointer): Shift+Enter newlines, grows without horizontal overflow, Enter sends intact', async ({ page }) => {
   await pair(page);
   const input = page.locator('#chat-input');
   const restHeight = (await input.boundingBox())!.height;
@@ -103,18 +103,38 @@ test('composer caps at ~10rem and scrolls internally past the cap', async ({ pag
   await expect.poll(async () => (await input.boundingBox())!.height).toBeLessThanOrEqual(70);
 });
 
-test('multi-line composer on a 390px phone: grows inside the sheet, never overflows horizontally', async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+test('touch composer on a 390px phone (coarse pointer): return inserts a newline, send button visible, click-to-send works', async ({ browser }) => {
+  // Emulate the TOUCH INPUT MODALITY, not just the width: the composer
+  // keys off `(pointer: coarse)`, which phones match and a narrow DESKTOP
+  // window does not. hasTouch is what flips Chromium's pointer media.
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    hasTouch: true,
+  });
+  const page = await context.newPage();
   await pairMobile(page);
   await page.locator('#chat-bubble').click();
   await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
   const input = page.locator('#chat-input');
   const restHeight = (await input.boundingBox())!.height;
+  expect(
+    await page.evaluate(() => window.matchMedia('(pointer: coarse)').matches),
+  ).toBe(true); // the emulation premise itself, asserted
+
+  // The return key is labeled for its actual job, and the SEND BUTTON is
+  // visible — on touch it is the send gesture.
+  await expect(input).toHaveAttribute('enterkeyhint', 'enter');
+  await expect(page.locator('#chat-send')).toBeVisible();
 
   await input.click();
   await page.keyboard.type('line one of the plan');
-  await page.keyboard.press('Shift+Enter');
+  // RETURN KEY MUST NOT SEND on touch — it inserts a newline.
+  await page.keyboard.press('Enter');
   await page.keyboard.type('line two of the plan');
+  await expect(input).toHaveValue('line one of the plan\nline two of the plan');
+  // Nothing of MINE was sent (the shared mock log replays earlier tests'
+  // user bubbles, so the no-send check is text-scoped, not count-based).
+  await expect(page.locator('.msg--user', { hasText: 'line one of the plan' })).toHaveCount(0);
   expect((await input.boundingBox())!.height).toBeGreaterThan(restHeight);
   expect((await input.boundingBox())!.x).toBeGreaterThanOrEqual(0);
   // The composer surface never overflows horizontally inside the sheet
@@ -136,15 +156,17 @@ test('multi-line composer on a 390px phone: grows inside the sheet, never overfl
     expect(box.y + box.height).toBeLessThanOrEqual(844);
   }
 
-  await page.keyboard.press('Enter');
+  // Click-to-send works; the newline arrives INTACT and the composer
+  // cleared + collapsed.
+  await page.locator('#chat-send').click();
   await expect(page.locator('.msg--user', { hasText: 'line two of the plan' })).toBeVisible();
-  // The newline arrives INTACT and the composer cleared + collapsed.
   const bubbleText = await page.locator('.msg--user .msg__text').last().textContent();
   expect(bubbleText).toBe('line one of the plan\nline two of the plan');
   await expect(input).toHaveValue('');
   await expect
     .poll(async () => (await input.boundingBox())!.height)
     .toBeLessThanOrEqual(restHeight + 1);
+  await context.close();
 });
 
 test('context controls compact in place and New chat advances a reload-safe empty view', async ({ page }) => {
@@ -249,6 +271,10 @@ test('mobile viewport: board-first; chat is a corner bubble that opens a sheet',
   await expect(reply).toBeVisible();
   await expect(reply).not.toHaveClass(/msg--streaming/);
 });
+
+
+
+
 
 test('wrong token: inline error, stays on pairing across reload', async ({ page }) => {
   await page.goto('/');

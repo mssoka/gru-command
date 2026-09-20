@@ -27,6 +27,14 @@ import { el, mustGet } from './dom.js';
 
 const MOBILE_QUERY = '(max-width: 768px)';
 
+/** Touch devices: the return key inserts a newline (composer fork 1,
+ * user ruling 2026-09-20) — the send gesture is the always-visible Send
+ * button. `pointer: coarse` describes the PRIMARY input modality, which
+ * is what a virtual keyboard's return-key semantics follow; width-only
+ * sniffing would misclassify narrow desktop windows and touch-screen
+ * laptops (fine primary pointer) as touch. */
+const COARSE_QUERY = '(pointer: coarse)';
+
 /** The attach resolution surface main.ts binds per pair (token rotates). */
 export interface AttachSurface {
   browse(path: string): Promise<BrowseResult>;
@@ -75,6 +83,7 @@ export class ChatView {
   private activeTool: HTMLElement | null = null;
   private unread = 0;
   private mobile = window.matchMedia(MOBILE_QUERY);
+  private coarse = window.matchMedia(COARSE_QUERY);
   /** Ready-to-send chips (SPEC ruling 19). */
   private pending: AttachmentChip[] = [];
   /** Uploads in flight, keyed by gesture identity (same-name files may overlap). */
@@ -98,13 +107,18 @@ export class ChatView {
     ) => boolean,
   ) {
     // Multi-line composer (textarea): Enter sends, Shift+Enter inserts a
-    // newline. Guards: modifier combos are not sends; key auto-repeat
-    // must not re-submit (a held Enter would stack failed-send notes);
-    // IME composition (CJK/emoji pickers) uses Enter to CONFIRM — never
-    // send while composing (isComposing; keyCode 229 is the legacy
-    // composition code some browsers still emit).
+    // newline — DESKTOP/fine-pointer only. Coarse-pointer (touch) devices
+    // take the standard mobile pattern: the return key inserts a newline
+    // via the native default (which also keeps IME confirmation native),
+    // and sending is the button's job. Guards on the intercepting path:
+    // modifier combos are not sends; key auto-repeat must not re-submit
+    // (a held Enter would stack failed-send notes); IME composition
+    // (CJK/emoji pickers) uses Enter to CONFIRM — never send while
+    // composing (isComposing; keyCode 229 is the legacy composition code
+    // some browsers still emit).
     this.input.addEventListener('keydown', (event) => {
       if (event.key !== 'Enter' || event.shiftKey) return;
+      if (this.coarse.matches) return;
       if (event.altKey || event.ctrlKey || event.metaKey) return;
       if (event.repeat) return;
       if (event.isComposing || event.keyCode === 229) return;
@@ -116,6 +130,9 @@ export class ChatView {
     this.input.addEventListener('input', () => this.autosize());
     // Reflow outside of typing (window resize) re-wraps lines — re-measure.
     window.addEventListener('resize', () => this.autosize());
+    this.setEnterKeyHint();
+    // Keyboard attach/detach (tablets etc.) flips the touch pattern live.
+    this.coarse.addEventListener('change', () => this.setEnterKeyHint());
     this.autosize();
 
     this.form.addEventListener('submit', (event) => {
@@ -182,6 +199,12 @@ export class ChatView {
     place();
     // Sheet starts closed: inert until first opened.
     this.sheet.toggleAttribute('inert', this.sheet.dataset.open !== 'true');
+  }
+
+  /** The virtual keyboard's return key is labeled for its actual job:
+   * newline on touch, send on desktop. */
+  private setEnterKeyHint(): void {
+    this.input.setAttribute('enterkeyhint', this.coarse.matches ? 'enter' : 'send');
   }
 
   /** Grow the composer to fit its content (one row at rest); the CSS
