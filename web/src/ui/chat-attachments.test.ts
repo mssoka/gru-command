@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BrowseResult, UploadedFile } from '../lib/attach-client.js';
-import type { ContextFrame } from '../lib/protocol.js';
+import { parseServerFrame, type ContextFrame } from '../lib/protocol.js';
 import { ChatView, type AttachSurface } from './chat.js';
 
 function installChatDom(): void {
@@ -156,7 +156,7 @@ describe('chat context control rendering', () => {
     const request = vi.fn(() => true);
     view.bindControls(request);
     view.setControlsConnected(true);
-    view.setContext({
+    const wireSnapshot = parseServerFrame(JSON.stringify({
       type: 'context',
       epoch: 3,
       replay_floor_seq: 41,
@@ -165,7 +165,10 @@ describe('chat context control rendering', () => {
       compact_supported: true,
       session_active: true,
       writer: true,
-    });
+    }));
+    expect(wireSnapshot?.type).toBe('context');
+    if (wireSnapshot?.type !== 'context') throw new Error('provider context did not parse');
+    view.setContext(wireSnapshot);
     const status = document.getElementById('chat-context-status')!;
     expect(status.textContent).toBe('37% context');
     expect(status.getAttribute('title')).toContain('370 of 1,000 tokens');
@@ -219,6 +222,16 @@ describe('chat context control rendering', () => {
       writer: true,
     });
     expect(announcement.textContent).toContain('provider refused');
+
+    view.showContextEvent({ type: 'context_event', action: 'compact', ok: true });
+    expect(announcement.textContent).toBe('Context compacted successfully');
+    view.showContextEvent({
+      type: 'context_event',
+      action: 'new_chat',
+      ok: false,
+      message: 'New chat started, but supervision is degraded',
+    });
+    expect(announcement.textContent).toContain('supervision is degraded');
   });
 
   it('clears the active view immediately for New chat and restores it on rejection', () => {
@@ -241,6 +254,11 @@ describe('chat context control rendering', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     document.getElementById('chat-new')!.click();
     expect(document.getElementById('chat-log')?.textContent).not.toContain('retired transcript');
+    view.upsertMessage({
+      client_msg_id: 'pending-after-reset',
+      text: 'typed into pending view',
+      status: 'queued',
+    });
 
     view.showControlResult({
       type: 'control_result',
@@ -253,6 +271,11 @@ describe('chat context control rendering', () => {
     });
     expect(document.getElementById('chat-log')?.textContent).toContain('retired transcript');
     expect(document.getElementById('chat-log')?.textContent).toContain('fresh spawn failed');
+    expect(
+      [...document.querySelectorAll('.msg--user')].filter((node) =>
+        node.textContent?.includes('typed into pending view'),
+      ),
+    ).toHaveLength(1);
   });
 });
 

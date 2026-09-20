@@ -299,6 +299,7 @@ async function main(): Promise<number> {
     // even while the old supervised slot is healthy. Activation then advances
     // the slot generation so no stale restart can swap the old epoch back in.
     spawnFreshGru: () => registry.spawn('gru', {}),
+    canAdoptFreshGru: () => gruSlot.canReplace(),
     adoptFreshGru: (handle) => gruSlot.adoptReplacement(handle),
     siblingUpgradePaths: [BOARD_WS_PATH],
     log: (level, msg, fields) => logger.log(level, msg, fields),

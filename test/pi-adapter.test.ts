@@ -238,25 +238,6 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       release();
       await expect(compacting).rejects.toThrow(/without a terminal event/);
 
-      let releaseDisposed!: () => void;
-      internal.session = new Proxy(nativeSession, {
-        get(target, key) {
-          if (key === 'compact') {
-            return () =>
-              new Promise<void>((resolve) => {
-                releaseDisposed = resolve;
-              });
-          }
-          return Reflect.get(target, key, target);
-        },
-      });
-      const disposedDuringCompact = handle.compact!();
-      const internals = handle as unknown as { disposed: boolean };
-      internals.disposed = true;
-      releaseDisposed();
-      await expect(disposedDuringCompact).rejects.toThrow(/disposed during native compaction/);
-      internals.disposed = false;
-
       internal.session = new Proxy(nativeSession, {
         get(target, key) {
           if (key === 'compact') return async () => {};
@@ -270,6 +251,42 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     } finally {
       await handle.dispose();
     }
+  });
+
+  it('resolves native compaction terminal failure when dispose races compact', async () => {
+    const fx = await fixture([{ deltas: ['first answer'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    type InternalSession = {
+      compact(): Promise<unknown>;
+      dispose(): void;
+      readonly sessionId: string;
+      readonly sessionFile: string | undefined;
+      readonly isIdle: boolean;
+      readonly isCompacting: boolean;
+    };
+    const internal = handle as unknown as { session: InternalSession };
+    const nativeSession = internal.session;
+    let release!: () => void;
+    internal.session = new Proxy(nativeSession, {
+      get(target, key) {
+        if (key === 'compact') {
+          return () => new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        }
+        return Reflect.get(target, key, target);
+      },
+    });
+    const compacting = handle.compact!();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const disposing = handle.dispose();
+    release();
+    await expect(compacting).rejects.toThrow(/disposed during native compaction/);
+    await disposing;
+    expect(
+      events.filter((event) => event.type === 'compaction_end' && !event.success),
+    ).toHaveLength(1);
   });
 
   it('emits thinking deltas before text when the model reasons', async () => {

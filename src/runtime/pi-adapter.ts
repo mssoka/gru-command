@@ -330,6 +330,7 @@ export class PiAgentHandle implements AgentHandle {
   private compactionEndTimer: ReturnType<typeof setTimeout> | null = null;
   private explicitCompactionTerminal: {
     readonly resolve: (event: Extract<RuntimeEvent, { type: 'compaction_end' }>) => void;
+    settled: boolean;
   } | null = null;
   private disposed = false;
 
@@ -388,7 +389,7 @@ export class PiAgentHandle implements AgentHandle {
 
   async prompt(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
-    if (this.compacting || this.session.isCompacting) {
+    if (this.compacting || this.nativeCompactionOpen || this.session.isCompacting) {
       throw new Error('agent session is compacting; prompt requires an idle session');
     }
     const owner = options.owner ?? this.principal;
@@ -400,7 +401,7 @@ export class PiAgentHandle implements AgentHandle {
 
   async steer(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
-    if (this.compacting || this.session.isCompacting) {
+    if (this.compacting || this.nativeCompactionOpen || this.session.isCompacting) {
       throw new Error('agent session is compacting; steer requires an idle session');
     }
     const owner = options.owner ?? this.principal;
@@ -416,7 +417,7 @@ export class PiAgentHandle implements AgentHandle {
 
   async followUp(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
-    if (this.compacting || this.session.isCompacting) {
+    if (this.compacting || this.nativeCompactionOpen || this.session.isCompacting) {
       throw new Error('agent session is compacting; follow-up requires an idle session');
     }
     const owner = options.owner ?? this.principal;
@@ -431,7 +432,13 @@ export class PiAgentHandle implements AgentHandle {
   }
 
   getContextUsage = (): ContextUsage | null => {
-    if (this.disposed || this.compacting || this.session.isStreaming || this.session.isCompacting) {
+    if (
+      this.disposed ||
+      this.compacting ||
+      this.nativeCompactionOpen ||
+      this.session.isStreaming ||
+      this.session.isCompacting
+    ) {
       return null;
     }
     const usage = this.session.getContextUsage();
@@ -457,17 +464,20 @@ export class PiAgentHandle implements AgentHandle {
   canCompact = (): boolean =>
     !this.disposed &&
     !this.compacting &&
+    !this.nativeCompactionOpen &&
     this.liveTurn === null &&
     this.queue.length === 0 &&
     this.session.isIdle &&
     !this.session.isCompacting;
 
-  isCompacting = (): boolean => this.compacting || this.session.isCompacting;
+  isCompacting = (): boolean =>
+    this.compacting || this.nativeCompactionOpen || this.session.isCompacting;
 
   compact = async (): Promise<void> => {
     this.assertLive();
     if (
       this.compacting ||
+      this.nativeCompactionOpen ||
       this.liveTurn !== null ||
       this.queue.length > 0 ||
       !this.session.isIdle ||
@@ -485,7 +495,7 @@ export class PiAgentHandle implements AgentHandle {
         resolveTerminal = resolveTerminalPromise;
       },
     );
-    const waiter = { resolve: resolveTerminal };
+    const waiter = { resolve: resolveTerminal, settled: false };
     this.explicitCompactionTerminal = waiter;
     this.compacting = true;
     let failed = false;
@@ -497,21 +507,23 @@ export class PiAgentHandle implements AgentHandle {
       failure = error;
     } finally {
       this.compacting = false;
-      if (failed || this.pendingCompactionEnd === null) {
-        this.pendingCompactionEnd = {
-          type: 'compaction_end',
-          success: false,
-          error:
-            failed
-              ? failure instanceof Error
-                ? failure.message
-                : String(failure)
-              : 'native compaction settled without a terminal event',
-        };
-        this.nativeCompactionOpen = true;
-        this.compactionEndDeadline = Date.now() + COMPACTION_END_RECONCILE_MS;
+      if (!this.disposed) {
+        if (failed || this.pendingCompactionEnd === null) {
+          this.pendingCompactionEnd = {
+            type: 'compaction_end',
+            success: false,
+            error:
+              failed
+                ? failure instanceof Error
+                  ? failure.message
+                  : String(failure)
+                : 'native compaction settled without a terminal event',
+          };
+          this.nativeCompactionOpen = true;
+          this.compactionEndDeadline = Date.now() + COMPACTION_END_RECONCILE_MS;
+        }
+        this.flushCompactionEndWhenSettled();
       }
-      this.flushCompactionEndWhenSettled();
     }
     try {
       if (this.disposed) {
@@ -536,9 +548,25 @@ export class PiAgentHandle implements AgentHandle {
     this.disposed = true;
     if (this.compactionEndTimer !== null) clearTimeout(this.compactionEndTimer);
     this.compactionEndTimer = null;
+    const abortCompaction =
+      (this.explicitCompactionTerminal !== null &&
+        !this.explicitCompactionTerminal.settled) ||
+      this.compacting ||
+      this.nativeCompactionOpen ||
+      this.pendingCompactionEnd !== null;
     this.pendingCompactionEnd = null;
     this.nativeCompactionOpen = false;
     this.compactionEndDeadline = 0;
+    if (abortCompaction) {
+      // Resolve the explicit waiter before clearing lifecycle state. compact()
+      // may still be awaiting the SDK call, but once it settles it observes
+      // this one authoritative failed terminal instead of waiting forever.
+      this.publishCompactionEnd({
+        type: 'compaction_end',
+        success: false,
+        error: 'agent session disposed during native compaction',
+      });
+    }
     const drained = this.queue.splice(0);
     for (const item of drained) {
       if (item.timer !== null) clearTimeout(item.timer);
@@ -689,12 +717,18 @@ export class PiAgentHandle implements AgentHandle {
   private publishCompactionEnd(
     terminal: Extract<RuntimeEvent, { type: 'compaction_end' }>,
   ): void {
+    const waiter = this.explicitCompactionTerminal;
+    if (waiter?.settled === true) return;
     this.emit(terminal);
-    this.explicitCompactionTerminal?.resolve(terminal);
+    if (waiter !== null) {
+      waiter.settled = true;
+      waiter.resolve(terminal);
+    }
   }
 
   /** Map pi SDK events onto the runtime-agnostic event surface. */
   private onPiEvent(event: unknown): void {
+    if (this.disposed) return;
     const e = event as Record<string, unknown>;
     switch (e['type']) {
       case 'agent_start':
@@ -726,10 +760,17 @@ export class PiAgentHandle implements AgentHandle {
         this.emit({ type: 'turn_end' });
         return;
       case 'compaction_start':
+        if (this.nativeCompactionOpen) return;
         this.nativeCompactionOpen = true;
         this.emit({ type: 'compaction_start' });
         return;
       case 'compaction_end': {
+        if (
+          !this.nativeCompactionOpen &&
+          !this.compacting &&
+          (this.explicitCompactionTerminal === null ||
+            this.explicitCompactionTerminal.settled)
+        ) return;
         const success = e['aborted'] !== true && typeof e['errorMessage'] !== 'string';
         this.pendingCompactionEnd = {
           type: 'compaction_end',

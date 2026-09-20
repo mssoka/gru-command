@@ -41,7 +41,9 @@ let epoch = 0;
 let replayFloorSeq = 0;
 let controlState: ContextControlState = 'idle';
 let failNextCompact = false;
+let failNextNewChat = false;
 let compactGeneration = 0;
+let newChatGeneration = 0;
 const deferredUsers: Array<{ socket: WebSocket; frame: UserFrame }> = [];
 const chatClients = new Map<WebSocket, { writer: boolean }>();
 
@@ -472,8 +474,8 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     return;
   }
   // Dev control plane (tests): POST /__reset clears the frame log;
-  // POST /__drop terminates every connected socket; POST /__compact-fail
-  // makes the next native compact fail after its visible progress state.
+  // POST /__drop terminates every connected socket; the failure endpoints
+  // fail the next matching context control after its visible progress state.
   if (req.method === 'POST' && req.url === '/__compact-fail') {
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' });
@@ -481,6 +483,17 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
       return;
     }
     failNextCompact = true;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}\n');
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/__new-chat-fail') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    failNextNewChat = true;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}\n');
     return;
@@ -502,13 +515,19 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
       res.end('{"error":"unauthorized"}\n');
       return;
     }
+    // Counters may rewind only after every client is detached; otherwise a
+    // live browser observes impossible seq/epoch regression.
+    for (const socket of server.clients) socket.terminate();
+    chatClients.clear();
     log.length = 0;
     seq = 0;
     epoch = 0;
     replayFloorSeq = 0;
     controlState = 'idle';
     failNextCompact = false;
+    failNextNewChat = false;
     compactGeneration += 1;
+    newChatGeneration += 1;
     deferredUsers.length = 0;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}\n');
@@ -527,6 +546,22 @@ const boardServer = new WebSocketServer({ noServer: true });
 
 httpServer.on('upgrade', (request, socket, head) => {
   const { pathname } = new URL(request.url ?? '/', 'http://localhost');
+  const origin = request.headers.origin;
+  if (origin !== undefined) {
+    try {
+      const parsed = new URL(origin);
+      if (
+        (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+        parsed.host !== request.headers.host
+      ) {
+        socket.destroy();
+        return;
+      }
+    } catch {
+      socket.destroy();
+      return;
+    }
+  }
   if (pathname === '/ws') {
     server.handleUpgrade(request, socket, head, (ws) => server.emit('connection', ws, request));
     return;
@@ -713,61 +748,97 @@ function handleControlFrame(socket: WebSocket, frame: ControlFrame): void {
     }, 300);
     return;
   }
-  epoch += 1;
-  replayFloorSeq = seq;
-  // Match production activation ordering: publish the committed boundary
-  // while reset is still in progress, then terminal result, then idle.
-  broadcastContext();
-  send(socket, {
-    type: 'control_result',
-    action: frame.action,
-    request_id: frame.request_id,
-    ok: true,
-    epoch,
-  });
-  controlState = 'idle';
-  broadcastContext();
+  const generation = ++newChatGeneration;
+  const fail = failNextNewChat;
+  failNextNewChat = false;
+  setTimeout(() => {
+    if (generation !== newChatGeneration) return;
+    if (fail) {
+      if (socket.readyState === WebSocket.OPEN) {
+        send(socket, {
+          type: 'control_result',
+          action: frame.action,
+          request_id: frame.request_id,
+          ok: false,
+          epoch,
+          code: 'failed',
+          message: 'mock fresh session spawn failed',
+        });
+      }
+      controlState = 'idle';
+      broadcastContext();
+      drainDeferredUsers();
+      return;
+    }
+    epoch += 1;
+    replayFloorSeq = seq;
+    // Match production activation ordering: publish the committed boundary
+    // while reset is still in progress, then terminal result, then idle.
+    broadcastContext();
+    if (socket.readyState === WebSocket.OPEN) {
+      send(socket, {
+        type: 'control_result',
+        action: frame.action,
+        request_id: frame.request_id,
+        ok: true,
+        epoch,
+      });
+    }
+    controlState = 'idle';
+    broadcastContext();
+    drainDeferredUsers();
+  }, fail ? 2_500 : 600);
 }
 
 function drainDeferredUsers(): void {
   if (controlState !== 'idle') return;
-  let next = deferredUsers.shift();
-  while (next !== undefined && next.socket.readyState !== WebSocket.OPEN) {
-    next = deferredUsers.shift();
+  for (;;) {
+    const next = deferredUsers.shift();
+    if (next === undefined) return;
+    if (next.socket.readyState !== WebSocket.OPEN) continue;
+    if (handleUserFrame(next.socket, next.frame)) return;
+    // A terminal duplicate starts no reply; keep draining until a unique
+    // frame owns the one-at-a-time scripted turn.
   }
-  if (next !== undefined) handleUserFrame(next.socket, next.frame);
 }
 
-/** Dedup by client_msg_id: re-received frames get a fresh ack, no re-reply. */
-function handleUserFrame(socket: WebSocket, frame: UserFrame): void {
+/** Dedup by epoch + client_msg_id: re-received frames get a fresh ack. */
+function handleUserFrame(socket: WebSocket, frame: UserFrame): boolean {
   if (chatClients.get(socket)?.writer !== true) {
     send(socket, { type: 'error', message: 'read-only: another client holds the pen' });
-    return;
+    return false;
   }
   if (controlState !== 'idle') {
     deferredUsers.push({ socket, frame });
-    return;
+    return false;
+  }
+  if (frame.epoch !== epoch) {
+    send(socket, { type: 'error', message: 'stale chat epoch; reconnect required' });
+    socket.close(1012, 'stale chat epoch');
+    return false;
   }
   const prior = log.find(
     (logged): logged is LoggedFrame & { type: 'user' } =>
       logged.type === 'user' &&
       logged.client_msg_id === frame.client_msg_id &&
-      logged.seq > replayFloorSeq,
+      logged.epoch === frame.epoch,
   );
   if (prior !== undefined) {
     send(socket, record({ type: 'ack', client_msg_id: frame.client_msg_id, seq: nextSeq() }));
-    return;
+    return false;
   }
   const loggedUser = record({
     type: 'user',
     text: frame.text,
     client_msg_id: frame.client_msg_id,
+    epoch: frame.epoch,
     ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
     seq: nextSeq(),
   });
   broadcastFrame(loggedUser, socket);
   send(socket, record({ type: 'ack', client_msg_id: frame.client_msg_id, seq: nextSeq() }));
   scriptedReply(socket, frame.text, frame.attachments);
+  return true;
 }
 
 const shutdown = (): void => {

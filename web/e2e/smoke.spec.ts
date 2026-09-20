@@ -78,6 +78,37 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await sendAndWaitReply(page, 'first words in fresh epoch');
 });
 
+test('failed New chat restores history and delivers a word typed in the pending view once', async ({ page }) => {
+  await pair(page);
+  await sendAndWaitReply(page, 'retired words before failed reset');
+  const armFailure = await page.request.post('http://localhost:8788/__new-chat-fail', {
+    headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+  });
+  expect(armFailure.ok()).toBe(true);
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.locator('#chat-new').click();
+  await expect(page.locator('#chat-context-status')).toHaveText('Starting new chat…');
+  await expect(page.locator('.msg--user', { hasText: 'retired words before failed reset' })).toHaveCount(0);
+  await page.locator('#chat-input').fill('word typed during failed reset');
+  await page.locator('#chat-send').click();
+  await expect(page.locator('.msg--user', { hasText: 'word typed during failed reset' })).toHaveCount(1);
+  await page.reload();
+  await expect(page.locator('#chat-view')).toBeVisible();
+  await expect(page.locator('.msg--user', { hasText: 'word typed during failed reset' })).toHaveCount(1);
+  await page.waitForTimeout(1_000);
+  await expect(page.locator('.msg--user', { hasText: 'retired words before failed reset' })).toHaveCount(0);
+
+  await expect(
+    page.locator('.notice-line', { hasText: 'New chat did not complete before reconnect' }),
+  ).toBeVisible();
+  await expect(page.locator('.msg--user', { hasText: 'retired words before failed reset' })).toHaveCount(1);
+  await expect(page.locator('.msg--user', { hasText: 'word typed during failed reset' })).toHaveCount(1);
+  const reply = page.locator('.msg--gru', { hasText: 'You said: "word typed during failed reset"' });
+  await expect(reply).toHaveCount(1);
+  await expect(reply).not.toHaveClass(/msg--streaming/);
+});
+
 test('reconnect keeps history after reload (no duplicates)', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'remember this message');
@@ -129,6 +160,65 @@ test('wrong token: inline error, stays on pairing across reload', async ({ page 
   await expect(page.locator('#chat-view')).toBeHidden();
 });
 
+test('legacy outbox migration is atomic and browser tabs keep independent queues', async ({
+  page,
+  context,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('gru-pairing-token', 'migration-test-invalid-token');
+    localStorage.setItem(
+      'gru-outbox',
+      JSON.stringify([
+        { client_msg_id: 'legacy-only', text: 'legacy queued word', status: 'queued' },
+        { client_msg_id: 'duplicate', text: 'legacy duplicate', status: 'queued' },
+      ]),
+    );
+    sessionStorage.setItem(
+      'gru-outbox',
+      JSON.stringify([
+        { client_msg_id: 'tab-a-only', text: 'tab A queued word', status: 'queued' },
+        { client_msg_id: 'duplicate', text: 'tab A wins duplicate', status: 'queued' },
+      ]),
+    );
+  });
+  await page.goto('/');
+  await expect(page.locator('#pair-error')).toContainText('unauthorized');
+  const migrated = await page.evaluate(() => ({
+    legacy: localStorage.getItem('gru-outbox'),
+    outbox: JSON.parse(sessionStorage.getItem('gru-outbox') ?? '[]') as Array<{
+      client_msg_id: string;
+      text: string;
+    }>,
+  }));
+  expect(migrated.legacy).toBeNull();
+  expect(migrated.outbox.map((entry) => entry.client_msg_id)).toEqual([
+    'tab-a-only',
+    'duplicate',
+    'legacy-only',
+  ]);
+  expect(migrated.outbox.find((entry) => entry.client_msg_id === 'duplicate')?.text).toBe(
+    'tab A wins duplicate',
+  );
+  await expect(page.locator('.msg--user', { hasText: 'tab A queued word' })).toHaveCount(1);
+
+  const tabB = await context.newPage();
+  await tabB.addInitScript(() => {
+    localStorage.setItem('gru-pairing-token', 'migration-test-invalid-token');
+    sessionStorage.setItem(
+      'gru-outbox',
+      JSON.stringify([
+        { client_msg_id: 'tab-b-only', text: 'tab B queued word', status: 'queued' },
+      ]),
+    );
+  });
+  await tabB.goto('/');
+  await expect(tabB.locator('#pair-error')).toContainText('unauthorized');
+  await expect(tabB.locator('.msg--user', { hasText: 'tab B queued word' })).toHaveCount(1);
+  await expect(tabB.locator('.msg--user', { hasText: 'tab A queued word' })).toHaveCount(0);
+  await expect(page.locator('.msg--user', { hasText: 'tab B queued word' })).toHaveCount(0);
+  await tabB.close();
+});
+
 test('mock controls reject missing/wrong tokens without state changes and valid controls act', async ({ page }) => {
   const initialReset = await page.request.post('http://localhost:8788/__reset', {
     headers: { authorization: `Bearer ${MOCK_TOKEN}` },
@@ -137,7 +227,7 @@ test('mock controls reject missing/wrong tokens without state changes and valid 
   await pair(page);
   await sendAndWaitReply(page, 'control-state-survives');
 
-  for (const route of ['__pulse', '__drop', '__reset']) {
+  for (const route of ['__pulse', '__drop', '__reset', '__compact-fail', '__new-chat-fail']) {
     const missing = await page.request.post(`http://localhost:8788/${route}`);
     expect(missing.status(), `${route} missing token`).toBe(401);
     const wrong = await page.request.post(`http://localhost:8788/${route}`, {
@@ -153,6 +243,10 @@ test('mock controls reject missing/wrong tokens without state changes and valid 
   await page.reload();
   await expect(page.locator('.msg--user', { hasText: 'control-state-survives' })).toHaveCount(1);
   await expect(page.locator('.msg--user', { hasText: 'still-connected-after-denials' })).toHaveCount(1);
+  await page.locator('#chat-compact').click();
+  await expect(page.locator('#chat-context-announcement')).toHaveText(
+    'Context compacted successfully',
+  );
 
   const board = new WebSocket('ws://localhost:8788/board/ws');
   const nextBoardSnapshot = (): Promise<void> => new Promise((resolve, reject) => {

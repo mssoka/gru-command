@@ -61,9 +61,12 @@ export class ChatFrameLog {
   readonly file: string;
   private frames: LoggedFrame[] = [];
   private seq = 0;
-  /** Latest seq for each logged user id. Epoch floors scope de-duplication
-   * without deleting any historical frame. */
+  /** Latest seq for each epoch + user-id pair. A client_msg_id may be
+   * reused safely in a later durable chat epoch, but never within one. */
   private readonly seenUserIds = new Map<string, number>();
+  /** Pre-upgrade user frames had no epoch. Their seq relative to the durable
+   * replay floor assigns them to the one active epoch without rewriting logs. */
+  private readonly legacySeenUserIds = new Map<string, number>();
   /** Open tool names (multiset stack) + whether a turn is open. */
   private readonly openTools: string[] = [];
   private turnOpen = false;
@@ -233,8 +236,9 @@ export class ChatFrameLog {
     return this.frames;
   }
 
-  hasSeenUserId(clientMsgId: string, replayFloorSeq = 0): boolean {
-    return (this.seenUserIds.get(clientMsgId) ?? 0) > replayFloorSeq;
+  hasSeenUserId(clientMsgId: string, epoch: number, replayFloorSeq = 0): boolean {
+    return this.seenUserIds.has(userDedupKey(epoch, clientMsgId)) ||
+      (this.legacySeenUserIds.get(clientMsgId) ?? 0) > replayFloorSeq;
   }
 
   /**
@@ -325,7 +329,11 @@ export class ChatFrameLog {
   private track(frame: LoggedFrame): void {
     switch (frame.type) {
       case 'user':
-        this.seenUserIds.set(frame.client_msg_id, frame.seq);
+        if (frame.epoch !== undefined) {
+          this.seenUserIds.set(userDedupKey(frame.epoch, frame.client_msg_id), frame.seq);
+        } else {
+          this.legacySeenUserIds.set(frame.client_msg_id, frame.seq);
+        }
         break;
       case 'tool':
         if (frame.state === 'start') {
@@ -342,6 +350,10 @@ export class ChatFrameLog {
         break;
     }
   }
+}
+
+function userDedupKey(epoch: number, clientMsgId: string): string {
+  return `${epoch}\u0000${clientMsgId}`;
 }
 
 /** JSON.parse that yields null instead of throwing (tail probing). */

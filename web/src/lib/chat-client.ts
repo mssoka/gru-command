@@ -79,6 +79,8 @@ export interface ChatClientOptions {
   readonly webSocketCtor?: WebSocketCtor;
   readonly idgen?: () => string;
   readonly initialMessages?: readonly ChatMessage[];
+  /** Test/embedding seam; production default remains 5 seconds. */
+  readonly contextTimeoutMs?: number;
 }
 
 /** Minimal structural type over the browser WebSocket (and `ws` in tests). */
@@ -121,6 +123,7 @@ export function chipsValid(chips: unknown): chips is readonly AttachmentChip[] {
 }
 
 const OUTBOX_KEY = 'gru-outbox';
+const PENDING_RESET_KEY = 'gru-pending-new-chat';
 const SOCKET_OPEN = 1;
 /** Guard against a wedge pasting unbounded text into storage + frames. */
 export const MAX_MESSAGE_CHARS = 4_000;
@@ -146,6 +149,8 @@ export class ChatClient {
   /** While New chat is unresolved, newly typed words stay browser-local. The
    * authoritative idle context (including reconnect recovery) releases them
    * into whichever epoch actually won. */
+  private pendingCompactRequest: string | null = null;
+  private pendingCompactRecovery = false;
   private pendingNewChatRequest: string | null = null;
   private pendingNewChatOriginEpoch: number | null = null;
   private pendingNewChatResultEpoch: number | null = null;
@@ -153,6 +158,10 @@ export class ChatClient {
    * snapshot. Kept separately because ordinary reconnect reconciliation is
    * consumed by that first (possibly still-resetting) context frame. */
   private pendingNewChatRecovery = false;
+  /** A reload while reset is unresolved must not replay the retiring epoch
+   * into the optimistic empty view. Frames still advance seq bookkeeping. */
+  private suppressReplayFrames = false;
+  private readonly suppressedReplay: LoggedFrame[] = [];
   private readonly messages = new Map<string, ChatMessage>();
   private readonly outbox: string[] = [];
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
@@ -173,6 +182,13 @@ export class ChatClient {
       }
       if (!this.outbox.includes(stored.client_msg_id)) this.outbox.push(stored.client_msg_id);
     }
+    const pendingReset = this.readPendingReset();
+    if (pendingReset !== null) {
+      this.pendingNewChatRequest = pendingReset.requestId;
+      this.pendingNewChatOriginEpoch = pendingReset.originEpoch;
+      this.pendingNewChatRecovery = true;
+      this.suppressReplayFrames = true;
+    }
   }
 
   getState(): ConnectionState {
@@ -181,6 +197,10 @@ export class ChatClient {
 
   getMessages(): readonly ChatMessage[] {
     return [...this.messages.values()];
+  }
+
+  hasPendingNewChat(): boolean {
+    return this.pendingNewChatRequest !== null;
   }
 
   connect(): void {
@@ -248,24 +268,44 @@ export class ChatClient {
     if (socket === null || socket.readyState !== SOCKET_OPEN) {
       throw new Error('chat controls require an open connection');
     }
+    if (action === 'compact' && this.pendingCompactRequest !== null) {
+      throw new Error('context compaction is already pending');
+    }
     if (action === 'new_chat' && this.pendingNewChatRequest !== null) {
       throw new Error('new chat is already pending');
     }
     const requestId = `control-${this.id()}`;
+    if (action === 'compact') {
+      this.pendingCompactRequest = requestId;
+      this.pendingCompactRecovery = false;
+    }
     if (action === 'new_chat') {
+      if (this.currentEpoch === null) {
+        throw new Error('new chat requires an authoritative context epoch');
+      }
+      if (!this.persistPendingReset(requestId, this.currentEpoch)) {
+        throw new Error('could not persist pending New chat state');
+      }
       this.pendingNewChatRequest = requestId;
       this.pendingNewChatOriginEpoch = this.currentEpoch;
       this.pendingNewChatResultEpoch = null;
       this.pendingNewChatRecovery = false;
+      this.suppressReplayFrames = false;
     }
     try {
       socket.send(JSON.stringify({ type: 'control', action, request_id: requestId }));
     } catch (error) {
+      if (this.pendingCompactRequest === requestId) {
+        this.pendingCompactRequest = null;
+        this.pendingCompactRecovery = false;
+      }
       if (this.pendingNewChatRequest === requestId) {
         this.pendingNewChatRequest = null;
         this.pendingNewChatOriginEpoch = null;
         this.pendingNewChatResultEpoch = null;
         this.pendingNewChatRecovery = false;
+        this.suppressReplayFrames = false;
+        this.clearPendingReset();
       }
       throw error;
     }
@@ -324,6 +364,7 @@ export class ChatClient {
     socket.onclose = () => {
       if (this.socket !== socket) return; // stale socket from a prior attempt
       this.socket = null;
+      if (this.pendingCompactRequest !== null) this.pendingCompactRecovery = true;
       if (this.stopped) {
         this.setState('idle');
         return;
@@ -364,7 +405,7 @@ export class ChatClient {
         this.timers.delete(contextDeadline);
         if (this.contextDeadline === contextDeadline) this.contextDeadline = null;
         if (this.socket === socket && this.awaitingContext) socket.close();
-      }, CONTEXT_TIMEOUT_MS);
+      }, this.options.contextTimeoutMs ?? CONTEXT_TIMEOUT_MS);
       this.contextDeadline = contextDeadline;
       this.timers.add(contextDeadline);
       // Wait for the authoritative epoch snapshot before deciding whether
@@ -385,6 +426,10 @@ export class ChatClient {
     }
 
     if (frame.type === 'control_result') {
+      if (frame.action === 'compact' && frame.request_id === this.pendingCompactRequest) {
+        this.pendingCompactRequest = null;
+        this.pendingCompactRecovery = false;
+      }
       if (frame.action === 'new_chat' && frame.request_id === this.pendingNewChatRequest) {
         if (frame.ok) {
           // Do not flush on success alone. The following idle context is the
@@ -400,6 +445,8 @@ export class ChatClient {
           this.pendingNewChatOriginEpoch = null;
           this.pendingNewChatResultEpoch = null;
           this.pendingNewChatRecovery = false;
+          this.suppressReplayFrames = false;
+          this.clearPendingReset();
         }
       }
       this.events.controlResult?.(frame);
@@ -415,6 +462,19 @@ export class ChatClient {
       this.stopped = true;
       this.events.fatal(frame.message);
       socket.close();
+      return;
+    }
+
+    if (
+      this.suppressReplayFrames &&
+      'seq' in frame &&
+      typeof frame.seq === 'number'
+    ) {
+      // Keep transport continuity while the persisted pending-reset marker
+      // hides the retiring epoch. If authoritative recovery proves failure,
+      // the buffered replay restores that epoch before replayEnd.
+      this.suppressedReplay.push(frame as LoggedFrame);
+      this.bumpSeq(frame.seq);
       return;
     }
 
@@ -519,6 +579,33 @@ export class ChatClient {
         }
       }
     }
+    const pendingRetiredEpoch =
+      this.pendingNewChatRequest !== null &&
+      this.pendingNewChatOriginEpoch === snapshot.epoch &&
+      snapshot.state !== 'idle';
+    this.suppressReplayFrames = pendingRetiredEpoch;
+    if (!pendingRetiredEpoch && snapshot.epoch !== this.pendingNewChatOriginEpoch) {
+      this.suppressedReplay.length = 0;
+    }
+
+    if (
+      this.pendingCompactRequest !== null &&
+      this.pendingCompactRecovery &&
+      snapshot.state === 'idle'
+    ) {
+      this.events.controlResult?.({
+        type: 'control_result',
+        action: 'compact',
+        request_id: this.pendingCompactRequest,
+        ok: false,
+        epoch: snapshot.epoch,
+        code: 'failed',
+        message: 'Compaction outcome was lost during reconnect; current context is idle.',
+      });
+      this.pendingCompactRequest = null;
+      this.pendingCompactRecovery = false;
+    }
+
     let pendingNewChatCleared = false;
     if (this.pendingNewChatRequest !== null && snapshot.state === 'idle') {
       const committed =
@@ -534,7 +621,10 @@ export class ChatClient {
       if (inferredFailure) {
         // The terminal result was lost with the socket, and an authoritative
         // idle snapshot still names the request's origin epoch: no durable
-        // reset committed. An advanced epoch is recovered success instead.
+        // reset committed. Announce rollback first so a reloaded ChatView
+        // exits its persisted optimistic-empty model; then replay the held
+        // retiring transcript into that restored model.
+        this.suppressReplayFrames = false;
         this.events.controlResult?.({
           type: 'control_result',
           action: 'new_chat',
@@ -544,12 +634,16 @@ export class ChatClient {
           code: 'failed',
           message: 'New chat did not complete before reconnect',
         });
+        this.restoreSuppressedReplay();
       }
       if (committed || inferredFailure) {
         this.pendingNewChatRequest = null;
         this.pendingNewChatOriginEpoch = null;
         this.pendingNewChatResultEpoch = null;
         this.pendingNewChatRecovery = false;
+        this.suppressReplayFrames = false;
+        this.suppressedReplay.length = 0;
+        this.clearPendingReset();
         pendingNewChatCleared = true;
       }
     }
@@ -564,13 +658,42 @@ export class ChatClient {
     if (pendingNewChatCleared || snapshot.state === 'idle') this.flushOutbox();
   }
 
+  private restoreSuppressedReplay(): void {
+    for (const frame of this.suppressedReplay.splice(0)) {
+      if (frame.type === 'ack') {
+        const message = this.messages.get(frame.client_msg_id);
+        if (message && message.status !== 'acked') {
+          message.status = 'acked';
+          this.events.messageStatus({ ...message });
+          this.removeFromOutbox(frame.client_msg_id);
+        }
+        continue;
+      }
+      if (frame.type === 'user') {
+        const local = this.messages.get(frame.client_msg_id);
+        if (local && local.status !== 'acked') {
+          local.status = 'acked';
+          this.events.messageStatus({ ...local });
+          this.removeFromOutbox(frame.client_msg_id);
+          continue;
+        }
+      }
+      this.events.frame(frame);
+    }
+  }
+
   private bumpSeq(seq: number): void {
     if (seq > this.lastSeenSeq) this.lastSeenSeq = seq;
     this.maybeEndReplay();
   }
 
   private maybeEndReplay(): void {
-    if (!this.replaying || this.awaitingContext || this.state !== 'open') return;
+    if (
+      !this.replaying ||
+      this.awaitingContext ||
+      this.suppressReplayFrames ||
+      this.state !== 'open'
+    ) return;
     if (this.lastSeenSeq < this.highWaterSeq) return;
     this.replaying = false;
     this.events.replayEnd();
@@ -594,10 +717,12 @@ export class ChatClient {
       const message = this.messages.get(id);
       if (message === undefined || message.status === 'acked') continue;
       if (message.status !== 'queued') continue;
+      if (this.currentEpoch === null) continue;
       const frame: UserFrame = {
         type: 'user',
         text: message.text,
         client_msg_id: message.client_msg_id,
+        epoch: this.currentEpoch,
         ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       };
       const previousEpoch = message.epoch;
@@ -710,6 +835,45 @@ export class ChatClient {
       return out;
     } catch {
       return [];
+    }
+  }
+
+  private readPendingReset(): { requestId: string; originEpoch: number } | null {
+    try {
+      const raw = this.options.storage.getItem(PENDING_RESET_KEY);
+      if (raw === null) return null;
+      const value: unknown = JSON.parse(raw);
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+      const parsed = value as Record<string, unknown>;
+      return typeof parsed.request_id === 'string' &&
+        parsed.request_id !== '' &&
+        typeof parsed.origin_epoch === 'number' &&
+        Number.isSafeInteger(parsed.origin_epoch) &&
+        parsed.origin_epoch >= 0
+        ? { requestId: parsed.request_id, originEpoch: parsed.origin_epoch }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private persistPendingReset(requestId: string, originEpoch: number): boolean {
+    try {
+      this.options.storage.setItem(
+        PENDING_RESET_KEY,
+        JSON.stringify({ request_id: requestId, origin_epoch: originEpoch }),
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private clearPendingReset(): void {
+    try {
+      this.options.storage.removeItem(PENDING_RESET_KEY);
+    } catch {
+      /* an authoritative in-memory resolution still releases this page */
     }
   }
 

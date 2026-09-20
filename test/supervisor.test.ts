@@ -654,7 +654,7 @@ describe('supervisor — intentional slot generations', () => {
     h.dispose();
   });
 
-  it('intentional replacement preserves restart history and leaves the breaker alert unacknowledged', async () => {
+  it('intentional replacement fails closed after the breaker opens and leaves its alert unacknowledged', async () => {
     const h = boot();
     const slot = h.supervisor.declareSlot({
       id: 'gru-breaker-replacement',
@@ -670,15 +670,17 @@ describe('supervisor — intentional slot generations', () => {
     await sleep(50);
     const alert = h.notificationsOfKind('supervision.breaker').find((item) => item.ackedAt === null);
     expect(alert).toBeDefined();
+    expect(slot.canReplace()).toBe(false);
 
     const fresh = new FakeHandle('gru', 'fresh-after-breaker', null);
     h.registry.adopt(fresh);
-    await slot.adoptReplacement(fresh);
+    await expect(slot.adoptReplacement(fresh)).rejects.toThrow(/breaker is open/);
+    expect(fresh.disposed).toBe(true);
     expect(
       h.api.listNotifications({ limit: 100 }).find((item) => item.id === alert!.id)?.ackedAt,
     ).toBeNull();
-    expect(slot.current()?.id).toBe(fresh.id);
-    expect(h.supervisor.viewFor(fresh.id)).toMatchObject({
+    expect(slot.current()).toBeNull();
+    expect(h.supervisor.viewFor(first.id)).toMatchObject({
       breakerOpen: true,
       state: 'stopped',
       restarts: 3,

@@ -98,6 +98,9 @@ export interface SupervisedSlot {
   current(): AgentHandle | null;
   /** Fired when a supervisor restart produced a new live handle. */
   onSwap(listener: (handle: AgentHandle) => void): () => void;
+  /** Whether an intentional replacement may commit now. An open breaker
+   * fails closed: chat must not install a handle the watchdog will ignore. */
+  canReplace(): boolean;
   /** Intentionally make an already-spawned fresh handle current. This
    * advances the slot generation so an older restart cannot swap back in. */
   adoptReplacement(handle: AgentHandle): Promise<void>;
@@ -190,6 +193,7 @@ export class Supervisor {
           internal.swapListeners.delete(listener);
         };
       },
+      canReplace: () => this.slotAgent(internal)?.breakerOpen !== true,
       adoptReplacement: (handle) => this.adoptSlotReplacement(internal, handle),
       release: () => {
         // Invalidate in-flight restart rungs before deleting their records.
@@ -275,6 +279,10 @@ export class Supervisor {
     if (this.disposed || this.slots.get(slot.id) !== slot) {
       await this.registry.disposeHandle(handle).catch(() => {});
       throw new Error(`supervised slot "${slot.id}" is not active`);
+    }
+    if ([...this.agents.values()].some((agent) => agent.slot === slot && agent.breakerOpen)) {
+      await this.registry.disposeHandle(handle).catch(() => {});
+      throw new Error(`supervised slot "${slot.id}" breaker is open`);
     }
     const retired = [...this.agents.values()].filter(
       (agent) => agent.slot === slot && agent.agentId !== handle.id,

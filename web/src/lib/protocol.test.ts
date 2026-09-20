@@ -25,15 +25,17 @@ describe('parseClientFrame', () => {
   });
 
   it('accepts a valid user frame', () => {
-    const frame = parseClientFrame({ type: 'user', text: 'hi', client_msg_id: 'abc' });
-    expect(frame).toEqual({ type: 'user', text: 'hi', client_msg_id: 'abc' });
+    const frame = parseClientFrame({ type: 'user', text: 'hi', client_msg_id: 'abc', epoch: 2 });
+    expect(frame).toEqual({ type: 'user', text: 'hi', client_msg_id: 'abc', epoch: 2 });
   });
 
   it('rejects malformed input', () => {
     expect(parseClientFrame('not json')).toBeNull();
     expect(parseClientFrame(null)).toBeNull();
     expect(parseClientFrame([])).toBeNull();
-    expect(parseClientFrame({ type: 'user', text: 'hi' })).toBeNull();
+    expect(parseClientFrame({ type: 'user', text: 'hi', epoch: 0 })).toBeNull();
+    expect(parseClientFrame({ type: 'user', text: 'hi', client_msg_id: 'x' })).toBeNull();
+    expect(parseClientFrame({ type: 'user', text: 'hi', client_msg_id: 'x', epoch: -1 })).toBeNull();
     expect(parseClientFrame({ type: 'nope' })).toBeNull();
   });
 });
@@ -142,6 +144,31 @@ describe('context-control frames', () => {
     });
   });
 
+  it('accepts authoritative provider usage and rejects every numeric boundary violation', () => {
+    const context = {
+      type: 'context',
+      epoch: 2,
+      replay_floor_seq: 9,
+      state: 'idle',
+      usage: { tokens: 370, context_window: 1_000, percent: 37 },
+      compact_supported: true,
+      session_active: true,
+      writer: true,
+    } as const;
+    expect(parseServerFrame(context)).toEqual(context);
+    for (const usage of [
+      { tokens: -1, context_window: 1_000, percent: 37 },
+      { tokens: Number.NaN, context_window: 1_000, percent: 37 },
+      { tokens: 370, context_window: 0, percent: 37 },
+      { tokens: 370, context_window: Number.POSITIVE_INFINITY, percent: 37 },
+      { tokens: 370, context_window: 1_000, percent: -0.1 },
+      { tokens: 370, context_window: 1_000, percent: 100.1 },
+      { tokens: 370, context_window: 1_000, percent: Number.NaN },
+    ]) {
+      expect(parseServerFrame({ ...context, usage })).toBeNull();
+    }
+  });
+
   it('rejects malformed control, context, and inconsistent terminal results', () => {
     expect(parseClientFrame({ type: 'control', action: 'reset', request_id: 'n1' })).toBeNull();
     expect(
@@ -196,8 +223,12 @@ describe('attachment chips on user frames (SPEC ruling 19)', () => {
   ];
 
   it('accepts a user frame carrying valid chips', () => {
-    const frame = parseClientFrame({ type: 'user', text: 'look', client_msg_id: 'a1', attachments: chips });
-    expect(frame).toEqual({ type: 'user', text: 'look', client_msg_id: 'a1', attachments: chips });
+    const frame = parseClientFrame({
+      type: 'user', text: 'look', client_msg_id: 'a1', epoch: 3, attachments: chips,
+    });
+    expect(frame).toEqual({
+      type: 'user', text: 'look', client_msg_id: 'a1', epoch: 3, attachments: chips,
+    });
   });
 
   it('accepts an attachment-ONLY frame (empty text, chips present)', () => {
@@ -205,13 +236,14 @@ describe('attachment chips on user frames (SPEC ruling 19)', () => {
       type: 'user',
       text: '',
       client_msg_id: 'a2',
+      epoch: 0,
       attachments: [{ path: '/x.png', name: 'x.png', kind: 'image' }],
     });
     expect(frame?.type).toBe('user');
   });
 
   it('rejects empty-text frames WITHOUT chips (still malformed)', () => {
-    expect(parseClientFrame({ type: 'user', text: '', client_msg_id: 'a3' })).toBeNull();
+    expect(parseClientFrame({ type: 'user', text: '', client_msg_id: 'a3', epoch: 0 })).toBeNull();
   });
 
   it('rejects bad chip kinds, empty arrays, and over-cap arrays', () => {
@@ -220,15 +252,19 @@ describe('attachment chips on user frames (SPEC ruling 19)', () => {
         type: 'user',
         text: 'x',
         client_msg_id: 'a4',
+        epoch: 0,
         attachments: [{ path: '/v', name: 'v', kind: 'video' }],
       }),
     ).toBeNull();
-    expect(parseClientFrame({ type: 'user', text: 'x', client_msg_id: 'a5', attachments: [] })).toBeNull();
+    expect(
+      parseClientFrame({ type: 'user', text: 'x', client_msg_id: 'a5', epoch: 0, attachments: [] }),
+    ).toBeNull();
     expect(
       parseClientFrame({
         type: 'user',
         text: 'x',
         client_msg_id: 'a6',
+        epoch: 0,
         attachments: Array.from({ length: 9 }, (_, i) => ({ path: `/f${i}`, name: `f${i}`, kind: 'file' as const })),
       }),
     ).toBeNull();

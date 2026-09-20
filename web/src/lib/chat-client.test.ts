@@ -25,11 +25,16 @@ class TestServer {
   epoch = 0;
   replayFloorSeq = 0;
   contextState: 'idle' | 'busy' | 'compacting' | 'resetting' = 'idle';
+  usage: ContextFrame['usage'] = null;
   controls: Array<{ action: 'compact' | 'new_chat'; request_id: string }> = [];
   failNextNewChat = false;
   deferNextNewChat = false;
+  deferNextCompact = false;
   writer = true;
+  omitNextContext = false;
+  authCount = 0;
   deferredNewChat: { socket: WebSocket; request_id: string } | null = null;
+  deferredCompact: { socket: WebSocket; request_id: string } | null = null;
   sockets = new Set<WebSocket>();
 
   async start(): Promise<void> {
@@ -50,14 +55,19 @@ class TestServer {
             return;
           }
           authed = true;
+          this.authCount += 1;
           const lastSeen = frame.last_seen_seq ?? 0;
           this.send(socket, { type: 'auth_ok', seq: this.seq });
+          if (this.omitNextContext) {
+            this.omitNextContext = false;
+            return;
+          }
           this.send(socket, {
             type: 'context',
             epoch: this.epoch,
             replay_floor_seq: this.replayFloorSeq,
             state: this.contextState,
-            usage: null,
+            usage: this.usage,
             compact_supported: true,
             session_active: true,
             writer: this.writer,
@@ -70,6 +80,13 @@ class TestServer {
         }
         if (frame.type === 'control') {
           this.controls.push({ action: frame.action, request_id: frame.request_id });
+          if (frame.action === 'compact' && this.deferNextCompact) {
+            this.deferNextCompact = false;
+            this.contextState = 'compacting';
+            this.deferredCompact = { socket, request_id: frame.request_id };
+            this.broadcastContext();
+            return;
+          }
           if (frame.action === 'new_chat' && this.deferNextNewChat) {
             this.deferNextNewChat = false;
             this.contextState = 'resetting';
@@ -106,7 +123,7 @@ class TestServer {
             epoch: this.epoch,
             replay_floor_seq: this.replayFloorSeq,
             state: this.contextState,
-            usage: null,
+            usage: this.usage,
             compact_supported: true,
             session_active: true,
             writer: true,
@@ -114,7 +131,12 @@ class TestServer {
           return;
         }
         if (frame.type !== 'user') return;
-        if (this.log.some((l) => l.type === 'user' && l.client_msg_id === frame.client_msg_id)) {
+        if (
+          frame.epoch !== this.epoch ||
+          this.log.some(
+            (l) => l.type === 'user' && l.client_msg_id === frame.client_msg_id && l.epoch === frame.epoch,
+          )
+        ) {
           this.send(socket, { type: 'ack', client_msg_id: frame.client_msg_id, seq: ++this.seq });
           return;
         }
@@ -122,6 +144,7 @@ class TestServer {
           type: 'user',
           text: frame.text,
           client_msg_id: frame.client_msg_id,
+          epoch: frame.epoch,
           ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
           seq: ++this.seq,
         });
@@ -144,12 +167,29 @@ class TestServer {
         epoch: this.epoch,
         replay_floor_seq: this.replayFloorSeq,
         state: this.contextState,
-        usage: null,
+        usage: this.usage,
         compact_supported: true,
         session_active: true,
         writer: this.writer,
       });
     }
+  }
+
+  completeDeferredCompact(): void {
+    const pending = this.deferredCompact;
+    if (pending === null) throw new Error('no deferred compact');
+    this.deferredCompact = null;
+    if (pending.socket.readyState === WebSocket.OPEN) {
+      this.send(pending.socket, {
+        type: 'control_result',
+        action: 'compact',
+        request_id: pending.request_id,
+        ok: true,
+        epoch: this.epoch,
+      });
+    }
+    this.contextState = 'idle';
+    this.broadcastContext();
   }
 
   completeDeferredNewChat(): void {
@@ -239,7 +279,12 @@ interface Harness {
   controlResultFrames: ControlResultFrame[];
 }
 
-function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Harness {
+function makeClient(
+  server: TestServer,
+  storage: StorageLike,
+  token = TOKEN,
+  options: { readonly contextTimeoutMs?: number } = {},
+): Harness {
   const frames: LoggedFrame[] = [];
   const statuses: ChatMessage[] = [];
   const states: ConnectionState[] = [];
@@ -258,6 +303,7 @@ function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Ha
       storage,
       webSocketCtor: WebSocket as unknown as ConstructorParameters<typeof ChatClient>[0]['webSocketCtor'],
       idgen: () => `m${Math.random().toString(36).slice(2, 10)}`,
+      ...options,
     },
     {
       connection: (s) => states.push(s),
@@ -333,6 +379,15 @@ describe('ChatClient', () => {
     expect(h.frames.some((f) => f.type === 'tool' && f.name === 'echo-tool')).toBe(true);
   });
 
+  it('delivers authoritative non-null provider usage through the protocol seam', async () => {
+    server.usage = { tokens: 370, context_window: 1_000, percent: 37 };
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.contexts.length > 0 && h.replayEnds === 1);
+    expect(h.contexts[0]?.usage).toEqual(server.usage);
+  });
+
   it('sends fixed control actions and clears old sent messages only after epoch confirmation', async () => {
     const h = makeClient(server, memStorage());
     clients.push(h.client);
@@ -378,6 +433,63 @@ describe('ChatClient', () => {
     await waitFor(() => h.client.getMessages().some((message) => message.text === 'never sent words'));
     expect(h.client.getMessages().some((message) => message.text === 'old epoch')).toBe(false);
     expect(h.client.getMessages().some((message) => message.text === 'never sent words')).toBe(true);
+  });
+
+  it('reports an honest unknown compact outcome after its terminal result is lost', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
+    server.deferNextCompact = true;
+    const requestId = h.client.requestControl('compact');
+    await waitFor(() => h.contexts.some((snapshot) => snapshot.state === 'compacting'));
+    server.dropAll();
+    await waitFor(() => h.states.includes('offline'));
+    await waitFor(
+      () => h.client.getState() === 'open' && h.contexts.filter((s) => s.state === 'compacting').length >= 2,
+    );
+    server.completeDeferredCompact();
+    await waitFor(() => h.controlResultFrames.some((result) => result.request_id === requestId));
+    expect(
+      h.controlResultFrames.find((result) => result.request_id === requestId),
+    ).toMatchObject({
+      ok: false,
+      code: 'failed',
+      message: expect.stringContaining('lost during reconnect'),
+    });
+  });
+
+  it('persists pending New chat across reload and suppresses retiring replay until commit', async () => {
+    const storage = memStorage();
+    const first = makeClient(server, storage);
+    clients.push(first.client);
+    first.client.connect();
+    await waitFor(() => first.client.getState() === 'open' && first.replayEnds === 1);
+    first.client.send('retired transcript');
+    await waitFor(() => server.log.some((frame) => frame.type === 'user'));
+
+    server.deferNextNewChat = true;
+    first.client.requestControl('new_chat');
+    await waitFor(() => first.contexts.some((snapshot) => snapshot.state === 'resetting'));
+    expect(storage.map.has('gru-pending-new-chat')).toBe(true);
+    first.client.stop();
+
+    const reloaded = makeClient(server, storage);
+    clients.push(reloaded.client);
+    expect(reloaded.client.hasPendingNewChat()).toBe(true);
+    reloaded.client.connect();
+    await waitFor(
+      () => reloaded.contexts.some((snapshot) => snapshot.state === 'resetting'),
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(reloaded.frames.some((frame) => frame.type === 'user' && frame.text === 'retired transcript')).toBe(false);
+    expect(reloaded.replayEnds).toBe(0);
+
+    server.completeDeferredNewChat();
+    await waitFor(() => reloaded.epochs.includes(1) && reloaded.replayEnds === 1);
+    expect(reloaded.client.hasPendingNewChat()).toBe(false);
+    expect(storage.map.has('gru-pending-new-chat')).toBe(false);
+    expect(reloaded.frames.some((frame) => frame.type === 'user' && frame.text === 'retired transcript')).toBe(false);
   });
 
   it('recovers a pending new chat when reconnect first observes resetting', async () => {
@@ -636,6 +748,19 @@ describe('ChatClient', () => {
     await waitFor(() =>
       h.frames.some((f) => f.type === 'delta' && f.text.includes('after drop')),
     );
+  });
+
+  it('closes and retries when auth_ok is not followed by required context', async () => {
+    server.omitNextContext = true;
+    const h = makeClient(server, memStorage(), TOKEN, { contextTimeoutMs: 20 });
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.states.includes('offline'));
+    expect(h.replayEnds).toBe(0);
+    expect(h.contexts).toEqual([]);
+    await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
+    expect(server.authCount).toBeGreaterThanOrEqual(2);
+    expect(h.contexts.at(-1)).toMatchObject({ type: 'context', epoch: 0 });
   });
 
   it('bad token → fatal error, no reconnect loop', async () => {

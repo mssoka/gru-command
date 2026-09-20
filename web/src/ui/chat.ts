@@ -181,6 +181,12 @@ export class ChatView {
     this.renderContext();
   }
 
+  /** Restore the optimistic empty view from a tab-persisted unresolved
+   * New-chat marker after reload/re-pair. */
+  restorePendingNewChat(): void {
+    this.beginPendingResetView();
+  }
+
   private beginPendingResetView(): void {
     if (this.pendingResetView !== null) return;
     this.pendingResetView = {

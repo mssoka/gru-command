@@ -7,6 +7,7 @@ import './styles/tokens.css';
 import './styles/components.css';
 
 import { ChatClient, type ConnectionState } from './lib/chat-client.js';
+import { migrateLegacyOutbox, safeStorage } from './lib/chat-storage.js';
 import { AttachClient, readFileBytes } from './lib/attach-client.js';
 import { WS_PATH, type LoggedFrame } from './lib/protocol.js';
 import { BoardClient } from './lib/board-client.js';
@@ -22,21 +23,13 @@ import { initSettings, THEME_EVENT } from './ui/settings.js';
 
 const TOKEN_KEY = 'gru-pairing-token';
 
-const storage = window.localStorage;
+const storage = safeStorage(() => window.localStorage);
 // Chat drafts/outbox are tab-scoped: a writer tab must never overwrite a
-// read-only tab's queued words. sessionStorage still survives reloads. Move
-// the pre-context-controls shared outbox once so an upgrade cannot lose it.
-const chatStorage = window.sessionStorage;
-const LEGACY_OUTBOX_KEY = 'gru-outbox';
-try {
-  const legacyOutbox = storage.getItem(LEGACY_OUTBOX_KEY);
-  if (chatStorage.getItem(LEGACY_OUTBOX_KEY) === null && legacyOutbox !== null) {
-    chatStorage.setItem(LEGACY_OUTBOX_KEY, legacyOutbox);
-    storage.removeItem(LEGACY_OUTBOX_KEY);
-  }
-} catch {
-  // Blocked storage degrades to ChatClient's in-memory queue.
-}
+// read-only tab's queued words. sessionStorage survives reloads in that tab.
+// Move and merge the pre-context-controls shared outbox atomically; a failed
+// target write leaves the source untouched for a later recovery attempt.
+const chatStorage = safeStorage(() => window.sessionStorage);
+migrateLegacyOutbox(storage, chatStorage);
 
 // Theme applies before first paint decision; default is light.
 applyTheme(document, getTheme(storage));
@@ -175,8 +168,8 @@ function onConnection(state: ConnectionState): void {
       'conn',
       'work',
       state === 'reconnecting'
-        ? 'Reconnecting to Gru — messages queue safely…'
-        : 'Connection lost — typed words are queued, never lost.',
+        ? 'Reconnecting to Gru — messages stay queued in this tab…'
+        : 'Connection lost — typed words stay queued in this tab.',
     );
   } else if (state === 'connecting' || state === 'authenticating') {
     showBanner('conn', 'info', 'Connecting to Gru…');
@@ -252,6 +245,7 @@ function startChat(token: string): void {
       },
     },
   );
+  if (client.hasPendingNewChat()) chatView.restorePendingNewChat();
   chatView.bindControls((action) => {
     if (client === null) return false;
     try {

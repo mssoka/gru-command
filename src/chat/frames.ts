@@ -46,6 +46,9 @@ export interface UserFrame {
   readonly type: 'user';
   readonly text: string;
   readonly client_msg_id: string;
+  /** Durable active-chat epoch observed before this frame left the client.
+   * The server rejects stale/future epochs before logging or delivery. */
+  readonly epoch: number;
   /** Ready-to-send chips from the ONE attach flow (SPEC ruling 19).
    * Optional + absent on legacy frames; validated chip-by-chip. */
   readonly attachments?: readonly AttachmentChip[];
@@ -110,7 +113,13 @@ export interface NoticeFrame {
   readonly seq: number;
 }
 
-export interface ReplayedUserFrame extends UserFrame {
+export interface ReplayedUserFrame {
+  readonly type: 'user';
+  readonly text: string;
+  readonly client_msg_id: string;
+  /** Absent only on logs written before epoch-stamped user frames shipped. */
+  readonly epoch?: number;
+  readonly attachments?: readonly AttachmentChip[];
   readonly seq: number;
 }
 
@@ -231,15 +240,25 @@ export function parseClientFrame(raw: unknown): ClientFrame | null {
       return frame;
     }
     case 'user': {
-      if (typeof value.text !== 'string' || !isNonEmptyString(value.client_msg_id)) return null;
+      if (
+        typeof value.text !== 'string' ||
+        !isNonEmptyString(value.client_msg_id) ||
+        !isSeq(value.epoch)
+      ) return null;
       const attachments = parseAttachments(value.attachments);
       if (attachments === null) return null;
       // Attachment-only messages are legal (chips carry the content);
       // a frame with neither text nor chips is malformed (ruling 19).
       if (value.text.trim() === '' && attachments === undefined) return null;
       return attachments === undefined
-        ? { type: 'user', text: value.text, client_msg_id: value.client_msg_id }
-        : { type: 'user', text: value.text, client_msg_id: value.client_msg_id, attachments };
+        ? { type: 'user', text: value.text, client_msg_id: value.client_msg_id, epoch: value.epoch }
+        : {
+            type: 'user',
+            text: value.text,
+            client_msg_id: value.client_msg_id,
+            epoch: value.epoch,
+            attachments,
+          };
     }
     case 'control':
       return (value.action === 'compact' || value.action === 'new_chat') &&
@@ -367,15 +386,23 @@ export function parseServerFrame(raw: unknown): ServerFrame | null {
         if (typeof value.text !== 'string' ||
           !isNonEmptyString(value.client_msg_id) ||
           !isSeq(value.seq)) return null;
+        if (value.epoch !== undefined && !isSeq(value.epoch)) return null;
         const attachments = parseAttachments(value.attachments);
         if (attachments === null) return null;
         if (value.text.trim() === '' && attachments === undefined) return null;
         return attachments === undefined
-          ? { type: 'user', text: value.text, client_msg_id: value.client_msg_id, seq: value.seq }
+          ? {
+              type: 'user',
+              text: value.text,
+              client_msg_id: value.client_msg_id,
+              ...(isSeq(value.epoch) ? { epoch: value.epoch } : {}),
+              seq: value.seq,
+            }
           : {
               type: 'user',
               text: value.text,
               client_msg_id: value.client_msg_id,
+              ...(isSeq(value.epoch) ? { epoch: value.epoch } : {}),
               seq: value.seq,
               attachments,
             };

@@ -67,6 +67,16 @@ function sameSessionFile(left: string, right: string | null | undefined): boolea
   }
 }
 
+function sameNativeSession(
+  left: AgentHandle,
+  right: AgentHandle | null,
+): boolean {
+  return right !== null &&
+    (left === right ||
+      left.id === right.id ||
+      (left.sessionFile !== null && sameSessionFile(left.sessionFile, right.sessionFile)));
+}
+
 /**
  * Compose the delivered prompt (SPEC ruling 19(d)): the composer text
  * plus a path manifest the AGENT reads itself. No bytes, no inline
@@ -99,6 +109,9 @@ export interface ChatServerOptions {
   /** Mint a native session without resume/transcript context. This is
    * mandatory: reusing spawnGru(null) could return the supervised old handle. */
   readonly spawnFreshGru: () => Promise<AgentHandle>;
+  /** Fail-closed preflight for the supervised slot (for example, an open
+   * crash-loop breaker). Called immediately before durable activation. */
+  readonly canAdoptFreshGru?: () => boolean;
   /** Bind a successfully committed fresh handle to its supervised slot. */
   readonly adoptFreshGru?: (handle: AgentHandle) => Promise<void>;
   readonly log?: Log;
@@ -143,6 +156,8 @@ interface Client {
   /** Consecutive pings without a pong; two missed → terminate. */
   pongMisses: number;
   authDeadline: ReturnType<typeof setTimeout> | null;
+  /** One deferred-frame failure poisons the ordered stream for this socket. */
+  deferredFailed: boolean;
 }
 
 /**
@@ -204,6 +219,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   } | null = null;
   let pendingDeliveries = 0;
   let deferredControlFrames = 0;
+  let deferredFrameTail: Promise<void> = Promise.resolve();
+  /** Fatal native-writer uncertainty after failed compaction retirement.
+   * Only process restart or a confirmed late resume may clear it. */
+  let recoveryBlockedReason: string | null = null;
   const pendingNotices: Array<{ readonly text: string; readonly onPersist?: () => void }> = [];
   /** callId → tool name, for tool_end frames (the contract carries names). */
   const openCalls = new Map<string, string>();
@@ -376,8 +395,14 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             type: 'context_event',
             action: 'compact',
             ok: event.success,
-            ...(!event.success && event.error !== undefined
-              ? { message: boundedControlMessage(event.error) }
+            ...(!event.success
+              ? {
+                  message: boundedControlMessage(
+                    event.error?.trim() !== '' && event.error !== undefined
+                      ? event.error
+                      : 'Native compaction failed',
+                  ),
+                }
               : {}),
           });
         }
@@ -482,6 +507,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       }
     }
     const runtimeBusy =
+      recoveryBlockedReason !== null ||
       healthProbeFailed ||
       spawning !== null ||
       pendingDeliveries > 0 ||
@@ -585,13 +611,20 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   function deliver(client: Client, text: string, attachments?: readonly AttachmentChip[]): void {
     pendingDeliveries += 1;
     broadcastContext();
-    const waitForControl = controlBarrier;
     void (async () => {
       try {
-        // A frame received after a control started waits behind that control;
-        // native turns, compaction, and reset never overlap.
-        if (waitForControl !== null) await waitForControl;
+        // Re-enter every current barrier after every await. Provider-native
+        // compaction can begin after the user frame was durably acknowledged
+        // but before a lazy session spawn returns.
+        for (;;) {
+          const barriers = activeDeliveryBarriers();
+          if (barriers.length === 0) break;
+          await (barriers.length === 1 ? barriers[0]! : Promise.all(barriers).then(() => {}));
+        }
         if (disposed) return;
+        if (recoveryBlockedReason !== null) {
+          throw new Error('chat recovery is blocked; restart the service');
+        }
         // Chip-path provenance (review r1): only workspace/uploads paths
         // ride the manifest — a handcrafted chip pointing elsewhere drops
         // GRACEFULLY: a visible notice, never a silent pass, never an error.
@@ -627,12 +660,27 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
           return;
         }
         let gru: AgentHandle;
-        try {
-          gru = await ensureGru();
-        } catch (error) {
-          // Ephemeral: a transient spawn failure must not replay forever.
-          send(client, ephemeralError(`gru is unavailable: ${(error as Error).message}`));
-          return;
+        for (;;) {
+          try {
+            gru = await ensureGru();
+          } catch (error) {
+            // Ephemeral: a transient spawn failure must not replay forever.
+            send(client, ephemeralError('Gru is temporarily unavailable; retry after reconnect.'));
+            log('error', 'Gru delivery spawn failed', { error: errorMessage(error) });
+            return;
+          }
+          const barriers = activeDeliveryBarriers();
+          if (barriers.length > 0) {
+            await (barriers.length === 1 ? barriers[0]! : Promise.all(barriers).then(() => {}));
+            if (disposed) return;
+            continue;
+          }
+          if (recoveryBlockedReason !== null) {
+            throw new Error('chat recovery is blocked; restart the service');
+          }
+          // A supervisor swap can replace the handle while ensureGru awaits.
+          if (handle !== gru) continue;
+          break;
         }
         const imageChips = allowed.filter((chip) => chip.kind === 'image');
         const visionUnavailable = imageChips.length > 0 && !gru.capabilities.images;
@@ -723,6 +771,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       authedAt: 0,
       pongMisses: 0,
       authDeadline: null,
+      deferredFailed: false,
     };
     clients.add(client);
     client.authDeadline = setTimeout(() => {
@@ -836,6 +885,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     const snapshot = contextFrame(client);
     if (
       disposed ||
+      recoveryBlockedReason !== null ||
       controlBarrier !== null ||
       snapshot.state !== 'idle'
     ) {
@@ -874,6 +924,21 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         }
         flushPendingNotices();
         broadcastContext();
+        if (recoveryBlockedReason !== null) {
+          // control_result and the canonical blocked snapshot are queued
+          // first; then every accepted client reconnects only after an
+          // explicit service-level recovery.
+          setTimeout(() => {
+            for (const connected of clients) {
+              if (!connected.authed) continue;
+              try {
+                connected.socket.close(1011, 'chat recovery requires service restart');
+              } catch {
+                /* already gone */
+              }
+            }
+          }, 0).unref();
+        }
       });
     // Deferred user frames continue only AFTER the terminal result and fresh
     // idle/epoch snapshot have been queued to sockets. That ordering lets a
@@ -908,26 +973,99 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     });
   }
 
+  function blockChatRecovery(reason: string, detail: unknown): void {
+    recoveryBlockedReason = reason;
+    log('error', 'chat recovery blocked after native writer uncertainty', {
+      reason,
+      error: errorMessage(detail),
+    });
+    broadcastContext();
+  }
+
   async function retireAndResumeAfterCompactTimeout(
     active: AgentHandle,
     timeout: ControlTimeoutError,
   ): Promise<never> {
     // Detach first: a late native event or a newly arrived message must never
     // target the handle being aborted. The surrounding control barrier stays
-    // closed until disposal releases the native writer and resume completes.
+    // closed until bounded disposal confirms the native writer is gone.
     if (handle === active) teardownHandle();
     try {
-      await active.dispose();
+      await withControlDeadline(active.dispose(), 'timed-out Gru disposal');
     } catch (error) {
-      log('warn', 'timed-out Gru compaction disposal failed', { error: errorMessage(error) });
+      blockChatRecovery(
+        'Native compaction timed out and the old session could not be retired; restart the service to recover safely.',
+        error,
+      );
+      throw new Error('native compaction recovery is blocked');
     }
     if (disposed) throw timeout;
+    const recovery = ensureGru();
     try {
-      await ensureGru();
+      await withControlDeadline(recovery, 'committed-session recovery');
+      recoveryBlockedReason = null;
     } catch (error) {
-      throw new Error(`${timeout.message}; Gru recovery failed: ${errorMessage(error)}`);
+      blockChatRecovery(
+        'Native compaction timed out and the committed session could not be resumed; restart the service to recover safely.',
+        error,
+      );
+      // A safe resume that merely exceeded the deadline may still settle.
+      // Clear the block only after that exact committed-session spawn wins.
+      void recovery.then(
+        () => {
+          if (!disposed) {
+            recoveryBlockedReason = null;
+            broadcastContext();
+          }
+        },
+        () => {},
+      );
+      throw new Error('native compaction recovery is blocked');
     }
     throw timeout;
+  }
+
+  async function finalizeCommittedNewChat(
+    staged: AgentHandle,
+    retired: AgentHandle | null,
+  ): Promise<void> {
+    if (disposed) return;
+    try {
+      if (options.adoptFreshGru !== undefined) {
+        await withControlDeadline(
+          options.adoptFreshGru(staged),
+          'fresh Gru supervision adoption',
+        );
+      } else if (retired !== null && retired !== staged) {
+        await withControlDeadline(retired.dispose(), 'retired Gru disposal');
+      }
+      log('info', 'new chat post-commit supervision settled', {
+        epoch,
+        session_file: staged.sessionFile,
+      });
+    } catch (error) {
+      // The durable boundary is already committed and the control result has
+      // been released. Report bounded degradation separately; never pin the
+      // reset barrier behind supervisor or retired-handle cleanup.
+      log('error', 'new chat post-commit supervision degraded', {
+        error: errorMessage(error),
+        session_file: staged.sessionFile,
+      });
+      let stagedDisposed = false;
+      try {
+        stagedDisposed = staged.health().state === 'disposed';
+      } catch {
+        stagedDisposed = true;
+      }
+      if (stagedDisposed && handle === staged) teardownHandle();
+      broadcastContextEvent({
+        type: 'context_event',
+        action: 'new_chat',
+        ok: false,
+        message: 'New chat started, but supervision is degraded; restart the service if chat becomes unavailable.',
+      });
+      broadcastContext();
+    }
   }
 
   async function runControl(frame: ControlFrame): Promise<void> {
@@ -981,7 +1119,13 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
           // but never dispose the still-active old handle if a buggy spawner
           // eventually returns it.
           void freshSpawn
-            .then((late) => late === old ? undefined : late.dispose())
+            .then((late) => {
+              // A buggy late result may be a distinct wrapper over either the
+              // captured retiring session or whatever session is active now.
+              // Never dispose an alias of a live native writer.
+              if (sameNativeSession(late, old) || sameNativeSession(late, handle)) return;
+              return late.dispose();
+            })
             .catch(() => {});
         }
         throw error;
@@ -1023,6 +1167,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         ) {
           throw new Error('retiring Gru became active during fresh-session spawn');
         }
+        if (options.canAdoptFreshGru?.() === false) {
+          throw new Error('supervision breaker is open; acknowledge it before starting a new chat');
+        }
         // This one atomic rename is the activation point: session identity,
         // epoch, and replay floor move together. Old logs/sessions are untouched.
         const state = options.pointer.advance(staged.sessionFile, frameLog.highWaterSeq);
@@ -1049,32 +1196,15 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       // then cleared by the delayed boundary snapshot and never shown again.
       broadcastContext();
 
-      if (options.adoptFreshGru !== undefined) {
-        try {
-          await options.adoptFreshGru(staged);
-        } catch (error) {
-          // Durable activation cannot roll back. Report New chat as committed
-          // and surface supervision degradation separately instead of lying
-          // with an ordinary failed control result for an already-new epoch.
-          log('error', 'fresh Gru supervision adoption failed', { error: String(error) });
-          let stagedDisposed = false;
-          try {
-            stagedDisposed = staged.health().state === 'disposed';
-          } catch {
-            stagedDisposed = true;
-          }
-          if (stagedDisposed) teardownHandle();
-          broadcastContextEvent({
-            type: 'context_event',
-            action: 'new_chat',
-            ok: false,
-            message: boundedControlMessage(
-              `New chat started, but supervision adoption failed: ${errorMessage(error)}`,
-            ),
-          });
-        }
-      }
-      if (old !== null && old !== staged) await old.dispose().catch(() => {});
+      // Post-commit adoption/retirement is best-effort and independently
+      // bounded. Start it on the next event-loop turn so this control's
+      // result, idle snapshot, and barrier release are queued first even if a
+      // supplied adopter throws synchronously.
+      const committed = staged;
+      const postCommit = setTimeout(() => {
+        void finalizeCommittedNewChat(committed, old);
+      }, 0);
+      postCommit.unref();
       log('info', 'new chat activated', {
         epoch,
         replay_floor_seq: replayFloorSeq,
@@ -1082,7 +1212,13 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       });
     } catch (error) {
       if (staged !== null && staged !== old && handle !== staged) {
-        await staged.dispose().catch(() => {});
+        try {
+          await withControlDeadline(staged.dispose(), 'rejected fresh Gru disposal');
+        } catch (cleanupError) {
+          log('warn', 'rejected fresh Gru cleanup did not settle', {
+            error: errorMessage(cleanupError),
+          });
+        }
       }
       throw error;
     }
@@ -1094,14 +1230,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     );
   }
 
-  function failDeferredUserFrame(
-    client: Client,
-    error: unknown,
-    forceReconnect: boolean,
-  ): void {
+  function failDeferredUserFrame(client: Client, error: unknown): void {
+    if (client.deferredFailed) return;
+    client.deferredFailed = true;
     log('error', 'deferred chat frame failed', { error: errorMessage(error) });
-    send(client, ephemeralError(`gru is unavailable: ${errorMessage(error)}`));
-    if (!forceReconnect) return;
+    send(client, ephemeralError('Chat delivery could not be reconciled; reconnecting safely.'));
     // A frame accepted behind a mutable boundary has no ack. Closing forces
     // the persisted browser outbox through authoritative epoch reconciliation
     // instead of retrying blindly in a potentially different chat.
@@ -1115,10 +1248,13 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   async function processDeferredUserFrame(
     client: Client,
     frame: UserFrame,
-    receivedEpoch: number,
   ): Promise<void> {
+    let repairingMissingBoundary = boundarySessionMissing;
     for (;;) {
-      if (disposed || !client.authed) return;
+      if (disposed || !client.authed || client.deferredFailed) return;
+      if (recoveryBlockedReason !== null) {
+        throw new Error('chat recovery is blocked');
+      }
       // Re-read both barriers after every await. A second provider compaction
       // or control may have started while the frame waited behind the first.
       const barriers = activeDeliveryBarriers();
@@ -1131,6 +1267,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         // read errors also take the same no-ack recovery path below.
         const pointed = options.pointer.current();
         boundarySessionMissing = pointed !== null && options.pointer.resumeCandidate() === null;
+        repairingMissingBoundary ||= boundarySessionMissing;
       }
       if (handle === null) {
         pendingDeliveries += 1;
@@ -1145,47 +1282,71 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         // may have begun during its await. Revalidate from the top.
         continue;
       }
-      handleUserFrame(client, frame, epoch !== receivedEpoch);
+      // A frame that arrived validly and itself discovered a vanished native
+      // boundary follows that repair into the newly minted epoch. This is
+      // distinct from a stale resend arriving after an already-committed New
+      // chat, which fails the strict epoch check below.
+      handleUserFrame(
+        client,
+        repairingMissingBoundary && frame.epoch !== epoch
+          ? { ...frame, epoch }
+          : frame,
+      );
       return;
     }
   }
 
   /** Frames arriving while a control is active are held before logging or
    * delivery. Authorization is fixed at arrival, while every mutable runtime
-   * gate is revalidated after waits. */
+   * gate is revalidated after waits. Deferred processing is one FIFO chain so
+   * a failed predecessor can never be overtaken by a later accepted frame. */
   function queueUserFrame(client: Client, frame: UserFrame): void {
     if (!client.writer) {
       send(client, ephemeralError('read-only: another client holds the pen'));
       return;
     }
+    if (client.deferredFailed || recoveryBlockedReason !== null) {
+      failDeferredUserFrame(client, new Error('chat recovery is blocked'));
+      return;
+    }
     const barriers = activeDeliveryBarriers();
-    if (barriers.length === 0 && handle !== null) {
+    if (barriers.length === 0 && handle !== null && deferredControlFrames === 0) {
       try {
         handleUserFrame(client, frame);
       } catch (error) {
-        failDeferredUserFrame(client, error, false);
+        failDeferredUserFrame(client, error);
       }
       return;
     }
     if (deferredControlFrames >= MAX_DEFERRED_CONTROL_FRAMES) {
-      send(client, ephemeralError('too many messages are waiting for chat context recovery'));
+      send(client, ephemeralError('too many messages are waiting; reconnecting to retry safely.'));
+      client.deferredFailed = true;
+      try {
+        client.socket.close(1013, 'chat recovery queue full');
+      } catch {
+        /* already gone */
+      }
       return;
     }
     deferredControlFrames += 1;
-    const receivedEpoch = epoch;
-    const forceReconnect = barriers.length > 0 || boundarySessionMissing;
-    void processDeferredUserFrame(client, frame, receivedEpoch)
-      .catch((error: unknown) => failDeferredUserFrame(client, error, forceReconnect))
+    const task = deferredFrameTail.then(() => processDeferredUserFrame(client, frame));
+    deferredFrameTail = task.catch(() => {});
+    void task
+      .catch((error: unknown) => failDeferredUserFrame(client, error))
       .finally(() => {
         deferredControlFrames -= 1;
       });
   }
 
-  /** Dedup by client_msg_id: re-received frames get a fresh ack, no re-delivery.
-   * The caller already authorized this arrival; writer promotion after an await
-   * must not retroactively reject an accepted frame. */
-  function handleUserFrame(client: Client, frame: UserFrame, echoToSender = false): void {
-    if (frameLog.hasSeenUserId(frame.client_msg_id, replayFloorSeq)) {
+  /** Dedup by epoch + client_msg_id. The server, not the official browser,
+   * enforces that stale old-epoch resends never enter a fresh conversation. */
+  function handleUserFrame(client: Client, frame: UserFrame): void {
+    if (frame.epoch !== epoch) {
+      throw new Error(
+        `user frame epoch ${frame.epoch} does not match active epoch ${epoch}`,
+      );
+    }
+    if (frameLog.hasSeenUserId(frame.client_msg_id, frame.epoch, replayFloorSeq)) {
       send(client, frameLog.append({ type: 'ack', client_msg_id: frame.client_msg_id }));
       return;
     }
@@ -1193,10 +1354,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       type: 'user',
       text: frame.text,
       client_msg_id: frame.client_msg_id,
+      epoch: frame.epoch,
       ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
     });
     broadcastExceptSender(loggedUser, client);
-    if (echoToSender) send(client, loggedUser);
     send(client, frameLog.append({ type: 'ack', client_msg_id: frame.client_msg_id }));
     deliver(client, frame.text, frame.attachments);
   }

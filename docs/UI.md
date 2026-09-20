@@ -78,7 +78,7 @@ Client → server:
 | Frame | Fields | Notes |
 |---|---|---|
 | `auth` | `token`, `last_seen_seq?` | MUST be first; re-auth carries the high-water mark and receives fresh context state |
-| `user` | `text`, `client_msg_id` | queued client-side while offline |
+| `user` | `epoch`, `text`, `client_msg_id` | queued client-side while offline; server rejects a stale epoch before logging/delivery |
 | `control` | `action: compact\|new_chat`, `request_id` | fixed writer-only controls; no free-form slash command |
 
 Server → client (durable conversation frames carry a monotonic `seq`):
@@ -100,7 +100,9 @@ Server → client (durable conversation frames carry a monotonic `seq`):
 fresh `context`, then replays logged frames above both the client seq and
 the durable replay floor. An epoch advance clears only the active visible
 history and sent/acked messages; browser-local never-sent outbox words are
-retained and flushed after the new snapshot. The client still dedupes by
+atomically restamped and flushed after the new snapshot. A tab-local
+pending-reset marker suppresses retired replay across reload until an
+idle snapshot proves commit or rollback. The client dedupes by
 `seq`/`client_msg_id` within the active epoch.
 
 **Mock control plane (tests):** token-authenticated `POST /__reset` on
@@ -120,12 +122,14 @@ frames, see [CHAT.md](./CHAT.md)). The pairing token still persists
 indefinitely in `localStorage` (`gru-pairing-token`) — lifetime/rotation
 belongs to the E9 token flow.
 
-**Never lose a typed word in the active tab:** unacked messages persist in
-tab-scoped `sessionStorage` (`gru-outbox`, id + text + chips), survive reload,
-render as queued bubbles, and flush in order after re-auth; replay ends exactly
-when the stream reaches the `auth_ok` high-water mark. Initial persistence
-failure rejects the send so the composer keeps its text/chips instead of
-pretending a non-durable bubble was queued.
+**Typed-word recovery in the active tab:** unacked messages persist in
+tab-scoped `sessionStorage` (`gru-outbox`, id + epoch + text + chips), survive
+ordinary reload/reconnect, render as queued bubbles, and flush in order after
+re-auth; replay ends exactly when the stream reaches the `auth_ok` high-water
+mark. Initial persistence failure rejects send so the composer keeps its
+text/chips. Later storage failure keeps the in-memory queue and surfaces the
+failure, but site-data clearing, browser eviction, or catastrophic storage loss
+can still remove it; this is not server-side message durability.
 
 ## The composer attach flow (SPEC ruling 19)
 
@@ -217,8 +221,10 @@ follow-up lane, not part of this contract.
   composer shows provider context percent (or explicit unavailable),
   **Compact context**, and **New chat**. Busy/read-only/unsupported states
   disable the relevant controls. New chat uses native confirmation and
-  immediately opens an empty pending-reset view; a pre-commit failure restores
-  the retired render model, while a durable epoch finalizes the empty view.
+  immediately opens an empty pending-reset view, persisted per tab across
+  reload; a pre-commit failure restores the retired render model, while a
+  durable epoch finalizes the empty view. Words entered while reset is pending
+  stay visible and are sent once to the authoritative winning epoch.
   Compact success/failure and unsolicited provider outcomes are announced in
   a dedicated persistent live region that idle usage refreshes cannot erase.
 - **Board (E6)** — desktop tab `🗺️ Board`: repo-grouped job cards, round

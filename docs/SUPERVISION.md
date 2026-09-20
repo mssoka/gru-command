@@ -37,12 +37,16 @@ itself and the user sees a notice). Failed rungs back off (2 s base,
 doubling, 60 s cap) and retry.
 
 An intentional **New chat** is not a restart rung. The chat layer first
-mints and durably activates a fresh unresumed handle, then calls the
-slot's intentional replacement path. That advances a slot generation;
-any older restart already in flight is disposed on completion and cannot
-swap the retired conversation back in. Restart-ring/breaker bookkeeping
-follows the stable slot onto the replacement, and intentional replacement
-does not acknowledge or erase an existing breaker notification.
+preflights the slot (`canReplace()`); an open breaker rejects the reset before
+any fresh runtime is spawned. It then mints and durably activates a fresh
+unresumed handle, reports the committed epoch, and releases the chat control
+mutex before bounded intentional adoption/retired-handle cleanup. Adoption
+advances the slot generation; any older restart already in flight is disposed
+on completion and cannot swap the retired conversation back in.
+Restart-ring/breaker bookkeeping follows the stable slot onto the replacement,
+and intentional replacement does not acknowledge or erase an existing breaker
+notification. Post-commit adoption failure is a degradation event, not a false
+reset failure.
 
 **What is NOT a restart:** an in-band turn error (`state: 'error'`) —
 the adapter contract already recovers on the next turn. Only hangs and

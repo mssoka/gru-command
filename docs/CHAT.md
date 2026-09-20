@@ -25,7 +25,7 @@ configuration in production.
 | Frame | Fields | Notes |
 |---|---|---|
 | `auth` | `token`, `last_seen_seq?` | MUST be the first frame, within 5 s of connect |
-| `user` | `text`, `client_msg_id`, `attachments?` | a chat message; `client_msg_id` dedupes re-sends. `attachments` (SPEC ruling 19): 1–8 chips `{path, name, kind: file\|image}` — PATH references from the one attach flow; an attachment-only frame (empty `text` + chips) is legal, a frame with neither is malformed |
+| `user` | `epoch`, `text`, `client_msg_id`, `attachments?` | a chat message stamped with the sender's authoritative epoch; stale epochs are rejected before logging or delivery, and `(epoch, client_msg_id)` dedupes re-sends. `attachments` (SPEC ruling 19): 1–8 chips `{path, name, kind: file\|image}` — PATH references from the one attach flow; an attachment-only frame (empty `text` + chips) is legal, a frame with neither is malformed |
 | `control` | `action: compact\|new_chat`, `request_id` | fixed product controls only; writer-only and accepted only while the chat is idle |
 
 ### Server → client
@@ -181,8 +181,12 @@ No adapter or UI reconstructs usage from streamed deltas.
   Visible chat messages are not removed. The typed native terminal event is
   the outcome authority; provider-initiated outcomes broadcast as
   `context_event`. Failure is bounded and the old conversation remains usable.
-  If a compact deadline expires, chat detaches and disposes the timed-out
-  handle, resumes the committed session, and only then reopens queued delivery.
+  If cleanup proves the old writer cannot be retired, recovery fails closed and
+  chat remains gated rather than risking two native writers. If a compact
+  deadline expires, chat detaches and disposes the timed-out handle, resumes the
+  committed session, and only then reopens queued delivery. If a socket drops
+  after requesting compact and before its ephemeral terminal reply, the client
+  waits for authoritative idle state and reports that the outcome is unknown.
 - **New chat** is destructive only to the active view/context: after the
   native confirmation, the browser immediately presents an empty pending
   view (restoring the retired render on pre-commit failure). The server mints
@@ -193,35 +197,45 @@ No adapter or UI reconstructs usage from streamed deltas.
   queued deliveries. Supervisor restarts are coordinated by slot generation:
   an intentional fresh replacement wins and any stale completion is disposed.
   Replacement preserves restart/breaker history and never acknowledges an
-  unrelated notification. Once the epoch is durably activated, New chat is
-  reported as committed even if later supervision adoption degrades; that
-  degradation is a separate `context_event`. Busy attempts are rejected.
+  unrelated notification. An open breaker is rejected before a fresh handle is
+  spawned. Once the epoch is durably activated, New chat is reported and the
+  control mutex is released before bounded supervision adoption/retired-handle
+  cleanup; later degradation is a separate `context_event`. Busy attempts are rejected.
   Non-writer tabs remain read-only. Context usage is unavailable during
   compaction/reset until the provider can supply fresh data.
 
-## Reconnect and never-lose-a-typed-word
+## Reconnect and typed-word recovery
 
 - The client queues unacked messages locally (its outbox) and re-sends
-  them after re-auth; the server `ack`s every received `user` frame
-  BEFORE any runtime work, and dedupes re-received frames by
-  `client_msg_id` — a re-send gets a fresh `ack`, never a re-delivery,
-  never a duplicate `user` frame.
+  them after re-auth; every frame carries the epoch last authenticated by that
+  tab. The server rejects stale-epoch frames before history or runtime work,
+  `ack`s accepted frames BEFORE delivery, and dedupes re-received frames by
+  `(epoch, client_msg_id)` (with replay compatibility for legacy unstamped log
+  entries) — a re-send gets a fresh `ack`, never a re-delivery, never a
+  duplicate `user` frame.
 - A message whose RUNTIME delivery fails (spawn outage, disposed
   session) stays acked and logged with an error frame recording the
-  failure — there is no automatic redelivery; re-send it. The typed word
-  is never silently lost, and neither is the failure.
+  failure — there is no automatic redelivery; re-send it. While browser
+  storage remains available, the typed word and its failure remain visible.
 - Reconnecting clients re-auth with `last_seen_seq`; the server sends
   `auth_ok` (high-water), a fresh `context` snapshot, then every logged
   frame with `seq > max(last_seen_seq, replay_floor_seq)` in order, then
   live traffic. The browser clears the active view only after observing
-  an advanced durable epoch. Sent/acked messages from the retired epoch
-  are dropped; never-sent local outbox words survive and flush into the
-  new epoch.
+  an advanced durable epoch. A tab-local pending-reset marker preserves that
+  empty pending view across reload and prevents retired replay from flashing.
+  Sent/acked messages from the retired epoch are dropped; never-sent local
+  outbox words are atomically restamped and flushed into the new epoch.
 - Live frames emitted during a client's replay have seqs above the
   high-water mark and arrive after the replay by per-socket FIFO —
   gapless by the seq invariant.
 
 ## Durability across restarts
+
+Browser outboxes use `sessionStorage`: they survive reload and reconnect in
+that tab, but not explicit site-data clearing, browser-managed eviction, or
+catastrophic storage failure. Initial storage failure rejects send so the
+composer retains the word; later mutations preserve the in-memory queue and
+surface failure rather than claiming disk durability.
 
 - **Frame log:** survives restarts by construction (append-only,
   synchronous writes — durable across process death via the OS page
