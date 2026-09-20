@@ -34,7 +34,7 @@ const PINS: Record<string, number> = {
   'notifications.test.ts': 5,
   'perkins-driver.test.ts': 2,
   'perkins-wave.test.ts': 16,
-  'pi-adapter.test.ts': 39,
+  'pi-adapter.test.ts': 41,
   'rehearsal.test.ts': 4,
   'roles-definitions.test.ts': 7,
   'roles-gru.test.ts': 4,

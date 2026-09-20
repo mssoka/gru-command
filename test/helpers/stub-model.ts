@@ -152,7 +152,13 @@ export async function makeIsolatedModelRuntime(): Promise<ModelRuntime> {
 
 export async function makeStubModelRuntime(
   script: StubScript,
-  options: { readonly input?: readonly ('text' | 'image')[] } = {},
+  options: {
+    readonly input?: readonly ('text' | 'image')[];
+    /** Skip the auth-cache refresh: hasConfiguredAuth() reports false for
+     * every provider — the stale-snapshot shape of the product's shared
+     * offline runtime (refreshOnCreate: false). Default: refresh. */
+    readonly refreshAuthCache?: boolean;
+  } = {},
 ): Promise<ModelRuntime> {
   const { authPath, modelsPath } = isolatedPaths();
   const runtime = await ModelRuntime.create({
@@ -241,6 +247,9 @@ export async function makeStubModelRuntime(
   // registerNativeProvider does not refresh the synchronous auth-status
   // cache; a targeted offline refresh makes hasConfiguredAuth() coherent
   // (the real boot path does the equivalent in its services layer).
-  await runtime.refresh({ allowNetwork: false, providers: [STUB_PROVIDER_ID] });
+  // Tests that must reproduce the STALE shape keep the cache cold.
+  if (options.refreshAuthCache !== false) {
+    await runtime.refresh({ allowNetwork: false, providers: [STUB_PROVIDER_ID] });
+  }
   return runtime;
 }

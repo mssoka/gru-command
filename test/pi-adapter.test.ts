@@ -507,6 +507,84 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     await handle.dispose();
   });
 
+  it('resolves the settings default eagerly when the auth snapshot is stale (2026-09-20 probe shape)', async () => {
+    // User report: chat + Bob consolidation died with "No API key found for
+    // the selected model" although the user's settings and auth were valid.
+    // The shared offline ModelRuntime (refreshOnCreate: false) never builds
+    // its auth snapshot, so pi's own settings-default path — gated on
+    // hasConfiguredAuth() — rejected the user's configured default and fell
+    // through to "first available"/nothing. The adapter must resolve the
+    // settings default ITSELF and pass the explicit model. Hermetic repro:
+    // stub runtime with a COLD auth cache — hasConfiguredAuth() is false
+    // for every provider, exactly like the user's runtime; prompting an
+    // explicitly-passed model still works (probe P2).
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-pi-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
+    const agentDir = mkdtempSync(join(tmpdir(), 'gru-command-agentdir-'));
+    cleanupDirs.push(home, workspace, agentDir);
+    // No [models] section: the product path resolves the "default" sentinel.
+    writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n`, 'utf-8');
+    writeFileSync(
+      join(agentDir, 'settings.json'),
+      `${JSON.stringify({ defaultProvider: 'gru-stub', defaultModel: 'stub-model' })}\n`,
+      'utf-8',
+    );
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const store = new SessionStore(config.dataDir);
+    const logs: Array<{ level: string; msg: string; fields?: Record<string, unknown> }> = [];
+    const runtime = new PiRuntime({
+      config,
+      store,
+      agentDir,
+      modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['settings default'] }]), {
+        refreshAuthCache: false,
+      }),
+      log: (level, msg, fields) => logs.push({ level, msg, fields }),
+    });
+    const handle = await runtime.spawn('gru');
+    try {
+      const events = collect(handle);
+      await handle.prompt('sentinel check', { owner: 'alice' });
+      expect(
+        events.filter((e) => e.type === 'text_delta').map((e) => (e as { delta: string }).delta),
+      ).toEqual(['settings default']);
+      // Spawn logs the RESOLVED model so future complaints name the model.
+      const spawnLog = logs.find((l) => l.msg.includes('model resolved'));
+      expect(spawnLog).toBeDefined();
+      expect(spawnLog?.level).toBe('info');
+      expect(spawnLog?.fields?.['model']).toBe('gru-stub/stub-model');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('fails loud when the settings default names an unregistered model', async () => {
+    // A settings default that misses the catalog must never silently
+    // reroute to "first available" (the 2026-09-20 bug shape); it names
+    // the stale reference like the explicit path does.
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-pi-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
+    const agentDir = mkdtempSync(join(tmpdir(), 'gru-command-agentdir-'));
+    cleanupDirs.push(home, workspace, agentDir);
+    writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n`, 'utf-8');
+    writeFileSync(
+      join(agentDir, 'settings.json'),
+      `${JSON.stringify({ defaultProvider: 'nope', defaultModel: 'no-such-model' })}\n`,
+      'utf-8',
+    );
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const store = new SessionStore(config.dataDir);
+    const runtime = new PiRuntime({
+      config,
+      store,
+      agentDir,
+      modelRuntime: await makeStubModelRuntime(new StubScript([]), { refreshAuthCache: false }),
+    });
+    await expect(runtime.spawn('gru')).rejects.toThrow(
+      /settings default "nope\/no-such-model" is not a registered model/,
+    );
+  });
+
   it('dispose releases the session lock', async () => {
     const fx = await fixture();
     const handle = await fx.runtime.spawn('gru');
