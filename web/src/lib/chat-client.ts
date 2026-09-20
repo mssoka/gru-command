@@ -16,6 +16,9 @@ import {
   WS_PATH,
   parseServerFrame,
   type AttachmentChip,
+  type ContextFrame,
+  type ControlAction,
+  type ControlResultFrame,
   type LoggedFrame,
   type ServerFrame,
   type UserFrame,
@@ -37,6 +40,8 @@ export interface ChatMessage {
   readonly text: string;
   /** Attach chips (SPEC ruling 19): paths the agent reads itself. */
   readonly attachments?: readonly AttachmentChip[];
+  /** Epoch in which this message actually left the browser. */
+  epoch?: number;
   status: MessageStatus;
 }
 
@@ -52,6 +57,12 @@ export interface ChatClientEvents {
   replayStart(full: boolean): void;
   /** Full history was restored (replay caught up to live traffic). */
   replayEnd(): void;
+  /** Fresh server-owned context/control state. */
+  context?(snapshot: ContextFrame): void;
+  /** A requested fixed control reached a terminal result. */
+  controlResult?(result: ControlResultFrame): void;
+  /** The durable active-chat epoch changed; the UI clears only its view. */
+  epochChange?(epoch: number): void;
   /** Fatal error (bad token, protocol failure) — pairing must redo. */
   fatal(message: string): void;
 }
@@ -112,6 +123,7 @@ const SOCKET_OPEN = 1;
 export const MAX_MESSAGE_CHARS = 4_000;
 /** A socket that never finishes handshaking is treated as down. */
 const CONNECT_TIMEOUT_MS = 10_000;
+const CONTEXT_TIMEOUT_MS = 5_000;
 
 const BACKOFF_MS = [800, 1_600, 3_200, 6_400, 12_000] as const;
 
@@ -120,12 +132,27 @@ export class ChatClient {
   private state: ConnectionState = 'idle';
   private lastSeenSeq = 0;
   private highWaterSeq = 0;
+  private currentEpoch: number | null = null;
   private attempts = 0;
   private stopped = false;
   private replaying = false;
+  private awaitingContext = false;
+  private reconnectPending = false;
+  private serverControlState: ContextFrame['state'] | null = null;
+  private serverWriter: boolean | null = null;
+  /** While New chat is unresolved, newly typed words stay browser-local. The
+   * authoritative idle context (including reconnect recovery) releases them
+   * into whichever epoch actually won. */
+  private pendingNewChatRequest: string | null = null;
+  private pendingNewChatResultEpoch: number | null = null;
+  /** A reconnect first observed this pending reset before its terminal idle
+   * snapshot. Kept separately because ordinary reconnect reconciliation is
+   * consumed by that first (possibly still-resetting) context frame. */
+  private pendingNewChatRecovery = false;
   private readonly messages = new Map<string, ChatMessage>();
   private readonly outbox: string[] = [];
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+  private contextDeadline: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly options: ChatClientOptions,
@@ -135,9 +162,10 @@ export class ChatClient {
       this.messages.set(message.client_msg_id, { ...message });
     }
     for (const stored of this.readOutbox()) {
-      // Restored queued messages keep their text so a reload loses nothing.
+      // Restored entries retain whether they actually left the browser;
+      // epoch confirmation decides whether a sent item may be retried.
       if (!this.messages.has(stored.client_msg_id)) {
-        this.messages.set(stored.client_msg_id, { ...stored, status: 'queued' });
+        this.messages.set(stored.client_msg_id, { ...stored });
       }
       if (!this.outbox.includes(stored.client_msg_id)) this.outbox.push(stored.client_msg_id);
     }
@@ -156,6 +184,7 @@ export class ChatClient {
     // Defensive: a second connect must not leak the old socket or timers.
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
+    this.contextDeadline = null;
     this.socket?.close();
     this.socket = null;
     // Surface restored queued messages so the UI renders them as bubbles.
@@ -170,6 +199,7 @@ export class ChatClient {
     this.stopped = true;
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
+    this.contextDeadline = null;
     this.socket?.close();
     this.socket = null;
     // onclose's stale-socket check returns early after nulling, so the
@@ -202,6 +232,36 @@ export class ChatClient {
     return { ...message };
   }
 
+  requestControl(action: ControlAction): string {
+    if (this.state !== 'open' || this.replaying) {
+      throw new Error('chat controls require an open, synchronized connection');
+    }
+    const socket = this.socket;
+    if (socket === null || socket.readyState !== SOCKET_OPEN) {
+      throw new Error('chat controls require an open connection');
+    }
+    if (action === 'new_chat' && this.pendingNewChatRequest !== null) {
+      throw new Error('new chat is already pending');
+    }
+    const requestId = `control-${this.id()}`;
+    if (action === 'new_chat') {
+      this.pendingNewChatRequest = requestId;
+      this.pendingNewChatResultEpoch = null;
+      this.pendingNewChatRecovery = false;
+    }
+    try {
+      socket.send(JSON.stringify({ type: 'control', action, request_id: requestId }));
+    } catch (error) {
+      if (this.pendingNewChatRequest === requestId) {
+        this.pendingNewChatRequest = null;
+        this.pendingNewChatResultEpoch = null;
+        this.pendingNewChatRecovery = false;
+      }
+      throw error;
+    }
+    return requestId;
+  }
+
   private id(): string {
     return this.options.idgen?.() ?? globalThis.crypto.randomUUID();
   }
@@ -232,7 +292,11 @@ export class ChatClient {
       clearTimeout(connectTimer);
       this.timers.delete(connectTimer);
       this.setState('authenticating');
-      const auth: Record<string, unknown> = { type: 'auth', token: this.options.token };
+      this.awaitingContext = true;
+      const auth: Record<string, unknown> = {
+        type: 'auth',
+        token: this.options.token,
+      };
       if (this.lastSeenSeq > 0) auth.last_seen_seq = this.lastSeenSeq;
       socket.send(JSON.stringify(auth));
     };
@@ -271,6 +335,7 @@ export class ChatClient {
       // deduping every future frame into silence.
       if (frame.seq < this.lastSeenSeq) {
         this.lastSeenSeq = 0;
+        this.currentEpoch = null;
         // Detach before closing so onclose treats it as stale and doesn't
         // schedule a second reconnect.
         this.socket = null;
@@ -281,20 +346,52 @@ export class ChatClient {
       }
       this.highWaterSeq = frame.seq;
       this.attempts = 0;
-      // Unacked messages from a previous connection are re-queued; the
-      // server dedups re-received user frames by client_msg_id and re-acks.
-      for (const message of this.messages.values()) {
-        if (message.status === 'sent') {
-          message.status = 'queued';
-          this.events.messageStatus({ ...message });
-        }
+      if (this.contextDeadline !== null) {
+        clearTimeout(this.contextDeadline);
+        this.timers.delete(this.contextDeadline);
       }
+      const contextDeadline = setTimeout(() => {
+        this.timers.delete(contextDeadline);
+        if (this.contextDeadline === contextDeadline) this.contextDeadline = null;
+        if (this.socket === socket && this.awaitingContext) socket.close();
+      }, CONTEXT_TIMEOUT_MS);
+      this.contextDeadline = contextDeadline;
+      this.timers.add(contextDeadline);
+      // Wait for the authoritative epoch snapshot before deciding whether
+      // a sent/unacked item may be retried. It may belong to a retired epoch.
+      this.reconnectPending = true;
       this.replaying = true;
       this.events.replayStart(this.lastSeenSeq === 0);
       this.setState('open');
       // auth_ok's seq is the log high-water mark: replay ends exactly when
       // the stream catches up to it. Empty replay ends immediately.
       this.maybeEndReplay();
+      return;
+    }
+
+    if (frame.type === 'context') {
+      this.handleContext(frame);
+      return;
+    }
+
+    if (frame.type === 'control_result') {
+      if (frame.action === 'new_chat' && frame.request_id === this.pendingNewChatRequest) {
+        if (frame.ok) {
+          // Do not flush on success alone. The following idle context is the
+          // authoritative boundary and closes the crash window between
+          // durable activation and deferred server-side logging.
+          this.pendingNewChatResultEpoch = frame.epoch;
+        } else {
+          // No epoch transition can follow a terminal rejection. Release the
+          // local hold now; the server sends a canonical context snapshot
+          // immediately after every pre-lifecycle rejection (and control
+          // finally does the same after an attempted transition).
+          this.pendingNewChatRequest = null;
+          this.pendingNewChatResultEpoch = null;
+          this.pendingNewChatRecovery = false;
+        }
+      }
+      this.events.controlResult?.(frame);
       return;
     }
 
@@ -338,13 +435,124 @@ export class ChatClient {
     this.events.frame(frame);
   }
 
+  private handleContext(snapshot: ContextFrame): void {
+    const priorEpoch = this.currentEpoch;
+    if (priorEpoch !== null && snapshot.epoch < priorEpoch) {
+      this.stopped = true;
+      this.events.fatal(
+        `server context epoch regressed from ${priorEpoch} to ${snapshot.epoch}; refusing unsafe replay`,
+      );
+      this.socket?.close();
+      return;
+    }
+    this.awaitingContext = false;
+    if (this.contextDeadline !== null) {
+      clearTimeout(this.contextDeadline);
+      this.timers.delete(this.contextDeadline);
+      this.contextDeadline = null;
+    }
+    this.serverControlState = snapshot.state;
+    this.serverWriter = snapshot.writer;
+    const reconciling = this.reconnectPending;
+    if (reconciling && this.pendingNewChatRequest !== null) {
+      this.pendingNewChatRecovery = true;
+    }
+    let outboxChanged = false;
+    let initialEpochPruned = false;
+    if (priorEpoch === null) {
+      this.currentEpoch = snapshot.epoch;
+      this.lastSeenSeq = Math.max(this.lastSeenSeq, snapshot.replay_floor_seq);
+      // On page restoration, persisted `sent` items carry the epoch in which
+      // they left. Never resend one into a different active conversation.
+      // Legacy entries had no status/epoch and restore as queued (safe).
+      for (const [id, message] of this.messages) {
+        if (message.epoch !== undefined && message.epoch !== snapshot.epoch) {
+          this.messages.delete(id);
+          outboxChanged = true;
+          initialEpochPruned = true;
+        } else if (message.status === 'sent' && this.reconnectPending) {
+          message.status = 'queued';
+          this.events.messageStatus({ ...message });
+          outboxChanged = true;
+        }
+      }
+    } else if (snapshot.epoch !== priorEpoch) {
+      this.currentEpoch = snapshot.epoch;
+      this.lastSeenSeq = snapshot.replay_floor_seq;
+      // Only messages that never left this browser survive a durable reset.
+      // Sent/acked entries belong to the retired epoch and must not be
+      // resurrected by a reconnect resend.
+      for (const [id, message] of this.messages) {
+        if (message.status !== 'queued' || message.epoch !== undefined) {
+          this.messages.delete(id);
+          outboxChanged = true;
+        }
+      }
+      this.events.epochChange?.(snapshot.epoch);
+    } else {
+      this.lastSeenSeq = Math.max(this.lastSeenSeq, snapshot.replay_floor_seq);
+      if (this.reconnectPending) {
+        // Same epoch: normal at-least-once retry; server-side id dedup makes
+        // this safe and returns a fresh ack.
+        for (const message of this.messages.values()) {
+          if (message.status === 'sent') {
+            message.status = 'queued';
+            this.events.messageStatus({ ...message });
+            outboxChanged = true;
+          }
+        }
+      }
+    }
+    let pendingNewChatCleared = false;
+    if (
+      this.pendingNewChatRequest !== null &&
+      snapshot.state === 'idle' &&
+      (
+        (this.pendingNewChatResultEpoch !== null &&
+          snapshot.epoch >= this.pendingNewChatResultEpoch) ||
+        (this.pendingNewChatResultEpoch === null && this.pendingNewChatRecovery)
+      )
+    ) {
+      if (
+        this.pendingNewChatResultEpoch === null &&
+        this.pendingNewChatRecovery &&
+        priorEpoch === snapshot.epoch
+      ) {
+        // The terminal result was lost with the socket, but an authoritative
+        // idle snapshot in the original epoch proves reset did not commit.
+        this.events.controlResult?.({
+          type: 'control_result',
+          action: 'new_chat',
+          request_id: this.pendingNewChatRequest,
+          ok: false,
+          epoch: snapshot.epoch,
+          code: 'failed',
+          message: 'New chat did not complete before reconnect',
+        });
+      }
+      this.pendingNewChatRequest = null;
+      this.pendingNewChatResultEpoch = null;
+      this.pendingNewChatRecovery = false;
+      pendingNewChatCleared = true;
+    }
+    this.reconnectPending = false;
+    if (outboxChanged) this.persistOutbox();
+    // A fresh page renders restored outbox entries at replayStart, before its
+    // first authoritative epoch arrives. Clear that temporary old-epoch
+    // bubble if reconciliation just proved it belongs to a retired chat.
+    if (initialEpochPruned) this.events.epochChange?.(snapshot.epoch);
+    this.events.context?.(snapshot);
+    this.maybeEndReplay();
+    if (pendingNewChatCleared || snapshot.state === 'idle') this.flushOutbox();
+  }
+
   private bumpSeq(seq: number): void {
     if (seq > this.lastSeenSeq) this.lastSeenSeq = seq;
     this.maybeEndReplay();
   }
 
   private maybeEndReplay(): void {
-    if (!this.replaying || this.state !== 'open') return;
+    if (!this.replaying || this.awaitingContext || this.state !== 'open') return;
     if (this.lastSeenSeq < this.highWaterSeq) return;
     this.replaying = false;
     this.events.replayEnd();
@@ -352,7 +560,14 @@ export class ChatClient {
   }
 
   private flushOutbox(): void {
-    if (this.state !== 'open' || this.replaying) return;
+    if (
+      this.state !== 'open' ||
+      this.replaying ||
+      this.pendingNewChatRequest !== null ||
+      this.serverWriter !== true ||
+      this.serverControlState === 'compacting' ||
+      this.serverControlState === 'resetting'
+    ) return;
     const socket = this.socket;
     if (socket === null || socket.readyState !== SOCKET_OPEN) return;
     // Outbox entries stay until acked — a dropped socket re-sends them on
@@ -367,8 +582,27 @@ export class ChatClient {
         client_msg_id: message.client_msg_id,
         ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       };
-      socket.send(JSON.stringify(frame));
+      const previousEpoch = message.epoch;
       message.status = 'sent';
+      if (this.currentEpoch !== null) message.epoch = this.currentEpoch;
+      // Persist the exact sent epoch before bytes leave this process. If
+      // storage is unavailable, keep the word queued locally rather than
+      // creating a reload shape that can cross an epoch without provenance.
+      if (!this.persistOutbox()) {
+        message.status = 'queued';
+        if (previousEpoch === undefined) delete message.epoch;
+        else message.epoch = previousEpoch;
+        continue;
+      }
+      try {
+        socket.send(JSON.stringify(frame));
+      } catch {
+        message.status = 'queued';
+        if (previousEpoch === undefined) delete message.epoch;
+        else message.epoch = previousEpoch;
+        this.persistOutbox();
+        continue;
+      }
       this.events.messageStatus({ ...message });
     }
   }
@@ -396,14 +630,21 @@ export class ChatClient {
     client_msg_id: string;
     text: string;
     attachments?: readonly AttachmentChip[];
+    epoch?: number;
+    status: 'queued' | 'sent';
   }> {
     try {
       const raw = this.options.storage.getItem(OUTBOX_KEY);
       if (raw === null) return [];
       const parsed: unknown = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [];
-      const out: Array<{ client_msg_id: string; text: string; attachments?: readonly AttachmentChip[] }> =
-        [];
+      const out: Array<{
+        client_msg_id: string;
+        text: string;
+        attachments?: readonly AttachmentChip[];
+        epoch?: number;
+        status: 'queued' | 'sent';
+      }> = [];
       for (const entry of parsed) {
         if (
           typeof entry === 'object' &&
@@ -416,6 +657,8 @@ export class ChatClient {
             client_msg_id: string;
             text: string;
             attachments?: unknown;
+            epoch?: unknown;
+            status?: unknown;
           };
           // Validate EACH record independently: one hostile attachments
           // value must not throw away healthy siblings. Invalid chips
@@ -429,10 +672,20 @@ export class ChatClient {
               ? record.attachments
               : undefined;
           if (text === '' && attachments === undefined) continue;
+          const epoch =
+            typeof record.epoch === 'number' &&
+            Number.isSafeInteger(record.epoch) &&
+            record.epoch >= 0
+              ? record.epoch
+              : undefined;
           out.push({
             client_msg_id: record.client_msg_id,
             text,
             ...(attachments !== undefined ? { attachments } : {}),
+            ...(epoch !== undefined ? { epoch } : {}),
+            // Old persisted shapes omitted status; treating those as never
+            // sent preserves the pre-epoch never-lose behavior.
+            status: record.status === 'sent' ? 'sent' : 'queued',
           });
         }
       }
@@ -442,7 +695,7 @@ export class ChatClient {
     }
   }
 
-  private persistOutbox(): void {
+  private persistOutbox(): boolean {
     try {
       const entries = this.outbox
         .map((id) => this.messages.get(id))
@@ -451,6 +704,8 @@ export class ChatClient {
           client_msg_id: m.client_msg_id,
           text: m.text,
           ...(m.attachments !== undefined ? { attachments: m.attachments } : {}),
+          ...(m.epoch !== undefined ? { epoch: m.epoch } : {}),
+          status: m.status,
         }));
       // Drop ids whose messages vanished or got acked.
       this.outbox.length = 0;
@@ -460,8 +715,10 @@ export class ChatClient {
       } else {
         this.options.storage.setItem(OUTBOX_KEY, JSON.stringify(entries));
       }
+      return true;
     } catch {
       // Storage full/blocked: the in-memory queue still protects this page.
+      return false;
     }
   }
 }

@@ -43,6 +43,41 @@ test('pair, send, streamed reply with tool line', async ({ page }) => {
   await expect(page.locator('.tool-line', { hasText: 'mock-echo' })).toBeVisible();
 });
 
+test('context controls compact in place and New chat advances a reload-safe empty view', async ({ page }) => {
+  await pair(page);
+  await sendAndWaitReply(page, 'context control old words');
+  await expect(page.locator('#chat-context-status')).toHaveText('Context unavailable');
+
+  await expect(page.locator('#chat-compact')).toBeEnabled();
+  await page.locator('#chat-compact').click();
+  await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
+  await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(1);
+  await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
+
+  const compactFailure = await page.request.post('http://localhost:8788/__compact-fail', {
+    headers: { Authorization: `Bearer ${MOCK_TOKEN}` },
+  });
+  expect(compactFailure.ok()).toBe(true);
+  await expect(page.locator('#chat-compact')).toBeEnabled();
+  await page.locator('#chat-compact').click();
+  await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
+  await expect(
+    page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
+  ).toBeVisible();
+  await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(1);
+
+  page.once('dialog', (dialog) => dialog.dismiss());
+  await page.locator('#chat-new').click();
+  await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(1);
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.locator('#chat-new').click();
+  await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(0);
+  await page.reload();
+  await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(0);
+  await sendAndWaitReply(page, 'first words in fresh epoch');
+});
+
 test('reconnect keeps history after reload (no duplicates)', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'remember this message');

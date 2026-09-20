@@ -68,10 +68,12 @@ interface SupervisedAgent {
   agentId: string;
   role: Role;
   slot: SupervisedSlotInternal | null;
+  slotGeneration: number;
   handle: AgentHandle | null;
   sessionFile: string | null;
   state: SupervisionState;
   openTurn: boolean;
+  openControl: boolean;
   lastEventAt: number;
   lastFileBytes: number | null;
   /** Restart timestamps (epoch ms) — the breaker ring. */
@@ -96,6 +98,9 @@ export interface SupervisedSlot {
   current(): AgentHandle | null;
   /** Fired when a supervisor restart produced a new live handle. */
   onSwap(listener: (handle: AgentHandle) => void): () => void;
+  /** Intentionally make an already-spawned fresh handle current. This
+   * advances the slot generation so an older restart cannot swap back in. */
+  adoptReplacement(handle: AgentHandle): Promise<void>;
   /** Deregister the slot (owner shutdown); stops supervision of it. */
   release(): void;
 }
@@ -105,6 +110,7 @@ interface SupervisedSlotInternal {
   readonly role: Role;
   readonly spawn: (options?: SpawnOptions) => Promise<AgentHandle>;
   readonly swapListeners: Set<(handle: AgentHandle) => void>;
+  generation: number;
 }
 
 export interface SupervisorOptions {
@@ -161,6 +167,7 @@ export class Supervisor {
       role: input.role,
       spawn: input.spawn,
       swapListeners: new Set(),
+      generation: 0,
     };
     this.slots.set(input.id, internal);
     return {
@@ -169,7 +176,11 @@ export class Supervisor {
       ensure: (options) => this.ensureSlot(internal, options),
       current: () => {
         for (const agent of this.agents.values()) {
-          if (agent.slot === internal && agent.handle !== null) return agent.handle;
+          if (
+            agent.slot === internal &&
+            agent.slotGeneration === internal.generation &&
+            agent.handle !== null
+          ) return agent.handle;
         }
         return null;
       },
@@ -179,7 +190,10 @@ export class Supervisor {
           internal.swapListeners.delete(listener);
         };
       },
+      adoptReplacement: (handle) => this.adoptSlotReplacement(internal, handle),
       release: () => {
+        // Invalidate in-flight restart rungs before deleting their records.
+        internal.generation += 1;
         this.slots.delete(internal.id);
         for (const agent of this.agents.values()) {
           if (agent.slot === internal) {
@@ -230,7 +244,21 @@ export class Supervisor {
         if (rearming !== null) this.notifications.ack(rearming, 'slot-use');
       }
     }
+    const ensureGeneration = slot.generation;
     const handle = await slot.spawn(options);
+    if (this.disposed || this.slots.get(slot.id) !== slot) {
+      await this.registry.disposeHandle(handle).catch(() => {});
+      throw new Error(`supervised slot "${slot.id}" is not active`);
+    }
+    if (slot.generation !== ensureGeneration) {
+      // An intentional replacement won while this ordinary ensure spawn was
+      // in flight. Never attach the stale result to the replacement's newer
+      // generation or leave a second live handle behind.
+      await this.registry.disposeHandle(handle).catch(() => {});
+      const current = this.slotAgent(slot)?.handle ?? null;
+      if (current !== null) return current;
+      throw new Error(`supervised slot "${slot.id}" changed generation during ensure`);
+    }
     this.adopt(handle, slot, options?.resumeFile ?? null);
     // A handle death outside a restart rung (owner teardown) can leave a
     // stale slot-bound record shadowing the fresh one — retire stale
@@ -238,6 +266,66 @@ export class Supervisor {
     // SPEC ruling 1), carrying the restart ring onto the live record.
     this.retireStaleSlotRecords(slot, handle.id);
     return handle;
+  }
+
+  private async adoptSlotReplacement(
+    slot: SupervisedSlotInternal,
+    handle: AgentHandle,
+  ): Promise<void> {
+    if (this.disposed || this.slots.get(slot.id) !== slot) {
+      await this.registry.disposeHandle(handle).catch(() => {});
+      throw new Error(`supervised slot "${slot.id}" is not active`);
+    }
+    slot.generation += 1;
+    const generation = slot.generation;
+    this.adopt(handle, slot, handle.sessionFile);
+    const live = this.agents.get(handle.id);
+    if (live !== undefined) {
+      live.slot = slot;
+      live.slotGeneration = generation;
+      live.handle = handle;
+      live.sessionFile = handle.sessionFile;
+      live.state = 'watching';
+      live.openTurn = false;
+      live.openControl = false;
+      live.inRestart = false;
+      live.breakerOpen = false;
+    }
+
+    const retired = [...this.agents.values()].filter(
+      (agent) => agent.slot === slot && agent.agentId !== handle.id,
+    );
+    for (const agent of retired) {
+      if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
+      if (agent.breakerNotificationId !== null) {
+        try {
+          this.notifications.ack(agent.breakerNotificationId, 'intentional-replacement');
+        } catch (error) {
+          this.log('warn', 'failed to acknowledge retired slot breaker notification', {
+            agent_id: agent.agentId,
+            notification_id: agent.breakerNotificationId,
+            error: String(error),
+          });
+        }
+        agent.breakerNotificationId = null;
+      }
+      this.agents.delete(agent.agentId);
+      const old = agent.handle;
+      agent.handle = null;
+      if (old !== null) {
+        await this.registry.disposeHandle(old).catch((error: unknown) => {
+          this.log('warn', 'dispose during intentional slot replacement failed', {
+            agent_id: agent.agentId,
+            error: String(error),
+          });
+        });
+      }
+    }
+    this.log('info', 'adopted intentional fresh slot replacement', {
+      slot: slot.id,
+      agent_id: handle.id,
+      generation,
+    });
   }
 
   /**
@@ -249,7 +337,7 @@ export class Supervisor {
     let stale: SupervisedAgent | null = null;
     let staleRank = -1;
     for (const agent of this.agents.values()) {
-      if (agent.slot !== slot) continue;
+      if (agent.slot !== slot || agent.slotGeneration !== slot.generation) continue;
       if (agent.handle !== null) return agent;
       const rank = agent.inRestart ? 2 : agent.breakerOpen ? 1 : 0;
       if (rank >= staleRank) {
@@ -319,6 +407,7 @@ export class Supervisor {
         if (agent === undefined) return;
         agent.handle = null;
         agent.openTurn = false;
+        agent.openControl = false;
         // A breaker-STOPPED agent keeps its record: the escalation names
         // it and the ack must find it to re-arm (deleting here would strand
         // the stopped agent — same reasoning as inRestart stickiness).
@@ -340,8 +429,17 @@ export class Supervisor {
         case 'turn_end':
           agent.openTurn = false;
           break;
+        case 'compaction_start':
+          agent.openControl = true;
+          break;
+        case 'compaction_end':
+          agent.openControl = false;
+          break;
         case 'state':
-          if (event.state === 'disposed') agent.openTurn = false;
+          if (event.state === 'disposed') {
+            agent.openTurn = false;
+            agent.openControl = false;
+          }
           break;
         case 'error':
           if (event.fatal) {
@@ -388,7 +486,10 @@ export class Supervisor {
     if (existing !== undefined) {
       existing.handle = handle ?? existing.handle;
       existing.role = role;
-      if (slot !== null) existing.slot = slot;
+      if (slot !== null) {
+        existing.slot = slot;
+        existing.slotGeneration = slot.generation;
+      }
       if (envelope?.sessionFile !== null && envelope?.sessionFile !== undefined) {
         existing.sessionFile = envelope.sessionFile;
       } else if (existing.sessionFile === null && resumeFile !== null) {
@@ -403,10 +504,12 @@ export class Supervisor {
       agentId,
       role,
       slot,
+      slotGeneration: slot?.generation ?? 0,
       handle,
       sessionFile,
       state: 'watching',
       openTurn: false,
+      openControl: false,
       lastEventAt: this.now(),
       lastFileBytes: this.fileSize(sessionFile),
       restartRing: [],
@@ -431,7 +534,7 @@ export class Supervisor {
       if (agent.handle === null || agent.state !== 'watching' || agent.breakerOpen) continue;
       const health = this.handleState(agent.handle);
       const busy = health === 'streaming' || health === 'spawning';
-      if (!busy && !agent.openTurn) continue;
+      if (!busy && !agent.openTurn && !agent.openControl) continue;
       // Liveness = events OR bytes: session-file growth also resets the clock.
       const bytes = this.fileSize(agent.sessionFile);
       if (bytes !== null && agent.lastFileBytes !== null && bytes > agent.lastFileBytes) {
@@ -442,12 +545,13 @@ export class Supervisor {
       if (bytes !== null) agent.lastFileBytes = bytes;
       const silence = now - agent.lastEventAt;
       if (silence >= this.cfg.turnSilenceMs) {
-        this.log('warn', 'turn hang detected — climbing restart ladder', {
+        const reason = agent.openControl ? 'compaction hang' : 'turn hang';
+        this.log('warn', `${reason} detected — climbing restart ladder`, {
           agent_id: agent.agentId,
           silence_ms: silence,
           threshold_ms: this.cfg.turnSilenceMs,
         });
-        void this.restartRung(agent, 'turn hang');
+        void this.restartRung(agent, reason);
       }
     }
   }
@@ -501,7 +605,10 @@ export class Supervisor {
 
   private async restartRungInner(agentRef: SupervisedAgent, reason: string): Promise<void> {
     let agent = agentRef;
+    const restartSlot = agent.slot;
+    const restartGeneration = agent.slotGeneration;
     try {
+      if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
       const windowStart = this.now() - this.cfg.restartWindowMs;
       agent.restartRing = agent.restartRing.filter((ts) => ts >= windowStart);
       if (agent.restartRing.length >= this.cfg.maxRestarts) {
@@ -510,7 +617,7 @@ export class Supervisor {
       }
       if (agent.restartRing.length === 0) {
         // A new cluster: one FYI notification per incident, not per rung.
-        const kind = reason.startsWith('turn hang')
+        const kind = reason.startsWith('turn hang') || reason.startsWith('compaction hang')
           ? 'supervision.hang'
           : reason.startsWith('fatal error')
             ? 'supervision.fatal'
@@ -537,6 +644,7 @@ export class Supervisor {
       const old = agent.handle;
       agent.handle = null;
       agent.openTurn = false;
+      agent.openControl = false;
       if (old !== null) {
         try {
           await this.registry.disposeHandle(old);
@@ -548,14 +656,22 @@ export class Supervisor {
         }
       }
 
+      if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
+
       // Respawn with resume (crash = resume, SPEC ruling 3).
       const resumeFile = agent.sessionFile;
       try {
         const spawned =
-          agent.slot !== null
-            ? await agent.slot.spawn(resumeFile !== null ? { resumeFile } : {})
+          restartSlot !== null
+            ? await restartSlot.spawn(resumeFile !== null ? { resumeFile } : {})
             : await this.registry.spawn(agent.role, resumeFile !== null ? { resumeFile } : {});
-        this.adopt(spawned, agent.slot, resumeFile);
+        if (restartSlot !== null && restartSlot.generation !== restartGeneration) {
+          // An intentional fresh replacement won while this old restart was
+          // in flight. Dispose the stale result and never notify swap listeners.
+          await this.registry.disposeHandle(spawned).catch(() => {});
+          return;
+        }
+        this.adopt(spawned, restartSlot, resumeFile);
         // A resumed session keeps its id; a fresh mint does NOT — the
         // supervision history (ring, breaker, slot binding) follows the
         // supervised ENTITY, never the session id.
@@ -568,7 +684,7 @@ export class Supervisor {
           attempt,
           resumed: resumeFile !== null,
         });
-        for (const listener of agent.slot?.swapListeners ?? []) {
+        for (const listener of restartSlot?.swapListeners ?? []) {
           try {
             listener(spawned);
           } catch (error) {
@@ -576,6 +692,7 @@ export class Supervisor {
           }
         }
       } catch (error) {
+        if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
         // Failed rung: count it, back off, schedule the next.
         agent.consecutiveFailures += 1;
         this.log('error', 'restart rung failed', {
@@ -612,6 +729,7 @@ export class Supervisor {
     const adopted = this.agents.get(newId);
     if (adopted === undefined || adopted === old) return old;
     adopted.slot = old.slot;
+    adopted.slotGeneration = old.slotGeneration;
     adopted.restartRing = old.restartRing;
     adopted.breakerOpen = old.breakerOpen;
     adopted.breakerNotificationId = old.breakerNotificationId;

@@ -27,6 +27,16 @@
  *   CLAUDE_DOUBLE_NO_PARTIALS=1 suppress stream_event partials
  *   CLAUDE_DOUBLE_MISMATCH=1    init frame carries a foreign session id
  *   CLAUDE_DOUBLE_IGNORE_TERM=1 ignore SIGTERM (SIGKILL-path tests)
+ *   CLAUDE_DOUBLE_COMPACT_ERROR=1 fail the native /compact control
+ *   CLAUDE_DOUBLE_COMPACT_STATUS_FAIL=1 report native failure with a successful command result
+ *   CLAUDE_DOUBLE_COMPACT_EXIT_ERROR=1 report native success, then exit non-zero
+ *   CLAUDE_DOUBLE_COMPACT_NO_INIT=1 omit the compact init frame
+ *   CLAUDE_DOUBLE_COMPACT_INIT_NO_ID=1 emit compact init without session_id
+ *   CLAUDE_DOUBLE_COMPACT_NO_RESULT=1 omit the compact result frame
+ *   CLAUDE_DOUBLE_COMPACT_CONTENT=1 emit command content/tool frames
+ *   CLAUDE_DOUBLE_COMPACT_FORGED_RESULT=1 put compact_result on a non-status frame
+ *   CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT=1 omit required result fields
+ *   CLAUDE_DOUBLE_COMPACT_HOLD_FILE=/path wait during /compact until disposed
  */
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
@@ -250,7 +260,75 @@ async function run() {
     return;
   }
 
-  out(initFrame());
+  if (prompt === '/compact' && process.env['CLAUDE_DOUBLE_COMPACT_NO_INIT'] === '1') {
+    // Deliberately omit identity initialization.
+  } else if (prompt === '/compact' && process.env['CLAUDE_DOUBLE_COMPACT_INIT_NO_ID'] === '1') {
+    const init = initFrame();
+    delete init.session_id;
+    out(init);
+  } else {
+    out(initFrame());
+  }
+
+  if (prompt === '/compact') {
+    if (process.env['CLAUDE_DOUBLE_COMPACT_CONTENT'] === '1') {
+      await emitThinkingTurn('compact command chatter');
+      await emitToolTurn('CompactTool');
+    }
+    const compactHold = process.env['CLAUDE_DOUBLE_COMPACT_HOLD_FILE'];
+    if (compactHold !== undefined && compactHold !== '') {
+      const deadline = Date.now() + 25_000;
+      while (!existsSync(compactHold)) {
+        if (Date.now() > deadline) {
+          process.stderr.write(`double compact hold timeout waiting for ${compactHold}\n`);
+          process.exit(4);
+        }
+        await delay(10);
+      }
+    }
+    if (process.env['CLAUDE_DOUBLE_COMPACT_ERROR'] === '1') {
+      out(resultFrame('native compact failed', true));
+    } else if (process.env['CLAUDE_DOUBLE_COMPACT_STATUS_FAIL'] === '1') {
+      out({
+        type: 'system',
+        subtype: 'status',
+        status: null,
+        compact_result: 'failed',
+        compact_error: 'native compact status failed',
+        session_id: sessionId,
+      });
+      // Claude can report slash-command success even when compaction itself
+      // failed. The adapter must key completion from compact_result/boundary.
+      out(resultFrame('Command completed', false));
+    } else {
+      if (process.env['CLAUDE_DOUBLE_COMPACT_FORGED_RESULT'] === '1') {
+        out({ type: 'assistant_status', compact_result: 'success', session_id: sessionId });
+      } else {
+        out({
+          type: 'system',
+          subtype: 'status',
+          status: null,
+          compact_result: 'success',
+          session_id: sessionId,
+        });
+        out({
+          type: 'system',
+          subtype: 'compact_boundary',
+          session_id: sessionId,
+        });
+      }
+      if (process.env['CLAUDE_DOUBLE_COMPACT_NO_RESULT'] !== '1') {
+        const result = resultFrame('Compacted conversation', false);
+        if (process.env['CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT'] === '1') {
+          delete result.is_error;
+          delete result.subtype;
+        }
+        out(result);
+      }
+      if (process.env['CLAUDE_DOUBLE_COMPACT_EXIT_ERROR'] === '1') process.exitCode = 7;
+    }
+    return;
+  }
 
   if (prompt.startsWith('hold:')) {
     const releaseFile = prompt.slice('hold:'.length).trim();

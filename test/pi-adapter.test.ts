@@ -132,6 +132,146 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('exposes native context usage and a failed native compact keeps the same session usable', async () => {
+    const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const events = collect(handle);
+      await handle.prompt('first turn');
+      const usage = handle.getContextUsage?.();
+      const nativeUsage = (
+        handle as unknown as {
+          session: {
+            getContextUsage(): {
+              tokens: number | null;
+              contextWindow: number;
+              percent: number | null;
+            } | undefined;
+          };
+        }
+      ).session.getContextUsage();
+      expect(usage).not.toBeNull();
+      expect(nativeUsage?.tokens).not.toBeNull();
+      expect(nativeUsage?.percent).not.toBeNull();
+      expect(usage).toEqual({
+        tokens: nativeUsage?.tokens,
+        contextWindow: nativeUsage?.contextWindow,
+        percent: Math.max(0, Math.min(100, nativeUsage!.percent!)),
+      });
+      expect(handle.canCompact?.()).toBe(true);
+      const id = handle.id;
+      const file = handle.sessionFile;
+      await expect(handle.compact?.()).rejects.toThrow(/Nothing to compact|Already compacted/);
+      expect(handle.id).toBe(id);
+      expect(handle.sessionFile).toBe(file);
+      expect(events.some((event) => event.type === 'compaction_start')).toBe(true);
+      expect(
+        events.some((event) => event.type === 'compaction_end' && !event.success),
+      ).toBe(true);
+      await handle.prompt('still usable');
+      expect(fx.script.calls.map((call) => call.prompt)).toContain('still usable');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('successfully compacts through the installed Pi SDK without changing session identity', async () => {
+    const fx = await fixture([
+      { deltas: ['first answer'] },
+      { deltas: ['second answer'] },
+      { deltas: ['## Goal\nKeep the tested conversation usable.'] },
+      { deltas: ['after compact'] },
+    ]);
+    writeFileSync(
+      join(fx.agentDir, 'settings.json'),
+      `${JSON.stringify({ compaction: { keepRecentTokens: 1, reserveTokens: 100 } })}\n`,
+      'utf-8',
+    );
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const events = collect(handle);
+      await handle.prompt('first turn');
+      await handle.prompt('second turn');
+      const id = handle.id;
+      const file = handle.sessionFile;
+      await handle.compact?.();
+      expect(handle.id).toBe(id);
+      expect(handle.sessionFile).toBe(file);
+      expect(events.some((event) => event.type === 'compaction_end' && event.success)).toBe(true);
+      expect(
+        readFileSync(file!, 'utf-8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { type?: string })
+          .some((entry) => entry.type === 'compaction'),
+      ).toBe(true);
+      // Pi deliberately withholds post-compaction usage until another model response.
+      expect(handle.getContextUsage?.()).toBeNull();
+      await handle.prompt('continue after compact');
+      expect(handle.getContextUsage?.()).not.toBeNull();
+
+      type InternalSession = {
+        compact(): Promise<unknown>;
+        readonly sessionId: string;
+        readonly sessionFile: string | undefined;
+        readonly isIdle: boolean;
+        readonly isCompacting: boolean;
+      };
+      const internal = handle as unknown as { session: InternalSession };
+      const nativeSession = internal.session;
+      let release!: () => void;
+      const heldSession = new Proxy(nativeSession, {
+        get(target, key) {
+          if (key === 'compact') {
+            return () => new Promise<void>((resolve) => {
+              release = resolve;
+            });
+          }
+          return Reflect.get(target, key, target);
+        },
+      });
+      internal.session = heldSession;
+      const compacting = handle.compact!();
+      expect(handle.isCompacting?.()).toBe(true);
+      await expect(handle.compact?.()).rejects.toThrow(/busy/);
+      await expect(handle.prompt('must not overlap')).rejects.toThrow(/compacting/);
+      release();
+      await compacting;
+
+      let releaseDisposed!: () => void;
+      internal.session = new Proxy(nativeSession, {
+        get(target, key) {
+          if (key === 'compact') {
+            return () =>
+              new Promise<void>((resolve) => {
+                releaseDisposed = resolve;
+              });
+          }
+          return Reflect.get(target, key, target);
+        },
+      });
+      const disposedDuringCompact = handle.compact!();
+      const internals = handle as unknown as { disposed: boolean };
+      internals.disposed = true;
+      releaseDisposed();
+      await expect(disposedDuringCompact).rejects.toThrow(/disposed during native compaction/);
+      internals.disposed = false;
+
+      internal.session = new Proxy(nativeSession, {
+        get(target, key) {
+          if (key === 'compact') return async () => {};
+          if (key === 'sessionId') return 'foreign-session-id';
+          return Reflect.get(target, key, target);
+        },
+      });
+      await expect(handle.compact?.()).rejects.toThrow(/changed session identity/);
+      expect(handle.health().state).toBe('disposed');
+      internal.session = nativeSession;
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it('emits thinking deltas before text when the model reasons', async () => {
     const fx = await fixture([{ thinking: ['pondering'], deltas: ['answer'] }]);
     const handle = await fx.runtime.spawn('gru');

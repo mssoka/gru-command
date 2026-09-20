@@ -74,6 +74,19 @@ describe('ChatFrameLog', () => {
     expect(log.replayAfter(99)).toEqual([]);
   });
 
+  it('applies an epoch replay floor without modifying historical frames or cross-epoch dedup', () => {
+    const dir = fixture();
+    const log = ChatFrameLog.load(dir);
+    log.append({ type: 'user', text: 'old', client_msg_id: 'same-id' });
+    log.append({ type: 'delta', text: 'old reply' });
+    const bytesBefore = readFileSync(join(dir, FRAME_LOG_NAME), 'utf-8');
+    expect(log.replayAfter(0, 2)).toEqual([]);
+    expect(log.hasSeenUserId('same-id', 2)).toBe(false);
+    log.append({ type: 'user', text: 'new', client_msg_id: 'same-id' });
+    expect(log.hasSeenUserId('same-id', 2)).toBe(true);
+    expect(readFileSync(join(dir, FRAME_LOG_NAME), 'utf-8').startsWith(bytesBefore)).toBe(true);
+  });
+
   it('rebuilds the client_msg_id dedup index across reloads', () => {
     const dir = fixture();
     const log = ChatFrameLog.load(dir);

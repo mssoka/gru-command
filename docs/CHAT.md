@@ -26,11 +26,13 @@ configuration in production.
 |---|---|---|
 | `auth` | `token`, `last_seen_seq?` | MUST be the first frame, within 5 s of connect |
 | `user` | `text`, `client_msg_id`, `attachments?` | a chat message; `client_msg_id` dedupes re-sends. `attachments` (SPEC ruling 19): 1–8 chips `{path, name, kind: file\|image}` — PATH references from the one attach flow; an attachment-only frame (empty `text` + chips) is legal, a frame with neither is malformed |
+| `control` | `action: compact\|new_chat`, `request_id` | fixed product controls only; writer-only and accepted only while the chat is idle |
 
 ### Server → client
 
-Every frame except the two fatal/ephemeral classes carries a monotonic
-`seq` assigned from the durable frame log.
+Durable conversation frames carry a monotonic `seq` assigned from the
+frame log. Fresh `context` snapshots and `control_result` replies are
+explicitly ephemeral: they are never logged or replayed.
 
 | Frame | Fields | Notes |
 |---|---|---|
@@ -42,6 +44,8 @@ Every frame except the two fatal/ephemeral classes carries a monotonic
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |
 | `notice` | `text`, `seq` | product notice surfaced in chat (E7, SPEC ruling 13): action-required notifications ("⚠ Action required: …") and supervisor restart notices. Logged + replayed; never fatal, never a turn |
 | `error` | `message`, `fatal?`, `seq?` | see the error classes below |
+| `context` | `epoch`, `replay_floor_seq`, `state: idle\|busy\|compacting\|resetting`, `usage`, `compact_supported`, `session_active`, `writer` | fresh server-owned snapshot after auth and on every control/writer/runtime-state transition. `usage` is provider-owned or `null`, never a frontend estimate |
+| `control_result` | `action`, `request_id`, `ok`, `epoch`, `code?`, `message?` | terminal result for exactly one request; failures distinguish `busy`, `unsupported`, `read_only`, `no_session`, and runtime/persistence `failed` |
 
 The contract has no frames for thinking deltas or in-progress tool
 updates: both are dropped at the socket boundary (transcript views own
@@ -139,8 +143,8 @@ concurrently attached clients are **read-only** — they receive
 `auth_ok`, the replay, and every live broadcast, but their `user`
 frames are rejected with an ephemeral `read-only` error (nothing is
 logged or delivered). When the writer disconnects, the pen promotes to
-the earliest authenticated reader (FIFO). Promotion sends no frame — a
-promoted client simply finds its sends working. Transport heartbeats
+the earliest authenticated reader (FIFO). Clients receive a fresh
+`context` snapshot reflecting the promotion. Transport heartbeats
 (ws ping/pong every 30 s; two misses terminate) ensure a silently dead
 socket releases the pen.
 
@@ -161,6 +165,30 @@ error mid-turn** is logged as an `error` frame, then the turn is
 settled immediately: open tools end (reverse order), the turn ends —
 history always reads "the turn died here," never an open stream.
 
+## Context usage, Compact, and New chat
+
+The context row is a control/status surface, not chat content. Pi reports
+native `getContextUsage()` values while idle; Claude print mode does not
+expose a trustworthy whole-context measure, so it reports unavailable.
+No adapter or UI reconstructs usage from streamed deltas.
+
+- **Compact context** invokes the active provider's native control in the
+  same session. Pi uses its SDK compactor; Claude executes a dedicated
+  resumed machine-output `/compact` process and suppresses every command
+  output frame from chat. The session id/file must remain unchanged.
+  Visible chat messages are not removed. Failure is terminal and bounded,
+  and the old conversation remains usable.
+- **New chat** is destructive only to the active view/context: after a
+  native confirmation, the server mints without resume/transcript/summary,
+  activates the durable epoch boundary, and publishes a fresh snapshot.
+  It does not fake reset by clearing DOM or sending prose to the model.
+- Controls serialize against turns, runtime spawning, one another, and
+  queued deliveries. Supervisor restarts are coordinated by slot generation:
+  an intentional fresh replacement wins and any stale completion is disposed.
+  Busy attempts are rejected rather than guessed.
+  Non-writer tabs remain read-only. Context usage is unavailable during
+  compaction/reset until the provider can supply fresh data.
+
 ## Reconnect and never-lose-a-typed-word
 
 - The client queues unacked messages locally (its outbox) and re-sends
@@ -173,10 +201,12 @@ history always reads "the turn died here," never an open stream.
   failure — there is no automatic redelivery; re-send it. The typed word
   is never silently lost, and neither is the failure.
 - Reconnecting clients re-auth with `last_seen_seq`; the server sends
-  `auth_ok` (high-water), then every logged frame with
-  `seq > last_seen_seq` in order, then live traffic. No
-  `last_seen_seq` (fresh page) replays everything, restoring both sides
-  of the conversation.
+  `auth_ok` (high-water), a fresh `context` snapshot, then every logged
+  frame with `seq > max(last_seen_seq, replay_floor_seq)` in order, then
+  live traffic. The browser clears the active view only after observing
+  an advanced durable epoch. Sent/acked messages from the retired epoch
+  are dropped; never-sent local outbox words survive and flush into the
+  new epoch.
 - Live frames emitted during a client's replay have seqs above the
   high-water mark and arrive after the replay by per-socket FIFO —
   gapless by the seq invariant.
@@ -192,14 +222,17 @@ history always reads "the turn died here," never an open stream.
   attaches, the server appends the closing frames (open tools end in
   reverse order, then `turn end`). This is the mock's aborted-turn rule,
   moved to the one place a real multi-client server can see it.
-- **The Gru brain:** the active session file is recorded at
-  `<data_dir>/chat/gru-session.json` (atomic writes). On boot the chat
-  server resumes THAT session via the runtime (`resumeFile`) — the same
-  brain, never a fork. A pointer naming a vanished file spawns fresh
-  with a warning (the history is gone either way); a corrupt pointer or
-  a resume error fails loud.
-- Log rotation (frame log and `service.log` alike) is deferred to the
-  supervision epic by prior review ruling.
+- **The Gru brain:** the active session file, chat `epoch`, and
+  `replayFloorSeq` are recorded together at
+  `<data_dir>/chat/gru-session.json` (atomic writes; legacy files default
+  both numbers to zero). On boot the chat server resumes THAT session.
+  **New chat** first mints an unresumed native session, then atomically
+  advances all three fields and swaps the supervised slot; any failure
+  before activation leaves the old session/epoch usable. New chat never
+  deletes or rewrites old native transcripts or frame-log bytes, and a
+  second reset simply advances the boundary again. Frame shards remain
+  subject only to the configured size/retention policy described in
+  `SUPERVISION.md`; a reset itself does not rotate or prune them.
 
 ## Pairing, static UI, and the LAN phone flow
 
@@ -224,9 +257,10 @@ catch-up.
 
 - Client messages are capped at 4 000 chars client-side; the server
   caps frame payloads at 64 KiB (a wedged client can't flood memory).
-- A message rejected as read-only is NOT re-delivered when its client
-  is later promoted — the sender re-sends it (the UI keeps it in the
-  outbox only while unacked; a read-only rejection leaves it sent).
+- The official browser does not transmit while its authoritative context
+  says `writer:false`; words stay queued locally and flush after pen
+  promotion. Raw/third-party clients that send anyway receive an ephemeral
+  read-only rejection and must decide whether to retry.
 - Shutdown: the service closes chat clients first (1001 going away) so
   the UI queues before the runtime turns die; the next boot's
   boot-settle closes anything left open.

@@ -64,6 +64,11 @@
     <div id="chat-main-mount" class="reveal">
       <section id="chat-view" class="pp-card chat-panel chat-panel--desktop" hidden>
         <div class="chat-log" id="chat-log"></div>
+        <div class="chat-context" id="chat-context-controls" aria-label="Chat context controls">
+          <span class="pp-chip chat-context__status" id="chat-context-status" role="status" aria-live="polite">Context unavailable</span>
+          <button class="pp-btn pp-btn--secondary chat-context__button" type="button" id="chat-compact" disabled>Compact context</button>
+          <button class="pp-btn pp-btn--secondary chat-context__button" type="button" id="chat-new" disabled>New chat</button>
+        </div>
         <form class="chat-compose" id="chat-form">
           <div class="chat-chips" id="chat-chips" hidden></div>
           <div class="chat-compose__row">

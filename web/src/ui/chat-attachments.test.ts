@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BrowseResult, UploadedFile } from '../lib/attach-client.js';
+import type { ContextFrame } from '../lib/protocol.js';
 import { ChatView, type AttachSurface } from './chat.js';
 
 function installChatDom(): void {
@@ -9,6 +10,21 @@ function installChatDom(): void {
   mainMount.id = 'chat-main-mount';
   const log = document.createElement('div');
   log.id = 'chat-log';
+  const context = document.createElement('div');
+  context.id = 'chat-context-controls';
+  const contextStatus = document.createElement('span');
+  contextStatus.id = 'chat-context-status';
+  contextStatus.setAttribute('role', 'status');
+  contextStatus.setAttribute('aria-live', 'polite');
+  const compact = document.createElement('button');
+  compact.id = 'chat-compact';
+  compact.type = 'button';
+  compact.disabled = true;
+  const newChat = document.createElement('button');
+  newChat.id = 'chat-new';
+  newChat.type = 'button';
+  newChat.disabled = true;
+  context.append(contextStatus, compact, newChat);
   const form = document.createElement('form');
   form.id = 'chat-form';
   const chips = document.createElement('div');
@@ -49,7 +65,7 @@ function installChatDom(): void {
 
   const view = document.createElement('section');
   view.id = 'chat-view';
-  view.append(log, form, picker);
+  view.append(log, context, form, picker);
   const bubble = document.createElement('button');
   bubble.id = 'chat-bubble';
   const badge = document.createElement('span');
@@ -97,6 +113,71 @@ async function settle(): Promise<void> {
 }
 
 beforeEach(() => installChatDom());
+
+describe('chat context control rendering', () => {
+  it('disables controls from authoritative reader, busy, inactive, unsupported, and disconnected state', () => {
+    const view = new ChatView(() => true);
+    view.bindControls(() => true);
+    view.setControlsConnected(true);
+    const set = (overrides: Partial<ContextFrame> = {}) =>
+      view.setContext({
+        type: 'context',
+        epoch: 1,
+        replay_floor_seq: 0,
+        state: 'idle',
+        usage: null,
+        compact_supported: true,
+        session_active: true,
+        writer: true,
+        ...overrides,
+      });
+    const compact = document.getElementById('chat-compact') as HTMLButtonElement;
+    const fresh = document.getElementById('chat-new') as HTMLButtonElement;
+
+    set({ writer: false });
+    expect([compact.disabled, fresh.disabled]).toEqual([true, true]);
+    set({ state: 'busy' });
+    expect([compact.disabled, fresh.disabled]).toEqual([true, true]);
+    set({ session_active: false });
+    expect([compact.disabled, fresh.disabled]).toEqual([true, false]);
+    set({ compact_supported: false });
+    expect([compact.disabled, fresh.disabled]).toEqual([true, false]);
+    set();
+    view.setControlsConnected(false);
+    expect([compact.disabled, fresh.disabled]).toEqual([true, true]);
+  });
+
+  it('renders authoritative usage and announces optimistic New chat progress accessibly', () => {
+    const view = new ChatView(() => true);
+    const request = vi.fn(() => true);
+    view.bindControls(request);
+    view.setControlsConnected(true);
+    view.setContext({
+      type: 'context',
+      epoch: 3,
+      replay_floor_seq: 41,
+      state: 'idle',
+      usage: { tokens: 370, context_window: 1_000, percent: 37 },
+      compact_supported: true,
+      session_active: true,
+      writer: true,
+    });
+    const status = document.getElementById('chat-context-status')!;
+    expect(status.textContent).toBe('37% context');
+    expect(status.getAttribute('title')).toContain('370 of 1,000 tokens');
+    expect(status.getAttribute('aria-label')).toContain('37 percent context used');
+    expect(status.getAttribute('role')).toBe('status');
+    expect(status.getAttribute('aria-live')).toBe('polite');
+
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    document.getElementById('chat-new')!.click();
+    expect(request).toHaveBeenCalledWith('new_chat');
+    expect(status.textContent).toBe('Starting new chat…');
+    expect(status.hasAttribute('aria-busy')).toBe(true);
+    expect((document.getElementById('chat-compact') as HTMLButtonElement).disabled).toBe(true);
+    expect((document.getElementById('chat-new') as HTMLButtonElement).disabled).toBe(true);
+  });
+});
 
 describe('composer attach consumer paths', () => {
   it('keeps typed text and chips after a failed send; remove and Escape remain live', async () => {

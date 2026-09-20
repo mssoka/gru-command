@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
 import { ChatClient, type ChatMessage, type ConnectionState } from './chat-client.js';
-import { parseClientFrame, type LoggedFrame, type ServerFrame } from './protocol.js';
+import {
+  parseClientFrame,
+  type ContextFrame,
+  type LoggedFrame,
+  type ServerFrame,
+} from './protocol.js';
 import type { StorageLike } from '../theme.js';
 
 /**
@@ -16,6 +21,14 @@ class TestServer {
   port = 0;
   log: LoggedFrame[] = [];
   seq = 0;
+  epoch = 0;
+  replayFloorSeq = 0;
+  contextState: 'idle' | 'busy' | 'compacting' | 'resetting' = 'idle';
+  controls: Array<{ action: 'compact' | 'new_chat'; request_id: string }> = [];
+  failNextNewChat = false;
+  deferNextNewChat = false;
+  writer = true;
+  deferredNewChat: { socket: WebSocket; request_id: string } | null = null;
   sockets = new Set<WebSocket>();
 
   async start(): Promise<void> {
@@ -38,10 +51,65 @@ class TestServer {
           authed = true;
           const lastSeen = frame.last_seen_seq ?? 0;
           this.send(socket, { type: 'auth_ok', seq: this.seq });
+          this.send(socket, {
+            type: 'context',
+            epoch: this.epoch,
+            replay_floor_seq: this.replayFloorSeq,
+            state: this.contextState,
+            usage: null,
+            compact_supported: true,
+            session_active: true,
+            writer: this.writer,
+          });
           for (const logged of this.log) {
             const s = 'seq' in logged && typeof logged.seq === 'number' ? logged.seq : 0;
-            if (s > lastSeen) this.send(socket, logged);
+            if (s > Math.max(lastSeen, this.replayFloorSeq)) this.send(socket, logged);
           }
+          return;
+        }
+        if (frame.type === 'control') {
+          this.controls.push({ action: frame.action, request_id: frame.request_id });
+          if (frame.action === 'new_chat' && this.deferNextNewChat) {
+            this.deferNextNewChat = false;
+            this.contextState = 'resetting';
+            this.deferredNewChat = { socket, request_id: frame.request_id };
+            this.broadcastContext();
+            return;
+          }
+          const failNewChat = frame.action === 'new_chat' && this.failNextNewChat;
+          this.failNextNewChat = false;
+          if (frame.action === 'new_chat' && !failNewChat) {
+            this.epoch += 1;
+            this.replayFloorSeq = this.seq;
+          }
+          this.send(socket, failNewChat
+            ? {
+                type: 'control_result',
+                action: frame.action,
+                request_id: frame.request_id,
+                ok: false,
+                epoch: this.epoch,
+                code: 'failed',
+                message: 'fresh spawn failed',
+              }
+            : {
+                type: 'control_result',
+                action: frame.action,
+                request_id: frame.request_id,
+                ok: true,
+                epoch: this.epoch,
+              });
+          this.contextState = 'idle';
+          this.send(socket, {
+            type: 'context',
+            epoch: this.epoch,
+            replay_floor_seq: this.replayFloorSeq,
+            state: this.contextState,
+            usage: null,
+            compact_supported: true,
+            session_active: true,
+            writer: true,
+          });
           return;
         }
         if (frame.type !== 'user') return;
@@ -65,6 +133,45 @@ class TestServer {
 
   record(frame: LoggedFrame): void {
     this.log.push(frame);
+  }
+
+  broadcastContext(): void {
+    for (const socket of this.sockets) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      this.send(socket, {
+        type: 'context',
+        epoch: this.epoch,
+        replay_floor_seq: this.replayFloorSeq,
+        state: this.contextState,
+        usage: null,
+        compact_supported: true,
+        session_active: true,
+        writer: this.writer,
+      });
+    }
+  }
+
+  completeDeferredNewChat(): void {
+    const pending = this.deferredNewChat;
+    if (pending === null) throw new Error('no deferred new chat');
+    this.deferredNewChat = null;
+    this.epoch += 1;
+    this.replayFloorSeq = this.seq;
+    // Production publishes the committed epoch while it is still resetting,
+    // before the terminal result and final idle snapshot.
+    this.contextState = 'resetting';
+    this.broadcastContext();
+    if (pending.socket.readyState === WebSocket.OPEN) {
+      this.send(pending.socket, {
+        type: 'control_result',
+        action: 'new_chat',
+        request_id: pending.request_id,
+        ok: true,
+        epoch: this.epoch,
+      });
+    }
+    this.contextState = 'idle';
+    this.broadcastContext();
   }
 
   send(socket: WebSocket, frame: ServerFrame): void {
@@ -125,6 +232,9 @@ interface Harness {
   fatals: string[];
   replayStarts: boolean[];
   replayEnds: number;
+  epochs: number[];
+  contexts: ContextFrame[];
+  controlResults: string[];
 }
 
 function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Harness {
@@ -133,6 +243,9 @@ function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Ha
   const states: ConnectionState[] = [];
   const fatals: string[] = [];
   const replayStarts: boolean[] = [];
+  const epochs: number[] = [];
+  const contexts: ContextFrame[] = [];
+  const controlResults: string[] = [];
   let replayEnds = 0;
   const client = new ChatClient(
     {
@@ -151,6 +264,9 @@ function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Ha
       replayEnd: () => {
         replayEnds += 1;
       },
+      context: (snapshot) => contexts.push(snapshot),
+      epochChange: (epoch) => epochs.push(epoch),
+      controlResult: (result) => controlResults.push(result.request_id),
       fatal: (m) => fatals.push(m),
     },
   );
@@ -161,6 +277,9 @@ function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Ha
     states,
     fatals,
     replayStarts,
+    epochs,
+    contexts,
+    controlResults,
     get replayEnds() {
       return replayEnds;
     },
@@ -205,6 +324,197 @@ describe('ChatClient', () => {
     const deltaTexts = h.frames.filter((f) => f.type === 'delta').map((f) => f.text);
     expect(deltaTexts.join('')).toContain('echo:hello boss');
     expect(h.frames.some((f) => f.type === 'tool' && f.name === 'echo-tool')).toBe(true);
+  });
+
+  it('sends fixed control actions and clears old sent messages only after epoch confirmation', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
+    h.client.send('old epoch');
+    await waitFor(() => h.client.getMessages().some((message) => message.status === 'acked'));
+
+    const compactId = h.client.requestControl('compact');
+    await waitFor(() => h.controlResults.includes(compactId));
+    expect(server.controls.at(-1)?.action).toBe('compact');
+
+    server.failNextNewChat = true;
+    const failedResetId = h.client.requestControl('new_chat');
+    const afterFailedReset = h.client.send('typed while failed reset is pending');
+    await waitFor(() => h.controlResults.includes(failedResetId));
+    await waitFor(() =>
+      server.log.some((frame) => frame.type === 'user' && frame.text === afterFailedReset.text),
+    );
+    expect(
+      h.client.getMessages().find((message) => message.client_msg_id === afterFailedReset.client_msg_id),
+    ).toMatchObject({ status: 'acked', epoch: 0 });
+
+    const resetId = h.client.requestControl('new_chat');
+    const duringReset = h.client.send('typed while reset is pending');
+    expect(duringReset.status).toBe('queued');
+    expect(duringReset.epoch).toBeUndefined();
+    expect(server.log.some((frame) => frame.type === 'user' && frame.text === duringReset.text)).toBe(false);
+    await waitFor(() => h.controlResults.includes(resetId) && h.epochs.includes(1));
+    await waitFor(() =>
+      server.log.some((frame) => frame.type === 'user' && frame.text === duringReset.text),
+    );
+    expect(
+      h.client.getMessages().find((message) => message.client_msg_id === duringReset.client_msg_id),
+    ).toMatchObject({ status: 'acked', epoch: 1 });
+
+    h.client.stop();
+    h.client.send('never sent words');
+    server.epoch = 2;
+    server.replayFloorSeq = server.seq;
+    h.client.connect();
+    await waitFor(() => h.epochs.includes(2));
+    await waitFor(() => h.client.getMessages().some((message) => message.text === 'never sent words'));
+    expect(h.client.getMessages().some((message) => message.text === 'old epoch')).toBe(false);
+    expect(h.client.getMessages().some((message) => message.text === 'never sent words')).toBe(true);
+  });
+
+  it('recovers a pending new chat when reconnect first observes resetting', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
+
+    server.deferNextNewChat = true;
+    h.client.requestControl('new_chat');
+    const held = h.client.send('held across reset reconnect');
+    await waitFor(() => h.contexts.some((snapshot) => snapshot.state === 'resetting'));
+    server.dropAll();
+    await waitFor(() => h.states.includes('offline'));
+    await waitFor(
+      () =>
+        h.client.getState() === 'open' &&
+        h.contexts.filter((snapshot) => snapshot.state === 'resetting').length >= 2,
+    );
+    expect(server.log.some((frame) => frame.type === 'user' && frame.text === held.text)).toBe(false);
+
+    server.completeDeferredNewChat();
+    await waitFor(() => h.epochs.includes(1));
+    await waitFor(() => server.log.some((frame) => frame.type === 'user' && frame.text === held.text));
+    expect(
+      h.client.getMessages().find((message) => message.client_msg_id === held.client_msg_id),
+    ).toMatchObject({ status: 'acked', epoch: 1 });
+    expect(() => h.client.requestControl('new_chat')).not.toThrow();
+  });
+
+  it('surfaces an inferred failed New chat when its result is lost on reconnect', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
+
+    server.deferNextNewChat = true;
+    const requestId = h.client.requestControl('new_chat');
+    const held = h.client.send('return to old epoch after failed reset');
+    await waitFor(() => h.contexts.some((snapshot) => snapshot.state === 'resetting'));
+    server.dropAll();
+    await waitFor(() => h.states.includes('offline'));
+    await waitFor(
+      () =>
+        h.client.getState() === 'open' &&
+        h.contexts.filter((snapshot) => snapshot.state === 'resetting').length >= 2,
+    );
+
+    server.deferredNewChat = null;
+    server.contextState = 'idle';
+    server.broadcastContext();
+    await waitFor(() => h.controlResults.includes(requestId));
+    await waitFor(() => server.log.some((frame) => frame.type === 'user' && frame.text === held.text));
+    expect(server.epoch).toBe(0);
+  });
+
+  it('keeps reader words queued locally until that socket is promoted writer', async () => {
+    server.writer = false;
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
+    const queued = h.client.send('wait for the pen');
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(server.log.some((frame) => frame.type === 'user' && frame.text === queued.text)).toBe(false);
+    const beforePromotion = h.client.getMessages().find(
+      (message) => message.client_msg_id === queued.client_msg_id,
+    );
+    expect(beforePromotion).toMatchObject({ status: 'queued' });
+    expect(beforePromotion?.epoch).toBeUndefined();
+
+    server.writer = true;
+    server.broadcastContext();
+    await waitFor(() => server.log.some((frame) => frame.type === 'user' && frame.text === queued.text));
+    await waitFor(
+      () =>
+        h.client.getMessages().find((message) => message.client_msg_id === queued.client_msg_id)
+          ?.status === 'acked',
+    );
+  });
+
+  it('fails closed on a regressed context epoch without clearing the active view', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
+    server.epoch = 2;
+    server.broadcastContext();
+    await waitFor(() => h.epochs.includes(2));
+    const contextsAtTwo = h.contexts.length;
+
+    server.epoch = 1;
+    server.broadcastContext();
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(h.contexts).toHaveLength(contextsAtTwo);
+    expect(h.epochs).not.toContain(1);
+    expect(h.fatals.some((message) => message.includes('epoch regressed'))).toBe(true);
+  });
+
+  it('does not send a queued word when its sent epoch cannot be persisted', async () => {
+    const blockedStorage: StorageLike = {
+      getItem: () => null,
+      removeItem: () => {},
+      setItem: () => {
+        throw new Error('quota blocked');
+      },
+    };
+    const h = makeClient(server, blockedStorage);
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
+    const message = h.client.send('stay local without durable epoch');
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(server.log.some((frame) => frame.type === 'user' && frame.text === message.text)).toBe(false);
+    expect(h.client.getMessages().find((item) => item.client_msg_id === message.client_msg_id)).toMatchObject({
+      status: 'queued',
+    });
+  });
+
+  it('reload does not resurrect a persisted sent item across an epoch boundary', async () => {
+    const storage = memStorage();
+    storage.setItem(
+      'gru-outbox',
+      JSON.stringify([
+        { client_msg_id: 'sent-old', text: 'already left old epoch', status: 'sent', epoch: 0 },
+        { client_msg_id: 'never-sent', text: 'still local', status: 'queued' },
+      ]),
+    );
+    server.contextState = 'resetting';
+    const h = makeClient(server, storage);
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(server.log.some((frame) => frame.type === 'user' && frame.text === 'still local')).toBe(false);
+    server.epoch = 1;
+    server.replayFloorSeq = server.seq;
+    server.contextState = 'idle';
+    server.broadcastContext();
+    await waitFor(() => h.client.getMessages().some((message) => message.text === 'still local'));
+    await waitFor(() => server.log.some((frame) => frame.type === 'user' && frame.text === 'still local'));
+    expect(server.log.some((frame) => frame.type === 'user' && frame.text === 'already left old epoch')).toBe(false);
+    expect(h.client.getMessages().some((message) => message.text === 'already left old epoch')).toBe(false);
+    expect(h.epochs).toContain(1);
   });
 
   it('OFFLINE-SEND: typed while down → queued, persisted, flushed on connect', async () => {
@@ -483,8 +793,18 @@ describe('attachments ride the outbox (SPEC ruling 19)', () => {
 
     const persisted = JSON.parse(storage.map.get('gru-outbox') ?? '[]') as Array<Record<string, unknown>>;
     expect(persisted).toEqual([
-      { client_msg_id: withText.client_msg_id, text: 'review this', attachments: textChips },
-      { client_msg_id: attachmentOnly.client_msg_id, text: '', attachments: imageChips },
+      {
+        client_msg_id: withText.client_msg_id,
+        text: 'review this',
+        attachments: textChips,
+        status: 'queued',
+      },
+      {
+        client_msg_id: attachmentOnly.client_msg_id,
+        text: '',
+        attachments: imageChips,
+        status: 'queued',
+      },
     ]);
 
     const second = makeClient(server, storage);

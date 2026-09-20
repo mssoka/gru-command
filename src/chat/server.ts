@@ -1,11 +1,12 @@
+import { realpathSync, statSync } from 'node:fs';
 import type { IncomingMessage, Server as HttpServer } from 'node:http';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
 import { hashToken, tokenConfigured as isTokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { AgentHandle, RuntimeEvent } from '../runtime/types.js';
+import type { AgentHandle, AgentState, RuntimeEvent } from '../runtime/types.js';
 import { chipPathAllowed } from '../attachments/resolver.js';
 import type { AttachmentChip } from '../attachments/resolver.js';
 import type { ChatFrameLog } from './frame-log.js';
@@ -14,6 +15,10 @@ import {
   ephemeralError,
   parseClientFrame,
   type ClientFrame,
+  type ContextControlState,
+  type ContextFrame,
+  type ControlFrame,
+  type ControlResultCode,
   type ErrorFrame,
   type LoggedFrame,
   type ServerFrame,
@@ -25,6 +30,30 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 
 /** Prompts from the chat surface share one owner — the single user (SPEC ruling 1). */
 const CHAT_OWNER = 'chat';
+/** Keep provider failures useful without allowing an unbounded machine error
+ * to flood the control row or WebSocket frame. */
+const MAX_CONTROL_MESSAGE_CHARS = 240;
+const MAX_DEFERRED_CONTROL_FRAMES = 128;
+const MAX_PENDING_NOTICES = 128;
+
+function boundedControlMessage(message: string): string {
+  if (message.length <= MAX_CONTROL_MESSAGE_CHARS) return message;
+  return `${message.slice(0, MAX_CONTROL_MESSAGE_CHARS - 1)}…`;
+}
+
+function sameSessionFile(left: string, right: string | null | undefined): boolean {
+  if (right === null || right === undefined) return false;
+  try {
+    const leftStat = statSync(left);
+    const rightStat = statSync(right);
+    if (leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino) return true;
+    return realpathSync.native(left) === realpathSync.native(right);
+  } catch {
+    // Identity checks still need a deterministic fallback for an adapter
+    // that reports its path just before materializing the transcript.
+    return resolve(left) === resolve(right);
+  }
+}
 
 /**
  * Compose the delivered prompt (SPEC ruling 19(d)): the composer text
@@ -55,11 +84,18 @@ export interface ChatServerOptions {
   /** Spawn (or resume) the single Gru session. Injected: the chat layer
    * never touches a concrete adapter or the registry (runtime-agnostic). */
   readonly spawnGru: (resumeFile: string | null) => Promise<AgentHandle>;
+  /** Mint a native session without resume/transcript context. This is
+   * mandatory: reusing spawnGru(null) could return the supervised old handle. */
+  readonly spawnFreshGru: () => Promise<AgentHandle>;
+  /** Bind a successfully committed fresh handle to its supervised slot. */
+  readonly adoptFreshGru?: (handle: AgentHandle) => Promise<void>;
   readonly log?: Log;
   /** First-frame-must-be-auth deadline (mock parity: 5 000 ms). */
   readonly authDeadlineMs?: number;
   /** Transport heartbeat interval; 0 disables. Default 30 000 ms. */
   readonly heartbeatMs?: number;
+  /** Deadline for provider compaction and fresh-session minting. */
+  readonly controlTimeoutMs?: number;
   /** ws payload cap — the client caps messages at 4 000 chars; 64 KiB is generous. */
   readonly maxPayloadBytes?: number;
   /** Upgrade paths owned by SIBLING ws surfaces (the board's /board/ws,
@@ -111,6 +147,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   const frameLog = options.frameLog;
   const authDeadlineMs = options.authDeadlineMs ?? 5_000;
   const heartbeatMs = options.heartbeatMs ?? 30_000;
+  const controlTimeoutMs = options.controlTimeoutMs ?? 120_000;
   const siblingUpgradePaths = new Set(options.siblingUpgradePaths ?? []);
   const tokenHash = hashToken(options.config.auth.token);
   const tokenConfigured = isTokenConfigured(options.config.auth.token);
@@ -120,6 +157,20 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     maxPayload: options.maxPayloadBytes ?? 64 * 1024,
   });
   const clients = new Set<Client>();
+  const initialBoundary = options.pointer.current();
+  let epoch = initialBoundary?.epoch ?? 0;
+  let replayFloorSeq = initialBoundary?.replayFloorSeq ?? 0;
+  /** A durable boundary whose native session vanished must be repaired before
+   * another user frame is logged; otherwise the replacement model and the
+   * visible replay would start from different histories. */
+  let boundarySessionMissing =
+    initialBoundary !== null && options.pointer.resumeCandidate() === null;
+  if (replayFloorSeq > frameLog.highWaterSeq) {
+    throw new Error(
+      `gru session replay floor ${replayFloorSeq} exceeds chat frame high-water ` +
+        `${frameLog.highWaterSeq}; refusing a boundary that would hide future frames`,
+    );
+  }
 
   let handle: AgentHandle | null = null;
   let unsubscribe: (() => void) | null = null;
@@ -130,6 +181,14 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   /** True from a prompt delivery until the turn end lands (or the prompt
    * rejects) — the steer-vs-prompt decision for the NEXT message. */
   let turnLive = false;
+  let runtimeCompacting = false;
+  let runtimeCompactionBarrier: Promise<void> | null = null;
+  let resolveRuntimeCompaction: (() => void) | null = null;
+  let controlState: ContextControlState = 'idle';
+  let controlBarrier: Promise<void> | null = null;
+  let pendingDeliveries = 0;
+  let deferredControlFrames = 0;
+  const pendingNotices: string[] = [];
   /** callId → tool name, for tool_end frames (the contract carries names). */
   const openCalls = new Map<string, string>();
 
@@ -149,7 +208,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       void attempt
         .catch(() => {})
         .finally(() => {
-          if (spawning === attempt) spawning = null;
+          if (spawning === attempt) {
+            spawning = null;
+            broadcastContext();
+          }
         });
     }
     return spawning;
@@ -159,9 +221,14 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     try {
       // Inside the try (r1 W4): a corrupt resume pointer must surface as
       // a spawn failure and CLEAR the spawn gate — not wedge it forever.
+      const priorBoundary = options.pointer.current();
       const resumeFile = options.pointer.resumeCandidate();
+      const replacingUnrecoverableBoundary =
+        boundarySessionMissing || (priorBoundary !== null && resumeFile === null);
+      boundarySessionMissing = replacingUnrecoverableBoundary;
       log('info', 'spawning the single Gru session', {
         resume: resumeFile !== null,
+        replacing_unrecoverable_boundary: replacingUnrecoverableBoundary,
       });
       const spawned = await options.spawnGru(resumeFile);
       if (disposed) {
@@ -170,9 +237,41 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         await spawned.dispose().catch(() => {});
         throw new Error('chat server disposed during gru spawn');
       }
-      handle = spawned;
-      unsubscribe = spawned.subscribe(onRuntimeEvent);
-      if (spawned.sessionFile !== null) options.pointer.record(spawned.sessionFile);
+      let stagedUnsubscribe: (() => void) | null = null;
+      try {
+        if (spawned.sessionFile === null || spawned.sessionFile === '') {
+          throw new Error('Gru chat session has no durable session file');
+        }
+        if (resumeFile !== null && !sameSessionFile(spawned.sessionFile, resumeFile)) {
+          throw new Error('resumed Gru spawn changed native session identity');
+        }
+        stagedUnsubscribe = subscribeHandle(spawned);
+        // A vanished pointed session means the replacement model has no
+        // native memory of visible history. Advance the floor before
+        // publishing the handle. With no pointer, durable model context was
+        // never established; logged spawn failures/notices remain visible.
+        const state = replacingUnrecoverableBoundary
+          ? options.pointer.advance(spawned.sessionFile, frameLog.highWaterSeq)
+          : options.pointer.record(spawned.sessionFile);
+        epoch = state.epoch;
+        replayFloorSeq = state.replayFloorSeq;
+        boundarySessionMissing = false;
+        handle = spawned;
+        unsubscribe = stagedUnsubscribe;
+      } catch (error) {
+        try {
+          stagedUnsubscribe?.();
+        } catch (unsubscribeError) {
+          log('warn', 'staged Gru unsubscribe failed after spawn rejection', {
+            error: String(unsubscribeError),
+          });
+        } finally {
+          await spawned.dispose().catch(() => {});
+        }
+        throw error;
+      }
+      flushPendingNotices();
+      broadcastContext();
       log('info', 'gru session live', { session_file: spawned.sessionFile });
       return spawned;
     } catch (error) {
@@ -191,10 +290,30 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     return seqed;
   }
 
+  function flushPendingNotices(): void {
+    for (const notice of pendingNotices.splice(0)) {
+      try {
+        emitLogged({ type: 'notice', text: notice });
+      } catch (error) {
+        log('error', 'failed to persist a deferred Gru notice', {
+          error: String(error),
+        });
+      }
+    }
+  }
+
   function settleOpenTurn(): void {
     for (const closing of frameLog.settleOpenTurn()) broadcast(closing);
     openCalls.clear();
     turnLive = false;
+  }
+
+  function subscribeHandle(source: AgentHandle): () => void {
+    return source.subscribe((event) => {
+      // A broken unsubscribe implementation must not let a retired runtime
+      // mutate the newly active handle's chat state during disposal.
+      if (handle === source) onRuntimeEvent(event);
+    });
   }
 
   function onRuntimeEvent(event: RuntimeEvent): void {
@@ -202,13 +321,27 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       case 'turn_start':
         turnLive = true;
         emitLogged({ type: 'turn', state: 'start' });
+        broadcastContext();
         break;
       case 'turn_end':
         turnLive = false;
         // A fatal error may already have settled this turn — never log a
         // dangling end (replay would render a turn boundary out of nowhere).
-        if (!frameLog.hasOpenTurn) break;
-        emitLogged({ type: 'turn', state: 'end' });
+        if (frameLog.hasOpenTurn) emitLogged({ type: 'turn', state: 'end' });
+        broadcastContext();
+        break;
+      case 'compaction_start':
+        runtimeCompacting = true;
+        if (runtimeCompactionBarrier === null) {
+          runtimeCompactionBarrier = new Promise<void>((resolve) => {
+            resolveRuntimeCompaction = resolve;
+          });
+        }
+        broadcastContext();
+        break;
+      case 'compaction_end':
+        settleRuntimeCompaction();
+        broadcastContext();
         break;
       case 'text_delta':
         emitLogged({ type: 'delta', text: event.delta });
@@ -242,6 +375,12 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
           log('warn', 'gru session disposed — next message respawns it', {});
           teardownHandle();
           settleOpenTurn();
+          broadcastContext();
+        } else {
+          // Provider health determines whether usage is trustworthy. State
+          // transitions therefore invalidate/refresh the snapshot even when
+          // no durable chat frame is produced.
+          broadcastContext();
         }
         break;
       case 'queued':
@@ -265,11 +404,124 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     }
   }
 
+  function settleRuntimeCompaction(): void {
+    runtimeCompacting = false;
+    const resolve = resolveRuntimeCompaction;
+    resolveRuntimeCompaction = null;
+    runtimeCompactionBarrier = null;
+    resolve?.();
+  }
+
   function teardownHandle(): void {
-    unsubscribe?.();
-    unsubscribe = null;
-    handle = null;
-    openCalls.clear();
+    try {
+      unsubscribe?.();
+    } catch (error) {
+      log('warn', 'Gru unsubscribe failed during teardown', { error: String(error) });
+    } finally {
+      unsubscribe = null;
+      handle = null;
+      settleRuntimeCompaction();
+      openCalls.clear();
+    }
+  }
+
+  function contextFrame(client: Client): ContextFrame {
+    const active = handle;
+    let health: AgentState | null = null;
+    let healthProbeFailed = false;
+    let nativeCompacting = runtimeCompacting;
+    if (active !== null) {
+      try {
+        health = active.health().state;
+        nativeCompacting ||= active.isCompacting?.() === true;
+      } catch {
+        healthProbeFailed = true;
+        // Health/usage are advisory. A failed probe makes controls cautious
+        // and usage unavailable; it must not disrupt the socket.
+      }
+    }
+    const runtimeBusy =
+      healthProbeFailed ||
+      spawning !== null ||
+      pendingDeliveries > 0 ||
+      turnLive ||
+      frameLog.hasOpenTurn ||
+      health === 'spawning' ||
+      health === 'streaming';
+    const state: ContextControlState =
+      controlState !== 'idle'
+        ? controlState
+        : nativeCompacting
+          ? 'compacting'
+          : runtimeBusy
+            ? 'busy'
+            : 'idle';
+    let usage: ContextFrame['usage'] = null;
+    if (active !== null && state === 'idle' && active.getContextUsage !== undefined) {
+      try {
+        const measured =
+          health === 'idle' || health === 'error' ? active.getContextUsage() : null;
+        if (
+          measured !== null &&
+          Number.isFinite(measured.tokens) && measured.tokens >= 0 &&
+          Number.isFinite(measured.contextWindow) && measured.contextWindow > 0 &&
+          Number.isFinite(measured.percent)
+        ) {
+          usage = {
+            tokens: measured.tokens,
+            context_window: measured.contextWindow,
+            percent: Math.max(0, Math.min(100, measured.percent)),
+          };
+        }
+      } catch {
+        // A provider usage probe is optional telemetry, never a chat failure.
+      }
+    }
+    const sessionActive = active !== null && health !== 'disposed';
+    let compactSupported = sessionActive && active?.compact !== undefined;
+    if (compactSupported && active?.canCompact !== undefined) {
+      try {
+        compactSupported = active.canCompact();
+      } catch {
+        compactSupported = false;
+      }
+    }
+    return {
+      type: 'context',
+      epoch,
+      replay_floor_seq: replayFloorSeq,
+      state,
+      usage,
+      compact_supported: compactSupported,
+      session_active: sessionActive,
+      writer: client.writer,
+    };
+  }
+
+  function broadcastContext(): void {
+    for (const client of clients) {
+      if (client.authed) send(client, contextFrame(client));
+    }
+  }
+
+  function controlResult(
+    client: Client,
+    frame: ControlFrame,
+    ok: boolean,
+    code?: ControlResultCode,
+    message?: string,
+  ): void {
+    send(client, {
+      type: 'control_result',
+      action: frame.action,
+      request_id: frame.request_id,
+      ok,
+      epoch,
+      ...(code !== undefined ? { code } : {}),
+      ...(message !== undefined && message !== ''
+        ? { message: boundedControlMessage(message) }
+        : {}),
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -284,76 +536,99 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
    * the user + a never-guess instruction for the agent — never an error
    * frame, never a silent drop. */
   function deliver(client: Client, text: string, attachments?: readonly AttachmentChip[]): void {
+    pendingDeliveries += 1;
+    broadcastContext();
+    const waitForControl = controlBarrier;
     void (async () => {
-      // Chip-path provenance (review r1): only workspace/uploads paths
-      // ride the manifest — a handcrafted chip pointing elsewhere drops
-      // GRACEFULLY: a visible notice, never a silent pass, never an error.
-      const allowed: AttachmentChip[] = [];
-      const rejected: string[] = [];
-      for (const chip of attachments ?? []) {
-        if (chipPathAllowed(options.config.workspaceRoot, join(options.config.dataDir, 'uploads'), chip.path)) {
-          allowed.push(chip);
-        } else {
-          rejected.push(chip.path);
-        }
-      }
-      if (rejected.length > 0) {
-        emitLogged({
-          type: 'notice',
-          text:
-            `Attachment path not allowed (outside the workspace and uploads): ${rejected.join(', ')} — ` +
-            'dropped from the message Gru receives.',
-        });
-      }
-      if (text.trim() === '' && allowed.length === 0) {
-        emitLogged({
-          type: 'notice',
-          text: 'No deliverable content remained after attachment validation — empty prompt skipped.',
-        });
-        return;
-      }
-      let gru: AgentHandle;
       try {
-        gru = await ensureGru();
-      } catch (error) {
-        // Ephemeral: a transient spawn failure must not replay forever.
-        send(client, ephemeralError(`gru is unavailable: ${(error as Error).message}`));
-        return;
-      }
-      const imageChips = allowed.filter((chip) => chip.kind === 'image');
-      const visionUnavailable = imageChips.length > 0 && !gru.capabilities.images;
-      if (visionUnavailable) {
-        emitLogged({
-          type: 'notice',
-          text:
-            `Vision is unavailable on the current model — ${imageChips.length} image attachment(s) ` +
-            'sent as paths only; Gru is instructed not to guess at their contents.',
-        });
-      }
-      const prompt = composeDeliveredPrompt(text, allowed.length > 0 ? allowed : undefined, visionUnavailable);
-      const midTurn = turnLive;
-      try {
-        if (midTurn) {
-          await gru.steer(prompt, { owner: CHAT_OWNER });
-        } else {
-          turnLive = true; // optimistic: the turn_start event confirms
-          await gru.prompt(prompt, { owner: CHAT_OWNER });
-          turnLive = false;
+        // A frame received after a control started waits behind that control;
+        // native turns, compaction, and reset never overlap.
+        if (waitForControl !== null) await waitForControl;
+        if (disposed) return;
+        // Chip-path provenance (review r1): only workspace/uploads paths
+        // ride the manifest — a handcrafted chip pointing elsewhere drops
+        // GRACEFULLY: a visible notice, never a silent pass, never an error.
+        const allowed: AttachmentChip[] = [];
+        const rejected: string[] = [];
+        for (const chip of attachments ?? []) {
+          if (
+            chipPathAllowed(
+              options.config.workspaceRoot,
+              join(options.config.dataDir, 'uploads'),
+              chip.path,
+            )
+          ) {
+            allowed.push(chip);
+          } else {
+            rejected.push(chip.path);
+          }
         }
-      } catch (error) {
-        const message = (error as Error).message;
-        const dead = /disposed/.test(message);
-        if (dead) teardownHandle();
-        // Conversation-relevant (this message failed to deliver) → logged.
-        emitLogged({ type: 'error', message: `message delivery failed: ${message}` });
-        // Settle only when the turn is actually over (r1 W2): our prompt
-        // dying, or a disposed session, ends the event stream — close the
-        // log. A rejected STEER leaves the live runtime turn running:
-        // record the failure, never close over it.
-        if (dead || !midTurn) {
-          turnLive = false;
-          settleOpenTurn();
+        if (rejected.length > 0) {
+          emitLogged({
+            type: 'notice',
+            text:
+              `Attachment path not allowed (outside the workspace and uploads): ${rejected.join(', ')} — ` +
+              'dropped from the message Gru receives.',
+          });
         }
+        if (text.trim() === '' && allowed.length === 0) {
+          emitLogged({
+            type: 'notice',
+            text:
+              'No deliverable content remained after attachment validation — empty prompt skipped.',
+          });
+          return;
+        }
+        let gru: AgentHandle;
+        try {
+          gru = await ensureGru();
+        } catch (error) {
+          // Ephemeral: a transient spawn failure must not replay forever.
+          send(client, ephemeralError(`gru is unavailable: ${(error as Error).message}`));
+          return;
+        }
+        const imageChips = allowed.filter((chip) => chip.kind === 'image');
+        const visionUnavailable = imageChips.length > 0 && !gru.capabilities.images;
+        if (visionUnavailable) {
+          emitLogged({
+            type: 'notice',
+            text:
+              `Vision is unavailable on the current model — ${imageChips.length} image attachment(s) ` +
+              'sent as paths only; Gru is instructed not to guess at their contents.',
+          });
+        }
+        const prompt = composeDeliveredPrompt(
+          text,
+          allowed.length > 0 ? allowed : undefined,
+          visionUnavailable,
+        );
+        const midTurn = turnLive;
+        try {
+          if (midTurn) {
+            await gru.steer(prompt, { owner: CHAT_OWNER });
+          } else {
+            turnLive = true; // optimistic: the turn_start event confirms
+            await gru.prompt(prompt, { owner: CHAT_OWNER });
+            turnLive = false;
+          }
+        } catch (error) {
+          const message = (error as Error).message;
+          const dead = /disposed/.test(message);
+          if (dead) teardownHandle();
+          // Conversation-relevant (this message failed to deliver) → logged.
+          emitLogged({ type: 'error', message: `message delivery failed: ${message}` });
+          // Settle only when the turn is actually over (r1 W2): our prompt
+          // dying, or a disposed session, ends the event stream — close the
+          // log. A rejected STEER leaves the live runtime turn running:
+          // record the failure, never close over it.
+          if (dead || !midTurn) {
+            turnLive = false;
+            settleOpenTurn();
+          }
+        }
+      } finally {
+        pendingDeliveries -= 1;
+        broadcastContext();
       }
     })();
   }
@@ -434,7 +709,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         sendError(client, ephemeralError('already authenticated'), true);
         return;
       }
-      handleUserFrame(client, frame);
+      if (frame.type === 'control') {
+        handleControlFrame(client, frame);
+        return;
+      }
+      queueUserFrame(client, frame);
     });
     socket.on('close', () => {
       if (client.authDeadline !== null) clearTimeout(client.authDeadline);
@@ -473,38 +752,327 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     client.writer = ![...clients].some((other) => other.authed && other.writer);
     const highWater = frameLog.highWaterSeq;
     send(client, { type: 'auth_ok', seq: highWater });
+    // The fresh control snapshot precedes replay. It carries the durable
+    // epoch/floor so a client can reset its active view before old frames
+    // have any chance to render.
+    send(client, contextFrame(client));
     // Synchronous block: the replay snapshot covers exactly seqs ≤ the
     // high-water mark; live frames (> high-water) arrive after it by
     // per-socket FIFO — gapless by the seq-continuity invariant.
-    for (const replayed of frameLog.replayAfter(frame.last_seen_seq ?? 0)) {
+    for (const replayed of frameLog.replayAfter(frame.last_seen_seq ?? 0, replayFloorSeq)) {
       send(client, replayed);
     }
     log('info', 'chat client authenticated', {
       writer: client.writer,
       last_seen_seq: frame.last_seen_seq ?? 0,
       high_water_seq: highWater,
+      epoch,
+      replay_floor_seq: replayFloorSeq,
     });
   }
 
-  /** Dedup by client_msg_id: re-received frames get a fresh ack, no re-delivery. */
-  function handleUserFrame(client: Client, frame: UserFrame): void {
+  function handleControlFrame(client: Client, frame: ControlFrame): void {
+    const reject = (code: ControlResultCode, message: string): void => {
+      controlResult(client, frame, false, code, message);
+      // Reconcile the browser's optimistic progress state even when the
+      // request is rejected before a control lifecycle (and therefore has no
+      // terminal finally/broadcast of its own).
+      send(client, contextFrame(client));
+    };
+    if (!client.writer) {
+      reject('read_only', 'another client holds the pen');
+      return;
+    }
+    const snapshot = contextFrame(client);
+    if (
+      disposed ||
+      controlBarrier !== null ||
+      snapshot.state !== 'idle'
+    ) {
+      reject('busy', 'chat is busy');
+      return;
+    }
+    if (frame.action === 'compact') {
+      if (handle === null) {
+        reject('no_session', 'no active Gru session');
+        return;
+      }
+      if (handle.compact === undefined || !snapshot.compact_supported) {
+        reject('unsupported', 'native compaction is unavailable for the current session');
+        return;
+      }
+    }
+
+    controlState = frame.action === 'compact' ? 'compacting' : 'resetting';
+    broadcastContext();
+    const lifecycle = runControl(frame)
+      .then(() => controlResult(client, frame, true))
+      .catch((error: unknown) => {
+        controlResult(
+          client,
+          frame,
+          false,
+          'failed',
+          error instanceof Error ? error.message : String(error),
+        );
+      })
+      .finally(() => {
+        controlState = 'idle';
+        if (disposed) {
+          pendingNotices.length = 0;
+          return;
+        }
+        flushPendingNotices();
+        broadcastContext();
+      });
+    // Deferred user frames continue only AFTER the terminal result and fresh
+    // idle/epoch snapshot have been queued to sockets. That ordering lets a
+    // client clear the retired epoch before an accepted new-epoch user echo.
+    controlBarrier = lifecycle.then(
+      () => {
+        controlBarrier = null;
+      },
+      () => {
+        controlBarrier = null;
+      },
+    );
+  }
+
+  function withControlDeadline<T>(
+    operation: Promise<T>,
+    label: string,
+    onTimeout: () => void,
+  ): Promise<T> {
+    if (controlTimeoutMs <= 0) return operation;
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        try {
+          onTimeout();
+        } finally {
+          reject(new Error(`${label} timed out after ${controlTimeoutMs} ms`));
+        }
+      }, controlTimeoutMs);
+      timer.unref();
+      operation.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error: unknown) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  async function runControl(frame: ControlFrame): Promise<void> {
+    if (frame.action === 'compact') {
+      const active = handle;
+      if (active === null || active.compact === undefined) {
+        throw new Error('native compaction is unavailable');
+      }
+      try {
+        await withControlDeadline(active.compact(), 'native compaction', () => {
+          void active.dispose().catch(() => {});
+        });
+      } finally {
+        // Runtime lifecycle events are advisory; the control promise is the
+        // terminal boundary and must not leave a stale compacting snapshot.
+        settleRuntimeCompaction();
+      }
+      return;
+    }
+
+    const old = handle;
+    const priorSessionFile = options.pointer.current()?.sessionFile ?? null;
+    let staged: AgentHandle | null = null;
+    try {
+      const freshSpawn = options.spawnFreshGru();
+      staged = await withControlDeadline(freshSpawn, 'fresh Gru spawn', () => {
+        void freshSpawn.then((late) => late.dispose()).catch(() => {});
+      });
+      if (disposed) throw new Error('chat server disposed during new chat');
+      if (staged.sessionFile === null || staged.sessionFile === '') {
+        throw new Error('fresh Gru session has no durable session file');
+      }
+      if (
+        staged === old ||
+        staged.id === old?.id ||
+        sameSessionFile(staged.sessionFile, old?.sessionFile) ||
+        sameSessionFile(staged.sessionFile, priorSessionFile)
+      ) {
+        throw new Error('fresh Gru spawn reused the active native session');
+      }
+      if (staged.health().state === 'disposed') {
+        throw new Error('fresh Gru session was disposed before activation');
+      }
+      // Prepare the event subscription before the durable activation point;
+      // a throwing adapter cannot advance the epoch and then report failure.
+      const stagedUnsubscribe = subscribeHandle(staged);
+      let activated = false;
+      try {
+        // A retiring runtime that became active while the fresh provider was
+        // minting cannot be truncated honestly. Abort before activation and
+        // leave the old epoch/turn in charge.
+        if (turnLive || frameLog.hasOpenTurn) {
+          throw new Error('retiring Gru became active during fresh-session spawn');
+        }
+        // This one atomic rename is the activation point: session identity,
+        // epoch, and replay floor move together. Old logs/sessions are untouched.
+        const state = options.pointer.advance(staged.sessionFile, frameLog.highWaterSeq);
+        epoch = state.epoch;
+        replayFloorSeq = state.replayFloorSeq;
+        boundarySessionMissing = false;
+        activated = true;
+      } finally {
+        if (!activated) stagedUnsubscribe();
+      }
+
+      try {
+        unsubscribe?.();
+      } catch (error) {
+        log('warn', 'retired Gru unsubscribe failed during new chat', { error: String(error) });
+      }
+      unsubscribe = stagedUnsubscribe;
+      handle = staged;
+      settleRuntimeCompaction();
+      turnLive = false;
+      openCalls.clear();
+      // Publish the committed epoch before any await below. Otherwise a
+      // concurrent durable notice can be rendered into the retiring view,
+      // then cleared by the delayed boundary snapshot and never shown again.
+      broadcastContext();
+
+      if (options.adoptFreshGru !== undefined) {
+        try {
+          await options.adoptFreshGru(staged);
+        } catch (error) {
+          // The pointer cannot roll back after activation. If the adoption
+          // path disposed its input (for example a slot was released during
+          // shutdown), drop the dead in-memory handle so the next prompt
+          // resumes the committed session instead of advertising it as live.
+          log('error', 'fresh Gru supervision adoption failed', { error: String(error) });
+          let stagedDisposed = false;
+          try {
+            stagedDisposed = staged.health().state === 'disposed';
+          } catch {
+            stagedDisposed = true;
+          }
+          if (stagedDisposed) teardownHandle();
+          if (old !== null && old !== staged) await old.dispose().catch(() => {});
+          throw new Error(`fresh Gru supervision adoption failed: ${String(error)}`);
+        }
+      } else if (old !== null && old !== staged) {
+        await old.dispose().catch(() => {});
+      }
+      log('info', 'new chat activated', {
+        epoch,
+        replay_floor_seq: replayFloorSeq,
+        session_file: staged.sessionFile,
+      });
+    } catch (error) {
+      if (staged !== null && staged !== old && handle !== staged) {
+        await staged.dispose().catch(() => {});
+      }
+      throw error;
+    }
+  }
+
+  /** Frames arriving while a control is active are held before logging or
+   * delivery. This preserves ordering and prevents a reset floor from hiding
+   * a newly accepted message. */
+  function queueUserFrame(client: Client, frame: UserFrame): void {
+    // Authorization is decided when the frame arrives, never after a pending
+    // reset gives a read-only tab time to become the promoted writer.
     if (!client.writer) {
       send(client, ephemeralError('read-only: another client holds the pen'));
       return;
     }
-    if (frameLog.hasSeenUserId(frame.client_msg_id)) {
+    const barriers = [controlBarrier, runtimeCompactionBarrier].filter(
+      (pending): pending is Promise<void> => pending !== null,
+    );
+    if (barriers.length > 0) {
+      if (deferredControlFrames >= MAX_DEFERRED_CONTROL_FRAMES) {
+        send(client, ephemeralError('too many messages are waiting for the active control'));
+        return;
+      }
+      deferredControlFrames += 1;
+      const beforeEpoch = epoch;
+      const barrier = barriers.length === 1 ? barriers[0]! : Promise.all(barriers).then(() => {});
+      void barrier
+        .then(() => {
+          if (!disposed && client.authed) handleUserFrame(client, frame, epoch !== beforeEpoch);
+        })
+        .finally(() => {
+          deferredControlFrames -= 1;
+        });
+      return;
+    }
+    if (handle === null && !boundarySessionMissing) {
+      try {
+        const pointed = options.pointer.current();
+        boundarySessionMissing = pointed !== null && options.pointer.resumeCandidate() === null;
+      } catch {
+        // Preserve the existing corrupt-pointer path: append/ack the user,
+        // then let spawnGru surface the loud pointer error without crashing
+        // the WebSocket message callback.
+      }
+    }
+    if (handle === null && boundarySessionMissing) {
+      if (pendingDeliveries >= MAX_DEFERRED_CONTROL_FRAMES) {
+        send(client, ephemeralError('too many messages are waiting for session repair'));
+        return;
+      }
+      // Repair the missing native side of a durable boundary BEFORE this
+      // frame consumes a seq. The replacement activation advances the floor;
+      // echo afterward because the sender's old-epoch local bubble is cleared
+      // by the new context snapshot while it waits here.
+      const beforeEpoch = epoch;
+      pendingDeliveries += 1;
+      broadcastContext();
+      void ensureGru()
+        .then(() => {
+          if (!disposed && client.authed) handleUserFrame(client, frame, epoch !== beforeEpoch);
+        })
+        .catch((error: unknown) => {
+          send(client, ephemeralError(`gru is unavailable: ${(error as Error).message}`));
+          // This frame was intentionally not logged or acked before boundary
+          // repair. Force normal reconnect reconciliation so its persisted
+          // `sent` outbox entry becomes queued and retries the repair.
+          try {
+            client.socket.close(1011, 'gru boundary repair failed');
+          } catch {
+            /* already gone */
+          }
+        })
+        .finally(() => {
+          pendingDeliveries -= 1;
+          broadcastContext();
+        });
+      return;
+    }
+    handleUserFrame(client, frame);
+  }
+
+  /** Dedup by client_msg_id: re-received frames get a fresh ack, no re-delivery. */
+  function handleUserFrame(client: Client, frame: UserFrame, echoToSender = false): void {
+    if (!client.writer) {
+      send(client, ephemeralError('read-only: another client holds the pen'));
+      return;
+    }
+    if (frameLog.hasSeenUserId(frame.client_msg_id, replayFloorSeq)) {
       send(client, frameLog.append({ type: 'ack', client_msg_id: frame.client_msg_id }));
       return;
     }
-    broadcastExceptSender(
-      frameLog.append({
-        type: 'user',
-        text: frame.text,
-        client_msg_id: frame.client_msg_id,
-        ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
-      }),
-      client,
-    );
+    const loggedUser = frameLog.append({
+      type: 'user',
+      text: frame.text,
+      client_msg_id: frame.client_msg_id,
+      ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
+    });
+    broadcastExceptSender(loggedUser, client);
+    if (echoToSender) send(client, loggedUser);
     send(client, frameLog.append({ type: 'ack', client_msg_id: frame.client_msg_id }));
     deliver(client, frame.text, frame.attachments);
   }
@@ -520,6 +1088,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     }
     if (best !== null) {
       best.writer = true;
+      broadcastContext();
       log('info', 'chat pen promoted to the next client', {});
     }
   }
@@ -593,6 +1162,13 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
     surfaceNotice(text: string): void {
       if (disposed || text === '') return;
+      if (controlState === 'resetting' || (spawning !== null && boundarySessionMissing)) {
+        // New chat commits its replay floor while resetting. Delay notices so
+        // an action-required alert can never be logged below that floor.
+        if (pendingNotices.length < MAX_PENDING_NOTICES) pendingNotices.push(text);
+        else log('warn', 'dropping notice because the reset notice queue is full', {});
+        return;
+      }
       // Logged first (the log is the source of replay), broadcast second —
       // the standard emitLogged contract. A notice never opens a turn.
       emitLogged({ type: 'notice', text });
@@ -600,14 +1176,48 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
     adoptRestartedGru(next: AgentHandle): void {
       if (disposed) return;
+      // A restart begun before an intentional New chat must never swap the
+      // retired epoch back in. The durable pointer is the activation truth.
+      const activeFile = options.pointer.current()?.sessionFile ?? null;
+      if (activeFile !== null && !sameSessionFile(activeFile, next.sessionFile)) {
+        log('warn', 'ignoring stale supervisor Gru swap', {
+          active_session_file: activeFile,
+          stale_session_file: next.sessionFile,
+        });
+        void next.dispose().catch(() => {});
+        return;
+      }
+      if (next.sessionFile === null || next.sessionFile === '') {
+        log('error', 'ignoring supervisor Gru swap without a durable session file', {});
+        void next.dispose().catch(() => {});
+        return;
+      }
+      // Stage the new subscription before retiring the old one. A throwing
+      // adapter must not leave chat advertising an unsubscribed handle.
+      let nextUnsubscribe: () => void;
+      try {
+        nextUnsubscribe = subscribeHandle(next);
+      } catch (error) {
+        log('error', 'ignoring supervisor Gru swap whose subscription failed', {
+          error: String(error),
+        });
+        void next.dispose().catch(() => {});
+        return;
+      }
       // A supervisor restart replaced the handle: re-wire this server's
       // subscription + pointer. The old handle was disposed by the
       // supervisor (its pending prompts already rejected).
-      unsubscribe?.();
-      unsubscribe = null;
+      try {
+        unsubscribe?.();
+      } catch (error) {
+        log('warn', 'Gru unsubscribe failed during supervisor adoption', { error: String(error) });
+      }
+      unsubscribe = nextUnsubscribe;
+      settleRuntimeCompaction();
       handle = next;
-      unsubscribe = next.subscribe(onRuntimeEvent);
-      if (next.sessionFile !== null) options.pointer.record(next.sessionFile);
+      const state = options.pointer.record(next.sessionFile);
+      epoch = state.epoch;
+      replayFloorSeq = state.replayFloorSeq;
       // The restarted session may have been mid-conversation: close any
       // turn the OLD handle left open in the frame log so replay stays
       // settled, then tell the user what happened.
@@ -616,6 +1226,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         type: 'notice',
         text: 'Gru session restarted by the supervisor — conversation resumed from the durable session file.',
       });
+      broadcastContext();
       log('info', 'adopted supervisor-restarted gru session', {
         session_file: next.sessionFile,
       });
@@ -640,7 +1251,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       await new Promise<void>((resolveClose) => {
         wss.close(() => resolveClose());
       });
-      unsubscribe?.();
+      try {
+        unsubscribe?.();
+      } catch (error) {
+        log('warn', 'Gru unsubscribe failed during chat shutdown', { error: String(error) });
+      }
       unsubscribe = null;
       handle = null;
     },

@@ -61,8 +61,9 @@ export class ChatFrameLog {
   readonly file: string;
   private frames: LoggedFrame[] = [];
   private seq = 0;
-  /** client_msg_ids of every logged `user` frame (dedup on re-send). */
-  private readonly seenUserIds = new Set<string>();
+  /** Latest seq for each logged user id. Epoch floors scope de-duplication
+   * without deleting any historical frame. */
+  private readonly seenUserIds = new Map<string, number>();
   /** Open tool names (multiset stack) + whether a turn is open. */
   private readonly openTools: string[] = [];
   private turnOpen = false;
@@ -179,7 +180,12 @@ export class ChatFrameLog {
         throw new FrameLogCorruptError(file, index + 1, `unparseable json (${String(error)})`);
       }
       const frame = parseServerFrame(parsed);
-      if (frame === null || frame.type === 'auth_ok') {
+      if (
+        frame === null ||
+        frame.type === 'auth_ok' ||
+        frame.type === 'context' ||
+        frame.type === 'control_result'
+      ) {
         throw new FrameLogCorruptError(file, index + 1, 'not a logged chat frame');
       }
       if (frame.type === 'error' && frame.fatal === true) {
@@ -226,8 +232,8 @@ export class ChatFrameLog {
     return this.frames;
   }
 
-  hasSeenUserId(clientMsgId: string): boolean {
-    return this.seenUserIds.has(clientMsgId);
+  hasSeenUserId(clientMsgId: string, replayFloorSeq = 0): boolean {
+    return (this.seenUserIds.get(clientMsgId) ?? 0) > replayFloorSeq;
   }
 
   /**
@@ -293,8 +299,9 @@ export class ChatFrameLog {
   }
 
   /** Frames with seq > lastSeenSeq, in order (the reconnect replay). */
-  replayAfter(lastSeenSeq: number): readonly LoggedFrame[] {
-    return this.frames.filter((frame) => loggedFrameSeq(frame) > lastSeenSeq);
+  replayAfter(lastSeenSeq: number, replayFloorSeq = 0): readonly LoggedFrame[] {
+    const floor = Math.max(lastSeenSeq, replayFloorSeq);
+    return this.frames.filter((frame) => loggedFrameSeq(frame) > floor);
   }
 
   /**
@@ -317,7 +324,7 @@ export class ChatFrameLog {
   private track(frame: LoggedFrame): void {
     switch (frame.type) {
       case 'user':
-        this.seenUserIds.add(frame.client_msg_id);
+        this.seenUserIds.set(frame.client_msg_id, frame.seq);
         break;
       case 'tool':
         if (frame.state === 'start') {

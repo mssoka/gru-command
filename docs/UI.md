@@ -77,10 +77,11 @@ Client → server:
 
 | Frame | Fields | Notes |
 |---|---|---|
-| `auth` | `token`, `last_seen_seq?` | MUST be first; re-auth carries the high-water mark |
+| `auth` | `token`, `last_seen_seq?` | MUST be first; re-auth carries the high-water mark and receives fresh context state |
 | `user` | `text`, `client_msg_id` | queued client-side while offline |
+| `control` | `action: compact\|new_chat`, `request_id` | fixed writer-only controls; no free-form slash command |
 
-Server → client (every frame carries a monotonic `seq`):
+Server → client (durable conversation frames carry a monotonic `seq`):
 
 | Frame | Fields | Notes |
 |---|---|---|
@@ -91,12 +92,15 @@ Server → client (every frame carries a monotonic `seq`):
 | `tool` | `name`, `state: start\|end`, `seq` | live tool status line |
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |
 | `error` | `message`, `fatal?`, `seq?` | fatal → socket closes (bad token) |
+| `context` | `epoch`, `replay_floor_seq`, `state`, `usage`, capability/session/writer flags | fresh ephemeral control state; provider usage or explicit unavailable |
+| `control_result` | action/request id, `ok`, `epoch`, failure details | ephemeral terminal result; never replayed as chat |
 
-**Reconnect:** re-auth with `last_seen_seq`; server sends `auth_ok` then
-replays every logged frame with `seq > last_seen_seq` in order, then
-resumes live. Omitting `last_seen_seq` (fresh page load) replays
-everything. The client dedupes by `seq`/`client_msg_id`; re-sent user
-frames (unacked across a drop) are deduped server-side and re-acked.
+**Reconnect:** re-auth with `last_seen_seq`; server sends `auth_ok`, a
+fresh `context`, then replays logged frames above both the client seq and
+the durable replay floor. An epoch advance clears only the active visible
+history and sent/acked messages; browser-local never-sent outbox words are
+retained and flushed after the new snapshot. The client still dedupes by
+`seq`/`client_msg_id` within the active epoch.
 
 **Mock control plane (tests):** token-authenticated `POST /__reset` on
 the mock port clears the frame log and sequence — keeps e2e snapshots
@@ -206,7 +210,11 @@ follow-up lane, not part of this contract.
   unread badge counts deltas arriving while closed). Gru replies render as
   GFM markdown (see the [rendering contract](#message-rendering-gfm-contract--issue-10));
   streaming deltas re-render token-by-token with a caret; tool activity is
-  a live status line. User messages stay plain text.
+  a live status line. User messages stay plain text. A quiet row above the
+  composer shows provider context percent (or explicit unavailable),
+  **Compact context**, and **New chat**. Busy/read-only/unsupported states
+  disable the relevant controls; New chat uses native confirmation and
+  only clears after the server confirms a durable epoch advance.
 - **Board (E6)** — desktop tab `🗺️ Board`: repo-grouped job cards, round
   rows with 7 per-lens live chips, agent rail, transcripts list,
   notification center (see [BOARD.md](./BOARD.md)). **Phone:

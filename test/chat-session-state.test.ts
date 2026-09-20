@@ -49,8 +49,37 @@ describe('GruSessionPointer', () => {
     const pointer = new GruSessionPointer(dir, (level, msg) => {
       if (level === 'warn') warnings.push(msg);
     });
+    expect(pointer.current()).toMatchObject({ epoch: 0, replayFloorSeq: 0 });
     expect(pointer.resumeCandidate()).toBeNull();
     expect(warnings.some((msg) => msg.includes('vanished'))).toBe(true);
+  });
+
+  it('advances epoch and replay floor atomically while preserving the old session file', () => {
+    const dir = fixture();
+    const oldFile = join(dir, 'old.jsonl');
+    const freshFile = join(dir, 'fresh.jsonl');
+    writeFileSync(oldFile, 'old bytes\n');
+    writeFileSync(freshFile, '');
+    const pointer = new GruSessionPointer(dir);
+    pointer.record(oldFile);
+    expect(pointer.advance(freshFile, 41)).toMatchObject({
+      sessionFile: freshFile,
+      epoch: 1,
+      replayFloorSeq: 41,
+    });
+    expect(new GruSessionPointer(dir).current()).toMatchObject({ epoch: 1, replayFloorSeq: 41 });
+    expect(pointer.resumeCandidate()).toBe(freshFile);
+  });
+
+  it('two successive resets advance safely and a later record preserves the boundary', () => {
+    const dir = fixture();
+    const files = ['one', 'two', 'three'].map((name) => join(dir, `${name}.jsonl`));
+    for (const file of files) writeFileSync(file, '');
+    const pointer = new GruSessionPointer(dir);
+    pointer.record(files[0]!);
+    pointer.advance(files[1]!, 10);
+    expect(pointer.advance(files[2]!, 20)).toMatchObject({ epoch: 2, replayFloorSeq: 20 });
+    expect(pointer.record(files[2]!)).toMatchObject({ epoch: 2, replayFloorSeq: 20 });
   });
 
   it('a corrupt pointer fails loud — never guesses', () => {
@@ -59,5 +88,17 @@ describe('GruSessionPointer', () => {
     expect(() => new GruSessionPointer(dir).resumeCandidate()).toThrowError(/unreadable/);
     writeFileSync(join(dir, SESSION_STATE_NAME), '{"other":1}\n', 'utf-8');
     expect(() => new GruSessionPointer(dir).resumeCandidate()).toThrowError(/no sessionFile/);
+    writeFileSync(
+      join(dir, SESSION_STATE_NAME),
+      `${JSON.stringify({ sessionFile: join(dir, 'x.jsonl'), epoch: null, replayFloorSeq: null })}\n`,
+      'utf-8',
+    );
+    expect(() => new GruSessionPointer(dir).current()).toThrowError(/invalid epoch\/replay floor/);
+    writeFileSync(
+      join(dir, SESSION_STATE_NAME),
+      `${JSON.stringify({ sessionFile: join(dir, 'x.jsonl'), epoch: 1 })}\n`,
+      'utf-8',
+    );
+    expect(() => new GruSessionPointer(dir).current()).toThrowError(/incomplete epoch\/replay floor/);
   });
 });

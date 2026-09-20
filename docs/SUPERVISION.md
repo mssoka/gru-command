@@ -36,6 +36,12 @@ swap listeners for declared slots (the chat Gru session re-wires
 itself and the user sees a notice). Failed rungs back off (2 s base,
 doubling, 60 s cap) and retry.
 
+An intentional **New chat** is not a restart rung. The chat layer first
+mints and durably activates a fresh unresumed handle, then calls the
+slot's intentional replacement path. That advances a slot generation;
+any older restart already in flight is disposed on completion and cannot
+swap the retired conversation back in.
+
 **What is NOT a restart:** an in-band turn error (`state: 'error'`) —
 the adapter contract already recovers on the next turn. Only hangs and
 fatal errors climb.

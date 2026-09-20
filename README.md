@@ -15,7 +15,9 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
 ## What's inside
 
 - **Chat with one brain** — a single Gru session behind an authenticated
-  WebSocket; reconnect-safe history, never lose a typed word. Attach
+  WebSocket; reconnect-safe history, never lose a typed word. See native
+  context usage when the provider exposes it, compact in place, or start a
+  fresh durable chat epoch without deleting old transcripts. Attach
   workspace files, phone camera/gallery files, or clipboard images through
   one path-based flow; text-only models decline image interpretation
   visibly instead of guessing ([CHAT.md](docs/CHAT.md)).

@@ -12,7 +12,13 @@
  */
 
 import type { ChatMessage, ConnectionState } from '../lib/chat-client.js';
-import type { AttachmentChip, LoggedFrame } from '../lib/protocol.js';
+import type {
+  AttachmentChip,
+  ContextFrame,
+  ControlAction,
+  ControlResultFrame,
+  LoggedFrame,
+} from '../lib/protocol.js';
 import { imageKindFor, type BrowseResult, type UploadedFile } from '../lib/attach-client.js';
 import { MAX_ATTACHMENTS_PER_MESSAGE } from '../lib/protocol.js';
 import { renderMarkdown } from '../lib/markdown.js';
@@ -42,6 +48,9 @@ export class ChatView {
   private readonly chipsRow = mustGet<HTMLElement>('chat-chips');
   private readonly attachButton = mustGet<HTMLButtonElement>('chat-attach');
   private readonly fileInput = mustGet<HTMLInputElement>('chat-attach-file');
+  private readonly contextStatus = document.getElementById('chat-context-status');
+  private readonly compactButton = document.getElementById('chat-compact') as HTMLButtonElement | null;
+  private readonly newChatButton = document.getElementById('chat-new') as HTMLButtonElement | null;
   private readonly picker = mustGet<HTMLElement>('attach-picker');
   private readonly pickerList = mustGet<HTMLElement>('attach-picker-list');
   private readonly pickerPath = mustGet<HTMLElement>('attach-picker-path');
@@ -64,6 +73,9 @@ export class ChatView {
   private browseGeneration = 0;
   /** Absolute workspace root from the current browse (chip paths). */
   private browseRoot = '';
+  private context: ContextFrame | null = null;
+  private controlsConnected = false;
+  private requestControl: ((action: ControlAction) => boolean) | null = null;
 
   constructor(
     private readonly onSend: (
@@ -97,6 +109,16 @@ export class ChatView {
     });
 
     this.wireAttachFlow();
+    this.compactButton?.addEventListener('click', () => {
+      this.beginControl('compact');
+    });
+    this.newChatButton?.addEventListener('click', () => {
+      if (!window.confirm('Start a new chat? Durable history is kept, but this active view will clear.')) {
+        return;
+      }
+      this.beginControl('new_chat');
+    });
+    this.renderContext();
 
     this.bubble.addEventListener('click', () => this.setSheetOpen(true));
     const grip = mustGet<HTMLElement>('chat-sheet-grip');
@@ -122,6 +144,107 @@ export class ChatView {
     place();
     // Sheet starts closed: inert until first opened.
     this.sheet.toggleAttribute('inert', this.sheet.dataset.open !== 'true');
+  }
+
+  // -----------------------------------------------------------------------
+  // Context controls
+  // -----------------------------------------------------------------------
+
+  bindControls(request: ((action: ControlAction) => boolean) | null): void {
+    this.requestControl = request;
+    this.renderContext();
+  }
+
+  private beginControl(action: ControlAction): void {
+    if (this.requestControl?.(action) !== true || this.context === null) return;
+    // Disable immediately against double-clicks; the server's canonical
+    // snapshot replaces this optimistic busy state on the next frame.
+    this.context = {
+      ...this.context,
+      state: action === 'compact' ? 'compacting' : 'resetting',
+      usage: null,
+    };
+    this.renderContext();
+  }
+
+  setControlsConnected(connected: boolean): void {
+    this.controlsConnected = connected;
+    this.renderContext();
+  }
+
+  setContext(snapshot: ContextFrame): void {
+    this.context = snapshot;
+    this.renderContext();
+  }
+
+  showControlResult(result: ControlResultFrame): void {
+    if (!result.ok) {
+      this.ephemeralNote(
+        `${result.action === 'compact' ? 'compact context' : 'new chat'} failed: ` +
+          (result.message ?? result.code ?? 'unknown error'),
+      );
+    } else if (result.action === 'compact') {
+      this.ephemeralNote('context compacted');
+    }
+  }
+
+  private renderContext(): void {
+    const snapshot = this.context;
+    const connected = this.controlsConnected;
+    const busy = snapshot?.state !== 'idle';
+    if (this.contextStatus !== null) {
+      this.contextStatus.classList.toggle('chat-context__status--busy', connected && busy);
+      this.contextStatus.toggleAttribute('aria-busy', connected && busy);
+      if (!connected || snapshot === null) {
+        this.contextStatus.textContent = 'Context unavailable';
+        this.contextStatus.title = 'No current runtime context measurement';
+        this.contextStatus.setAttribute('aria-label', 'Context unavailable');
+      } else if (snapshot.state === 'busy') {
+        this.contextStatus.textContent = 'Gru is working…';
+        this.contextStatus.title = 'Context controls are available again after the current turn';
+        this.contextStatus.setAttribute('aria-label', 'Gru is working; context controls are busy');
+      } else if (snapshot.state === 'compacting') {
+        this.contextStatus.textContent = 'Compacting context…';
+        this.contextStatus.title = 'Native compaction is in progress';
+        this.contextStatus.setAttribute('aria-label', 'Compacting context');
+      } else if (snapshot.state === 'resetting') {
+        this.contextStatus.textContent = 'Starting new chat…';
+        this.contextStatus.title = 'A fresh native session is being activated';
+        this.contextStatus.setAttribute('aria-label', 'Starting a new chat');
+      } else if (snapshot.usage === null) {
+        this.contextStatus.textContent = 'Context unavailable';
+        this.contextStatus.title = 'The runtime did not provide current context usage';
+        this.contextStatus.setAttribute('aria-label', 'Context usage unavailable');
+      } else {
+        const percent = Math.round(Math.max(0, Math.min(100, snapshot.usage.percent)));
+        this.contextStatus.textContent = `${percent}% context`;
+        this.contextStatus.title =
+          `${Math.round(snapshot.usage.tokens).toLocaleString()} of ` +
+          `${Math.round(snapshot.usage.context_window).toLocaleString()} tokens`;
+        this.contextStatus.setAttribute(
+          'aria-label',
+          `${percent} percent context used; ${this.contextStatus.title}`,
+        );
+      }
+    }
+    if (this.compactButton !== null) {
+      this.compactButton.disabled =
+        !connected || snapshot === null || busy || !snapshot.writer ||
+        !snapshot.session_active || !snapshot.compact_supported;
+      this.compactButton.title =
+        snapshot !== null && !snapshot.writer
+          ? 'Read-only tab: another client holds the pen'
+          : snapshot !== null && !snapshot.compact_supported
+            ? 'Native compaction is unavailable for this runtime'
+            : 'Compact context in the current native session';
+    }
+    if (this.newChatButton !== null) {
+      this.newChatButton.disabled = !connected || snapshot === null || busy || !snapshot.writer;
+      this.newChatButton.title =
+        snapshot !== null && !snapshot.writer
+          ? 'Read-only tab: another client holds the pen'
+          : 'Start a truly fresh native conversation';
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -345,6 +468,9 @@ export class ChatView {
   reset(): void {
     this.log.replaceChildren();
     this.bubbles.clear();
+    this.unread = 0;
+    this.bubble.dataset.unread = '0';
+    this.badge.textContent = '0';
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';

@@ -97,6 +97,74 @@ describe('parseServerFrame', () => {
   });
 });
 
+describe('context-control frames', () => {
+  it('accepts canonical control, context, and terminal result shapes', () => {
+    expect(parseClientFrame({ type: 'control', action: 'new_chat', request_id: 'n1' })).toEqual({
+      type: 'control',
+      action: 'new_chat',
+      request_id: 'n1',
+    });
+    expect(
+      parseServerFrame({
+        type: 'context',
+        epoch: 2,
+        replay_floor_seq: 9,
+        state: 'idle',
+        usage: null,
+        compact_supported: true,
+        session_active: true,
+        writer: true,
+      }),
+    ).toMatchObject({ type: 'context', epoch: 2, replay_floor_seq: 9 });
+    expect(
+      parseServerFrame({
+        type: 'control_result',
+        action: 'compact',
+        request_id: 'c1',
+        ok: false,
+        epoch: 2,
+        code: 'failed',
+        message: 'provider declined',
+      }),
+    ).toMatchObject({ type: 'control_result', ok: false, code: 'failed' });
+  });
+
+  it('rejects malformed control, context, and inconsistent terminal results', () => {
+    expect(parseClientFrame({ type: 'control', action: 'reset', request_id: 'n1' })).toBeNull();
+    expect(
+      parseServerFrame({
+        type: 'context',
+        epoch: -1,
+        replay_floor_seq: 0,
+        state: 'idle',
+        usage: null,
+        compact_supported: true,
+        session_active: true,
+        writer: true,
+      }),
+    ).toBeNull();
+    expect(
+      parseServerFrame({
+        type: 'control_result',
+        action: 'compact',
+        request_id: 'c1',
+        ok: false,
+        epoch: 1,
+      }),
+    ).toBeNull();
+    expect(
+      parseServerFrame({
+        type: 'control_result',
+        action: 'compact',
+        request_id: 'c1',
+        ok: true,
+        epoch: 1,
+        code: 'failed',
+      }),
+    ).toBeNull();
+  });
+});
+
 describe('loggedFrameSeq', () => {
   it('reads seq, defaulting error frames without one to 0', () => {
     expect(loggedFrameSeq({ type: 'delta', text: 'x', seq: 42 })).toBe(42);

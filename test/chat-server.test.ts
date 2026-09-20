@@ -2,7 +2,15 @@ import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { connect as netConnect, type Socket } from 'node:net';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -48,7 +56,7 @@ interface StubCall {
 
 class StubGruHandle implements AgentHandle {
   readonly role = 'gru' as const;
-  readonly id = 'stub-gru';
+  readonly id: string;
   /** Vision-capable by default; the SPEC ruling 19 gate tests flip it. */
   capabilities: AgentCapabilities = {
     streaming: true,
@@ -75,11 +83,20 @@ class StubGruHandle implements AgentHandle {
   nextSoftError: string | null = null;
   /** The NEXT steer rejects with this error (W2 leg). */
   nextSteerError: string | null = null;
+  compactCalls = 0;
+  nextCompactError: string | null = null;
+  nextCompactHold: Promise<void> | null = null;
+  throwOnUnsubscribe = false;
+  throwHealthProbe = false;
+  throwUsageProbe = false;
+  throwCompactProbe = false;
+  disposed = false;
   private state: AgentState = 'idle';
   private readonly listeners = new Set<RuntimeEventListener>();
 
-  constructor(sessionFile: string | null) {
+  constructor(sessionFile: string | null, id = 'stub-gru') {
     this.sessionFile = sessionFile;
+    this.id = id;
   }
 
   async prompt(text: string, options?: PromptOptions): Promise<void> {
@@ -130,12 +147,38 @@ class StubGruHandle implements AgentHandle {
     throw new Error('not used by the chat layer');
   }
 
+  getContextUsage() {
+    if (this.throwUsageProbe) throw new Error('usage probe failed');
+    return this.state === 'idle'
+      ? { tokens: 20, contextWindow: 100, percent: 20, source: 'provider' as const }
+      : null;
+  }
+
+  async compact(): Promise<void> {
+    this.compactCalls += 1;
+    this.emit({ type: 'compaction_start' });
+    const hold = this.nextCompactHold;
+    this.nextCompactHold = null;
+    if (hold !== null) await hold;
+    const failure = this.nextCompactError;
+    this.nextCompactError = null;
+    if (failure !== null) {
+      this.emit({ type: 'compaction_end', success: false, error: failure });
+      throw new Error(failure);
+    }
+    this.emit({ type: 'compaction_end', success: true });
+  }
+
   subscribe(listener: RuntimeEventListener): () => void {
     this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    return () => {
+      if (this.throwOnUnsubscribe) throw new Error('stub unsubscribe failed');
+      this.listeners.delete(listener);
+    };
   }
 
   health() {
+    if (this.throwHealthProbe) throw new Error('health probe failed');
     return {
       state: this.state,
       lastActivity: null,
@@ -143,7 +186,15 @@ class StubGruHandle implements AgentHandle {
     };
   }
 
-  async dispose(): Promise<void> {}
+  canCompact = (): boolean => {
+    if (this.throwCompactProbe) throw new Error('compact probe failed');
+    return !this.disposed && this.state === 'idle';
+  };
+
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    this.setState('disposed');
+  }
 
   /** Test hook: emit a runtime event directly (lens guards, edge shapes). */
   fire(event: RuntimeEvent): void {
@@ -206,6 +257,7 @@ interface Harness {
   readonly port: number;
   readonly handle: StubGruHandle;
   readonly spawnCalls: (string | null)[];
+  readonly freshHandles: StubGruHandle[];
   close(): Promise<void>;
 }
 
@@ -213,9 +265,19 @@ async function makeHarness(options: {
   readonly token?: string;
   readonly authDeadlineMs?: number;
   readonly heartbeatMs?: number;
+  readonly controlTimeoutMs?: number;
   readonly steer?: 'native' | 'queued';
   readonly reuseDir?: string;
   readonly failFirstSpawn?: Error;
+  readonly failFirstFreshSpawn?: Error;
+  readonly failFirstPointerAdvance?: Error;
+  readonly freshSpawnHold?: Promise<void>;
+  readonly returnMismatchedOnResume?: boolean;
+  readonly reuseActiveOnFresh?: boolean;
+  readonly reuseActiveAliasOnFresh?: boolean;
+  readonly reuseActiveHardLinkOnFresh?: boolean;
+  readonly reuseActiveIdOnFresh?: boolean;
+  readonly adoptFreshGru?: (handle: AgentHandle) => Promise<void>;
   readonly siblingUpgradePaths?: readonly string[];
 } = {}): Promise<Harness> {
   const dir = options.reuseDir ?? mkdtempSync(join(tmpdir(), 'gru-command-e4-'));
@@ -239,11 +301,25 @@ async function makeHarness(options: {
 
   const frameLog = ChatFrameLog.load(chatDir);
   const pointer = new GruSessionPointer(chatDir);
-  const handle = new StubGruHandle(sessionFile);
+  if (options.failFirstPointerAdvance !== undefined) {
+    const advance = pointer.advance.bind(pointer);
+    let failure: Error | null = options.failFirstPointerAdvance;
+    pointer.advance = (file, floor) => {
+      if (failure !== null) {
+        const error = failure;
+        failure = null;
+        throw error;
+      }
+      return advance(file, floor);
+    };
+  }
+  const handle = new StubGruHandle(pointer.resumeCandidate() ?? sessionFile);
   const runtime = new StubGruRuntime(handle, options.steer ?? 'native');
   const wrapped = options.steer === 'queued' ? withFallbacks(runtime) : runtime;
   const spawnCalls: (string | null)[] = [];
+  const freshHandles: StubGruHandle[] = [];
   let spawnFailure: Error | null = options.failFirstSpawn ?? null;
+  let freshSpawnFailure: Error | null = options.failFirstFreshSpawn ?? null;
   const chat = createChatServer({
     config: {
       auth: { token: options.token ?? TOKEN },
@@ -260,10 +336,55 @@ async function makeHarness(options: {
         spawnFailure = null;
         return Promise.reject(error);
       }
+      if (resumeFile !== null && options.returnMismatchedOnResume === true) {
+        const mismatched = new StubGruHandle(
+          join(sessionsDir, 'mismatched-resume.jsonl'),
+          'mismatched-resume',
+        );
+        freshHandles.push(mismatched);
+        return Promise.resolve(mismatched);
+      }
       return wrapped.spawn('gru');
     },
+    spawnFreshGru: async () => {
+      if (options.freshSpawnHold !== undefined) await options.freshSpawnHold;
+      if (options.reuseActiveOnFresh === true) return handle;
+      if (options.reuseActiveAliasOnFresh === true) {
+        const alias = join(sessionsDir, 'active-session-alias.jsonl');
+        symlinkSync(handle.sessionFile!, alias);
+        const fresh = new StubGruHandle(alias, 'stub-aliased-active');
+        freshHandles.push(fresh);
+        return fresh;
+      }
+      if (options.reuseActiveHardLinkOnFresh === true) {
+        const alias = join(sessionsDir, 'active-session-hard-link.jsonl');
+        linkSync(handle.sessionFile!, alias);
+        const fresh = new StubGruHandle(alias, 'stub-hard-linked-active');
+        freshHandles.push(fresh);
+        return fresh;
+      }
+      if (freshSpawnFailure !== null) {
+        const error = freshSpawnFailure;
+        freshSpawnFailure = null;
+        throw error;
+      }
+      const file = join(sessionsDir, `fresh-${freshHandles.length + 1}.jsonl`);
+      writeFileSync(file, '');
+      const fresh = new StubGruHandle(
+        file,
+        options.reuseActiveIdOnFresh === true
+          ? handle.id
+          : `stub-fresh-${freshHandles.length + 1}`,
+      );
+      freshHandles.push(fresh);
+      return fresh;
+    },
+    ...(options.adoptFreshGru !== undefined
+      ? { adoptFreshGru: options.adoptFreshGru }
+      : {}),
     authDeadlineMs: options.authDeadlineMs,
     heartbeatMs: options.heartbeatMs ?? 0, // off by default; the heartbeat test opts in
+    controlTimeoutMs: options.controlTimeoutMs,
   });
   const http = createServer((_req, res) => {
     res.writeHead(404);
@@ -283,6 +404,7 @@ async function makeHarness(options: {
     port,
     handle,
     spawnCalls,
+    freshHandles,
     async close() {
       await chat.dispose();
       await new Promise<void>((resolveClose) => {
@@ -299,6 +421,8 @@ class TestClient {
   readonly frames: Received[] = [];
   readonly closed: Promise<number>;
   private readonly socket: WebSocket;
+  /** Older client fixtures ignore the additive ephemeral context frame. */
+  private contextControls = false;
 
   constructor(port: number, path: string = '/ws') {
     this.socket = new WebSocket(`ws://127.0.0.1:${port}${path}`);
@@ -310,7 +434,9 @@ class TestClient {
     });
     this.socket.on('message', (data: unknown) => {
       const raw = String(data);
-      this.frames.push(web.parseServerFrame(raw) ?? { type: '__malformed__', raw });
+      const parsed = web.parseServerFrame(raw) ?? { type: '__malformed__' as const, raw };
+      if (parsed.type === 'context' && !this.contextControls) return;
+      this.frames.push(parsed);
     });
   }
 
@@ -326,12 +452,17 @@ class TestClient {
     this.socket.send(typeof payload === 'string' ? payload : JSON.stringify(payload));
   }
 
-  auth(token: string, lastSeenSeq?: number): void {
+  auth(token: string, lastSeenSeq?: number, contextControls = false): void {
+    this.contextControls = contextControls;
     this.sendRaw({
       type: 'auth',
       token,
       ...(lastSeenSeq !== undefined ? { last_seen_seq: lastSeenSeq } : {}),
     });
+  }
+
+  control(action: 'compact' | 'new_chat', requestId: string): void {
+    this.sendRaw({ type: 'control', action, request_id: requestId });
   }
 
   send(text: string, clientMsgId: string): void {
@@ -434,10 +565,15 @@ class PongBlindClient {
   }
 }
 
-async function authedClient(port: number, token: string = TOKEN, lastSeenSeq?: number): Promise<TestClient> {
+async function authedClient(
+  port: number,
+  token: string = TOKEN,
+  lastSeenSeq?: number,
+  contextControls = false,
+): Promise<TestClient> {
   const client = new TestClient(port);
   await client.open();
-  client.auth(token, lastSeenSeq);
+  client.auth(token, lastSeenSeq, contextControls);
   await client.waitFor(isType('auth_ok'), 'auth_ok');
   return client;
 }
@@ -1172,7 +1308,7 @@ describe('chat server (real sockets, stub Gru)', () => {
     harness.handle.nextHold = new Promise((resolve) => {
       releaseTurn = resolve;
     });
-    const client = await authedClient(harness.port);
+    const client = await authedClient(harness.port, TOKEN, undefined, true);
     client.send('turn that outlives the session', 'm1');
     await client.waitFor(
       (frame) => frame.type === 'turn' && (frame as web.TurnFrame).state === 'start',
@@ -1180,12 +1316,51 @@ describe('chat server (real sockets, stub Gru)', () => {
     );
     expect(harness.frameLog.hasOpenTurn).toBe(true);
 
+    harness.handle.throwOnUnsubscribe = true;
     harness.handle.fire({ type: 'state', state: 'disposed' });
     await pollUntil(() => !harness.frameLog.hasOpenTurn, 'settled on disposal');
     expect(harness.frameLog.history.at(-1)).toMatchObject({ type: 'turn', state: 'end' });
+    expect(
+      client.frames.some(
+        (frame) => frame.type === 'context' && frame.session_active === false,
+      ),
+    ).toBe(true);
     releaseTurn(); // the leaked stub turn ends into no listeners
     await client.close();
     await harness.close();
+  });
+
+  it('rejects and disposes a resume spawn that returns a different session file', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-e4-resume-mismatch-'));
+    cleanupDirs.push(dir);
+    const first = await makeHarness({ reuseDir: dir });
+    let pointerBefore: ReturnType<GruSessionPointer['current']> = null;
+    try {
+      const client = await authedClient(first.port);
+      client.send('establish resume identity', 'resume-identity-before');
+      await client.waitFor(isTurnEndFrame, 'establish resume identity');
+      pointerBefore = new GruSessionPointer(first.chatDir).current();
+      await client.close();
+    } finally {
+      await first.close();
+    }
+
+    const restarted = await makeHarness({ reuseDir: dir, returnMismatchedOnResume: true });
+    try {
+      const client = await authedClient(restarted.port);
+      client.send('must not switch brains', 'resume-identity-after');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'error' && /changed native session identity/.test(frame.message),
+          'resume identity rejection',
+        ),
+      ).toBeDefined();
+      expect(new GruSessionPointer(restarted.chatDir).current()).toEqual(pointerBefore);
+      expect(restarted.freshHandles[0]?.disposed).toBe(true);
+      await client.close();
+    } finally {
+      await restarted.close();
+    }
   });
 
   it('service restart: seq and history continue, an open turn boot-settles, the same Gru resumes', async () => {
@@ -1530,6 +1705,873 @@ describe('chat server — attach flow (SPEC ruling 19)', () => {
         'distinct nine-chip malformed error',
       );
       expect(h.handle.calls.length).toBe(0);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+describe('chat context controls and durable new-chat boundaries', () => {
+  it('sends fresh writer-aware context snapshots and compact is native, serialized, and non-durable', async () => {
+    const h = await makeHarness();
+    try {
+      const writer = await authedClient(h.port, TOKEN, undefined, true);
+      writer.send('establish session', 'establish-control-session');
+      await writer.waitFor(isTurnEndFrame, 'establish turn');
+      const writerContext = await writer.waitFor(
+        (frame) =>
+          frame.type === 'context' && frame.compact_supported && frame.state === 'idle',
+        'writer context after session spawn',
+      );
+      expect(writerContext).toMatchObject({
+        type: 'context',
+        epoch: 0,
+        state: 'idle',
+        writer: true,
+        compact_supported: true,
+        usage: { tokens: 20, context_window: 100, percent: 20 },
+      });
+      const historyBeforeCompact = [...h.frameLog.history];
+      const reader = await authedClient(h.port, TOKEN, undefined, true);
+      expect(await reader.waitFor(isType('context'), 'reader context')).toMatchObject({ writer: false });
+      reader.control('compact', 'reader-compact');
+      expect(
+        await reader.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'reader-compact',
+          'reader rejection',
+        ),
+      ).toMatchObject({ ok: false, code: 'read_only' });
+
+      writer.control('compact', 'writer-compact');
+      expect(
+        await writer.waitFor(
+          (frame) => frame.type === 'context' && frame.state === 'compacting',
+          'compacting snapshot',
+        ),
+      ).toMatchObject({ usage: null });
+      expect(
+        await writer.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'writer-compact',
+          'compact result',
+        ),
+      ).toMatchObject({ ok: true, epoch: 0 });
+      expect(h.handle.compactCalls).toBe(1);
+      expect(h.frameLog.history).toEqual(historyBeforeCompact);
+      await writer.close();
+      expect(
+        await reader.waitFor(
+          (frame) => frame.type === 'context' && frame.writer,
+          'promoted writer context',
+        ),
+      ).toMatchObject({ state: 'idle', writer: true });
+      await reader.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('isolates throwing provider probes behind conservative context snapshots', async () => {
+    const h = await makeHarness();
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish before probe faults', 'probe-establish');
+      await client.waitFor(isTurnEndFrame, 'probe setup turn');
+
+      h.handle.throwHealthProbe = true;
+      h.handle.fire({ type: 'state', state: 'idle' });
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'context' && frame.state === 'busy' && frame.usage === null,
+          'health probe fallback',
+        ),
+      ).toBeDefined();
+      h.handle.throwHealthProbe = false;
+
+      h.handle.throwUsageProbe = true;
+      h.handle.fire({ type: 'state', state: 'idle' });
+      await client.waitFor(
+        (frame) =>
+          frame.type === 'context' &&
+          frame.state === 'idle' &&
+          frame.session_active &&
+          frame.usage === null,
+        'usage probe fallback',
+      );
+      h.handle.throwUsageProbe = false;
+
+      h.handle.throwCompactProbe = true;
+      h.handle.fire({ type: 'state', state: 'idle' });
+      await client.waitFor(
+        (frame) =>
+          frame.type === 'context' &&
+          frame.state === 'idle' &&
+          frame.session_active &&
+          !frame.compact_supported,
+        'compact probe fallback',
+      );
+      h.handle.throwCompactProbe = false;
+      client.send('still usable after probe faults', 'probe-after');
+      await pollUntil(
+        () => h.handle.calls.some((call) => call.text === 'still usable after probe faults'),
+        'delivery after probe faults',
+      );
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('keeps a promoted writer serialized behind an unresolved native compaction', async () => {
+    const h = await makeHarness();
+    try {
+      const writer = await authedClient(h.port, TOKEN, undefined, true);
+      writer.send('establish before held compact', 'establish-held-compact');
+      await writer.waitFor(isTurnEndFrame, 'establish held compact session');
+      const reader = await authedClient(h.port, TOKEN, undefined, true);
+      let release!: () => void;
+      h.handle.nextCompactHold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      writer.control('compact', 'held-compact');
+      await writer.waitFor(
+        (frame) => frame.type === 'context' && frame.state === 'compacting',
+        'held compact started',
+      );
+      await writer.close();
+      expect(
+        await reader.waitFor(
+          (frame) => frame.type === 'context' && frame.writer && frame.state === 'compacting',
+          'reader promoted during compact',
+        ),
+      ).toMatchObject({ writer: true, state: 'compacting' });
+
+      reader.send('queued behind held compact', 'queued-held-compact');
+      reader.control('compact', 'overlap-held-compact');
+      expect(
+        await reader.waitFor(
+          (frame) =>
+            frame.type === 'control_result' && frame.request_id === 'overlap-held-compact',
+          'overlapping compact rejection',
+        ),
+      ).toMatchObject({ ok: false, code: 'busy' });
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(
+        h.frameLog.history.some(
+          (frame) => frame.type === 'user' && frame.client_msg_id === 'queued-held-compact',
+        ),
+      ).toBe(false);
+      expect(h.handle.calls.some((call) => call.text === 'queued behind held compact')).toBe(false);
+
+      release();
+      await reader.waitFor(
+        (frame) => frame.type === 'ack' && frame.client_msg_id === 'queued-held-compact',
+        'queued message ack after compact',
+      );
+      await pollUntil(
+        () => h.handle.calls.some((call) => call.text === 'queued behind held compact'),
+        'queued delivery after held compact',
+      );
+      await reader.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('serializes user delivery behind provider-initiated compaction events', async () => {
+    const h = await makeHarness();
+    try {
+      const writer = await authedClient(h.port, TOKEN, undefined, true);
+      writer.send('establish before automatic compact', 'establish-auto-compact');
+      await writer.waitFor(isTurnEndFrame, 'establish automatic compact session');
+      h.handle.fire({ type: 'compaction_start' });
+      await writer.waitFor(
+        (frame) => frame.type === 'context' && frame.state === 'compacting',
+        'automatic compact snapshot',
+      );
+      writer.send('queued behind automatic compact', 'queued-auto-compact');
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(
+        h.frameLog.history.some(
+          (frame) => frame.type === 'user' && frame.client_msg_id === 'queued-auto-compact',
+        ),
+      ).toBe(false);
+      expect(h.handle.calls.some((call) => call.text === 'queued behind automatic compact')).toBe(false);
+
+      h.handle.fire({ type: 'compaction_end', success: true });
+      await writer.waitFor(
+        (frame) => frame.type === 'ack' && frame.client_msg_id === 'queued-auto-compact',
+        'automatic compact queued ack',
+      );
+      await pollUntil(
+        () => h.handle.calls.some((call) => call.text === 'queued behind automatic compact'),
+        'delivery after automatic compact',
+      );
+      await writer.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('rejects no-session, busy, failed, and unsupported compaction without damaging chat', async () => {
+    const h = await makeHarness();
+    try {
+      const writer = await authedClient(h.port, TOKEN, undefined, true);
+
+      const contextsBeforeNoSession = writer.frames.filter(isType('context')).length;
+      writer.control('compact', 'no-session');
+      expect(
+        await writer.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'no-session',
+          'no-session rejection',
+        ),
+      ).toMatchObject({ ok: false, code: 'no_session' });
+      await writer.waitFor(
+        () => writer.frames.filter(isType('context')).length === contextsBeforeNoSession + 1,
+        'canonical context after pre-lifecycle rejection',
+      );
+
+      writer.send('establish', 'establish-for-errors');
+      await writer.waitFor(isTurnEndFrame, 'established turn');
+      let release!: () => void;
+      h.handle.nextHold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const heldEnd = nextTurnEnd(writer);
+      writer.send('hold turn', 'held-turn');
+      await writer.waitFor(
+        (frame) => frame.type === 'turn' && frame.state === 'start',
+        'held turn start',
+      );
+      writer.control('compact', 'busy-compact');
+      expect(
+        await writer.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'busy-compact',
+          'busy rejection',
+        ),
+      ).toMatchObject({ ok: false, code: 'busy' });
+      release();
+      await heldEnd;
+
+      h.handle.nextCompactError = `provider failure ${'x'.repeat(500)}`;
+      writer.control('compact', 'failed-compact');
+      const failed = await writer.waitFor(
+        (frame) => frame.type === 'control_result' && frame.request_id === 'failed-compact',
+        'bounded compact failure',
+      );
+      expect(failed).toMatchObject({ ok: false, code: 'failed' });
+      expect(failed.type === 'control_result' ? failed.message?.length : 0).toBeLessThanOrEqual(240);
+      writer.send('usable after compact failure', 'after-compact-failure');
+      await pollUntil(
+        () => h.handle.calls.some((call) => call.text === 'usable after compact failure'),
+        'delivery after compact failure',
+      );
+
+      Object.defineProperty(h.handle, 'compact', { value: undefined, configurable: true });
+      writer.control('compact', 'unsupported-compact');
+      expect(
+        await writer.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'unsupported-compact',
+          'unsupported rejection',
+        ),
+      ).toMatchObject({ ok: false, code: 'unsupported' });
+      await writer.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('caps user frames deferred behind a held control', async () => {
+    const h = await makeHarness();
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish before queue cap', 'queue-cap-establish');
+      await client.waitFor(isTurnEndFrame, 'queue cap setup');
+      let release!: () => void;
+      h.handle.nextCompactHold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      client.control('compact', 'queue-cap-compact');
+      await client.waitFor(
+        (frame) => frame.type === 'context' && frame.state === 'compacting',
+        'queue cap compacting',
+      );
+      for (let index = 0; index < 129; index += 1) {
+        client.send(`deferred ${index}`, `deferred-cap-${index}`);
+      }
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'error' && /too many messages/.test(frame.message),
+          'deferred queue overflow',
+        ),
+      ).toBeDefined();
+      expect(
+        h.frameLog.history.some(
+          (frame) => frame.type === 'user' && frame.client_msg_id === 'deferred-cap-128',
+        ),
+      ).toBe(false);
+      release();
+      await client.waitFor(
+        (frame) => frame.type === 'control_result' && frame.request_id === 'queue-cap-compact',
+        'queue cap compact result',
+      );
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('bounds a non-settling native compact and fresh-session spawn', async () => {
+    const compactHarness = await makeHarness({ controlTimeoutMs: 25 });
+    try {
+      const client = await authedClient(compactHarness.port, TOKEN, undefined, true);
+      client.send('establish before timeout', 'establish-timeout');
+      await client.waitFor(isTurnEndFrame, 'establish before timeout');
+      compactHarness.handle.nextCompactHold = new Promise<void>(() => {});
+      client.control('compact', 'compact-timeout');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'compact-timeout',
+          'compact timeout result',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed' });
+      expect(compactHarness.handle.disposed).toBe(true);
+      await client.close();
+    } finally {
+      await compactHarness.close();
+    }
+
+    const spawnHarness = await makeHarness({
+      controlTimeoutMs: 25,
+      freshSpawnHold: new Promise<void>(() => {}),
+    });
+    try {
+      const client = await authedClient(spawnHarness.port, TOKEN, undefined, true);
+      const before = new GruSessionPointer(spawnHarness.chatDir).current();
+      client.control('new_chat', 'spawn-timeout');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'spawn-timeout',
+          'fresh spawn timeout result',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed', epoch: 0 });
+      expect(new GruSessionPointer(spawnHarness.chatDir).current()).toEqual(before);
+      expect(spawnHarness.handle.disposed).toBe(false);
+      await client.close();
+    } finally {
+      await spawnHarness.close();
+    }
+  });
+
+  it('new chat advances one atomic epoch/floor, preserves old bytes, and supports repeated resets', async () => {
+    const h = await makeHarness();
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('old epoch words', 'cross-epoch-id');
+      await client.waitFor(isTurnEndFrame, 'old turn');
+      const oldSession = h.handle.sessionFile!;
+      const oldBytes = readFileSync(oldSession);
+      const floor = h.frameLog.highWaterSeq;
+      h.handle.throwOnUnsubscribe = true;
+
+      client.control('new_chat', 'new-1');
+      // The next socket frame is held behind activation and accepted into
+      // the fresh epoch (never hidden under the newly committed floor).
+      client.send('typed during reset', 'during-reset-id');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'new-1',
+          'first reset',
+        ),
+      ).toMatchObject({ ok: true, epoch: 1 });
+      const boundarySnapshotIndex = client.frames.findIndex(
+        (frame) => frame.type === 'context' && frame.epoch === 1,
+      );
+      const resetResultIndex = client.frames.findIndex(
+        (frame) => frame.type === 'control_result' && frame.request_id === 'new-1',
+      );
+      expect(boundarySnapshotIndex).toBeGreaterThanOrEqual(0);
+      expect(boundarySnapshotIndex).toBeLessThan(resetResultIndex);
+      const firstFresh = h.freshHandles[0]!;
+      expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({
+        sessionFile: firstFresh.sessionFile,
+        epoch: 1,
+        replayFloorSeq: floor,
+      });
+      expect(h.handle.disposed).toBe(true);
+      expect(
+        client.frames.some(
+          (frame) => frame.type === 'context' && frame.epoch === 1 && frame.session_active,
+        ),
+      ).toBe(true);
+      expect(readFileSync(oldSession)).toEqual(oldBytes);
+      await pollUntil(() => firstFresh.calls.length === 1, 'deferred fresh delivery');
+      expect(firstFresh.calls[0]?.text).toBe('typed during reset');
+      expect(
+        client.frames.some(
+          (frame) => frame.type === 'user' && frame.text === 'typed during reset',
+        ),
+      ).toBe(true);
+
+      // Dedup scope is the active epoch, so the same browser id is legal.
+      client.send('new epoch words', 'cross-epoch-id');
+      await pollUntil(() => firstFresh.calls.length === 2, 'fresh delivery');
+      const reconnect = await authedClient(h.port, TOKEN, 0, true);
+      await reconnect.waitFor(isType('context'), 'reconnect context');
+      await new Promise<void>((resolve) => setTimeout(resolve, 30));
+      expect(
+        reconnect.frames.some(
+          (frame) => frame.type === 'user' && frame.text === 'old epoch words',
+        ),
+      ).toBe(false);
+      expect(
+        reconnect.frames.some(
+          (frame) => frame.type === 'user' && frame.text === 'new epoch words',
+        ),
+      ).toBe(true);
+      const reconnectContextIndex = reconnect.frames.findIndex(
+        (frame) => frame.type === 'context' && frame.epoch === 1,
+      );
+      const reconnectFreshFrameIndex = reconnect.frames.findIndex(
+        (frame) => frame.type === 'user' && frame.text === 'new epoch words',
+      );
+      expect(reconnectContextIndex).toBeGreaterThanOrEqual(0);
+      expect(reconnectContextIndex).toBeLessThan(reconnectFreshFrameIndex);
+
+      client.control('new_chat', 'new-2');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'new-2',
+          'second reset',
+        ),
+      ).toMatchObject({ ok: true, epoch: 2 });
+      expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({ epoch: 2 });
+      expect(firstFresh.disposed).toBe(true);
+      await reconnect.close();
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('logs notices raised during reset above the committed replay floor', async () => {
+    let release!: () => void;
+    const h = await makeHarness({
+      freshSpawnHold: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    });
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.control('new_chat', 'notice-during-reset');
+      await client.waitFor(
+        (frame) => frame.type === 'context' && frame.state === 'resetting',
+        'resetting before notice',
+      );
+      h.chat.surfaceNotice('action required while reset is staging');
+      expect(
+        h.frameLog.history.some(
+          (frame) => frame.type === 'notice' && frame.text.includes('action required'),
+        ),
+      ).toBe(false);
+      release();
+      await client.waitFor(
+        (frame) =>
+          frame.type === 'control_result' && frame.request_id === 'notice-during-reset',
+        'reset result before notice',
+      );
+      await client.waitFor(
+        (frame) => frame.type === 'notice' && frame.text.includes('action required'),
+        'deferred notice',
+      );
+      const state = new GruSessionPointer(h.chatDir).current()!;
+      const notice = h.frameLog.history.find(
+        (frame) => frame.type === 'notice' && frame.text.includes('action required'),
+      );
+      expect(notice?.seq).toBeGreaterThan(state.replayFloorSeq);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('reloads the durable epoch/floor and resumes the fresh session after service restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-e4-epoch-restart-'));
+    cleanupDirs.push(dir);
+    const first = await makeHarness({ reuseDir: dir });
+    let freshFile = '';
+    let floor = 0;
+    try {
+      const client = await authedClient(first.port, TOKEN, undefined, true);
+      client.send('retired before service restart', 'retired-before-restart');
+      await client.waitFor(isTurnEndFrame, 'retired turn');
+      client.control('new_chat', 'restart-boundary');
+      await client.waitFor(
+        (frame) => frame.type === 'control_result' && frame.request_id === 'restart-boundary',
+        'new chat before restart',
+      );
+      const state = new GruSessionPointer(first.chatDir).current()!;
+      freshFile = state.sessionFile;
+      floor = state.replayFloorSeq;
+      await client.close();
+    } finally {
+      await first.close();
+    }
+
+    const restarted = await makeHarness({ reuseDir: dir });
+    try {
+      const client = await authedClient(restarted.port, TOKEN, 0, true);
+      expect(await client.waitFor(isType('context'), 'restarted context')).toMatchObject({
+        epoch: 1,
+        replay_floor_seq: floor,
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 30));
+      expect(
+        client.frames.some(
+          (frame) => frame.type === 'user' && frame.text === 'retired before service restart',
+        ),
+      ).toBe(false);
+      client.send('after service restart', 'after-epoch-restart');
+      await pollUntil(() => restarted.spawnCalls[0] === freshFile, 'resume fresh session after restart');
+      await client.close();
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  it('invokes fresh-handle adoption after durable New chat activation', async () => {
+    let adopted: AgentHandle | null = null;
+    let retired: AgentHandle | null = null;
+    const h = await makeHarness({
+      adoptFreshGru: async (fresh) => {
+        adopted = fresh;
+        await retired?.dispose();
+      },
+    });
+    retired = h.handle;
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.control('new_chat', 'adopt-fresh');
+      await client.waitFor(
+        (frame) => frame.type === 'control_result' && frame.request_id === 'adopt-fresh',
+        'fresh adoption result',
+      );
+      expect(adopted).toBe(h.freshHandles[0]);
+      expect(new GruSessionPointer(h.chatDir).current()?.sessionFile).toBe(
+        h.freshHandles[0]?.sessionFile,
+      );
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('reports failed supervision adoption after committing the fresh boundary', async () => {
+    const h = await makeHarness({
+      adoptFreshGru: async (fresh) => {
+        await fresh.dispose();
+        throw new Error('slot inactive');
+      },
+    });
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.control('new_chat', 'adopt-failed');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'adopt-failed',
+          'failed adoption result',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed', epoch: 1 });
+      expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({ epoch: 1 });
+      expect(
+        client.frames.some(
+          (frame) => frame.type === 'context' && frame.epoch === 1 && !frame.session_active,
+        ),
+      ).toBe(true);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('refuses startup when the durable replay floor is ahead of the frame log', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-e4-ahead-floor-'));
+    cleanupDirs.push(dir);
+    const chatDir = join(dir, 'chat');
+    mkdirSync(chatDir, { recursive: true });
+    const sessionFile = join(dir, 'session.jsonl');
+    writeFileSync(sessionFile, '');
+    const pointer = new GruSessionPointer(chatDir);
+    pointer.advance(sessionFile, 1);
+    const frameLog = ChatFrameLog.load(chatDir);
+    expect(() =>
+      createChatServer({
+        config: {
+          auth: { token: TOKEN },
+          workspaceRoot: dir,
+          dataDir: dir,
+        } as GruCommandConfig,
+        frameLog,
+        pointer,
+        spawnGru: async () => new StubGruHandle(sessionFile),
+        spawnFreshGru: async () => new StubGruHandle(join(dir, 'fresh.jsonl'), 'fresh'),
+        heartbeatMs: 0,
+      }),
+    ).toThrow(/replay floor 1 exceeds chat frame high-water 0/);
+  });
+
+  it('retries the same unacked words after vanished-session repair initially fails', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-e4-vanished-retry-'));
+    cleanupDirs.push(dir);
+    const first = await makeHarness({ reuseDir: dir });
+    let vanishedFile = '';
+    try {
+      const client = await authedClient(first.port, TOKEN, undefined, true);
+      client.control('new_chat', 'prepare-vanished-retry');
+      await client.waitFor(
+        (frame) =>
+          frame.type === 'control_result' && frame.request_id === 'prepare-vanished-retry',
+        'prepare vanished retry boundary',
+      );
+      vanishedFile = new GruSessionPointer(first.chatDir).current()!.sessionFile;
+      await client.close();
+    } finally {
+      await first.close();
+    }
+    rmSync(vanishedFile, { force: true });
+
+    const restarted = await makeHarness({
+      reuseDir: dir,
+      failFirstSpawn: new Error('repair temporarily unavailable'),
+    });
+    try {
+      const firstAttempt = await authedClient(restarted.port, TOKEN, 0, true);
+      firstAttempt.send('retry these exact words', 'vanished-retry-id');
+      await firstAttempt.waitFor(
+        (frame) => frame.type === 'error' && /temporarily unavailable/.test(frame.message),
+        'repair failure notice',
+      );
+      expect(await firstAttempt.closed).toBe(1011);
+      expect(
+        restarted.frameLog.history.some(
+          (frame) => frame.type === 'user' && frame.client_msg_id === 'vanished-retry-id',
+        ),
+      ).toBe(false);
+      expect(
+        firstAttempt.frames.some(
+          (frame) => frame.type === 'ack' && frame.client_msg_id === 'vanished-retry-id',
+        ),
+      ).toBe(false);
+
+      const retry = await authedClient(restarted.port, TOKEN, 0, true);
+      retry.send('retry these exact words', 'vanished-retry-id');
+      await pollUntil(
+        () => restarted.handle.calls.some((call) => call.text === 'retry these exact words'),
+        'delivery after repair retry',
+      );
+      const state = new GruSessionPointer(restarted.chatDir).current()!;
+      const logged = restarted.frameLog.history.find(
+        (frame) => frame.type === 'user' && frame.client_msg_id === 'vanished-retry-id',
+      );
+      expect(state.epoch).toBe(2);
+      expect(logged?.seq).toBeGreaterThan(state.replayFloorSeq);
+      await retry.close();
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  it('advances the epoch before accepting words when a pointed native session vanished', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-e4-vanished-boundary-'));
+    cleanupDirs.push(dir);
+    const first = await makeHarness({ reuseDir: dir });
+    let vanishedFile = '';
+    let highWaterBeforeRepair = 0;
+    try {
+      const client = await authedClient(first.port, TOKEN, undefined, true);
+      client.send('before vanished session', 'before-vanished');
+      await client.waitFor(isTurnEndFrame, 'turn before vanished session');
+      client.control('new_chat', 'vanished-new-chat');
+      await client.waitFor(
+        (frame) => frame.type === 'control_result' && frame.request_id === 'vanished-new-chat',
+        'new chat before vanished session',
+      );
+      const fresh = first.freshHandles[0]!;
+      client.send('fresh words before loss', 'fresh-before-loss');
+      await pollUntil(() => fresh.calls.length === 1, 'fresh words delivered before loss');
+      vanishedFile = fresh.sessionFile!;
+      highWaterBeforeRepair = first.frameLog.highWaterSeq;
+      await client.close();
+    } finally {
+      await first.close();
+    }
+    rmSync(vanishedFile, { force: true });
+
+    const restarted = await makeHarness({ reuseDir: dir });
+    try {
+      const client = await authedClient(restarted.port, TOKEN, 0, true);
+      client.send('first words after repair', 'after-vanished-repair');
+      await pollUntil(
+        () => restarted.handle.calls.some((call) => call.text === 'first words after repair'),
+        'first delivery after vanished boundary repair',
+      );
+      const state = new GruSessionPointer(restarted.chatDir).current()!;
+      expect(restarted.spawnCalls[0]).toBeNull();
+      expect(state).toMatchObject({
+        sessionFile: restarted.handle.sessionFile,
+        epoch: 2,
+        replayFloorSeq: highWaterBeforeRepair,
+      });
+      const repairedUser = restarted.frameLog.history.find(
+        (frame) => frame.type === 'user' && frame.client_msg_id === 'after-vanished-repair',
+      );
+      expect(repairedUser?.seq).toBeGreaterThan(state.replayFloorSeq);
+      expect(
+        client.frames.some(
+          (frame) => frame.type === 'user' && frame.client_msg_id === 'after-vanished-repair',
+        ),
+      ).toBe(true);
+      await client.close();
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  it('rejects a fresh spawn that reuses the active native session', async () => {
+    const h = await makeHarness({ reuseActiveOnFresh: true });
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish old native session', 'establish-before-reuse');
+      await client.waitFor(isTurnEndFrame, 'establish before reuse');
+      const before = new GruSessionPointer(h.chatDir).current();
+      client.control('new_chat', 'reused-fresh');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'reused-fresh',
+          'reused fresh rejection',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed', epoch: 0 });
+      expect(new GruSessionPointer(h.chatDir).current()).toEqual(before);
+      expect(h.handle.disposed).toBe(false);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('rejects a fresh path alias that resolves to the active native session', async () => {
+    const h = await makeHarness({ reuseActiveAliasOnFresh: true });
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish before alias reuse', 'establish-before-alias-reuse');
+      await client.waitFor(isTurnEndFrame, 'establish before alias reuse');
+      const before = new GruSessionPointer(h.chatDir).current();
+      client.control('new_chat', 'reused-alias');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'reused-alias',
+          'reused alias rejection',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed', epoch: 0 });
+      expect(new GruSessionPointer(h.chatDir).current()).toEqual(before);
+      expect(h.freshHandles[0]?.disposed).toBe(true);
+      expect(h.handle.disposed).toBe(false);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('rejects a fresh hard link that aliases the active native session', async () => {
+    const h = await makeHarness({ reuseActiveHardLinkOnFresh: true });
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish before hard-link reuse', 'establish-before-hard-link-reuse');
+      await client.waitFor(isTurnEndFrame, 'establish before hard-link reuse');
+      const before = new GruSessionPointer(h.chatDir).current();
+      client.control('new_chat', 'reused-hard-link');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'reused-hard-link',
+          'reused hard-link rejection',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed', epoch: 0 });
+      expect(new GruSessionPointer(h.chatDir).current()).toEqual(before);
+      expect(h.freshHandles[0]?.disposed).toBe(true);
+      expect(h.handle.disposed).toBe(false);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('rejects a fresh file that reuses the active native session id', async () => {
+    const h = await makeHarness({ reuseActiveIdOnFresh: true });
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish old native id', 'establish-before-id-reuse');
+      await client.waitFor(isTurnEndFrame, 'establish before id reuse');
+      const before = new GruSessionPointer(h.chatDir).current();
+      client.control('new_chat', 'reused-id');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'reused-id',
+          'reused id rejection',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed', epoch: 0 });
+      expect(new GruSessionPointer(h.chatDir).current()).toEqual(before);
+      expect(h.freshHandles[0]?.disposed).toBe(true);
+      expect(h.handle.disposed).toBe(false);
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a failed durable activation disposes the staged session and keeps the old chat usable', async () => {
+    const h = await makeHarness({ failFirstPointerAdvance: new Error('pointer write failed') });
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish before pointer failure', 'establish-pointer-failure');
+      await client.waitFor(isTurnEndFrame, 'establish before pointer failure');
+      const before = new GruSessionPointer(h.chatDir).current();
+      client.control('new_chat', 'pointer-fail');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'pointer-fail',
+          'pointer activation failure',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed', epoch: 0 });
+      expect(new GruSessionPointer(h.chatDir).current()).toEqual(before);
+      expect(h.freshHandles[0]?.disposed).toBe(true);
+      expect(h.handle.disposed).toBe(false);
+      client.send('old usable after pointer failure', 'after-pointer-failure');
+      await pollUntil(
+        () => h.handle.calls.some((call) => call.text === 'old usable after pointer failure'),
+        'old delivery after pointer failure',
+      );
+      await client.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a failed fresh spawn leaves the old epoch/session usable', async () => {
+    const h = await makeHarness({ failFirstFreshSpawn: new Error('mint failed') });
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      const before = new GruSessionPointer(h.chatDir).current();
+      client.control('new_chat', 'new-fail');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'new-fail',
+          'failed reset',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed', epoch: 0 });
+      expect(new GruSessionPointer(h.chatDir).current()).toEqual(before);
+      client.send('old remains usable', 'after-failed-reset');
+      await pollUntil(() => h.handle.calls.length === 1, 'old delivery after failed reset');
+      expect(h.handle.calls[0]?.text).toBe('old remains usable');
       await client.close();
     } finally {
       await h.close();

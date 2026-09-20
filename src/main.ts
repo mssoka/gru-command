@@ -295,6 +295,11 @@ async function main(): Promise<number> {
     frameLog,
     pointer: new GruSessionPointer(chatDir, (level, msg, fields) => logger.log(level, msg, fields)),
     spawnGru: (resumeFile) => gruSlot.ensure(resumeFile !== null ? { resumeFile } : {}),
+    // New chat deliberately bypasses ensure(): it must mint without resume
+    // even while the old supervised slot is healthy. Activation then advances
+    // the slot generation so no stale restart can swap the old epoch back in.
+    spawnFreshGru: () => registry.spawn('gru', {}),
+    adoptFreshGru: (handle) => gruSlot.adoptReplacement(handle),
     siblingUpgradePaths: [BOARD_WS_PATH],
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
