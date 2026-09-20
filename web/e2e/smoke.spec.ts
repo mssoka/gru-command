@@ -361,3 +361,72 @@ test.describe('themes', () => {
     await expect(page.locator('html')).toHaveClass(/dark/);
   });
 });
+
+test.describe('phone chrome (390px)', () => {
+  /** The document must never scroll sideways: the AC number, verbatim. */
+  async function assertNoHorizontalOverflow(page: Page): Promise<void> {
+    const { scrollWidth, clientWidth } = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+    }));
+    expect(
+      scrollWidth,
+      `document scrolls sideways: ${scrollWidth} > ${clientWidth}`,
+    ).toBeLessThanOrEqual(clientWidth);
+  }
+
+  /** Visible AND fully inside the viewport — no clipped chrome controls. */
+  async function assertReachable(page: Page, selector: string): Promise<void> {
+    const loc = page.locator(selector);
+    await expect(loc).toBeVisible();
+    const box = await loc.boundingBox();
+    expect(box, `${selector} rendered`).not.toBeNull();
+    const vw = await page.evaluate(() => document.documentElement.clientWidth);
+    expect(box!.x, `${selector} left edge on screen`).toBeGreaterThanOrEqual(0);
+    expect(box!.x + box!.width, `${selector} right edge on screen`).toBeLessThanOrEqual(vw);
+  }
+
+  const CHROME_CONTROLS = ['#tab-chat', '#tab-board', '#theme-toggle', '#settings-toggle'];
+
+  test('nav fits the phone: zero horizontal overflow on chat and board, every control reachable', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+
+    // Chat surface (pre-pair the same chrome renders over the pairing card).
+    await page.goto('/');
+    await expect(page.locator('#pairing-view')).toBeVisible();
+    await assertNoHorizontalOverflow(page);
+    for (const selector of CHROME_CONTROLS) {
+      await assertReachable(page, selector);
+    }
+
+    // Board surface (paired mobile: board is the default view, bell shows).
+    await pairMobile(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    await expect(page.locator('#notification-bell')).toBeVisible();
+    await assertNoHorizontalOverflow(page);
+    for (const selector of [...CHROME_CONTROLS, '#notification-bell']) {
+      await assertReachable(page, selector);
+    }
+
+    // Chat surface, paired: the phone chat is the corner-bubble sheet.
+    await page.locator('#chat-bubble').click();
+    await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
+    await assertNoHorizontalOverflow(page);
+    await page.locator('#chat-sheet-grip').click();
+    await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'false');
+  });
+
+  test('561px band: the single-row nav still fits without overflow or clipped controls', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 561, height: 844 });
+    await page.goto('/');
+    await expect(page.locator('#pairing-view')).toBeVisible();
+    await assertNoHorizontalOverflow(page);
+    for (const selector of CHROME_CONTROLS) {
+      await assertReachable(page, selector);
+    }
+  });
+});

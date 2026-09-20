@@ -1395,3 +1395,64 @@ body {
 .notice-line--ephemeral {
   opacity: 0.85;
 }
+
+/* ------------------------------------------------------------------ */
+/* Phone chrome: compact two-row nav (≤560px)                          */
+/*                                                                     */
+/* Below ~560px the single-row header (logo + title + tabs + status +  */
+/* bell/theme/settings) exceeds the viewport — on a 390px phone it     */
+/* measured scrollWidth 519 with theme/settings clipped off-screen.    */
+/* Phone-only treatment: tabs wrap onto their own full-width row, the  */
+/* title block tightens, spacing shrinks. flex-wrap is the hard        */
+/* guarantee: worst case the header grows a row, it never overflows    */
+/* horizontally. Desktop (≥768px) is untouched; 561–768px still fits   */
+/* on one row (max-content ≈ 519px < 561px), so no rules there.        */
+/* ------------------------------------------------------------------ */
+@media (max-width: 560px) {
+  .app-nav {
+    flex-wrap: wrap;
+    column-gap: 10px;
+    row-gap: 8px;
+    padding: 10px 14px;
+  }
+
+  .app-nav__logo {
+    font-size: 22px;
+  }
+
+  .app-nav__title {
+    font-size: 15px;
+  }
+
+  /* The tagline is decorative; dropping it buys row 1 the icon room.
+     Scoped to the tagline itself — other .lbl uses must keep rendering. */
+  .app-nav__tagline {
+    display: none;
+  }
+
+  .app-nav__tabs {
+    order: 10;
+    flex: 1 1 100%;
+    margin-left: 0;
+    gap: 8px;
+  }
+
+  .app-nav__tab {
+    flex: 1 1 0;
+  }
+
+  /* Overlays tuned for the single-row nav height need the two-row
+     clearance so they do not pile on top of the chrome. Measured two-row
+     nav height at 390px: 110px (headless chromium) → token + margin. */
+  :root {
+    --phone-nav-clearance: 116px;
+  }
+
+  .notification-panel {
+    top: var(--phone-nav-clearance);
+  }
+
+  .toast-stack {
+    top: var(--phone-nav-clearance);
+  }
+}
