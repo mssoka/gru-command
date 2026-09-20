@@ -1038,6 +1038,97 @@ describe('chat server (real sockets, stub Gru)', () => {
     await harness.close();
   });
 
+  it('a failed frame-log append during delivery is caught, reported, and never fatal (r3 blocker)', async () => {
+    const harness = await makeHarness();
+    try {
+      const client = await authedClient(harness.port);
+      const done1 = nextTurnEnd(client);
+      client.send('baseline before disk failure', 'm1');
+      await done1;
+
+      // Fail the next two non-transport appends (user/ack already landed):
+      // the turn-start frame (mid-prompt) and the inner delivery-error
+      // frame that follows. Before the r3 fix the second throw escaped the
+      // void-ed deliver() task as an unhandled rejection — which the
+      // service treats as fatal (process.exit).
+      const originalAppend = harness.frameLog.append.bind(harness.frameLog);
+      let remainingFailures = 2;
+      (harness.frameLog as unknown as { append: typeof originalAppend }).append = (
+        frame: Parameters<typeof originalAppend>[0],
+      ) => {
+        if (remainingFailures > 0 && frame.type !== 'user' && frame.type !== 'ack') {
+          remainingFailures -= 1;
+          throw new Error('simulated ENOSPC: disk full');
+        }
+        return originalAppend(frame);
+      };
+
+      client.send('hit the broken log', 'm2');
+      const bounded = await client.waitFor(
+        (frame) => frame.type === 'error' &&
+          (frame as web.ErrorFrame).message.includes(
+            'message delivery failed; the conversation stays usable',
+          ),
+        'bounded durable delivery failure',
+      );
+      // The backstop frame is durable (replayable), never fatal.
+      expect(typeof (bounded as web.ErrorFrame).seq).toBe('number');
+      expect((bounded as web.ErrorFrame).fatal).toBeUndefined();
+
+      // The service is alive and the delivery gate recovered.
+      const done3 = nextTurnEnd(client);
+      client.send('still alive after ENOSPC', 'm3');
+      await done3;
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('a persistently broken frame log degrades to an ephemeral error without killing the service', async () => {
+    const harness = await makeHarness();
+    try {
+      const client = await authedClient(harness.port);
+      const done1 = nextTurnEnd(client);
+      client.send('baseline before persistent failure', 'm1');
+      await done1;
+
+      // Every turn/error append fails while user/ack appends still pass —
+      // so the message is accepted, the delivery chain hits the failure,
+      // and the outer backstop must fall back to the ephemeral channel.
+      const originalAppend = harness.frameLog.append.bind(harness.frameLog);
+      let sabotage = true;
+      (harness.frameLog as unknown as { append: typeof originalAppend }).append = (
+        frame: Parameters<typeof originalAppend>[0],
+      ) => {
+        if (sabotage && (frame.type === 'turn' || frame.type === 'error')) {
+          throw new Error('simulated EACCES: log unwritable');
+        }
+        return originalAppend(frame);
+      };
+
+      client.send('hit the unwritable log', 'm2');
+      const ephemeral = await client.waitFor(
+        (frame) => frame.type === 'error' &&
+          (frame as web.ErrorFrame).message.includes(
+            'message delivery failed; the conversation stays usable',
+          ),
+        'ephemeral delivery failure',
+      );
+      expect((ephemeral as web.ErrorFrame).seq).toBeUndefined();
+      expect((ephemeral as web.ErrorFrame).fatal).toBeUndefined();
+
+      // Recovery: repair the log and the same session keeps working.
+      sabotage = false;
+      const done3 = nextTurnEnd(client);
+      client.send('recovered after repair', 'm3');
+      await done3;
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('a steer rejection mid-live-turn logs the failure but never force-settles the running turn', async () => {
     const harness = await makeHarness();
     let releaseTurn!: () => void;

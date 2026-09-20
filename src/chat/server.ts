@@ -611,6 +611,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   function deliver(client: Client, text: string, attachments?: readonly AttachmentChip[]): void {
     pendingDeliveries += 1;
     broadcastContext();
+    // Declared here so BOTH the task-level catch and the inner prompt
+    // try/catch can see them (a catch block cannot read the try block's
+    // locals — the r3 backstop needs to know what this delivery opened).
+    let midTurn = false;
+    let ownedOpenTurn = false;
     void (async () => {
       try {
         // Re-enter every current barrier after every await. Provider-native
@@ -697,11 +702,12 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
           allowed.length > 0 ? allowed : undefined,
           visionUnavailable,
         );
-        const midTurn = turnLive;
         try {
-          if (midTurn) {
+          if (turnLive) {
+            midTurn = true;
             await gru.steer(prompt, { owner: CHAT_OWNER });
           } else {
+            ownedOpenTurn = true;
             turnLive = true; // optimistic: the turn_start event confirms
             await gru.prompt(prompt, { owner: CHAT_OWNER });
             turnLive = false;
@@ -720,6 +726,38 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             turnLive = false;
             settleOpenTurn();
           }
+        }
+      } catch (error) {
+        // Backstop (r3 blocker): this task used to have try/finally only, so
+        // a failed frame-log append (ENOSPC/EACCES) or the recovery-blocked
+        // guard rejected unhandled — and the service exits on unhandled
+        // rejections. One disk hiccup must never kill chat: log it, settle
+        // only the turn THIS delivery opened, and report a bounded error
+        // frame through whichever channel still works.
+        log('error', 'chat delivery failed', { error: errorMessage(error) });
+        if (ownedOpenTurn && turnLive) {
+          try {
+            settleOpenTurn();
+          } catch (settleError) {
+            log('warn', 'chat turn settlement failed during delivery failure', {
+              error: errorMessage(settleError),
+            });
+            turnLive = false;
+          }
+        }
+        const message = recoveryBlockedReason !== null
+          ? 'chat recovery is blocked; restart the service to continue messaging'
+          : 'message delivery failed; the conversation stays usable — re-send if needed';
+        try {
+          emitLogged({ type: 'error', message });
+        } catch (appendError) {
+          // The durable log is the failing surface — degrade to an ephemeral
+          // per-socket frame instead of dying; retry transport recovers the
+          // unacked/outbox word client-side.
+          log('error', 'chat delivery failure could not be logged durably', {
+            error: errorMessage(appendError),
+          });
+          send(client, ephemeralError(message));
         }
       } finally {
         pendingDeliveries -= 1;
