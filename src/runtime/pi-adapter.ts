@@ -6,7 +6,8 @@ import {
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
-import { dirname, isAbsolute, relative } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative } from 'node:path';
 import type { GruCommandConfig, Role } from '../config.js';
 import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
@@ -71,6 +72,24 @@ interface QueuedMessage {
 }
 
 /**
+ * Read defaultProvider/defaultModel from the agentDir settings
+ * (<agentDir>/settings.json). Plain JSON with BOM stripping, matching the
+ * SDK's own loader; a missing, unreadable, or partial file names nothing.
+ */
+function readSettingsDefault(agentDir: string): { provider: string; model: string } | undefined {
+  try {
+    const raw = readFileSync(join(agentDir, 'settings.json'), 'utf-8').replace(/^\uFEFF/, '');
+    const parsed = JSON.parse(raw) as { defaultProvider?: unknown; defaultModel?: unknown };
+    const provider = typeof parsed.defaultProvider === 'string' ? parsed.defaultProvider : undefined;
+    const model = typeof parsed.defaultModel === 'string' ? parsed.defaultModel : undefined;
+    if (provider !== undefined && model !== undefined) return { provider, model };
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Reference AgentRuntime over the pi SDK (EPICS E2 story 2; SPEC ruling 4).
  *
  * One PiRuntime hosts any number of AgentHandles; each handle wraps one
@@ -110,17 +129,18 @@ export class PiRuntime implements AgentRuntime {
   }
 
   /**
-   * Fail-loud model resolution (SPEC ruling 16): "default" (or "") passes
-   * through to pi's own resolution (session restore → settings → first
-   * available); an explicit "provider/model" must resolve or spawn fails
-   * naming the reference.
+   * Fail-loud model resolution (SPEC ruling 16): "default" (or "") resolves
+   * the USER's settings default eagerly (see resolveSettingsDefault) and
+   * only falls through to pi's own resolution when settings name nothing;
+   * an explicit "provider/model" must resolve or spawn fails naming the
+   * reference.
    */
   private async resolveModel(role: Role, override?: string): Promise<Model<Api> | undefined> {
     const ref =
       override !== undefined
         ? override
         : resolveSpawnPolicy(this.config, 'pi', role).model;
-    if (ref === '' || ref === 'default') return undefined;
+    if (ref === '' || ref === 'default') return this.resolveSettingsDefault();
     const slash = ref.indexOf('/');
     if (slash <= 0 || slash >= ref.length - 1) {
       throw new Error(`model reference must be "provider/model" or "default", got: ${ref}`);
@@ -130,6 +150,31 @@ export class PiRuntime implements AgentRuntime {
     const model = (await this.runtime()).getModel(provider, modelId);
     if (model === undefined) {
       throw new Error(`unknown model "${ref}" — no such provider/model is registered`);
+    }
+    return model;
+  }
+
+  /**
+   * The "default" sentinel means the user's configured default
+   * (defaultProvider/defaultModel in <agentDir>/settings.json). Resolve it
+   * EAGERLY and hand pi the explicit model: the shared offline ModelRuntime
+   * (refreshOnCreate: false) never builds its auth snapshot, so pi's own
+   * settings-default path — gated on hasConfiguredAuth() — rejects the
+   * user's valid default and falls through to "first available"/nothing
+   * (2026-09-20 report: chat + Bob consolidation died with "No API key
+   * found for the selected model" while fully authed). Prompting an
+   * explicitly-passed model bypasses the stale gate. When settings name
+   * nothing, undefined preserves pi's own resolution (fresh installs).
+   */
+  private async resolveSettingsDefault(): Promise<Model<Api> | undefined> {
+    const settingsDefault = readSettingsDefault(this.agentDir);
+    if (settingsDefault === undefined) return undefined;
+    const model = (await this.runtime()).getModel(settingsDefault.provider, settingsDefault.model);
+    if (model === undefined) {
+      throw new Error(
+        `settings default "${settingsDefault.provider}/${settingsDefault.model}" is not a registered model — ` +
+          `update ${join(this.agentDir, 'settings.json')} or set [models] default to an explicit "provider/model"`,
+      );
     }
     return model;
   }
@@ -165,6 +210,13 @@ export class PiRuntime implements AgentRuntime {
     const cwd = resolveSpawnCwd(this.config.workspaceRoot, options.cwd);
     const model = await this.resolveModel(role, options.model);
     const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
+    // Name the RESOLVED model: future "No API key"-style complaints must
+    // name the actual model, not the sentinel that requested it.
+    this.log('info', 'spawn: model resolved', {
+      role,
+      model: model ? `${model.provider}/${model.id}` : 'pi default resolution (settings name no default)',
+      thinkingLevel: thinkingLevel ?? 'default',
+    });
     // Normalize like the SDK (tilde + file://) so the lock key, the
     // active-file key, and the session's own path are one and the same.
     const resumeFile =
