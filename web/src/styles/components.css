@@ -1400,13 +1400,17 @@ body {
 /* Phone chrome: compact two-row nav (≤560px)                          */
 /*                                                                     */
 /* Below ~560px the single-row header (logo + title + tabs + status +  */
-/* bell/theme/settings) exceeds the viewport — on a 390px phone it     */
-/* measured scrollWidth 519 with theme/settings clipped off-screen.    */
-/* Phone-only treatment: tabs wrap onto their own full-width row, the  */
-/* title block tightens, spacing shrinks. flex-wrap is the hard        */
-/* guarantee: worst case the header grows a row, it never overflows    */
-/* horizontally. Desktop (≥768px) is untouched; 561–768px still fits   */
-/* on one row (max-content ≈ 519px < 561px), so no rules there.        */
+/* bell/theme/settings) does not fit: on a 390px phone it measured     */
+/* scrollWidth 519 on the board view with theme/settings clipped       */
+/* off-screen (natural width 581 unpaired / 643 paired; 519 is the     */
+/* flex-shrink floor). Phone-only treatment: tabs wrap onto their own  */
+/* full-width row, the title block tightens, spacing shrinks — the     */
+/* header's minimum width drops under the phone budget. flex-wrap      */
+/* lets the header grow rows instead of pushing sideways; it is        */
+/* layout, not a CSS overflow guarantee — the e2e is the guarantee     */
+/* (scrollWidth <= clientWidth asserted on chat + board at 390px and   */
+/* 561px). Desktop (≥768px) is untouched; 561–768px still fits on one  */
+/* row (shrink floor ≈ 519px < 561px, e2e-pinned), so no rules there.  */
 /* ------------------------------------------------------------------ */
 @media (max-width: 560px) {
   .app-nav {

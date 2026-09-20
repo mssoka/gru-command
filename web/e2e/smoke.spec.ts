@@ -362,7 +362,7 @@ test.describe('themes', () => {
   });
 });
 
-test.describe('phone chrome (390px)', () => {
+test.describe('phone chrome', () => {
   /** The document must never scroll sideways: the AC number, verbatim. */
   async function assertNoHorizontalOverflow(page: Page): Promise<void> {
     const { scrollWidth, clientWidth } = await page.evaluate(() => ({
@@ -388,6 +388,30 @@ test.describe('phone chrome (390px)', () => {
 
   const CHROME_CONTROLS = ['#tab-chat', '#tab-board', '#theme-toggle', '#settings-toggle'];
 
+  /** Top-anchored overlays must clear the nav, whatever its wrapped
+   * height: kills any mutation of --phone-nav-clearance to less than the
+   * nav height (token→0px fails both assertions; the deleted per-overlay
+   * override falls back to 58/64px and fails too). Not a guard against
+   * deleting the token itself — var() then goes auto/static-position. */
+  async function assertOverlaysClearNav(page: Page): Promise<void> {
+    // #board-view's .reveal animates a transform for 0.4s; a running
+    // transform makes board-view the absolute panel's containing block
+    // and would mask a too-small top. Wait it out so both overlays are
+    // measured against the viewport like in steady state.
+    await page.waitForFunction(
+      () => getComputedStyle(document.querySelector('#board-view')!).transform === 'none',
+      undefined,
+      { timeout: 5_000 },
+    );
+    const m = await page.evaluate(() => ({
+      navBottom: document.querySelector('.app-nav')!.getBoundingClientRect().bottom,
+      panelTop: document.querySelector('#notification-panel')!.getBoundingClientRect().top,
+      toastTop: document.querySelector('#toasts')!.getBoundingClientRect().top,
+    }));
+    expect(m.panelTop, 'notification panel clears the nav').toBeGreaterThanOrEqual(m.navBottom);
+    expect(m.toastTop, 'toast stack clears the nav').toBeGreaterThanOrEqual(m.navBottom);
+  }
+
   test('nav fits the phone: zero horizontal overflow on chat and board, every control reachable', async ({
     page,
   }) => {
@@ -397,6 +421,8 @@ test.describe('phone chrome (390px)', () => {
     await page.goto('/');
     await expect(page.locator('#pairing-view')).toBeVisible();
     await assertNoHorizontalOverflow(page);
+    // Direct tagline-suppression coverage: the decorative line is phone-off.
+    await expect(page.locator('.app-nav__tagline')).toBeHidden();
     for (const selector of CHROME_CONTROLS) {
       await assertReachable(page, selector);
     }
@@ -410,12 +436,20 @@ test.describe('phone chrome (390px)', () => {
       await assertReachable(page, selector);
     }
 
+    // Perkins r1 blocker: the clearance overrides are load-bearing — open
+    // the panel and prove both top-anchored overlays sit below the nav.
+    await page.locator('#notification-bell').click();
+    await expect(page.locator('.board-notification').first()).toBeVisible();
+    await assertOverlaysClearNav(page);
+    await page.locator('#notification-bell').click();
+
     // Chat surface, paired: the phone chat is the corner-bubble sheet.
     await page.locator('#chat-bubble').click();
     await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
     await assertNoHorizontalOverflow(page);
     await page.locator('#chat-sheet-grip').click();
     await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'false');
+    await assertNoHorizontalOverflow(page);
   });
 
   test('561px band: the single-row nav still fits without overflow or clipped controls', async ({
@@ -425,7 +459,18 @@ test.describe('phone chrome (390px)', () => {
     await page.goto('/');
     await expect(page.locator('#pairing-view')).toBeVisible();
     await assertNoHorizontalOverflow(page);
+    // The tagline only drops under the phone breakpoint.
+    await expect(page.locator('.app-nav__tagline')).toBeVisible();
     for (const selector of CHROME_CONTROLS) {
+      await assertReachable(page, selector);
+    }
+
+    // Paired, the bell joins the nav — the worst-case (widest) header.
+    await pairMobile(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    await expect(page.locator('#notification-bell')).toBeVisible();
+    await assertNoHorizontalOverflow(page);
+    for (const selector of [...CHROME_CONTROLS, '#notification-bell']) {
       await assertReachable(page, selector);
     }
   });
