@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -19,6 +20,7 @@ import {
   BMAD_INSTALLER_VERSION,
   BMAD_MODULE_PINS,
   bmadToolsForAnswers,
+  commandAvailable,
   onboardBmadRepo as onboardBmadRepoImpl,
 } from '../src/wizard/bmad-onboarding.js';
 
@@ -161,18 +163,15 @@ describe('per-selected-repo BMAD onboarding', () => {
     writeFileSync(join(customSkill, 'SKILL.md'), '# user custom\n');
     writeFileSync(join(customSkill, 'workflow.md'), '{{.implementation_artifacts}}\n');
     const calls: string[][] = [];
-    const childEnvs: NodeJS.ProcessEnv[] = [];
     const parsed = answers(fixture.workspace, fixture.name, 'install');
     const result = onboardBmadRepo(fixture.name, 'install', {
       workspaceRoot: fixture.workspace,
       answers: parsed,
-      env: { OPENROUTER_API_KEY: 'must-not-reach-bmad' },
-      run: successfulInstaller(fixture.repo, calls, childEnvs),
+      run: successfulInstaller(fixture.repo, calls),
     });
 
     expect(result.ready, result.message).toBe(true);
     expect(calls).toHaveLength(2);
-    expect(childEnvs.every((env) => env.OPENROUTER_API_KEY === undefined)).toBe(true);
     expect(calls[1]).toEqual(expect.arrayContaining([
       'npx',
       '--yes',
@@ -350,6 +349,85 @@ describe('per-selected-repo BMAD onboarding', () => {
       'preserve me\n',
     );
     expect(existsSync(join(failed.repo, '.gru-command', 'bmad-install.json'))).toBe(false);
+  });
+
+  it('missing-prerequisite failure names the missing tool and never marks ready (failure matrix)', () => {
+    const fixture = fixtureRepo('missing-prereq');
+    const result = onboardBmadRepoImpl(fixture.name, 'install', {
+      workspaceRoot: fixture.workspace,
+      answers: answers(fixture.workspace, fixture.name, 'install'),
+      run: successfulInstaller(fixture.repo, []),
+      // Seam kills the assertPrerequisites guard: any onboarding whose
+      // prerequisite list throw is deleted would mark this ready.
+      prerequisiteCheck: (command) => command !== 'uv',
+    });
+    expect(result.ready).toBe(false);
+    expect(result.message).toContain('missing BMAD prerequisite(s): uv');
+    expect(existsSync(join(fixture.repo, '.gru-command', 'bmad-install.json'))).toBe(false);
+  });
+
+  it('the PRODUCTION prerequisite probe executes and detects a missing binary (mutation-kill)', () => {
+    // Real spawnSync path — never the test seam. Deleting the probe's
+    // status/error check (or its absence detection) flips these asserts.
+    expect(commandAvailable('node', process.env, tmpdir())).toBe(true);
+    expect(commandAvailable('gru-no-such-binary-4f7c2a', process.env, tmpdir())).toBe(false);
+    // Production probes pass on this machine end-to-end: with NO seam
+    // injected, onboarding reaches the installer (its fixture failure names
+    // the installer), never the missing-prerequisite error.
+    const fixture = fixtureRepo('production-probe');
+    const runner = (() => ({
+      status: 1,
+      signal: null,
+      stdout: '',
+      stderr: 'fixture installer failure',
+      pid: 1,
+      output: [],
+    })) as unknown as typeof spawnSync;
+    const result = onboardBmadRepoImpl(fixture.name, 'install', {
+      workspaceRoot: fixture.workspace,
+      answers: answers(fixture.workspace, fixture.name, 'install'),
+      run: runner,
+    });
+    expect(result.ready).toBe(false);
+    expect(result.message).toContain('official BMAD installer exited 1');
+    expect(result.message).not.toContain('missing BMAD prerequisite');
+  });
+
+  it('read-only repo fails visibly without a ready record (failure matrix)', () => {
+    const fixture = fixtureRepo('read-only');
+    chmodSync(fixture.repo, 0o555);
+    try {
+      // successfulInstaller materializes the install INTO the --directory
+      // target: the write into the read-only repo throws EACCES for real.
+      const result = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: successfulInstaller(fixture.repo, []),
+      });
+      expect(result.ready).toBe(false);
+      expect(result.message).toMatch(/EACCES|permission denied/i);
+      expect(existsSync(join(fixture.repo, '.gru-command', 'bmad-install.json'))).toBe(false);
+    } finally {
+      chmodSync(fixture.repo, 0o755);
+    }
+  });
+
+  it('interrupted/partial install is refused until repaired, never overwritten (failure matrix)', () => {
+    for (const action of ['install', 'reuse'] as const) {
+      const fixture = fixtureRepo(`partial-${action}`);
+      mkdirSync(join(fixture.repo, '_bmad', 'bmm'), { recursive: true });
+      writeFileSync(join(fixture.repo, '_bmad', 'bmm', 'half-written'), 'interrupted\n');
+      const result = onboardBmadRepoImpl(fixture.name, action, {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, action),
+        run: successfulInstaller(fixture.repo, []),
+      });
+      expect(result.ready, `${action}: ${result.message}`).toBe(false);
+      expect(result.message).toContain('partial BMAD installation detected');
+      expect(result.message).toContain('preserve it and repair or choose skip');
+      expect(existsSync(join(fixture.repo, '_bmad', 'bmm', 'half-written'))).toBe(true);
+      expect(existsSync(join(fixture.repo, '.gru-command', 'bmad-install.json'))).toBe(false);
+    }
   });
 
   it('rejects malformed existing manifests and symlinked selected repos without mutation', () => {

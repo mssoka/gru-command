@@ -5,7 +5,7 @@
  * and invokes the project-local bmad-build renderer without global skill paths.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import process from 'node:process';
 import { join } from 'node:path';
@@ -59,6 +59,18 @@ try {
   if (!realpathSync(skill).startsWith(realpathSync(worktree))) {
     throw new Error('fresh worktree skill resolved outside the isolated worktree');
   }
+  // bmad-review gate ruling (fork-3 extension): the default pinned module set
+  // must carry the project-local bmad-review skill so a default-onboarded user
+  // can gate on it — 0 blockers = clear to merge; blockers route back to the
+  // implementing minion as fix directives, never inform-only. Perkins stays the
+  // stronger exact-head gate with autonomous-merge authority.
+  const reviewSkill = join(worktree, '.agents', 'skills', 'bmad-review', 'SKILL.md');
+  if (!existsSync(reviewSkill) || lstatSync(reviewSkill).isSymbolicLink() || !statSync(reviewSkill).isFile()) {
+    throw new Error('fresh worktree lacks the project-local bmad-review gate skill');
+  }
+  if (!realpathSync(reviewSkill).startsWith(realpathSync(worktree))) {
+    throw new Error('fresh worktree bmad-review resolved outside the isolated worktree');
+  }
   const rendered = execFileSync(
     'uv',
     ['run', '--no-cache', renderer, '--project-root', worktree, '--skill', skill],
@@ -69,9 +81,12 @@ try {
     throw new Error(`project-local bmad-build renderer did not emit a workflow path: ${rendered}`);
   }
   const record = JSON.parse(readFileSync(join(repo, '.gru-command', 'bmad-install.json'), 'utf-8'));
+  if (!(record.runtime_skills?.pi ?? []).includes('bmad-review')) {
+    throw new Error('BMAD record does not carry bmad-review in runtime_skills');
+  }
   process.stdout.write(
     `PASS official BMAD onboarding modules=${record.modules.map((m) => `${m.name}@${m.version}`).join(',')} ` +
-      `tools=${record.tools.join(',')} fresh_worktree=${worktree} renderer=${workflowPath}\n`,
+      `tools=${record.tools.join(',')} review=bmad-review fresh_worktree=${worktree} renderer=${workflowPath}\n`,
   );
   git(repo, ['worktree', 'remove', '--force', worktree]);
 } finally {

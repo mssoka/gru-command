@@ -18,7 +18,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline/promises';
-import { emitKeypressEvents } from 'node:readline';
 import { stdout } from 'node:process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { existsSync, openSync, realpathSync } from 'node:fs';
@@ -31,7 +30,7 @@ import {
   AnswersError,
   generateToken,
   parseAnswers,
-  validateHost,
+  resolveBindHost,
   validateWorkspaceRoot,
   type WizardAnswers,
 } from './answers.js';
@@ -39,15 +38,11 @@ import {
   buildQrPayload,
   discoverManagedRepos,
   generateConfigToml,
+  loadExistingInstanceConfig,
+  seedAnswersFromConfig,
   writeConfigText,
 } from './steps.js';
 import { onboardBmadRepo } from './bmad-onboarding.js';
-import {
-  checkJev,
-  persistJevCredential,
-  readJevStatus,
-  type JevStatus,
-} from './jev-setup.js';
 
 const WIZARD_USAGE =
   'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
@@ -90,11 +85,6 @@ interface WizardTerminal {
   readonly output: WriteStream;
 }
 
-interface InteractivePlan {
-  readonly answers: WizardAnswers;
-  readonly localJevCredential: string | null;
-}
-
 function openWizardTerminal(repoRoot: string): WizardTerminal {
   if (process.env.GRU_COMMAND_TEST_NO_TTY === '1') {
     fail(
@@ -123,61 +113,32 @@ async function ask(rl: ReturnType<typeof createInterface>, question: string): Pr
   return (await rl.question(question)).trim();
 }
 
-async function askMasked(terminal: WizardTerminal, question: string): Promise<string> {
-  // Arm raw mode and the key handler before exposing the prompt. A PTY
-  // driver (or a very fast paste) may answer as soon as it sees the prompt;
-  // writing first creates a race where the terminal itself echoes the secret.
-  emitKeypressEvents(terminal.input);
-  terminal.input.setRawMode(true);
-  terminal.input.resume();
-  return new Promise<string>((resolveValue, reject) => {
-    const chars: string[] = [];
-    const finish = (error?: Error): void => {
-      terminal.input.off('keypress', onKey);
-      terminal.input.setRawMode(false);
-      terminal.output.write('\n');
-      if (error !== undefined) reject(error);
-      else resolveValue(chars.join(''));
-    };
-    const onKey = (
-      text: string,
-      key: { name?: string; ctrl?: boolean; meta?: boolean },
-    ): void => {
-      if (key.ctrl === true && key.name === 'c') {
-        finish(new Error('credential entry cancelled'));
-      } else if (key.name === 'return' || key.name === 'enter') {
-        finish();
-      } else if (key.name === 'backspace') {
-        if (chars.pop() !== undefined) terminal.output.write('\b \b');
-      } else if (text !== '' && key.ctrl !== true && key.meta !== true) {
-        chars.push(text);
-        terminal.output.write('*');
-      }
-    };
-    terminal.input.on('keypress', onKey);
-    terminal.output.write(question);
-  });
-}
-
 function yn(value: string): boolean {
   return value.toLowerCase() === 'y' || value.toLowerCase() === 'yes';
 }
 
 async function interactiveAnswers(
   probe: readonly RuntimeProbeResult[],
-  repoRoot: string,
-  instanceDir: string,
   terminal: WizardTerminal,
-  decisionsCliPath?: string,
-): Promise<InteractivePlan> {
+  prior: ReturnType<typeof loadExistingInstanceConfig>,
+): Promise<WizardAnswers> {
   const rl = createInterface({ input: terminal.input, output: terminal.output });
   const out = terminal.output;
   out.write('\nGru Command setup — press Enter to accept every [default].\n');
+  if (prior !== null) {
+    out.write(
+      `\nExisting config found — Enter keeps its values (round-trip; a timestamped\n` +
+        `  backup is written before any rewrite).\n`,
+    );
+  }
 
-  let workspaceRoot = '~/code';
+  let workspaceRoot = prior?.workspaceRoot ?? '~/code';
   for (;;) {
-    const answer = await ask(rl, '\nWorkspace root (holds ONLY your managed repos) [~/code]: ');
-    workspaceRoot = answer === '' ? '~/code' : answer;
+    const answer = await ask(
+      rl,
+      `\nWorkspace root (holds ONLY your managed repos) [${workspaceRoot}]: `,
+    );
+    workspaceRoot = answer === '' ? workspaceRoot : answer;
     try {
       validateWorkspaceRoot(workspaceRoot);
       break;
@@ -252,7 +213,7 @@ async function interactiveAnswers(
     }
   }
 
-  const runtimeDefault = defaultRuntimeId(probe);
+  const runtimeDefault = prior?.runtimes.default ?? defaultRuntimeId(probe);
   let runtime = runtimeDefault;
   for (;;) {
     const answer = await ask(
@@ -264,32 +225,43 @@ async function interactiveAnswers(
     out.write(`  ✗ valid runtimes: ${RUNTIME_IDS.join(', ')}\n`);
   }
 
+  const modelDefault = prior?.models.default === '' ? 'default' : prior?.models.default ?? 'default';
   const model =
     (await ask(
       rl,
-      '\nModel reference — Enter = the runtime\'s own configured model ("default")\n  [default]: ',
-    )) || 'default';
+      `\nModel reference — Enter = the runtime's own configured model ("default")\n  [${modelDefault}]: `,
+    )) || modelDefault;
+  const thinkingDefault =
+    prior?.thinking.default === '' ? 'default' : prior?.thinking.default ?? 'default';
   const thinkingLevel =
     (await ask(
       rl,
-      "\nThinking level — Enter = the runtime's own (\"default\")\n  [default]: ",
-    )) || 'default';
+      `\nThinking level — Enter = the runtime's own ("default")\n  [${thinkingDefault}]: `,
+    )) || thinkingDefault;
 
-  let host = '127.0.0.1';
+  // Bind-host input (user-found bug): "yes" passed the old syntax-only
+  // check and the config later died with getaddrinfo ENOTFOUND yes. The
+  // prompt now demands an ADDRESS, and every entry must be an IP literal
+  // or a resolvable hostname — y/n-style tokens are rejected and the
+  // wizard re-prompts. 0.0.0.0 (all interfaces) stays a valid answer.
+  let host = prior?.server.host ?? '127.0.0.1';
   for (;;) {
-    const answer = await ask(rl, '\nBind host — your LAN address to pair a phone [127.0.0.1]: ');
-    host = answer === '' ? '127.0.0.1' : answer;
+    const answer = await ask(
+      rl,
+      `\nBind host (IP address, e.g. 192.168.1.23 — Enter = ${host} loopback-only) [${host}]: `,
+    );
+    const candidate = answer === '' ? host : answer;
     try {
-      validateHost(host);
+      host = await resolveBindHost(candidate);
       break;
     } catch (error) {
       out.write(`  ✗ ${(error as Error).message}\n`);
     }
   }
 
-  let port = 7665;
+  let port = prior?.server.port ?? 7665;
   for (;;) {
-    const answer = await ask(rl, 'Bind port (0 = ephemeral) [7665]: ');
+    const answer = await ask(rl, `Bind port (0 = ephemeral) [${port}]: `);
     if (answer === '') break;
     const parsed = Number(answer);
     if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 65535) {
@@ -300,37 +272,9 @@ async function interactiveAnswers(
   }
 
   const generated = generateToken();
-  const tokenAnswer = await ask(rl, `\nPairing token [${generated}]: `);
-  const token = tokenAnswer === '' ? generated : tokenAnswer;
-
-  const jevEnabled = yn(await ask(rl, '\nEnable optional Jev decisions provider? [y/N]: '));
-  let persistEnvCredential = false;
-  let requestLocalCredential = false;
-  if (jevEnabled) {
-    let status: JevStatus;
-    try {
-      status = readJevStatus({ repoRoot, instanceDir, cliPath: decisionsCliPath });
-      out.write(
-        `Jev credential status: ${status.credential_present ? 'present' : 'absent'} ` +
-          `(${status.credential_source}).\n`,
-      );
-    } catch (error) {
-      out.write(`Jev offline status unavailable: ${(error as Error).message}\n`);
-      status = { enabled: false, credential_present: false, credential_source: 'none' };
-    }
-    if (status.credential_source === 'environment') {
-      out.write(
-        'Environment-only credentials may disappear when launchd/systemd starts the service.\n',
-      );
-      persistEnvCredential = yn(
-        await ask(rl, 'Persist the environment key to the protected instance store? [y/N]: '),
-      );
-    } else if (!status.credential_present) {
-      requestLocalCredential = yn(
-        await ask(rl, 'Enter and persist an OpenRouter key locally (masked)? [y/N]: '),
-      );
-    }
-  }
+  const tokenDefault = prior?.auth.token !== undefined && prior.auth.token !== '' ? prior.auth.token : generated;
+  const tokenAnswer = await ask(rl, `\nPairing token [${tokenDefault}]: `);
+  const token = tokenAnswer === '' ? tokenDefault : tokenAnswer;
 
   const registerService = yn(
     await ask(rl, '\nRegister the OS service (launchd/systemd, starts at login)? [y/N]: '),
@@ -340,9 +284,6 @@ async function interactiveAnswers(
   const smoke = smokeAnswer !== 'n' && smokeAnswer !== 'no';
   rl.close();
 
-  const localJevCredential = requestLocalCredential
-    ? await askMasked(terminal, 'OpenRouter key (input hidden): ')
-    : null;
   const answers = parseAnswers(
     JSON.stringify({
       workspace_root: workspaceRoot,
@@ -354,13 +295,11 @@ async function interactiveAnswers(
       host,
       port,
       token,
-      jev_enabled: jevEnabled,
-      persist_env_credential: persistEnvCredential,
       register_service: registerService,
       smoke,
     }),
   );
-  return { answers, localJevCredential };
+  return answers;
 }
 
 // ---------------------------------------------------------------------------
@@ -477,9 +416,6 @@ export async function runFirstBootSmoke(options: {
     ...process.env,
     GRU_COMMAND_HOME: options.instanceDir,
   };
-  // Never leak the shell credential to a service child. Smoke must prove
-  // restart-safe instance-store resolution or deterministic fallback.
-  delete childEnv.OPENROUTER_API_KEY;
   const child = spawn(process.execPath, [distMain], {
     env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -603,45 +539,63 @@ async function main(argv: readonly string[]): Promise<number> {
   if (!isAbsolute(instanceDir)) fail(`instance dir must be absolute: ${instanceDir}`);
 
   const repoRoot = repoRootFrom(import.meta.url);
-  const decisionsCliPath = process.env.GRU_COMMAND_TEST_DECISIONS_CLI;
   stdout.write('Gru Command setup wizard\n=========================');
   const probe = probeRuntimes();
   printProbe(probe);
 
+  // Round-trip: load + schema-validate any existing config FIRST. A
+  // malformed config fails loud here — a re-run never silently drops or
+  // misreads user configuration.
+  let prior: ReturnType<typeof loadExistingInstanceConfig> = null;
+  try {
+    prior = loadExistingInstanceConfig(instanceDir);
+  } catch (error) {
+    fail(
+      `existing config cannot be re-read — fix or remove it before re-running:\n  ${(error as Error).message}`,
+    );
+  }
+
   let answers: WizardAnswers;
-  let localJevCredential: string | null = null;
   let terminal: WizardTerminal | null = null;
   if (noInteract) {
+    let rawKeys: ReadonlySet<string> = new Set();
     try {
-      answers = parseAnswers(answersJson ?? '{}');
+      // Key names only (for round-trip seeding precedence); parseAnswers
+      // owns validation and its documented errors. Guard the plain-object
+      // shape so 'null'/arrays/string JSON cannot crash with a raw
+      // TypeError before parseAnswers speaks.
+      const parsed: unknown = JSON.parse(answersJson ?? '{}');
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        rawKeys = new Set(Object.keys(parsed as Record<string, unknown>));
+      }
+      // Secrets never belong on the command line (documented contract):
+      // the wizard generates or preserves the pairing token itself.
+      if (rawKeys.has('token')) {
+        fail('secrets are forbidden in --answers: token — the wizard generates or preserves the pairing token', 1);
+      }
+      answers = seedAnswersFromConfig(parseAnswers(answersJson ?? '{}'), prior, rawKeys);
     } catch (error) {
       if (error instanceof AnswersError) fail(String(error.message), 1);
       throw error;
     }
+    // Bind-host acceptance applies on the non-interactive path too: an
+    // unresolvable hostname would write a config that dies at boot.
+    try {
+      await resolveBindHost(answers.host);
+    } catch (error) {
+      fail(String((error as Error).message));
+    }
     stdout.write('\nNon-interactive mode (unspecified answers = documented defaults).\n');
   } else {
     terminal = openWizardTerminal(repoRoot);
-    const plan = await interactiveAnswers(
-      probe,
-      repoRoot,
-      instanceDir,
-      terminal,
-      decisionsCliPath,
-    );
-    answers = plan.answers;
-    localJevCredential = plan.localJevCredential;
+    answers = await interactiveAnswers(probe, terminal, prior);
   }
 
   const configPath = configPathFor(instanceDir);
   if (existsSync(configPath) && !force) {
     fail(`refusing to overwrite existing ${configPath} without --force`);
   }
-  const configText = generateConfigToml({
-    answers,
-    instanceDir,
-    repoRoot,
-    decisionsCliPath,
-  });
+  const configText = generateConfigToml({ answers, instanceDir, prior });
 
   stdout.write(
     `\nSelected repos for BMAD onboarding: ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none)'}\n`,
@@ -706,57 +660,9 @@ async function main(argv: readonly string[]): Promise<number> {
     }
   }
 
-  // Validate and persist an explicitly approved key before replacing any
-  // config. The Jev child receives the value only on stdin.
-  if (answers.jevEnabled && answers.persistEnvCredential) {
-    const key = process.env.OPENROUTER_API_KEY;
-    if (key === undefined || key.trim() === '') {
-      fail(
-        'Jev environment persistence was approved, but OPENROUTER_API_KEY is unavailable; ' +
-          'config was not written',
-      );
-    }
-    persistJevCredential({ repoRoot, instanceDir, cliPath: decisionsCliPath }, key);
-    stdout.write('Jev credential persisted to the protected instance store (value not displayed).\n');
-  } else if (answers.jevEnabled && localJevCredential !== null) {
-    persistJevCredential(
-      { repoRoot, instanceDir, cliPath: decisionsCliPath },
-      localJevCredential,
-    );
-    localJevCredential = null;
-    stdout.write('Jev credential persisted to the protected instance store (value not displayed).\n');
-  }
-
   const write = writeConfigText(instanceDir, configText, { force });
   stdout.write(`\nWrote ${write.configPath}\n`);
   if (write.backupPath !== null) stdout.write(`Previous config backed up: ${write.backupPath}\n`);
-
-  if (answers.jevEnabled) {
-    try {
-      const status = readJevStatus({ repoRoot, instanceDir, cliPath: decisionsCliPath });
-      if (status.credential_source === 'environment' && !answers.persistEnvCredential) {
-        stdout.write(
-          'WARNING: Jev is using an environment-only key; an OS service restart may not receive it.\n',
-        );
-      }
-      const check = checkJev({ repoRoot, instanceDir, cliPath: decisionsCliPath });
-      if (check.status === 'ready') {
-        stdout.write('Jev readiness: ready.\n');
-      } else {
-        stdout.write(
-          `Jev readiness: degraded (${check.reason ?? 'unknown'}). ` +
-            'Gru Command remains usable with deterministic fallback.\n' +
-            'Correct it, then run: node dist/decisions/cli.js check --json\n',
-        );
-      }
-    } catch {
-      stdout.write(
-        'Jev readiness: degraded (local CLI unavailable or malformed). ' +
-          'Gru Command remains usable with deterministic fallback.\n' +
-          'Correct it, then run: node dist/decisions/cli.js check --json\n',
-      );
-    }
-  }
 
   let smokePort: number | null = null;
   if (answers.smoke) {
@@ -807,10 +713,7 @@ async function main(argv: readonly string[]): Promise<number> {
 
   if (answers.registerService) {
     stdout.write('\nRegistering the OS service (install.sh --service)…\n');
-    const serviceEnv = { ...process.env };
-    delete serviceEnv.OPENROUTER_API_KEY;
     const result = spawnSync('bash', [join(repoRoot, 'install.sh'), '--service'], {
-      env: serviceEnv,
       stdio: 'inherit',
     });
     if (result.status !== 0) {

@@ -7,21 +7,17 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig, configPathFor } from '../src/config.js';
 import { probeRuntimes } from '../src/runtime/probe.js';
 import { formatHostForUrl, runFirstBootSmoke } from '../src/wizard/main.js';
-import { writeDecisionsCliFixture } from './helpers/decisions-cli.js';
-import {
-  AnswersError,
-  generateToken,
-  parseAnswers,
-  validateWorkspaceRoot,
-} from '../src/wizard/answers.js';
+import { AnswersError, generateToken, parseAnswers, resolveBindHost, validateHost, validateWorkspaceRoot } from '../src/wizard/answers.js';
 import {
   backupTimestamp,
   buildQrPayload,
   discoverManagedRepos,
   generateConfigToml,
+  seedAnswersFromConfig,
   writeConfigText,
   writeInstanceConfig,
 } from '../src/wizard/steps.js';
+import type { GruCommandConfig } from '../src/config.js';
 
 /**
  * Setup wizard units (E9): answers validation (fail-loud, nothing
@@ -30,7 +26,6 @@ import {
  * screen, managed-repo discovery, and no-runtime warn-and-proceed data.
  */
 
-const repoRoot = join(import.meta.dirname, '..');
 const cleanupDirs: string[] = [];
 afterAll(() => {
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
@@ -42,27 +37,18 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
-const decisionsFixtureRoot = tempDir('gru-command-decisions-fixture-');
-const decisionsCliPath = writeDecisionsCliFixture(decisionsFixtureRoot);
-
 function writeWizardConfig(
   instanceDir: string,
   answers = parseAnswers('{}'),
   home?: string,
   force = false,
+  explicitKeys?: ReadonlySet<string>,
 ) {
-  return writeInstanceConfig({
-    instanceDir,
-    answers,
-    repoRoot,
-    home,
-    force,
-    decisionsCliPath,
-  });
+  return writeInstanceConfig({ instanceDir, answers, home, force, explicitKeys });
 }
 
 function generateWizardConfig(instanceDir: string, answers = parseAnswers('{}')): string {
-  return generateConfigToml({ answers, instanceDir, repoRoot, decisionsCliPath });
+  return generateConfigToml({ answers, instanceDir });
 }
 
 describe('wizard answers', () => {
@@ -79,8 +65,6 @@ describe('wizard answers', () => {
     expect(answers.token).not.toBe('');
     expect(answers.registerService).toBe(false);
     expect(answers.smoke).toBe(true);
-    expect(answers.jevEnabled).toBe(false);
-    expect(answers.persistEnvCredential).toBe(false);
     expect(answers.bmad).toEqual({});
   });
 
@@ -101,8 +85,6 @@ describe('wizard answers', () => {
       ['{"host":"1:2"}', /answers.host is not a valid IPv6/],
       ['{"host":"::ffff:999.1.1.1"}', /answers.host is not a valid IPv6/],
       ['{"token":""}', /answers.token must not be empty/],
-      ['{"persist_env_credential":true}', /requires answers.jev_enabled=true/],
-      ['{"openrouter_api_key":"secret"}', /unknown answers key `openrouter_api_key`/],
       ['{"frobnicate":1}', /unknown answers key `frobnicate`/],
       ['not json', /--answers is not valid JSON/],
     ];
@@ -239,13 +221,19 @@ describe('wizard config generation', () => {
     const w1 = writeWizardConfig(instanceDir, first, home);
     expect(w1.backupPath).toBeNull();
     expect(() => writeWizardConfig(instanceDir, second, home)).toThrow(/without --force/);
-    const w2 = writeWizardConfig(instanceDir, second, home, true);
+    // Explicit answers ride with their raw JSON key names — an explicit
+    // token always wins over the prior config.
+    const w2 = writeWizardConfig(instanceDir, second, home, true, new Set(['token']));
     expect(w2.backupPath).not.toBeNull();
     // Millisecond precision (Perkins r2 note): same-second reruns must
     // not clobber — the name carries ms.
     expect(w2.backupPath).toMatch(/config\.toml\.backup-\d{8}T\d{6}\d{3}Z$/);
     expect(readFileSync(w2.backupPath!, 'utf-8')).toContain('first-token');
     expect(readFileSync(w2.configPath, 'utf-8')).toContain('second-token');
+    // Round-trip guarantee: a LATER re-run without explicit keys keeps the
+    // operator's token instead of silently regenerating it.
+    const w3 = writeWizardConfig(instanceDir, parseAnswers('{}'), home, true);
+    expect(readFileSync(w3.configPath, 'utf-8')).toContain('second-token');
     // The backup timestamp is filesystem-safe (no colons).
     expect(backupTimestamp()).not.toContain(':');
   });
@@ -288,7 +276,6 @@ describe('wizard config generation', () => {
     expect(text).toContain('[chat]');
     expect(text).toContain('[worktrees]');
     expect(text).toContain('[dispatch]');
-    expect(text).toContain('[decisions.jev]');
     // The vacuous version loaded an EMPTY instance dir (pure defaults);
     // the real check writes the generated text and loads THAT file —
     // loadConfig throws on unknown keys, so passing IS the assertion.
@@ -369,6 +356,75 @@ describe('wizard CLI surface', () => {
     }
   });
 
+  it('bind-host y/n tokens are rejected — they once booted a config into getaddrinfo ENOTFOUND yes', () => {
+    for (const bad of ['y', 'Y', 'yes', 'YES', 'n', 'N', 'no', 'No']) {
+      expect(() => validateHost(bad), bad).toThrow(/is not a bind host — enter an IP address/);
+      expect(() => parseAnswers(JSON.stringify({ host: bad })), bad).toThrow(/is not a bind host/);
+    }
+    // The 0.0.0.0 all-interfaces answer stays valid (the health smoke
+    // maps it to 127.0.0.1 for polling).
+    expect(parseAnswers(JSON.stringify({ host: '0.0.0.0' })).host).toBe('0.0.0.0');
+  });
+
+  it('resolveBindHost: IP literals skip the resolver; hostnames must resolve; failures name the fix', async () => {
+    let lookups = 0;
+    const lookup = async (): Promise<void> => {
+      lookups += 1;
+    };
+    for (const literal of ['127.0.0.1', '192.168.1.23', '0.0.0.0']) {
+      expect(await resolveBindHost(literal, lookup), literal).toBe(literal);
+    }
+    expect(lookups).toBe(0); // IP literals never touch the resolver
+    expect(await resolveBindHost('gru-host.test', lookup)).toBe('gru-host.test');
+    expect(lookups).toBe(1); // a hostname IS resolved before acceptance
+
+    const refusing = async (): Promise<void> => {
+      throw new Error('NXDOMAIN');
+    };
+    await expect(resolveBindHost('nope.invalid', refusing)).rejects.toThrow(
+      /bind host "nope\.invalid" does not resolve.*enter an IP address/s,
+    );
+    const pending = (): Promise<void> => new Promise(() => {});
+    await expect(resolveBindHost('slow.invalid', pending, 20)).rejects.toThrow(/timed out/);
+    await expect(resolveBindHost('yes', lookup)).rejects.toThrow(/is not a bind host/);
+  });
+
+  it('re-run seeding: existing config values become the prompt defaults; explicit answers win', () => {
+    const prior = {
+      workspaceRoot: '/tmp/some-workspace',
+      server: { host: '192.168.1.5', port: 7700 },
+      auth: { token: 'prior-token' },
+      runtimes: { default: 'claude-code' },
+      models: { default: 'zai-coding-cn/glm-5.3' },
+      thinking: { default: 'high' },
+    } as unknown as GruCommandConfig;
+
+    // '{}' — nothing explicit: every prompted field adopts the prior value.
+    const seeded = seedAnswersFromConfig(parseAnswers('{}'), prior);
+    expect(seeded.workspaceRoot).toBe('/tmp/some-workspace');
+    expect(seeded.runtime).toBe('claude-code');
+    expect(seeded.model).toBe('zai-coding-cn/glm-5.3');
+    expect(seeded.thinkingLevel).toBe('high');
+    expect(seeded.host).toBe('192.168.1.5');
+    expect(seeded.port).toBe(7700);
+    expect(seeded.token).toBe('prior-token'); // never silently regenerated
+
+    // Explicit answers always win — including resetting a field to the
+    // documented default (the raw key marks intent).
+    const reset = seedAnswersFromConfig(
+      parseAnswers(JSON.stringify({ host: '127.0.0.1', token: 'fresh-token' })),
+      prior,
+      new Set(['host', 'token']),
+    );
+    expect(reset.host).toBe('127.0.0.1');
+    expect(reset.token).toBe('fresh-token');
+    expect(reset.port).toBe(7700); // not explicit → prior
+
+    // No prior config → answers pass through untouched.
+    const fresh = parseAnswers('{}');
+    expect(seedAnswersFromConfig(fresh, null)).toBe(fresh);
+  });
+
   it('--answers without a JSON argument exits 2 with usage', () => {
     const repoRoot = join(import.meta.dirname, '..');
     let status = 0;
@@ -382,6 +438,36 @@ describe('wizard CLI surface', () => {
       status = (error as { status?: number }).status ?? 1;
     }
     expect(status).toBe(2);
+  });
+
+  it('--answers rejects secrets (token) and non-object JSON with the documented errors', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const wizard = join(repoRoot, 'dist/wizard/main.js');
+    const runWizard = (answers: string): { status: number; stderr: string } => {
+      try {
+        const out = execFileSync('bash', ['-c', `node ${JSON.stringify(wizard)} --answers ${JSON.stringify(answers)}`], {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: { ...process.env, GRU_COMMAND_HOME: tempDir('gru-command-wizard-answers-') },
+        });
+        return { status: 0, stderr: out };
+      } catch (error) {
+        const err = error as { status?: number; stderr?: string | Buffer };
+        return { status: err.status ?? 1, stderr: String(err.stderr ?? '') };
+      }
+    };
+    // Secrets are forbidden on the command line (documented contract).
+    const secret = runWizard('{"token":"leaky"}');
+    expect(secret.status).toBe(1);
+    expect(secret.stderr).toContain('secrets are forbidden in --answers: token');
+    // Non-object JSON must produce the documented parse error — never a
+    // raw TypeError from the round-trip key pre-parse (Perkins R1 warning).
+    for (const bad of ['null', '[1,2]', '"str"']) {
+      const res = runWizard(bad);
+      expect(res.status, bad).toBe(1);
+      expect(res.stderr, bad).toMatch(/must be a JSON object|not valid JSON/);
+      expect(res.stderr, bad).not.toContain('TypeError');
+    }
   });
 
   it('pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)', async () => {
@@ -398,13 +484,12 @@ describe('wizard CLI surface', () => {
         [
           join(repoRoot2, 'dist', 'wizard', 'main.js'),
           '--answers',
-          JSON.stringify({ port: heldPort, smoke: false, token: 'h2-token' }),
+          JSON.stringify({ port: heldPort, smoke: false }),
         ],
         {
           env: {
             ...process.env,
             GRU_COMMAND_HOME: instance,
-            GRU_COMMAND_TEST_DECISIONS_CLI: decisionsCliPath,
           },
           stdio: ['ignore', 'pipe', 'pipe'],
           timeout: 30_000,
@@ -459,35 +544,6 @@ describe('wizard first-boot smoke — failure modes (I/O matrix)', () => {
         token: 'wizard-test-token',
       }),
     ).rejects.toThrow(/health_reachable.*never came|never came.*health_reachable/);
-  });
-
-  it('scrubs OPENROUTER_API_KEY from the smoke child environment', async () => {
-    const stage = tempDir('gru-command-smoke-scrub-');
-    const marker = join(stage, 'child-env.txt');
-    mkdirSync(join(stage, 'dist'), { recursive: true });
-    writeFileSync(
-      join(stage, 'dist', 'main.js'),
-      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, process.env.OPENROUTER_API_KEY ? 'present' : 'absent'); process.exit(4);`,
-      'utf-8',
-    );
-    const previous = process.env.OPENROUTER_API_KEY;
-    process.env.OPENROUTER_API_KEY = 'parent-only-secret';
-    try {
-      await expect(
-        runFirstBootSmoke({
-          repoRoot: stage,
-          instanceDir: tempDir('gru-command-smoke-scrub-home-'),
-          host: '127.0.0.1',
-          port: 0,
-          timeoutMs: 5_000,
-          token: 'wizard-test-token',
-        }),
-      ).rejects.toThrow(/exit code 4/);
-      expect(readFileSync(marker, 'utf-8')).toBe('absent');
-    } finally {
-      if (previous === undefined) delete process.env.OPENROUTER_API_KEY;
-      else process.env.OPENROUTER_API_KEY = previous;
-    }
   });
 
   it('a service that exits before listening fails loud naming the exit', async () => {

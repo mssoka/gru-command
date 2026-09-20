@@ -382,15 +382,10 @@ bob = { thinking_level = "medium" }
 });
 
 describe('docs/example.config.toml', () => {
-  it('parses and validates the generic portion through the loader (docs drift guard)', () => {
+  it('parses and validates through the loader (docs drift guard)', () => {
     const example = readFileSync(join(import.meta.dirname, '..', 'docs', 'example.config.toml'), 'utf-8');
-    // The decisions table is sibling-owned and is validated in the real Jev
-    // combined-head rehearsal; this lane's current loader does not own it.
-    const decisionsOffset = example.indexOf('\n[decisions.');
-    expect(decisionsOffset).toBeGreaterThan(0);
-    const generic = example.slice(0, decisionsOffset) + '\n';
     const home = tmpHome();
-    writeConfig(home, generic);
+    writeConfig(home, example);
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     expect(config.runtimes.default).toBe('pi');
     expect(config.models.default).toBe('default');

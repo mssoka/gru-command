@@ -33,10 +33,6 @@ export interface WizardAnswers {
   readonly token: string;
   readonly registerService: boolean;
   readonly smoke: boolean;
-  /** Jev remains opt-in; provider credentials are never valid answer fields. */
-  readonly jevEnabled: boolean;
-  /** Explicit consent to persist OPENROUTER_API_KEY through child stdin. */
-  readonly persistEnvCredential: boolean;
   /** Per-selected-repo BMAD action. Fresh defaults to install; existing to reuse. */
   readonly bmad: Readonly<Record<string, BmadRepoAction>>;
 }
@@ -61,8 +57,6 @@ const ANSWER_KEYS = [
   'token',
   'register_service',
   'smoke',
-  'jev_enabled',
-  'persist_env_credential',
   'bmad',
 ] as const;
 
@@ -141,9 +135,21 @@ export function isIpv6Literal(value: string): boolean {
   return groups === 8; // full form
 }
 
+/** Tokens that answer YES/NO questions are never valid bind hosts — the
+ * wizard must re-prompt instead of writing a config that dies at boot
+ * with getaddrinfo ENOTFOUND yes (user-found bind-host input bug). */
+const YN_TOKEN_RE = /^(?:y|yes|n|no)\.?$/i;
+
 /** Bind-host validation: an IPv4/IPv6 literal or a plausible hostname —
- * anything else ("not a host!") would write a config that dies at boot. */
+ * anything else ("not a host!", "yes", "n") would write a config that
+ * dies at boot. Syntax only; resolvability is checked separately by
+ * {@link resolveBindHost}. */
 export function validateHost(value: string): string {
+  if (YN_TOKEN_RE.test(value)) {
+    throw new AnswersError(
+      `'${value}' is not a bind host — enter an IP address (e.g. 192.168.1.23 or 127.0.0.1) or a resolvable hostname`,
+    );
+  }
   const ipv4 = IPV4_RE.exec(value);
   if (ipv4 !== null) {
     const octetsOk = ipv4.slice(1).every((octet) => Number(octet) <= 255);
@@ -158,6 +164,43 @@ export function validateHost(value: string): string {
   throw new AnswersError(
     `answers.host must be an IPv4/IPv6 literal or a hostname, got: ${value}`,
   );
+}
+
+/** Async host lookup seam (tests inject; production uses dns.promises). */
+export type HostLookup = (host: string) => Promise<void>;
+
+async function defaultLookup(host: string): Promise<void> {
+  const { lookup } = await import('node:dns/promises');
+  await lookup(host);
+}
+
+/**
+ * Full bind-host acceptance for the interactive prompt and the
+ * non-interactive path: syntactically valid (IP literal or hostname,
+ * never a y/n token) AND — for hostnames — actually resolvable.
+ * IP literals (127.0.0.1, 192.168.x.x, 0.0.0.0) need no lookup.
+ */
+export async function resolveBindHost(
+  value: string,
+  lookup: HostLookup = defaultLookup,
+  timeoutMs = 5_000,
+): Promise<string> {
+  const host = validateHost(value);
+  if (IPV4_RE.test(host) || host.includes(':')) return host; // IP literal
+  try {
+    await Promise.race([
+      lookup(host),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs),
+      ),
+    ]);
+  } catch (error) {
+    const detail = (error as Error).message || 'name or service not known';
+    throw new AnswersError(
+      `bind host "${host}" does not resolve (${detail}) — enter an IP address (e.g. 192.168.1.23) or a resolvable hostname`,
+    );
+  }
+  return host;
 }
 
 /**
@@ -277,8 +320,6 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
   for (const [field, value] of [
     ['register_service', raw['register_service']],
     ['smoke', raw['smoke']],
-    ['jev_enabled', raw['jev_enabled']],
-    ['persist_env_credential', raw['persist_env_credential']],
   ] as const) {
     if (value !== undefined && typeof value !== 'boolean') {
       throw new AnswersError(`answers.${field} must be a boolean, got ${typeof value}`);
@@ -309,12 +350,6 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     }
   }
 
-  const jevEnabled = raw['jev_enabled'] === true;
-  const persistEnvCredential = raw['persist_env_credential'] === true;
-  if (persistEnvCredential && !jevEnabled) {
-    throw new AnswersError('answers.persist_env_credential requires answers.jev_enabled=true');
-  }
-
   return {
     workspaceRoot,
     repos,
@@ -327,8 +362,6 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     token,
     registerService: raw['register_service'] === true,
     smoke: raw['smoke'] !== false,
-    jevEnabled,
-    persistEnvCredential,
     bmad,
   };
 }

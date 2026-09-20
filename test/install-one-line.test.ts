@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -75,7 +75,16 @@ function buildFixtureRepo(): { fixture: string; home: string } {
   mkdirSync(join(fixture, 'tools'), { recursive: true });
   writeFileSync(
     join(fixture, 'tools', 'verify-perkins-resource.mjs'),
-    '// fixture product-owned install-relative verifier\n',
+    [
+      "import { appendFileSync, existsSync, realpathSync } from 'node:fs';",
+      "import { join } from 'node:path';",
+      "const root = realpathSync(process.argv[2] ?? '');",
+      "for (const path of ['resources/perkins-code-review/policy.json', 'dist/runtime/review-mcp-server.mjs']) {",
+      "  if (!existsSync(join(root, path))) throw new Error('missing Perkins fixture asset: ' + path);",
+      "}",
+      "if (process.env.GRU_PERKINS_VERIFY_LOG) appendFileSync(process.env.GRU_PERKINS_VERIFY_LOG, root + '\\n');",
+      '',
+    ].join('\n'),
     'utf-8',
   );
   writeFileSync(join(fixture, '.gitignore'), 'node_modules/\ndist/\npackage-lock.json\n', 'utf-8');
@@ -98,14 +107,13 @@ function buildFixtureRepo(): { fixture: string; home: string } {
   writeFileSync(
     join(fixture, 'make-dist.mjs'),
     [
-      "import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';",
-      "if (process.env.GRU_CHILD_ENV_LOG) appendFileSync(process.env.GRU_CHILD_ENV_LOG, process.env.OPENROUTER_API_KEY ? 'present\\n' : 'absent\\n');",
+      "import { mkdirSync, writeFileSync } from 'node:fs';",
       'mkdirSync("dist/wizard", { recursive: true });',
       'mkdirSync("dist/cli", { recursive: true });',
-      'mkdirSync("dist/decisions", { recursive: true });',
+      'mkdirSync("dist/runtime", { recursive: true });',
       'writeFileSync("dist/main.js", "// fixture service stub\\n");',
       'writeFileSync("dist/cli/config-generate.js", "// fixture config CLI stub\\n");',
-      'writeFileSync("dist/decisions/cli.js", "// fixture decisions CLI stub\\n");',
+      'if (process.env.GRU_FIXTURE_OMIT_MCP !== "1") writeFileSync("dist/runtime/review-mcp-server.mjs", "// fixture scoped review MCP bridge\\n");',
       // The fixture wizard stub: records that it ran + the answers it got,
       // into the instance dir — the real wizard is covered by the
       // rehearsal + wizard tests.
@@ -177,7 +185,7 @@ describe('install.sh setup mode (one-line path)', () => {
     const bare = tempDir('gru-command-bare-');
     copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
     const target = join(home, 'gru-command');
-    const childEnvLog = join(home, 'child-env.log');
+    const verifyLog = join(home, 'perkins-verify.log');
 
     const { stdout, status } = run(
       join(bare, 'install.sh'),
@@ -187,8 +195,7 @@ describe('install.sh setup mode (one-line path)', () => {
         GRU_COMMAND_HOME: join(home, '.gru-command'),
         GRU_COMMAND_ORIGIN: `file://${fixture}`,
         GRU_COMMAND_TARGET: target,
-        GRU_CHILD_ENV_LOG: childEnvLog,
-        OPENROUTER_API_KEY: 'must-not-reach-installer-children',
+        GRU_PERKINS_VERIFY_LOG: verifyLog,
       },
     );
     expect(status, stdout).toBe(0);
@@ -206,7 +213,26 @@ describe('install.sh setup mode (one-line path)', () => {
     const config = join(home, '.gru-command', 'config.toml');
     expect(existsSync(config)).toBe(true);
     expect(stdout).toContain('WIZARD-RAN');
-    expect(readFileSync(childEnvLog, 'utf-8').split('\n').filter(Boolean)).not.toContain('present');
+    expect(stdout).toContain('verifying installed Perkins resources');
+    expect(readFileSync(verifyLog, 'utf-8').trim()).toBe(realpathSync(target));
+  });
+
+  it('fails closed before setup when the built Perkins MCP bridge is missing', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const bare = tempDir('gru-command-missing-mcp-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const instance = join(home, '.gru-command');
+    const result = run(join(bare, 'install.sh'), ['--no-interact'], {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_ORIGIN: `file://${fixture}`,
+      GRU_COMMAND_TARGET: join(home, 'gru-command'),
+      GRU_FIXTURE_OMIT_MCP: '1',
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('build did not produce dist/runtime/review-mcp-server.mjs');
+    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
   });
 
   it('a newly recreated clone preserves a retained instance config instead of rerunning setup', () => {

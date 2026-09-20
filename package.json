@@ -36,6 +36,7 @@
     "mock": "npm run mock -w web",
     "wizard": "node dist/wizard/main.js",
     "config:generate": "node dist/cli/config-generate.js",
+    "config:docs": "node scripts/render-config-doc.mjs",
     "start": "node dist/main.js"
   },
   "dependencies": {

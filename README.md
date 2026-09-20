@@ -69,10 +69,10 @@ cd gru-command
 ./install.sh            # deps + build, then the wizard
 ```
 
-Explicit non-interactive defaults (the JSON is optional; provider credentials
-are rejected and must never be placed in it). Omit `token` to generate the
-pairing token privately in-process; an explicitly supplied token is an ordinary
-command-line argument and may be visible to local process inspection:
+Explicit non-interactive defaults (the JSON is optional). Omit `token` to
+generate the pairing token privately in-process; an explicitly supplied token
+is an ordinary command-line argument and may be visible to local process
+inspection:
 
 ```bash
 ./install.sh --no-interact
@@ -90,12 +90,6 @@ npm run config:generate                 # refuses an existing file
 npm run config:generate -- --force      # timestamped 0600 backup first
 ```
 
-The wizard can enable optional Jev decisions (default off). Credential
-status is offline and sanitized; masked local entry is sent only to
-`dist/decisions/cli.js credentials set --stdin`. An environment key is
-never copied without explicit consent, and environment-only use warns
-that launchd/systemd may not inherit it.
-
 ### Project-local BMAD setup
 
 For each selected managed repo—not the workspace root and never every
@@ -105,6 +99,11 @@ four approved defaults: `bmm,cis,tea,gds` (core is implicit), with
 external pins `cis=v0.3.2`, `tea=v1.27.2`, `gds=v0.7.2`. Runtime bindings
 follow the selected `pi`/Claude tools. Existing/customized installs
 default to **reuse unchanged**; per-repo skip is always available.
+The pinned set carries `bmad-review` out of the box, and it is a gate:
+0 blockers means clear to merge, while blockers route back to the
+implementing minion as fix directives—never inform-only. Perkins
+(GitHub/GitLab) remains the stronger gate with exact-head verdicts and
+autonomous-merge authority.
 
 Successful setup records exact versions in
 `.gru-command/bmad-install.json`, adds an idempotent owned bootstrap

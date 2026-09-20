@@ -86,7 +86,13 @@ function tail(text: string, max = 2_000): string {
   return text.length <= max ? text : `…${text.slice(-max)}`;
 }
 
-function commandAvailable(command: string, env: NodeJS.ProcessEnv, cwd: string): boolean {
+/**
+ * The PRODUCTION prerequisite probe (real spawnSync --version). Exported
+ * for the BMAD failure-matrix acceptance: the failure classes must exercise
+ * the real probe, not only the test seam, so deleting either guard fails
+ * the suite.
+ */
+export function commandAvailable(command: string, env: NodeJS.ProcessEnv, cwd: string): boolean {
   const result = spawnSync(command, ['--version'], {
     cwd,
     encoding: 'utf-8',
@@ -569,7 +575,7 @@ import { createHash } from 'node:crypto';
 import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, relative, resolve, isAbsolute } from 'node:path';
-const childEnv = { ...process.env }; delete childEnv.OPENROUTER_API_KEY;
+const childEnv = { ...process.env };
 const root = realpathSync(process.cwd());
 const sourceRaw = execFileSync('git', ['config', '--local', '--get', 'gru-command.bmad-source'], { encoding: 'utf-8', env: childEnv }).trim();
 if (!sourceRaw) throw new Error('missing git-local gru-command.bmad-source; rerun Gru Command BMAD onboarding');
@@ -813,7 +819,6 @@ export function onboardBmadRepo(
     return { repo: repoName, action, ready: false, message: 'skipped by explicit per-repo choice' };
   }
   const env = { ...process.env, ...options.env };
-  delete env.OPENROUTER_API_KEY;
   const tools = bmadToolsForAnswers(options.answers);
   try {
     const repoPath = validateRepo(options.workspaceRoot, repoName, env);
@@ -905,10 +910,4 @@ export function onboardBmadRepo(
       message: String((error as Error).message),
     };
   }
-}
-
-export function onboardSelectedRepos(options: BmadOnboardingOptions): BmadRepoResult[] {
-  return options.answers.repos.map((repo) =>
-    onboardBmadRepo(repo, options.answers.bmad[repo] ?? 'skip', options),
-  );
 }

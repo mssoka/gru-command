@@ -14,8 +14,11 @@ import {
 import { join } from 'node:path';
 import { parse } from 'smol-toml';
 import { homedir } from 'node:os';
-import { expandTilde } from '../config.js';
-import { renderCompleteConfig, tomlString } from '../config-template.js';
+import { configPathFor, expandTilde, type GruCommandConfig, loadConfig } from '../config.js';
+import {
+  renderReferenceConfig,
+  tomlString,
+} from '../config-reference.js';
 import type { WizardAnswers } from './answers.js';
 
 export { tomlString };
@@ -57,15 +60,16 @@ export function discoverManagedRepos(workspaceRoot: string): string[] {
     .sort();
 }
 
-/** Render the same complete configuration used by config-generate. */
+/** Render the same complete configuration used by config-generate. When
+ * `prior` (the previously loaded config) is given, user-set values outside
+ * the wizard's prompts are preserved into the rendered text. */
 export function generateConfigToml(options: {
   readonly answers: WizardAnswers;
   readonly instanceDir: string;
-  readonly repoRoot: string;
-  readonly decisionsCliPath?: string;
+  readonly prior?: GruCommandConfig | null;
 }): string {
   const { answers } = options;
-  return renderCompleteConfig(
+  return renderReferenceConfig(
     {
       instanceDir: options.instanceDir,
       workspaceRoot: answers.workspaceRoot,
@@ -76,9 +80,8 @@ export function generateConfigToml(options: {
       model: answers.model,
       thinkingLevel: answers.thinkingLevel,
       roles: answers.roles,
-      jevEnabled: answers.jevEnabled,
     },
-    { repoRoot: options.repoRoot, cliPath: options.decisionsCliPath },
+    options.prior ?? null,
   );
 }
 
@@ -133,6 +136,8 @@ export function writeConfigText(
   mkdirSync(instanceDir, { recursive: true, mode: 0o700 });
   const configPath = join(instanceDir, 'config.toml');
   let backupPath: string | null = null;
+  /** Identity of the PREVIOUS config — null when none existed (fresh dir),
+   * in which case there is nothing to anti-clobber. */
   let originalIdentity: string | null = null;
   const identity = (): string => {
     const info = statSync(configPath);
@@ -165,8 +170,12 @@ export function writeConfigText(
   const tmpPath = `${configPath}.tmp-${process.pid}`;
   try {
     writeFileSync(tmpPath, text, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
-    if (options.force === true) {
-      if (originalIdentity === null || identity() !== originalIdentity) {
+    if (originalIdentity !== null) {
+      // Anti-clobber applies only when a previous config actually existed:
+      // --force on a FRESH instance dir has nothing to protect and must
+      // simply publish (it used to throw "config changed after backup"
+      // deterministically because the identity was never captured).
+      if (identity() !== originalIdentity) {
         throw new Error(
           `config changed after backup: ${configPath}; refusing to overwrite the newer file`,
         );
@@ -190,21 +199,95 @@ export function writeConfigText(
   return { configPath, backupPath };
 }
 
+/**
+ * Load the existing instance config for a re-run. Returns null when no
+ * config file exists; a present-but-invalid config throws (ConfigError)
+ * so a re-run can never silently drop or misread user configuration.
+ */
+export function loadExistingInstanceConfig(instanceDir: string): GruCommandConfig | null {
+  if (!existsSync(configPathFor(instanceDir))) return null;
+  return loadConfig({ GRU_COMMAND_HOME: instanceDir });
+}
+
+/** Documented prompt defaults — a field still at these values on a re-run
+ * adopts the existing config's value instead (existing values are the
+ * prompt defaults; explicit answers and non-default picks always win). */
+const PROMPT_DEFAULTS = {
+  workspaceRoot: '~/code',
+  runtime: 'pi' as const,
+  model: 'default',
+  thinkingLevel: 'default',
+  host: '127.0.0.1',
+  port: 7665,
+  token: '',
+};
+
+/**
+ * Round-trip seeding: unspecified/at-default prompted fields adopt the
+ * existing config's value, so a re-run keeps the operator's workspace,
+ * bind host/port, runtime, model/thinking, and pairing token unless they
+ * explicitly choose otherwise. `explicit` carries the raw --answers JSON
+ * key names the operator actually provided — an explicit value ALWAYS
+ * wins over the prior config ("token" is checked by name because the
+ * unspecified default is a fresh random generation, not a sentinel).
+ * Sections the wizard never prompts for are preserved separately
+ * (renderReferenceConfig `preserved`).
+ */
+export function seedAnswersFromConfig(
+  answers: WizardAnswers,
+  prior: GruCommandConfig | null,
+  explicit: ReadonlySet<string> = new Set(),
+): WizardAnswers {
+  if (prior === null) return answers;
+  const priorModel = prior.models.default === '' ? 'default' : prior.models.default;
+  const priorThinking = prior.thinking.default === '' ? 'default' : prior.thinking.default;
+  return {
+    ...answers,
+    workspaceRoot:
+      !explicit.has('workspace_root') && answers.workspaceRoot === PROMPT_DEFAULTS.workspaceRoot
+        ? prior.workspaceRoot
+        : answers.workspaceRoot,
+    runtime:
+      !explicit.has('runtime') && answers.runtime === PROMPT_DEFAULTS.runtime
+        ? prior.runtimes.default
+        : answers.runtime,
+    model: !explicit.has('model') && answers.model === PROMPT_DEFAULTS.model ? priorModel : answers.model,
+    thinkingLevel:
+      !explicit.has('thinking_level') && answers.thinkingLevel === PROMPT_DEFAULTS.thinkingLevel
+        ? priorThinking
+        : answers.thinkingLevel,
+    host: !explicit.has('host') && answers.host === PROMPT_DEFAULTS.host ? prior.server.host : answers.host,
+    port: !explicit.has('port') && answers.port === PROMPT_DEFAULTS.port ? prior.server.port : answers.port,
+    token:
+      !explicit.has('token') && prior.auth.token !== '' ? prior.auth.token : answers.token,
+  };
+}
+
+/**
+ * Write the instance config with the backup-first contract. The existing
+ * config (when any) is loaded and schema-validated FIRST — a malformed
+ * config fails loud before anything is written — and its values seed the
+ * answers and ride along as `preserved` so a re-run never silently drops
+ * user-set values or hand-tuned sections.
+ */
 export function writeInstanceConfig(options: {
   readonly instanceDir: string;
   readonly answers: WizardAnswers;
-  readonly repoRoot: string;
   readonly home?: string;
   readonly force?: boolean;
-  readonly decisionsCliPath?: string;
+  readonly prior?: GruCommandConfig | null;
+  /** Raw --answers JSON keys the caller explicitly provided. */
+  readonly explicitKeys?: ReadonlySet<string>;
 }): ConfigWriteResult {
+  const prior = options.prior !== undefined ? options.prior : loadExistingInstanceConfig(options.instanceDir);
+  const seeded = seedAnswersFromConfig(options.answers, prior, options.explicitKeys);
   const home = options.home ?? homedir();
-  const workspaceAbs = expandTilde(options.answers.workspaceRoot, home);
+  const workspaceAbs = expandTilde(seeded.workspaceRoot, home);
   if (!workspaceAbs.startsWith('/')) {
     throw new Error(
-      `workspace_root must resolve to an absolute path, got: ${options.answers.workspaceRoot}`,
+      `workspace_root must resolve to an absolute path, got: ${seeded.workspaceRoot}`,
     );
   }
-  const text = generateConfigToml(options);
+  const text = generateConfigToml({ answers: seeded, instanceDir: options.instanceDir, prior });
   return writeConfigText(options.instanceDir, text, { force: options.force });
 }

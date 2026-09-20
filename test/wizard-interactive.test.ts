@@ -3,7 +3,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { writeDecisionsCliFixture } from './helpers/decisions-cli.js';
 
 /**
  * Interactive wizard under a REAL PTY (Perkins r2 T1): the documented
@@ -25,8 +24,6 @@ function tempDir(prefix: string): string {
   cleanupDirs.push(dir);
   return dir;
 }
-
-const decisionsCliPath = writeDecisionsCliFixture(tempDir('gru-command-pty-decisions-'));
 
 function fixtureWorkspace(): string {
   const workspace = tempDir('gru-command-pty-ws-');
@@ -73,7 +70,6 @@ function ptyWizard(
     out = execFileSync('expect', ['-c', script.join('\n')], {
       env: {
         ...process.env,
-        GRU_COMMAND_TEST_DECISIONS_CLI: decisionsCliPath,
         ...env,
       },
       encoding: 'utf-8',
@@ -104,12 +100,9 @@ const BMAD_B_PROMPT = 'BMAD in repo-b';
 const RUNTIME_PROMPT = 'Default runtime — ';
 const MODEL_PROMPT = 'Model reference';
 const THINKING_PROMPT = 'Thinking level';
-const HOST_PROMPT = 'Bind host';
+const HOST_PROMPT = 'Bind host (IP address, e.g. 192.168.1.23';
 const PORT_PROMPT = 'Bind port';
 const TOKEN_PROMPT = 'Pairing token';
-const JEV_PROMPT = 'Enable optional Jev decisions provider';
-const JEV_LOCAL_PROMPT = 'Enter and persist an OpenRouter key locally';
-const JEV_MASKED_PROMPT = 'OpenRouter key (input hidden)';
 const REGISTER_PROMPT = 'Register the OS service';
 const SMOKE_PROMPT = 'first-boot smoke test now';
 
@@ -133,7 +126,6 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: HOST_PROMPT, send: '' }, // 127.0.0.1
         { expect: PORT_PROMPT, send: '0' }, // ephemeral: smoke-safe on a busy machine
         { expect: TOKEN_PROMPT, send: '' }, // generated
-        { expect: JEV_PROMPT, send: 'n' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: '' }, // yes (default) — real smoke
       ],
@@ -184,7 +176,6 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: HOST_PROMPT, send: '' },
         { expect: PORT_PROMPT, send: '0' },
         { expect: TOKEN_PROMPT, send: '' },
-        { expect: JEV_PROMPT, send: 'n' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: 'n' },
       ],
@@ -197,39 +188,6 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(output).toContain('  repo-a: install');
     expect(output).toContain('BMAD ready in repo-a');
     expect(existsSync(join(workspace, 'repo-a', '.gru-command', 'bmad-install.json'))).toBe(true);
-  }, 120_000);
-
-  it('Jev local credential entry is masked and reaches only the protected child-stdin store', () => {
-    const workspace = fixtureWorkspace();
-    const instance = tempDir('gru-command-pty-jev-');
-    const secret = 'sk-or-v1-masked-fixture';
-    const { output, status } = ptyWizard(
-      [
-        { expect: WS_PROMPT, send: workspace },
-        { expect: REPOS_PROMPT, send: '' },
-        { expect: BMAD_A_PROMPT, send: 'n' },
-        { expect: BMAD_B_PROMPT, send: 'n' },
-        { expect: RUNTIME_PROMPT, send: '' },
-        { expect: MODEL_PROMPT, send: '' },
-        { expect: THINKING_PROMPT, send: '' },
-        { expect: HOST_PROMPT, send: '' },
-        { expect: PORT_PROMPT, send: '0' },
-        { expect: TOKEN_PROMPT, send: '' },
-        { expect: JEV_PROMPT, send: 'y' },
-        { expect: JEV_LOCAL_PROMPT, send: 'y' },
-        { expect: REGISTER_PROMPT, send: 'n' },
-        { expect: SMOKE_PROMPT, send: 'n' },
-        { expect: JEV_MASKED_PROMPT, send: secret },
-      ],
-      { GRU_COMMAND_HOME: instance, JEV_FIXTURE_READY: '1' },
-    );
-    expect(status, output).toBe(0);
-    expect(output).toContain('Jev readiness: ready');
-    expect(output).not.toContain(secret);
-    expect(readFileSync(join(instance, 'credentials', 'openrouter.key'), 'utf-8')).toBe(
-      `${secret}\n`,
-    );
-    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).not.toContain(secret);
   }, 120_000);
 
   it('every prompt loop retries on invalid input, then accepts the valid answer', () => {
@@ -251,7 +209,6 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: PORT_PROMPT, send: '99999' }, // ✗ out of range
         { expect: PORT_PROMPT, send: '0' }, // retried, ephemeral
         { expect: TOKEN_PROMPT, send: '' },
-        { expect: JEV_PROMPT, send: 'n' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: 'n' }, // this leg is about the prompts
       ],
@@ -282,7 +239,6 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: HOST_PROMPT, send: '' },
         { expect: PORT_PROMPT, send: '0' },
         { expect: TOKEN_PROMPT, send: '' },
-        { expect: JEV_PROMPT, send: 'n' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: 'n' },
       ],
@@ -308,7 +264,6 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: HOST_PROMPT, send: '' },
         { expect: PORT_PROMPT, send: '0' },
         { expect: TOKEN_PROMPT, send: '' },
-        { expect: JEV_PROMPT, send: 'n' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: 'n' },
       ],
@@ -318,6 +273,59 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     // The grouping line preserves the ANSWERED order (the discovery list
     // is sorted; the pick is the user's sequence).
     expect(output).toContain('Selected repos for BMAD onboarding: repo-b, repo-a');
+  }, 120_000);
+
+  it('bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config (user-found boot bug)', () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-host-');
+    const { output, status } = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '' },
+        { expect: BMAD_A_PROMPT, send: 'n' },
+        { expect: BMAD_B_PROMPT, send: 'n' },
+        { expect: RUNTIME_PROMPT, send: '' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: 'yes' }, // rejected — re-prompt, never written
+        { expect: HOST_PROMPT, send: 'no' }, // rejected again
+        { expect: HOST_PROMPT, send: '0.0.0.0' }, // valid: all interfaces
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+      ],
+      { GRU_COMMAND_HOME: instance },
+    );
+    expect(status, output).toBe(0);
+    expect(output).toContain('is not a bind host — enter an IP address');
+    const text = readFileSync(join(instance, 'config.toml'), 'utf-8');
+    expect(text).toContain('host = "0.0.0.0"');
+  }, 120_000);
+
+  it('bind host accepts a resolvable hostname (localhost) end-to-end', () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-hostname-');
+    const { output, status } = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '' },
+        { expect: BMAD_A_PROMPT, send: 'n' },
+        { expect: BMAD_B_PROMPT, send: 'n' },
+        { expect: RUNTIME_PROMPT, send: '' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: 'localhost' }, // resolvable → accepted
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+      ],
+      { GRU_COMMAND_HOME: instance },
+    );
+    expect(status, output).toBe(0);
+    const text = readFileSync(join(instance, 'config.toml'), 'utf-8');
+    expect(text).toContain('host = "localhost"');
   }, 120_000);
 });
 

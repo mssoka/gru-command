@@ -46,13 +46,12 @@ LAUNCHCTL_BIN="${GRU_COMMAND_LAUNCHCTL:-launchctl}"
 SYSTEMCTL_BIN="${GRU_COMMAND_SYSTEMCTL:-systemctl}"
 
 err() { echo "install.sh: $*" >&2; }
-# Secrets approved for wizard persistence stay in this trusted shell/wizard;
-# unrelated package, VCS, build, and service-manager children never inherit it.
-run_sanitized() { env -u OPENROUTER_API_KEY "$@"; }
 # The range MUST cover the whole header block through the seam lines
 # (GRU_COMMAND_ORIGIN / GRU_COMMAND_TARGET) — --help shows all of it.
 usage() {
-  sed -n '2,31p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//' >&2
+  # Print the header comment block (everything after the shebang up to the
+  # first line of code) so --help can never drift from the header.
+  awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]:-$0}" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -265,9 +264,9 @@ install_launchd() {
   printf '%s\n' "$rendered" > "$target.r"
   verify_unit "$target.r" "$target"
   # Refresh: unload before overwriting so the new unit takes effect.
-  run_sanitized "$LAUNCHCTL_BIN" unload "$target" >/dev/null 2>&1 || true
+  "$LAUNCHCTL_BIN" unload "$target" >/dev/null 2>&1 || true
   mv "$target.r" "$target"
-  run_sanitized "$LAUNCHCTL_BIN" load "$target"
+  "$LAUNCHCTL_BIN" load "$target"
   echo "installed: $target"
   echo "instance:  $INSTANCE_DIR"
   echo "status:    launchctl list | grep gru-command"
@@ -279,7 +278,7 @@ uninstall_launchd() {
     [[ "$(service_ownership)" == "owned" ]] || {
       err "refusing to uninstall unrelated service unit: $target"; exit 1;
     }
-    run_sanitized "$LAUNCHCTL_BIN" unload "$target" >/dev/null 2>&1 || true
+    "$LAUNCHCTL_BIN" unload "$target" >/dev/null 2>&1 || true
     rm -f "$target"
     echo "uninstalled: $target"
   else
@@ -297,11 +296,11 @@ install_systemd() {
   printf '%s' "$rendered" > "$target.r"
   verify_unit "$target.r" "$target"
   mv "$target.r" "$target"
-  run_sanitized "$SYSTEMCTL_BIN" --user daemon-reload
-  run_sanitized "$SYSTEMCTL_BIN" --user enable gru-command.service
+  "$SYSTEMCTL_BIN" --user daemon-reload
+  "$SYSTEMCTL_BIN" --user enable gru-command.service
   # `enable --now` does not restart an already-active unit. restart starts
   # an inactive fresh unit and guarantees updated code for an active one.
-  run_sanitized "$SYSTEMCTL_BIN" --user restart gru-command.service
+  "$SYSTEMCTL_BIN" --user restart gru-command.service
   echo "installed: $target"
   echo "instance:  $INSTANCE_DIR"
   echo "status:    systemctl --user status gru-command"
@@ -313,9 +312,9 @@ uninstall_systemd() {
     [[ "$(service_ownership)" == "owned" ]] || {
       err "refusing to uninstall unrelated service unit: $target"; exit 1;
     }
-    run_sanitized "$SYSTEMCTL_BIN" --user disable --now gru-command.service >/dev/null 2>&1 || true
+    "$SYSTEMCTL_BIN" --user disable --now gru-command.service >/dev/null 2>&1 || true
     rm -f "$target"
-    run_sanitized "$SYSTEMCTL_BIN" --user daemon-reload
+    "$SYSTEMCTL_BIN" --user daemon-reload
     echo "uninstalled: gru-command.service"
   else
     echo "not installed"
@@ -360,7 +359,7 @@ inside_checkout() {
 
 verify_checkout_origin() {
   local root="$1" configured
-  configured="$(run_sanitized git -C "$root" remote get-url origin 2>/dev/null || true)"
+  configured="$(git -C "$root" remote get-url origin 2>/dev/null || true)"
   if [[ "$configured" != "$CLONE_ORIGIN" ]]; then
     err "refusing to update checkout with unexpected origin: $root"
     err "expected: $CLONE_ORIGIN"
@@ -371,13 +370,13 @@ verify_checkout_origin() {
 
 update_checkout_path() {
   local root="$1"
-  if [[ -n "$(run_sanitized git -C "$root" status --porcelain --untracked-files=normal)" ]]; then
+  if [[ -n "$(git -C "$root" status --porcelain --untracked-files=normal)" ]]; then
     err "refusing to update a dirty checkout: $root"
     err "commit, stash, or remove local changes first; nothing was pulled"
     exit 1
   fi
   echo "updating source with git pull --ff-only…"
-  if ! run_sanitized git -C "$root" pull --ff-only; then
+  if ! git -C "$root" pull --ff-only; then
     err "fast-forward-only update failed; resolve divergence manually (no reset was attempted)"
     exit 1
   fi
@@ -394,22 +393,24 @@ build_product() {
     # Reproducible and non-mutating: `npm install` can rewrite a stale root
     # package version in package-lock.json, making the managed checkout
     # dirty and causing the next safe update to refuse itself.
-    run_sanitized npm ci --no-audit --no-fund
+    npm ci --no-audit --no-fund
   else
-    run_sanitized npm install --no-audit --no-fund
+    npm install --no-audit --no-fund
   fi
   echo "building service and local CLIs…"
-  run_sanitized npm run build
-  if run_sanitized "$NODE_BIN" -e "const p=require('./package.json'); process.exit(p.scripts?.['build:web'] ? 0 : 1)"; then
+  npm run build
+  if "$NODE_BIN" -e "const p=require('./package.json'); process.exit(p.scripts?.['build:web'] ? 0 : 1)"; then
     echo "building web UI…"
-    run_sanitized npm run build:web
+    npm run build:web
   fi
-  for artifact in dist/main.js dist/wizard/main.js dist/cli/config-generate.js dist/decisions/cli.js; do
+  for artifact in dist/main.js dist/wizard/main.js dist/cli/config-generate.js dist/runtime/review-mcp-server.mjs resources/perkins-code-review/policy.json tools/verify-perkins-resource.mjs; do
     if [[ ! -f "$artifact" ]]; then
       err "build did not produce $artifact"
       exit 1
     fi
   done
+  echo "verifying installed Perkins resources…"
+  "$NODE_BIN" tools/verify-perkins-resource.mjs "$REPO_ROOT"
 }
 
 restart_owned_service_if_present() {
@@ -470,7 +471,7 @@ run_setup() {
       fi
     else
       echo "cloning $CLONE_ORIGIN → $CLONE_TARGET"
-      run_sanitized git clone "$CLONE_ORIGIN" "$CLONE_TARGET"
+      git clone "$CLONE_ORIGIN" "$CLONE_TARGET"
       cloned=1
     fi
 
@@ -481,13 +482,11 @@ run_setup() {
     [[ "$ANSWERS_SET" -eq 1 ]] && forward+=(--answers "$ANSWERS")
     if [[ "$UPDATE_REQUESTED" -eq 0 && "$NO_INTERACT" -eq 0 && "$FORCE" -eq 0 && "$ANSWERS_SET" -eq 0 ]]; then
       GRU_COMMAND_REEXEC=1 \
-        GRU_COMMAND_SOURCE_UPDATE=0 \
         GRU_COMMAND_SOURCE_UPDATED="$source_update" \
         GRU_COMMAND_FRESH_CLONE="$cloned" \
         exec bash "$CLONE_TARGET/install.sh"
     fi
     GRU_COMMAND_REEXEC=1 \
-      GRU_COMMAND_SOURCE_UPDATE=0 \
       GRU_COMMAND_SOURCE_UPDATED="$source_update" \
       GRU_COMMAND_FRESH_CLONE="$cloned" \
       exec bash "$CLONE_TARGET/install.sh" "${forward[@]}"
@@ -495,7 +494,7 @@ run_setup() {
 
   command -v git >/dev/null 2>&1 || { err "git not found on PATH — install git first"; exit 1; }
 
-  if [[ "${GRU_COMMAND_SOURCE_UPDATE:-0}" -eq 1 || "$UPDATE_REQUESTED" -eq 1 ]]; then
+  if [[ "$UPDATE_REQUESTED" -eq 1 ]]; then
     source_update=1
     update_checkout
   elif [[ "${GRU_COMMAND_SOURCE_UPDATED:-0}" -eq 1 ]]; then

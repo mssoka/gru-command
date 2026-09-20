@@ -1,24 +1,17 @@
 #!/usr/bin/env node
-import { dirname, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
 import { instanceDirFromEnv } from '../config.js';
 import { parseAnswers } from '../wizard/answers.js';
-import { checkJev } from '../wizard/jev-setup.js';
 import { writeInstanceConfig } from '../wizard/steps.js';
 
-const USAGE = 'usage: node dist/cli/config-generate.js [--force] [--enable-jev]';
-
-function repoRootFrom(importMetaUrl: string): string {
-  return resolve(dirname(fileURLToPath(importMetaUrl)), '..', '..');
-}
+const USAGE = 'usage: node dist/cli/config-generate.js [--force]';
 
 export function runConfigGenerate(argv: readonly string[]): number {
   let force = false;
-  let enableJev = false;
   for (const arg of argv) {
     if (arg === '--force') force = true;
-    else if (arg === '--enable-jev') enableJev = true;
     else if (arg === '-h' || arg === '--help') {
       process.stdout.write(`${USAGE}\n`);
       return 0;
@@ -28,41 +21,14 @@ export function runConfigGenerate(argv: readonly string[]): number {
     }
   }
 
-  const repoRoot = repoRootFrom(import.meta.url);
   const instanceDir = instanceDirFromEnv();
-  const answers = parseAnswers(JSON.stringify({ jev_enabled: enableJev }));
-  const decisionsCliPath = process.env.GRU_COMMAND_TEST_DECISIONS_CLI;
-  const result = writeInstanceConfig({
-    instanceDir,
-    answers,
-    repoRoot,
-    force,
-    decisionsCliPath,
-  });
+  const answers = parseAnswers('{}');
+  const result = writeInstanceConfig({ instanceDir, answers, force });
   process.stdout.write(`Wrote complete configuration: ${result.configPath}\n`);
   if (result.backupPath !== null) {
     process.stdout.write(`Previous configuration backed up: ${result.backupPath}\n`);
   }
 
-  if (enableJev) {
-    try {
-      const check = checkJev({ repoRoot, instanceDir, cliPath: decisionsCliPath });
-      if (check.status === 'ready') {
-        process.stdout.write('Jev readiness: ready\n');
-      } else {
-        process.stderr.write(
-          `config-generate: Jev readiness: degraded (${check.reason ?? 'unknown'}) — ` +
-            'the core service remains usable. Run: node dist/decisions/cli.js check --json\n',
-        );
-      }
-    } catch {
-      process.stderr.write(
-        'config-generate: Jev readiness: degraded (local CLI unavailable or malformed) — ' +
-          'the configuration was written and core service remains usable. ' +
-          'Run: node dist/decisions/cli.js check --json\n',
-      );
-    }
-  }
   return 0;
 }
 
