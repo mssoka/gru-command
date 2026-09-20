@@ -99,6 +99,30 @@ test('pair with the real token, send, streamed echo reply', async ({ page }) => 
   await sendAndWaitReply(page, 'real socket hello');
 });
 
+test('multi-line prompt rides the real socket intact (agent receives the newline)', async ({ page }) => {
+  await pair(page);
+  const line1 = 'first real line';
+  const line2 = 'second real line';
+  const input = page.locator('#chat-input');
+  await input.click();
+  await page.keyboard.type(line1);
+  await page.keyboard.press('Shift+Enter');
+  await page.keyboard.type(line2);
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.msg--user', { hasText: line2 })).toBeVisible();
+  const reply = page.locator('.msg--gru', { hasText: `echo: ${line1}` });
+  await expect(reply).toBeVisible();
+  await expect(reply).not.toHaveClass(/msg--streaming/);
+  // The rendered user bubble keeps the newline (display side).
+  const bubbleText = await page.locator('.msg--user .msg__text').last().textContent();
+  expect(bubbleText).toBe(`${line1}\n${line2}`);
+  // The composer cleared after the successful send.
+  await expect(input).toHaveValue('');
+  // AGENT-SIDE receipt: the double's prompt log carries the EXACT
+  // composer text — the wire never flattened the newline.
+  expect(lastAgentPrompt()?.prompt).toContain(`${line1}\n${line2}`);
+});
+
 test('real native compact preserves history and New chat starts unresumed behind a durable epoch', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'real context control old words');

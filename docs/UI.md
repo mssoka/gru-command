@@ -131,6 +131,17 @@ text/chips. Later storage failure keeps the in-memory queue and surfaces the
 failure, but site-data clearing, browser eviction, or catastrophic storage loss
 can still remove it; this is not server-side message durability.
 
+**Multi-line composer:** the composer is a one-row `<textarea>` that auto-grows
+with content (re-measured on input, window resize, and the mobile/desktop
+reparent) up to a hard `max-height: 10rem` cap — past the cap it scrolls
+internally — and collapses back to one row after send/clear. **Enter sends**;
+**Shift+Enter inserts a newline**; modifier combos (Alt/Ctrl/Cmd+Enter) are
+not sends; key auto-repeat never re-sends; IME composition is respected —
+Enter during composition (`isComposing`, legacy `keyCode` 229) confirms the
+text instead of sending. The composer carries `enterkeyhint="send"` so touch
+keyboards label the key honestly; inserting a newline on a phone (no hardware
+Shift) is a known open question, not a shipped gesture.
+
 ## The composer attach flow (SPEC ruling 19)
 
 The composer carries an attach button (📎) — the ONE flow for bringing

@@ -55,7 +55,8 @@ export class ChatView {
   private readonly bubble = mustGet<HTMLButtonElement>('chat-bubble');
   private readonly badge = mustGet<HTMLElement>('chat-badge');
   private readonly mainMount = mustGet<HTMLElement>('chat-main-mount');
-  private readonly input = mustGet<HTMLInputElement>('chat-input');
+  private readonly form = mustGet<HTMLFormElement>('chat-form');
+  private readonly input = mustGet<HTMLTextAreaElement>('chat-input');
   private readonly chipsRow = mustGet<HTMLElement>('chat-chips');
   private readonly attachButton = mustGet<HTMLButtonElement>('chat-attach');
   private readonly fileInput = mustGet<HTMLInputElement>('chat-attach-file');
@@ -96,7 +97,28 @@ export class ChatView {
       attachments?: readonly AttachmentChip[],
     ) => boolean,
   ) {
-    mustGet<HTMLFormElement>('chat-form').addEventListener('submit', (event) => {
+    // Multi-line composer (textarea): Enter sends, Shift+Enter inserts a
+    // newline. Guards: modifier combos are not sends; key auto-repeat
+    // must not re-submit (a held Enter would stack failed-send notes);
+    // IME composition (CJK/emoji pickers) uses Enter to CONFIRM — never
+    // send while composing (isComposing; keyCode 229 is the legacy
+    // composition code some browsers still emit).
+    this.input.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' || event.shiftKey) return;
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.repeat) return;
+      if (event.isComposing || event.keyCode === 229) return;
+      event.preventDefault();
+      this.form.requestSubmit();
+    });
+    // Auto-grow with content; the CSS max-height is the hard cap (the
+    // textarea scrolls internally past it) and this keeps height honest.
+    this.input.addEventListener('input', () => this.autosize());
+    // Reflow outside of typing (window resize) re-wraps lines — re-measure.
+    window.addEventListener('resize', () => this.autosize());
+    this.autosize();
+
+    this.form.addEventListener('submit', (event) => {
       event.preventDefault();
       const text = this.input.value.trim();
       if (text === '' && this.pending.length === 0) return;
@@ -117,6 +139,7 @@ export class ChatView {
       }
       if (!queued) return; // keep the typed words + chips
       this.input.value = '';
+      this.autosize(); // collapse back to one row after send/clear
       this.clearChips();
       this.closePicker();
     });
@@ -152,11 +175,33 @@ export class ChatView {
         this.mainMount.append(this.panel);
         this.setSheetOpen(false);
       }
+      // New container width reflows lines — re-measure the composer.
+      this.autosize();
     };
     this.mobile.addEventListener('change', place);
     place();
     // Sheet starts closed: inert until first opened.
     this.sheet.toggleAttribute('inert', this.sheet.dataset.open !== 'true');
+  }
+
+  /** Grow the composer to fit its content (one row at rest); the CSS
+   * `max-height` cap clamps it, then the textarea scrolls internally.
+   * An empty composer gets NO inline height: intrinsic rows="1" sizing
+   * is one row, and Chromium folds a WRAPPED placeholder (narrow sheet)
+   * into scrollHeight when collapsed — placeholder must never drive
+   * layout. Non-empty: measure with the height collapsed so scrollHeight
+   * reflects CONTENT. */
+  private autosize(): void {
+    if (this.input.value === '') {
+      this.input.style.removeProperty('height');
+      return;
+    }
+    this.input.style.height = '0';
+    // scrollHeight excludes borders; box-sizing is border-box, so the
+    // explicit height must carry them (offsetHeight − clientHeight at the
+    // collapsed state is exactly the border box).
+    const borders = this.input.offsetHeight - this.input.clientHeight;
+    this.input.style.height = `${this.input.scrollHeight + borders}px`;
   }
 
   // -----------------------------------------------------------------------

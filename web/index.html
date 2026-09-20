@@ -75,8 +75,9 @@
           <div class="chat-compose__row">
             <button class="pp-btn pp-btn--icon chat-attach-btn" type="button" id="chat-attach"
                     title="Attach files" aria-haspopup="dialog" aria-expanded="false">📎</button>
-            <input class="pp-input" id="chat-input" placeholder="Tell Gru what you need, boss…"
-                   autocomplete="off" maxlength="4000" aria-label="Message Gru">
+            <textarea class="pp-input" id="chat-input" rows="1" enterkeyhint="send"
+                      placeholder="Tell Gru what you need, boss…"
+                      autocomplete="off" maxlength="4000" aria-label="Message Gru"></textarea>
             <button class="pp-btn" type="submit" id="chat-send">Send 🚀</button>
           </div>
           <!-- The ONE attach flow (SPEC ruling 19): device files (phone

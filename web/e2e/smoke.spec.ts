@@ -43,6 +43,110 @@ test('pair, send, streamed reply with tool line', async ({ page }) => {
   await expect(page.locator('.tool-line', { hasText: 'mock-echo' })).toBeVisible();
 });
 
+test('multi-line composer: Shift+Enter newlines, grows without horizontal overflow, Enter sends intact', async ({ page }) => {
+  await pair(page);
+  const input = page.locator('#chat-input');
+  const restHeight = (await input.boundingBox())!.height;
+
+  const line1 = 'steal the moon';
+  const line2 = 'minions assemble at dawn';
+  await input.click();
+  await page.keyboard.type(line1);
+  await page.keyboard.press('Shift+Enter');
+  await page.keyboard.type(line2);
+  await expect(input).toHaveValue(`${line1}\n${line2}`);
+
+  // The composer visibly grew, the composer itself fits the viewport,
+  // and the chat panel still fits one column (document-level scrollWidth
+  // is polluted by a PRE-EXISTING nav overflow at narrow widths — the
+  // composer surface is what this lane owns).
+  const grownHeight = (await input.boundingBox())!.height;
+  expect(grownHeight).toBeGreaterThan(restHeight);
+  expect((await input.boundingBox())!.x).toBeGreaterThanOrEqual(0);
+  const panelFits = await page.evaluate(() => {
+    const panel = document.getElementById('chat-view')!;
+    return panel.scrollWidth <= panel.clientWidth;
+  });
+  expect(panelFits).toBe(true);
+
+  // Enter (no Shift) sends; the newline arrives in the log INTACT.
+  await page.keyboard.press('Enter');
+  const bubbleText = await page.locator('.msg--user .msg__text').last().textContent();
+  expect(bubbleText).toBe(`${line1}\n${line2}`);
+  const reply = page.locator('.msg--gru', { hasText: `You said: "${line1}` });
+  await expect(reply).toBeVisible();
+  await expect(reply).not.toHaveClass(/msg--streaming/);
+
+  // The composer collapsed back to its rest height after the send.
+  await expect
+    .poll(async () => (await input.boundingBox())!.height)
+    .toBeLessThanOrEqual(restHeight + 1);
+  await expect(input).toHaveValue('');
+});
+
+test('composer caps at ~10rem and scrolls internally past the cap', async ({ page }) => {
+  await pair(page);
+  const input = page.locator('#chat-input');
+  const lines = Array.from({ length: 14 }, (_, i) => `line ${i + 1} of the tall draft`);
+  await input.fill(lines.join('\n'));
+  const geo = await input.evaluate((el) => ({
+    height: (el as HTMLElement).getBoundingClientRect().height,
+    scrollH: (el as HTMLTextAreaElement).scrollHeight,
+    clientH: (el as HTMLElement).clientHeight,
+  }));
+  expect(geo.height).toBeLessThanOrEqual(161); // max-height: 10rem + rounding
+  expect(geo.scrollH).toBeGreaterThan(geo.clientH); // internal scroll engaged
+  await page.locator('#chat-send').click();
+  await expect(page.locator('.msg--user', { hasText: 'line 14 of the tall draft' })).toBeVisible();
+  // Send collapsed the capped composer back to one row.
+  await expect(input).toHaveValue('');
+  await expect.poll(async () => (await input.boundingBox())!.height).toBeLessThanOrEqual(70);
+});
+
+test('multi-line composer on a 390px phone: grows inside the sheet, never overflows horizontally', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await pairMobile(page);
+  await page.locator('#chat-bubble').click();
+  await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
+  const input = page.locator('#chat-input');
+  const restHeight = (await input.boundingBox())!.height;
+
+  await input.click();
+  await page.keyboard.type('line one of the plan');
+  await page.keyboard.press('Shift+Enter');
+  await page.keyboard.type('line two of the plan');
+  expect((await input.boundingBox())!.height).toBeGreaterThan(restHeight);
+  expect((await input.boundingBox())!.x).toBeGreaterThanOrEqual(0);
+  // The composer surface never overflows horizontally inside the sheet
+  // (document-level scrollWidth is polluted by a PRE-EXISTING nav
+  // overflow at narrow widths — the composer surface is what this lane
+  // owns).
+  const sheetFits = await page.evaluate(() => {
+    const sheet = document.getElementById('chat-sheet')!;
+    return sheet.scrollWidth <= sheet.clientWidth;
+  });
+  expect(sheetFits).toBe(true);
+  // Controls stay reachable: attach + send sit inside the viewport, on
+  // BOTH axes (a grown composer must not push them off the phone screen).
+  for (const control of ['#chat-attach', '#chat-send']) {
+    const box = (await page.locator(control).boundingBox())!;
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(390);
+    expect(box.y).toBeGreaterThanOrEqual(0);
+    expect(box.y + box.height).toBeLessThanOrEqual(844);
+  }
+
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.msg--user', { hasText: 'line two of the plan' })).toBeVisible();
+  // The newline arrives INTACT and the composer cleared + collapsed.
+  const bubbleText = await page.locator('.msg--user .msg__text').last().textContent();
+  expect(bubbleText).toBe('line one of the plan\nline two of the plan');
+  await expect(input).toHaveValue('');
+  await expect
+    .poll(async () => (await input.boundingBox())!.height)
+    .toBeLessThanOrEqual(restHeight + 1);
+});
+
 test('context controls compact in place and New chat advances a reload-safe empty view', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'context control old words');
