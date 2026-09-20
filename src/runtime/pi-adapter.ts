@@ -328,6 +328,9 @@ export class PiAgentHandle implements AgentHandle {
   private nativeCompactionOpen = false;
   private compactionEndDeadline = 0;
   private compactionEndTimer: ReturnType<typeof setTimeout> | null = null;
+  private explicitCompactionTerminal: {
+    readonly resolve: (event: Extract<RuntimeEvent, { type: 'compaction_end' }>) => void;
+  } | null = null;
   private disposed = false;
 
   constructor(
@@ -474,6 +477,16 @@ export class PiAgentHandle implements AgentHandle {
     }
     const id = this.id;
     const file = this.sessionFile;
+    let resolveTerminal!: (
+      event: Extract<RuntimeEvent, { type: 'compaction_end' }>,
+    ) => void;
+    const terminal = new Promise<Extract<RuntimeEvent, { type: 'compaction_end' }>>(
+      (resolveTerminalPromise) => {
+        resolveTerminal = resolveTerminalPromise;
+      },
+    );
+    const waiter = { resolve: resolveTerminal };
+    this.explicitCompactionTerminal = waiter;
     this.compacting = true;
     let failed = false;
     let failure: unknown;
@@ -484,27 +497,38 @@ export class PiAgentHandle implements AgentHandle {
       failure = error;
     } finally {
       this.compacting = false;
-      if (this.nativeCompactionOpen && this.pendingCompactionEnd === null) {
+      if (failed || this.pendingCompactionEnd === null) {
         this.pendingCompactionEnd = {
           type: 'compaction_end',
           success: false,
-          error: 'native compaction settled without a terminal event',
+          error:
+            failed
+              ? failure instanceof Error
+                ? failure.message
+                : String(failure)
+              : 'native compaction settled without a terminal event',
         };
+        this.nativeCompactionOpen = true;
         this.compactionEndDeadline = Date.now() + COMPACTION_END_RECONCILE_MS;
       }
       this.flushCompactionEndWhenSettled();
     }
-    if (this.disposed) {
-      throw new Error('agent session disposed during native compaction');
+    try {
+      if (this.disposed) {
+        throw new Error('agent session disposed during native compaction');
+      }
+      if (this.session.sessionId !== id || this.session.sessionFile !== file) {
+        // Identity drift compromises the durable pointer regardless of whether
+        // the native compaction also threw. Retire the handle; it must never
+        // accept another prompt under the old advertised session identity.
+        await this.dispose();
+        throw new Error('native compaction changed session identity');
+      }
+      const outcome = await terminal;
+      if (!outcome.success) throw new Error(outcome.error ?? 'native compaction failed');
+    } finally {
+      if (this.explicitCompactionTerminal === waiter) this.explicitCompactionTerminal = null;
     }
-    if (this.session.sessionId !== id || this.session.sessionFile !== file) {
-      // Identity drift compromises the durable pointer regardless of whether
-      // the native compaction also threw. Retire the handle; it must never
-      // accept another prompt under the old advertised session identity.
-      await this.dispose();
-      throw new Error('native compaction changed session identity');
-    }
-    if (failed) throw failure;
   };
 
   async dispose(): Promise<void> {
@@ -638,7 +662,7 @@ export class PiAgentHandle implements AgentHandle {
         this.pendingCompactionEnd = null;
         this.nativeCompactionOpen = false;
         this.compactionEndDeadline = 0;
-        this.emit({
+        this.publishCompactionEnd({
           type: 'compaction_end',
           success: false,
           error: 'native compaction state did not settle after its terminal event',
@@ -659,7 +683,14 @@ export class PiAgentHandle implements AgentHandle {
     this.pendingCompactionEnd = null;
     this.nativeCompactionOpen = false;
     this.compactionEndDeadline = 0;
+    this.publishCompactionEnd(terminal as Extract<RuntimeEvent, { type: 'compaction_end' }>);
+  }
+
+  private publishCompactionEnd(
+    terminal: Extract<RuntimeEvent, { type: 'compaction_end' }>,
+  ): void {
     this.emit(terminal);
+    this.explicitCompactionTerminal?.resolve(terminal);
   }
 
   /** Map pi SDK events onto the runtime-agnostic event surface. */

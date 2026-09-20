@@ -527,7 +527,10 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const turn = handle.prompt(`hold:${releaseFile}`, { owner: 'alice' });
     const rejected = expect(turn).rejects.toThrow(/disposed/);
     await waitFor(() => handle.health().state === 'streaming');
-    await handle.dispose();
+    const disposing = handle.dispose();
+    const concurrentDispose = handle.dispose();
+    expect(concurrentDispose).toBe(disposing);
+    await Promise.all([disposing, concurrentDispose]);
     await rejected;
     expect(handle.health().state).toBe('disposed');
     expect(existsSync(`${handle.sessionFile}.lock`)).toBe(false);
@@ -1188,14 +1191,19 @@ describe('NdjsonParser (pure)', () => {
 });
 
 describe('ClaudeControlTranslator (pure)', () => {
-  it.each([
-    ['status', { type: 'system', subtype: 'status', compact_result: 'success' }],
-    ['boundary', { type: 'system', subtype: 'compact_boundary' }],
-  ] as const)('accepts a native compact success reported by %s alone', (_name, frame) => {
+  function expectCompactSuccess(frame: StreamFrame): void {
     const translator = new ClaudeControlTranslator();
     translator.ingest(frame);
     expect(translator.compactSucceeded).toBe(true);
     expect(translator.compactFailure).toBeNull();
+  }
+
+  it('accepts a native compact success reported by status alone', () => {
+    expectCompactSuccess({ type: 'system', subtype: 'status', compact_result: 'success' });
+  });
+
+  it('accepts a native compact success reported by boundary alone', () => {
+    expectCompactSuccess({ type: 'system', subtype: 'compact_boundary' });
   });
 
   it('keeps a native compact failure sticky if a later status claims success', () => {

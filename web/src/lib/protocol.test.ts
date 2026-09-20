@@ -127,6 +127,19 @@ describe('context-control frames', () => {
         message: 'provider declined',
       }),
     ).toMatchObject({ type: 'control_result', ok: false, code: 'failed' });
+    expect(
+      parseServerFrame({
+        type: 'context_event',
+        action: 'compact',
+        ok: false,
+        message: 'automatic compaction failed',
+      }),
+    ).toEqual({
+      type: 'context_event',
+      action: 'compact',
+      ok: false,
+      message: 'automatic compaction failed',
+    });
   });
 
   it('rejects malformed control, context, and inconsistent terminal results', () => {
@@ -161,6 +174,10 @@ describe('context-control frames', () => {
         epoch: 1,
         code: 'failed',
       }),
+    ).toBeNull();
+    expect(parseServerFrame({ type: 'context_event', action: 'other', ok: true })).toBeNull();
+    expect(
+      parseServerFrame({ type: 'context_event', action: 'compact', ok: false, message: '' }),
     ).toBeNull();
   });
 });

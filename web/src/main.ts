@@ -239,6 +239,7 @@ function startChat(token: string): void {
         chatView?.setControlsConnected(!replaying);
       },
       controlResult: (result) => chatView?.showControlResult(result),
+      contextEvent: (event) => chatView?.showContextEvent(event),
       epochChange: () => {
         chatView?.reset();
         // A durable boundary retains only browser-local, never-sent words.

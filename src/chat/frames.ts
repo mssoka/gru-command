@@ -13,7 +13,7 @@
  * `auth` (first frame), `user`, and `control`. Server → client: `auth_ok`,
  * `context`, `control_result`, `ack`, `delta`, `tool`, `turn`, `error`,
  * and `user` (replays). Durable/logged frames carry a monotonic `seq`;
- * context, control results, and fatal/transport errors are ephemeral.
+ * context snapshots/events, control results, and fatal/transport errors are ephemeral.
  */
 
 export const WS_PATH = '/ws';
@@ -152,10 +152,20 @@ export interface ControlResultFrame {
   readonly message?: string;
 }
 
+/** Unsolicited provider lifecycle outcome. Unlike control_result, this is
+ * broadcast to every connected view and has no client request to correlate. */
+export interface ContextEventFrame {
+  readonly type: 'context_event';
+  readonly action: ControlAction;
+  readonly ok: boolean;
+  readonly message?: string;
+}
+
 export type ServerFrame =
   | AuthOkFrame
   | ContextFrame
   | ControlResultFrame
+  | ContextEventFrame
   | AckFrame
   | DeltaFrame
   | ToolFrame
@@ -315,6 +325,18 @@ export function parseServerFrame(raw: unknown): ServerFrame | null {
         ...(typeof value.message === 'string' ? { message: value.message } : {}),
       };
     }
+    case 'context_event':
+      if (
+        (value.action !== 'compact' && value.action !== 'new_chat') ||
+        typeof value.ok !== 'boolean' ||
+        (value.message !== undefined && !isNonEmptyString(value.message))
+      ) return null;
+      return {
+        type: 'context_event',
+        action: value.action,
+        ok: value.ok,
+        ...(typeof value.message === 'string' ? { message: value.message } : {}),
+      };
     case 'ack':
       return isNonEmptyString(value.client_msg_id) && isSeq(value.seq)
         ? { type: 'ack', client_msg_id: value.client_msg_id, seq: value.seq }
@@ -380,9 +402,12 @@ function safeJson(text: string): unknown {
   }
 }
 
-/** Frames that replay out of the durable log. Control state is always a
- * fresh snapshot/result and is never persisted. */
-export type LoggedFrame = Exclude<ServerFrame, AuthOkFrame | ContextFrame | ControlResultFrame>;
+/** Frames that replay out of the durable log. Control state/outcomes are
+ * always fresh and never persisted. */
+export type LoggedFrame = Exclude<
+  ServerFrame,
+  AuthOkFrame | ContextFrame | ControlResultFrame | ContextEventFrame
+>;
 
 export function loggedFrameSeq(frame: LoggedFrame): number {
   // All logged frames carry a mandatory seq except `error`, where it is

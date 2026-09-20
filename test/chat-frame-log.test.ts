@@ -240,10 +240,35 @@ describe('ChatFrameLog', () => {
     expect(() => ChatFrameLog.load(dir)).toThrowError(/seq gap/);
   });
 
-  it('fails loud on a logged auth_ok frame (never a logged frame)', () => {
-    const dir = fixture();
-    seedFile(dir, [{ type: 'auth_ok', seq: 1 }]);
-    expect(() => ChatFrameLog.load(dir)).toThrowError(/not a logged chat frame/);
+  it('fails loud on every ephemeral frame type persisted in the durable log', () => {
+    const ephemeralFrames = [
+      { type: 'auth_ok', seq: 1 },
+      {
+        type: 'context',
+        epoch: 0,
+        replay_floor_seq: 0,
+        state: 'idle',
+        usage: null,
+        compact_supported: false,
+        session_active: false,
+        writer: true,
+        seq: 1,
+      },
+      {
+        type: 'control_result',
+        action: 'compact',
+        request_id: 'compact-1',
+        ok: true,
+        epoch: 0,
+        seq: 1,
+      },
+      { type: 'context_event', action: 'compact', ok: true, seq: 1 },
+    ];
+    for (const frame of ephemeralFrames) {
+      const dir = fixture();
+      seedFile(dir, [frame]);
+      expect(() => ChatFrameLog.load(dir)).toThrowError(/not a logged chat frame/);
+    }
   });
 
   it('boot-settles an open turn: open tools end in reverse order, then the turn', () => {

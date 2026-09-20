@@ -559,6 +559,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   private compacting = false;
   private readonly listeners = new Set<RuntimeEventListener>();
   private disposed = false;
+  private disposalPromise: Promise<void> | null = null;
 
   constructor(
     role: Role,
@@ -652,11 +653,19 @@ export class ClaudeCodeHandle implements AgentHandle {
     }
   };
 
-  async dispose(): Promise<void> {
-    if (this.disposed) return;
+  dispose(): Promise<void> {
+    // Every caller observes the same terminal cleanup. Returning early merely
+    // because disposed was marked would expose a still-running child and a
+    // still-held session lock to concurrent supervisor/chat recovery.
+    this.disposalPromise ??= this.disposeOnce();
+    return this.disposalPromise;
+  }
+
+  private async disposeOnce(): Promise<void> {
     this.disposed = true;
     const live = this.live;
     let killTimer: ReturnType<typeof setTimeout> | null = null;
+    let exitDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
     if (live !== null) {
       const childExited =
         live.exitCode !== null || live.signalCode !== null
@@ -666,9 +675,9 @@ export class ClaudeCodeHandle implements AgentHandle {
               live.once('error', () => resolve());
             });
       // SIGTERM is the documented abort (the CLI exits 143); escalate to
-      // SIGKILL if the process ignores it. Do not release the session lock
-      // until the child is dead AND its transcript stream has settled: a
-      // supervisor resume must never overlap the retiring native writer.
+      // SIGKILL if the process ignores it. A second bounded grace after the
+      // forced kill prevents a broken ChildProcess implementation from
+      // retaining the transcript and session lock forever.
       try {
         live.kill('SIGTERM');
       } catch {
@@ -684,16 +693,22 @@ export class ClaudeCodeHandle implements AgentHandle {
         }
       }, this.params.killGraceMs);
       killTimer.unref();
-      await childExited;
+      const exitDeadline = new Promise<void>((resolve) => {
+        exitDeadlineTimer = setTimeout(resolve, this.params.killGraceMs * 2);
+        exitDeadlineTimer.unref();
+      });
+      await Promise.race([childExited, exitDeadline]);
       clearTimeout(killTimer);
+      if (exitDeadlineTimer !== null) clearTimeout(exitDeadlineTimer);
 
       const flushDeadline = Date.now() + this.params.killGraceMs;
       while (this.live !== null && Date.now() < flushDeadline) {
         await new Promise<void>((resolve) => setTimeout(resolve, 1));
       }
       if (this.live !== null) {
-        // A dead child can still leave a wedged filesystem stream. Cancel its
-        // buffered writes and await the fd close before releasing the lock.
+        // A dead or non-reporting child can leave a wedged filesystem stream.
+        // Cancel buffered writes and settle the operation before releasing
+        // ownership so disposal remains deterministic.
         const transcript = this.liveTranscript;
         if (transcript !== null) {
           const closed = finished(transcript).catch(() => {});

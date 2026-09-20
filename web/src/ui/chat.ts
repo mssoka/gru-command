@@ -14,6 +14,7 @@
 import type { ChatMessage, ConnectionState } from '../lib/chat-client.js';
 import type {
   AttachmentChip,
+  ContextEventFrame,
   ContextFrame,
   ControlAction,
   ControlResultFrame,
@@ -36,6 +37,16 @@ export interface AttachSurface {
  * queued (no client / rejected) — the composer keeps the typed words and
  * chips (review r1: clearing first violated "never lose a typed word"). */
 
+interface PendingResetView {
+  readonly nodes: readonly Node[];
+  readonly bubbles: Map<string, HTMLElement>;
+  readonly streamingBubble: HTMLElement | null;
+  readonly streamingBody: HTMLElement | null;
+  readonly streamText: string;
+  readonly activeTool: HTMLElement | null;
+  readonly unread: number;
+}
+
 export class ChatView {
   private readonly log = mustGet<HTMLElement>('chat-log');
   private readonly panel = mustGet<HTMLElement>('chat-view');
@@ -48,14 +59,15 @@ export class ChatView {
   private readonly chipsRow = mustGet<HTMLElement>('chat-chips');
   private readonly attachButton = mustGet<HTMLButtonElement>('chat-attach');
   private readonly fileInput = mustGet<HTMLInputElement>('chat-attach-file');
-  private readonly contextStatus = document.getElementById('chat-context-status');
-  private readonly compactButton = document.getElementById('chat-compact') as HTMLButtonElement | null;
-  private readonly newChatButton = document.getElementById('chat-new') as HTMLButtonElement | null;
+  private readonly contextStatus = mustGet<HTMLElement>('chat-context-status');
+  private readonly contextAnnouncement = mustGet<HTMLElement>('chat-context-announcement');
+  private readonly compactButton = mustGet<HTMLButtonElement>('chat-compact');
+  private readonly newChatButton = mustGet<HTMLButtonElement>('chat-new');
   private readonly picker = mustGet<HTMLElement>('attach-picker');
   private readonly pickerList = mustGet<HTMLElement>('attach-picker-list');
   private readonly pickerPath = mustGet<HTMLElement>('attach-picker-path');
   private readonly pickerError = mustGet<HTMLElement>('attach-picker-error');
-  private readonly bubbles = new Map<string, HTMLElement>();
+  private bubbles = new Map<string, HTMLElement>();
   private streamingBubble: HTMLElement | null = null;
   private streamingBody: HTMLElement | null = null;
   private streamText = '';
@@ -74,6 +86,7 @@ export class ChatView {
   /** Absolute workspace root from the current browse (chip paths). */
   private browseRoot = '';
   private context: ContextFrame | null = null;
+  private pendingResetView: PendingResetView | null = null;
   private controlsConnected = false;
   private requestControl: ((action: ControlAction) => boolean) | null = null;
 
@@ -109,10 +122,10 @@ export class ChatView {
     });
 
     this.wireAttachFlow();
-    this.compactButton?.addEventListener('click', () => {
+    this.compactButton.addEventListener('click', () => {
       this.beginControl('compact');
     });
-    this.newChatButton?.addEventListener('click', () => {
+    this.newChatButton.addEventListener('click', () => {
       if (!window.confirm('Start a new chat? Durable history is kept, but this active view will clear.')) {
         return;
       }
@@ -157,6 +170,7 @@ export class ChatView {
 
   private beginControl(action: ControlAction): void {
     if (this.requestControl?.(action) !== true || this.context === null) return;
+    if (action === 'new_chat') this.beginPendingResetView();
     // Disable immediately against double-clicks; the server's canonical
     // snapshot replaces this optimistic busy state on the next frame.
     this.context = {
@@ -165,6 +179,49 @@ export class ChatView {
       usage: null,
     };
     this.renderContext();
+  }
+
+  private beginPendingResetView(): void {
+    if (this.pendingResetView !== null) return;
+    this.pendingResetView = {
+      nodes: [...this.log.childNodes],
+      bubbles: this.bubbles,
+      streamingBubble: this.streamingBubble,
+      streamingBody: this.streamingBody,
+      streamText: this.streamText,
+      activeTool: this.activeTool,
+      unread: this.unread,
+    };
+    // Confirmation accepted: immediately show the fresh pending view. The
+    // detached render model remains available for an uncommitted failure.
+    this.log.replaceChildren();
+    this.bubbles = new Map();
+    this.streamingBubble = null;
+    this.streamingBody = null;
+    this.streamText = '';
+    this.activeTool = null;
+    this.unread = 0;
+    this.bubble.dataset.unread = '0';
+    this.badge.textContent = '0';
+  }
+
+  private rollbackPendingResetView(): void {
+    const prior = this.pendingResetView;
+    if (prior === null) return;
+    const pendingNodes = [...this.log.childNodes];
+    const pendingBubbles = this.bubbles;
+    this.log.replaceChildren(...prior.nodes, ...pendingNodes);
+    this.bubbles = prior.bubbles;
+    for (const [id, bubble] of pendingBubbles) this.bubbles.set(id, bubble);
+    this.streamingBubble = prior.streamingBubble;
+    this.streamingBody = prior.streamingBody;
+    this.streamText = prior.streamText;
+    this.activeTool = prior.activeTool;
+    this.unread = prior.unread;
+    this.bubble.dataset.unread = String(this.unread);
+    this.badge.textContent = String(this.unread);
+    this.pendingResetView = null;
+    this.scrollToEnd();
   }
 
   setControlsConnected(connected: boolean): void {
@@ -179,72 +236,87 @@ export class ChatView {
 
   showControlResult(result: ControlResultFrame): void {
     if (!result.ok) {
-      this.ephemeralNote(
+      if (result.action === 'new_chat') this.rollbackPendingResetView();
+      const message =
         `${result.action === 'compact' ? 'compact context' : 'new chat'} failed: ` +
-          (result.message ?? result.code ?? 'unknown error'),
-      );
+        (result.message ?? result.code ?? 'unknown error');
+      this.ephemeralNote(message);
+      this.announceContextOutcome(message);
     } else if (result.action === 'compact') {
       this.ephemeralNote('context compacted');
+      this.announceContextOutcome('Context compacted successfully');
     }
+  }
+
+  showContextEvent(event: ContextEventFrame): void {
+    const message = event.ok
+      ? event.action === 'compact'
+        ? 'Context compacted successfully'
+        : 'New chat started'
+      : event.message ??
+        (event.action === 'compact' ? 'Context compaction failed' : 'New chat supervision degraded');
+    this.ephemeralNote(message);
+    this.announceContextOutcome(message);
+  }
+
+  private announceContextOutcome(message: string): void {
+    // A dedicated persistent live region is intentionally independent from
+    // the frequently-refreshed usage/status chip, so the following idle
+    // context snapshot cannot overwrite a terminal announcement.
+    this.contextAnnouncement.textContent = message;
   }
 
   private renderContext(): void {
     const snapshot = this.context;
     const connected = this.controlsConnected;
     const busy = snapshot?.state !== 'idle';
-    if (this.contextStatus !== null) {
-      this.contextStatus.classList.toggle('chat-context__status--busy', connected && busy);
-      this.contextStatus.toggleAttribute('aria-busy', connected && busy);
-      if (!connected || snapshot === null) {
-        this.contextStatus.textContent = 'Context unavailable';
-        this.contextStatus.title = 'No current runtime context measurement';
-        this.contextStatus.setAttribute('aria-label', 'Context unavailable');
-      } else if (snapshot.state === 'busy') {
-        this.contextStatus.textContent = 'Gru is working…';
-        this.contextStatus.title = 'Context controls are available again after the current turn';
-        this.contextStatus.setAttribute('aria-label', 'Gru is working; context controls are busy');
-      } else if (snapshot.state === 'compacting') {
-        this.contextStatus.textContent = 'Compacting context…';
-        this.contextStatus.title = 'Native compaction is in progress';
-        this.contextStatus.setAttribute('aria-label', 'Compacting context');
-      } else if (snapshot.state === 'resetting') {
-        this.contextStatus.textContent = 'Starting new chat…';
-        this.contextStatus.title = 'A fresh native session is being activated';
-        this.contextStatus.setAttribute('aria-label', 'Starting a new chat');
-      } else if (snapshot.usage === null) {
-        this.contextStatus.textContent = 'Context unavailable';
-        this.contextStatus.title = 'The runtime did not provide current context usage';
-        this.contextStatus.setAttribute('aria-label', 'Context usage unavailable');
-      } else {
-        const percent = Math.round(Math.max(0, Math.min(100, snapshot.usage.percent)));
-        this.contextStatus.textContent = `${percent}% context`;
-        this.contextStatus.title =
-          `${Math.round(snapshot.usage.tokens).toLocaleString()} of ` +
-          `${Math.round(snapshot.usage.context_window).toLocaleString()} tokens`;
-        this.contextStatus.setAttribute(
-          'aria-label',
-          `${percent} percent context used; ${this.contextStatus.title}`,
-        );
-      }
+    this.contextStatus.classList.toggle('chat-context__status--busy', connected && busy);
+    this.contextStatus.toggleAttribute('aria-busy', connected && busy);
+    if (!connected || snapshot === null) {
+      this.contextStatus.textContent = 'Context unavailable';
+      this.contextStatus.title = 'No current runtime context measurement';
+      this.contextStatus.setAttribute('aria-label', 'Context unavailable');
+    } else if (snapshot.state === 'busy') {
+      this.contextStatus.textContent = 'Gru is working…';
+      this.contextStatus.title = 'Context controls are available again after the current turn';
+      this.contextStatus.setAttribute('aria-label', 'Gru is working; context controls are busy');
+    } else if (snapshot.state === 'compacting') {
+      this.contextStatus.textContent = 'Compacting context…';
+      this.contextStatus.title = 'Native compaction is in progress';
+      this.contextStatus.setAttribute('aria-label', 'Compacting context');
+    } else if (snapshot.state === 'resetting') {
+      this.contextStatus.textContent = 'Starting new chat…';
+      this.contextStatus.title = 'A fresh native session is being activated';
+      this.contextStatus.setAttribute('aria-label', 'Starting a new chat');
+    } else if (snapshot.usage === null) {
+      this.contextStatus.textContent = 'Context unavailable';
+      this.contextStatus.title = 'The runtime did not provide current context usage';
+      this.contextStatus.setAttribute('aria-label', 'Context usage unavailable');
+    } else {
+      const percent = Math.round(Math.max(0, Math.min(100, snapshot.usage.percent)));
+      this.contextStatus.textContent = `${percent}% context`;
+      this.contextStatus.title =
+        `${Math.round(snapshot.usage.tokens).toLocaleString()} of ` +
+        `${Math.round(snapshot.usage.context_window).toLocaleString()} tokens`;
+      this.contextStatus.setAttribute(
+        'aria-label',
+        `${percent} percent context used; ${this.contextStatus.title}`,
+      );
     }
-    if (this.compactButton !== null) {
-      this.compactButton.disabled =
-        !connected || snapshot === null || busy || !snapshot.writer ||
-        !snapshot.session_active || !snapshot.compact_supported;
-      this.compactButton.title =
-        snapshot !== null && !snapshot.writer
-          ? 'Read-only tab: another client holds the pen'
-          : snapshot !== null && !snapshot.compact_supported
-            ? 'Native compaction is unavailable for this runtime'
-            : 'Compact context in the current native session';
-    }
-    if (this.newChatButton !== null) {
-      this.newChatButton.disabled = !connected || snapshot === null || busy || !snapshot.writer;
-      this.newChatButton.title =
-        snapshot !== null && !snapshot.writer
-          ? 'Read-only tab: another client holds the pen'
-          : 'Start a truly fresh native conversation';
-    }
+    this.compactButton.disabled =
+      !connected || snapshot === null || busy || !snapshot.writer ||
+      !snapshot.session_active || !snapshot.compact_supported;
+    this.compactButton.title =
+      snapshot !== null && !snapshot.writer
+        ? 'Read-only tab: another client holds the pen'
+        : snapshot !== null && !snapshot.compact_supported
+          ? 'Native compaction is unavailable for this runtime'
+          : 'Compact context in the current native session';
+    this.newChatButton.disabled = !connected || snapshot === null || busy || !snapshot.writer;
+    this.newChatButton.title =
+      snapshot !== null && !snapshot.writer
+        ? 'Read-only tab: another client holds the pen'
+        : 'Start a truly fresh native conversation';
   }
 
   // -----------------------------------------------------------------------
@@ -466,6 +538,7 @@ export class ChatView {
 
   /** Fresh page load: the server replays everything — rebuild the log. */
   reset(): void {
+    this.pendingResetView = null;
     this.log.replaceChildren();
     this.bubbles.clear();
     this.unread = 0;

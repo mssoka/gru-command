@@ -305,9 +305,14 @@ async function main(): Promise<number> {
   });
   gruSlot.onSwap((handle) => chat.adoptRestartedGru(handle));
   surfaceInChat = (notification) => {
-    chat.surfaceNotice(`⚠ Action required: ${notification.title}${notification.detail !== null ? ` — ${notification.detail}` : ''}`);
-    // The chat stream displayed it — record the receipt (shown:true).
-    notifications.markShown(notification.id, 'gru-chat');
+    chat.surfaceNotice(
+      `⚠ Action required: ${notification.title}${notification.detail !== null ? ` — ${notification.detail}` : ''}`,
+      () => {
+        // Receipt follows durable persistence/broadcast, including notices
+        // queued across a reset boundary. Rejected/failed notices stay unshown.
+        notifications.markShown(notification.id, 'gru-chat');
+      },
+    );
   };
   state.supervisor = supervisorLive;
 

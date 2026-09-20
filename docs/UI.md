@@ -93,7 +93,8 @@ Server → client (durable conversation frames carry a monotonic `seq`):
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |
 | `error` | `message`, `fatal?`, `seq?` | fatal → socket closes (bad token) |
 | `context` | `epoch`, `replay_floor_seq`, `state`, `usage`, capability/session/writer flags | fresh ephemeral control state; provider usage or explicit unavailable |
-| `control_result` | action/request id, `ok`, `epoch`, failure details | ephemeral terminal result; never replayed as chat |
+| `control_result` | action/request id, `ok`, `epoch`, failure details | ephemeral correlated terminal result; never replayed as chat |
+| `context_event` | action, `ok`, optional bounded message | ephemeral broadcast outcome for provider compaction or post-commit supervision degradation |
 
 **Reconnect:** re-auth with `last_seen_seq`; server sends `auth_ok`, a
 fresh `context`, then replays logged frames above both the client seq and
@@ -119,10 +120,12 @@ frames, see [CHAT.md](./CHAT.md)). The pairing token still persists
 indefinitely in `localStorage` (`gru-pairing-token`) — lifetime/rotation
 belongs to the E9 token flow.
 
-**Never lose a typed word:** unacked messages persist in `localStorage`
-(`gru-outbox`, id + text + chips), render as queued bubbles, and flush
-in order after re-auth; replay ends exactly when the stream reaches the
-`auth_ok` high-water mark.
+**Never lose a typed word in the active tab:** unacked messages persist in
+tab-scoped `sessionStorage` (`gru-outbox`, id + text + chips), survive reload,
+render as queued bubbles, and flush in order after re-auth; replay ends exactly
+when the stream reaches the `auth_ok` high-water mark. Initial persistence
+failure rejects the send so the composer keeps its text/chips instead of
+pretending a non-durable bubble was queued.
 
 ## The composer attach flow (SPEC ruling 19)
 
@@ -213,8 +216,11 @@ follow-up lane, not part of this contract.
   a live status line. User messages stay plain text. A quiet row above the
   composer shows provider context percent (or explicit unavailable),
   **Compact context**, and **New chat**. Busy/read-only/unsupported states
-  disable the relevant controls; New chat uses native confirmation and
-  only clears after the server confirms a durable epoch advance.
+  disable the relevant controls. New chat uses native confirmation and
+  immediately opens an empty pending-reset view; a pre-commit failure restores
+  the retired render model, while a durable epoch finalizes the empty view.
+  Compact success/failure and unsolicited provider outcomes are announced in
+  a dedicated persistent live region that idle usage refreshes cannot erase.
 - **Board (E6)** — desktop tab `🗺️ Board`: repo-grouped job cards, round
   rows with 7 per-lens live chips, agent rail, transcripts list,
   notification center (see [BOARD.md](./BOARD.md)). **Phone:

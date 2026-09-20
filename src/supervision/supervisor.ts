@@ -276,6 +276,18 @@ export class Supervisor {
       await this.registry.disposeHandle(handle).catch(() => {});
       throw new Error(`supervised slot "${slot.id}" is not active`);
     }
+    const retired = [...this.agents.values()].filter(
+      (agent) => agent.slot === slot && agent.agentId !== handle.id,
+    );
+    const inheritedRestartRing = retired
+      .flatMap((agent) => agent.restartRing)
+      .sort((left, right) => left - right);
+    const inheritedBreaker = retired.find((agent) => agent.breakerOpen);
+    const inheritedFailures = retired.reduce(
+      (highest, agent) => Math.max(highest, agent.consecutiveFailures),
+      0,
+    );
+
     slot.generation += 1;
     const generation = slot.generation;
     this.adopt(handle, slot, handle.sessionFile);
@@ -285,30 +297,23 @@ export class Supervisor {
       live.slotGeneration = generation;
       live.handle = handle;
       live.sessionFile = handle.sessionFile;
-      live.state = 'watching';
+      live.state = inheritedBreaker === undefined ? 'watching' : 'stopped';
       live.openTurn = false;
       live.openControl = false;
       live.inRestart = false;
-      live.breakerOpen = false;
+      live.restartRing = [...live.restartRing, ...inheritedRestartRing]
+        .sort((left, right) => left - right);
+      live.consecutiveFailures = Math.max(live.consecutiveFailures, inheritedFailures);
+      live.breakerOpen = inheritedBreaker !== undefined;
+      live.breakerNotificationId =
+        inheritedBreaker?.breakerNotificationId ?? live.breakerNotificationId;
     }
 
-    const retired = [...this.agents.values()].filter(
-      (agent) => agent.slot === slot && agent.agentId !== handle.id,
-    );
     for (const agent of retired) {
       if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
-      if (agent.breakerNotificationId !== null) {
-        try {
-          this.notifications.ack(agent.breakerNotificationId, 'intentional-replacement');
-        } catch (error) {
-          this.log('warn', 'failed to acknowledge retired slot breaker notification', {
-            agent_id: agent.agentId,
-            notification_id: agent.breakerNotificationId,
-            error: String(error),
-          });
-        }
-        agent.breakerNotificationId = null;
-      }
+      // Intentional session replacement invalidates stale work by generation;
+      // it does not erase restart history or acknowledge a human-facing
+      // breaker notification. Both follow the stable supervised slot.
       this.agents.delete(agent.agentId);
       const old = agent.handle;
       agent.handle = null;
@@ -665,9 +670,15 @@ export class Supervisor {
           restartSlot !== null
             ? await restartSlot.spawn(resumeFile !== null ? { resumeFile } : {})
             : await this.registry.spawn(agent.role, resumeFile !== null ? { resumeFile } : {});
-        if (restartSlot !== null && restartSlot.generation !== restartGeneration) {
-          // An intentional fresh replacement won while this old restart was
-          // in flight. Dispose the stale result and never notify swap listeners.
+        if (
+          this.disposed ||
+          (restartSlot !== null &&
+            (this.slots.get(restartSlot.id) !== restartSlot ||
+              restartSlot.generation !== restartGeneration))
+        ) {
+          // Shutdown, release, or an intentional fresh replacement won while
+          // this restart was in flight. Dispose the stale result and never
+          // adopt it or notify swap listeners.
           await this.registry.disposeHandle(spawned).catch(() => {});
           return;
         }

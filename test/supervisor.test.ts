@@ -274,12 +274,13 @@ describe('supervisor — watchdog + restart ladder', () => {
     const handle = new FakeHandle('gru', 'gru-compact-hang', null);
     h.registry.adopt(handle);
     const spawnsBefore = h.registry.spawnCalls.length;
+    const notificationsBefore = h.notificationsOfKind('supervision.hang').length;
     handle.emit({ type: 'compaction_start' });
     h.advance(60);
     await sleep(20);
     expect(handle.disposed).toBe(true);
     expect(h.registry.spawnCalls.length).toBe(spawnsBefore + 1);
-    expect(h.notificationsOfKind('supervision.hang').length).toBe(2);
+    expect(h.notificationsOfKind('supervision.hang').length).toBe(notificationsBefore + 1);
   });
 
   it('a completed native compaction disarms the hang watchdog', async () => {
@@ -560,6 +561,34 @@ describe('supervisor — intentional slot generations', () => {
     h.dispose();
   });
 
+  it('supervisor shutdown disposes a restart spawn that completes afterward', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-restart-shutdown',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    let releaseRestart!: () => void;
+    let stale!: FakeHandle;
+    h.registry.spawnImpl = async (role, options) => {
+      stale = new FakeHandle(role, 'stale-restart-after-shutdown', options?.resumeFile ?? null);
+      await new Promise<void>((resolve) => {
+        releaseRestart = resolve;
+      });
+      return stale;
+    };
+    hang(first);
+    h.advance(60);
+    await sleep(10);
+    h.supervisor.dispose();
+    releaseRestart();
+    await sleep(20);
+    expect(stale.disposed).toBe(true);
+    expect(slot.current()).toBeNull();
+    h.dispose();
+  });
+
   it('an intentional fresh replacement wins over an in-flight ordinary ensure', async () => {
     const h = boot();
     const slot = h.supervisor.declareSlot({
@@ -625,7 +654,7 @@ describe('supervisor — intentional slot generations', () => {
     h.dispose();
   });
 
-  it('intentional replacement acknowledges a retired slot breaker alert', async () => {
+  it('intentional replacement preserves restart history and leaves the breaker alert unacknowledged', async () => {
     const h = boot();
     const slot = h.supervisor.declareSlot({
       id: 'gru-breaker-replacement',
@@ -647,8 +676,13 @@ describe('supervisor — intentional slot generations', () => {
     await slot.adoptReplacement(fresh);
     expect(
       h.api.listNotifications({ limit: 100 }).find((item) => item.id === alert!.id)?.ackedAt,
-    ).not.toBeNull();
+    ).toBeNull();
     expect(slot.current()?.id).toBe(fresh.id);
+    expect(h.supervisor.viewFor(fresh.id)).toMatchObject({
+      breakerOpen: true,
+      state: 'stopped',
+      restarts: 3,
+    });
     h.dispose();
   });
 

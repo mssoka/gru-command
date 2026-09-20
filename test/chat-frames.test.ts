@@ -125,6 +125,8 @@ const SERVER_CORPUS: readonly unknown[] = [
   },
   { type: 'context', epoch: 2, replay_floor_seq: 41, state: 'busy', usage: null, compact_supported: true, session_active: true, writer: true },
   { type: 'control_result', action: 'new_chat', request_id: 'new-1', ok: true, epoch: 2 },
+  { type: 'context_event', action: 'compact', ok: true },
+  { type: 'context_event', action: 'compact', ok: false, message: 'provider failed' },
   {
     type: 'control_result',
     action: 'compact',
@@ -142,6 +144,9 @@ const SERVER_CORPUS: readonly unknown[] = [
   { type: 'control_result', action: 'compact', request_id: 'x', ok: true, epoch: Number.MAX_SAFE_INTEGER + 1 },
   { type: 'control_result', action: 'compact', request_id: 'x', ok: false, epoch: 1 },
   { type: 'control_result', action: 'compact', request_id: 'x', ok: true, epoch: 1, code: 'failed' },
+  { type: 'context_event', action: 'other', ok: true },
+  { type: 'context_event', action: 'compact', ok: 'yes' },
+  { type: 'context_event', action: 'compact', ok: false, message: '' },
   { type: 'notice', text: 'no seq' }, // E7: notice REQUIRES seq
   { type: 'notice', text: '', seq: 13 }, // E7: empty text is malformed
   { type: 'notice', seq: 14 }, // E7: missing text

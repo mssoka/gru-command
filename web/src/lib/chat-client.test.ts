@@ -4,6 +4,7 @@ import { ChatClient, type ChatMessage, type ConnectionState } from './chat-clien
 import {
   parseClientFrame,
   type ContextFrame,
+  type ControlResultFrame,
   type LoggedFrame,
   type ServerFrame,
 } from './protocol.js';
@@ -235,6 +236,7 @@ interface Harness {
   epochs: number[];
   contexts: ContextFrame[];
   controlResults: string[];
+  controlResultFrames: ControlResultFrame[];
 }
 
 function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Harness {
@@ -246,6 +248,7 @@ function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Ha
   const epochs: number[] = [];
   const contexts: ContextFrame[] = [];
   const controlResults: string[] = [];
+  const controlResultFrames: ControlResultFrame[] = [];
   let replayEnds = 0;
   const client = new ChatClient(
     {
@@ -266,7 +269,10 @@ function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Ha
       },
       context: (snapshot) => contexts.push(snapshot),
       epochChange: (epoch) => epochs.push(epoch),
-      controlResult: (result) => controlResults.push(result.request_id),
+      controlResult: (result) => {
+        controlResults.push(result.request_id);
+        controlResultFrames.push(result);
+      },
       fatal: (m) => fatals.push(m),
     },
   );
@@ -280,6 +286,7 @@ function makeClient(server: TestServer, storage: StorageLike, token = TOKEN): Ha
     epochs,
     contexts,
     controlResults,
+    controlResultFrames,
     get replayEnds() {
       return replayEnds;
     },
@@ -401,6 +408,40 @@ describe('ChatClient', () => {
     expect(() => h.client.requestControl('new_chat')).not.toThrow();
   });
 
+  it('treats an advanced resetting epoch as committed success when the result was lost', async () => {
+    const h = makeClient(server, memStorage());
+    clients.push(h.client);
+    h.client.connect();
+    await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
+
+    server.deferNextNewChat = true;
+    const requestId = h.client.requestControl('new_chat');
+    const held = h.client.send('deliver into recovered committed epoch');
+    await waitFor(() => h.contexts.some((snapshot) => snapshot.state === 'resetting'));
+    server.dropAll();
+    await waitFor(() => h.states.includes('offline'));
+    // Durable activation committed while the requesting socket was gone.
+    // Reconnect first sees that advanced epoch still in resetting state.
+    server.deferredNewChat = null;
+    server.epoch = 1;
+    server.replayFloorSeq = server.seq;
+    server.contextState = 'resetting';
+    await waitFor(
+      () =>
+        h.client.getState() === 'open' &&
+        h.contexts.some((snapshot) => snapshot.epoch === 1 && snapshot.state === 'resetting'),
+    );
+    server.contextState = 'idle';
+    server.broadcastContext();
+    await waitFor(() => server.log.some((frame) => frame.type === 'user' && frame.text === held.text));
+    expect(
+      h.controlResultFrames.some((result) => result.request_id === requestId && !result.ok),
+    ).toBe(false);
+    expect(
+      h.client.getMessages().find((message) => message.client_msg_id === held.client_msg_id),
+    ).toMatchObject({ status: 'acked', epoch: 1 });
+  });
+
   it('surfaces an inferred failed New chat when its result is lost on reconnect', async () => {
     const h = makeClient(server, memStorage());
     clients.push(h.client);
@@ -470,7 +511,7 @@ describe('ChatClient', () => {
     expect(h.fatals.some((message) => message.includes('epoch regressed'))).toBe(true);
   });
 
-  it('does not send a queued word when its sent epoch cannot be persisted', async () => {
+  it('rejects a send when its initial durable queue entry cannot be persisted', async () => {
     const blockedStorage: StorageLike = {
       getItem: () => null,
       removeItem: () => {},
@@ -482,12 +523,12 @@ describe('ChatClient', () => {
     clients.push(h.client);
     h.client.connect();
     await waitFor(() => h.client.getState() === 'open' && h.replayEnds === 1);
-    const message = h.client.send('stay local without durable epoch');
+    expect(() => h.client.send('stay local without durable epoch')).toThrow(/storage is unavailable/);
     await new Promise<void>((resolve) => setTimeout(resolve, 30));
-    expect(server.log.some((frame) => frame.type === 'user' && frame.text === message.text)).toBe(false);
-    expect(h.client.getMessages().find((item) => item.client_msg_id === message.client_msg_id)).toMatchObject({
-      status: 'queued',
-    });
+    expect(
+      server.log.some((frame) => frame.type === 'user' && frame.text === 'stay local without durable epoch'),
+    ).toBe(false);
+    expect(h.client.getMessages()).toEqual([]);
   });
 
   it('reload does not resurrect a persisted sent item across an epoch boundary', async () => {

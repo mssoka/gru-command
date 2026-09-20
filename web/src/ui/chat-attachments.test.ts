@@ -16,6 +16,10 @@ function installChatDom(): void {
   contextStatus.id = 'chat-context-status';
   contextStatus.setAttribute('role', 'status');
   contextStatus.setAttribute('aria-live', 'polite');
+  const announcement = document.createElement('span');
+  announcement.id = 'chat-context-announcement';
+  announcement.setAttribute('role', 'status');
+  announcement.setAttribute('aria-live', 'polite');
   const compact = document.createElement('button');
   compact.id = 'chat-compact';
   compact.type = 'button';
@@ -24,7 +28,7 @@ function installChatDom(): void {
   newChat.id = 'chat-new';
   newChat.type = 'button';
   newChat.disabled = true;
-  context.append(contextStatus, compact, newChat);
+  context.append(contextStatus, announcement, compact, newChat);
   const form = document.createElement('form');
   form.id = 'chat-form';
   const chips = document.createElement('div');
@@ -176,6 +180,79 @@ describe('chat context control rendering', () => {
     expect(status.hasAttribute('aria-busy')).toBe(true);
     expect((document.getElementById('chat-compact') as HTMLButtonElement).disabled).toBe(true);
     expect((document.getElementById('chat-new') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('announces compact success and failure in a persistent live region', () => {
+    const view = new ChatView(() => true);
+    const announcement = document.getElementById('chat-context-announcement')!;
+    expect(announcement.getAttribute('role')).toBe('status');
+    expect(announcement.getAttribute('aria-live')).toBe('polite');
+
+    view.showControlResult({
+      type: 'control_result',
+      action: 'compact',
+      request_id: 'compact-ok',
+      ok: true,
+      epoch: 1,
+    });
+    expect(announcement.textContent).toBe('Context compacted successfully');
+    view.showControlResult({
+      type: 'control_result',
+      action: 'compact',
+      request_id: 'compact-failed',
+      ok: false,
+      epoch: 1,
+      code: 'failed',
+      message: 'provider refused',
+    });
+    expect(announcement.textContent).toContain('compact context failed: provider refused');
+    // An idle usage refresh updates only the usage chip, not the terminal
+    // announcement users of assistive technology are still consuming.
+    view.setContext({
+      type: 'context',
+      epoch: 1,
+      replay_floor_seq: 0,
+      state: 'idle',
+      usage: null,
+      compact_supported: true,
+      session_active: true,
+      writer: true,
+    });
+    expect(announcement.textContent).toContain('provider refused');
+  });
+
+  it('clears the active view immediately for New chat and restores it on rejection', () => {
+    const view = new ChatView(() => true);
+    view.bindControls(() => true);
+    view.setControlsConnected(true);
+    view.setContext({
+      type: 'context',
+      epoch: 4,
+      replay_floor_seq: 10,
+      state: 'idle',
+      usage: null,
+      compact_supported: true,
+      session_active: true,
+      writer: true,
+    });
+    view.addFrame({ type: 'notice', text: 'retired transcript', seq: 11 }, false);
+    expect(document.getElementById('chat-log')?.textContent).toContain('retired transcript');
+
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    document.getElementById('chat-new')!.click();
+    expect(document.getElementById('chat-log')?.textContent).not.toContain('retired transcript');
+
+    view.showControlResult({
+      type: 'control_result',
+      action: 'new_chat',
+      request_id: 'new-failed',
+      ok: false,
+      epoch: 4,
+      code: 'failed',
+      message: 'fresh spawn failed',
+    });
+    expect(document.getElementById('chat-log')?.textContent).toContain('retired transcript');
+    expect(document.getElementById('chat-log')?.textContent).toContain('fresh spawn failed');
   });
 });
 

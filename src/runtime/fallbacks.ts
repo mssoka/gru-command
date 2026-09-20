@@ -79,6 +79,8 @@ class FallbackHandle implements AgentHandle {
   private stateBusy = false;
   /** Automatic/provider-initiated compaction may bypass compact(). */
   private nativeCompacting = false;
+  private explicitCompactionTerminal: Extract<RuntimeEvent, { type: 'compaction_end' }> | null = null;
+  private explicitCompactionActive = false;
   private pumping = false;
   private disposed = false;
   private readonly queue: QueuedTurn[] = [];
@@ -104,23 +106,41 @@ class FallbackHandle implements AgentHandle {
           throw new Error('agent session is busy; compaction requires an idle session');
         }
         this.controlInFlight = true;
+        this.explicitCompactionActive = true;
+        this.explicitCompactionTerminal = null;
+        let failed = false;
+        let failure: unknown;
         try {
           await inner.compact!();
+        } catch (error) {
+          failed = true;
+          failure = error;
         } finally {
           this.controlInFlight = false;
-          // A broken inner adapter may reject after compaction_start without
-          // its terminal event; close both this queue gate and the lifecycle
-          // seen by supervision.
-          const missingTerminal = this.nativeCompacting;
-          this.nativeCompacting = false;
-          if (missingTerminal) {
-            this.emit({
+          // A broken inner adapter may settle without a terminal event. Close
+          // both this queue gate and the lifecycle seen by supervision, and
+          // make the public compact promise reject from the same outcome.
+          if (this.explicitCompactionTerminal === null) {
+            this.explicitCompactionTerminal = {
               type: 'compaction_end',
               success: false,
-              error: 'native compaction ended without a terminal event',
-            });
+              error: failed
+                ? failure instanceof Error
+                  ? failure.message
+                  : String(failure)
+                : 'native compaction ended without a terminal event',
+            };
+            this.nativeCompacting = false;
+            this.emit(this.explicitCompactionTerminal);
           }
+          this.explicitCompactionActive = false;
           void this.pump();
+        }
+        const outcome = this.explicitCompactionTerminal;
+        this.explicitCompactionTerminal = null;
+        if (failed) throw failure;
+        if (outcome === null || !outcome.success) {
+          throw new Error(outcome?.error ?? 'native compaction failed');
         }
       };
     }
@@ -142,6 +162,7 @@ class FallbackHandle implements AgentHandle {
       this.nativeCompacting = true;
     } else if (event.type === 'compaction_end') {
       this.nativeCompacting = false;
+      if (this.explicitCompactionActive) this.explicitCompactionTerminal = event;
     }
     // Observers must see the native terminal event before a synchronously
     // started queued prompt can emit the next turn's lifecycle.

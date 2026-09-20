@@ -86,6 +86,8 @@ class StubGruHandle implements AgentHandle {
   compactCalls = 0;
   nextCompactError: string | null = null;
   nextCompactHold: Promise<void> | null = null;
+  disposeHold: Promise<void> | null = null;
+  disposalStarted = false;
   throwOnUnsubscribe = false;
   throwHealthProbe = false;
   throwUsageProbe = false;
@@ -192,6 +194,10 @@ class StubGruHandle implements AgentHandle {
   };
 
   async dispose(): Promise<void> {
+    this.disposalStarted = true;
+    const hold = this.disposeHold;
+    this.disposeHold = null;
+    if (hold !== null) await hold;
     this.disposed = true;
     this.setState('disposed');
   }
@@ -258,6 +264,7 @@ interface Harness {
   readonly handle: StubGruHandle;
   readonly spawnCalls: (string | null)[];
   readonly freshHandles: StubGruHandle[];
+  readonly resumedHandles: StubGruHandle[];
   close(): Promise<void>;
 }
 
@@ -277,6 +284,7 @@ async function makeHarness(options: {
   readonly reuseActiveAliasOnFresh?: boolean;
   readonly reuseActiveHardLinkOnFresh?: boolean;
   readonly reuseActiveIdOnFresh?: boolean;
+  readonly replaceDisposedOnResume?: boolean;
   readonly adoptFreshGru?: (handle: AgentHandle) => Promise<void>;
   readonly siblingUpgradePaths?: readonly string[];
 } = {}): Promise<Harness> {
@@ -318,6 +326,7 @@ async function makeHarness(options: {
   const wrapped = options.steer === 'queued' ? withFallbacks(runtime) : runtime;
   const spawnCalls: (string | null)[] = [];
   const freshHandles: StubGruHandle[] = [];
+  const resumedHandles: StubGruHandle[] = [];
   let spawnFailure: Error | null = options.failFirstSpawn ?? null;
   let freshSpawnFailure: Error | null = options.failFirstFreshSpawn ?? null;
   const chat = createChatServer({
@@ -343,6 +352,11 @@ async function makeHarness(options: {
         );
         freshHandles.push(mismatched);
         return Promise.resolve(mismatched);
+      }
+      if (resumeFile !== null && handle.disposed && options.replaceDisposedOnResume === true) {
+        const resumed = new StubGruHandle(resumeFile, `stub-resumed-${resumedHandles.length + 1}`);
+        resumedHandles.push(resumed);
+        return Promise.resolve(resumed);
       }
       return wrapped.spawn('gru');
     },
@@ -405,6 +419,7 @@ async function makeHarness(options: {
     handle,
     spawnCalls,
     freshHandles,
+    resumedHandles,
     async close() {
       await chat.dispose();
       await new Promise<void>((resolveClose) => {
@@ -1899,6 +1914,12 @@ describe('chat context controls and durable new-chat boundaries', () => {
       expect(h.handle.calls.some((call) => call.text === 'queued behind automatic compact')).toBe(false);
 
       h.handle.fire({ type: 'compaction_end', success: true });
+      expect(
+        await writer.waitFor(
+          (frame) => frame.type === 'context_event' && frame.action === 'compact',
+          'automatic compact outcome',
+        ),
+      ).toMatchObject({ ok: true });
       await writer.waitFor(
         (frame) => frame.type === 'ack' && frame.client_msg_id === 'queued-auto-compact',
         'automatic compact queued ack',
@@ -1907,6 +1928,67 @@ describe('chat context controls and durable new-chat boundaries', () => {
         () => h.handle.calls.some((call) => call.text === 'queued behind automatic compact'),
         'delivery after automatic compact',
       );
+      await writer.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('projects provider-initiated compaction failures to every live user', async () => {
+    const h = await makeHarness();
+    try {
+      const writer = await authedClient(h.port, TOKEN, undefined, true);
+      writer.send('establish before provider failure', 'establish-provider-failure');
+      await writer.waitFor(isTurnEndFrame, 'provider failure setup');
+      const reader = await authedClient(h.port, TOKEN, undefined, true);
+      h.handle.fire({ type: 'compaction_start' });
+      h.handle.fire({ type: 'compaction_end', success: false, error: 'automatic compact failed' });
+      for (const client of [writer, reader]) {
+        expect(
+          await client.waitFor(
+            (frame) => frame.type === 'context_event' && frame.action === 'compact',
+            'provider failure outcome',
+          ),
+        ).toMatchObject({ ok: false, message: 'automatic compact failed' });
+      }
+      await writer.close();
+      await reader.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('uses the native terminal event as explicit compaction result authority', async () => {
+    const h = await makeHarness();
+    try {
+      const writer = await authedClient(h.port, TOKEN, undefined, true);
+      writer.send('establish terminal authority', 'establish-terminal-authority');
+      await writer.waitFor(isTurnEndFrame, 'terminal authority setup');
+      Object.defineProperty(h.handle, 'compact', {
+        configurable: true,
+        value: async () => {
+          h.handle.fire({ type: 'compaction_start' });
+          h.handle.fire({
+            type: 'compaction_end',
+            success: false,
+            error: 'terminal says compaction failed',
+          });
+          // Deliberately resolve to emulate a broken adapter. The server must
+          // still trust the typed native terminal rather than report success.
+        },
+      });
+      writer.control('compact', 'terminal-authority');
+      expect(
+        await writer.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'terminal-authority',
+          'terminal-authority result',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed', message: 'terminal says compaction failed' });
+      expect(
+        writer.frames.filter(
+          (frame) => frame.type === 'context_event' && frame.action === 'compact',
+        ),
+      ).toHaveLength(0);
       await writer.close();
     } finally {
       await h.close();
@@ -2021,6 +2103,48 @@ describe('chat context controls and durable new-chat boundaries', () => {
     }
   });
 
+  it('consumes deferred-frame failures and closes for no-ack reconnect recovery', async () => {
+    const h = await makeHarness();
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish deferred failure', 'deferred-failure-establish');
+      await client.waitFor(isTurnEndFrame, 'deferred failure setup');
+      let release!: () => void;
+      h.handle.nextCompactHold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      client.control('compact', 'deferred-failure-compact');
+      await client.waitFor(
+        (frame) => frame.type === 'context' && frame.state === 'compacting',
+        'deferred failure compacting',
+      );
+      const append = h.frameLog.append.bind(h.frameLog);
+      h.frameLog.append = ((frame) => {
+        if (frame.type === 'user' && frame.client_msg_id === 'deferred-failure-message') {
+          throw new Error('injected append failure');
+        }
+        return append(frame);
+      }) as ChatFrameLog['append'];
+      client.send('fail after barrier', 'deferred-failure-message');
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      release();
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'error' && /injected append failure/.test(frame.message),
+          'deferred failure surfaced',
+        ),
+      ).toBeDefined();
+      expect(await client.closed).toBe(1011);
+      expect(
+        h.frameLog.history.some(
+          (frame) => frame.type === 'user' && frame.client_msg_id === 'deferred-failure-message',
+        ),
+      ).toBe(false);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('bounds a non-settling native compact and fresh-session spawn', async () => {
     const compactHarness = await makeHarness({ controlTimeoutMs: 25 });
     try {
@@ -2060,6 +2184,100 @@ describe('chat context controls and durable new-chat boundaries', () => {
       await client.close();
     } finally {
       await spawnHarness.close();
+    }
+  });
+
+  it('never disposes the active handle when a timed-out fresh spawn later returns it', async () => {
+    let releaseSpawn!: () => void;
+    const h = await makeHarness({
+      controlTimeoutMs: 25,
+      reuseActiveOnFresh: true,
+      freshSpawnHold: new Promise<void>((resolve) => {
+        releaseSpawn = resolve;
+      }),
+    });
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish before late reuse', 'late-reuse-establish');
+      await client.waitFor(isTurnEndFrame, 'late reuse setup');
+      const before = new GruSessionPointer(h.chatDir).current();
+      client.control('new_chat', 'late-reuse-timeout');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'late-reuse-timeout',
+          'late reuse timeout result',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed' });
+      releaseSpawn();
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(h.handle.disposed).toBe(false);
+      expect(new GruSessionPointer(h.chatDir).current()).toEqual(before);
+      client.send('active survives late reuse', 'late-reuse-after');
+      await pollUntil(
+        () => h.handle.calls.some((call) => call.text === 'active survives late reuse'),
+        'active delivery after late reuse',
+      );
+      await client.close();
+    } finally {
+      releaseSpawn?.();
+      await h.close();
+    }
+  });
+
+  it('keeps compact timeout delivery gated until disposal and committed-session recovery finish', async () => {
+    const h = await makeHarness({ controlTimeoutMs: 25, replaceDisposedOnResume: true });
+    let releaseCompact!: () => void;
+    let releaseDispose!: () => void;
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish timeout recovery', 'timeout-recovery-establish');
+      await client.waitFor(isTurnEndFrame, 'timeout recovery setup');
+      h.handle.nextCompactHold = new Promise<void>((resolve) => {
+        releaseCompact = resolve;
+      });
+      h.handle.disposeHold = new Promise<void>((resolve) => {
+        releaseDispose = resolve;
+      });
+      client.control('compact', 'timeout-recovery-compact');
+      client.send('wait until resumed', 'timeout-recovery-message');
+      await pollUntil(() => h.handle.disposalStarted, 'retiring handle disposal started');
+      await new Promise<void>((resolve) => setTimeout(resolve, 35));
+      expect(
+        client.frames.some(
+          (frame) =>
+            frame.type === 'control_result' && frame.request_id === 'timeout-recovery-compact',
+        ),
+      ).toBe(false);
+      expect(
+        h.frameLog.history.some(
+          (frame) => frame.type === 'user' && frame.client_msg_id === 'timeout-recovery-message',
+        ),
+      ).toBe(false);
+
+      releaseDispose();
+      expect(
+        await client.waitFor(
+          (frame) =>
+            frame.type === 'control_result' && frame.request_id === 'timeout-recovery-compact',
+          'timeout result after recovery',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed' });
+      await client.waitFor(
+        (frame) => frame.type === 'ack' && frame.client_msg_id === 'timeout-recovery-message',
+        'deferred frame after recovery',
+      );
+      expect(h.resumedHandles).toHaveLength(1);
+      await pollUntil(
+        () => h.resumedHandles[0]!.calls.some((call) => call.text === 'wait until resumed'),
+        'deferred prompt routed to resumed handle',
+      );
+      expect(h.handle.calls.some((call) => call.text === 'wait until resumed')).toBe(false);
+      releaseCompact();
+      await client.close();
+    } finally {
+      releaseDispose?.();
+      releaseCompact?.();
+      await h.close();
     }
   });
 
@@ -2266,7 +2484,7 @@ describe('chat context controls and durable new-chat boundaries', () => {
     }
   });
 
-  it('reports failed supervision adoption after committing the fresh boundary', async () => {
+  it('reports committed New chat success and separately surfaces failed supervision adoption', async () => {
     const h = await makeHarness({
       adoptFreshGru: async (fresh) => {
         await fresh.dispose();
@@ -2279,9 +2497,15 @@ describe('chat context controls and durable new-chat boundaries', () => {
       expect(
         await client.waitFor(
           (frame) => frame.type === 'control_result' && frame.request_id === 'adopt-failed',
-          'failed adoption result',
+          'committed adoption result',
         ),
-      ).toMatchObject({ ok: false, code: 'failed', epoch: 1 });
+      ).toMatchObject({ ok: true, epoch: 1 });
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'context_event' && frame.action === 'new_chat',
+          'supervision degradation event',
+        ),
+      ).toMatchObject({ ok: false, message: expect.stringContaining('adoption failed') });
       expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({ epoch: 1 });
       expect(
         client.frames.some(
@@ -2434,6 +2658,94 @@ describe('chat context controls and durable new-chat boundaries', () => {
       await client.close();
     } finally {
       await restarted.close();
+    }
+  });
+
+  it('publishes a repaired epoch before flushing notices above its replay floor', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-e4-repair-notice-order-'));
+    cleanupDirs.push(dir);
+    const first = await makeHarness({ reuseDir: dir });
+    let vanishedFile = '';
+    try {
+      const client = await authedClient(first.port, TOKEN, undefined, true);
+      client.control('new_chat', 'repair-notice-prepare');
+      await client.waitFor(
+        (frame) => frame.type === 'control_result' && frame.request_id === 'repair-notice-prepare',
+        'prepare repair boundary',
+      );
+      vanishedFile = new GruSessionPointer(first.chatDir).current()!.sessionFile;
+      await client.close();
+    } finally {
+      await first.close();
+    }
+    rmSync(vanishedFile, { force: true });
+
+    const restarted = await makeHarness({ reuseDir: dir });
+    try {
+      const client = await authedClient(restarted.port, TOKEN, 0, true);
+      restarted.chat.surfaceNotice('notice preserved across repair');
+      client.send('trigger repair', 'repair-notice-trigger');
+      await client.waitFor(
+        (frame) => frame.type === 'notice' && frame.text === 'notice preserved across repair',
+        'notice after repaired context',
+      );
+      const repairedContextIndex = client.frames.findIndex(
+        (frame) => frame.type === 'context' && frame.epoch === 2,
+      );
+      const noticeIndex = client.frames.findIndex(
+        (frame) => frame.type === 'notice' && frame.text === 'notice preserved across repair',
+      );
+      expect(repairedContextIndex).toBeGreaterThanOrEqual(0);
+      expect(noticeIndex).toBeGreaterThan(repairedContextIndex);
+      const state = new GruSessionPointer(restarted.chatDir).current()!;
+      const notice = restarted.frameLog.history.find(
+        (frame) => frame.type === 'notice' && frame.text === 'notice preserved across repair',
+      );
+      expect(notice?.seq).toBeGreaterThan(state.replayFloorSeq);
+      await client.close();
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  it('aborts New chat if the retiring runtime starts provider compaction during fresh minting', async () => {
+    let releaseSpawn!: () => void;
+    const h = await makeHarness({
+      freshSpawnHold: new Promise<void>((resolve) => {
+        releaseSpawn = resolve;
+      }),
+    });
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      client.send('establish before reset race', 'reset-compact-race-establish');
+      await client.waitFor(isTurnEndFrame, 'reset compact race setup');
+      const before = new GruSessionPointer(h.chatDir).current();
+      client.control('new_chat', 'reset-compact-race');
+      await client.waitFor(
+        (frame) => frame.type === 'context' && frame.state === 'resetting',
+        'reset staging',
+      );
+      h.handle.fire({ type: 'compaction_start' });
+      releaseSpawn();
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'reset-compact-race',
+          'reset race result',
+        ),
+      ).toMatchObject({ ok: false, code: 'failed', epoch: before?.epoch ?? 0 });
+      expect(new GruSessionPointer(h.chatDir).current()).toEqual(before);
+      expect(h.freshHandles[0]?.disposed).toBe(true);
+      expect(h.handle.disposed).toBe(false);
+      h.handle.fire({ type: 'compaction_end', success: true });
+      client.send('old session still usable', 'reset-compact-race-after');
+      await pollUntil(
+        () => h.handle.calls.some((call) => call.text === 'old session still usable'),
+        'old session after aborted reset',
+      );
+      await client.close();
+    } finally {
+      releaseSpawn?.();
+      await h.close();
     }
   });
 

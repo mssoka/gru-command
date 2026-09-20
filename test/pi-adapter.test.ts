@@ -236,7 +236,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       await expect(handle.compact?.()).rejects.toThrow(/busy/);
       await expect(handle.prompt('must not overlap')).rejects.toThrow(/compacting/);
       release();
-      await compacting;
+      await expect(compacting).rejects.toThrow(/without a terminal event/);
 
       let releaseDisposed!: () => void;
       internal.session = new Proxy(nativeSession, {

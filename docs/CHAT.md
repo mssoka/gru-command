@@ -31,8 +31,9 @@ configuration in production.
 ### Server → client
 
 Durable conversation frames carry a monotonic `seq` assigned from the
-frame log. Fresh `context` snapshots and `control_result` replies are
-explicitly ephemeral: they are never logged or replayed.
+frame log. Fresh `context` snapshots, `control_result` replies, and
+unsolicited `context_event` outcomes are explicitly ephemeral: they are
+never logged or replayed.
 
 | Frame | Fields | Notes |
 |---|---|---|
@@ -46,6 +47,7 @@ explicitly ephemeral: they are never logged or replayed.
 | `error` | `message`, `fatal?`, `seq?` | see the error classes below |
 | `context` | `epoch`, `replay_floor_seq`, `state: idle\|busy\|compacting\|resetting`, `usage`, `compact_supported`, `session_active`, `writer` | fresh server-owned snapshot after auth and on every control/writer/runtime-state transition. `usage` is provider-owned or `null`, never a frontend estimate |
 | `control_result` | `action`, `request_id`, `ok`, `epoch`, `code?`, `message?` | terminal result for exactly one request; failures distinguish `busy`, `unsupported`, `read_only`, `no_session`, and runtime/persistence `failed` |
+| `context_event` | `action: compact\|new_chat`, `ok`, `message?` | broadcast terminal outcome without a client request: provider-initiated compaction, or a committed New chat whose later supervision adoption degraded |
 
 The contract has no frames for thinking deltas or in-progress tool
 updates: both are dropped at the socket boundary (transcript views own
@@ -176,16 +178,24 @@ No adapter or UI reconstructs usage from streamed deltas.
   same session. Pi uses its SDK compactor; Claude executes a dedicated
   resumed machine-output `/compact` process and suppresses every command
   output frame from chat. The session id/file must remain unchanged.
-  Visible chat messages are not removed. Failure is terminal and bounded,
-  and the old conversation remains usable.
-- **New chat** is destructive only to the active view/context: after a
-  native confirmation, the server mints without resume/transcript/summary,
-  activates the durable epoch boundary, and publishes a fresh snapshot.
-  It does not fake reset by clearing DOM or sending prose to the model.
+  Visible chat messages are not removed. The typed native terminal event is
+  the outcome authority; provider-initiated outcomes broadcast as
+  `context_event`. Failure is bounded and the old conversation remains usable.
+  If a compact deadline expires, chat detaches and disposes the timed-out
+  handle, resumes the committed session, and only then reopens queued delivery.
+- **New chat** is destructive only to the active view/context: after the
+  native confirmation, the browser immediately presents an empty pending
+  view (restoring the retired render on pre-commit failure). The server mints
+  without resume/transcript/summary, activates the durable epoch boundary,
+  and publishes a fresh snapshot. It does not reset by prose or delete old
+  session/log files.
 - Controls serialize against turns, runtime spawning, one another, and
   queued deliveries. Supervisor restarts are coordinated by slot generation:
   an intentional fresh replacement wins and any stale completion is disposed.
-  Busy attempts are rejected rather than guessed.
+  Replacement preserves restart/breaker history and never acknowledges an
+  unrelated notification. Once the epoch is durably activated, New chat is
+  reported as committed even if later supervision adoption degrades; that
+  degradation is a separate `context_event`. Busy attempts are rejected.
   Non-writer tabs remain read-only. Context usage is unavailable during
   compaction/reset until the provider can supply fresh data.
 
@@ -228,7 +238,9 @@ No adapter or UI reconstructs usage from streamed deltas.
   both numbers to zero). On boot the chat server resumes THAT session.
   **New chat** first mints an unresumed native session, then atomically
   advances all three fields and swaps the supervised slot; any failure
-  before activation leaves the old session/epoch usable. New chat never
+  before activation leaves the old session/epoch usable. A failure after
+  that commit is surfaced as supervision degradation, never a false reset
+  failure for an already-advanced epoch. New chat never
   deletes or rewrites old native transcripts or frame-log bytes, and a
   second reset simply advances the boundary again. Frame shards remain
   subject only to the configured size/retention policy described in

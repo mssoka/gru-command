@@ -16,6 +16,7 @@ import {
   WS_PATH,
   parseServerFrame,
   type AttachmentChip,
+  type ContextEventFrame,
   type ContextFrame,
   type ControlAction,
   type ControlResultFrame,
@@ -61,6 +62,8 @@ export interface ChatClientEvents {
   context?(snapshot: ContextFrame): void;
   /** A requested fixed control reached a terminal result. */
   controlResult?(result: ControlResultFrame): void;
+  /** Provider-initiated or degraded context lifecycle outcome. */
+  contextEvent?(event: ContextEventFrame): void;
   /** The durable active-chat epoch changed; the UI clears only its view. */
   epochChange?(epoch: number): void;
   /** Fatal error (bad token, protocol failure) — pairing must redo. */
@@ -144,6 +147,7 @@ export class ChatClient {
    * authoritative idle context (including reconnect recovery) releases them
    * into whichever epoch actually won. */
   private pendingNewChatRequest: string | null = null;
+  private pendingNewChatOriginEpoch: number | null = null;
   private pendingNewChatResultEpoch: number | null = null;
   /** A reconnect first observed this pending reset before its terminal idle
    * snapshot. Kept separately because ordinary reconnect reconciliation is
@@ -226,7 +230,11 @@ export class ChatClient {
     };
     this.messages.set(message.client_msg_id, message);
     this.outbox.push(message.client_msg_id);
-    this.persistOutbox();
+    if (!this.persistOutbox()) {
+      this.messages.delete(message.client_msg_id);
+      this.outbox.pop();
+      throw new Error('could not persist the queued message; browser storage is unavailable');
+    }
     this.events.messageStatus({ ...message });
     this.flushOutbox();
     return { ...message };
@@ -246,6 +254,7 @@ export class ChatClient {
     const requestId = `control-${this.id()}`;
     if (action === 'new_chat') {
       this.pendingNewChatRequest = requestId;
+      this.pendingNewChatOriginEpoch = this.currentEpoch;
       this.pendingNewChatResultEpoch = null;
       this.pendingNewChatRecovery = false;
     }
@@ -254,6 +263,7 @@ export class ChatClient {
     } catch (error) {
       if (this.pendingNewChatRequest === requestId) {
         this.pendingNewChatRequest = null;
+        this.pendingNewChatOriginEpoch = null;
         this.pendingNewChatResultEpoch = null;
         this.pendingNewChatRecovery = false;
       }
@@ -387,11 +397,17 @@ export class ChatClient {
           // immediately after every pre-lifecycle rejection (and control
           // finally does the same after an attempted transition).
           this.pendingNewChatRequest = null;
+          this.pendingNewChatOriginEpoch = null;
           this.pendingNewChatResultEpoch = null;
           this.pendingNewChatRecovery = false;
         }
       }
       this.events.controlResult?.(frame);
+      return;
+    }
+
+    if (frame.type === 'context_event') {
+      this.events.contextEvent?.(frame);
       return;
     }
 
@@ -504,22 +520,21 @@ export class ChatClient {
       }
     }
     let pendingNewChatCleared = false;
-    if (
-      this.pendingNewChatRequest !== null &&
-      snapshot.state === 'idle' &&
-      (
+    if (this.pendingNewChatRequest !== null && snapshot.state === 'idle') {
+      const committed =
         (this.pendingNewChatResultEpoch !== null &&
           snapshot.epoch >= this.pendingNewChatResultEpoch) ||
-        (this.pendingNewChatResultEpoch === null && this.pendingNewChatRecovery)
-      )
-    ) {
-      if (
+        (this.pendingNewChatOriginEpoch !== null &&
+          snapshot.epoch > this.pendingNewChatOriginEpoch);
+      const inferredFailure =
+        !committed &&
         this.pendingNewChatResultEpoch === null &&
         this.pendingNewChatRecovery &&
-        priorEpoch === snapshot.epoch
-      ) {
-        // The terminal result was lost with the socket, but an authoritative
-        // idle snapshot in the original epoch proves reset did not commit.
+        this.pendingNewChatOriginEpoch === snapshot.epoch;
+      if (inferredFailure) {
+        // The terminal result was lost with the socket, and an authoritative
+        // idle snapshot still names the request's origin epoch: no durable
+        // reset committed. An advanced epoch is recovered success instead.
         this.events.controlResult?.({
           type: 'control_result',
           action: 'new_chat',
@@ -530,10 +545,13 @@ export class ChatClient {
           message: 'New chat did not complete before reconnect',
         });
       }
-      this.pendingNewChatRequest = null;
-      this.pendingNewChatResultEpoch = null;
-      this.pendingNewChatRecovery = false;
-      pendingNewChatCleared = true;
+      if (committed || inferredFailure) {
+        this.pendingNewChatRequest = null;
+        this.pendingNewChatOriginEpoch = null;
+        this.pendingNewChatResultEpoch = null;
+        this.pendingNewChatRecovery = false;
+        pendingNewChatCleared = true;
+      }
     }
     this.reconnectPending = false;
     if (outboxChanged) this.persistOutbox();

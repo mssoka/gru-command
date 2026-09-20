@@ -184,7 +184,8 @@ export class ChatFrameLog {
         frame === null ||
         frame.type === 'auth_ok' ||
         frame.type === 'context' ||
-        frame.type === 'control_result'
+        frame.type === 'control_result' ||
+        frame.type === 'context_event'
       ) {
         throw new FrameLogCorruptError(file, index + 1, 'not a logged chat frame');
       }
