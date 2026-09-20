@@ -279,6 +279,14 @@ body {
   position: relative;
 }
 
+/* Grid items must be shrinkable below their content's intrinsic width
+   (the composer's cols-based intrinsic size, long unbreakable words):
+   without this, the implicit column track blows past narrow viewports
+   (390px sheet) and clips. */
+.chat-panel > * {
+  min-width: 0;
+}
+
 .chat-log {
   overflow-y: auto;
   padding: 18px 16px 8px;
@@ -531,6 +539,19 @@ body {
 .chat-compose .pp-input {
   flex: 1;
   min-width: 0;
+}
+
+/* Multi-line composer: one row at rest, auto-grows with content (the JS
+   autosize keeps height honest), hard-capped here — past the cap it
+   scrolls internally. resize:none kills the native grab handle: the
+   composer sizes itself. No field-sizing: Chromium sizes it to fit a
+   WRAPPED placeholder on narrow screens — the placeholder must behave
+   like the single-line input's (clipped), never drive layout. */
+.chat-compose textarea.pp-input {
+  resize: none;
+  overflow-y: auto;
+  max-height: 10rem;
+  line-height: 1.45;
 }
 
 /* Mobile: chat becomes a corner bubble */

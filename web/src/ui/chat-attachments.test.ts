@@ -38,7 +38,7 @@ function installChatDom(): void {
   const attach = document.createElement('button');
   attach.id = 'chat-attach';
   attach.type = 'button';
-  const input = document.createElement('input');
+  const input = document.createElement('textarea');
   input.id = 'chat-input';
   const send = document.createElement('button');
   send.id = 'chat-send';
@@ -294,7 +294,7 @@ describe('composer attach consumer paths', () => {
     document.getElementById('chat-attach')!.click();
     await settle();
     (document.querySelector('.attach-row--file') as HTMLButtonElement).click();
-    const input = document.getElementById('chat-input') as HTMLInputElement;
+    const input = document.getElementById('chat-input') as HTMLTextAreaElement;
     input.value = 'do not lose me';
     document.getElementById('chat-form')!.dispatchEvent(
       new Event('submit', { bubbles: true, cancelable: true }),
@@ -332,7 +332,7 @@ describe('composer attach consumer paths', () => {
 
     resolvers[0]!({ path: '/uploads/one-same.png', name: 'same.png', bytes: 3 });
     await settle();
-    (document.getElementById('chat-input') as HTMLInputElement).value = 'wait for both';
+    (document.getElementById('chat-input') as HTMLTextAreaElement).value = 'wait for both';
     document.getElementById('chat-form')!.dispatchEvent(
       new Event('submit', { bubbles: true, cancelable: true }),
     );
