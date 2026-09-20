@@ -19,6 +19,8 @@ import { DEFAULT_MOCK_TOKEN, resolveMockExposure } from './safety.js';
 import {
   parseClientFrame,
   type AttachmentChip,
+  type ContextControlState,
+  type ControlFrame,
   type ErrorFrame,
   type LoggedFrame,
   type ServerFrame,
@@ -35,6 +37,15 @@ const DELTA_INTERVAL_MS = 45;
 /** In-memory frame log — the mock's stand-in for the session store. */
 const log: LoggedFrame[] = [];
 let seq = 0;
+let epoch = 0;
+let replayFloorSeq = 0;
+let controlState: ContextControlState = 'idle';
+let failNextCompact = false;
+let failNextNewChat = false;
+let compactGeneration = 0;
+let newChatGeneration = 0;
+const deferredUsers: Array<{ socket: WebSocket; frame: UserFrame }> = [];
+const chatClients = new Map<WebSocket, { writer: boolean }>();
 
 function nextSeq(): number {
   seq += 1;
@@ -48,6 +59,31 @@ function record(frame: LoggedFrame): LoggedFrame {
 
 function send(socket: WebSocket, frame: ServerFrame): void {
   socket.send(JSON.stringify(frame));
+}
+
+function sendContext(socket: WebSocket): void {
+  send(socket, {
+    type: 'context',
+    epoch,
+    replay_floor_seq: replayFloorSeq,
+    state: controlState,
+    usage: null,
+    compact_supported: true,
+    session_active: true,
+    writer: chatClients.get(socket)?.writer === true,
+  });
+}
+
+function broadcastContext(): void {
+  for (const socket of chatClients.keys()) {
+    if (socket.readyState === WebSocket.OPEN) sendContext(socket);
+  }
+}
+
+function broadcastFrame(frame: LoggedFrame, except?: WebSocket): void {
+  for (const socket of chatClients.keys()) {
+    if (socket !== except && socket.readyState === WebSocket.OPEN) send(socket, frame);
+  }
 }
 
 function sendError(socket: WebSocket, message: string, fatal: boolean): void {
@@ -65,6 +101,8 @@ function sendError(socket: WebSocket, message: string, fatal: boolean): void {
 
 /** Deterministic scripted Gru reply: turn → tool activity → deltas → end. */
 function scriptedReply(socket: WebSocket, userText: string, attachments?: readonly AttachmentChip[]): void {
+  controlState = 'busy';
+  broadcastContext();
   // Attach chips echo as PATH lines (SPEC ruling 19 parity: the mock is
   // the executable spec — paths, never pasted bytes).
   const chipLines = (attachments ?? []).map((chip) => `📎 ${chip.name} → ${chip.path}`).join(' ');
@@ -95,6 +133,9 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
       clearInterval(timer);
       socket.off('close', finishAborted);
       emit({ type: 'turn', state: 'end', seq: nextSeq() });
+      controlState = 'idle';
+      broadcastContext();
+      drainDeferredUsers();
       return;
     }
     emit({ type: 'delta', text: chunk, seq: nextSeq() });
@@ -111,14 +152,19 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     clearInterval(timer);
     if (!toolEnded) {
       toolEnded = true;
-      record({ type: 'tool', name: 'mock-echo', state: 'end', seq: nextSeq() });
+      const toolEnd = record({ type: 'tool', name: 'mock-echo', state: 'end', seq: nextSeq() });
+      broadcastFrame(toolEnd);
     }
-    record({ type: 'turn', state: 'end', seq: nextSeq() });
+    const turnEnd = record({ type: 'turn', state: 'end', seq: nextSeq() });
+    broadcastFrame(turnEnd);
+    controlState = 'idle';
+    broadcastContext();
+    drainDeferredUsers();
   }
 
   function emit(frame: LoggedFrame): void {
     record(frame);
-    send(socket, frame);
+    broadcastFrame(frame);
   }
 }
 
@@ -428,7 +474,30 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     return;
   }
   // Dev control plane (tests): POST /__reset clears the frame log;
-  // POST /__drop terminates every connected socket.
+  // POST /__drop terminates every connected socket; the failure endpoints
+  // fail the next matching context control after its visible progress state.
+  if (req.method === 'POST' && req.url === '/__compact-fail') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    failNextCompact = true;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}\n');
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/__new-chat-fail') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    failNextNewChat = true;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}\n');
+    return;
+  }
   if (req.method === 'POST' && req.url === '/__drop') {
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' });
@@ -446,8 +515,20 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
       res.end('{"error":"unauthorized"}\n');
       return;
     }
+    // Counters may rewind only after every client is detached; otherwise a
+    // live browser observes impossible seq/epoch regression.
+    for (const socket of server.clients) socket.terminate();
+    chatClients.clear();
     log.length = 0;
     seq = 0;
+    epoch = 0;
+    replayFloorSeq = 0;
+    controlState = 'idle';
+    failNextCompact = false;
+    failNextNewChat = false;
+    compactGeneration += 1;
+    newChatGeneration += 1;
+    deferredUsers.length = 0;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}\n');
     return;
@@ -465,6 +546,22 @@ const boardServer = new WebSocketServer({ noServer: true });
 
 httpServer.on('upgrade', (request, socket, head) => {
   const { pathname } = new URL(request.url ?? '/', 'http://localhost');
+  const origin = request.headers.origin;
+  if (origin !== undefined) {
+    try {
+      const parsed = new URL(origin);
+      if (
+        (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+        parsed.host !== request.headers.host
+      ) {
+        socket.destroy();
+        return;
+      }
+    } catch {
+      socket.destroy();
+      return;
+    }
+  }
   if (pathname === '/ws') {
     server.handleUpgrade(request, socket, head, (ws) => server.emit('connection', ws, request));
     return;
@@ -549,13 +646,16 @@ server.on('connection', (socket) => {
         return;
       }
       authed = true;
-    const lastSeen = frame.last_seen_seq ?? 0;
+      const writer = ![...chatClients.values()].some((client) => client.writer);
+      chatClients.set(socket, { writer });
+      const lastSeen = frame.last_seen_seq ?? 0;
       // auth_ok.seq is the log high-water mark; because every seq-consuming
       // frame is logged, counter === max logged seq at all times.
       send(socket, { type: 'auth_ok', seq });
+      sendContext(socket);
       for (const logged of log) {
         const frameSeq = 'seq' in logged && typeof logged.seq === 'number' ? logged.seq : 0;
-        if (frameSeq > lastSeen) send(socket, logged);
+        if (frameSeq > Math.max(lastSeen, replayFloorSeq)) send(socket, logged);
       }
       return;
     }
@@ -564,34 +664,181 @@ server.on('connection', (socket) => {
       sendError(socket, 'already authenticated', false);
       return;
     }
+    if (frame.type === 'control') {
+      handleControlFrame(socket, frame);
+      return;
+    }
 
     handleUserFrame(socket, frame);
   });
 
+  socket.on('close', () => {
+    const wasWriter = chatClients.get(socket)?.writer === true;
+    chatClients.delete(socket);
+    if (wasWriter) {
+      const promoted = chatClients.values().next().value as { writer: boolean } | undefined;
+      if (promoted !== undefined) promoted.writer = true;
+      broadcastContext();
+    }
+  });
   socket.on('error', () => {
     // A broken client socket must not take the mock down.
   });
 });
 
-/** Dedup by client_msg_id: re-received frames get a fresh ack, no re-reply. */
-function handleUserFrame(socket: WebSocket, frame: UserFrame): void {
+function handleControlFrame(socket: WebSocket, frame: ControlFrame): void {
+  if (chatClients.get(socket)?.writer !== true) {
+    send(socket, {
+      type: 'control_result',
+      action: frame.action,
+      request_id: frame.request_id,
+      ok: false,
+      epoch,
+      code: 'read_only',
+      message: 'another client holds the pen',
+    });
+    sendContext(socket);
+    return;
+  }
+  if (controlState !== 'idle') {
+    send(socket, {
+      type: 'control_result',
+      action: frame.action,
+      request_id: frame.request_id,
+      ok: false,
+      epoch,
+      code: 'busy',
+      message: 'chat is busy',
+    });
+    sendContext(socket);
+    return;
+  }
+  controlState = frame.action === 'compact' ? 'compacting' : 'resetting';
+  broadcastContext();
+  if (frame.action === 'compact') {
+    // Keep progress visible long enough for browser-level accessibility/UI
+    // proof, then emit one deterministic terminal result.
+    const generation = ++compactGeneration;
+    setTimeout(() => {
+      if (generation !== compactGeneration) return;
+      const fail = failNextCompact;
+      failNextCompact = false;
+      controlState = 'idle';
+      if (socket.readyState === WebSocket.OPEN) {
+        send(socket, fail
+          ? {
+              type: 'control_result',
+              action: frame.action,
+              request_id: frame.request_id,
+              ok: false,
+              epoch,
+              code: 'failed',
+              message: 'mock native compact failed',
+            }
+          : {
+              type: 'control_result',
+              action: frame.action,
+              request_id: frame.request_id,
+              ok: true,
+              epoch,
+            });
+      }
+      broadcastContext();
+      drainDeferredUsers();
+    }, 300);
+    return;
+  }
+  const generation = ++newChatGeneration;
+  const fail = failNextNewChat;
+  failNextNewChat = false;
+  setTimeout(() => {
+    if (generation !== newChatGeneration) return;
+    if (fail) {
+      if (socket.readyState === WebSocket.OPEN) {
+        send(socket, {
+          type: 'control_result',
+          action: frame.action,
+          request_id: frame.request_id,
+          ok: false,
+          epoch,
+          code: 'failed',
+          message: 'mock fresh session spawn failed',
+        });
+      }
+      controlState = 'idle';
+      broadcastContext();
+      drainDeferredUsers();
+      return;
+    }
+    epoch += 1;
+    replayFloorSeq = seq;
+    // Match production activation ordering: publish the committed boundary
+    // while reset is still in progress, then terminal result, then idle.
+    broadcastContext();
+    if (socket.readyState === WebSocket.OPEN) {
+      send(socket, {
+        type: 'control_result',
+        action: frame.action,
+        request_id: frame.request_id,
+        ok: true,
+        epoch,
+      });
+    }
+    controlState = 'idle';
+    broadcastContext();
+    drainDeferredUsers();
+  }, fail ? 2_500 : 600);
+}
+
+function drainDeferredUsers(): void {
+  if (controlState !== 'idle') return;
+  for (;;) {
+    const next = deferredUsers.shift();
+    if (next === undefined) return;
+    if (next.socket.readyState !== WebSocket.OPEN) continue;
+    if (handleUserFrame(next.socket, next.frame)) return;
+    // A terminal duplicate starts no reply; keep draining until a unique
+    // frame owns the one-at-a-time scripted turn.
+  }
+}
+
+/** Dedup by epoch + client_msg_id: re-received frames get a fresh ack. */
+function handleUserFrame(socket: WebSocket, frame: UserFrame): boolean {
+  if (chatClients.get(socket)?.writer !== true) {
+    send(socket, { type: 'error', message: 'read-only: another client holds the pen' });
+    return false;
+  }
+  if (controlState !== 'idle') {
+    deferredUsers.push({ socket, frame });
+    return false;
+  }
+  if (frame.epoch !== epoch) {
+    send(socket, { type: 'error', message: 'stale chat epoch; reconnect required' });
+    socket.close(1012, 'stale chat epoch');
+    return false;
+  }
   const prior = log.find(
     (logged): logged is LoggedFrame & { type: 'user' } =>
-      logged.type === 'user' && logged.client_msg_id === frame.client_msg_id,
+      logged.type === 'user' &&
+      logged.client_msg_id === frame.client_msg_id &&
+      logged.epoch === frame.epoch,
   );
   if (prior !== undefined) {
     send(socket, record({ type: 'ack', client_msg_id: frame.client_msg_id, seq: nextSeq() }));
-    return;
+    return false;
   }
-  record({
+  const loggedUser = record({
     type: 'user',
     text: frame.text,
     client_msg_id: frame.client_msg_id,
+    epoch: frame.epoch,
     ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
     seq: nextSeq(),
   });
+  broadcastFrame(loggedUser, socket);
   send(socket, record({ type: 'ack', client_msg_id: frame.client_msg_id, seq: nextSeq() }));
   scriptedReply(socket, frame.text, frame.attachments);
+  return true;
 }
 
 const shutdown = (): void => {

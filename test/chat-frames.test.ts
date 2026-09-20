@@ -23,29 +23,35 @@ const CLIENT_CORPUS: readonly unknown[] = [
   { type: 'auth', token: 'tok' },
   { type: 'auth', token: 'tok', last_seen_seq: 0 },
   { type: 'auth', token: 'tok', last_seen_seq: 42 },
-  { type: 'user', text: 'hello', client_msg_id: 'id-1' },
+  { type: 'control', action: 'compact', request_id: 'compact-1' },
+  { type: 'control', action: 'new_chat', request_id: 'new-1' },
+  { type: 'user', text: 'hello', client_msg_id: 'id-1', epoch: 0 },
   // valid: SPEC ruling 19 attachment chips (both kinds, absent optional)
   {
     type: 'user',
     text: 'look',
     client_msg_id: 'id-2',
+    epoch: 3,
     attachments: [
       { path: '/ws/repo/notes.md', name: 'notes.md', kind: 'file' },
       { path: '/data/uploads/1-shot.png', name: 'shot.png', kind: 'image' },
     ],
   },
-  { type: 'user', text: '', client_msg_id: 'id-3', attachments: [{ path: '/x.png', name: 'x.png', kind: 'image' }] },
+  { type: 'user', text: '', client_msg_id: 'id-3', epoch: 0, attachments: [{ path: '/x.png', name: 'x.png', kind: 'image' }] },
   // valid: extra keys are ignored
   { type: 'auth', token: 'tok', extra: true },
-  { type: 'user', text: 'x', client_msg_id: 'id', future: 'field' },
+  { type: 'user', text: 'x', client_msg_id: 'id', epoch: 4, future: 'field' },
   // invalid
   { type: 'auth' },
   { type: 'auth', token: '' },
   { type: 'auth', token: 7 },
   { type: 'auth', token: 'tok', last_seen_seq: -1 },
   { type: 'auth', token: 'tok', last_seen_seq: 1.5 },
+  { type: 'auth', token: 'tok', last_seen_seq: Number.MAX_SAFE_INTEGER + 1 },
   { type: 'auth', token: 'tok', last_seen_seq: '7' },
   { type: 'auth', token: 'tok', last_seen_seq: null },
+  { type: 'control', action: 'reset', request_id: 'bad' },
+  { type: 'control', action: 'compact', request_id: '' },
   { type: 'user', text: '', client_msg_id: 'id' }, // no text AND no chips
   // invalid: SPEC ruling 19 chip shapes (empty array, bad kind, too many,
   // empty fields, oversized path)
@@ -77,7 +83,7 @@ const CLIENT_CORPUS: readonly unknown[] = [
   42,
   'not json at all',
   '{"type":"auth","token":"tok"}', // valid JSON string — parsed then validated
-  '{"type":"user","text":"hi","client_msg_id":"id"}',
+  '{"type":"user","text":"hi","client_msg_id":"id","epoch":0}',
   '{"broken json',
   true,
 ];
@@ -108,13 +114,47 @@ const SERVER_CORPUS: readonly unknown[] = [
   { type: 'error', message: 'boom', fatal: true },
   { type: 'error', message: 'boom', seq: 10 },
   { type: 'error', message: 'boom', fatal: false, seq: 11 },
+  {
+    type: 'context',
+    epoch: 2,
+    replay_floor_seq: 41,
+    state: 'idle',
+    usage: { tokens: 10, context_window: 100, percent: 10 },
+    compact_supported: true,
+    session_active: true,
+    writer: false,
+  },
+  { type: 'context', epoch: 2, replay_floor_seq: 41, state: 'busy', usage: null, compact_supported: true, session_active: true, writer: true },
+  { type: 'control_result', action: 'new_chat', request_id: 'new-1', ok: true, epoch: 2 },
+  { type: 'context_event', action: 'compact', ok: true },
+  { type: 'context_event', action: 'compact', ok: false, message: 'provider failed' },
+  {
+    type: 'control_result',
+    action: 'compact',
+    request_id: 'compact-1',
+    ok: false,
+    epoch: 2,
+    code: 'busy',
+    message: 'chat is busy',
+  },
   // invalid
+  { type: 'context', epoch: -1, replay_floor_seq: 0, state: 'idle', usage: null, compact_supported: true, session_active: true, writer: true },
+  { type: 'context', epoch: Number.MAX_SAFE_INTEGER + 1, replay_floor_seq: 0, state: 'idle', usage: null, compact_supported: true, session_active: true, writer: true },
+  { type: 'context', epoch: 1, replay_floor_seq: Number.MAX_SAFE_INTEGER + 1, state: 'idle', usage: null, compact_supported: true, session_active: true, writer: true },
+  { type: 'context', epoch: 1, replay_floor_seq: 0, state: 'working', usage: null, compact_supported: true, session_active: true, writer: true },
+  { type: 'control_result', action: 'compact', request_id: 'x', ok: true, epoch: Number.MAX_SAFE_INTEGER + 1 },
+  { type: 'control_result', action: 'compact', request_id: 'x', ok: false, epoch: 1 },
+  { type: 'control_result', action: 'compact', request_id: 'x', ok: true, epoch: 1, code: 'failed' },
+  { type: 'context_event', action: 'other', ok: true },
+  { type: 'context_event', action: 'compact', ok: 'yes' },
+  { type: 'context_event', action: 'compact', ok: false, message: '' },
   { type: 'notice', text: 'no seq' }, // E7: notice REQUIRES seq
   { type: 'notice', text: '', seq: 13 }, // E7: empty text is malformed
   { type: 'notice', seq: 14 }, // E7: missing text
   { type: 'auth_ok' },
   { type: 'auth_ok', seq: -1 },
   { type: 'auth_ok', seq: 1.5 },
+  { type: 'auth_ok', seq: Number.MAX_SAFE_INTEGER + 1 },
   { type: 'ack', client_msg_id: '', seq: 1 },
   { type: 'ack', client_msg_id: 'id' },
   { type: 'user', text: 'hi', client_msg_id: 'id' }, // replay user needs seq
@@ -175,18 +215,20 @@ describe('chat frame parser parity with the web contract module', () => {
       { type: 'turn', state: 'start' },
       { type: 'turn', state: 'end' },
       { type: 'error', message: 'logged error' },
-      { type: 'user', text: 'hi', client_msg_id: 'id-1' },
+      { type: 'user', text: 'hi', client_msg_id: 'id-1', epoch: 0 },
       // SPEC ruling 19: user frames with chips + attachment-only frames.
       {
         type: 'user',
         text: 'hi',
         client_msg_id: 'id-2',
+        epoch: 0,
         attachments: [{ path: '/ws/repo/shot.png', name: 'shot.png', kind: 'image' }],
       },
       {
         type: 'user',
         text: '',
         client_msg_id: 'id-3',
+        epoch: 0,
         attachments: [{ path: '/data/uploads/1-x.png', name: 'x.png', kind: 'image' }],
       },
     ];

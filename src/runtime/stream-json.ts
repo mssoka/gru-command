@@ -107,6 +107,69 @@ export interface ResultInfo {
   readonly text: string | null;
 }
 
+/** Machine-frame reader for native Claude controls such as `/compact`.
+ * Unlike a turn translator it has no content event surface by design:
+ * assistant text/tool frames are consumed as command output and can never
+ * escape into chat. */
+export class ClaudeControlTranslator {
+  private readonly frames = new ClaudeTurnTranslator();
+  private compactBoundary = false;
+  private compactResult: 'success' | 'failed' | null = null;
+  private compactError: string | null = null;
+
+  get init(): InitInfo | null {
+    return this.frames.init;
+  }
+
+  get result(): ResultInfo | null {
+    return this.frames.result;
+  }
+
+  /** Native compact succeeded only when Claude reports its compact status or
+   * emits the compact boundary. A nominally successful slash-command result
+   * alone is insufficient: the command can complete while compaction fails. */
+  get compactSucceeded(): boolean {
+    return this.compactResult === 'success' || (this.compactResult === null && this.compactBoundary);
+  }
+
+  get compactFailure(): string | null {
+    return this.compactResult === 'failed'
+      ? (this.compactError ?? 'claude reported native compaction failed')
+      : null;
+  }
+
+  ingest(frame: StreamFrame): void {
+    // ClaudeTurnTranslator already carries the pinned init/result validation
+    // rules. Deliberately discard every returned content event.
+    this.frames.ingest(frame);
+
+    // Claude 2.1.x emits `system/compact_boundary` on success and may also
+    // place compact_result/compact_error on its status frame. Accept both
+    // documented machine shapes, but never infer success from human text.
+    if (
+      (frame['type'] === 'system' && frame['subtype'] === 'compact_boundary') ||
+      frame['type'] === 'compact_boundary'
+    ) {
+      this.compactBoundary = true;
+    }
+    // A compact_result is authoritative only on Claude's machine status
+    // frame. Ignore same-named fields on assistant/tool/unknown frames so
+    // command content cannot forge a native control outcome.
+    if (frame['type'] !== 'system' || frame['subtype'] !== 'status') return;
+    const result = frame['compact_result'];
+    if (result === 'success' && this.compactResult !== 'failed') {
+      this.compactResult = 'success';
+      this.compactError = null;
+    } else if (result === 'failed' || result === 'failure' || result === 'error') {
+      this.compactResult = 'failed';
+      this.compactError =
+        typeof frame['compact_error'] === 'string' && frame['compact_error'] !== ''
+          ? frame['compact_error']
+          : null;
+    }
+  }
+}
+
 interface OpenBlock {
   readonly type: string;
   readonly id?: string;

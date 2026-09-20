@@ -39,6 +39,18 @@ describe.skipIf(process.env[SMOKE_FLAG] !== '1')('claude-code smoke (live CLI)',
         expect(deltas.join('')).toBeTruthy();
         expect(handle.health().state).toBe('idle');
 
+        // Native control qualification: compact the real CLI session, then
+        // prove that the same identity remains usable for another turn.
+        expect(handle.canCompact?.()).toBe(true);
+        await handle.compact?.();
+        const afterCompact: string[] = [];
+        handle.subscribe((event) => {
+          if (event.type === 'text_delta') afterCompact.push(event.delta);
+        });
+        await handle.prompt('Reply with exactly the word: compacted', { owner: 'smoke' });
+        expect(afterCompact.join('')).toBeTruthy();
+        expect(handle.health().state).toBe('idle');
+
         // Continuity: dispose + resume against the same transcript file.
         const file = handle.sessionFile!;
         await handle.dispose();

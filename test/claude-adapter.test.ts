@@ -11,6 +11,7 @@ import {
 } from '../src/runtime/claude-adapter.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
 import {
+  ClaudeControlTranslator,
   ClaudeTurnTranslator,
   extractSessionId,
   NdjsonParser,
@@ -31,6 +32,16 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_NO_PARTIALS',
   'CLAUDE_DOUBLE_MISMATCH',
   'CLAUDE_DOUBLE_IGNORE_TERM',
+  'CLAUDE_DOUBLE_COMPACT_ERROR',
+  'CLAUDE_DOUBLE_COMPACT_STATUS_FAIL',
+  'CLAUDE_DOUBLE_COMPACT_EXIT_ERROR',
+  'CLAUDE_DOUBLE_COMPACT_NO_INIT',
+  'CLAUDE_DOUBLE_COMPACT_INIT_NO_ID',
+  'CLAUDE_DOUBLE_COMPACT_NO_RESULT',
+  'CLAUDE_DOUBLE_COMPACT_CONTENT',
+  'CLAUDE_DOUBLE_COMPACT_FORGED_RESULT',
+  'CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT',
+  'CLAUDE_DOUBLE_COMPACT_HOLD_FILE',
 ] as const;
 
 const cleanupDirs: string[] = [];
@@ -167,6 +178,156 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       );
       expect(invocations[1]!.argv[invocations[1]!.argv.indexOf('--resume') + 1]).toBe(handle.id);
       expect(invocations[1]!.argv).not.toContain('--session-id');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('runs native /compact in a dedicated resumed process without leaking command text', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const events = collect(handle);
+      expect(handle.getContextUsage).toBeUndefined();
+      expect(handle.canCompact?.()).toBe(false);
+      await handle.prompt('establish the session');
+      expect(handle.getContextUsage).toBeUndefined();
+      expect(handle.canCompact?.()).toBe(true);
+      const textBefore = deltas(events, 'text_delta').join('');
+      const contentEventsBefore = events.filter(
+        (event) =>
+          event.type === 'text_delta' ||
+          event.type === 'thinking_delta' ||
+          event.type === 'tool_start' ||
+          event.type === 'tool_update' ||
+          event.type === 'tool_end',
+      ).length;
+      const id = handle.id;
+      const file = handle.sessionFile;
+      process.env['CLAUDE_DOUBLE_COMPACT_CONTENT'] = '1';
+      await handle.compact?.();
+      expect(handle.id).toBe(id);
+      expect(handle.sessionFile).toBe(file);
+      expect(deltas(events, 'text_delta').join('')).toBe(textBefore);
+      expect(
+        events.filter(
+          (event) =>
+            event.type === 'text_delta' ||
+            event.type === 'thinking_delta' ||
+            event.type === 'tool_start' ||
+            event.type === 'tool_update' ||
+            event.type === 'tool_end',
+        ),
+      ).toHaveLength(contentEventsBefore);
+      expect(events.filter((event) => event.type === 'compaction_start')).toHaveLength(1);
+      expect(
+        events.filter((event) => event.type === 'compaction_end' && event.success),
+      ).toHaveLength(1);
+      const compact = doubleInvocations(fx).at(-1)!;
+      expect(compact.prompt).toBe('/compact');
+      expect(compact.argv[compact.argv.indexOf('--resume') + 1]).toBe(id);
+      expect(compact.argv).not.toContain('--session-id');
+      const compactFrames = readFileSync(file!, 'utf-8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(
+        compactFrames.some(
+          (frame) => frame['type'] === 'system' && frame['subtype'] === 'compact_boundary',
+        ),
+      ).toBe(true);
+      expect(
+        compactFrames.some(
+          (frame) => frame['type'] === 'result' && frame['result'] === 'Compacted conversation',
+        ),
+      ).toBe(true);
+      await handle.prompt('continue after native compact');
+      expect(deltas(events, 'text_delta').join('')).toContain('continue after native compact');
+      const continuation = doubleInvocations(fx).at(-1)!;
+      expect(continuation.argv[continuation.argv.indexOf('--resume') + 1]).toBe(id);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('dispose kills a held native compact before unlocking and the session resumes', async () => {
+    const fx = fixture({ killGraceMs: 50 });
+    const handle = await fx.runtime.spawn('gru');
+    await handle.prompt('establish before held compact');
+    process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+    const file = handle.sessionFile!;
+    const releaseFile = join(fx.home, 'release-held-compact');
+    process.env['CLAUDE_DOUBLE_COMPACT_HOLD_FILE'] = releaseFile;
+    const compact = handle.compact!();
+    const rejected = expect(compact).rejects.toThrow(/disposed/);
+    await waitFor(() => handle.isCompacting?.() === true && doubleInvocations(fx).length >= 2);
+    const disposing = handle.dispose();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(existsSync(`${file}.lock`)).toBe(true);
+    await disposing;
+    await rejected;
+    expect(existsSync(`${file}.lock`)).toBe(false);
+
+    delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
+    delete process.env['CLAUDE_DOUBLE_COMPACT_HOLD_FILE'];
+    const resumed = await fx.runtime.spawn('gru', { resumeFile: file });
+    try {
+      await resumed.prompt('usable after compact restart');
+      expect(resumed.health().state).toBe('idle');
+    } finally {
+      await resumed.dispose();
+    }
+  });
+
+  it('a native compact failure is bounded and the Claude conversation remains usable', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const events = collect(handle);
+      await handle.prompt('establish');
+      process.env['CLAUDE_DOUBLE_COMPACT_ERROR'] = '1';
+      await expect(handle.compact?.()).rejects.toThrow(/native compact failed/);
+      expect(
+        events.some((event) => event.type === 'compaction_end' && !event.success),
+      ).toBe(true);
+      delete process.env['CLAUDE_DOUBLE_COMPACT_ERROR'];
+      await handle.prompt('still usable');
+      expect(deltas(events, 'text_delta').join('')).toContain('still usable');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('does not fake compact success when the slash command succeeds but native compaction fails', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      await handle.prompt('establish');
+      process.env['CLAUDE_DOUBLE_COMPACT_STATUS_FAIL'] = '1';
+      await expect(handle.compact?.()).rejects.toThrow(/native compact status failed/);
+      delete process.env['CLAUDE_DOUBLE_COMPACT_STATUS_FAIL'];
+      process.env['CLAUDE_DOUBLE_MISMATCH'] = '1';
+      await expect(handle.compact?.()).rejects.toThrow(/session id mismatch/);
+      delete process.env['CLAUDE_DOUBLE_MISMATCH'];
+      process.env['CLAUDE_DOUBLE_COMPACT_EXIT_ERROR'] = '1';
+      await expect(handle.compact?.()).rejects.toThrow(/exit 7/);
+      delete process.env['CLAUDE_DOUBLE_COMPACT_EXIT_ERROR'];
+      process.env['CLAUDE_DOUBLE_COMPACT_NO_INIT'] = '1';
+      await expect(handle.compact?.()).rejects.toThrow(/without an init frame/);
+      delete process.env['CLAUDE_DOUBLE_COMPACT_NO_INIT'];
+      process.env['CLAUDE_DOUBLE_COMPACT_INIT_NO_ID'] = '1';
+      await expect(handle.compact?.()).rejects.toThrow(/init reported \(empty\)/);
+      delete process.env['CLAUDE_DOUBLE_COMPACT_INIT_NO_ID'];
+      process.env['CLAUDE_DOUBLE_COMPACT_NO_RESULT'] = '1';
+      await expect(handle.compact?.()).rejects.toThrow(/without a result frame/);
+      delete process.env['CLAUDE_DOUBLE_COMPACT_NO_RESULT'];
+      process.env['CLAUDE_DOUBLE_COMPACT_FORGED_RESULT'] = '1';
+      await expect(handle.compact?.()).rejects.toThrow(/without a native compact success/);
+      delete process.env['CLAUDE_DOUBLE_COMPACT_FORGED_RESULT'];
+      process.env['CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT'] = '1';
+      await expect(handle.compact?.()).rejects.toThrow(/malformed result frame/);
+      delete process.env['CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT'];
+      await handle.prompt('usable after status failure');
     } finally {
       await handle.dispose();
     }
@@ -364,9 +525,13 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const handle = await fx.runtime.spawn('gru');
     const events = collect(handle);
     const turn = handle.prompt(`hold:${releaseFile}`, { owner: 'alice' });
+    const rejected = expect(turn).rejects.toThrow(/disposed/);
     await waitFor(() => handle.health().state === 'streaming');
-    await handle.dispose();
-    await expect(turn).rejects.toThrow(/disposed/);
+    const disposing = handle.dispose();
+    const concurrentDispose = handle.dispose();
+    expect(concurrentDispose).toBe(disposing);
+    await Promise.all([disposing, concurrentDispose]);
+    await rejected;
     expect(handle.health().state).toBe('disposed');
     expect(existsSync(`${handle.sessionFile}.lock`)).toBe(false);
     expect(states(events)[states(events).length - 1]).toBe('disposed');
@@ -377,11 +542,16 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const fx = fixture({ killGraceMs: 50 });
     const handle = await fx.runtime.spawn('gru');
     const turn = handle.prompt('hold:never', { owner: 'alice' });
+    const rejected = expect(turn).rejects.toThrow(/disposed/);
     await waitFor(() => handle.health().state === 'streaming');
-    await handle.dispose();
+    const disposing = handle.dispose();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(existsSync(`${handle.sessionFile}.lock`)).toBe(true);
+    await disposing;
+    expect(existsSync(`${handle.sessionFile}.lock`)).toBe(false);
     // Settles only when the process actually dies — SIGKILL is the only
     // way out here, so this resolving at all proves the escalation fired.
-    await expect(turn).rejects.toThrow(/disposed/);
+    await rejected;
     await fx.runtime.dispose();
   });
 
@@ -829,8 +999,13 @@ describe('RuntimeRegistry + claude-code (fallback-wrapped)', () => {
     const handle = await registry.spawn('gru');
     try {
       const events = collect(handle);
+      expect(handle.canCompact?.()).toBe(false);
       await handle.prompt('through the registry', { owner: 'alice' });
       expect(deltas(events, 'text_delta').join('')).toBe('echo: through the registry');
+      expect(handle.canCompact?.()).toBe(true);
+      await handle.compact?.();
+      expect(handle.canCompact?.()).toBe(true);
+      expect(events.some((event) => event.type === 'compaction_end' && event.success)).toBe(true);
       const status = registry.status();
       expect(status.adapters).toEqual([{ id: 'claude-code', state: 'ok' }]);
       expect(status.agentSession.state).toBe('idle');
@@ -1012,6 +1187,37 @@ describe('NdjsonParser (pure)', () => {
     parser.end();
     expect(frames).toEqual([{ ok: true }]);
     expect(garbage).toEqual(['[1,2,3]', '42', '"str"']);
+  });
+});
+
+describe('ClaudeControlTranslator (pure)', () => {
+  function expectCompactSuccess(frame: StreamFrame): void {
+    const translator = new ClaudeControlTranslator();
+    translator.ingest(frame);
+    expect(translator.compactSucceeded).toBe(true);
+    expect(translator.compactFailure).toBeNull();
+  }
+
+  it('accepts a native compact success reported by status alone', () => {
+    expectCompactSuccess({ type: 'system', subtype: 'status', compact_result: 'success' });
+  });
+
+  it('accepts a native compact success reported by boundary alone', () => {
+    expectCompactSuccess({ type: 'system', subtype: 'compact_boundary' });
+  });
+
+  it('keeps a native compact failure sticky if a later status claims success', () => {
+    const translator = new ClaudeControlTranslator();
+    translator.ingest({
+      type: 'system',
+      subtype: 'status',
+      compact_result: 'failed',
+      compact_error: 'first failure',
+    });
+    translator.ingest({ type: 'system', subtype: 'status', compact_result: 'success' });
+    translator.ingest({ type: 'system', subtype: 'compact_boundary' });
+    expect(translator.compactSucceeded).toBe(false);
+    expect(translator.compactFailure).toBe('first failure');
   });
 });
 

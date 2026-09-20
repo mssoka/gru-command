@@ -7,6 +7,7 @@ import './styles/tokens.css';
 import './styles/components.css';
 
 import { ChatClient, type ConnectionState } from './lib/chat-client.js';
+import { migrateLegacyOutbox, safeStorage } from './lib/chat-storage.js';
 import { AttachClient, readFileBytes } from './lib/attach-client.js';
 import { WS_PATH, type LoggedFrame } from './lib/protocol.js';
 import { BoardClient } from './lib/board-client.js';
@@ -22,7 +23,13 @@ import { initSettings, THEME_EVENT } from './ui/settings.js';
 
 const TOKEN_KEY = 'gru-pairing-token';
 
-const storage = window.localStorage;
+const storage = safeStorage(() => window.localStorage);
+// Chat drafts/outbox are tab-scoped: a writer tab must never overwrite a
+// read-only tab's queued words. sessionStorage survives reloads in that tab.
+// Move and merge the pre-context-controls shared outbox atomically; a failed
+// target write leaves the source untouched for a later recovery attempt.
+const chatStorage = safeStorage(() => window.sessionStorage);
+migrateLegacyOutbox(storage, chatStorage);
 
 // Theme applies before first paint decision; default is light.
 applyTheme(document, getTheme(storage));
@@ -152,14 +159,17 @@ mobileQuery.addEventListener('change', () => showView(activeView));
 
 function onConnection(state: ConnectionState): void {
   renderConnectionDot(state);
+  // `open` is emitted at auth_ok, just before the required fresh context
+  // snapshot. Keep stale controls disabled until that snapshot arrives.
+  if (state !== 'open') chatView?.setControlsConnected(false);
   if (state === 'reconnecting' || state === 'offline') {
     chatView?.markStreamIncomplete();
     showBanner(
       'conn',
       'work',
       state === 'reconnecting'
-        ? 'Reconnecting to Gru — messages queue safely…'
-        : 'Connection lost — typed words are queued, never lost.',
+        ? 'Reconnecting to Gru — messages stay queued in this tab…'
+        : 'Connection lost — typed words stay queued in this tab.',
     );
   } else if (state === 'connecting' || state === 'authenticating') {
     showBanner('conn', 'info', 'Connecting to Gru…');
@@ -191,14 +201,16 @@ function startChat(token: string): void {
   });
   client?.stop();
   let replaying = false;
+  let contextReady = false;
   client = new ChatClient(
-    { token, host: location.host, secure, storage },
+    { token, host: location.host, secure, storage: chatStorage },
     {
       connection: onConnection,
       messageStatus: (message) => chatView?.upsertMessage(message),
       frame: (frame: LoggedFrame) => chatView?.addFrame(frame, !replaying),
       replayStart: (full) => {
         replaying = true;
+        contextReady = false;
         if (full) {
           chatView?.reset();
           // reset() wipes the DOM — re-render locally-queued bubbles so a
@@ -210,12 +222,39 @@ function startChat(token: string): void {
       },
       replayEnd: () => {
         replaying = false;
+        chatView?.setControlsConnected(contextReady);
+      },
+      context: (snapshot) => {
+        contextReady = true;
+        chatView?.setContext(snapshot);
+        // The authoritative snapshot arrives before replay by contract, but
+        // controls cannot be sent until replay has reached its high-water.
+        chatView?.setControlsConnected(!replaying);
+      },
+      controlResult: (result) => chatView?.showControlResult(result),
+      contextEvent: (event) => chatView?.showContextEvent(event),
+      epochChange: () => {
+        chatView?.reset();
+        // A durable boundary retains only browser-local, never-sent words.
+        for (const message of client?.getMessages() ?? []) {
+          if (message.status === 'queued') chatView?.upsertMessage({ ...message });
+        }
       },
       fatal: (message) => {
         failPairing(message);
       },
     },
   );
+  if (client.hasPendingNewChat()) chatView.restorePendingNewChat();
+  chatView.bindControls((action) => {
+    if (client === null) return false;
+    try {
+      client.requestControl(action);
+      return true;
+    } catch {
+      return false;
+    }
+  });
   client.connect();
   startBoard(token);
 }

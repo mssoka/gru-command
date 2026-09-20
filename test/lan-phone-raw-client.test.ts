@@ -23,6 +23,7 @@ interface RawFrame {
   readonly message?: string;
   readonly fatal?: boolean;
   readonly state?: string;
+  readonly epoch?: number;
 }
 
 const W5_TOKEN = 'w5-lan-phone-token';
@@ -31,6 +32,7 @@ const W5_TOKEN = 'w5-lan-phone-token';
 class RawClient {
   readonly frames: RawFrame[] = [];
   private readonly openPromise: Promise<void>;
+  private epoch = 0;
 
   constructor(
     private readonly socket: WebSocket,
@@ -47,7 +49,9 @@ class RawClient {
       socket.once('error', reject);
     });
     socket.on('message', (data: unknown) => {
-      this.frames.push(JSON.parse(String(data)) as RawFrame);
+      const frame = JSON.parse(String(data)) as RawFrame;
+      if (frame.type === 'context' && typeof frame.epoch === 'number') this.epoch = frame.epoch;
+      this.frames.push(frame);
     });
   }
 
@@ -57,7 +61,9 @@ class RawClient {
   }
 
   send(text: string, clientMsgId: string): void {
-    this.socket.send(JSON.stringify({ type: 'user', text, client_msg_id: clientMsgId }));
+    this.socket.send(
+      JSON.stringify({ type: 'user', text, client_msg_id: clientMsgId, epoch: this.epoch }),
+    );
   }
 
   sendWithAttachments(
@@ -66,7 +72,13 @@ class RawClient {
     attachments: readonly { readonly path: string; readonly name: string; readonly kind: 'file' | 'image' }[],
   ): void {
     this.socket.send(
-      JSON.stringify({ type: 'user', text, client_msg_id: clientMsgId, attachments }),
+      JSON.stringify({
+        type: 'user',
+        text,
+        client_msg_id: clientMsgId,
+        epoch: this.epoch,
+        attachments,
+      }),
     );
   }
 

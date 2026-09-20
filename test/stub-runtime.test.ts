@@ -24,6 +24,10 @@ class ScriptRuntime implements AgentRuntime {
   nextHold?: Promise<void>;
   /** When set, the NEXT prompt-driven turn rejects with this error. */
   nextError?: string;
+  /** Optional hold applied to native compaction. */
+  nextCompactHold?: Promise<void>;
+  nextCompactError?: string;
+  compactCalls = 0;
   readonly capabilities: AgentCapabilities = {
     streaming: true,
     steer: 'queued',
@@ -87,6 +91,10 @@ class ScriptHandle implements AgentHandle {
     this.setState('error');
   }
 
+  fire(event: RuntimeEvent): void {
+    this.emit(event);
+  }
+
   private setState(state: AgentState): void {
     this.state = state;
     this.last = new Date().toISOString();
@@ -116,6 +124,21 @@ class ScriptHandle implements AgentHandle {
     const owner = options?.owner ?? 'default';
     this.runtime.calls.push({ op: 'followUp', text, owner });
   }
+  getContextUsage() {
+    return { tokens: 12, contextWindow: 100, percent: 12 };
+  }
+  isCompacting = (): boolean => false;
+  compact = async (): Promise<void> => {
+    this.runtime.compactCalls += 1;
+    this.emit({ type: 'compaction_start' });
+    if (this.runtime.nextCompactHold !== undefined) await this.runtime.nextCompactHold;
+    if (this.runtime.nextCompactError !== undefined) {
+      const error = this.runtime.nextCompactError;
+      this.runtime.nextCompactError = undefined;
+      throw new Error(error);
+    }
+    this.emit({ type: 'compaction_end', success: true });
+  };
   subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -136,6 +159,48 @@ describe('interface-layer fallbacks (steer-unable → queue-until-idle)', () => 
     const handle = await runtime.spawn('gru');
     await handle.steer('hello', { owner: 'alice' });
     expect(inner.calls).toEqual([{ op: 'prompt', text: 'hello', owner: 'alice' }]);
+  });
+
+  it('forwards provider usage and serializes queued turns behind native compaction', async () => {
+    const inner = new ScriptRuntime('queued');
+    const handle = await withFallbacks(inner).spawn('gru');
+    expect(handle.getContextUsage?.()).toEqual({ tokens: 12, contextWindow: 100, percent: 12 });
+    let release!: () => void;
+    inner.nextCompactHold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const compacting = handle.compact!();
+    const queued = handle.prompt('after compact', { owner: 'alice' });
+    expect(inner.calls).toEqual([]);
+    release();
+    await compacting;
+    await queued;
+    expect(inner.compactCalls).toBe(1);
+    expect(inner.calls).toContainEqual({ op: 'prompt', text: 'after compact', owner: 'alice' });
+
+    const lifecycle: RuntimeEvent[] = [];
+    handle.subscribe((event) => lifecycle.push(event));
+    inner.handle!.fire({ type: 'compaction_start' });
+    const automatic = handle.prompt('after automatic compact', { owner: 'bob' });
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    expect(inner.calls.some((call) => call.text === 'after automatic compact')).toBe(false);
+    inner.handle!.fire({ type: 'compaction_end', success: true });
+    await automatic;
+    expect(inner.calls).toContainEqual({
+      op: 'prompt',
+      text: 'after automatic compact',
+      owner: 'bob',
+    });
+    expect(lifecycle.findIndex((event) => event.type === 'compaction_end')).toBeLessThan(
+      lifecycle.findIndex(
+        (event) => event.type === 'state' && event.state === 'streaming',
+      ),
+    );
+
+    inner.nextCompactError = 'compact transport broke';
+    await expect(handle.compact!()).rejects.toThrow(/transport broke/);
+    expect(lifecycle.at(-1)).toMatchObject({ type: 'compaction_end', success: false });
+    await expect(handle.prompt('after broken compact', { owner: 'carol' })).resolves.toBeUndefined();
   });
 
   it('steer while a turn is live is queued, then delivered after idle', async () => {

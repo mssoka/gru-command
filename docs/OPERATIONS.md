@@ -109,7 +109,10 @@ To talk to the Gru brain directly with a runtime CLI (pi or claude):
   Inspect read-only while running (`sqlite3 file:…?mode=ro`), or after
   a stop. Schema + migration rules: [LEDGER.md](./LEDGER.md).
 - **Chat history** — `chat/gru.frames.jsonl`, seq-consecutive frames;
-  reconnect replay spans rotation shards (8 MB × 3). A corrupt log
+  `chat/gru-session.json` atomically selects the active native session,
+  epoch, and replay floor. New chat advances that boundary without deleting
+  historical frames or native transcripts. Reconnect replay spans rotation
+  shards (8 MB × 3). A corrupt log
   refuses boot — history is never silently truncated
   ([CHAT.md](./CHAT.md)).
 - **Worktree lanes** — job worktrees under `<data_dir>/worktrees/`,

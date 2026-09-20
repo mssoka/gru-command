@@ -33,11 +33,13 @@ const DOUBLE_LOG = join(tmpdir(), `gru-e2e-double-${Date.now()}.jsonl`);
 process.env.CLAUDE_DOUBLE_LOG = DOUBLE_LOG;
 
 /** Last {prompt, images} the agent-side double received. */
-function lastAgentPrompt(): { prompt: string; images: number } | null {
+function lastAgentPrompt(): { prompt: string; images: number; argv: string[] } | null {
   try {
     const lines = readFileSync(DOUBLE_LOG, 'utf-8').trim().split('\n');
     const last = lines.at(-1);
-    return last === undefined || last === '' ? null : (JSON.parse(last) as { prompt: string; images: number });
+    return last === undefined || last === ''
+      ? null
+      : (JSON.parse(last) as { prompt: string; images: number; argv: string[] });
   } catch {
     return null;
   }
@@ -95,6 +97,40 @@ async function sendAndWaitReply(page: Page, text: string): Promise<void> {
 test('pair with the real token, send, streamed echo reply', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'real socket hello');
+});
+
+test('real native compact preserves history and New chat starts unresumed behind a durable epoch', async ({ page }) => {
+  await pair(page);
+  await sendAndWaitReply(page, 'real context control old words');
+  const pointerFile = join(durableHome, 'chat', 'gru-session.json');
+
+  await expect(page.locator('#chat-compact')).toBeEnabled();
+  await page.locator('#chat-compact').click();
+  await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
+  await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(1);
+  const oldPointer = JSON.parse(readFileSync(pointerFile, 'utf-8')) as {
+    sessionFile: string;
+    epoch: number;
+  };
+  const oldBytes = readFileSync(oldPointer.sessionFile);
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.locator('#chat-new').click();
+  await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(0);
+  const freshPointer = JSON.parse(readFileSync(pointerFile, 'utf-8')) as {
+    sessionFile: string;
+    epoch: number;
+  };
+  expect(freshPointer.epoch).toBe(oldPointer.epoch + 1);
+  expect(freshPointer.sessionFile).not.toBe(oldPointer.sessionFile);
+  expect(readFileSync(oldPointer.sessionFile)).toEqual(oldBytes);
+
+  await page.reload();
+  await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(0);
+  await sendAndWaitReply(page, 'first real words in fresh epoch');
+  const invocation = lastAgentPrompt();
+  expect(invocation?.argv).toContain('--session-id');
+  expect(invocation?.argv).not.toContain('--resume');
 });
 
 test('reload keeps history from the real frame log (no duplicates)', async ({ page }) => {

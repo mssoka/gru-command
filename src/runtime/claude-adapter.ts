@@ -15,6 +15,7 @@ import {
 } from 'node:fs';
 import type { WriteStream } from 'node:fs';
 import { basename, isAbsolute, join, relative } from 'node:path';
+import { finished } from 'node:stream/promises';
 import type { GruCommandConfig, Role } from '../config.js';
 import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
@@ -26,6 +27,7 @@ import {
   SessionAlreadyActiveError,
 } from './session-paths.js';
 import {
+  ClaudeControlTranslator,
   ClaudeTurnTranslator,
   extractSessionId,
   NdjsonParser,
@@ -552,8 +554,12 @@ export class ClaudeCodeHandle implements AgentHandle {
   private lastActivity: string | null = null;
   private stateError: string | undefined;
   private live: ChildProcess | null = null;
+  private liveTranscript: WriteStream | null = null;
+  private settleLiveOnDispose: (() => void) | null = null;
+  private compacting = false;
   private readonly listeners = new Set<RuntimeEventListener>();
   private disposed = false;
+  private disposalPromise: Promise<void> | null = null;
 
   constructor(
     role: Role,
@@ -597,9 +603,9 @@ export class ClaudeCodeHandle implements AgentHandle {
     if (text === '' && (options.images === undefined || options.images.length === 0)) {
       throw new Error('empty prompt: nothing to send (no text, no images)');
     }
-    if (this.live !== null) {
+    if (this.live !== null || this.compacting) {
       throw new Error(
-        'claude-code turn in flight — one turn at a time per session ' +
+        'claude-code turn in flight or control active — one operation at a time per session ' +
           '(the interface fallback serializes product callers; direct callers must wait)',
       );
     }
@@ -616,19 +622,68 @@ export class ClaudeCodeHandle implements AgentHandle {
     return this.prompt(text, options);
   }
 
-  async dispose(): Promise<void> {
-    if (this.disposed) return;
+  canCompact = (): boolean =>
+    !this.disposed && this.sessionEstablished && this.live === null && !this.compacting;
+
+  isCompacting = (): boolean => this.compacting;
+
+  /** Claude's print transport exposes no trustworthy whole-context usage.
+   * Deliberately omit getContextUsage rather than deriving a percentage from
+   * per-turn token counts or transcript bytes. */
+
+  compact = async (): Promise<void> => {
+    this.assertLive();
+    if (!this.sessionEstablished) {
+      throw new Error('claude-code session is not established; nothing can be compacted');
+    }
+    if (this.live !== null || this.compacting) {
+      throw new Error('agent session is busy; compaction requires an idle session');
+    }
+    this.compacting = true;
+    this.emit({ type: 'compaction_start' });
+    try {
+      await this.runCompactionControl();
+      this.emit({ type: 'compaction_end', success: true });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({ type: 'compaction_end', success: false, error: message });
+      throw error;
+    } finally {
+      this.compacting = false;
+    }
+  };
+
+  dispose(): Promise<void> {
+    // Every caller observes the same terminal cleanup. Returning early merely
+    // because disposed was marked would expose a still-running child and a
+    // still-held session lock to concurrent supervisor/chat recovery.
+    this.disposalPromise ??= this.disposeOnce();
+    return this.disposalPromise;
+  }
+
+  private async disposeOnce(): Promise<void> {
     this.disposed = true;
     const live = this.live;
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
+    let exitDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
     if (live !== null) {
+      const childExited =
+        live.exitCode !== null || live.signalCode !== null
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => {
+              live.once('close', () => resolve());
+              live.once('error', () => resolve());
+            });
       // SIGTERM is the documented abort (the CLI exits 143); escalate to
-      // SIGKILL if the process ignores it.
+      // SIGKILL if the process ignores it. A second bounded grace after the
+      // forced kill prevents a broken ChildProcess implementation from
+      // retaining the transcript and session lock forever.
       try {
         live.kill('SIGTERM');
       } catch {
         /* already gone */
       }
-      const killTimer = setTimeout(() => {
+      killTimer = setTimeout(() => {
         if (this.live !== null) {
           try {
             this.live.kill('SIGKILL');
@@ -638,6 +693,30 @@ export class ClaudeCodeHandle implements AgentHandle {
         }
       }, this.params.killGraceMs);
       killTimer.unref();
+      const exitDeadline = new Promise<void>((resolve) => {
+        exitDeadlineTimer = setTimeout(resolve, this.params.killGraceMs * 2);
+        exitDeadlineTimer.unref();
+      });
+      await Promise.race([childExited, exitDeadline]);
+      clearTimeout(killTimer);
+      if (exitDeadlineTimer !== null) clearTimeout(exitDeadlineTimer);
+
+      const flushDeadline = Date.now() + this.params.killGraceMs;
+      while (this.live !== null && Date.now() < flushDeadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      }
+      if (this.live !== null) {
+        // A dead or non-reporting child can leave a wedged filesystem stream.
+        // Cancel buffered writes and settle the operation before releasing
+        // ownership so disposal remains deterministic.
+        const transcript = this.liveTranscript;
+        if (transcript !== null) {
+          const closed = finished(transcript).catch(() => {});
+          transcript.destroy(new Error('session transcript flush timed out'));
+          await closed;
+        }
+        this.settleLiveOnDispose?.();
+      }
     }
     try {
       this.store.releaseLock(this.sessionFile);
@@ -669,6 +748,191 @@ export class ClaudeCodeHandle implements AgentHandle {
     }
   }
 
+  /** A dedicated, resumed native slash-command process. Its machine frames
+   * remain in the native transcript for forensics, but content events are
+   * intentionally discarded so `/compact` output can never become chat text. */
+  private runCompactionControl(): Promise<void> {
+    const params = this.params;
+    const translator = new ClaudeControlTranslator();
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let failed = false;
+      let failure = '';
+      let child: ChildProcess | null = null;
+      let stderrTail = '';
+      let sawInit = false;
+
+      const settle = (error: Error | null): void => {
+        if (settled) return;
+        settled = true;
+        this.live = null;
+        this.liveTranscript = null;
+        this.settleLiveOnDispose = null;
+        if (error === null) resolve();
+        else reject(error);
+      };
+      this.settleLiveOnDispose = () => settle(new Error('agent session disposed'));
+      const fail = (detail: string): void => {
+        if (failed) return;
+        failed = true;
+        failure = detail;
+      };
+
+      let transcript: WriteStream;
+      try {
+        transcript = createWriteStream(params.sessionFile, { flags: 'a' });
+        this.liveTranscript = transcript;
+      } catch (error) {
+        settle(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      transcript.on('error', (error: Error) => {
+        this.log('error', 'session transcript write failed during compaction', {
+          file: params.sessionFile,
+          error: String(error),
+        });
+        fail(`session transcript write failed during compaction: ${String(error)}`);
+        try {
+          child?.kill('SIGTERM');
+        } catch {
+          /* already gone */
+        }
+      });
+
+      const handleFrame = (frame: StreamFrame): void => {
+        if (!transcript.write(`${JSON.stringify(frame)}\n`)) {
+          child?.stdout?.pause();
+          transcript.once('drain', () => child?.stdout?.resume());
+        }
+        const reportedSession = frame['session_id'];
+        const terminal = frame['type'] === 'result';
+        if (
+          (typeof reportedSession === 'string' && reportedSession !== params.sessionId) ||
+          (terminal && (typeof reportedSession !== 'string' || reportedSession === ''))
+        ) {
+          fail(
+            `session id mismatch: requested ${params.sessionId}, claude reported ` +
+              `${typeof reportedSession === 'string' && reportedSession !== '' ? reportedSession : '(empty)'} ` +
+              'during compaction',
+          );
+          try {
+            child?.kill('SIGTERM');
+          } catch {
+            /* already gone */
+          }
+        }
+        if (
+          terminal &&
+          (typeof frame['is_error'] !== 'boolean' ||
+            typeof frame['subtype'] !== 'string' ||
+            frame['subtype'] === '')
+        ) {
+          fail('claude compaction returned a malformed result frame');
+          try {
+            child?.kill('SIGTERM');
+          } catch {
+            /* already gone */
+          }
+        }
+        // Parse the same machine protocol as turns, but deliberately do not
+        // emit any translated text/thinking/tool events.
+        translator.ingest(frame);
+        if (frame['type'] === 'system' && frame['subtype'] === 'init') {
+          sawInit = true;
+          const init = translator.init;
+          if (init === null || init.sessionId !== params.sessionId) {
+            fail(
+              `session id mismatch: requested ${params.sessionId}, claude init reported ` +
+                `${init?.sessionId || '(empty)'} during compaction`,
+            );
+            try {
+              child?.kill('SIGTERM');
+            } catch {
+              /* already gone */
+            }
+          }
+        }
+      };
+      const parser = new NdjsonParser({
+        onFrame: handleFrame,
+        onGarbage: (line) =>
+          this.log('warn', 'skipping non-JSON line on claude compaction stdout', {
+            line: line.slice(0, 200),
+          }),
+      });
+
+      try {
+        // Compaction is meaningful only for an established conversation, so
+        // this path ALWAYS resumes; it never mints or forks a session.
+        child = spawn(params.binary, claudeTurnArgs(params, true), {
+          cwd: params.cwd,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+      } catch (error) {
+        this.onInfraError(error);
+        transcript.end(() =>
+          settle(new Error(`claude compaction process failed to spawn: ${String(error)}`)),
+        );
+        return;
+      }
+      this.live = child;
+      child.stdout?.on('data', (chunk: Buffer) => parser.push(chunk));
+      child.stderr?.on('data', (chunk: Buffer) => {
+        stderrTail = (stderrTail + chunk.toString('utf8')).slice(-STDERR_TAIL_BYTES);
+      });
+      child.on('error', (error: Error) => {
+        this.onInfraError(error);
+        fail(`claude compaction process failed to spawn: ${String(error)}`);
+        parser.end();
+        transcript.end(() => settle(new Error(failure)));
+      });
+      child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+        parser.end();
+        transcript.end(() => {
+          if (this.disposed) {
+            settle(new Error('agent session disposed'));
+            return;
+          }
+          const result = translator.result;
+          if (!failed && !sawInit) {
+            fail('claude compaction completed without an init frame');
+          }
+          if (!failed && result === null) {
+            const via = signal !== null ? `signal ${signal}` : `exit ${code}`;
+            fail(
+              `claude compaction ended via ${via} without a result frame` +
+                (stderrTail.trim() !== '' ? `: ${stderrTail.trim()}` : ''),
+            );
+          }
+          if (!failed && result?.isError === true) {
+            fail(result.text ?? `claude compaction failed (${result.subtype})`);
+          }
+          if (!failed && (signal !== null || code !== 0)) {
+            const via = signal !== null ? `signal ${signal}` : `exit ${code}`;
+            fail(
+              `claude compaction ended via ${via}` +
+                (stderrTail.trim() !== '' ? `: ${stderrTail.trim()}` : ''),
+            );
+          }
+          const compactFailure = translator.compactFailure;
+          if (!failed && compactFailure !== null) fail(compactFailure);
+          if (!failed && !translator.compactSucceeded) {
+            fail(
+              'claude compact command completed without a native compact success status or boundary',
+            );
+          }
+          settle(failed ? new Error(failure) : null);
+        });
+      });
+
+      child.stdin?.write(`${JSON.stringify(claudePromptFrame('/compact'))}\n`, (error) => {
+        if (error != null) fail(`failed to write claude compaction command: ${String(error)}`);
+        child?.stdin?.end();
+      });
+    });
+  }
+
   private runTurn(text: string, images?: PromptOptions['images']): Promise<void> {
     this.setState('spawning');
     const params = this.params;
@@ -686,9 +950,12 @@ export class ClaudeCodeHandle implements AgentHandle {
         if (settled) return;
         settled = true;
         this.live = null;
+        this.liveTranscript = null;
+        this.settleLiveOnDispose = null;
         if (error === null) resolve();
         else reject(error);
       };
+      this.settleLiveOnDispose = () => settle(new Error('agent session disposed'));
 
       // Mark the turn failed (loud, once). Settling happens in the close
       // handler so the transcript stream is always flushed first.
@@ -707,6 +974,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       let transcript: WriteStream;
       try {
         transcript = createWriteStream(params.sessionFile, { flags: 'a' });
+        this.liveTranscript = transcript;
       } catch (error) {
         failTurn(String(error));
         settle(new Error(failure));

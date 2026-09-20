@@ -58,6 +58,17 @@ beforeEach(() => {
   mainMount.id = 'chat-main-mount';
   const log = document.createElement('div');
   log.id = 'chat-log';
+  const context = document.createElement('div');
+  context.id = 'chat-context-controls';
+  const contextStatus = document.createElement('span');
+  contextStatus.id = 'chat-context-status';
+  const contextAnnouncement = document.createElement('span');
+  contextAnnouncement.id = 'chat-context-announcement';
+  const compact = document.createElement('button');
+  compact.id = 'chat-compact';
+  const newChat = document.createElement('button');
+  newChat.id = 'chat-new';
+  context.append(contextStatus, contextAnnouncement, compact, newChat);
   const form = document.createElement('form');
   form.id = 'chat-form';
   const chips = document.createElement('div');
@@ -91,7 +102,7 @@ beforeEach(() => {
   picker.append(pickerUp, pickerPath, pickerDevice, pickerClose, pickerError, pickerList);
   const view = document.createElement('section');
   view.id = 'chat-view';
-  view.append(log, form, picker);
+  view.append(log, context, form, picker);
   const bubble = document.createElement('button');
   bubble.id = 'chat-bubble';
   const badge = document.createElement('span');

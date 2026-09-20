@@ -3,6 +3,7 @@ import type {
   AgentHandle,
   AgentRuntime,
   AgentState,
+  ContextUsage,
   PromptOptions,
   RuntimeEvent,
   RuntimeEventListener,
@@ -65,11 +66,21 @@ class FallbackHandle implements AgentHandle {
   readonly sessionFile: string | null;
   /** The wrapped handle's declared gaps surface unchanged (SPEC ruling 4). */
   readonly capabilities: AgentRuntime['capabilities'];
+  readonly getContextUsage?: () => ContextUsage | null;
+  readonly compact?: () => Promise<void>;
+  readonly canCompact?: () => boolean;
+  readonly isCompacting?: () => boolean;
 
   /** A turn is being delivered by THIS pipeline (set+clear per-path only). */
   private inFlight = false;
+  /** A native control owns the same single-operation lane as turns. */
+  private controlInFlight = false;
   /** The inner runtime reported a live turn via state events. */
   private stateBusy = false;
+  /** Automatic/provider-initiated compaction may bypass compact(). */
+  private nativeCompacting = false;
+  private explicitCompactionTerminal: Extract<RuntimeEvent, { type: 'compaction_end' }> | null = null;
+  private explicitCompactionActive = false;
   private pumping = false;
   private disposed = false;
   private readonly queue: QueuedTurn[] = [];
@@ -80,20 +91,83 @@ class FallbackHandle implements AgentHandle {
     this.id = inner.id;
     this.sessionFile = inner.sessionFile;
     this.capabilities = inner.capabilities;
+    if (inner.getContextUsage !== undefined) {
+      this.getContextUsage = () => inner.getContextUsage!();
+    }
+    if (inner.canCompact !== undefined) {
+      this.canCompact = () => !this.busy && this.queue.length === 0 && inner.canCompact!();
+    }
+    this.isCompacting = () =>
+      this.controlInFlight || this.nativeCompacting || inner.isCompacting?.() === true;
+    if (inner.compact !== undefined) {
+      this.compact = async () => {
+        this.assertLive();
+        if (this.busy || this.queue.length > 0 || inner.isCompacting?.() === true) {
+          throw new Error('agent session is busy; compaction requires an idle session');
+        }
+        this.controlInFlight = true;
+        this.explicitCompactionActive = true;
+        this.explicitCompactionTerminal = null;
+        let failed = false;
+        let failure: unknown;
+        try {
+          await inner.compact!();
+        } catch (error) {
+          failed = true;
+          failure = error;
+        } finally {
+          this.controlInFlight = false;
+          // A broken inner adapter may settle without a terminal event. Close
+          // both this queue gate and the lifecycle seen by supervision, and
+          // make the public compact promise reject from the same outcome.
+          if (this.explicitCompactionTerminal === null) {
+            this.explicitCompactionTerminal = {
+              type: 'compaction_end',
+              success: false,
+              error: failed
+                ? failure instanceof Error
+                  ? failure.message
+                  : String(failure)
+                : 'native compaction ended without a terminal event',
+            };
+            this.nativeCompacting = false;
+            this.emit(this.explicitCompactionTerminal);
+          }
+          this.explicitCompactionActive = false;
+          void this.pump();
+        }
+        const outcome = this.explicitCompactionTerminal;
+        this.explicitCompactionTerminal = null;
+        if (failed) throw failure;
+        if (outcome === null || !outcome.success) {
+          throw new Error(outcome?.error ?? 'native compaction failed');
+        }
+      };
+    }
     inner.subscribe((event) => this.onInnerEvent(event));
   }
 
   private get busy(): boolean {
-    return this.inFlight || this.stateBusy;
+    return this.inFlight || this.controlInFlight || this.stateBusy || this.nativeCompacting;
   }
 
   private onInnerEvent(event: RuntimeEvent): void {
     if (event.type === 'state') {
       this.stateBusy = isStreamingState(event.state);
-      if (!this.busy) void this.pump();
-      if (event.state === 'disposed') this.rejectQueue('agent session disposed');
+      if (event.state === 'disposed') {
+        this.nativeCompacting = false;
+        this.rejectQueue('agent session disposed');
+      }
+    } else if (event.type === 'compaction_start') {
+      this.nativeCompacting = true;
+    } else if (event.type === 'compaction_end') {
+      this.nativeCompacting = false;
+      if (this.explicitCompactionActive) this.explicitCompactionTerminal = event;
     }
+    // Observers must see the native terminal event before a synchronously
+    // started queued prompt can emit the next turn's lifecycle.
     this.emit(event);
+    if (!this.busy) void this.pump();
   }
 
   prompt(text: string, options: PromptOptions = {}): Promise<void> {

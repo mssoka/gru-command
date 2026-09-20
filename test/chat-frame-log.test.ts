@@ -40,14 +40,14 @@ describe('ChatFrameLog', () => {
   it('persists every append and reloads with the counter at the high-water mark', () => {
     const dir = fixture();
     const log = ChatFrameLog.load(dir);
-    log.append({ type: 'user', text: 'hello', client_msg_id: 'id-1' });
+    log.append({ type: 'user', text: 'hello', client_msg_id: 'id-1', epoch: 0 });
     log.append({ type: 'ack', client_msg_id: 'id-1' });
     log.append({ type: 'delta', text: 'chunk' });
 
     const reloaded = ChatFrameLog.load(dir);
     expect(reloaded.highWaterSeq).toBe(3);
     expect(reloaded.history).toEqual([
-      { type: 'user', text: 'hello', client_msg_id: 'id-1', seq: 1 },
+      { type: 'user', text: 'hello', client_msg_id: 'id-1', epoch: 0, seq: 1 },
       { type: 'ack', client_msg_id: 'id-1', seq: 2 },
       { type: 'delta', text: 'chunk', seq: 3 },
     ]);
@@ -74,14 +74,39 @@ describe('ChatFrameLog', () => {
     expect(log.replayAfter(99)).toEqual([]);
   });
 
+  it('applies an epoch replay floor without modifying historical frames or cross-epoch dedup', () => {
+    const dir = fixture();
+    const log = ChatFrameLog.load(dir);
+    log.append({ type: 'user', text: 'old', client_msg_id: 'same-id', epoch: 0 });
+    log.append({ type: 'delta', text: 'old reply' });
+    const bytesBefore = readFileSync(join(dir, FRAME_LOG_NAME), 'utf-8');
+    expect(log.replayAfter(0, 2)).toEqual([]);
+    expect(log.hasSeenUserId('same-id', 0)).toBe(true);
+    expect(log.hasSeenUserId('same-id', 1)).toBe(false);
+    log.append({ type: 'user', text: 'new', client_msg_id: 'same-id', epoch: 1 });
+    expect(log.hasSeenUserId('same-id', 1)).toBe(true);
+    expect(readFileSync(join(dir, FRAME_LOG_NAME), 'utf-8').startsWith(bytesBefore)).toBe(true);
+  });
+
+  it('scopes legacy unstamped dedup by the durable replay floor', () => {
+    const dir = fixture();
+    const log = ChatFrameLog.load(dir);
+    const legacy = log.append({ type: 'user', text: 'legacy', client_msg_id: 'legacy-id' });
+    expect(log.hasSeenUserId('legacy-id', 0, 0)).toBe(true);
+    expect(log.hasSeenUserId('legacy-id', 1, legacy.seq)).toBe(false);
+    const reloaded = ChatFrameLog.load(dir);
+    expect(reloaded.hasSeenUserId('legacy-id', 0, 0)).toBe(true);
+    expect(reloaded.hasSeenUserId('legacy-id', 1, legacy.seq)).toBe(false);
+  });
+
   it('rebuilds the client_msg_id dedup index across reloads', () => {
     const dir = fixture();
     const log = ChatFrameLog.load(dir);
-    log.append({ type: 'user', text: 'once', client_msg_id: 'id-7' });
-    expect(log.hasSeenUserId('id-7')).toBe(true);
-    expect(log.hasSeenUserId('id-8')).toBe(false);
+    log.append({ type: 'user', text: 'once', client_msg_id: 'id-7', epoch: 4 });
+    expect(log.hasSeenUserId('id-7', 4)).toBe(true);
+    expect(log.hasSeenUserId('id-8', 4)).toBe(false);
     const reloaded = ChatFrameLog.load(dir);
-    expect(reloaded.hasSeenUserId('id-7')).toBe(true);
+    expect(reloaded.hasSeenUserId('id-7', 4)).toBe(true);
   });
 
   it('tolerates a torn final line (crash mid-append) with a warn', () => {
@@ -227,10 +252,35 @@ describe('ChatFrameLog', () => {
     expect(() => ChatFrameLog.load(dir)).toThrowError(/seq gap/);
   });
 
-  it('fails loud on a logged auth_ok frame (never a logged frame)', () => {
-    const dir = fixture();
-    seedFile(dir, [{ type: 'auth_ok', seq: 1 }]);
-    expect(() => ChatFrameLog.load(dir)).toThrowError(/not a logged chat frame/);
+  it('fails loud on every ephemeral frame type persisted in the durable log', () => {
+    const ephemeralFrames = [
+      { type: 'auth_ok', seq: 1 },
+      {
+        type: 'context',
+        epoch: 0,
+        replay_floor_seq: 0,
+        state: 'idle',
+        usage: null,
+        compact_supported: false,
+        session_active: false,
+        writer: true,
+        seq: 1,
+      },
+      {
+        type: 'control_result',
+        action: 'compact',
+        request_id: 'compact-1',
+        ok: true,
+        epoch: 0,
+        seq: 1,
+      },
+      { type: 'context_event', action: 'compact', ok: true, seq: 1 },
+    ];
+    for (const frame of ephemeralFrames) {
+      const dir = fixture();
+      seedFile(dir, [frame]);
+      expect(() => ChatFrameLog.load(dir)).toThrowError(/not a logged chat frame/);
+    }
   });
 
   it('boot-settles an open turn: open tools end in reverse order, then the turn', () => {

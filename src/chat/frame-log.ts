@@ -61,8 +61,12 @@ export class ChatFrameLog {
   readonly file: string;
   private frames: LoggedFrame[] = [];
   private seq = 0;
-  /** client_msg_ids of every logged `user` frame (dedup on re-send). */
-  private readonly seenUserIds = new Set<string>();
+  /** Latest seq for each epoch + user-id pair. A client_msg_id may be
+   * reused safely in a later durable chat epoch, but never within one. */
+  private readonly seenUserIds = new Map<string, number>();
+  /** Pre-upgrade user frames had no epoch. Their seq relative to the durable
+   * replay floor assigns them to the one active epoch without rewriting logs. */
+  private readonly legacySeenUserIds = new Map<string, number>();
   /** Open tool names (multiset stack) + whether a turn is open. */
   private readonly openTools: string[] = [];
   private turnOpen = false;
@@ -179,7 +183,13 @@ export class ChatFrameLog {
         throw new FrameLogCorruptError(file, index + 1, `unparseable json (${String(error)})`);
       }
       const frame = parseServerFrame(parsed);
-      if (frame === null || frame.type === 'auth_ok') {
+      if (
+        frame === null ||
+        frame.type === 'auth_ok' ||
+        frame.type === 'context' ||
+        frame.type === 'control_result' ||
+        frame.type === 'context_event'
+      ) {
         throw new FrameLogCorruptError(file, index + 1, 'not a logged chat frame');
       }
       if (frame.type === 'error' && frame.fatal === true) {
@@ -226,8 +236,9 @@ export class ChatFrameLog {
     return this.frames;
   }
 
-  hasSeenUserId(clientMsgId: string): boolean {
-    return this.seenUserIds.has(clientMsgId);
+  hasSeenUserId(clientMsgId: string, epoch: number, replayFloorSeq = 0): boolean {
+    return this.seenUserIds.has(userDedupKey(epoch, clientMsgId)) ||
+      (this.legacySeenUserIds.get(clientMsgId) ?? 0) > replayFloorSeq;
   }
 
   /**
@@ -293,8 +304,9 @@ export class ChatFrameLog {
   }
 
   /** Frames with seq > lastSeenSeq, in order (the reconnect replay). */
-  replayAfter(lastSeenSeq: number): readonly LoggedFrame[] {
-    return this.frames.filter((frame) => loggedFrameSeq(frame) > lastSeenSeq);
+  replayAfter(lastSeenSeq: number, replayFloorSeq = 0): readonly LoggedFrame[] {
+    const floor = Math.max(lastSeenSeq, replayFloorSeq);
+    return this.frames.filter((frame) => loggedFrameSeq(frame) > floor);
   }
 
   /**
@@ -317,7 +329,11 @@ export class ChatFrameLog {
   private track(frame: LoggedFrame): void {
     switch (frame.type) {
       case 'user':
-        this.seenUserIds.add(frame.client_msg_id);
+        if (frame.epoch !== undefined) {
+          this.seenUserIds.set(userDedupKey(frame.epoch, frame.client_msg_id), frame.seq);
+        } else {
+          this.legacySeenUserIds.set(frame.client_msg_id, frame.seq);
+        }
         break;
       case 'tool':
         if (frame.state === 'start') {
@@ -334,6 +350,10 @@ export class ChatFrameLog {
         break;
     }
   }
+}
+
+function userDedupKey(epoch: number, clientMsgId: string): string {
+  return `${epoch}\u0000${clientMsgId}`;
 }
 
 /** JSON.parse that yields null instead of throwing (tail probing). */

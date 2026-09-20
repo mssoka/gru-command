@@ -10,9 +10,10 @@
  *
  * Contract summary (see docs/CHAT.md for the full server-side contract):
  * endpoint `/ws`, JSON text frames both directions. Client → server:
- * `auth` (first frame) and `user`. Server → client: `auth_ok`, `ack`,
- * `delta`, `tool`, `turn`, `error`, and `user` (replays). Every logged
- * frame carries a monotonic `seq`.
+ * `auth` (first frame), `user`, and `control`. Server → client: `auth_ok`,
+ * `context`, `control_result`, `ack`, `delta`, `tool`, `turn`, `error`,
+ * and `user` (replays). Durable/logged frames carry a monotonic `seq`;
+ * context snapshots/events, control results, and fatal/transport errors are ephemeral.
  */
 
 export const WS_PATH = '/ws';
@@ -45,12 +46,23 @@ export interface UserFrame {
   readonly type: 'user';
   readonly text: string;
   readonly client_msg_id: string;
+  /** Durable active-chat epoch observed before this frame left the client.
+   * The server rejects stale/future epochs before logging or delivery. */
+  readonly epoch: number;
   /** Ready-to-send chips from the ONE attach flow (SPEC ruling 19).
    * Optional + absent on legacy frames; validated chip-by-chip. */
   readonly attachments?: readonly AttachmentChip[];
 }
 
-export type ClientFrame = AuthFrame | UserFrame;
+export type ControlAction = 'compact' | 'new_chat';
+
+export interface ControlFrame {
+  readonly type: 'control';
+  readonly action: ControlAction;
+  readonly request_id: string;
+}
+
+export type ClientFrame = AuthFrame | UserFrame | ControlFrame;
 
 export type ToolState = 'start' | 'end';
 export type TurnState = 'start' | 'end';
@@ -101,12 +113,68 @@ export interface NoticeFrame {
   readonly seq: number;
 }
 
-export interface ReplayedUserFrame extends UserFrame {
+export interface ReplayedUserFrame {
+  readonly type: 'user';
+  readonly text: string;
+  readonly client_msg_id: string;
+  /** Absent only on logs written before epoch-stamped user frames shipped. */
+  readonly epoch?: number;
+  readonly attachments?: readonly AttachmentChip[];
   readonly seq: number;
+}
+
+export type ContextControlState = 'idle' | 'busy' | 'compacting' | 'resetting';
+
+export interface ContextUsageFrame {
+  readonly tokens: number;
+  readonly context_window: number;
+  readonly percent: number;
+}
+
+/** Fresh, server-owned control state. It is intentionally ephemeral: every
+ * authentication receives a new snapshot rather than replaying stale state. */
+export interface ContextFrame {
+  readonly type: 'context';
+  readonly epoch: number;
+  readonly replay_floor_seq: number;
+  readonly state: ContextControlState;
+  readonly usage: ContextUsageFrame | null;
+  readonly compact_supported: boolean;
+  readonly session_active: boolean;
+  readonly writer: boolean;
+}
+
+export type ControlResultCode =
+  | 'busy'
+  | 'no_session'
+  | 'unsupported'
+  | 'read_only'
+  | 'failed';
+
+export interface ControlResultFrame {
+  readonly type: 'control_result';
+  readonly action: ControlAction;
+  readonly request_id: string;
+  readonly ok: boolean;
+  readonly epoch: number;
+  readonly code?: ControlResultCode;
+  readonly message?: string;
+}
+
+/** Unsolicited provider lifecycle outcome. Unlike control_result, this is
+ * broadcast to every connected view and has no client request to correlate. */
+export interface ContextEventFrame {
+  readonly type: 'context_event';
+  readonly action: ControlAction;
+  readonly ok: boolean;
+  readonly message?: string;
 }
 
 export type ServerFrame =
   | AuthOkFrame
+  | ContextFrame
+  | ControlResultFrame
+  | ContextEventFrame
   | AckFrame
   | DeltaFrame
   | ToolFrame
@@ -128,7 +196,7 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 function isSeq(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 /** Validate an optional attachments array (SPEC ruling 19 chips).
@@ -172,16 +240,31 @@ export function parseClientFrame(raw: unknown): ClientFrame | null {
       return frame;
     }
     case 'user': {
-      if (typeof value.text !== 'string' || !isNonEmptyString(value.client_msg_id)) return null;
+      if (
+        typeof value.text !== 'string' ||
+        !isNonEmptyString(value.client_msg_id) ||
+        !isSeq(value.epoch)
+      ) return null;
       const attachments = parseAttachments(value.attachments);
       if (attachments === null) return null;
       // Attachment-only messages are legal (chips carry the content);
       // a frame with neither text nor chips is malformed (ruling 19).
       if (value.text.trim() === '' && attachments === undefined) return null;
       return attachments === undefined
-        ? { type: 'user', text: value.text, client_msg_id: value.client_msg_id }
-        : { type: 'user', text: value.text, client_msg_id: value.client_msg_id, attachments };
+        ? { type: 'user', text: value.text, client_msg_id: value.client_msg_id, epoch: value.epoch }
+        : {
+            type: 'user',
+            text: value.text,
+            client_msg_id: value.client_msg_id,
+            epoch: value.epoch,
+            attachments,
+          };
     }
+    case 'control':
+      return (value.action === 'compact' || value.action === 'new_chat') &&
+        isNonEmptyString(value.request_id)
+        ? { type: 'control', action: value.action, request_id: value.request_id }
+        : null;
     default:
       return null;
   }
@@ -194,6 +277,85 @@ export function parseServerFrame(raw: unknown): ServerFrame | null {
   switch (value.type) {
     case 'auth_ok':
       return isSeq(value.seq) ? { type: 'auth_ok', seq: value.seq } : null;
+    case 'context': {
+      if (
+        !isSeq(value.epoch) ||
+        !isSeq(value.replay_floor_seq) ||
+        (value.state !== 'idle' &&
+          value.state !== 'busy' &&
+          value.state !== 'compacting' &&
+          value.state !== 'resetting') ||
+        typeof value.compact_supported !== 'boolean' ||
+        typeof value.session_active !== 'boolean' ||
+        typeof value.writer !== 'boolean'
+      ) return null;
+      let usage: ContextUsageFrame | null = null;
+      if (value.usage !== null) {
+        if (!isRecord(value.usage)) return null;
+        if (
+          typeof value.usage.tokens !== 'number' ||
+          !Number.isFinite(value.usage.tokens) ||
+          value.usage.tokens < 0 ||
+          typeof value.usage.context_window !== 'number' ||
+          !Number.isFinite(value.usage.context_window) ||
+          value.usage.context_window <= 0 ||
+          typeof value.usage.percent !== 'number' ||
+          !Number.isFinite(value.usage.percent) ||
+          value.usage.percent < 0 ||
+          value.usage.percent > 100
+        ) return null;
+        usage = {
+          tokens: value.usage.tokens,
+          context_window: value.usage.context_window,
+          percent: value.usage.percent,
+        };
+      }
+      return {
+        type: 'context',
+        epoch: value.epoch,
+        replay_floor_seq: value.replay_floor_seq,
+        state: value.state,
+        usage,
+        compact_supported: value.compact_supported,
+        session_active: value.session_active,
+        writer: value.writer,
+      };
+    }
+    case 'control_result': {
+      if (
+        (value.action !== 'compact' && value.action !== 'new_chat') ||
+        !isNonEmptyString(value.request_id) ||
+        typeof value.ok !== 'boolean' ||
+        !isSeq(value.epoch)
+      ) return null;
+      const codes: readonly ControlResultCode[] = [
+        'busy', 'no_session', 'unsupported', 'read_only', 'failed',
+      ];
+      if (value.code !== undefined && !codes.includes(value.code as ControlResultCode)) return null;
+      if (value.ok ? value.code !== undefined : value.code === undefined) return null;
+      if (value.message !== undefined && !isNonEmptyString(value.message)) return null;
+      return {
+        type: 'control_result',
+        action: value.action,
+        request_id: value.request_id,
+        ok: value.ok,
+        epoch: value.epoch,
+        ...(value.code !== undefined ? { code: value.code as ControlResultCode } : {}),
+        ...(typeof value.message === 'string' ? { message: value.message } : {}),
+      };
+    }
+    case 'context_event':
+      if (
+        (value.action !== 'compact' && value.action !== 'new_chat') ||
+        typeof value.ok !== 'boolean' ||
+        (value.message !== undefined && !isNonEmptyString(value.message))
+      ) return null;
+      return {
+        type: 'context_event',
+        action: value.action,
+        ok: value.ok,
+        ...(typeof value.message === 'string' ? { message: value.message } : {}),
+      };
     case 'ack':
       return isNonEmptyString(value.client_msg_id) && isSeq(value.seq)
         ? { type: 'ack', client_msg_id: value.client_msg_id, seq: value.seq }
@@ -224,15 +386,23 @@ export function parseServerFrame(raw: unknown): ServerFrame | null {
         if (typeof value.text !== 'string' ||
           !isNonEmptyString(value.client_msg_id) ||
           !isSeq(value.seq)) return null;
+        if (value.epoch !== undefined && !isSeq(value.epoch)) return null;
         const attachments = parseAttachments(value.attachments);
         if (attachments === null) return null;
         if (value.text.trim() === '' && attachments === undefined) return null;
         return attachments === undefined
-          ? { type: 'user', text: value.text, client_msg_id: value.client_msg_id, seq: value.seq }
+          ? {
+              type: 'user',
+              text: value.text,
+              client_msg_id: value.client_msg_id,
+              ...(isSeq(value.epoch) ? { epoch: value.epoch } : {}),
+              seq: value.seq,
+            }
           : {
               type: 'user',
               text: value.text,
               client_msg_id: value.client_msg_id,
+              ...(isSeq(value.epoch) ? { epoch: value.epoch } : {}),
               seq: value.seq,
               attachments,
             };
@@ -259,8 +429,12 @@ function safeJson(text: string): unknown {
   }
 }
 
-/** Frames that replay out of the server log on reconnect (all but auth_ok). */
-export type LoggedFrame = Exclude<ServerFrame, AuthOkFrame>;
+/** Frames that replay out of the durable log. Control state/outcomes are
+ * always fresh and never persisted. */
+export type LoggedFrame = Exclude<
+  ServerFrame,
+  AuthOkFrame | ContextFrame | ControlResultFrame | ContextEventFrame
+>;
 
 export function loggedFrameSeq(frame: LoggedFrame): number {
   // All logged frames carry a mandatory seq except `error`, where it is

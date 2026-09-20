@@ -77,10 +77,11 @@ Client → server:
 
 | Frame | Fields | Notes |
 |---|---|---|
-| `auth` | `token`, `last_seen_seq?` | MUST be first; re-auth carries the high-water mark |
-| `user` | `text`, `client_msg_id` | queued client-side while offline |
+| `auth` | `token`, `last_seen_seq?` | MUST be first; re-auth carries the high-water mark and receives fresh context state |
+| `user` | `epoch`, `text`, `client_msg_id` | queued client-side while offline; server rejects a stale epoch before logging/delivery |
+| `control` | `action: compact\|new_chat`, `request_id` | fixed writer-only controls; no free-form slash command |
 
-Server → client (every frame carries a monotonic `seq`):
+Server → client (durable conversation frames carry a monotonic `seq`):
 
 | Frame | Fields | Notes |
 |---|---|---|
@@ -91,12 +92,18 @@ Server → client (every frame carries a monotonic `seq`):
 | `tool` | `name`, `state: start\|end`, `seq` | live tool status line |
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |
 | `error` | `message`, `fatal?`, `seq?` | fatal → socket closes (bad token) |
+| `context` | `epoch`, `replay_floor_seq`, `state`, `usage`, capability/session/writer flags | fresh ephemeral control state; provider usage or explicit unavailable |
+| `control_result` | action/request id, `ok`, `epoch`, failure details | ephemeral correlated terminal result; never replayed as chat |
+| `context_event` | action, `ok`, optional bounded message | ephemeral broadcast outcome for provider compaction or post-commit supervision degradation |
 
-**Reconnect:** re-auth with `last_seen_seq`; server sends `auth_ok` then
-replays every logged frame with `seq > last_seen_seq` in order, then
-resumes live. Omitting `last_seen_seq` (fresh page load) replays
-everything. The client dedupes by `seq`/`client_msg_id`; re-sent user
-frames (unacked across a drop) are deduped server-side and re-acked.
+**Reconnect:** re-auth with `last_seen_seq`; server sends `auth_ok`, a
+fresh `context`, then replays logged frames above both the client seq and
+the durable replay floor. An epoch advance clears only the active visible
+history and sent/acked messages; browser-local never-sent outbox words are
+atomically restamped and flushed after the new snapshot. A tab-local
+pending-reset marker suppresses retired replay across reload until an
+idle snapshot proves commit or rollback. The client dedupes by
+`seq`/`client_msg_id` within the active epoch.
 
 **Mock control plane (tests):** token-authenticated `POST /__reset` on
 the mock port clears the frame log and sequence — keeps e2e snapshots
@@ -115,10 +122,14 @@ frames, see [CHAT.md](./CHAT.md)). The pairing token still persists
 indefinitely in `localStorage` (`gru-pairing-token`) — lifetime/rotation
 belongs to the E9 token flow.
 
-**Never lose a typed word:** unacked messages persist in `localStorage`
-(`gru-outbox`, id + text + chips), render as queued bubbles, and flush
-in order after re-auth; replay ends exactly when the stream reaches the
-`auth_ok` high-water mark.
+**Typed-word recovery in the active tab:** unacked messages persist in
+tab-scoped `sessionStorage` (`gru-outbox`, id + epoch + text + chips), survive
+ordinary reload/reconnect, render as queued bubbles, and flush in order after
+re-auth; replay ends exactly when the stream reaches the `auth_ok` high-water
+mark. Initial persistence failure rejects send so the composer keeps its
+text/chips. Later storage failure keeps the in-memory queue and surfaces the
+failure, but site-data clearing, browser eviction, or catastrophic storage loss
+can still remove it; this is not server-side message durability.
 
 ## The composer attach flow (SPEC ruling 19)
 
@@ -206,7 +217,16 @@ follow-up lane, not part of this contract.
   unread badge counts deltas arriving while closed). Gru replies render as
   GFM markdown (see the [rendering contract](#message-rendering-gfm-contract--issue-10));
   streaming deltas re-render token-by-token with a caret; tool activity is
-  a live status line. User messages stay plain text.
+  a live status line. User messages stay plain text. A quiet row above the
+  composer shows provider context percent (or explicit unavailable),
+  **Compact context**, and **New chat**. Busy/read-only/unsupported states
+  disable the relevant controls. New chat uses native confirmation and
+  immediately opens an empty pending-reset view, persisted per tab across
+  reload; a pre-commit failure restores the retired render model, while a
+  durable epoch finalizes the empty view. Words entered while reset is pending
+  stay visible and are sent once to the authoritative winning epoch.
+  Compact success/failure and unsolicited provider outcomes are announced in
+  a dedicated persistent live region that idle usage refreshes cannot erase.
 - **Board (E6)** — desktop tab `🗺️ Board`: repo-grouped job cards, round
   rows with 7 per-lens live chips, agent rail, transcripts list,
   notification center (see [BOARD.md](./BOARD.md)). **Phone:

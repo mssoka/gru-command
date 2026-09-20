@@ -295,14 +295,25 @@ async function main(): Promise<number> {
     frameLog,
     pointer: new GruSessionPointer(chatDir, (level, msg, fields) => logger.log(level, msg, fields)),
     spawnGru: (resumeFile) => gruSlot.ensure(resumeFile !== null ? { resumeFile } : {}),
+    // New chat deliberately bypasses ensure(): it must mint without resume
+    // even while the old supervised slot is healthy. Activation then advances
+    // the slot generation so no stale restart can swap the old epoch back in.
+    spawnFreshGru: () => registry.spawn('gru', {}),
+    canAdoptFreshGru: () => gruSlot.canReplace(),
+    adoptFreshGru: (handle) => gruSlot.adoptReplacement(handle),
     siblingUpgradePaths: [BOARD_WS_PATH],
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   gruSlot.onSwap((handle) => chat.adoptRestartedGru(handle));
   surfaceInChat = (notification) => {
-    chat.surfaceNotice(`⚠ Action required: ${notification.title}${notification.detail !== null ? ` — ${notification.detail}` : ''}`);
-    // The chat stream displayed it — record the receipt (shown:true).
-    notifications.markShown(notification.id, 'gru-chat');
+    chat.surfaceNotice(
+      `⚠ Action required: ${notification.title}${notification.detail !== null ? ` — ${notification.detail}` : ''}`,
+      () => {
+        // Receipt follows durable persistence/broadcast, including notices
+        // queued across a reset boundary. Rejected/failed notices stay unshown.
+        notifications.markShown(notification.id, 'gru-chat');
+      },
+    );
   };
   state.supervisor = supervisorLive;
 

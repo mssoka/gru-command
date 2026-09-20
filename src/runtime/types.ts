@@ -69,6 +69,15 @@ export interface RuntimeHealth {
   readonly note?: string;
 }
 
+/** Provider/runtime-owned context accounting. Callers must never infer this
+ * from transcript or frame-log bytes. A null result means that the runtime
+ * has no current, trustworthy measurement. */
+export interface ContextUsage {
+  readonly tokens: number;
+  readonly contextWindow: number;
+  readonly percent: number;
+}
+
 /** Options for spawn(). */
 export interface SpawnOptions {
   /**
@@ -112,6 +121,12 @@ export type RuntimeEvent =
   | { readonly type: 'tool_end'; readonly callId: string; readonly isError: boolean }
   | { readonly type: 'turn_start' }
   | { readonly type: 'turn_end' }
+  | { readonly type: 'compaction_start' }
+  | {
+      readonly type: 'compaction_end';
+      readonly success: boolean;
+      readonly error?: string;
+    }
   | {
       /** A message was queued because a turn is live (single-writer, SPEC ruling 1). */
       readonly type: 'queued';
@@ -162,6 +177,14 @@ export interface AgentHandle {
   steer(text: string, options?: PromptOptions): Promise<void>;
   /** Queue a message for after the current turn completes. */
   followUp(text: string, options?: PromptOptions): Promise<void>;
+  /** Current native/provider context usage, or null when unavailable/stale. */
+  readonly getContextUsage?: () => ContextUsage | null;
+  /** Run the runtime's native context compaction on this same session. */
+  readonly compact?: () => Promise<void>;
+  /** Whether native compaction can currently start (distinct from support). */
+  readonly canCompact?: () => boolean;
+  /** Whether native compaction is currently active. */
+  readonly isCompacting?: () => boolean;
   subscribe(listener: RuntimeEventListener): () => void;
   health(): AgentHealth;
   dispose(): Promise<void>;

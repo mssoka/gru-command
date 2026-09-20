@@ -16,6 +16,39 @@ concrete adapter — the interface is the contract (SPEC ruling 4).
 | `thinkingLevelControl` | ✅ | ✅ | thinking level settable per spawn (claude: `--effort`) |
 | `followUp` | ✅ | ❌ | claude has no native followUp channel — queued messages deliver as fresh prompt turns |
 
+## Context controls
+
+`AgentHandle` also has optional provider-owned controls:
+`getContextUsage()` (fresh whole-context tokens/window/percent or `null`),
+`compact()` (native in-place compaction), `canCompact()` (live idle/capability
+check), and `isCompacting()`. `canCompact()` may be false even when the method
+exists, while a turn, queue, or native reconciliation is active. These are not
+inferred capability booleans: presence plus live state determines the chat
+snapshot. Fallback wrappers forward them while preserving their
+single-operation queue.
+
+- **Pi:** usage comes directly from `AgentSession.getContextUsage()` and
+  compaction from `AgentSession.compact()`. Native compaction lifecycle
+  events map to runtime `compaction_start/end`; the adapter owns one lifecycle
+  through post-terminal identity reconciliation, ignores provider duplicates,
+  and emits exactly one failed terminal if disposal wins. The terminal event is
+  the result authority (missing/failed terminals reject), and the adapter
+  verifies the session id/file did not change.
+- **Claude Code:** print mode does not expose trustworthy whole-context
+  usage, so usage is deliberately unavailable. Compaction runs native
+  `/compact` through a dedicated `--resume <same uuid>` machine-output
+  process. Its frames append to the same product transcript for forensics,
+  but a control-only translator suppresses all command output from chat.
+  Init/session/result frames and the native compact status/boundary are
+  validated; a successful slash-command result alone is not success, and
+  failure leaves the session usable.
+
+Both adapters reject controls while a turn/control is active. Claude disposal
+is shared by concurrent callers and bounded through TERM/KILL plus transcript
+settlement before releasing the session lock. New chat is not an adapter
+`reset`: orchestration mints a wholly fresh unresumed handle and atomically
+swaps it at the durable chat boundary.
+
 ## Claude Code adapter (`claude-code`)
 
 Hosts sessions on the Claude Code **headless CLI** — `claude -p` with

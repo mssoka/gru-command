@@ -270,6 +270,43 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(h.notificationsOfKind('supervision.hang').length).toBe(1);
   });
 
+  it('a silent native compaction is bounded by the same hang watchdog', async () => {
+    const handle = new FakeHandle('gru', 'gru-compact-hang', null);
+    h.registry.adopt(handle);
+    const spawnsBefore = h.registry.spawnCalls.length;
+    const notificationsBefore = h.notificationsOfKind('supervision.hang').length;
+    handle.emit({ type: 'compaction_start' });
+    h.advance(60);
+    await sleep(20);
+    expect(handle.disposed).toBe(true);
+    expect(h.registry.spawnCalls.length).toBe(spawnsBefore + 1);
+    expect(h.notificationsOfKind('supervision.hang').length).toBe(notificationsBefore + 1);
+  });
+
+  it('a completed native compaction disarms the hang watchdog', async () => {
+    const handle = new FakeHandle('gru', 'gru-compact-complete', null);
+    h.registry.adopt(handle);
+    const spawnsBefore = h.registry.spawnCalls.length;
+    handle.emit({ type: 'compaction_start' });
+    handle.emit({ type: 'compaction_end', success: true });
+    h.advance(60);
+    await sleep(20);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls.length).toBe(spawnsBefore);
+  });
+
+  it('a failed native compaction also disarms the hang watchdog', async () => {
+    const handle = new FakeHandle('gru', 'gru-compact-failed', null);
+    h.registry.adopt(handle);
+    const spawnsBefore = h.registry.spawnCalls.length;
+    handle.emit({ type: 'compaction_start' });
+    handle.emit({ type: 'compaction_end', success: false, error: 'provider declined' });
+    h.advance(60);
+    await sleep(20);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls.length).toBe(spawnsBefore);
+  });
+
   it('in-band errors NEVER restart (the adapter contract recovers)', async () => {
     const handle = new FakeHandle('minion', 'minion-inband', null);
     h.registry.adopt(handle);
@@ -494,6 +531,193 @@ describe('supervisor — declared slots (the Gru chat session shape)', () => {
     // The new handle is bound to the slot (restart uses slot.spawn).
     const view = h.supervisor.viewFor(swapped[0]!.id);
     expect(view?.slotId).toBe('gru-main');
+    h.dispose();
+  });
+});
+
+describe('supervisor — intentional slot generations', () => {
+  it('disposes an ordinary ensure spawn that completes after supervisor shutdown', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-ensure-shutdown',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    let releaseEnsure!: () => void;
+    let stale!: FakeHandle;
+    h.registry.spawnImpl = async (role, options) => {
+      stale = new FakeHandle(role, 'stale-after-shutdown', options?.resumeFile ?? null);
+      await new Promise<void>((resolve) => {
+        releaseEnsure = resolve;
+      });
+      return stale;
+    };
+    const ensuring = slot.ensure({});
+    await sleep(10);
+    h.supervisor.dispose();
+    releaseEnsure();
+    await expect(ensuring).rejects.toThrow(/not active/);
+    expect(stale.disposed).toBe(true);
+    h.dispose();
+  });
+
+  it('supervisor shutdown disposes a restart spawn that completes afterward', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-restart-shutdown',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    let releaseRestart!: () => void;
+    let stale!: FakeHandle;
+    h.registry.spawnImpl = async (role, options) => {
+      stale = new FakeHandle(role, 'stale-restart-after-shutdown', options?.resumeFile ?? null);
+      await new Promise<void>((resolve) => {
+        releaseRestart = resolve;
+      });
+      return stale;
+    };
+    hang(first);
+    h.advance(60);
+    await sleep(10);
+    h.supervisor.dispose();
+    releaseRestart();
+    await sleep(20);
+    expect(stale.disposed).toBe(true);
+    expect(slot.current()).toBeNull();
+    h.dispose();
+  });
+
+  it('an intentional fresh replacement wins over an in-flight ordinary ensure', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-ensure-generation',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    let releaseEnsure!: () => void;
+    let stale!: FakeHandle;
+    h.registry.spawnImpl = async (role, options) => {
+      stale = new FakeHandle(role, 'stale-ensure', options?.resumeFile ?? null);
+      await new Promise<void>((resolve) => {
+        releaseEnsure = resolve;
+      });
+      return stale;
+    };
+    const ensuring = slot.ensure({});
+    await sleep(10);
+
+    const fresh = new FakeHandle('gru', 'fresh-during-ensure', null);
+    h.registry.adopt(fresh);
+    await slot.adoptReplacement(fresh);
+    releaseEnsure();
+
+    expect(await ensuring).toBe(fresh);
+    expect(stale.disposed).toBe(true);
+    expect(slot.current()).toBe(fresh);
+    h.dispose();
+  });
+
+  it('an intentional fresh replacement cannot be undone by a stale restart completion', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-generation',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    let releaseRestart!: () => void;
+    let stale!: FakeHandle;
+    h.registry.spawnImpl = async (role, options) => {
+      stale = new FakeHandle(role, 'stale-restart', options?.resumeFile ?? null);
+      await new Promise<void>((resolve) => {
+        releaseRestart = resolve;
+      });
+      return stale;
+    };
+    const swaps: AgentHandle[] = [];
+    slot.onSwap((handle) => swaps.push(handle));
+    hang(first);
+    h.advance(60);
+    await sleep(10);
+
+    const fresh = new FakeHandle('gru', 'intentional-fresh', null);
+    h.registry.adopt(fresh);
+    await slot.adoptReplacement(fresh);
+    releaseRestart();
+    await sleep(30);
+
+    expect(slot.current()?.id).toBe('intentional-fresh');
+    expect(stale.disposed).toBe(true);
+    expect(swaps).toEqual([]);
+    h.dispose();
+  });
+
+  it('intentional replacement fails closed after the breaker opens and leaves its alert unacknowledged', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-breaker-replacement',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    h.registry.spawnImpl = async () => {
+      throw new Error('restart unavailable');
+    };
+    hang(first);
+    h.advance(60);
+    await sleep(50);
+    const alert = h.notificationsOfKind('supervision.breaker').find((item) => item.ackedAt === null);
+    expect(alert).toBeDefined();
+    expect(slot.canReplace()).toBe(false);
+
+    const fresh = new FakeHandle('gru', 'fresh-after-breaker', null);
+    h.registry.adopt(fresh);
+    await expect(slot.adoptReplacement(fresh)).rejects.toThrow(/breaker is open/);
+    expect(fresh.disposed).toBe(true);
+    expect(
+      h.api.listNotifications({ limit: 100 }).find((item) => item.id === alert!.id)?.ackedAt,
+    ).toBeNull();
+    expect(slot.current()).toBeNull();
+    expect(h.supervisor.viewFor(first.id)).toMatchObject({
+      breakerOpen: true,
+      state: 'stopped',
+      restarts: 3,
+    });
+    h.dispose();
+  });
+
+  it('releasing a slot invalidates and disposes an in-flight restart result', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-release-generation',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    let releaseRestart!: () => void;
+    let stale!: FakeHandle;
+    h.registry.spawnImpl = async (role, options) => {
+      stale = new FakeHandle(role, 'released-stale-restart', options?.resumeFile ?? null);
+      await new Promise<void>((resolve) => {
+        releaseRestart = resolve;
+      });
+      return stale;
+    };
+    const swaps: AgentHandle[] = [];
+    slot.onSwap((handle) => swaps.push(handle));
+    hang(first);
+    h.advance(60);
+    await sleep(10);
+
+    slot.release();
+    releaseRestart();
+    await sleep(30);
+
+    expect(slot.current()).toBeNull();
+    expect(stale.disposed).toBe(true);
+    expect(swaps).toEqual([]);
     h.dispose();
   });
 });
