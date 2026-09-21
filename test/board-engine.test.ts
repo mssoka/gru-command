@@ -9,6 +9,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import type { Role } from '../src/config.js';
+import type { DecisionRuntimeStatus } from '../src/decisions/runtime.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -49,6 +50,58 @@ describe('board engine — adapter events → ledger events → board state', ()
     // at event time); the engine renders the durable table.
     new NotificationCenter({ ledger: api, bus });
     engine = new BoardEngine({ ledger: api, bus });
+  });
+
+  it('projects a live ready decision status instead of pinning the default disabled state', () => {
+    const ready = new BoardEngine({
+      ledger: api,
+      bus,
+      decisionsStatus: () => ({
+        enabled: true,
+        status: 'ready',
+        reason: null,
+        model: '~typesafe/jev-latest',
+        endpoint: 'https://openrouter.ai/api/alpha/decisions',
+        credentialPresent: true,
+        credentialSource: 'file',
+        checkedAt: new Date(0).toISOString(),
+        incarnation: 'test-incarnation',
+        generation: 7,
+      }),
+    });
+    expect(ready.snapshot().decisions).toMatchObject({ status: 'ready', credentialPresent: true, generation: 7 });
+  });
+
+  it('projects ready, degraded, recovered and disabled decision generations without notification ack forgery', () => {
+    let current: DecisionRuntimeStatus = {
+      enabled: true,
+      status: 'ready' as const,
+      reason: null,
+      model: '~typesafe/jev-latest',
+      endpoint: 'https://openrouter.ai/api/alpha/decisions',
+      credentialPresent: true,
+      credentialSource: 'file' as const,
+      checkedAt: new Date(0).toISOString(),
+      incarnation: 'test-incarnation',
+      generation: 1,
+    };
+    const live = new BoardEngine({ ledger: api, bus, decisionsStatus: () => current });
+    expect(live.snapshot().decisions.status).toBe('ready');
+    current = { ...current, status: 'degraded', reason: 'provider_degraded', generation: 2 };
+    expect(live.snapshot().decisions).toMatchObject({ status: 'degraded', reason: 'provider_degraded', generation: 2 });
+    const incident = api.recordNotification({
+      id: 'decision-transition-incident', kind: 'decisions.degraded.provider_degraded',
+      routing: 'action-required', severity: 'error', title: 'Decision provider degraded',
+    });
+    api.resolveNotificationsByKindPrefix('decisions.degraded.', 'decisions-runtime');
+    current = { ...current, status: 'ready', reason: null, generation: 3 };
+    expect(live.snapshot().decisions.status).toBe('ready');
+    expect(api.getNotification(incident.id)).toMatchObject({ ackedAt: null, resolvedAt: expect.any(String), resolvedBy: 'decisions-runtime' });
+    current = {
+      ...current, enabled: false, status: 'disabled', reason: 'disabled',
+      credentialPresent: false, credentialSource: 'none', generation: 4,
+    };
+    expect(live.snapshot().decisions).toMatchObject({ enabled: false, status: 'disabled', generation: 4 });
   });
 
   it('a spawned agent lands in the ledger + snapshot agent rail', () => {

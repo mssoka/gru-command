@@ -109,6 +109,42 @@ export interface ReviewConfig {
   readonly enabled: boolean;
 }
 
+export interface JevConfig {
+  readonly enabled: boolean;
+  readonly model: string;
+  readonly endpoint: string;
+  readonly timeoutMs: number;
+}
+
+export interface DecisionThresholdConfig {
+  readonly act: number;
+  readonly confirm: number;
+  readonly requireConfirmOnAct: boolean;
+}
+
+export interface DecisionsConfig {
+  readonly jev: JevConfig;
+  readonly thresholds: Readonly<{
+    read_only: DecisionThresholdConfig;
+    operational: DecisionThresholdConfig;
+    destructive: DecisionThresholdConfig;
+  }>;
+}
+
+export const DEFAULT_DECISIONS_CONFIG: DecisionsConfig = {
+  jev: {
+    enabled: false,
+    model: '~typesafe/jev-latest',
+    endpoint: 'https://openrouter.ai/api/alpha/decisions',
+    timeoutMs: 2_000,
+  },
+  thresholds: {
+    read_only: { act: 0.6, confirm: 0.4, requireConfirmOnAct: false },
+    operational: { act: 0.75, confirm: 0.55, requireConfirmOnAct: false },
+    destructive: { act: 0.85, confirm: 0.7, requireConfirmOnAct: true },
+  },
+};
+
 export interface GruCommandConfig {
   readonly workspaceRoot: string;
   readonly dataDir: string;
@@ -123,6 +159,7 @@ export interface GruCommandConfig {
   readonly worktrees: WorktreesConfig;
   readonly dispatch: DispatchConfig;
   readonly review: ReviewConfig;
+  readonly decisions: DecisionsConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
   /** Absolute per-instance directory holding config, identity, logs, sessions. */
@@ -226,6 +263,7 @@ const TOP_LEVEL_KEYS = [
   'worktrees',
   'dispatch',
   'review',
+  'decisions',
 ] as const;
 
 /** Sentinel meaning "the runtime harness's own configured default" (SPEC ruling 16). */
@@ -332,6 +370,13 @@ function requireNonNegativeInt(value: unknown, file: string, field: string): num
   return value;
 }
 
+function requireUnitNumber(value: unknown, file: string, field: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new ConfigError(`${field} must be a finite number between 0 and 1`, file, field);
+  }
+  return value;
+}
+
 function isInsideOrEqual(outer: string, inner: string): boolean {
   const rel = relative(outer, inner);
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
@@ -396,6 +441,7 @@ export function loadConfig(
   let worktrees: WorktreesConfig | null = null;
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
   let review: ReviewConfig = { enabled: true };
+  let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
   let sourceFile: string | null = null;
 
   if (configState(file) === 'present') {
@@ -674,6 +720,9 @@ export function loadConfig(
             : review.enabled,
       };
     }
+    if (raw['decisions'] !== undefined) {
+      decisions = readDecisionsConfig(raw['decisions'], file, decisions);
+    }
   }
 
   for (const [label, dir] of [
@@ -724,9 +773,118 @@ export function loadConfig(
     },
     dispatch,
     review,
+    decisions,
     sourceFile,
     instanceDir,
   };
+}
+
+function readDecisionThreshold(
+  value: unknown,
+  file: string,
+  field: string,
+  defaults: DecisionThresholdConfig,
+): DecisionThresholdConfig {
+  const table = requireTable(value, file, field);
+  const valid = ['act', 'confirm', 'require_confirm_on_act'];
+  for (const key of Object.keys(table)) {
+    if (!valid.includes(key)) {
+      throw new ConfigError(
+        `unknown key \`${key}\` in [${field}] (valid keys: ${valid.join(', ')})`,
+        file,
+        `${field}.${key}`,
+      );
+    }
+  }
+  const result: DecisionThresholdConfig = {
+    act: table['act'] !== undefined ? requireUnitNumber(table['act'], file, `${field}.act`) : defaults.act,
+    confirm: table['confirm'] !== undefined ? requireUnitNumber(table['confirm'], file, `${field}.confirm`) : defaults.confirm,
+    requireConfirmOnAct:
+      table['require_confirm_on_act'] !== undefined
+        ? requireBool(table['require_confirm_on_act'], file, `${field}.require_confirm_on_act`)
+        : defaults.requireConfirmOnAct,
+  };
+  if (result.confirm >= result.act) {
+    throw new ConfigError(
+      `${field}.confirm (${result.confirm}) must be less than ${field}.act (${result.act})`,
+      file,
+      field,
+    );
+  }
+  return result;
+}
+
+function readDecisionsConfig(
+  value: unknown,
+  file: string,
+  defaults: DecisionsConfig,
+): DecisionsConfig {
+  const table = requireTable(value, file, 'decisions');
+  for (const key of Object.keys(table)) {
+    if (!['jev', 'thresholds'].includes(key)) {
+      throw new ConfigError(
+        `unknown key \`${key}\` in [decisions] (valid keys: jev, thresholds)`,
+        file,
+        `decisions.${key}`,
+      );
+    }
+  }
+  let jev = defaults.jev;
+  if (table['jev'] !== undefined) {
+    const jevTable = requireTable(table['jev'], file, 'decisions.jev');
+    const valid = ['enabled', 'model', 'endpoint', 'timeout_ms'];
+    for (const key of Object.keys(jevTable)) {
+      if (!valid.includes(key)) {
+        throw new ConfigError(
+          `unknown key \`${key}\` in [decisions.jev] (valid keys: ${valid.join(', ')})`,
+          file,
+          `decisions.jev.${key}`,
+        );
+      }
+    }
+    jev = {
+      enabled: jevTable['enabled'] !== undefined ? requireBool(jevTable['enabled'], file, 'decisions.jev.enabled') : jev.enabled,
+      model: jevTable['model'] !== undefined ? requireString(jevTable['model'], file, 'decisions.jev.model') : jev.model,
+      endpoint: jevTable['endpoint'] !== undefined ? requireString(jevTable['endpoint'], file, 'decisions.jev.endpoint') : jev.endpoint,
+      timeoutMs: jevTable['timeout_ms'] !== undefined ? requirePositiveInt(jevTable['timeout_ms'], file, 'decisions.jev.timeout_ms') : jev.timeoutMs,
+    };
+  }
+  let thresholds = defaults.thresholds;
+  if (table['thresholds'] !== undefined) {
+    const thresholdsTable = requireTable(table['thresholds'], file, 'decisions.thresholds');
+    const risks = ['read_only', 'operational', 'destructive'] as const;
+    for (const key of Object.keys(thresholdsTable)) {
+      if (!(risks as readonly string[]).includes(key)) {
+        throw new ConfigError(
+          `unknown key \`${key}\` in [decisions.thresholds] (valid keys: ${risks.join(', ')})`,
+          file,
+          `decisions.thresholds.${key}`,
+        );
+      }
+    }
+    thresholds = {
+      read_only:
+        thresholdsTable['read_only'] !== undefined
+          ? readDecisionThreshold(thresholdsTable['read_only'], file, 'decisions.thresholds.read_only', thresholds.read_only)
+          : thresholds.read_only,
+      operational:
+        thresholdsTable['operational'] !== undefined
+          ? readDecisionThreshold(thresholdsTable['operational'], file, 'decisions.thresholds.operational', thresholds.operational)
+          : thresholds.operational,
+      destructive:
+        thresholdsTable['destructive'] !== undefined
+          ? readDecisionThreshold(thresholdsTable['destructive'], file, 'decisions.thresholds.destructive', thresholds.destructive)
+          : thresholds.destructive,
+    };
+  }
+  if (!thresholds.destructive.requireConfirmOnAct) {
+    throw new ConfigError(
+      'decisions.thresholds.destructive.require_confirm_on_act must be true',
+      file,
+      'decisions.thresholds.destructive.require_confirm_on_act',
+    );
+  }
+  return { jev, thresholds };
 }
 
 /**

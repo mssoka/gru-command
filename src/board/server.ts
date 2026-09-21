@@ -12,6 +12,7 @@ import type { NotificationCenter } from '../notifications/center.js';
 import type { TranscriptService } from '../transcripts/service.js';
 import { BOARD_WS_PATH, parseBoardClientFrame, type BoardServerFrame } from './frames.js';
 import type { BoardEngine } from './engine.js';
+import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -35,6 +36,8 @@ export interface BoardServerOptions {
   /** E7: fired after a successful ack — the supervisor re-arms an open
    * breaker whose notification was acked. */
   readonly onNotificationAck?: (id: string) => void;
+  readonly decisionsStatus?: () => DecisionRuntimeStatus;
+  readonly onDecisionsRecheck?: () => Promise<DecisionRuntimeStatus>;
   readonly log?: Log;
   /** First-frame-must-be-auth deadline (chat parity: 5 s). */
   readonly authDeadlineMs?: number;
@@ -196,6 +199,15 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           json(res, 200, engine.snapshot());
           return;
         }
+        if (req.method === 'GET' && path === '/api/decisions/status') {
+          if (!authed(req, res)) return;
+          if (options.decisionsStatus === undefined) {
+            json(res, 404, { error: 'not_found' });
+            return;
+          }
+          json(res, 200, options.decisionsStatus());
+          return;
+        }
         if (req.method === 'GET' && path === '/api/transcripts') {
           if (!authed(req, res)) return;
           json(res, 200, { transcripts: transcripts.list() });
@@ -238,6 +250,15 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         }
 
         // --- writes (the thin record API; authorship UI is E8) ----------
+        if (req.method === 'POST' && path === '/api/decisions/recheck') {
+          if (!authed(req, res)) return;
+          if (options.onDecisionsRecheck === undefined) {
+            json(res, 404, { error: 'not_found' });
+            return;
+          }
+          json(res, 200, await options.onDecisionsRecheck());
+          return;
+        }
         if (req.method === 'POST' && (path === '/api/jobs' || path === '/api/rounds' || path === '/api/agents' || path === '/api/agents/state' || path === '/api/lenses/bind' || path === '/api/lenses/outcome')) {
           if (!authed(req, res)) return;
           const body = (await readBody(req)) as Record<string, unknown>;

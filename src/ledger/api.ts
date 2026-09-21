@@ -127,6 +127,9 @@ export interface NotificationRecord {
   readonly shownBy: string | null;
   readonly ackedAt: string | null;
   readonly ackedBy: string | null;
+  /** System resolution is distinct from a human acknowledgement. */
+  readonly resolvedAt: string | null;
+  readonly resolvedBy: string | null;
 }
 
 /** Marker for not-found failures the HTTP surface maps to 404 (typed —
@@ -963,9 +966,68 @@ export class LedgerApi {
   listNotifications(opts: { limit?: number; unackedOnly?: boolean } = {}): readonly NotificationRecord[] {
     const limit = opts.limit ?? 50;
     const sql = opts.unackedOnly
-      ? 'SELECT * FROM notifications WHERE acked_at IS NULL ORDER BY ts DESC, id LIMIT ?'
+      ? 'SELECT * FROM notifications WHERE acked_at IS NULL AND resolved_at IS NULL ORDER BY ts DESC, id LIMIT ?'
       : 'SELECT * FROM notifications ORDER BY ts DESC, id LIMIT ?';
     return (this.db.prepare(sql).all(limit) as Row[]).map((row) => this.notificationFromRow(row));
+  }
+
+  /** Enrich an already-durable provisional notification after async triage. */
+  updateNotificationTriage(id: string, routing: NotificationRouting, detail: string | null): NotificationRecord | null {
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null || current.ackedAt !== null || current.resolvedAt !== null) return null;
+      const changed = this.db
+        .prepare('UPDATE notifications SET routing = ?, detail = ? WHERE id = ? AND acked_at IS NULL AND resolved_at IS NULL')
+        .run(routing, detail, id);
+      if (changed.changes === 0) return null;
+      this.appendEvent({
+        kind: 'notification.triaged',
+        agentId: current.agentId,
+        payload: { id, routing },
+      });
+      return this.getNotification(id);
+    });
+  }
+
+  findNotificationByKind(kind: string, mode: 'any' | 'unacked' | 'active' | boolean = 'any'): NotificationRecord | null {
+    const normalized = mode === true ? 'unacked' : mode === false ? 'any' : mode;
+    const sql = normalized === 'unacked'
+      ? 'SELECT * FROM notifications WHERE kind = ? AND acked_at IS NULL AND resolved_at IS NULL ORDER BY ts DESC, id LIMIT 1'
+      : normalized === 'active'
+        ? 'SELECT * FROM notifications WHERE kind = ? AND resolved_at IS NULL ORDER BY ts DESC, id LIMIT 1'
+        : 'SELECT * FROM notifications WHERE kind = ? ORDER BY ts DESC, id LIMIT 1';
+    const row = this.db.prepare(sql).get(kind) as Row | undefined;
+    return row === undefined ? null : this.notificationFromRow(row);
+  }
+
+  /**
+   * Resolve product incidents without forging a human acknowledgement.
+   * Every changed row emits an event so connected status/notification
+   * surfaces refresh immediately.
+   */
+  resolveNotificationsByKindPrefix(prefix: string, by: string): readonly NotificationRecord[] {
+    if (prefix === '' || by === '') throw new Error('resolution prefix/by must be non-empty');
+    return this.transaction(() => {
+      const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+      const rows = this.db
+        .prepare("SELECT * FROM notifications WHERE kind LIKE ? ESCAPE '\\' AND resolved_at IS NULL ORDER BY ts, id")
+        .all(`${escaped}%`) as Row[];
+      const resolved: NotificationRecord[] = [];
+      for (const raw of rows) {
+        const id = str(raw.id);
+        const at = nowIso();
+        this.db
+          .prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ? AND resolved_at IS NULL')
+          .run(at, by, id);
+        this.appendEvent({
+          kind: 'notification.resolved',
+          agentId: nstr(raw.agent_id),
+          payload: { id, by },
+        });
+        resolved.push(this.getNotification(id) as NotificationRecord);
+      }
+      return resolved;
+    });
   }
 
   /**
@@ -1082,6 +1144,8 @@ export class LedgerApi {
       shownBy: nstr(row.shown_by),
       ackedAt: nstr(row.acked_at),
       ackedBy: nstr(row.acked_by),
+      resolvedAt: nstr(row.resolved_at),
+      resolvedBy: nstr(row.resolved_by),
     };
   }
 }

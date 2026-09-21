@@ -20,6 +20,7 @@ import { TranscriptView } from './ui/transcript.js';
 import { mustGet } from './ui/dom.js';
 import { initPairing, showPairingError } from './ui/pairing.js';
 import { initSettings, THEME_EVENT } from './ui/settings.js';
+import { DecisionStatusCard } from './ui/decisions-status.js';
 
 const TOKEN_KEY = 'gru-pairing-token';
 
@@ -42,6 +43,7 @@ let chatView: ChatView | null = null;
 let boardClient: BoardClient | null = null;
 let boardView: BoardView | null = null;
 let transcriptView: TranscriptView | null = null;
+const decisionStatusCard = new DecisionStatusCard(() => boardClient?.recheckDecisions() ?? null);
 /** E7: the live toast surface — one stack, reused across re-pairs. */
 const toastStack = new ToastStack(document.getElementById('toasts'));
 /** E7: browser Notification permission — requested on the pair gesture,
@@ -286,6 +288,7 @@ function startBoard(token: string): void {
       },
       snapshot: (snapshot) => {
         boardView?.render(snapshot);
+        decisionStatusCard.render(snapshot.decisions);
         const signature = snapshot.agents
           .map((agent) => `${agent.id}:${agent.sessionFile ?? ''}`)
           .join('|');

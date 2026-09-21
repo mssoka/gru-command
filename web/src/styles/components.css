@@ -696,6 +696,105 @@ body {
   padding: 3px 10px;
 }
 
+/* Jev stays a subordinate instrument panel, not a competing dashboard. */
+.decision-status {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 14px;
+  overflow: hidden;
+  padding: 15px 16px;
+  border: var(--outline-thin);
+  border-radius: var(--radius-md);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--rev) 24%, transparent), transparent 52%),
+    var(--soft);
+}
+
+.decision-status::after {
+  content: 'JEV';
+  position: absolute;
+  right: -4px;
+  bottom: -15px;
+  font-weight: 950;
+  font-size: 54px;
+  letter-spacing: -0.08em;
+  color: var(--line);
+  opacity: 0.045;
+  transform: rotate(-7deg);
+  pointer-events: none;
+}
+
+.decision-status__head {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.decision-status__stamp {
+  min-width: 88px;
+  padding: 6px 11px;
+  border: var(--outline-thin);
+  border-radius: 999px;
+  box-shadow: 2px 3px 0 rgba(34, 48, 74, 0.15);
+  background: var(--park);
+  text-align: center;
+  font-size: 11px;
+  font-weight: 950;
+  letter-spacing: 0.16em;
+}
+
+.decision-status__stamp[data-state='ready'] { background: var(--done); color: var(--on-state); }
+.decision-status__stamp[data-state='checking'] { background: var(--work); color: var(--on-state); }
+.decision-status__stamp[data-state='degraded'] { background: var(--alert); color: var(--on-state); }
+
+.decision-status__summary {
+  grid-column: 1 / -1;
+  margin: 0;
+  max-width: 62ch;
+  font-size: 13px;
+  font-weight: 750;
+  line-height: 1.4;
+}
+
+.decision-status__meta {
+  min-width: 0;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.decision-status__setup {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 5px;
+  padding-top: 8px;
+  border-top: 2px dashed var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.decision-status__setup code {
+  width: fit-content;
+  max-width: 100%;
+  padding: 4px 7px;
+  border-radius: 7px;
+  background: var(--card);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.decision-status__recheck {
+  align-self: end;
+  justify-self: end;
+  padding: 6px 11px;
+  font-size: 12px;
+  z-index: 1;
+}
+
 /* Page-load reveal — one orchestrated pop, staggered */
 .reveal {
   animation: reveal-in 0.4s var(--ease-pop) backwards;

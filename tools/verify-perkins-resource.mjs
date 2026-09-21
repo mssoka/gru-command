@@ -19,9 +19,25 @@ const EXCLUDED_PRODUCT_MARKERS = [
   ['api', 'alpha', 'decisions'],
   ['open', 'router', 'api', 'key'],
 ].map((parts) => parts.join(''));
+// The residue invariant is PERKINS-SURFACE INDEPENDENCE: the integrity-pinned
+// Perkins policy/bridge/server bytes and the Perkins role must not embed the
+// optional Jev decision feature. It was originally written as a whole-product
+// scan when Jev shipped nowhere; since the decisions lane landed
+// (gru-command-jev-integration), the product legitimately carries Jev outside
+// the Perkins surface, so the scan is scoped to the Perkins-owned paths —
+// including the compiled artifacts' declaration and source-map siblings,
+// which embed the same source text.
 const PRODUCT_SCAN_ENTRIES = [
-  'dist', 'resources', 'roles', 'tools', 'install', 'web/dist',
-  'README.md', 'LICENSE', 'package.json', 'install.sh',
+  'dist/dispatch/perkins-review',
+  'dist/dispatch/perkins.js',
+  'dist/dispatch/perkins.d.ts',
+  'dist/dispatch/perkins.js.map',
+  'dist/runtime/review-mcp-bridge.js',
+  'dist/runtime/review-mcp-bridge.d.ts',
+  'dist/runtime/review-mcp-bridge.js.map',
+  'dist/runtime/review-mcp-server.mjs',
+  'resources',
+  'roles',
 ];
 
 function contained(root, candidate) {
@@ -97,9 +113,6 @@ function scanExcludedResidue(root) {
     if (bytes.byteLength !== info.size) throw new Error(`product residue file changed while read: ${rel}`);
     scannedBytes += bytes.byteLength;
     scannedFiles += 1;
-    // This trusted verifier necessarily carries the fragmented denylist used
-    // to detect residue. Scan every other shipping file's bytes.
-    if (rel === 'tools/verify-perkins-resource.mjs') return;
     const loweredText = bytes.toString('utf8').toLowerCase();
     for (const marker of EXCLUDED_PRODUCT_MARKERS) {
       if (loweredText.includes(marker)) throw new Error(`excluded product residue found in file: ${rel}`);

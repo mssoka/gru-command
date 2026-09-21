@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test, type FileChooser, type Page } from '@playwright/test';
-import { startRealService, type RealServiceHandle } from '../../test/helpers/real-service.mjs';
+import { pickFreePort, startRealService, type RealServiceHandle } from '../../test/helpers/real-service.mjs';
 
 /**
  * Real-server smoke (E5c): the REAL service (repo dist/main.js, real
@@ -30,6 +30,9 @@ const REAL_PORT = Number(process.env.REAL_SERVICE_PORT ?? 7790);
  * prompt the agent received ({prompt, images}) — the agent-side receipt
  * for the full-gesture attach tests. Set before the service spawns. */
 const DOUBLE_LOG = join(tmpdir(), `gru-e2e-double-${Date.now()}.jsonl`);
+const JEV_FETCH_LOG = join(tmpdir(), `gru-e2e-jev-${Date.now()}.jsonl`);
+const JEV_MODE_FILE = join(tmpdir(), `gru-e2e-jev-mode-${Date.now()}`);
+const JEV_PRELOAD = join(import.meta.dirname, '..', '..', 'test', 'helpers', 'jev-fetch-double.mjs');
 process.env.CLAUDE_DOUBLE_LOG = DOUBLE_LOG;
 
 /** Last {prompt, images} the agent-side double received. */
@@ -54,7 +57,15 @@ let durableWorkspace = '';
 test.beforeAll(async () => {
   // keepHome: the home/workspace must survive stop() so the restart test
   // can reboot on the same durable state; afterAll removes them.
-  service = await startRealService({ port: REAL_PORT, token: REAL_TOKEN, keepHome: true });
+  writeFileSync(JEV_MODE_FILE, 'success', 'utf8');
+  service = await startRealService({
+    port: REAL_PORT,
+    token: REAL_TOKEN,
+    keepHome: true,
+    decisionKey: 'E2E-FILE-CREDENTIAL-CANARY',
+    nodeImport: JEV_PRELOAD,
+    extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
+  });
   durableHome = service.home;
   durableWorkspace = service.workspace;
 });
@@ -66,6 +77,8 @@ test.afterAll(async () => {
   rmSync(durableWorkspace, { recursive: true, force: true });
   durableHome = '';
   durableWorkspace = '';
+  rmSync(JEV_FETCH_LOG, { force: true });
+  rmSync(JEV_MODE_FILE, { force: true });
 });
 
 async function pair(page: Page): Promise<void> {
@@ -193,6 +206,8 @@ test('service restart drops the socket; reconnect keeps history and flushes the 
     token: REAL_TOKEN,
     home: durableHome,
     workspace: durableWorkspace,
+    nodeImport: JEV_PRELOAD,
+    extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
   });
   await expect(page.locator('#banners .banner')).toBeHidden({ timeout: 15_000 });
   const flushedReply = page.locator('.msg--gru', { hasText: 'echo: typed while down' });
@@ -403,6 +418,75 @@ test.describe('themes', () => {
     await page.reload();
     await expect(page.locator('html')).toHaveClass(/dark/);
   });
+});
+
+test('Settings recheck shows real degraded → recovered Jev state and resolved incident semantics', async ({ page }) => {
+  const configFile = join(durableHome, 'config.toml');
+  writeFileSync(configFile, '[decisions.jev]\nenabled = true\n', 'utf8');
+  try {
+    await pair(page);
+    await page.locator('#settings-toggle').click();
+    await expect(page.locator('#settings-view')).toBeVisible();
+    await expect(page.locator('#decisions-stamp')).toHaveText('READY');
+    await expect(page.locator('#decisions-meta')).toContainText('file credential');
+
+    writeFileSync(JEV_MODE_FILE, 'network-error', 'utf8');
+    await page.locator('#decisions-recheck').click();
+    await expect(page.locator('#decisions-stamp')).toHaveText('FALLBACK');
+    await expect(page.locator('#decisions-summary')).toContainText('Deterministic fallback');
+
+    writeFileSync(JEV_MODE_FILE, 'success', 'utf8');
+    await page.locator('#decisions-recheck').click();
+    await expect(page.locator('#decisions-stamp')).toHaveText('READY');
+    await expect(page.locator('#decisions-recheck')).toBeEnabled();
+
+    await page.locator('#notification-bell').click();
+    const incident = page.locator('.board-notification', { hasText: 'Jev degraded' }).first();
+    await expect(incident).toContainText('resolved');
+    await expect(incident.locator('.board-notification__ack')).toHaveCount(0);
+  } finally {
+    writeFileSync(configFile, '[decisions.jev]\nenabled = false\n', 'utf8');
+    await expect.poll(async () => {
+      const response = await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/decisions/status`, {
+        headers: { authorization: `Bearer ${REAL_TOKEN}` },
+      });
+      return (await response.json()).status;
+    }).toBe('disabled');
+  }
+});
+
+test('missing-key enabled startup is durable degraded: a browser connected AFTER startup sees the actionable notice', async ({ page }) => {
+  const port = await pickFreePort();
+  const token = 'e2e-missing-key-token';
+  // Enabled config with NO credential anywhere; OPENROUTER_API_KEY is
+  // scrubbed from the child environment by the boot helper.
+  const service = await startRealService({
+    port,
+    token,
+    decisionsEnabled: true,
+    nodeImport: JEV_PRELOAD,
+    extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
+  });
+  try {
+    await page.goto(`http://127.0.0.1:${port}`);
+    await expect(page.locator('#pairing-view')).toBeVisible();
+    await page.locator('#pair-token').fill(token);
+    await page.locator('#pair-submit').click();
+    await expect(page.locator('#chat-view')).toBeVisible();
+    // The Settings card shows the honest degraded state, never a ready badge.
+    await page.locator('#settings-toggle').click();
+    await expect(page.locator('#decisions-stamp')).toHaveText('FALLBACK');
+    await expect(page.locator('#decisions-summary')).toContainText('credential');
+    // And the durable incident is on the authenticated BOARD surface for a
+    // browser that connected after startup (no CLI-only error, no phantom
+    // receipt). The panel lives inside #board-view — open the Board tab.
+    await page.locator('#tab-board').click();
+    await page.locator('#notification-bell').click();
+    await expect(page.locator('.board-notification', { hasText: 'Jev degraded' }).first()).toBeVisible();
+    await expect(page.locator('.board-notification', { hasText: 'Jev degraded' }).first().locator('.board-notification__ack')).toBeVisible();
+  } finally {
+    await service.stop();
+  }
 });
 
 // ---------------------------------------------------------------------------

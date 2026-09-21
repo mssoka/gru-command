@@ -46,6 +46,18 @@ function snapshot(): BoardSnapshot {
       { id: 'gru-1', role: 'gru', label: 'gru', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: null, supervision: null },
     ],
     notifications: [],
+    decisions: {
+      enabled: false,
+      status: 'disabled',
+      reason: 'disabled',
+      model: '~typesafe/jev-latest',
+      endpoint: 'https://openrouter.ai/api/alpha/decisions',
+      credentialPresent: false,
+      credentialSource: 'none',
+      checkedAt: null,
+      incarnation: 'test-incarnation',
+      generation: 0,
+    },
   };
 }
 
@@ -75,6 +87,17 @@ describe('board server-frame validator', () => {
     const badLens = snapshot();
     (badLens.repos[0]!.jobs[0]!.rounds[0]!.lenses[0] as unknown as { state: unknown }).state = 7;
     expect(isValidSnapshot(badLens)).toBe(false);
+    const badDecision = snapshot();
+    delete (badDecision.decisions as unknown as Record<string, unknown>).generation;
+    expect(isValidSnapshot(badDecision)).toBe(false);
+    const coercedDecision = snapshot();
+    (coercedDecision.decisions as unknown as { status: unknown }).status = { toString: () => 'ready' };
+    expect(isValidSnapshot(coercedDecision)).toBe(false);
+    const missingResolution = snapshot();
+    (missingResolution.notifications as unknown as Record<string, unknown>[]).push({
+      id: 'n1', ts: '2026-01-01T00:00:00.000Z', severity: 'error', routing: 'action-required', title: 'incident', ackedAt: null,
+    });
+    expect(isValidSnapshot(missingResolution)).toBe(false);
     const empty: Record<string, unknown> = {};
     expect(isValidSnapshot(empty)).toBe(false);
   });

@@ -7,6 +7,7 @@ import type { LogLevel } from './logger.js';
 import { hashToken, tokenConfigured, tokenMatches } from './auth.js';
 import type { RuntimeStatus } from './runtime/registry.js';
 import type { SupervisionStatus } from './supervision/supervisor.js';
+import type { DecisionRuntimeStatus } from './decisions/runtime.js';
 import type { StaticRoot } from './static.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
@@ -49,6 +50,7 @@ export interface HealthPayload {
   };
   readonly liveness: LivenessBlock;
   readonly supervision: SupervisionStatus | null;
+  readonly decisions: DecisionRuntimeStatus | null;
   readonly session: {
     readonly path: string;
     readonly declared: boolean;
@@ -150,6 +152,7 @@ export function buildHealthPayload(
   requestId: string,
   runtimeStatus: RuntimeStatus | null = null,
   supervisionStatus: SupervisionStatus | null = null,
+  decisionsStatus: DecisionRuntimeStatus | null = null,
 ): HealthPayload {
   const liveness: LivenessBlock =
     runtimeStatus === null
@@ -204,6 +207,7 @@ export function buildHealthPayload(
     },
     liveness,
     supervision: supervisionStatus,
+    decisions: decisionsStatus,
     session: {
       path: join(config.dataDir, 'sessions'),
       declared: true,
@@ -228,6 +232,7 @@ export interface ServiceOptions {
   /** Supervision status feed (E7): answers the /health supervision block.
    * Null (or omitted) reports `supervision: null` — pre-E7 shape. */
   readonly supervisionStatus?: () => SupervisionStatus | null;
+  readonly decisionsStatus?: () => DecisionRuntimeStatus | null;
   /** First claim hook after /health, before static (E6: the board's
    * /api/* routes). Returning true means the request was handled — the
    * service skips static + 404 and does not log it (the hook owns that). */
@@ -292,6 +297,7 @@ export function createService(
             requestId,
             runtimeStatus(),
             options.supervisionStatus !== undefined ? options.supervisionStatus() : null,
+            options.decisionsStatus !== undefined ? options.decisionsStatus() : null,
           );
           // W-C (E9 r3 carry): the pairing surface gets LIVENESS ONLY —
           // workspace_root / data_dir / install fingerprint / session
