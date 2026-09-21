@@ -728,6 +728,8 @@ describe('supervisor — intentional slot generations', () => {
     expect(slot.current()).toBeNull();
     expect(stale.disposed).toBe(true);
     expect(swaps).toEqual([]);
+  });
+});
 
 describe('supervisor — isolated review ownership', () => {
   it('never restarts a slotted review handle and disposes it after durable abort bookkeeping', async () => {
