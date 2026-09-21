@@ -59,9 +59,21 @@ async function reviewPreflightCheck(
     'model-provider': async () => {
       const modelRef = resolveSpawnPolicy(config, runtimeId, 'perkins').model;
       if (runtimeId === 'claude-code') {
-        const result = spawnSync('claude', ['--version'], { encoding: 'utf-8', timeout: 10_000 });
-        if (result.error !== undefined || result.status !== 0) {
-          throw new Error('the claude-code runtime binary is unavailable');
+        // Probe binary presence AND auth: a cheap authenticated call proves
+        // the provider is configured and reachable. --version alone is
+        // insufficient (succeeds without credentials).
+        const resolvedModel = modelRef === '' || modelRef === 'default' ? '' : `--model ${modelRef}`;
+        const probe = spawnSync(
+          'claude',
+          ['-p', 'reply with exactly: ok', '--max-turns', '1', '--no-session-persistence', ...(resolvedModel ? [resolvedModel] : [])],
+          { encoding: 'utf-8', timeout: 30_000, input: '' },
+        );
+        if (probe.error !== undefined) {
+          throw new Error(`claude-code probe failed: ${String(probe.error)}`);
+        }
+        if (probe.status !== 0) {
+          const stderr = (probe.stderr ?? '').trim().slice(0, 300);
+          throw new Error(`claude-code is not configured/authed for the review model (exit ${probe.status}): ${stderr}`);
         }
         return;
       }

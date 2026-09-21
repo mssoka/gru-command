@@ -539,8 +539,16 @@ export class PerkinsHybridReview {
             if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) throw writeError;
           }
         }
-        writeReviewArtifact(review, `lenses/${chunk}/${lens}.attempt-${attempt}-${runToken}.error.json`, { error: message });
-        writeReviewArtifact(review, `lenses/${chunk}/${lens}.attempt-${attempt}-${runToken}.envelope.json`, envelope);
+        for (const [suffix, value] of [
+          [`.error.json`, { error: message } as unknown],
+          [`.envelope.json`, envelope as unknown],
+        ] as const) {
+          try {
+            writeReviewArtifact(review, `lenses/${chunk}/${lens}.attempt-${attempt}-${runToken}${suffix}`, value);
+          } catch (writeError) {
+            if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) throw writeError;
+          }
+        }
         this.onProgress({ lens, chunk, state: 'error', note: message });
         return {
           resultId: `failed-${lens}-${chunk}-a${attempt}`,

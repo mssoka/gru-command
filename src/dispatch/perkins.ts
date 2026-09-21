@@ -33,6 +33,8 @@ import {
   type ReviewPreflightResult,
 } from './review-path.js';
 
+const FALLBACK_REVIEW_TIMEOUT_MS = 15 * 60 * 1_000;
+
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 function redaction(_value: string): string {
@@ -756,10 +758,14 @@ export class WaveRunner {
       // have changed the tree, and the next review must see those bytes.
       // Working-tree diff against the base commit: uncommitted minion fixes
       // MUST be visible to the re-review round.
+      // Mark untracked files as intent-to-add so `git diff` sees them, then
+      // undo the markers — the gate reviews the full working tree.
+      spawnSync('git', ['-C', lanePath, 'add', '-N', '.'], { timeout: 10_000 });
       const diffResult = spawnSync(
         'git', ['-C', lanePath, 'diff', '--no-ext-diff', '--no-color', baseRef],
         { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024, timeout: 30_000 },
       );
+      spawnSync('git', ['-C', lanePath, 'reset', '-q', '--'], { timeout: 10_000 });
       if (diffResult.error !== undefined || diffResult.status !== 0) {
         this.terminalFallbackBlocked(
           job.id,
@@ -863,12 +869,16 @@ export class WaveRunner {
         input.diff,
       ].join('\n');
       if (input.signal.aborted) throw new Error('review operation aborted');
+      let reviewTimer: ReturnType<typeof setTimeout> | null = null;
       await Promise.race([
         handle.prompt(prompt, { owner: 'bmad-review-gate' }),
         new Promise<never>((_resolve, reject) => {
           input.signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
+          reviewTimer = setTimeout(() => reject(new Error(`fallback review timed out after ${FALLBACK_REVIEW_TIMEOUT_MS}ms`)), FALLBACK_REVIEW_TIMEOUT_MS);
+          reviewTimer.unref?.();
         }),
       ]);
+      if (reviewTimer !== null) clearTimeout(reviewTimer);
     } finally {
       await handle.dispose();
     }

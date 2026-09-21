@@ -33,7 +33,7 @@ const PINS: Record<string, number> = {
   'logger.test.ts': 3,
   'notifications.test.ts': 5,
   'perkins-builtin-review.test.ts': 50,
-  'perkins-builtin-wave.test.ts': 30,
+  'perkins-builtin-wave.test.ts': 32,
   'pi-adapter.test.ts': 46,
   'rehearsal.test.ts': 4,
   'roles-definitions.test.ts': 9,

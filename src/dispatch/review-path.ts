@@ -114,8 +114,11 @@ export function isGitHubRemote(host: string): boolean {
  * credentials to them. */
 export function isGitLabRemote(host: string): boolean {
   if (host.includes('@') || host.includes('/') || host.includes(' ')) return false;
-  const firstLabel = host.toLowerCase().split('.')[0]!;
-  return firstLabel.startsWith('gitlab');
+  const lowered = host.toLowerCase();
+  // Only gitlab.com and self-hosted hosts whose FIRST hostname label is
+  // exactly 'gitlab' (e.g. gitlab.example.test). This prevents credential
+  // leakage to lookalike hosts like evil.gitlab.attacker.test.
+  return lowered === 'gitlab.com' || lowered.split('.')[0] === 'gitlab';
 }
 
 /** Cheap GitHub probe: the gh token must read the exact remote repo. */

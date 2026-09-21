@@ -1192,3 +1192,163 @@ describe('poster transport negatives and fallback-gate terminals', () => {
     expect(outcome.clearToMerge).toBe(false);
   });
 });
+
+describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
+  async function makeProductionGateHarness(options: {
+    findingToWrite: readonly Record<string, string>[];
+    skillContent?: string;
+  }): Promise<{
+    wave: WaveRunner;
+    job: { readonly id: string };
+    ledger: LedgerApi;
+    port: GitReviewPort;
+    root: string;
+    artifacts: string;
+    sessions: string;
+    repo: FixtureRepo;
+    skillPath: string;
+    prompts: string[];
+    spawnCwds: string[];
+    escalations: string[];
+  }> {
+    const repo = makeFixtureRepo('perkins-prod-gate');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/prod-gate']);
+    repo.commitFile('src/prod.ts', 'export const prod = 1;\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-prod-gate-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-prod-gate-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-prod-gate-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-prod-gate-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/prod-gate', repo.head());
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-prod-gate' });
+    const job = ledger.addJob({ id: 'job-prod-gate', repo: 'fixture', title: 'prod gate', baseBranch: 'main' });
+    const skillPath = join(artifacts, 'skills', 'bmad-review', 'SKILL.md');
+    mkdirSync(dirname(skillPath), { recursive: true });
+    writeFileSync(skillPath, options.skillContent ?? '---\nname: bmad-review\n---\nreview skill bytes', 'utf8');
+    const prompts: string[] = [];
+    const spawnCwds: string[] = [];
+    const escalations: string[] = [];
+    const spawner: AgentSpawner = async (role, spawnOptions = {}) => {
+      spawnCwds.push(spawnOptions.cwd ?? '');
+      const file = join(sessions, `prod-${spawnCwds.length}.jsonl`);
+      writeFileSync(file, '', 'utf8');
+      return {
+        role,
+        id: `prod-minion-${spawnCwds.length}`,
+        sessionFile: file,
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        reviewIsolation: undefined,
+        async prompt(text: string) {
+          prompts.push(text);
+          // The minion writes the findings JSON to the requested report file
+          const reportMatch = /Write your findings as ONE JSON array to exactly this file: (.+)$/mu.exec(text);
+          if (reportMatch !== null) {
+            writeFileSync(reportMatch[1]!, JSON.stringify(options.findingToWrite), 'utf8');
+          }
+        },
+        async steer() {},
+        async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle', lastActivity: null, sessionFile: file }; },
+        async dispose() {},
+      };
+    };
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner,
+      reviewArtifactRoot: artifacts,
+      reviewPreflight: async () => ({
+        ok: false,
+        failures: [preflightFailure('review-policy', 'the Perkins review gate is disabled')],
+      }),
+      // NO runFallbackReview — the production default runs
+      fallbackGate: {
+        skillPath,
+        fixDirectiveSink: async () => ({ delivered: true, minionId: 'prod-1' }),
+      },
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations };
+  }
+
+  it('spawns a minion with the skill prompt, parses findings, and reports clear-to-merge on clean', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(h.prompts).toHaveLength(1);
+      expect(h.prompts[0]).toContain(h.skillPath);
+      expect(h.prompts[0]).toContain('WORKING DIFF');
+      expect(h.spawnCwds[0]).toBe(h.repo.path);
+      expect(outcome.clearToMerge).toBe(true);
+      expect(outcome.iterations).toBe(1);
+      expect(outcome.reportFiles).toHaveLength(1);
+      const phases = h.ledger.listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'job.fallback-review')
+        .map((event) => (event.payload as { phase?: string }).phase)
+        .reverse();
+      expect(phases).toEqual(['started', 'triaged', 'pass']);
+    } finally {
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it('terminalizes blocked when the minion never writes the report file', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'perkins-prod-gate-nores-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-prod-gate-nores-art-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-prod-gate-nores-ses-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-prod-gate-nores-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'main', makeFixtureRepo('perkins-prod-gate-nores-repo').head());
+    await port.createJobWorktree({ repoPath: makeFixtureRepo('perkins-prod-gate-nores-repo2').path, jobId: 'job-nores' });
+    const job = ledger.addJob({ id: 'job-nores', repo: 'fixture', title: 'no report', baseBranch: 'main' });
+    const skillPath = join(artifacts, 'SKILL.md');
+    writeFileSync(skillPath, 'skill', 'utf8');
+    let promptText = '';
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: async (role) => {
+        const file = join(sessions, 'prod-nres.jsonl');
+        writeFileSync(file, '', 'utf8');
+        return {
+          role, id: 'prod-nres', sessionFile: file,
+          capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+          async prompt(text: string) { promptText = text; /* deliberately does NOT write the report */ },
+          async steer() {}, async followUp() {},
+          subscribe() { return () => {}; },
+          health() { return { state: 'idle', lastActivity: null, sessionFile: file }; },
+          async dispose() {},
+        };
+      },
+      reviewArtifactRoot: artifacts,
+      reviewPreflight: async () => ({
+        ok: false,
+        failures: [{ leg: 'model-provider', detail: 'not authed', remediation: 'auth' }],
+      }),
+      fallbackGate: {
+        skillPath,
+        fixDirectiveSink: async () => ({ delivered: true }),
+      },
+      escalate: () => {},
+    });
+    const outcome = await wave.runRound({ jobId: job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.iterations).toBe(1); // first round throws (no report file) → blocked immediately
+    expect(outcome.skillInstalled).toBe(true);
+    expect(promptText).toContain('WORKING DIFF');
+    const phases = ledger.listEvents({ limit: 200 })
+      .filter((event) => event.kind === 'job.fallback-review')
+      .map((event) => (event.payload as { phase?: string }).phase);
+    expect(phases[0]).toBe('blocked'); // newest-first order
+  });
+});
