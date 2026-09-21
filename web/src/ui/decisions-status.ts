@@ -41,7 +41,7 @@ export class DecisionStatusCard {
       this.recheckPending = true;
       this.syncRecheckButton();
       void pending
-        .then((status) => this.render(status))
+        .then((status) => this.render(status, 'recheck'))
         .catch(() => {
           // A failed HTTP reply is not versioned. Do not let it overwrite a
           // newer pushed state that arrived while the request was pending.
@@ -56,16 +56,20 @@ export class DecisionStatusCard {
     });
   }
 
-  render(status: DecisionStatusView): void {
+  render(status: DecisionStatusView, source: 'snapshot' | 'recheck' = 'snapshot'): void {
     // Board snapshots and explicit recheck replies race over separate
-    // transports. Within one service incarnation, generation is the
-    // server-owned ordering key; ACROSS incarnations generations are not
-    // comparable at all, so a reply from any other incarnation is stale by
-    // definition (a dead process cannot outrank the live pushed state).
-    if (
-      this.current !== null &&
-      (status.incarnation !== this.current.incarnation || status.generation < this.current.generation)
-    ) return;
+    // transports, and service restarts change the ordering domain entirely:
+    // generations are only comparable INSIDE one incarnation.
+    //  - A SNAPSHOT always wins: it is the live server's own state, so its
+    //    incarnation becomes current even when it differs (this is what
+    //    keeps the card following a restarted service).
+    //  - A RECHECK REPLY from any incarnation other than the current one is
+    //    stale by definition — a dead process cannot outrank live state —
+    //    and within the same incarnation an older generation loses.
+    if (this.current !== null) {
+      if (source === 'recheck' && status.incarnation !== this.current.incarnation) return;
+      if (status.incarnation === this.current.incarnation && status.generation < this.current.generation) return;
+    }
     this.current = status;
     this.stamp.textContent = LABELS[status.status];
     this.stamp.dataset.state = status.status;

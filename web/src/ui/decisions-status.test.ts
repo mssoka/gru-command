@@ -86,17 +86,29 @@ describe('decision status card', () => {
     expect(button.hidden).toBe(true);
   });
 
-  it('discards a late reply from a dead service incarnation even with a higher generation', async () => {
+  it('consumes the late recheck reply through the production recheck path: newer incarnations win, dead-incarnation replies lose', async () => {
     const response = deferred<DecisionStatusView>();
     const card = new DecisionStatusCard(() => response.promise);
     const button = document.querySelector<HTMLButtonElement>('#decisions-recheck')!;
-    // Live state pushed from the NEW process incarnation...
+    // Live OLD-incarnation state, ENABLED so the real recheck control is
+    // usable — the late reply below is consumed through the card's own
+    // click path, not by calling render directly.
+    card.render({ ...status(4, 'degraded'), incarnation: 'old-process' });
+    expect(button.hidden).toBe(false);
+    button.click();
+    expect(button.disabled).toBe(true);
+    // The service restarts: a snapshot push from the NEW incarnation is the
+    // live server's own state and must be followed.
     card.render({ ...status(0, 'disabled', false), incarnation: 'new-process' });
     expect(document.querySelector('#decisions-stamp')?.textContent).toBe('OFF');
-    // ...an in-flight HTTP reply from the OLD incarnation must never win.
+    // The stale pre-restart reply finally resolves through the recheck
+    // callback — a dead incarnation must not outrank live state.
     response.resolve({ ...status(9, 'ready'), incarnation: 'old-process' });
     await vi.waitFor(() => expect(button.textContent).toBe('Recheck'));
     expect(document.querySelector('#decisions-stamp')?.textContent).toBe('OFF');
     expect(document.querySelector('#decisions-summary')?.textContent).toContain('Deterministic routing only');
+    // A reply from the LIVE incarnation is consumed normally.
+    card.render({ ...status(7, 'ready'), incarnation: 'new-process' });
+    expect(document.querySelector('#decisions-stamp')?.textContent).toBe('READY');
   });
 });

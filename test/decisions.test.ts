@@ -190,7 +190,36 @@ describe('typed decision semantics', () => {
     expect(deterministicFailureClass('turn hang detected')).toBe('turn_hang');
     expect(deterministicFailureClass('compaction hang detected')).toBe('turn_hang');
     expect(deterministicFailureClass('fatal opaque runtime failure')).toBe('fatal_runtime');
+    // Compound/camel spellings keep their walls (the r1 word-boundary fix
+    // must not trade recall for precision).
+    expect(deterministicFailureClass('oauth token rejected by provider')).toBe('authentication_wall');
+    expect(deterministicFailureClass('auth_error: invalid credentials')).toBe('authentication_wall');
+    expect(deterministicFailureClass('authn failure: bad key')).toBe('authentication_wall');
+    expect(deterministicFailureClass('RateLimited by upstream')).toBe('quota_wall');
+    expect(deterministicFailureClass('agent crashed on boot')).toBe('fatal_runtime');
   });
+
+  it('bounds the redaction scan cost: the pre-slice order is load-bearing on hostile single-line blocks', () => {
+    // One long single line of word-character filler with secret markers —
+    // the shape that makes the labeled-secret scans quadratic when they run
+    // before any bound (the r2 battery measured ~448,000 ms slice-last on
+    // this class; the shipped pre-slice order stays in milliseconds).
+    // The measured worst case: a long MATCH-FREE word-char run. Every start
+    // position expands the lazy labeled-secret prefixes to the end of the
+    // line when no match exists — O(n²) slice-last (300k chars ≈ 129 s
+    // measured); the shipped pre-slice bounds every pass to the 4× window.
+    const hostile = 'q'.repeat(80_000) + 'CANARY-beyond-any-window'; // slice-last on this shape measured ~9 s (quadratic in the run length)
+    const started = Date.now();
+    const out = redactedText(hostile, 800);
+    const elapsed = Date.now() - started;
+    // The marker sits beyond every window: truncation (not redaction)
+    // removes it, and the output stays bounded.
+    expect(out).not.toContain('CANARY');
+    expect(out.length).toBeLessThanOrEqual(800);
+    // A reverted order must blow this budget — and the test timeout —
+    // instead of passing on output shape.
+    expect(elapsed).toBeLessThan(1_500);
+  }, 2_000);
 
   it('accepts the API-documented probability-weighted score BETWEEN rubric levels', () => {
     // docs.typesafe.ai/api: a Score answer's `score` is probability-weighted
@@ -566,11 +595,13 @@ describe('runtime startup, degradation and generation safety', () => {
     runtime.dispose();
   });
 
-  it('a transient decide-time failure degrades, then ONE bounded automatic recheck recovers without operator action', async () => {
+  it('a transient decide-time failure degrades, then ONE bounded automatic recheck PER INCIDENT recovers without operator action', async () => {
     let calls = 0;
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       calls += 1;
-      if (calls === 2) throw new TypeError('transient decide-time network blip'); // call 1 is the startup probe
+      // Odd calls are startup/recheck probes (succeed); even calls are
+      // decide-time requests (fail) — two incidents, two bounded recoveries.
+      if (calls % 2 === 0) throw new TypeError('transient decide-time network blip');
       return new Response(JSON.stringify(answerEnvelope(String(init?.body))), { status: 200 });
     }) as unknown as typeof fetch;
     const notifications = {
@@ -587,12 +618,17 @@ describe('runtime startup, degradation and generation safety', () => {
       loadConfig: () => ({ decisions: cloneConfig(true) } as unknown as GruCommandConfig),
       notifications: notifications as unknown as NotificationCenter,
     });
-    expect(await runtime.start()).toMatchObject({ status: 'ready' });
-    const first = await runtime.decide(eventDecisionRequest(EVENT));
+    expect(await runtime.start()).toMatchObject({ status: 'ready' }); // probe 1
+    const first = await runtime.decide(eventDecisionRequest(EVENT)); // call 2 fails
     expect(first.provenance).toMatchObject({ source: 'deterministic', fallbackReason: 'network_error' });
     expect(await runtime.status()).toMatchObject({ status: 'degraded', reason: 'network_error' });
-    await vi.waitFor(() => expect(runtime.status()).toMatchObject({ status: 'ready' }));
-    expect(notifications.resolveIncidents).toHaveBeenCalledWith('decisions.degraded.', 'decisions-runtime');
+    await vi.waitFor(() => expect(runtime.status()).toMatchObject({ status: 'ready' })); // probe 3: incident 1 healed
+    // Re-armed by recovery: a SECOND incident gets its own single recheck.
+    const second = await runtime.decide(eventDecisionRequest(EVENT)); // call 4 fails
+    expect(second.provenance).toMatchObject({ source: 'deterministic' });
+    await vi.waitFor(() => expect(runtime.status()).toMatchObject({ status: 'ready' })); // probe 5: incident 2 healed
+    // resolveIncidents fires on every ready transition: boot + 2 recoveries.
+    expect(notifications.resolveIncidents).toHaveBeenCalledTimes(3);
     runtime.dispose();
   });
 
@@ -625,11 +661,16 @@ describe('runtime startup, degradation and generation safety', () => {
       fetchImpl,
       watchConfig: false,
       transientRecoveryMs: 10,
+      // ENABLED on-disk config: if auth were (wrongly) treated as transient,
+      // the automatic recheck would re-probe here — this stub makes that
+      // mutation visible as fetch call #2 instead of hiding behind a
+      // default-off disk read.
+      loadConfig: () => ({ decisions: cloneConfig(true) } as unknown as GruCommandConfig),
     });
     await runtime.start(); // probe 401 → auth_rejected (human action, no auto retry)
     expect(await runtime.status()).toMatchObject({ status: 'degraded', reason: 'auth_rejected' });
     await sleep(60);
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // the mutated list would re-probe (2+)
     runtime.dispose();
   });
 

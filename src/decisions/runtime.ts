@@ -294,18 +294,7 @@ export class DecisionRuntime implements DecisionService {
       config.jev.enabled ? 'provider_degraded' : 'disabled',
     );
     if (!config.jev.enabled) {
-      this.currentStatus = {
-        enabled: false,
-        status: 'disabled',
-        reason: 'disabled',
-        model: config.jev.model,
-        endpoint: config.jev.endpoint,
-        credentialPresent: false,
-        credentialSource: 'none',
-        checkedAt: new Date().toISOString(),
-        incarnation: this.incarnation,
-        generation: this.generation,
-      };
+      this.currentStatus = this.disabledStatusOf('disabled', new Date().toISOString());
       this.signalStatus();
       const resolved = this.resolveDegradedIncidents();
       if ((!initial && previous !== 'disabled') || resolved > 0) this.postResolved('disabled');
@@ -469,23 +458,28 @@ export class DecisionRuntime implements DecisionService {
     this.transientRecoveryTimer.unref?.();
   }
 
+  /** The single shape for "Jev off": zero credential claims, one reason. */
+  private disabledStatusOf(reason: DecisionFailureReason, checkedAt: string | null): DecisionRuntimeStatus {
+    return {
+      enabled: false,
+      status: 'disabled',
+      reason,
+      model: this.currentConfig.jev.model,
+      endpoint: this.currentConfig.jev.endpoint,
+      credentialPresent: false,
+      credentialSource: 'none',
+      checkedAt,
+      incarnation: this.incarnation,
+      generation: this.generation,
+    };
+  }
+
   private degradeInvalidConfig(): DecisionRuntimeStatus {
     if (!this.currentConfig.jev.enabled) {
       // A Jev-OFF instance stays off: an unrelated config.toml typo must not
       // enable the feature or invent an operator incident. The
       // last-known-good thresholds keep deterministic routing intact.
-      this.currentStatus = {
-        enabled: false,
-        status: 'disabled',
-        reason: 'config_invalid',
-        model: this.currentConfig.jev.model,
-        endpoint: this.currentConfig.jev.endpoint,
-        credentialPresent: false,
-        credentialSource: 'none',
-        checkedAt: new Date().toISOString(),
-        incarnation: this.incarnation,
-        generation: this.generation,
-      };
+      this.currentStatus = this.disabledStatusOf('config_invalid', new Date().toISOString());
       this.signalStatus();
       return this.status();
     }

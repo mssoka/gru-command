@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { LogLevel } from '../logger.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { DecisionService } from '../decisions/types.js';
-import { eventDecisionRequest } from '../decisions/questions.js';
+import { eventDecisionRequest, redactedText } from '../decisions/questions.js';
 import {
   LedgerApi,
   type NotificationRecord,
@@ -29,7 +29,14 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 function transcriptTailOf(payload: Record<string, unknown>): string | null {
   for (const key of ['error', 'detail', 'note', 'text']) {
     const value = payload[key];
-    if (typeof value === 'string' && value.trim() !== '') return value.slice(-400);
+    if (typeof value === 'string' && value.trim() !== '') {
+      // REDACT FIRST, then tail: slicing first could split a secret away
+      // from its field-name marker, and the tail's redaction pass cannot
+      // match a marker it never sees (the raw secret would ride to the
+      // provider). Redaction over the bounded window kills the secret
+      // wherever its marker sits; the final slice then bounds the payload.
+      return redactedText(value, 4_000).slice(-400);
+    }
   }
   return null;
 }
@@ -170,21 +177,25 @@ export class NotificationCenter {
       this.recordDerived(event, payload, 'fyi', null);
       return;
     }
-    // Commit a provisional deterministic row before any await. Provider
-    // latency never blocks EventBus ordering, and a process crash cannot
-    // erase the operator-visible incident. Jev may enrich this same row.
-    // Bounded sensor context per the amendment: recent same-source history
-    // from the durable ledger plus a redacted tail of the event's primary
-    // text — never a whole session history, never unredacted bytes.
-    const recentEvents = this.ledger.listEvents({ limit: 40 });
+    // Commit a provisional deterministic row BEFORE any fallible work:
+    // provider latency never blocks EventBus ordering, and a process crash
+    // (or a sensor-read throw) cannot erase the operator-visible incident.
+    // Jev may enrich this same row.
     const provisional = this.recordDerived(event, payload, 'fyi', null);
     if (provisional === null) return;
+    // Bounded sensor context per the amendment: recent same-source history
+    // from the durable ledger (STRICTLY PRIOR events — the triggering event
+    // is already committed) plus a redacted tail of the event's primary
+    // text — never a whole session history, never unredacted bytes.
+    const recentEvents = this.ledger.listEvents({ limit: 40 });
     const request = eventDecisionRequest(event, {
       transcriptTail: transcriptTailOf(payload),
       recentSameSourceEvents: recentEvents.filter(
-        (row) => row.agentId !== null && row.agentId === event.agentId,
+        (row) => row.seq < event.seq && row.agentId !== null && row.agentId === event.agentId,
       ).length,
-      recentSameKindEvents: recentEvents.filter((row) => row.kind === event.kind).length,
+      recentSameKindEvents: recentEvents.filter(
+        (row) => row.seq < event.seq && row.kind === event.kind,
+      ).length,
     });
     void this.decisions
       .decide(request)

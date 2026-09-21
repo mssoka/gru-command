@@ -171,12 +171,18 @@ export type FailureClass = (typeof FAILURE_CLASSES)[number];
 
 export function deterministicFailureClass(reason: string): FailureClass {
   // Word-bounded signals: bare substrings wall-classified unrelated text
-  // ("author" hit `auth`; "port 13020" hit `1302`).
-  if (/\bauth\b|\bauth(?:entication|orized|orization)\b|unauthorized|invalid api.?key|\b401\b/i.test(reason)) return 'authentication_wall';
-  if (/\bquota\b|\brate[- ]?limit\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)) return 'quota_wall';
+  // ("author" hit `auth`; "port 13020" hit `1302`). The stems still admit
+  // snake/camel/compound spellings (oauth, auth_error, RateLimited, crashed)
+  // so real walls keep their deterministic stop.
+  if (
+    /\b(?:unauthorized|oauth|auth(?:entication|orization|orized|n|[_-]error|[_-]failure)?)\b|invalid api.?key|\b401\b/i.test(reason)
+  ) return 'authentication_wall';
+  if (
+    /\bquota\b|\brate[- ]?limit(?:ed)?\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)
+  ) return 'quota_wall';
   if (/network|connect|dns|socket|econn|fetch failed/i.test(reason)) return 'network_failure';
   if (/turn hang|compaction hang|silence|watchdog/i.test(reason)) return 'turn_hang';
-  if (/\bfatal\b|panic|\bcrash\b|disposed/i.test(reason)) return 'fatal_runtime';
+  if (/\bfatal\b|\bpanic\b|\bcrash(?:ed|ing)?\b|disposed/i.test(reason)) return 'fatal_runtime';
   return 'unknown';
 }
 

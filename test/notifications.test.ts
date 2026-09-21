@@ -319,6 +319,50 @@ describe('notification center — durable log + receipts + acks', () => {
     expect(recurrence.id).not.toBe(first.id);
   });
 
+  it('delivers the bounded transcript tail and strictly-prior same-source history to the decision state', async () => {
+    const rig = boot();
+    let released!: (value: Awaited<ReturnType<DecisionService['decide']>>) => void;
+    const decide = vi.fn((_request: Parameters<DecisionService['decide']>[0]) =>
+      new Promise<Awaited<ReturnType<DecisionService['decide']>>>((resolve) => { released = resolve; }));
+    rig.center.setDecisionService({ decide } as unknown as DecisionService);
+    rig.api.addJob({ id: 'tail-job', repo: 'demo', title: 'Tail wiring' });
+    rig.api.registerAgent({ id: 'tail-agent', role: 'minion', jobId: 'tail-job' });
+    const errorText = 'turn failed: the provider session died mid-stream and the retry did not recover the turn.';
+    rig.api.setAgentState('tail-agent', 'error', errorText);
+    expect(decide).toHaveBeenCalledOnce();
+    const state = JSON.parse(String(decide.mock.calls[0]![0].state)) as {
+      transcript_tail?: string | null;
+      recent_same_source?: { events?: number; same_kind?: number };
+    };
+    // The free-text tail RIDES the provider-bound state (mutating
+    // transcriptTailOf to null fails exactly here)...
+    expect(state.transcript_tail).toBe(errorText);
+    // ...with STRICTLY-PRIOR ledger history: the triggering event itself is
+    // already committed and must not count itself.
+    expect(state.recent_same_source).toEqual({ events: 1, same_kind: 0 });
+    released(deterministicOutcome(decide.mock.calls[0]![0], DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+  });
+
+  it('redacts the tail BEFORE bounding it: a marker split by a naive slice(-400) cannot leak', async () => {
+    const rig = boot();
+    let released!: (value: Awaited<ReturnType<DecisionService['decide']>>) => void;
+    const decide = vi.fn((_request: Parameters<DecisionService['decide']>[0]) =>
+      new Promise<Awaited<ReturnType<DecisionService['decide']>>>((resolve) => { released = resolve; }));
+    rig.center.setDecisionService({ decide } as unknown as DecisionService);
+    rig.api.addJob({ id: 'split-marker', repo: 'demo', title: 'Split marker' });
+    rig.api.registerAgent({ id: 'split-agent', role: 'minion', jobId: 'split-marker' });
+    // The field marker straddles the naive 400-char cut (positions 400-409
+    // of an 803-char string): slicing first orphans the raw key bytes from
+    // their marker, and the tail's redaction pass can never match them.
+    const errorText = 'a'.repeat(399) + ' sk-or-v1-' + 'K'.repeat(395);
+    rig.api.setAgentState('split-agent', 'error', errorText);
+    expect(decide).toHaveBeenCalledOnce();
+    const state = JSON.parse(String(decide.mock.calls[0]![0].state)) as { transcript_tail?: string | null };
+    expect(state.transcript_tail).not.toContain('KKKK');
+    expect(state.transcript_tail).toContain('[redacted]');
+    released(deterministicOutcome(decide.mock.calls[0]![0], DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+  });
+
   it('adversarial suppress-text plus a maximum-confidence noise answer cannot silence or demote incidents', async () => {
     const rig = boot();
     // A direct action-required post never passes through Jev triage at all:
