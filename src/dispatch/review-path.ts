@@ -333,3 +333,12 @@ export function skillInstalled(skillPath: string): boolean {
     return false;
   }
 }
+
+/** Build the argv tokens for a claude-code auth probe. The --model flag and
+ * its value MUST be separate argv tokens — the combined single-token form
+ * (e.g. '--model claude-sonnet-4') is rejected by the CLI. */
+export function buildClaudeCodeAuthArgs(modelRef: string): string[] {
+  const resolved = modelRef.trim();
+  const modelArgs = resolved === '' || resolved === 'default' ? [] : ['--model', resolved];
+  return ['-p', 'reply with exactly: ok', '--max-turns', '1', '--no-session-persistence', ...modelArgs];
+}

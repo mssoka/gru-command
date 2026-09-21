@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ConfigError, loadConfig } from '../src/config.js';
+import { buildClaudeCodeAuthArgs, isGitLabRemote } from '../src/dispatch/review-path.js';
 import {
   boundedDiff,
   parseFallbackFindingsReport,
@@ -334,5 +335,42 @@ describe('claude-code preflight model argv split (Blocker A pin)', () => {
     const buggyForm = modelRef === '' || modelRef === 'default' ? '' : `--model ${modelRef}`;
     expect(buggyForm).toContain(' ');
     expect(modelArgs).not.toEqual([buggyForm]);
+  });
+});
+
+describe('claude-code auth argv builder (Blocker 1: mutation-killing pin)', () => {
+  it('builds --model and its value as SEPARATE argv tokens, never a combined single token', () => {
+    // With a configured model: --model and the ref are two distinct tokens
+    const args = buildClaudeCodeAuthArgs('claude-sonnet-4-20250514');
+    expect(args).toContain('--model');
+    expect(args).toContain('claude-sonnet-4-20250514');
+    // CRITICAL: the two are NOT joined into one token
+    expect(args).not.toContain('--model claude-sonnet-4-20250514');
+    // The model value must be a direct element, not concatenated
+    const modelIdx = args.indexOf('--model');
+    expect(modelIdx).toBeGreaterThanOrEqual(0);
+    expect(args[modelIdx + 1]).toBe('claude-sonnet-4-20250514');
+  });
+
+  it('omits the --model flag when the ref is empty or default', () => {
+    for (const ref of ['', 'default']) {
+      const args = buildClaudeCodeAuthArgs(ref);
+      expect(args).not.toContain('--model');
+      expect(args.join(' ')).not.toContain('--model');
+    }
+  });
+});
+
+describe('isGitLabRemote first-label exact match (Blocker 2: mutation-killing pin)', () => {
+  it('rejects hosts whose first label MERELY STARTS WITH gitlab (the old heuristic accepted these)', () => {
+    // These are the DELTA cases: the OLD startsWith heuristic returned true,
+    // the NEW exact-first-label match returns false. If the fix is reverted,
+    // these assertions FAIL.
+    expect(isGitLabRemote('gitlabfoo.example.com')).toBe(false);
+    expect(isGitLabRemote('gitlabfy.com')).toBe(false);
+    // The still-accepted canonical hosts
+    expect(isGitLabRemote('gitlab.com')).toBe(true);
+    expect(isGitLabRemote('gitlab.example.test')).toBe(true);
+    expect(isGitLabRemote('gitlab.internal.corp')).toBe(true);
   });
 });

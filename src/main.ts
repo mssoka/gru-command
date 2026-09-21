@@ -26,6 +26,7 @@ import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import type { Role } from './config.js';
 import { resolveSpawnPolicy } from './config.js';
 import {
+  buildClaudeCodeAuthArgs,
   isGitHubRemote,
   isGitLabRemote,
   probeGitHubRemote,
@@ -75,12 +76,10 @@ async function reviewPreflightCheck(
         // Probe binary presence AND auth: a cheap authenticated call proves
         // the provider is configured and reachable. --version alone is
         // insufficient (succeeds without credentials).
-        // The --model flag and its value must be SEPARATE argv tokens —
-        // the combined single-token form is rejected by the CLI.
-        const modelArgs = modelRef === '' || modelRef === 'default' ? [] : ['--model', modelRef];
+        const authArgs = buildClaudeCodeAuthArgs(modelRef);
         const probe = spawnSync(
           'claude',
-          ['-p', 'reply with exactly: ok', '--max-turns', '1', '--no-session-persistence', ...modelArgs],
+          authArgs,
           { encoding: 'utf-8', timeout: 30_000, input: '' },
         );
         if (probe.error !== undefined) {

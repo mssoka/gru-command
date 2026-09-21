@@ -1333,3 +1333,47 @@ describe('error-path EEXIST guards (V5 revert-mutation pin)', () => {
     expect(envelopeFiles.length).toBeGreaterThanOrEqual(2);
   });
 });
+describe('EEXIST guards: write-once collision in catch path (Blocker 3: mutation-killing pin)', () => {
+  it('catch path tolerates EEXIST when onProgress throws after artifacts are already written', async () => {
+    // Trigger: the try block writes raw.json + envelope.json, then
+    // onProgress throws (registered callback). The catch fires and must
+    // tolerate EEXIST on raw.json and envelope.json re-writes.
+    const fixture = makeReviewRepo();
+    repos.push(fixture.repo);
+    const base = fixture.repo.git(['rev-parse', 'main']);
+    const target = fixture.repo.head();
+    const root = temp('perkins-eexist-');
+    const frozen = freezeReviewInputs({
+      roundId: 'eexist-round', repoPath: fixture.repo.path, artifactRoot: root,
+      baseRef: base, targetRef: target, spec: 'eexist test',
+    });
+    const fake = fakeHybridSpawner(temp('perkins-eexist-sessions-'), { childAnswer: () => '[]' });
+    let doneCalls = 0;
+    const engine = new PerkinsHybridReview({
+      spawner: fake.spawner,
+      policy: loadPerkinsPolicy(),
+      onProgress: (progress) => {
+        if (progress.state === 'done') {
+          doneCalls += 1;
+          if (doneCalls === 1) {
+            // Throw on the FIRST done — after the try block has already
+            // written raw.json and envelope.json for this lens/chunk.
+            throw new Error('progress listener exploded');
+          }
+        }
+      },
+    });
+    // Run the full review; the first lens/chunk triggers the EEXIST path
+    const result = await engine.run({
+      roundId: 'eexist-test', roundNumber: 1, frozenReview: frozen,
+      movementRef: 'feature/review', noSpec: false,
+    });
+    // Without EEXIST guards, the EEXIST from raw.json/envelope.json in the
+    // catch path would cascade and fail the entire lens batch → INCOMPLETE.
+    // With guards, the review completes normally.
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.completeness).toMatchObject({ complete: true, requiredLensRuns: 7, validLensRuns: 7 });
+    // doneCalls: first lens/chunk throws, the remaining 6 succeed normally
+    expect(doneCalls).toBeGreaterThanOrEqual(7);
+  });
+});
