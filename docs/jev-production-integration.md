@@ -151,10 +151,11 @@ schemes, URL userinfo, opaque key formats, private-key blocks).
 | `credential_invalid` | Remove whitespace/empty environment input or rewrite one non-empty line through the CLI. |
 | `credential_unsafe` | Remove symlinks; set the credentials directory to `0700` and key file to `0600`; re-provision if ownership is uncertain. |
 | `auth_rejected` / `forbidden` | Verify the OpenRouter credential and access, then recheck. |
-| `provider_degraded` | Wait for provider/rate-limit recovery; deterministic behavior remains active. |
-| `timeout` / `network_error` | Verify DNS/TLS/connectivity to `openrouter.ai`; the request timeout is intentionally bounded. |
+| `provider_degraded` | One automatic recheck runs after a transient degradation; if still degraded, wait for provider/rate-limit recovery and use Recheck — deterministic behavior remains active. |
+| `timeout` / `network_error` | One automatic recheck runs after a transient degradation; if still degraded, verify DNS/TLS/connectivity to `openrouter.ai` (the request timeout is intentionally bounded) and use Recheck. |
 | `malformed_response` | Leave deterministic fallback active and inspect the configured model/endpoint compatibility. |
 | `endpoint_untrusted` | Restore the verified HTTPS endpoint. Resolved portable credentials are never sent elsewhere. |
-| `config_invalid` | Correct the named strict config error; the service remains deterministic/degraded. |
+| `config_invalid` | Correct the named strict config error; the service remains deterministic/degraded (an instance with Jev off stays off). |
+| `probe_failed` | The provider answered but did not confirm the synthetic health check; verify the configured model/endpoint compatibility, then recheck. |
 
 No live-provider request is made while `enabled = false`.

@@ -22,7 +22,7 @@ const PINS: Record<string, number> = {
   'config.test.ts': 43,
   'decisions-cli.test.ts': 4,
   'decisions-service-integration.test.ts': 1,
-  'decisions.test.ts': 35,
+  'decisions.test.ts': 42,
   'dispatch-e2e.test.ts': 3,
   'dispatch-joins.test.ts': 2,
   'dispatch-server.test.ts': 8,
@@ -34,7 +34,7 @@ const PINS: Record<string, number> = {
   'ledger-api.test.ts': 17,
   'ledger-db.test.ts': 6,
   'logger.test.ts': 3,
-  'notifications.test.ts': 12,
+  'notifications.test.ts': 13,
   'perkins-builtin-review.test.ts': 52,
   'perkins-builtin-wave.test.ts': 34,
   'pi-adapter.test.ts': 46,
@@ -51,7 +51,7 @@ const PINS: Record<string, number> = {
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
   'suite-shape.test.ts': 1,
-  'supervisor.test.ts': 32,
+  'supervisor.test.ts': 37,
   'transcripts.test.ts': 13,
   'uploads-dir.test.ts': 3,
   'wizard.test.ts': 19,
@@ -73,7 +73,7 @@ describe('suite shape', () => {
     for (const file of files) {
       const source = readFileSync(join(dir, file), 'utf-8');
       expect(source, `${file}: parameterized cases evade the static suite pin; register explicit cases`).not.toMatch(
-        /\b(?:it|test)\.each\(/,
+        /\b(?:it|test|describe)\.each\(/,
       );
       const registered = (source.match(/\bit\(/g) ?? []).length;
       const pinned = PINS[file] ?? -1;

@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test, type FileChooser, type Page } from '@playwright/test';
-import { startRealService, type RealServiceHandle } from '../../test/helpers/real-service.mjs';
+import { pickFreePort, startRealService, type RealServiceHandle } from '../../test/helpers/real-service.mjs';
 
 /**
  * Real-server smoke (E5c): the REAL service (repo dist/main.js, real
@@ -452,6 +452,40 @@ test('Settings recheck shows real degraded → recovered Jev state and resolved 
       });
       return (await response.json()).status;
     }).toBe('disabled');
+  }
+});
+
+test('missing-key enabled startup is durable degraded: a browser connected AFTER startup sees the actionable notice', async ({ page }) => {
+  const port = await pickFreePort();
+  const token = 'e2e-missing-key-token';
+  // Enabled config with NO credential anywhere; OPENROUTER_API_KEY is
+  // scrubbed from the child environment by the boot helper.
+  const service = await startRealService({
+    port,
+    token,
+    decisionsEnabled: true,
+    nodeImport: JEV_PRELOAD,
+    extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
+  });
+  try {
+    await page.goto(`http://127.0.0.1:${port}`);
+    await expect(page.locator('#pairing-view')).toBeVisible();
+    await page.locator('#pair-token').fill(token);
+    await page.locator('#pair-submit').click();
+    await expect(page.locator('#chat-view')).toBeVisible();
+    // The Settings card shows the honest degraded state, never a ready badge.
+    await page.locator('#settings-toggle').click();
+    await expect(page.locator('#decisions-stamp')).toHaveText('FALLBACK');
+    await expect(page.locator('#decisions-summary')).toContainText('credential');
+    // And the durable incident is on the authenticated BOARD surface for a
+    // browser that connected after startup (no CLI-only error, no phantom
+    // receipt). The panel lives inside #board-view — open the Board tab.
+    await page.locator('#tab-board').click();
+    await page.locator('#notification-bell').click();
+    await expect(page.locator('.board-notification', { hasText: 'Jev degraded' }).first()).toBeVisible();
+    await expect(page.locator('.board-notification', { hasText: 'Jev degraded' }).first().locator('.board-notification__ack')).toBeVisible();
+  } finally {
+    await service.stop();
   }
 });
 

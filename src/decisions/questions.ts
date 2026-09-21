@@ -28,7 +28,13 @@ function isSecretKey(key: string): boolean {
 }
 
 export function redactedText(value: string, max = 800): string {
-  return value
+  // Bound the scan window BEFORE any pattern pass: these regexes run on the
+  // synchronous event path and untrusted single-line blocks can be
+  // arbitrarily long. The 4x window leaves room for redaction markers while
+  // the final slice enforces the caller's bound; every pattern pass is then
+  // linear in a constant-size window, not in the raw input length.
+  const bounded = value.length > max * 4 ? value.slice(0, max * 4) : value;
+  return bounded
     .replace(PRIVATE_KEY_BLOCK, '[redacted private key]')
     .replace(URL_USERINFO_SECRET, '$1$2:[redacted]@')
     .replace(QUOTED_SECRET, '$1"[redacted]"')
@@ -110,7 +116,19 @@ const EVENT_QUESTIONS = {
   },
 } as const satisfies QuestionSet;
 
-export function eventDecisionRequest(event: BusEvent): DecisionRequest<typeof EVENT_QUESTIONS> {
+export interface EventDecisionContext {
+  /** Bounded redacted tail of the event's primary text (the transcript
+   * surface for error events) — never a whole session history. */
+  readonly transcriptTail?: string | null;
+  /** Recent same-source history summary from the durable ledger. */
+  readonly recentSameSourceEvents?: number;
+  readonly recentSameKindEvents?: number;
+}
+
+export function eventDecisionRequest(
+  event: BusEvent,
+  context: EventDecisionContext = {},
+): DecisionRequest<typeof EVENT_QUESTIONS> {
   return {
     state: filteredState({
       kind: event.kind,
@@ -119,6 +137,11 @@ export function eventDecisionRequest(event: BusEvent): DecisionRequest<typeof EV
       round_id: event.roundId,
       lens: event.lens,
       payload: event.payload,
+      transcript_tail: context.transcriptTail ?? null,
+      recent_same_source: {
+        events: context.recentSameSourceEvents ?? 0,
+        same_kind: context.recentSameKindEvents ?? 0,
+      },
     }),
     questions: EVENT_QUESTIONS,
     risks: { needs_action: 'operational', event_class: 'read_only', severity: 'read_only' },
@@ -147,11 +170,13 @@ export const FAILURE_CLASSES = [
 export type FailureClass = (typeof FAILURE_CLASSES)[number];
 
 export function deterministicFailureClass(reason: string): FailureClass {
-  if (/auth(?:entication|orization)?|unauthorized|invalid api.?key|\b401\b/i.test(reason)) return 'authentication_wall';
-  if (/quota|rate.?limit|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|1302|1308/i.test(reason)) return 'quota_wall';
+  // Word-bounded signals: bare substrings wall-classified unrelated text
+  // ("author" hit `auth`; "port 13020" hit `1302`).
+  if (/\bauth\b|\bauth(?:entication|orized|orization)\b|unauthorized|invalid api.?key|\b401\b/i.test(reason)) return 'authentication_wall';
+  if (/\bquota\b|\brate[- ]?limit\b|insufficient (?:balance|credit)|\b402\b|\b403\b|\b429\b|\b1302\b|\b1308\b/i.test(reason)) return 'quota_wall';
   if (/network|connect|dns|socket|econn|fetch failed/i.test(reason)) return 'network_failure';
-  if (/turn hang|silence|watchdog/i.test(reason)) return 'turn_hang';
-  if (/fatal|panic|crash|disposed/i.test(reason)) return 'fatal_runtime';
+  if (/turn hang|compaction hang|silence|watchdog/i.test(reason)) return 'turn_hang';
+  if (/\bfatal\b|panic|\bcrash\b|disposed/i.test(reason)) return 'fatal_runtime';
   return 'unknown';
 }
 

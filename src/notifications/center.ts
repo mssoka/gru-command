@@ -26,6 +26,14 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * Snapshots never derive — the standing feed IS the table.
  */
 
+function transcriptTailOf(payload: Record<string, unknown>): string | null {
+  for (const key of ['error', 'detail', 'note', 'text']) {
+    const value = payload[key];
+    if (typeof value === 'string' && value.trim() !== '') return value.slice(-400);
+  }
+  return null;
+}
+
 /** Kinds derived from board events (FYI by nature). */
 const DERIVED_KINDS: Readonly<Record<string, { severity: NotificationSeverity; title: (e: BusEvent, payload: Record<string, unknown>) => string; detail: (payload: Record<string, unknown>) => string | null }>> = {
   'job.status': {
@@ -165,9 +173,19 @@ export class NotificationCenter {
     // Commit a provisional deterministic row before any await. Provider
     // latency never blocks EventBus ordering, and a process crash cannot
     // erase the operator-visible incident. Jev may enrich this same row.
+    // Bounded sensor context per the amendment: recent same-source history
+    // from the durable ledger plus a redacted tail of the event's primary
+    // text — never a whole session history, never unredacted bytes.
+    const recentEvents = this.ledger.listEvents({ limit: 40 });
     const provisional = this.recordDerived(event, payload, 'fyi', null);
     if (provisional === null) return;
-    const request = eventDecisionRequest(event);
+    const request = eventDecisionRequest(event, {
+      transcriptTail: transcriptTailOf(payload),
+      recentSameSourceEvents: recentEvents.filter(
+        (row) => row.agentId !== null && row.agentId === event.agentId,
+      ).length,
+      recentSameKindEvents: recentEvents.filter((row) => row.kind === event.kind).length,
+    });
     void this.decisions
       .decide(request)
       .then((outcome) => {

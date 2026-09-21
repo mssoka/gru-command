@@ -790,18 +790,31 @@ export class Supervisor {
           requires_confirm: deterministicWall ? false : restartRoute.requiresConfirm,
         },
       });
-      if (
-        failureClass === 'authentication_wall' ||
-        failureClass === 'quota_wall' ||
-        !restartAuthorized
-      ) {
-        this.stopForGuidance(
-          agent,
-          restartAdvised && !restartAuthorized ? 'restart_confirmation_required' : failureClass,
-        );
+      if (classifiedWall) {
+        // A wall already evident in the runtime error stops unconditionally:
+        // model advice never burns rungs on it.
+        this.stopForGuidance(agent, failureClass);
         return;
       }
-      if (allowRestart) await this.restartRung(agent, reason);
+      if (restartAuthorized) {
+        // THE GRANT LEG: a high-confidence act-band answer yields the same
+        // unattended restart the deterministic ladder would have run — no
+        // human ack required, no escalation row.
+        if (allowRestart) await this.restartRung(agent, reason);
+        return;
+      }
+      if (restartRoute.path === 'fallback') {
+        // Uncertain advice is not a stop order: low confidence falls back to
+        // the exact deterministic behavior (the ladder) the no-service path
+        // would run, instead of stopping an agent the ladder would restart.
+        if (allowRestart) await this.restartRung(agent, reason);
+        return;
+      }
+      // Confirm band (or act with requireConfirm): the human gate owns it.
+      this.stopForGuidance(
+        agent,
+        restartAdvised ? 'restart_confirmation_required' : failureClass,
+      );
     } catch (error) {
       this.log('error', 'recovery classification failed; using deterministic restart guards', {
         agent_id: agent.agentId,

@@ -58,12 +58,13 @@ export class DecisionStatusCard {
 
   render(status: DecisionStatusView): void {
     // Board snapshots and explicit recheck replies race over separate
-    // transports. Generation is the server-owned ordering key: an older
-    // HTTP reply must never overwrite a newer pushed configuration state.
+    // transports. Within one service incarnation, generation is the
+    // server-owned ordering key; ACROSS incarnations generations are not
+    // comparable at all, so a reply from any other incarnation is stale by
+    // definition (a dead process cannot outrank the live pushed state).
     if (
       this.current !== null &&
-      status.incarnation === this.current.incarnation &&
-      status.generation < this.current.generation
+      (status.incarnation !== this.current.incarnation || status.generation < this.current.generation)
     ) return;
     this.current = status;
     this.stamp.textContent = LABELS[status.status];

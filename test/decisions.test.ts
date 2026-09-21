@@ -12,7 +12,12 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_DECISIONS_CONFIG, loadConfig, type DecisionsConfig } from '../src/config.js';
+import {
+  DEFAULT_DECISIONS_CONFIG,
+  loadConfig,
+  type DecisionsConfig,
+  type GruCommandConfig,
+} from '../src/config.js';
 import {
   isolateDecisionEnvironment,
   parseCredentialStdin,
@@ -20,8 +25,10 @@ import {
   writeCredential,
 } from '../src/decisions/credentials.js';
 import {
+  deterministicFailureClass,
   eventDecisionRequest,
   filteredState,
+  redactedText,
   supervisionDecisionRequest,
 } from '../src/decisions/questions.js';
 import { JevDecisionService, JevProvider } from '../src/decisions/provider.js';
@@ -103,6 +110,8 @@ const EVENT: BusEvent = {
   payload: { error: 'boom' },
 };
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 describe('decision config schema', () => {
   it('loads the complete default-off Jev section and strict per-risk thresholds', () => {
     const instance = temp('gru-decisions-config-');
@@ -169,6 +178,18 @@ describe('typed decision semantics', () => {
     expect(() => validateAnswer(scoreQuestion, {
       type: 'score', score: 0, legend: { 0: 'wrong', 1: 'hi' }, probabilities: { 0: 1, 1: 0 }, confidence: 1,
     }, 'q')).toThrow(/does not match/);
+  });
+
+  it('wall classification requires real auth/quota signals, not bare substrings', () => {
+    expect(deterministicFailureClass('HTTP 401 unauthorized')).toBe('authentication_wall');
+    expect(deterministicFailureClass('invalid api key rejected')).toBe('authentication_wall');
+    expect(deterministicFailureClass('quota exceeded (HTTP 429)')).toBe('quota_wall');
+    expect(deterministicFailureClass('rate limit hit')).toBe('quota_wall');
+    expect(deterministicFailureClass('the author of the review paused the run')).toBe('unknown');
+    expect(deterministicFailureClass('connection to port 13020 failed')).toBe('network_failure');
+    expect(deterministicFailureClass('turn hang detected')).toBe('turn_hang');
+    expect(deterministicFailureClass('compaction hang detected')).toBe('turn_hang');
+    expect(deterministicFailureClass('fatal opaque runtime failure')).toBe('fatal_runtime');
   });
 
   it('accepts the API-documented probability-weighted score BETWEEN rubric levels', () => {
@@ -492,6 +513,126 @@ describe('portable credential resolver', () => {
 });
 
 describe('runtime startup, degradation and generation safety', () => {
+  it('packages the amendment-specified sensor context into the event request state', () => {
+    const state = eventDecisionRequest(EVENT, {
+      transcriptTail: 'last bounded tail of the error surface',
+      recentSameSourceEvents: 3,
+      recentSameKindEvents: 2,
+    }).state;
+    const parsed = JSON.parse(state) as {
+      transcript_tail?: string;
+      recent_same_source?: { events?: number; same_kind?: number };
+    };
+    expect(parsed.transcript_tail).toBe('last bounded tail of the error surface');
+    expect(parsed.recent_same_source).toEqual({ events: 3, same_kind: 2 });
+    // Default context stays shape-stable for callers without a sensor.
+    const bare = JSON.parse(eventDecisionRequest(EVENT).state) as {
+      transcript_tail?: unknown;
+      recent_same_source?: unknown;
+    };
+    expect(bare.transcript_tail).toBeNull();
+    expect(bare.recent_same_source).toEqual({ events: 0, same_kind: 0 });
+  });
+
+  it('bounds the redaction scan window: long tails truncate without leaking and in-window secrets still redact', () => {
+    const inWindow = `${'x'.repeat(1_000)} Authorization: Bearer CANARY-in-window`;
+    expect(redactedText(inWindow, 800)).not.toContain('CANARY-in-window');
+    const out = redactedText(`${'x'.repeat(100_000)}\nCANARY-beyond-window`, 800);
+    expect(out).not.toContain('CANARY-beyond-window');
+    expect(out).toHaveLength(800);
+  });
+
+  it('an unrelated config typo never flips a Jev-off instance on or invents an incident', async () => {
+    const postIncident = vi.fn();
+    const runtime = new DecisionRuntime(cloneConfig(false), {
+      instanceDir: temp('gru-decisions-off-invalid-'),
+      env: {},
+      watchConfig: false,
+      loadConfig: () => {
+        throw new Error('boom: unrelated config typo');
+      },
+      notifications: {
+        postIncident,
+        post: vi.fn(),
+        resolveIncidents: vi.fn(() => []),
+      } as unknown as NotificationCenter,
+    });
+    expect(await runtime.start()).toMatchObject({ status: 'disabled', enabled: false });
+    const status = await runtime.recheck(); // configureFromDisk throws → degradeInvalidConfig
+    expect(status).toMatchObject({ enabled: false, status: 'disabled', reason: 'config_invalid' });
+    expect(postIncident).not.toHaveBeenCalled();
+    const outcome = await runtime.decide(eventDecisionRequest(EVENT));
+    expect(outcome.provenance).toMatchObject({ source: 'deterministic' });
+    runtime.dispose();
+  });
+
+  it('a transient decide-time failure degrades, then ONE bounded automatic recheck recovers without operator action', async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      calls += 1;
+      if (calls === 2) throw new TypeError('transient decide-time network blip'); // call 1 is the startup probe
+      return new Response(JSON.stringify(answerEnvelope(String(init?.body))), { status: 200 });
+    }) as unknown as typeof fetch;
+    const notifications = {
+      postIncident: vi.fn(),
+      post: vi.fn(),
+      resolveIncidents: vi.fn(() => []),
+    };
+    const runtime = new DecisionRuntime(cloneConfig(true), {
+      instanceDir: temp('gru-decisions-transient-'),
+      env: { OPENROUTER_API_KEY: 'test-key' },
+      fetchImpl,
+      watchConfig: false,
+      transientRecoveryMs: 10,
+      loadConfig: () => ({ decisions: cloneConfig(true) } as unknown as GruCommandConfig),
+      notifications: notifications as unknown as NotificationCenter,
+    });
+    expect(await runtime.start()).toMatchObject({ status: 'ready' });
+    const first = await runtime.decide(eventDecisionRequest(EVENT));
+    expect(first.provenance).toMatchObject({ source: 'deterministic', fallbackReason: 'network_error' });
+    expect(await runtime.status()).toMatchObject({ status: 'degraded', reason: 'network_error' });
+    await vi.waitFor(() => expect(runtime.status()).toMatchObject({ status: 'ready' }));
+    expect(notifications.resolveIncidents).toHaveBeenCalledWith('decisions.degraded.', 'decisions-runtime');
+    runtime.dispose();
+  });
+
+  it('a still-down provider consumes the single automatic recheck and then stops retrying on its own', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError('provider down');
+    }) as unknown as typeof fetch;
+    const runtime = new DecisionRuntime(cloneConfig(true), {
+      instanceDir: temp('gru-decisions-loop-'),
+      env: { OPENROUTER_API_KEY: 'test-key' },
+      fetchImpl,
+      watchConfig: false,
+      transientRecoveryMs: 10,
+      loadConfig: () => ({ decisions: cloneConfig(true) } as unknown as GruCommandConfig),
+    });
+    await runtime.start(); // probe 1 fails → degrade → arms the auto recheck
+    expect(await runtime.status()).toMatchObject({ status: 'degraded', reason: 'network_error' });
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2)); // the automatic recheck probe
+    await sleep(60);
+    expect(fetchImpl).toHaveBeenCalledTimes(2); // consumed: no third attempt, no loop
+    expect(await runtime.status()).toMatchObject({ status: 'degraded', reason: 'network_error' });
+    runtime.dispose();
+  });
+
+  it('non-transient decide-time failures (auth) degrade without any automatic recheck', async () => {
+    const fetchImpl = vi.fn(async () => new Response('denied', { status: 401 })) as unknown as typeof fetch;
+    const runtime = new DecisionRuntime(cloneConfig(true), {
+      instanceDir: temp('gru-decisions-auth-'),
+      env: { OPENROUTER_API_KEY: 'test-key' },
+      fetchImpl,
+      watchConfig: false,
+      transientRecoveryMs: 10,
+    });
+    await runtime.start(); // probe 401 → auth_rejected (human action, no auto retry)
+    expect(await runtime.status()).toMatchObject({ status: 'degraded', reason: 'auth_rejected' });
+    await sleep(60);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    runtime.dispose();
+  });
+
   it('default-off starts and serves every request with zero provider calls', async () => {
     const fetchImpl = vi.fn();
     const runtime = new DecisionRuntime(cloneConfig(false), {

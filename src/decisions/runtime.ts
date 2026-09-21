@@ -48,6 +48,9 @@ export interface DecisionRuntimeOptions {
   readonly fetchImpl?: typeof globalThis.fetch;
   readonly watchConfig?: boolean;
   readonly loadConfig?: (env: NodeJS.ProcessEnv, home: string) => GruCommandConfig;
+  /** Test seam: delay before the one bounded automatic recheck after a
+   * transient degradation (default 5000 ms). */
+  readonly transientRecoveryMs?: number;
   /** Durable/status-bus projection; failures are isolated from routing. */
   readonly onStatusChange?: (status: DecisionRuntimeStatus) => void;
 }
@@ -109,6 +112,11 @@ export class DecisionRuntime implements DecisionService {
   private eventWatcher: FSWatcher | null = null;
   private recheckInFlight: Promise<DecisionRuntimeStatus> | null = null;
   private recheckTrailing = false;
+  /** One bounded automatic recheck per transient degradation incident; a
+   * still-down provider then waits for a human recheck or a config change
+   * (no unbounded retry/poll/spend loop). Re-armed by every ready/disable. */
+  private transientRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private autoRecheckArmed = true;
   private currentStatus: DecisionRuntimeStatus;
 
   constructor(initial: DecisionsConfig, options: DecisionRuntimeOptions) {
@@ -301,6 +309,7 @@ export class DecisionRuntime implements DecisionService {
       this.signalStatus();
       const resolved = this.resolveDegradedIncidents();
       if ((!initial && previous !== 'disabled') || resolved > 0) this.postResolved('disabled');
+      this.autoRecheckArmed = true;
       return this.status();
     }
 
@@ -399,6 +408,7 @@ export class DecisionRuntime implements DecisionService {
       detail: `Startup check passed; model ${this.currentStatus.model}.`,
       dedupe: 'all',
     }));
+    this.autoRecheckArmed = true;
     return this.status();
   }
 
@@ -437,10 +447,48 @@ export class DecisionRuntime implements DecisionService {
       // recovery/disable resolves it, then allow a later recurrence.
       dedupe: 'active',
     }));
+    if (reason === 'timeout' || reason === 'network_error' || reason === 'provider_degraded') {
+      this.scheduleTransientRecovery();
+    }
     return this.status();
   }
 
+  /** One bounded automatic recheck per transient degradation incident: a
+   * single provider blip heals without operator action, and a second
+   * consecutive failure consumes the arm so no retry/poll/spend loop can
+   * form. Re-arm happens on every recovery (ready) or disable. */
+  private scheduleTransientRecovery(): void {
+    if (this.disposed || !this.autoRecheckArmed || this.transientRecoveryTimer !== null) return;
+    this.autoRecheckArmed = false;
+    this.transientRecoveryTimer = setTimeout(() => {
+      this.transientRecoveryTimer = null;
+      if (this.disposed) return;
+      this.log('info', 'transient degradation — performing the one bounded automatic recheck', {});
+      void this.recheck();
+    }, this.options.transientRecoveryMs ?? 5_000);
+    this.transientRecoveryTimer.unref?.();
+  }
+
   private degradeInvalidConfig(): DecisionRuntimeStatus {
+    if (!this.currentConfig.jev.enabled) {
+      // A Jev-OFF instance stays off: an unrelated config.toml typo must not
+      // enable the feature or invent an operator incident. The
+      // last-known-good thresholds keep deterministic routing intact.
+      this.currentStatus = {
+        enabled: false,
+        status: 'disabled',
+        reason: 'config_invalid',
+        model: this.currentConfig.jev.model,
+        endpoint: this.currentConfig.jev.endpoint,
+        credentialPresent: false,
+        credentialSource: 'none',
+        checkedAt: new Date().toISOString(),
+        incarnation: this.incarnation,
+        generation: this.generation,
+      };
+      this.signalStatus();
+      return this.status();
+    }
     this.currentConfig = { ...this.currentConfig, jev: { ...this.currentConfig.jev, enabled: true } };
     return this.degrade('config_invalid');
   }
@@ -483,6 +531,10 @@ export class DecisionRuntime implements DecisionService {
     if (this.disposed) return;
     this.disposed = true;
     this.generation += 1;
+    if (this.transientRecoveryTimer !== null) {
+      clearTimeout(this.transientRecoveryTimer);
+      this.transientRecoveryTimer = null;
+    }
     this.pendingJev?.dispose();
     this.pendingJev = null;
     this.jev?.dispose();
