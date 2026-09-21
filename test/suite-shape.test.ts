@@ -30,7 +30,7 @@ const PINS: Record<string, number> = {
   'dispatch-server.test.ts': 8,
   'health.test.ts': 18,
   'identity.test.ts': 3,
-  'install-one-line.test.ts': 23,
+  'install-one-line.test.ts': 29,
   'install.test.ts': 12,
   'lan-phone-raw-client.test.ts': 6,
   'ledger-api.test.ts': 17,
@@ -60,7 +60,7 @@ const PINS: Record<string, number> = {
   'wizard.test.ts': 24,
   'wizard-interactive.test.ts': 8,
   'wizard-register.test.ts': 2,
-  'worktree-manager.test.ts': 35,
+  'worktree-manager.test.ts': 36,
   'worktree-manifest.test.ts': 6,
   'worktree-port.test.ts': 4,
   'worktrees-server.test.ts': 3,
@@ -78,7 +78,7 @@ describe('suite shape', () => {
       expect(source, `${file}: parameterized cases evade the static suite pin; register explicit cases`).not.toMatch(
         /\b(?:it|test|describe)\.each\(/,
       );
-      const registered = (source.match(/\bit\(/g) ?? []).length;
+      const registered = (source.match(/\bit\(|\bit\.skipIf\(/g) ?? []).length;
       const pinned = PINS[file] ?? -1;
       expect(
         registered,

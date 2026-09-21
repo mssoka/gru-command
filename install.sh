@@ -9,7 +9,11 @@
 #   ./install.sh                     fresh install, or safe update when an
 #                                    instance config already exists
 #   ./install.sh --update            pull --ff-only + deps + builds + restart
-#                                    only an owned installed service
+#                                    an owned installed service; when the
+#                                    unit is absent, register it (prompted;
+#                                    automatic with --no-interact or with
+#                                    no terminal; a decline prints the
+#                                    --service hint)
 #   ./install.sh --no-interact       fresh setup with documented defaults
 #   ./install.sh --answers '<json>'  fresh non-interactive setup overrides;
 #                                    secrets are forbidden in answers
@@ -42,6 +46,7 @@ ANSWERS_SET=0
 NO_INTERACT=0
 FORCE=0
 UPDATE_REQUESTED=0
+SERVICE_REGISTRATION_DECLINED=0
 LAUNCHCTL_BIN="${GRU_COMMAND_LAUNCHCTL:-launchctl}"
 SYSTEMCTL_BIN="${GRU_COMMAND_SYSTEMCTL:-systemctl}"
 
@@ -413,12 +418,53 @@ build_product() {
   "$NODE_BIN" tools/verify-perkins-resource.mjs "$REPO_ROOT"
 }
 
+# Absent-unit update path: ask before registering. Reads the controlling
+# terminal when stdin is a pipe (`cat install.sh | bash` must not eat the
+# script from stdin); with no terminal at all (cron/CI) the default-Y
+# answer applies — matching the --no-interact outcome — and is announced
+# on stderr, never silent. Returns 0 = register, 1 = declined. bash 3.2
+# compatible (macOS /bin/bash).
+prompt_register_service() {
+  local reply=""
+  local prompt="No service unit installed — register one now? [Y/n] "
+  if [[ -t 0 ]]; then
+    read -r -p "$prompt" reply || true
+  elif { exec 3< /dev/tty; } 2>/dev/null; then
+    read -r -p "$prompt" reply <&3 || true
+    exec 3<&-
+  else
+    echo "install.sh: no terminal for the register prompt — auto-registering (pass --no-interact to acknowledge, or run ./install.sh --service later)" >&2
+    reply=""
+  fi
+  case "$reply" in
+    ""|y|Y|yes|Yes|YES) return 0 ;;
+    n|N|no|No|nO|NO) return 1 ;;
+    *)
+      err "unrecognized answer '$reply' — not registering (./install.sh --service registers it later)"
+      return 1
+      ;;
+  esac
+}
+
 restart_owned_service_if_present() {
   local ownership
   ownership="$(service_ownership)"
   case "$ownership" in
     absent)
-      echo "service restart: no installed Gru Command unit for this repo/instance"
+      # A configured instance without its unit is a broken install, not a
+      # clean state (live 2026-09-21: deleted plist, green run, dead
+      # service). Register through the same path the wizard uses; an
+      # explicit decline stays green but names the recovery command after
+      # completion. Owned/foreign handling below is unchanged.
+      if [[ "$NO_INTERACT" -eq 1 ]] || prompt_register_service; then
+        echo "no installed unit found — registering the Gru Command service…"
+        case "$OS" in
+          darwin) install_launchd ;;
+          linux) install_systemd ;;
+        esac
+      else
+        SERVICE_REGISTRATION_DECLINED=1
+      fi
       ;;
     foreign)
       err "refusing to restart unrelated service unit: $(service_target)"
@@ -513,6 +559,16 @@ run_setup() {
   if [[ "$source_update" -eq 1 && -f "$INSTANCE_DIR/config.toml" && "$ANSWERS_SET" -eq 0 && "$FORCE" -eq 0 ]]; then
     restart_owned_service_if_present
     echo "update complete; existing config preserved: $INSTANCE_DIR/config.toml"
+    # Completion honesty: after a decline nothing is installed or running.
+    # The hint stays actionable when cwd is not the checkout (piped re-exec).
+    if [[ "$SERVICE_REGISTRATION_DECLINED" -eq 1 ]]; then
+      local service_hint="./install.sh"
+      # Same-file test (dev+ino), not a path compare: bash's REPO_ROOT and
+      # $PWD can disagree on symlink depth (macOS /var vs /private/var),
+      # and the hint only needs ./install.sh to be THE checkout's installer.
+      [[ "./install.sh" -ef "$REPO_ROOT/install.sh" ]] || service_hint="$REPO_ROOT/install.sh"
+      echo "no service installed or running — $service_hint --service registers it later"
+    fi
     return 0
   fi
 
