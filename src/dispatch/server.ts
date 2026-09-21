@@ -45,6 +45,13 @@ function optStrField(body: Record<string, unknown>, field: string): string | und
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
+function optBoolField(body: Record<string, unknown>, field: string): boolean | undefined {
+  const value = body[field];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'boolean') throw new Error(`${field} must be a boolean`);
+  return value;
+}
+
 function optStrArray(body: Record<string, unknown>, field: string): readonly string[] | undefined {
   const value = body[field];
   if (value === undefined) return undefined;
@@ -151,16 +158,32 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     if (req.method === 'POST' && path === '/api/dispatch/review') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
-      const begun = await options.wave.beginRound({
+      const input = {
         jobId: strField(body, 'job_id'),
         ...(optStrField(body, 'target_ref') !== undefined ? { targetRef: optStrField(body, 'target_ref') } : {}),
         ...(optStrArray(body, 'lenses') !== undefined ? { lenses: optStrArray(body, 'lenses') } : {}),
-      });
-      track(begun.run);
+        ...(optBoolField(body, 'no_spec') !== undefined ? { noSpec: optBoolField(body, 'no_spec') } : {}),
+      };
+      const outcome = await options.wave.requestReview(input);
+      if (outcome.route !== 'perkins') {
+        // bmad-review fallback gate: findings, triage, and fix directives run
+        // in the background; the response names the failed pre-flight legs.
+        track(outcome.run);
+        json(res, 202, {
+          route: outcome.route,
+          clear_to_merge: outcome.clearToMerge,
+          skill_installed: outcome.skillInstalled,
+          failed_legs: outcome.failedLegs.map((leg) => ({ leg: leg.leg, detail: leg.detail, remediation: leg.remediation })),
+          note: outcome.note,
+        });
+        return true;
+      }
+      track(outcome.run);
       json(res, 202, {
-        round_id: begun.round.id,
-        status: begun.round.status,
-        lenses: begun.round.lenses.map((chip) => chip.lens),
+        route: 'perkins',
+        round_id: outcome.round.id,
+        status: outcome.round.status,
+        lenses: outcome.round.lenses.map((chip) => chip.lens),
       });
       return true;
     }

@@ -100,38 +100,53 @@ function lastUserPrompt(context: Context): {
   imageCount: number;
   images: StubImage[];
 } {
+  let userIndex = -1;
   for (let i = context.messages.length - 1; i >= 0; i -= 1) {
-    const message = context.messages[i];
-    if (message !== undefined && message.role === 'user') {
-      const content = message.content;
-      if (typeof content === 'string') return { text: content, imageCount: 0, images: [] };
-      const images = content
-        .filter((block) => block.type === 'image')
-        .map((block) => ({ data: block.data, mimeType: block.mimeType }));
-      return {
-        text: content
-          .filter((block) => block.type === 'text')
-          .map((block) => block.text)
-          .join(''),
-        imageCount: images.length,
-        images,
-      };
+    if (context.messages[i]?.role === 'user') {
+      userIndex = i;
+      break;
     }
   }
-  return { text: '(no user message)', imageCount: 0, images: [] };
+  if (userIndex === -1) return { text: '(no user message)', imageCount: 0, images: [] };
+  const message = context.messages[userIndex]!;
+  const content = message.content;
+  let text = typeof content === 'string'
+    ? content
+    : content.filter((block) => block.type === 'text').map((block) => block.text).join('');
+  const images = typeof content === 'string'
+    ? []
+    : content
+        .filter((block) => block.type === 'image')
+        .map((block) => ({ data: block.data, mimeType: block.mimeType }));
+  for (let i = userIndex + 1; i < context.messages.length; i += 1) {
+    const trailing = context.messages[i];
+    if (trailing?.role !== 'toolResult') continue;
+    const resultText = typeof trailing.content === 'string'
+      ? trailing.content
+      : (Array.isArray(trailing.content) ? trailing.content : [])
+          .filter((block) => block.type === 'text')
+          .map((block) => block.text)
+          .join('');
+    text += `\n[TOOL_RESULT ${String(trailing.toolName)}] ${resultText}`;
+  }
+  return { text, imageCount: images.length, images };
 }
+
+export type StubResponder = (prompt: string, callIndex: number) => StubTurn;
 
 export class StubScript {
   private turns: StubTurn[];
+  private readonly responder: StubResponder | null;
   readonly calls: StubCall[] = [];
 
-  constructor(turns: readonly StubTurn[]) {
-    this.turns = [...turns];
+  constructor(turns: readonly StubTurn[] | StubResponder) {
+    this.turns = typeof turns === 'function' ? [] : [...turns];
+    this.responder = typeof turns === 'function' ? turns : null;
   }
 
   next(prompt: string, images: StubImage[] = []): StubTurn {
     this.calls.push({ prompt, imageCount: images.length, images });
-    return this.turns.shift() ?? { deltas: ['stub: ', 'ok'] };
+    return this.responder?.(prompt, this.calls.length - 1) ?? this.turns.shift() ?? { deltas: ['stub: ', 'ok'] };
   }
 }
 

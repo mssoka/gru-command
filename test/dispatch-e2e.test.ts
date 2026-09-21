@@ -1,14 +1,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
+import type { FallbackGateOutcome, WaveOutcome } from '../src/dispatch/perkins.js';
+
+function asWave(outcome: WaveOutcome | FallbackGateOutcome): WaveOutcome {
+  if (!('route' in outcome)) return outcome;
+  throw new Error(`expected a Perkins wave outcome, got ${outcome.route}`);
+}
 import { BoardEngine } from '../src/board/engine.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
-import { WaveRunner, type LensResult } from '../src/dispatch/perkins.js';
+import { WaveRunner } from '../src/dispatch/perkins.js';
+import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
 import type { AgentCapabilities, AgentHandle, AgentState, PromptOptions, RuntimeEvent, SpawnOptions } from '../src/runtime/types.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
@@ -52,6 +60,8 @@ interface DispatchHarness {
  * worktree — exercising the real git path a dispatched agent uses. */
 async function defaultMinionSettle(_text: string, cwd: string): Promise<void> {
   writeFileSync(join(cwd, 'minion-deliverable.txt'), 'stub change delivered\n');
+  execFileSync('git', ['-C', cwd, 'add', 'minion-deliverable.txt']);
+  execFileSync('git', ['-C', cwd, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'test: deliver minion change'], { stdio: 'ignore' });
 }
 
 function makeHandle(id: string, role: Role, settle: (text: string) => Promise<void>): FakeHandle {
@@ -82,7 +92,6 @@ function makeHandle(id: string, role: Role, settle: (text: string) => Promise<vo
 
 function makeDispatchHarness(opts: {
   minionSettle?: (text: string, cwd: string) => Promise<void>;
-  lensResult?: (lens: string) => Promise<LensResult>;
 } = {}): DispatchHarness {
   const repo = makeFixtureRepo('fixture-app');
   const dataDir = mkdtempSync(join(tmpdir(), 'gru-command-e2edata-'));
@@ -93,9 +102,17 @@ function makeDispatchHarness(opts: {
   const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-e2ewt-')));
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const handles: FakeHandle[] = [];
+  const reviewSessions = join(dataDir, 'review-sessions');
+  mkdirSync(reviewSessions, { recursive: true });
+  const hybrid = fakeHybridSpawner(reviewSessions, { childAnswer: () => '[]' });
   let n = 0;
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
+    if (role === 'perkins') {
+      const handle = await hybrid.spawner(role, options);
+      engine.onRuntimeEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+      return handle;
+    }
     const id = `agent-${++n}`;
     const cwd = options?.cwd ?? '';
     const handle = makeHandle(
@@ -106,21 +123,17 @@ function makeDispatchHarness(opts: {
         : async () => {},
     );
     handles.push(handle);
-    // Simulate the production registry tap: the board engine registers
-    // every spawned handle (spawn envelope) as an agent row.
     engine.onRuntimeEvent({ agentId: handle.id, role, sessionFile: null, phase: 'spawned' });
     return handle;
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
   const poster = { post: vi.fn(async () => {}) };
-  const lensResult =
-    opts.lensResult ?? (async () => ({ state: 'done' as const, verdict: 'clean' as const }));
   const wave = new WaveRunner({
     ledger,
     worktrees,
     spawner,
     poster,
-    driveLens: async (ctx) => lensResult(ctx.lens),
+    reviewArtifactRoot: join(dataDir, 'reviews'),
   });
   return {
     ledger,
@@ -152,9 +165,7 @@ function harness(opts: Parameters<typeof makeDispatchHarness>[0] = {}): Dispatch
 
 describe('end-to-end dispatch (E8 story 4)', () => {
   it('runs the full heist arc on a fixture repo: briefing → minion on a worktree → board → PR → wave → release', async () => {
-    const h = harness({
-      lensResult: async (lens) => ({ state: 'done', verdict: lens === 'edge' ? 'note' : 'clean' }),
-    });
+    const h = harness();
 
     // --- Gru authors a briefing; ops hands it off; the minion runs. ---
     const outcome = await h.dispatch.dispatch({
@@ -164,7 +175,7 @@ describe('end-to-end dispatch (E8 story 4)', () => {
       briefing: 'Make the widget polish generic and verify it. Acceptance: tests pass.',
     });
     expect(outcome.job.status).toBe('working');
-    expect((await outcome.settled).ok).toBe(true);
+    expect(await outcome.settled).toEqual({ ok: true });
 
     // Ruling 17: the minion session is ROOTED IN THE PROJECT WORKTREE.
     const minionSpawn = h.spawns.find((spawn) => spawn.role === 'minion');
@@ -202,7 +213,7 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     // --- The PR link lands; review wave runs; verdict consolidates. ---
     h.dispatch.recordPr('widget-polish', PR_URL);
     expect(h.ledger.getJob('widget-polish')?.prUrl).toBe(PR_URL);
-    const waveOutcome = await h.wave.runRound({ jobId: 'widget-polish' });
+    const waveOutcome = asWave(await h.wave.runRound({ jobId: 'widget-polish' }));
     expect(waveOutcome.verdict).toBe('approved');
     expect(waveOutcome.posted).toBe(true);
     expect(h.poster.post).toHaveBeenCalledWith(expect.objectContaining({ prUrl: PR_URL }));

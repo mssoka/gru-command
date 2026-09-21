@@ -1,13 +1,16 @@
 import {
   createAgentSession,
+  createReadOnlyTools,
   DefaultResourceLoader,
   getAgentDir,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
 } from '@earendil-works/pi-coding-agent';
+import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
-import { readFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative } from 'node:path';
+import { realpathSync, readFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { GruCommandConfig, Role } from '../config.js';
 import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
@@ -26,6 +29,7 @@ import type {
   AgentRuntime,
   AgentState,
   ContextUsage,
+  NativeAgentTool,
   PromptOptions,
   RuntimeEvent,
   RuntimeEventListener,
@@ -34,6 +38,67 @@ import type {
 } from './types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
+
+function confinedReviewTools(cwd: string, requested: readonly IsolatedToolName[]): {
+  readonly names: string[];
+  readonly tools: ToolDefinition[];
+} {
+  const root = realpathSync(cwd);
+  const wanted = new Set(requested);
+  if (wanted.size !== requested.length) throw new Error('isolated review tool names must be unique');
+  const tools = createReadOnlyTools(cwd)
+    .filter((tool) => wanted.has(tool.name as IsolatedToolName))
+    .map((tool) => {
+      const original = tool.execute.bind(tool);
+      const name = `review_${tool.name}`;
+      return {
+        ...tool,
+        name,
+        label: name,
+        description: `${tool.description} Paths are confined to the immutable review working directory.`,
+        async execute(toolCallId, rawParams, signal, onUpdate, _context) {
+          const params = rawParams as Record<string, unknown>;
+          const requestedPath = params['path'] === undefined ? '.' : params['path'];
+          if (typeof requestedPath !== 'string' || requestedPath.includes('\0') || requestedPath.startsWith('file:')) {
+            throw new Error('isolated review tool path is invalid');
+          }
+          const actual = realpathSync(resolve(root, requestedPath));
+          const rel = relative(root, actual);
+          if (rel.startsWith('..') || isAbsolute(rel)) {
+            throw new Error('isolated review tool path escapes the review working directory');
+          }
+          return original(toolCallId, { ...params, path: actual } as never, signal, onUpdate);
+        },
+      } satisfies ToolDefinition;
+    });
+  if (tools.length !== wanted.size) throw new Error('isolated review requested an unavailable read-only tool');
+  return { names: tools.map((tool) => tool.name), tools };
+}
+
+function nativeReviewTools(definitions: readonly NativeAgentTool[]): ToolDefinition[] {
+  const names = new Set<string>();
+  return definitions.map((definition) => {
+    if (!/^perkins_[a-z0-9_]{1,48}$/.test(definition.name) || names.has(definition.name)) {
+      throw new Error(`invalid or duplicate native review tool name: ${definition.name}`);
+    }
+    names.add(definition.name);
+    return {
+      name: definition.name,
+      label: definition.name,
+      description: definition.description,
+      parameters: definition.inputSchema as ToolDefinition['parameters'],
+      async execute(_toolCallId, params, signal) {
+        const result = await definition.execute(params, signal);
+        return {
+          content: [{ type: 'text', text: result.text }],
+          details: result.details ?? {},
+          ...(result.terminate === true ? { terminate: true } : {}),
+        };
+      },
+    } satisfies ToolDefinition;
+  });
+}
 
 const COMPACTION_END_RECONCILE_MS = 5_000;
 
@@ -217,6 +282,15 @@ export class PiRuntime implements AgentRuntime {
       model: model ? `${model.provider}/${model.id}` : 'pi default resolution (settings name no default)',
       thinkingLevel: thinkingLevel ?? 'default',
     });
+    const isolatedReview = options.isolatedReview;
+    const reviewLead = options.reviewLead;
+    if (isolatedReview !== undefined && reviewLead !== undefined) {
+      throw new Error('a review session cannot be both a lead and a lens child');
+    }
+    const reviewMode = reviewLead ?? isolatedReview;
+    if (reviewMode !== undefined && options.resumeFile !== undefined) {
+      throw new Error('isolated review sessions must be fresh and cannot resume ambient context');
+    }
     // Normalize like the SDK (tilde + file://) so the lock key, the
     // active-file key, and the session's own path are one and the same.
     const resumeFile =
@@ -252,19 +326,48 @@ export class PiRuntime implements AgentRuntime {
         resumeFile !== undefined
           ? SessionManager.open(resumeFile, dirname(resumeFile), cwd)
           : SessionManager.create(cwd, this.store.sessionDirFor(role, cwd));
+      const isolatedSettings = reviewMode === undefined
+        ? undefined
+        : SettingsManager.inMemory({}, { projectTrusted: false });
       const loader = new DefaultResourceLoader({
         cwd,
         agentDir: this.agentDir,
-        systemPromptOverride: () => roleDef.systemPrompt,
+        ...(isolatedSettings !== undefined ? { settingsManager: isolatedSettings } : {}),
+        ...(reviewMode !== undefined
+          ? {
+              noExtensions: true,
+              noSkills: true,
+              noPromptTemplates: true,
+              noThemes: true,
+              noContextFiles: true,
+            }
+          : {}),
+        systemPromptOverride: () => reviewMode?.systemPrompt ?? roleDef.systemPrompt,
+        ...(reviewMode !== undefined
+          ? {
+              skillsOverride: () => ({ skills: [], diagnostics: [] }),
+              promptsOverride: () => ({ prompts: [], diagnostics: [] }),
+              agentsFilesOverride: () => ({ agentsFiles: [] }),
+              appendSystemPromptOverride: () => [],
+            }
+          : {}),
       });
       await loader.reload();
+      const isolatedTools = reviewMode === undefined ? null : confinedReviewTools(cwd, reviewMode.tools);
+      const leadTools = reviewLead === undefined ? [] : nativeReviewTools(reviewLead.nativeTools);
+      const tools = isolatedTools === null
+        ? roleDef.tools
+        : [...isolatedTools.names, ...leadTools.map((tool) => tool.name)];
       const { session } = await createAgentSession({
         cwd,
         agentDir: this.agentDir,
         model,
         ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
-        tools: [...roleDef.tools],
+        ...(reviewMode !== undefined ? { noTools: 'all' as const } : {}),
+        tools: [...tools],
+        ...(isolatedTools !== null ? { customTools: [...isolatedTools.tools, ...leadTools] } : {}),
         resourceLoader: loader,
+        ...(isolatedSettings !== undefined ? { settingsManager: isolatedSettings } : {}),
         sessionManager,
         modelRuntime: await this.runtime(),
       });
@@ -293,6 +396,7 @@ export class PiRuntime implements AgentRuntime {
         session,
         sessionFile,
         capabilitiesForModelInput(PI_CAPABILITIES, session.model?.input),
+        reviewMode !== undefined,
         this.store,
         this.log,
         () => {
@@ -363,6 +467,7 @@ export class PiAgentHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string;
+  readonly reviewIsolation?: true;
   readonly capabilities: AgentCapabilities;
 
   /** The principal unnamed callers are attributed to (single-writer). */
@@ -408,6 +513,7 @@ export class PiAgentHandle implements AgentHandle {
     },
     sessionFile: string,
     capabilities: AgentCapabilities,
+    isolatedReview: boolean,
     private readonly store: SessionStore,
     private readonly log: Log,
     private readonly onDispose: () => void = () => {},
@@ -416,6 +522,7 @@ export class PiAgentHandle implements AgentHandle {
     this.id = session.sessionId;
     this.sessionFile = sessionFile;
     this.capabilities = capabilities;
+    if (isolatedReview) this.reviewIsolation = true;
     // Unnamed callers share one principal PER HANDLE — one chat brain per
     // session (SPEC ruling 1). Two distinct sessions always differ, so a
     // stranger's steer/followUp queues instead of passing natively.

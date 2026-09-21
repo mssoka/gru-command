@@ -62,3 +62,10 @@ frame_log_keep = 3
 
 [dispatch]                        # dispatch flow (E8) — all optional
 bob_interval_ms = 3600000         # Bob's consolidation interval; 0 disables
+
+[review]
+# Review gate policy (user amendment 2026-09-20). Optional; enabled by default.
+# enabled: false routes every review request to the bmad-review fallback gate
+# (when installed; otherwise escalate-only). true keeps Perkins as the primary
+# gate behind the four-leg capability pre-flight.
+enabled = true

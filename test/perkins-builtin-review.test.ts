@@ -1,0 +1,1379 @@
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  assertFrozenPromptBounds,
+  baseMovedSinceFreeze,
+  chunkUnifiedDiff,
+  freezeReviewInputs,
+  FROZEN_CHUNK_MAX_BYTES,
+  FROZEN_DIFF_MAX_BYTES,
+  FROZEN_SPEC_MAX_BYTES,
+  resolveReviewBaseRef,
+  reviewArtifactDirectory,
+  writeReviewArtifact,
+  type FrozenReview,
+} from '../src/dispatch/perkins-review/artifacts.js';
+import { loadPerkinsPolicy, PERKINS_LENSES, PERKINS_POLICY_SHA256 } from '../src/dispatch/perkins-review/policy.js';
+import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
+import {
+  PerkinsHybridReview,
+  PERKINS_REPORT_MAX_BYTES,
+  type PerkinsHybridResult,
+} from '../src/dispatch/perkins-review/hybrid.js';
+import {
+  dedupeVerifiedFindings,
+  parseFindings,
+  parseFixAuditResults,
+  parseVerificationResults,
+  verdictForFindings,
+  type ReviewFinding,
+  type VerifiedFinding,
+} from '../src/dispatch/perkins-review/types.js';
+import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { fakeHybridSpawner, type LeadBrainOptions } from './helpers/perkins-hybrid-double.js';
+
+const repos: FixtureRepo[] = [];
+const temporaryDirectories: string[] = [];
+function temp(prefix: string): string {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+afterEach(() => {
+  while (repos.length > 0) repos.pop()!.cleanup();
+  while (temporaryDirectories.length > 0) rmSync(temporaryDirectories.pop()!, { recursive: true, force: true });
+});
+
+function lensFrom(prompt: string): string {
+  if (prompt.includes('source=blind')) return 'blind';
+  return /"source": "(blind|edge|acceptance|security|architecture|codebase|tests)"/.exec(prompt)?.[1] ?? 'unknown';
+}
+
+function finding(source: string, severity: 'blocker' | 'warning' | 'note' = 'blocker', overrides: Partial<ReviewFinding> = {}): ReviewFinding {
+  return {
+    source: source as ReviewFinding['source'],
+    severity,
+    category: 'correctness',
+    title: `${source} grounded defect`,
+    location: 'src/main.ts:1',
+    evidence: 'export function answer(): number {',
+    detail: 'The exact changed function demonstrates the defect.',
+    recommended_fix: 'Correct the function and retain a regression test.',
+    ...overrides,
+  };
+}
+
+function makeReviewRepo(name = 'perkins-hybrid'): { repo: FixtureRepo; base: string; target: string } {
+  const repo = makeFixtureRepo(name);
+  const base = repo.head();
+  repo.git(['checkout', '-b', 'feature/review']);
+  const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+  return { repo, base, target };
+}
+
+interface HybridHarness {
+  readonly repo: FixtureRepo;
+  readonly base: string;
+  readonly target: string;
+  readonly root: string;
+  readonly frozen: FrozenReview;
+  readonly calls: ReturnType<typeof fakeHybridSpawner>['calls'];
+  readonly leadCalls: ReturnType<typeof fakeHybridSpawner>['leadCalls'];
+  readonly childCalls: ReturnType<typeof fakeHybridSpawner>['childCalls'];
+  readonly toolErrors: ReturnType<typeof fakeHybridSpawner>['toolErrors'];
+  run(input?: { noSpec?: boolean; priorConsolidatedFile?: string }): Promise<PerkinsHybridResult>;
+}
+
+function hybridHarness(brain: LeadBrainOptions, options?: { noSpec?: boolean; spec?: string; priorConsolidatedFile?: string; beforeFreeze?: (repo: FixtureRepo) => void }): HybridHarness {
+  const fixture = makeReviewRepo();
+  repos.push(fixture.repo);
+  options?.beforeFreeze?.(fixture.repo);
+  const base = fixture.repo.git(['rev-parse', 'main']);
+  const target = fixture.repo.head();
+  const root = temp('perkins-hybrid-test-');
+  const frozen = freezeReviewInputs({
+    roundId: 'hybrid-round',
+    repoPath: fixture.repo.path,
+    artifactRoot: root,
+    baseRef: base,
+    targetRef: target,
+    movementRef: 'feature/review',
+    ...(options?.noSpec === true
+      ? { noSpec: true }
+      : { spec: options?.spec ?? 'return 43' }),
+  });
+  const fake = fakeHybridSpawner(temp('perkins-hybrid-sessions-'), brain);
+  const engine = new PerkinsHybridReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+  return {
+    ...fixture,
+    base,
+    target,
+    root,
+    frozen,
+    calls: fake.calls,
+    leadCalls: fake.leadCalls,
+    childCalls: fake.childCalls,
+    toolErrors: fake.toolErrors,
+    run: (input = {}) => engine.run({
+      roundId: 'hybrid-round',
+      roundNumber: 1,
+      frozenReview: frozen,
+      movementRef: 'feature/review',
+      noSpec: input.noSpec ?? options?.noSpec ?? false,
+      ...(input.priorConsolidatedFile !== undefined || options?.priorConsolidatedFile !== undefined
+        ? { priorConsolidatedFile: input.priorConsolidatedFile ?? options?.priorConsolidatedFile }
+        : {}),
+    }),
+  };
+}
+
+describe('bundled Perkins policy and deterministic contracts', () => {
+  it('loads the integrity-pinned canonical seven-lens resource with the hybrid lead workflow', () => {
+    const policy = loadPerkinsPolicy();
+    expect(policy.identity).toBe('perkins-code-review');
+    expect(policy.portableContract.rules.fullLenses).toEqual(PERKINS_LENSES);
+    expect(policy.provenance.sourceSha256).toHaveLength(64);
+    expect(PERKINS_POLICY_SHA256).toHaveLength(64);
+    expect(policy.hostReplacements.join(' ')).toContain('Herdr');
+    expect(policy.portableContract.blindPrompt).toContain('"recommended_fix": "the concrete change');
+    expect(policy.portableContract.leadWorkflow).toContain('perkins_submit_review');
+    expect(policy.portableContract.leadWorkflow).toContain('INCOMPLETE never approves');
+  });
+
+  it('verifies installed-root containment and rejects a policy symlink that escapes the product', () => {
+    const root = temp('perkins-installed-root-');
+    const policyDir = join(root, 'resources', 'perkins-code-review');
+    const moduleDir = join(root, 'dist', 'dispatch', 'perkins-review');
+    mkdirSync(policyDir, { recursive: true });
+    mkdirSync(moduleDir, { recursive: true });
+    mkdirSync(join(root, 'dist', 'runtime'), { recursive: true });
+    const serverBytes = readFileSync(join(import.meta.dirname, '..', 'src', 'runtime', 'review-mcp-server.mjs'));
+    writeFileSync(join(root, 'dist', 'runtime', 'review-mcp-server.mjs'), serverBytes);
+    const serverHash = createHash('sha256').update(serverBytes).digest('hex');
+    writeFileSync(
+      join(root, 'dist', 'runtime', 'review-mcp-bridge.js'),
+      `export const PERKINS_MCP_SERVER_SHA256 = '${serverHash}';\n`,
+      'utf8',
+    );
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}\n', 'utf8');
+    const source = readFileSync(join(import.meta.dirname, '..', 'resources', 'perkins-code-review', 'policy.json'));
+    const hash = createHash('sha256').update(source).digest('hex');
+    const policy = JSON.parse(source.toString('utf8')) as { provenance: { sourceSha256: string } };
+    const policyFile = join(policyDir, 'policy.json');
+    writeFileSync(policyFile, source);
+    const loaderFile = join(moduleDir, 'policy.js');
+    const loader = (expectedHash: string) => `
+      import { readFileSync } from 'node:fs';
+      import { fileURLToPath } from 'node:url';
+      export const PERKINS_POLICY_FILE = fileURLToPath(new URL('../../../resources/perkins-code-review/policy.json', import.meta.url));
+      export const PERKINS_POLICY_SHA256 = '${expectedHash}';
+      export const PERKINS_CANONICAL_SOURCE_SHA256 = '${policy.provenance.sourceSha256}';
+      export function loadPerkinsPolicy() { return JSON.parse(readFileSync(PERKINS_POLICY_FILE, 'utf8')); }
+    `;
+    writeFileSync(loaderFile, loader(hash), 'utf8');
+    const verifier = join(import.meta.dirname, '..', 'tools', 'verify-perkins-resource.mjs');
+    for (const args of [[verifier], [verifier, '   ']]) {
+      const usage = spawnSync(process.execPath, args, { encoding: 'utf8' });
+      expect(usage.status).toBe(2);
+      expect(usage.stdout).toBe('');
+      expect(usage.stderr).toBe('usage: node tools/verify-perkins-resource.mjs <installed-product-root>\n');
+    }
+    expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8' })).not.toThrow();
+    const productRoot = join(import.meta.dirname, '..');
+    expect(() => execFileSync(process.execPath, [verifier, productRoot], {
+      encoding: 'utf8', env: { PATH: process.env.PATH ?? '', HOME: temp('perkins-empty-home-') },
+    })).not.toThrow();
+
+    const excludedMarkers = [
+      ['j', 'ev'],
+      ['open', 'router'],
+      ['decision', 'service'],
+      ['api', 'alpha', 'decisions'],
+      ['open', 'router', 'api', 'key'],
+    ].map((parts) => parts.join(''));
+    const roles = join(root, 'roles');
+    mkdirSync(roles, { recursive: true });
+    const contentResidue = join(roles, 'residue.md');
+    for (const marker of excludedMarkers) {
+      writeFileSync(contentResidue, `excluded ${marker} product byte`, 'utf8');
+      expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' }))
+        .toThrow(/excluded product residue found in file/);
+    }
+    rmSync(contentResidue);
+    const pathResidue = join(roles, `${excludedMarkers[0]}-pilot.md`);
+    writeFileSync(pathResidue, 'path-only residue', 'utf8');
+    expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' }))
+      .toThrow(/excluded product residue found in path/);
+    rmSync(pathResidue);
+
+    // Separator/case variants of the vendor identifiers must also fail.
+    for (const variant of [
+      `${['OPEN', 'ROUTER', '_API_KEY=redacted'].join('')}`,
+      `${['decision', '-service residue'].join('')}`,
+      `endpoint https://x.example/${['api', '/', 'alpha', '/', 'decisions'].join('')}`,
+      `${['Decision', ' Service prose'].join('')}`,
+    ]) {
+      writeFileSync(contentResidue, variant, 'utf8');
+      expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' }))
+        .toThrow(/excluded product residue found in file/);
+    }
+    rmSync(contentResidue);
+
+    // A symlink planted inside a scanned entry must be refused outright.
+    const symlinkResidue = join(roles, 'link.md');
+    symlinkSync(join(root, 'package.json'), symlinkResidue);
+    expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' }))
+      .toThrow(/residue scan refuses symlink/u);
+    unlinkSync(symlinkResidue);
+
+    // Missing TOP-LEVEL entries are tolerated (optional shipped paths); the
+    // walker rethrows any nested ENOENT so a mid-walk disappearance fails
+    // verification loudly (structural guarantee in scanFile/visit).
+    rmSync(join(root, 'web'), { recursive: true, force: true });
+    expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' })).not.toThrow();
+    mkdirSync(join(root, 'web'), { recursive: true });
+
+    // A shipped file over the per-file scan bound fails closed.
+    writeFileSync(join(roles, 'oversize.md'), 'x'.repeat(17 * 1024 * 1024), 'utf8');
+    expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' }))
+      .toThrow(/byte bound exceeded/u);
+    rmSync(join(roles, 'oversize.md'));
+
+    writeFileSync(policyFile, `${source.toString('utf8')}corrupt`, 'utf8');
+    expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' })).toThrow();
+    writeFileSync(policyFile, source);
+
+    const serverFile = join(root, 'dist', 'runtime', 'review-mcp-server.mjs');
+    writeFileSync(serverFile, Buffer.concat([serverBytes, Buffer.from('\n// corrupt\n')]));
+    expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' })).toThrow();
+    writeFileSync(serverFile, serverBytes);
+    const externalServer = join(temp('perkins-external-server-'), 'review-mcp-server.mjs');
+    writeFileSync(externalServer, serverBytes);
+    unlinkSync(serverFile);
+    symlinkSync(externalServer, serverFile);
+    expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' })).toThrow();
+    unlinkSync(serverFile);
+    writeFileSync(serverFile, serverBytes);
+
+    const wrongProvenance = structuredClone(policy);
+    wrongProvenance.provenance.sourceSha256 = '0'.repeat(64);
+    const wrongBytes = `${JSON.stringify(wrongProvenance, null, 2)}\n`;
+    writeFileSync(policyFile, wrongBytes, 'utf8');
+    writeFileSync(loaderFile, loader(createHash('sha256').update(wrongBytes).digest('hex')), 'utf8');
+    expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' })).toThrow();
+    writeFileSync(policyFile, source);
+    writeFileSync(loaderFile, loader(hash), 'utf8');
+
+    const outside = join(temp('perkins-external-policy-'), 'policy.json');
+    writeFileSync(outside, source);
+    unlinkSync(policyFile);
+    symlinkSync(outside, policyFile);
+    expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' })).toThrow();
+  });
+
+  it('packs, extracts, verifies, and MCP-smokes the rebuilt source-free product under an empty home', async () => {
+    const productRoot = join(import.meta.dirname, '..');
+    const packRoot = temp('perkins-pack-source-');
+    const tarRoot = temp('perkins-pack-tar-');
+    const extractRoot = temp('perkins-pack-extract-');
+    const emptyHome = temp('perkins-source-free-home-');
+    mkdirSync(join(emptyHome, '.pi', 'agent', 'skills'), { recursive: true });
+    for (const entry of [
+      'package.json', 'package-lock.json', 'tsconfig.json', 'README.md', 'LICENSE', 'install.sh',
+      'src', 'resources', 'roles', 'tools', 'install',
+    ]) cpSync(join(productRoot, entry), join(packRoot, entry), { recursive: true });
+    // web's tsc typechecks its e2e specs, which import the shared real-service
+    // helper from the parent tree — the pack staging needs it for build:web.
+    mkdirSync(join(packRoot, 'test', 'helpers'), { recursive: true });
+    for (const entry of ['real-service.mjs', 'real-service.d.mts']) {
+      cpSync(
+        join(productRoot, 'test', 'helpers', entry),
+        join(packRoot, 'test', 'helpers', entry),
+      );
+    }
+    mkdirSync(join(packRoot, 'web'), { recursive: true });
+    for (const entry of [
+      'package.json', 'tsconfig.json', 'vite.config.ts', 'vitest.config.ts', 'playwright.config.ts',
+      'index.html', 'src', 'mock', 'e2e',
+    ]) {
+      cpSync(join(productRoot, 'web', entry), join(packRoot, 'web', entry), { recursive: true });
+    }
+    symlinkSync(join(productRoot, 'node_modules'), join(packRoot, 'node_modules'), 'dir');
+    mkdirSync(join(packRoot, 'dist'), { recursive: true });
+    mkdirSync(join(packRoot, 'web', 'dist'), { recursive: true });
+    writeFileSync(join(packRoot, 'dist', 'stale-before-prepack.txt'), 'must be cleaned', 'utf8');
+    writeFileSync(join(packRoot, 'web', 'dist', 'stale-before-prepack.txt'), 'must be cleaned', 'utf8');
+
+    const packOutput = execFileSync('npm', ['pack', '--json', '--pack-destination', tarRoot], {
+      cwd: packRoot,
+      encoding: 'utf8',
+      timeout: 120_000,
+      maxBuffer: 32 * 1024 * 1024,
+      env: { ...process.env, HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
+    });
+    const jsonStart = packOutput.lastIndexOf('\n[\n  {');
+    const packed = JSON.parse(packOutput.slice(jsonStart === -1 ? packOutput.indexOf('[') : jsonStart + 1)) as
+      Array<{ filename: string; files: Array<{ path: string }> }>;
+    const packedFiles = packed[0]?.files.map((entry) => entry.path).sort() ?? [];
+    expect(packedFiles).toEqual(expect.arrayContaining([
+      'dist/runtime/review-mcp-bridge.js',
+      'dist/runtime/review-mcp-server.mjs',
+      'resources/perkins-code-review/policy.json',
+      'tools/verify-perkins-resource.mjs',
+      'install.sh',
+      'install/launchd/com.gru-command.service.plist.template',
+      'install/systemd/gru-command.service.template',
+      'roles/perkins.md',
+      'web/dist/index.html',
+    ]));
+    const excludedMarker = ['j', 'ev'].join('');
+    expect(packedFiles.some((file) =>
+      file.startsWith('src/') || file.startsWith('_bmad/') || file.toLowerCase().includes(excludedMarker),
+    )).toBe(false);
+    expect(packedFiles).not.toContain('dist/stale-before-prepack.txt');
+    expect(packedFiles).not.toContain('web/dist/stale-before-prepack.txt');
+
+    execFileSync('tar', ['-xzf', join(tarRoot, packed[0]!.filename), '-C', extractRoot]);
+    const stage = join(extractRoot, 'package');
+    expect(existsSync(join(stage, 'src'))).toBe(false);
+    expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
+    })).not.toThrow();
+
+    const smokeFile = join(stage, 'source-free-smoke.mjs');
+    writeFileSync(smokeFile, `
+      import { readFileSync, realpathSync } from 'node:fs';
+      import { spawn } from 'node:child_process';
+      import { loadPerkinsPolicy } from './dist/dispatch/perkins-review/policy.js';
+      import { ReviewMcpBridge } from './dist/runtime/review-mcp-bridge.js';
+      const bridge = await ReviewMcpBridge.start([{
+        name: 'perkins_probe', description: 'staged probe', inputSchema: { type: 'object' },
+        execute: async () => ({ text: 'stage-ok' }),
+      }]);
+      const config = JSON.parse(readFileSync(bridge.configFile, 'utf8'));
+      const server = config.mcpServers.gru_perkins;
+      if (realpathSync(server.args[0]) !== realpathSync('./dist/runtime/review-mcp-server.mjs')) {
+        throw new Error('MCP server escaped the staged product');
+      }
+      const child = spawn(server.command, server.args, {
+        env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', ...server.env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let buffered = '';
+      const waiters = new Map();
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        buffered += chunk;
+        for (;;) {
+          const newline = buffered.indexOf('\\n');
+          if (newline === -1) break;
+          const line = buffered.slice(0, newline);
+          buffered = buffered.slice(newline + 1);
+          if (line.trim() === '') continue;
+          const message = JSON.parse(line);
+          if (message.id !== undefined && waiters.has(message.id)) {
+            waiters.get(message.id)(message);
+            waiters.delete(message.id);
+          }
+        }
+      });
+      const call = (id, method, params) => {
+        const response = new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('staged MCP timeout: ' + method)), 5000);
+          waiters.set(id, (message) => { clearTimeout(timer); resolve(message); });
+        });
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\\n');
+        return response;
+      };
+      try {
+        const initialized = await call(1, 'initialize', { protocolVersion: '2099-arbitrary', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
+        const listed = await call(2, 'tools/list', {});
+        const called = await call(3, 'tools/call', { name: 'perkins_probe', arguments: {} });
+        process.stdout.write(JSON.stringify({
+          identity: loadPerkinsPolicy().identity,
+          protocolVersion: initialized.result.protocolVersion,
+          listed: JSON.stringify(listed).includes('perkins_probe'),
+          called: JSON.stringify(called).includes('stage-ok'),
+        }));
+      } finally {
+        child.kill('SIGTERM');
+        await bridge.close();
+      }
+    `, 'utf8');
+    const smoke = JSON.parse(execFileSync(process.execPath, [smokeFile], {
+      cwd: stage,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
+    })) as { identity: string; protocolVersion: string; listed: boolean; called: boolean };
+    expect(smoke).toEqual({
+      identity: 'perkins-code-review', protocolVersion: '2024-11-05', listed: true, called: true,
+    });
+  });
+
+  it('fails loud for missing, malformed, and identity-corrupt policy resources', () => {
+    const root = temp('perkins-policy-failure-');
+    expect(() => loadPerkinsPolicy(join(root, 'missing.json'))).toThrow(/unreadable/);
+    // The integrity pin applies to EVERY resolved path, so alternate-path
+    // fixtures fail closed on the digest before any content parsing.
+    const malformed = join(root, 'malformed.json');
+    writeFileSync(malformed, '{', 'utf8');
+    expect(() => loadPerkinsPolicy(malformed)).toThrow(/integrity mismatch/);
+    const corrupt = join(root, 'corrupt.json');
+    writeFileSync(corrupt, '{"identity":"wrong"}', 'utf8');
+    expect(() => loadPerkinsPolicy(corrupt)).toThrow(/integrity mismatch/);
+  });
+
+  it('rejects non-string enum fields and assistant JSON from a failed model turn', () => {
+    expect(() => parseFindings(JSON.stringify([{ ...finding('security'), severity: true }]), 'security')).toThrow(/severity/);
+    expect(() => parseFixAuditResults(JSON.stringify([{ prior_index: 0, status: true, evidence: 'x', reason: 'x' }]), 1)).toThrow(/status/);
+    expect(() => parseVerificationResults(JSON.stringify([{ candidate: 0, disposition: 1, evidence: 'x', reason: 'x' }]), 1)).toThrow(/disposition/);
+    const file = join(temp('perkins-failed-session-'), 'session.jsonl');
+    writeFileSync(file, `${JSON.stringify({
+      type: 'message',
+      message: { role: 'assistant', content: [{ type: 'text', text: '[]' }], stopReason: 'error' },
+    })}\n`, 'utf8');
+    expect(() => finalAssistantText(file)).toThrow(/did not complete successfully/);
+    const claudeFile = join(dirname(file), 'claude-session.jsonl');
+    writeFileSync(claudeFile, [
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: '[]' }] } }),
+      JSON.stringify({ type: 'result', subtype: 'error_max_turns', is_error: true, result: 'turn limit reached' }),
+      '',
+    ].join('\n'), 'utf8');
+    expect(() => finalAssistantText(claudeFile)).toThrow(/Claude result: turn limit reached/);
+    const unterminated = join(dirname(file), 'unterminated-session.jsonl');
+    writeFileSync(unterminated, `${JSON.stringify({ role: 'assistant', text: '[]' })}\n`, 'utf8');
+    expect(() => finalAssistantText(unterminated)).toThrow(/no successful terminal completion frame/);
+  });
+
+  it('rejects symlinked convention files instead of reading outside the frozen tree', () => {
+    const fixture = makeReviewRepo();
+    repos.push(fixture.repo);
+    const outside = join(temp('perkins-convention-secret-'), 'secret');
+    writeFileSync(outside, 'SECRET_TOKEN=must-not-leak', 'utf8');
+    symlinkSync(outside, join(fixture.repo.path, 'AGENTS.md'));
+    expect(() => freezeReviewInputs({
+      roundId: 'symlink-conventions',
+      repoPath: fixture.repo.path,
+      baseRef: fixture.base,
+      targetRef: fixture.target,
+      artifactRoot: temp('perkins-symlink-artifacts-'),
+      spec: 'review spec',
+    })).toThrow(/not pristine|must be a regular file/);
+  });
+
+  it('rejects traversal round ids before resolving an artifact directory', () => {
+    const root = temp('perkins-artifact-containment-');
+    for (const id of ['../outside', 'nested/round', '..', '.']) {
+      expect(() => reviewArtifactDirectory(root, id)).toThrow(/safe artifact path component/);
+    }
+    expect(reviewArtifactDirectory(root, 'job-safe-r1')).toBe(join(root, 'job-safe-r1'));
+    const linkParent = temp('perkins-artifact-link-parent-');
+    const linkedRoot = join(linkParent, 'linked-root');
+    symlinkSync(root, linkedRoot);
+    expect(() => reviewArtifactDirectory(linkedRoot, 'job-safe-r2')).toThrow(/artifact root must be a real directory/);
+  });
+
+  it('coalesces small cross-directory diffs into one chunk and never truncates an oversized file', () => {
+    const huge = `diff --git a/src/huge.ts b/src/huge.ts\n${Array.from({ length: 3_010 }, (_, i) => `+line ${i}`).join('\n')}\n`;
+    const chunks = chunkUnifiedDiff(huge, 3_000);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]?.oversizeSingleFile).toBe(true);
+    expect(chunks[0]?.diff).toContain('+line 3009');
+    const quoted = chunkUnifiedDiff('diff --git "a/src/file name.ts" "b/src/file name.ts"\n--- "a/src/file name.ts"\n+++ "b/src/file name.ts"\n@@ -0,0 +1 @@\n+ok\n');
+    expect(quoted[0]?.files).toEqual(['src/file name.ts']);
+    const smallAcrossDirectories = chunkUnifiedDiff([
+      'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -0,0 +1 @@\n+export {};\n',
+      'diff --git a/test/a.test.ts b/test/a.test.ts\n--- a/test/a.test.ts\n+++ b/test/a.test.ts\n@@ -0,0 +1 @@\n+test.todo();\n',
+      'diff --git a/docs/a.md b/docs/a.md\n--- a/docs/a.md\n+++ b/docs/a.md\n@@ -0,0 +1 @@\n+note\n',
+    ].join(''));
+    expect(smallAcrossDirectories).toHaveLength(1);
+    expect(smallAcrossDirectories[0]?.files).toEqual(['src/a.ts', 'test/a.test.ts', 'docs/a.md']);
+  });
+
+  it('fails closed on UTF-8 byte bounds for frozen diff, spec, and transport-safe chunks', () => {
+    const base = { diff: '', specContext: 'ok', projectConventions: 'ok', chunks: [] as const };
+    expect(() => assertFrozenPromptBounds({
+      ...base, diff: 'x'.repeat(FROZEN_DIFF_MAX_BYTES + 1),
+    })).toThrow(/frozen diff exceeds/);
+    expect(() => assertFrozenPromptBounds({
+      ...base, specContext: '界'.repeat(Math.floor(FROZEN_SPEC_MAX_BYTES / 3) + 1),
+    })).toThrow(/frozen spec context exceeds/);
+    // An oversize single-hunk chunk is allowed past the per-chunk prompt
+    // target but must still fit the tool transport bound.
+    expect(() => assertFrozenPromptBounds({
+      ...base,
+      chunks: [{ id: '001', files: ['src/huge.ts'], lineCount: 1, oversizeSingleFile: true, diff: 'x'.repeat(FROZEN_CHUNK_MAX_BYTES + 1) }],
+    })).not.toThrow();
+    expect(() => assertFrozenPromptBounds({
+      ...base,
+      chunks: [{ id: '001', files: ['src/huge.ts'], lineCount: 1, oversizeSingleFile: false, diff: 'x'.repeat(FROZEN_CHUNK_MAX_BYTES + 1) }],
+    })).toThrow(/frozen chunk 001 exceeds/);
+    expect(() => assertFrozenPromptBounds({
+      ...base,
+      chunks: [{ id: '001', files: ['src/huge.ts'], lineCount: 1, oversizeSingleFile: true, diff: 'x'.repeat(900 * 1024 + 1) }],
+    })).toThrow(/frozen chunk 001 exceeds/);
+  });
+
+  it('pins canonical schema/accuracy paragraphs and explicit host replacements against drift', () => {
+    const policy = loadPerkinsPolicy();
+    expect(policy.portableContract.sharedPrompt).toContain('Return ONE valid JSON array');
+    expect(policy.portableContract.sharedPrompt).toContain('independently re-verified');
+    expect(policy.portableContract.blindPrompt).toContain('no repository, spec, project/global context, skill, or sibling-worktree access');
+    expect(policy.portableContract.lenses.edge).toContain('pure path tracer');
+    expect(policy.portableContract.lenses.acceptance).toContain('scope drift');
+    expect(policy.portableContract.lenses.security).toContain('SSRF');
+    expect(policy.portableContract.lenses.architecture).toContain('module boundaries');
+    expect(policy.portableContract.lenses.codebase).toContain('orphaned exports');
+    expect(policy.portableContract.lenses.tests).toContain('P0 100%');
+    expect(policy.portableContract.leadWorkflow).toContain('deduplicate by normalized title and location');
+    // The verification and re-review prompts are pinned provenance: they
+    // document the evidence/audit discipline the host enforces in code.
+    expect(policy.portableContract.verificationPrompt).toContain('independent verification phase');
+    expect(policy.portableContract.verificationPrompt).toContain('N/A');
+    expect(policy.portableContract.reReviewPrompt).toContain('Fix-audit every prior consolidated finding');
+    expect(policy.portableContract.reReviewPrompt).toContain('PATH ABSENT: <cited-path>');
+    expect(policy.portableContract.rules.chunkLineThreshold).toBe(3_000);
+    expect(policy.portableContract.rules.incompleteNeverApproves).toBe(true);
+    expect(policy.hostReplacements).toEqual(expect.arrayContaining([
+      expect.stringContaining('native AgentSpawner'),
+      expect.stringContaining('Herdr'),
+      expect.stringContaining('INCOMPLETE'),
+      expect.stringContaining('superseded'),
+    ]));
+  });
+
+  it('threads the policy-pinned chunk threshold through freezeReviewInputs', () => {
+    const policy = loadPerkinsPolicy();
+    // Freeze-time chunking must use the pinned threshold, not an independent
+    // code default: a smaller policy value splits the same diff into more chunks.
+    const repo = makeFixtureRepo('perkins-threshold-threading');
+    const lines = Array.from({ length: 120 }, (_, i) => `export const line${i} = ${i};`).join('\n');
+    const base = repo.head();
+    repo.commitFile('src/a.ts', `${lines}\n`);
+    repo.commitFile('src/b.ts', `${lines}\n`);
+    const dir = temp('perkins-threshold-artifacts-');
+    const frozen = freezeReviewInputs({
+      roundId: 'threshold-3000', repoPath: repo.path, artifactRoot: dir,
+      baseRef: base, targetRef: repo.head(), spec: 'threshold check', chunkLineThreshold: policy.portableContract.rules.chunkLineThreshold,
+    });
+    const pinned = freezeReviewInputs({
+      roundId: 'threshold-1', repoPath: repo.path, artifactRoot: dir,
+      baseRef: base, targetRef: repo.head(), spec: 'threshold check', chunkLineThreshold: 1,
+    });
+    expect(frozen.chunks.length).toBe(1);
+    expect(pinned.chunks.length).toBe(2);
+  });
+
+  it('strictly rejects malformed, overlong, cross-lens, and missing tests-gate output', () => {
+    expect(() => parseFindings('```json\n[]\n```', 'blind')).toThrow(/bare JSON array/);
+    expect(() => parseFindings(JSON.stringify([finding('security')]), 'blind')).toThrow(/source must be blind/);
+    expect(() => parseFindings(JSON.stringify([{ ...finding('blind'), extra: true }]), 'blind')).toThrow(/keys/);
+    expect(() => parseFindings(JSON.stringify([{ ...finding('blind'), detail: 'word '.repeat(41) }]), 'blind'))
+      .toThrow(/exceeds 40 words/);
+    expect(() => parseFindings(JSON.stringify([{ ...finding('blind'), evidence: '界'.repeat(1_334) }]), 'blind'))
+      .toThrow(/exceeds 4000 UTF-8 bytes/);
+    expect(() => parseFindings('[]', 'tests')).toThrow(/exactly one coverage-gate/);
+    expect(() => parseFindings(JSON.stringify([{
+      ...finding('tests', 'warning'), category: 'coverage-gate', title: 'Coverage gate: PASS',
+    }]), 'tests')).toThrow(/matching note\|warning\|blocker severity/);
+  });
+
+  it('deduplicates by normalized title/location and applies exact blocker thresholds', () => {
+    const verified = (source: ReviewFinding['source'], title: string): VerifiedFinding => ({
+      ...finding(source, 'blocker', { title }),
+      chunks: ['001'],
+      sources: [source],
+      roundOrigin: 1,
+      verification: { disposition: 'confirmed', evidence: 'exact', reason: 'read' },
+    });
+    const deduped = dedupeVerifiedFindings([verified('blind', 'Same Defect'), verified('edge', ' same   defect ')]);
+    expect(deduped).toHaveLength(1);
+    expect(deduped[0]?.sources).toEqual(['blind', 'edge']);
+    const complete = { complete: true, requiredLensRuns: 7, validLensRuns: 7, failedRuns: [], verificationComplete: true };
+    expect(verdictForFindings([], complete)).toBe('READY TO MERGE');
+    expect(verdictForFindings([{ ...verified('blind', 'warning only'), severity: 'warning' }], complete)).toBe('READY TO MERGE');
+    expect(verdictForFindings([verified('blind', 'one')], complete)).toBe('NEEDS CHANGES');
+    expect(verdictForFindings(Array.from({ length: 3 }, (_, i) => verified('blind', `b${i}`)), complete)).toBe('NEEDS CHANGES');
+    expect(verdictForFindings(Array.from({ length: 4 }, (_, i) => verified('blind', `b${i}`)), complete)).toBe('MAJOR REWORK NEEDED');
+    expect(verdictForFindings([], { ...complete, complete: false })).toBe('INCOMPLETE');
+  });
+});
+
+describe('Perkins hybrid lead engine', () => {
+  it('one lead schedules all seven isolated lens children through native tools and produces a durable READY report', async () => {
+    const h = hybridHarness({ childAnswer: () => '[]' }, {
+      spec: 'SPEC-CONTEXT-CANARY: return 43.',
+      beforeFreeze: (repo) => {
+        repo.git(['checkout', 'main']);
+        writeFileSync(join(repo.path, 'AGENTS.md'), 'PROJECT-CONTEXT-CANARY', 'utf8');
+        writeFileSync(join(repo.path, 'repository-only-canary.txt'), 'REPOSITORY-READ-CANARY', 'utf8');
+        repo.git(['add', 'AGENTS.md']);
+        repo.git(['add', 'repository-only-canary.txt']);
+        repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'test: add tracked review context']);
+        repo.git(['checkout', 'feature/review']);
+        repo.git(['rebase', 'main']);
+      },
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.completeness).toMatchObject({ complete: true, requiredLensRuns: 7, validLensRuns: 7 });
+    expect(h.leadCalls).toHaveLength(1);
+    const lead = h.leadCalls[0]!;
+    expect(lead.options.reviewLead?.nativeTools.map((tool) => tool.name)).toEqual([
+      'perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact', 'perkins_submit_review',
+    ]);
+    expect(lead.options.reviewLead?.systemPrompt).toContain('perkins_submit_review');
+    expect(lead.options.reviewLead?.tools).toEqual(['read', 'grep', 'find', 'ls']);
+    expect(lead.prompt).toContain('SPEC-CONTEXT-CANARY');
+    expect(lead.prompt).toContain('PROJECT-CONTEXT-CANARY');
+    expect(lead.prompt).toContain('REQUIRED CHILD COVERAGE');
+    expect(h.childCalls).toHaveLength(7);
+    const blind = h.childCalls.find((call) => lensFrom(call.prompt ?? '') === 'blind')!;
+    expect(blind.options.isolatedReview?.tools).toEqual([]);
+    expect(blind.options.cwd).toBe(result.artifactDirectory);
+    expect(blind.prompt).not.toContain('PROJECT-CONTEXT-CANARY');
+    expect(blind.prompt).not.toContain('SPEC-CONTEXT-CANARY');
+    expect(blind.prompt).not.toContain('REPOSITORY-READ-CANARY');
+    expect(h.childCalls.find((call) => lensFrom(call.prompt ?? '') === 'acceptance')?.prompt).toContain('SPEC-CONTEXT-CANARY');
+    expect(h.childCalls.find((call) => lensFrom(call.prompt ?? '') === 'codebase')?.prompt).toContain('PROJECT-CONTEXT-CANARY');
+    for (const call of h.childCalls) {
+      expect(call.prompt).toContain('"recommended_fix"');
+      expect(call.prompt).toContain('at most 40 words');
+    }
+    for (const call of h.childCalls.filter((candidate) => candidate !== blind)) {
+      expect(call.options.isolatedReview?.tools).toEqual(['read', 'grep', 'find', 'ls']);
+      expect(call.options.cwd).toBe(h.repo.path);
+    }
+    const promptHashes = Object.fromEntries(h.childCalls.map((call) => [
+      lensFrom(call.prompt ?? ''),
+      createHash('sha256').update(call.prompt ?? '').digest('hex'),
+    ]));
+    // Independently pinned delivered child bytes: shortening a lens
+    // brief/schema, dropping the accuracy mandate, or changing host
+    // interpolation fails even if the bundled-resource hash is refreshed.
+    expect(promptHashes).toEqual({
+      acceptance: '1c5d4e92b1636b792a25bcc52b8c0876109ae859b16d3f89250e7334ba53aed6',
+      architecture: '3df902f91ae88bdae56cc5f55991834fa1d7e54aefcc1eccd66f04d688704eab',
+      blind: 'f77456657e85f99b7d9f1bde1e5309601421943f961c74d9ef3c9fd67385167a',
+      codebase: '4102b98a8ec64484bd44f3f0fd708a350b1384c2b7cb55e121eec41c8f3cfccb',
+      edge: '55d7ef8eea062e7d846a32a2673f5154a00c0c23ae269bc813079c1b003bb8e3',
+      security: '7fbf3d7ed29ea2e3211264d397c5e3fa2c0da7828ba86c8eb0b278dc011347b8',
+      tests: 'ddada35af0bffc5bae20ade67a2a20ba7d0029691332fc19767d1400a0a99a35',
+    });
+    expect(readFileSync(result.reportFile, 'utf8')).toContain('READY TO MERGE');
+    expect(readFileSync(join(result.artifactDirectory, 'manifest.json'), 'utf8')).toContain(h.target);
+    const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+      architecture: string; childResults: Array<{ agentId: string }>; frozen: { targetSha: string };
+    };
+    expect(consolidated.architecture).toBe('perkins-hybrid');
+    expect(consolidated.childResults).toHaveLength(7);
+    expect(consolidated.childResults.every((entry) => typeof entry.agentId === 'string')).toBe(true);
+    const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead', 'receipt.json'), 'utf8')) as {
+      nativeTools: string[]; leadAgentId: string;
+    };
+    expect(receipt.nativeTools).toEqual(['perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact', 'perkins_submit_review']);
+    expect(receipt.leadAgentId).toBe('lead-0');
+  });
+
+  it('preserves replacement metacharacters byte-for-byte in delivered frozen diff prompts', async () => {
+    const fixture = makeFixtureRepo('perkins-replacement-metacharacters');
+    repos.push(fixture);
+    const base = fixture.head();
+    fixture.git(['checkout', '-b', 'feature/replacement']);
+    const line = "export const replacement = '$&-$`-$\\'';";
+    const placeholderLine = "export const opaque = '{{SPEC_CONTEXT}}::{{LENS}}';";
+    const target = fixture.commitFile('src/replacement.ts', `${line}\n${placeholderLine}\n`);
+    const root = temp('perkins-replacement-artifacts-');
+    const frozen = freezeReviewInputs({
+      roundId: 'hybrid-replacement', repoPath: fixture.path, artifactRoot: root,
+      baseRef: base, targetRef: target, movementRef: 'feature/replacement', spec: 'review exact diff bytes',
+    });
+    const fake = fakeHybridSpawner(temp('perkins-replacement-sessions-'), { childAnswer: () => '[]' });
+    const engine = new PerkinsHybridReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+    await engine.run({ roundId: 'hybrid-replacement', roundNumber: 1, frozenReview: frozen, movementRef: 'feature/replacement', noSpec: false });
+    for (const call of fake.childCalls) {
+      expect(call.prompt).toContain(line);
+      expect(call.prompt).toContain(placeholderLine);
+      expect(call.prompt).not.toContain('{{DIFF}}');
+    }
+  });
+
+  it('uses exactly six lenses only in explicit no-spec mode', async () => {
+    const h = hybridHarness({ childAnswer: () => '[]' }, { noSpec: true });
+    const result = await h.run({ noSpec: true });
+    expect(result.completeness.requiredLensRuns).toBe(6);
+    expect(h.childCalls.some((call) => lensFrom(call.prompt ?? '') === 'acceptance')).toBe(false);
+  });
+
+  it('retries one malformed child once through the lead, then accepts its valid empty array', async () => {
+    let blindCalls = 0;
+    const h = hybridHarness({ childAnswer: (prompt) => {
+      if (lensFrom(prompt) === 'blind' && blindCalls++ === 0) return 'not json';
+      return '[]';
+    } });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(blindCalls).toBe(2);
+    expect(h.childCalls).toHaveLength(8);
+    expect(h.toolErrors).toHaveLength(0);
+  });
+
+  it('fails closed when a child never validates: missing coverage rejects the terminal submission', async () => {
+    const h = hybridHarness({ childAnswer: (prompt) => lensFrom(prompt) === 'security' ? 'malformed' : '[]' });
+    await expect(h.run()).rejects.toThrow(/coverage is missing/);
+    expect(h.toolErrors.some((entry) => /coverage is missing/.test(entry.error))).toBe(true);
+    expect(h.frozen.directory).toBeDefined();
+    const envelopeDir = join(h.frozen.directory, 'lenses', '001');
+    const envelopeName = readdirSync(envelopeDir).find((entry) => /^security\.attempt-2-[0-9a-f]+\.envelope\.json$/u.test(entry));
+    expect(envelopeName).toBeDefined();
+    const envelope = JSON.parse(readFileSync(join(envelopeDir, envelopeName!), 'utf8')) as {
+      attempt: number; status: string;
+    };
+    expect(envelope).toMatchObject({ attempt: 2, status: 'invalid' });
+    expect(readFileSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.error.json'), 'utf8')).toContain('coverage is missing');
+    expect(() => readFileSync(join(h.frozen.directory, 'perkins-report.md'))).toThrow();
+  });
+
+  it('runs a complete child wave for every deterministic diff chunk', async () => {
+    const fixture = makeFixtureRepo('perkins-chunk-wave');
+    repos.push(fixture);
+    const base = fixture.head();
+    fixture.git(['checkout', '-b', 'feature/chunks']);
+    const a = Array.from({ length: 1_600 }, (_, index) => `export const a${index} = ${index};`).join('\n');
+    fixture.commitFile('alpha/a.ts', `${a}\n`);
+    const b = Array.from({ length: 1_600 }, (_, index) => `export const b${index} = ${index};`).join('\n');
+    const target = fixture.commitFile('beta/b.ts', `${b}\n`);
+    const root = temp('perkins-chunk-artifacts-');
+    const frozen = freezeReviewInputs({
+      roundId: 'hybrid-chunks', repoPath: fixture.path, artifactRoot: root,
+      baseRef: base, targetRef: target, movementRef: 'feature/chunks', spec: 'review every changed file',
+    });
+    const fake = fakeHybridSpawner(temp('perkins-chunk-sessions-'), { childAnswer: () => '[]' });
+    const engine = new PerkinsHybridReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+    const result = await engine.run({ roundId: 'hybrid-chunks', roundNumber: 1, frozenReview: frozen, movementRef: 'feature/chunks', noSpec: false });
+    expect(result.completeness).toMatchObject({ requiredLensRuns: 14, validLensRuns: 14 });
+    expect(fake.childCalls).toHaveLength(14);
+    expect(readFileSync(join(result.artifactDirectory, 'chunks', '001.patch'), 'utf8')).toContain('alpha/a.ts');
+    expect(readFileSync(join(result.artifactDirectory, 'chunks', '002.patch'), 'utf8')).toContain('beta/b.ts');
+  });
+
+  it('holds the round-wide child concurrency at four and cleans unique tracked sessions', async () => {
+    let active = 0;
+    let maximum = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reachedFour!: () => void;
+    const fourActive = new Promise<void>((resolve) => { reachedFour = resolve; });
+    const h = hybridHarness({
+      childAnswer: async () => {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        if (active === 4) reachedFour();
+        await gate;
+        active -= 1;
+        return '[]';
+      },
+    });
+    const running = h.run();
+    await fourActive;
+    expect(maximum).toBe(4);
+    expect(h.childCalls).toHaveLength(4);
+    release();
+    await expect(running).resolves.toMatchObject({ canonicalVerdict: 'READY TO MERGE' });
+    expect(maximum).toBe(4);
+    expect(new Set(h.childCalls.map((call) => call.agentId)).size).toBe(7);
+    expect(new Set(h.childCalls.map((call) => call.sessionFile)).size).toBe(7);
+    expect(h.childCalls.every((call) => call.disposed === true)).toBe(true);
+  });
+
+  it('lead-verified candidates enforce 4+ blocker major rework and force N/A demotion', async () => {
+    const blockers = new Set(['blind', 'edge', 'acceptance', 'security']);
+    const h = hybridHarness({
+      childAnswer: (prompt) => {
+        const lens = lensFrom(prompt);
+        if (blockers.has(lens)) return JSON.stringify([finding(lens)]);
+        if (lens === 'tests') return JSON.stringify([finding('tests', 'blocker', { title: 'unanchored', location: 'N/A', evidence: 'N/A' })]);
+        return '[]';
+      },
+      decide: (candidate) => ({
+        disposition: 'confirmed',
+        evidence: candidate.evidence === 'N/A' ? 'N/A' : 'export function answer(): number {',
+        reason: 'lead re-read the frozen tree',
+      }),
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('MAJOR REWORK NEEDED');
+    expect(result.findings.filter((entry) => entry.severity === 'blocker')).toHaveLength(4);
+    expect(result.findings.find((entry) => entry.title === 'unanchored')).toMatchObject({
+      severity: 'warning', verification: { disposition: 'unverifiable-speculative' },
+    });
+    expect(result.verificationSummary).toMatchObject({ candidates: 5, confirmed: 4, speculative: 1, deduplicated: 5 });
+  });
+
+  it('decides 201 candidates in one terminal submission without truncating coverage', async () => {
+    const many = (source: 'blind' | 'security', count: number, offset: number) =>
+      Array.from({ length: count }, (_, index) => finding(source, 'warning', { title: `grounded candidate ${offset + index}` }));
+    const h = hybridHarness({
+      childAnswer: (prompt) => {
+        const lens = lensFrom(prompt);
+        if (lens === 'blind') return JSON.stringify(many('blind', 100, 0));
+        if (lens === 'security') return JSON.stringify(many('security', 101, 100));
+        return '[]';
+      },
+    });
+    const result = await h.run();
+    expect(result.verificationSummary).toMatchObject({ candidates: 201, confirmed: 201 });
+    expect(result.completeness.verificationComplete).toBe(true);
+    expect(result.findings).toHaveLength(201);
+  });
+
+  it('accepts independently located cross-file lead evidence from the frozen tracked tree', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      decide: () => ({
+        disposition: 'confirmed',
+        evidence: 'Fixture repository for dispatch-flow tests.',
+        reason: 'cross-file dependency verified in README.md',
+      }),
+    });
+    const result = await h.run();
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.verification).toMatchObject({
+      disposition: 'confirmed',
+      evidence: 'Fixture repository for dispatch-flow tests.',
+    });
+  });
+
+  it('rejects fabricated lead verification evidence fail-closed', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      decide: () => ({ disposition: 'confirmed', evidence: 'FABRICATED-QUOTE-NOT-IN-TREE', reason: 'untrusted lead claimed it read this' }),
+    });
+    await expect(h.run()).rejects.toThrow(/not one contiguous locatable substring|not locatable/);
+  });
+
+  it('requires contradictory frozen evidence at the cited path for every rejected candidate', async () => {
+    const fabricated = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      decide: () => ({
+        disposition: 'rejected', evidence: 'FABRICATED-CONTRADICTION', reason: 'lead rejects without reading',
+      }),
+    });
+    await expect(fabricated.run()).rejects.toThrow(/lacks contradictory frozen evidence/);
+
+    const grounded = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      decide: () => ({
+        disposition: 'rejected', evidence: '  return 43;', reason: 'the cited implementation contradicts the candidate claim',
+      }),
+    });
+    const result = await grounded.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.verificationSummary).toMatchObject({ candidates: 1, rejected: 1, confirmed: 0 });
+    expect(result.findings).toEqual([]);
+  });
+
+  it('rejects unresolved speculative decisions for code-anchored candidates', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      decide: () => ({
+        disposition: 'unverifiable-speculative',
+        evidence: 'export function answer(): number {',
+        reason: 'lead declined to decide an anchored candidate',
+      }),
+    });
+    await expect(h.run()).rejects.toThrow(/anchored candidate must be confirmed or rejected/);
+    expect(() => readFileSync(join(h.frozen.directory, 'consolidated.json'))).toThrow();
+  });
+
+  it('rejects candidate evidence quoted through a parent symlink outside the frozen tree', async () => {
+    const outsideDir = temp('perkins-evidence-outside-');
+    writeFileSync(join(outsideDir, 'secret.ts'), 'OUTSIDE-EVIDENCE-CANARY\n', 'utf8');
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security'
+        ? JSON.stringify([finding('security', 'warning', { location: 'linked/secret.ts:1', evidence: 'OUTSIDE-EVIDENCE-CANARY' })])
+        : '[]',
+    });
+    symlinkSync(outsideDir, join(h.repo.path, 'linked'));
+    await expect(h.run()).rejects.toThrow(/not (one contiguous locatable substring|locatable)/);
+  });
+
+  it('audits prior findings: fixed findings are not carried and history is immutable', async () => {
+    const first = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+    });
+    const firstResult = await first.run();
+    expect(firstResult.canonicalVerdict).toBe('NEEDS CHANGES');
+    const historical = readFileSync(join(firstResult.artifactDirectory, 'consolidated.json'), 'utf8');
+
+    const secondTarget = first.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+    const frozen = freezeReviewInputs({
+      roundId: 'hybrid-round-two', repoPath: first.repo.path, artifactRoot: first.root,
+      baseRef: first.base, targetRef: secondTarget, movementRef: 'feature/review', spec: 'return 44',
+    });
+    const fake = fakeHybridSpawner(temp('perkins-rereview-sessions-'), {
+      childAnswer: () => '[]',
+      priorAudit: () => [{ prior_index: 0, status: 'fixed', evidence: '  return 43;', reason: 'the frozen diff deletes the defective return value' }],
+    });
+    const engine = new PerkinsHybridReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+    const result = await engine.run({
+      roundId: 'hybrid-round-two', roundNumber: 2, frozenReview: frozen, movementRef: 'feature/review', noSpec: false,
+      priorConsolidatedFile: join(firstResult.artifactDirectory, 'consolidated.json'),
+    });
+    expect(result.priorAudit).toEqual([expect.objectContaining({ status: 'fixed' })]);
+    expect(result.findings).toEqual([]);
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(readFileSync(join(firstResult.artifactDirectory, 'consolidated.json'), 'utf8')).toBe(historical);
+  });
+
+  it('carries still-present findings with original round markers and dedupes fresh rediscovery', async () => {
+    const first = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+    });
+    const firstResult = await first.run();
+    const fake = fakeHybridSpawner(temp('perkins-carry-sessions-'), {
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      priorAudit: () => [{ prior_index: 0, status: 'still-present', evidence: '  return 43;', reason: 'exact defect remains' }],
+    });
+    const secondFrozen = freezeReviewInputs({
+      roundId: 'hybrid-carry-two', repoPath: first.repo.path, artifactRoot: first.root,
+      baseRef: first.base, targetRef: first.target, movementRef: 'feature/review', spec: 'return 43',
+    });
+    const engine = new PerkinsHybridReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+    const result = await engine.run({
+      roundId: 'hybrid-carry-two', roundNumber: 2, frozenReview: secondFrozen, movementRef: 'feature/review', noSpec: false,
+      priorConsolidatedFile: join(firstResult.artifactDirectory, 'consolidated.json'),
+    });
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({
+      roundOrigin: 1,
+      sources: ['security'],
+      evidence: '  return 43;',
+      verification: { evidence: '  return 43;', reason: 'exact defect remains' },
+    });
+    expect(result.verificationSummary.deduplicated).toBe(1);
+    expect(result.canonicalVerdict).toBe('NEEDS CHANGES');
+  });
+
+  it('rejects a prior durable finding missing report-required chunks before any model session', async () => {
+    const h = hybridHarness({ childAnswer: () => '[]' });
+    const prior = join(h.root, 'malformed-prior.json');
+    writeFileSync(prior, JSON.stringify({ schemaVersion: 2, frozen: { targetSha: h.target }, findings: [{
+      ...finding('security'),
+      sources: ['security'],
+      roundOrigin: 1,
+      verification: { disposition: 'confirmed', evidence: 'return 43;', reason: 'verified' },
+    }] }), 'utf8');
+    await expect(h.run({ priorConsolidatedFile: prior })).rejects.toThrow(/failed the durable schema/);
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('guard discriminators: foreign refs, dropped candidates, verdict mismatch, and missing report titles all fail closed', async () => {
+    const child = (prompt: string) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]';
+    const foreign = hybridHarness({ childAnswer: child, foreignCandidate: true });
+    await expect(foreign.run()).rejects.toThrow(/exactly once|unowned candidate references/);
+
+    const dropped = hybridHarness({ childAnswer: child, dropCandidate: true });
+    await expect(dropped.run()).rejects.toThrow(/exactly once/);
+
+    const mismatch = hybridHarness({ childAnswer: child, verdictOverride: 'READY TO MERGE' });
+    await expect(mismatch.run()).rejects.toThrow(/conflicts with canonical/);
+
+    const missingTitle = hybridHarness({ childAnswer: child, omitTitle: 'security grounded defect' });
+    await expect(missingTitle.run()).rejects.toThrow(/omits required finding proof/);
+  });
+
+  it('rejects array-coerced terminal enum values', async () => {
+    const child = (prompt: string) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]';
+    const badDisposition = hybridHarness({
+      childAnswer: child,
+      decide: () => ({
+        disposition: ['confirmed'] as unknown as 'confirmed',
+        evidence: 'export function answer(): number {',
+        reason: 'array must not pass enum validation',
+      }),
+    });
+    await expect(badDisposition.run()).rejects.toThrow(/disposition is invalid/);
+
+    const badVerdict = hybridHarness({
+      childAnswer: () => '[]',
+      verdictOverride: ['READY TO MERGE'] as unknown as string,
+    });
+    await expect(badVerdict.run()).rejects.toThrow(/canonical_verdict is invalid/);
+  });
+
+  it('accepts a near-limit report by UTF-8 bytes and rejects a smaller-character multibyte overflow', async () => {
+    let nearBytes = 0;
+    const near = hybridHarness({
+      childAnswer: () => '[]',
+      transformReport: (report) => {
+        const prefix = `${report}\n`;
+        const padding = 'x'.repeat(PERKINS_REPORT_MAX_BYTES - Buffer.byteLength(prefix, 'utf8'));
+        const value = `${prefix}${padding}`;
+        nearBytes = Buffer.byteLength(value, 'utf8');
+        return value;
+      },
+    });
+    await expect(near.run()).resolves.toMatchObject({ canonicalVerdict: 'READY TO MERGE' });
+    expect(nearBytes).toBe(PERKINS_REPORT_MAX_BYTES);
+
+    let multibyteCharacters = 0;
+    const overflow = hybridHarness({
+      childAnswer: () => '[]',
+      transformReport: (report) => {
+        const value = `${report}\n${'界'.repeat(Math.floor(PERKINS_REPORT_MAX_BYTES / 3) + 1)}`;
+        multibyteCharacters = value.length;
+        return value;
+      },
+    });
+    expect(multibyteCharacters).toBe(0);
+    await expect(overflow.run()).rejects.toThrow(/report_markdown exceeds .* UTF-8 bytes/);
+    expect(multibyteCharacters).toBeLessThan(PERKINS_REPORT_MAX_BYTES);
+  });
+
+  it('a lead that never submits fails the review without approval', async () => {
+    const h = hybridHarness({ childAnswer: () => '[]', neverSubmit: true });
+    await expect(h.run()).rejects.toThrow(/without an accepted terminal submission/);
+    expect(() => readFileSync(join(h.frozen.directory, 'consolidated.json'))).toThrow();
+  });
+
+  it('exposes bounded read-chunk and store-artifact tools to the lead', async () => {
+    const h = hybridHarness({
+      childAnswer: () => '[]',
+      readChunks: true,
+      storeArtifact: { name: 'note-1.md', content: 'Lead investigation note.' },
+    });
+    const result = await h.run();
+    expect(readFileSync(join(result.artifactDirectory, 'lead', 'notes', 'note-1.md'), 'utf8')).toContain('Lead investigation note.');
+  });
+
+  it('rejects out-of-contract tool usage: non-required lenses, duplicate runs, and duplicate artifacts', async () => {
+    const badLens = hybridHarness({
+      childAnswer: () => '[]',
+      badRuns: [{ lens: 'acceptance', chunk: '001' }],
+    }, { noSpec: true });
+    await expect(badLens.run({ noSpec: true })).rejects.toThrow(/not required/);
+
+    const duplicate = hybridHarness({ childAnswer: () => '[]', duplicateRun: true });
+    await expect(duplicate.run()).rejects.toThrow(/cannot duplicate/);
+
+    const duplicateArtifact = hybridHarness({
+      childAnswer: () => '[]',
+      storeArtifact: { name: 'note-1.md', content: 'first' },
+      duplicateArtifact: true,
+    });
+    await expect(duplicateArtifact.run()).rejects.toThrow(/limit or duplicate/u);
+
+    const h = hybridHarness({
+      childAnswer: () => '[]',
+      storeArtifact: { name: 'note-1.md', content: 'first' },
+    });
+    await h.run();
+  });
+
+  it('rejects terminal submission when the lead never read a frozen chunk', async () => {
+    const h = hybridHarness({ childAnswer: () => '[]', readChunks: false });
+    await expect(h.run()).rejects.toThrow(/lead has not read every frozen chunk/u);
+    expect(() => readFileSync(join(h.frozen.directory, 'consolidated.json'))).toThrow();
+  });
+
+  it('treats a CONCERNS coverage gate as a warning that never blocks', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => {
+        const lens = lensFrom(prompt);
+        if (lens === 'tests') {
+          return JSON.stringify([{ ...finding('tests', 'warning'), category: 'coverage-gate', title: 'Coverage gate: CONCERNS', location: 'N/A', evidence: 'N/A', detail: 'live smoke not executed', recommended_fix: 'run the smoke' }]);
+        }
+        return '[]';
+      },
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.findings.some((f) => f.category === 'coverage-gate')).toBe(false);
+  });
+
+  it('blocks READY when the tests lens reports a FAIL coverage gate', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => {
+        const lens = lensFrom(prompt);
+        if (lens === 'tests') {
+          return JSON.stringify([{ ...finding('tests', 'blocker'), category: 'coverage-gate', title: 'Coverage gate: FAIL', location: 'N/A', evidence: 'N/A', detail: 'changed behavior is untested', recommended_fix: 'add tests' }]);
+        }
+        return '[]';
+      },
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(result.findings.some((f) => f.category === 'coverage-gate' && f.severity === 'blocker')).toBe(true);
+  });
+
+  it('forces INCOMPLETE when the target ref moves and rejects a conclusive proposal', async () => {
+    const rejected = hybridHarness({
+      childAnswer: () => '[]',
+      beforeSubmit: () => {
+        rejected.repo.git(['checkout', '-B', 'feature/review', rejected.repo.head()]);
+        rejected.repo.commitFile('src/moved.ts', 'export const moved = true;\n');
+      },
+    });
+    await expect(rejected.run()).rejects.toThrow(/conflicts with canonical INCOMPLETE/);
+    expect(() => readFileSync(join(rejected.frozen.directory, 'consolidated.json'))).toThrow();
+
+    const accepted = hybridHarness({
+      childAnswer: () => '[]',
+      verdictOverride: 'INCOMPLETE',
+      beforeSubmit: () => {
+        accepted.repo.git(['checkout', '-B', 'feature/review', accepted.repo.head()]);
+        accepted.repo.commitFile('src/moved.ts', 'export const moved = true;\n');
+      },
+    });
+    const result = await accepted.run();
+    expect(result.headMoved).toBe(true);
+    expect(result.targetSha).toBe(accepted.target);
+    expect(result.completeness.complete).toBe(false);
+    expect(result.canonicalVerdict).toBe('INCOMPLETE');
+    expect(readFileSync(result.reportFile, 'utf8')).toContain('**Verdict: INCOMPLETE**');
+  });
+
+  it('freezes exact SHAs, hashes and full diff artifacts before model work without overwriting a round', () => {
+    const h = makeReviewRepo();
+    repos.push(h.repo);
+    const root = temp('perkins-freeze-');
+    const input = {
+      roundId: 'freeze', repoPath: h.repo.path, artifactRoot: root,
+      baseRef: h.base, targetRef: h.target, movementRef: 'feature/review', spec: 'spec',
+    } as const;
+    const frozen = freezeReviewInputs(input);
+    expect(frozen.manifest).toMatchObject({ targetSha: h.target, diffBaseSha: h.base, specMode: 'supplied' });
+    expect(frozen.diff).toContain('return 43');
+    const originalManifest = readFileSync(join(frozen.directory, 'manifest.json'), 'utf8');
+    expect(readFileSync(join(frozen.directory, 'diff.patch'), 'utf8')).toBe(frozen.diff);
+    expect(() => freezeReviewInputs(input)).toThrow(/EEXIST/);
+    expect(readFileSync(join(frozen.directory, 'manifest.json'), 'utf8')).toBe(originalManifest);
+  });
+});
+
+describe('review base resolution and remote base drift', () => {
+  it('resolves explicit base, origin/HEAD, main fallback, and fails closed with no base', () => {
+    const repo = makeFixtureRepo('perkins-base-resolution'); // starts on main
+    repos.push(repo);
+    repo.commitFile('src/base.ts', 'export const base = 1;\n');
+    expect(resolveReviewBaseRef(repo.path, 'main')).toBe('main');
+    expect(resolveReviewBaseRef(repo.path, '')).toBe('main');
+    expect(resolveReviewBaseRef(repo.path, null)).toBe('main');
+    // A bare repo with no resolvable base fails closed, named.
+    const bare = makeFixtureRepo('perkins-base-resolution-none');
+    repos.push(bare);
+    execFileSync('git', ['-C', bare.path, 'checkout', '--orphan', 'empty'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', bare.path, 'branch', '-D', 'main'], { stdio: 'ignore' });
+    expect(() => resolveReviewBaseRef(bare.path, null)).toThrow(/requires job.baseBranch or a resolvable/u);
+  });
+
+  it('freezes with a local slash-bearing baseRef and sees no drift', () => {
+    const repo = makeFixtureRepo('perkins-base-local-slash');
+    const base = repo.commitFile('src/one.ts', 'export const one = 1;\n');
+    repo.commitFile('src/two.ts', 'export const two = 2;\n');
+    const frozen = freezeReviewInputs({
+      roundId: 'local-slash', repoPath: repo.path, artifactRoot: temp('perkins-local-slash-'),
+      baseRef: base, targetRef: repo.head(), spec: 's',
+    });
+    // A 40-hex base cannot drift remotely; the local check alone applies.
+    expect(frozen.manifest.baseRef).toBe(base);
+    expect(baseMovedSinceFreeze(frozen)).toBe(false);
+  });
+
+  it('detects remote base drift, tolerates missing remotes, and fails closed on ls-remote errors', () => {
+    const repo = makeFixtureRepo('perkins-base-drift');
+    repos.push(repo);
+    repo.commitFile('src/base.ts', 'export const base = 1;\n');
+    const remoteBare = temp('perkins-drift-remote-');
+    execFileSync('git', ['init', '--bare', remoteBare], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repo.path, 'remote', 'add', 'origin', remoteBare]);
+    execFileSync('git', ['-C', repo.path, 'push', 'origin', 'main'], { stdio: 'ignore' });
+    // A local commit AHEAD of the remote base gives the frozen diff content.
+    repo.commitFile('src/reviewed.ts', 'export const reviewed = 1;\n');
+    const frozen = freezeReviewInputs({
+      roundId: 'drift-check', repoPath: repo.path, artifactRoot: temp('perkins-drift-artifacts-'),
+      baseRef: 'origin/main', targetRef: repo.head(), spec: 'drift check',
+    });
+    expect(baseMovedSinceFreeze(frozen)).toBe(false);
+    // Remote-only movement: the local branch still matches, the remote moved.
+    const advance = temp('perkins-drift-clone-');
+    execFileSync('git', ['clone', '--quiet', remoteBare, advance], { stdio: 'ignore' });
+    writeFileSync(join(advance, 'drift.ts'), 'export const drift = true;\n', 'utf8');
+    execFileSync('git', ['-C', advance, 'add', 'drift.ts'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', advance, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'drift'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', advance, 'push', 'origin', 'main'], { stdio: 'ignore' });
+    expect(baseMovedSinceFreeze(frozen)).toBe(true);
+    rmSync(advance, { recursive: true, force: true });
+
+    // A slash-bearing LOCAL branch (feature/x) is not a remote: local check
+    // passes and the absent remote is not misparsed as a drift source.
+    const localBranch = freezeReviewInputs({
+      roundId: 'drift-local', repoPath: repo.path, artifactRoot: temp('perkins-drift-artifacts-'),
+      baseRef: 'origin/main', targetRef: repo.head(), spec: 'drift check',
+    });
+    expect(localBranch.manifest.baseRef).toBe('origin/main');
+    // Frozen after the remote moved: the same remote/branch drift applies.
+    expect(baseMovedSinceFreeze(localBranch)).toBe(true);
+    // ls-remote against a vanished remote fails closed as drift.
+    rmSync(remoteBare, { recursive: true, force: true });
+    expect(baseMovedSinceFreeze(localBranch)).toBe(true);
+  });
+});
+
+describe('review chunking and artifact guards (third-review fixes)', () => {
+  it('splits an oversized multi-hunk file at hunk boundaries within both bounds', () => {
+    const hunk = Array.from({ length: 2500 }, (_, i) => `+export const thing${i} = ${i};`).join('\n'); // ~72 KiB per hunk
+    const fileBlock = (name: string): string => `diff --git a/${name} b/${name}
+index 1111111..2222222 100644
+--- a/${name}
++++ b/${name}
+@@ -1,3 +1,703 @@
+ context
+${hunk}
+@@ -200,3 +900,703 @@
+ more context
+${hunk}
+@@ -400,3 +1500,703 @@
+ more context
+${hunk}
+@@ -600,3 +2100,703 @@
+ more context
+${hunk}
+`;
+    const diff = `${fileBlock('src/big.ts')}${fileBlock('src/other.ts')}`;
+    const chunks = chunkUnifiedDiff(diff, 3000);
+    expect(chunks.length).toBeGreaterThanOrEqual(3);
+    for (const chunk of chunks) {
+      expect(Buffer.byteLength(chunk.diff, 'utf8')).toBeLessThanOrEqual(FROZEN_CHUNK_MAX_BYTES);
+      expect(chunk.oversizeSingleFile).toBe(false);
+      expect(chunk.diff).toMatch(/^@@/m);
+    }
+    expect(chunks.flatMap((chunk) => chunk.files)).toContain('src/big.ts');
+    expect(chunks.flatMap((chunk) => chunk.files)).toContain('src/other.ts');
+  });
+
+  it('splits a file whose path contains @@ at the true hunk boundary', () => {
+    const body = 'diff --git a/src/we@@ird.ts b/src/we@@ird.ts\nindex 1111111..2222222 100644\n--- a/src/we@@ird.ts\n+++ b/src/we@@ird.ts\n@@ -1,2 +1,3 @@\n context\n+added line\n';
+    const chunks = chunkUnifiedDiff(body, 1);
+    const weird = chunks.filter((chunk) => chunk.files[0] === 'src/we@@ird.ts');
+    expect(weird.length).toBeGreaterThanOrEqual(1);
+    for (const chunk of weird) {
+      expect(chunk.diff.startsWith('diff --git a/src/we@@ird.ts b/src/we@@ird.ts')).toBe(true);
+      expect(chunk.diff).toContain('@@ -1,2 +1,3 @@');
+    }
+  });
+
+  it('rejects writeReviewArtifact traversal, absolute, and backslash paths', () => {
+    const repo = makeFixtureRepo('perkins-artifact-traversal');
+    const base = repo.commitFile('src/one.ts', 'export const one = 1;\n');
+    repo.commitFile('src/two.ts', 'export const two = 2;\n');
+    const dir = temp('perkins-artifact-traversal-');
+    const frozen = freezeReviewInputs({
+      roundId: 'traversal', repoPath: repo.path, artifactRoot: dir, baseRef: base, targetRef: repo.head(), spec: 's',
+    });
+    for (const bad of ['../escape', '/abs', 'a\\b', 'a/../b', '']) {
+      expect(() => writeReviewArtifact(frozen, bad, 'x')).toThrow(/escapes round directory/u);
+    }
+  });
+
+  it('rejects freezeReviewInputs ingress conflicts (spec+noSpec, neither)', () => {
+    const repo = makeFixtureRepo('perkins-freeze-ingress');
+    expect(() => freezeReviewInputs({
+      roundId: 'ingress', repoPath: repo.path, artifactRoot: temp('perkins-ingress-'),
+      baseRef: repo.head(), targetRef: repo.head(), spec: 's', noSpec: true,
+    })).toThrow(/cannot supply both spec and explicit no-spec/u);
+    expect(() => freezeReviewInputs({
+      roundId: 'ingress2', repoPath: repo.path, artifactRoot: temp('perkins-ingress-'),
+      baseRef: repo.head(), targetRef: repo.head(),
+    })).toThrow(/requires frozen spec\/context or explicit noSpec/u);
+  });
+
+  it('rejects cross-lens coverage-gate findings', () => {
+    expect(() => parseFindings(JSON.stringify([finding('blind', 'warning', { category: 'coverage-gate', title: 'Coverage gate: PASS' })]), 'blind'))
+      .toThrow(/owned only by the tests lens/u);
+  });
+
+  it('rejects a committed symlink in the frozen target tree', () => {
+    const repo = makeFixtureRepo('perkins-frozen-symlink');
+    const base = repo.commitFile('src/one.ts', 'export const one = 1;\n');
+    repo.git(['checkout', '-b', 'feature/symlink']);
+    symlinkSync('target', join(repo.path, 'src', 'link.ts'));
+    repo.git(['add', 'src/link.ts']);
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'symlink']);
+    expect(() => freezeReviewInputs({
+      roundId: 'frozen-symlink', repoPath: repo.path, artifactRoot: temp('perkins-frozen-symlink-'),
+      baseRef: base, targetRef: repo.head(), spec: 's',
+    })).toThrow(/frozen target contains a symlink/u);
+  });
+});
+
+describe('error-path EEXIST guards (V5 revert-mutation pin)', () => {
+  it('completes a retry after a malformed attempt without any EEXIST error escaping', async () => {
+    let securityCalls = 0;
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? (++securityCalls === 1 ? 'malformed' : '[]') : '[]',
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    for (const entry of h.toolErrors) {
+      expect(entry.error).not.toContain('EEXIST');
+      expect(entry.error).not.toContain('already exists');
+    }
+    const envelopeDir = join(h.frozen.directory, 'lenses', '001');
+    const errorFiles = readdirSync(envelopeDir).filter((f) => f.includes('.error.json'));
+    expect(errorFiles.length).toBeGreaterThanOrEqual(1);
+    const envelopeFiles = readdirSync(envelopeDir).filter((f) => f.includes('.envelope.json'));
+    expect(envelopeFiles.length).toBeGreaterThanOrEqual(2);
+  });
+});
+describe('EEXIST guards: write-once collision in catch path (Blocker 3: mutation-killing pin)', () => {
+  it('catch path tolerates EEXIST when onProgress throws after artifacts are already written', async () => {
+    // Trigger: the try block writes raw.json + envelope.json, then
+    // onProgress throws (registered callback). The catch fires and must
+    // tolerate EEXIST on raw.json and envelope.json re-writes.
+    const fixture = makeReviewRepo();
+    repos.push(fixture.repo);
+    const base = fixture.repo.git(['rev-parse', 'main']);
+    const target = fixture.repo.head();
+    const root = temp('perkins-eexist-');
+    const frozen = freezeReviewInputs({
+      roundId: 'eexist-round', repoPath: fixture.repo.path, artifactRoot: root,
+      baseRef: base, targetRef: target, spec: 'eexist test',
+    });
+    const fake = fakeHybridSpawner(temp('perkins-eexist-sessions-'), { childAnswer: () => '[]' });
+    let doneCalls = 0;
+    const engine = new PerkinsHybridReview({
+      spawner: fake.spawner,
+      policy: loadPerkinsPolicy(),
+      onProgress: (progress) => {
+        if (progress.state === 'done') {
+          doneCalls += 1;
+          if (doneCalls === 1) {
+            // Throw on the FIRST done — after the try block has already
+            // written raw.json and envelope.json for this lens/chunk.
+            throw new Error('progress listener exploded');
+          }
+        }
+      },
+    });
+    // Run the full review; the first lens/chunk triggers the EEXIST path
+    const result = await engine.run({
+      roundId: 'eexist-test', roundNumber: 1, frozenReview: frozen,
+      movementRef: 'feature/review', noSpec: false,
+    });
+    // Without EEXIST guards, the EEXIST from raw.json/envelope.json in the
+    // catch path would cascade and fail the entire lens batch → INCOMPLETE.
+    // With guards, the review completes normally.
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.completeness).toMatchObject({ complete: true, requiredLensRuns: 7, validLensRuns: 7 });
+    // doneCalls: first lens/chunk throws, the remaining 6 succeed normally
+    expect(doneCalls).toBeGreaterThanOrEqual(7);
+  });
+});

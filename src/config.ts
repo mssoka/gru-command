@@ -97,6 +97,18 @@ export interface DispatchConfig {
   readonly bobIntervalMs: number;
 }
 
+/** Review gate policy (Perkins primary; bmad-review fallback gate per the
+ * 2026-09-20 amendment, fork-3). */
+export interface ReviewConfig {
+  /** false routes every review request to the installed bmad-review fallback
+   * gate (full gate semantics: host triage, fix directives, bounded re-review;
+   * only an exact-head Perkins READY can authorize a merge, and merge stays
+   * user-held). true keeps Perkins as the primary gate behind the four-leg
+   * pre-flight capability check. A failed pre-flight is always reported, never
+   * a silent downgrade. */
+  readonly enabled: boolean;
+}
+
 export interface GruCommandConfig {
   readonly workspaceRoot: string;
   readonly dataDir: string;
@@ -110,6 +122,7 @@ export interface GruCommandConfig {
   readonly chat: ChatConfig;
   readonly worktrees: WorktreesConfig;
   readonly dispatch: DispatchConfig;
+  readonly review: ReviewConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
   /** Absolute per-instance directory holding config, identity, logs, sessions. */
@@ -212,6 +225,7 @@ const TOP_LEVEL_KEYS = [
   'chat',
   'worktrees',
   'dispatch',
+  'review',
 ] as const;
 
 /** Sentinel meaning "the runtime harness's own configured default" (SPEC ruling 16). */
@@ -381,6 +395,7 @@ export function loadConfig(
   let chat: ChatConfig = { frameLogMaxBytes: 8_388_608, frameLogKeep: 3 };
   let worktrees: WorktreesConfig | null = null;
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
+  let review: ReviewConfig = { enabled: true };
   let sourceFile: string | null = null;
 
   if (configState(file) === 'present') {
@@ -641,6 +656,24 @@ export function loadConfig(
             : dispatch.bobIntervalMs,
       };
     }
+    if (raw['review'] !== undefined) {
+      const table = requireTable(raw['review'], file, 'review');
+      for (const key of Object.keys(table)) {
+        if (!['enabled'].includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [review] (valid keys: enabled)`,
+            file,
+            `review.${key}`,
+          );
+        }
+      }
+      review = {
+        enabled:
+          table['enabled'] !== undefined
+            ? requireBool(table['enabled'], file, 'review.enabled')
+            : review.enabled,
+      };
+    }
   }
 
   for (const [label, dir] of [
@@ -690,6 +723,7 @@ export function loadConfig(
       setupTimeoutMs: worktrees?.setupTimeoutMs ?? 120_000,
     },
     dispatch,
+    review,
     sourceFile,
     instanceDir,
   };

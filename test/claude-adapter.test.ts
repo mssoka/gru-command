@@ -1,8 +1,10 @@
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createConnection } from 'node:net';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import {
   CLAUDE_CODE_CAPABILITIES,
@@ -19,6 +21,11 @@ import {
 } from '../src/runtime/stream-json.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import type { RuntimeEvent } from '../src/runtime/types.js';
+import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
+import { PerkinsHybridReview } from '../src/dispatch/perkins-review/hybrid.js';
+import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
+import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
+import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
 /**
  * claude-code adapter tests (EPICS E3): a STUBBED CLI double (executable
@@ -42,6 +49,7 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_COMPACT_FORGED_RESULT',
   'CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT',
   'CLAUDE_DOUBLE_COMPACT_HOLD_FILE',
+  'CLAUDE_DOUBLE_WORKFLOW_CANDIDATE',
 ] as const;
 
 const cleanupDirs: string[] = [];
@@ -748,11 +756,85 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(build!.argv[build!.argv.indexOf('--tools') + 1]).toBe('Read,Bash,Edit,Write,Grep,Glob,LS');
     // The role prompt is the perkins/minion definition's own:
     expect(review!.argv[review!.argv.indexOf('--append-system-prompt') + 1]).toContain(
-      'review agent',
+      'Hybrid Code Review Lead',
     );
     expect(build!.argv[build!.argv.indexOf('--append-system-prompt') + 1]).toContain(
       'worker agent',
     );
+  });
+
+  it('enforces isolated-review tools and disables ambient Claude resources in argv', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('perkins', {
+      isolatedReview: { systemPrompt: 'isolated policy', tools: [] },
+    });
+    await handle.prompt('frozen diff only');
+    await handle.dispose();
+    const [record] = doubleInvocations(fx);
+    expect(record!.argv[record!.argv.indexOf('--permission-mode') + 1]).toBe('dontAsk');
+    expect(record!.argv[record!.argv.indexOf('--tools') + 1]).toBe('');
+    expect(record!.argv[record!.argv.indexOf('--system-prompt') + 1]).toBe('isolated policy');
+    expect(record!.argv).not.toContain('--append-system-prompt');
+    expect(record!.argv).toEqual(expect.arrayContaining([
+      '--safe-mode', '--disable-slash-commands', '--strict-mcp-config', '--setting-sources', '', '--no-chrome',
+    ]));
+    expect(record!.argv[record!.argv.indexOf('--setting-sources') + 1]).toBe('');
+    expect(record!.argv).not.toContain('--allowedTools');
+    expect(handle.reviewIsolation).toBe(true);
+  });
+
+  it('runs a hybrid Perkins lead through the real Claude adapter and scoped MCP bridge', async () => {
+    const fx = fixture();
+    const repo = makeFixtureRepo('claude-perkins-hybrid');
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/review']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    process.env['CLAUDE_DOUBLE_WORKFLOW_CANDIDATE'] = '1';
+    try {
+      const frozen = freezeReviewInputs({
+        roundId: 'claude-hybrid-round', repoPath: repo.path, artifactRoot: join(fx.home, 'review-artifacts'),
+        baseRef: base, targetRef: target, movementRef: 'feature/review', spec: 'Acceptance: answer returns 43.',
+      });
+      const engine = new PerkinsHybridReview({
+        spawner: (role, options) => fx.runtime.spawn(role, options),
+        policy: loadPerkinsPolicy(),
+      });
+      const result = await engine.run({
+        roundId: 'claude-hybrid-round', roundNumber: 1, frozenReview: frozen,
+        movementRef: 'feature/review', noSpec: false,
+      });
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      expect(result.completeness).toMatchObject({ requiredLensRuns: 7, validLensRuns: 7 });
+      const invocations = doubleInvocations(fx);
+      expect(invocations).toHaveLength(8);
+      const lead = invocations.find((record) => record.prompt.includes('REQUIRED CHILD COVERAGE'));
+      expect(lead).toBeDefined();
+      const configFile = lead!.argv[lead!.argv.indexOf('--mcp-config') + 1];
+      expect(configFile).toContain('mcp-config.json');
+      const allowed = lead!.argv[lead!.argv.indexOf('--allowedTools') + 1] ?? '';
+      expect(allowed).toContain('mcp__gru_perkins__perkins_run_lenses');
+      expect(allowed).toContain('mcp__gru_perkins__perkins_submit_review');
+      expect(allowed).toMatch(/Read\(\/.+\/\*\*\)/);
+      expect(lead!.argv[lead!.argv.indexOf('--setting-sources') + 1]).toBe('');
+      const bridgeDirectory = dirname(configFile ?? '');
+      await vi.waitFor(() => expect(existsSync(bridgeDirectory)).toBe(false));
+      expect(result.findings).toHaveLength(1);
+      expect(result.findings[0]?.verification).toMatchObject({ disposition: 'confirmed' });
+    } finally {
+      await fx.runtime.dispose();
+      repo.cleanup();
+    }
+  });
+
+  it('rejects resume for isolated reviews so ambient history cannot cross the boundary', async () => {
+    const fx = fixture();
+    const ordinary = await fx.runtime.spawn('perkins');
+    const file = ordinary.sessionFile!;
+    await ordinary.dispose();
+    await expect(fx.runtime.spawn('perkins', {
+      resumeFile: file,
+      isolatedReview: { systemPrompt: 'isolated', tools: [] },
+    })).rejects.toThrow(/must be fresh/);
   });
 
   it('mapRoleTools maps every known role tool and fails loud on an unknown id', () => {
@@ -1366,6 +1448,131 @@ describe('ClaudeTurnTranslator (pure)', () => {
   });
 });
 
+describe('ReviewMcpBridge bounded protocol failures', () => {
+  it('cleans the owned temporary directory when chmod fails during startup', async () => {
+    const prefix = 'gru-review-mcp-';
+    const before = new Set(readdirSync(tmpdir()).filter((entry) => entry.startsWith(prefix)));
+    await expect(ReviewMcpBridge.start([{
+      name: 'perkins_probe', description: 'probe', inputSchema: { type: 'object' },
+      execute: async () => ({ text: 'ok' }),
+    }], {
+      chmod: () => { throw new Error('forced chmod failure'); },
+    })).rejects.toThrow('forced chmod failure');
+    const created = readdirSync(tmpdir()).filter((entry) => entry.startsWith(prefix) && !before.has(entry));
+    expect(created).toEqual([]);
+  });
+
+  it('returns a bounded error for an oversized request without an uncaught socket error', async () => {
+    const bridge = await ReviewMcpBridge.start([{
+      name: 'perkins_probe', description: 'probe', inputSchema: { type: 'object' },
+      execute: async () => ({ text: 'ok' }),
+    }]);
+    try {
+      const response = await new Promise<string>((resolveResponse, reject) => {
+        const socket = createConnection(bridge.socketPath);
+        let body = '';
+        const timer = setTimeout(() => reject(new Error('oversize bridge response timed out')), 5_000);
+        socket.setEncoding('utf8');
+        socket.once('connect', () => socket.write(`${'x'.repeat(1024 * 1024 + 1)}\n`));
+        socket.on('data', (chunk) => { body += chunk; });
+        socket.once('error', reject);
+        socket.once('end', () => {
+          clearTimeout(timer);
+          resolveResponse(body);
+        });
+      });
+      expect(JSON.parse(response)).toMatchObject({
+        id: 'invalid', ok: false, error: 'review bridge request exceeds 1 MiB',
+      });
+    } finally {
+      const directory = dirname(bridge.configFile);
+      await bridge.close();
+      expect(existsSync(directory)).toBe(false);
+    }
+  });
+
+  it('rejects malformed request input and non-object native structured details', async () => {
+    const bridge = await ReviewMcpBridge.start([{
+      name: 'perkins_bad_details', description: 'bad details', inputSchema: { type: 'object' },
+      execute: async () => ({ text: 'unsafe', details: 'not-an-object' } as never),
+    }]);
+    const call = async (request: unknown): Promise<{ ok: boolean; error?: string }> =>
+      new Promise((resolveResponse, reject) => {
+        const socket = createConnection(bridge.socketPath);
+        let body = '';
+        socket.setEncoding('utf8');
+        socket.once('connect', () => socket.write(`${JSON.stringify(request)}\n`));
+        socket.on('data', (chunk) => { body += chunk; });
+        socket.once('error', reject);
+        socket.once('end', () => resolveResponse(JSON.parse(body) as { ok: boolean; error?: string }));
+      });
+    try {
+      await expect(call({ id: 'array-input', name: 'perkins_bad_details', input: [] }))
+        .resolves.toMatchObject({ ok: false, error: 'review bridge request input must be an object' });
+      await expect(call({ id: 'bad-details', name: 'perkins_bad_details', input: {} }))
+        .resolves.toMatchObject({ ok: false, error: 'native review tool returned non-object structured details' });
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('caps aggregate bridge sockets and concurrent close callers share one teardown', async () => {
+    const bridge = await ReviewMcpBridge.start([{
+      name: 'perkins_probe', description: 'probe', inputSchema: { type: 'object' },
+      execute: async () => ({ text: 'ok' }),
+    }]);
+    const held = Array.from({ length: 16 }, () => createConnection(bridge.socketPath));
+    for (const socket of held) socket.on('error', () => {});
+    await Promise.all(held.map((socket) => new Promise<void>((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    })));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const rejected = await new Promise<string>((resolve, reject) => {
+      const socket = createConnection(bridge.socketPath);
+      let body = '';
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk) => { body += chunk; });
+      socket.once('error', reject);
+      socket.once('end', () => resolve(body));
+    });
+    expect(JSON.parse(rejected)).toMatchObject({
+      id: 'invalid', ok: false, error: 'review bridge connection limit reached',
+    });
+    const first = bridge.close();
+    const second = bridge.close();
+    expect(first).toBe(second);
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(held.every((socket) => socket.destroyed)).toBe(true);
+  });
+
+  it('contains a peer disconnect while an asynchronous native tool is completing', async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const toolStarted = new Promise<void>((resolveStarted) => { started = resolveStarted; });
+    const toolRelease = new Promise<void>((resolveRelease) => { release = resolveRelease; });
+    const bridge = await ReviewMcpBridge.start([{
+      name: 'perkins_wait', description: 'wait', inputSchema: { type: 'object' },
+      execute: async () => {
+        started();
+        await toolRelease;
+        return { text: 'finished after disconnect' };
+      },
+    }]);
+    const socket = createConnection(bridge.socketPath);
+    socket.on('error', () => {});
+    socket.once('connect', () => {
+      socket.write(`${JSON.stringify({ id: 'disconnect', name: 'perkins_wait', input: {} })}\n`);
+    });
+    await toolStarted;
+    socket.destroy();
+    release();
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    await expect(bridge.close()).resolves.toBeUndefined();
+  });
+});
+
 describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
   it('runs the CLI with the explicit project cwd, not the workspace root', async () => {
     const fx = fixture();
@@ -1385,5 +1592,57 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
       /does not exist/,
     );
     expect(doubleInvocations(fx)).toHaveLength(0);
+  });
+});
+
+describe('isolated-review confinement guards', () => {
+  it('rejects a review cwd containing allowedTools pattern metacharacters before spawn', async () => {
+    const fx = fixture();
+    const hostile = join(fx.workspace, 'hostile(*)&dir');
+    mkdirSync(hostile, { recursive: true });
+    await expect(fx.runtime.spawn('perkins', {
+      cwd: hostile,
+      isolatedReview: { systemPrompt: 'isolated policy', tools: ['read'] },
+    }).then(async (handle) => {
+      try {
+        return await handle.prompt('frozen diff only');
+      } finally {
+        await handle.dispose();
+      }
+    })).rejects.toThrow(/pattern metacharacters unsafe for Claude allowedTools confinement/u);
+    expect(doubleInvocations(fx)).toHaveLength(0);
+  });
+});
+
+describe('ReviewMcpBridge fail-closed guards', () => {
+  it('rejects invalid or duplicate native tool names at start', async () => {
+    await expect(ReviewMcpBridge.start([{
+      name: 'not-perkins-prefixed', description: 'x', inputSchema: { type: 'object' }, execute: async () => ({ text: '' }),
+    }])).rejects.toThrow(/invalid or duplicate native review tool name/u);
+    const tool = {
+      name: 'perkins_ok', description: 'x', inputSchema: { type: 'object' }, execute: async () => ({ text: '' }),
+    };
+    await expect(ReviewMcpBridge.start([tool, { ...tool, name: 'perkins_ok' }]))
+      .rejects.toThrow(/invalid or duplicate native review tool name/u);
+  });
+
+  it('rejects a tampered bundled MCP server before launching it', async () => {
+    const staged = mkdtempSync(join(tmpdir(), 'claude-bridge-stage-'));
+    const originalServer = readFileSync(new URL('../src/runtime/review-mcp-server.mjs', import.meta.url));
+    const originalBridge = readFileSync(new URL('../dist/runtime/review-mcp-bridge.js', import.meta.url));
+    try {
+      writeFileSync(join(staged, 'review-mcp-server.mjs'), Buffer.concat([originalServer, Buffer.from('\n// tampered\n')]));
+      const stagedBridgeSource = originalBridge.toString('utf8').replace(/\/\/# sourceMappingURL=.*\n?/u, '');
+      writeFileSync(join(staged, 'review-mcp-bridge.js'), stagedBridgeSource, 'utf8');
+      writeFileSync(join(staged, 'package.json'), '{"type":"module"}\n', 'utf8');
+      const { ReviewMcpBridge: StagedBridge } = await import(
+        pathToFileURL(join(staged, 'review-mcp-bridge.js')).href
+      );
+      await expect(StagedBridge.start([{
+        name: 'perkins_ok', description: 'x', inputSchema: { type: 'object' }, execute: async () => ({ text: '' }),
+      }])).rejects.toThrow(/integrity mismatch/u);
+    } finally {
+      rmSync(staged, { recursive: true, force: true });
+    }
   });
 });

@@ -51,15 +51,17 @@ class FakeHandle implements AgentHandle {
     thinkingLevelControl: false,
     followUp: false,
   };
+  readonly reviewIsolation: true | undefined;
   state: AgentState = 'idle';
   disposed = false;
   promptCount = 0;
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
 
-  constructor(role: Role, id: string, sessionFile: string | null) {
+  constructor(role: Role, id: string, sessionFile: string | null, reviewIsolation = false) {
     this.role = role;
     this.id = id;
     this.sessionFile = sessionFile;
+    this.reviewIsolation = reviewIsolation ? true : undefined;
   }
 
   emit(event: RuntimeEvent): void {
@@ -82,13 +84,21 @@ class FakeHandle implements AgentHandle {
       this.listeners.delete(listener);
     };
   }
-  health() {
+  healthImpl: null | (() => AgentState) = null;
+  private healthBase() {
     return {
       state: this.state,
       lastActivity: new Date().toISOString(),
       ...(this.state === 'error' ? { error: 'stub' } : {}),
       sessionFile: this.sessionFile,
     };
+  }
+  health() {
+    if (this.healthImpl !== null) {
+      const forced = this.healthImpl();
+      if (forced !== null) return { ...this.healthBase(), state: forced };
+    }
+    return this.healthBase();
   }
   async dispose(): Promise<void> {
     this.disposed = true;
@@ -718,6 +728,53 @@ describe('supervisor — intentional slot generations', () => {
     expect(slot.current()).toBeNull();
     expect(stale.disposed).toBe(true);
     expect(swaps).toEqual([]);
+  });
+});
+
+describe('supervisor — isolated review ownership', () => {
+  it('never restarts a slotted review handle and disposes it after durable abort bookkeeping', async () => {
+    const h = boot();
+    h.registry.spawnImpl = async (role) => new FakeHandle(role, 'isolated-review-slot', null, true);
+    const slot = h.supervisor.declareSlot({
+      id: 'review-slot',
+      role: 'perkins',
+      spawn: (options) => h.registry.spawn('perkins', options),
+    });
+    const handle = await slot.ensure({});
+    h.api.registerAgent({ id: handle.id, role: 'perkins' });
+    (handle as FakeHandle).emit({ type: 'error', error: 'review transport failed', fatal: true });
+    (handle as FakeHandle).emit({ type: 'error', error: 'late duplicate fatal event', fatal: true });
+    await sleep(30);
+    expect(h.registry.spawnCalls).toHaveLength(1);
+    expect((handle as FakeHandle).disposed).toBe(true);
+    expect(h.api.getAgent(handle.id)?.state).toBe('error');
+    expect(h.api.listEvents({ limit: 100 }).some((event) =>
+      event.kind === 'supervision.review-attempt-aborted' && event.agentId === handle.id,
+    )).toBe(true);
+    h.dispose();
+  });
+
+  it('aborts a SILENT (hung) isolated review handle via the watchdog, never respawning it', async () => {
+    const h = boot();
+    const handle = new FakeHandle('perkins', 'isolated-review-hang', null, true);
+    handle.healthImpl = () => 'streaming';
+    h.registry.adopt(handle);
+    h.api.registerAgent({ id: handle.id, role: 'perkins' });
+    const spawnsBefore = h.registry.spawnCalls.length;
+    // Advance past the turn-silence threshold with no events and no growth.
+    h.advance(2_000_000);
+    await sleep(30);
+    expect(h.registry.spawnCalls).toHaveLength(spawnsBefore);
+    expect(handle.disposed).toBe(true);
+    expect(h.api.getAgent(handle.id)?.state).toBe('error');
+    expect(h.api.listEvents({ limit: 100 }).some((event) =>
+      event.kind === 'supervision.review-attempt-aborted' && event.agentId === handle.id,
+    )).toBe(true);
+    // A late duplicate fatal event after the abort never respawns either.
+    handle.emit({ type: 'error', error: 'late fatal after abort', fatal: true });
+    await sleep(30);
+    expect(h.registry.spawnCalls).toHaveLength(spawnsBefore);
+
     h.dispose();
   });
 });

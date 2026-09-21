@@ -29,6 +29,13 @@ plain and factual.
 - **Watch the board.** stalled lanes, tripped breakers, paused sweeps,
   and deferred verdicts are yours to escalate to the chief with
   pointers, not prose.
+- **Guard the review runtime contract.** Installed builds carry the
+  integrity-pinned Perkins policy and scoped Pi/Claude bridges beside the
+  compiled product. Perkins reviews never fall back to source files,
+  ambient skills, extensions, settings, or general shell/task tools;
+  missing, escaping, or tampered assets fail closed. A failed capability
+  pre-flight routes the review request to the installed bmad-review
+  fallback gate instead — never a silent downgrade.
 
 ## Standing orders
 

@@ -188,6 +188,17 @@ function nstr(value: unknown): string | null {
   return value === null || value === undefined ? null : str(value);
 }
 
+export function requireSafeRecordId(value: string, name: string, maxLength = 128): void {
+  if (
+    value.length > maxLength ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) ||
+    value === '.' ||
+    value === '..'
+  ) {
+    throw new Error(`${name} must be a safe ${maxLength}-character record identifier`);
+  }
+}
+
 export class LedgerApi {
   private readonly db: DatabaseSync;
   private readonly bus: EventBus | null;
@@ -278,7 +289,19 @@ export class LedgerApi {
       this.db
         .prepare('SELECT * FROM events ORDER BY seq DESC LIMIT ?')
         .all(limit) as Row[]
-    ).map((row) => ({
+    ).map((row) => this.eventFromRow(row));
+  }
+
+  /** Latest durable event for one review round/kind (restart reconciliation). */
+  latestRoundEvent(roundId: string, kind: string): EventRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM events WHERE round_id = ? AND kind = ? ORDER BY seq DESC LIMIT 1')
+      .get(roundId, kind) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  private eventFromRow(row: Row): EventRecord {
+    return {
       seq: Number(row.seq),
       ts: str(row.ts),
       kind: str(row.kind),
@@ -287,7 +310,7 @@ export class LedgerApi {
       roundId: nstr(row.round_id),
       lens: nstr(row.lens),
       payload: JSON.parse(str(row.payload)) as unknown,
-    }));
+    };
   }
 
   // ------------------------------------------------------------------
@@ -304,6 +327,7 @@ export class LedgerApi {
     if (input.id === '' || input.repo === '' || input.title === '') {
       throw new Error('job id, repo, and title must be non-empty');
     }
+    requireSafeRecordId(input.id, 'job id');
     return this.transaction(() => {
       if (this.getJob(input.id) !== null) {
         throw new Error(`job "${input.id}" already exists`);

@@ -11,38 +11,45 @@ fail-loud at boot); this page is the map.
 | Gru | `roles/gru.md` | workspace root | chat only | judgment: consult, plan-before-heist, dispatch, verify |
 | Silas | `roles/silas.md` | workspace root | ledger/ops | operations: briefings are contracts, lanes, sweeps, close-outs |
 | minion | `roles/minion.md` | **spawn-provided** (the job worktree) | code | one briefing per lane, verified work, honest commits |
-| Perkins | `roles/perkins.md` | **spawn-provided** (a detached review worktree) | nothing | adversarial multi-lens review, strict severity vocabulary |
+| Perkins | `roles/perkins.md` | **spawn-provided** (frozen detached review tree) | review artifacts only | one hybrid lead delegates, verifies, audits, reconciles, and reports through narrow host tools |
 | Bob | `roles/bob.md` | workspace root | memory files | periodic consolidation with provenance |
 
 ## Cwd policy (SPEC ruling 17)
 
 - The chat Gru, ops (Silas), and memory (Bob) host at the **workspace
   root** — they operate across repos.
-- Minions and Perkins lens agents host at the **project root they
-  serve** — a fresh git worktree per job (see FLOW.md). This is where
-  per-repo skills and bmad folders resolve: the project's own
-  `.agents/skills` and `_bmad` are discovered from the session cwd, and
-  fresh worktrees get them via the repo's bootstrap manifest
-  (`.gru-command/worktree.toml`). Discovery NEVER falls back to the
-  workspace root. A `spawn_provided` role spawned without a cwd fails
-  loud (never a silent workspace-root landing).
+- Minions host at the **project root they serve** and discover that
+  project's own `.agents/skills` and `_bmad` through the fresh worktree
+  bootstrap manifest (`.gru-command/worktree.toml`).
+- Perkins leads and non-blind lens children are rooted in the frozen detached
+  review tree; blind children are rooted outside it. Review sessions disable
+  all project/global skills, context files, extensions, prompts, settings,
+  plugins, and unrelated MCP servers. The sole MCP exception is a fresh,
+  per-session bridge for the Claude lead's four product-native tools; children
+  never receive it. Discovery never falls back to the workspace or agent home. A `spawn_provided` role without a cwd fails loud.
 
 ## Permissions
 
-Tool sets narrow with responsibility: Perkins reviewers get read-only
-tools (no bash, no edit, no write — reviews never write the tree);
-minions get the full editing set; Gru/Silas/Bob carry operational tool
-sets. Runtime adapters map these to their native tool surfaces.
+Tool sets narrow with responsibility. The Perkins lead gets only frozen
+chunk read, tracked child delegation, bounded note storage, terminal submit,
+and confined tree reads. Non-blind children get confined read/grep/find/list;
+blind gets no tools. Seven required lens types run for every frozen chunk (six
+only for explicit no-spec); each malformed lens/chunk attempt may be retried
+within the policy limit as a new tracked child. No reviewer gets bash, edit,
+write, general tasks, or nested delegation. Minions get the full editing set;
+Gru/Silas/Bob carry operational tool sets. Runtime adapters enforce the same
+policy natively.
 
 ## Skills
 
-Skill ids are declared per role (`src/roles.ts`), runtime-agnostic: the
-seven Perkins lens skills (`lens-blind` … `lens-tests`), minion
-verification/hygiene skills, Bob's consolidation skill. Skills are NOT
-injected by this service — they resolve from the project's own skill
-folders at the session cwd, so the same role definition carries each
-project's own conventions (a project-local skill shadows any global
-one).
+Skill ids are declared per role (`src/roles.ts`) for ordinary sessions.
+Minion verification/hygiene and Bob consolidation skills resolve from the
+normal project/agent locations. Perkins review sessions are the deliberate
+exception: the integrity-pinned package policy is loaded install-relatively
+and is the sole authority for lead/child prompts. Repository, diff, spec,
+convention, prior-finding, and child text is untrusted evidence rather than
+instruction. All ambient skill discovery is disabled so review identity and
+prompts cannot drift with the host environment.
 
 ## The gate
 

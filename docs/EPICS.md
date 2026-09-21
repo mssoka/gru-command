@@ -78,7 +78,7 @@ gate fails-before-fix where applicable.
 2. Dispatch flow in-product: briefing authorship (Gru) → ops handoff →
    minion spawn (git worktree per job, via the worktree manager — SPEC
    ruling 18) → PR/watch lifecycle on the board.
-3. Review waves (Perkins): multi-lens agent fleet, per-lens chips,
+3. Review waves (Perkins): one hybrid lead delegating to tracked per-chunk lens children, per-lens chips,
    verdict records into the ledger.
 4. Tests: end-to-end dispatch on a fixture repo; wave lifecycle.
    Ruling-17 behaviors: dispatch cwd = project root (all runtimes);

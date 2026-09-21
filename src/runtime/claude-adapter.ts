@@ -22,6 +22,7 @@ import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
 import { resolveSpawnCwd } from './cwd.js';
+import { ReviewMcpBridge } from './review-mcp-bridge.js';
 import {
   normalizeSessionPath,
   SessionAlreadyActiveError,
@@ -305,7 +306,16 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       resolvedModel.input,
     );
     const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
-    const tools = mapRoleTools(role, roleDef.tools);
+    const isolatedReview = options.isolatedReview;
+    const reviewLead = options.reviewLead;
+    if (isolatedReview !== undefined && reviewLead !== undefined) {
+      throw new Error('a review session cannot be both a lead and a lens child');
+    }
+    const reviewMode = reviewLead ?? isolatedReview;
+    if (reviewMode !== undefined && options.resumeFile !== undefined) {
+      throw new Error('isolated review sessions must be fresh and cannot resume ambient context');
+    }
+    const fileTools = mapRoleTools(role, reviewMode?.tools ?? roleDef.tools);
     await this.ensureBinary();
 
     const resumeFile =
@@ -344,7 +354,11 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       lockAcquired = true;
     }
     let createdNewFile: string | null = null;
+    let reviewBridge: ReviewMcpBridge | undefined;
     try {
+      if (reviewLead !== undefined) reviewBridge = await ReviewMcpBridge.start(reviewLead.nativeTools);
+      const nativeTools = reviewBridge?.toolNames.map((name) => `mcp__gru_perkins__${name}`) ?? [];
+      const tools = [...fileTools, ...nativeTools];
       let sessionId: string;
       let sessionFile: string;
       // A resume of an empty transcript adopts the minted uuid from the
@@ -409,7 +423,14 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           cwd,
           binary: this.binary,
           tools,
-          systemPrompt: roleDef.systemPrompt,
+          systemPrompt: reviewMode?.systemPrompt ?? roleDef.systemPrompt,
+          isolatedReview: reviewMode !== undefined,
+          fileTools,
+          nativeTools,
+          ...(reviewBridge !== undefined ? {
+              mcpConfigFile: reviewBridge.configFile,
+              reviewBridge,
+            } : {}),
           killGraceMs: this.killGraceMs,
           resume: established,
           ...(model !== undefined ? { model } : {}),
@@ -431,6 +452,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       if (lockAcquired && resumeFile !== undefined && !this.activeFiles.has(resumeFile)) {
         this.store.releaseLock(resumeFile);
       }
+      await reviewBridge?.close();
       // Never leave an orphan empty transcript behind a failed fresh spawn
       // (it would pollute growth detection and hourly backups forever).
       if (createdNewFile !== null && !this.activeFiles.has(createdNewFile)) {
@@ -479,6 +501,11 @@ interface HandleParams {
   readonly binary: string;
   readonly tools: readonly string[];
   readonly systemPrompt: string;
+  readonly isolatedReview?: boolean;
+  readonly fileTools?: readonly string[];
+  readonly nativeTools?: readonly string[];
+  readonly mcpConfigFile?: string;
+  readonly reviewBridge?: ReviewMcpBridge;
   readonly killGraceMs: number;
   readonly resume: boolean;
   readonly model?: string;
@@ -503,12 +530,37 @@ export function claudeTurnArgs(params: HandleParams, resume: boolean): string[] 
     resume ? '--resume' : '--session-id',
     params.sessionId,
     '--permission-mode',
-    'bypassPermissions',
+    params.isolatedReview ? 'dontAsk' : 'bypassPermissions',
     '--tools',
     params.tools.join(','),
-    '--append-system-prompt',
+    params.isolatedReview ? '--system-prompt' : '--append-system-prompt',
     params.systemPrompt,
   ];
+  if (params.isolatedReview) {
+    args.push(
+      '--safe-mode',
+      '--disable-slash-commands',
+      '--strict-mcp-config',
+      '--setting-sources',
+      '',
+      '--no-chrome',
+    );
+    const absoluteRoot = params.cwd.replaceAll('\\', '/').replace(/\/+$/, '');
+    // A literal backslash in a POSIX path is rewritten above and would point
+    // the confinement glob somewhere else — reject it off-Windows.
+    if (
+      /[*?[\]{}(),!\r\n]/u.test(absoluteRoot) ||
+      (process.platform !== 'win32' && params.cwd.includes('\\'))
+    ) {
+      throw new Error('isolated review cwd contains pattern metacharacters unsafe for Claude allowedTools confinement');
+    }
+    const allowed = [
+      ...(params.fileTools ?? params.tools).map((tool) => `${tool}(${absoluteRoot}/**)`),
+      ...(params.nativeTools ?? []),
+    ];
+    if (allowed.length > 0) args.push('--allowedTools', allowed.join(','));
+    if (params.mcpConfigFile !== undefined) args.push('--mcp-config', params.mcpConfigFile);
+  }
   if (params.model !== undefined) args.push('--model', params.model);
   if (params.thinkingLevel !== undefined) args.push('--effort', params.thinkingLevel);
   return args;
@@ -540,6 +592,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string;
+  readonly reviewIsolation?: true;
   readonly capabilities: AgentCapabilities;
 
   private readonly params: HandleParams;
@@ -575,6 +628,7 @@ export class ClaudeCodeHandle implements AgentHandle {
     this.capabilities = capabilities;
     this.id = params.sessionId;
     this.sessionFile = params.sessionFile;
+    if (params.isolatedReview) this.reviewIsolation = true;
     this.sessionEstablished = params.resume;
     this.store = store;
     this.log = log;
@@ -721,8 +775,12 @@ export class ClaudeCodeHandle implements AgentHandle {
     try {
       this.store.releaseLock(this.sessionFile);
     } finally {
-      this.setState('disposed');
-      this.onDispose();
+      try {
+        await this.params.reviewBridge?.close();
+      } finally {
+        this.setState('disposed');
+        this.onDispose();
+      }
     }
   }
 
