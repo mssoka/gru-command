@@ -16,16 +16,32 @@ The config file is always `<instance dir>/config.toml`.
 ## The setup wizard
 
 The setup wizard (`npm run wizard`, or `node dist/wizard/main.js`) is
-the supported way to create this file: it probes installed runtime
-CLIs, asks for the workspace root and managed repos, and writes a
-config that matches this schema exactly — the `"default"` sentinel for
-models/thinking (SPEC ruling 16), a generated `[auth]` token, and the
-bind host/port. Non-interactive runs take `--answers '<json>'`
-(unspecified answers = documented defaults; invalid answers fail loud
-with NOTHING written). Re-running the wizard over an existing
-`config.toml` copies it to `config.toml.backup-<timestamp>` first; a
-failed backup aborts before any write. Hand edits are first-class: the
-wizard never rewrites a file you did not point it at.
+the supported installation path. It reads prompts from `/dev/tty`, so a
+`curl | bash` install remains one invocation, probes runtime CLIs, asks
+for managed repos, offers per-repo BMAD onboarding, and writes the same
+**complete teaching config** as the generator below. Every concrete
+default is active; optional role/runtime overrides are shown commented
+because activating a placeholder would change precedence.
+
+True headless use is explicit: `--no-interact` accepts documented
+defaults, and optional `--answers '<json>'` may contain only non-secret
+choices. Invalid answers fail before config writes. Neither path
+replaces an existing config without `--force`; force first creates a
+timestamped 0600 backup and aborts if backup creation fails. A re-run
+is round-trip safe: existing config values become the prompt defaults
+(`--answers` keys, when explicitly provided, win), every section the
+wizard does not prompt for is carried forward as-is, and a malformed
+existing config fails loud instead of being silently replaced.
+
+Generate without the rest of onboarding using:
+
+```bash
+npm run config:generate                 # writes <instance>/config.toml
+npm run config:generate -- --force      # backup, then atomic replacement
+```
+
+`docs/example.config.toml` is copy-only documentation. Editing it never
+changes the running application.
 
 The instance dir also carries state that is NOT config and has no keys
 here: `sessions/`, `chat/`, `logs/`, `ledger/`, `worktrees/` and
@@ -53,134 +69,158 @@ created at boot — SPEC ruling 19).
 
 ## Schema
 
-```toml
-# Root: the directory holding your managed repositories/projects.
-# Default: ~/code
-workspace_root = "~/code"
+The block below is GENERATED from `src/config-reference.ts` — the same
+module that renders the wizard's `config.toml`, so the documented schema
+and the emitted config cannot drift. Regenerate with `npm run config:docs`;
+the test suite fails if the committed block ever diverges. Uncommenting an
+example line activates that override.
 
-# Root: the per-instance data directory (config, identity, logs, sessions).
-# Default: ~/.gru-command  (i.e. the instance dir itself)
+<!-- BEGIN GENERATED CONFIG REFERENCE — source: src/config-reference.ts; regenerate: npm run config:docs -->
+```toml
+# Gru Command configuration.
+# This is the live file read from <instance>/config.toml — and it doubles
+# as the reference: every documented section is present with its default
+# and a one-line purpose comment. Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
+# Edit values in place, then restart only your Gru Command service.
+
+# Root: the directory containing only managed project repositories.
+workspace_root = "~/code"
+# Root: per-instance state. ~-anchored so a restored config re-anchors to
+# the NEW machine's home — an absolute machine-specific path would
+# redirect all state to the old machine on restore. Explicit
+# GRU_COMMAND_HOME setups emit their exact absolute dir by design.
 data_dir = "~/.gru-command"
 
 [server]
-# Bind address. Default "127.0.0.1" (this machine only). To pair a phone
-# or another device on the LAN, bind the machine's LAN address (or
-# 0.0.0.0 for all interfaces) — the chat socket and the web UI share
-# this port. v1 has no TLS: LAN only, never expose to WAN.
+# Bind address. Loopback is safest; use a LAN address (or 0.0.0.0 for all
+# interfaces) only on a trusted LAN. v1 has no TLS.
 host = "127.0.0.1"
-# Listen port. 0 = ephemeral (pick a free port; useful in tests).
-# Default: 7665. Must be an integer 0–65535.
+# Listen port; 0 chooses an ephemeral port. Integer 0–65535.
 port = 7665
 
 [auth]
-# Pairing token for the web front-end — LIVE since the chat epic (E4):
-# the /ws chat socket requires it on the first frame. When empty or
-# absent, the chat endpoint rejects EVERY connection ("chat is not
-# configured"); /health stays up either way. Must be a non-empty string
-# when present. Generate one per install (the setup wizard does this).
+# Pairing token for authenticated browser/WebSocket access. Keep this file private.
 token = "a-random-pairing-token"
 
 [runtimes]
-# Which agent runtime hosts sessions. Both adapters are implemented:
-# "pi" (pi SDK reference) and "claude-code" (headless claude -p CLI).
-# Default: "pi"
+# Session host runtime: "pi" or "claude-code".
 default = "pi"
 
 [runtimes.roles]
-# Optional per-role overrides. Valid roles:
-#   gru, silas, minion, perkins, bob
-gru = "pi"
-minion = "claude-code"
+# Optional per-role runtime overrides (valid roles: gru, silas, minion, perkins, bob);
+# omitted roles inherit runtimes.default.
+# gru = "pi"
+# silas = "pi"
+# minion = "pi"
+# perkins = "pi"
+# bob = "pi"
 
 [models]
-# Default model reference. "default" = the runtime harness's own
-# configured model (SPEC ruling 16 — the product never hardcodes a
-# model). Explicit: "provider/model". Optional; default "default".
+# Default model reference. An explicit "provider/model" reference is passed to pi as-is; claude-code strips the provider segment for its CLI --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
 default = "default"
 
 [models.roles]
-# Optional per-role model overrides (same role names as runtimes.roles).
-# "default" here means "runtime's own" for that role.
-gru = "provider/model-b"
+# Optional per-role model overrides (valid roles: gru, silas, minion, perkins, bob);
+# "default" means the runtime's own for that role. Per-runtime
+# inline-table overrides live under [runtimes.<id>.roles].
+# gru = "default"
+# silas = "default"
+# minion = "default"
+# perkins = "default"
+# bob = "default"
 
 [thinking]
-# Thinking level policy, same shape as [models]. "default" = the
-# runtime's own setting. Optional; default "default".
+# Default thinking level. "default" delegates to the runtime; explicit
+# levels are runtime-specific (pi: minimal/low/medium/high/xhigh/max; claude-code: low/medium/high/xhigh/max/ultracode).
 default = "default"
 
 [thinking.roles]
-# Optional per-role thinking overrides.
-perkins = "max"
+# Optional per-role thinking overrides (valid roles: gru, silas, minion, perkins, bob); per-runtime
+# inline-table overrides live under [runtimes.<id>.roles].
+# gru = "default"
+# silas = "default"
+# minion = "default"
+# perkins = "default"
+# bob = "default"
 
-[runtimes.pi]
-# Per-runtime model & thinking overrides for pi-hosted sessions
-# (pi accepts thinking levels: minimal, low, medium, high, xhigh, max).
-model = "default"
-thinking_level = "default"
+# [runtimes.pi]
+# # Optional runtime-wide policy; omitted keys inherit [models]/[thinking].
+# # Thinking levels accepted: minimal | low | medium | high | xhigh | max.
+# # An explicit "provider/model" reference is passed to pi as-is; claude-code strips the provider segment for its CLI --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
+# # model = "default"
+# # thinking_level = "default"
 
-# [runtimes.claude-code] works the same way for claude-hosted sessions.
-# Thinking levels accepted there: low, medium, high, xhigh, max,
-# ultracode (mapped to the CLI's --effort). An explicit "provider/model"
-# model reference strips the provider segment for the CLI's --model flag.
-# See RUNTIMES.md for the full per-runtime semantics.
+# [runtimes.pi.roles]
+# # Optional per-role inline tables (at least one field when uncommented).
+# # Example: minion = { model = "default", thinking_level = "low" }
+# # gru = { model = "default", thinking_level = "low" }
+# # silas = { model = "default", thinking_level = "low" }
+# # minion = { model = "default", thinking_level = "low" }
+# # perkins = { model = "default", thinking_level = "low" }
+# # bob = { model = "default", thinking_level = "low" }
 
-[runtimes.pi.roles]
-# Per-runtime per-role overrides; inline tables with model and/or
-# thinking_level (at least one).
-minion = { model = "provider/model-c", thinking_level = "low" }
-bob = { thinking_level = "medium" }
+# [runtimes.claude-code]
+# # Optional runtime-wide policy; omitted keys inherit [models]/[thinking].
+# # Thinking levels accepted: low | medium | high | xhigh | max | ultracode (mapped to the CLI --effort; anything else fails loud at spawn naming the valid set).
+# # An explicit "provider/model" reference is passed to pi as-is; claude-code strips the provider segment for its CLI --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
+# # model = "default"
+# # thinking_level = "default"
+
+# [runtimes.claude-code.roles]
+# # Optional per-role inline tables (at least one field when uncommented).
+# # Example: minion = { model = "default", thinking_level = "low" }
+# # gru = { model = "default", thinking_level = "low" }
+# # silas = { model = "default", thinking_level = "low" }
+# # minion = { model = "default", thinking_level = "low" }
+# # perkins = { model = "default", thinking_level = "low" }
+# # bob = { model = "default", thinking_level = "low" }
 
 [supervision]
-# In-process supervision policy (E7 — see SUPERVISION.md). All optional.
-# Watchdog: an open turn with no runtime event AND no session-file
-# growth for this long is hung and climbs the restart ladder.
+# Agent watchdog and crash-loop breaker (see SUPERVISION.md).
 enabled = true
+# Open turn with no runtime event and no session growth for this long = hung.
 turn_silence_ms = 900000
-# Crash-loop breaker: >= max_restarts within a rolling restart_window_ms
-# trips the breaker (agent stopped, action-required notification; ack
-# re-arms).
+# >= max_restarts within this rolling window trips the breaker.
 restart_window_ms = 600000
 max_restarts = 3
 # Backoff base between failed restart rungs (doubles, capped at 60s).
 restart_backoff_ms = 2000
 
 [logging]
-# Size-based service.log rotation. Optional.
+# service.log size-based rotation.
 max_bytes = 10485760
 keep = 5
 
 [chat]
-# Chat frame-log rotation (E7): rotate gru.frames.jsonl at the cap, keep
-# N shards; reconnect replay spans shards (history intact in-window).
+# gru.frames.jsonl rotation; reconnect replay spans retained shards.
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
 
 [worktrees]
-# Worktree manager (E8, SPEC ruling 18). All optional.
-# root: where job/review worktrees are created (default:
-# <data_dir>/worktrees).
-# preserve_root: where untracked deliverables land on sweep (default:
-# <data_dir>/worktree-preserves).
-# setup_timeout_ms: budget per one-time bootstrap setup command.
+# Job/review worktree roots follow data_dir by default; uncomment only to relocate.
+# root = "~/.gru-command/worktrees"
+# preserve_root = "~/.gru-command/worktree-preserves"
+# Budget per one-time bootstrap setup command.
 setup_timeout_ms = 120000
 
 [dispatch]
-# Dispatch flow (E8). Optional.
-# bob_interval_ms: Bob's periodic consolidation interval; 0 disables.
+# Bob consolidation interval; 0 disables the periodic trigger.
 bob_interval_ms = 3600000
 
 [review]
-# Review gate policy (user amendment 2026-09-20). Optional; enabled by default.
-# enabled: false routes every review request to the bmad-review fallback gate
-# (when installed; otherwise escalate-only) — findings + triage + fix directives;
-# clear-to-merge is a report; merge stays user-held. true keeps Perkins
-# as the primary gate behind the four-leg
-# pre-flight (bundled resource integrity, review model provider auth,
-# code-host token for the repo remote (GitHub or GitLab), review policy
-# enabled). A failed pre-flight never silently downgrades a configured gate:
-# the failed legs and their remediations are always reported.
+# Review gate policy. true keeps Perkins as the primary gate behind the
+# fail-closed four-leg pre-flight (bundled resource integrity, review-model
+# provider auth, GitHub/GitLab token for verdict posting, review policy
+# enabled); a failed leg is always reported, never a silent downgrade.
+# false routes every review request to the installed bmad-review fallback
+# gate (findings triaged; blockers routed to the implementing minion as fix
+# directives; 0 blockers = clear to merge; merge stays user-held).
 enabled = true
+
 ```
+<!-- END GENERATED CONFIG REFERENCE -->
 
 See [`example.config.toml`](./example.config.toml) for a complete generic
 example.

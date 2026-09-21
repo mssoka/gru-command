@@ -390,14 +390,7 @@ describe('docs/example.config.toml', () => {
     expect(config.runtimes.default).toBe('pi');
     expect(config.models.default).toBe('default');
     expect(config.thinking.default).toBe('default');
-    expect(config.runtimes.policies['pi']).toEqual({
-      model: 'default',
-      thinkingLevel: 'default',
-      roles: {
-        minion: { model: 'provider/model-c', thinkingLevel: 'low' },
-        bob: { thinkingLevel: 'medium' },
-      },
-    });
+    expect(config.runtimes.policies['pi']?.roles).toEqual({});
   });
 });
 

@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 /**
@@ -53,11 +53,41 @@ function buildFixtureRepo(): { fixture: string; home: string } {
   const fixture = tempDir('gru-command-fixture-src-');
   const home = tempDir('gru-command-fixture-home-');
   copyFileSync(join(repoRoot, 'install.sh'), join(fixture, 'install.sh'));
+  for (const unit of [
+    'launchd/com.gru-command.service.plist.template',
+    'systemd/gru-command.service.template',
+  ]) {
+    const target = join(fixture, 'install', unit);
+    mkdirSync(join(fixture, 'install', ...unit.split('/').slice(0, -1)), { recursive: true });
+    copyFileSync(join(repoRoot, 'install', unit), target);
+  }
   // A product checkout is a Gru Command checkout: package.json NAMED
   // gru-command + src/ + install.sh + .git (W-B tightened the heuristic —
   // repo shape alone no longer passes).
   mkdirSync(join(fixture, 'src'), { recursive: true });
   writeFileSync(join(fixture, 'src', 'marker.ts'), 'export {};\n', 'utf-8');
+  mkdirSync(join(fixture, 'resources', 'perkins-code-review'), { recursive: true });
+  writeFileSync(
+    join(fixture, 'resources', 'perkins-code-review', 'policy.json'),
+    '{"fixture":"tracked-product-root-resource-v1"}\n',
+    'utf-8',
+  );
+  mkdirSync(join(fixture, 'tools'), { recursive: true });
+  writeFileSync(
+    join(fixture, 'tools', 'verify-perkins-resource.mjs'),
+    [
+      "import { appendFileSync, existsSync, realpathSync } from 'node:fs';",
+      "import { join } from 'node:path';",
+      "const root = realpathSync(process.argv[2] ?? '');",
+      "for (const path of ['resources/perkins-code-review/policy.json', 'dist/runtime/review-mcp-server.mjs']) {",
+      "  if (!existsSync(join(root, path))) throw new Error('missing Perkins fixture asset: ' + path);",
+      "}",
+      "if (process.env.GRU_PERKINS_VERIFY_LOG) appendFileSync(process.env.GRU_PERKINS_VERIFY_LOG, root + '\\n');",
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  writeFileSync(join(fixture, '.gitignore'), 'node_modules/\ndist/\npackage-lock.json\n', 'utf-8');
   writeFileSync(
     join(fixture, 'package.json'),
     JSON.stringify(
@@ -66,7 +96,7 @@ function buildFixtureRepo(): { fixture: string; home: string } {
         version: '0.0.0',
         private: true,
         type: 'module',
-        scripts: { build: 'node make-dist.mjs' },
+        scripts: { build: 'node make-dist.mjs', 'build:web': 'node make-web.mjs' },
       },
       null,
       2,
@@ -79,18 +109,42 @@ function buildFixtureRepo(): { fixture: string; home: string } {
     [
       "import { mkdirSync, writeFileSync } from 'node:fs';",
       'mkdirSync("dist/wizard", { recursive: true });',
+      'mkdirSync("dist/cli", { recursive: true });',
+      'mkdirSync("dist/runtime", { recursive: true });',
       'writeFileSync("dist/main.js", "// fixture service stub\\n");',
+      'writeFileSync("dist/cli/config-generate.js", "// fixture config CLI stub\\n");',
+      'if (process.env.GRU_FIXTURE_OMIT_MCP !== "1") writeFileSync("dist/runtime/review-mcp-server.mjs", "// fixture scoped review MCP bridge\\n");',
       // The fixture wizard stub: records that it ran + the answers it got,
       // into the instance dir — the real wizard is covered by the
       // rehearsal + wizard tests.
       'writeFileSync("dist/wizard/main.js", `#!/usr/bin/env node',
-      "import { mkdirSync, writeFileSync } from 'node:fs';",
+      "import { mkdirSync, openSync, writeFileSync } from 'node:fs';",
+      "import { createInterface } from 'node:readline/promises';",
+      "import { ReadStream, WriteStream } from 'node:tty';",
       'const home = process.env.GRU_COMMAND_HOME ?? "";',
-      "const answers = process.argv.slice(2).join(' ');",
+      "let answers = process.argv.slice(2).join(' ');",
+      "if (answers === '') {",
+      "  const input = new ReadStream(openSync('/dev/tty', 'r'));",
+      "  const output = new WriteStream(openSync('/dev/tty', 'w'));",
+      "  const rl = createInterface({ input, output });",
+      "  answers = 'interactive:' + (await rl.question('FIXTURE WIZARD PROMPT: ')).trim();",
+      "  rl.close();",
+      "}",
       "if (home) { mkdirSync(home, { recursive: true });",
       '  writeFileSync(home + "/config.toml", "wizard-ran: " + answers); }',
       'console.log("WIZARD-RAN " + answers);',
+      'process.exit(0);',
       '`);',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  writeFileSync(
+    join(fixture, 'make-web.mjs'),
+    [
+      "import { mkdirSync, writeFileSync } from 'node:fs';",
+      'mkdirSync("web/dist", { recursive: true });',
+      'writeFileSync("web/dist/install-built.txt", "built by installer\\n");',
       '',
     ].join('\n'),
     'utf-8',
@@ -109,6 +163,19 @@ function gitInitCommit(dir: string): void {
   ]);
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function expectAvailable(): boolean {
+  try {
+    execFileSync('which', ['expect'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 describe('install.sh setup mode (one-line path)', () => {
   it('piped install: clones when absent → deps → build → wizard (marker written)', () => {
     const { fixture, home } = buildFixtureRepo();
@@ -118,6 +185,7 @@ describe('install.sh setup mode (one-line path)', () => {
     const bare = tempDir('gru-command-bare-');
     copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
     const target = join(home, 'gru-command');
+    const verifyLog = join(home, 'perkins-verify.log');
 
     const { stdout, status } = run(
       join(bare, 'install.sh'),
@@ -127,22 +195,214 @@ describe('install.sh setup mode (one-line path)', () => {
         GRU_COMMAND_HOME: join(home, '.gru-command'),
         GRU_COMMAND_ORIGIN: `file://${fixture}`,
         GRU_COMMAND_TARGET: target,
+        GRU_PERKINS_VERIFY_LOG: verifyLog,
       },
     );
     expect(status, stdout).toBe(0);
     // Clone landed and was built.
     expect(existsSync(join(target, 'package.json'))).toBe(true);
     expect(existsSync(join(target, 'dist/main.js'))).toBe(true);
+    expect(readFileSync(join(target, 'web', 'dist', 'install-built.txt'), 'utf-8')).toContain(
+      'built by installer',
+    );
+    expect(
+      readFileSync(join(target, 'resources', 'perkins-code-review', 'policy.json'), 'utf-8'),
+    ).toContain('tracked-product-root-resource-v1');
+    expect(existsSync(join(target, 'tools', 'verify-perkins-resource.mjs'))).toBe(true);
     // The wizard ran non-interactively with the forwarded answers.
     const config = join(home, '.gru-command', 'config.toml');
     expect(existsSync(config)).toBe(true);
     expect(stdout).toContain('WIZARD-RAN');
+    expect(stdout).toContain('verifying installed Perkins resources');
+    expect(readFileSync(verifyLog, 'utf-8').trim()).toBe(realpathSync(target));
   });
 
-  it('second run reuses the existing checkout (no re-clone)', () => {
+  it('fails closed before setup when the built Perkins MCP bridge is missing', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const bare = tempDir('gru-command-missing-mcp-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const instance = join(home, '.gru-command');
+    const result = run(join(bare, 'install.sh'), ['--no-interact'], {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_ORIGIN: `file://${fixture}`,
+      GRU_COMMAND_TARGET: join(home, 'gru-command'),
+      GRU_FIXTURE_OMIT_MCP: '1',
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('build did not produce dist/runtime/review-mcp-server.mjs');
+    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
+  });
+
+  it('a newly recreated clone preserves a retained instance config instead of rerunning setup', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const bare = tempDir('gru-command-retained-config-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const instance = join(home, '.gru-command');
+    mkdirSync(instance, { recursive: true });
+    writeFileSync(join(instance, 'config.toml'), 'retained-user-config\n');
+    const result = run(join(bare, 'install.sh'), [], {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_ORIGIN: `file://${fixture}`,
+      GRU_COMMAND_TARGET: join(home, 'gru-command'),
+    });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('update complete; existing config preserved');
+    expect(result.stdout).not.toContain('WIZARD-RAN');
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toBe('retained-user-config\n');
+  });
+
+  it.skipIf(!expectAvailable())('literal cat|bash install keeps prompts on /dev/tty and completes in one invocation', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const bare = tempDir('gru-command-pipe-pty-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const instance = join(home, '.gru-command');
+    const launcher = join(bare, 'launch.sh');
+    writeFileSync(
+      launcher,
+      [
+        '#!/usr/bin/env bash',
+        'set -euo pipefail',
+        `export HOME=${shellQuote(home)}`,
+        `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
+        `export GRU_COMMAND_ORIGIN=${shellQuote(`file://${fixture}`)}`,
+        `export GRU_COMMAND_TARGET=${shellQuote(join(home, 'gru-command'))}`,
+        `cd ${shellQuote(bare)}`,
+        'cat install.sh | bash',
+        '',
+      ].join('\n'),
+      { encoding: 'utf-8', mode: 0o755 },
+    );
+    const expectScript = [
+      'set timeout 120',
+      `spawn bash ${launcher}`,
+      'expect -ex {FIXTURE WIZARD PROMPT: }',
+      'send -- "from-dev-tty\\r"',
+      'expect eof',
+      'set result [wait]',
+      'exit [lindex $result 3]',
+    ].join('\n');
+    const output = execFileSync('expect', ['-c', expectScript], {
+      encoding: 'utf-8',
+      timeout: 150_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).replace(/\r/g, '');
+    expect(output).toContain('cloning');
+    expect(output).toContain('FIXTURE WIZARD PROMPT');
+    expect(output).toContain('WIZARD-RAN interactive:from-dev-tty');
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toContain(
+      'interactive:from-dev-tty',
+    );
+  }, 180_000);
+
+  it('second run fast-forwards the existing clean checkout, preserves config, and does not re-run wizard', () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const bare = tempDir('gru-command-bare2-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const target = join(home, 'gru-command');
+    const instance = join(home, '.gru-command');
+    const env = {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_ORIGIN: `file://${fixture}`,
+      GRU_COMMAND_TARGET: target,
+    };
+    expect(run(join(bare, 'install.sh'), ['--answers', '{"token":"preserved"}'], env).status).toBe(0);
+    const before = readFileSync(join(instance, 'config.toml'), 'utf-8');
+    writeFileSync(join(fixture, 'remote-update.txt'), 'pulled', 'utf-8');
+    writeFileSync(
+      join(fixture, 'resources', 'perkins-code-review', 'policy.json'),
+      '{"fixture":"tracked-product-root-resource-v2"}\n',
+      'utf-8',
+    );
+    execFileSync('git', [
+      '-C', fixture, 'add', 'remote-update.txt', 'resources/perkins-code-review/policy.json',
+    ]);
+    execFileSync('git', [
+      '-C', fixture, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=fixture',
+      'commit', '-qm', 'fixture update',
+    ]);
+
+    const second = run(join(bare, 'install.sh'), [], env);
+    expect(second.status, `${second.stdout}\n${second.stderr}`).toBe(0);
+    expect(existsSync(join(target, 'remote-update.txt'))).toBe(true);
+    expect(
+      readFileSync(join(target, 'resources', 'perkins-code-review', 'policy.json'), 'utf-8'),
+    ).toContain('tracked-product-root-resource-v2');
+    expect(existsSync(join(target, 'tools', 'verify-perkins-resource.mjs'))).toBe(true);
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toBe(before);
+    expect(second.stdout).toContain('git pull --ff-only');
+    expect(second.stdout).toContain('update complete; existing config preserved');
+    expect(second.stdout).not.toContain('WIZARD-RAN');
+  });
+
+  it('fast-forwards an old target before executing target-local installer logic', () => {
+    const { fixture, home } = buildFixtureRepo();
+    const currentInstaller = readFileSync(join(fixture, 'install.sh'), 'utf-8');
+    writeFileSync(
+      join(fixture, 'install.sh'),
+      '#!/usr/bin/env bash\nprintf old > "$OLD_INSTALLER_MARKER"\nexit 77\n',
+    );
+    gitInitCommit(fixture);
+    const target = join(home, 'gru-command');
+    execFileSync('git', ['clone', `file://${fixture}`, target], { stdio: 'pipe' });
+    writeFileSync(join(fixture, 'install.sh'), currentInstaller);
+    execFileSync('git', ['-C', fixture, 'add', 'install.sh']);
+    execFileSync('git', [
+      '-C', fixture, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=fixture',
+      'commit', '-qm', 'new installer',
+    ]);
+
+    const bare = tempDir('gru-command-old-target-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const instance = join(home, '.gru-command');
+    mkdirSync(instance, { recursive: true });
+    writeFileSync(join(instance, 'config.toml'), 'preserved\n');
+    const oldMarker = join(home, 'old-installer-ran');
+    const result = run(join(bare, 'install.sh'), [], {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_ORIGIN: `file://${fixture}`,
+      GRU_COMMAND_TARGET: target,
+      OLD_INSTALLER_MARKER: oldMarker,
+    });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(existsSync(oldMarker)).toBe(false);
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toBe('preserved\n');
+  });
+
+  it('refuses a dirty existing checkout before pull/build and preserves its config', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const bare = tempDir('gru-command-dirty-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const target = join(home, 'gru-command');
+    const instance = join(home, '.gru-command');
+    const env = {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_ORIGIN: `file://${fixture}`,
+      GRU_COMMAND_TARGET: target,
+    };
+    expect(run(join(bare, 'install.sh'), ['--answers', '{"token":"keep-me"}'], env).status).toBe(0);
+    const before = readFileSync(join(instance, 'config.toml'), 'utf-8');
+    writeFileSync(join(target, 'local-untracked.txt'), 'do not delete', 'utf-8');
+    const updated = run(join(bare, 'install.sh'), [], env);
+    expect(updated.status).toBe(1);
+    expect(updated.stderr).toContain('refusing to update a dirty checkout');
+    expect(readFileSync(join(target, 'local-untracked.txt'), 'utf-8')).toBe('do not delete');
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toBe(before);
+  });
+
+  it('refuses a non-fast-forward divergent checkout without reset', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const bare = tempDir('gru-command-diverged-bare-');
     copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
     const target = join(home, 'gru-command');
     const env = {
@@ -152,13 +412,134 @@ describe('install.sh setup mode (one-line path)', () => {
       GRU_COMMAND_TARGET: target,
     };
     expect(run(join(bare, 'install.sh'), ['--answers', '{}'], env).status).toBe(0);
-    // Marker INSIDE the clone: a re-clone (rm + clone) would destroy it.
-    const marker = join(target, 'no-reclone-marker');
-    writeFileSync(marker, 'kept', 'utf-8');
-    const second = run(join(bare, 'install.sh'), ['--answers', '{}'], env);
-    expect(second.status, second.stdout).toBe(0);
-    expect(existsSync(marker)).toBe(true);
-    expect(second.stdout).toContain('reusing existing checkout');
+    writeFileSync(join(target, 'local-commit.txt'), 'local', 'utf-8');
+    execFileSync('git', ['-C', target, 'add', 'local-commit.txt']);
+    execFileSync('git', [
+      '-C', target, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=fixture',
+      'commit', '-qm', 'local divergence',
+    ]);
+    writeFileSync(join(fixture, 'remote-commit.txt'), 'remote', 'utf-8');
+    execFileSync('git', ['-C', fixture, 'add', 'remote-commit.txt']);
+    execFileSync('git', [
+      '-C', fixture, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=fixture',
+      'commit', '-qm', 'remote divergence',
+    ]);
+    const updated = run(join(bare, 'install.sh'), [], env);
+    expect(updated.status).toBe(1);
+    expect(updated.stderr).toContain('fast-forward-only update failed');
+    expect(existsSync(join(target, 'local-commit.txt'))).toBe(true);
+  });
+
+  it('restarts only an owned service and refuses a foreign unit with the same public name', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const bare = tempDir('gru-command-service-update-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const target = join(home, 'gru-command');
+    const instance = join(home, '.gru-command');
+    const managerLog = join(home, 'manager.log');
+    const manager = join(home, 'service-manager');
+    writeFileSync(manager, '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"\nexit 0\n', {
+      encoding: 'utf-8',
+      mode: 0o755,
+    });
+    const unit = process.platform === 'darwin'
+      ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
+      : join(home, '.config', 'systemd', 'user', 'gru-command.service');
+    const env = {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_ORIGIN: `file://${fixture}`,
+      GRU_COMMAND_TARGET: target,
+      GRU_MANAGER_LOG: managerLog,
+      GRU_COMMAND_LAUNCHCTL: manager,
+      GRU_COMMAND_SYSTEMCTL: manager,
+    };
+    expect(run(join(bare, 'install.sh'), ['--answers', '{}'], env).status).toBe(0);
+
+    mkdirSync(dirname(unit), { recursive: true });
+    writeFileSync(unit, '/someone/else/dist/main.js\n/someone/else/.gru-command\n');
+    const foreign = run(join(bare, 'install.sh'), [], env);
+    expect(foreign.status).toBe(1);
+    expect(foreign.stderr).toContain('refusing to restart unrelated service unit');
+    expect(readFileSync(unit, 'utf-8')).toContain('/someone/else');
+
+    const renderedOwned = run(join(target, 'install.sh'), ['--print'], env);
+    expect(renderedOwned.status, renderedOwned.stderr).toBe(0);
+    writeFileSync(unit, renderedOwned.stdout);
+    const owned = run(join(bare, 'install.sh'), [], env);
+    expect(owned.status, `${owned.stdout}\n${owned.stderr}`).toBe(0);
+    expect(owned.stdout).toContain('restarting owned Gru Command service');
+    const managerCalls = readFileSync(managerLog, 'utf-8');
+    if (process.platform === 'darwin') {
+      expect(managerCalls.split('\n')).toContain(`load ${unit}`);
+    } else {
+      expect(managerCalls).toMatch(/--user daemon-reload[\s\S]*--user enable gru-command\.service[\s\S]*--user restart gru-command\.service/);
+    }
+    expect(readFileSync(unit, 'utf-8')).toContain(`${target}/dist/main.js`);
+  });
+
+  it('direct --service/--uninstall also enforce exact unit ownership', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const instance = join(home, '.gru-command');
+    const managerLog = join(home, 'manager.log');
+    const manager = join(home, 'service-manager');
+    writeFileSync(manager, '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"\nexit 0\n', {
+      encoding: 'utf-8',
+      mode: 0o755,
+    });
+    const env = {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_MANAGER_LOG: managerLog,
+      GRU_COMMAND_LAUNCHCTL: manager,
+      GRU_COMMAND_SYSTEMCTL: manager,
+    };
+    expect(run(join(fixture, 'install.sh'), ['--answers', '{"smoke":false}'], env).status).toBe(0);
+    const unit = process.platform === 'darwin'
+      ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
+      : join(home, '.config', 'systemd', 'user', 'gru-command.service');
+    mkdirSync(dirname(unit), { recursive: true });
+    writeFileSync(unit, 'foreign-user-unit\n');
+    const refusedRegister = run(join(fixture, 'install.sh'), ['--service'], env);
+    expect(refusedRegister.status).not.toBe(0);
+    expect(readFileSync(unit, 'utf-8')).toBe('foreign-user-unit\n');
+    const refusedUninstall = run(join(fixture, 'install.sh'), ['--uninstall'], env);
+    expect(refusedUninstall.status).not.toBe(0);
+    expect(readFileSync(unit, 'utf-8')).toBe('foreign-user-unit\n');
+
+    const rendered = run(join(fixture, 'install.sh'), ['--print'], env);
+    expect(rendered.status, rendered.stderr).toBe(0);
+    const unmarked = process.platform === 'darwin'
+      ? rendered.stdout.replace(
+          '  <key>GruCommandManagedBy</key>\n  <string>gru-command-install-v2</string>\n',
+          '',
+        )
+      : rendered.stdout.replace('X-GruCommandManagedBy=gru-command-install-v2\n', '');
+    writeFileSync(unit, unmarked);
+    expect(run(join(fixture, 'install.sh'), ['--uninstall'], env).status).not.toBe(0);
+    expect(readFileSync(unit, 'utf-8')).toBe(unmarked);
+    if (process.platform === 'darwin') {
+      const wrongExecutable = rendered.stdout.replace(
+        `<string>${process.execPath}</string>`,
+        '<string>/usr/bin/false</string>',
+      );
+      expect(wrongExecutable).not.toBe(rendered.stdout);
+      writeFileSync(unit, wrongExecutable);
+      expect(run(join(fixture, 'install.sh'), ['--uninstall'], env).status).not.toBe(0);
+      expect(readFileSync(unit, 'utf-8')).toBe(wrongExecutable);
+    }
+    const previousNode = rendered.stdout.replace(process.execPath, '/opt/previous-node/bin/node');
+    expect(previousNode).not.toBe(rendered.stdout);
+    writeFileSync(unit, previousNode);
+    expect(run(join(fixture, 'install.sh'), ['--uninstall'], env).status).toBe(0);
+    expect(existsSync(unit)).toBe(false);
+    writeFileSync(unit, rendered.stdout);
+    expect(run(join(fixture, 'install.sh'), ['--uninstall'], env).status).toBe(0);
+    expect(existsSync(unit)).toBe(false);
+    expect(run(join(fixture, 'install.sh'), ['--service'], env).status).toBe(0);
+    expect(readFileSync(unit, 'utf-8')).toBe(rendered.stdout);
   });
 
   it('inside a clone: no flags clone the product — deps+build+wizard only', () => {
@@ -175,6 +556,17 @@ describe('install.sh setup mode (one-line path)', () => {
     // No re-clone happened: the target dir was never created.
     expect(existsSync(elsewhere)).toBe(false);
     expect(existsSync(join(home, '.gru-command', 'config.toml'))).toBe(true);
+  });
+
+  it('--no-interact alone completes with documented defaults and never opens the TTY', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const result = run(join(fixture, 'install.sh'), ['--no-interact'], {
+      HOME: home,
+      GRU_COMMAND_HOME: join(home, '.gru-command'),
+    });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('WIZARD-RAN --no-interact');
   });
 
   it('--answers=<json> equals-form parses identically (wizard marker written)', () => {
@@ -196,6 +588,42 @@ describe('install.sh setup mode (one-line path)', () => {
       expect(stderr).toContain('--answers is only valid with setup mode');
       expect(stderr).toContain('--print');
     }
+  });
+
+  it('rejects update without a config and refuses a pre-positioned checkout from another origin', () => {
+    const noConfigHome = tempDir('gru-command-update-no-config-home-');
+    const noConfigBare = tempDir('gru-command-update-no-config-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(noConfigBare, 'install.sh'));
+    const noConfigTarget = join(noConfigHome, 'gru-command');
+    const noConfig = run(join(noConfigBare, 'install.sh'), ['--update'], {
+      HOME: noConfigHome,
+      GRU_COMMAND_HOME: join(noConfigHome, '.gru-command'),
+      GRU_COMMAND_TARGET: noConfigTarget,
+    });
+    expect(noConfig.status).toBe(1);
+    expect(noConfig.stderr).toContain('--update requires an existing configured instance');
+    expect(existsSync(noConfigTarget)).toBe(false);
+
+    const first = buildFixtureRepo();
+    const second = buildFixtureRepo();
+    gitInitCommit(first.fixture);
+    gitInitCommit(second.fixture);
+    const target = join(first.home, 'gru-command');
+    execFileSync('git', ['clone', `file://${first.fixture}`, target], { stdio: 'pipe' });
+    const instance = join(first.home, '.gru-command');
+    mkdirSync(instance, { recursive: true });
+    writeFileSync(join(instance, 'config.toml'), 'preserved\n');
+    const bare = tempDir('gru-command-origin-guard-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const wrongOrigin = run(join(bare, 'install.sh'), [], {
+      HOME: first.home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_TARGET: target,
+      GRU_COMMAND_ORIGIN: `file://${second.fixture}`,
+    });
+    expect(wrongOrigin.status).toBe(1);
+    expect(wrongOrigin.stderr).toContain('unexpected origin');
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toBe('preserved\n');
   });
 
   it('clone failure (bad GRU_COMMAND_ORIGIN) exits non-zero with a named error', () => {

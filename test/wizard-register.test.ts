@@ -56,7 +56,10 @@ function runWizard(fixture: string, instance: string, answers: string) {
     process.execPath,
     [join(fixture, 'dist', 'wizard', 'main.js'), '--answers', answers],
     {
-      env: { ...process.env, GRU_COMMAND_HOME: instance },
+      env: {
+        ...process.env,
+        GRU_COMMAND_HOME: instance,
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 60_000,
     },
@@ -66,7 +69,7 @@ function runWizard(fixture: string, instance: string, answers: string) {
 describe('wizard service registration (Perkins r1 W9)', () => {
   it('register_service spawns bash <repo>/install.sh --service (the E7 path, one mechanism)', () => {
     const { fixture, marker, instance } = buildFixture(0);
-    const res = runWizard(fixture, instance, '{"register_service":true,"smoke":false,"port":0,"token":"reg-token"}');
+    const res = runWizard(fixture, instance, '{"register_service":true,"smoke":false,"port":0}');
     const out = `${res.stdout?.toString('utf-8') ?? ''}${res.stderr?.toString('utf-8') ?? ''}`;
     expect(res.status, out).toBe(0);
     // The stub ran with exactly the service-registration argv.
@@ -78,7 +81,7 @@ describe('wizard service registration (Perkins r1 W9)', () => {
 
   it('a failing registration fails the wizard loud (named exit)', () => {
     const { fixture, marker, instance } = buildFixture(3);
-    const res = runWizard(fixture, instance, '{"register_service":true,"smoke":false,"port":0,"token":"reg-token"}');
+    const res = runWizard(fixture, instance, '{"register_service":true,"smoke":false,"port":0}');
     expect(res.status).toBe(1);
     expect(res.stderr?.toString('utf-8') ?? '').toContain('service registration failed');
     expect(readFileSync(marker, 'utf-8').trim()).toBe('--service');

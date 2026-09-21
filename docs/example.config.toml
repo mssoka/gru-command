@@ -1,64 +1,90 @@
-# Example configuration for Gru Command.
-# Copy to ~/.gru-command/config.toml and edit.
-# Every value below is generic — replace with your own.
+# Copy-only example for Gru Command.
+# The application reads ~/.gru-command/config.toml (or $GRU_COMMAND_HOME/config.toml),
+# never this docs file. Prefer `npm run config:generate` for a live teaching config.
 
-workspace_root = "~/code"          # where your managed repos live (e.g. repos named alpha, beta)
-data_dir = "~/.gru-command"        # per-instance state; never inside workspace_root
+workspace_root = "~/code"          # selected managed repositories only
+data_dir = "~/.gru-command"        # instance state; never inside workspace_root
 
 [server]
-host = "127.0.0.1"                 # bind your LAN address to pair a phone; LAN only (no TLS in v1)
-port = 7665
+host = "127.0.0.1"                 # trusted LAN only; v1 has no TLS
+port = 7665                         # 0 = ephemeral
 
 [auth]
-token = "replace-with-a-random-string"   # required for the /ws chat socket (empty = chat rejects all)
+token = "replace-with-a-random-string" # generated uniquely by the wizard/generator
 
 [runtimes]
 default = "pi"                     # "pi" | "claude-code"
 
-[runtimes.roles]                   # optional per-role overrides
-gru = "pi"
-silas = "pi"
-minion = "claude-code"
-perkins = "pi"
-bob = "pi"
+[runtimes.roles]
+# Optional; omitted roles inherit runtimes.default.
+# gru = "pi"
+# silas = "pi"
+# minion = "pi"
+# perkins = "pi"
+# bob = "pi"
 
 [models]
-# "default" = the runtime harness's own configured model (SPEC ruling 16:
-# the product never hardcodes a model). Explicit: "provider/model".
-default = "default"
+default = "default"                # runtime's configured model; never hardcoded here
 
-[models.roles]                     # optional per-role overrides
-gru = "provider/model-b"
+[models.roles]
+# Optional; uncommenting "default" deliberately pins the runtime default.
+# gru = "default"
+# silas = "default"
+# minion = "default"
+# perkins = "default"
+# bob = "default"
 
-[thinking]                         # thinking level policy, same shape as [models]
-default = "default"                # or a level the runtime accepts
+[thinking]
+default = "default"                # runtime's configured thinking level
 
 [thinking.roles]
-perkins = "max"
+# gru = "default"
+# silas = "default"
+# minion = "default"
+# perkins = "default"
+# bob = "default"
 
-[runtimes.pi]                      # per-runtime model & thinking policy
-model = "default"
-thinking_level = "default"
+[runtimes.pi]
+# model = "default"                # optional runtime-wide overrides
+# thinking_level = "default"
 
-[runtimes.pi.roles]                # per-runtime per-role (model and/or thinking_level)
-minion = { model = "provider/model-c", thinking_level = "low" }
-bob = { thinking_level = "medium" }
+[runtimes.pi.roles]
+# gru = { model = "default", thinking_level = "default" }
+# silas = { model = "default", thinking_level = "default" }
+# minion = { model = "default", thinking_level = "default" }
+# perkins = { model = "default", thinking_level = "default" }
+# bob = { model = "default", thinking_level = "default" }
 
-[supervision]                      # in-process supervision (E7) — all optional
+[runtimes.claude-code]
+# model = "default"
+# thinking_level = "default"
+
+[runtimes.claude-code.roles]
+# gru = { model = "default", thinking_level = "default" }
+# silas = { model = "default", thinking_level = "default" }
+# minion = { model = "default", thinking_level = "default" }
+# perkins = { model = "default", thinking_level = "default" }
+# bob = { model = "default", thinking_level = "default" }
+
+[supervision]
 enabled = true
-turn_silence_ms = 900000           # open turn silent this long = hung
-restart_window_ms = 600000         # rolling crash-loop window
-max_restarts = 3                   # >= this many restarts in the window trips the breaker
-restart_backoff_ms = 2000          # base backoff between failed rungs (doubles, 60s cap)
+turn_silence_ms = 900000
+restart_window_ms = 600000
+max_restarts = 3
+restart_backoff_ms = 2000
 
-[logging]                          # size-based service.log rotation
+[logging]
 max_bytes = 10485760
 keep = 5
 
-[chat]                             # frame-log rotation; replay spans shards
+[chat]
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
 
+[worktrees]
+# root = "~/.gru-command/worktrees" # omitted so it follows data_dir
+# preserve_root = "~/.gru-command/worktree-preserves"
+setup_timeout_ms = 120000
 
 [dispatch]                        # dispatch flow (E8) — all optional
 bob_interval_ms = 3600000         # Bob's consolidation interval; 0 disables

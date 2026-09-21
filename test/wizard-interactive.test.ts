@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -68,7 +68,10 @@ function ptyWizard(
   let status = 0;
   try {
     out = execFileSync('expect', ['-c', script.join('\n')], {
-      env: { ...process.env, ...env },
+      env: {
+        ...process.env,
+        ...env,
+      },
       encoding: 'utf-8',
       timeout: 110_000,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -92,10 +95,12 @@ function expectAvailable(): boolean {
 
 const WS_PROMPT = 'Workspace root (holds ONLY your managed repos)';
 const REPOS_PROMPT = 'Managed repos — comma-separated numbers or names';
+const BMAD_A_PROMPT = 'BMAD in repo-a';
+const BMAD_B_PROMPT = 'BMAD in repo-b';
 const RUNTIME_PROMPT = 'Default runtime — ';
 const MODEL_PROMPT = 'Model reference';
 const THINKING_PROMPT = 'Thinking level';
-const HOST_PROMPT = 'Bind host';
+const HOST_PROMPT = 'Bind host (IP address, e.g. 192.168.1.23';
 const PORT_PROMPT = 'Bind port';
 const TOKEN_PROMPT = 'Pairing token';
 const REGISTER_PROMPT = 'Register the OS service';
@@ -113,6 +118,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       [
         { expect: WS_PROMPT, send: workspace },
         { expect: REPOS_PROMPT, send: '' }, // default = all found
+        { expect: BMAD_A_PROMPT, send: 'n' },
+        { expect: BMAD_B_PROMPT, send: 'n' },
         { expect: RUNTIME_PROMPT, send: '' }, // default runtime
         { expect: MODEL_PROMPT, send: '' }, // "default" sentinel
         { expect: THINKING_PROMPT, send: '' }, // "default" sentinel
@@ -128,12 +135,59 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(output).toContain('Repos under the workspace root:');
     expect(output).toContain('1. repo-a');
     expect(output).toContain('2. repo-b');
-    expect(output).toContain('Managed repos (board grouping): repo-a, repo-b');
+    expect(output).toContain('Selected repos for BMAD onboarding: repo-a, repo-b');
     expect(output).toContain('Smoke green');
     expect(output).toContain('Setup complete');
     const config = readFileSync(join(instance, 'config.toml'), 'utf-8');
     expect(config).toContain('port = 0');
     expect(config).toContain(`workspace_root = "${workspace}"`);
+  }, 120_000);
+
+  it('Enter accepts the default-on fresh BMAD action and reaches ready state', () => {
+    const workspace = fixtureWorkspace();
+    execFileSync('git', ['-C', join(workspace, 'repo-a'), 'init', '-q']);
+    const instance = tempDir('gru-command-pty-bmad-default-');
+    const bin = tempDir('gru-command-pty-bmad-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(
+      join(bin, 'npx'),
+      [
+        '#!/usr/bin/env node',
+        "const { mkdirSync, writeFileSync } = require('node:fs');",
+        "const { join } = require('node:path');",
+        "if (process.argv.includes('--version')) { console.log('10.0.0'); process.exit(0); }",
+        "const root = process.cwd();",
+        "const manifest = ['installation:', '  version: 6.12.0', 'modules:', '  - name: core', '    version: 6.12.0', '  - name: bmm', '    version: 6.12.0', '  - name: cis', '    version: v0.3.2', '  - name: tea', '    version: v1.27.2', '  - name: gds', '    version: v0.7.2', 'ides:', '  - pi', ''].join('\\n');",
+        "for (const module of ['core','bmm','cis','tea','gds']) { mkdirSync(join(root, '_bmad', module), { recursive: true }); writeFileSync(join(root, '_bmad', module, 'marker.txt'), module + '\\n'); }",
+        "mkdirSync(join(root, '_bmad', '_config'), { recursive: true }); writeFileSync(join(root, '_bmad', '_config', 'manifest.yaml'), manifest);",
+        "for (const skill of ['bmad-build','bmad-help','gds-quick-dev']) { const dir=join(root,'.agents','skills',skill); mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,'SKILL.md'),'# skill\\n'); writeFileSync(join(dir,'workflow.md'),'{{.implementation_artifacts}}\\n'); }",
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const { output, status } = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '1' },
+        { expect: BMAD_A_PROMPT, send: '' },
+        { expect: RUNTIME_PROMPT, send: '' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: '' },
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+      ],
+      {
+        GRU_COMMAND_HOME: instance,
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+      },
+    );
+    expect(status, output).toBe(0);
+    expect(output).toContain('  repo-a: install');
+    expect(output).toContain('BMAD ready in repo-a');
+    expect(existsSync(join(workspace, 'repo-a', '.gru-command', 'bmad-install.json'))).toBe(true);
   }, 120_000);
 
   it('every prompt loop retries on invalid input, then accepts the valid answer', () => {
@@ -144,6 +198,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: WS_PROMPT, send: 'code' }, // ✗ relative
         { expect: WS_PROMPT, send: workspace }, // retried, valid
         { expect: REPOS_PROMPT, send: '' },
+        { expect: BMAD_A_PROMPT, send: 'n' },
+        { expect: BMAD_B_PROMPT, send: 'n' },
         { expect: RUNTIME_PROMPT, send: 'vim' }, // ✗ unknown runtime
         { expect: RUNTIME_PROMPT, send: '' }, // retried, default
         { expect: MODEL_PROMPT, send: '' },
@@ -176,6 +232,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       [
         { expect: WS_PROMPT, send: workspace },
         { expect: REPOS_PROMPT, send: '1' }, // by index → repo-a
+        { expect: BMAD_A_PROMPT, send: 'n' },
         { expect: RUNTIME_PROMPT, send: '' },
         { expect: MODEL_PROMPT, send: '' },
         { expect: THINKING_PROMPT, send: '' },
@@ -188,8 +245,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { GRU_COMMAND_HOME: instance },
     );
     expect(status, output).toBe(0);
-    expect(output).toContain('Managed repos (board grouping): repo-a');
-    expect(output).not.toContain('board grouping): repo-a, repo-b');
+    expect(output).toContain('Selected repos for BMAD onboarding: repo-a');
+    expect(output).not.toContain('BMAD onboarding: repo-a, repo-b');
   }, 120_000);
 
   it('managed-repo multi-pick by NAME (comma-separated) selects exactly those repos', () => {
@@ -199,6 +256,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       [
         { expect: WS_PROMPT, send: workspace },
         { expect: REPOS_PROMPT, send: 'repo-b, repo-a' }, // by name, comma-separated
+        { expect: BMAD_B_PROMPT, send: 'n' },
+        { expect: BMAD_A_PROMPT, send: 'n' },
         { expect: RUNTIME_PROMPT, send: '' },
         { expect: MODEL_PROMPT, send: '' },
         { expect: THINKING_PROMPT, send: '' },
@@ -213,7 +272,60 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(status, output).toBe(0);
     // The grouping line preserves the ANSWERED order (the discovery list
     // is sorted; the pick is the user's sequence).
-    expect(output).toContain('Managed repos (board grouping): repo-b, repo-a');
+    expect(output).toContain('Selected repos for BMAD onboarding: repo-b, repo-a');
+  }, 120_000);
+
+  it('bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config (user-found boot bug)', () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-host-');
+    const { output, status } = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '' },
+        { expect: BMAD_A_PROMPT, send: 'n' },
+        { expect: BMAD_B_PROMPT, send: 'n' },
+        { expect: RUNTIME_PROMPT, send: '' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: 'yes' }, // rejected — re-prompt, never written
+        { expect: HOST_PROMPT, send: 'no' }, // rejected again
+        { expect: HOST_PROMPT, send: '0.0.0.0' }, // valid: all interfaces
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+      ],
+      { GRU_COMMAND_HOME: instance },
+    );
+    expect(status, output).toBe(0);
+    expect(output).toContain('is not a bind host — enter an IP address');
+    const text = readFileSync(join(instance, 'config.toml'), 'utf-8');
+    expect(text).toContain('host = "0.0.0.0"');
+  }, 120_000);
+
+  it('bind host accepts a resolvable hostname (localhost) end-to-end', () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-hostname-');
+    const { output, status } = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '' },
+        { expect: BMAD_A_PROMPT, send: 'n' },
+        { expect: BMAD_B_PROMPT, send: 'n' },
+        { expect: RUNTIME_PROMPT, send: '' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: 'localhost' }, // resolvable → accepted
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+      ],
+      { GRU_COMMAND_HOME: instance },
+    );
+    expect(status, output).toBe(0);
+    const text = readFileSync(join(instance, 'config.toml'), 'utf-8');
+    expect(text).toContain('host = "localhost"');
   }, 120_000);
 });
 

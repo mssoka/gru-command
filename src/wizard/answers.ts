@@ -13,6 +13,8 @@ import { expandTilde, ROLES, RUNTIME_IDS, type Role, type RuntimeId } from '../c
  * nothing written.
  */
 
+export type BmadRepoAction = 'install' | 'reuse' | 'skip';
+
 export interface WizardAnswers {
   /** Raw workspace-root string as answered (`~`-form preserved in output). */
   readonly workspaceRoot: string;
@@ -31,6 +33,8 @@ export interface WizardAnswers {
   readonly token: string;
   readonly registerService: boolean;
   readonly smoke: boolean;
+  /** Per-selected-repo BMAD action. Fresh defaults to install; existing to reuse. */
+  readonly bmad: Readonly<Record<string, BmadRepoAction>>;
 }
 
 /** Error class for answers validation — message is the whole UX. */
@@ -53,6 +57,7 @@ const ANSWER_KEYS = [
   'token',
   'register_service',
   'smoke',
+  'bmad',
 ] as const;
 
 export const DEFAULT_WORKSPACE_ROOT = '~/code';
@@ -130,9 +135,21 @@ export function isIpv6Literal(value: string): boolean {
   return groups === 8; // full form
 }
 
+/** Tokens that answer YES/NO questions are never valid bind hosts — the
+ * wizard must re-prompt instead of writing a config that dies at boot
+ * with getaddrinfo ENOTFOUND yes (user-found bind-host input bug). */
+const YN_TOKEN_RE = /^(?:y|yes|n|no)\.?$/i;
+
 /** Bind-host validation: an IPv4/IPv6 literal or a plausible hostname —
- * anything else ("not a host!") would write a config that dies at boot. */
+ * anything else ("not a host!", "yes", "n") would write a config that
+ * dies at boot. Syntax only; resolvability is checked separately by
+ * {@link resolveBindHost}. */
 export function validateHost(value: string): string {
+  if (YN_TOKEN_RE.test(value)) {
+    throw new AnswersError(
+      `'${value}' is not a bind host — enter an IP address (e.g. 192.168.1.23 or 127.0.0.1) or a resolvable hostname`,
+    );
+  }
   const ipv4 = IPV4_RE.exec(value);
   if (ipv4 !== null) {
     const octetsOk = ipv4.slice(1).every((octet) => Number(octet) <= 255);
@@ -147,6 +164,43 @@ export function validateHost(value: string): string {
   throw new AnswersError(
     `answers.host must be an IPv4/IPv6 literal or a hostname, got: ${value}`,
   );
+}
+
+/** Async host lookup seam (tests inject; production uses dns.promises). */
+export type HostLookup = (host: string) => Promise<void>;
+
+async function defaultLookup(host: string): Promise<void> {
+  const { lookup } = await import('node:dns/promises');
+  await lookup(host);
+}
+
+/**
+ * Full bind-host acceptance for the interactive prompt and the
+ * non-interactive path: syntactically valid (IP literal or hostname,
+ * never a y/n token) AND — for hostnames — actually resolvable.
+ * IP literals (127.0.0.1, 192.168.x.x, 0.0.0.0) need no lookup.
+ */
+export async function resolveBindHost(
+  value: string,
+  lookup: HostLookup = defaultLookup,
+  timeoutMs = 5_000,
+): Promise<string> {
+  const host = validateHost(value);
+  if (IPV4_RE.test(host) || host.includes(':')) return host; // IP literal
+  try {
+    await Promise.race([
+      lookup(host),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs),
+      ),
+    ]);
+  } catch (error) {
+    const detail = (error as Error).message || 'name or service not known';
+    throw new AnswersError(
+      `bind host "${host}" does not resolve (${detail}) — enter an IP address (e.g. 192.168.1.23) or a resolvable hostname`,
+    );
+  }
+  return host;
 }
 
 /**
@@ -193,6 +247,9 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
       }
       return name;
     });
+    if (new Set(repos).size !== repos.length) {
+      throw new AnswersError('answers.repos must not contain duplicate repo names');
+    }
     const workspaceAbs = expandTilde(workspaceRoot, home);
     for (const name of repos) {
       const repoDir = join(workspaceAbs, name);
@@ -269,6 +326,30 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     }
   }
 
+  const bmad: Record<string, BmadRepoAction> = {};
+  const workspaceAbs = expandTilde(workspaceRoot, home);
+  for (const repo of repos) {
+    bmad[repo] = existsSync(join(workspaceAbs, repo, '_bmad', '_config', 'manifest.yaml'))
+      ? 'reuse'
+      : 'install';
+  }
+  if (raw['bmad'] !== undefined) {
+    if (!isPlainObject(raw['bmad'])) {
+      throw new AnswersError('answers.bmad must be an object of selected repo → install | reuse | skip');
+    }
+    for (const [repo, action] of Object.entries(raw['bmad'])) {
+      if (!repos.includes(repo)) {
+        throw new AnswersError(`answers.bmad names unselected repo \`${repo}\``);
+      }
+      if (!['install', 'reuse', 'skip'].includes(String(action))) {
+        throw new AnswersError(
+          `answers.bmad.${repo} must be "install", "reuse", or "skip", got: ${JSON.stringify(action)}`,
+        );
+      }
+      bmad[repo] = action as BmadRepoAction;
+    }
+  }
+
   return {
     workspaceRoot,
     repos,
@@ -281,5 +362,6 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     token,
     registerService: raw['register_service'] === true,
     smoke: raw['smoke'] !== false,
+    bmad,
   };
 }

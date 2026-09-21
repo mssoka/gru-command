@@ -31,6 +31,18 @@ function print(env: NodeJS.ProcessEnv = {}): { stdout: string; status: number } 
 }
 
 describe('install.sh --print rendering', () => {
+  it('declares the standalone Perkins resources in the npm package allowlist', () => {
+    const packageJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8')) as {
+      files?: string[];
+    };
+    expect(packageJson.files).toEqual(expect.arrayContaining([
+      'dist/',
+      'resources/perkins-code-review/policy.json',
+      'roles/',
+      'tools/verify-perkins-resource.mjs',
+    ]));
+  });
+
   it('renders the platform unit with every placeholder substituted absolutely', () => {
     const { stdout, status } = print();
     expect(status).toBe(0);
@@ -44,10 +56,12 @@ describe('install.sh --print rendering', () => {
     if (process.platform === 'darwin') {
       expect(stdout).toContain('<key>Label</key>');
       expect(stdout).toContain('<string>com.gru-command.service</string>');
+      expect(stdout).toContain('<string>gru-command-install-v2</string>');
       expect(stdout).toContain('<key>KeepAlive</key>');
       expect(stdout).toContain('<key>SuccessfulExit</key>');
     } else {
       expect(stdout).toContain('[Unit]');
+      expect(stdout).toContain('X-GruCommandManagedBy=gru-command-install-v2');
       expect(stdout).toContain('Restart=on-failure');
       expect(stdout).toContain('WantedBy=default.target');
     }

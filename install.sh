@@ -6,11 +6,14 @@
 # (no clone present → clone → deps → build → setup wizard → first-boot smoke)
 #
 # Usage:
-#   ./install.sh                     full setup: deps + build →
-#                                    setup wizard (clone-when-absent when
-#                                    piped from the one-liner)
-#   ./install.sh --answers '<json>'  same setup, non-interactive wizard
-#                                    (unspecified answers = defaults)
+#   ./install.sh                     fresh install, or safe update when an
+#                                    instance config already exists
+#   ./install.sh --update            pull --ff-only + deps + builds + restart
+#                                    only an owned installed service
+#   ./install.sh --no-interact       fresh setup with documented defaults
+#   ./install.sh --answers '<json>'  fresh non-interactive setup overrides;
+#                                    secrets are forbidden in answers
+#   ./install.sh --force             allow wizard/config replacement with backup
 #   ./install.sh --service           register + start the OS service only
 #                                    (the E7 path; also how the wizard
 #                                    registers the service — one mechanism)
@@ -36,12 +39,19 @@ CLONE_TARGET="${GRU_COMMAND_TARGET:-$HOME/gru-command}"
 MODE="setup"
 ANSWERS=""
 ANSWERS_SET=0
+NO_INTERACT=0
+FORCE=0
+UPDATE_REQUESTED=0
+LAUNCHCTL_BIN="${GRU_COMMAND_LAUNCHCTL:-launchctl}"
+SYSTEMCTL_BIN="${GRU_COMMAND_SYSTEMCTL:-systemctl}"
 
 err() { echo "install.sh: $*" >&2; }
 # The range MUST cover the whole header block through the seam lines
 # (GRU_COMMAND_ORIGIN / GRU_COMMAND_TARGET) — --help shows all of it.
 usage() {
-  sed -n '2,26p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//' >&2
+  # Print the header comment block (everything after the shebang up to the
+  # first line of code) so --help can never drift from the header.
+  awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]:-$0}" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -49,20 +59,31 @@ while [[ $# -gt 0 ]]; do
     --print) MODE="print" ; shift ;;
     --uninstall) MODE="uninstall" ; shift ;;
     --service) MODE="service" ; shift ;;
+    --update) UPDATE_REQUESTED=1; shift ;;
+    --no-interact) NO_INTERACT=1; shift ;;
+    --force) FORCE=1; shift ;;
     --answers)
       [[ $# -ge 2 ]] || { err "--answers requires a JSON argument"; exit 2; }
-      ANSWERS="$2"; ANSWERS_SET=1; shift 2 ;;
+      ANSWERS="$2"; ANSWERS_SET=1; NO_INTERACT=1; shift 2 ;;
     --answers=*)
-      ANSWERS="${1#--answers=}"; ANSWERS_SET=1; shift ;;
+      ANSWERS="${1#--answers=}"; ANSWERS_SET=1; NO_INTERACT=1; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) err "unknown flag: $1 (valid: --answers <json>, --service, --print, --uninstall, -h|--help)"; exit 2 ;;
+    *) err "unknown flag: $1 (valid: --update, --no-interact, --answers <json>, --force, --service, --print, --uninstall, -h|--help)"; exit 2 ;;
   esac
 done
 
 # Contradicting combos fail loud instead of resolving silently: --answers
 # is a SETUP-mode argument; pairing it with another mode drops one of them.
-if [[ -n "$ANSWERS" && "$MODE" != "setup" ]]; then
+if [[ "$ANSWERS_SET" -eq 1 && "$MODE" != "setup" ]]; then
   err "--answers is only valid with setup mode, but mode is --$MODE — pass --answers alone (setup is the default)"
+  exit 2
+fi
+if [[ "$UPDATE_REQUESTED" -eq 1 && ( "$ANSWERS_SET" -eq 1 || "$FORCE" -eq 1 ) ]]; then
+  err "--update preserves config and cannot be combined with --answers or --force"
+  exit 2
+fi
+if [[ "$MODE" != "setup" && ( "$NO_INTERACT" -eq 1 || "$FORCE" -eq 1 || "$UPDATE_REQUESTED" -eq 1 ) ]]; then
+  err "--no-interact, --force, and --update are setup lifecycle flags"
   exit 2
 fi
 # An explicitly-empty --answers must not silently flip to interactive mode
@@ -165,20 +186,87 @@ verify_unit() {
 
 # ---------------------------------------------------------------------------
 # Platform installers (E7 — reached via --service, and by the wizard's
-# optional service-registration step)
+# optional service-registration step). Existing unit names are shared public
+# names, so path ownership is proven before overwrite/restart.
 # ---------------------------------------------------------------------------
+service_target() {
+  case "$OS" in
+    darwin) printf '%s\n' "$HOME/Library/LaunchAgents/$LABEL.plist" ;;
+    linux) printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/gru-command.service" ;;
+  esac
+}
+
+service_ownership() {
+  local target expected expected_env actual_exec expected_program rendered arg_count executable program instance managed
+  target="$(service_target)"
+  if [[ ! -f "$target" ]]; then
+    if [[ "$OS" == "linux" && -d "$target.d" ]]; then echo "foreign"; else echo "absent"; fi
+    return
+  fi
+  case "$OS" in
+    darwin)
+      command -v plutil >/dev/null 2>&1 || { echo "foreign"; return; }
+      managed="$(plutil -extract GruCommandManagedBy raw -o - "$target" 2>/dev/null || true)"
+      arg_count="$(plutil -extract ProgramArguments raw -o - "$target" 2>/dev/null || true)"
+      executable="$(plutil -extract ProgramArguments.0 raw -o - "$target" 2>/dev/null || true)"
+      program="$(plutil -extract ProgramArguments.1 raw -o - "$target" 2>/dev/null || true)"
+      instance="$(plutil -extract EnvironmentVariables.GRU_COMMAND_HOME raw -o - "$target" 2>/dev/null || true)"
+      if [[ "$managed" == "gru-command-install-v2" && "$arg_count" == "2" && \
+            "$executable" == /*/node && "$program" == "$REPO_ROOT/dist/main.js" && \
+            "$instance" == "$INSTANCE_DIR" ]]; then
+        echo "owned"
+      else
+        echo "foreign"
+      fi
+      ;;
+    linux)
+      if [[ -d "$target.d" ]]; then
+        echo "foreign"
+        return
+      fi
+      rendered="$(render_unit "$REPO_ROOT/install/systemd/gru-command.service.template" "$NODE_BIN" "$REPO_ROOT" "$INSTANCE_DIR")"
+      expected="$(printf '%s\n' "$rendered" | grep '^ExecStart=' || true)"
+      expected_env="$(printf '%s\n' "$rendered" | grep '^Environment=GRU_COMMAND_HOME=' || true)"
+      expected_program="${expected#* }"
+      actual_exec="$(grep '^ExecStart=' "$target" || true)"
+      actual_exec="${actual_exec% "$expected_program"}"
+      if [[ -n "$expected" && -n "$expected_env" ]] && \
+         [[ "$actual_exec" == ExecStart=*node || "$actual_exec" == ExecStart=*"node'" || "$actual_exec" == ExecStart=*'node"' ]] && \
+         [[ "$(grep -Fxc 'X-GruCommandManagedBy=gru-command-install-v2' "$target" || true)" == "1" ]] && \
+         [[ "$(grep -c '^ExecStart=' "$target" || true)" == "1" ]] && \
+         [[ "$(grep -c '^Environment=GRU_COMMAND_HOME=' "$target" || true)" == "1" ]] && \
+         grep -Fqx -- "${actual_exec} ${expected_program}" "$target" && grep -Fxq -- "$expected_env" "$target"; then
+        echo "owned"
+      else
+        echo "foreign"
+      fi
+      ;;
+  esac
+}
+
+assert_service_owned_or_absent() {
+  local ownership
+  ownership="$(service_ownership)"
+  if [[ "$ownership" == "foreign" ]]; then
+    err "refusing to overwrite unrelated service unit: $(service_target)"
+    err "the installed unit does not target repo $REPO_ROOT and instance $INSTANCE_DIR"
+    exit 1
+  fi
+}
+
 install_launchd() {
   local target_dir="$HOME/Library/LaunchAgents"
   local target="$target_dir/$LABEL.plist"
   local rendered
+  assert_service_owned_or_absent
   rendered="$(render_unit "$REPO_ROOT/install/launchd/$LABEL.plist.template" "$NODE_BIN" "$REPO_ROOT" "$INSTANCE_DIR")"
   mkdir -p "$target_dir" "$INSTANCE_DIR/logs"
   printf '%s\n' "$rendered" > "$target.r"
   verify_unit "$target.r" "$target"
   # Refresh: unload before overwriting so the new unit takes effect.
-  launchctl unload "$target" >/dev/null 2>&1 || true
+  "$LAUNCHCTL_BIN" unload "$target" >/dev/null 2>&1 || true
   mv "$target.r" "$target"
-  launchctl load "$target"
+  "$LAUNCHCTL_BIN" load "$target"
   echo "installed: $target"
   echo "instance:  $INSTANCE_DIR"
   echo "status:    launchctl list | grep gru-command"
@@ -187,7 +275,10 @@ install_launchd() {
 uninstall_launchd() {
   local target="$HOME/Library/LaunchAgents/$LABEL.plist"
   if [[ -f "$target" ]]; then
-    launchctl unload "$target" >/dev/null 2>&1 || true
+    [[ "$(service_ownership)" == "owned" ]] || {
+      err "refusing to uninstall unrelated service unit: $target"; exit 1;
+    }
+    "$LAUNCHCTL_BIN" unload "$target" >/dev/null 2>&1 || true
     rm -f "$target"
     echo "uninstalled: $target"
   else
@@ -196,26 +287,34 @@ uninstall_launchd() {
 }
 
 install_systemd() {
-  local target_dir="$HOME/.config/systemd/user"
+  local target_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   local target="$target_dir/gru-command.service"
   local rendered
+  assert_service_owned_or_absent
   rendered="$(render_unit "$REPO_ROOT/install/systemd/gru-command.service.template" "$NODE_BIN" "$REPO_ROOT" "$INSTANCE_DIR")"
   mkdir -p "$target_dir" "$INSTANCE_DIR/logs"
   printf '%s' "$rendered" > "$target.r"
   verify_unit "$target.r" "$target"
   mv "$target.r" "$target"
-  systemctl --user daemon-reload
-  systemctl --user enable --now gru-command.service
+  "$SYSTEMCTL_BIN" --user daemon-reload
+  "$SYSTEMCTL_BIN" --user enable gru-command.service
+  # `enable --now` does not restart an already-active unit. restart starts
+  # an inactive fresh unit and guarantees updated code for an active one.
+  "$SYSTEMCTL_BIN" --user restart gru-command.service
   echo "installed: $target"
   echo "instance:  $INSTANCE_DIR"
   echo "status:    systemctl --user status gru-command"
 }
 
 uninstall_systemd() {
-  if systemctl --user list-unit-files 2>/dev/null | grep -q '^gru-command.service'; then
-    systemctl --user disable --now gru-command.service >/dev/null 2>&1 || true
-    rm -f "$HOME/.config/systemd/user/gru-command.service"
-    systemctl --user daemon-reload
+  local target="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/gru-command.service"
+  if [[ -f "$target" ]]; then
+    [[ "$(service_ownership)" == "owned" ]] || {
+      err "refusing to uninstall unrelated service unit: $target"; exit 1;
+    }
+    "$SYSTEMCTL_BIN" --user disable --now gru-command.service >/dev/null 2>&1 || true
+    rm -f "$target"
+    "$SYSTEMCTL_BIN" --user daemon-reload
     echo "uninstalled: gru-command.service"
   else
     echo "not installed"
@@ -258,17 +357,98 @@ inside_checkout() {
   is_product_checkout "$REPO_ROOT"
 }
 
+verify_checkout_origin() {
+  local root="$1" configured
+  configured="$(git -C "$root" remote get-url origin 2>/dev/null || true)"
+  if [[ "$configured" != "$CLONE_ORIGIN" ]]; then
+    err "refusing to update checkout with unexpected origin: $root"
+    err "expected: $CLONE_ORIGIN"
+    err "actual:   ${configured:-<missing>}"
+    exit 1
+  fi
+}
+
+update_checkout_path() {
+  local root="$1"
+  if [[ -n "$(git -C "$root" status --porcelain --untracked-files=normal)" ]]; then
+    err "refusing to update a dirty checkout: $root"
+    err "commit, stash, or remove local changes first; nothing was pulled"
+    exit 1
+  fi
+  echo "updating source with git pull --ff-only…"
+  if ! git -C "$root" pull --ff-only; then
+    err "fast-forward-only update failed; resolve divergence manually (no reset was attempted)"
+    exit 1
+  fi
+}
+
+update_checkout() {
+  update_checkout_path "$REPO_ROOT"
+}
+
+build_product() {
+  cd "$REPO_ROOT"
+  echo "installing dependencies…"
+  if [[ -f package-lock.json ]]; then
+    # Reproducible and non-mutating: `npm install` can rewrite a stale root
+    # package version in package-lock.json, making the managed checkout
+    # dirty and causing the next safe update to refuse itself.
+    npm ci --no-audit --no-fund
+  else
+    npm install --no-audit --no-fund
+  fi
+  echo "building service and local CLIs…"
+  npm run build
+  if "$NODE_BIN" -e "const p=require('./package.json'); process.exit(p.scripts?.['build:web'] ? 0 : 1)"; then
+    echo "building web UI…"
+    npm run build:web
+  fi
+  for artifact in dist/main.js dist/wizard/main.js dist/cli/config-generate.js dist/runtime/review-mcp-server.mjs resources/perkins-code-review/policy.json tools/verify-perkins-resource.mjs; do
+    if [[ ! -f "$artifact" ]]; then
+      err "build did not produce $artifact"
+      exit 1
+    fi
+  done
+  echo "verifying installed Perkins resources…"
+  "$NODE_BIN" tools/verify-perkins-resource.mjs "$REPO_ROOT"
+}
+
+restart_owned_service_if_present() {
+  local ownership
+  ownership="$(service_ownership)"
+  case "$ownership" in
+    absent)
+      echo "service restart: no installed Gru Command unit for this repo/instance"
+      ;;
+    foreign)
+      err "refusing to restart unrelated service unit: $(service_target)"
+      exit 1
+      ;;
+    owned)
+      echo "restarting owned Gru Command service…"
+      case "$OS" in
+        darwin) install_launchd ;;
+        linux) install_systemd ;;
+      esac
+      ;;
+  esac
+}
+
 run_setup() {
+  local source_update=0
+  local cloned=0
   # The identity predicate parses package.json with Node, so enforce the
   # installer prerequisite before asking it to distinguish pipe vs clone.
   if ! node_ok; then
     err "node >= 22.19 required, found $("$NODE_BIN" --version) — upgrade Node.js first"
     exit 1
   fi
+  if [[ "$UPDATE_REQUESTED" -eq 1 && ! -f "$INSTANCE_DIR/config.toml" ]]; then
+    err "--update requires an existing configured instance at $INSTANCE_DIR/config.toml"
+    err "run setup without --update for a fresh installation"
+    exit 1
+  fi
   if ! inside_checkout; then
-    # One-liner case (e.g. curl | bash): clone to the target dir.
-    # A re-exec guard: if we already re-executed once and STILL are not
-    # inside a checkout, fail loud — never loop.
     if [[ -n "${GRU_COMMAND_REEXEC:-}" ]]; then
       err "re-exec landed outside a product checkout: $REPO_ROOT"
       err "(the clone target must be a Gru Command checkout: package.json named gru-command + src/ + install.sh + .git)"
@@ -278,7 +458,12 @@ run_setup() {
     if [[ -e "$CLONE_TARGET" ]]; then
       if is_product_checkout "$CLONE_TARGET"; then
         echo "reusing existing checkout: $CLONE_TARGET"
-        echo "notice: not updating the checkout — run git pull yourself"
+        # Pull with the downloaded current installer before re-executing.
+        # An old target script may not know the safe updater contract. Do not
+        # execute a pre-positioned fork when this one-liner names another origin.
+        verify_checkout_origin "$CLONE_TARGET"
+        update_checkout_path "$CLONE_TARGET"
+        source_update=1
       else
         err "clone target exists and is not a Gru Command checkout: $CLONE_TARGET"
         err "move it, or set GRU_COMMAND_TARGET to another path"
@@ -287,35 +472,58 @@ run_setup() {
     else
       echo "cloning $CLONE_ORIGIN → $CLONE_TARGET"
       git clone "$CLONE_ORIGIN" "$CLONE_TARGET"
+      cloned=1
     fi
-    # Re-exec INSIDE the clone: absolute re-resolution, one code path.
-    if [[ -n "$ANSWERS" ]]; then
-      GRU_COMMAND_REEXEC=1 exec bash "$CLONE_TARGET/install.sh" --answers "$ANSWERS"
+
+    local forward=()
+    [[ "$UPDATE_REQUESTED" -eq 1 ]] && forward+=(--update)
+    [[ "$NO_INTERACT" -eq 1 ]] && forward+=(--no-interact)
+    [[ "$FORCE" -eq 1 ]] && forward+=(--force)
+    [[ "$ANSWERS_SET" -eq 1 ]] && forward+=(--answers "$ANSWERS")
+    if [[ "$UPDATE_REQUESTED" -eq 0 && "$NO_INTERACT" -eq 0 && "$FORCE" -eq 0 && "$ANSWERS_SET" -eq 0 ]]; then
+      GRU_COMMAND_REEXEC=1 \
+        GRU_COMMAND_SOURCE_UPDATED="$source_update" \
+        GRU_COMMAND_FRESH_CLONE="$cloned" \
+        exec bash "$CLONE_TARGET/install.sh"
     fi
-    GRU_COMMAND_REEXEC=1 exec bash "$CLONE_TARGET/install.sh"
+    GRU_COMMAND_REEXEC=1 \
+      GRU_COMMAND_SOURCE_UPDATED="$source_update" \
+      GRU_COMMAND_FRESH_CLONE="$cloned" \
+      exec bash "$CLONE_TARGET/install.sh" "${forward[@]}"
   fi
 
-  # Inside the checkout.
-  cd "$REPO_ROOT"
-  # ALWAYS install deps: a pulled checkout with new dependencies must not
-  # crash at wizard exec — npm install is a no-op when already satisfied.
-  echo "installing dependencies…"
-  npm install --no-audit --no-fund
-  if [[ ! -f dist/main.js || ! -f dist/wizard/main.js ]]; then
-    echo "building…"
-    npm run build
+  command -v git >/dev/null 2>&1 || { err "git not found on PATH — install git first"; exit 1; }
+
+  if [[ "$UPDATE_REQUESTED" -eq 1 ]]; then
+    source_update=1
+    update_checkout
+  elif [[ "${GRU_COMMAND_SOURCE_UPDATED:-0}" -eq 1 ]]; then
+    source_update=1
+  elif [[ -f "$INSTANCE_DIR/config.toml" ]]; then
+    source_update=1
+    # A just-created clone is already at its fetched head. A retained clone
+    # with retained config must update before build.
+    [[ "${GRU_COMMAND_FRESH_CLONE:-0}" -eq 1 ]] || update_checkout
   fi
-  # A partial build must die HERE, named — not as MODULE_NOT_FOUND at exec.
-  for artifact in dist/main.js dist/wizard/main.js; do
-    if [[ ! -f "$artifact" ]]; then
-      err "build did not produce $artifact"
-      exit 1
-    fi
-  done
-  if [[ -n "$ANSWERS" ]]; then
-    exec "$NODE_BIN" dist/wizard/main.js --answers "$ANSWERS"
+
+  build_product
+
+  # A configured instance is an update, never a request to regenerate user
+  # settings.
+  if [[ "$source_update" -eq 1 && -f "$INSTANCE_DIR/config.toml" && "$ANSWERS_SET" -eq 0 && "$FORCE" -eq 0 ]]; then
+    restart_owned_service_if_present
+    echo "update complete; existing config preserved: $INSTANCE_DIR/config.toml"
+    return 0
   fi
-  exec "$NODE_BIN" dist/wizard/main.js
+
+  local wizard_args=()
+  [[ "$NO_INTERACT" -eq 1 ]] && wizard_args+=(--no-interact)
+  [[ "$FORCE" -eq 1 ]] && wizard_args+=(--force)
+  [[ "$ANSWERS_SET" -eq 1 ]] && wizard_args+=(--answers "$ANSWERS")
+  if [[ "$NO_INTERACT" -eq 0 && "$FORCE" -eq 0 && "$ANSWERS_SET" -eq 0 ]]; then
+    exec "$NODE_BIN" dist/wizard/main.js
+  fi
+  exec "$NODE_BIN" dist/wizard/main.js "${wizard_args[@]}"
 }
 
 case "$MODE" in

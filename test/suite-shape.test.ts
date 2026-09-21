@@ -15,18 +15,20 @@ const PINS: Record<string, number> = {
   'bob-scheduler.test.ts': 5,
   'chat-frame-log.test.ts': 20,
   'chat-frames.test.ts': 4,
-  'attachments.test.ts': 28,
+  'attachments.test.ts': 29,
+  'bmad-onboarding.test.ts': 10,
   'chat-server.test.ts': 74,
   'chat-session-state.test.ts': 6,
   'claude-adapter.test.ts': 71,
+  'config-generate.test.ts': 7,
   'config.test.ts': 39,
   'dispatch-e2e.test.ts': 3,
   'dispatch-joins.test.ts': 2,
   'dispatch-server.test.ts': 8,
   'health.test.ts': 17,
   'identity.test.ts': 3,
-  'install-one-line.test.ts': 14,
-  'install.test.ts': 11,
+  'install-one-line.test.ts': 24,
+  'install.test.ts': 12,
   'lan-phone-raw-client.test.ts': 6,
   'ledger-api.test.ts': 17,
   'ledger-db.test.ts': 6,
@@ -51,10 +53,10 @@ const PINS: Record<string, number> = {
   'supervisor.test.ts': 24,
   'transcripts.test.ts': 13,
   'uploads-dir.test.ts': 3,
-  'wizard.test.ts': 19,
-  'wizard-interactive.test.ts': 5,
+  'wizard.test.ts': 24,
+  'wizard-interactive.test.ts': 8,
   'wizard-register.test.ts': 2,
-  'worktree-manager.test.ts': 35,
+  'worktree-manager.test.ts': 36,
   'worktree-manifest.test.ts': 6,
   'worktree-port.test.ts': 4,
   'worktrees-server.test.ts': 3,
@@ -69,7 +71,7 @@ describe('suite shape', () => {
     expect(files).toEqual(Object.keys(PINS).sort());
     for (const file of files) {
       const source = readFileSync(join(dir, file), 'utf-8');
-      const registered = (source.match(/\bit\(/g) ?? []).length;
+      const registered = (source.match(/\bit(?:\.\w+)*\(/g) ?? []).length;
       const pinned = PINS[file] ?? -1;
       expect(
         registered,
