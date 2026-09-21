@@ -25,6 +25,7 @@ import {
   type UserFrame,
 } from './protocol.js';
 import type { StorageLike } from '../theme.js';
+import { uuidV4 } from './uuid.js';
 
 export type ConnectionState =
   | 'idle'
@@ -313,7 +314,9 @@ export class ChatClient {
   }
 
   private id(): string {
-    return this.options.idgen?.() ?? globalThis.crypto.randomUUID();
+    // uuidV4 falls back to getRandomValues-based v4 minting where
+    // crypto.randomUUID is absent (insecure contexts: LAN HTTP origins).
+    return this.options.idgen?.() ?? uuidV4();
   }
 
   private setState(state: ConnectionState): void {
