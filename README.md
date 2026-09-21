@@ -83,7 +83,11 @@ Re-running the one-liner or `./install.sh` for a configured instance is
 a safe updater: it refuses a dirty/diverged clone, uses
 `git pull --ff-only`, installs dependencies, rebuilds, preserves the
 config, and restarts only a service unit that names this exact
-repo/instance. Generate a fresh complete config separately with:
+repo/instance — and if that unit is missing entirely (deleted plist,
+failed prior install), the updater registers it afresh: prompted
+interactively, automatic under `--no-interact` or whenever no terminal is
+available (cron/CI); declining keeps the run green and prints the
+`./install.sh --service` hint. Generate a fresh complete config separately with:
 
 ```bash
 npm run config:generate                 # refuses an existing file
