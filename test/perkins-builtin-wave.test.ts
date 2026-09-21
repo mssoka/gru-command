@@ -1352,3 +1352,67 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     expect(phases[0]).toBe('blocked'); // newest-first order
   });
 });
+
+
+describe('fallback diff includes untracked files (V3 revert-mutation pin)', () => {
+  it('round-2 diff includes new-file fixes created by the fix directive', async () => {
+    const repo = makeFixtureRepo('perkins-untracked-fix');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/untracked']);
+    repo.commitFile('src/base.ts', 'export const base = 1;\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-untracked-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-untracked-art-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-untracked-ses-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-untracked-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/untracked', repo.head());
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-untracked-fix' });
+    const job = ledger.addJob({ id: 'job-untracked-fix', repo: 'fixture', title: 'untracked', baseBranch: 'main' });
+    const skillFile = join(artifacts, 'SKILL.md');
+    writeFileSync(skillFile, 'skill', 'utf8');
+    const escalations: string[] = [];
+    const diffsSeen: string[] = [];
+    const blocker: FallbackFinding[] = [
+      { title: 'missing feature', category: 'correctness', location: 'src/new.ts:1', evidence: 'N/A', detail: 'new file needed' },
+    ];
+    const wave = new WaveRunner({
+      ledger, worktrees: port,
+      spawner: makeSpawner(sessions, []),
+      reviewArtifactRoot: artifacts,
+      reviewPreflight: async () => ({
+        ok: false,
+        failures: [preflightFailure('review-policy', 'disabled')],
+      }),
+      fallbackGate: {
+        skillPath: skillFile,
+        runFallbackReview: async (input) => {
+          diffsSeen.push(input.diff);
+          const findings = input.iteration === 1 ? blocker : [];
+          writeFileSync(input.reportFile, JSON.stringify(findings), 'utf8');
+          return findings;
+        },
+        fixDirectiveSink: async () => {
+          writeFileSync(join(repo.path, 'src', 'new-feature.ts'), 'export const fixed = true;\n');
+          return { delivered: true, minionId: 'm1' };
+        },
+      },
+      escalate: (title) => escalations.push(title),
+    });
+    const outcome = await wave.runRound({ jobId: job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(true);
+    expect(diffsSeen.length).toBe(2);
+    expect(diffsSeen[0]).not.toContain('new-feature.ts');
+    expect(diffsSeen[1]).toContain('new-feature.ts');
+  });
+});
+
+describe('fallback review timeout constant is exported and positive (V4 pin)', () => {
+  it('pins the 15-minute wall-clock bound', async () => {
+    const { FALLBACK_REVIEW_TIMEOUT_MS } = await import('../src/dispatch/perkins.js');
+    expect(FALLBACK_REVIEW_TIMEOUT_MS).toBe(15 * 60 * 1_000);
+    expect(FALLBACK_REVIEW_TIMEOUT_MS).toBeGreaterThan(0);
+  });
+});

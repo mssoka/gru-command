@@ -1313,3 +1313,23 @@ ${hunk}
     })).toThrow(/frozen target contains a symlink/u);
   });
 });
+
+describe('error-path EEXIST guards (V5 revert-mutation pin)', () => {
+  it('completes a retry after a malformed attempt without any EEXIST error escaping', async () => {
+    let securityCalls = 0;
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? (++securityCalls === 1 ? 'malformed' : '[]') : '[]',
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    for (const entry of h.toolErrors) {
+      expect(entry.error).not.toContain('EEXIST');
+      expect(entry.error).not.toContain('already exists');
+    }
+    const envelopeDir = join(h.frozen.directory, 'lenses', '001');
+    const errorFiles = readdirSync(envelopeDir).filter((f) => f.includes('.error.json'));
+    expect(errorFiles.length).toBeGreaterThanOrEqual(1);
+    const envelopeFiles = readdirSync(envelopeDir).filter((f) => f.includes('.envelope.json'));
+    expect(envelopeFiles.length).toBeGreaterThanOrEqual(2);
+  });
+});

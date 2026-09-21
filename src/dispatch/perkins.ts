@@ -33,7 +33,7 @@ import {
   type ReviewPreflightResult,
 } from './review-path.js';
 
-const FALLBACK_REVIEW_TIMEOUT_MS = 15 * 60 * 1_000;
+export const FALLBACK_REVIEW_TIMEOUT_MS = 15 * 60 * 1_000;
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 

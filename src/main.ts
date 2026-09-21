@@ -1,5 +1,6 @@
+import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { chmodSync, mkdirSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
@@ -46,6 +47,18 @@ async function modelRuntimeForProbe(): Promise<ModelRuntime> {
   return cachedModelRuntime;
 }
 
+/** Locate the installed bmad-review skill: check both the pi agent dir
+ * and ~/.agents (the BMAD default install root) for maximum compatibility. */
+function resolveBmadReviewSkillPath(): string {
+  for (const base of [getAgentDir(), join(homedir(), '.agents')]) {
+    const candidate = join(base, 'skills', 'bmad-review', 'SKILL.md');
+    if (existsSync(candidate)) return candidate;
+  }
+  // Return the pi agent dir path as the default — the gate will report
+  // 'not installed' if neither location has it.
+  return join(getAgentDir(), 'skills', 'bmad-review', 'SKILL.md');
+}
+
 /** Fail-closed four-leg review pre-flight (user amendment 2026-09-20). */
 async function reviewPreflightCheck(
   config: ReturnType<typeof loadConfig>,
@@ -62,10 +75,12 @@ async function reviewPreflightCheck(
         // Probe binary presence AND auth: a cheap authenticated call proves
         // the provider is configured and reachable. --version alone is
         // insufficient (succeeds without credentials).
-        const resolvedModel = modelRef === '' || modelRef === 'default' ? '' : `--model ${modelRef}`;
+        // The --model flag and its value must be SEPARATE argv tokens —
+        // the combined single-token form is rejected by the CLI.
+        const modelArgs = modelRef === '' || modelRef === 'default' ? [] : ['--model', modelRef];
         const probe = spawnSync(
           'claude',
-          ['-p', 'reply with exactly: ok', '--max-turns', '1', '--no-session-persistence', ...(resolvedModel ? [resolvedModel] : [])],
+          ['-p', 'reply with exactly: ok', '--max-turns', '1', '--no-session-persistence', ...modelArgs],
           { encoding: 'utf-8', timeout: 30_000, input: '' },
         );
         if (probe.error !== undefined) {
@@ -502,7 +517,7 @@ async function main(): Promise<number> {
     reviewArtifactRoot: join(config.dataDir, 'reviews'),
     reviewPreflight: (input) => reviewPreflightCheck(config, input.repoPath),
     fallbackGate: {
-      skillPath: join(getAgentDir(), 'skills', 'bmad-review', 'SKILL.md'),
+      skillPath: resolveBmadReviewSkillPath(),
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
         registry,
         ledger,

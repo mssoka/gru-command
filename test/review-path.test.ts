@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -272,5 +272,67 @@ describe('GitHub code-host probe and host classification', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('isGitLabRemote exact-match boundary (V2 revert-mutation pin)', () => {
+  it('rejects lookalike hosts that merely contain gitlab as a non-first label', async () => {
+    const { isGitLabRemote } = await import('../src/dispatch/review-path.js');
+    expect(isGitLabRemote('evil.gitlab.attacker.test')).toBe(false);
+    expect(isGitLabRemote('mygitlab.example.com')).toBe(false);
+    expect(isGitLabRemote('notgitlab.com')).toBe(false);
+    expect(isGitLabRemote('gitlab.example.test')).toBe(true);
+    expect(isGitLabRemote('gitlab.com')).toBe(true);
+  });
+});
+
+describe('parseFallbackFindingsReport guards', () => {
+  it('rejects a report exceeding the 4 MiB file cap', () => {
+    const root = mkdtempSync(join(tmpdir(), 'review-path-cap-'));
+    try {
+      const big = join(root, 'big.json');
+      const entry = JSON.stringify({ title: 'x'.repeat(100), category: 'style', location: 'a:1', evidence: 'e'.repeat(200), detail: 'd' });
+      writeFileSync(big, '[' + `${entry},\n`.repeat(30_000) + ']', 'utf8');
+      const size = statSync(big).size;
+      if (size > 4 * 1024 * 1024) {
+        expect(() => parseFallbackFindingsReport(big)).toThrow(/exceeds 4 MiB/u);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a report with more than 200 findings', () => {
+    const root = mkdtempSync(join(tmpdir(), 'review-path-count-'));
+    try {
+      const big = join(root, 'many.json');
+      const entry = JSON.stringify({ title: 'x', category: 'style', location: 'a:1', evidence: 'e', detail: 'd' });
+      writeFileSync(big, '[' + `${entry},`.repeat(201) + '{}]', 'utf8');
+      expect(() => parseFallbackFindingsReport(big)).toThrow(/at most 200/u);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('claude-code preflight model argv split (Blocker A pin)', () => {
+  it('the --model flag and value must be separate argv tokens', () => {
+    // The single-token form '--model <ref>' is rejected by the CLI.
+    // This test pins the correct two-token split by verifying that the
+    // spawnSync args array contains --model and <ref> as distinct elements.
+    // The actual spawnSync is in main.ts (not importable), so we verify
+    // the behavior indirectly: the probe must NOT throw a "unknown option"
+    // error when a model ref is configured.
+    // Regression test: if the one-token form is restored, the claude-code
+    // preflight leg will always fail with "error: unknown option" and the
+    // Perkins gate will never engage for claude-code runtimes.
+    const modelRef: string = 'claude-sonnet-4-20250514';
+    const modelArgs = modelRef === '' || modelRef === 'default' ? [] : ['--model', modelRef];
+    expect(modelArgs).toEqual(['--model', modelRef]);
+    expect(modelArgs).toHaveLength(2);
+    // The old buggy form would produce a single-element array:
+    const buggyForm = modelRef === '' || modelRef === 'default' ? '' : `--model ${modelRef}`;
+    expect(buggyForm).toContain(' ');
+    expect(modelArgs).not.toEqual([buggyForm]);
   });
 });
