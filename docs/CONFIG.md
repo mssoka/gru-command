@@ -168,6 +168,18 @@ setup_timeout_ms = 120000
 # Dispatch flow (E8). Optional.
 # bob_interval_ms: Bob's periodic consolidation interval; 0 disables.
 bob_interval_ms = 3600000
+
+[review]
+# Review gate policy (user amendment 2026-09-20). Optional; enabled by default.
+# enabled: false routes every review request to the bmad-review fallback gate
+# (when installed; otherwise escalate-only) — findings + triage + fix directives;
+# clear-to-merge is a report; merge stays user-held. true keeps Perkins
+# as the primary gate behind the four-leg
+# pre-flight (bundled resource integrity, review model provider auth,
+# code-host token for the repo remote (GitHub or GitLab), review policy
+# enabled). A failed pre-flight never silently downgrades a configured gate:
+# the failed legs and their remediations are always reported.
+enabled = true
 ```
 
 See [`example.config.toml`](./example.config.toml) for a complete generic

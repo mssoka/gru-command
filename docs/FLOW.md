@@ -5,17 +5,18 @@ lands on the ledger — the record of record — and the board renders the
 whole arc live.
 
 ```
- Gru (chat)          ops (Silas role)            minion                  Perkins fleet
- ──────────          ─────────────────           ───────                 ──────────────
+ Gru (chat)          ops (Silas role)            minion                  Perkins hybrid
+ ──────────          ─────────────────           ───────                 ───────────────
  consult → plan
  briefing ─────────► job row (briefing verbatim)
                       │ fresh worktree + branch
                       ├─────────────────────────► spawned IN the worktree
                       │                           briefing turn …
                       │                           deliverable + PR link ◄─┤
-                      │                                                   round (7 lenses)
-                      │                                                   detached worktree
-                      │                                                   verdict → PR comment
+                      │                                                   one lead
+                      │                                                   7/6 lens types × chunks
+                      │                                                   verify + audit
+                      │                                                   report → PR comment
  release ◄─────────── sweep (preserve-first)                            (chips live on the board)
 ```
 
@@ -50,20 +51,93 @@ the sweep. The board groups by repo; the phone is board-first.
 
 ## 4. Review waves (Perkins)
 
-`POST /api/dispatch/review` `{job_id, target_ref?, lenses?}` — one
-round = a multi-lens agent fleet:
+`POST /api/dispatch/review` `{job_id, target_ref?, no_spec?}` freezes one
+exact target/base/diff/spec set in a detached review worktree. A round has
+one real Perkins lead and exactly seven required lens types per frozen diff
+chunk (blind, edge, acceptance, security, architecture, codebase, tests), or
+six types per chunk only when `no_spec: true` explicitly removes acceptance.
+Each lens/chunk attempt is a distinct tracked child; malformed attempts are
+retryable up to the policy limit, so the total child-session count may exceed
+the required coverage cardinality.
 
-- A **detached** worktree at the ref under review (reviews never grow
-  branch debris — ruling 18d).
-- One agent per lens (blind, edge, acceptance, security, architecture,
-  codebase, tests), each bound to its live chip on the board, each
-  ending with the strict protocol line `LENS-VERDICT: blocker|warning|note|clean`.
-- **Consolidation is honest arithmetic**: any blocker or warning →
-  `changes-requested`; only notes/clean → `approved`. A lens that could
-  not conclude withholds the verdict and escalates — never softened.
-- The verdict lands in the ledger first, then posts to the PR via `gh
-  pr comment`; a posting failure escalates (action-required) without
-  un-recording the verdict.
+- The lead receives only four product-native tools: read a frozen chunk,
+  run tracked lens children, store bounded notes, and submit terminal proof.
+  It owns delegation, investigation, verification, deduplication, prior
+  audit, verdict calculation, and report authorship.
+- Lens children are fresh, ambient-free sessions. Blind has no tools or
+  repository/spec context; other lenses get confined read/grep/find/list
+  tools. No reviewer gets shell, edit, write, ambient skills, extensions,
+  settings, unrelated MCP servers, or nested delegation. The only MCP
+  exception is the per-session, product-owned Claude lead bridge exposing the
+  same four narrow tools; lens children never receive it.
+- The integrity-pinned package policy is the sole prompt authority for lead
+  and child review behavior; interpolated repository/spec/convention text is
+  untrusted evidence, never instruction. The host bounds attempts,
+  concurrency, candidate/report bytes, and wall time; records every child;
+  verifies exact coverage, candidate ownership,
+  frozen-commit evidence, prior audit, source stability, report contents,
+  delivery, and canonical blocker arithmetic. Zero blockers is READY TO
+  MERGE, 1–3 is NEEDS CHANGES, and 4+ is MAJOR REWORK NEEDED. Warnings and
+  notes never block.
+- A malformed child output consumes one attempt and may be retried within the
+  pinned bound. Any exhausted attempt, cancellation, restart, changed
+  source/checkout, unsupported evidence, invalid audit, missing coverage,
+  or delivery failure durably terminalizes the round as INCOMPLETE. It can
+  neither post nor record approval. Startup reconciliation marks interrupted
+  rounds INCOMPLETE and releases their owned detached lanes.
+- Installed builds load the integrity-pinned policy and Claude MCP server
+  relative to the compiled package. Missing, tampered, symlinked, or
+  source-fallback resources fail closed.
+- The Claude stream-json CLI does not expose a deterministic lead-turn
+  discriminator. Claude coverage therefore pins total lead time and terminal
+  tool acceptance, while direct turn-count discrimination remains covered by
+  the Pi/offline session path; no direct Claude turn-count coverage is claimed.
+
+## 4b. Review-path selection: the bmad-review fallback gate (user amendment 2026-09-20, fork-3 extension)
+
+Perkins is the PRIMARY review gate. At review request time — before any
+round is created — a fail-closed four-leg capability pre-flight decides the
+route:
+
+1. **Bundled resource integrity** — the SHA-256-pinned Perkins policy loads
+   (and the compiled MCP server carries its pin).
+2. **Review model provider** — the configured review model resolves and its
+   provider holds credentials (cheap probe; no generation call). On the
+   claude-code runtime this is a CLI-availability probe; on pi it checks
+   model resolution plus provider auth.
+3. **Code-host integration** — a GitHub (`gh`) or GitLab (`GITLAB_TOKEN`)
+   token valid for the exact repository remote, used for SHA-bound verdict
+   delivery. Only GitHub and GitLab hosts are supported; other origins fail
+   the leg closed (credentials are never sent to unknown hosts).
+4. **Review policy enabled** — `[review] enabled = true` in config.
+
+All legs pass → Perkins review (the gate). Any leg fails → the request
+routes to the bmad-review skill **if installed** (never bundled with the
+product). The fallback carries FULL GATE semantics: the session returns
+findings; the host triages them (release-safety categories — correctness,
+security, data loss, broken builds, and related crash/regression/
+vulnerability/injection/secret-leak tags — are BLOCKERS; the rest are
+notes); BLOCKERS > 0 routes a fix directive to the implementing MINION
+session, the lane's working diff is re-read, and the gate re-reviews after
+fixes (bounded rounds); 0 blockers = PASS reported as clear-to-merge. The
+fallback session is a full-capability minion by design — it must load the
+ambient BMAD skill — and is instructed never to gate, approve, merge, or
+modify implementation code; every gate decision is the host's. The fallback
+never records a Perkins verdict and never moves merge authority: only an
+exact-head Perkins READY can authorize a merge, and merge stays user-held
+everywhere. A failed pre-flight is never a silent downgrade — the failed
+legs, their remediations, and both recovery options (install BMAD via
+onboarding / restore Perkins) are escalated and recorded on the job as
+`job.fallback-review` events. GitLab merge requests get the same SHA-bound
+delivery discipline as GitHub (head + base verified before a note is
+posted), and the GitLab probe and poster resolve their token
+identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`); GitHub
+authenticates through the `gh` CLI.
+
+Report artifacts persist before delivery, but the local round verdict is
+recorded only after SHA-bound delivery proof succeeds; delivery failure
+terminalizes the round as durable INCOMPLETE alongside the preserved
+report — it never erases already-preserved findings.
 
 ## 5. Release (the sweep)
 

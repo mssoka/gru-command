@@ -1,12 +1,14 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../../src/dispatch/worktree-port.js';
 
 /**
  * In-memory worktree port (test double for the E8 CORE suites — the real
- * manager is its own lane). Lanes are REAL directories (agents need a cwd)
- * but no git: the core's joins under test are spawn/prompt/board joins,
- * not git mechanics — those live on the manager lane.
+ * manager is its own lane). Lanes are real directories; when the supplied
+ * repository is Git-backed this double uses real linked worktrees so hybrid
+ * review tests can freeze exact commits. Non-Git contract fixtures retain the
+ * lightweight directory behavior.
  */
 
 export class InMemoryWorktreePort implements WorktreePort {
@@ -19,7 +21,7 @@ export class InMemoryWorktreePort implements WorktreePort {
   }
 
   async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
-    return this.create('job', input.repoPath, input.jobId, input.jobId, null, `gru/${input.jobId}`, 'sha-job');
+    return this.create('job', input.repoPath, input.jobId, input.jobId, null, `gru/${input.jobId}`, 'sha-job', 'HEAD');
   }
 
   async createReviewWorktree(input: {
@@ -36,6 +38,7 @@ export class InMemoryWorktreePort implements WorktreePort {
       input.roundId,
       null,
       `sha-${input.ref}`,
+      input.ref,
     );
   }
 
@@ -47,12 +50,30 @@ export class InMemoryWorktreePort implements WorktreePort {
     roundId: string | null,
     branch: string | null,
     sha: string,
+    gitRef: string,
   ): WorktreeLane {
     if (this.lanes.has(id)) throw new Error(`worktree "${id}" already exists`);
     const repoName = repoPath.split('/').filter(Boolean).pop() ?? repoPath;
     const path = join(this.root, repoName, `${kind === 'job' ? 'job' : 'review'}-${id}`);
     if (existsSync(path)) throw new Error(`worktree path already exists: ${path}`);
-    mkdirSync(path, { recursive: true });
+    let actualSha = sha;
+    let isGitRepo = false;
+    try {
+      execFileSync('git', ['-C', repoPath, 'rev-parse', '--is-inside-work-tree'], { stdio: 'ignore' });
+      isGitRepo = true;
+    } catch {
+      // Contract-only tests intentionally use non-git fixture directories.
+    }
+    if (isGitRepo) {
+      mkdirSync(dirname(path), { recursive: true });
+      const args = kind === 'job'
+        ? ['-C', repoPath, 'worktree', 'add', '-b', branch as string, path, gitRef]
+        : ['-C', repoPath, 'worktree', 'add', '--detach', path, gitRef];
+      execFileSync('git', args, { stdio: 'ignore' });
+      actualSha = execFileSync('git', ['-C', path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    } else {
+      mkdirSync(path, { recursive: true });
+    }
     const lane: WorktreeLane = {
       id,
       kind,
@@ -60,7 +81,7 @@ export class InMemoryWorktreePort implements WorktreePort {
       repoName,
       path,
       branch,
-      sha,
+      sha: actualSha,
       jobId,
       roundId,
       status: 'active',
@@ -88,7 +109,21 @@ export class InMemoryWorktreePort implements WorktreePort {
       return { status: 'swept', preserved: null, branch: 'none', freshHead: 'sha-head' };
     }
     this.lanes.set(input.worktreeId, { ...lane, status: 'swept' });
-    rmSync(lane.path, { recursive: true, force: true });
+    try {
+      execFileSync('git', ['-C', lane.repoPath, 'worktree', 'remove', '--force', lane.path], { stdio: 'ignore' });
+    } catch {
+      rmSync(lane.path, { recursive: true, force: true });
+    }
+    if (lane.branch !== null) {
+      // Job lanes create their own branch; leaving it behind wedges a
+      // same-id re-create in later tests.
+      try {
+        execFileSync('git', ['-C', lane.repoPath, 'branch', '-D', lane.branch], { stdio: 'ignore' });
+        execFileSync('git', ['-C', lane.repoPath, 'worktree', 'prune'], { stdio: 'ignore' });
+      } catch {
+        // Branch cleanup is best-effort for the contract double.
+      }
+    }
     return { status: 'swept', preserved: null, branch: 'none', freshHead: 'sha-head' };
   }
 

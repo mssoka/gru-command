@@ -149,8 +149,14 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
   it('creates review worktrees DETACHED — no branch, ever (ruling 18d)', async () => {
     const h = harness();
     const repo = h.make();
+    mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
+    writeFileSync(
+      join(repo.path, '.gru-command', 'worktree.toml'),
+      '[[setup]]\ncommand = "echo bootstrap-output > .boot-marker"',
+    );
     ledgerJob(h, 'job-reviewable', repo);
     const jobRow = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-reviewable' });
+    expect(existsSync(join(jobRow.path, '.boot-marker'))).toBe(true);
     h.ledger.addRound({ jobId: 'job-reviewable', targetRef: jobRow.branch });
     const review = await h.manager.createReviewWorktree({
       repoPath: repo.path,
@@ -163,6 +169,8 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
     expect(ref).toBe('HEAD'); // detached
     const branches = repo.git(['branch', '--list', 'gru/*']);
     expect(branches).not.toContain('r1');
+    expect(existsSync(join(review.path, '.boot-marker'))).toBe(false);
+    expect(repo.git(['status', '--porcelain=v1', '--untracked-files=all', '--ignored'], review.path)).toBe('');
   });
 
   it('refuses a reused branch or path for a second job lane', async () => {

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -6,8 +6,12 @@ import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath } from '../src/runtime/pi-adapter.js';
 import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
-import { capabilitiesForModelInput, type RuntimeEvent } from '../src/runtime/types.js';
-import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubTurn } from './helpers/stub-model.js';
+import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
+import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubResponder, type StubTurn } from './helpers/stub-model.js';
+import { PerkinsHybridReview } from '../src/dispatch/perkins-review/hybrid.js';
+import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
+import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
+import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
 /**
  * Perkins r3 B1: a gated-twin mock for createAgentSession. Disarmed, it is
@@ -20,6 +24,7 @@ const twinGate = vi.hoisted(() => ({
   armed: false,
   fail0: null as null | (() => void),
   release1: null as null | (() => void),
+  lastOptions: null as unknown,
 }));
 
 vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
@@ -30,6 +35,7 @@ vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
   return {
     ...actual,
     createAgentSession: async (opts: unknown) => {
+      twinGate.lastOptions = opts;
       if (!twinGate.armed) {
         return actual.createAgentSession(opts as never);
       }
@@ -58,10 +64,12 @@ interface Fixture {
   agentDir: string;
   store: SessionStore;
   script: StubScript;
+  config: ReturnType<typeof loadConfig>;
+  modelRuntime: Awaited<ReturnType<typeof makeStubModelRuntime>>;
 }
 
 async function fixture(
-  turns: readonly StubTurn[] = [],
+  turns: readonly StubTurn[] | StubResponder = [],
   modelInput: readonly ('text' | 'image')[] = ['text'],
 ): Promise<Fixture & { runtime: PiRuntime }> {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-pi-'));
@@ -78,7 +86,7 @@ async function fixture(
   const script = new StubScript(turns);
   const modelRuntime = await makeStubModelRuntime(script, { input: modelInput });
   const runtime = new PiRuntime({ config, store, agentDir, modelRuntime });
-  return { home, workspace, agentDir, store, script, runtime };
+  return { home, workspace, agentDir, store, script, config, modelRuntime, runtime };
 }
 
 function collect(handle: { subscribe(listener: (event: RuntimeEvent) => void): () => void }): RuntimeEvent[] {
@@ -105,6 +113,215 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     } finally {
       await handle.dispose();
     }
+  });
+
+  it('enforces isolated-review tools and strips ambient Pi resources', async () => {
+    const fx = await fixture();
+    writeFileSync(join(fx.workspace, 'AGENTS.md'), 'PROJECT-CONTEXT-CANARY', 'utf8');
+    mkdirSync(join(fx.agentDir, 'skills', 'canary'), { recursive: true });
+    writeFileSync(join(fx.agentDir, 'skills', 'canary', 'SKILL.md'), '---\nname: canary\ndescription: secret canary\n---\nCANARY', 'utf8');
+    const handle = await fx.runtime.spawn('perkins', {
+      isolatedReview: { systemPrompt: 'isolated policy', tools: [] },
+    });
+    try {
+      const options = twinGate.lastOptions as {
+        noTools?: string;
+        tools?: string[];
+        resourceLoader: {
+          getSkills(): { skills: unknown[] };
+          getPrompts(): { prompts: unknown[] };
+          getAgentsFiles(): { agentsFiles: unknown[] };
+          getExtensions(): { extensions: unknown[] };
+          getSystemPrompt(): string | undefined;
+          getAppendSystemPrompt(): string[];
+        };
+      };
+      expect(options.noTools).toBe('all');
+      expect(options.tools).toEqual([]);
+      expect(options.resourceLoader.getSkills().skills).toEqual([]);
+      expect(options.resourceLoader.getPrompts().prompts).toEqual([]);
+      expect(options.resourceLoader.getAgentsFiles().agentsFiles).toEqual([]);
+      expect(options.resourceLoader.getExtensions().extensions).toEqual([]);
+      expect(options.resourceLoader.getAppendSystemPrompt()).toEqual([]);
+      expect(options.resourceLoader.getSystemPrompt()).toBe('isolated policy');
+      expect(handle.reviewIsolation).toBe(true);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('runs a hybrid Perkins lead through the production registry and real Pi adapter', async () => {
+    const securityFinding = JSON.stringify([{
+      source: 'security', severity: 'warning', category: 'coverage', title: 'Verified adapter finding',
+      location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line is independently reviewable.',
+      recommended_fix: 'Retain verification coverage for this path.',
+    }]);
+    let leadTurns = 0;
+    const confirmed = new Map<string, { candidate_ref: string }>();
+    const harvest = (prompt: string): void => {
+      for (const markerText of prompt.split('[TOOL_RESULT perkins_run_lenses]').slice(1)) {
+        const payload = markerText.split(/\n\[TOOL_RESULT /)[0]!.trim();
+        try {
+          const parsed = JSON.parse(payload) as { results: Array<{ findings: Array<{ ref: string }> }> };
+          for (const result of parsed.results) {
+            for (const candidate of result.findings) confirmed.set(candidate.ref, { candidate_ref: candidate.ref });
+          }
+        } catch { /* non-JSON tool text */ }
+      }
+    };
+    const fx = await fixture((prompt) => {
+      if (prompt.includes('REQUIRED CHILD COVERAGE')) {
+        leadTurns += 1;
+        harvest(prompt);
+        if (leadTurns === 1) {
+          return {
+            deltas: [],
+            toolCall: { id: 'lead-read-1', name: 'perkins_read_chunk', args: { chunk: '001' } },
+          };
+        }
+        if (leadTurns === 2) {
+          return {
+            deltas: [],
+            toolCall: {
+              id: 'lead-run-1', name: 'perkins_run_lenses',
+              args: { runs: ['blind', 'edge', 'acceptance', 'security'].map((lens) => ({ lens, chunk: '001' })) },
+            },
+          };
+        }
+        if (leadTurns === 3) {
+          return {
+            deltas: [],
+            toolCall: {
+              id: 'lead-run-2', name: 'perkins_run_lenses',
+              args: { runs: ['architecture', 'codebase', 'tests'].map((lens) => ({ lens, chunk: '001' })) },
+            },
+          };
+        }
+        if (leadTurns >= 5) return { deltas: ['hybrid lead complete'] };
+        const targetSha = /^Frozen target SHA: (.+)$/m.exec(prompt)?.[1] ?? '';
+        const baseSha = /^Frozen diff base SHA: (.+)$/m.exec(prompt)?.[1] ?? '';
+        return {
+          deltas: [],
+          toolCall: {
+            id: 'lead-submit', name: 'perkins_submit_review',
+            args: {
+              canonical_verdict: 'READY TO MERGE',
+              candidate_decisions: [...confirmed.values()].map((candidate) => ({
+                ...candidate,
+                disposition: 'confirmed',
+                evidence: 'export function answer(): number {',
+                reason: 'lead verified against the frozen tree',
+              })),
+              prior_audit: [],
+              report_markdown: [
+                '# Perkins Code Review',
+                '',
+                '**Verdict: READY TO MERGE**',
+                `Target: ${targetSha}`,
+                `Base: ${baseSha}`,
+                'Coverage: blind edge acceptance security architecture codebase tests',
+                'warning Verified adapter finding src/main.ts:2',
+                '  return 43;',
+                'Retain verification coverage for this path.',
+              ].join('\n'),
+            },
+          },
+        };
+      }
+      const lens = /"source": "(blind|edge|acceptance|security|architecture|codebase|tests)"/.exec(prompt)?.[1];
+      const testsGate = JSON.stringify([{
+        source: 'tests', severity: 'warning', category: 'coverage-gate', title: 'Coverage gate: CONCERNS',
+        location: 'N/A', evidence: 'N/A', detail: 'Changed behavior has no executed live-credential smoke proof.',
+        recommended_fix: 'Run the opt-in live-credential smoke test before release.',
+      }]);
+      return { deltas: [lens === 'security' ? securityFinding : lens === 'tests' ? testsGate : '[]'] };
+    });
+    const repo = makeFixtureRepo('pi-perkins-hybrid');
+    let registry: RuntimeRegistry | null = null;
+    const owned: AgentHandle[] = [];
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/review']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    try {
+      const frozen = freezeReviewInputs({
+        roundId: 'pi-hybrid-round', repoPath: repo.path, artifactRoot: join(fx.home, 'review-artifacts'),
+        baseRef: base, targetRef: target, movementRef: 'feature/review', spec: 'Acceptance: answer returns 43.',
+      });
+      registry = new RuntimeRegistry({
+        config: fx.config,
+        store: fx.store,
+        pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+      });
+      const engine = new PerkinsHybridReview({
+        spawner: async (role, options) => {
+          const handle = await registry!.spawn(role, options);
+          owned.push(handle);
+          return handle;
+        },
+        policy: loadPerkinsPolicy(),
+      });
+      const result = await engine.run({
+        roundId: 'pi-hybrid-round', roundNumber: 1, frozenReview: frozen,
+        movementRef: 'feature/review', noSpec: false,
+      });
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      expect(result.completeness).toMatchObject({ requiredLensRuns: 7, validLensRuns: 7 });
+      expect(leadTurns).toBe(4);
+      expect(fx.script.calls.filter((call) => !call.prompt.includes('REQUIRED CHILD COVERAGE'))).toHaveLength(7);
+      expect(result.findings).toHaveLength(1);
+      expect(owned).toHaveLength(8);
+      expect(new Set(owned.map((handle) => handle.id)).size).toBe(8);
+      expect(new Set(owned.map((handle) => handle.sessionFile)).size).toBe(8);
+      expect(owned.every((handle) => handle.reviewIsolation === true)).toBe(true);
+      expect(registry.status().activeSessions).toBe(0);
+    } finally {
+      await registry?.dispose();
+      await fx.runtime.dispose();
+      repo.cleanup();
+    }
+  });
+
+  it('confines isolated-review read tools to the review working directory', async () => {
+    const fx = await fixture();
+    const outsideDir = mkdtempSync(join(tmpdir(), 'pi-review-outside-'));
+    cleanupDirs.push(outsideDir);
+    const outside = join(outsideDir, 'secret.txt');
+    writeFileSync(outside, 'must not be readable', 'utf8');
+    const linkedOutside = join(fx.workspace, 'linked-secret.txt');
+    symlinkSync(outside, linkedOutside);
+    const handle = await fx.runtime.spawn('perkins', {
+      cwd: fx.workspace,
+      isolatedReview: { systemPrompt: 'isolated policy', tools: ['read'] },
+    });
+    try {
+      const options = twinGate.lastOptions as {
+        tools?: string[];
+        customTools?: Array<{ execute(...args: unknown[]): Promise<unknown> }>;
+      };
+      expect(options.tools).toEqual(['review_read']);
+      expect(options.customTools).toHaveLength(1);
+      const inside = join(fx.workspace, 'inside-review.txt');
+      writeFileSync(inside, 'inside review canary', 'utf8');
+      await expect(options.customTools![0]!.execute('call', { path: inside }, undefined, undefined, { cwd: fx.workspace }))
+        .resolves.toSatisfy((result: unknown) => JSON.stringify(result).includes('inside review canary'));
+      await expect(options.customTools![0]!.execute('call', { path: outside }, undefined, undefined, { cwd: fx.workspace }))
+        .rejects.toThrow(/escapes the review working directory/);
+      await expect(options.customTools![0]!.execute('call', { path: linkedOutside }, undefined, undefined, { cwd: fx.workspace }))
+        .rejects.toThrow(/escapes the review working directory/);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('rejects resume for isolated reviews so ambient history cannot cross the boundary', async () => {
+    const fx = await fixture();
+    const ordinary = await fx.runtime.spawn('perkins');
+    const file = ordinary.sessionFile!;
+    await ordinary.dispose();
+    await expect(fx.runtime.spawn('perkins', {
+      resumeFile: file,
+      isolatedReview: { systemPrompt: 'isolated', tools: [] },
+    })).rejects.toThrow(/must be fresh/);
   });
 
   it('round-trips a prompt with ordered deltas, turn lifecycle, and a durable session file', async () => {
@@ -718,6 +935,31 @@ describe('RuntimeRegistry', () => {
     }
     expect(registry.status().activeSessions).toBe(0);
     await registry.dispose();
+  });
+
+  it('forwards isolatedReview through the production registry to the adapter', async () => {
+    const fx = await fixture();
+    const registry = new RuntimeRegistry({
+      config: fx.config,
+      store: fx.store,
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    });
+    registry.boot();
+    const handle = await registry.spawn('perkins', {
+      isolatedReview: { systemPrompt: 'registry-isolated-policy', tools: [] },
+    });
+    try {
+      const options = twinGate.lastOptions as {
+        noTools?: string;
+        resourceLoader: { getSystemPrompt(): string | undefined; getSkills(): { skills: unknown[] } };
+      };
+      expect(options.noTools).toBe('all');
+      expect(options.resourceLoader.getSystemPrompt()).toBe('registry-isolated-policy');
+      expect(options.resourceLoader.getSkills().skills).toEqual([]);
+    } finally {
+      await registry.disposeHandle(handle);
+      await registry.dispose();
+    }
   });
 
   it('resolves claude-code to a fallback-wrapped adapter and still rejects unknown ids', () => {

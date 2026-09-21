@@ -90,7 +90,9 @@ export const ROLE_DEFINITIONS: Readonly<Record<Role, RoleDefinition>> = {
     role: 'perkins',
     systemPrompt: loadRoleSystemPrompt('perkins'),
     tools: ['read', 'grep', 'find', 'ls'],
-    skills: ['lens-blind', 'lens-edge', 'lens-acceptance', 'lens-security', 'lens-architecture', 'lens-codebase', 'lens-tests'],
+    // Hybrid review sessions never load role skills: the pinned policy is
+    // their only prompt authority (lens-* fleet declarations are retired).
+    skills: [],
     cwd: 'spawn_provided',
   },
   bob: {

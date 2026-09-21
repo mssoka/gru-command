@@ -55,9 +55,17 @@ integrated. Other users can install it on their laptops from GitHub.
     configures adapters; picks managed repos, models/providers; generates
     the pairing QR.
 15. **Roles are product-native:** Gru (CEO interface), Silas (ops COO),
-    minions (workers), Perkins (review waves), Bob (memory
-    consolidation) — defined by prompt + skill set + permissions,
-    runtime-agnostic.
+    minions (workers), Perkins (hybrid review lead + tracked lens children),
+    Bob (memory consolidation) — defined by prompt + skill set + permissions,
+    runtime-agnostic. A Perkins round freezes exact inputs, then one lead owns
+    complete seven-lens coverage (six only for explicit no-spec), independent
+    verification, reconciliation, prior-finding audit, canonical blocker
+    arithmetic, and report authorship through narrow host tools. The host
+    freezes identity, disables ambient resources, tracks/disposes children,
+    bounds attempts/concurrency/time/bytes, preserves evidence, and rejects
+    incomplete, moved, unowned, unsupported, undelivered, or malformed proof.
+    Canonical verdicts are 0 blockers = READY TO MERGE, 1–3 = NEEDS CHANGES,
+    4+ = MAJOR REWORK NEEDED; INCOMPLETE never approves.
 16. **Runtime model & thinking policy.** DEFAULT = the runtime
     harness's own default: a `model = "default"` sentinel means
     "whatever pi / Claude Code is configured to use" — never hardcode a
@@ -131,42 +139,6 @@ integrated. Other users can install it on their laptops from GitHub.
     dirs (logs/, chat/) — DIRECTORY CREATION ONLY, instance state per
     ruling 7, never inside the workspace root.
 
-20. **DecisionService seam (canon — text only; the client rides the
-    jev-pilot PR).** Routing decisions, gates, and escalation calls flow
-    through ONE typed seam fed by the product's four judgment-adjacent
-    subsystems — the event bus (`src/events/bus.ts`), the supervisor
-    (`src/supervision/supervisor.ts`), the worktree manager
-    (`src/worktrees/manager.ts`), and the Perkins wave runner
-    (`src/dispatch/perkins.ts`). Deterministic code is the
-    always-available implementation; a decision provider may answer
-    specific question sets, per the following canon (user ruling via
-    Gru/Silas, 2026-09-19): (1) the Jev provider is CONFIG-GATED,
-    DEFAULT-OFF — disabled or unreachable falls back to deterministic
-    defaults, always reversible, one flag for end users; it is
-    PROBE-VERIFIED before any real routing (a live check on the
-    configured endpoint — the probe-first discipline, never a trusted
-    assumption). (2) Confidence
-    semantics: confidence ships on Choice and Score questions ONLY; Noul
-    (true/false) carries probability ONLY — noul gates use probability
-    thresholds, choice/score gates use confidence; three-path routing
-    (high = act, medium = flag/confirm, low = deterministic fallback);
-    the interface exposes BOTH probabilities and confidence; thresholds
-    are per-risk-class config — read-only low, destructive high (~0.85)
-    WITH confirm. (3) Question design for JEVi-1.13 jaggedness: literal
-    criteria with boundary cases; arithmetic/counting/dates stay in
-    code, never the model; filter state before sending (context rot); no
-    cross-question invariants; destructive gates tested against
-    adversarial command text. (4) Batching economics: parallel questions
-    in one call are ~12× cheaper — question sets batch. (5) API shape
-    for the record: POST `https://openrouter.ai/api/alpha/decisions`
-    (alpha namespace), slug `~typesafe/jev-latest`; questions carry
-    criteria objects (noul true/false, choice per-option, score ordered
-    rubric); answers = noul probability, choice pick + probabilities,
-    score + distribution. Access verified 2026-09-19
-    (`typesafe/jev-1.13-20260917`, HTTP 200, 328 ms, ~$0.000026/call).
-    See docs.typesafe.ai/confidence.md,
-    docs.typesafe.ai/model-jaggedness/jev-1.13.md,
-    docs.typesafe.ai/patterns/confidence-routing.md.
 
 ## Sources
 

@@ -465,6 +465,10 @@ export class Supervisor {
               });
               break;
             }
+            if (agent.handle?.reviewIsolation === true) {
+              this.abortIsolatedReviewAttempt(agent, `fatal error: ${event.error}`);
+              break;
+            }
             this.log('warn', 'fatal runtime error — climbing restart ladder', {
               agent_id: agent.agentId,
               error: event.error,
@@ -558,6 +562,10 @@ export class Supervisor {
       if (bytes !== null) agent.lastFileBytes = bytes;
       const silence = now - agent.lastEventAt;
       if (silence >= this.cfg.turnSilenceMs) {
+        if (agent.handle?.reviewIsolation === true) {
+          this.abortIsolatedReviewAttempt(agent, 'turn hang');
+          continue;
+        }
         const reason = agent.openControl ? 'compaction hang' : 'turn hang';
         this.log('warn', `${reason} detected — climbing restart ladder`, {
           agent_id: agent.agentId,
@@ -590,6 +598,57 @@ export class Supervisor {
   // Restart ladder + crash-loop breaker
   // ------------------------------------------------------------------
 
+  /** Review attempts are fresh, ambient-free, and owned by the enclosing
+   * Perkins workflow. Abort the attempt; never respawn it through the generic
+   * resume ladder, which would violate isolation and attempt accounting. */
+  private abortIsolatedReviewAttempt(agent: SupervisedAgent, reason: string): void {
+    if (agent.inRestart || agent.handle === null) return;
+    const handle = agent.handle;
+    // Persistent workflow-owned stop guard: late fatal/state events from the
+    // detached handle must never enter the generic restart ladder.
+    agent.inRestart = true;
+    agent.handle = null;
+    agent.openTurn = false;
+    agent.state = 'stopped';
+    this.log('warn', 'isolated review attempt aborted for workflow-owned recovery', {
+      agent_id: agent.agentId,
+      reason,
+    });
+    void (async () => {
+      try {
+        try {
+          this.ledger.setAgentState(agent.agentId, 'error', reason);
+        } catch (error) {
+          this.log('warn', 'isolated review stop state could not be persisted', {
+            agent_id: agent.agentId,
+            error: String(error),
+          });
+        }
+        try {
+          this.ledger.appendCustomEvent({
+            kind: 'supervision.review-attempt-aborted',
+            agentId: agent.agentId,
+            payload: { reason },
+          });
+        } catch (error) {
+          this.log('warn', 'isolated review abort event could not be persisted', {
+            agent_id: agent.agentId,
+            error: String(error),
+          });
+        }
+      } finally {
+        try {
+          await this.registry.disposeHandle(handle);
+        } catch (error) {
+          this.log('warn', 'isolated review attempt disposal failed', {
+            agent_id: agent.agentId,
+            error: String(error),
+          });
+        }
+      }
+    })();
+  }
+
   /** One restart rung. Single-flight per agent: a later trigger while a
    * rung is executing is absorbed (the rung's spawn IS the recovery).
    * Supervision NEVER takes the service down: any internal throw is
@@ -597,6 +656,10 @@ export class Supervisor {
   private async restartRung(agentRef: SupervisedAgent, reason: string): Promise<void> {
     const agent = agentRef;
     if (this.disposed || !this.cfg.enabled || agent.inRestart || agent.breakerOpen) return;
+    if (agent.handle?.reviewIsolation === true) {
+      this.abortIsolatedReviewAttempt(agent, reason);
+      return;
+    }
     agent.inRestart = true;
     agent.state = 'restarting';
     try {

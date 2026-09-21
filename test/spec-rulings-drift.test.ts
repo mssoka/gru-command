@@ -51,10 +51,15 @@ describe('SPEC locked-rulings numbering drift pin', () => {
     expect(block).toContain('Detached-for-reviews, branch-for-jobs');
   });
 
-  it('rulings 19 and 20 are the attach/uploads and DecisionService canon (E9)', () => {
+  it('ruling 19 is the attach/uploads canon and the excluded pilot ruling is absent', () => {
     const nums = rulingNumbers(spec);
-    expect(nums.at(-1)).toBe(20);
-    const block19 = spec.slice(spec.indexOf('19. **'), spec.indexOf('20. **'));
+    expect(nums.at(-1)).toBe(19);
+    expect(nums).not.toContain(20);
+    const ruling19 = spec.indexOf('19. **');
+    const sources = spec.indexOf('## Sources');
+    expect(ruling19).toBeGreaterThanOrEqual(0);
+    expect(sources).toBeGreaterThan(ruling19);
+    const block19 = spec.slice(ruling19, sources);
     expect(block19).toContain('by PATH');
     expect(block19).toContain('gru-command-attach1');
     expect(block19).toContain('<data_dir>/uploads/');
@@ -71,17 +76,13 @@ describe('SPEC locked-rulings numbering drift pin', () => {
     expect(block19).toContain('ALWAYS receives a path and reads the file itself');
     expect(block19).toContain('vision gated on');
     expect(block19).toContain('graceful decline');
-    const block20 = spec.slice(spec.indexOf('20. **'), spec.indexOf('## Sources'));
-    expect(block20).toContain('DecisionService');
-    expect(block20).toContain('src/events/bus.ts');
-    expect(block20).toContain('src/supervision/supervisor.ts');
-    expect(block20).toContain('src/worktrees/manager.ts');
-    expect(block20).toContain('src/dispatch/perkins.ts');
-    expect(block20).toContain('CONFIG-GATED,\n    DEFAULT-OFF');
-    expect(block20).toContain('PROBE-VERIFIED before any real routing');
-    expect(block20).toContain('~12× cheaper');
-    expect(block20).toContain('openrouter.ai/api/alpha/decisions');
-    expect(block20).toContain('docs.typesafe.ai/confidence.md');
+    const lowered = spec.toLowerCase();
+    for (const marker of [
+      ['j', 'ev'],
+      ['decision', 'service'],
+      ['open', 'router'],
+      ['api', 'alpha', 'decisions'],
+    ].map((parts) => parts.join(''))) expect(lowered).not.toContain(marker);
   });
 
   it('load-bearing cross-references still cite the right numbers', () => {

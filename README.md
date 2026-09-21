@@ -25,7 +25,12 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   review rounds with per-lens live chips, notification center
   ([BOARD.md](docs/BOARD.md)).
 - **Dispatch flow** — briefing → per-job git worktrees → minions →
-  adversarial review waves → PR verdicts ([FLOW.md](docs/FLOW.md),
+  adversarial hybrid review waves → SHA-bound PR verdicts. Perkins runs seven
+  required lens types per frozen chunk (six only for explicit no-spec), with
+  malformed attempts retryable within a pinned bound. Its install-relative,
+  integrity-pinned policy is the sole prompt authority; repository text is
+  untrusted evidence. Claude leads alone receive a fresh scoped MCP bridge for
+  the same narrow native tools ([FLOW.md](docs/FLOW.md),
   [WORKTREES.md](docs/WORKTREES.md)).
 - **Pluggable runtimes** — `pi` (reference) and Claude Code adapters;
   models/thinking default to each runtime's own configuration
@@ -103,7 +108,7 @@ console, forensics and backups:
 
 | Doc | What it covers |
 |---|---|
-| [SPEC.md](docs/SPEC.md) | the product constitution — 20 locked rulings |
+| [SPEC.md](docs/SPEC.md) | the product constitution — 19 locked rulings |
 | [CONFIG.md](docs/CONFIG.md) | configuration reference (schema + validation) |
 | [OPERATIONS.md](docs/OPERATIONS.md) | running it: services, emergency console, forensics, backups |
 | [CHAT.md](docs/CHAT.md) | the single-Gru chat socket protocol + reconnect contract |

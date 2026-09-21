@@ -345,7 +345,8 @@ export class WorktreeManager {
       // failures roll the detached tree back — no unregistered debris.
       let record;
       try {
-        this.bootstrap(repo.repoPath, path);
+        // Review lanes must contain only bytes tracked by the frozen commit.
+        // Job bootstrap links/setup outputs are intentionally not applied.
         const sha = runGit(path, ['rev-parse', 'HEAD']);
         record = this.opts.ledger.registerWorktree({
         id: input.roundId,

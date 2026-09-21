@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +11,8 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { loadConfig } from '../src/config.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
-import { WaveRunner, type LensDriver } from '../src/dispatch/perkins.js';
+import { WaveRunner } from '../src/dispatch/perkins.js';
+import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
@@ -48,8 +50,11 @@ interface ServerHarness {
   spawns: { role: Role; options: SpawnOptions }[];
   close: () => Promise<void>;
 }
-
-async function boot(opts: { token?: string; driveLens?: LensDriver } = {}): Promise<ServerHarness> {
+async function boot(opts: {
+  token?: string;
+  reviewPreflight?: ConstructorParameters<typeof WaveRunner>[0]['reviewPreflight'];
+  fallbackGate?: ConstructorParameters<typeof WaveRunner>[0]['fallbackGate'];
+} = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
   const token = opts.token ?? TOKEN;
@@ -65,14 +70,23 @@ async function boot(opts: { token?: string; driveLens?: LensDriver } = {}): Prom
   const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
   const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
   const spawns: { role: Role; options: SpawnOptions }[] = [];
+  const reviewSessions = join(dir, 'review-sessions');
+  mkdirSync(reviewSessions, { recursive: true });
+  const hybrid = fakeHybridSpawner(reviewSessions, { childAnswer: () => '[]' });
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
+    if (role === 'perkins') return hybrid.spawner(role, options);
     return {
       role,
       id: `agent-${spawns.length}`,
       sessionFile: null,
       capabilities: FAKE_CAPABILITIES,
-      async prompt() {},
+      async prompt() {
+        if (role !== 'minion' || options?.cwd === undefined) return;
+        writeFileSync(join(options.cwd, 'http-deliverable.txt'), 'review me\n');
+        execFileSync('git', ['-C', options.cwd, 'add', 'http-deliverable.txt']);
+        execFileSync('git', ['-C', options.cwd, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'test: http deliverable'], { stdio: 'ignore' });
+      },
       async steer() {},
       async followUp() {},
       subscribe() {
@@ -89,9 +103,10 @@ async function boot(opts: { token?: string; driveLens?: LensDriver } = {}): Prom
     ledger,
     worktrees,
     spawner,
-    ...(opts.driveLens !== undefined
-      ? { driveLens: opts.driveLens }
-      : { driveLens: async () => ({ state: 'done' as const, verdict: 'clean' as const }) }),
+    poster: { async post() {} },
+    reviewArtifactRoot: join(dir, 'reviews'),
+    ...(opts.reviewPreflight !== undefined ? { reviewPreflight: opts.reviewPreflight } : {}),
+    ...(opts.fallbackGate !== undefined ? { fallbackGate: opts.fallbackGate } : {}),
   });
   const server = createDispatchServer({ config: cfg, dispatch, wave });
   const http: HttpServer = createServer((req, res) => {
@@ -105,8 +120,10 @@ async function boot(opts: { token?: string; driveLens?: LensDriver } = {}): Prom
     port,
     ledger,
     spawns,
+    wave,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
+      await wave.shutdown();
       db.close();
     },
   };
@@ -206,11 +223,14 @@ describe('dispatch server (E8)', () => {
       expect(pr.status).toBe(200);
       expect(field<string>(pr.json, 'prUrl')).toBe(PR_URL);
       const review = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'http-review' }, TOKEN);
+      if (review.status !== 202) throw new Error(`review failed: ${JSON.stringify(review)}`);
       expect(review.status).toBe(202);
       expect(field<string>(review.json, 'round_id')).toBe('http-review-r1');
       expect(field<string[]>(review.json, 'lenses')).toHaveLength(7);
-      // Give the (fake, instant) fleet a beat to finish.
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      const deadline = Date.now() + 5_000;
+      while (h.ledger.getRound('http-review-r1')?.verdict !== 'approved' && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
       expect(h.ledger.getRound('http-review-r1')?.verdict).toBe('approved');
     } finally {
       await h.close();
@@ -218,12 +238,134 @@ describe('dispatch server (E8)', () => {
   });
 
 
+  it('accepts explicit no_spec=true as six lenses and rejects non-boolean no_spec', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-no-spec');
+    cleanupRepos.push(repo);
+    try {
+      const dispatched = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-no-spec', repo_path: repo.path, title: 'no spec', briefing: 'ordinary briefing',
+      }, TOKEN);
+      expect(dispatched.status).toBe(202);
+      const invalid = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'http-no-spec', no_spec: 'true',
+      }, TOKEN);
+      expect(invalid.status).toBe(400);
+      expect(field<string>(invalid.json, 'detail')).toContain('no_spec must be a boolean');
+      expect(h.ledger.listRounds('http-no-spec')).toHaveLength(0);
+
+      const review = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'http-no-spec', no_spec: true,
+      }, TOKEN);
+      expect(review.status).toBe(202);
+      expect(field<string[]>(review.json, 'lenses')).toEqual([
+        'blind', 'edge', 'security', 'architecture', 'codebase', 'tests',
+      ]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('rejects traversal and overlong job ids while accepting the 128-character boundary', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-safe-job-id');
+    cleanupRepos.push(repo);
+    try {
+      for (const jobId of ['../escape', 'a'.repeat(129)]) {
+        const response = await call(h.port, 'POST', '/api/dispatch', {
+          job_id: jobId, repo_path: repo.path, title: 'unsafe id', briefing: 'must reject before lane creation',
+        }, TOKEN);
+        expect(response.status).toBe(400);
+        expect(field<string>(response.json, 'detail')).toContain('safe 128-character record identifier');
+        expect(h.ledger.getJob(jobId)).toBeNull();
+      }
+      const boundary = 'a'.repeat(128);
+      const accepted = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: boundary, repo_path: repo.path, title: 'boundary id', briefing: 'accepted exact limit',
+      }, TOKEN);
+      expect(accepted.status).toBe(202);
+      expect(field<string>(accepted.json, 'job_id')).toBe(boundary);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('validates request bodies loudly (400, never a silent lane)', async () => {
     const h = await boot();
     try {
       const bad = await call(h.port, 'POST', '/api/dispatch', { job_id: 'x' }, TOKEN);
       expect(bad.status).toBe(400);
       expect(field<string>(bad.json, 'error')).toBe('bad_request');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('routes a failed pre-flight to the bmad-review fallback gate over HTTP', async () => {
+    const skillDir = mkdtempSync(join(tmpdir(), 'bmad-review-skill-'));
+    cleanupDirs.push(skillDir);
+    const skillFile = join(skillDir, 'SKILL.md');
+    writeFileSync(skillFile, '---\nname: bmad-review\n---\ninstalled', 'utf8');
+    const h = await boot({
+      reviewPreflight: async () => ({
+        ok: false,
+        failures: [{
+          leg: 'review-policy',
+          detail: 'the Perkins review gate is disabled in config',
+          remediation: 'Enable the Perkins review gate in config: set [review] enabled = true in the instance config.',
+        }],
+      }),
+      fallbackGate: {
+        skillPath: skillFile,
+        runFallbackReview: async () => [],
+        fixDirectiveSink: async () => ({ delivered: true }),
+      },
+    });
+    const repo = makeFixtureRepo('fixture-http-fallback');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-fallback', repo_path: repo.path, title: 'fallback', briefing: 'gate me',
+      }, TOKEN);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'http-fallback' }, TOKEN);
+      expect(review.status).toBe(202);
+      expect(field<string>(review.json, 'route')).toBe('bmad-review-fallback');
+      const legs = (review.json as { failed_legs: Array<{ leg: string; remediation: string }> }).failed_legs;
+      expect(legs).toHaveLength(1);
+      expect(legs[0]?.leg).toBe('review-policy');
+      expect(legs[0]?.remediation).toContain('[review] enabled = true');
+      expect(field<boolean>(review.json, 'skill_installed')).toBe(true);
+      const deadline = Date.now() + 5_000;
+      while (
+        !h.ledger.listEvents({ limit: 50 }).some((event) =>
+          event.kind === 'job.fallback-review' &&
+          event.jobId === 'http-fallback' &&
+          (event.payload as { phase?: string }).phase === 'pass')
+        && Date.now() < deadline
+      ) await new Promise((resolve) => setTimeout(resolve, 20));
+      const passEvent = h.ledger.listEvents({ limit: 50 }).find((event) =>
+        event.kind === 'job.fallback-review' &&
+        (event.payload as { phase?: string }).phase === 'pass');
+      expect(passEvent).not.toBeNull();
+      expect((passEvent!.payload as { clearToMerge?: boolean }).clearToMerge).toBe(true);
+      expect(h.ledger.listRounds('http-fallback')).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('keeps the Perkins route annotated when the pre-flight passes', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-perkins-route');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-route-perkins', repo_path: repo.path, title: 'perkins route', briefing: 'gate me',
+      }, TOKEN);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'http-route-perkins' }, TOKEN);
+      expect(review.status).toBe(202);
+      expect(field<string>(review.json, 'route')).toBe('perkins');
+      expect(field<string>(review.json, 'round_id')).toBe('http-route-perkins-r1');
     } finally {
       await h.close();
     }

@@ -181,6 +181,8 @@ export class RuntimeRegistry {
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+      ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
+      ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),
       model: policy.model,
       thinkingLevel,
     });

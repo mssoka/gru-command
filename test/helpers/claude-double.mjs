@@ -37,11 +37,15 @@
  *   CLAUDE_DOUBLE_COMPACT_FORGED_RESULT=1 put compact_result on a non-status frame
  *   CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT=1 omit required result fields
  *   CLAUDE_DOUBLE_COMPACT_HOLD_FILE=/path wait during /compact until disposed
+ *   CLAUDE_DOUBLE_WORKFLOW_CANDIDATE=1 emit one security finding plus verifier response
  */
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
-import { appendFileSync, existsSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { spawn as childSpawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
+import { clearTimeout as clearTimer, setTimeout as setTimer } from 'node:timers';
 import { setInterval } from 'node:timers';
 
 const argv = process.argv.slice(2);
@@ -235,6 +239,66 @@ async function emitToolTurn(toolName) {
   await emitTextTurn('tool done');
 }
 
+/** Minimal MCP stdio client: newline-delimited JSON-RPC to the bridge
+ * server named in --mcp-config (what the real claude CLI does). */
+async function mcpSession(configFile) {
+  const config = JSON.parse(readFileSync(configFile, 'utf8'));
+  const server = config.mcpServers['gru_perkins'];
+  if (server === undefined) throw new Error(`no gru_perkins server in ${configFile}`);
+  const proc = childSpawn(server.command, server.args, {
+    env: { ...process.env, ...server.env },
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  let nextId = 1;
+  const pending = new Map();
+  const lines = createInterface({ input: proc.stdout });
+  lines.on('line', (line) => {
+    if (!line.trim()) return;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (message.id !== undefined && pending.has(message.id)) {
+      pending.get(message.id)(message);
+      pending.delete(message.id);
+    }
+  });
+  const call = (method, params) =>
+    new Promise((resolve, reject) => {
+      const id = nextId++;
+      const timer = setTimer(() => {
+        pending.delete(id);
+        reject(new Error(`mcp ${method} timeout`));
+      }, 60_000);
+      timer.unref?.();
+      pending.set(id, (message) => {
+        clearTimer(timer);
+        if (message.error !== undefined) reject(new Error(message.error.message ?? 'mcp error'));
+        else resolve(message);
+      });
+      proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+    });
+  return {
+    call,
+    close: () => {
+      try {
+        proc.stdin.end();
+        proc.kill('SIGTERM');
+      } catch {
+        /* already gone */
+      }
+    },
+  };
+}
+
+function mcpToolText(response) {
+  const text = response.result?.content?.[0]?.text;
+  if (typeof text !== 'string') throw new Error('mcp tool returned no text');
+  return text;
+}
+
 /** Write a frame in tiny byte chunks, splitting multi-byte characters. */
 async function writeChunked(obj) {
   const buf = Buffer.from(`${JSON.stringify(obj)}\n`, 'utf8');
@@ -330,6 +394,69 @@ async function run() {
     return;
   }
 
+  if (prompt.includes('REQUIRED CHILD COVERAGE')) {
+    const configFile = flagValue('--mcp-config');
+    if (configFile === undefined) {
+      process.stderr.write('hybrid lead prompt without --mcp-config\n');
+      process.exit(2);
+    }
+    const session = await mcpSession(configFile);
+    try {
+      const listed = await session.call('tools/list', {});
+      const names = listed.result.tools.map((tool) => tool.name).sort().join(',');
+      const chunk = await session.call('tools/call', {
+        name: 'perkins_read_chunk',
+        arguments: { chunk: '001' },
+      });
+      if (!mcpToolText(chunk).includes('diff --git')) throw new Error('invalid frozen chunk read');
+      const run = (lenses) =>
+        session.call('tools/call', {
+          name: 'perkins_run_lenses',
+          arguments: { runs: lenses.map((lens) => ({ lens, chunk: '001' })) },
+        });
+      const first = await run(['blind', 'edge', 'acceptance', 'security']);
+      const second = await run(['architecture', 'codebase', 'tests']);
+      const refs = [];
+      for (const response of [first, second]) {
+        const payload = JSON.parse(mcpToolText(response));
+        for (const result of payload.results) {
+          if (result.status !== 'valid') continue;
+          for (const finding of result.findings) refs.push(finding.ref);
+        }
+      }
+      const submission = await session.call('tools/call', {
+        name: 'perkins_submit_review',
+        arguments: {
+          canonical_verdict: 'READY TO MERGE',
+          candidate_decisions: refs.map((ref) => ({
+            candidate_ref: ref,
+            disposition: 'confirmed',
+            evidence: 'export function answer(): number {',
+            reason: 'lead verified against the frozen tree over MCP',
+          })),
+          prior_audit: [],
+          report_markdown: [
+            '# Perkins Code Review',
+            '',
+            '**Verdict: READY TO MERGE**',
+            `Target: ${/^Frozen target SHA: (.+)$/m.exec(prompt)?.[1] ?? ''}`,
+            `Base: ${/^Frozen diff base SHA: (.+)$/m.exec(prompt)?.[1] ?? ''}`,
+            'Coverage: blind edge acceptance security architecture codebase tests',
+            'warning Verified adapter finding src/main.ts:2',
+            '  return 43;',
+            'Retain verification coverage for this path.',
+          ].join('\n'),
+        },
+      });
+      const final = `hybrid lead complete; tools=${names}; submit=${mcpToolText(submission)}`;
+      await emitTextTurn(final);
+      out(resultFrame(final, false));
+    } finally {
+      session.close();
+    }
+    return;
+  }
+
   if (prompt.startsWith('hold:')) {
     const releaseFile = prompt.slice('hold:'.length).trim();
     const deadline = Date.now() + 25_000;
@@ -340,6 +467,18 @@ async function run() {
       }
       await delay(10);
     }
+  }
+
+  if (process.env['CLAUDE_DOUBLE_WORKFLOW_CANDIDATE'] === '1') {
+    let answer = '[]';
+    if (prompt.includes('"source": "security"')) {
+      answer = '[{"source":"security","severity":"warning","category":"coverage","title":"Verified adapter finding","location":"src/main.ts:2","evidence":"  return 43;","detail":"The changed line is independently reviewable.","recommended_fix":"Retain verification coverage for this path."}]';
+    } else if (prompt.includes('"source": "tests"')) {
+      answer = '[{"source":"tests","severity":"warning","category":"coverage-gate","title":"Coverage gate: CONCERNS","location":"N/A","evidence":"N/A","detail":"Changed behavior has no executed live-credential smoke proof.","recommended_fix":"Run the opt-in live-credential smoke test before release."}]';
+    }
+    await emitTextTurn(answer);
+    out(resultFrame(answer, false));
+    return;
   }
 
   if (prompt.includes('no-result-ok')) {

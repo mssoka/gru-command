@@ -64,6 +64,7 @@ class FallbackHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string | null;
+  readonly reviewIsolation?: true;
   /** The wrapped handle's declared gaps surface unchanged (SPEC ruling 4). */
   readonly capabilities: AgentRuntime['capabilities'];
   readonly getContextUsage?: () => ContextUsage | null;
@@ -90,6 +91,7 @@ class FallbackHandle implements AgentHandle {
     this.role = inner.role;
     this.id = inner.id;
     this.sessionFile = inner.sessionFile;
+    if (inner.reviewIsolation === true) this.reviewIsolation = true;
     this.capabilities = inner.capabilities;
     if (inner.getContextUsage !== undefined) {
       this.getContextUsage = () => inner.getContextUsage!();

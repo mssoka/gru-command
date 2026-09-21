@@ -78,6 +78,30 @@ export interface ContextUsage {
   readonly percent: number;
 }
 
+export interface NativeAgentToolResult {
+  /** Bounded text returned to the lead model. */
+  readonly text: string;
+  /** Structured host evidence retained in the session/tool result. */
+  readonly details?: Readonly<Record<string, unknown>>;
+  /** Skip another model turn only when every tool in the batch terminates. */
+  readonly terminate?: boolean;
+}
+
+/** Product-owned narrow tool callable by a review lead. It is deliberately
+ * runtime-neutral; adapters expose the same callback through Pi custom tools
+ * or the scoped Claude MCP bridge. */
+export interface NativeAgentTool {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: Readonly<Record<string, unknown>>;
+  execute(input: unknown, signal?: AbortSignal): Promise<NativeAgentToolResult>;
+}
+
+export interface IsolatedReviewPolicy {
+  readonly systemPrompt: string;
+  readonly tools: readonly ('read' | 'grep' | 'find' | 'ls')[];
+}
+
 /** Options for spawn(). */
 export interface SpawnOptions {
   /**
@@ -102,6 +126,15 @@ export interface SpawnOptions {
    * runtime's own setting (SPEC ruling 16 passthrough).
    */
   readonly thinkingLevel?: string;
+  /**
+   * Fresh ambient-free lens child. The adapter replaces the role prompt and
+   * tools, disables project/global resources, and forbids resume.
+   */
+  readonly isolatedReview?: IsolatedReviewPolicy;
+  /** Fresh ambient-free Perkins lead with product-owned orchestration tools. */
+  readonly reviewLead?: IsolatedReviewPolicy & {
+    readonly nativeTools: readonly NativeAgentTool[];
+  };
 }
 
 /**
@@ -160,6 +193,8 @@ export interface AgentHandle {
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string | null;
+  /** Fresh ambient-free review attempt whose retry lifecycle belongs to its workflow. */
+  readonly reviewIsolation?: true;
   /** The hosting runtime's capability declaration (SPEC ruling 4):
    * surfaces read the SAME gaps the adapter declared — the chat surface
    * gates vision on it (SPEC ruling 19: graceful decline, never a guess). */

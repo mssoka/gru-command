@@ -16,14 +16,125 @@ import { TranscriptService } from './transcripts/service.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
-import { GhPrPoster, WaveRunner } from './dispatch/perkins.js';
+import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { createService, type ServiceHandle } from './server.js';
 import { createAttachmentsServer } from './attachments/server.js';
 import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import type { Role } from './config.js';
+import { resolveSpawnPolicy } from './config.js';
+import {
+  isGitHubRemote,
+  isGitLabRemote,
+  probeGitHubRemote,
+  probeGitLabRemote,
+  probeModelProvider,
+  probeReviewPolicy,
+  repoRemote,
+  runReviewPreflight,
+  type ModelProviderProbe,
+} from './dispatch/review-path.js';
+import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
+import { spawnSync } from 'node:child_process';
+import { getAgentDir, ModelRuntime } from '@earendil-works/pi-coding-agent';
 import type { SpawnOptions } from './runtime/types.js';
+
+let cachedModelRuntime: ModelRuntime | null = null;
+async function modelRuntimeForProbe(): Promise<ModelRuntime> {
+  cachedModelRuntime ??= await ModelRuntime.create({ refreshOnCreate: false });
+  return cachedModelRuntime;
+}
+
+/** Fail-closed four-leg review pre-flight (user amendment 2026-09-20). */
+async function reviewPreflightCheck(
+  config: ReturnType<typeof loadConfig>,
+  repoPath: string,
+): Promise<Awaited<ReturnType<typeof runReviewPreflight>>> {
+  const runtimeId = config.runtimes.roles['perkins'] ?? config.runtimes.default;
+  return runReviewPreflight({
+    'resource-integrity': () => {
+      loadPerkinsPolicy();
+    },
+    'model-provider': async () => {
+      const modelRef = resolveSpawnPolicy(config, runtimeId, 'perkins').model;
+      if (runtimeId === 'claude-code') {
+        const result = spawnSync('claude', ['--version'], { encoding: 'utf-8', timeout: 10_000 });
+        if (result.error !== undefined || result.status !== 0) {
+          throw new Error('the claude-code runtime binary is unavailable');
+        }
+        return;
+      }
+      const runtime = await modelRuntimeForProbe();
+      const probe: ModelProviderProbe = {
+        modelRef,
+        getModel: (provider, id) => runtime.getModel(provider, id),
+        checkAuth: (provider) => runtime.checkAuth(provider),
+        availableProviders: () => runtime.getProviders().map((provider) => provider.id),
+      };
+      await probeModelProvider(probe);
+    },
+    'code-host': async () => {
+      const remote = repoRemote(repoPath);
+      if (remote === null) throw new Error(`repository origin is not a parseable https/ssh remote: ${repoPath}`);
+      if (isGitHubRemote(remote.host)) probeGitHubRemote(remote);
+      else if (isGitLabRemote(remote.host)) await probeGitLabRemote(remote, process.env['GITLAB_TOKEN'] ?? process.env['GL_TOKEN']);
+      else {
+        throw new Error(
+          `unsupported code host '${remote.host}' — the review gate supports GitHub (gh) and GitLab (GITLAB_TOKEN) remotes`,
+        );
+      }
+    },
+    'review-policy': () => probeReviewPolicy({ reviewEnabled: () => config.review.enabled }),
+  });
+}
+
+/** Route blocker findings back to the implementing minion session: the live
+ * job minion first; otherwise a fresh minion on the job lane. */
+async function routeFixDirectiveToMinion(input: {
+  registry: RuntimeRegistry;
+  ledger: LedgerApi;
+  worktreeManager: WorktreeManager;
+  jobId: string;
+  directive: string;
+  signal: AbortSignal;
+}): Promise<{ delivered: boolean; minionId?: string; note?: string }> {
+  const minions = input.ledger
+    .listAgents()
+    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+  for (const minion of [...minions].reverse()) {
+    const handle = input.registry.getHandle(minion.id);
+    if (handle !== null) {
+      await racedPrompt(handle, input.directive, input.signal);
+      return { delivered: true, minionId: minion.id };
+    }
+  }
+  const lane = input.worktreeManager
+    .listWorktrees({ jobId: input.jobId })
+    .find((candidate) => candidate.kind === 'job');
+  if (lane === undefined) {
+    return { delivered: false, note: 'no implementing minion session and no job lane' };
+  }
+  const handle = await input.registry.spawn('minion', { cwd: lane.path });
+  try {
+    await racedPrompt(handle, input.directive, input.signal);
+  } finally {
+    await handle.dispose();
+  }
+  return { delivered: true, minionId: handle.id };
+}
+
+/** Race a prompt against cancellation so shutdown cannot stall on an
+ * in-flight fix-directive turn. */
+function racedPrompt(handle: { prompt(text: string, options?: { owner?: string }): Promise<void> }, text: string, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new Error('review operation aborted'));
+  return Promise.race([
+    handle.prompt(text, { owner: 'bmad-review-gate' }),
+    new Promise<never>((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
+    }),
+  ]);
+}
 import { ChatFrameLog } from './chat/frame-log.js';
 import { createChatServer, type ChatServer } from './chat/server.js';
 import { BOARD_WS_PATH } from './board/frames.js';
@@ -124,6 +235,7 @@ async function main(): Promise<number> {
     ledgerDb?: LedgerDb;
     supervisor?: Supervisor;
     bob?: BobScheduler;
+    wave?: WaveRunner;
   } = {};
   let shuttingDown = false;
   const shutdown = (signal: string) => {
@@ -175,6 +287,13 @@ async function main(): Promise<number> {
             state.bob.stop();
           } catch (error) {
             logger.error('bob scheduler stop failed', { error: String(error) });
+          }
+        }
+        if (state.wave !== undefined) {
+          try {
+            await state.wave.shutdown();
+          } catch (error) {
+            logger.error('Perkins review shutdown failed', { error: String(error) });
           }
         }
         if (state.registry !== undefined) {
@@ -367,12 +486,27 @@ async function main(): Promise<number> {
     ledger,
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
-    poster: new GhPrPoster(),
+    poster: new AutoVerdictPoster(),
+    reviewArtifactRoot: join(config.dataDir, 'reviews'),
+    reviewPreflight: (input) => reviewPreflightCheck(config, input.repoPath),
+    fallbackGate: {
+      skillPath: join(getAgentDir(), 'skills', 'bmad-review', 'SKILL.md'),
+      fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
+        registry,
+        ledger,
+        worktreeManager,
+        jobId: directiveInput.jobId,
+        directive: directiveInput.directive,
+        signal: directiveInput.signal,
+      }),
+    },
     escalate: (title, detail) => {
       notifications.post({ kind: 'review-escalation', routing: 'action-required', severity: 'error', title, detail });
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  state.wave = wave;
+  await wave.recoverInterruptedRounds();
   const bobSlot = supervisorLive.declareSlot({
     id: 'bob-consolidator',
     role: 'bob',

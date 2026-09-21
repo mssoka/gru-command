@@ -28,6 +28,34 @@ describe('role definitions (E8)', () => {
     expect(gru).toContain('briefing');
   });
 
+  it('pins the Perkins hybrid persona contract phrases', () => {
+    const perkins = ROLE_DEFINITIONS['perkins'].systemPrompt;
+    for (const phrase of [
+      'perkins_run_lenses',
+      'perkins_submit_review',
+      'READY TO MERGE',
+      'NEEDS CHANGES',
+      'MAJOR REWORK NEEDED',
+      'INCOMPLETE',
+      'Exact evidence is mandatory',
+      'The blind child has no tools',
+    ]) expect(perkins).toContain(phrase);
+  });
+
+  it('pins the Silas installed-review runtime guard', () => {
+    const silas = ROLE_DEFINITIONS['silas'].systemPrompt.toLowerCase();
+    for (const clause of [
+      'integrity-pinned perkins policy',
+      'scoped pi/claude bridges',
+      'never fall back to source files',
+      'ambient skills',
+      'general shell/task tools',
+      'tampered assets fail closed',
+      'bmad-review',
+      'never a silent downgrade',
+    ]) expect(silas).toContain(clause);
+  });
+
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {
     expect(ROLE_DEFINITIONS['gru'].cwd).toBe('workspace_root');
     expect(ROLE_DEFINITIONS['silas'].cwd).toBe('workspace_root');
@@ -48,10 +76,8 @@ describe('role definitions (E8)', () => {
   });
 
   it('maps runtime-agnostic skills per role (declared, not injected)', () => {
-    expect(ROLE_DEFINITIONS['perkins'].skills).toHaveLength(7);
-    for (const lens of ['lens-blind', 'lens-edge', 'lens-tests']) {
-      expect(ROLE_DEFINITIONS['perkins'].skills).toContain(lens);
-    }
+    // Hybrid review sessions override skills to empty; the lens-* fleet is retired.
+    expect(ROLE_DEFINITIONS['perkins'].skills).toEqual([]);
     expect(ROLE_DEFINITIONS['minion'].skills.length).toBeGreaterThan(0);
     expect(ROLE_DEFINITIONS['bob'].skills).toContain('memory-consolidation');
   });
