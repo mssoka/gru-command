@@ -23,6 +23,8 @@ import { createDispatchServer } from './dispatch/server.js';
 import { createService, type ServiceHandle } from './server.js';
 import { createAttachmentsServer } from './attachments/server.js';
 import { uploadsDirNeedsHardening } from './attachments/resolver.js';
+import { DecisionRuntime } from './decisions/runtime.js';
+import { isolateDecisionEnvironment } from './decisions/credentials.js';
 import type { Role } from './config.js';
 import { resolveSpawnPolicy } from './config.js';
 import {
@@ -169,6 +171,9 @@ import { createStaticRoot, defaultStaticRoot } from './static.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
 async function main(): Promise<number> {
+  // Capture once, then remove the provider key from the ambient process
+  // environment before probes, agents, setup hooks, git, or gh can spawn.
+  const decisionEnvironment = isolateDecisionEnvironment();
   let config;
   try {
     config = loadConfig();
@@ -260,6 +265,7 @@ async function main(): Promise<number> {
     board?: Awaited<ReturnType<typeof createBoardServer>>;
     ledgerDb?: LedgerDb;
     supervisor?: Supervisor;
+    decisions?: DecisionRuntime;
     bob?: BobScheduler;
     wave?: WaveRunner;
   } = {};
@@ -299,6 +305,13 @@ async function main(): Promise<number> {
             await state.board.dispose();
           } catch (error) {
             logger.error('board server shutdown failed', { error: String(error) });
+          }
+        }
+        if (state.decisions !== undefined) {
+          try {
+            state.decisions.dispose();
+          } catch (error) {
+            logger.error('decision runtime dispose failed', { error: String(error) });
           }
         }
         if (state.supervisor !== undefined) {
@@ -391,10 +404,23 @@ async function main(): Promise<number> {
   // E7: late-bound supervision feed — the engine is constructed before
   // the supervisor exists; the closure resolves per snapshot.
   let supervisor: Supervisor | null = null;
+  let decisions: DecisionRuntime | null = null;
   const engine = new BoardEngine({
     ledger,
     bus,
     supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
+    decisionsStatus: () => decisions?.status() ?? {
+      enabled: false,
+      status: 'disabled',
+      reason: 'disabled',
+      model: config.decisions.jev.model,
+      endpoint: config.decisions.jev.endpoint,
+      credentialPresent: false,
+      credentialSource: 'none',
+      checkedAt: null,
+      incarnation: 'service-not-started',
+      generation: 0,
+    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   registry.onAgentEvent((envelope) => engine.onRuntimeEvent(envelope));
@@ -422,11 +448,38 @@ async function main(): Promise<number> {
     onActionRequired: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  const decisionRuntime = new DecisionRuntime(config.decisions, {
+    instanceDir: config.instanceDir,
+    env: decisionEnvironment,
+    notifications,
+    onStatusChange: (status) => {
+      ledger.appendCustomEvent({
+        kind: 'decisions.status',
+        payload: {
+          enabled: status.enabled,
+          status: status.status,
+          reason: status.reason,
+          model: status.model,
+          credential_source: status.credentialSource,
+          incarnation: status.incarnation,
+          generation: status.generation,
+        },
+      });
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  decisions = decisionRuntime;
+  state.decisions = decisionRuntime;
+  notifications.setDecisionService(
+    decisionRuntime,
+    () => decisionRuntime.status().status === 'ready',
+  );
   const supervisorLive = new Supervisor({
     config: config.supervision,
     registry,
     ledger,
     notifications,
+    decisions: decisionRuntime,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   supervisor = supervisorLive;
@@ -461,6 +514,11 @@ async function main(): Promise<number> {
     );
   };
   state.supervisor = supervisorLive;
+  // Enabled installs perform exactly one bounded synthetic check before
+  // the server listens; disabled installs do not resolve a credential or
+  // start a request. Chat notification persistence is bound first so a
+  // boot-time degradation is visible to clients that connect later.
+  await decisionRuntime.start();
 
   const board = createBoardServer({
     config,
@@ -470,6 +528,8 @@ async function main(): Promise<number> {
     bus,
     notifications,
     onNotificationAck: (id) => supervisorLive.onNotificationAcked(id),
+    decisionsStatus: () => decisionRuntime.status(),
+    onDecisionsRecheck: () => decisionRuntime.recheck(),
     siblingUpgradePaths: ['/ws'],
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -567,6 +627,7 @@ async function main(): Promise<number> {
     {
       staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)),
       supervisionStatus: () => supervisorLive.status(),
+      decisionsStatus: () => decisionRuntime.status(),
       requestHook: (req, res, path) =>
         attachmentsServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||

@@ -4,6 +4,7 @@ import type { AgentState } from '../runtime/types.js';
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { EventBus } from '../events/bus.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
+import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
 import {
   DEFAULT_LENSES,
   LedgerApi,
@@ -77,12 +78,15 @@ export interface NotificationView {
   readonly agentId: string | null;
   readonly shownAt: string | null;
   readonly ackedAt: string | null;
+  readonly resolvedAt: string | null;
+  readonly resolvedBy: string | null;
 }
 
 export interface BoardSnapshot {
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
+  readonly decisions: DecisionRuntimeStatus;
 }
 
 /** Agent-rail ordering: the standing crew first, workers after. */
@@ -95,6 +99,7 @@ export interface BoardEngineOptions {
   /** E7: live supervision views per agent id (late-bound — main wires it
    * to the supervisor after both exist). */
   readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
+  readonly decisionsStatus?: () => DecisionRuntimeStatus;
 }
 
 export class BoardEngine {
@@ -109,10 +114,23 @@ export class BoardEngine {
     this.bus = opts.bus;
     this.log = opts.log ?? (() => {});
     this.supervisionFor = opts.supervisionFor ?? (() => null);
+    this.decisionsStatus = opts.decisionsStatus ?? (() => ({
+      enabled: false,
+      status: 'disabled',
+      reason: 'disabled',
+      model: '~typesafe/jev-latest',
+      endpoint: 'https://openrouter.ai/api/alpha/decisions',
+      credentialPresent: false,
+      credentialSource: 'none',
+      checkedAt: null,
+      incarnation: 'board-not-started',
+      generation: 0,
+    }));
     this.bus.subscribe(() => this.notifyChanged());
   }
 
   private readonly supervisionFor: (agentId: string) => AgentSupervisionView | null;
+  private readonly decisionsStatus: () => DecisionRuntimeStatus;
 
   /** Fired after any event that may have changed the board. */
   onChange(listener: () => void): () => void {
@@ -253,7 +271,7 @@ export class BoardEngine {
           (ROLE_ORDER[a.role] ?? 99) - (ROLE_ORDER[b.role] ?? 99) ||
           (b.lastActivity ?? '').localeCompare(a.lastActivity ?? ''),
       );
-    return { repos, agents, notifications: this.notifications() };
+    return { repos, agents, notifications: this.notifications(), decisions: this.decisionsStatus() };
   }
 
   private jobView(job: JobRecord): JobView {
@@ -321,6 +339,8 @@ export class BoardEngine {
         agentId: row.agentId,
         shownAt: row.shownAt,
         ackedAt: row.ackedAt,
+        resolvedAt: row.resolvedAt,
+        resolvedBy: row.resolvedBy,
       }));
   }
 

@@ -13,6 +13,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { TranscriptService } from '../src/transcripts/service.js';
 import { loadConfig } from '../src/config.js';
+import { DecisionRuntime } from '../src/decisions/runtime.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -51,6 +52,12 @@ async function boot(token: string): Promise<{
   const api = new LedgerApi(db.handle, { bus });
   const engine = new BoardEngine({ ledger: api, bus });
   const notifications = new NotificationCenter({ ledger: api, bus });
+  const decisions = new DecisionRuntime(cfg.decisions, {
+    instanceDir: cfg.instanceDir,
+    env: { GRU_COMMAND_HOME: cfg.instanceDir },
+    home: '/home/tester',
+    watchConfig: false,
+  });
   const board = createBoardServer({
     config: cfg,
     engine,
@@ -58,6 +65,8 @@ async function boot(token: string): Promise<{
     transcripts: new TranscriptService(join(dir, 'sessions'), { ledger: api }),
     bus,
     notifications,
+    decisionsStatus: () => decisions.status(),
+    onDecisionsRecheck: () => decisions.recheck(),
     pushDebounceMs: 10,
   });
   const http: HttpServer = createServer((req, res) => {
@@ -74,6 +83,7 @@ async function boot(token: string): Promise<{
     bus,
     board,
     async close() {
+      decisions.dispose();
       await board.dispose();
       await new Promise<void>((resolveClose) => {
         http.closeAllConnections();
@@ -171,6 +181,23 @@ describe('board server — HTTP API', () => {
     expect(ok.body).toHaveProperty('repos');
     expect(ok.body).toHaveProperty('agents');
     expect(ok.body).toHaveProperty('notifications');
+    expect(ok.body).toHaveProperty('decisions', expect.objectContaining({ status: 'disabled' }));
+  });
+
+  it('decision status and recheck are authenticated and return the durable disabled state', async () => {
+    expect((await getJson(harness.port, '/api/decisions/status', null)).status).toBe(401);
+    expect((await postJson(harness.port, '/api/decisions/recheck', null, {})).status).toBe(401);
+    expect((await postJson(harness.port, '/api/decisions/recheck', 'wrong-token', {})).status).toBe(401);
+    const status = await getJson(harness.port, '/api/decisions/status', 'board-test-token');
+    expect(status).toEqual({
+      status: 200,
+      body: expect.objectContaining({ enabled: false, status: 'disabled', credentialPresent: false }),
+    });
+    const recheck = await postJson(harness.port, '/api/decisions/recheck', 'board-test-token', {});
+    expect(recheck).toEqual({
+      status: 200,
+      body: expect.objectContaining({ enabled: false, status: 'disabled', reason: 'disabled' }),
+    });
   });
 
   it('the write API creates jobs/rounds/agents and validates status transitions', async () => {

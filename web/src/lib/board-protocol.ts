@@ -64,12 +64,28 @@ export interface NotificationView {
   readonly agentId: string | null;
   readonly shownAt: string | null;
   readonly ackedAt: string | null;
+  readonly resolvedAt: string | null;
+  readonly resolvedBy: string | null;
+}
+
+export interface DecisionStatusView {
+  readonly enabled: boolean;
+  readonly status: 'disabled' | 'checking' | 'ready' | 'degraded';
+  readonly reason: string | null;
+  readonly model: string;
+  readonly endpoint: string;
+  readonly credentialPresent: boolean;
+  readonly credentialSource: 'environment' | 'file' | 'none';
+  readonly checkedAt: string | null;
+  readonly incarnation: string;
+  readonly generation: number;
 }
 
 export interface BoardSnapshot {
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
+  readonly decisions: DecisionStatusView;
 }
 
 export interface TranscriptInfo {
@@ -170,11 +186,29 @@ function nstr(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+export function isValidDecisionStatus(value: unknown): value is DecisionStatusView {
+  return isRecord(value) &&
+    typeof value.enabled === 'boolean' &&
+    typeof value.status === 'string' &&
+    ['disabled', 'checking', 'ready', 'degraded'].includes(value.status) &&
+    (value.reason === null || typeof value.reason === 'string') &&
+    typeof value.model === 'string' &&
+    typeof value.endpoint === 'string' &&
+    typeof value.credentialPresent === 'boolean' &&
+    typeof value.credentialSource === 'string' &&
+    ['none', 'environment', 'file'].includes(value.credentialSource) &&
+    (value.checkedAt === null || typeof value.checkedAt === 'string') &&
+    typeof value.incarnation === 'string' && value.incarnation.length > 0 &&
+    Number.isSafeInteger(value.generation) &&
+    Number(value.generation) >= 0;
+}
+
 export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (!isRecord(value)) return false;
   if (!Array.isArray(value.repos) || !Array.isArray(value.agents) || !Array.isArray(value.notifications)) {
     return false;
   }
+  if (!isValidDecisionStatus(value.decisions)) return false;
   const agentsOk = value.agents.every(
     (agent) =>
       isRecord(agent) &&
@@ -191,9 +225,16 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       isRecord(notification) &&
       typeof notification.id === 'string' &&
       typeof notification.ts === 'string' &&
+      typeof notification.kind === 'string' &&
       (notification.severity === 'info' || notification.severity === 'error') &&
       (notification.routing === 'fyi' || notification.routing === 'action-required') &&
-      typeof notification.title === 'string',
+      typeof notification.title === 'string' &&
+      (notification.detail === null || typeof notification.detail === 'string') &&
+      (notification.agentId === null || typeof notification.agentId === 'string') &&
+      (notification.shownAt === null || typeof notification.shownAt === 'string') &&
+      (notification.ackedAt === null || typeof notification.ackedAt === 'string') &&
+      (notification.resolvedAt === null || typeof notification.resolvedAt === 'string') &&
+      (notification.resolvedBy === null || typeof notification.resolvedBy === 'string'),
   );
   if (!agentsOk || !notificationsOk) return false;
   return value.repos.every(

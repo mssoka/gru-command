@@ -5,6 +5,8 @@ import type { AgentHandle, AgentState, SpawnOptions } from '../runtime/types.js'
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { NotificationCenter } from '../notifications/center.js';
+import type { DecisionService } from '../decisions/types.js';
+import { deterministicFailureClass, supervisionDecisionRequest } from '../decisions/questions.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -85,6 +87,23 @@ interface SupervisedAgent {
   inRestart: boolean;
   /** Pending backoff timer (a scheduled next rung). */
   backoffTimer: ReturnType<typeof setTimeout> | null;
+  /** Monotonic event/adoption generation; timestamps can collide within one ms. */
+  activityGeneration: number;
+  /** One classification at a time; watchdog ticks cannot create spend loops. */
+  decisionPending: boolean;
+  /** True while an adapter's error/state:error/turn_end sequence belongs to
+   * the failure currently being classified rather than to new activity. */
+  failureTerminalPending: boolean;
+  /** Latest failure arriving during classification; replayed only while its
+   * captured entity/activity token still describes the same failed handle. */
+  queuedRecovery: {
+    reason: string;
+    allowRestart: boolean;
+    runtimeError: boolean;
+    handle: AgentHandle | null;
+    activityGeneration: number;
+    openTurn: boolean;
+  } | null;
 }
 
 /** A declared supervision slot — a stable identity that outlives handles
@@ -121,6 +140,10 @@ export interface SupervisorOptions {
   readonly registry: SupervisorRegistry;
   readonly ledger: LedgerApi;
   readonly notifications: NotificationCenter;
+  /** Optional decision service: classifies failure signatures for
+   * restart-versus-escalate guidance. Counters, ceilings, stop/cancel state,
+   * and re-arm remain deterministic here regardless of this service. */
+  readonly decisions?: DecisionService;
   readonly log?: Log;
   /** Test seam: tick interval override (default: min(silence/4, 5 s)). */
   readonly tickMs?: number;
@@ -133,6 +156,7 @@ export class Supervisor {
   private readonly registry: SupervisorRegistry;
   private readonly ledger: LedgerApi;
   private readonly notifications: NotificationCenter;
+  private readonly decisions: DecisionService | null;
   private readonly log: Log;
   private readonly now: () => number;
   private readonly agents = new Map<string, SupervisedAgent>();
@@ -147,6 +171,7 @@ export class Supervisor {
     this.registry = opts.registry;
     this.ledger = opts.ledger;
     this.notifications = opts.notifications;
+    this.decisions = opts.decisions ?? null;
     this.log = opts.log ?? (() => {});
     this.now = opts.now ?? Date.now;
     this.tickOverride = opts.tickMs ?? null;
@@ -435,6 +460,18 @@ export class Supervisor {
       const event = envelope.event;
       if (event === undefined) return;
       agent.lastEventAt = this.now();
+      // Adapters emit `error` followed immediately by their sticky
+      // `state:error`. The latter is the same failure, not recovery/new
+      // activity; letting it advance the token would invalidate the bounded
+      // provider-wall decision started by the error event itself.
+      const expectedFailureTerminal =
+        agent.decisionPending &&
+        agent.failureTerminalPending &&
+        ((event.type === 'state' && event.state === 'error') || event.type === 'turn_end');
+      if (!expectedFailureTerminal) {
+        agent.activityGeneration += 1;
+        if (event.type !== 'error') agent.failureTerminalPending = false;
+      }
       switch (event.type) {
         case 'turn_start':
           agent.openTurn = true;
@@ -455,25 +492,26 @@ export class Supervisor {
           }
           break;
         case 'error':
+          if (!this.cfg.enabled) {
+            // Supervision off = pure registry behavior: errors are the
+            // runtime's/owner's business — observed, never acted on.
+            this.log('info', 'runtime error observed — supervision disabled, no restart', {
+              agent_id: agent.agentId,
+              error: event.error,
+            });
+            break;
+          }
           if (event.fatal) {
-            if (!this.cfg.enabled) {
-              // Supervision off = pure registry behavior: fatal errors are
-              // the runtime's/owner's business — observed, never acted on.
-              this.log('info', 'fatal runtime error observed — supervision disabled, no restart', {
-                agent_id: agent.agentId,
-                error: event.error,
-              });
-              break;
-            }
-            if (agent.handle?.reviewIsolation === true) {
-              this.abortIsolatedReviewAttempt(agent, `fatal error: ${event.error}`);
-              break;
-            }
             this.log('warn', 'fatal runtime error — climbing restart ladder', {
               agent_id: agent.agentId,
               error: event.error,
             });
-            void this.restartRung(agent, `fatal error: ${event.error}`);
+            void this.evaluateRecovery(agent, `fatal error: ${event.error}`, true, true);
+          } else {
+            // Preserve the adapter contract: in-band failures never restart.
+            // They still enter provider-wall classification so known auth or
+            // quota failures produce durable stop/re-arm guidance.
+            void this.evaluateRecovery(agent, `runtime error: ${event.error}`, false, true);
           }
           break;
         default:
@@ -514,6 +552,7 @@ export class Supervisor {
       }
       if (handle !== null && handle.sessionFile !== null) existing.sessionFile = handle.sessionFile;
       existing.lastEventAt = this.now();
+      existing.activityGeneration += 1;
       return true;
     }
     const sessionFile = handle?.sessionFile ?? envelope?.sessionFile ?? resumeFile ?? null;
@@ -535,6 +574,10 @@ export class Supervisor {
       breakerNotificationId: null,
       inRestart: false,
       backoffTimer: null,
+      activityGeneration: 0,
+      decisionPending: false,
+      failureTerminalPending: false,
+      queuedRecovery: null,
     });
     this.log('info', 'supervising agent', { agent_id: agentId, role, slot: slot?.id ?? null });
     return true;
@@ -557,6 +600,7 @@ export class Supervisor {
       if (bytes !== null && agent.lastFileBytes !== null && bytes > agent.lastFileBytes) {
         agent.lastFileBytes = bytes;
         agent.lastEventAt = now;
+        agent.activityGeneration += 1;
         continue;
       }
       if (bytes !== null) agent.lastFileBytes = bytes;
@@ -572,7 +616,7 @@ export class Supervisor {
           silence_ms: silence,
           threshold_ms: this.cfg.turnSilenceMs,
         });
-        void this.restartRung(agent, reason);
+        void this.evaluateRecovery(agent, reason);
       }
     }
   }
@@ -595,7 +639,7 @@ export class Supervisor {
   }
 
   // ------------------------------------------------------------------
-  // Restart ladder + crash-loop breaker
+  // Decision-backed recovery guidance + restart ladder
   // ------------------------------------------------------------------
 
   /** Review attempts are fresh, ambient-free, and owned by the enclosing
@@ -647,6 +691,187 @@ export class Supervisor {
         }
       }
     })();
+  }
+
+  /** Classify one failure signature and route recovery guidance. The
+   * deterministic ladder (counters, ceilings, backoff, breaker, re-arm) stays
+   * authoritative: Jev classifies the signature only and can never grant a
+   * restart past these guards — an `act`-band restart_advised with requireConfirm
+   * still stops for a human, and known auth/quota walls always stop without
+   * burning rungs, whatever the model answers. */
+  private async evaluateRecovery(
+    agent: SupervisedAgent,
+    reason: string,
+    allowRestart = true,
+    runtimeError = false,
+  ): Promise<void> {
+    // Perkins review attempts are owned by the bounded review workflow. A
+    // supervisor resume would drop that attempt's cwd/isolation contract and
+    // race the workflow's one permitted retry, so abort the handle only; the
+    // workflow records/retries it and owns every replacement.
+    if (agent.handle?.reviewIsolation === true) {
+      this.abortIsolatedReviewAttempt(agent, reason);
+      return;
+    }
+    const deterministicClass = deterministicFailureClass(reason);
+    const deterministicWall = deterministicClass === 'authentication_wall' || deterministicClass === 'quota_wall';
+    if (this.decisions === null) {
+      if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
+        this.stopForGuidance(agent, deterministicClass);
+      } else if (allowRestart) {
+        await this.restartRung(agent, reason);
+      }
+      return;
+    }
+    if (agent.decisionPending) {
+      // Keep only the newest trigger: bounded one-slot replay avoids both a
+      // spend loop and the old failure mode where a second error invalidated
+      // the first decision then vanished.
+      agent.queuedRecovery = {
+        reason,
+        allowRestart,
+        runtimeError,
+        handle: agent.handle,
+        activityGeneration: agent.activityGeneration,
+        openTurn: agent.openTurn,
+      };
+      if (runtimeError) agent.failureTerminalPending = true;
+      return;
+    }
+    if (agent.inRestart || agent.breakerOpen || agent.handle === null) return;
+    agent.decisionPending = true;
+    agent.failureTerminalPending = runtimeError;
+    const expectedHandle = agent.handle;
+    const expectedActivityGeneration = agent.activityGeneration;
+    const expectedOpenTurn = agent.openTurn;
+    const request = supervisionDecisionRequest({
+      reason,
+      agentId: agent.agentId,
+      role: agent.role,
+      restartCount: agent.restartRing.length,
+      breakerLimit: this.cfg.maxRestarts,
+    });
+    try {
+      const outcome = await this.decisions.decide(request);
+      // The entity may have been stopped/disposed/replaced while Jev was
+      // answering. A stale answer never starts a restart.
+      if (
+        this.disposed ||
+        this.agents.get(agent.agentId) !== agent ||
+        agent.handle !== expectedHandle ||
+        agent.activityGeneration !== expectedActivityGeneration ||
+        (!runtimeError && agent.openTurn !== expectedOpenTurn) ||
+        agent.breakerOpen
+      ) return;
+      const classAnswer = outcome.routes.failure_class.path === 'fallback'
+        ? request.fallback.failure_class
+        : outcome.answers.failure_class;
+      const restartAnswer = outcome.routes.restart_advised.path === 'fallback'
+        ? request.fallback.restart_advised
+        : outcome.answers.restart_advised;
+      // Model guidance may refine unknown/transient failures, but it cannot
+      // contradict a provider wall that is already evident in the runtime
+      // error. Burning restart rungs on known auth/quota walls is futile.
+      const failureClass = deterministicWall ? deterministicClass : classAnswer.choice;
+      const classifiedWall = failureClass === 'authentication_wall' || failureClass === 'quota_wall';
+      const restartAdvised = classifiedWall ? false : restartAnswer.noul >= 0.5;
+      const restartRoute = outcome.routes.restart_advised;
+      const restartAuthorized =
+        restartAdvised && restartRoute.path === 'act' && restartRoute.requiresConfirm === false;
+      this.ledger.appendCustomEvent({
+        kind: 'supervision.guidance',
+        agentId: agent.agentId,
+        payload: {
+          class: failureClass,
+          restart_advised: restartAdvised,
+          restart_authorized: restartAuthorized,
+          source: deterministicWall ? 'deterministic_guard' : outcome.provenance.source,
+          route: deterministicWall ? 'fallback' : restartRoute.path,
+          requires_confirm: deterministicWall ? false : restartRoute.requiresConfirm,
+        },
+      });
+      if (
+        failureClass === 'authentication_wall' ||
+        failureClass === 'quota_wall' ||
+        !restartAuthorized
+      ) {
+        this.stopForGuidance(
+          agent,
+          restartAdvised && !restartAuthorized ? 'restart_confirmation_required' : failureClass,
+        );
+        return;
+      }
+      if (allowRestart) await this.restartRung(agent, reason);
+    } catch (error) {
+      this.log('error', 'recovery classification failed; using deterministic restart guards', {
+        agent_id: agent.agentId,
+        error: String(error),
+      });
+      if (
+        !this.disposed &&
+        this.agents.get(agent.agentId) === agent &&
+        agent.handle === expectedHandle &&
+        agent.activityGeneration === expectedActivityGeneration &&
+        (runtimeError || agent.openTurn === expectedOpenTurn) &&
+        !agent.breakerOpen
+      ) {
+        if (deterministicWall) this.stopForGuidance(agent, deterministicClass);
+        else if (allowRestart) await this.restartRung(agent, reason);
+      }
+    } finally {
+      agent.decisionPending = false;
+      agent.failureTerminalPending = false;
+      const queued = agent.queuedRecovery;
+      agent.queuedRecovery = null;
+      const queuedTurnStillMatches = queued?.runtimeError === true || queued?.openTurn === agent.openTurn;
+      if (
+        queued !== null &&
+        !this.disposed &&
+        !agent.inRestart &&
+        !agent.breakerOpen &&
+        agent.handle !== null &&
+        agent.handle === queued.handle &&
+        agent.activityGeneration === queued.activityGeneration &&
+        queuedTurnStillMatches
+      ) {
+        void this.evaluateRecovery(agent, queued.reason, queued.allowRestart, queued.runtimeError);
+      }
+    }
+  }
+
+  /** Known futile retry walls stop once and require the existing human ack
+   * re-arm path; they never burn the restart ring blindly. */
+  private stopForGuidance(agent: SupervisedAgent, failureClass: string): void {
+    if (agent.breakerOpen) return;
+    agent.breakerOpen = true;
+    agent.state = 'stopped';
+    agent.openTurn = false;
+    agent.openControl = false;
+    const handle = agent.handle;
+    agent.handle = null;
+    this.ledger.appendCustomEvent({
+      kind: 'supervision.escalated',
+      agentId: agent.agentId,
+      payload: { class: failureClass, restarts: agent.restartRing.length },
+    });
+    const notification = this.notifications.postIncident({
+      kind: `supervision.provider-wall.${agent.agentId}.${failureClass}`,
+      routing: 'action-required',
+      severity: 'error',
+      title: `Agent ${agent.agentId} stopped: ${failureClass.replaceAll('_', ' ')}`,
+      detail: 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.',
+      agentId: agent.agentId,
+      dedupe: 'unacked',
+    });
+    agent.breakerNotificationId = notification.id;
+    if (handle !== null) {
+      void this.registry.disposeHandle(handle).catch((error: unknown) => {
+        this.log('warn', 'dispose after provider-wall escalation failed', {
+          agent_id: agent.agentId,
+          error: String(error),
+        });
+      });
+    }
   }
 
   /** One restart rung. Single-flight per agent: a later trigger while a

@@ -54,11 +54,27 @@
         <strong>Chat socket</strong>
         <span class="settings__value" id="settings-endpoint">—</span>
       </div>
+      <section class="decision-status" aria-labelledby="decisions-title">
+        <div class="decision-status__head">
+          <div>
+            <div class="lbl">Optional classifier</div>
+            <strong id="decisions-title">Decision routing</strong>
+          </div>
+          <span id="decisions-stamp" class="decision-status__stamp" data-state="disabled">OFF</span>
+        </div>
+        <p id="decisions-summary" class="decision-status__summary" role="status" aria-live="polite">Deterministic routing only. Jev makes zero requests.</p>
+        <div id="decisions-meta" class="decision-status__meta">~typesafe/jev-latest · credential not inspected</div>
+        <div id="decisions-setup" class="decision-status__setup">
+          <span>Local setup only — never paste a key into this browser. Store the credential, then explicitly enable Jev in <code>config.toml</code>.</span>
+          <code>node dist/decisions/cli.js credentials set --stdin</code>
+          <code>[decisions.jev]<br>enabled = true</code>
+        </div>
+        <button id="decisions-recheck" class="pp-btn pp-btn--secondary decision-status__recheck" type="button" hidden>Recheck</button>
+      </section>
       <div class="settings__row">
         <strong>Pairing</strong>
         <button id="settings-unpair" class="pp-btn pp-btn--secondary">Unpair this browser</button>
       </div>
-      <div class="lbl">More settings land with the board (E6) and notifications (E7).</div>
     </section>
 
     <div id="chat-main-mount" class="reveal">

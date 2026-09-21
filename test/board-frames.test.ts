@@ -63,6 +63,18 @@ const SNAPSHOT_VALID = {
   ],
   agents: [],
   notifications: [],
+  decisions: {
+    enabled: false,
+    status: 'disabled',
+    reason: 'disabled',
+    model: '~typesafe/jev-latest',
+    endpoint: 'https://openrouter.ai/api/alpha/decisions',
+    credentialPresent: false,
+    credentialSource: 'none',
+    checkedAt: null,
+    incarnation: 'test-incarnation',
+    generation: 0,
+  },
 };
 
 const SERVER_CORPUS: readonly unknown[] = [

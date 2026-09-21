@@ -277,4 +277,14 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_worktree_processes_wt ON worktree_processes(worktree_id);
     `,
   },
+  {
+    id: 7,
+    name: 'jev-notification-resolution',
+    sql: `
+      ALTER TABLE notifications ADD COLUMN resolved_at TEXT;
+      ALTER TABLE notifications ADD COLUMN resolved_by TEXT;
+      CREATE INDEX idx_notifications_kind_active
+        ON notifications(kind, resolved_at, acked_at);
+    `,
+  },
 ];

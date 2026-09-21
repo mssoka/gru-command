@@ -33,4 +33,12 @@ export declare function startRealService(options?: {
   workspace?: string;
   /** Model ref written to config; unknown metadata declines vision conservatively. */
   model?: string;
+  /** Write enabled=true into the hermetic decision configuration. */
+  decisionsEnabled?: boolean;
+  /** Provision through the compiled stdin-only CLI before service boot. */
+  decisionKey?: string;
+  /** Offline child preload, e.g. the Jev fetch double. */
+  nodeImport?: string;
+  /** Additional non-secret test controls for the child process. */
+  extraEnv?: NodeJS.ProcessEnv;
 }): Promise<RealServiceHandle>;

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer } from 'ws';
 import { BoardClient, type BoardConnectionState } from './board-client.js';
 import type { BoardSnapshot } from './board-protocol.js';
@@ -32,6 +32,18 @@ function snapshotFor(jobId: string): BoardSnapshot {
     ],
     agents: [],
     notifications: [],
+    decisions: {
+      enabled: false,
+      status: 'disabled',
+      reason: 'disabled',
+      model: '~typesafe/jev-latest',
+      endpoint: 'https://openrouter.ai/api/alpha/decisions',
+      credentialPresent: false,
+      credentialSource: 'none',
+      checkedAt: null,
+      incarnation: 'test-incarnation',
+      generation: 0,
+    },
   };
 }
 
@@ -181,6 +193,22 @@ describe('board client', () => {
     }
     server.push(snapshotFor('still-alive'));
     await waitFor(() => seen.includes('still-alive'), 'live after noise');
+  });
+
+  it('posts an authenticated decision recheck and rejects malformed status replies', async () => {
+    const ready = { ...snapshotFor('recheck').decisions, enabled: true, status: 'ready' as const, reason: null, credentialPresent: true, credentialSource: 'file' as const, generation: 4 };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(ready), { status: 200 })) as unknown as typeof fetch;
+    client = new BoardClient(
+      { token: TOKEN, host: `127.0.0.1:${server.port}`, fetchImpl },
+      { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+    );
+    await expect(client.recheckDecisions()).resolves.toMatchObject({ status: 'ready', generation: 4 });
+    const [path, init] = vi.mocked(fetchImpl).mock.calls[0]!;
+    expect(path).toBe('/api/decisions/recheck');
+    expect(init).toMatchObject({ method: 'POST', headers: expect.objectContaining({ authorization: `Bearer ${TOKEN}` }) });
+
+    vi.mocked(fetchImpl).mockResolvedValueOnce(new Response('{"status":"ready"}', { status: 200 }));
+    await expect(client.recheckDecisions()).rejects.toThrow(/malformed status/);
   });
 
   it('stop() halts reconnects', async () => {

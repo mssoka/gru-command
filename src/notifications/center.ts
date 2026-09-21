@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { LogLevel } from '../logger.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
+import type { DecisionService } from '../decisions/types.js';
+import { eventDecisionRequest } from '../decisions/questions.js';
 import {
   LedgerApi,
   type NotificationRecord,
@@ -65,6 +67,8 @@ export class NotificationCenter {
   private readonly ledger: LedgerApi;
   private readonly onActionRequired: (notification: NotificationRecord) => void;
   private readonly log: Log;
+  private decisions: DecisionService | null = null;
+  private decisionsReady: () => boolean = () => false;
 
   constructor(opts: NotificationCenterOptions) {
     this.ledger = opts.ledger;
@@ -74,6 +78,12 @@ export class NotificationCenter {
     // synchronously in write order, so the source row is already durable
     // when the FYI row lands.
     opts.bus.subscribe((event) => this.derive(event));
+  }
+
+  /** Attach the optional async triage observer after composition. */
+  setDecisionService(decisions: DecisionService, ready: () => boolean = () => true): void {
+    this.decisions = decisions;
+    this.decisionsReady = ready;
   }
 
   /** Direct post — supervisor escalations and product surfaces. */
@@ -101,6 +111,28 @@ export class NotificationCenter {
     return record;
   }
 
+  /** Incident post with durable restart-safe deduplication. */
+  postIncident(input: {
+    kind: string;
+    routing: NotificationRouting;
+    severity: NotificationSeverity;
+    title: string;
+    detail?: string | null;
+    agentId?: string | null;
+    dedupe: 'unacked' | 'active' | 'all';
+  }): NotificationRecord {
+    const existing = this.ledger.findNotificationByKind(
+      input.kind,
+      input.dedupe === 'all' ? 'any' : input.dedupe,
+    );
+    if (existing !== null) return existing;
+    return this.post(input);
+  }
+
+  resolveIncidents(kindPrefix: string, by: string): readonly NotificationRecord[] {
+    return this.ledger.resolveNotificationsByKindPrefix(kindPrefix, by);
+  }
+
   /** Display receipt (shown:true doctrine) — idempotent per surface. */
   markShown(id: string, surface: string): NotificationRecord | null {
     return this.ledger.markNotificationShown(id, surface);
@@ -111,26 +143,94 @@ export class NotificationCenter {
     return this.ledger.ackNotification(id, by);
   }
 
-  /** Bus derivation: board-worthy events become durable FYI rows, once. */
+  /** Bus derivation: board-worthy events become durable rows, once. */
   private derive(event: BusEvent): void {
     // Ack/shown echoes must never re-derive (no loops, no dupes).
     if (event.kind.startsWith('notification.')) return;
     if (event.kind === 'supervision.restart') return; // posted directly with richer context
     const rule = DERIVED_KINDS[event.kind];
     if (rule === undefined) return;
-    // Conditional severities: only the error-ish transitions derive.
-    if (event.kind === 'job.status' && String((event.payload as Record<string, unknown>).to ?? '') !== 'blocked') return;
-    if (event.kind === 'agent.state' && String((event.payload as Record<string, unknown>).to ?? '') !== 'error') return;
-    if (event.kind === 'lens.status' && String((event.payload as Record<string, unknown>).to ?? '') !== 'error') return;
+    // Conditional severities: only the error-ish transitions derive. This
+    // filter also prevents model calls on token/runtime traffic.
     const payload = (event.payload ?? {}) as Record<string, unknown>;
+    if (event.kind === 'job.status' && String(payload.to ?? '') !== 'blocked') return;
+    if (event.kind === 'agent.state' && String(payload.to ?? '') !== 'error') return;
+    if (event.kind === 'lens.status' && String(payload.to ?? '') !== 'error') return;
+    if (this.decisions === null || !this.decisionsReady()) {
+      // Preserve the pre-Jev synchronous durability/order when the optional
+      // provider is disabled or degraded. No microtask crash window.
+      this.recordDerived(event, payload, 'fyi', null);
+      return;
+    }
+    // Commit a provisional deterministic row before any await. Provider
+    // latency never blocks EventBus ordering, and a process crash cannot
+    // erase the operator-visible incident. Jev may enrich this same row.
+    const provisional = this.recordDerived(event, payload, 'fyi', null);
+    if (provisional === null) return;
+    const request = eventDecisionRequest(event);
+    void this.decisions
+      .decide(request)
+      .then((outcome) => {
+        const actionRoute = outcome.routes.needs_action;
+        const classRoute = outcome.routes.event_class;
+        const severityRoute = outcome.routes.severity;
+        const classAnswer = classRoute.path === 'fallback'
+          ? request.fallback.event_class
+          : outcome.answers.event_class;
+        const severityAnswer = severityRoute.path === 'fallback'
+          ? request.fallback.severity
+          : outcome.answers.severity;
+        // Jev may only route UP (fyi → action-required). A deterministic
+        // provenance, a fallback-band action metric, or any low-confidence
+        // answer leaves the safe FYI route in place (fail toward attention).
+        const routing: NotificationRouting =
+          outcome.provenance.source === 'jev' && actionRoute.path !== 'fallback'
+            ? 'action-required'
+            : 'fyi';
+        const severityLabels = ['low', 'medium', 'high'] as const;
+        const severityIndex = Math.min(
+          severityLabels.length - 1,
+          Math.max(0, Math.round(severityAnswer.score)),
+        );
+        const detail =
+          outcome.provenance.source === 'jev'
+            ? `Jev ${classAnswer.choice}/${classRoute.path}; severity ${severityLabels[severityIndex]}/${severityRoute.path}; action ${actionRoute.path} (${actionRoute.metricKind} ${actionRoute.metric.toFixed(2)})`
+            : null;
+        const original = rule.detail(payload);
+        const updated = this.ledger.updateNotificationTriage(
+          provisional.id,
+          routing,
+          [original, detail].filter((part): part is string => part !== null && part !== '').join(' — ') || null,
+        );
+        if (updated !== null && provisional.routing !== 'action-required' && updated.routing === 'action-required') {
+          this.onActionRequired(updated);
+        }
+      })
+      .catch((error: unknown) => {
+        this.log('error', 'event decision triage failed; provisional deterministic FYI retained', {
+          event_kind: event.kind,
+          seq: event.seq,
+          error: String(error),
+        });
+      });
+  }
+
+  private recordDerived(
+    event: BusEvent,
+    payload: Record<string, unknown>,
+    routing: NotificationRouting,
+    triage: string | null,
+  ): NotificationRecord | null {
+    const rule = DERIVED_KINDS[event.kind];
+    if (rule === undefined) return null;
     try {
-      this.ledger.recordNotification({
-        id: randomUUID(),
+      const original = rule.detail(payload);
+      return this.post({
         kind: event.kind,
-        routing: 'fyi',
+        routing,
         severity: rule.severity,
         title: rule.title(event, payload),
-        detail: rule.detail(payload),
+        detail: [original, triage].filter((part): part is string => part !== null && part !== '').join(' — ') || null,
         agentId: event.agentId,
       });
     } catch (error) {
@@ -141,6 +241,7 @@ export class NotificationCenter {
         seq: event.seq,
         error: String(error),
       });
+      return null;
     }
   }
 }

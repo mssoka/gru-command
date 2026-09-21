@@ -18,7 +18,7 @@
  */
 
 import { createServer } from 'node:net';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { get as httpGet } from 'node:http';
 import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -80,6 +80,10 @@ export async function startRealService({
   home: existingHome,
   workspace: existingWorkspace,
   model = 'anthropic/claude-sonnet-4-5',
+  decisionsEnabled = false,
+  decisionKey,
+  nodeImport,
+  extraEnv = {},
 } = {}) {
   const mainJs = join(REPO_ROOT, 'dist', 'main.js');
   if (!existsSync(mainJs)) {
@@ -118,19 +122,37 @@ export async function startRealService({
       // production uses (B1). Tests can select an unknown/text-only ref to
       // exercise the conservative decline through the real service.
       `default = "${model}"`,
+      ...(decisionsEnabled ? ['[decisions.jev]', 'enabled = true'] : []),
       '',
     ].join('\n'),
     'utf-8',
   );
 
+  if (decisionKey !== undefined) {
+    const provisionEnv = { ...process.env, GRU_COMMAND_HOME: home };
+    delete provisionEnv.OPENROUTER_API_KEY;
+    const provisioned = spawnSync(
+      process.execPath,
+      [join(REPO_ROOT, 'dist', 'decisions', 'cli.js'), 'credentials', 'set', '--stdin'],
+      { cwd: REPO_ROOT, env: provisionEnv, input: `${decisionKey}\n`, encoding: 'utf8' },
+    );
+    if (provisioned.status !== 0) failLoud(`decision credential provisioning failed: ${provisioned.stderr}`);
+  }
+
+  const childEnv = {
+    ...process.env,
+    ...extraEnv,
+    GRU_COMMAND_HOME: home,
+    PATH: `${binDir}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH ?? ''}`,
+  };
+  delete childEnv.OPENROUTER_API_KEY;
+  if (nodeImport !== undefined) {
+    childEnv.NODE_OPTIONS = `${childEnv.NODE_OPTIONS ?? ''} --import=${nodeImport}`.trim();
+  }
   const child = spawn(process.execPath, [mainJs], {
     cwd: REPO_ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: {
-      ...process.env,
-      GRU_COMMAND_HOME: home,
-      PATH: `${binDir}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH ?? ''}`,
-    },
+    env: childEnv,
   });
   let stderrTail = '';
   child.stdout.on('data', () => {}); // drain: the service log must never wedge the pipe

@@ -78,6 +78,71 @@ describe('config defaults', () => {
   });
 });
 
+describe('decision config', () => {
+  it('is strictly default-off with the verified endpoint and risk-class defaults', () => {
+    const config = loadConfig({ GRU_COMMAND_HOME: tmpHome() }, '/home/tester');
+    expect(config.decisions).toEqual({
+      jev: {
+        enabled: false,
+        model: '~typesafe/jev-latest',
+        endpoint: 'https://openrouter.ai/api/alpha/decisions',
+        timeoutMs: 2_000,
+      },
+      thresholds: {
+        read_only: { act: 0.6, confirm: 0.4, requireConfirmOnAct: false },
+        operational: { act: 0.75, confirm: 0.55, requireConfirmOnAct: false },
+        destructive: { act: 0.85, confirm: 0.7, requireConfirmOnAct: true },
+      },
+    });
+  });
+
+  it('loads explicit Jev transport and all three threshold tables', () => {
+    const home = tmpHome();
+    writeConfig(home, `
+[decisions.jev]
+enabled = true
+model = "typesafe/jev-1.13-20260917"
+endpoint = "https://openrouter.ai/api/alpha/decisions"
+timeout_ms = 2500
+
+[decisions.thresholds.read_only]
+act = 0.72
+confirm = 0.42
+require_confirm_on_act = false
+
+[decisions.thresholds.operational]
+act = 0.82
+confirm = 0.62
+require_confirm_on_act = false
+
+[decisions.thresholds.destructive]
+act = 0.92
+confirm = 0.82
+require_confirm_on_act = true
+`);
+    const decisions = loadConfig({ GRU_COMMAND_HOME: home }).decisions;
+    expect(decisions.jev).toMatchObject({ enabled: true, timeoutMs: 2_500 });
+    expect(decisions.thresholds.operational).toEqual({ act: 0.82, confirm: 0.62, requireConfirmOnAct: false });
+    expect(decisions.thresholds.destructive.requireConfirmOnAct).toBe(true);
+  });
+
+  it('rejects unknown decision keys and inverted thresholds', () => {
+    const unknownHome = tmpHome();
+    writeConfig(unknownHome, '[decisions.jev]\nenabeld = true\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: unknownHome })).toThrow(/unknown key `enabeld`/);
+
+    const invertedHome = tmpHome();
+    writeConfig(invertedHome, '[decisions.thresholds.operational]\nact = 0.5\nconfirm = 0.5\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: invertedHome })).toThrow(/must be less than/);
+  });
+
+  it('will not allow destructive confirmation to be configured away', () => {
+    const home = tmpHome();
+    writeConfig(home, '[decisions.thresholds.destructive]\nrequire_confirm_on_act = false\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/must be true/);
+  });
+});
+
 describe('config round-trip', () => {
   it('loads a valid file with resolved values', () => {
     const home = tmpHome();

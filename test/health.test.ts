@@ -6,6 +6,7 @@ import { configPathFor, loadConfig } from '../src/config.js';
 import { loadOrCreateIdentity } from '../src/identity.js';
 import { createService, type ServiceHandle } from '../src/server.js';
 import { VERSION } from '../src/version.js';
+import { DecisionRuntime } from '../src/decisions/runtime.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -186,6 +187,38 @@ describe('GET /health', () => {
       const agents = supervision['agents'] as Array<Record<string, unknown>>;
       expect(agents[0]).toMatchObject({ agentId: 'gru-main', state: 'watching', restarts: 1 });
     } finally {
+      await handle.stop();
+    }
+  });
+
+  it('publishes durable decision readiness without exposing credential material', async () => {
+    const home = tmpHome();
+    writeFileSync(
+      configPathFor(home),
+      '[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "health-test-token"\n',
+      'utf-8',
+    );
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const identity = loadOrCreateIdentity(config.dataDir);
+    const decisions = new DecisionRuntime(config.decisions, {
+      instanceDir: config.instanceDir,
+      watchConfig: false,
+    });
+    const service = createService(config, identity, () => {}, () => null, {
+      decisionsStatus: () => decisions.status(),
+    });
+    const handle = await service.start();
+    try {
+      const body = (await (await authedHealth(handle.port)).json()) as Record<string, unknown>;
+      expect(body['decisions']).toMatchObject({
+        enabled: false,
+        status: 'disabled',
+        credentialPresent: false,
+        credentialSource: 'none',
+      });
+      expect(JSON.stringify(body)).not.toContain('apiKey');
+    } finally {
+      decisions.dispose();
       await handle.stop();
     }
   });

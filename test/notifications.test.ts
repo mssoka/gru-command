@@ -1,11 +1,14 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { DEFAULT_DECISIONS_CONFIG } from '../src/config.js';
+import type { DecisionService } from '../src/decisions/types.js';
+import { deterministicOutcome } from '../src/decisions/service.js';
 
 /**
  * Notification system tests (EPICS E7 story 2): the durable log, FYI
@@ -43,6 +46,38 @@ function boot(): Rig {
     onActionRequired: (notification) => actionRequired.push(notification),
   });
   return { api, bus, center, actionRequired };
+}
+
+async function expectClosedTriageDoesNotResurface(closed: 'acknowledged' | 'resolved'): Promise<void> {
+  const pending = boot();
+  let release!: (value: Awaited<ReturnType<DecisionService['decide']>>) => void;
+  const decide = vi.fn((_request: Parameters<DecisionService['decide']>[0]) =>
+    new Promise<Awaited<ReturnType<DecisionService['decide']>>>((resolve) => { release = resolve; }));
+  pending.center.setDecisionService({ decide } as unknown as DecisionService);
+  pending.api.addJob({ id: `closed-${closed}`, repo: 'demo', title: `Closed ${closed}` });
+  pending.api.setJobStatus(`closed-${closed}`, 'working');
+  pending.api.setJobStatus(`closed-${closed}`, 'blocked');
+  const provisional = pending.api.listNotifications({ limit: 50 }).find((item) => item.title.includes(`closed-${closed}`))!;
+  if (closed === 'acknowledged') pending.center.ack(provisional.id, 'operator');
+  else pending.center.resolveIncidents('job.status', 'system-recovery');
+
+  const request = decide.mock.calls[0]![0];
+  const fallback = deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled');
+  release({
+    ...fallback,
+    answers: { ...fallback.answers, needs_action: { type: 'noul', noul: 0.99 } },
+    routes: {
+      ...fallback.routes,
+      needs_action: { path: 'act', metric: 0.99, metricKind: 'probability', requiresConfirm: false, riskClass: 'operational' },
+    },
+    provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(pending.api.getNotification(provisional.id)).toMatchObject({ routing: 'fyi' });
+  expect(pending.actionRequired.map((item) => item.id)).not.toContain(provisional.id);
+  expect(pending.api.listEvents({ limit: 100 }).filter((event) =>
+    event.kind === 'notification.triaged' && (event.payload as { id?: string }).id === provisional.id,
+  )).toHaveLength(0);
 }
 
 describe('notification center — durable log + receipts + acks', () => {
@@ -144,6 +179,136 @@ describe('notification center — durable log + receipts + acks', () => {
     const verdictRows = rig2.api.listNotifications({ limit: 50 }).filter((n) => n.kind === 'round.verdict');
     expect(verdictRows.length).toBe(1);
     expect(verdictRows[0]?.severity).toBe('info');
+  });
+
+  it('keeps deterministic notification durability synchronous while Jev is not ready', () => {
+    const gated = boot();
+    const decide = vi.fn();
+    gated.center.setDecisionService({ decide } as unknown as DecisionService, () => false);
+    gated.api.addJob({ id: 'jev-gated', repo: 'demo', title: 'Gated event route' });
+    gated.api.setJobStatus('jev-gated', 'working');
+    gated.api.setJobStatus('jev-gated', 'blocked');
+    const row = gated.api.listNotifications({ limit: 50 }).find((item) => item.title.includes('jev-gated'));
+    expect(row).toMatchObject({ routing: 'fyi', detail: 'working → blocked' });
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it('persists a provisional notification before enabled Jev triage settles', async () => {
+    const pending = boot();
+    let release!: (value: Awaited<ReturnType<DecisionService['decide']>>) => void;
+    const decide = vi.fn((_request: Parameters<DecisionService['decide']>[0]) =>
+      new Promise<Awaited<ReturnType<DecisionService['decide']>>>((resolve) => {
+        release = resolve;
+      }));
+    pending.center.setDecisionService({ decide } as unknown as DecisionService);
+    pending.api.addJob({ id: 'pending-jev', repo: 'demo', title: 'Pending Jev event' });
+    pending.api.setJobStatus('pending-jev', 'working');
+    pending.api.setJobStatus('pending-jev', 'blocked');
+    const provisional = pending.api.listNotifications({ limit: 50 }).find((item) => item.title.includes('pending-jev'));
+    expect(provisional).toMatchObject({ routing: 'fyi', detail: 'working → blocked' });
+
+    const request = decide.mock.calls[0]![0];
+    const fallback = deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled');
+    release({
+      ...fallback,
+      answers: { ...fallback.answers, needs_action: { type: 'noul', noul: 0.95 } },
+      routes: {
+        ...fallback.routes,
+        needs_action: { path: 'act', metric: 0.95, metricKind: 'probability', requiresConfirm: false, riskClass: 'operational' },
+      },
+      provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null },
+    });
+    await vi.waitFor(() => expect(pending.api.getNotification(provisional!.id)).toMatchObject({ routing: 'action-required' }));
+    expect(pending.api.listNotifications({ limit: 50 }).filter((item) => item.title.includes('pending-jev'))).toHaveLength(1);
+    expect(pending.actionRequired.map((item) => item.id)).toContain(provisional!.id);
+  });
+
+  it('does not resurface an acknowledged provisional row after delayed Jev triage', async () => {
+    await expectClosedTriageDoesNotResurface('acknowledged');
+  });
+
+  it('does not resurface a resolved provisional row after delayed Jev triage', async () => {
+    await expectClosedTriageDoesNotResurface('resolved');
+  });
+
+  it('actual orchestration events consume Jev routes asynchronously without blocking/recursing', async () => {
+    const rig4 = boot();
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) => {
+      const fallback = deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled');
+      return {
+        ...fallback,
+        answers: {
+          ...fallback.answers,
+          needs_action: { type: 'noul', noul: 0.7 },
+          event_class: {
+            type: 'choice',
+            choice: 'action_required',
+            probabilities: { routine_fyi: 0, operator_attention: 0, action_required: 1, settle_noise: 0, unknown: 0 },
+            confidence: 0.95,
+          },
+        },
+        routes: {
+          ...fallback.routes,
+          needs_action: { path: 'confirm', metric: 0.7, metricKind: 'probability', requiresConfirm: true, riskClass: 'operational' },
+          event_class: { path: 'act', metric: 0.95, metricKind: 'confidence', requiresConfirm: false, riskClass: 'read_only' },
+        },
+        provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null },
+      };
+    });
+    rig4.center.setDecisionService({ decide } as unknown as DecisionService);
+    rig4.api.addJob({ id: 'jev-event', repo: 'demo', title: 'Jev event route' });
+    rig4.api.setJobStatus('jev-event', 'working');
+    rig4.api.setJobStatus('jev-event', 'blocked');
+    await vi.waitFor(() => {
+      const row = rig4.api.listNotifications({ limit: 50 }).find((item) => item.title.includes('jev-event'));
+      expect(row).toMatchObject({ routing: 'action-required' });
+      expect(row?.detail).toContain('Jev action_required');
+    });
+    expect(decide).toHaveBeenCalledTimes(1); // notification.created never recurses
+  });
+
+  it('resolves literal incident prefixes without SQL wildcards and allows a later recurrence', () => {
+    const incidents = boot();
+    const literal = incidents.center.postIncident({
+      kind: 'decisions.degraded.a_b%', routing: 'action-required', severity: 'error', title: 'literal', dedupe: 'unacked',
+    });
+    const neighbor = incidents.center.postIncident({
+      kind: 'decisions.degraded.axbX', routing: 'action-required', severity: 'error', title: 'neighbor', dedupe: 'unacked',
+    });
+    expect(incidents.center.resolveIncidents('decisions.degraded.a_b%', 'runtime').map((item) => item.id)).toEqual([literal.id]);
+    expect(incidents.api.getNotification(neighbor.id)?.resolvedAt).toBeNull();
+    const recurrence = incidents.center.postIncident({
+      kind: 'decisions.degraded.a_b%', routing: 'action-required', severity: 'error', title: 'literal again', dedupe: 'unacked',
+    });
+    expect(recurrence.id).not.toBe(literal.id);
+    expect(recurrence.ackedAt).toBeNull();
+    expect(recurrence.resolvedAt).toBeNull();
+    expect(incidents.api.listNotifications({ limit: 20, unackedOnly: true }).map((item) => item.id)).not.toContain(literal.id);
+    const resolutionEventsBefore = incidents.api.listEvents({ limit: 100 }).filter((event) =>
+      event.kind === 'notification.resolved' && (event.payload as { id?: string }).id === literal.id,
+    );
+    incidents.center.resolveIncidents('decisions.degraded.a_b%', 'runtime');
+    const resolutionEventsAfter = incidents.api.listEvents({ limit: 100 }).filter((event) =>
+      event.kind === 'notification.resolved' && (event.payload as { id?: string }).id === literal.id,
+    );
+    expect(resolutionEventsAfter).toHaveLength(resolutionEventsBefore.length);
+  });
+
+  it('does not duplicate an acknowledged but unresolved active incident', () => {
+    const incidents = boot();
+    const first = incidents.center.postIncident({
+      kind: 'decisions.degraded.timeout', routing: 'action-required', severity: 'error', title: 'degraded', dedupe: 'active',
+    });
+    incidents.center.ack(first.id, 'operator');
+    const repeated = incidents.center.postIncident({
+      kind: 'decisions.degraded.timeout', routing: 'action-required', severity: 'error', title: 'degraded again', dedupe: 'active',
+    });
+    expect(repeated.id).toBe(first.id);
+    incidents.center.resolveIncidents('decisions.degraded.', 'runtime');
+    const recurrence = incidents.center.postIncident({
+      kind: 'decisions.degraded.timeout', routing: 'action-required', severity: 'error', title: 'degraded later', dedupe: 'active',
+    });
+    expect(recurrence.id).not.toBe(first.id);
   });
 
   it('unackedOnly filters the pending surface (badge feed)', () => {

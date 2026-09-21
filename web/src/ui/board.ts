@@ -245,7 +245,7 @@ export class BoardView {
         el(
           'div',
           'board-notification__title',
-          `${icon} ${item.title}${item.ackedAt !== null ? ' ✓' : ''}`,
+          `${icon} ${item.title}${item.resolvedAt !== null ? ' · resolved' : item.ackedAt !== null ? ' ✓' : ''}`,
         ),
         el(
           'div',
@@ -254,8 +254,10 @@ export class BoardView {
         ),
       );
       // Ack button: action-required rows clear through a human ack
-      // (acking also re-arms a tripped breaker server-side).
-      if (item.ackedAt === null) {
+      // (acking also re-arms a tripped breaker server-side). A resolved
+      // incident no longer needs human action — no ack control, no badge,
+      // no toast — but the durable row stays visible for the record.
+      if (item.ackedAt === null && item.resolvedAt === null) {
         const ack = document.createElement('button');
         ack.type = 'button';
         ack.className = 'board-notification__ack';
@@ -290,7 +292,7 @@ export class BoardView {
     for (const notification of notifications) {
       if (this.knownNotificationIds.has(notification.id)) continue;
       this.knownNotificationIds.add(notification.id);
-      if (firstRender) continue; // history load — no toast spam
+      if (firstRender || notification.resolvedAt !== null) continue; // history/resolved — no toast spam
       this.onToast?.(notification);
       this.sendShown(notification, 'web-toast');
     }
@@ -316,9 +318,9 @@ export class BoardView {
 
   /** Badge = unacked error-severity items not yet seen here (panel-open
    * marks seen; an ack from ANY device clears it via ackedAt). */
-  private updateBadge(notifications: readonly { id: string; severity: string; ackedAt: string | null }[]): void {
+  private updateBadge(notifications: readonly { id: string; severity: string; ackedAt: string | null; resolvedAt: string | null }[]): void {
     const unseen = notifications.filter(
-      (n) => n.severity === 'error' && n.ackedAt === null && !this.seenErrorIds.has(n.id),
+      (n) => n.severity === 'error' && n.ackedAt === null && n.resolvedAt === null && !this.seenErrorIds.has(n.id),
     ).length;
     this.notificationBell.dataset.unread = String(unseen);
   }

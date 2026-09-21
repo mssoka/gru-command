@@ -247,10 +247,22 @@ function sampleSnapshot(): unknown {
       { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: null, supervision: null },
     ],
     notifications: [
-      { id: 'mock-n1', ts: new Date().toISOString(), kind: 'job.status', routing: 'fyi', severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync', agentId: null, shownAt: null, ackedAt: null },
-      { id: 'mock-n2', ts: new Date(Date.now() - 120_000).toISOString(), kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'Round r1 verdict', detail: 'approved', agentId: null, shownAt: new Date().toISOString(), ackedAt: new Date().toISOString() },
-      { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null },
+      { id: 'mock-n1', ts: new Date().toISOString(), kind: 'job.status', routing: 'fyi', severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
+      { id: 'mock-n2', ts: new Date(Date.now() - 120_000).toISOString(), kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'Round r1 verdict', detail: 'approved', agentId: null, shownAt: new Date().toISOString(), ackedAt: new Date().toISOString(), resolvedAt: null, resolvedBy: null },
+      { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
     ],
+    decisions: {
+      enabled: true,
+      status: 'ready',
+      reason: null,
+      model: 'typesafe/jev-1.13-20260917',
+      endpoint: 'https://openrouter.ai/api/alpha/decisions',
+      credentialPresent: true,
+      credentialSource: 'file',
+      checkedAt: new Date().toISOString(),
+      incarnation: 'mock-incarnation',
+      generation: 1,
+    },
   };
 }
 
@@ -322,6 +334,20 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(sampleSnapshot()) + '\n');
+    return;
+  }
+  if (
+    (req.method === 'GET' && url.pathname === '/api/decisions/status') ||
+    (req.method === 'POST' && url.pathname === '/api/decisions/recheck')
+  ) {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    const snapshot = sampleSnapshot() as { decisions: unknown };
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(snapshot.decisions) + '\n');
     return;
   }
   if (req.method === 'GET' && url.pathname === '/api/transcripts') {

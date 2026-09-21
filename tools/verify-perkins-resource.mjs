@@ -19,9 +19,19 @@ const EXCLUDED_PRODUCT_MARKERS = [
   ['api', 'alpha', 'decisions'],
   ['open', 'router', 'api', 'key'],
 ].map((parts) => parts.join(''));
+// The residue invariant is PERKINS-SURFACE INDEPENDENCE: the integrity-pinned
+// Perkins policy/bridge/server bytes and the Perkins role must not embed the
+// optional Jev decision feature. It was originally written as a whole-product
+// scan when Jev shipped nowhere; since the decisions lane landed
+// (gru-command-jev-integration), the product legitimately carries Jev outside
+// the Perkins surface, so the scan is scoped to the Perkins-owned paths.
 const PRODUCT_SCAN_ENTRIES = [
-  'dist', 'resources', 'roles', 'tools', 'install', 'web/dist',
-  'README.md', 'LICENSE', 'package.json', 'install.sh',
+  'dist/dispatch/perkins-review',
+  'dist/dispatch/perkins.js',
+  'dist/runtime/review-mcp-bridge.js',
+  'dist/runtime/review-mcp-server.mjs',
+  'resources',
+  'roles',
 ];
 
 function contained(root, candidate) {

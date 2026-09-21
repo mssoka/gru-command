@@ -8,8 +8,11 @@
 
 import {
   BOARD_WS_PATH,
+  isValidDecisionStatus,
+  isValidSnapshot,
   parseBoardServerFrame,
   type BoardSnapshot,
+  type DecisionStatusView,
   type TranscriptInfo,
   type TranscriptPage,
   type TranscriptSearchResult,
@@ -153,11 +156,19 @@ export class BoardClient {
   /** One-shot HTTP snapshot fetch (initial load + reconnect catch-up). */
   async refetchSnapshot(): Promise<void> {
     try {
-      const snapshot = await this.api<BoardSnapshot>('/api/board');
+      const snapshot = await this.api<unknown>('/api/board');
+      if (!isValidSnapshot(snapshot)) throw new Error('board api returned a malformed snapshot');
       this.events.snapshot(snapshot);
     } catch {
       /* connection state carries the error surface */
     }
+  }
+
+  /** Re-run the bounded decision-provider startup check; no credential crosses HTTP. */
+  async recheckDecisions(): Promise<DecisionStatusView> {
+    const response = await this.postApi('/api/decisions/recheck', {});
+    if (!isValidDecisionStatus(response)) throw new Error('decision recheck returned a malformed status');
+    return response;
   }
 
   listTranscripts(): Promise<{ transcripts: readonly TranscriptInfo[] }> {

@@ -9,31 +9,32 @@ import { describe, expect, it } from 'vitest';
  * Adding a test? Bump this pin — that is the point.
  */
 const PINS: Record<string, number> = {
-  'board-engine.test.ts': 13,
+  'board-engine.test.ts': 15,
   'board-frames.test.ts': 3,
-  'board-server.test.ts': 13,
+  'board-server.test.ts': 14,
   'bob-scheduler.test.ts': 5,
   'chat-frame-log.test.ts': 20,
   'chat-frames.test.ts': 4,
-  'attachments.test.ts': 29,
-  'bmad-onboarding.test.ts': 10,
+  'attachments.test.ts': 28,
   'chat-server.test.ts': 74,
   'chat-session-state.test.ts': 6,
   'claude-adapter.test.ts': 71,
-  'config-generate.test.ts': 7,
-  'config.test.ts': 39,
+  'config.test.ts': 43,
+  'decisions-cli.test.ts': 4,
+  'decisions-service-integration.test.ts': 1,
+  'decisions.test.ts': 35,
   'dispatch-e2e.test.ts': 3,
   'dispatch-joins.test.ts': 2,
   'dispatch-server.test.ts': 8,
-  'health.test.ts': 17,
+  'health.test.ts': 18,
   'identity.test.ts': 3,
-  'install-one-line.test.ts': 24,
-  'install.test.ts': 12,
+  'install-one-line.test.ts': 14,
+  'install.test.ts': 11,
   'lan-phone-raw-client.test.ts': 6,
   'ledger-api.test.ts': 17,
   'ledger-db.test.ts': 6,
   'logger.test.ts': 3,
-  'notifications.test.ts': 5,
+  'notifications.test.ts': 12,
   'perkins-builtin-review.test.ts': 52,
   'perkins-builtin-wave.test.ts': 34,
   'pi-adapter.test.ts': 46,
@@ -50,13 +51,13 @@ const PINS: Record<string, number> = {
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
   'suite-shape.test.ts': 1,
-  'supervisor.test.ts': 24,
+  'supervisor.test.ts': 32,
   'transcripts.test.ts': 13,
   'uploads-dir.test.ts': 3,
-  'wizard.test.ts': 24,
-  'wizard-interactive.test.ts': 8,
+  'wizard.test.ts': 19,
+  'wizard-interactive.test.ts': 5,
   'wizard-register.test.ts': 2,
-  'worktree-manager.test.ts': 36,
+  'worktree-manager.test.ts': 35,
   'worktree-manifest.test.ts': 6,
   'worktree-port.test.ts': 4,
   'worktrees-server.test.ts': 3,
@@ -71,7 +72,10 @@ describe('suite shape', () => {
     expect(files).toEqual(Object.keys(PINS).sort());
     for (const file of files) {
       const source = readFileSync(join(dir, file), 'utf-8');
-      const registered = (source.match(/\bit(?:\.\w+)*\(/g) ?? []).length;
+      expect(source, `${file}: parameterized cases evade the static suite pin; register explicit cases`).not.toMatch(
+        /\b(?:it|test)\.each\(/,
+      );
+      const registered = (source.match(/\bit\(/g) ?? []).length;
       const pinned = PINS[file] ?? -1;
       expect(
         registered,

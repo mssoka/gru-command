@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -11,7 +11,9 @@ import {
   type AgentSupervisionView,
   type SupervisorRegistry,
 } from '../src/supervision/supervisor.js';
-import type { Role } from '../src/config.js';
+import { DEFAULT_DECISIONS_CONFIG, type Role } from '../src/config.js';
+import type { DecisionService } from '../src/decisions/types.js';
+import { deterministicOutcome } from '../src/decisions/service.js';
 import type {
   AgentCapabilities,
   AgentHandle,
@@ -181,7 +183,7 @@ interface Harness {
   dispose(): void;
 }
 
-function boot(): Harness {
+function boot(decisions?: DecisionService): Harness {
   const dir = tmpDir();
   const db = new LedgerDb(dir);
   const bus = new EventBus();
@@ -220,6 +222,7 @@ function boot(): Harness {
     registry,
     ledger: api,
     notifications: center,
+    ...(decisions !== undefined ? { decisions } : {}),
     tickMs: 5,
     now: () => harness.nowMs,
   });
@@ -442,6 +445,227 @@ describe('supervisor — watchdog + restart ladder', () => {
 
     supervisor.dispose();
     db.close();
+  });
+});
+
+describe('supervisor — workflow-owned review attempts', () => {
+  it('aborts an isolated review attempt without spawning a non-isolated replacement', async () => {
+    const h = boot();
+    const handle = new FakeHandle('perkins', 'perkins-isolated-attempt', null, true);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    handle.emit({ type: 'error', error: 'review attempt hung', fatal: true });
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
+    h.dispose();
+  });
+});
+
+describe('supervisor — decision-backed failure guidance', () => {
+  it('discards delayed guidance when later agent activity makes the failure observation stale', async () => {
+    let release!: (value: ReturnType<typeof deterministicOutcome>) => void;
+    const decide = vi.fn((_request: Parameters<DecisionService['decide']>[0]) =>
+      new Promise<ReturnType<typeof deterministicOutcome>>((resolve) => {
+        release = (value) => resolve(value);
+      }),
+    );
+    const h = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('perkins', 'perkins-stale-guidance', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    handle.emit({ type: 'error', error: 'temporary transport failure', fatal: true });
+    await vi.waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
+    // Recovery/activity on the same handle invalidates the outstanding
+    // classification even when the fake clock has not advanced a millisecond.
+    handle.emit({ type: 'state', state: 'idle' });
+    const request = decide.mock.calls[0]![0];
+    release(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+    await sleep(20);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', restarts: 0, breakerOpen: false });
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.guidance')).toBe(false);
+    h.dispose();
+  });
+
+  it('drops a queued failure that predates recovery instead of replaying it against the recovered handle', async () => {
+    let release!: (value: ReturnType<typeof deterministicOutcome>) => void;
+    const decide = vi.fn((_request: Parameters<DecisionService['decide']>[0]) =>
+      new Promise<ReturnType<typeof deterministicOutcome>>((resolve) => { release = resolve; }));
+    const h = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('minion', 'minion-queued-stale', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    handle.emit({ type: 'error', error: 'first transient failure', fatal: true });
+    await vi.waitFor(() => expect(decide).toHaveBeenCalledOnce());
+    handle.emit({ type: 'error', error: 'second queued failure', fatal: true });
+    handle.emit({ type: 'state', state: 'idle' });
+    const request = decide.mock.calls[0]![0];
+    release(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+    await sleep(30);
+    expect(decide).toHaveBeenCalledOnce();
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', restarts: 0 });
+    h.dispose();
+  });
+
+  it('consumes Jev guidance when it changes an unknown fatal failure from restart to stop', async () => {
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) => {
+      const fallback = deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled');
+      return {
+        ...fallback,
+        answers: {
+          ...fallback.answers,
+          failure_class: {
+            type: 'choice' as const,
+            choice: 'authentication_wall' as const,
+            probabilities: {
+              transient_runtime: 0, authentication_wall: 1, quota_wall: 0, network_failure: 0,
+              turn_hang: 0, fatal_runtime: 0, unknown: 0,
+            },
+            confidence: 0.99,
+          },
+          restart_advised: { type: 'noul' as const, noul: 0.01 },
+        },
+        routes: {
+          ...fallback.routes,
+          failure_class: { path: 'act' as const, metric: 0.99, metricKind: 'confidence' as const, requiresConfirm: false, riskClass: 'operational' as const },
+          restart_advised: { path: 'fallback' as const, metric: 0.01, metricKind: 'probability' as const, requiresConfirm: false, riskClass: 'operational' as const },
+        },
+        provenance: { source: 'jev' as const, fallbackReason: null, model: 'jev-test', latencyMs: 1, usage: null },
+      };
+    });
+    const h = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('minion', 'minion-jev-stop', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    handle.emit({ type: 'error', error: 'fatal opaque runtime failure', fatal: true });
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.api.listEvents({ limit: 50 }).find((row) => row.kind === 'supervision.guidance')?.payload)
+      .toMatchObject({ class: 'authentication_wall', source: 'jev', restart_advised: false });
+    h.dispose();
+  });
+
+  it('does not let the adapter error -> state:error -> turn_end sequence stale its pending wall classification', async () => {
+    let release!: () => void;
+    const decide = vi.fn((request: Parameters<DecisionService['decide']>[0]) =>
+      new Promise<ReturnType<typeof deterministicOutcome>>((resolve) => {
+        release = () => resolve(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+      }));
+    const h = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('perkins', 'perkins-error-state-pair', null);
+    h.registry.adopt(handle);
+    handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
+    await vi.waitFor(() => expect(decide).toHaveBeenCalledOnce());
+    handle.setState('error', 'HTTP 401 unauthorized');
+    handle.emit({ type: 'turn_end' });
+    release();
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
+    h.dispose();
+  });
+
+  it('requires human acknowledgement when restart guidance is in the confirmation band', async () => {
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) => {
+      const fallback = deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled');
+      return {
+        ...fallback,
+        answers: { ...fallback.answers, restart_advised: { type: 'noul' as const, noul: 0.6 } },
+        routes: {
+          ...fallback.routes,
+          restart_advised: {
+            path: 'confirm' as const,
+            metric: 0.6,
+            metricKind: 'probability' as const,
+            requiresConfirm: true,
+            riskClass: 'operational' as const,
+          },
+        },
+        provenance: { source: 'jev' as const, fallbackReason: null, model: 'jev-test', latencyMs: 1, usage: null },
+      };
+    });
+    const h = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('minion', 'minion-confirm-restart', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    handle.emit({ type: 'error', error: 'fatal opaque runtime failure', fatal: true });
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    const incident = h.api.listNotifications({ limit: 50 }).find((row) => row.kind.includes('restart_confirmation_required'));
+    expect(incident).toMatchObject({ routing: 'action-required' });
+    h.center.ack(incident!.id, 'test-human');
+    h.supervisor.onNotificationAcked(incident!.id);
+    await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
+    h.dispose();
+  });
+
+  it('applies deterministic provider-wall guards even when the decision service is unavailable', async () => {
+    const h = boot({ decide: vi.fn(async () => { throw new Error('decision service down'); }) } as unknown as DecisionService);
+    const handle = new FakeHandle('perkins', 'perkins-wall-decision-down', null);
+    h.registry.adopt(handle);
+    handle.emit({ type: 'error', error: 'quota exceeded (HTTP 429)', fatal: false });
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
+    expect(h.api.listNotifications({ limit: 20 }).some((row) => row.kind.includes('quota_wall'))).toBe(true);
+    h.dispose();
+  });
+
+  it('consumes an actual nonfatal adapter auth-wall event: no blind restart, stop + durable ask, ack re-arms', async () => {
+    const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) => {
+      const fallback = deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled');
+      return {
+        ...fallback,
+        answers: {
+          ...fallback.answers,
+          // Deliberately unsafe advice: the known 401 wall below must
+          // override both fields and prevent a futile restart.
+          failure_class: {
+            type: 'choice',
+            choice: 'transient_runtime',
+            probabilities: {
+              transient_runtime: 1,
+              authentication_wall: 0,
+              quota_wall: 0,
+              network_failure: 0,
+              turn_hang: 0,
+              fatal_runtime: 0,
+              unknown: 0,
+            },
+            confidence: 0.99,
+          },
+          restart_advised: { type: 'noul', noul: 0.99 },
+        },
+        routes: {
+          ...fallback.routes,
+          failure_class: { path: 'act', metric: 0.99, metricKind: 'confidence', requiresConfirm: false, riskClass: 'operational' },
+          restart_advised: { path: 'act', metric: 0.99, metricKind: 'probability', requiresConfirm: false, riskClass: 'operational' },
+        },
+        provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 1, usage: null },
+      };
+    });
+    const h = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('perkins', 'perkins-auth-wall', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
+    await vi.waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
+    const guidance = h.api.listEvents({ limit: 50 }).find((row) => row.kind === 'supervision.guidance');
+    expect(guidance?.payload).toMatchObject({
+      class: 'authentication_wall', restart_advised: false, source: 'deterministic_guard', route: 'fallback',
+    });
+    const incident = h.api.listNotifications({ limit: 50 }).find((row) => row.kind.includes('provider-wall'));
+    expect(incident).toMatchObject({ routing: 'action-required' });
+
+    h.center.ack(incident!.id, 'test-human');
+    h.supervisor.onNotificationAcked(incident!.id);
+    await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
+    h.dispose();
   });
 });
 
