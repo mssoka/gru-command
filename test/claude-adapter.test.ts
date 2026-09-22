@@ -955,6 +955,42 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     for (const configFile of configFiles) expect(existsSync(dirname(configFile))).toBe(false);
   });
 
+  it('closes the scoped bridge when the spawn fails after the bridge started', async () => {
+    const fx = fixture();
+    // Deterministic post-bridge failure: a FILE occupies the role's session
+    // directory path, so the scaffold mkdir fails only AFTER the scoped
+    // bridge was started — cleanup must still own the bridge's teardown.
+    const sessionDir = fx.store.sessionDirFor('perkins', fx.workspace);
+    mkdirSync(dirname(sessionDir), { recursive: true });
+    writeFileSync(sessionDir, 'not a directory');
+    // Confine bridge temp dirs to this test's own TMPDIR: the assertion can
+    // never observe a concurrent worker's live bridge.
+    const bridgeTmp = mkdtempSync(join(tmpdir(), 'claude-bridge-tmp-'));
+    cleanupDirs.push(bridgeTmp);
+    const previousTmpdir = process.env['TMPDIR'];
+    process.env['TMPDIR'] = bridgeTmp;
+    try {
+      await expect(fx.runtime.spawn('perkins', {
+        cwd: fx.workspace,
+        isolatedReview: {
+          systemPrompt: 'lens policy',
+          tools: ['read'],
+          nativeTools: [{
+            name: 'perkins_submit_findings',
+            description: 'submit structured lens findings',
+            inputSchema: { type: 'object' },
+            execute: async () => ({ text: 'ok' }),
+          }],
+        },
+      })).rejects.toThrow(/EEXIST|file already exists, mkdir/);
+      // The failed spawn left no bridge temp directory behind.
+      expect(readdirSync(bridgeTmp)).toEqual([]);
+    } finally {
+      if (previousTmpdir === undefined) delete process.env['TMPDIR'];
+      else process.env['TMPDIR'] = previousTmpdir;
+    }
+  });
+
   it('runs a hybrid Perkins lead through the real Claude adapter and scoped MCP bridge', async () => {
     const fx = fixture();
     const repo = makeFixtureRepo('claude-perkins-hybrid');

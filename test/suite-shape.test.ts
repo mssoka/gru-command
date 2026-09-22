@@ -20,7 +20,7 @@ const PINS: Record<string, number> = {
   'bmad-onboarding.test.ts': 10,
   'chat-server.test.ts': 80,
   'chat-session-state.test.ts': 6,
-  'claude-adapter.test.ts': 75,
+  'claude-adapter.test.ts': 76,
   'config-generate.test.ts': 7,
   'config.test.ts': 49,
   'decisions-cli.test.ts': 4,
