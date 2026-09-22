@@ -58,13 +58,15 @@ repo. Sessions resume from disk on every start (SPEC ruling 12).
 ## Supervision and the crash-loop breaker
 
 The in-process supervisor watches every hosted agent (liveness = runtime
-events OR session-file growth; a hung turn climbs a restart ladder with
-resume — the conversation survives). ≥ 3 restarts inside 10 minutes
-trips the **crash-loop breaker**: the agent is stopped, an
-action-required notification escalates (chat notice + board bell), and
-**acking that notification re-arms** supervision. A service restart
-also clears an open breaker — the ack record is durable, the breaker
-state is not.
+events OR session-file growth OR a live open tool; a hung turn climbs a
+restart ladder with resume — the conversation survives, and the
+interrupted prompt is re-delivered or the lane is escalated as
+recoverable). Sleep/wake gaps grant a fresh silence window instead of
+restarting. ≥ 3 restarts inside 10 minutes trips the **crash-loop
+breaker**: the agent is stopped, an action-required notification
+escalates (chat notice + board bell), and **acking that notification
+re-arms** supervision. A service restart also clears an open breaker —
+the ack record is durable, the breaker state is not.
 
 Knobs (`[supervision]` in `config.toml`): `turn_silence_ms` (default 15
 min), `restart_window_ms` / `max_restarts` / `restart_backoff_ms`, and
