@@ -463,7 +463,13 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             client.socket.ping();
           } catch {
             client.socket.terminate();
+            continue;
           }
+          // Application-level keepalive (contract parity with the web
+          // client): the browser cannot observe transport pings, so a
+          // JSON ping is the client's liveness proof. A zombie socket
+          // receives none and the client force-closes into reconnect.
+          send(client.socket, { type: 'ping' });
         }
       }
     }, heartbeatMs);

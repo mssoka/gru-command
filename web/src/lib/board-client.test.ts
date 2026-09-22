@@ -26,6 +26,8 @@ function snapshotFor(jobId: string): BoardSnapshot {
             baseBranch: null,
             note: null,
             rounds: [],
+            lane: null,
+            lastAgentActivity: null,
           },
         ],
       },
@@ -44,6 +46,7 @@ function snapshotFor(jobId: string): BoardSnapshot {
       incarnation: 'test-incarnation',
       generation: 0,
     },
+    unackedActionRequired: 0,
   };
 }
 
@@ -219,5 +222,104 @@ describe('board client', () => {
     expect(client.getState()).toBe('offline');
     // The ws close handshake takes a tick to reach the server.
     await waitFor(() => (server.wss?.clients.size ?? 0) === 0, 'server-side close');
+  });
+
+  it('detects a silently-dead socket via the liveness clock and recovers without a manual reload', async () => {
+    const seen: string[] = [];
+    const states: BoardConnectionState[] = [];
+    let fetches = 0;
+    const fetchImpl = (async (path: string) => {
+      if (path === '/api/board') {
+        fetches += 1;
+        return new Response(JSON.stringify(snapshotFor('fetched')), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    }) as typeof fetch;
+    client = new BoardClient(
+      {
+        token: TOKEN,
+        host: `127.0.0.1:${server.port}`,
+        fetchImpl,
+        livenessWindowMs: 120,
+        livenessCheckMs: 20,
+      },
+      {
+        connection: (state) => states.push(state),
+        snapshot: (snap) => seen.push(snap.repos[0]?.jobs[0]?.id ?? '?'),
+        fatal: () => {},
+      },
+    );
+    client.connect();
+    await waitFor(() => seen.some((id) => id.startsWith('initial-')), 'initial ws snapshot');
+    const fetchesBeforeRecovery = fetches;
+    // The test server sends NO keepalive frames: the socket goes silent and
+    // must be declared stale — the zombie shape that used to freeze the board.
+    await waitFor(() => states.includes('stale'), 'stale detection');
+    // Recovery happens on its own: reconnect → fresh auth → new snapshot,
+    // and the reconnect path refetched over HTTP first.
+    await waitFor(() => seen.some((id) => id.startsWith('initial-2')), 'self-recovered snapshot');
+    expect(fetches).toBeGreaterThan(fetchesBeforeRecovery);
+    expect(client.getState()).toBe('open');
+  });
+
+  it('keepalive ping frames refresh the liveness clock — a quiet-but-live socket is never reopened', async () => {
+    const states: BoardConnectionState[] = [];
+    client = new BoardClient(
+      {
+        token: TOKEN,
+        host: `127.0.0.1:${server.port}`,
+        fetchImpl: (async () => new Response(JSON.stringify(snapshotFor('fetched')), { status: 200 })) as typeof fetch,
+        livenessWindowMs: 100,
+        livenessCheckMs: 20,
+      },
+      { connection: (state) => states.push(state), snapshot: () => {}, fatal: () => {} },
+    );
+    client.connect();
+    await waitFor(() => client?.getState() === 'open', 'open');
+    // The server pings every 30 ms — well inside the 100 ms window — for
+    // long enough that a silent socket would have gone stale twice.
+    const pingers: ReturnType<typeof setInterval>[] = [];
+    for (const socket of server.wss?.clients ?? []) {
+      pingers.push(setInterval(() => socket.send(JSON.stringify({ type: 'ping' })), 30));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    for (const pinger of pingers) clearInterval(pinger);
+    expect(states).not.toContain('stale');
+    expect(client.getState()).toBe('open');
+  });
+
+  it('wake() refetches the snapshot unconditionally and reopens a socket silent past the window', async () => {
+    const seen: string[] = [];
+    let fetches = 0;
+    const fetchImpl = (async (path: string) => {
+      if (path === '/api/board') {
+        fetches += 1;
+        return new Response(JSON.stringify(snapshotFor('fetched')), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    }) as typeof fetch;
+    client = new BoardClient(
+      {
+        token: TOKEN,
+        host: `127.0.0.1:${server.port}`,
+        fetchImpl,
+        livenessWindowMs: 100,
+        livenessCheckMs: 60_000, // the periodic check stays out of the way
+      },
+      {
+        connection: () => {},
+        snapshot: (snap) => seen.push(snap.repos[0]?.jobs[0]?.id ?? '?'),
+        fatal: () => {},
+      },
+    );
+    client.connect();
+    await waitFor(() => seen.some((id) => id.startsWith('initial-')), 'initial ws snapshot');
+    const fetchesBeforeWake = fetches;
+    await new Promise((resolve) => setTimeout(resolve, 160)); // silent past the window
+    client.wake();
+    // Wake always refetches, even when the liveness clock has not expired…
+    await waitFor(() => fetches > fetchesBeforeWake, 'wake refetch');
+    // …and reopens the silent socket so the board resumes without a reload.
+    await waitFor(() => seen.some((id) => id.startsWith('initial-2')), 'wake reopen');
   });
 });

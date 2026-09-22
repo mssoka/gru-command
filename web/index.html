@@ -116,6 +116,11 @@
     </div>
 
     <section id="board-view" class="board-view reveal" hidden>
+      <div class="board-trackers" id="board-trackers">
+        <span class="lbl">Trackers</span>
+        <span class="pp-chip board-decisions" id="board-decisions" data-state="disabled">Jev: OFF</span>
+        <span class="pp-chip pp-chip--alert board-unacked" id="board-unacked" hidden>🔔 0 action-required</span>
+      </div>
       <div class="board-layout">
         <div class="board-main">
           <div id="board-jobs" class="board-jobs"></div>

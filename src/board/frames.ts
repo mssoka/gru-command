@@ -19,6 +19,15 @@ export interface BoardAuthOkFrame {
   readonly type: 'auth_ok';
 }
 
+/** Application-level keepalive (contract parity with the web client):
+ * proves the socket is alive while the board is quiet so the client can
+ * detect a zombie/half-open connection without a manual reload. The
+ * client refreshes its stale clock on ANY inbound frame; ping semantics
+ * carry no sequence or snapshot state. */
+export interface BoardPingFrame {
+  readonly type: 'ping';
+}
+
 export interface BoardSnapshotFrame {
   readonly type: 'board';
   readonly snapshot: unknown;
@@ -30,7 +39,7 @@ export interface BoardErrorFrame {
   readonly fatal: boolean;
 }
 
-export type BoardServerFrame = BoardAuthOkFrame | BoardSnapshotFrame | BoardErrorFrame;
+export type BoardServerFrame = BoardAuthOkFrame | BoardPingFrame | BoardSnapshotFrame | BoardErrorFrame;
 
 /** Parse one inbound client frame; returns null on anything malformed. */
 export function parseBoardClientFrame(raw: unknown): BoardClientFrame | null {

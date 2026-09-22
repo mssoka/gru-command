@@ -123,6 +123,13 @@ export interface ReplayedUserFrame {
   readonly seq: number;
 }
 
+/** Application-level keepalive (contract parity with the web client):
+ * proves the socket is alive while chat is quiet. NEVER logged/replayed —
+ * it carries no seq and reconnect/outbox semantics ignore it. */
+export interface PingFrame {
+  readonly type: 'ping';
+}
+
 export type ContextControlState = 'idle' | 'busy' | 'compacting' | 'resetting';
 
 export interface ContextUsageFrame {
@@ -181,7 +188,8 @@ export type ServerFrame =
   | TurnFrame
   | ErrorFrame
   | NoticeFrame
-  | ReplayedUserFrame;
+  | ReplayedUserFrame
+  | PingFrame;
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -275,6 +283,8 @@ export function parseServerFrame(raw: unknown): ServerFrame | null {
   const value = typeof raw === 'string' ? safeJson(raw) : raw;
   if (!isRecord(value)) return null;
   switch (value.type) {
+    case 'ping':
+      return { type: 'ping' };
     case 'auth_ok':
       return isSeq(value.seq) ? { type: 'auth_ok', seq: value.seq } : null;
     case 'context': {
@@ -433,7 +443,7 @@ function safeJson(text: string): unknown {
  * always fresh and never persisted. */
 export type LoggedFrame = Exclude<
   ServerFrame,
-  AuthOkFrame | ContextFrame | ControlResultFrame | ContextEventFrame
+  AuthOkFrame | ContextFrame | ControlResultFrame | ContextEventFrame | PingFrame
 >;
 
 export function loggedFrameSeq(frame: LoggedFrame): number {

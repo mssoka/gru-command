@@ -188,7 +188,10 @@ export class ChatFrameLog {
         frame.type === 'auth_ok' ||
         frame.type === 'context' ||
         frame.type === 'control_result' ||
-        frame.type === 'context_event'
+        frame.type === 'context_event' ||
+        // Keepalives are never persisted: a ping on disk is corrupt by
+        // construction, not something to replay.
+        frame.type === 'ping'
       ) {
         throw new FrameLogCorruptError(file, index + 1, 'not a logged chat frame');
       }

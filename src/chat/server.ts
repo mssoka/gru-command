@@ -1560,6 +1560,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         }
         client.pongMisses += 1;
         client.socket.ping();
+        // Application-level keepalive (contract parity with the web
+        // client): the browser cannot observe transport pings, so a JSON
+        // ping is the client's liveness evidence. Never logged/replayed;
+        // outbox and seq reconciliation never see it.
+        send(client, { type: 'ping' });
       }
     }, heartbeatMs);
     heartbeat.unref();

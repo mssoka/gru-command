@@ -30,6 +30,16 @@ export interface LensChipView {
   readonly state: string;
   readonly agentId: string | null;
   readonly note: string | null;
+  /** Structured verdict parsed off the outcome note (null until a lens
+   * records `verdict — evidence`; error/pending chips stay null). */
+  readonly verdict: string | null;
+}
+
+/** One lens's retry count inside a round (the wave's attempt counter,
+ * read back off the child agents registered for the round). */
+export interface LensAttemptView {
+  readonly lens: string;
+  readonly attempts: number;
 }
 
 export interface RoundView {
@@ -38,8 +48,22 @@ export interface RoundView {
   readonly status: string;
   readonly verdict: string | null;
   readonly targetRef: string | null;
+  readonly createdAt: string;
   readonly updatedAt: string;
   readonly lenses: readonly LensChipView[];
+  /** Per-lens attempt counts — only lenses with ≥1 bound child appear. */
+  readonly lensAttempts: readonly LensAttemptView[];
+  /** Lenses whose recorded outcome verdict is `blocker` (0 until outcomes land). */
+  readonly blockers: number;
+}
+
+/** The job's managed worktree lane as the board's lane strip renders it
+ * (null when the job has no worktree row at all). */
+export interface LaneView {
+  readonly branch: string | null;
+  readonly sha: string;
+  readonly status: string;
+  readonly createdAt: string;
 }
 
 export interface JobView {
@@ -52,6 +76,10 @@ export interface JobView {
   readonly baseBranch: string | null;
   readonly note: string | null;
   readonly rounds: readonly RoundView[];
+  /** The job's lane (active preferred), null when never created. */
+  readonly lane: LaneView | null;
+  /** Newest lastActivity across the job's bound agents (null when none). */
+  readonly lastAgentActivity: string | null;
 }
 
 export interface AgentView {
@@ -87,10 +115,49 @@ export interface BoardSnapshot {
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionRuntimeStatus;
+  /** Action-required notifications still awaiting a human ack (a
+   * system-resolved incident no longer needs human action). Counted from
+   * the table, not the 30-row feed window, so the badge stays true. */
+  readonly unackedActionRequired: number;
 }
 
 /** Agent-rail ordering: the standing crew first, workers after. */
 const ROLE_ORDER: Readonly<Record<Role, number>> = { gru: 0, silas: 1, perkins: 2, minion: 3, bob: 4 };
+
+/** Liveness-first rail order: agents actively working float to the top,
+ * the graveyard sinks. Liveness IS the primary key — an old disposed chat
+ * epoch must never outrank a streaming lens (role order and recency are
+ * only tiebreakers inside one liveness band). */
+const STATE_ORDER: Readonly<Record<AgentState, number>> = {
+  streaming: 0,
+  spawning: 1,
+  idle: 2,
+  error: 3,
+  disposed: 4,
+};
+
+/** Lens outcomes mint notes as `${verdict} — ${evidence}` (the Perkins
+ * wave); the verdict prefix is the only structured part, so it is parsed
+ * ONCE here and every board surface sees one shape. */
+const LENS_VERDICTS = ['blocker', 'warning', 'note', 'clean'] as const;
+
+function lensVerdictFromNote(note: string | null): string | null {
+  if (note === null) return null;
+  for (const verdict of LENS_VERDICTS) {
+    if (note.startsWith(`${verdict} — `)) return verdict;
+  }
+  return null;
+}
+
+/** Lens children mint `lens:chunk` labels; a retry appends `#attempt`
+ * (`blind:001#2`). The round tracker reads the lens prefix back off both
+ * shapes so attempts count together. */
+function lensFromAgentLabel(label: string | null): string | null {
+  if (label === null) return null;
+  const cut = label.indexOf(':');
+  if (cut <= 0) return null;
+  return label.slice(0, cut);
+}
 
 export interface BoardEngineOptions {
   readonly ledger: LedgerApi;
@@ -253,28 +320,69 @@ export class BoardEngine {
 
   snapshot(): BoardSnapshot {
     const jobs = this.ledger.listJobs();
+    const agentRows = this.ledger.listAgents();
+    // Per-job newest agent activity and per-round lens attempt counts are
+    // derived once per snapshot from the same agent rows (ISO stamps
+    // compare lexicographically; lens children mint `lens:chunk` labels).
+    const activityByJob = new Map<string, string>();
+    const attemptsByRound = new Map<string, Map<string, number>>();
+    for (const agent of agentRows) {
+      if (agent.jobId !== null && agent.lastActivity !== null) {
+        const newest = activityByJob.get(agent.jobId);
+        if (newest === undefined || agent.lastActivity > newest) activityByJob.set(agent.jobId, agent.lastActivity);
+      }
+      const lens = lensFromAgentLabel(agent.label);
+      if (agent.roundId !== null && lens !== null) {
+        const perLens = attemptsByRound.get(agent.roundId) ?? new Map<string, number>();
+        perLens.set(lens, (perLens.get(lens) ?? 0) + 1);
+        attemptsByRound.set(agent.roundId, perLens);
+      }
+    }
+    const repos = [...this.jobViews(jobs, activityByJob, attemptsByRound).entries()]
+      .map(([name, group]) => ({ name, jobs: group }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const agents = agentRows
+      .map((agent) => this.agentView(agent))
+      .sort(
+        (a, b) =>
+          STATE_ORDER[a.state] - STATE_ORDER[b.state] ||
+          (ROLE_ORDER[a.role] ?? 99) - (ROLE_ORDER[b.role] ?? 99) ||
+          (b.lastActivity ?? '').localeCompare(a.lastActivity ?? ''),
+      );
+    return {
+      repos,
+      agents,
+      notifications: this.notifications(),
+      decisions: this.decisionsStatus(),
+      unackedActionRequired: this.ledger.countPendingActionRequired(),
+    };
+  }
+
+  /** Repo-grouped job views (the group map preserves ledger job order). */
+  private jobViews(
+    jobs: readonly JobRecord[],
+    activityByJob: ReadonlyMap<string, string>,
+    attemptsByRound: ReadonlyMap<string, ReadonlyMap<string, number>>,
+  ): Map<string, JobView[]> {
     const byRepo = new Map<string, JobView[]>();
     for (const job of jobs) {
-      const view = this.jobView(job);
+      const view = this.jobView(job, activityByJob.get(job.id) ?? null, attemptsByRound);
       const group = byRepo.get(job.repo) ?? [];
       group.push(view);
       byRepo.set(job.repo, group);
     }
-    const repos = [...byRepo.entries()]
-      .map(([name, group]) => ({ name, jobs: group }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-    const agents = this.ledger
-      .listAgents()
-      .map((agent) => this.agentView(agent))
-      .sort(
-        (a, b) =>
-          (ROLE_ORDER[a.role] ?? 99) - (ROLE_ORDER[b.role] ?? 99) ||
-          (b.lastActivity ?? '').localeCompare(a.lastActivity ?? ''),
-      );
-    return { repos, agents, notifications: this.notifications(), decisions: this.decisionsStatus() };
+    return byRepo;
   }
 
-  private jobView(job: JobRecord): JobView {
+  private jobView(
+    job: JobRecord,
+    lastAgentActivity: string | null,
+    attemptsByRound: ReadonlyMap<string, ReadonlyMap<string, number>>,
+  ): JobView {
+    // Lane strip data (E8 registry): the active lane wins; a swept/paused
+    // lane still renders the last known position for the record.
+    const lanes = this.ledger.listWorktrees({ jobId: job.id }).filter((lane) => lane.kind === 'job');
+    const lane = lanes.find((candidate) => candidate.status === 'active') ?? lanes.at(-1) ?? null;
     return {
       id: job.id,
       repo: job.repo,
@@ -284,24 +392,39 @@ export class BoardEngine {
       prUrl: job.prUrl,
       baseBranch: job.baseBranch,
       note: job.note,
-      rounds: this.ledger.listRounds(job.id).map((round) => this.roundView(round)),
+      rounds: this.ledger
+        .listRounds(job.id)
+        .map((round) => this.roundView(round, attemptsByRound.get(round.id) ?? new Map<string, number>())),
+      lane:
+        lane === null
+          ? null
+          : { branch: lane.branch, sha: lane.sha, status: lane.status, createdAt: lane.createdAt },
+      lastAgentActivity,
     };
   }
 
-  private roundView(round: RoundRecord): RoundView {
+  private roundView(round: RoundRecord, attemptsByLens: ReadonlyMap<string, number>): RoundView {
+    const lenses = round.lenses.map((chip) => ({
+      lens: chip.lens,
+      state: chip.state,
+      agentId: chip.agentId,
+      note: chip.note,
+      verdict: lensVerdictFromNote(chip.note),
+    }));
     return {
       id: round.id,
       seq: round.seq,
       status: round.status,
       verdict: round.verdict,
       targetRef: round.targetRef,
+      createdAt: round.createdAt,
       updatedAt: round.updatedAt,
-      lenses: round.lenses.map((chip) => ({
-        lens: chip.lens,
-        state: chip.state,
-        agentId: chip.agentId,
-        note: chip.note,
-      })),
+      lenses,
+      lensAttempts: [...attemptsByLens.entries()]
+        .filter(([lens]) => round.lenses.some((chip) => chip.lens === lens))
+        .map(([lens, attempts]) => ({ lens, attempts }))
+        .sort((left, right) => left.lens.localeCompare(right.lens)),
+      blockers: lenses.filter((chip) => chip.verdict === 'blocker').length,
     };
   }
 

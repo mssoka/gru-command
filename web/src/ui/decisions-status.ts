@@ -17,12 +17,28 @@ const REASONS: Readonly<Record<string, string>> = {
   stale_generation: 'A result from an older configuration was discarded.',
 };
 
-const LABELS: Readonly<Record<DecisionStatusView['status'], string>> = {
+export const DECISION_LABELS: Readonly<Record<DecisionStatusView['status'], string>> = {
   disabled: 'OFF',
   checking: 'CHECKING',
   ready: 'READY',
   degraded: 'FALLBACK',
 };
+
+const LABELS = DECISION_LABELS;
+
+/** Board chip tone per decision status (paper/ink state tokens). */
+export function decisionChipTone(status: DecisionStatusView['status']): string {
+  switch (status) {
+    case 'ready':
+      return 'pp-chip--done';
+    case 'checking':
+      return 'pp-chip--work';
+    case 'degraded':
+      return 'pp-chip--alert';
+    default:
+      return 'pp-chip--park';
+  }
+}
 
 export class DecisionStatusCard {
   private readonly stamp = mustGet<HTMLElement>('decisions-stamp');

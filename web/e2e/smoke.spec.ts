@@ -451,6 +451,62 @@ test.describe('board (E6, mock feed)', () => {
     await page.locator('#notification-bell').click();
   });
 
+  test('trackers: lane strip, round progress, decisions + unacked, disposed collapse', async ({ page }) => {
+    await pair(page);
+    await page.locator('#tab-board').click();
+    await expect(page.locator('#board-view')).toBeVisible();
+
+    // Lane detail strip: branch, base sha, lane age, agent activity age.
+    const lane = page.locator('.board-lane').first();
+    await expect(lane).toBeVisible();
+    await expect(lane.locator('.board-lane__branch')).toContainText('gru/demo-api-payment-fix');
+    await expect(lane.locator('.board-lane__base')).toContainText('abc1234');
+    await expect(lane.locator('.board-lane__age')).toContainText('lane');
+    await expect(lane.locator('.board-lane__activity')).toContainText('agent');
+
+    // Round progress: lens count, blockers, elapsed, attempt counts.
+    const progress = page.locator('.board-round__progress').first();
+    await expect(progress).toContainText('/7 lenses');
+    await expect(progress.locator('.board-round__blockers')).toContainText('1 blocker');
+    await expect(progress.locator('.board-round__elapsed')).toContainText('elapsed');
+    await expect(page.locator('.board-lens', { hasText: 'blind ×2' })).toBeVisible();
+    await expect(page.locator('.board-lens--blocker')).toHaveCount(1);
+
+    // Jev decisions chip + unacked action-required badge.
+    await expect(page.locator('#board-decisions')).toContainText('Jev: READY');
+    await expect(page.locator('#board-unacked')).toBeVisible();
+
+    // Disposed rows collapse by default behind the toggle.
+    const rail = page.locator('#board-agents');
+    await expect(rail.locator('.board-agent--disposed')).toHaveCount(0);
+    const toggle = rail.locator('.board-agent-toggle');
+    await expect(toggle).toContainText('1 disposed');
+    await toggle.click();
+    await expect(rail.locator('.board-agent--disposed')).toHaveCount(1);
+    // Streaming silas carries the client-side turn-age counter.
+    await expect(rail.locator('.board-agent__age').first()).toContainText('quiet');
+  });
+
+  test('trackers render in dark theme and on a narrow phone viewport', async ({ page }) => {
+    await pair(page);
+    await page.locator('#tab-board').click();
+    await expect(page.locator('.board-lane').first()).toBeVisible();
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    // Same tracker surfaces stay rendered with the dark tokens applied.
+    await expect(page.locator('#board-decisions')).toBeVisible();
+    await expect(page.locator('.board-round__progress').first()).toBeVisible();
+    await expect(page.locator('.board-lane__age')).toBeVisible();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator('.board-trackers')).toBeVisible();
+    await expect(page.locator('#board-unacked')).toBeVisible();
+    await expect(page.locator('#board-agents .board-agent').first()).toBeVisible();
+    const fits = await page.evaluate(
+      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    );
+    expect(fits).toBe(true);
+  });
+
   test('transcript drawer: mock transcript lists, opens, searches', async ({ page }) => {
     await pair(page);
     await page.locator('#tab-board').click();

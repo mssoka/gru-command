@@ -53,10 +53,15 @@ const SNAPSHOT_VALID = {
               status: 'live',
               verdict: null,
               targetRef: null,
+              createdAt: '2026-01-01T00:00:00.000Z',
               updatedAt: '2026-01-01T00:00:00.000Z',
-              lenses: [{ lens: 'blind', state: 'pending', agentId: null, note: null }],
+              lensAttempts: [],
+              blockers: 0,
+              lenses: [{ lens: 'blind', state: 'pending', agentId: null, note: null, verdict: null }],
             },
           ],
+          lane: null,
+          lastAgentActivity: null,
         },
       ],
     },
@@ -75,10 +80,12 @@ const SNAPSHOT_VALID = {
     incarnation: 'test-incarnation',
     generation: 0,
   },
+  unackedActionRequired: 0,
 };
 
 const SERVER_CORPUS: readonly unknown[] = [
   { type: 'auth_ok' },
+  { type: 'ping' },
   { type: 'error', message: 'invalid token', fatal: true },
   { type: 'error', message: 'soft', fatal: false },
   { type: 'board', snapshot: SNAPSHOT_VALID },
@@ -113,13 +120,13 @@ describe('board frame parity (server parser ↔ web validator)', () => {
     for (const item of SERVER_CORPUS) {
       const client = web.parseBoardServerFrame(item);
       const valid = client !== null;
-      if (item === (SERVER_CORPUS[3] as unknown)) {
+      if (item === (SERVER_CORPUS[4] as unknown)) {
         expect(valid, 'the valid snapshot exemplar must parse').toBe(true);
       }
       // The server never parses its own outbound frames; the contract here
       // is that the web side accepts exactly the shapes the server sends.
       if (valid) {
-        expect(['auth_ok', 'error', 'board']).toContain(client.type);
+        expect(['auth_ok', 'ping', 'error', 'board']).toContain(client.type);
       }
     }
   });

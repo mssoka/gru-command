@@ -31,13 +31,18 @@ function snapshot(): BoardSnapshot {
                 status: 'live',
                 verdict: null,
                 targetRef: null,
+                createdAt: '2026-01-01T00:00:00.000Z',
                 updatedAt: '2026-01-01T00:00:00.000Z',
+                lensAttempts: [{ lens: 'blind', attempts: 2 }],
+                blockers: 0,
                 lenses: [
-                  { lens: 'blind', state: 'done', agentId: 'a1', note: null },
-                  { lens: 'edge', state: 'error', agentId: 'a2', note: 'cap' },
+                  { lens: 'blind', state: 'done', agentId: 'a1', note: null, verdict: null },
+                  { lens: 'edge', state: 'error', agentId: 'a2', note: 'cap', verdict: null },
                 ],
               },
             ],
+            lane: { branch: 'gru/job-1', sha: 'abc123', status: 'active', createdAt: '2026-01-01T00:00:00.000Z' },
+            lastAgentActivity: null,
           },
         ],
       },
@@ -58,12 +63,14 @@ function snapshot(): BoardSnapshot {
       incarnation: 'test-incarnation',
       generation: 0,
     },
+    unackedActionRequired: 0,
   };
 }
 
 describe('board server-frame validator', () => {
-  it('accepts auth_ok, snapshot, and error frames', () => {
+  it('accepts auth_ok, ping, snapshot, and error frames', () => {
     expect(parseBoardServerFrame({ type: 'auth_ok' })).toEqual({ type: 'auth_ok' });
+    expect(parseBoardServerFrame({ type: 'ping' })).toEqual({ type: 'ping' });
     const board = parseBoardServerFrame({ type: 'board', snapshot: snapshot() });
     expect(board?.type).toBe('board');
     const error = parseBoardServerFrame({ type: 'error', message: 'bad token', fatal: true });
@@ -98,6 +105,15 @@ describe('board server-frame validator', () => {
       id: 'n1', ts: '2026-01-01T00:00:00.000Z', severity: 'error', routing: 'action-required', title: 'incident', ackedAt: null,
     });
     expect(isValidSnapshot(missingResolution)).toBe(false);
+    const badLane = snapshot();
+    (badLane.repos[0]!.jobs[0] as unknown as { lane: unknown }).lane = { branch: 7, sha: 'x', status: 'active', createdAt: 'now' };
+    expect(isValidSnapshot(badLane)).toBe(false);
+    const badAttempts = snapshot();
+    (badAttempts.repos[0]!.jobs[0]!.rounds[0] as unknown as { lensAttempts: unknown }).lensAttempts = [{ lens: 'blind', attempts: '2' }];
+    expect(isValidSnapshot(badAttempts)).toBe(false);
+    const badUnacked = snapshot();
+    (badUnacked as unknown as { unackedActionRequired: unknown }).unackedActionRequired = 'none';
+    expect(isValidSnapshot(badUnacked)).toBe(false);
     const empty: Record<string, unknown> = {};
     expect(isValidSnapshot(empty)).toBe(false);
   });

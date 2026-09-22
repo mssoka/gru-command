@@ -304,3 +304,110 @@ describe('board engine — adapter events → ledger events → board state', ()
     expect(api.getAgent('never-spawned')).not.toBeNull();
   });
 });
+
+describe('board engine — liveness-first rail and job trackers', () => {
+  function fresh(): { api: LedgerApi; bus: EventBus; engine: BoardEngine } {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    return { api, bus, engine: new BoardEngine({ ledger: api, bus }) };
+  }
+
+  it('sorts the rail by liveness before role: disposed gru BELOW streaming perkins; streaming above idle', () => {
+    const { api, engine } = fresh();
+    api.registerAgent({ id: 'chat-gru', role: 'gru' });
+    api.setAgentState('chat-gru', 'disposed');
+    api.registerAgent({ id: 'lens-perkins', role: 'perkins' });
+    api.setAgentState('lens-perkins', 'streaming');
+    api.registerAgent({ id: 'ops-silas', role: 'silas' });
+    api.setAgentState('ops-silas', 'idle');
+    api.registerAgent({ id: 'err-perkins', role: 'perkins' });
+    api.setAgentState('err-perkins', 'error');
+    api.registerAgent({ id: 'spawn-bob', role: 'bob' }); // spawning
+    const ids = engine.snapshot().agents.map((agent) => agent.id);
+    // The observed bug: a disposed gru epoch outranked a streaming lens.
+    expect(ids.indexOf('lens-perkins')).toBeLessThan(ids.indexOf('ops-silas'));
+    expect(ids.indexOf('lens-perkins')).toBeLessThan(ids.indexOf('chat-gru'));
+    expect(ids.indexOf('spawn-bob')).toBeLessThan(ids.indexOf('ops-silas'));
+    expect(ids.indexOf('ops-silas')).toBeLessThan(ids.indexOf('err-perkins'));
+    expect(ids.indexOf('err-perkins')).toBeLessThan(ids.indexOf('chat-gru'));
+  });
+
+  it('breaks liveness ties by role order, then newest activity', () => {
+    const { api, engine } = fresh();
+    for (const [id, role] of [
+      ['minion-a', 'minion'],
+      ['gru-a', 'gru'],
+      ['silas-a', 'silas'],
+      ['bob-a', 'bob'],
+    ] as const) {
+      api.registerAgent({ id, role });
+      api.setAgentState(id, 'idle');
+    }
+    expect(engine.snapshot().agents.map((agent) => agent.id)).toEqual([
+      'gru-a',
+      'silas-a',
+      'minion-a',
+      'bob-a',
+    ]);
+    api.registerAgent({ id: 'minion-b', role: 'minion' });
+    api.setAgentState('minion-b', 'idle');
+    // minion-b's state change is newer — it leads minion-a inside the band.
+    expect(engine.snapshot().agents.map((agent) => agent.id)).toEqual([
+      'gru-a',
+      'silas-a',
+      'minion-b',
+      'minion-a',
+      'bob-a',
+    ]);
+  });
+
+  it('lane strip + round trackers carry branch, base sha, attempts, blockers and activity from the record', () => {
+    const { api, engine } = fresh();
+    const job = api.addJob({ id: 'track-job', repo: 'demo-repo', title: 'Tracked' });
+    api.setJobStatus(job.id, 'working');
+    api.registerWorktree({
+      id: job.id,
+      kind: 'job',
+      repoPath: '/repos/demo-repo',
+      repoName: 'demo-repo',
+      path: '/worktrees/demo-repo/job-track-job',
+      branch: 'gru/track-job',
+      sha: 'abc123base',
+      jobId: job.id,
+    });
+    const round = api.addRound({ jobId: job.id, targetRef: 'abc123base' });
+    // One lens attempt, then a retry with the attempt-suffixed label.
+    api.registerAgent({ id: 'lens-blind-1', role: 'perkins', label: 'blind:001', roundId: round.id, jobId: job.id });
+    api.registerAgent({ id: 'lens-blind-2', role: 'perkins', label: 'blind:001#2', roundId: round.id, jobId: job.id });
+    api.registerAgent({ id: 'lens-edge-1', role: 'perkins', label: 'edge:001', roundId: round.id, jobId: job.id });
+    api.setAgentState('lens-blind-2', 'streaming');
+    api.setLensOutcome(round.id, 'blind', 'done', 'blocker — two unsafe retries remain');
+    api.setLensOutcome(round.id, 'edge', 'done', 'clean — nothing found');
+    const view = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((entry) => entry.id === job.id);
+    expect(view?.lane).toMatchObject({ branch: 'gru/track-job', sha: 'abc123base', status: 'active' });
+    expect(view?.lastAgentActivity).not.toBeNull();
+    const roundView = view?.rounds[0];
+    expect(roundView?.lensAttempts).toEqual([
+      { lens: 'blind', attempts: 2 },
+      { lens: 'edge', attempts: 1 },
+    ]);
+    expect(roundView?.blockers).toBe(1);
+    expect(roundView?.lenses.find((chip) => chip.lens === 'blind')?.verdict).toBe('blocker');
+    expect(roundView?.lenses.find((chip) => chip.lens === 'edge')?.verdict).toBe('clean');
+  });
+
+  it('counts unacked action-required rows from the whole table, not the feed window', () => {
+    const { api, engine } = fresh();
+    api.recordNotification({ id: 'n-action', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Ack me' });
+    api.recordNotification({ id: 'n-fyi', kind: 'test.notice', routing: 'fyi', severity: 'info', title: 'FYI' });
+    expect(engine.snapshot().unackedActionRequired).toBe(1);
+    api.ackNotification('n-action', 'web');
+    expect(engine.snapshot().unackedActionRequired).toBe(0);
+    const resolved = api.recordNotification({ id: 'n-resolved', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Resolved' });
+    expect(engine.snapshot().unackedActionRequired).toBe(1);
+    api.resolveNotificationsByKindPrefix('test.', 'runtime');
+    expect(api.getNotification(resolved.id)?.resolvedAt).not.toBeNull();
+    expect(engine.snapshot().unackedActionRequired).toBe(0);
+  });
+});

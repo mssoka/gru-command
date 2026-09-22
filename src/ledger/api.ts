@@ -1018,6 +1018,19 @@ export class LedgerApi {
     return (this.db.prepare(sql).all(limit) as Row[]).map((row) => this.notificationFromRow(row));
   }
 
+  /** Count action-required notifications still awaiting a human ack (a
+   * system-resolved incident no longer needs human action). Read straight
+   * from the TABLE — not the bounded feed window — so the board's badge
+   * stays true even when old rows have scrolled past the feed's limit. */
+  countPendingActionRequired(): number {
+    const row = this.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM notifications WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL",
+      )
+      .get() as Row;
+    return Number(row.n);
+  }
+
   /** Enrich an already-durable provisional notification after async triage. */
   updateNotificationTriage(id: string, routing: NotificationRouting, detail: string | null): NotificationRecord | null {
     return this.transaction(() => {

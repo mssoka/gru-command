@@ -26,7 +26,10 @@ function tmpDir(): string {
   return dir;
 }
 
-async function boot(token: string): Promise<{
+async function boot(
+  token: string,
+  overrides: Partial<{ heartbeatMs: number }> = {},
+): Promise<{
   port: number;
   api: LedgerApi;
   bus: EventBus;
@@ -68,6 +71,7 @@ async function boot(token: string): Promise<{
     decisionsStatus: () => decisions.status(),
     onDecisionsRecheck: () => decisions.recheck(),
     pushDebounceMs: 10,
+    ...overrides,
   });
   const http: HttpServer = createServer((req, res) => {
     if (board.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
@@ -359,6 +363,22 @@ describe('board server — WS push', () => {
     await wrongFirst.open();
     wrongFirst.send({ type: 'board', snapshot: {} });
     await wrongFirst.closed;
+  });
+
+  it('heartbeat sends application-level ping frames (client liveness evidence)', async () => {
+    const env = await boot('heartbeat-board-token', { heartbeatMs: 40 });
+    try {
+      const client = new BoardClient(env.port);
+      await client.open();
+      client.send({ type: 'auth', token: 'heartbeat-board-token' });
+      await client.waitFor((f) => f.type === 'auth_ok', 'auth_ok');
+      // The server pings every 40 ms; the JSON ping frame is how the
+      // browser client refreshes its stale clock.
+      await client.waitFor((f) => f.type === 'ping', 'app ping');
+      await client.close();
+    } finally {
+      await env.close();
+    }
   });
 
   it('authed WS clients survive post-auth noise frames (valid JSON or garbage)', async () => {
