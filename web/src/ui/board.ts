@@ -3,6 +3,13 @@
  * chips and per-lens round chips, the agent rail (the standing crew), and
  * the notification center. Read-only by design: authorship arrives with
  * the dispatch flow epic.
+ *
+ * v3: job cards are collapsed by default — title + status + one compact
+ * signal + one meta line. Clicking the card expands v2's full detail
+ * (lane strip, rounds whose lens chips reveal per round). The expanded
+ * set persists per job; actionable state (unacked action-required
+ * notifications, failed/aborted rounds) rides the collapsed face and is
+ * never hidden by the collapse.
  */
 
 import {
@@ -15,7 +22,10 @@ import {
   type NotificationView,
   type RoundView,
 } from '../lib/board-protocol.js';
+import { loadExpandedJobs, saveExpandedJobs } from '../lib/board-collapse.js';
+import { jobSignal, pluralCount, roundSummary, unackedByJob } from '../lib/board-signals.js';
 import type { BoardClient } from '../lib/board-client.js';
+import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
 
@@ -47,6 +57,15 @@ export class BoardView {
   private readonly decisionsChip: HTMLElement;
   private readonly unackedChip: HTMLElement;
   private readonly onOpenTranscript: (request: TranscriptOpenRequest) => void;
+  /** v3: collapsed-by-default job cards. The expanded set loads once from
+   * the injected storage (null = session-only) and persists on every
+   * operator toggle; a snapshot push re-reads it and never auto-expands. */
+  private readonly collapseStorage: StorageLike | null;
+  private readonly expandedJobs: Set<string>;
+  /** Rounds whose lens chips the operator revealed (transient per view). */
+  private readonly expandedRounds = new Set<string>();
+  /** Unique aria-controls ids for lazily built bodies / lens-chip rows. */
+  private nextRegionId = 0;
   /** Disposed rows are collapsed by default; the toggle state survives
    * snapshot pushes so a live board does not re-open the graveyard. */
   private disposedExpanded = false;
@@ -72,6 +91,7 @@ export class BoardView {
   constructor(
     onOpenTranscript: (request: TranscriptOpenRequest) => void,
     boardClient: BoardClient | null = null,
+    collapseStorage: StorageLike | null = null,
   ) {
     this.mount = mustGet('board-jobs');
     this.notificationBell = mustGet<HTMLButtonElement>('notification-bell');
@@ -81,6 +101,8 @@ export class BoardView {
     this.unackedChip = mustGet('board-unacked');
     this.onOpenTranscript = onOpenTranscript;
     this.boardClient = boardClient;
+    this.collapseStorage = collapseStorage;
+    this.expandedJobs = collapseStorage === null ? new Set() : loadExpandedJobs(collapseStorage);
     this.notificationBell.addEventListener('click', () => {
       this.notificationPanel.hidden = !this.notificationPanel.hidden;
       this.notificationBell.dataset.open = String(!this.notificationPanel.hidden);
@@ -194,27 +216,92 @@ export class BoardView {
       this.mount.append(empty);
       return;
     }
+    const unacked = unackedByJob(snapshot);
     for (const repo of snapshot.repos) {
       const card = el('section', 'pp-card board-repo reveal');
       const head = el('div', 'board-repo__head');
       head.append(el('h2', 'board-repo__name', `📦 ${repo.name}`), el('span', 'lbl', `${repo.jobs.length} job${repo.jobs.length === 1 ? '' : 's'}`));
       card.append(head);
-      for (const job of repo.jobs) card.append(this.jobRow(job));
+      for (const job of repo.jobs) card.append(this.jobRow(job, unacked.get(job.id) ?? 0));
       this.mount.append(card);
     }
   }
 
-  private jobRow(job: JobView): HTMLElement {
+  /** One collapsed-by-default card. Collapsed DOM is exactly: title +
+   * status chip + optional PR link + optional one compact signal chip +
+   * one meta line. The detail body is built only when expanded. */
+  private jobRow(job: JobView, unackedActionRequired: number): HTMLElement {
     const row = el('article', 'board-job');
-    const title = el('div', 'board-job__title');
-    title.append(
-      el('span', 'board-job__name', job.title),
-      el('span', `pp-chip ${jobChipTone(job.status)}`, job.status),
+    row.dataset.jobId = job.id;
+
+    const head = el('div', 'board-job__head');
+    const toggle = el('button', 'board-job__toggle');
+    toggle.type = 'button';
+    const chevron = el('span', 'board-job__chevron', '▸');
+    chevron.setAttribute('aria-hidden', 'true');
+    const name = el('span', 'board-job__name', job.title);
+    name.title = job.title;
+    toggle.append(
+      chevron,
+      name,
+      el('span', `pp-chip board-job__status ${jobChipTone(job.status)}`, job.status),
     );
-    row.append(title);
+    head.append(toggle);
+    if (job.prUrl !== null) {
+      const link = el('a', 'board-job__pr', 'PR ↗');
+      link.href = job.prUrl;
+      link.target = '_blank';
+      link.rel = 'noreferrer';
+      // Opening the PR is not a disclosure gesture.
+      link.addEventListener('click', (event) => event.stopPropagation());
+      head.append(link);
+    }
+    row.append(head);
+
+    const signal = jobSignal(job, unackedActionRequired);
+    if (signal !== null) {
+      const chip = el('span', `pp-chip board-job__signal pp-chip--${signal.tone}`, signal.label);
+      chip.title = signal.title;
+      row.append(chip);
+    }
+
     const meta = el('div', 'board-job__meta lbl');
     meta.textContent = `${job.id} · updated ${formatTs(job.updatedAt)}${job.baseBranch !== null ? ` · base ${job.baseBranch}` : ''}`;
     row.append(meta);
+
+    let body: HTMLElement | null = null;
+    const setExpanded = (expanded: boolean, persist = true): void => {
+      if (expanded) {
+        body ??= this.jobBody(job);
+        row.append(body);
+        toggle.setAttribute('aria-controls', body.id);
+      } else if (body !== null) {
+        body.remove();
+      }
+      toggle.setAttribute('aria-expanded', String(expanded));
+      chevron.textContent = expanded ? '▾' : '▸';
+      row.dataset.expanded = String(expanded);
+      if (persist) this.setJobExpanded(job.id, expanded);
+    };
+    const flip = (): void => setExpanded(row.dataset.expanded !== 'true');
+    toggle.addEventListener('click', flip);
+    // Whole-card click target for the summary face; interactive children
+    // (PR link, controls) and the expanded body keep their own behavior.
+    row.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      if (target.closest('a, button, .board-job__body') !== null) return;
+      flip();
+    });
+    setExpanded(this.expandedJobs.has(job.id), false);
+    return row;
+  }
+
+  /** Expanded detail (the v2 surface): lane strip, note, condensed rounds. */
+  private jobBody(job: JobView): HTMLElement {
+    const body = el('div', 'board-job__body');
+    this.nextRegionId += 1;
+    body.id = `board-job-body-${this.nextRegionId}`;
     if (job.lane !== null) {
       const lane = el('div', 'board-lane');
       lane.append(
@@ -226,46 +313,74 @@ export class BoardView {
       if (job.lane.status !== 'active') {
         lane.append(el('span', 'pp-chip pp-chip--park board-lane__status', job.lane.status));
       }
-      row.append(lane);
+      body.append(lane);
     }
-    if (job.note !== null && job.note !== '') row.append(el('div', 'board-job__note', job.note));
-    for (const round of job.rounds) row.append(this.roundRow(round));
-    if (job.prUrl !== null) {
-      const link = el('a', 'board-job__pr', 'pull request ↗');
-      link.href = job.prUrl;
-      link.target = '_blank';
-      link.rel = 'noreferrer';
-      row.append(link);
-    }
-    return row;
+    if (job.note !== null && job.note !== '') body.append(el('div', 'board-job__note', job.note));
+    for (const round of job.rounds) body.append(this.roundRow(round));
+    return body;
   }
 
+  /** One round header row: `round N` chip + status + verdict + lens
+   * summary with failures counted inline. The per-lens chips are revealed
+   * by clicking the row — seven near-identical pills per round were the
+   * noise v3 removes, so they are never default-open. */
   private roundRow(round: RoundView): HTMLElement {
     const roundRow = el('div', 'board-round');
-    const head = el('div', 'board-round__head');
-    head.append(
+    const summary = roundSummary(round);
+    const toggle = el('button', 'board-round__toggle');
+    toggle.type = 'button';
+    const chevron = el('span', 'board-round__chevron', '▸');
+    chevron.setAttribute('aria-hidden', 'true');
+    toggle.append(
       el('span', 'pp-chip pp-chip--perkins', `round ${round.seq}`),
-      el('span', 'lbl', round.status + (round.verdict !== null ? ` · ${round.verdict}` : '')),
+      el('span', 'lbl board-round__status', round.status),
     );
-    roundRow.append(head);
-    const attempts = new Map(round.lensAttempts.map((entry) => [entry.lens, entry.attempts]));
-    const done = round.lenses.filter((chip) => chip.state === 'done').length;
-    const progress = el('div', 'board-round__progress');
-    progress.append(
-      el('span', 'lbl', `${done}/${round.lenses.length} lenses`),
-      this.ageNode('lbl board-round__elapsed', round.createdAt, '', ' elapsed'),
-    );
-    if (round.blockers > 0) {
-      progress.append(
-        el(
-          'span',
-          'pp-chip pp-chip--alert board-round__blockers',
-          `⛔ ${round.blockers} blocker${round.blockers === 1 ? '' : 's'}`,
-        ),
+    if (round.verdict !== null) {
+      toggle.append(el('span', 'lbl board-round__verdict', `· ${round.verdict}`));
+    }
+    toggle.append(el('span', 'lbl board-round__lens-progress', `${summary.done}/${summary.total} lenses`));
+    if (summary.blockers > 0) {
+      toggle.append(
+        el('span', 'pp-chip pp-chip--alert board-round__blockers', `⛔ ${pluralCount(summary.blockers, 'blocker')}`),
       );
     }
-    roundRow.append(progress);
+    if (summary.failures > 0) {
+      toggle.append(
+        el('span', 'pp-chip pp-chip--alert board-round__failures', `✕ ${pluralCount(summary.failures, 'lens failure')}`),
+      );
+    }
+    if (round.status === 'live' || round.status === 'pending') {
+      toggle.append(this.ageNode('lbl board-round__elapsed', round.createdAt, '', ' elapsed'));
+    }
+    toggle.append(chevron);
+
+    let chips: HTMLElement | null = null;
+    const setExpanded = (expanded: boolean, remember = true): void => {
+      if (remember) {
+        if (expanded) this.expandedRounds.add(round.id);
+        else this.expandedRounds.delete(round.id);
+      }
+      if (expanded) {
+        chips ??= this.lensChips(round);
+        roundRow.append(chips);
+        toggle.setAttribute('aria-controls', chips.id);
+      } else if (chips !== null) {
+        chips.remove();
+      }
+      toggle.setAttribute('aria-expanded', String(expanded));
+      chevron.textContent = expanded ? '▾' : '▸';
+    };
+    toggle.addEventListener('click', () => setExpanded(!this.expandedRounds.has(round.id)));
+    roundRow.append(toggle);
+    setExpanded(this.expandedRounds.has(round.id), false);
+    return roundRow;
+  }
+
+  private lensChips(round: RoundView): HTMLElement {
     const chips = el('div', 'board-round__lenses');
+    this.nextRegionId += 1;
+    chips.id = `board-round-chips-${this.nextRegionId}`;
+    const attempts = new Map(round.lensAttempts.map((entry) => [entry.lens, entry.attempts]));
     for (const chip of round.lenses) {
       const attemptCount = attempts.get(chip.lens) ?? 0;
       const node = el(
@@ -278,8 +393,13 @@ export class BoardView {
       else if (attemptCount > 1) node.title = `${attemptCount} attempts`;
       chips.append(node);
     }
-    roundRow.append(chips);
-    return roundRow;
+    return chips;
+  }
+
+  private setJobExpanded(jobId: string, expanded: boolean): void {
+    if (expanded) this.expandedJobs.add(jobId);
+    else this.expandedJobs.delete(jobId);
+    if (this.collapseStorage !== null) saveExpandedJobs(this.collapseStorage, this.expandedJobs);
   }
 
   // ------------------------------------------------------------------

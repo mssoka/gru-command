@@ -8,6 +8,7 @@ import type {
   NotificationView,
   RoundView,
 } from '../lib/board-protocol.js';
+import { memoryStorage } from '../lib/chat-storage.js';
 import { BoardView } from './board.js';
 
 type DecisionsOverrides = Partial<BoardSnapshot['decisions']>;
@@ -167,26 +168,40 @@ describe('board view resolved-notification rendering', () => {
 describe('board trackers', () => {
   beforeEach(mountBoardDom);
 
-  it('renders the lane strip (branch, base sha, lane age, agent activity age)', () => {
+  it('renders the lane strip (branch, base sha, lane age, agent activity age) once expanded', () => {
     const view = new BoardView(() => {});
     view.render(snapshot());
+    expect(document.querySelector('.board-lane')).toBeNull(); // collapsed default
+    document.querySelector<HTMLButtonElement>('.board-job__toggle')?.click();
     expect(document.querySelector('.board-lane__branch')?.textContent).toContain('gru/job-1');
     expect(document.querySelector('.board-lane__base')?.textContent).toContain('abc1234');
     expect(document.querySelector('.board-lane__age')?.textContent).toMatch(/lane \d+[smhd]/);
     expect(document.querySelector('.board-lane__activity')?.textContent).toMatch(/agent \d+[smhd]/);
   });
 
-  it('renders round progress: done/total lenses, blockers, elapsed, and per-lens attempt counts', () => {
+  it('condenses the round header: progress, blockers and failures inline; lens chips behind the row', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ jobs: [baseJob({ rounds: [baseRound({ lensAttempts: [{ lens: 'blind', attempts: 2 }, { lens: 'security', attempts: 1 }] })] })] }));
-    const progress = document.querySelector('.board-round__progress');
-    expect(progress?.textContent).toContain('2/2 lenses');
-    expect(progress?.textContent).toContain('1 blocker');
-    expect(progress?.querySelector('.board-round__elapsed')?.textContent).toMatch(/\d+[smhd] elapsed/);
+    document.querySelector<HTMLButtonElement>('.board-job__toggle')?.click();
+    const round = document.querySelector<HTMLButtonElement>('.board-round__toggle');
+    expect(round?.textContent).toContain('round 1');
+    expect(round?.textContent).toContain('live');
+    expect(round?.textContent).toContain('2/2 lenses');
+    expect(round?.textContent).toContain('1 blocker');
+    expect(round?.querySelector('.board-round__elapsed')?.textContent).toMatch(/\d+[smhd] elapsed/);
+    expect(round?.getAttribute('aria-expanded')).toBe('false');
+    expect(document.querySelectorAll('.board-lens')).toHaveLength(0);
+
+    round?.click();
+    expect(round?.getAttribute('aria-expanded')).toBe('true');
+    expect(document.querySelectorAll('.board-lens')).toHaveLength(2);
     const blind = document.querySelector<HTMLElement>('.board-lens');
     expect(blind?.textContent).toContain('blind ×2');
     expect(blind?.classList.contains('board-lens--blocker')).toBe(true);
     expect(blind?.title).toContain('unsafe retry');
+
+    round?.click();
+    expect(document.querySelectorAll('.board-lens')).toHaveLength(0);
   });
 
   it('renders the Jev decisions chip with the live status tone', () => {
@@ -287,5 +302,136 @@ describe('board view job status chips', () => {
     expect(chip?.className).toContain('pp-chip--work');
     // The tone class carries the state color in both themes (tokens.css).
     expect(chip?.className).not.toContain('pp-chip--rev');
+  });
+});
+
+describe('board card collapse (v3)', () => {
+  beforeEach(mountBoardDom);
+
+  function clickToggle(card: Element): void {
+    card.querySelector<HTMLButtonElement>('.board-job__toggle')?.click();
+  }
+
+  it('renders collapsed cards as summary only: title, status, one meta line, PR link', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [baseJob({ prUrl: 'https://example.invalid/pr/7' })] }));
+    const card = document.querySelector('.board-job');
+    expect(card?.querySelector('.board-job__name')?.textContent).toBe('Review job');
+    expect(card?.querySelector('.board-job__status')?.textContent).toBe('in-review');
+    expect(card?.querySelector<HTMLAnchorElement>('.board-job__pr')?.getAttribute('href')).toBe(
+      'https://example.invalid/pr/7',
+    );
+    expect(card?.querySelector('.board-job__meta')?.textContent).toContain('job-1');
+    // No detail nodes exist until the card is expanded.
+    expect(card?.querySelector('.board-job__body')).toBeNull();
+    expect(document.querySelector('.board-lane, .board-round, .board-lens, .board-job__note')).toBeNull();
+    const control = card?.querySelector<HTMLButtonElement>('.board-job__toggle');
+    expect(control?.tagName).toBe('BUTTON');
+    expect(control?.getAttribute('aria-expanded')).toBe('false');
+    expect(card?.querySelector('.board-job__chevron')?.textContent).toBe('▸');
+  });
+
+  it('expands from a click anywhere on the summary and collapses again; the PR link does not toggle', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [baseJob({ prUrl: 'https://example.invalid/pr/7' })] }));
+    const card = document.querySelector<HTMLElement>('.board-job');
+    if (card === null) throw new Error('card missing');
+    const control = card.querySelector<HTMLButtonElement>('.board-job__toggle');
+    if (control === null) throw new Error('toggle missing');
+
+    card.querySelector<HTMLElement>('.board-job__meta')?.click();
+    expect(card.dataset.expanded).toBe('true');
+    expect(control.getAttribute('aria-expanded')).toBe('true');
+    expect(card.querySelector('.board-job__body')).not.toBeNull();
+    expect(card.querySelector('.board-lane')).not.toBeNull();
+    expect(card.querySelector('.board-round')).not.toBeNull();
+    expect(card.querySelector('.board-job__chevron')?.textContent).toBe('▾');
+
+    // The PR link owns its click — the card stays open. (The test cancels
+    // the navigation itself; the component's stopPropagation is the claim.)
+    const pr = card.querySelector<HTMLAnchorElement>('.board-job__pr');
+    pr?.addEventListener('click', (event) => event.preventDefault());
+    pr?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    expect(card.dataset.expanded).toBe('true');
+
+    control.click();
+    expect(card.dataset.expanded).toBe('false');
+    expect(control.getAttribute('aria-expanded')).toBe('false');
+    expect(card.querySelector('.board-job__body')).toBeNull();
+    expect(card.querySelector('.board-job__chevron')?.textContent).toBe('▸');
+  });
+
+  it('persists per-job expansion in storage and restores it for a fresh view (reload)', () => {
+    const storage = memoryStorage();
+    const view = new BoardView(() => {}, null, storage);
+    view.render(snapshot());
+    expect(storage.getItem('gru-board-expanded-jobs')).toBeNull();
+
+    clickToggle(document.querySelector('.board-job') as Element);
+    expect(JSON.parse(storage.getItem('gru-board-expanded-jobs') ?? 'null')).toEqual(['job-1']);
+
+    // A fresh view over the same storage = a page reload.
+    const reloaded = new BoardView(() => {}, null, storage);
+    reloaded.render(snapshot());
+    const card = document.querySelector<HTMLElement>('.board-job');
+    expect(card?.dataset.expanded).toBe('true');
+    expect(card?.querySelector('.board-job__body')).not.toBeNull();
+
+    clickToggle(card as Element);
+    expect(storage.getItem('gru-board-expanded-jobs')).toBeNull();
+    const collapsedAgain = new BoardView(() => {}, null, storage);
+    collapsedAgain.render(snapshot());
+    expect(document.querySelector<HTMLElement>('.board-job')?.dataset.expanded).toBe('false');
+  });
+
+  it('keeps actionable state on the collapsed face: unacked action-required + failed live round', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            rounds: [
+              baseRound({
+                lenses: [
+                  { lens: 'blind', state: 'done', agentId: 'lens-agent', note: 'blocker — unsafe retry', verdict: 'blocker' },
+                  { lens: 'security', state: 'error', agentId: 'lens-agent-2', note: 'provider cap hit', verdict: null },
+                  { lens: 'tests', state: 'live', agentId: 'lens-agent-3', note: null, verdict: null },
+                ],
+              }),
+            ],
+          }),
+        ],
+        notifications: [notification('n1', { agentId: 'lens-agent' })],
+        agents: [agent('lens-agent', { jobId: 'job-1' })],
+        unackedActionRequired: 1,
+      }),
+    );
+    const signal = document.querySelector('.board-job__signal');
+    expect(signal?.textContent).toContain('1 action-required');
+    expect(signal?.textContent).toContain('1 blocker');
+    expect(signal?.textContent).toContain('1 lens failure');
+    expect(signal?.classList.contains('pp-chip--alert')).toBe(true);
+    expect(document.querySelector('.board-job__body')).toBeNull();
+  });
+
+  it('marks an aborted latest round on the collapsed card', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [baseJob({ rounds: [baseRound({ status: 'aborted', verdict: null })] })] }));
+    const signal = document.querySelector('.board-job__signal');
+    expect(signal?.textContent).toContain('round 1 aborted');
+    expect(signal?.classList.contains('pp-chip--alert')).toBe(true);
+    expect(document.querySelector('.board-job__body')).toBeNull();
+  });
+
+  it('a new live round updates the collapsed signal without auto-expanding', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [baseJob({ rounds: [baseRound({ status: 'pending' })] })] }));
+    expect(document.querySelector('.board-job__signal')?.textContent).toContain('pending');
+
+    view.render(snapshot());
+    const card = document.querySelector<HTMLElement>('.board-job');
+    expect(card?.dataset.expanded).toBe('false');
+    expect(card?.querySelector('.board-job__body')).toBeNull();
+    expect(card?.querySelector('.board-job__signal')?.textContent).toContain('live');
   });
 });

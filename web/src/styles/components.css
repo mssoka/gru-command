@@ -923,22 +923,83 @@ body {
   border-radius: var(--radius-sm);
   padding: 12px 14px;
   background: var(--soft);
+  cursor: pointer;
 }
 
-.board-job__title {
+.board-job:hover {
+  background: var(--card);
+}
+
+/* Collapsed face: chevron + title + status chip on one row; the optional
+   signal chip and the meta line follow. The detail body is disclosed. */
+.board-job__head {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.board-job__toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.board-job__toggle:focus-visible,
+.board-round__toggle:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.board-job__chevron {
+  flex: none;
+  width: 1em;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted);
 }
 
 .board-job__name {
   font-weight: 800;
+  flex: 1;
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.board-job__status {
+  flex: none;
+}
+
+/* The one compact signal a collapsed card may carry (live round,
+   blockers/failures, unacked action-required). It wraps instead of
+   overflowing on narrow viewports. */
+.board-job__signal {
+  justify-self: start;
+  max-width: 100%;
+  white-space: normal;
+  text-align: left;
+  font-size: 10px;
+  padding: 3px 10px;
 }
 
 .board-job__meta {
   color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .board-job__note {
@@ -948,9 +1009,18 @@ body {
 }
 
 .board-job__pr {
+  flex: none;
+  align-self: flex-start;
+  margin-top: 2px;
   font-size: 13px;
   font-weight: 800;
   color: var(--ink);
+}
+
+.board-job__body {
+  display: grid;
+  gap: 7px;
+  cursor: auto;
 }
 
 .board-round {
@@ -961,10 +1031,26 @@ body {
   margin-top: 2px;
 }
 
-.board-round__head {
+/* Condensed round header: chip + status/verdict + lens summary; clicking
+   reveals the per-lens pills. */
+.board-round__toggle {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  flex-wrap: wrap;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.board-round__chevron {
+  margin-left: auto;
+  color: var(--muted);
 }
 
 .board-round__lenses {
@@ -1029,14 +1115,8 @@ body {
   color: var(--muted);
 }
 
-/* Round progress: attempts, blockers, elapsed */
-
-.board-round__progress {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-}
+/* Round progress: elapsed age (attempts/blockers/failures ride the
+   condensed header toggle). */
 
 .board-round__elapsed {
   color: var(--muted);

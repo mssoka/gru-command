@@ -282,8 +282,13 @@ test.describe('board (E6)', () => {
     await expect(page.locator('#board-view')).toBeVisible();
     const repoCard = page.locator('.board-repo', { hasText: 'e2e-repo' });
     await expect(repoCard).toBeVisible();
-    await expect(repoCard.locator('.board-job', { hasText: 'Board e2e job' })).toBeVisible();
-    // All 7 lens chips render on the round.
+    const jobCard = repoCard.locator('.board-job', { hasText: 'Board e2e job' });
+    await expect(jobCard).toBeVisible();
+    // Collapsed by default; the round's 7 lens chips are behind the disclosures.
+    await expect(jobCard).toHaveAttribute('data-expanded', 'false');
+    await expect(repoCard.locator('.board-lens')).toHaveCount(0);
+    await jobCard.locator('.board-job__toggle').click();
+    await jobCard.locator('.board-round__toggle').click();
     await expect(repoCard.locator('.board-lens')).toHaveCount(7);
 
     // A status transition through the API pushes a fresh snapshot live.
