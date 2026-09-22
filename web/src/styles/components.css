@@ -287,6 +287,15 @@ body {
   min-width: 0;
 }
 
+/* Panel children occupy one cell each, explicitly: the jump pill must
+   OVERLAP the log's cell, and an explicitly placed grid item otherwise
+   displaces auto-placed siblings into new rows — the log would leave its
+   capped 52vh scroll box and grow to its full content height (which also
+   broke the bottom-distance math that drives auto-follow). */
+.chat-panel > .chat-log { grid-area: 1 / 1; }
+.chat-panel > .chat-context { grid-area: 2 / 1; }
+.chat-panel > .chat-compose { grid-area: 3 / 1; }
+
 .chat-log {
   overflow-y: auto;
   padding: 18px 16px 8px;
@@ -304,8 +313,7 @@ body {
    disengaged (the reader is in history). It sits in the log's grid cell
    and never takes layout from the message column. */
 .chat-jump {
-  grid-row: 1;
-  grid-column: 1;
+  grid-area: 1 / 1;
   align-self: end;
   justify-self: center;
   z-index: 2;
