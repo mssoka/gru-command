@@ -41,7 +41,8 @@ function writeLine(socket: Socket, value: unknown): void {
   }
 }
 
-/** Scoped local bridge used only by one Claude review-lead session. The MCP
+/** Scoped local bridge for one Claude review session — lead or lens child.
+ * Each bridge exposes exactly the native tools its session declared. The MCP
  * subprocess receives a 0700 Unix-socket path, not arbitrary service access. */
 export class ReviewMcpBridge {
   readonly configFile: string;

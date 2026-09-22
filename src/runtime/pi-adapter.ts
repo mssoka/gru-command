@@ -582,10 +582,13 @@ export class PiRuntime implements AgentRuntime {
       });
       await loader.reload();
       const isolatedTools = reviewMode === undefined ? null : confinedReviewTools(cwd, reviewMode.tools);
-      const leadTools = reviewLead === undefined ? [] : nativeReviewTools(reviewLead.nativeTools);
+      // Declared native tools ride the SAME helper for leads and lens
+      // children: the ADAPTER translates the declaration to in-process
+      // tools, so callers never branch on harness (SPEC ruling 4).
+      const nativeTools = reviewMode === undefined ? [] : nativeReviewTools(reviewMode.nativeTools ?? []);
       const tools = isolatedTools === null
         ? roleDef.tools
-        : [...isolatedTools.names, ...leadTools.map((tool) => tool.name)];
+        : [...isolatedTools.names, ...nativeTools.map((tool) => tool.name)];
       const { session } = await createAgentSession({
         cwd,
         agentDir: this.agentDir,
@@ -593,7 +596,7 @@ export class PiRuntime implements AgentRuntime {
         ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
         ...(reviewMode !== undefined ? { noTools: 'all' as const } : {}),
         tools: [...tools],
-        ...(isolatedTools !== null ? { customTools: [...isolatedTools.tools, ...leadTools] } : {}),
+        ...(isolatedTools !== null ? { customTools: [...isolatedTools.tools, ...nativeTools] } : {}),
         resourceLoader: loader,
         ...(isolatedSettings !== undefined ? { settingsManager: isolatedSettings } : {}),
         sessionManager,

@@ -71,9 +71,15 @@ the required coverage cardinality.
 - Lens children are fresh, ambient-free sessions. Blind has no tools or
   repository/spec context; other lenses get confined read/grep/find/list
   tools. No reviewer gets shell, edit, write, ambient skills, extensions,
-  settings, unrelated MCP servers, or nested delegation. The only MCP
-  exception is the per-session, product-owned Claude lead bridge exposing the
-  same five narrow tools; lens children never receive it.
+  settings, unrelated MCP servers, or nested delegation. A review session
+  may declare product-native tools, and the ADAPTER exposes exactly those
+  declared tools on every harness: pi injects them in-process, claude-code
+  attaches a session-scoped, product-owned MCP bridge. The lead declares
+  its five orchestration tools; a lens child that declares native tools
+  gets only its own (for example a structured submit-findings channel) and
+  never sees the lead's five. That seam is harness-independent by design —
+  review isolation and tool exposure live in the adapter implementation,
+  never in caller branches on harness.
 - The integrity-pinned package policy is the sole prompt authority for lead
   and child review behavior; interpolated repository/spec/convention text is
   untrusted evidence, never instruction. The host bounds attempts,

@@ -100,6 +100,15 @@ export interface NativeAgentTool {
 export interface IsolatedReviewPolicy {
   readonly systemPrompt: string;
   readonly tools: readonly ('read' | 'grep' | 'find' | 'ls')[];
+  /**
+   * Product-owned tools declared for this isolated review session. The
+   * ADAPTER exposes them on every runtime (pi: in-process custom tools;
+   * claude-code: the session-scoped MCP bridge) — callers declare WHAT is
+   * available and never branch on harness. Omitted = the session exposes no
+   * native tools (blind/lens children that declare none); a declared list is
+   * exposed exactly, nothing more.
+   */
+  readonly nativeTools?: readonly NativeAgentTool[];
 }
 
 /** Options for spawn(). */

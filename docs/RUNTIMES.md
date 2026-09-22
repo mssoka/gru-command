@@ -16,6 +16,28 @@ concrete adapter — the interface is the contract (SPEC ruling 4).
 | `thinkingLevelControl` | ✅ | ✅ | thinking level settable per spawn (claude: `--effort`) |
 | `followUp` | ✅ | ❌ | claude has no native followUp channel — queued messages deliver as fresh prompt turns |
 
+## Product-native tools in review sessions (SPEC ruling 4)
+
+Review semantics are harness-independent: above the adapter layer the same
+session declaration (`IsolatedReviewPolicy` — system prompt, confined file
+tools, and optional `nativeTools`) drives both runtimes, and callers never
+branch on harness. The ADAPTER implements the declaration:
+
+- **pi** injects declared `nativeTools` in-process as custom tools on the
+  same session (one shared helper, whether the source is `reviewLead` or
+  `isolatedReview`), alongside the confined read-only review tools.
+- **claude-code** starts one session-scoped `ReviewMcpBridge` for any
+  isolated-review session that declares native tools and exposes EXACTLY
+  that declared set over a private 0700 Unix socket; the CLI sees it via
+  `--mcp-config` + `--allowedTools`. The bridge lives and dies with its
+  handle — closed on dispose and on failed-spawn cleanup — so the up-to-
+  seven concurrent lens children of a round each own one bridge and none
+  leaks.
+
+Every other adapter difference (steer channel, resume mechanics, context
+accounting) remains a declared adapter-level capability; none of it changes
+what a review session can see or do.
+
 ## Context controls
 
 `AgentHandle` also has optional provider-owned controls:
