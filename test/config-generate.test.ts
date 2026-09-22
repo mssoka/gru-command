@@ -72,6 +72,7 @@ describe('config-generate CLI', () => {
       'chat',
       'worktrees',
       'dispatch',
+      'silas',
       'review',
     ]);
     for (const section of [

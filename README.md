@@ -32,6 +32,12 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   untrusted evidence. Claude leads alone receive a fresh scoped MCP bridge for
   the same narrow native tools ([FLOW.md](docs/FLOW.md),
   [WORKTREES.md](docs/WORKTREES.md)).
+- **Hosted ops (Silas)** — the operations role runs as a supervised session
+  that closes the follow-through loop without a human ping (delivered job →
+  PR registered → review wave) and breaks recurring blocker loops: same
+  blocker twice → fix directive, third → re-brief a fresh minion, fourth →
+  escalation. Evolving blockers keep looping — there is no round cap
+  ([FLOW.md](docs/FLOW.md)).
 - **Pluggable runtimes** — `pi` (reference) and Claude Code adapters;
   models/thinking default to each runtime's own configuration
   ([RUNTIMES.md](docs/RUNTIMES.md)).

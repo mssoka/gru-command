@@ -332,6 +332,24 @@ export class LedgerApi {
     return row === undefined ? null : this.eventFromRow(row);
   }
 
+  /** One job's events, newest first (ops digest scans; bounded). */
+  listJobEvents(jobId: string, opts: { limit?: number } = {}): readonly EventRecord[] {
+    const limit = opts.limit ?? 200;
+    return (
+      this.db
+        .prepare('SELECT * FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT ?')
+        .all(jobId, limit) as Row[]
+    ).map((row) => this.eventFromRow(row));
+  }
+
+  /** Latest durable event for one job/kind (ops follow-through checks). */
+  latestJobEvent(jobId: string, kind: string): EventRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM events WHERE job_id = ? AND kind = ? ORDER BY seq DESC LIMIT 1')
+      .get(jobId, kind) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
   private eventFromRow(row: Row): EventRecord {
     return {
       seq: Number(row.seq),

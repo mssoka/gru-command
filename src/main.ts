@@ -19,6 +19,8 @@ import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
 import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
+import { SilasDriver } from './dispatch/silas-driver.js';
+import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { createService, type ServiceHandle } from './server.js';
 import { createAttachmentsServer } from './attachments/server.js';
@@ -115,53 +117,6 @@ async function reviewPreflightCheck(
     },
     'review-policy': () => probeReviewPolicy({ reviewEnabled: () => config.review.enabled }),
   });
-}
-
-/** Route blocker findings back to the implementing minion session: the live
- * job minion first; otherwise a fresh minion on the job lane. */
-async function routeFixDirectiveToMinion(input: {
-  registry: RuntimeRegistry;
-  ledger: LedgerApi;
-  worktreeManager: WorktreeManager;
-  jobId: string;
-  directive: string;
-  signal: AbortSignal;
-}): Promise<{ delivered: boolean; minionId?: string; note?: string }> {
-  const minions = input.ledger
-    .listAgents()
-    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
-  for (const minion of [...minions].reverse()) {
-    const handle = input.registry.getHandle(minion.id);
-    if (handle !== null) {
-      await racedPrompt(handle, input.directive, input.signal);
-      return { delivered: true, minionId: minion.id };
-    }
-  }
-  const lane = input.worktreeManager
-    .listWorktrees({ jobId: input.jobId })
-    .find((candidate) => candidate.kind === 'job');
-  if (lane === undefined) {
-    return { delivered: false, note: 'no implementing minion session and no job lane' };
-  }
-  const handle = await input.registry.spawn('minion', { cwd: lane.path });
-  try {
-    await racedPrompt(handle, input.directive, input.signal);
-  } finally {
-    await handle.dispose();
-  }
-  return { delivered: true, minionId: handle.id };
-}
-
-/** Race a prompt against cancellation so shutdown cannot stall on an
- * in-flight fix-directive turn. */
-function racedPrompt(handle: { prompt(text: string, options?: { owner?: string }): Promise<void> }, text: string, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.reject(new Error('review operation aborted'));
-  return Promise.race([
-    handle.prompt(text, { owner: 'bmad-review-gate' }),
-    new Promise<never>((_resolve, reject) => {
-      signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
-    }),
-  ]);
 }
 import { ChatFrameLog } from './chat/frame-log.js';
 import { createChatServer, type ChatServer } from './chat/server.js';
@@ -268,6 +223,7 @@ async function main(): Promise<number> {
     supervisor?: Supervisor;
     decisions?: DecisionRuntime;
     bob?: BobScheduler;
+    silas?: SilasDriver;
     wave?: WaveRunner;
   } = {};
   let shuttingDown = false;
@@ -327,6 +283,13 @@ async function main(): Promise<number> {
             state.bob.stop();
           } catch (error) {
             logger.error('bob scheduler stop failed', { error: String(error) });
+          }
+        }
+        if (state.silas !== undefined) {
+          try {
+            state.silas.stop();
+          } catch (error) {
+            logger.error('silas driver stop failed', { error: String(error) });
           }
         }
         if (state.wave !== undefined) {
@@ -593,10 +556,11 @@ async function main(): Promise<number> {
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
         registry,
         ledger,
-        worktreeManager,
+        worktrees: worktreeManager,
         jobId: directiveInput.jobId,
         directive: directiveInput.directive,
         signal: directiveInput.signal,
+        owner: 'bmad-review-gate',
       }),
     },
     escalate: (title, detail) => {
@@ -616,10 +580,25 @@ async function main(): Promise<number> {
     slot: bobSlot,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Silas ops hosting (E8 follow-through; owner ruling 2026-09-21): the
+  // supervised slot follows the gru-main / bob-consolidator pattern exactly
+  // — model and thinking resolve from config ([models.roles] silas /
+  // [thinking.roles] silas) at spawn, never hardcoded here.
+  const silasSlot = config.silas.enabled
+    ? supervisorLive.declareSlot({
+        id: 'silas-ops',
+        role: 'silas',
+        spawn: (spawnOptions) => registry.spawn('silas', spawnOptions ?? {}),
+      })
+    : null;
   const dispatchServer = createDispatchServer({
     config,
     dispatch: dispatcher,
     wave,
+    ledger,
+    ...(config.silas.enabled && silasSlot !== null
+      ? { silasOps: { registry, worktrees: worktreeManager, notifications } }
+      : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
@@ -656,6 +635,25 @@ async function main(): Promise<number> {
   chat.warmup();
   supervisorLive.start();
   bob.start();
+  if (silasSlot !== null) {
+    // The driver starts after listen so its wake prompt carries the real
+    // bound port (config port 0 = ephemeral); until then no sweeps run and
+    // event wakes wait for the first sweep — the sweep is the safety net.
+    const silas = new SilasDriver({
+      slot: silasSlot,
+      ledger,
+      worktrees: worktreeManager,
+      config: config.silas,
+      ops: {
+        baseUrl: `http://${handle.host}:${handle.port}`,
+        configPath: configPathFor(config.instanceDir),
+      },
+      bus,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    state.silas = silas;
+    silas.start();
+  }
 
   logger.info('listening', { host: handle.host, port: handle.port });
   return new Promise<number>(() => {

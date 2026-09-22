@@ -8,6 +8,7 @@
   "files": [
     "dist/",
     "resources/perkins-code-review/policy.json",
+    "resources/silas-skills/",
     "roles/",
     "tools/verify-perkins-resource.mjs",
     "install/",

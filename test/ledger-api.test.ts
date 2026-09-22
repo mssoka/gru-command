@@ -229,6 +229,25 @@ describe('ledger api — the record of state', () => {
     expect(api.listEventsAfter(third.seq)).toEqual([]);
   });
 
+  it('listJobEvents/latestJobEvent scope the stream to one job (ops digest queries)', () => {
+    api.addJob({ id: 'scoped-events', repo: 'billing-api', title: 'scope check' });
+    api.appendCustomEvent({ kind: 'silas.wake', jobId: 'scoped-events', payload: { n: 1 } });
+    api.appendCustomEvent({ kind: 'silas.wake', jobId: 'scoped-events', payload: { n: 2 } });
+    api.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'scoped-events', payload: {} });
+    api.appendCustomEvent({ kind: 'other.job', jobId: 'fix-login-flow', payload: {} });
+    const events = api.listJobEvents('scoped-events');
+    expect(events.length).toBeGreaterThanOrEqual(3);
+    expect(events.every((event) => event.jobId === 'scoped-events')).toBe(true);
+    // newest first: the last append (directive-sent) leads
+    expect(events[0]?.kind).toBe('silas.directive-sent');
+    // bounded
+    expect(api.listJobEvents('scoped-events', { limit: 2 })).toHaveLength(2);
+    // latest-by-kind
+    const latest = api.latestJobEvent('scoped-events', 'silas.wake');
+    expect((latest?.payload as { n?: number }).n).toBe(2);
+    expect(api.latestJobEvent('scoped-events', 'never-happened')).toBeNull();
+    expect(api.latestJobEvent('no-such-job', 'silas.wake')).toBeNull();
+  });
   it('a restarted ledger (same file) serves the full record — the board rebuilds from it', () => {
     db.close();
     const dataDir = cleanupDirs[0] as string; // the dir from beforeAll
@@ -242,4 +261,5 @@ describe('ledger api — the record of state', () => {
     expect(api2.listEvents().length).toBeGreaterThan(10);
     db2.close();
   });
+
 });

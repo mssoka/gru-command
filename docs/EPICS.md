@@ -84,6 +84,15 @@ gate fails-before-fix where applicable.
    Ruling-17 behaviors: dispatch cwd = project root (all runtimes);
    per-repo skills discovery inside worktrees via the bootstrap
    manifest.
+5. Silas ops hosting (2026-09-21 ruling): the silas role runs as a
+   supervised session (`silas-ops` slot) whose driver wakes it on
+   job-delivered / minion-error / round-verdict events plus a periodic
+   sweep, hands it the actionable-states digest, and lets it close the
+   delivered→PR→review loop and run the same-blocker recurrence ladder
+   (directive → re-brief fresh minion → escalate; no round cap while
+   blockers evolve) through the authenticated `/api/silas/*` surface.
+   Ops skills ship in-repo (`resources/silas-skills/`) and reach the
+   session via wake-prompt injection.
 
 ## E9 — Installer, wizard & docs
 1. GitHub one-line installer + setup wizard (runtimes detect, repos

@@ -620,4 +620,43 @@ describe('dispatch config (E8)', () => {
       expect(() => loadConfig({ GRU_COMMAND_HOME: h2 }, '/home/tester'), text).toThrow(ConfigError);
     }
   });
+
+  it('the [silas] section boots enabled by default (owner ruling: live, not dark)', () => {
+    const home = tmpHome();
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.silas).toEqual({
+      enabled: true,
+      sweepIntervalMs: 300_000,
+      stallThresholdMs: 1_800_000,
+      directiveAt: 2,
+      rebriefAt: 3,
+      escalateAt: 4,
+    });
+  });
+
+  it('a full [silas] section parses; garbage and non-ascending thresholds refuse boot', () => {
+    const home = tmpHome();
+    writeConfig(home, '[silas]\nenabled = false\nsweep_interval_ms = 0\nstall_threshold_ms = 600000\ndirective_at = 1\nrebrief_at = 2\nescalate_at = 3\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').silas).toEqual({
+      enabled: false,
+      sweepIntervalMs: 0,
+      stallThresholdMs: 600_000,
+      directiveAt: 1,
+      rebriefAt: 2,
+      escalateAt: 3,
+    });
+    const bad: readonly string[] = [
+      '[silas]\nunknown = 1\n',
+      '[silas]\nsweep_interval_ms = -1\n',
+      '[silas]\nstall_threshold_ms = 1.5\n',
+      '[silas]\ndirective_at = 3\nrebrief_at = 3\n',
+      '[silas]\ndirective_at = 2\nrebrief_at = 4\nescalate_at = 4\n',
+      '[silas]\nenabled = "yes"\n',
+    ];
+    for (const text of bad) {
+      const h2 = tmpHome();
+      writeFileSync(join(h2, 'config.toml'), text, 'utf-8');
+      expect(() => loadConfig({ GRU_COMMAND_HOME: h2 }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
 });

@@ -190,6 +190,63 @@ fresh-head creation — lands as its OWN review lane (`src/worktrees/`,
 unavailable and dispatch fails loud, never silent.
 
 
+## Ops follow-through (Silas, hosted; owner ruling 2026-09-21)
+
+The Silas role is a HOSTED session: a supervised slot (`silas-ops`, the
+gru-main / bob-consolidator pattern) woken by its driver
+(`src/dispatch/silas-driver.ts`). The driver is the watchtower; Silas is
+the judgment; the dispatch surface is the mechanical hand.
+
+- **Wakes** fire on the events that matter (`job.delivered`,
+  `job.minion-error`, `round.verdict`) plus a periodic sweep
+  (`[silas] sweep_interval_ms`, default 5 min). A trigger arriving while a
+  silas turn is open queues ONE latest trigger (the decisions runtime's
+  one-slot replay) — never dropped, never stacked.
+- **The digest** handed to every wake carries the actionable states,
+  computed from the ledger: delivered jobs with no PR registered; PRs
+  whose follow-up delivery proves the lane head moved past the newest
+  round's reviewed target (first review AND re-review after a fix round;
+  an unchanged head warrants no round; and a review already REQUESTED for
+  the current state retires the row — including the bmad-review fallback
+  route, which creates no round and owns its own fix loop); NEEDS CHANGES
+  verdicts awaiting follow-through, with per-blocker recurrence analysis;
+  working lanes whose minion has been silent past `stall_threshold_ms`;
+  plus recent minion errors for context.
+- **The loop closes without a human ping**: on a delivered job, Silas
+  finds the PR (transcript/`gh`), registers it
+  (`POST /api/dispatch/pr … by=silas`), and triggers the wave
+  (`POST /api/dispatch/review … by=silas`). Attribution lands as
+  `silas.pr-registered` / `silas.review-triggered` ledger events.
+- **The recurrence ladder (no hard round cap).** While blockers evolve,
+  fix rounds re-enter review without limit. A changes-requested verdict
+  awaiting follow-through always gets at least the first fix directive per
+  blocker (a new blocker included — otherwise the lane could never
+  re-open). A settled directive/re-brief turn lands as a `job.delivered`
+  event carrying the lane head it produced; the digest only fires the
+  re-review when that head moved past the round's reviewed target. When
+  the SAME canonical blocker (normalized category/location/title
+  fingerprint) recurs across consecutive verdict rounds, the digest names
+  the rung and Silas executes it through `/api/silas/*`: `directive_at`
+  (default 2) → fix directive to the implementing minion; `rebrief_at`
+  (default 3) → re-brief a FRESH minion on the same lane; `escalate_at`
+  (default 4) → action-required notification surfaced to the Gru chat.
+  Escalation always beats an endless loop. Every rung lands as
+  `silas.directive-sent`, `silas.rebrief`, or `silas.escalated`.
+- **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,
+  track, close; never product code; never merge; preserve before remove;
+  escalate with pointers. Silas acts only through the authenticated ops
+  surface — the pairing token is read from the instance config at call
+  time, never echoed.
+- **Skills** — `ops-dispatch` and `ledger-closeout` ship in-repo under
+  `resources/silas-skills/` and are injected into every wake prompt (the
+  delivery mechanism: Silas hosts at the workspace root, so plain project
+  skill discovery does not apply; a clean install needs nothing else on
+  disk). The files are the source of truth.
+- **Off switch** — `[silas] enabled = false` hosts no slot and fires no
+  wakes; the `/api/silas/*` surface answers 503. Model and thinking come
+  from config (`[models.roles] silas` / `[thinking.roles] silas`), never
+  hardcoded.
+
 ## Bob (periodic memory)
 
 Bob's consolidation trigger runs on the configured interval
@@ -208,4 +265,13 @@ never blocking a live operation.
 
 [dispatch]
 # bob_interval_ms = 3600000        # 0 disables Bob's trigger
+
+[silas]
+# hosted ops session (see "Ops follow-through" above); live by default
+# enabled = true
+# sweep_interval_ms = 300000
+# stall_threshold_ms = 1800000
+# directive_at = 2
+# rebrief_at = 3
+# escalate_at = 4
 ```
