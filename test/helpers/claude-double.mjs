@@ -25,6 +25,8 @@
  *   CLAUDE_DOUBLE_LOG=<file>    append one JSON record per invocation
  *                               {argv, cwd, prompt, images} at turn end
  *   CLAUDE_DOUBLE_NO_PARTIALS=1 suppress stream_event partials
+ *   CLAUDE_DOUBLE_TOOL_HOLD_MS=<ms> hold the tool_use open this long before
+ *                               emitting its tool_result (long-tool tests)
  *   CLAUDE_DOUBLE_MISMATCH=1    init frame carries a foreign session id
  *   CLAUDE_DOUBLE_IGNORE_TERM=1 ignore SIGTERM (SIGKILL-path tests)
  *   CLAUDE_DOUBLE_COMPACT_ERROR=1 fail the native /compact control
@@ -228,6 +230,8 @@ async function emitToolTurn(toolName) {
       { type: 'tool_use', id: callId, name: toolName, input: { command: 'ls' } },
     ]),
   );
+  const holdMs = Number(process.env['CLAUDE_DOUBLE_TOOL_HOLD_MS'] ?? '0');
+  if (Number.isFinite(holdMs) && holdMs > 0) await delay(holdMs);
   out({
     type: 'user',
     session_id: sessionId,

@@ -280,6 +280,7 @@ describe('board engine — adapter events → ledger events → board state', ()
               restarts: 3,
               breakerOpen: true,
               openTurn: false,
+              openToolCalls: 0,
               lastEventAt: '2026-09-18T00:00:00.000Z',
               lastFileBytes: 0,
             }

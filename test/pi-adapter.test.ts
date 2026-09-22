@@ -1073,6 +1073,40 @@ describe('Perkins r1 regressions', () => {
     }
   });
 
+  it('E7 follow-up: a long quiet bash run heartbeats and reports a live process', async () => {
+    const fx = await fixture([
+      { deltas: [], toolCall: { id: 'call-quiet', name: 'bash', args: { command: 'sleep 0.3' } } },
+      { deltas: ['quiet tool done'] },
+    ]);
+    // Short heartbeat cadence: the production derivation is exercised by
+    // tool-heartbeat.test.ts; this proves the pi wiring end to end.
+    const runtime = new PiRuntime({
+      config: fx.config,
+      store: fx.store,
+      agentDir: fx.agentDir,
+      modelRuntime: fx.modelRuntime,
+      toolHeartbeatMs: 40,
+    });
+    const handle = await runtime.spawn('gru');
+    try {
+      const events = collect(handle);
+      const turn = handle.prompt('run the quiet tool', { owner: 'alice' });
+      // The quiet bash child is the live-process probe's evidence.
+      await vi.waitFor(() => expect(handle.hasLiveProcess?.()).toBe(true));
+      await turn;
+      expect(handle.hasLiveProcess?.()).toBe(false);
+      const heartbeats = events.filter(
+        (event) => event.type === 'tool_update' && event.callId === 'call-quiet',
+      );
+      // The bash tool itself emits only its empty start update; the
+      // periodic still-running updates prove the heartbeat fired.
+      expect(heartbeats.length).toBeGreaterThanOrEqual(3);
+    } finally {
+      await handle.dispose();
+      await runtime.dispose();
+    }
+  });
+
   it('W7: error turn — in-band completion: error event + state error, then recovers', async () => {
     const fx = await fixture([{ deltas: [], error: 'model exploded' }, { deltas: ['recovered'] }]);
     const handle = await fx.runtime.spawn('gru');

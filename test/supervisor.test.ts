@@ -18,6 +18,8 @@ import type {
   AgentCapabilities,
   AgentHandle,
   AgentState,
+  PendingTurn,
+  PromptOptions,
   RuntimeEvent,
   SpawnOptions,
 } from '../src/runtime/types.js';
@@ -57,6 +59,12 @@ class FakeHandle implements AgentHandle {
   state: AgentState = 'idle';
   disposed = false;
   promptCount = 0;
+  /** Recorded prompt deliveries (text + owner) — resume assertions. */
+  readonly promptCalls: { text: string; owner: string | null }[] = [];
+  /** hasLiveProcess probe result; false = no live child process. */
+  liveProcess = false;
+  /** pendingTurn snapshot; null = the runtime cannot name the live prompt. */
+  pendingTurnSnapshot: PendingTurn | null = null;
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
 
   constructor(role: Role, id: string, sessionFile: string | null, reviewIsolation = false) {
@@ -75,11 +83,16 @@ class FakeHandle implements AgentHandle {
     this.emit({ type: 'state', state, ...(error !== undefined ? { error } : {}) });
   }
 
-  async prompt(): Promise<void> {
+  async prompt(text = '', options?: PromptOptions): Promise<void> {
     this.promptCount += 1;
+    this.promptCalls.push({ text, owner: options?.owner ?? null });
   }
   async steer(): Promise<void> {}
   async followUp(): Promise<void> {}
+  /** E7 live-work probe: a fake scheduler can declare a live child process. */
+  readonly hasLiveProcess = (): boolean => this.liveProcess;
+  /** E7 resume snapshot: what the runtime knows about the open turn. */
+  readonly pendingTurn = (): PendingTurn | null => this.pendingTurnSnapshot;
   subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.listeners.add(listener);
     return () => {
@@ -183,7 +196,7 @@ interface Harness {
   dispose(): void;
 }
 
-function boot(decisions?: DecisionService): Harness {
+function boot(decisions?: DecisionService, opts: { wallNow?: () => number } = {}): Harness {
   const dir = tmpDir();
   const db = new LedgerDb(dir);
   const bus = new EventBus();
@@ -223,6 +236,7 @@ function boot(decisions?: DecisionService): Harness {
     ledger: api,
     notifications: center,
     ...(decisions !== undefined ? { decisions } : {}),
+    ...(opts.wallNow !== undefined ? { wallNow: opts.wallNow } : {}),
     tickMs: 5,
     now: () => harness.nowMs,
   });
@@ -1288,6 +1302,140 @@ describe('supervisor — Perkins r1 fixes', () => {
     const view = h.supervisor.viewFor('slot-recovered');
     expect(view?.state).toBe('watching');
     expect(view?.breakerOpen).toBe(false);
+    h.dispose();
+  });
+});
+
+describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery', () => {
+  it('an open tool call with a live process is activity — silence never trips the watchdog', async () => {
+    const h = boot();
+    const handle = new FakeHandle('minion', 'minion-live-tool', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    hang(handle);
+    handle.emit({ type: 'tool_start', callId: 'bash-1', tool: 'bash' });
+    handle.liveProcess = true;
+    // Three full silence windows with no events and no transcript growth.
+    for (let window = 0; window < 3; window += 1) {
+      h.advance(60);
+      await sleep(30);
+    }
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.supervisor.viewFor('minion-live-tool')?.openToolCalls).toBe(1);
+
+    // The process exits and the tool returns: REAL silence now trips.
+    handle.liveProcess = false;
+    handle.emit({ type: 'tool_end', callId: 'bash-1', isError: false });
+    h.advance(60);
+    await sleep(60);
+    expect(handle.disposed).toBe(true);
+    expect(h.registry.spawnCalls).toHaveLength(spawns + 1);
+    h.dispose();
+  });
+
+  it('tool heartbeats keep a long silent run alive without any transcript growth', async () => {
+    const h = boot();
+    const handle = new FakeHandle('minion', 'minion-heartbeat', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    hang(handle);
+    handle.emit({ type: 'tool_start', callId: 'bash-2', tool: 'bash' });
+    for (let beat = 0; beat < 8; beat += 1) {
+      h.advance(30); // below the 50ms silence window
+      handle.emit({ type: 'tool_update', callId: 'bash-2' });
+    }
+    await sleep(60);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    h.dispose();
+  });
+
+  it('a killed open turn is re-delivered on the resumed session under its owner', async () => {
+    const h = boot();
+    const handle = new FakeHandle('minion', 'minion-resume', null);
+    h.registry.adopt(handle);
+    hang(handle);
+    handle.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:job-1' };
+    h.advance(60);
+    await vi.waitFor(() => {
+      const resumed = [...h.registry.handlesById.values()].find(
+        (candidate) => candidate.id !== 'minion-resume' && candidate.role === 'minion',
+      );
+      expect(resumed?.promptCalls).toEqual([
+        { text: 'finish the briefing', owner: 'dispatch:job-1' },
+      ]);
+    }, { timeout: 5_000 });
+    expect(handle.disposed).toBe(true);
+    const recovery = h.api
+      .listEvents({ limit: 100 })
+      .filter((event) => event.kind === 'supervision.turn-recovery');
+    expect(recovery.some((event) => (event.payload as Record<string, unknown>)['disposition'] === 'resume-attempted')).toBe(true);
+    expect(recovery.some((event) => (event.payload as Record<string, unknown>)['disposition'] === 'resumed')).toBe(true);
+    // A resumable turn never orphans the lane.
+    expect(h.notificationsOfKind('supervision.turn-orphaned.minion-resume')).toHaveLength(0);
+    h.dispose();
+  });
+
+  it('a restart that cannot snapshot the turn posts a durable recoverable-lane note with job + branch + phase', async () => {
+    const h = boot();
+    h.api.addJob({ id: 'job-orphan', repo: 'gru-command', title: 'orphan lane' });
+    h.api.setJobStatus('job-orphan', 'working');
+    h.api.registerAgent({ id: 'minion-orphan', role: 'minion', jobId: 'job-orphan' });
+    h.api.registerWorktree({
+      id: 'job-orphan',
+      kind: 'job',
+      repoPath: '/tmp/repo',
+      repoName: 'gru-command',
+      path: '/tmp/worktrees/job-orphan',
+      branch: 'gru/orphan-lane',
+      sha: 'abc1234',
+      jobId: 'job-orphan',
+    });
+    const handle = new FakeHandle('minion', 'minion-orphan', null);
+    h.registry.adopt(handle);
+    hang(handle); // pendingTurnSnapshot stays null — the runtime cannot name it
+    h.advance(60);
+    await vi.waitFor(() => {
+      expect(h.notificationsOfKind('supervision.turn-orphaned.minion-orphan')).toHaveLength(1);
+    }, { timeout: 5_000 });
+    const note = h.notificationsOfKind('supervision.turn-orphaned.minion-orphan')[0]!;
+    expect(note.routing).toBe('action-required');
+    expect(note.agentId).toBe('minion-orphan');
+    expect(note.detail).toContain('job-orphan');
+    expect(note.detail).toContain('phase working');
+    expect(note.detail).toContain('branch gru/orphan-lane');
+    expect(note.detail).toContain('/tmp/worktrees/job-orphan');
+    const orphaned = h.api
+      .listEvents({ limit: 100 })
+      .find((event) => event.kind === 'supervision.turn-recovery');
+    expect((orphaned?.payload as Record<string, unknown>)['disposition']).toBe('orphaned');
+    h.dispose();
+  });
+
+  it('a sleep/wake wall-clock gap grants a fresh window and never restarts open turns', async () => {
+    let wallMs = 5_000_000;
+    const h = boot(undefined, { wallNow: () => wallMs });
+    const handle = new FakeHandle('minion', 'minion-wake', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    hang(handle);
+    h.advance(1); // establish the tick baseline before the machine sleeps
+    wallMs += 10 * 60_000; // a ten-minute system sleep
+    h.advance(60); // the post-wake tick: real silence, but nothing could run
+    await sleep(60);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.api.listEvents({ limit: 50 }).some((event) => event.kind === 'supervision.wake')).toBe(true);
+    const wake = h.notificationsOfKind('supervision.wake');
+    expect(wake).toHaveLength(1);
+    expect(wake[0]?.routing).toBe('fyi');
+    expect(wake[0]?.detail).toContain('minion-wake');
+    // The fresh window is real: continued silence past it still climbs.
+    h.advance(60);
+    await sleep(60);
+    expect(handle.disposed).toBe(true);
+    expect(h.registry.spawnCalls).toHaveLength(spawns + 1);
     h.dispose();
   });
 });

@@ -37,6 +37,7 @@ const DOUBLE = join(import.meta.dirname, 'helpers', 'claude-double.mjs');
 const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_LOG',
   'CLAUDE_DOUBLE_NO_PARTIALS',
+  'CLAUDE_DOUBLE_TOOL_HOLD_MS',
   'CLAUDE_DOUBLE_MISMATCH',
   'CLAUDE_DOUBLE_IGNORE_TERM',
   'CLAUDE_DOUBLE_COMPACT_ERROR',
@@ -70,7 +71,7 @@ interface Fixture {
   runtime: ClaudeCodeRuntime;
 }
 
-function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime } = {}): Fixture {
+function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number } = {}): Fixture {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
   const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
   cleanupDirs.push(home, workspace);
@@ -85,6 +86,7 @@ function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime } = 
     store,
     binary: DOUBLE,
     ...(knobs.killGraceMs !== undefined ? { killGraceMs: knobs.killGraceMs } : {}),
+    ...(knobs.toolHeartbeatMs !== undefined ? { toolHeartbeatMs: knobs.toolHeartbeatMs } : {}),
     ...(knobs.modelRuntime !== undefined ? { modelRuntime: knobs.modelRuntime } : {}),
     log: (level, msg, fields) => logs.push({ level, msg, fields }),
   });
@@ -389,6 +391,27 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const ends = events.filter((e) => e.type === 'tool_end');
       expect(ends).toEqual([{ type: 'tool_end', callId: 'toolu_double_1', isError: false }]);
       expect(deltas(events, 'text_delta').join('')).toBe('tool done');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('E7 follow-up: a held-open tool call heartbeats and reports a live process', async () => {
+    process.env['CLAUDE_DOUBLE_TOOL_HOLD_MS'] = '300';
+    const fx = fixture({ toolHeartbeatMs: 25 });
+    const handle = await fx.runtime.spawn('minion');
+    try {
+      const events = collect(handle);
+      const turn = handle.prompt('tool:Bash please');
+      await vi.waitFor(() => expect(handle.hasLiveProcess?.()).toBe(true), { timeout: 5_000 });
+      await turn;
+      expect(handle.hasLiveProcess?.()).toBe(false);
+      const updates = events.filter(
+        (event) => event.type === 'tool_update' && event.callId === 'toolu_double_1',
+      );
+      // Two input_json_delta partials plus periodic heartbeats while the
+      // call stayed open — the heartbeat count must exceed the partials.
+      expect(updates.length).toBeGreaterThanOrEqual(3);
     } finally {
       await handle.dispose();
     }
