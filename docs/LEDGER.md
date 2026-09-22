@@ -65,7 +65,9 @@ lens:   pending → live → done | error               (terminal: the last two)
 - `delivered` is the settle point: the minion's briefing turn completed
   and no PR is on record yet. The settle handler moves `ok → delivered`
   and `error → blocked`; a registered PR moves `working|delivered →
-  in-review`.
+  in-review`. A Silas follow-through (directive or re-brief) re-opens a
+  delivered lane (`delivered → working`) — the fresh attempt supersedes
+  the prior delivery.
 - `merged` has **no internal writer**: merge detection belongs to the
   external sweep (Silas) — the remaining external caller of the job
   machine. Nothing in the ledger infers a merge.

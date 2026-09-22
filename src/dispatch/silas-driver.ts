@@ -380,12 +380,16 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       });
     }
 
-    // (2) PR registered, review overdue (first or re-review).
-    if (job.prUrl !== null && job.status === 'working' && newestRound === null && !reviewAlreadyRequested) {
+    // (2) PR registered, review overdue (first or re-review). Any status
+    // that owes a review counts: `working` (a PR linked row-side),
+    // `delivered` (settled before the PR landed) and `in-review` (the
+    // register-PR hop lands there). Blocked/parked/terminal lanes do not.
+    const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
+    if (job.prUrl !== null && reviewPending && newestRound === null && !reviewAlreadyRequested) {
       digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl, priorRounds: 0 });
     } else if (
       job.prUrl !== null &&
-      job.status === 'working' &&
+      reviewPending &&
       newestRound !== null &&
       delivered !== null &&
       followUpChangedTarget(delivered, newestRound) &&

@@ -27,13 +27,15 @@ const JOB_TERMINAL: ReadonlySet<JobStatus> = new Set(['merged', 'done']);
  * point: the minion's briefing turn completed (ok) and no PR is on
  * record yet; a registered PR moves it to `in-review`. `working →
  * in-review` stays legal for a PR registered before the turn settles.
- * `merged` has NO internal writer: merge detection belongs to the
- * external sweep (Silas) — the remaining external caller.
+ * A Silas follow-through (directive or re-brief) re-opens a delivered
+ * lane (`delivered → working`): the fresh attempt supersedes the prior
+ * delivery. `merged` has NO internal writer: merge detection belongs to
+ * the external sweep (Silas) — the remaining external caller.
  */
 const JOB_TRANSITIONS: Readonly<Record<JobStatus, readonly JobStatus[]>> = {
   dispatched: ['working', 'blocked', 'parked'],
   working: ['delivered', 'in-review', 'blocked', 'parked', 'done'],
-  delivered: ['in-review', 'blocked', 'parked', 'done'],
+  delivered: ['working', 'in-review', 'blocked', 'parked', 'done'],
   'in-review': ['working', 'blocked', 'parked', 'merged', 'done'],
   blocked: ['dispatched', 'working', 'in-review', 'parked'],
   parked: ['dispatched', 'working', 'in-review', 'blocked'],
