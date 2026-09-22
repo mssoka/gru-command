@@ -174,6 +174,8 @@ npm test        # lint + typecheck + build + full offline suite
 npm run wizard  # fresh wizard; use -- --force to replace config with backup
 ```
 
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is the authoritative full gate — it runs `npm test` on every pull request and push to `main`; dispatch lanes verify only their narrow suites locally.
+
 The default test suite runs fully offline (stub model provider, stubbed
 claude CLI double, fixture PATHs). Opt-in live smoke tests and the
 fresh-machine install rehearsal are env-gated — see
