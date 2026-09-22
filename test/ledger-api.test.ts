@@ -73,6 +73,53 @@ describe('ledger api — the record of state', () => {
     expect(api.getJob('docs-pass')?.status).toBe('working');
   });
 
+  it('the delivered arc: working → delivered → in-review, with delivered side-hops', () => {
+    api.addJob({ id: 'deliver-truth', repo: 'billing-api', title: 'Deliver the truth' });
+    api.setJobStatus('deliver-truth', 'working');
+    const delivered = api.setJobStatus('deliver-truth', 'delivered');
+    expect(delivered.status).toBe('delivered');
+    expect(api.setJobStatus('deliver-truth', 'in-review').status).toBe('in-review');
+    const hops = api.listEvents().filter((e) => e.kind === 'job.status' && e.jobId === 'deliver-truth');
+    expect(hops.map((e) => (e.payload as { to: string }).to).reverse()).toEqual(['working', 'delivered', 'in-review']);
+
+    // delivered's recoverable side-hops and its terminal done.
+    api.addJob({ id: 'deliver-blocked', repo: 'billing-api', title: 'Blocked after delivery' });
+    api.setJobStatus('deliver-blocked', 'working');
+    api.setJobStatus('deliver-blocked', 'delivered');
+    expect(api.setJobStatus('deliver-blocked', 'blocked').status).toBe('blocked');
+
+    api.addJob({ id: 'deliver-parked', repo: 'billing-api', title: 'Parked after delivery' });
+    api.setJobStatus('deliver-parked', 'working');
+    api.setJobStatus('deliver-parked', 'delivered');
+    expect(api.setJobStatus('deliver-parked', 'parked').status).toBe('parked');
+
+    api.addJob({ id: 'deliver-done', repo: 'billing-api', title: 'Done after delivery' });
+    api.setJobStatus('deliver-done', 'working');
+    api.setJobStatus('deliver-done', 'delivered');
+    expect(api.setJobStatus('deliver-done', 'done').status).toBe('done');
+    expect(() => api.setJobStatus('deliver-done', 'working')).toThrow(/illegal transition done → working/u);
+  });
+
+  it('delivered is never a regression target — only working may enter it', () => {
+    api.addJob({ id: 'no-regress', repo: 'billing-api', title: 'No regression' });
+    api.setJobStatus('no-regress', 'working');
+    api.setJobStatus('no-regress', 'in-review');
+    expect(() => api.setJobStatus('no-regress', 'delivered')).toThrow(/illegal transition in-review → delivered/u);
+
+    const blockedJob = api.addJob({ id: 'blocked-no-deliver', repo: 'billing-api', title: 'Blocked' });
+    api.setJobStatus(blockedJob.id, 'working');
+    api.setJobStatus(blockedJob.id, 'blocked');
+    expect(() => api.setJobStatus(blockedJob.id, 'delivered')).toThrow(/illegal transition blocked → delivered/u);
+
+    const parkedJob = api.addJob({ id: 'parked-no-deliver', repo: 'billing-api', title: 'Parked' });
+    api.setJobStatus(parkedJob.id, 'working');
+    api.setJobStatus(parkedJob.id, 'parked');
+    expect(() => api.setJobStatus(parkedJob.id, 'delivered')).toThrow(/illegal transition parked → delivered/u);
+
+    const dispatchedJob = api.addJob({ id: 'dispatched-no-deliver', repo: 'billing-api', title: 'Dispatched' });
+    expect(() => api.setJobStatus(dispatchedJob.id, 'delivered')).toThrow(/illegal transition dispatched → delivered/u);
+  });
+
   it('notes and PR URLs land on the row + event log', () => {
     api.noteJob('docs-pass', 'waiting on the base sync');
     api.setJobPr('docs-pass', 'https://example.invalid/pr/7');

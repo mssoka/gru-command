@@ -10,6 +10,7 @@
 export const JOB_STATUSES = [
   'dispatched',
   'working',
+  'delivered',
   'in-review',
   'blocked',
   'parked',
@@ -20,10 +21,19 @@ export type JobStatus = (typeof JOB_STATUSES)[number];
 
 const JOB_TERMINAL: ReadonlySet<JobStatus> = new Set(['merged', 'done']);
 
-/** dispatched → working → in-review → merged|done; blocked/parked are recoverable side-states. */
+/**
+ * dispatched → working → delivered → in-review → merged|done;
+ * blocked/parked are recoverable side-states. `delivered` is the settle
+ * point: the minion's briefing turn completed (ok) and no PR is on
+ * record yet; a registered PR moves it to `in-review`. `working →
+ * in-review` stays legal for a PR registered before the turn settles.
+ * `merged` has NO internal writer: merge detection belongs to the
+ * external sweep (Silas) — the remaining external caller.
+ */
 const JOB_TRANSITIONS: Readonly<Record<JobStatus, readonly JobStatus[]>> = {
   dispatched: ['working', 'blocked', 'parked'],
-  working: ['in-review', 'blocked', 'parked', 'done'],
+  working: ['delivered', 'in-review', 'blocked', 'parked', 'done'],
+  delivered: ['in-review', 'blocked', 'parked', 'done'],
   'in-review': ['working', 'blocked', 'parked', 'merged', 'done'],
   blocked: ['dispatched', 'working', 'in-review', 'parked'],
   parked: ['dispatched', 'working', 'in-review', 'blocked'],

@@ -52,15 +52,23 @@ Illegal transitions **throw** (`src/ledger/states.ts`); nothing is
 coerced and no event is written for a rejected change.
 
 ```text
-job:    dispatched → working → in-review → merged | done
+job:    dispatched → working → delivered → in-review → merged | done
         (any non-terminal ⇄ blocked / parked as recoverable side-states;
-         merged/done are terminal)
+         merged/done are terminal; a PR registered before the turn
+         settles keeps working → in-review legal)
 
 round:  pending → live → verdict-posted | aborted   (terminal: the last two)
 
 lens:   pending → live → done | error               (terminal: the last two)
 ```
 
+- `delivered` is the settle point: the minion's briefing turn completed
+  and no PR is on record yet. The settle handler moves `ok → delivered`
+  and `error → blocked`; a registered PR moves `working|delivered →
+  in-review`.
+- `merged` has **no internal writer**: merge detection belongs to the
+  external sweep (Silas) — the remaining external caller of the job
+  machine. Nothing in the ledger infers a merge.
 - `setRoundVerdict` also transitions the round to `verdict-posted` — a
   posted verdict IS that state (and a verdict on a still-`pending` round
   fails loud, machine and all, leaving no trace).
