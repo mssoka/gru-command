@@ -419,6 +419,10 @@ export class ChatClient {
     this.setState(this.attempts === 0 ? 'connecting' : 'reconnecting');
     const socket = new ctor(`${scheme}://${this.options.host}${WS_PATH}`);
     this.socket = socket;
+    // A fresh socket starts a fresh liveness clock: the PREVIOUS socket's
+    // silence must never declare this handshake stale before it can
+    // authenticate (which aborted the reconnect and churned the retry).
+    this.lastFrameAt = Date.now();
 
     const connectTimer = setTimeout(() => {
       this.timers.delete(connectTimer);
