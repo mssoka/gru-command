@@ -18,6 +18,7 @@ import { WebSocket } from 'ws';
 import * as web from '../web/src/lib/protocol.js';
 import { ChatFrameLog } from '../src/chat/frame-log.js';
 import { createChatServer, type ChatServer } from '../src/chat/server.js';
+import { AWARENESS_WAKE_INSTRUCTION, type AwarenessInjection, type GruAwarenessPort } from '../src/chat/awareness.js';
 import { GruSessionPointer, SESSION_STATE_NAME } from '../src/chat/session-state.js';
 import type { GruCommandConfig } from '../src/config.js';
 import { withFallbacks } from '../src/runtime/fallbacks.js';
@@ -301,6 +302,7 @@ async function makeHarness(options: {
   readonly canAdoptFreshGru?: () => boolean;
   readonly adoptFreshGru?: (handle: AgentHandle) => Promise<void>;
   readonly siblingUpgradePaths?: readonly string[];
+  readonly awareness?: GruAwarenessPort;
 } = {}): Promise<Harness> {
   const dir = options.reuseDir ?? mkdtempSync(join(tmpdir(), 'gru-command-e4-'));
   cleanupDirs.push(dir);
@@ -414,6 +416,7 @@ async function makeHarness(options: {
     ...(options.adoptFreshGru !== undefined
       ? { adoptFreshGru: options.adoptFreshGru }
       : {}),
+    ...(options.awareness !== undefined ? { awareness: options.awareness } : {}),
     authDeadlineMs: options.authDeadlineMs,
     heartbeatMs: options.heartbeatMs ?? 0, // off by default; the heartbeat test opts in
     controlTimeoutMs: options.controlTimeoutMs,
@@ -3185,6 +3188,132 @@ describe('chat context controls and durable new-chat boundaries', () => {
       await client.close();
     } finally {
       await h.close();
+    }
+  });
+});
+
+describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
+  const sampleInjection = (): AwarenessInjection => ({
+    text: '[gru awareness · service context — not a user message]\nSince your last turn:\n- job j1: working → in-review',
+    coveredThroughSeq: 41,
+  });
+
+  it('rides the prepared awareness block ahead of a user prompt and commits only after delivery', async () => {
+    const injection = sampleInjection();
+    const commits: AwarenessInjection[] = [];
+    const harness = await makeHarness({
+      awareness: {
+        prepare: () => injection,
+        commit: (value) => commits.push(value),
+      },
+    });
+    try {
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('where are we', 'm1');
+      await done;
+      expect(harness.handle.calls).toEqual([
+        { op: 'prompt', text: `${injection.text}\n\nwhere are we`, owner: 'chat' },
+      ]);
+      expect(commits).toEqual([injection]);
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('delivers a plain user prompt when the awareness layer has nothing to inject', async () => {
+    const commits: AwarenessInjection[] = [];
+    const harness = await makeHarness({
+      awareness: {
+        prepare: () => null,
+        commit: (value) => commits.push(value),
+      },
+    });
+    try {
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('plain message', 'm1');
+      await done;
+      expect(harness.handle.calls).toEqual([{ op: 'prompt', text: 'plain message', owner: 'chat' }]);
+      expect(commits).toEqual([]);
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('wakeAwareness starts a turn from the injected block plus the wake instruction', async () => {
+    const injection = sampleInjection();
+    const commits: AwarenessInjection[] = [];
+    const harness = await makeHarness({
+      awareness: {
+        prepare: () => injection,
+        commit: (value) => commits.push(value),
+      },
+    });
+    try {
+      harness.chat.wakeAwareness();
+      await pollUntil(() => harness.handle.calls.length === 1, 'awareness wake turn');
+      expect(harness.handle.calls).toEqual([
+        { op: 'prompt', text: `${injection.text}\n\n${AWARENESS_WAKE_INSTRUCTION}`, owner: 'chat' },
+      ]);
+      await pollUntil(() => commits.length === 1, 'awareness wake commit');
+      // The wake turn is an ordinary durable turn in the stream (replayable).
+      expect(
+        harness.frameLog.history.some((frame) => frame.type === 'turn' && frame.state === 'start'),
+      ).toBe(true);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('a wake requested mid-turn waits and runs as one trailing turn', async () => {
+    const injection = sampleInjection();
+    let releaseTurn!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const harness = await makeHarness({
+      awareness: {
+        prepare: () => injection,
+        commit: () => {},
+      },
+    });
+    harness.handle.nextHold = hold;
+    try {
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('busy now', 'm1');
+      await pollUntil(() => harness.handle.calls.length === 1, 'user turn live');
+      harness.chat.wakeAwareness();
+      // Mid-turn: never steered into the live conversation.
+      expect(harness.handle.calls).toHaveLength(1);
+      releaseTurn();
+      await done;
+      await pollUntil(() => harness.handle.calls.length === 2, 'trailing wake turn');
+      expect(harness.handle.calls[1]).toMatchObject({ op: 'prompt', owner: 'chat' });
+      expect(harness.handle.calls[1]?.text).toContain(AWARENESS_WAKE_INSTRUCTION);
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('a wake with nothing to inject neither spawns a session nor burns a turn', async () => {
+    const harness = await makeHarness({
+      awareness: {
+        prepare: () => null,
+        commit: () => {},
+      },
+    });
+    try {
+      harness.chat.wakeAwareness();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(harness.handle.calls).toEqual([]);
+      expect(harness.spawnCalls).toEqual([]);
+    } finally {
+      await harness.close();
     }
   });
 });

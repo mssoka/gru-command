@@ -70,6 +70,13 @@ export interface AwarenessInjection {
   readonly coveredThroughSeq: number;
 }
 
+/** The chat server's narrow view of the awareness layer (injection provider
+ * + delivery receipt). The wake decision stays inside the layer. */
+export interface GruAwarenessPort {
+  prepare(): AwarenessInjection | null;
+  commit(injection: AwarenessInjection): void;
+}
+
 export type GruAwarenessLedger = Pick<
   LedgerApi,
   'getNotification' | 'listEventsAfter' | 'latestEventSeq'

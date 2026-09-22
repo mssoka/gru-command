@@ -26,6 +26,11 @@ import {
   type UserFrame,
 } from './frames.js';
 import type { GruSessionPointer } from './session-state.js';
+import {
+  AWARENESS_WAKE_INSTRUCTION,
+  type AwarenessInjection,
+  type GruAwarenessPort,
+} from './awareness.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -128,6 +133,9 @@ export interface ChatServerOptions {
    * handlers can claim them. Unlisted non-/ws paths still die (standalone
    * behavior unchanged). */
   readonly siblingUpgradePaths?: readonly string[];
+  /** Gru awareness (dispatch briefing 2026-09-22): the injection provider
+   * whose context block rides each prompt, plus the wake sink target. */
+  readonly awareness?: GruAwarenessPort;
 }
 
 export interface ChatServer {
@@ -138,6 +146,11 @@ export interface ChatServer {
   /** Surface a product notice in the chat stream (E7, SPEC ruling 13 —
    * action-required items Gru surfaces in chat). Logged + replayed. */
   surfaceNotice(text: string, onPersist?: () => void): boolean;
+  /** Start an awareness turn when the lane is idle (the awareness layer's
+   * wake sink calls this). Coalesced: a request arriving mid-turn or
+   * mid-wake is served by one trailing turn, never as a mid-turn steer.
+   * No-op without an attached awareness layer or when disposed. */
+  wakeAwareness(): void;
   /** Adopt a supervisor-restarted Gru handle (E7): re-wire subscription
    * + session pointer onto the new live handle. */
   adoptRestartedGru(handle: AgentHandle): void;
@@ -220,6 +233,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   let pendingDeliveries = 0;
   let deferredControlFrames = 0;
   let deferredFrameTail: Promise<void> = Promise.resolve();
+  /** Awareness wake coalescing: one request → at most one trailing turn. */
+  let wakeRequested = false;
+  let wakeRunning = false;
   /** Fatal native-writer uncertainty after failed compaction retirement.
    * Only process restart or a confirmed late resume may clear it. */
   let recoveryBlockedReason: string | null = null;
@@ -246,6 +262,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
           if (spawning === attempt) {
             spawning = null;
             broadcastContext();
+            maybeWake();
           }
         });
     }
@@ -371,6 +388,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         // dangling end (replay would render a turn boundary out of nowhere).
         if (frameLog.hasOpenTurn) emitLogged({ type: 'turn', state: 'end' });
         broadcastContext();
+        maybeWake();
         break;
       case 'compaction_start':
         runtimeCompacting = true;
@@ -601,14 +619,70 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   // Delivery (prompt when idle, steer mid-turn)
   // -----------------------------------------------------------------------
 
+  /** Awareness context for one prompt; fail-soft — a broken awareness layer
+   * must never take message delivery down. */
+  function awarenessPrepare(): AwarenessInjection | null {
+    if (options.awareness === undefined) return null;
+    try {
+      return options.awareness.prepare();
+    } catch (error) {
+      log('error', 'gru awareness prepare failed — delivering without service context', {
+        error: errorMessage(error),
+      });
+      return null;
+    }
+  }
+
+  function awarenessCommit(injection: AwarenessInjection): void {
+    try {
+      options.awareness?.commit(injection);
+    } catch (error) {
+      log('error', 'gru awareness commit failed — context may re-inject', {
+        error: errorMessage(error),
+      });
+    }
+  }
+
+  /** Start a coalesced awareness turn when the lane is idle. A request that
+   * arrives mid-turn or mid-wake waits for a trailing turn instead of
+   * steering into a live conversation; settle hooks call back here. */
+  function maybeWake(): void {
+    if (disposed || !wakeRequested || wakeRunning || options.awareness === undefined) return;
+    if (
+      turnLive ||
+      frameLog.hasOpenTurn ||
+      pendingDeliveries > 0 ||
+      spawning !== null ||
+      controlBarrier !== null ||
+      runtimeCompactionBarrier !== null ||
+      recoveryBlockedReason !== null
+    ) {
+      return;
+    }
+    wakeRequested = false;
+    wakeRunning = true;
+    void deliver(null, '', undefined, true).finally(() => {
+      wakeRunning = false;
+      if (wakeRequested) maybeWake();
+    });
+  }
+
   /** SPEC ruling 19(d): the agent ALWAYS receives paths and reads the
    * files itself. The manifest appends the chip paths to the prompt
    * text — no bytes ever ride the prompt in the attach flow. When the
    * runtime cannot host vision (capabilities.images false, SPEC ruling
    * 4) an image chip triggers the GRACEFUL DECLINE: a visible notice for
    * the user + a never-guess instruction for the agent — never an error
-   * frame, never a silent drop. */
-  function deliver(client: Client, text: string, attachments?: readonly AttachmentChip[]): void {
+   * frame, never a silent drop.
+   *
+   * `client` is null for an awareness wake (policy-started, no user
+   * message: the injected block plus the wake instruction IS the prompt). */
+  function deliver(
+    client: Client | null,
+    text: string,
+    attachments?: readonly AttachmentChip[],
+    wake = false,
+  ): Promise<void> {
     pendingDeliveries += 1;
     broadcastContext();
     // Declared here so BOTH the task-level catch and the inner prompt
@@ -616,7 +690,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     // locals — the r3 backstop needs to know what this delivery opened).
     let midTurn = false;
     let ownedOpenTurn = false;
-    void (async () => {
+    return (async () => {
       try {
         // Re-enter every current barrier after every await. Provider-native
         // compaction can begin after the user frame was durably acknowledged
@@ -629,6 +703,13 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         if (disposed) return;
         if (recoveryBlockedReason !== null) {
           throw new Error('chat recovery is blocked; restart the service');
+        }
+        // A wake turn exists only to carry service context: with nothing to
+        // inject, do not spawn a session or burn a model turn.
+        let wakeInjection: AwarenessInjection | null = null;
+        if (wake) {
+          wakeInjection = awarenessPrepare();
+          if (wakeInjection === null) return;
         }
         // Chip-path provenance (review r1): only workspace/uploads paths
         // ride the manifest — a handcrafted chip pointing elsewhere drops
@@ -656,7 +737,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               'dropped from the message Gru receives.',
           });
         }
-        if (text.trim() === '' && allowed.length === 0) {
+        if (text.trim() === '' && allowed.length === 0 && !wake) {
           emitLogged({
             type: 'notice',
             text:
@@ -670,7 +751,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             gru = await ensureGru();
           } catch (error) {
             // Ephemeral: a transient spawn failure must not replay forever.
-            send(client, ephemeralError('Gru is temporarily unavailable; retry after reconnect.'));
+            if (client !== null) {
+              send(client, ephemeralError('Gru is temporarily unavailable; retry after reconnect.'));
+            }
             log('error', 'Gru delivery spawn failed', { error: errorMessage(error) });
             return;
           }
@@ -697,27 +780,60 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               'sent as paths only; Gru is instructed not to guess at their contents.',
           });
         }
-        const prompt = composeDeliveredPrompt(
-          text,
-          allowed.length > 0 ? allowed : undefined,
-          visionUnavailable,
-        );
         try {
           if (turnLive) {
+            if (wake) {
+              // Lost the idle race to a user turn: requeue the wake for the
+              // next idle point instead of steering into the conversation.
+              wakeRequested = true;
+              return;
+            }
             midTurn = true;
-            await gru.steer(prompt, { owner: CHAT_OWNER });
+            // A steer rides the LIVE turn, so no new turn is opened and no
+            // injection rides it — the block stays queued for the next prompt.
+            await gru.steer(
+              composeDeliveredPrompt(text, allowed.length > 0 ? allowed : undefined, visionUnavailable),
+              { owner: CHAT_OWNER },
+            );
           } else {
+            const injection = wake ? wakeInjection : awarenessPrepare();
+            const baseText =
+              injection === null
+                ? text
+                : wake
+                  ? `${injection.text}\n\n${AWARENESS_WAKE_INSTRUCTION}`
+                  : `${injection.text}\n\n${text}`;
+            const prompt = composeDeliveredPrompt(
+              baseText,
+              allowed.length > 0 ? allowed : undefined,
+              visionUnavailable,
+            );
             ownedOpenTurn = true;
             turnLive = true; // optimistic: the turn_start event confirms
             await gru.prompt(prompt, { owner: CHAT_OWNER });
             turnLive = false;
+            // Receipt only after the turn accepted the block: a failed
+            // delivery retries the same context on the next turn.
+            if (injection !== null) awarenessCommit(injection);
           }
         } catch (error) {
           const message = (error as Error).message;
           const dead = /disposed/.test(message);
           if (dead) teardownHandle();
-          // Conversation-relevant (this message failed to deliver) → logged.
-          emitLogged({ type: 'error', message: `message delivery failed: ${message}` });
+          if (wake) {
+            // An autonomous turn failing is an operational degradation, not
+            // a user message failure — say so durably; the queued context
+            // rides the next user message.
+            emitLogged({
+              type: 'notice',
+              text:
+                `Gru awareness: automatic turn failed (${boundedControlMessage(message)}); ` +
+                'the context will ride the next message.',
+            });
+          } else {
+            // Conversation-relevant (this message failed to deliver) → logged.
+            emitLogged({ type: 'error', message: `message delivery failed: ${message}` });
+          }
           // Settle only when the turn is actually over (r1 W2): our prompt
           // dying, or a disposed session, ends the event stream — close the
           // log. A rejected STEER leaves the live runtime turn running:
@@ -757,11 +873,12 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
           log('error', 'chat delivery failure could not be logged durably', {
             error: errorMessage(appendError),
           });
-          send(client, ephemeralError(message));
+          if (client !== null) send(client, ephemeralError(message));
         }
       } finally {
         pendingDeliveries -= 1;
         broadcastContext();
+        maybeWake();
       }
     })();
   }
@@ -984,9 +1101,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     controlBarrier = lifecycle.then(
       () => {
         controlBarrier = null;
+        maybeWake();
       },
       () => {
         controlBarrier = null;
+        maybeWake();
       },
     );
   }
@@ -1397,7 +1516,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     });
     broadcastExceptSender(loggedUser, client);
     send(client, frameLog.append({ type: 'ack', client_msg_id: frame.client_msg_id }));
-    deliver(client, frame.text, frame.attachments);
+    void deliver(client, frame.text, frame.attachments);
   }
 
   /** The pen promotes to the earliest AUTHENTICATED reader (r1 N6):
@@ -1500,6 +1619,12 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       emitLogged({ type: 'notice', text });
       onPersist?.();
       return true;
+    },
+
+    wakeAwareness(): void {
+      if (disposed || options.awareness === undefined) return;
+      wakeRequested = true;
+      maybeWake();
     },
 
     adoptRestartedGru(next: AgentHandle): void {
