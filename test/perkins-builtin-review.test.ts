@@ -352,6 +352,7 @@ describe('bundled Perkins policy and deterministic contracts', () => {
       import { readFileSync, realpathSync } from 'node:fs';
       import { spawn } from 'node:child_process';
       import { loadPerkinsPolicy } from './dist/dispatch/perkins-review/policy.js';
+      import { loadSilasSkills } from './dist/dispatch/silas-driver.js';
       import { ReviewMcpBridge } from './dist/runtime/review-mcp-bridge.js';
       const bridge = await ReviewMcpBridge.start([{
         name: 'perkins_probe', description: 'staged probe', inputSchema: { type: 'object' },
@@ -401,6 +402,7 @@ describe('bundled Perkins policy and deterministic contracts', () => {
           protocolVersion: initialized.result.protocolVersion,
           listed: JSON.stringify(listed).includes('perkins_probe'),
           called: JSON.stringify(called).includes('stage-ok'),
+          silasSkills: loadSilasSkills().map((skill) => skill.name),
         }));
       } finally {
         child.kill('SIGTERM');
@@ -412,9 +414,10 @@ describe('bundled Perkins policy and deterministic contracts', () => {
       encoding: 'utf8',
       timeout: 10_000,
       env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
-    })) as { identity: string; protocolVersion: string; listed: boolean; called: boolean };
+    })) as { identity: string; protocolVersion: string; listed: boolean; called: boolean; silasSkills: string[] };
     expect(smoke).toEqual({
       identity: 'perkins-code-review', protocolVersion: '2024-11-05', listed: true, called: true,
+      silasSkills: ['ops-dispatch', 'ledger-closeout'],
     });
   });
 
