@@ -123,7 +123,7 @@ function mountBoardDom(): void {
   document.body.innerHTML = `
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
-    <button id="notification-bell"></button>
+    <button id="notification-bell"><span id="notification-badge">0</span></button>
     <div id="notification-panel"><div id="notification-list"></div></div>
     <span id="board-decisions"></span>
     <span id="board-unacked" hidden></span>
@@ -146,6 +146,7 @@ describe('board view resolved-notification rendering', () => {
     expect(document.querySelector('.board-notification__title')?.textContent).toContain('resolved');
     expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(0);
     expect(document.querySelector<HTMLElement>('#notification-bell')?.dataset.unread).toBe('0');
+    expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('0');
     expect(toast).not.toHaveBeenCalled();
 
     view.render(

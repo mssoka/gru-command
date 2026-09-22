@@ -42,6 +42,7 @@ export interface TranscriptOpenRequest {
 export class BoardView {
   private readonly mount: HTMLElement;
   private readonly notificationBell: HTMLButtonElement;
+  private readonly notificationBadge: HTMLElement;
   private readonly notificationPanel: HTMLElement;
   private readonly decisionsChip: HTMLElement;
   private readonly unackedChip: HTMLElement;
@@ -74,6 +75,7 @@ export class BoardView {
   ) {
     this.mount = mustGet('board-jobs');
     this.notificationBell = mustGet<HTMLButtonElement>('notification-bell');
+    this.notificationBadge = mustGet('notification-badge');
     this.notificationPanel = mustGet('notification-panel');
     this.decisionsChip = mustGet('board-decisions');
     this.unackedChip = mustGet('board-unacked');
@@ -301,13 +303,18 @@ export class BoardView {
       const toggle = el(
         'button',
         'board-agent-toggle',
-        `${this.disposedExpanded ? '▾' : '▸'} ${disposed.length} disposed`,
+        `${this.disposedExpanded ? '−' : '+'}${disposed.length} disposed`,
       );
       toggle.type = 'button';
       toggle.setAttribute('aria-expanded', String(this.disposedExpanded));
       toggle.addEventListener('click', () => {
         this.disposedExpanded = !this.disposedExpanded;
         this.renderAgents(agents);
+        // The rail is max-height scrollable: reveal the disclosed row
+        // instead of leaving it clipped below the fold.
+        if (this.disposedExpanded) {
+          rail.querySelector<HTMLElement>('.board-agent--disposed')?.scrollIntoView?.({ block: 'nearest' });
+        }
       });
       rail.append(toggle);
       if (this.disposedExpanded) {
@@ -448,12 +455,14 @@ export class BoardView {
   }
 
   /** Badge = unacked error-severity items not yet seen here (panel-open
-   * marks seen; an ack from ANY device clears it via ackedAt). */
+   * marks seen; an ack from ANY device clears it via ackedAt). The number
+   * is rendered — a literal "0" badge read as a false alert. */
   private updateBadge(notifications: readonly { id: string; severity: string; ackedAt: string | null; resolvedAt: string | null }[]): void {
     const unseen = notifications.filter(
       (n) => n.severity === 'error' && n.ackedAt === null && n.resolvedAt === null && !this.seenErrorIds.has(n.id),
     ).length;
     this.notificationBell.dataset.unread = String(unseen);
+    this.notificationBadge.textContent = String(unseen);
   }
 }
 

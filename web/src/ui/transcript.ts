@@ -78,13 +78,18 @@ export class TranscriptView {
       const toggle = el(
         'button',
         'board-agent-toggle',
-        `${this.disposedExpanded ? '▾' : '▸'} ${disposed.length} disposed`,
+        `${this.disposedExpanded ? '−' : '+'}${disposed.length} disposed`,
       );
       toggle.type = 'button';
       toggle.setAttribute('aria-expanded', String(this.disposedExpanded));
       toggle.addEventListener('click', () => {
         this.disposedExpanded = !this.disposedExpanded;
         this.renderList(this.lastInfos, this.lastDisposed);
+        // The list is max-height scrollable: reveal the disclosed row
+        // instead of leaving it clipped below the fold.
+        if (this.disposedExpanded) {
+          this.listMount.querySelector<HTMLElement>('.board-agent--disposed')?.scrollIntoView?.({ block: 'nearest' });
+        }
       });
       this.listMount.append(toggle);
       if (this.disposedExpanded) {
