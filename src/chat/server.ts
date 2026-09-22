@@ -31,6 +31,7 @@ import {
   type AwarenessInjection,
   type GruAwarenessPort,
 } from './awareness.js';
+import { SpawnRetryGate } from './spawn-backoff.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -128,6 +129,11 @@ export interface ChatServerOptions {
   readonly controlTimeoutMs?: number;
   /** ws payload cap — the client caps messages at 4 000 chars; 64 KiB is generous. */
   readonly maxPayloadBytes?: number;
+  /** Spawn-retry backoff base (doubles per consecutive failure; default
+   * 1 000 ms, 0 disables the gate — tests use small/zero values). */
+  readonly spawnBackoffBaseMs?: number;
+  /** Spawn-retry backoff cap (default 60 000 ms). */
+  readonly spawnBackoffMaxMs?: number;
   /** Upgrade paths owned by SIBLING ws surfaces (the board's /board/ws,
    * E6): the chat handler passes them instead of destroying, so sibling
    * handlers can claim them. Unlisted non-/ws paths still die (standalone
@@ -159,6 +165,22 @@ export interface ChatServer {
   dispose(): Promise<void>;
 }
 
+const SPAWN_BACKOFF_BASE_MS = 1_000;
+const SPAWN_BACKOFF_MAX_MS = 60_000;
+
+/**
+ * Raised by ensureGru() while the bounded spawn-retry gate is cooling down.
+ * Distinct from genuine spawn errors: the deferred-frame path must NOT
+ * close the socket for this one — closing is the reconnect trigger, and
+ * reconnecting during the window is exactly the storm being bounded.
+ */
+class SpawnBackoffError extends Error {
+  constructor(readonly retryInMs: number) {
+    super(`Gru session start is backed off; the next attempt is allowed in ${retryInMs} ms`);
+    this.name = 'SpawnBackoffError';
+  }
+}
+
 interface Client {
   readonly socket: WebSocket;
   authed: boolean;
@@ -188,6 +210,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   const authDeadlineMs = options.authDeadlineMs ?? 5_000;
   const heartbeatMs = options.heartbeatMs ?? 30_000;
   const controlTimeoutMs = options.controlTimeoutMs ?? 120_000;
+  const spawnBackoffMaxMs = options.spawnBackoffMaxMs ?? SPAWN_BACKOFF_MAX_MS;
+  const spawnGate = new SpawnRetryGate(
+    options.spawnBackoffBaseMs ?? SPAWN_BACKOFF_BASE_MS,
+    spawnBackoffMaxMs,
+  );
   const siblingUpgradePaths = new Set(options.siblingUpgradePaths ?? []);
   const tokenHash = hashToken(options.config.auth.token);
   const tokenConfigured = isTokenConfigured(options.config.auth.token);
@@ -249,6 +276,12 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
   function ensureGru(): Promise<AgentHandle> {
     if (handle !== null) return Promise.resolve(handle);
+    // Bounded retries: after a failure, a reconnect (or a fresh message)
+    // inside the backoff window must NOT reach the spawner again. The gate
+    // rejects fast; the durable error was surfaced once per failure episode.
+    if (spawnGate.isBlocked()) {
+      return Promise.reject(new SpawnBackoffError(spawnGate.blockedFor()));
+    }
     if (spawning === null) {
       const attempt = spawnGru();
       // Assign the gate BEFORE any settlement callback can run: a
@@ -313,6 +346,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         boundarySessionMissing = false;
         handle = spawned;
         unsubscribe = stagedUnsubscribe;
+        spawnGate.reset();
       } catch (error) {
         try {
           stagedUnsubscribe?.();
@@ -333,7 +367,32 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       log('info', 'gru session live', { session_file: spawned.sessionFile });
       return spawned;
     } catch (error) {
-      log('error', 'gru spawn failed', { error: String(error) });
+      const message = errorMessage(error);
+      const retryInMs = spawnGate.recordFailure();
+      const firstFailure = spawnGate.failureCount === 1;
+      log('error', 'gru spawn failed', {
+        error: message,
+        consecutive_failures: spawnGate.failureCount,
+        retry_in_ms: retryInMs,
+      });
+      if (firstFailure) {
+        // ONE durable surface per failure episode (SPEC chat error class:
+        // logged, never fatal). Later attempts within the episode log but
+        // do not re-surface, so a broken model cannot flood chat.
+        try {
+          emitLogged({
+            type: 'error',
+            message:
+              `Gru could not start: ${message}. Spawn retries are backed off ` +
+              `(exponential, capped at ${spawnBackoffMaxMs} ms); send a message or ` +
+              `reconnect after the window to retry.`,
+          });
+        } catch (surfaceError) {
+          log('warn', 'failed to persist the spawn-failure surface', {
+            error: errorMessage(surfaceError),
+          });
+        }
+      }
       throw error;
     }
   }
@@ -1396,6 +1455,24 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
   function failDeferredUserFrame(client: Client, error: unknown): void {
     if (client.deferredFailed) return;
+    if (error instanceof SpawnBackoffError) {
+      // Bounded fail-fast: do NOT mark the socket poisoned or close it — a
+      // close is the reconnect trigger, and every reconnect re-sends the
+      // unacked word. The word stays in the browser outbox and rides the
+      // next reconnect once the gate opens; the one durable surface for
+      // this episode already named the cause and the backoff policy.
+      log('warn', 'deferred chat frame rejected during spawn backoff', {
+        retry_in_ms: error.retryInMs,
+      });
+      send(
+        client,
+        ephemeralError(
+          'Gru is temporarily unavailable (spawn retries are backed off); ' +
+            'your message stays queued — retry after the next reconnect.',
+        ),
+      );
+      return;
+    }
     client.deferredFailed = true;
     log('error', 'deferred chat frame failed', { error: errorMessage(error) });
     send(client, ephemeralError('Chat delivery could not be reconciled; reconnecting safely.'));
@@ -1607,8 +1684,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     warmup(): void {
       void ensureGru().catch((error: unknown) => {
         // Logged (r1 W4): a warm boot failure is an ops-visible condition —
-        // the first message retries, but the boot log must say why.
-        log('warn', 'gru warmup failed — first message retries', {
+        // the first message retries (bounded by the spawn-retry gate), but
+        // the boot log must say why.
+        log('warn', 'gru warmup failed — retries are backed off', {
           error: String(error),
         });
       });

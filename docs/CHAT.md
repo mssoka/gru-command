@@ -131,8 +131,8 @@ tails. The writer is held to the same rule from the other side:
 | Class | `seq` | Logged | Replays to everyone | Used for |
 |---|---|---|---|---|
 | Fatal | no | never | no | bad/missing/late auth, chat not configured — the only frames that ever carry `fatal: true`, and they are never persisted |
-| Logged | yes | yes | yes | malformed frame (authenticated sockets), already-authenticated, runtime errors + delivery failures — **never `fatal: true`**: the shipped client treats any replayed fatal frame as pairing-fatal, so a logged runtime death must read as history, not poison |
-| Ephemeral | no | no | no | per-client policy notices: read-only rejection, spawn-failure notice, malformed frame before auth |
+| Logged | yes | yes | yes | malformed frame (authenticated sockets), already-authenticated, runtime errors + delivery failures + the once-per-episode spawn-failure surface — **never `fatal: true`**: the shipped client treats any replayed fatal frame as pairing-fatal, so a logged runtime death must read as history, not poison |
+| Ephemeral | no | no | no | per-client policy notices: read-only rejection, spawn-failure/backoff notice, malformed frame before auth |
 
 Ephemeral frames are for conditions that are expected policy (not
 malfunctions) and must not pollute permanent history for every future
@@ -217,6 +217,15 @@ No adapter or UI reconstructs usage from streamed deltas.
   session) stays acked and logged with an error frame recording the
   failure — there is no automatic redelivery; re-send it. While browser
   storage remains available, the typed word and its failure remain visible.
+- **Bounded spawn retries.** A failed Gru spawn arms an exponential
+  backoff (`1 s` doubling to a `60 s` cap). The FIRST failure of an
+  episode writes ONE durable `error` naming the cause and the backoff
+  policy; a message or reconnect inside the window is rejected fast with
+  an ephemeral notice and **no new spawn attempt** (and no socket close —
+  closing would re-trigger the resend loop). The unacked word stays in the
+  browser outbox and rides the first reconnect after the window; a
+  successful spawn resets the gate. A broken model therefore cannot turn
+  client reconnects into a per-second spawn loop.
 - Reconnecting clients re-auth with `last_seen_seq`; the server sends
   `auth_ok` (high-water), a fresh `context` snapshot, then every logged
   frame with `seq > max(last_seen_seq, replay_floor_seq)` in order, then

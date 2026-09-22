@@ -303,6 +303,10 @@ async function makeHarness(options: {
   readonly adoptFreshGru?: (handle: AgentHandle) => Promise<void>;
   readonly siblingUpgradePaths?: readonly string[];
   readonly awareness?: GruAwarenessPort;
+  /** Spawn-retry gate overrides: 0 disables the gate (default here so the
+   * legacy single-failure tests keep retrying immediately). */
+  readonly spawnBackoffBaseMs?: number;
+  readonly spawnBackoffMaxMs?: number;
 } = {}): Promise<Harness> {
   const dir = options.reuseDir ?? mkdtempSync(join(tmpdir(), 'gru-command-e4-'));
   cleanupDirs.push(dir);
@@ -420,6 +424,8 @@ async function makeHarness(options: {
     authDeadlineMs: options.authDeadlineMs,
     heartbeatMs: options.heartbeatMs ?? 0, // off by default; the heartbeat test opts in
     controlTimeoutMs: options.controlTimeoutMs,
+    spawnBackoffBaseMs: options.spawnBackoffBaseMs ?? 0,
+    spawnBackoffMaxMs: options.spawnBackoffMaxMs ?? 60_000,
   });
   const http = createServer((_req, res) => {
     res.writeHead(404);
@@ -1211,15 +1217,21 @@ describe('chat server (real sockets, stub Gru)', () => {
     await harness.close();
   });
 
-  it('spawn failure closes the unacked stream; reconnect retries and succeeds', async () => {
+  it('spawn failure surfaces once, closes the unacked stream; reconnect retries and succeeds', async () => {
     const harness = await makeHarness({ failFirstSpawn: new Error('model unavailable') });
     const client = await authedClient(harness.port);
     client.send('wake the brain', 'm1');
-    const notice = await client.waitFor(isType('error'), 'spawn failure');
-    expect(notice).toEqual({
-      type: 'error',
-      message: 'Chat delivery could not be reconciled; reconnecting safely.',
-    });
+    const surfaced = await client.waitFor(
+      (frame) => frame.type === 'error' && /Gru could not start: model unavailable/.test(frame.message),
+      'spawn failure surfaced',
+    );
+    // ONE durable surface: the actionable cause + the bounded backoff policy.
+    expect(surfaced).toMatchObject({ type: 'error', seq: 1 });
+    expect((surfaced as web.ErrorFrame).message).toContain('Spawn retries are backed off');
+    const notice = await client.waitFor(
+      (frame) => frame.type === 'error' && /could not be reconciled/.test(frame.message),
+      'reconciliation notice',
+    );
     expect(notice).not.toHaveProperty('seq');
     expect(await client.closed).toBe(1011);
     expect(harness.handle.calls).toEqual([]);
@@ -1230,6 +1242,54 @@ describe('chat server (real sockets, stub Gru)', () => {
     await done;
     expect(harness.handle.calls).toEqual([{ op: 'prompt', text: 'wake the brain', owner: 'chat' }]);
     expect(harness.spawnCalls).toEqual([null, null]); // fresh brain both times
+    await retry.close();
+    await harness.close();
+  });
+
+  it('a persistently broken spawn backs off: a reconnect within the window does not retry it', async () => {
+    // The 2026-09-22 07:30 shape: a client reconnect flushes the unacked
+    // word, the spawn fails, the server closes for no-ack recovery — and
+    // the next reconnect repeats it ~per second. With the bounded gate the
+    // reconnect is fast-rejected (no spawn, no close) until the window
+    // expires; one durable error names the cause.
+    const harness = await makeHarness({
+      failFirstSpawn: new Error('unknown model "deepseek/deepseek-flash"'),
+      spawnBackoffBaseMs: 40,
+      spawnBackoffMaxMs: 40,
+    });
+    const client = await authedClient(harness.port);
+    client.send('wake the brain', 'm1');
+    await client.waitFor(
+      (frame) => frame.type === 'error' && /Gru could not start/.test(frame.message),
+      'spawn failure surfaced',
+    );
+    expect(await client.closed).toBe(1011);
+    expect(harness.spawnCalls).toEqual([null]);
+
+    // Reconnect + resend INSIDE the window: no second spawn attempt, no
+    // socket close, and the word stays unacked for a later attempt.
+    const retry = await authedClient(harness.port);
+    retry.send('wake the brain', 'm1');
+    await retry.waitFor(
+      (frame) => frame.type === 'error' && /backed off/.test(frame.message),
+      'backoff fast-fail',
+    );
+    expect(harness.spawnCalls).toEqual([null]);
+    expect(retry.frames.some((frame) => frame.type === 'ack')).toBe(false);
+    // ONE durable surface for the whole failure episode; the fast-fail is
+    // ephemeral (never written to history).
+    expect(harness.frameLog.history.filter((frame) => frame.type === 'error')).toHaveLength(1);
+
+    // After the window: the next word takes a genuinely new attempt, which
+    // succeeds (failFirstSpawn consumed) — bounded, not wedged.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+    const done = nextTurnEnd(retry);
+    retry.send('wake the brain now', 'm2');
+    await done;
+    expect(harness.spawnCalls).toEqual([null, null]);
+    expect(
+      retry.frames.some((frame) => frame.type === 'ack' && frame.client_msg_id === 'm2'),
+    ).toBe(true);
     await retry.close();
     await harness.close();
   });
@@ -1332,7 +1392,10 @@ describe('chat server (real sockets, stub Gru)', () => {
     harness.handle.fire({ type: 'state', state: 'disposed' });
     writeFileSync(join(harness.chatDir, SESSION_STATE_NAME), '{"sessionFile":', 'utf-8');
     client.send('second', 'm2');
-    const failure = await client.waitFor(isType('error'), 'spawn failure surfaced');
+    const failure = await client.waitFor(
+      (frame) => frame.type === 'error' && /could not be reconciled/.test(frame.message),
+      'spawn failure surfaced',
+    );
     expect((failure as web.ErrorFrame).message).toContain('could not be reconciled');
     expect(await client.closed).toBe(1011);
 
@@ -2951,11 +3014,12 @@ describe('chat context controls and durable new-chat boundaries', () => {
         (frame) => frame.type === 'user' && frame.client_msg_id === 'after-vanished-repair',
       );
       expect(repairedUser?.seq).toBeGreaterThan(state.replayFloorSeq);
-      expect(
-        client.frames.some(
-          (frame) => frame.type === 'ack' && frame.client_msg_id === 'after-vanished-repair',
-        ),
-      ).toBe(true);
+      // The prompt can land server-side before the ack frame is observed on
+      // this socket; wait for the ack instead of racing the poll (flaky pin).
+      await client.waitFor(
+        (frame) => frame.type === 'ack' && frame.client_msg_id === 'after-vanished-repair',
+        'repair word ack',
+      );
       await client.close();
     } finally {
       await restarted.close();
