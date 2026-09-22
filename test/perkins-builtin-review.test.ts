@@ -1349,6 +1349,41 @@ describe('Perkins hybrid lead engine', () => {
     expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.delta.json'))).toBe(true);
   });
 
+  it('refuses to amend a rejected submission past the stored-base byte bound', async () => {
+    // 400 shape-valid decisions with ~3.9 KB of fabricated verification
+    // evidence serialize past the 1 MiB delta-base bound: the rejected whole
+    // is neither stored nor amendable, and the delta tells the lead to
+    // resubmit it whole.
+    const fabricated = 'F'.repeat(3_950);
+    const many = (lens: 'blind' | 'security'): string =>
+      JSON.stringify(Array.from({ length: 200 }, (_, index) =>
+        finding(lens, 'warning', { title: `${lens} grounded candidate ${index}` })));
+    const h = hybridHarness({
+      childAnswer: (prompt) => {
+        const lens = lensFrom(prompt);
+        return lens === 'security' || lens === 'blind' ? many(lens) : '[]';
+      },
+      decide: () => ({ disposition: 'confirmed', evidence: fabricated, reason: 'lead claims verification' }),
+      // The first attempt must stay a shape-clean submission so the host has
+      // something to weigh against the delta-base bound; its defects are
+      // semantic, so the report body itself is irrelevant here.
+      transformReport: () => '# rejected draft report\n',
+      submitPayload: (attempt, submission) => attempt === 1
+        ? submission
+        : { mode: 'delta', report_markdown: '# amended report\n' },
+    });
+    await expect(h.run()).rejects.toThrow(/exceeded the delta base byte bound; resubmit the full submission/u);
+    const stored = join(h.frozen.directory, 'lead', 'submission-attempt-1.json');
+    expect(Buffer.byteLength(readFileSync(stored, 'utf8'), 'utf8')).toBeGreaterThan(1024 * 1024);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-2.delta.json'))).toBe(true);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-2.json'))).toBe(false);
+    const rejection = JSON.parse(readFileSync(join(h.frozen.directory, 'lead', 'submission-attempt-2.error.json'), 'utf8')) as {
+      issues: ReadonlyArray<{ rule: string; message: string }>;
+    };
+    expect(rejection.issues.some((issue) =>
+      issue.rule === 'delta-base' && issue.message.includes('exceeded the delta base byte bound'))).toBe(true);
+  });
+
   it('reports every invalid prior-audit entry in one rejection', async () => {
     const prior = (index: number): Record<string, unknown> => ({
       ...finding('security', 'blocker', { title: `prior defect ${index}` }),
