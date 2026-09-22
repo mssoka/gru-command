@@ -47,7 +47,12 @@ fresh worktree back out and blocks the job with a note.
 The ledger's event stream drives the board: `job.handoff`,
 `job.minion-spawned`, `job.delivered` (or `job.minion-error`), the PR
 link (`POST /api/dispatch/pr`), review rounds with per-lens chips, and
-the sweep. The board groups by repo; the phone is board-first.
+the sweep. Statuses track that stream automatically: the settling turn
+moves `working → delivered` (ok) or `working → blocked` (error), and a
+registered PR opens the review window (`working|delivered →
+in-review`). Merge detection is NOT internal — nothing here writes
+`merged`; the external sweep (Silas) is the remaining caller. The board
+groups by repo; the phone is board-first.
 
 ## 4. Review waves (Perkins)
 

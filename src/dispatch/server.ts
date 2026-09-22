@@ -161,9 +161,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     return options.silasOps;
   }
 
+  /** Re-open the lane for a Silas follow-through: the follow-up turn is the
+   * lane working again. `in-review` is the pre-verdict review window; a
+   * `delivered` lane (settled before a PR/review request) re-opens the same
+   * way — the fresh directive/re-brief supersedes the prior delivery. */
   function flipJobToWorking(ledger: LedgerApi, jobId: string): void {
     const job = ledger.getJob(jobId);
-    if (job === null || job.status !== 'in-review') return;
+    if (job === null || (job.status !== 'in-review' && job.status !== 'delivered')) return;
     ledger.setJobStatus(jobId, 'working');
     ledger.noteJob(jobId, 'silas follow-through: fix loop re-opened, lane back to working');
   }

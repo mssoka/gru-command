@@ -275,3 +275,17 @@ describe('board agent rail — disposed collapse and turn-age', () => {
     expect(document.querySelectorAll('#board-agents .board-agent__age')).toHaveLength(1);
   });
 });
+
+describe('board view job status chips', () => {
+  beforeEach(mountBoardDom);
+
+  it('renders the delivered chip in the work color family (the same token in light and dark)', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [baseJob({ status: 'delivered' })] }));
+    const chip = document.querySelector('#board-jobs .board-job .pp-chip');
+    expect(chip?.textContent).toBe('delivered');
+    expect(chip?.className).toContain('pp-chip--work');
+    // The tone class carries the state color in both themes (tokens.css).
+    expect(chip?.className).not.toContain('pp-chip--rev');
+  });
+});

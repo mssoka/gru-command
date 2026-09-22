@@ -48,7 +48,7 @@ key `gru-theme`).
 | `--ink` | `#22304a` | `#e8ecf4` | primary text |
 | `--line` | `#22304a` | `#313c58` | chunky outlines |
 | `--muted` / `--faint` | `#6b7a94` / `#8a8678` | `#93a0b8` / `#6d7890` | secondary text |
-| `--work` | `#ffd54a` | `#ffd54a` | minion yellow: working, Gru bubbles |
+| `--work` | `#ffd54a` | `#ffd54a` | minion yellow: working/delivered, Gru bubbles |
 | `--done` | `#7ee08a` | `#6fd68a` | merged/done states |
 | `--rev` | `#9ad7f5` | `#7cc4ef` | review states |
 | `--park` | `#e8e3d8` | `#2a3350` | parked/vaulted |

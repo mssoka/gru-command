@@ -1,5 +1,6 @@
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, JobRecord } from '../ledger/api.js';
+import { isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import { requireSpawnCwd } from '../roles.js';
@@ -168,6 +169,7 @@ export class DispatchService {
               jobId: job.id,
               payload: { agentId: handle.id },
             });
+            this.recordSettleOutcome(job.id, 'delivered');
             this.log('info', 'minion briefing turn completed', { job: job.id, agent: handle.id });
             return { ok: true as const };
           },
@@ -177,6 +179,7 @@ export class DispatchService {
               jobId: job.id,
               payload: { agentId: handle.id, error: String(error) },
             });
+            this.recordSettleOutcome(job.id, 'blocked');
             this.log('error', 'minion briefing turn failed', {
               job: job.id,
               agent: handle.id,
@@ -194,7 +197,12 @@ export class DispatchService {
     }
   }
 
-  /** Record the PR link (the minion's lane artifact; merging is review's). */
+  /** Record the PR link (the minion's lane artifact; merging is review's).
+   * A registered PR opens the review window: working|delivered → in-review.
+   * Later states (blocked/parked/merged/done) are left as-is — a link
+   * never resurrects a lane. Merge DETECTION is not here: nothing in this
+   * service writes 'merged'; that stays the external sweep's (Silas's)
+   * call — the remaining external caller of the job machine. */
   recordPr(jobId: string, url: string): JobRecord {
     const job = this.opts.ledger.setJobPr(jobId, url);
     this.opts.ledger.appendCustomEvent({
@@ -202,6 +210,9 @@ export class DispatchService {
       jobId,
       payload: { url },
     });
+    if (job.status === 'working' || job.status === 'delivered') {
+      return this.opts.ledger.setJobStatus(jobId, 'in-review');
+    }
     return job;
   }
 
@@ -224,6 +235,32 @@ export class DispatchService {
       ...(opts.confirmKill !== undefined ? { confirmKill: opts.confirmKill } : {}),
       ...(opts.baseBranch !== undefined ? { baseBranch: opts.baseBranch } : {}),
     });
+  }
+
+  /**
+   * Settle status truth (owner report 2026-09-22): the briefing turn
+   * settling IS the delivery point — `delivered` on ok, `blocked` on
+   * error. `delivered` is legal only from `working` (its sole predecessor
+   * in the ledger machine); `blocked` is legal from every non-terminal
+   * state. When the job already advanced past the settle point (a PR
+   * registered mid-turn lands `in-review` first), the newer truth wins —
+   * the settle leaves it in place rather than forcing an illegal hop.
+   * Merge detection is NOT here: `merged` remains the external sweep's
+   * (Silas's) call — the remaining external caller of the job machine.
+   */
+  private recordSettleOutcome(jobId: string, status: 'delivered' | 'blocked'): void {
+    const current = this.opts.ledger.getJob(jobId);
+    if (current === null || current.status === status) return;
+    const legal = status === 'blocked' ? !isJobTerminal(current.status) : current.status === 'working';
+    if (!legal) {
+      this.log('info', 'settle status skipped — job already advanced', {
+        job: jobId,
+        status: current.status,
+        settle: status,
+      });
+      return;
+    }
+    this.opts.ledger.setJobStatus(jobId, status);
   }
 
   private async sweepQuietly(worktreeId: string): Promise<void> {

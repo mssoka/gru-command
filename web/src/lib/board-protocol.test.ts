@@ -127,6 +127,9 @@ describe('board server-frame validator', () => {
     expect(jobChipTone('in-review')).toContain('rev');
     expect(jobChipTone('merged')).toContain('done');
     expect(jobChipTone('blocked')).toContain('alert');
+    expect(jobChipTone('delivered')).toContain('work');
+    expect(jobChipTone('working')).toContain('work');
+    expect(jobChipTone('parked')).toContain('park');
     expect(agentStateTone('streaming')).toContain('work');
     expect(agentStateTone('error')).toContain('alert');
   });
