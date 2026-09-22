@@ -204,8 +204,9 @@ the judgment; the dispatch surface is the mechanical hand.
   one-slot replay) — never dropped, never stacked.
 - **The digest** handed to every wake carries the actionable states,
   computed from the ledger: delivered jobs with no PR registered; PRs
-  whose newest delivery is newer than their newest review round (first
-  review AND re-review after a fix round); NEEDS CHANGES verdicts awaiting
+  whose follow-up delivery proves the lane head moved past the newest
+  round's reviewed target (first review AND re-review after a fix round;
+  an unchanged head warrants no round); NEEDS CHANGES verdicts awaiting
   follow-through, with per-blocker recurrence analysis; working lanes whose
   minion has been silent past `stall_threshold_ms`; plus recent minion
   errors for context.
@@ -215,15 +216,20 @@ the judgment; the dispatch surface is the mechanical hand.
   (`POST /api/dispatch/review … by=silas`). Attribution lands as
   `silas.pr-registered` / `silas.review-triggered` ledger events.
 - **The recurrence ladder (no hard round cap).** While blockers evolve,
-  fix rounds re-enter review without limit. When the SAME canonical
-  blocker (normalized category/location/title fingerprint) recurs across
-  consecutive verdict rounds, the digest names the rung and Silas executes
-  it through `/api/silas/*`: `directive_at` (default 2) → fix directive to
-  the implementing minion; `rebrief_at` (default 3) → re-brief a FRESH
-  minion on the same lane; `escalate_at` (default 4) → action-required
-  notification surfaced to the Gru chat. Escalation always beats an
-  endless loop. Every rung lands as `silas.directive-sent`,
-  `silas.rebrief`, or `silas.escalated`.
+  fix rounds re-enter review without limit. A changes-requested verdict
+  awaiting follow-through always gets at least the first fix directive per
+  blocker (a new blocker included — otherwise the lane could never
+  re-open). A settled directive/re-brief turn lands as a `job.delivered`
+  event carrying the lane head it produced; the digest only fires the
+  re-review when that head moved past the round's reviewed target. When
+  the SAME canonical blocker (normalized category/location/title
+  fingerprint) recurs across consecutive verdict rounds, the digest names
+  the rung and Silas executes it through `/api/silas/*`: `directive_at`
+  (default 2) → fix directive to the implementing minion; `rebrief_at`
+  (default 3) → re-brief a FRESH minion on the same lane; `escalate_at`
+  (default 4) → action-required notification surfaced to the Gru chat.
+  Escalation always beats an endless loop. Every rung lands as
+  `silas.directive-sent`, `silas.rebrief`, or `silas.escalated`.
 - **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,
   track, close; never product code; never merge; preserve before remove;
   escalate with pointers. Silas acts only through the authenticated ops

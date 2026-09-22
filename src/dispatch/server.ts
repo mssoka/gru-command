@@ -6,7 +6,7 @@ import type { LedgerApi } from '../ledger/api.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
-import { rebriefFreshMinion, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
+import { rebriefFreshMinion, recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
 import type { WorktreePort } from './worktree-port.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -299,7 +299,23 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         },
       });
       flipJobToWorking(options.ledger, jobId);
-      json(res, 200, { job_id: jobId, minion_id: delivery.minionId ?? null });
+      // The follow-up delivery signal: the directive turn settled, so record
+      // the delivery (with the lane head it produced) that re-arms review.
+      const followUp = recordFollowUpDelivery({
+        ledger: options.ledger,
+        worktrees: ops.worktrees,
+        jobId,
+        agentId: delivery.minionId ?? null,
+        source: 'silas-directive',
+      });
+      if (followUp.note !== null) {
+        log('warn', 'silas follow-up delivery has no resolvable lane head', {
+          job: jobId,
+          lane: followUp.lanePath,
+          note: followUp.note,
+        });
+      }
+      json(res, 200, { job_id: jobId, minion_id: delivery.minionId ?? null, delivered_sha: followUp.sha });
       return true;
     }
     if (req.method === 'POST' && path === '/api/silas/rebrief') {
@@ -335,7 +351,23 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         payload: { minion_id: result.minionId, lane: result.lanePath, note },
       });
       flipJobToWorking(options.ledger, jobId);
-      json(res, 200, { job_id: jobId, minion_id: result.minionId, lane: result.lanePath });
+      // The follow-up delivery signal: the fresh minion's re-brief turn
+      // settled; record the delivery that re-arms the re-review.
+      const followUp = recordFollowUpDelivery({
+        ledger: options.ledger,
+        worktrees: ops.worktrees,
+        jobId,
+        agentId: result.minionId,
+        source: 'silas-rebrief',
+      });
+      if (followUp.note !== null) {
+        log('warn', 'silas follow-up delivery has no resolvable lane head', {
+          job: jobId,
+          lane: followUp.lanePath,
+          note: followUp.note,
+        });
+      }
+      json(res, 200, { job_id: jobId, minion_id: result.minionId, lane: result.lanePath, delivered_sha: followUp.sha });
       return true;
     }
     if (req.method === 'POST' && path === '/api/silas/escalate') {

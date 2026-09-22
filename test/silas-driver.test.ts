@@ -1,14 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  adviseFollowThrough,
   adviseRecurrence,
   blockerFingerprint,
   buildWakePrompt,
   computeSilasDigest,
   consecutiveRecurrence,
+  consolidatedBlockersFor,
+  deliveredTargetSha,
   digestActionCount,
+  followUpChangedTarget,
   loadSilasSkills,
   SilasDriver,
   type DigestLedger,
@@ -21,7 +25,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
-import type { JobRecord, RoundRecord } from '../src/ledger/api.js';
+import type { EventRecord, JobRecord, RoundRecord } from '../src/ledger/api.js';
 import type { Role } from '../src/config.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
@@ -78,6 +82,62 @@ describe('blocker recurrence policy', () => {
     expect(adviseRecurrence(2, { directiveAt: 2, rebriefAt: 5, escalateAt: 7 })).toBe('directive');
     expect(adviseRecurrence(5, { directiveAt: 2, rebriefAt: 5, escalateAt: 7 })).toBe('rebrief');
     expect(adviseRecurrence(7, { directiveAt: 2, rebriefAt: 5, escalateAt: 7 })).toBe('escalate');
+  });
+
+  it('an unhandled verdict gets the first fix directive for a NEW blocker; recurrences keep the 2/3/4 ladder', () => {
+    // The first NEEDS CHANGES verdict must hand the fix to the minion —
+    // monitor here was the dead branch: no rung ever landed, no round 2 existed.
+    expect(adviseFollowThrough(1, DEFAULT_SILAS_CONFIG)).toBe('directive');
+    // same blocker twice → directive again; third → re-brief; fourth → escalate
+    expect(adviseFollowThrough(2, DEFAULT_SILAS_CONFIG)).toBe('directive');
+    expect(adviseFollowThrough(3, DEFAULT_SILAS_CONFIG)).toBe('rebrief');
+    expect(adviseFollowThrough(4, DEFAULT_SILAS_CONFIG)).toBe('escalate');
+    expect(adviseFollowThrough(9, DEFAULT_SILAS_CONFIG)).toBe('escalate');
+    // no verdict rounds at all → nothing to direct
+    expect(adviseFollowThrough(0, DEFAULT_SILAS_CONFIG)).toBe('monitor');
+    // configured thresholds still floor at the first directive
+    expect(adviseFollowThrough(1, { directiveAt: 5, rebriefAt: 6, escalateAt: 7 })).toBe('directive');
+    expect(adviseFollowThrough(6, { directiveAt: 5, rebriefAt: 6, escalateAt: 7 })).toBe('rebrief');
+  });
+});
+
+// ------------------------------------------------------------------
+// Re-review freshness (the follow-up delivery signal)
+// ------------------------------------------------------------------
+
+describe('re-review freshness predicate', () => {
+  const delivery = (payload: unknown): EventRecord => ({
+    seq: 99,
+    ts: '2026-09-21T00:00:00.000Z',
+    kind: 'job.delivered',
+    agentId: 'minion-1',
+    jobId: 'job-x',
+    roundId: null,
+    lens: null,
+    payload,
+  });
+
+  it('reads the head sha a delivery recorded, never a fabricated one', () => {
+    expect(deliveredTargetSha(delivery({ sha: 'abc' }))).toBe('abc');
+    expect(deliveredTargetSha(delivery({ agentId: 'a1' }))).toBeNull();
+    expect(deliveredTargetSha(delivery({ sha: '' }))).toBeNull();
+    expect(deliveredTargetSha(delivery({ sha: 7 }))).toBeNull();
+    expect(deliveredTargetSha(delivery(null))).toBeNull();
+  });
+
+  it('warrants a round only when the delivery proves the head moved past the reviewed target', () => {
+    // moved head → re-review due
+    expect(followUpChangedTarget(delivery({ sha: 'sha-fixed' }), { targetRef: 'sha-reviewed' })).toBe(true);
+    // same head the round already reviewed → no round
+    expect(followUpChangedTarget(delivery({ sha: 'sha-reviewed' }), { targetRef: 'sha-reviewed' })).toBe(false);
+    // no recorded head (initial dispatch deliveries) → cannot prove a move → no round
+    expect(followUpChangedTarget(delivery({ agentId: 'a1' }), { targetRef: 'sha-reviewed' })).toBe(false);
+    // no reviewed target → nothing to compare → no round
+    expect(followUpChangedTarget(delivery({ sha: 'sha-fixed' }), { targetRef: null })).toBe(false);
+    // event seqs are NOT freshness: this is the old always-true cross-domain bug
+    const stale = delivery({ sha: 'sha-reviewed' });
+    expect((stale as { seq: number }).seq > 50).toBe(true);
+    expect(followUpChangedTarget(stale, { targetRef: 'sha-reviewed' })).toBe(false);
   });
 });
 
@@ -193,14 +253,15 @@ describe('silas digest (the four actionable states)', () => {
     const h = makeLedger();
     try {
       addJobWithDelivery(h.ledger, 'job-fix', { prUrl: 'https://git.example.invalid/o/r/pull/7' });
-      const round: RoundRecord = h.ledger.addRound({ jobId: 'job-fix', lenses: ['blind'] });
+      const round: RoundRecord = h.ledger.addRound({ jobId: 'job-fix', lenses: ['blind'], targetRef: 'sha-reviewed' });
       h.ledger.setRoundStatus(round.id, 'live');
       h.ledger.setRoundVerdict(round.id, 'changes-requested');
       h.ledger.setJobStatus('job-fix', 'in-review');
-      // Silas directive rung lands; the lane returns to working; minion delivers again.
+      // Silas directive rung lands; the lane returns to working; the minion's
+      // follow-up turn produces a NEW head (the delivery signal records it).
       h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-fix', payload: {} });
       h.ledger.setJobStatus('job-fix', 'working');
-      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-fix', payload: {} });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-fix', payload: { sha: 'sha-fixed' } });
 
       const digest = await computeSilasDigest({
         ledger: h.ledger,
@@ -216,7 +277,41 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
-  it('recurring same blocker climbs the ladder; evolving blockers stay on monitor', async () => {
+  it('re-review fires only for a moved head: the reviewed head and a missing head stay quiet', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-fresh', { prUrl: 'https://git.example.invalid/o/r/pull/8' });
+      const round = h.ledger.addRound({ jobId: 'job-fresh', lenses: ['blind'], targetRef: 'sha-reviewed' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setJobStatus('job-fresh', 'in-review');
+      h.ledger.setJobStatus('job-fresh', 'working');
+      const digestOf = () =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+        });
+
+      // The follow-up turn settled on exactly the head the round reviewed: no round.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-fresh', payload: { sha: 'sha-reviewed' } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+
+      // A delivery with no recorded head cannot prove a move: still no round.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-fresh', payload: { agentId: 'a9' } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+
+      // The next follow-up delivery moved the lane: re-review due.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-fresh', payload: { sha: 'sha-fixed' } });
+      const moved = await digestOf();
+      expect(moved.prWithoutReview.map((row) => row.jobId)).toEqual(['job-fresh']);
+      expect(moved.prWithoutReview[0]?.priorRounds).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a first or evolving blocker gets the first fix directive; the same blocker twice keeps the ladder; a landed rung stops the state', async () => {
     const h = makeLedger();
     try {
       addJobWithDelivery(h.ledger, 'job-loop', { prUrl: 'https://git.example.invalid/o/r/pull/9' });
@@ -242,7 +337,8 @@ describe('silas digest (the four actionable states)', () => {
       });
       expect(first.verdictsAwaitingDirective).toHaveLength(1);
       expect(first.verdictsAwaitingDirective[0]?.recurringBlockers[0]?.consecutiveRounds).toBe(1);
-      expect(first.verdictsAwaitingDirective[0]?.recurringBlockers[0]?.advice).toBe('monitor');
+      // the FIRST verdict must open the loop — monitor here was the dead branch
+      expect(first.verdictsAwaitingDirective[0]?.recurringBlockers[0]?.advice).toBe('directive');
 
       // round 2: same blocker again → directive rung
       const r2 = h.ledger.addRound({ jobId: 'job-loop', lenses: ['blind'] });
@@ -260,7 +356,7 @@ describe('silas digest (the four actionable states)', () => {
       expect(second.verdictsAwaitingDirective[0]?.recurringBlockers[0]?.advice).toBe('directive');
 
       // round 3: the blocker EVOLVED (fixed) and a NEW blocker appeared —
-      // the loop continues: the new blocker is on monitor, not the ladder.
+      // the loop continues: the new blocker gets its own first directive.
       const r3 = h.ledger.addRound({ jobId: 'job-loop', lenses: ['blind'] });
       reports.set(r3.id, [{ title: 'brand new defect', location: 'src/b.ts', category: 'security' }]);
       h.ledger.setRoundStatus(r3.id, 'live');
@@ -274,7 +370,7 @@ describe('silas digest (the four actionable states)', () => {
         trigger: 'round.verdict',
       });
       expect(third.verdictsAwaitingDirective[0]?.recurringBlockers).toHaveLength(1);
-      expect(third.verdictsAwaitingDirective[0]?.recurringBlockers[0]?.advice).toBe('monitor');
+      expect(third.verdictsAwaitingDirective[0]?.recurringBlockers[0]?.advice).toBe('directive');
 
       // once a silas rung lands after the verdict, the state stops firing
       h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-loop', payload: {} });
@@ -306,6 +402,65 @@ describe('silas digest (the four actionable states)', () => {
       expect(digest.minionErrors[0]?.error).toBe('provider down');
     } finally {
       h.cleanup();
+    }
+  });
+});
+
+// ------------------------------------------------------------------
+// Consolidated blockers port (the digest's first-fix input)
+// ------------------------------------------------------------------
+
+describe('consolidated blockers port', () => {
+  it('reads blocker findings from the round report; missing or malformed reports are loud notes, never silent empties', async () => {
+    const h = makeLedger();
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-consolidated-'));
+    try {
+      h.ledger.addJob({ id: 'job-port', repo: 'fixture-app', title: 't', briefing: 'b' });
+      const round = h.ledger.addRound({ jobId: 'job-port', lenses: ['blind'] });
+      h.ledger.appendCustomEvent({
+        kind: 'round.perkins-review',
+        jobId: 'job-port',
+        roundId: round.id,
+        payload: { artifactDirectory: dir },
+      });
+      writeFileSync(
+        join(dir, 'consolidated.json'),
+        JSON.stringify({
+          findings: [
+            { severity: 'blocker', category: 'correctness', title: 'boom', location: 'src/a.ts' },
+            { severity: 'warning', category: 'style', title: 'meh', location: 'src/b.ts' },
+            { severity: 'blocker', category: 'security', location: 'src/c.ts' },
+          ],
+        }),
+      );
+      const port = consolidatedBlockersFor(h.ledger);
+      const read = await port(round.id);
+      expect(read.blockers).toEqual([
+        { category: 'correctness', title: 'boom', location: 'src/a.ts' },
+        { category: 'security', title: '', location: 'src/c.ts' },
+      ]);
+      expect(read.note).toBeNull();
+
+      // No recorded report → a loud note, never a silent empty.
+      const bare = h.ledger.addRound({ jobId: 'job-port', lenses: ['blind'] });
+      const missing = await port(bare.id);
+      expect(missing.blockers).toEqual([]);
+      expect(missing.note).toContain('no consolidated report recorded');
+
+      // A malformed report → a loud note too.
+      writeFileSync(join(dir, 'consolidated.json'), JSON.stringify({ notFindings: true }));
+      const malformed = await port(round.id);
+      expect(malformed.blockers).toEqual([]);
+      expect(malformed.note).toContain('no findings array');
+
+      // An unreadable file → loud note, never a throw that blinds the sweep.
+      rmSync(join(dir, 'consolidated.json'));
+      const unreadable = await port(round.id);
+      expect(unreadable.blockers).toEqual([]);
+      expect(unreadable.note).toContain('blockers unavailable');
+    } finally {
+      h.cleanup();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
@@ -372,6 +527,10 @@ function makeDriver(opts: {
   sweepIntervalMs?: number;
   bus?: boolean;
   skills?: readonly SkillModule[];
+  timers?: {
+    setInterval: typeof setInterval;
+    clearInterval: typeof clearInterval;
+  };
 } = {}): DriverHarness {
   const h = makeLedger();
   const prompts: { text: string; owner?: string }[] = [];
@@ -414,6 +573,7 @@ function makeDriver(opts: {
     ops: { baseUrl: 'http://127.0.0.1:7665', configPath: '/instance/config.toml' },
     ...(opts.bus === false ? {} : { bus: h.bus }),
     ...(opts.skills !== undefined ? { skills: opts.skills } : {}),
+    ...(opts.timers !== undefined ? { setInterval: opts.timers.setInterval, clearInterval: opts.timers.clearInterval } : {}),
     log: () => {},
   });
   return {
@@ -568,6 +728,95 @@ describe('silas driver wakes', () => {
       await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-skill' });
       expect(h.prompts[0]?.text).toContain('INJECTED SKILL MARKER');
       expect(h.prompts[0]?.text).not.toContain('ops-dispatch');
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ------------------------------------------------------------------
+// Sweep timer + bus subscription surface (injected seams)
+// ------------------------------------------------------------------
+
+describe('silas driver sweep timer and wake kinds', () => {
+  it('start schedules the configured sweep; a tick wakes actionable lanes; stop clears and unsubscribes', async () => {
+    const ticks: Array<() => void> = [];
+    let cleared = 0;
+    const h = makeDriver({
+      sweepIntervalMs: 1234,
+      timers: {
+        setInterval: ((callback: () => void) => {
+          ticks.push(callback);
+          return { unref() {} } as unknown as ReturnType<typeof setInterval>;
+        }) as unknown as typeof setInterval,
+        clearInterval: (() => {
+          cleared += 1;
+        }) as unknown as typeof clearInterval,
+      },
+    });
+    try {
+      h.driver.start();
+      expect(h.driver.running).toBe(true);
+      expect(ticks).toHaveLength(1);
+      // an empty sweep tick does not wake
+      ticks[0]?.();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(0);
+      // an actionable tick wakes the slot with the sweep trigger
+      addJobWithDelivery(h.ledger, 'job-tick');
+      ticks[0]?.();
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      expect(h.prompts[0]?.text).toContain('trigger: sweep');
+      h.driver.stop();
+      expect(h.driver.running).toBe(false);
+      expect(cleared).toBe(1);
+      // stopped: neither later ticks nor bus events wake the slot
+      ticks[0]?.();
+      h.bus.publish({
+        seq: 1,
+        ts: new Date().toISOString(),
+        kind: 'job.delivered',
+        agentId: null,
+        jobId: 'job-tick',
+        roundId: null,
+        lens: null,
+        payload: {},
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('subscribes to every wake kind: job.delivered, round.verdict, and job.minion-error', async () => {
+    const h = makeDriver();
+    try {
+      h.driver.start();
+      h.bus.publish({
+        seq: 1,
+        ts: new Date().toISOString(),
+        kind: 'round.verdict',
+        agentId: null,
+        jobId: 'job-v',
+        roundId: 'job-v-r1',
+        lens: null,
+        payload: { verdict: 'changes-requested' },
+      });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      expect(h.prompts[0]?.text).toContain('trigger: round.verdict');
+      h.bus.publish({
+        seq: 2,
+        ts: new Date().toISOString(),
+        kind: 'job.minion-error',
+        agentId: null,
+        jobId: 'job-e',
+        roundId: null,
+        lens: null,
+        payload: { error: 'provider down' },
+      });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+      expect(h.prompts[1]?.text).toContain('trigger: job.minion-error');
     } finally {
       h.cleanup();
     }

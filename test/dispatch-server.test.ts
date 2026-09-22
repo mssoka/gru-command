@@ -8,12 +8,13 @@ import type { AddressInfo } from 'node:net';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
-import { loadConfig } from '../src/config.js';
+import { loadConfig, DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
+import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
@@ -53,6 +54,7 @@ interface ServerHarness {
   liveHandles: Map<string, AgentHandle>;
   disposedHandles: string[];
   notifications: NotificationCenter;
+  worktrees: InMemoryWorktreePort;
   close: () => Promise<void>;
 }
 async function boot(opts: {
@@ -162,6 +164,7 @@ async function boot(opts: {
     liveHandles,
     disposedHandles,
     notifications,
+    worktrees,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
       await wave.shutdown();
@@ -505,6 +508,14 @@ describe('dispatch server (E8)', () => {
       const event = h.ledger.listJobEvents('dir-job').find((candidate) => candidate.kind === 'silas.directive-sent');
       expect(event).not.toBeNull();
       expect((event?.payload as { blocker_fingerprint?: string }).blocker_fingerprint).toBe('correctness::src/a.ts::null deref');
+      // The follow-up delivery signal: the settled directive turn is recorded
+      // as a delivery carrying the lane's head (no-op minion → unchanged head).
+      const lane = h.worktrees.listWorktrees({ jobId: 'dir-job' }).find((candidate) => candidate.kind === 'job');
+      const head = execFileSync('git', ['-C', lane!.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const delivered = h.ledger.listJobEvents('dir-job').find((candidate) => candidate.kind === 'job.delivered');
+      expect(delivered).not.toBeNull();
+      expect(delivered?.payload).toMatchObject({ agentId: minionId, source: 'silas-directive', sha: head });
+      expect(field<string>(res.json, 'delivered_sha')).toBe(head);
     } finally {
       await h.close();
     }
@@ -535,6 +546,19 @@ describe('dispatch server (E8)', () => {
       // the re-brief prompt carries the original briefing (still the contract)
       expect(h.minionPrompts.some((entry) => entry.startsWith('cwd='))).toBe(true);
       expect(h.ledger.listAgents().some((agent) => agent.jobId === 'rebrief-job' && agent.role === 'minion')).toBe(true);
+      // the fresh minion's turn committed, and the follow-up delivery signal
+      // recorded the moved head the re-review freshness predicate reads
+      const lane = h.worktrees.listWorktrees({ jobId: 'rebrief-job' }).find((candidate) => candidate.kind === 'job');
+      const head = execFileSync('git', ['-C', lane!.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const delivered = h.ledger.listJobEvents('rebrief-job').find((candidate) => candidate.kind === 'job.delivered');
+      expect(delivered).not.toBeNull();
+      expect(delivered?.payload).toMatchObject({
+        agentId: `agent-${h.spawns.length}`,
+        source: 'silas-rebrief',
+        sha: head,
+      });
+      expect(head).not.toBe(lane?.sha);
+      expect(field<string>(res.json, 'delivered_sha')).toBe(head);
     } finally {
       await h.close();
     }
@@ -565,6 +589,78 @@ describe('dispatch server (E8)', () => {
         job_id: 'no-such-job', directive: 'fix it',
       }, TOKEN);
       expect(unknown.status).toBe(400);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the follow-up delivery signal arms the re-review only when the lane head moved past the reviewed target', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-freshness');
+    cleanupRepos.push(repo);
+    const laneOf = (jobId: string) =>
+      h.worktrees.listWorktrees({ jobId }).find((candidate) => candidate.kind === 'job');
+    const headOf = (path: string) =>
+      execFileSync('git', ['-C', path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const digestOf = () =>
+      computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+    try {
+      // (A) a directive whose turn produced NO new commit: the delivery
+      // records the reviewed head, so no re-review round is manufactured.
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'fresh-noop', repo_path: repo.path, title: 'noop fix', briefing: 'b',
+      }, TOKEN);
+      h.ledger.setJobPr('fresh-noop', PR_URL);
+      const noopLane = laneOf('fresh-noop')!;
+      const noopHead = headOf(noopLane.path);
+      h.ledger.addRound({ jobId: 'fresh-noop', lenses: ['blind'], targetRef: noopHead });
+      h.ledger.setJobStatus('fresh-noop', 'in-review');
+      const noopMinion = `agent-${h.spawns.length}`;
+      h.ledger.registerAgent({ id: noopMinion, role: 'minion', jobId: 'fresh-noop' });
+      h.liveHandles.set(noopMinion, {
+        role: 'minion',
+        id: noopMinion,
+        sessionFile: null,
+        capabilities: FAKE_CAPABILITIES,
+        prompt: async () => {},
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
+        async dispose() {},
+      });
+      const noop = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'fresh-noop', directive: 'fix it',
+      }, TOKEN);
+      expect(noop.status).toBe(200);
+      expect(field<string>(noop.json, 'delivered_sha')).toBe(noopHead);
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+
+      // (B) a directive whose fallback minion committed: the delivery head
+      // moves past the reviewed target → the re-review is due again.
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'fresh-moved', repo_path: repo.path, title: 'real fix', briefing: 'b',
+      }, TOKEN);
+      h.ledger.setJobPr('fresh-moved', PR_URL);
+      const movedLane = laneOf('fresh-moved')!;
+      const reviewedHead = headOf(movedLane.path);
+      h.ledger.addRound({ jobId: 'fresh-moved', lenses: ['blind'], targetRef: reviewedHead });
+      h.ledger.setJobStatus('fresh-moved', 'in-review');
+      const moved = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'fresh-moved', directive: 'fix the real thing',
+      }, TOKEN);
+      expect(moved.status).toBe(200);
+      const movedSha = field<string>(moved.json, 'delivered_sha');
+      expect(movedSha).not.toBe(reviewedHead);
+      expect(movedSha).toBe(headOf(movedLane.path));
+      const digest = await digestOf();
+      expect(digest.prWithoutReview.map((row) => row.jobId)).toEqual(['fresh-moved']);
+      expect(digest.prWithoutReview[0]?.priorRounds).toBe(1);
     } finally {
       await h.close();
     }

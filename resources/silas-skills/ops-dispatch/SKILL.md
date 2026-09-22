@@ -43,15 +43,16 @@ through the ops surface, never by improvising side channels.
    and the digest stops listing the job.
 
 3. **NEEDS CHANGES verdict awaiting follow-through.** The digest lists the
-   round's recurring blockers with `consecutive_rounds` and the advised
-   rung:
-   - `monitor` (blocker is new or evolving): the loop continues — do
-     nothing yet; the next verdict re-arms you.
+   round's blockers with `consecutive_rounds` and the advised rung:
    - `directive`: send a fix directive naming each blocker with its
      evidence, via `POST /api/silas/directive`
      `{"job_id":"<job>","directive":"...","blocker_fingerprint":"..."}`.
-     The service routes it to the live minion (or a fresh one on the lane)
-     and flips the job back to working.
+     A NEW blocker gets this rung too — it is the first fix directive, and
+     without it the lane can never re-open. The service routes the
+     directive to the live minion (or a fresh one on the lane), flips the
+     job back to working, and records the follow-up delivery when the turn
+     settles; that delivery, against the lane head it produced, is what
+     re-arms the re-review.
    - `rebrief`: same endpoint philosophy, but the lane needs a fresh
      worker: `POST /api/silas/rebrief {"job_id":"<job>","note":"..."}`.
      The note must carry what stalled and what to do differently.

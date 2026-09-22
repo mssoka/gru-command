@@ -94,6 +94,24 @@ export function adviseRecurrence(
   return 'monitor';
 }
 
+/**
+ * The action for a blocker on an UNHANDLED changes-requested verdict (the
+ * digest lists a verdict only while no silas rung has landed after it).
+ * This is NOT the recurrence ladder alone: a blocker on its FIRST verdict
+ * still gets the first fix directive — the verdict must be handed to the
+ * implementing minion, or the lane never re-opens, no second round can
+ * exist, and the 2/3/4 ladder is unreachable. Recurrences then climb the
+ * ladder unchanged (directive → re-brief → escalate).
+ */
+export function adviseFollowThrough(
+  consecutiveRounds: number,
+  thresholds: Pick<SilasConfig, 'directiveAt' | 'rebriefAt' | 'escalateAt'>,
+): RecurrenceAdvice {
+  if (consecutiveRounds <= 0) return 'monitor';
+  const recurrence = adviseRecurrence(consecutiveRounds, thresholds);
+  return recurrence === 'monitor' ? 'directive' : recurrence;
+}
+
 // ------------------------------------------------------------------
 // Digest (the four actionable states)
 // ------------------------------------------------------------------
@@ -246,6 +264,33 @@ export interface ComputeDigestInput {
   readonly now?: () => number;
 }
 
+/** The head sha a delivery event recorded (`job.delivered.payload.sha`) —
+ * the follow-up signal's freshness witness; null when absent. */
+export function deliveredTargetSha(event: EventRecord): string | null {
+  const payload = event.payload;
+  if (typeof payload !== 'object' || payload === null) return null;
+  const sha = (payload as { sha?: unknown }).sha;
+  return typeof sha === 'string' && sha !== '' ? sha : null;
+}
+
+/**
+ * The re-review freshness predicate: a re-review is warranted only when the
+ * newest delivery PROVES the lane moved past the round's reviewed target.
+ * Never compare `events.seq` with `rounds.seq` — those are different domains
+ * (global event AUTOINCREMENT vs per-job round ordinal) and the comparison is
+ * effectively always true, so an unchanged head would manufacture phantom
+ * rounds. No recorded head, or the same head the round already reviewed →
+ * no round.
+ */
+export function followUpChangedTarget(
+  delivered: EventRecord,
+  round: Pick<RoundRecord, 'targetRef'>,
+): boolean {
+  const sha = deliveredTargetSha(delivered);
+  const target = round.targetRef;
+  return sha !== null && target !== null && target !== '' && sha !== target;
+}
+
 /**
  * The compact digest of actionable ops states, computed from the ledger
  * alone (the ledger is the record; no runtime or filesystem probing beyond
@@ -253,12 +298,15 @@ export interface ComputeDigestInput {
  *
  * 1. deliveredWithoutPr — job delivered (completion turn settled) but no
  *    PR registered and no review round yet: find and register the PR.
- * 2. prWithoutReview — PR registered and the newest delivery is newer than
- *    the newest review round (or no round at all): request the wave. This
- *    is both the first review and the re-review after a fix round.
+ * 2. prWithoutReview — PR registered and the newest delivery proves the
+ *    lane moved past the newest round's reviewed target (or no round exists
+ *    yet): request the wave. This is both the first review and the
+ *    re-review after a fix round — a delivery on the SAME head the round
+ *    already reviewed warrants no new round.
  * 3. verdictsAwaitingDirective — the newest round recorded NEEDS CHANGES
  *    and no silas follow-through has landed since that verdict: deliver the
- *    ladder's rung (directive → re-brief → escalate) for recurring blockers.
+ *    first fix directive per blocker, then the ladder's rung (directive →
+ *    re-brief → escalate) for recurrences.
  * 4. stalledWorking — job working with no delivery while its minion has
  *    shown no activity past the stall threshold: assess the lane.
  *
@@ -316,7 +364,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       job.status === 'working' &&
       newestRound !== null &&
       delivered !== null &&
-      delivered.seq > newestRound.seq
+      followUpChangedTarget(delivered, newestRound)
     ) {
       digest.prWithoutReview.push({
         jobId: job.id,
@@ -361,7 +409,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
             ...blocker,
             fingerprint,
             consecutiveRounds,
-            advice: adviseRecurrence(consecutiveRounds, input.config),
+            advice: adviseFollowThrough(consecutiveRounds, input.config),
           });
         }
         digest.verdictsAwaitingDirective.push({
@@ -675,10 +723,11 @@ export function buildWakePrompt(input: {
     '## Recurrence policy (the ladder — no hard round cap)',
     '',
     'While blockers evolve, the loop continues: fix rounds re-enter review',
-    'without limit. When the SAME canonical blocker (same fingerprint) recurs',
-    'across consecutive verdict rounds, follow the advice named per blocker:',
-    'directive → re-brief a fresh minion → escalate. Escalation always beats',
-    'an endless loop.',
+    'without limit. A changes-requested verdict awaiting follow-through gets',
+    'at least the first fix directive per blocker; when the SAME canonical',
+    'blocker (same fingerprint) recurs across consecutive verdict rounds,',
+    'follow the advice named per blocker: directive → re-brief a fresh',
+    'minion → escalate. Escalation always beats an endless loop.',
     '',
     'Reply with a short completion note: what you did per lane, or why you',
     'left it untouched.',

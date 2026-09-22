@@ -2,6 +2,7 @@ import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import { requireSpawnCwd } from '../roles.js';
+import { resolveGitCommit } from './perkins-review/artifacts.js';
 import type { WorktreePort } from './worktree-port.js';
 
 /**
@@ -73,6 +74,44 @@ function racedPrompt(handle: { prompt(text: string, options?: { owner?: string }
       signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
     }),
   ]);
+}
+
+/**
+ * The follow-up delivery signal (the loop's close, not a blind re-fire):
+ * a settled directive or re-brief minion turn IS the implementing minion's
+ * delivery. Record it as `job.delivered` — the same event the initial
+ * briefing turn records — carrying the lane head the turn produced. The
+ * digest's freshness predicate reads that sha against the round's reviewed
+ * target: a moved head warrants the re-review; the same head does not.
+ */
+export function recordFollowUpDelivery(input: {
+  readonly ledger: Pick<LedgerApi, 'appendCustomEvent'>;
+  readonly worktrees: Pick<WorktreePort, 'listWorktrees'>;
+  readonly jobId: string;
+  readonly agentId: string | null;
+  readonly source: 'silas-directive' | 'silas-rebrief';
+}): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null } {
+  const jobLanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job');
+  const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];
+  let sha: string | null = null;
+  let note: string | null = null;
+  if (lane !== undefined) {
+    try {
+      sha = resolveGitCommit(lane.path, lane.branch !== null && lane.branch !== '' ? lane.branch : 'HEAD');
+    } catch (error) {
+      // The turn settled — the delivery stands; a head we cannot resolve only
+      // means the digest cannot prove a move, so no phantom re-review fires.
+      note = `lane head unresolved: ${String(error).slice(0, 200)}`;
+    }
+  } else {
+    note = 'no job lane in the registry to resolve a head from';
+  }
+  input.ledger.appendCustomEvent({
+    kind: 'job.delivered',
+    jobId: input.jobId,
+    payload: { agentId: input.agentId, source: input.source, sha },
+  });
+  return { sha, lanePath: lane?.path ?? null, note };
 }
 
 /** Render the prompt handed to a FRESH minion taking over a stuck lane:
