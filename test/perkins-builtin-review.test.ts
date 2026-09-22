@@ -280,8 +280,10 @@ describe('bundled Perkins policy and deterministic contracts', () => {
   });
 
   // The packed product is rebuilt end-to-end (`npm pack` runs prepack:
-  // build:web + backend build + verifier), which exceeds the global 30s test
-  // bound on slower machines while the subprocess itself is bounded at 120s.
+  // build:web + backend build + verifier). Under a loaded shared machine the
+  // subprocess has been observed past 120s, so it gets 300s and the test 360s:
+  // the subprocess bound fires cleanly before the test bound, instead of
+  // vitest killing npm and orphaning a half-finished build tree.
   it('packs, extracts, verifies, and MCP-smokes the rebuilt source-free product under an empty home', async () => {
     const productRoot = join(import.meta.dirname, '..');
     const packRoot = temp('perkins-pack-source-');
@@ -318,7 +320,7 @@ describe('bundled Perkins policy and deterministic contracts', () => {
     const packOutput = execFileSync('npm', ['pack', '--json', '--pack-destination', tarRoot], {
       cwd: packRoot,
       encoding: 'utf8',
-      timeout: 120_000,
+      timeout: 300_000,
       maxBuffer: 32 * 1024 * 1024,
       env: { ...process.env, HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
     });
@@ -424,7 +426,7 @@ describe('bundled Perkins policy and deterministic contracts', () => {
       identity: 'perkins-code-review', protocolVersion: '2024-11-05', listed: true, called: true,
       silasSkills: ['ops-dispatch', 'ledger-closeout'],
     });
-  }, 300_000);
+  }, 360_000);
 
   it('fails loud for missing, malformed, and identity-corrupt policy resources', () => {
     const root = temp('perkins-policy-failure-');
