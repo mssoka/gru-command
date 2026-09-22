@@ -209,6 +209,26 @@ describe('ledger api — the record of state', () => {
     expect(api.listLensBindings('wire-agent')).toEqual([{ roundId: round.id, lens: 'edge' }]);
   });
 
+  it('listEventsAfter + latestEventSeq: bounded windows strictly after a cursor', () => {
+    const base = api.latestEventSeq();
+    expect(base).toBeGreaterThan(0);
+    const first = api.appendCustomEvent({ kind: 'digest.one', payload: { n: 1 } });
+    const second = api.appendCustomEvent({ kind: 'digest.two', payload: { n: 2 } });
+    const third = api.appendCustomEvent({ kind: 'digest.three', payload: { n: 3 } });
+    expect(api.latestEventSeq()).toBe(third.seq);
+    // Strictly-after + oldest-first by default.
+    expect(api.listEventsAfter(base).map((e) => e.seq)).toEqual([first.seq, second.seq, third.seq]);
+    expect(api.listEventsAfter(first.seq).map((e) => e.kind)).toEqual(['digest.two', 'digest.three']);
+    // Newest-first + limit = the window shape the digest reads.
+    expect(api.listEventsAfter(base, { order: 'desc', limit: 2 }).map((e) => e.seq)).toEqual([
+      third.seq,
+      second.seq,
+    ]);
+    // Kind filter narrows the scan (notification events for action notes).
+    expect(api.listEventsAfter(base, { kinds: ['digest.two'] }).map((e) => e.seq)).toEqual([second.seq]);
+    expect(api.listEventsAfter(third.seq)).toEqual([]);
+  });
+
   it('a restarted ledger (same file) serves the full record — the board rebuilds from it', () => {
     db.close();
     const dataDir = cleanupDirs[0] as string; // the dir from beforeAll

@@ -295,6 +295,35 @@ export class LedgerApi {
     ).map((row) => this.eventFromRow(row));
   }
 
+  /** Events strictly after `seq` (the awareness digest window), bounded and
+   * ordered — oldest-first by default, newest-first with `order: 'desc'`.
+   * `kinds` narrows to an explicit set (empty/omitted = every kind). */
+  listEventsAfter(
+    seq: number,
+    opts: { limit?: number; order?: 'asc' | 'desc'; kinds?: readonly string[] } = {},
+  ): readonly EventRecord[] {
+    const limit = opts.limit ?? 100;
+    const order = opts.order === 'desc' ? 'DESC' : 'ASC';
+    const kinds = opts.kinds;
+    const where =
+      kinds === undefined || kinds.length === 0
+        ? 'seq > ?'
+        : `seq > ? AND kind IN (${kinds.map(() => '?').join(', ')})`;
+    const params: (number | string)[] = [seq, ...(kinds ?? [])];
+    return (
+      this.db
+        .prepare(`SELECT * FROM events WHERE ${where} ORDER BY seq ${order} LIMIT ?`)
+        .all(...params, limit) as Row[]
+    ).map((row) => this.eventFromRow(row));
+  }
+
+  /** Highest events.seq, or 0 when the table is empty. The cursor the Gru
+   * awareness digest advances past one delivered turn at a time. */
+  latestEventSeq(): number {
+    const row = this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get() as Row;
+    return Number(row.seq);
+  }
+
   /** Latest durable event for one review round/kind (restart reconciliation). */
   latestRoundEvent(roundId: string, kind: string): EventRecord | null {
     const row = this.db
