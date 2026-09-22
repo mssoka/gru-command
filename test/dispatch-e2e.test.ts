@@ -176,6 +176,8 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     });
     expect(outcome.job.status).toBe('working');
     expect(await outcome.settled).toEqual({ ok: true });
+    // Settle truth (2026-09-22): the settling turn lands `delivered`.
+    expect(h.ledger.getJob('widget-polish')?.status).toBe('delivered');
 
     // Ruling 17: the minion session is ROOTED IN THE PROJECT WORKTREE.
     const minionSpawn = h.spawns.find((spawn) => spawn.role === 'minion');
@@ -200,7 +202,7 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     let snapshot = h.engine.snapshot();
     const group = snapshot.repos.find((r) => r.name === 'fixture-app');
     expect(group?.jobs).toHaveLength(1);
-    expect(group?.jobs[0]?.status).toBe('working');
+    expect(group?.jobs[0]?.status).toBe('delivered');
     expect(group?.jobs[0]?.id).toBe('widget-polish');
     const events = h.ledger.listEvents({ limit: 100 });
     expect(events.some((e) => e.kind === 'job.handoff')).toBe(true);
@@ -213,6 +215,14 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     // --- The PR link lands; review wave runs; verdict consolidates. ---
     h.dispatch.recordPr('widget-polish', PR_URL);
     expect(h.ledger.getJob('widget-polish')?.prUrl).toBe(PR_URL);
+    // A registered PR opens the review window: delivered → in-review.
+    expect(h.ledger.getJob('widget-polish')?.status).toBe('in-review');
+    const jobHops = h.ledger
+      .listEvents({ limit: 100 })
+      .filter((e) => e.kind === 'job.status' && e.jobId === 'widget-polish')
+      .map((e) => (e.payload as { to: string }).to)
+      .reverse();
+    expect(jobHops).toEqual(['working', 'delivered', 'in-review']);
     const waveOutcome = asWave(await h.wave.runRound({ jobId: 'widget-polish' }));
     expect(waveOutcome.verdict).toBe('approved');
     expect(waveOutcome.posted).toBe(true);
@@ -278,7 +288,44 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     const settled = await outcome.settled;
     expect(settled.ok).toBe(false);
     expect(settled.error).toMatch(/turn exploded/);
+    // Settle truth: a failed turn blocks the job (which derives the
+    // existing blocked notification through the job.status event).
+    expect(failed.ledger.getJob('job-fail')?.status).toBe('blocked');
     const kinds = failed.ledger.listEvents({ limit: 100 }).map((e) => e.kind);
     expect(kinds).toContain('job.minion-error');
+  });
+
+  it('a PR registered before the turn settles wins: the settle leaves in-review in place', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const h = harness({ minionSettle: () => gate });
+
+    const outcome = await h.dispatch.dispatch({
+      jobId: 'job-early-pr',
+      repoPath: h.repo.path,
+      title: 'early PR',
+      briefing: 'open the PR before the turn ends',
+    });
+    expect(h.ledger.getJob('job-early-pr')?.status).toBe('working');
+    // The PR link lands mid-turn: working → in-review.
+    expect(h.dispatch.recordPr('job-early-pr', PR_URL).status).toBe('in-review');
+    release();
+    expect(await outcome.settled).toEqual({ ok: true });
+    // The delivered event is still recorded, but the newer in-review truth
+    // stands — no illegal in-review → delivered hop is forced.
+    expect(h.ledger.getJob('job-early-pr')?.status).toBe('in-review');
+    expect(h.ledger.listEvents({ limit: 100 }).map((e) => e.kind)).toContain('job.delivered');
+  });
+
+  it('a PR link never resurrects a blocked lane (recording only)', async () => {
+    const h = harness();
+    h.ledger.addJob({ id: 'job-blocked-pr', repo: 'fixture-app', title: 'blocked lane' });
+    h.ledger.setJobStatus('job-blocked-pr', 'working');
+    h.ledger.setJobStatus('job-blocked-pr', 'blocked');
+    const job = h.dispatch.recordPr('job-blocked-pr', PR_URL);
+    expect(job.prUrl).toBe(PR_URL);
+    expect(job.status).toBe('blocked');
   });
 });
