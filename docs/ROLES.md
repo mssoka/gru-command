@@ -9,7 +9,7 @@ fail-loud at boot); this page is the map.
 | Role | Persona file | Cwd policy | Writes | Craft |
 |------|-------------|-----------|--------|-------|
 | Gru | `roles/gru.md` | workspace root | chat only | judgment: consult, plan-before-heist, dispatch, verify |
-| Silas | `roles/silas.md` | workspace root | ledger/ops | operations: briefings are contracts, lanes, sweeps, close-outs |
+| Silas | `roles/silas.md` | workspace root | ledger/ops | operations: briefings are contracts, lanes, sweeps, close-outs; hosted as the `silas-ops` slot with follow-through + recurrence duties (`docs/FLOW.md`) |
 | minion | `roles/minion.md` | **spawn-provided** (the job worktree) | code | one briefing per lane, verified work, honest commits |
 | Perkins | `roles/perkins.md` | **spawn-provided** (frozen detached review tree) | review artifacts only | one hybrid lead delegates, verifies, audits, reconciles, and reports through narrow host tools |
 | Bob | `roles/bob.md` | workspace root | memory files | periodic consolidation with provenance |

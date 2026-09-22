@@ -114,6 +114,33 @@ export interface DispatchConfig {
   readonly bobIntervalMs: number;
 }
 
+/** Silas ops-hosting policy (E8 follow-through; owner ruling 2026-09-21).
+ * Silas closes the delivered→PR→review loop himself and breaks recurring
+ * blocker loops; this section tunes his watchtower, never his authority. */
+export interface SilasConfig {
+  /** Master switch: false declares no silas slot and fires no wakes. */
+  readonly enabled: boolean;
+  /** Periodic sweep interval; 0 disables the sweep (event wakes still fire). */
+  readonly sweepIntervalMs: number;
+  /** A working job whose minion shows no activity for this long is stalled. */
+  readonly stallThresholdMs: number;
+  /** Consecutive same-blocker rounds before a fix directive is advised. */
+  readonly directiveAt: number;
+  /** Consecutive same-blocker rounds before a fresh-minion re-brief. */
+  readonly rebriefAt: number;
+  /** Consecutive same-blocker rounds before escalation to the chief. */
+  readonly escalateAt: number;
+}
+
+export const DEFAULT_SILAS_CONFIG: SilasConfig = {
+  enabled: true,
+  sweepIntervalMs: 300_000,
+  stallThresholdMs: 1_800_000,
+  directiveAt: 2,
+  rebriefAt: 3,
+  escalateAt: 4,
+};
+
 /** Review gate policy (Perkins primary; bmad-review fallback gate per the
  * 2026-09-20 amendment, fork-3). */
 export interface ReviewConfig {
@@ -175,6 +202,7 @@ export interface GruCommandConfig {
   readonly chat: ChatConfig;
   readonly worktrees: WorktreesConfig;
   readonly dispatch: DispatchConfig;
+  readonly silas: SilasConfig;
   readonly review: ReviewConfig;
   readonly decisions: DecisionsConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
@@ -279,6 +307,7 @@ const TOP_LEVEL_KEYS = [
   'chat',
   'worktrees',
   'dispatch',
+  'silas',
   'review',
   'decisions',
 ] as const;
@@ -469,6 +498,7 @@ export function loadConfig(
   let chat: ChatConfig = { frameLogMaxBytes: 8_388_608, frameLogKeep: 3, notifyWake: 'never' };
   let worktrees: WorktreesConfig | null = null;
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
+  let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let review: ReviewConfig = { enabled: true };
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
   let sourceFile: string | null = null;
@@ -735,6 +765,46 @@ export function loadConfig(
             : dispatch.bobIntervalMs,
       };
     }
+    if (raw['silas'] !== undefined) {
+      const table = requireTable(raw['silas'], file, 'silas');
+      const VALID = ['enabled', 'sweep_interval_ms', 'stall_threshold_ms', 'directive_at', 'rebrief_at', 'escalate_at'];
+      for (const key of Object.keys(table)) {
+        if (!VALID.includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [silas] (valid keys: ${VALID.join(', ')})`,
+            file,
+            `silas.${key}`,
+          );
+        }
+      }
+      const directiveAt =
+        table['directive_at'] !== undefined
+          ? requirePositiveInt(table['directive_at'], file, 'silas.directive_at')
+          : silas.directiveAt;
+      const rebriefAt =
+        table['rebrief_at'] !== undefined
+          ? requirePositiveInt(table['rebrief_at'], file, 'silas.rebrief_at')
+          : silas.rebriefAt;
+      const escalateAt =
+        table['escalate_at'] !== undefined
+          ? requirePositiveInt(table['escalate_at'], file, 'silas.escalate_at')
+          : silas.escalateAt;
+      if (!(directiveAt < rebriefAt && rebriefAt < escalateAt)) {
+        throw new ConfigError(
+          `silas recurrence thresholds must strictly ascend (directive_at ${directiveAt} < rebrief_at ${rebriefAt} < escalate_at ${escalateAt})`,
+          file,
+          'silas.directive_at',
+        );
+      }
+      silas = {
+        enabled: table['enabled'] !== undefined ? requireBool(table['enabled'], file, 'silas.enabled') : silas.enabled,
+        sweepIntervalMs: table['sweep_interval_ms'] !== undefined ? requireNonNegativeInt(table['sweep_interval_ms'], file, 'silas.sweep_interval_ms') : silas.sweepIntervalMs,
+        stallThresholdMs: table['stall_threshold_ms'] !== undefined ? requirePositiveInt(table['stall_threshold_ms'], file, 'silas.stall_threshold_ms') : silas.stallThresholdMs,
+        directiveAt,
+        rebriefAt,
+        escalateAt,
+      };
+    }
     if (raw['review'] !== undefined) {
       const table = requireTable(raw['review'], file, 'review');
       for (const key of Object.keys(table)) {
@@ -805,6 +875,7 @@ export function loadConfig(
       setupTimeoutMs: worktrees?.setupTimeoutMs ?? 120_000,
     },
     dispatch,
+    silas,
     review,
     decisions,
     sourceFile,

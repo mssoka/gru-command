@@ -2,8 +2,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
+import type { LedgerApi } from '../ledger/api.js';
+import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
+import { rebriefFreshMinion, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
+import type { WorktreePort } from './worktree-port.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -14,10 +18,24 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * flow endpoints under /api/dispatch.
  */
 
+/** Silas's ops surface (E8 follow-through; owner ruling 2026-09-21): the
+ * narrow, authenticated endpoints the hosted silas session drives through
+ * its bash tool. No new powers beyond the silas authority (dispatch, track,
+ * close, escalate) — every action lands in the ledger as a silas.* event. */
+export interface SilasOpsSurface {
+  readonly registry: DirectiveRegistry;
+  readonly worktrees: WorktreePort;
+  readonly notifications: NotificationCenter;
+}
+
 export interface DispatchServerOptions {
   readonly config: GruCommandConfig;
   readonly dispatch: DispatchService;
   readonly wave: WaveRunner;
+  /** The record of record — silas.* attribution events land here. */
+  readonly ledger: LedgerApi;
+  /** Absent = /api/silas/* answers 503 (silas ops not hosted). */
+  readonly silasOps?: SilasOpsSurface;
   readonly log?: Log;
 }
 
@@ -66,6 +84,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   const tokenHash = hashToken(options.config.auth.token);
   const configured = tokenConfigured(options.config.auth.token);
   const inFlight = new Set<Promise<unknown>>();
+  const directiveControllers = new Set<AbortController>();
 
   function authed(req: IncomingMessage, res: ServerResponse): boolean {
     if (!configured) {
@@ -126,6 +145,29 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     void promise.finally(() => inFlight.delete(promise)).catch(() => {});
   }
 
+  /** Validate the optional attribution field: only 'silas' records silas.*
+   * ledger events; any other non-empty value is accepted and inert. */
+  function byField(body: Record<string, unknown>): string | undefined {
+    return optStrField(body, 'by');
+  }
+
+  /** The silas ops surface, or null with a 503 already written — the
+   * endpoints are hosted only when silas is enabled in config. */
+  function silasOpsOr503(res: ServerResponse): SilasOpsSurface | null {
+    if (options.silasOps === undefined) {
+      json(res, 503, { error: 'silas_ops_not_hosted', detail: 'silas ops are not hosted on this service' });
+      return null;
+    }
+    return options.silasOps;
+  }
+
+  function flipJobToWorking(ledger: LedgerApi, jobId: string): void {
+    const job = ledger.getJob(jobId);
+    if (job === null || job.status !== 'in-review') return;
+    ledger.setJobStatus(jobId, 'working');
+    ledger.noteJob(jobId, 'silas follow-through: fix loop re-opened, lane back to working');
+  }
+
   async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
     if (req.method === 'POST' && path === '/api/dispatch') {
       if (!authed(req, res)) return true;
@@ -151,13 +193,23 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     if (req.method === 'POST' && path === '/api/dispatch/pr') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
-      const job = options.dispatch.recordPr(strField(body, 'job_id'), strField(body, 'url'));
+      const by = byField(body);
+      const jobId = strField(body, 'job_id');
+      const job = options.dispatch.recordPr(jobId, strField(body, 'url'));
+      if (by === 'silas') {
+        options.ledger.appendCustomEvent({
+          kind: 'silas.pr-registered',
+          jobId,
+          payload: { url: job.prUrl },
+        });
+      }
       json(res, 200, job);
       return true;
     }
     if (req.method === 'POST' && path === '/api/dispatch/review') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
+      const by = byField(body);
       const input = {
         jobId: strField(body, 'job_id'),
         ...(optStrField(body, 'target_ref') !== undefined ? { targetRef: optStrField(body, 'target_ref') } : {}),
@@ -165,6 +217,16 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(optBoolField(body, 'no_spec') !== undefined ? { noSpec: optBoolField(body, 'no_spec') } : {}),
       };
       const outcome = await options.wave.requestReview(input);
+      if (by === 'silas') {
+        options.ledger.appendCustomEvent({
+          kind: 'silas.review-triggered',
+          jobId: input.jobId,
+          payload: {
+            route: outcome.route,
+            ...(outcome.route === 'perkins' ? { round_id: outcome.round.id } : {}),
+          },
+        });
+      }
       if (outcome.route !== 'perkins') {
         // bmad-review fallback gate: findings, triage, and fix directives run
         // in the background; the response names the failed pre-flight legs.
@@ -194,12 +256,122 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       json(res, 200, { worktrees: rows });
       return true;
     }
+    if (req.method === 'POST' && path === '/api/silas/directive') {
+      if (!authed(req, res)) return true;
+      const ops = silasOpsOr503(res);
+      if (ops === null) return true;
+      const body = await readBody(req);
+      const jobId = strField(body, 'job_id');
+      const directive = strField(body, 'directive');
+      const fingerprint = optStrField(body, 'blocker_fingerprint');
+      const job = options.ledger.getJob(jobId);
+      if (job === null) throw new Error(`job "${jobId}" not found`);
+      if (job.status === 'merged' || job.status === 'done') {
+        throw new Error(`job "${jobId}" is ${job.status} — terminal lanes take no directives`);
+      }
+      const controller = new AbortController();
+      directiveControllers.add(controller);
+      let delivery: { delivered: boolean; minionId?: string; note?: string };
+      try {
+        delivery = await routeFixDirectiveToMinion({
+          registry: ops.registry,
+          ledger: options.ledger,
+          worktrees: ops.worktrees,
+          jobId,
+          directive,
+          signal: controller.signal,
+          owner: 'silas-ops',
+        });
+      } finally {
+        directiveControllers.delete(controller);
+      }
+      if (!delivery.delivered) {
+        json(res, 502, { error: 'undelivered', detail: delivery.note ?? 'the directive could not reach the implementing minion' });
+        return true;
+      }
+      options.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId,
+        payload: {
+          minion_id: delivery.minionId ?? null,
+          ...(fingerprint !== undefined ? { blocker_fingerprint: fingerprint } : {}),
+          directive_bytes: Buffer.byteLength(directive, 'utf-8'),
+        },
+      });
+      flipJobToWorking(options.ledger, jobId);
+      json(res, 200, { job_id: jobId, minion_id: delivery.minionId ?? null });
+      return true;
+    }
+    if (req.method === 'POST' && path === '/api/silas/rebrief') {
+      if (!authed(req, res)) return true;
+      const ops = silasOpsOr503(res);
+      if (ops === null) return true;
+      const body = await readBody(req);
+      const jobId = strField(body, 'job_id');
+      const note = strField(body, 'note');
+      const job = options.ledger.getJob(jobId);
+      if (job === null) throw new Error(`job "${jobId}" not found`);
+      if (job.status === 'merged' || job.status === 'done') {
+        throw new Error(`job "${jobId}" is ${job.status} — terminal lanes are never re-briefed`);
+      }
+      const controller = new AbortController();
+      directiveControllers.add(controller);
+      let result: { minionId: string; lanePath: string; prompt: string };
+      try {
+        result = await rebriefFreshMinion({
+          registry: ops.registry,
+          ledger: options.ledger,
+          worktrees: ops.worktrees,
+          jobId,
+          note,
+          briefing: job.briefing,
+        });
+      } finally {
+        directiveControllers.delete(controller);
+      }
+      options.ledger.appendCustomEvent({
+        kind: 'silas.rebrief',
+        jobId,
+        payload: { minion_id: result.minionId, lane: result.lanePath, note },
+      });
+      flipJobToWorking(options.ledger, jobId);
+      json(res, 200, { job_id: jobId, minion_id: result.minionId, lane: result.lanePath });
+      return true;
+    }
+    if (req.method === 'POST' && path === '/api/silas/escalate') {
+      if (!authed(req, res)) return true;
+      const ops = silasOpsOr503(res);
+      if (ops === null) return true;
+      const body = await readBody(req);
+      const title = strField(body, 'title');
+      if (title.length > 500) throw new Error('title exceeds 500 characters');
+      const detail = optStrField(body, 'detail');
+      if (detail !== undefined && detail.length > 4000) throw new Error('detail exceeds 4000 characters');
+      const jobId = optStrField(body, 'job_id');
+      if (jobId !== undefined && options.ledger.getJob(jobId) === null) {
+        throw new Error(`job "${jobId}" not found`);
+      }
+      const notification = ops.notifications.post({
+        kind: 'silas.escalation',
+        routing: 'action-required',
+        severity: 'error',
+        title,
+        ...(detail !== undefined ? { detail } : {}),
+      });
+      options.ledger.appendCustomEvent({
+        kind: 'silas.escalated',
+        ...(jobId !== undefined ? { jobId } : {}),
+        payload: { title, notification_id: notification.id },
+      });
+      json(res, 200, { notification_id: notification.id });
+      return true;
+    }
     return false;
   }
 
   return {
     requestHook(req, res, path): boolean {
-      if (!path.startsWith('/api/dispatch')) return false;
+      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas')) return false;
       const startedAt = Date.now();
       handleApi(req, res, path)
         .then((handled) => {
@@ -224,8 +396,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     },
 
     dispose(): void {
-      // Fire-and-forget lanes are tracked; the manager/service own their
-      // own disposal — this surface just stops claiming requests.
+      // Abort any in-flight directive/re-brief turns so shutdown cannot
+      // stall on a wedged minion session; tracked lanes settle on abort.
+      for (const controller of directiveControllers) controller.abort();
     },
   };
 }

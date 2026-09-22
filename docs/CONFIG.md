@@ -218,6 +218,19 @@ setup_timeout_ms = 120000
 # Bob consolidation interval; 0 disables the periodic trigger.
 bob_interval_ms = 3600000
 
+[silas]
+# Hosted ops session (Silas): closes the delivered→PR→review loop and
+# breaks recurring blocker loops. enabled = false hosts no silas slot and
+# fires no wakes. There is no review-round cap: while blockers evolve the
+# loop continues; the directive/rebrief/escalate thresholds count
+# CONSECUTIVE verdict rounds carrying the SAME canonical blocker.
+enabled = true
+sweep_interval_ms = 300000
+stall_threshold_ms = 1800000
+directive_at = 2
+rebrief_at = 3
+escalate_at = 4
+
 [review]
 # Review gate policy. true keeps Perkins as the primary gate behind the
 # fail-closed four-leg pre-flight (bundled resource integrity, review-model

@@ -64,6 +64,7 @@ export const CONFIG_SECTION_HEADERS: readonly string[] = [
   '[chat]',
   '[worktrees]',
   '[dispatch]',
+  '[silas]',
   '[review]',
 ];
 
@@ -83,6 +84,7 @@ export const CONFIG_ACTIVE_TABLES: readonly string[] = [
   'chat',
   'worktrees',
   'dispatch',
+  'silas',
   'review',
 ];
 
@@ -358,6 +360,19 @@ export function renderReferenceConfig(
     '[dispatch]',
     '# Bob consolidation interval; 0 disables the periodic trigger.',
     `bob_interval_ms = ${preserved?.dispatch.bobIntervalMs ?? 3_600_000}`,
+    '',
+    '[silas]',
+    '# Hosted ops session (Silas): closes the delivered→PR→review loop and',
+    '# breaks recurring blocker loops. enabled = false hosts no silas slot and',
+    '# fires no wakes. There is no review-round cap: while blockers evolve the',
+    '# loop continues; the directive/rebrief/escalate thresholds count',
+    '# CONSECUTIVE verdict rounds carrying the SAME canonical blocker.',
+    `enabled = ${preserved?.silas.enabled ?? true}`,
+    `sweep_interval_ms = ${preserved?.silas.sweepIntervalMs ?? 300_000}`,
+    `stall_threshold_ms = ${preserved?.silas.stallThresholdMs ?? 1_800_000}`,
+    `directive_at = ${preserved?.silas.directiveAt ?? 2}`,
+    `rebrief_at = ${preserved?.silas.rebriefAt ?? 3}`,
+    `escalate_at = ${preserved?.silas.escalateAt ?? 4}`,
     '',
     '[review]',
     '# Review gate policy. true keeps Perkins as the primary gate behind the',

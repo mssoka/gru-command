@@ -14,6 +14,7 @@ import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
@@ -48,12 +49,18 @@ interface ServerHarness {
   port: number;
   ledger: LedgerApi;
   spawns: { role: Role; options: SpawnOptions }[];
+  minionPrompts: string[];
+  liveHandles: Map<string, AgentHandle>;
+  disposedHandles: string[];
+  notifications: NotificationCenter;
   close: () => Promise<void>;
 }
 async function boot(opts: {
   token?: string;
   reviewPreflight?: ConstructorParameters<typeof WaveRunner>[0]['reviewPreflight'];
   fallbackGate?: ConstructorParameters<typeof WaveRunner>[0]['fallbackGate'];
+  /** false = boot without the silas ops surface (endpoints answer 503). */
+  silasOps?: boolean;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -67,7 +74,9 @@ async function boot(opts: {
   mkdirSync(join(dir, 'wtpreserve'));
   const cfg = loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
   const db = new LedgerDb(dir);
-  const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+  const bus = new EventBus({});
+  const ledger = new LedgerApi(db.handle, { bus });
+  const notifications = new NotificationCenter({ ledger, bus });
   const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const reviewSessions = join(dir, 'review-sessions');
@@ -83,8 +92,12 @@ async function boot(opts: {
       capabilities: FAKE_CAPABILITIES,
       async prompt() {
         if (role !== 'minion' || options?.cwd === undefined) return;
-        writeFileSync(join(options.cwd, 'http-deliverable.txt'), 'review me\n');
-        execFileSync('git', ['-C', options.cwd, 'add', 'http-deliverable.txt']);
+        minionPrompts.push(`cwd=${options.cwd}`);
+        // idempotent per prompt: a fresh file per turn, so a second minion
+        // turn on the same lane (silas re-brief) always has a commit to make.
+        const file = join(options.cwd, `http-deliverable-${spawns.length}.txt`);
+        writeFileSync(file, 'review me\n');
+        execFileSync('git', ['-C', options.cwd, 'add', file]);
         execFileSync('git', ['-C', options.cwd, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'test: http deliverable'], { stdio: 'ignore' });
       },
       async steer() {},
@@ -99,6 +112,9 @@ async function boot(opts: {
     };
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
+  const minionPrompts: string[] = [];
+  const liveHandles = new Map<string, AgentHandle>();
+  const disposedHandles: string[] = [];
   const wave = new WaveRunner({
     ledger,
     worktrees,
@@ -108,7 +124,28 @@ async function boot(opts: {
     ...(opts.reviewPreflight !== undefined ? { reviewPreflight: opts.reviewPreflight } : {}),
     ...(opts.fallbackGate !== undefined ? { fallbackGate: opts.fallbackGate } : {}),
   });
-  const server = createDispatchServer({ config: cfg, dispatch, wave });
+  const server = createDispatchServer({
+    config: cfg,
+    dispatch,
+    wave,
+    ledger,
+    ...(opts.silasOps === false
+      ? {}
+      : {
+          silasOps: {
+            registry: {
+              getHandle: (id: string) => liveHandles.get(id) ?? null,
+              spawn: (role: Role, spawnOptions?: SpawnOptions) => spawner(role, spawnOptions),
+              disposeHandle: async (handle: AgentHandle) => {
+                disposedHandles.push(handle.id);
+                liveHandles.delete(handle.id);
+              },
+            },
+            worktrees,
+            notifications,
+          },
+        }),
+  });
   const http: HttpServer = createServer((req, res) => {
     if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
     res.writeHead(404);
@@ -121,6 +158,10 @@ async function boot(opts: {
     ledger,
     spawns,
     wave,
+    minionPrompts,
+    liveHandles,
+    disposedHandles,
+    notifications,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
       await wave.shutdown();
@@ -366,6 +407,191 @@ describe('dispatch server (E8)', () => {
       expect(review.status).toBe(202);
       expect(field<string>(review.json, 'route')).toBe('perkins');
       expect(field<string>(review.json, 'round_id')).toBe('http-route-perkins-r1');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('silas ops surface: 401 unauthenticated, 503 when not hosted', async () => {
+    const unhosted = await boot({ silasOps: false });
+    try {
+      const res = await call(unhosted.port, 'POST', '/api/silas/escalate', { title: 'x' }, TOKEN);
+      expect(res.status).toBe(503);
+      expect(field<string>(res.json, 'error')).toBe('silas_ops_not_hosted');
+    } finally {
+      await unhosted.close();
+    }
+    const h = await boot();
+    try {
+      const anon = await call(h.port, 'POST', '/api/silas/escalate', { title: 'x' });
+      expect(anon.status).toBe(401);
+      const wrong = await call(h.port, 'POST', '/api/silas/directive', { job_id: 'x', directive: 'y' }, 'nope');
+      expect(wrong.status).toBe(401);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('by=silas on the pr/review endpoints records silas attribution events; without by it does not', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-by');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'by-silas-job', repo_path: repo.path, title: 'attribution', briefing: 'b',
+      }, TOKEN);
+      const pr = await call(h.port, 'POST', '/api/dispatch/pr', {
+        job_id: 'by-silas-job', url: PR_URL, by: 'silas',
+      }, TOKEN);
+      expect(pr.status).toBe(200);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'by-silas-job', by: 'silas',
+      }, TOKEN);
+      expect(review.status).toBe(202);
+      const kinds = h.ledger.listJobEvents('by-silas-job').map((event) => event.kind);
+      expect(kinds).toContain('silas.pr-registered');
+      expect(kinds).toContain('silas.review-triggered');
+      const reviewEvent = h.ledger.listJobEvents('by-silas-job').find((event) => event.kind === 'silas.review-triggered');
+      expect((reviewEvent?.payload as { route?: string }).route).toBe('perkins');
+      // and an unattributed job stays clean of silas events
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'by-none-job', repo_path: repo.path, title: 'plain', briefing: 'b',
+      }, TOKEN);
+      await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'by-none-job', url: PR_URL }, TOKEN);
+      await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'by-none-job' }, TOKEN);
+      const plainKinds = h.ledger.listJobEvents('by-none-job').map((event) => event.kind);
+      expect(plainKinds).not.toContain('silas.pr-registered');
+      expect(plainKinds).not.toContain('silas.review-triggered');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/directive routes to the live minion, flips the lane back to working, records the event', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-directive');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'dir-job', repo_path: repo.path, title: 'directive lane', briefing: 'b',
+      }, TOKEN);
+      // The dispatched minion was the last spawn; simulate its LIVE handle
+      // in the registry (the same surface the real RuntimeRegistry provides).
+      const minionId = `agent-${h.spawns.length}`;
+      h.ledger.registerAgent({ id: minionId, role: 'minion', jobId: 'dir-job' });
+      h.liveHandles.set(minionId, {
+        role: 'minion',
+        id: minionId,
+        sessionFile: null,
+        capabilities: FAKE_CAPABILITIES,
+        prompt: async () => {},
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
+        async dispose() {},
+      });
+      h.ledger.setJobStatus('dir-job', 'in-review');
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-job',
+        directive: 'Fix the null deref at src/a.ts and re-run the suite.',
+        blocker_fingerprint: 'correctness::src/a.ts::null deref',
+      }, TOKEN);
+      expect(res.status).toBe(200);
+      expect(field<string>(res.json, 'minion_id')).toBe(minionId);
+      const job = h.ledger.getJob('dir-job');
+      expect(job?.status).toBe('working');
+      expect(job?.note ?? '').toContain('working');
+      const event = h.ledger.listJobEvents('dir-job').find((candidate) => candidate.kind === 'silas.directive-sent');
+      expect(event).not.toBeNull();
+      expect((event?.payload as { blocker_fingerprint?: string }).blocker_fingerprint).toBe('correctness::src/a.ts::null deref');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief retires the live minion and re-briefs a FRESH one on the same lane', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-rebrief');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
+      }, TOKEN);
+      const freshBefore = h.spawns.filter((spawn) => spawn.role === 'minion').length;
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'rebrief-job',
+        note: 'same blocker three rounds; try a different approach',
+      }, TOKEN);
+      expect(res.status).toBe(200);
+      const freshMinion = h.spawns.filter((spawn) => spawn.role === 'minion')[freshBefore];
+      expect(freshMinion).toBeDefined();
+      expect(field<string>(res.json, 'minion_id')).toBe(`agent-${h.spawns.length}`);
+      const job = h.ledger.getJob('rebrief-job');
+      expect(job?.status).toBe('working');
+      const event = h.ledger.listJobEvents('rebrief-job').find((candidate) => candidate.kind === 'silas.rebrief');
+      expect(event).not.toBeNull();
+      expect((event?.payload as { note?: string }).note).toContain('same blocker');
+      // the re-brief prompt carries the original briefing (still the contract)
+      expect(h.minionPrompts.some((entry) => entry.startsWith('cwd='))).toBe(true);
+      expect(h.ledger.listAgents().some((agent) => agent.jobId === 'rebrief-job' && agent.role === 'minion')).toBe(true);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/directive on a lane with no reachable minion answers 502 undelivered; terminal jobs refuse', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-undelivered');
+    cleanupRepos.push(repo);
+    try {
+      // a job row with no lane at all
+      h.ledger.addJob({ id: 'ghost-job', repo: 'nowhere', title: 't', briefing: 'b' });
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'ghost-job', directive: 'fix it',
+      }, TOKEN);
+      expect(res.status).toBe(502);
+      expect(field<string>(res.json, 'error')).toBe('undelivered');
+      // terminal jobs take no directives
+      h.ledger.addJob({ id: 'done-job', repo: 'nowhere', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('done-job', 'working');
+      h.ledger.setJobStatus('done-job', 'done');
+      const done = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'done-job', directive: 'fix it',
+      }, TOKEN);
+      expect(done.status).toBe(400);
+      // unknown job id fails loud
+      const unknown = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'no-such-job', directive: 'fix it',
+      }, TOKEN);
+      expect(unknown.status).toBe(400);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/escalate posts an action-required notification and lands a silas.escalated event', async () => {
+    const h = await boot();
+    try {
+      h.ledger.addJob({ id: 'esc-job', repo: 'r', title: 't', briefing: 'b' });
+      const res = await call(h.port, 'POST', '/api/silas/escalate', {
+        title: 'Same blocker recurred past the ladder',
+        detail: 'job esc-job: fingerprint correctness::src/a.ts::null deref, 4 consecutive rounds',
+        job_id: 'esc-job',
+      }, TOKEN);
+      expect(res.status).toBe(200);
+      const notificationId = field<string>(res.json, 'notification_id');
+      const event = h.ledger.listJobEvents('esc-job').find((candidate) => candidate.kind === 'silas.escalated');
+      expect(event).not.toBeNull();
+      expect((event?.payload as { notification_id?: string }).notification_id).toBe(notificationId);
+      const notification = h.ledger.listNotifications().find((row) => row.id === notificationId);
+      expect(notification?.routing).toBe('action-required');
+      expect(notification?.severity).toBe('error');
+      // unknown job id fails loud; empty title fails loud
+      const unknown = await call(h.port, 'POST', '/api/silas/escalate', { title: 'x', job_id: 'nope' }, TOKEN);
+      expect(unknown.status).toBe(400);
+      const empty = await call(h.port, 'POST', '/api/silas/escalate', { title: '' }, TOKEN);
+      expect(empty.status).toBe(400);
     } finally {
       await h.close();
     }

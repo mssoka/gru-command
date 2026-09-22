@@ -82,7 +82,13 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   the sheet.
 - **Agent rail:** every ledger agent with a live state chip (🧠 gru ·
   📋 silas · 🔧 minion · 🔍 perkins · 🌙 bob); clicking an agent with a
-  session file opens its transcript.
+  session file opens its transcript. The silas chip is LIVE when
+  `[silas] enabled` (default): the hosted ops session (`silas-ops` slot)
+  appears there whenever its wake turns run, and its follow-through lands
+  on the ledger as `silas.*` events (`silas.pr-registered`,
+  `silas.review-triggered`, `silas.directive-sent`, `silas.rebrief`,
+  `silas.escalated`, `silas.wake`) — visible in the event stream like
+  every other transition.
 - **Notification center (E7):** the bell panel renders the durable
   notification log — FYI rows (blocked jobs, errored agents/lenses,
   verdicts, supervisor events) and action-required rows (crash-loop
