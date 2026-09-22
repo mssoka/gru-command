@@ -39,8 +39,12 @@ through the ops surface, never by improvising side channels.
    guess a URL; a wrong registration poisons the review.
 
 2. **PR registered, review overdue.** Trigger the wave exactly as above.
-   Never trigger twice for the same state: after your call, a round exists
-   and the digest stops listing the job.
+   Never trigger twice for the same state: on the Perkins route a round
+   exists afterwards and the digest stops listing the job. On the
+   `bmad-review-fallback` route no round is created — the gate runs its own
+   fix loop — and the digest retires the row once your request lands as a
+   `job.fallback-review` event. If the digest still lists the job, the
+   request did not land: fix the call, never re-fire blind.
 
 3. **NEEDS CHANGES verdict awaiting follow-through.** The digest lists the
    round's blockers with `consecutive_rounds` and the advised rung:

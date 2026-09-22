@@ -292,6 +292,22 @@ export function followUpChangedTarget(
 }
 
 /**
+ * The review-request receipts the digest can read: the silas trigger that
+ * asked for a wave, and the bmad-review fallback gate's own lifecycle
+ * event. The fallback route creates no round, so the review-overdue row
+ * must retire on these — otherwise it re-fires every sweep and Silas
+ * re-triggers a gate that already owns the lane.
+ */
+function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord | null {
+  const candidates: EventRecord[] = [];
+  for (const kind of ['silas.review-triggered', 'job.fallback-review']) {
+    const event = ledger.latestJobEvent(jobId, kind);
+    if (event !== null) candidates.push(event);
+  }
+  return candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
+}
+
+/**
  * The compact digest of actionable ops states, computed from the ledger
  * alone (the ledger is the record; no runtime or filesystem probing beyond
  * the consolidated-report port):
@@ -302,7 +318,10 @@ export function followUpChangedTarget(
  *    lane moved past the newest round's reviewed target (or no round exists
  *    yet): request the wave. This is both the first review and the
  *    re-review after a fix round — a delivery on the SAME head the round
- *    already reviewed warrants no new round.
+ *    already reviewed warrants no new round. A review already REQUESTED
+ *    for the current state retires the row: the bmad-review fallback route
+ *    creates no round, and without its request event the row would re-fire
+ *    every sweep and re-trigger a gate that owns its own fix loop.
  * 3. verdictsAwaitingDirective — the newest round recorded NEEDS CHANGES
  *    and no silas follow-through has landed since that verdict: deliver the
  *    first fix directive per blocker, then the ladder's rung (directive →
@@ -338,6 +357,11 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     const newestRound = rounds[0] ?? null;
     const delivered = input.ledger.latestJobEvent(job.id, 'job.delivered');
     const minionError = input.ledger.latestJobEvent(job.id, 'job.minion-error');
+    // A request retires only the state it answered: it must postdate the
+    // latest delivery, so a later unreviewed delivery re-arms the row.
+    const reviewRequest = latestReviewRequest(input.ledger, job.id);
+    const reviewAlreadyRequested =
+      reviewRequest !== null && (delivered === null || reviewRequest.seq > delivered.seq);
 
     // (1) Delivered, no PR yet.
     if (delivered !== null && job.prUrl === null && rounds.length === 0) {
@@ -357,14 +381,15 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     }
 
     // (2) PR registered, review overdue (first or re-review).
-    if (job.prUrl !== null && job.status === 'working' && newestRound === null) {
+    if (job.prUrl !== null && job.status === 'working' && newestRound === null && !reviewAlreadyRequested) {
       digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl, priorRounds: 0 });
     } else if (
       job.prUrl !== null &&
       job.status === 'working' &&
       newestRound !== null &&
       delivered !== null &&
-      followUpChangedTarget(delivered, newestRound)
+      followUpChangedTarget(delivered, newestRound) &&
+      !reviewAlreadyRequested
     ) {
       digest.prWithoutReview.push({
         jobId: job.id,

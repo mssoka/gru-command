@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { recordFollowUpDelivery } from '../src/dispatch/fix-directive.js';
+import { recordFollowUpDelivery, renderRebriefPrompt } from '../src/dispatch/fix-directive.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -152,5 +152,23 @@ describe('recordFollowUpDelivery (the loop-closing signal)', () => {
     expect(result.lanePath).toBeNull();
     expect(result.note).toContain('no job lane');
     expect(ledger.events[0]?.payload).toEqual({ agentId: 'minion-3', source: 'silas-rebrief', sha: null });
+  });
+});
+
+describe('renderRebriefPrompt (the fresh worker contract)', () => {
+  it('carries the re-brief note AND the original briefing; a missing briefing is loud, never silent', () => {
+    const prompt = renderRebriefPrompt({
+      jobId: 'job-1',
+      briefing: 'THE ORIGINAL CONTRACT',
+      note: 'same blocker three rounds; try a different approach',
+    });
+    expect(prompt).toContain('Re-brief — job job-1');
+    expect(prompt).toContain('same blocker three rounds; try a different approach');
+    expect(prompt).toContain('THE ORIGINAL CONTRACT');
+    expect(prompt).toContain('never merge your own pull request');
+    // A job row with no stored briefing says so — the fresh worker must not
+    // silently receive an empty contract.
+    const bare = renderRebriefPrompt({ jobId: 'job-2', briefing: null, note: 'n' });
+    expect(bare).toContain('the job row carries no stored briefing');
   });
 });

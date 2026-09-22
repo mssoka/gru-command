@@ -206,10 +206,12 @@ the judgment; the dispatch surface is the mechanical hand.
   computed from the ledger: delivered jobs with no PR registered; PRs
   whose follow-up delivery proves the lane head moved past the newest
   round's reviewed target (first review AND re-review after a fix round;
-  an unchanged head warrants no round); NEEDS CHANGES verdicts awaiting
-  follow-through, with per-blocker recurrence analysis; working lanes whose
-  minion has been silent past `stall_threshold_ms`; plus recent minion
-  errors for context.
+  an unchanged head warrants no round; and a review already REQUESTED for
+  the current state retires the row — including the bmad-review fallback
+  route, which creates no round and owns its own fix loop); NEEDS CHANGES
+  verdicts awaiting follow-through, with per-blocker recurrence analysis;
+  working lanes whose minion has been silent past `stall_threshold_ms`;
+  plus recent minion errors for context.
 - **The loop closes without a human ping**: on a delivered job, Silas
   finds the PR (transcript/`gh`), registers it
   (`POST /api/dispatch/pr … by=silas`), and triggers the wave

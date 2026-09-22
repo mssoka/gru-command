@@ -226,6 +226,48 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
+  it('the delivered-without-PR row carries the lane and session coordinates the skill sends Silas to', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-lane', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-lane', 'working');
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-lane', payload: { agentId: 'a1' } });
+      h.ledger.registerAgent({
+        id: 'min-lane',
+        role: 'minion',
+        jobId: 'job-lane',
+        sessionFile: '/sessions/min-lane.jsonl',
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        worktrees: {
+          listWorktrees: (scope?: { jobId?: string }) =>
+            scope?.jobId === 'job-lane'
+              ? [
+                  { kind: 'job' as const, status: 'active' as const, path: '/lanes/job-lane', branch: 'gru/job-lane' },
+                  { kind: 'review' as const, status: 'active' as const, path: '/lanes/rev', branch: null },
+                ]
+              : [],
+        },
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'job.delivered',
+      });
+      expect(digest.deliveredWithoutPr).toEqual([
+        {
+          jobId: 'job-lane',
+          repo: 'fixture-app',
+          branch: 'gru/job-lane',
+          lanePath: '/lanes/job-lane',
+          minionSessionFile: '/sessions/min-lane.jsonl',
+          deliveredAt: expect.any(String),
+        },
+      ]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('flags a stalled working lane past the threshold, with the minion idle age', async () => {
     const h = makeLedger();
     try {
@@ -306,6 +348,73 @@ describe('silas digest (the four actionable states)', () => {
       const moved = await digestOf();
       expect(moved.prWithoutReview.map((row) => row.jobId)).toEqual(['job-fresh']);
       expect(moved.prWithoutReview[0]?.priorRounds).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a requested fallback review retires the review-overdue row; a later delivery re-arms it', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-fallback', { prUrl: 'https://git.example.invalid/o/r/pull/11' });
+      const digestOf = () =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+        });
+
+      // PR registered, no round: review overdue.
+      expect((await digestOf()).prWithoutReview.map((row) => row.jobId)).toEqual(['job-fallback']);
+
+      // The bmad-review fallback gate answered this state: it creates no
+      // round and never flips the job, so only its own event can retire
+      // the row — otherwise every sweep re-triggers the gate.
+      h.ledger.appendCustomEvent({
+        kind: 'job.fallback-review',
+        jobId: 'job-fallback',
+        payload: { phase: 'started', gate: true },
+      });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+
+      // A delivery AFTER the request is a new, unreviewed state → due again.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-fallback', payload: { agentId: 'a2' } });
+      expect((await digestOf()).prWithoutReview.map((row) => row.jobId)).toEqual(['job-fallback']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a requested re-review retires the moved-head row; the next delivery re-arms it', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-re', { prUrl: 'https://git.example.invalid/o/r/pull/12' });
+      const round = h.ledger.addRound({ jobId: 'job-re', lenses: ['blind'], targetRef: 'sha-reviewed' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setJobStatus('job-re', 'in-review');
+      h.ledger.setJobStatus('job-re', 'working');
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-re', payload: { sha: 'sha-fixed' } });
+      const digestOf = () =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+        });
+      expect((await digestOf()).prWithoutReview.map((row) => row.jobId)).toEqual(['job-re']);
+
+      // The re-review request landed (fallback route: no round row to read).
+      h.ledger.appendCustomEvent({
+        kind: 'silas.review-triggered',
+        jobId: 'job-re',
+        payload: { route: 'bmad-review-fallback' },
+      });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+
+      // The next fix delivery moved the head again → the re-review is due.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-re', payload: { sha: 'sha-second-fix' } });
+      expect((await digestOf()).prWithoutReview.map((row) => row.jobId)).toEqual(['job-re']);
     } finally {
       h.cleanup();
     }

@@ -51,6 +51,7 @@ interface ServerHarness {
   ledger: LedgerApi;
   spawns: { role: Role; options: SpawnOptions }[];
   minionPrompts: string[];
+  minionTurnTexts: string[];
   liveHandles: Map<string, AgentHandle>;
   disposedHandles: string[];
   notifications: NotificationCenter;
@@ -87,14 +88,16 @@ async function boot(opts: {
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
     if (role === 'perkins') return hybrid.spawner(role, options);
+    const id = `agent-${spawns.length}`;
     return {
       role,
-      id: `agent-${spawns.length}`,
+      id,
       sessionFile: null,
       capabilities: FAKE_CAPABILITIES,
-      async prompt() {
+      async prompt(text: string) {
         if (role !== 'minion' || options?.cwd === undefined) return;
         minionPrompts.push(`cwd=${options.cwd}`);
+        minionTurnTexts.push(text);
         // idempotent per prompt: a fresh file per turn, so a second minion
         // turn on the same lane (silas re-brief) always has a commit to make.
         const file = join(options.cwd, `http-deliverable-${spawns.length}.txt`);
@@ -110,11 +113,16 @@ async function boot(opts: {
       health() {
         return { state: 'idle', lastActivity: null, sessionFile: null };
       },
-      async dispose() {},
+      async dispose() {
+        // The directive route disposes a freshly spawned fallback minion
+        // itself; record it so tests can assert the cleanup ran.
+        if (role === 'minion') disposedHandles.push(id);
+      },
     };
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
   const minionPrompts: string[] = [];
+  const minionTurnTexts: string[] = [];
   const liveHandles = new Map<string, AgentHandle>();
   const disposedHandles: string[] = [];
   const wave = new WaveRunner({
@@ -161,6 +169,7 @@ async function boot(opts: {
     spawns,
     wave,
     minionPrompts,
+    minionTurnTexts,
     liveHandles,
     disposedHandles,
     notifications,
@@ -371,6 +380,23 @@ describe('dispatch server (E8)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'http-fallback', repo_path: repo.path, title: 'fallback', briefing: 'gate me',
       }, TOKEN);
+      // Let the minion's briefing turn settle, then register the PR: the
+      // digest's review-overdue state is PR-registered + no round.
+      const deliverDeadline = Date.now() + 5_000;
+      while (h.ledger.latestJobEvent('http-fallback', 'job.delivered') === null && Date.now() < deliverDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(h.ledger.latestJobEvent('http-fallback', 'job.delivered')).not.toBeNull();
+      await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'http-fallback', url: PR_URL }, TOKEN);
+      const digestOf = () =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+        });
+      expect((await digestOf()).prWithoutReview.map((row) => row.jobId)).toEqual(['http-fallback']);
+
       const review = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'http-fallback' }, TOKEN);
       expect(review.status).toBe(202);
       expect(field<string>(review.json, 'route')).toBe('bmad-review-fallback');
@@ -393,6 +419,9 @@ describe('dispatch server (E8)', () => {
       expect(passEvent).not.toBeNull();
       expect((passEvent!.payload as { clearToMerge?: boolean }).clearToMerge).toBe(true);
       expect(h.ledger.listRounds('http-fallback')).toHaveLength(0);
+      // With the gate engaged (no round, job still working), the digest
+      // retires the review-overdue row instead of re-triggering every sweep.
+      expect((await digestOf()).prWithoutReview).toEqual([]);
     } finally {
       await h.close();
     }
@@ -421,6 +450,8 @@ describe('dispatch server (E8)', () => {
       const res = await call(unhosted.port, 'POST', '/api/silas/escalate', { title: 'x' }, TOKEN);
       expect(res.status).toBe(503);
       expect(field<string>(res.json, 'error')).toBe('silas_ops_not_hosted');
+      const rebrief = await call(unhosted.port, 'POST', '/api/silas/rebrief', { job_id: 'x', note: 'y' }, TOKEN);
+      expect(rebrief.status).toBe(503);
     } finally {
       await unhosted.close();
     }
@@ -430,6 +461,8 @@ describe('dispatch server (E8)', () => {
       expect(anon.status).toBe(401);
       const wrong = await call(h.port, 'POST', '/api/silas/directive', { job_id: 'x', directive: 'y' }, 'nope');
       expect(wrong.status).toBe(401);
+      const rebriefAnon = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'x', note: 'y' });
+      expect(rebriefAnon.status).toBe(401);
     } finally {
       await h.close();
     }
@@ -529,6 +562,20 @@ describe('dispatch server (E8)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
       }, TOKEN);
+      // The prior minion is LIVE: the retirement path must actually run.
+      const priorMinion = `agent-${h.spawns.length}`;
+      h.liveHandles.set(priorMinion, {
+        role: 'minion',
+        id: priorMinion,
+        sessionFile: null,
+        capabilities: FAKE_CAPABILITIES,
+        prompt: async () => {},
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
+        async dispose() {},
+      });
       const freshBefore = h.spawns.filter((spawn) => spawn.role === 'minion').length;
       const res = await call(h.port, 'POST', '/api/silas/rebrief', {
         job_id: 'rebrief-job',
@@ -543,8 +590,14 @@ describe('dispatch server (E8)', () => {
       const event = h.ledger.listJobEvents('rebrief-job').find((candidate) => candidate.kind === 'silas.rebrief');
       expect(event).not.toBeNull();
       expect((event?.payload as { note?: string }).note).toContain('same blocker');
-      // the re-brief prompt carries the original briefing (still the contract)
-      expect(h.minionPrompts.some((entry) => entry.startsWith('cwd='))).toBe(true);
+      // The prior live session was retired, not leaked.
+      expect(h.disposedHandles).toContain(priorMinion);
+      // The re-brief prompt carries the original briefing (still the
+      // contract) AND the note — a cwd-only check proved neither.
+      const rebriefText = h.minionTurnTexts.find((text) => text.startsWith('Re-brief — job rebrief-job'));
+      expect(rebriefText).toBeDefined();
+      expect(rebriefText).toContain('the original contract');
+      expect(rebriefText).toContain('same blocker three rounds; try a different approach');
       expect(h.ledger.listAgents().some((agent) => agent.jobId === 'rebrief-job' && agent.role === 'minion')).toBe(true);
       // the fresh minion's turn committed, and the follow-up delivery signal
       // recorded the moved head the re-review freshness predicate reads
@@ -661,6 +714,58 @@ describe('dispatch server (E8)', () => {
       const digest = await digestOf();
       expect(digest.prWithoutReview.map((row) => row.jobId)).toEqual(['fresh-moved']);
       expect(digest.prWithoutReview[0]?.priorRounds).toBe(1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/directive on a lane with no live minion spawns a fresh one, delivers, and disposes it', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-directive-fresh');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'dir-fresh', repo_path: repo.path, title: 'dead minion', briefing: 'b',
+      }, TOKEN);
+      const lane = h.worktrees.listWorktrees({ jobId: 'dir-fresh' }).find((candidate) => candidate.kind === 'job');
+      expect(lane).toBeDefined();
+      const spawnsBefore = h.spawns.length;
+      // No live handle registered: the route must fall back to a fresh minion.
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-fresh', directive: 'Fix the dead lane and re-run the suite.',
+      }, TOKEN);
+      expect(res.status).toBe(200);
+      const fresh = h.spawns[spawnsBefore];
+      expect(fresh?.role).toBe('minion');
+      expect(fresh?.options.cwd).toBe(lane?.path);
+      expect(field<string>(res.json, 'minion_id')).toBe(`agent-${h.spawns.length}`);
+      expect(h.disposedHandles).toContain(`agent-${h.spawns.length}`);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief refuses unknown and terminal jobs, and a lane-less job fails loud', async () => {
+    const h = await boot();
+    try {
+      const unknown = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'no-such-job', note: 'x' }, TOKEN);
+      expect(unknown.status).toBe(400);
+      expect(field<string>(unknown.json, 'detail')).toContain('not found');
+
+      h.ledger.addJob({ id: 'done-rebrief', repo: 'nowhere', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('done-rebrief', 'working');
+      h.ledger.setJobStatus('done-rebrief', 'done');
+      const terminal = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'done-rebrief', note: 'x' }, TOKEN);
+      expect(terminal.status).toBe(400);
+      expect(field<string>(terminal.json, 'detail')).toContain('terminal lanes are never re-briefed');
+
+      // No job lane in the registry: the re-brief must fail loud instead of
+      // spawning a fresh worker with nowhere to work.
+      h.ledger.addJob({ id: 'laneless-rebrief', repo: 'nowhere', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('laneless-rebrief', 'working');
+      const laneLess = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'laneless-rebrief', note: 'x' }, TOKEN);
+      expect(laneLess.status).toBe(400);
+      expect(field<string>(laneLess.json, 'detail')).toContain('no active job lane');
     } finally {
       await h.close();
     }
