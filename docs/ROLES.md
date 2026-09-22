@@ -25,14 +25,15 @@ fail-loud at boot); this page is the map.
   review tree; blind children are rooted outside it. Review sessions disable
   all project/global skills, context files, extensions, prompts, settings,
   plugins, and unrelated MCP servers. The sole MCP exception is a fresh,
-  per-session bridge for the Claude lead's four product-native tools; children
+  per-session bridge for the Claude lead's five product-native tools; children
   never receive it. Discovery never falls back to the workspace or agent home. A `spawn_provided` role without a cwd fails loud.
 
 ## Permissions
 
 Tool sets narrow with responsibility. The Perkins lead gets only frozen
-chunk read, tracked child delegation, bounded note storage, terminal submit,
-and confined tree reads. Non-blind children get confined read/grep/find/list;
+chunk read, tracked child delegation, bounded note storage, submission
+preflight, terminal submit, and confined tree reads. Non-blind children get
+confined read/grep/find/list;
 blind gets no tools. Seven required lens types run for every frozen chunk (six
 only for explicit no-spec); each malformed lens/chunk attempt may be retried
 within the policy limit as a new tracked child. No reviewer gets bash, edit,

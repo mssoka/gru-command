@@ -355,6 +355,17 @@ function rejectionMessage(errors: readonly SubmissionValidationIssue[]): string 
   return lines.join('\n');
 }
 
+/** Thrown rejection carrying the complete issue list for the audit artifact. */
+class SubmissionRejection extends Error {
+  readonly issues: readonly SubmissionValidationIssue[];
+
+  constructor(issues: readonly SubmissionValidationIssue[]) {
+    super(rejectionMessage(issues));
+    this.name = 'SubmissionRejection';
+    this.issues = issues;
+  }
+}
+
 /** Same byte bound for the preflight channel's structured error list. */
 function boundedIssues(errors: readonly SubmissionValidationIssue[]): {
   readonly errors: readonly SubmissionValidationIssue[];
@@ -382,50 +393,92 @@ function findingPath(finding: Pick<ReviewFinding, 'location'>): string | null {
 
 const GIT_PROOF_TIMEOUT_MS = 30_000;
 
-function frozenBlobContains(review: FrozenReview, path: string, evidence: string): boolean {
+/** Per-validation memo for the frozen-tree proof lookups. The round's SHAs are
+ * immutable, so identical queries are wasted subprocesses; one validation pass
+ * (and each repeated preflight) shares this cache. */
+interface ProofCache {
+  readonly blobContains: Map<string, boolean>;
+  readonly pathDiffs: Map<string, string>;
+  readonly pathAbsent: Map<string, boolean>;
+  readonly anywhere: Map<string, boolean>;
+}
+
+function newProofCache(): ProofCache {
+  return { blobContains: new Map(), pathDiffs: new Map(), pathAbsent: new Map(), anywhere: new Map() };
+}
+
+function frozenBlobContains(review: FrozenReview, path: string, evidence: string, cache?: ProofCache): boolean {
+  const key = `${path}\0${evidence}`;
+  const cached = cache?.blobContains.get(key);
+  if (cached !== undefined) return cached;
+  let result = false;
   try {
     const blob = execFileSync('git', ['-C', review.manifest.repoPath, 'show', `${review.manifest.targetSha}:${path}`], {
       encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
     });
-    return blob.includes(evidence);
+    result = blob.includes(evidence);
   } catch {
-    return false;
+    result = false;
   }
+  cache?.blobContains.set(key, result);
+  return result;
 }
 
-function frozenPathDiff(review: FrozenReview, path: string, baseSha = review.manifest.diffBaseSha): string {
+function frozenPathDiff(
+  review: FrozenReview,
+  path: string,
+  baseSha = review.manifest.diffBaseSha,
+  cache?: ProofCache,
+): string {
+  const key = `${baseSha}\0${path}`;
+  const cached = cache?.pathDiffs.get(key);
+  if (cached !== undefined) return cached;
+  let diff = '';
   try {
-    return execFileSync('git', [
+    diff = execFileSync('git', [
       '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--unified=3',
       baseSha, review.manifest.targetSha, '--', `:(literal)${path}`,
     ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
   } catch {
-    return '';
+    diff = '';
   }
+  cache?.pathDiffs.set(key, diff);
+  return diff;
 }
 
-function evidenceAtCitedLocation(review: FrozenReview, finding: ReviewFinding, evidence: string): boolean {
+function evidenceAtCitedLocation(
+  review: FrozenReview,
+  finding: ReviewFinding,
+  evidence: string,
+  cache?: ProofCache,
+): boolean {
   if (evidence === 'N/A' || evidence.trim() === '') return false;
   const path = findingPath(finding);
   // Binding is to the CITED FILE in the frozen tree (blob or its diff), not
   // to the chunk's changed-file list: lens children read the whole frozen
   // tree and may cite an unchanged file with a real defect.
   if (path === null) return false;
-  return frozenBlobContains(review, path, evidence) || frozenPathDiff(review, path).includes(evidence);
+  return frozenBlobContains(review, path, evidence, cache) ||
+    frozenPathDiff(review, path, review.manifest.diffBaseSha, cache).includes(evidence);
 }
 
-function evidenceAnywhere(review: FrozenReview, evidence: string): boolean {
+function evidenceAnywhere(review: FrozenReview, evidence: string, cache?: ProofCache): boolean {
   if (evidence === 'N/A' || evidence.trim() === '') return false;
   if (review.chunks.some((chunk) => chunk.diff.includes(evidence))) return true;
+  const cached = cache?.anywhere.get(evidence);
+  if (cached !== undefined) return cached;
+  let result = false;
   try {
-    return execFileSync('git', [
+    result = execFileSync('git', [
       '-C', review.manifest.repoPath, 'grep', '-F', '--full-name', '--', evidence, review.manifest.targetSha, '--',
     ], {
       encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
     }).trim() !== '';
   } catch {
-    return false;
+    result = false;
   }
+  cache?.anywhere.set(evidence, result);
+  return result;
 }
 
 function fixedAuditEvidence(
@@ -433,20 +486,26 @@ function fixedAuditEvidence(
   finding: VerifiedFinding,
   evidence: string,
   priorTargetSha: string | null,
+  cache?: ProofCache,
 ): boolean {
   const path = findingPath(finding);
   if (path === null) return false;
   if (evidence === `PATH ABSENT: ${path}`) {
+    const cached = cache?.pathAbsent.get(path);
+    if (cached !== undefined) return cached;
+    let absent = false;
     try {
       execFileSync('git', ['-C', review.manifest.repoPath, 'cat-file', '-e', `${review.manifest.targetSha}:${path}`], {
         timeout: GIT_PROOF_TIMEOUT_MS, stdio: 'ignore',
       });
-      return false;
+      absent = false;
     } catch {
-      return true;
+      absent = true;
     }
+    cache?.pathAbsent.set(path, absent);
+    return absent;
   }
-  const diff = frozenPathDiff(review, path, priorTargetSha ?? review.manifest.diffBaseSha);
+  const diff = frozenPathDiff(review, path, priorTargetSha ?? review.manifest.diffBaseSha, cache);
   return diff.split('\n').some((line) => line.startsWith('-') && !line.startsWith('---') && line.slice(1) === evidence);
 }
 
@@ -981,7 +1040,7 @@ export class PerkinsHybridReview {
             if (validation.submission !== null) {
               writeReviewArtifact(review, `lead/submission-attempt-${attempt}.json`, validation.submission);
             }
-            throw new Error(rejectionMessage(validation.errors));
+            throw new SubmissionRejection(validation.errors);
           }
           const submission = validation.submission;
           writeReviewArtifact(review, `lead/submission-attempt-${attempt}.json`, submission);
@@ -1015,7 +1074,10 @@ export class PerkinsHybridReview {
             terminate: true,
           };
         } catch (error) {
-          writeReviewArtifact(review, `lead/submission-attempt-${attempt}.error.json`, { error: sanitizeError(error) });
+          writeReviewArtifact(review, `lead/submission-attempt-${attempt}.error.json`, {
+            error: sanitizeError(error),
+            ...(error instanceof SubmissionRejection ? { issues: error.issues } : {}),
+          });
           throw error;
         }
       },
@@ -1124,6 +1186,7 @@ export class PerkinsHybridReview {
     const errors: SubmissionValidationIssue[] = [...parsed.errors];
     const review = context.review;
     const report = parsed.report;
+    const proofCache = newProofCache();
     const push = (subject: string, rule: string, message: string): void => {
       errors.push({ subject, rule, message });
     };
@@ -1202,8 +1265,8 @@ export class PerkinsHybridReview {
         const located = speculativeNa || (
           path !== null && (
             audit.status === 'still-present'
-              ? frozenBlobContains(review, path, audit.evidence)
-              : fixedAuditEvidence(review, finding, audit.evidence, context.priorTargetSha)
+              ? frozenBlobContains(review, path, audit.evidence, proofCache)
+              : fixedAuditEvidence(review, finding, audit.evidence, context.priorTargetSha, proofCache)
           )
         );
         if (!located) {
@@ -1244,8 +1307,8 @@ export class PerkinsHybridReview {
       if (decision.disposition === 'rejected') {
         const anchored = findingPath(candidate) !== null && candidate.location !== 'N/A';
         const located = anchored
-          ? evidenceAtCitedLocation(review, candidate, decision.evidence)
-          : evidenceAnywhere(review, decision.evidence);
+          ? evidenceAtCitedLocation(review, candidate, decision.evidence, proofCache)
+          : evidenceAnywhere(review, decision.evidence, proofCache);
         if (!located || decision.evidence === candidate.evidence) {
           push(ref, 'rejected-evidence', `rejected candidate lacks contradictory frozen evidence at its cited location: ${ref}`);
         }
@@ -1259,10 +1322,10 @@ export class PerkinsHybridReview {
       }
       const disposition = forcedSpeculative ? 'unverifiable-speculative' : decision.disposition;
       if (disposition === 'confirmed') {
-        if (!evidenceAtCitedLocation(review, candidate, candidate.evidence)) {
+        if (!evidenceAtCitedLocation(review, candidate, candidate.evidence, proofCache)) {
           push(ref, 'confirmed-evidence', `candidate evidence is not locatable at its cited file/hunk: ${ref}`);
         }
-        if (!evidenceAnywhere(review, decision.evidence)) {
+        if (!evidenceAnywhere(review, decision.evidence, proofCache)) {
           push(ref, 'verification-evidence', `lead verification evidence is not locatable in the frozen review: ${ref}`);
         }
         if (errors.length > errorMark) continue;
