@@ -166,7 +166,19 @@ runs at wizard/boot time, never on a hot path.
   every other tier rejects empty overrides.)
 - Explicit overrides are `"provider/model"` strings (pi) validated
   **fail-loud** at spawn: an unresolvable reference is an error naming the
-  reference, never a silent fallback.
+  reference, never a silent fallback. The pi adapter first tries ONE bounded
+  network catalog refresh (see below) and only then fails.
+- **Catalog freshness (pi).** The runtime is created offline
+  (`refreshOnCreate: false`) so healthy spawns never wait on the network and
+  the 2026-09-20 settings-default auth fix stays intact. When a reference
+  misses the offline catalog, the adapter performs ONE bounded refresh
+  (`ModelRuntime.refresh({ allowNetwork: true, signal })`, target only the
+  referenced provider when it is known, full refresh otherwise) and then
+  re-resolves. The deadline is `[runtimes.pi] model_refresh_timeout_ms`
+  (default 10 000 ms); `[runtimes.pi] model_refresh = false` keeps the
+  catalog strictly offline. A second miss fails loud with the reference, the
+  refresh outcome, and the nearest registered models for that provider.
+  Concurrent unknown-model failures share one in-flight refresh.
 - Thinking levels: `"default"` passes through; pi accepts
   `minimal | low | medium | high | xhigh | max` and rejects anything else
   at spawn (fail-loud — pi CAN set the level). claude-code accepts

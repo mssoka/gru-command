@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
-import { PiRuntime, normalizeSessionPath } from '../src/runtime/pi-adapter.js';
+import { PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
 import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
@@ -68,9 +68,16 @@ interface Fixture {
   modelRuntime: Awaited<ReturnType<typeof makeStubModelRuntime>>;
 }
 
+interface FixtureOptions {
+  readonly modelCatalogRefresh?: PiRuntimeOptions['modelCatalogRefresh'];
+  readonly configExtra?: string;
+  readonly log?: PiRuntimeOptions['log'];
+}
+
 async function fixture(
   turns: readonly StubTurn[] | StubResponder = [],
   modelInput: readonly ('text' | 'image')[] = ['text'],
+  options: FixtureOptions = {},
 ): Promise<Fixture & { runtime: PiRuntime }> {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-pi-'));
   const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
@@ -78,14 +85,23 @@ async function fixture(
   cleanupDirs.push(home, workspace, agentDir);
   writeFileSync(
     configPathFor(home),
-    `workspace_root = "${workspace}"\n[models]\ndefault = "gru-stub/stub-model"\n`,
+    `workspace_root = "${workspace}"\n[models]\ndefault = "gru-stub/stub-model"\n${options.configExtra ?? ''}`,
     'utf-8',
   );
   const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
   const store = new SessionStore(config.dataDir);
   const script = new StubScript(turns);
   const modelRuntime = await makeStubModelRuntime(script, { input: modelInput });
-  const runtime = new PiRuntime({ config, store, agentDir, modelRuntime });
+  const runtime = new PiRuntime({
+    config,
+    store,
+    agentDir,
+    modelRuntime,
+    ...(options.modelCatalogRefresh !== undefined
+      ? { modelCatalogRefresh: options.modelCatalogRefresh }
+      : {}),
+    ...(options.log !== undefined ? { log: options.log } : {}),
+  });
   return { home, workspace, agentDir, store, script, config, modelRuntime, runtime };
 }
 
@@ -93,6 +109,16 @@ function collect(handle: { subscribe(listener: (event: RuntimeEvent) => void): (
   const events: RuntimeEvent[] = [];
   handle.subscribe((event) => events.push(event));
   return events;
+}
+
+/** Await a spawn that MUST fail and return its message for content pins. */
+async function rejection(promise: Promise<unknown>): Promise<Error> {
+  try {
+    await promise;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+  throw new Error('expected the promise to reject');
 }
 
 describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
@@ -658,10 +684,117 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
   });
 
   it('fails loud on an unknown model reference', async () => {
-    const fx = await fixture();
+    const fx = await fixture([], ['text'], {
+      configExtra: '[runtimes.pi]\nmodel_refresh = false\n',
+    });
     await expect(fx.runtime.spawn('gru', { model: 'nope/no-such-model' })).rejects.toThrow(
       /unknown model "nope\/no-such-model"/,
     );
+  });
+
+  it('resolves a live-catalog model through ONE bounded refresh (deepseek-flash shape)', async () => {
+    // Reproduces the owner report: the offline catalog misses the model
+    // (`getModel` returns undefined) while the live catalog has it. The
+    // adapter must refresh once, re-resolve, and spawn — without ever
+    // putting the network on the healthy-spawn path.
+    const refresher = vi.fn(async () => ({
+      attempted: true,
+      detail: 'completed within the 10000 ms budget',
+    }));
+    const fx = await fixture([{ deltas: ['live catalog model'] }], ['text'], {
+      modelCatalogRefresh: refresher,
+    });
+    const original = fx.modelRuntime.getModel.bind(fx.modelRuntime);
+    const getModel = vi
+      .spyOn(fx.modelRuntime, 'getModel')
+      .mockImplementationOnce(() => undefined)
+      .mockImplementation((provider, modelId) => original(provider, modelId));
+    try {
+      const handle = await fx.runtime.spawn('gru', { model: 'gru-stub/stub-model' });
+      try {
+        const events = collect(handle);
+        await handle.prompt('live check', { owner: 'alice' });
+        expect(
+          events.filter((e) => e.type === 'text_delta').map((e) => (e as { delta: string }).delta),
+        ).toEqual(['live catalog model']);
+      } finally {
+        await handle.dispose();
+      }
+      expect(refresher).toHaveBeenCalledTimes(1);
+      expect(refresher).toHaveBeenCalledWith(fx.modelRuntime, {
+        provider: 'gru-stub',
+        timeoutMs: 10_000,
+      });
+    } finally {
+      getModel.mockRestore();
+    }
+  });
+
+  it('healthy resolutions never touch the catalog refresh path (no added latency)', async () => {
+    const refresher = vi.fn(async () => ({ attempted: true, detail: 'must not run' }));
+    const fx = await fixture([{ deltas: ['ok'] }], ['text'], { modelCatalogRefresh: refresher });
+    const handle = await fx.runtime.spawn('gru');
+    await handle.dispose();
+    expect(refresher).not.toHaveBeenCalled();
+  });
+
+  it('unknown-model errors name the model, the refresh outcome, and the near matches', async () => {
+    const refresher = vi.fn(async () => ({
+      attempted: true,
+      detail: 'completed within the 10000 ms budget',
+    }));
+    const fx = await fixture([], ['text'], { modelCatalogRefresh: refresher });
+    const error = await rejection(
+      fx.runtime.spawn('gru', { model: 'gru-stub/no-such-model' }),
+    );
+    expect(error.message).toContain('unknown model "gru-stub/no-such-model"');
+    expect(error.message).toContain(
+      'catalog refresh attempted — completed within the 10000 ms budget',
+    );
+    expect(error.message).toContain('nearest registered models for "gru-stub": stub-model');
+    expect(refresher).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a skipped refresh when [runtimes.pi] model_refresh = false', async () => {
+    const refresher = vi.fn(async () => {
+      throw new Error('must not run');
+    });
+    const fx = await fixture([], ['text'], {
+      modelCatalogRefresh: refresher,
+      configExtra: '[runtimes.pi]\nmodel_refresh = false\n',
+    });
+    const error = await rejection(fx.runtime.spawn('gru', { model: 'nope/whatever' }));
+    expect(error.message).toContain('unknown model "nope/whatever"');
+    expect(error.message).toContain('catalog refresh skipped ([runtimes.pi] model_refresh = false)');
+    expect(error.message).toContain('provider "nope" is not registered');
+    expect(refresher).not.toHaveBeenCalled();
+  });
+
+  it('bounds the network refresh with model_refresh_timeout_ms', async () => {
+    const fx = await fixture([], ['text'], {
+      configExtra: '[runtimes.pi]\nmodel_refresh_timeout_ms = 25\n',
+    });
+    const refresh = vi.spyOn(fx.modelRuntime, 'refresh').mockImplementation(
+      (options) =>
+        new Promise((resolve) => {
+          const signal = options?.signal;
+          const settle = (): void => resolve({ aborted: true, errors: new Map<string, Error>() });
+          if (signal?.aborted === true) settle();
+          else signal?.addEventListener('abort', settle);
+        }),
+    );
+    try {
+      const startedAt = Date.now();
+      const error = await rejection(fx.runtime.spawn('gru', { model: 'gru-stub/live-only' }));
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+      expect(error.message).toContain('timed out after 25 ms');
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(refresh).toHaveBeenCalledWith(
+        expect.objectContaining({ allowNetwork: true, providers: ['gru-stub'] }),
+      );
+    } finally {
+      refresh.mockRestore();
+    }
   });
 
   it('accepts an explicit thinking level and fails loud on an invalid one (ruling 16)', async () => {
@@ -778,7 +911,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
   it('fails loud when the settings default names an unregistered model', async () => {
     // A settings default that misses the catalog must never silently
     // reroute to "first available" (the 2026-09-20 bug shape); it names
-    // the stale reference like the explicit path does.
+    // the stale reference like the explicit path does — plus the refresh
+    // outcome and the nearest registered alternatives.
     const home = mkdtempSync(join(tmpdir(), 'gru-command-pi-'));
     const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
     const agentDir = mkdtempSync(join(tmpdir(), 'gru-command-agentdir-'));
@@ -796,10 +930,16 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       store,
       agentDir,
       modelRuntime: await makeStubModelRuntime(new StubScript([]), { refreshAuthCache: false }),
+      modelCatalogRefresh: async () => ({
+        attempted: true,
+        detail: 'failed (no network in tests)',
+      }),
     });
-    await expect(runtime.spawn('gru')).rejects.toThrow(
-      /settings default "nope\/no-such-model" is not a registered model/,
-    );
+    const error = await rejection(runtime.spawn('gru'));
+    expect(error.message).toContain('settings default "nope/no-such-model" is not a registered model');
+    expect(error.message).toContain('catalog refresh attempted — failed (no network in tests)');
+    expect(error.message).toContain('provider "nope" is not registered');
+    expect(error.message).toContain(join(agentDir, 'settings.json'));
   });
 
   it('dispose releases the session lock', async () => {
@@ -1199,7 +1339,9 @@ describe('Perkins r1 regressions', () => {
   });
 
   it('N17: adapter health goes down on infrastructure failure and recovers', async () => {
-    const fx = await fixture([{ deltas: ['ok'] }]);
+    const fx = await fixture([{ deltas: ['ok'] }], ['text'], {
+      configExtra: '[runtimes.pi]\nmodel_refresh = false\n',
+    });
     // Poison the sessions dir for the gru role: a FILE where the dir must be.
     const roleDir = fx.store.sessionDirFor('gru', fx.workspace);
     mkdirSync(join(roleDir, '..'), { recursive: true });
