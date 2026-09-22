@@ -1254,8 +1254,10 @@ describe('chat server (real sockets, stub Gru)', () => {
     // expires; one durable error names the cause.
     const harness = await makeHarness({
       failFirstSpawn: new Error('unknown model "deepseek/deepseek-flash"'),
-      spawnBackoffBaseMs: 40,
-      spawnBackoffMaxMs: 40,
+      // Long enough that the reconnect + resend below lands INSIDE the
+      // window even on a loaded machine; the post-window wait outlasts it.
+      spawnBackoffBaseMs: 500,
+      spawnBackoffMaxMs: 500,
     });
     const client = await authedClient(harness.port);
     client.send('wake the brain', 'm1');
@@ -1271,7 +1273,9 @@ describe('chat server (real sockets, stub Gru)', () => {
     const retry = await authedClient(harness.port);
     retry.send('wake the brain', 'm1');
     await retry.waitFor(
-      (frame) => frame.type === 'error' && /backed off/.test(frame.message),
+      // The full-history replay ALSO carries the durable "backed off"
+      // error, so match the ephemeral fast-fail text specifically.
+      (frame) => frame.type === 'error' && /temporarily unavailable/.test(frame.message),
       'backoff fast-fail',
     );
     expect(harness.spawnCalls).toEqual([null]);
@@ -1281,8 +1285,10 @@ describe('chat server (real sockets, stub Gru)', () => {
     expect(harness.frameLog.history.filter((frame) => frame.type === 'error')).toHaveLength(1);
 
     // After the window: the next word takes a genuinely new attempt, which
-    // succeeds (failFirstSpawn consumed) — bounded, not wedged.
-    await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+    // succeeds (failFirstSpawn consumed) — bounded, not wedged. The gate's
+    // clock started at the first failure (before the fast-fail arrived),
+    // so 800 ms comfortably outlasts the 500 ms window.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 800));
     const done = nextTurnEnd(retry);
     retry.send('wake the brain now', 'm2');
     await done;
