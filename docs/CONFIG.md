@@ -197,6 +197,15 @@ keep = 5
 # gru.frames.jsonl rotation; reconnect replay spans retained shards.
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
+# Gru awareness wake policy. "never" (default) injects action-required
+# escalations and a compact ledger digest into the NEXT Gru turn passively
+# — no model turn runs by itself, so it adds no turn cost. Wake modes
+# start a Gru turn when a notification lands: "action-required" only for
+# action-required notifications; "all" for every notification (FYI
+# included). Each wake is a full model turn (provider tokens + latency),
+# so it costs whenever the lane is noisy. Wakes never acknowledge
+# anything: the human still holds every ack.
+notify_wake = "never"
 
 [worktrees]
 # Job/review worktree roots follow data_dir by default; uncomment only to relocate.
