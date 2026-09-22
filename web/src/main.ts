@@ -278,6 +278,7 @@ function startBoard(token: string): void {
       });
     },
     null, // the client is bound below — one source of truth, rebound per pair
+    storage, // card disclosure persists per job (safeStorage-wrapped localStorage)
   );
   boardClient?.stop();
   boardClient = new BoardClient(

@@ -436,12 +436,30 @@ test('socket drop shows a degraded banner that clears on recovery', async ({ pag
 });
 
 test.describe('board (E6, mock feed)', () => {
-  test('repo cards, lens chips, agent rail, notifications render from the mock snapshot', async ({ page }) => {
+  test('repo cards collapse by default; expanding reveals the round lens chips', async ({ page }) => {
     await pair(page);
     await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
     await expect(page.locator('.board-repo', { hasText: 'demo-api' })).toBeVisible();
-    // The sample round carries all 7 lens chips.
+
+    // Collapsed default: summary only — no detail nodes in the DOM.
+    const job = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
+    await expect(job).toHaveAttribute('data-expanded', 'false');
+    await expect(job.locator('.board-job__body')).toHaveCount(0);
+    await expect(page.locator('.board-lens')).toHaveCount(0);
+    // The one compact signal carries the live round + the unacked notice.
+    const signal = job.locator('.board-job__signal');
+    await expect(signal).toContainText('live');
+    await expect(signal).toContainText('action-required');
+
+    // Expand the card, then the round row: all 7 lens chips appear.
+    await job.locator('.board-job__toggle').click();
+    await expect(job).toHaveAttribute('data-expanded', 'true');
+    await expect(job.locator('.board-lane')).toBeVisible();
+    const round = job.locator('.board-round__toggle');
+    await expect(round).toContainText('3/7 lenses');
+    await expect(round).toContainText('1 blocker');
+    await round.click();
     await expect(page.locator('.board-lens')).toHaveCount(7);
     // The standing crew is on the rail.
     await expect(page.locator('#board-agents .board-agent', { hasText: 'silas' })).toBeVisible();
@@ -451,28 +469,63 @@ test.describe('board (E6, mock feed)', () => {
     await page.locator('#notification-bell').click();
   });
 
+  test('card disclosure persists per job across a reload (v3)', async ({ page }) => {
+    await pair(page);
+    await page.locator('#tab-board').click();
+    const job = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
+    await expect(job).toHaveAttribute('data-expanded', 'false');
+
+    // Collapsed board is dramatically shorter than the disclosed detail.
+    const collapsedHeight = await page.evaluate(
+      () => document.querySelector('#board-jobs')?.scrollHeight ?? 0,
+    );
+    await job.locator('.board-job__toggle').click();
+    await expect(job).toHaveAttribute('data-expanded', 'true');
+    await expect(job.locator('.board-lane')).toBeVisible();
+    const expandedHeight = await page.evaluate(
+      () => document.querySelector('#board-jobs')?.scrollHeight ?? 0,
+    );
+    expect(expandedHeight).toBeGreaterThan(collapsedHeight);
+
+    // Reload: the expanded job comes back expanded (per-job localStorage).
+    await page.reload();
+    await page.locator('#tab-board').click();
+    await expect(job).toHaveAttribute('data-expanded', 'true');
+
+    // Collapse it again; the next reload comes back collapsed.
+    await job.locator('.board-job__toggle').click();
+    await expect(job).toHaveAttribute('data-expanded', 'false');
+    await page.reload();
+    await page.locator('#tab-board').click();
+    await expect(job).toHaveAttribute('data-expanded', 'false');
+    await expect(job.locator('.board-job__body')).toHaveCount(0);
+  });
+
   test('trackers: lane strip, round progress, decisions + unacked, disposed collapse', async ({ page }) => {
     await pair(page);
     await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
 
-    // Lane detail strip: branch, base sha, lane age, agent activity age.
-    const lane = page.locator('.board-lane').first();
+    // The lane strip lives in the expanded detail (v2 surface, v3 default).
+    const card = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
+    await card.locator('.board-job__toggle').click();
+    const lane = card.locator('.board-lane');
     await expect(lane).toBeVisible();
     await expect(lane.locator('.board-lane__branch')).toContainText('gru/demo-api-payment-fix');
     await expect(lane.locator('.board-lane__base')).toContainText('abc1234');
     await expect(lane.locator('.board-lane__age')).toContainText('lane');
     await expect(lane.locator('.board-lane__activity')).toContainText('agent');
 
-    // Round progress: lens count, blockers, elapsed, attempt counts.
-    const progress = page.locator('.board-round__progress').first();
-    await expect(progress).toContainText('/7 lenses');
-    await expect(progress.locator('.board-round__blockers')).toContainText('1 blocker');
-    await expect(progress.locator('.board-round__elapsed')).toContainText('elapsed');
+    // Round header: lens count, blockers, elapsed; chips behind the row.
+    const round = card.locator('.board-round__toggle');
+    await expect(round).toContainText('/7 lenses');
+    await expect(round.locator('.board-round__blockers')).toContainText('1 blocker');
+    await expect(round.locator('.board-round__elapsed')).toContainText('elapsed');
+    await round.click();
     await expect(page.locator('.board-lens', { hasText: 'blind ×2' })).toBeVisible();
     await expect(page.locator('.board-lens--blocker')).toHaveCount(1);
 
-    // Jev decisions chip + unacked action-required badge.
+    // Jev decisions chip + unacked action-required badge stay global.
     await expect(page.locator('#board-decisions')).toContainText('Jev: READY');
     await expect(page.locator('#board-unacked')).toBeVisible();
 
@@ -490,13 +543,15 @@ test.describe('board (E6, mock feed)', () => {
   test('trackers render in dark theme and on a narrow phone viewport', async ({ page }) => {
     await pair(page);
     await page.locator('#tab-board').click();
-    await expect(page.locator('.board-lane').first()).toBeVisible();
+    const card = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
+    await card.locator('.board-job__toggle').click();
+    await expect(card.locator('.board-lane')).toBeVisible();
     await page.locator('#theme-toggle').click();
     await expect(page.locator('html')).toHaveClass(/dark/);
     // Same tracker surfaces stay rendered with the dark tokens applied.
     await expect(page.locator('#board-decisions')).toBeVisible();
-    await expect(page.locator('.board-round__progress').first()).toBeVisible();
-    await expect(page.locator('.board-lane__age')).toBeVisible();
+    await expect(card.locator('.board-round__toggle')).toBeVisible();
+    await expect(card.locator('.board-lane__age')).toBeVisible();
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(page.locator('.board-trackers')).toBeVisible();
     await expect(page.locator('#board-unacked')).toBeVisible();
