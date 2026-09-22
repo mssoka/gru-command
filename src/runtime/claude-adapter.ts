@@ -448,6 +448,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           ...(reviewBridge !== undefined ? {
               mcpConfigFile: reviewBridge.configFile,
               reviewBridge,
+              reviewTools: reviewBridge.toolNames,
             } : {}),
           killGraceMs: this.killGraceMs,
           resume: established,
@@ -523,6 +524,8 @@ interface HandleParams {
   readonly isolatedReview?: boolean;
   readonly fileTools?: readonly string[];
   readonly nativeTools?: readonly string[];
+  /** Raw perkins_* names wired through the bridge (capability declaration). */
+  readonly reviewTools?: readonly string[];
   readonly mcpConfigFile?: string;
   readonly reviewBridge?: ReviewMcpBridge;
   readonly killGraceMs: number;
@@ -612,6 +615,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   readonly id: string;
   readonly sessionFile: string;
   readonly reviewIsolation?: true;
+  readonly reviewTools?: readonly string[];
   readonly capabilities: AgentCapabilities;
 
   private readonly params: HandleParams;
@@ -653,6 +657,9 @@ export class ClaudeCodeHandle implements AgentHandle {
     this.id = params.sessionId;
     this.sessionFile = params.sessionFile;
     if (params.isolatedReview) this.reviewIsolation = true;
+    if (params.reviewTools !== undefined && params.reviewTools.length > 0) {
+      this.reviewTools = [...params.reviewTools];
+    }
     this.sessionEstablished = params.resume;
     this.store = store;
     this.log = log;

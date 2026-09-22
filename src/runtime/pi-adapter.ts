@@ -628,6 +628,7 @@ export class PiRuntime implements AgentRuntime {
         sessionFile,
         capabilitiesForModelInput(PI_CAPABILITIES, session.model?.input),
         reviewMode !== undefined,
+        nativeTools.map((tool) => tool.name),
         this.store,
         this.log,
         () => {
@@ -700,6 +701,7 @@ export class PiAgentHandle implements AgentHandle {
   readonly id: string;
   readonly sessionFile: string;
   readonly reviewIsolation?: true;
+  readonly reviewTools?: readonly string[];
   readonly capabilities: AgentCapabilities;
 
   /** The principal unnamed callers are attributed to (single-writer). */
@@ -751,6 +753,7 @@ export class PiAgentHandle implements AgentHandle {
     sessionFile: string,
     capabilities: AgentCapabilities,
     isolatedReview: boolean,
+    reviewToolNames: readonly string[],
     private readonly store: SessionStore,
     private readonly log: Log,
     private readonly onDispose: () => void = () => {},
@@ -761,6 +764,7 @@ export class PiAgentHandle implements AgentHandle {
     this.sessionFile = sessionFile;
     this.capabilities = capabilities;
     if (isolatedReview) this.reviewIsolation = true;
+    if (reviewToolNames.length > 0) this.reviewTools = [...reviewToolNames];
     // Unnamed callers share one principal PER HANDLE — one chat brain per
     // session (SPEC ruling 1). Two distinct sessions always differ, so a
     // stranger's steer/followUp queues instead of passing natively.

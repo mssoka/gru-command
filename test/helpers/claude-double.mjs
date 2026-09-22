@@ -474,6 +474,35 @@ async function run() {
   }
 
   if (process.env['CLAUDE_DOUBLE_WORKFLOW_CANDIDATE'] === '1') {
+    const configFile = flagValue('--mcp-config');
+    const lens = /Your lens id is "(blind|edge|acceptance|security|architecture|codebase|tests)"/.exec(prompt)?.[1];
+    if (lens !== undefined && configFile !== undefined) {
+      // Native-tool child (the host wired perkins_submit_findings through a
+      // scoped bridge): submit findings through the product tool exactly as
+      // the real model would. The host owns the lens id, so the input omits
+      // `source` — the same shape the prompt demands.
+      const findings = lens === 'security'
+        ? [{ severity: 'warning', category: 'coverage', title: 'Verified adapter finding', location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line is independently reviewable.', recommended_fix: 'Retain verification coverage for this path.' }]
+        : lens === 'tests'
+          ? [{ severity: 'warning', category: 'coverage-gate', title: 'Coverage gate: CONCERNS', location: 'N/A', evidence: 'N/A', detail: 'Changed behavior has no executed live-credential smoke proof.', recommended_fix: 'Run the opt-in live-credential smoke test before release.' }]
+          : [];
+      const session = await mcpSession(configFile);
+      try {
+        const response = await session.call('tools/call', {
+          name: 'perkins_submit_findings',
+          arguments: { findings },
+        });
+        const accepted = JSON.parse(mcpToolText(response));
+        if (accepted.accepted !== true) throw new Error('child submission was not accepted');
+      } finally {
+        session.close();
+      }
+      const summary = 'findings submitted via perkins_submit_findings';
+      await emitTextTurn(summary);
+      out(resultFrame(summary, false));
+      return;
+    }
+    // Text-path child (no native tool wired): the strict JSON envelope.
     let answer = '[]';
     if (prompt.includes('"source": "security"')) {
       answer = '[{"source":"security","severity":"warning","category":"coverage","title":"Verified adapter finding","location":"src/main.ts:2","evidence":"  return 43;","detail":"The changed line is independently reviewable.","recommended_fix":"Retain verification coverage for this path."}]';

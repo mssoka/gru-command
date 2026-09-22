@@ -106,7 +106,9 @@ export interface IsolatedReviewPolicy {
    * these on every runtime (pi: in-process custom tools; claude-code: the
    * session-scoped MCP bridge); callers declare WHAT is available and never
    * branch on harness. Omitted = the session exposes no native tools; a
-   * declared list is exposed exactly, nothing more.
+   * declared list is exposed exactly, nothing more. The adapter also records
+   * the wired names on the handle (`reviewTools`), so a caller that needs a
+   * capability check reads the honored declaration, not the request.
    */
   readonly nativeTools?: readonly NativeAgentTool[];
 }
@@ -217,6 +219,13 @@ export interface AgentHandle {
   readonly sessionFile: string | null;
   /** Fresh ambient-free review attempt whose retry lifecycle belongs to its workflow. */
   readonly reviewIsolation?: true;
+  /**
+   * Names of product-native review tools actually wired into this isolated
+   * session (runtime capability declaration, SPEC ruling 4). Absent/empty
+   * when none were requested or the runtime cannot host them; callers key
+   * their submission path off this, never off the spawn-time request.
+   */
+  readonly reviewTools?: readonly string[];
   /** The hosting runtime's capability declaration (SPEC ruling 4):
    * surfaces read the SAME gaps the adapter declared — the chat surface
    * gates vision on it (SPEC ruling 19: graceful decline, never a guess). */

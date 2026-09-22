@@ -112,6 +112,14 @@ interface ChildResultView {
 
 export interface LeadBrainOptions {
   readonly childAnswer: (prompt: string, call: HybridSpawnCall) => string | Promise<string>;
+  /**
+   * Simulate a native-tool child runtime (pi): the spawned handle declares
+   * the requested perkins_submit_findings tool and, with 'tool', every
+   * valid bare JSON array the child answers with is delivered through that
+   * tool instead of assistant text. 'text-only' declares the tool but never
+   * calls it (proves no silent text fallback). Absent = text-path runtime.
+   */
+  readonly childNativeTools?: 'tool' | 'text-only';
   readonly decide?: (candidate: ChildCandidateView) => LeadDecision;
   readonly priorAudit?: (
     prior: readonly unknown[],
@@ -144,6 +152,14 @@ const SEVERITY_RANK: Record<string, number> = { blocker: 3, warning: 2, note: 1 
 
 function normalize(value: string): string {
   return value.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/** Lens id from either child prompt shape: the text envelope ("source") or
+ * the native-tool contract (lens id line). */
+function lensFromPrompt(prompt: string): string | null {
+  return /"source": "(blind|edge|acceptance|security|architecture|codebase|tests)"/u.exec(prompt)?.[1] ??
+    /Your lens id is "(blind|edge|acceptance|security|architecture|codebase|tests)"/u.exec(prompt)?.[1] ??
+    null;
 }
 
 function extractJsonArray(prompt: string, header: string): string {
@@ -408,40 +424,72 @@ export function fakeHybridSpawner(
     const call: HybridSpawnCall = { options: spawnOptions, agentId, sessionFile: file };
     calls.push(call);
     (isLead ? leadCalls : childCalls).push(call);
+    const requestedNativeTools = spawnOptions.isolatedReview?.nativeTools ?? [];
+    const declaresNativeTools = !isLead && options.childNativeTools !== undefined && requestedNativeTools.length > 0;
     const handle: AgentHandle = {
       role: 'perkins',
       id: agentId,
       sessionFile: file,
       capabilities: CAPS,
       reviewIsolation: true,
+      ...(declaresNativeTools ? { reviewTools: requestedNativeTools.map((tool) => tool.name) } : {}),
       async prompt(prompt) {
         call.prompt = prompt;
         let text = isLead
           ? await runLead(call, prompt, spawnOptions.reviewLead!.nativeTools)
           : await options.childAnswer(prompt, call);
-        if (!isLead && /"source": "tests"/u.test(prompt)) {
-          try {
-            const parsed = JSON.parse(text) as unknown;
-            if (Array.isArray(parsed)) {
-              for (const entry of parsed) {
-                if (
-                  typeof entry === 'object' && entry !== null &&
-                  (entry as { category?: unknown }).category === 'coverage-gate' &&
-                  (entry as { title?: unknown }).title === 'Coverage gate: FAIL'
-                ) ownGateFail = true;
+        if (!isLead) {
+          const lens = lensFromPrompt(prompt);
+          if (lens === 'tests') {
+            try {
+              const parsed = JSON.parse(text) as unknown;
+              if (Array.isArray(parsed)) {
+                for (const entry of parsed) {
+                  if (
+                    typeof entry === 'object' && entry !== null &&
+                    (entry as { category?: unknown }).category === 'coverage-gate' &&
+                    (entry as { title?: unknown }).title === 'Coverage gate: FAIL'
+                  ) ownGateFail = true;
+                }
+                if (!parsed.some((entry) =>
+                  typeof entry === 'object' && entry !== null && (entry as { category?: unknown }).category === 'coverage-gate')) {
+                  parsed.push({
+                    source: 'tests', severity: 'note', category: 'coverage-gate', title: 'Coverage gate: PASS',
+                    location: 'N/A', evidence: 'N/A', detail: 'Required test coverage thresholds are satisfied.',
+                    recommended_fix: 'Keep the current coverage gate green.',
+                  });
+                  text = JSON.stringify(parsed);
+                }
               }
+            } catch {
+              // Preserve intentionally malformed child output for retry tests.
             }
-            if (Array.isArray(parsed) && !parsed.some((entry) =>
-              typeof entry === 'object' && entry !== null && (entry as { category?: unknown }).category === 'coverage-gate')) {
-              parsed.push({
-                source: 'tests', severity: 'note', category: 'coverage-gate', title: 'Coverage gate: PASS',
-                location: 'N/A', evidence: 'N/A', detail: 'Required test coverage thresholds are satisfied.',
-                recommended_fix: 'Keep the current coverage gate green.',
-              });
-              text = JSON.stringify(parsed);
+          }
+          if (options.childNativeTools === 'tool' && declaresNativeTools) {
+            // Simulate the runtime executing the child's tool call: a bare
+            // JSON array answer becomes the structured submission (source is
+            // host-owned and stripped); a schema rejection surfaces as a
+            // tool error the model could correct, and no call at all leaves
+            // the run unsubmitted.
+            const submit = requestedNativeTools.find((tool) => tool.name === 'perkins_submit_findings');
+            try {
+              const parsed = JSON.parse(text) as unknown;
+              if (Array.isArray(parsed) && submit !== undefined) {
+                const findings = parsed.map((entry) => {
+                  const candidate = entry as Record<string, unknown>;
+                  const { source: _source, ...rest } = candidate;
+                  return rest;
+                });
+                try {
+                  await submit.execute({ findings });
+                } catch {
+                  // The runtime reports the tool error to the model; the fake
+                  // child simply ends its turn with the rejection recorded.
+                }
+              }
+            } catch {
+              // Non-JSON answer: the scripted child never had a submission.
             }
-          } catch {
-            // Preserve intentionally malformed child output for retry tests.
           }
         }
         writeFileSync(file, `${JSON.stringify({ role: 'assistant', text, stopReason: 'stop' })}\n`, 'utf8');
