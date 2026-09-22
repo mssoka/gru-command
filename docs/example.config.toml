@@ -47,6 +47,8 @@ default = "default"                # runtime's configured thinking level
 [runtimes.pi]
 # model = "default"                # optional runtime-wide overrides
 # thinking_level = "default"
+# model_refresh = true             # ONE bounded network catalog refresh on unknown model
+# model_refresh_timeout_ms = 10000 # refresh deadline (ms); model_refresh = false = offline
 
 [runtimes.pi.roles]
 # gru = { model = "default", thinking_level = "default" }

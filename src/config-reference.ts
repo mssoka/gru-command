@@ -1,6 +1,8 @@
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import {
+  DEFAULT_MODEL_REFRESH,
+  DEFAULT_MODEL_REFRESH_TIMEOUT_MS,
   MODEL_DEFAULT_SENTINEL,
   ROLES,
   RUNTIME_IDS,
@@ -166,6 +168,24 @@ function runtimePolicyLines(
   else lines.push(`${c}# model = ${tomlString(MODEL_DEFAULT_SENTINEL)}`);
   if (thinking !== undefined) lines.push(`${c}thinking_level = ${tomlString(thinking)}`);
   else lines.push(`${c}# thinking_level = ${tomlString(MODEL_DEFAULT_SENTINEL)}`);
+  if (runtime === 'pi') {
+    const refresh = policy?.modelRefresh;
+    const refreshTimeout = policy?.modelRefreshTimeoutMs;
+    lines.push(
+      `${c}# On an unknown model, allow ONE bounded network catalog refresh before`,
+      `${c}# failing; set false for a strictly offline catalog.`,
+    );
+    lines.push(
+      refresh === undefined
+        ? `${c}# model_refresh = ${DEFAULT_MODEL_REFRESH}`
+        : `${c}model_refresh = ${refresh}`,
+    );
+    lines.push(
+      refreshTimeout === undefined
+        ? `${c}# model_refresh_timeout_ms = ${DEFAULT_MODEL_REFRESH_TIMEOUT_MS}`
+        : `${c}model_refresh_timeout_ms = ${refreshTimeout}`,
+    );
+  }
   lines.push('', `${c}[runtimes.${runtime}.roles]`);
   lines.push(
     `${c}# Optional per-role inline tables (at least one field when uncommented).`,
