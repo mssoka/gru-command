@@ -128,7 +128,7 @@ describe('gru awareness — passive injection', () => {
     ]);
   });
 
-  it('renders verdict blocker counts from the fallback gate triage', () => {
+  it('renders verdict blocker counts from the fallback gate triage and Perkins rounds', () => {
     const rig = boot();
     rig.api.appendCustomEvent({
       kind: 'job.fallback-review',
@@ -140,9 +140,16 @@ describe('gru awareness — passive injection', () => {
       jobId: 'j1',
       payload: { gate: true, phase: 'pass', iteration: 3, notes: 0, clearToMerge: true },
     });
+    rig.api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'j1',
+      roundId: 'j1-r1',
+      payload: { canonicalVerdict: 'NEEDS CHANGES', blockers: 2, complete: true },
+    });
     const block = rig.awareness.prepare();
     expect(block?.text).toContain('job j1: bmad-review round 2 — 3 blocker(s), 1 note(s)');
     expect(block?.text).toContain('job j1: bmad-review PASS — clear to merge (merge stays user-held)');
+    expect(block?.text).toContain('round j1-r1: Perkins NEEDS CHANGES — 2 blocker(s) (proof complete)');
   });
 
   it('keeps an older escalation visible even when newer events overflow the digest window', () => {

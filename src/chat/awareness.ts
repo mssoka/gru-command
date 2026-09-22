@@ -156,7 +156,10 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
   'round.perkins-review': (event) => {
     const payload = payloadOf(event);
     const verdict = textOf(payload.canonicalVerdict) ?? 'review complete';
-    return `round ${event.roundId ?? '?'}: Perkins ${verdict} (${payload.complete === false ? 'incomplete proof' : 'proof complete'})`;
+    const blockers = numberOf(payload.blockers);
+    return `round ${event.roundId ?? '?'}: Perkins ${verdict}${
+      blockers !== null ? ` — ${blockers} blocker(s)` : ''
+    } (${payload.complete === false ? 'incomplete proof' : 'proof complete'})`;
   },
   'round.perkins-incomplete': (event) => {
     const payload = payloadOf(event);
