@@ -1328,6 +1328,25 @@ describe('Perkins hybrid lead engine', () => {
     expect(h.toolErrors).toEqual([]);
   });
 
+  it('rejects an unamendable or malformed delta envelope without advancing the stored base', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      submitPayload: (attempt, submission) => attempt === 1
+        ? { mode: 'delta', extra_field: true, candidate_decisions: submission.candidate_decisions }
+        : submission,
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(/delta submission contains unsupported keys: extra_field/);
+    const rejection = JSON.parse(readFileSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.error.json'), 'utf8')) as {
+      issues: ReadonlyArray<{ subject: string; rule: string; message: string }>;
+    };
+    expect(rejection.issues.some((issue) => issue.rule === 'delta-shape')).toBe(true);
+    expect(rejection.issues.some((issue) => issue.rule === 'delta-base')).toBe(true);
+    // The broken envelope resolved to no coherent submission: nothing stored.
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.json'))).toBe(false);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.delta.json'))).toBe(true);
+  });
+
   it('reports every invalid prior-audit entry in one rejection', async () => {
     const prior = (index: number): Record<string, unknown> => ({
       ...finding('security', 'blocker', { title: `prior defect ${index}` }),
