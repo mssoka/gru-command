@@ -277,6 +277,9 @@ describe('bundled Perkins policy and deterministic contracts', () => {
     expect(() => execFileSync(process.execPath, [verifier, root], { encoding: 'utf8', stdio: 'pipe' })).toThrow();
   });
 
+  // The packed product is rebuilt end-to-end (`npm pack` runs prepack:
+  // build:web + backend build + verifier), which exceeds the global 30s test
+  // bound on slower machines while the subprocess itself is bounded at 120s.
   it('packs, extracts, verifies, and MCP-smokes the rebuilt source-free product under an empty home', async () => {
     const productRoot = join(import.meta.dirname, '..');
     const packRoot = temp('perkins-pack-source-');
@@ -419,7 +422,7 @@ describe('bundled Perkins policy and deterministic contracts', () => {
       identity: 'perkins-code-review', protocolVersion: '2024-11-05', listed: true, called: true,
       silasSkills: ['ops-dispatch', 'ledger-closeout'],
     });
-  });
+  }, 300_000);
 
   it('fails loud for missing, malformed, and identity-corrupt policy resources', () => {
     const root = temp('perkins-policy-failure-');
