@@ -223,12 +223,14 @@ describe('native-tools harness parity (hybrid double → both real adapters)', (
         expect(sorted(pi.nativeTools), `${label}: pi native tools`).toEqual(sorted(nativeTools));
         expect(sorted(claude.nativeTools), `${label}: claude native tools`).toEqual(sorted(nativeTools));
       }
-      // Lead behavior is unchanged: the lead still declares the five.
+      // The lead declares its six orchestration tools (record-decision
+      // joined the five after #48's parity harness landed).
       const lead = policies.find((policy) => policy.label === 'lead')!;
       expect(sorted(lead.nativeTools)).toEqual(sorted([
         'perkins_read_chunk',
         'perkins_run_lenses',
         'perkins_store_artifact',
+        'perkins_record_decision',
         'perkins_preflight_submission',
         'perkins_submit_review',
       ]));

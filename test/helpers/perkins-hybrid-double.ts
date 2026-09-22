@@ -64,6 +64,10 @@ export interface HybridPreflightOptions {
   readonly calls?: number;
   /** Applied to the preflight payload only; the real submission is untouched. */
   readonly mutate?: (submission: HybridSubmission) => HybridSubmission;
+  /** Build the exact preflight payload (defaults to the full submission). */
+  readonly payload?: (submission: HybridSubmission) => unknown;
+  /** Real-submission attempt the preflight calls precede (1-based, default 1). */
+  readonly beforeAttempt?: number;
   /** Skip the real submission after preflight (proves preflight accepts nothing). */
   readonly withhold?: boolean;
 }
@@ -72,6 +76,19 @@ export interface HybridPreflightResult {
   readonly text: string;
   readonly details?: Readonly<Record<string, unknown>>;
   readonly terminate?: boolean;
+}
+
+export interface HybridRecordResult {
+  readonly text: string;
+  readonly details?: Readonly<Record<string, unknown>>;
+}
+
+/** Scripted per-candidate record calls through perkins_record_decision. */
+export interface HybridRecordOptions {
+  /** Candidate indexes to record (default: every candidate). */
+  readonly only?: readonly number[];
+  /** Decision override for the record call (default: the submission's decision). */
+  readonly decide?: (candidate: ChildCandidateView, index: number) => LeadDecision;
 }
 
 interface ChildCandidateView {
@@ -115,8 +132,12 @@ export interface LeadBrainOptions {
   readonly transformReport?: (report: string) => string;
   /** Validate the exact submission through the preflight channel first. */
   readonly preflight?: HybridPreflightOptions;
+  /** Validate each decision through perkins_record_decision before submitting. */
+  readonly recordDecisions?: HybridRecordOptions;
   /** Extra real-submission attempts after a rejection (default 1 retry). */
   readonly submitRetries?: number;
+  /** Build the exact real-submission payload per attempt (1-based); default: the full submission. */
+  readonly submitPayload?: (attempt: number, submission: HybridSubmission, candidates: readonly ChildCandidateView[]) => unknown;
 }
 
 const SEVERITY_RANK: Record<string, number> = { blocker: 3, warning: 2, note: 1 };
@@ -171,12 +192,14 @@ export function fakeHybridSpawner(
   readonly childCalls: HybridSpawnCall[];
   readonly toolErrors: ReadonlyArray<{ tool: string; error: string }>;
   readonly preflightResults: ReadonlyArray<HybridPreflightResult>;
+  readonly recordResults: ReadonlyArray<HybridRecordResult>;
 } {
   const calls: HybridSpawnCall[] = [];
   const leadCalls: HybridSpawnCall[] = [];
   const childCalls: HybridSpawnCall[] = [];
   const toolErrors: { tool: string; error: string }[] = [];
   const preflightResults: HybridPreflightResult[] = [];
+  const recordResults: HybridRecordResult[] = [];
   let next = 0;
 
   let ownGateFail = false;
@@ -188,6 +211,7 @@ export function fakeHybridSpawner(
     const chunkTool = byName.get('perkins_read_chunk')!;
     const artifactTool = byName.get('perkins_store_artifact')!;
     const preflightTool = byName.get('perkins_preflight_submission');
+    const recordTool = byName.get('perkins_record_decision');
     const submitTool = byName.get('perkins_submit_review')!;
 
     const coverage = JSON.parse(extractJsonArray(prompt, '--- REQUIRED CHILD COVERAGE ---')) as
@@ -333,21 +357,40 @@ export function fakeHybridSpawner(
       prior_audit: priorAudit,
       report_markdown: report,
     };
-    if (options.preflight !== undefined) {
-      if (preflightTool === undefined) throw new Error('hybrid double expected the perkins_preflight_submission tool');
-      const preflightCalls = options.preflight.calls ?? 1;
-      for (let index = 0; index < preflightCalls; index += 1) {
-        const payload = options.preflight.mutate?.(submission) ?? submission;
-        const result = await preflightTool.execute(payload);
-        preflightResults.push({ text: result.text, details: result.details, terminate: result.terminate });
+    if (options.recordDecisions !== undefined) {
+      if (recordTool === undefined) throw new Error('hybrid double expected the perkins_record_decision tool');
+      for (const [index, candidate] of candidates.entries()) {
+        if (options.recordDecisions.only !== undefined && !options.recordDecisions.only.includes(index)) continue;
+        const decision = options.recordDecisions.decide?.(candidate, index)
+          ?? decisions.find((entry) => entry.candidate_ref === candidate.ref);
+        if (decision === undefined) continue;
+        const result = await recordTool.execute({ candidate_ref: candidate.ref, ...decision });
+        recordResults.push({ text: result.text, details: result.details });
       }
-      if (options.preflight.withhold === true) return 'lead preflighted and withheld the real submission';
     }
+    if (options.preflight !== undefined && (options.preflight.beforeAttempt ?? 1) < 1) {
+      throw new Error('hybrid double preflight.beforeAttempt must be >= 1');
+    }
+    const preflightBefore = options.preflight?.beforeAttempt ?? 1;
     const attempts = 1 + Math.max(options.submitRetries ?? 1, 0);
     let lastError: unknown;
     for (let index = 0; index < attempts; index += 1) {
+      const attempt = index + 1;
+      if (options.preflight !== undefined && attempt === preflightBefore) {
+        if (preflightTool === undefined) throw new Error('hybrid double expected the perkins_preflight_submission tool');
+        const preflightCalls = options.preflight.calls ?? 1;
+        for (let call = 0; call < preflightCalls; call += 1) {
+          const payload = options.preflight.payload !== undefined
+            ? options.preflight.payload(submission)
+            : (options.preflight.mutate?.(submission) ?? submission);
+          const result = await preflightTool.execute(payload as Record<string, unknown>);
+          preflightResults.push({ text: result.text, details: result.details, terminate: result.terminate });
+        }
+        if (options.preflight.withhold === true) return 'lead preflighted and withheld the real submission';
+      }
+      const payload = options.submitPayload?.(attempt, submission, candidates) ?? submission;
       try {
-        return (await submitTool.execute(submission)).text;
+        return (await submitTool.execute(payload as Record<string, unknown>)).text;
       } catch (error) {
         lastError = error;
         toolErrors.push({ tool: 'perkins_submit_review', error: String(error) });
@@ -412,5 +455,5 @@ export function fakeHybridSpawner(
     return handle;
   };
 
-  return { spawner, calls, leadCalls, childCalls, toolErrors, preflightResults };
+  return { spawner, calls, leadCalls, childCalls, toolErrors, preflightResults, recordResults };
 }

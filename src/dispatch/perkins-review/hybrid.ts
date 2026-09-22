@@ -37,6 +37,10 @@ const MAX_LEAD_ARTIFACT_BYTES = 100 * 1024;
  * well inside it for every real submission. */
 const MAX_VALIDATION_MESSAGE_BYTES = 256 * 1024;
 export const PERKINS_REPORT_MAX_BYTES = 128 * 1024;
+/** One real submission arrives through a <=1 MiB tool transport. A rejected
+ * submission kept as the delta base is stored only within that same bound;
+ * an over-bound rejection cannot be amended and must be resubmitted whole. */
+export const PERKINS_STORED_SUBMISSION_MAX_BYTES = 1024 * 1024;
 const REVIEW_OWNER = 'perkins-hybrid-review';
 
 const BLIND_SYSTEM_PROMPT =
@@ -135,6 +139,30 @@ interface LeadSubmission {
   readonly report_markdown: string;
 }
 
+/** Host state a candidate submission resolves against: decisions validated
+ * and recorded as the lead verified them, plus the last rejected submission
+ * that a delta may amend. */
+interface SubmissionState {
+  readonly recordedDecisions: ReadonlyMap<string, CandidateDecision>;
+  readonly lastRejected: LeadSubmission | null;
+  /** True when a coherent submission was rejected but exceeded the delta
+   * base bound, so the lead must resubmit it whole instead of amending. */
+  readonly lastRejectionOversized: boolean;
+}
+
+/** A delta resolved over stored host state: the merged whole plus every
+ * delta-envelope violation encountered while applying it. */
+interface ResolvedDelta {
+  /** Full-submission-shaped object; validated by the same collect-all pass. */
+  readonly merged: {
+    readonly canonical_verdict: unknown;
+    readonly candidate_decisions: readonly CandidateDecision[];
+    readonly prior_audit: readonly FixAuditResult[];
+    readonly report_markdown: unknown;
+  };
+  readonly errors: readonly SubmissionValidationIssue[];
+}
+
 /** One exhaustive submission-validation violation, addressable by the lead. */
 interface SubmissionValidationIssue {
   /** `candidate_ref`, `prior audit N`, `finding <title>`, `report`, or `submission`. */
@@ -201,9 +229,15 @@ interface SubmissionValidationFailure {
 type SubmissionValidation = SubmissionValidationSuccess | SubmissionValidationFailure;
 
 const SUBMISSION_KEYS = ['canonical_verdict', 'candidate_decisions', 'prior_audit', 'report_markdown'];
+const DELTA_KEYS = ['mode', 'canonical_verdict', 'candidate_decisions', 'prior_audit', 'report_markdown'];
 const CANDIDATE_DECISION_KEYS = ['candidate_ref', 'disposition', 'evidence', 'reason'];
 const PRIOR_AUDIT_KEYS = ['prior_index', 'status', 'evidence', 'reason'];
 const CANONICAL_VERDICTS = ['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'];
+
+function isDeltaEnvelope(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) &&
+    (value as { mode?: unknown }).mode === 'delta';
+}
 
 function hash(text: string): string {
   return createHash('sha256').update(text).digest('hex');
@@ -714,6 +748,14 @@ export class PerkinsHybridReview {
     const readChunks = new Set<string>();
     const agentIds = new Set<string>();
     const sessionFiles = new Set<string>();
+    // Frozen-tree proof lookups are immutable per round: one cache per run
+    // serves child-side evidence checks and every preflight/submission pass.
+    const proofCache = newProofCache();
+    const recordedDecisions = new Map<string, CandidateDecision>();
+    let lastRejectedSubmission: LeadSubmission | null = null;
+    let lastRejectionOversized = false;
+    let recordAttempts = 0;
+    let deltaSubmissions = 0;
     let terminalAttempts = 0;
     let preflightAttempts = 0;
     let accepted: PerkinsHybridResult | null = null;
@@ -758,6 +800,21 @@ export class PerkinsHybridReview {
         const reviewFindings = parsed.filter((finding) =>
           !(finding.source === 'tests' && finding.category === 'coverage-gate'),
         );
+        // Evidence pairing is enforced at envelope construction: a finding
+        // that cites a real file must quote that file (or its frozen diff),
+        // not a sibling file. The cheapest failure point is the child attempt
+        // itself, so the lead never inherits an unmixable candidate; a failed
+        // attempt stays retryable within the pinned lens bound.
+        for (const [findingIndex, finding] of reviewFindings.entries()) {
+          if (finding.evidence === 'N/A' || finding.evidence.trim() === '') continue;
+          const citedPath = findingPath(finding);
+          if (citedPath === null || finding.location === 'N/A') continue;
+          if (!evidenceAtCitedLocation(review, finding, finding.evidence, proofCache)) {
+            throw new Error(
+              `lens finding ${findingIndex} evidence is not locatable at its cited file/hunk: ${finding.location}`,
+            );
+          }
+        }
         // The tests lens's validated coverage gate is host-owned evidence:
         // carried into terminal proof so a FAIL gate blocks the verdict.
         const gate = parsed.find((finding) => finding.source === 'tests' && finding.category === 'coverage-gate');
@@ -978,7 +1035,7 @@ export class PerkinsHybridReview {
       lenses,
     };
 
-    const submissionSchema = {
+    const fullSubmissionSchema = {
       type: 'object', additionalProperties: false,
       required: ['canonical_verdict', 'candidate_decisions', 'prior_audit', 'report_markdown'],
       properties: {
@@ -988,22 +1045,94 @@ export class PerkinsHybridReview {
         report_markdown: { type: 'string', minLength: 1, maxLength: PERKINS_REPORT_MAX_BYTES },
       },
     };
+    const deltaSubmissionSchema = {
+      type: 'object', additionalProperties: false,
+      required: ['mode'],
+      properties: {
+        mode: { type: 'string', enum: ['delta'] },
+        canonical_verdict: { type: 'string', enum: ['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'] },
+        candidate_decisions: { type: 'array', maxItems: MAX_TOTAL_CANDIDATES, items: { type: 'object' } },
+        prior_audit: { type: 'array', maxItems: 10_000, items: { type: 'object' } },
+        report_markdown: { type: 'string', minLength: 1, maxLength: PERKINS_REPORT_MAX_BYTES },
+      },
+    };
+    const submissionSchema = { oneOf: [fullSubmissionSchema, deltaSubmissionSchema] };
+
+    /** Validate-at-store entry point: the same single decision validator the
+     * terminal pass runs, applied to one candidate decision. Clean decisions
+     * are kept in the round record and merged into the final submission. */
+    const recordTool: NativeAgentTool = {
+      name: 'perkins_record_decision',
+      description: 'Validate one candidate decision immediately with the exact rules perkins_submit_review enforces for it and, when clean, record it in the round decision record. A final submission may then carry only changed fields; recorded decisions are merged host-side and re-validated as the whole. Recording spends no terminal attempt and accepts nothing.',
+      inputSchema: {
+        type: 'object', additionalProperties: false,
+        required: [...CANDIDATE_DECISION_KEYS],
+        properties: {
+          candidate_ref: { type: 'string' },
+          disposition: { type: 'string', enum: ['confirmed', 'rejected', 'unverifiable-speculative'] },
+          evidence: { type: 'string' },
+          reason: { type: 'string' },
+        },
+      },
+      execute: async (raw, signal) => {
+        if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
+        if (accepted !== null) throw new Error('review already has an accepted terminal submission');
+        recordAttempts += 1;
+        const issues: SubmissionValidationIssue[] = [];
+        let decision: CandidateDecision | null = null;
+        if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+          issues.push({ subject: 'candidate decision', rule: 'candidate-decision-shape', message: 'candidate decision must be an object' });
+        } else {
+          decision = parseDecisionEntry(raw, 0, issues).decision;
+          if (decision !== null) issues.push(...this.validateDecision(validationContext, decision, proofCache));
+        }
+        const ok = issues.length === 0 && decision !== null;
+        if (ok) recordedDecisions.set(decision!.candidate_ref, decision!);
+        const bounded = boundedIssues(issues);
+        writeReviewArtifact(review, `lead/record-attempt-${recordAttempts}.json`, {
+          schemaVersion: 1,
+          ok,
+          ...(decision !== null ? { decision } : { raw_decision: raw }),
+          errorCount: issues.length,
+          errors: issues,
+        });
+        return {
+          text: JSON.stringify({
+            record: true,
+            recorded: ok,
+            ok,
+            ...(decision !== null ? { candidate_ref: decision.candidate_ref } : {}),
+            recordedCount: recordedDecisions.size,
+            errorCount: issues.length,
+            errors: bounded.errors,
+            ...(bounded.omitted > 0 ? { omittedErrorCount: bounded.omitted } : {}),
+          }),
+          details: {
+            record: true, recorded: ok, ok, errorCount: issues.length,
+            recordAttempt: recordAttempts, recordedCount: recordedDecisions.size,
+          },
+        };
+      },
+    };
 
     /** Validation-only entry point: the exact same validator as submission,
      * no terminal attempt consumed, no sealing, no termination. */
     const preflightTool: NativeAgentTool = {
       name: 'perkins_preflight_submission',
-      description: 'Validate a candidate terminal submission with the exact rules perkins_submit_review enforces, without spending a terminal attempt and without sealing the round. Returns the complete exhaustive error list in one response; ok=true means the same payload would be accepted. Preflight accepts nothing and never terminates.',
+      description: 'Validate a candidate terminal submission — a full payload or a {"mode":"delta"} amendment over the stored rejection/decision record — with the exact rules perkins_submit_review enforces, without spending a terminal attempt and without sealing the round. Returns the complete exhaustive error list in one response; ok=true means the same payload would be accepted. Preflight accepts nothing and never terminates.',
       inputSchema: submissionSchema,
       execute: async (raw, signal) => {
         if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
         if (accepted !== null) throw new Error('review already has an accepted terminal submission');
         preflightAttempts += 1;
-        const validation = this.validateSubmission(validationContext, raw);
+        const state: SubmissionState = { recordedDecisions, lastRejected: lastRejectedSubmission, lastRejectionOversized };
+        const validation = this.validateSubmission(validationContext, raw, state, proofCache);
         const errors = validation.ok ? [] : validation.errors;
         const bounded = boundedIssues(errors);
+        const mode = isDeltaEnvelope(raw) ? 'delta' : 'full';
         writeReviewArtifact(review, `lead/preflight-attempt-${preflightAttempts}.json`, {
           schemaVersion: 1,
+          mode,
           ok: validation.ok,
           errorCount: errors.length,
           errors,
@@ -1013,6 +1142,7 @@ export class PerkinsHybridReview {
         return {
           text: JSON.stringify({
             preflight: true,
+            mode,
             ok: validation.ok,
             errorCount: errors.length,
             errors: bounded.errors,
@@ -1020,6 +1150,7 @@ export class PerkinsHybridReview {
           }),
           details: {
             preflight: true,
+            mode,
             ok: validation.ok,
             errorCount: errors.length,
             preflightAttempt: preflightAttempts,
@@ -1030,19 +1161,34 @@ export class PerkinsHybridReview {
 
     const submitTool: NativeAgentTool = {
       name: 'perkins_submit_review',
-      description: 'Submit the lead-authored terminal proof and report. The host rejects missing coverage, foreign/missing candidates, unsupported verification, incomplete prior audits, changed HEAD, or incorrect verdict arithmetic; one rejection lists every violation in a single response.',
+      description: 'Submit the lead-authored terminal proof and report, either as a full payload or as {"mode":"delta"} carrying only changed fields over the stored rejection/decision record. The host rejects missing coverage, foreign/missing candidates, unsupported verification, incomplete prior audits, changed HEAD, or incorrect verdict arithmetic; one rejection lists every violation in a single response.',
       inputSchema: submissionSchema,
       execute: async (raw, signal) => {
         if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
         terminalAttempts += 1;
         if (terminalAttempts > MAX_TERMINAL_ATTEMPTS) throw new Error('terminal submission attempts exhausted');
         const attempt = terminalAttempts;
+        if (isDeltaEnvelope(raw)) deltaSubmissions += 1;
         try {
           if (accepted !== null) throw new Error('review already has an accepted terminal submission');
-          const validation = this.validateSubmission(validationContext, raw);
+          if (isDeltaEnvelope(raw)) {
+            writeReviewArtifact(review, `lead/submission-attempt-${attempt}.delta.json`, { schemaVersion: 1, delta: raw });
+          }
+          const state: SubmissionState = { recordedDecisions, lastRejected: lastRejectedSubmission, lastRejectionOversized };
+          const validation = this.validateSubmission(validationContext, raw, state, proofCache);
           if (!validation.ok) {
             if (validation.submission !== null) {
               writeReviewArtifact(review, `lead/submission-attempt-${attempt}.json`, validation.submission);
+              // A rejected submission becomes the amend base within the same
+              // byte bound the full path can receive; an over-bound rejection
+              // is not stored and must be resubmitted whole.
+              if (Buffer.byteLength(JSON.stringify(validation.submission), 'utf8') <= PERKINS_STORED_SUBMISSION_MAX_BYTES) {
+                lastRejectedSubmission = validation.submission;
+                lastRejectionOversized = false;
+              } else {
+                lastRejectedSubmission = null;
+                lastRejectionOversized = true;
+              }
             }
             throw new SubmissionRejection(validation.errors);
           }
@@ -1091,7 +1237,8 @@ export class PerkinsHybridReview {
       this.policy.portableContract.leadWorkflow,
       '',
       '--- PRODUCT-NATIVE TOOL CONTRACT ---',
-      'Use perkins_read_chunk to read frozen diff chunks; use perkins_run_lenses to start and receive tracked lens children; use perkins_store_artifact only for optional lead notes; use perkins_preflight_submission to validate a candidate terminal submission without spending a terminal attempt; finish by calling perkins_submit_review.',
+      'Use perkins_read_chunk to read frozen diff chunks; use perkins_run_lenses to start and receive tracked lens children; use perkins_store_artifact only for optional lead notes; use perkins_record_decision to validate and record each candidate decision as you verify it; use perkins_preflight_submission to validate a candidate terminal submission (full or delta) without spending a terminal attempt; finish by calling perkins_submit_review.',
+      'A terminal submission is either a full payload or {"mode":"delta", ...} carrying only changed fields; recorded decisions and the last rejected submission are applied host-side, then the merged whole is validated with the same exhaustive rules. An accepted delta is indistinguishable from an accepted full submission of the same content.',
       'Lens children never inherit these tools. You, the lead, must independently inspect and decide every returned candidate. Do not write implementation files.',
     ].join('\n');
     const initialPrompt = this.leadPrompt(review, lenses, prior);
@@ -1104,7 +1251,7 @@ export class PerkinsHybridReview {
         reviewLead: {
           systemPrompt,
           tools: ['read', 'grep', 'find', 'ls'],
-          nativeTools: [chunkTool, runTool, artifactTool, preflightTool, submitTool],
+          nativeTools: [chunkTool, runTool, artifactTool, recordTool, preflightTool, submitTool],
         },
       }), LEAD_SPAWN_TIMEOUT_MS, [input.signal]);
       registerIsolatedHandle(lead, 'lead');
@@ -1125,7 +1272,9 @@ export class PerkinsHybridReview {
         leadSessionFile: lead.sessionFile,
         turns,
         preflightCalls: preflightAttempts,
-        nativeTools: [chunkTool.name, runTool.name, artifactTool.name, preflightTool.name, submitTool.name],
+        decisionRecords: recordAttempts,
+        deltaSubmissions,
+        nativeTools: [chunkTool.name, runTool.name, artifactTool.name, recordTool.name, preflightTool.name, submitTool.name],
       });
       return accepted;
     } finally {
@@ -1178,19 +1327,206 @@ export class PerkinsHybridReview {
   }
 
   /**
-   * One exhaustive pass over a candidate submission. Collects every rule
+   * Resolve a candidate payload (full or delta) and validate it. A delta is
+   * applied host-side over the stored rejection, or over the decision record
+   * when no rejection has been stored, and the merged whole is then validated
+   * exactly like a full submission of the same content.
+   */
+  private validateSubmission(
+    context: SubmissionValidationContext,
+    raw: unknown,
+    state: SubmissionState,
+    proofCache: ProofCache,
+  ): SubmissionValidation {
+    const delta = this.resolveDeltaSubmission(context, raw, state);
+    if (delta === null) return this.validateResolvedSubmission(context, raw, proofCache);
+    const validation = this.validateResolvedSubmission(context, delta.merged, proofCache);
+    if (delta.errors.length === 0) return validation;
+    // The delta envelope did not resolve cleanly: nothing is sealed and the
+    // merged state is not advanced. Report the envelope violations together
+    // with whatever the merged whole still fails.
+    return { ok: false, submission: null, errors: [...delta.errors, ...(validation.ok ? [] : validation.errors)] };
+  }
+
+  /** Apply a delta payload over host state without validating it. Returns
+   * null for a full-submission payload. */
+  private resolveDeltaSubmission(
+    context: SubmissionValidationContext,
+    raw: unknown,
+    state: SubmissionState,
+  ): ResolvedDelta | null {
+    if (!isDeltaEnvelope(raw)) return null;
+    const value = raw as Record<string, unknown>;
+    const errors: SubmissionValidationIssue[] = [];
+    const unknownKeys = Object.keys(value).filter((key) => !DELTA_KEYS.includes(key));
+    if (unknownKeys.length > 0) {
+      errors.push({ subject: 'submission', rule: 'delta-shape', message: `delta submission contains unsupported keys: ${unknownKeys.join(', ')}` });
+    }
+    const base = state.lastRejected;
+    const baseDecisions = base?.candidate_decisions ?? [...state.recordedDecisions.values()];
+    const baseAudits = base?.prior_audit ?? [];
+    if (base === null && state.recordedDecisions.size === 0) {
+      errors.push({
+        subject: 'submission',
+        rule: 'delta-base',
+        message: state.lastRejectionOversized
+          ? 'the rejected submission exceeded the delta base byte bound; resubmit the full submission'
+          : 'delta submission has no stored rejection or recorded decisions to amend',
+      });
+    }
+    // Decisions: replace by candidate_ref, append new refs, first entry wins.
+    let deltaDecisions: readonly CandidateDecision[] = [];
+    if (value.candidate_decisions !== undefined) {
+      if (
+        !Array.isArray(value.candidate_decisions) ||
+        value.candidate_decisions.length > Math.max(context.candidates.size, MAX_TOTAL_CANDIDATES)
+      ) {
+        errors.push({ subject: 'submission', rule: 'delta-decisions', message: 'delta candidate_decisions is invalid' });
+      } else {
+        deltaDecisions = value.candidate_decisions
+          .map((entry, index) => parseDecisionEntry(entry, index, errors))
+          .flatMap((entry) => entry.decision === null ? [] : [entry.decision]);
+      }
+    }
+    const seenRefs = new Set<string>();
+    for (const decision of deltaDecisions) {
+      if (seenRefs.has(decision.candidate_ref)) {
+        errors.push({ subject: decision.candidate_ref, rule: 'delta-decisions', message: `delta decides ${decision.candidate_ref} more than once` });
+      }
+      seenRefs.add(decision.candidate_ref);
+    }
+    const decisionReplacement = new Map<string, CandidateDecision>();
+    for (const decision of deltaDecisions) {
+      if (!decisionReplacement.has(decision.candidate_ref)) decisionReplacement.set(decision.candidate_ref, decision);
+    }
+    const mergedDecisions = baseDecisions.map((decision) => decisionReplacement.get(decision.candidate_ref) ?? decision);
+    const knownRefs = new Set(baseDecisions.map((decision) => decision.candidate_ref));
+    for (const decision of deltaDecisions) {
+      if (knownRefs.has(decision.candidate_ref)) continue;
+      if (decisionReplacement.get(decision.candidate_ref) !== decision) continue;
+      knownRefs.add(decision.candidate_ref);
+      mergedDecisions.push(decision);
+    }
+    // Audits: replace by prior_index, append new indexes, first entry wins.
+    let deltaAudits: readonly FixAuditResult[] = [];
+    if (value.prior_audit !== undefined) {
+      if (!Array.isArray(value.prior_audit) || value.prior_audit.length > Math.max(context.prior.length, 10_000)) {
+        errors.push({ subject: 'submission', rule: 'delta-prior-audit', message: 'delta prior_audit is invalid' });
+      } else {
+        deltaAudits = value.prior_audit
+          .map((entry, index) => parseAuditEntry(entry, index, context.prior.length, errors))
+          .flatMap((entry) => entry.audit === null ? [] : [entry.audit]);
+      }
+    }
+    const seenAuditIndexes = new Set<number>();
+    for (const audit of deltaAudits) {
+      if (seenAuditIndexes.has(audit.prior_index)) {
+        errors.push({ subject: `prior audit ${audit.prior_index}`, rule: 'delta-prior-audit', message: `delta audits prior finding ${audit.prior_index} more than once` });
+      }
+      seenAuditIndexes.add(audit.prior_index);
+    }
+    const auditReplacement = new Map<number, FixAuditResult>();
+    for (const audit of deltaAudits) {
+      if (!auditReplacement.has(audit.prior_index)) auditReplacement.set(audit.prior_index, audit);
+    }
+    const mergedAudits = baseAudits.map((audit) => auditReplacement.get(audit.prior_index) ?? audit);
+    const knownAuditIndexes = new Set(baseAudits.map((audit) => audit.prior_index));
+    for (const audit of deltaAudits) {
+      if (knownAuditIndexes.has(audit.prior_index)) continue;
+      if (auditReplacement.get(audit.prior_index) !== audit) continue;
+      knownAuditIndexes.add(audit.prior_index);
+      mergedAudits.push(audit);
+    }
+    // Verdict/report: a supplied value replaces; a malformed supplied value is
+    // reported and leaves the base value in place.
+    let verdict: unknown = base?.canonical_verdict;
+    if (value.canonical_verdict !== undefined) {
+      if (typeof value.canonical_verdict !== 'string' || !CANONICAL_VERDICTS.includes(value.canonical_verdict)) {
+        errors.push({ subject: 'submission', rule: 'submission-verdict', message: 'terminal canonical_verdict is invalid' });
+      } else {
+        verdict = value.canonical_verdict;
+      }
+    }
+    let report: unknown = base?.report_markdown;
+    if (value.report_markdown !== undefined) {
+      const checked = collectBoundedString(
+        value.report_markdown, 'report_markdown', PERKINS_REPORT_MAX_BYTES, 'report', 'report-shape', errors,
+      );
+      if (checked !== null) report = checked;
+    }
+    return {
+      merged: {
+        canonical_verdict: verdict,
+        candidate_decisions: mergedDecisions,
+        prior_audit: mergedAudits,
+        report_markdown: report,
+      },
+      errors,
+    };
+  }
+
+  /**
+   * The single per-decision implementation shared by store-time recording,
+   * preflight and terminal submission. Returns every decision-scoped
+   * violation in stable order; an unowned reference is reported here too.
+   */
+  private validateDecision(
+    context: SubmissionValidationContext,
+    decision: CandidateDecision,
+    proofCache: ProofCache,
+  ): readonly SubmissionValidationIssue[] {
+    const issues: SubmissionValidationIssue[] = [];
+    const candidate = context.candidates.get(decision.candidate_ref);
+    if (candidate === undefined) {
+      issues.push({ subject: decision.candidate_ref, rule: 'decision-coverage', message: 'candidate reference is not owned by this review' });
+      return issues;
+    }
+    const ref = candidate.ref;
+    const review = context.review;
+    if (decision.disposition === 'rejected') {
+      const anchored = findingPath(candidate) !== null && candidate.location !== 'N/A';
+      const located = anchored
+        ? evidenceAtCitedLocation(review, candidate, decision.evidence, proofCache)
+        : evidenceAnywhere(review, decision.evidence, proofCache);
+      if (!located || decision.evidence === candidate.evidence) {
+        issues.push({ subject: ref, rule: 'rejected-evidence', message: `rejected candidate lacks contradictory frozen evidence at its cited location: ${ref}` });
+      }
+      return issues;
+    }
+    const forcedSpeculative = candidate.location === 'N/A' || candidate.evidence === 'N/A' || findingPath(candidate) === null;
+    if (!forcedSpeculative && decision.disposition === 'unverifiable-speculative') {
+      issues.push({ subject: ref, rule: 'anchored-disposition', message: `anchored candidate must be confirmed or rejected: ${ref}` });
+      return issues;
+    }
+    const disposition = forcedSpeculative ? 'unverifiable-speculative' : decision.disposition;
+    if (disposition === 'confirmed') {
+      if (!evidenceAtCitedLocation(review, candidate, candidate.evidence, proofCache)) {
+        issues.push({ subject: ref, rule: 'confirmed-evidence', message: `candidate evidence is not locatable at its cited file/hunk: ${ref}` });
+      }
+      if (!evidenceAnywhere(review, decision.evidence, proofCache)) {
+        issues.push({ subject: ref, rule: 'verification-evidence', message: `lead verification evidence is not locatable in the frozen review: ${ref}` });
+      }
+    }
+    return issues;
+  }
+
+  /**
+   * One exhaustive pass over a resolved full submission. Collects every rule
    * violation — schema, host state, candidate decisions, prior audit, verdict
    * arithmetic, and report structure — in stable order instead of throwing on
    * the first one, so a single rejection (or preflight) lets the lead fix
    * everything at once. Same rules and strictness as the original fail-fast
    * validator; only the reporting changed.
    */
-  private validateSubmission(context: SubmissionValidationContext, raw: unknown): SubmissionValidation {
+  private validateResolvedSubmission(
+    context: SubmissionValidationContext,
+    raw: unknown,
+    proofCache: ProofCache,
+  ): SubmissionValidation {
     const parsed = this.parseSubmission(raw, context.candidates.size, context.prior.length);
     const errors: SubmissionValidationIssue[] = [...parsed.errors];
     const review = context.review;
     const report = parsed.report;
-    const proofCache = newProofCache();
     const push = (subject: string, rule: string, message: string): void => {
       errors.push({ subject, rule, message });
     };
@@ -1306,33 +1642,16 @@ export class PerkinsHybridReview {
     let speculative = 0;
     for (const decision of decidedByRef.values()) {
       const candidate = context.candidates.get(decision.candidate_ref)!;
-      const ref = candidate.ref;
-      const errorMark = errors.length;
+      const decisionIssues = this.validateDecision(context, decision, proofCache);
+      errors.push(...decisionIssues);
       if (decision.disposition === 'rejected') {
-        const anchored = findingPath(candidate) !== null && candidate.location !== 'N/A';
-        const located = anchored
-          ? evidenceAtCitedLocation(review, candidate, decision.evidence, proofCache)
-          : evidenceAnywhere(review, decision.evidence, proofCache);
-        if (!located || decision.evidence === candidate.evidence) {
-          push(ref, 'rejected-evidence', `rejected candidate lacks contradictory frozen evidence at its cited location: ${ref}`);
-        }
-        if (errors.length === errorMark) rejected += 1;
+        if (decisionIssues.length === 0) rejected += 1;
         continue;
       }
       const forcedSpeculative = candidate.location === 'N/A' || candidate.evidence === 'N/A' || findingPath(candidate) === null;
-      if (!forcedSpeculative && decision.disposition === 'unverifiable-speculative') {
-        push(ref, 'anchored-disposition', `anchored candidate must be confirmed or rejected: ${ref}`);
-        continue;
-      }
       const disposition = forcedSpeculative ? 'unverifiable-speculative' : decision.disposition;
+      if (decisionIssues.length > 0) continue;
       if (disposition === 'confirmed') {
-        if (!evidenceAtCitedLocation(review, candidate, candidate.evidence, proofCache)) {
-          push(ref, 'confirmed-evidence', `candidate evidence is not locatable at its cited file/hunk: ${ref}`);
-        }
-        if (!evidenceAnywhere(review, decision.evidence, proofCache)) {
-          push(ref, 'verification-evidence', `lead verification evidence is not locatable in the frozen review: ${ref}`);
-        }
-        if (errors.length > errorMark) continue;
         confirmed += 1;
       } else {
         speculative += 1;
@@ -1479,9 +1798,11 @@ export class PerkinsHybridReview {
       JSON.stringify(prior.map((finding, prior_index) => ({ prior_index, ...finding })), null, 2),
       '',
       'Call perkins_run_lenses until every required lens/chunk has a valid owned result. Read any frozen chunk with perkins_read_chunk. Inspect the returned candidates against the frozen tree. Submit one candidate_decisions entry for every candidate ref and one prior_audit entry for every prior_index.',
+      'Record each decision with perkins_record_decision as you verify it: it validates the decision immediately with the same exhaustive rules and keeps clean decisions in the round record, so the final submission can carry only what is still missing.',
       'A rejected candidate still requires a concise reason. confirmed evidence must be one contiguous verbatim current-tree substring. N/A claims are speculative and cannot remain blockers.',
       'Pairing rules are enforced at cited locations: a rejected candidate needs contradictory evidence locatable at its cited file/hunk, confirmed candidate evidence must be locatable at its cited file/hunk, and your verification evidence must be locatable in the frozen review.',
-      'Before the terminal submission, call perkins_preflight_submission with the exact candidate submission. It spends no terminal attempt, accepts nothing, and returns every violation in one response; fix them all and preflight again until it reports no errors, then submit once.',
+      'Before the terminal submission, call perkins_preflight_submission with the exact candidate submission (full, or {"mode":"delta", ...} to amend the rejection record after a failed attempt). It spends no terminal attempt, accepts nothing, and returns every violation in one response; fix them all and preflight again until it reports no errors, then submit once.',
+      'After a rejected terminal submission, resubmit a delta: {"mode":"delta", "candidate_decisions": [only the changed/added decisions], ...changed report fields}. The host applies it over the rejected submission and re-validates the merged whole with the same rules. A delta is still a real terminal attempt.',
       'Write a complete Markdown report containing `**Verdict: ...**` and every retained finding title, then call perkins_submit_review. Never claim completion from missing/failed runs.',
     ].join('\n');
   }
