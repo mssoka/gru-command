@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Full suite (Node 22)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # This repo's `npm test` re-runs lint/typecheck/build as its own
+      # definition of green, then the backend + web suites. Keeping the
+      # stages above as separate steps makes a failure legible at a glance;
+      # this last step is the authoritative full gate.
+      - name: Full test suite
+        run: npm test
