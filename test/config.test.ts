@@ -704,3 +704,50 @@ describe('dispatch config (E8)', () => {
     }
   });
 });
+
+describe('verify config (contention fix 2026-09-22)', () => {
+  it('defaults: one concurrent run, auto worker budget, bounded waits', () => {
+    const home = tmpHome();
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.verify).toEqual({
+      maxConcurrent: 1,
+      workerBudget: 0,
+      lockWaitTimeoutMs: 900_000,
+      runTimeoutMs: 1_800_000,
+    });
+  });
+
+  it('parses a full [verify] section and refuses garbage loudly', () => {
+    const home = tmpHome();
+    writeConfig(
+      home,
+      [
+        '[verify]',
+        'max_concurrent = 2',
+        'worker_budget = 6',
+        'lock_wait_timeout_ms = 120000',
+        'run_timeout_ms = 600000',
+        '',
+      ].join('\n'),
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').verify).toEqual({
+      maxConcurrent: 2,
+      workerBudget: 6,
+      lockWaitTimeoutMs: 120_000,
+      runTimeoutMs: 600_000,
+    });
+    const bad: readonly string[] = [
+      '[verify]\nunknown = 1\n',
+      '[verify]\nmax_concurrent = 0\n',
+      '[verify]\nmax_concurrent = 1.5\n',
+      '[verify]\nworker_budget = -1\n',
+      '[verify]\nlock_wait_timeout_ms = 0\n',
+      '[verify]\nrun_timeout_ms = -5\n',
+    ];
+    for (const text of bad) {
+      const h2 = tmpHome();
+      writeFileSync(join(h2, 'config.toml'), text, 'utf-8');
+      expect(() => loadConfig({ GRU_COMMAND_HOME: h2 }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
+});

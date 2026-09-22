@@ -245,6 +245,18 @@ escalate_at = 4
 # directives; 0 blockers = clear to merge; merge stays user-held).
 enabled = true
 
+[verify]
+# Verification scheduler: lanes request their project's verify command
+# through POST /api/verify; the scheduler owns ONE global test budget
+# across lanes. Requests beyond max_concurrent queue FIFO, a queued
+# request past lock_wait_timeout_ms fails loud, a holder whose pid is
+# dead is released, and every run is recorded for review evidence.
+max_concurrent = 1
+# Total test workers across runs; 0 = auto (CPU cores - 2).
+worker_budget = 0
+lock_wait_timeout_ms = 900000
+run_timeout_ms = 1800000
+
 ```
 <!-- END GENERATED CONFIG REFERENCE -->
 

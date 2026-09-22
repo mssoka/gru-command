@@ -22,6 +22,7 @@ import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver } from './dispatch/silas-driver.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { createDispatchServer } from './dispatch/server.js';
+import { createVerificationServer } from './verify/server.js';
 import { createService, type ServiceHandle } from './server.js';
 import { createAttachmentsServer } from './attachments/server.js';
 import { uploadsDirNeedsHardening } from './attachments/resolver.js';
@@ -225,6 +226,7 @@ async function main(): Promise<number> {
     bob?: BobScheduler;
     silas?: SilasDriver;
     wave?: WaveRunner;
+    verify?: ReturnType<typeof createVerificationServer>;
   } = {};
   let shuttingDown = false;
   const shutdown = (signal: string) => {
@@ -297,6 +299,13 @@ async function main(): Promise<number> {
             await state.wave.shutdown();
           } catch (error) {
             logger.error('Perkins review shutdown failed', { error: String(error) });
+          }
+        }
+        if (state.verify !== undefined) {
+          try {
+            await state.verify.dispose();
+          } catch (error) {
+            logger.error('verification scheduler shutdown failed', { error: String(error) });
           }
         }
         if (state.registry !== undefined) {
@@ -602,6 +611,17 @@ async function main(): Promise<number> {
       : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // The verification surface (contention fix, 2026-09-22): lanes request
+  // their project's verify command through POST /api/verify; the scheduler
+  // owns the machine's ONE global test budget (FIFO, stale holders,
+  // worker cap) and records every run as review-consumable evidence.
+  const verifyServer = createVerificationServer({
+    config,
+    ledger,
+    worktrees: worktreeManager,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  state.verify = verifyServer;
   // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
   // same seam chat and dispatch both ride — workspace browse (on-disk
   // picks send paths, never bytes) + uploads materialization
@@ -625,6 +645,7 @@ async function main(): Promise<number> {
         attachmentsServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||
         dispatchServer.requestHook(req, res, path) ||
+        verifyServer.requestHook(req, res, path) ||
         board.requestHook(req, res, path),
     },
   );

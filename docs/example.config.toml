@@ -111,3 +111,12 @@ escalate_at = 4                   # …before escalation to the chief (always be
 # (when installed; otherwise escalate-only). true keeps Perkins as the primary
 # gate behind the four-leg capability pre-flight.
 enabled = true
+
+[verify]                          # verification scheduler (contention fix) — all optional
+# Lanes request their project's verify command via POST /api/verify
+# {job_id, scope}; the scheduler owns ONE global test budget across lanes.
+# Declared commands live in the repo at .gru-command/worktree.toml ([verify]).
+max_concurrent = 1                # concurrent runs; further requests queue FIFO
+worker_budget = 0                 # total test workers across runs; 0 = auto (cores - 2)
+lock_wait_timeout_ms = 900000     # queued request past this fails loud (never a silent hang)
+run_timeout_ms = 1800000          # per-run wall clock; expiry kills the process group

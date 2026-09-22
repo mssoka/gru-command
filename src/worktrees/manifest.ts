@@ -25,6 +25,10 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *
  *   [[setup]]                # one-time command, run with cwd = the worktree
  *   command = "npm install"
+ *
+ *   [verify]                 # the project's verification commands, by scope;
+ *   full = "npm test"        #   POST /api/verify runs these under the global
+ *   quick = "npm run lint"   #   test budget (see docs/FLOW.md)
  */
 
 export const MANIFEST_DIR = '.gru-command';
@@ -45,10 +49,19 @@ export interface ManifestSetup {
   readonly command: string;
 }
 
+/**
+ * Declared verification commands, keyed by scope. The scope `full` is the
+ * default a verify request resolves to; any other names are project-chosen.
+ * These commands are NOT run at worktree bootstrap — the verification
+ * scheduler runs them on request, under the global machine budget.
+ */
+export type ManifestVerify = Readonly<Record<string, string>>;
+
 export interface WorktreeManifest {
   readonly links: readonly ManifestLink[];
   readonly copies: readonly ManifestCopy[];
   readonly setup: readonly ManifestSetup[];
+  readonly verify: ManifestVerify;
 }
 
 /** A path that must stay inside the given root — resolve + containment. */
@@ -82,8 +95,8 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
     throw new Error(`worktree manifest ${source} is not valid TOML: ${String(error)}`);
   }
   for (const key of Object.keys(raw)) {
-    if (!['link', 'copy', 'setup'].includes(key)) {
-      throw new Error(`worktree manifest ${source} has unknown key "${key}" (valid: link, copy, setup)`);
+    if (!['link', 'copy', 'setup', 'verify'].includes(key)) {
+      throw new Error(`worktree manifest ${source} has unknown key "${key}" (valid: link, copy, setup, verify)`);
     }
   }
 
@@ -124,7 +137,40 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
     setup.push({ command });
   }
 
-  return { links, copies, setup };
+  const verifyEntries: Record<string, string> = {};
+  const rawVerify = raw['verify'];
+  if (rawVerify !== undefined) {
+    if (typeof rawVerify !== 'object' || rawVerify === null || Array.isArray(rawVerify)) {
+      throw new Error(`worktree manifest ${source}: [verify] must be a table of scope = command strings`);
+    }
+    for (const [scope, command] of Object.entries(rawVerify as Record<string, unknown>)) {
+      if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(scope)) {
+        throw new Error(
+          `worktree manifest ${source} [verify] scope "${scope}" must be a lowercase identifier (a-z, 0-9, _, -, ≤32 chars)`,
+        );
+      }
+      verifyEntries[scope] = nonEmptyString(command, `${source} verify.${scope}`);
+    }
+  }
+
+  return { links, copies, setup, verify: verifyEntries };
+}
+
+/**
+ * Resolve one declared verify command by scope. Fail-loud: an undeclared
+ * scope names every scope the project DID declare, so the caller can fix
+ * its request without guessing.
+ */
+export function resolveVerifyCommand(manifest: WorktreeManifest, scope: string): string {
+  const command = manifest.verify[scope];
+  if (command === undefined) {
+    const declared = Object.keys(manifest.verify).sort();
+    throw new Error(
+      `verify scope "${scope}" is not declared in ${MANIFEST_PATH} ` +
+        `(declared scopes: ${declared.length === 0 ? 'none' : declared.join(', ')})`,
+    );
+  }
+  return command;
 }
 
 /**
