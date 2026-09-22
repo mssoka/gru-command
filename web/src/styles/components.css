@@ -294,7 +294,36 @@ body {
   flex-direction: column;
   gap: 10px;
   scroll-behavior: smooth;
+  /* The viewport policy owns scrollTop during replay/streaming; browser
+     scroll anchoring must not quietly adjust it under the same layout
+     changes. */
+  overflow-anchor: none;
 }
+
+/* Jump-to-latest: overlays the log's bottom edge while auto-follow is
+   disengaged (the reader is in history). It sits in the log's grid cell
+   and never takes layout from the message column. */
+.chat-jump {
+  grid-row: 1;
+  grid-column: 1;
+  align-self: end;
+  justify-self: center;
+  z-index: 2;
+  margin-bottom: 10px;
+  padding: 5px 14px;
+  border: var(--outline-thin);
+  border-radius: 999px;
+  background: var(--work);
+  color: var(--on-state);
+  font-size: 12px;
+  font-weight: 800;
+  box-shadow: var(--shadow-card);
+  cursor: pointer;
+  animation: msg-in 0.2s var(--ease-pop);
+}
+
+.chat-jump:hover { transform: translateY(-1px); }
+.chat-jump:active { transform: translateY(1px); }
 
 .msg {
   max-width: 85%;

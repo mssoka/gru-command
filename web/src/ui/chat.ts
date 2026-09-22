@@ -35,6 +35,10 @@ const MOBILE_QUERY = '(max-width: 768px)';
  * laptops (fine primary pointer) as touch. */
 const COARSE_QUERY = '(pointer: coarse)';
 
+/** Distance from the log's bottom edge (px) that still counts as "near the
+ * bottom" for auto-follow — about one line of body text. */
+const STICK_THRESHOLD_PX = 40;
+
 /** The attach resolution surface main.ts binds per pair (token rotates). */
 export interface AttachSurface {
   browse(path: string): Promise<BrowseResult>;
@@ -51,6 +55,7 @@ interface PendingResetView {
   readonly streamingBubble: HTMLElement | null;
   readonly streamingBody: HTMLElement | null;
   readonly streamText: string;
+  readonly streamOpen: boolean;
   readonly activeTool: HTMLElement | null;
   readonly unread: number;
 }
@@ -80,8 +85,20 @@ export class ChatView {
   private streamingBubble: HTMLElement | null = null;
   private streamingBody: HTMLElement | null = null;
   private streamText = '';
+  /** True between turn:start (or the first bare delta of a partial replay)
+   * and closeStream/markStreamIncomplete. The bubble's DOM is created
+   * lazily on the first text delta, so tool-only turns leave no stub. */
+  private streamOpen = false;
   private activeTool: HTMLElement | null = null;
   private unread = 0;
+  /** Auto-follow engages while the reader is near the log's bottom; a
+   * user scroll away disengages until they return or jump-to-latest. */
+  private stickToBottom = true;
+  /** Last scrollTop the detector observed, for up-vs-down motion. */
+  private lastLogScrollTop = 0;
+  /** Pending coalesced replay-settle animation frame. */
+  private settleFrame: number | null = null;
+  private readonly jumpButton: HTMLButtonElement;
   private mobile = window.matchMedia(MOBILE_QUERY);
   private coarse = window.matchMedia(COARSE_QUERY);
   /** Ready-to-send chips (SPEC ruling 19). */
@@ -173,6 +190,16 @@ export class ChatView {
     });
     this.renderContext();
 
+    // Jump-to-latest: overlays the log's bottom edge while auto-follow is
+    // disengaged (the reader is in history); clicking re-engages.
+    this.jumpButton = el('button', 'chat-jump', '↓ Latest');
+    this.jumpButton.type = 'button';
+    this.jumpButton.setAttribute('aria-label', 'Jump to the latest message');
+    this.jumpButton.hidden = true;
+    this.jumpButton.addEventListener('click', () => this.scrollToEnd());
+    this.panel.append(this.jumpButton);
+    this.log.addEventListener('scroll', this.onLogScroll);
+
     this.bubble.addEventListener('click', () => this.setSheetOpen(true));
     const grip = mustGet<HTMLElement>('chat-sheet-grip');
     grip.addEventListener('click', () => this.setSheetOpen(false));
@@ -263,6 +290,7 @@ export class ChatView {
       streamingBubble: this.streamingBubble,
       streamingBody: this.streamingBody,
       streamText: this.streamText,
+      streamOpen: this.streamOpen,
       activeTool: this.activeTool,
       unread: this.unread,
     };
@@ -273,8 +301,13 @@ export class ChatView {
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
+    this.streamOpen = false;
     this.activeTool = null;
     this.unread = 0;
+    this.cancelSettleScroll();
+    this.stickToBottom = true;
+    this.jumpButton.hidden = true;
+    this.lastLogScrollTop = 0;
     this.bubble.dataset.unread = '0';
     this.badge.textContent = '0';
   }
@@ -290,6 +323,7 @@ export class ChatView {
     this.streamingBubble = prior.streamingBubble;
     this.streamingBody = prior.streamingBody;
     this.streamText = prior.streamText;
+    this.streamOpen = prior.streamOpen;
     this.activeTool = prior.activeTool;
     this.unread = prior.unread;
     this.bubble.dataset.unread = String(this.unread);
@@ -589,7 +623,7 @@ export class ChatView {
   private ephemeralNote(text: string): void {
     const line = el('div', 'notice-line notice-line--ephemeral', `⚠️ ${text}`);
     this.log.append(line);
-    this.scrollToEnd();
+    this.followContent(true);
     setTimeout(() => line.remove(), 6_000);
   }
 
@@ -621,12 +655,19 @@ export class ChatView {
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
+    this.streamOpen = false;
     this.activeTool = null;
+    this.cancelSettleScroll();
+    this.stickToBottom = true;
+    this.jumpButton.hidden = true;
+    this.lastLogScrollTop = 0;
   }
 
-  /** User message status changes: queued → sent → acked. */
-  upsertMessage(message: ChatMessage): void {
+  /** User message status changes: queued → sent → acked. `live` is false
+   * for replayed frames: the viewport settle coalesces those. */
+  upsertMessage(message: ChatMessage, live = true): void {
     let bubble = this.bubbles.get(message.client_msg_id);
+    const fresh = bubble === undefined;
     if (bubble === undefined) {
       bubble = el('div', 'msg msg--user');
       this.bubbles.set(message.client_msg_id, bubble);
@@ -643,19 +684,29 @@ export class ChatView {
           ? 'sent…'
           : null;
     if (meta !== null) bubble.append(el('span', 'msg__meta', meta));
-    this.scrollToEnd();
+    if (!live) {
+      this.scheduleSettleScroll();
+    } else if (fresh) {
+      // A just-sent message is a deliberate gesture: show it + re-engage.
+      this.scrollToEnd();
+    } else {
+      this.followContent(true);
+    }
   }
 
   /** Server frames: streamed Gru replies, tool lines, replayed history. */
   addFrame(frame: LoggedFrame, live: boolean): void {
     switch (frame.type) {
       case 'user': {
-        this.upsertMessage({
-          client_msg_id: frame.client_msg_id,
-          text: frame.text,
-          status: 'acked',
-          ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
-        });
+        this.upsertMessage(
+          {
+            client_msg_id: frame.client_msg_id,
+            text: frame.text,
+            status: 'acked',
+            ...(frame.attachments !== undefined ? { attachments: frame.attachments } : {}),
+          },
+          live,
+        );
         break;
       }
       case 'delta': {
@@ -664,15 +715,20 @@ export class ChatView {
         // delta — one paint, no flicker; incomplete constructs hold stable.
         //
         // Open the stream BEFORE accumulating: openStream() resets
-        // streamText when it creates fresh state, so resetting after the
+        // streamText when it opens fresh state, so resetting after the
         // `+=` would silently wipe the FIRST replayed delta of a same-page
         // reconnect (partial replay: bare deltas, no turn:start, no reset —
-        // Perkins r1/r2 blocker). Order is load-bearing.
-        const body = this.streamingBody ?? this.openStream();
+        // Perkins r1/r2 blocker). Order is load-bearing. The bubble's DOM
+        // is created lazily on the first text delta too: a tool-only turn
+        // never leaves an empty stub.
+        if (!this.streamOpen) this.openStream();
         this.streamText += frame.text;
-        renderMarkdown(this.streamText, body, { streaming: true });
+        if (frame.text !== '') {
+          const body = this.streamingBody ?? this.mountStreamBubble();
+          renderMarkdown(this.streamText, body, { streaming: true });
+        }
         if (live) this.bumpUnread();
-        this.scrollToEnd();
+        this.followContent(live);
         break;
       }
       case 'tool': {
@@ -693,7 +749,7 @@ export class ChatView {
             this.log.append(el('div', 'tool-line', `⚙️ ${frame.name} · done`));
           }
         }
-        this.scrollToEnd();
+        this.followContent(live);
         break;
       }
       case 'turn': {
@@ -701,13 +757,16 @@ export class ChatView {
           this.openStream();
         } else {
           this.closeStream();
+          // The final render can change height (held fragments resolve):
+          // keep a stuck viewport at the bottom, never move a disengaged one.
+          this.followContent(live);
         }
         break;
       }
       case 'error': {
         const line = el('div', 'tool-line', `⚠️ ${frame.message}`);
         this.log.append(line);
-        this.scrollToEnd();
+        this.followContent(live);
         break;
       }
       case 'notice': {
@@ -716,20 +775,29 @@ export class ChatView {
         const line = el('div', 'notice-line', frame.text);
         this.log.append(line);
         if (live) this.bumpUnread();
-        this.scrollToEnd();
+        this.followContent(live);
         break;
       }
     }
   }
 
-  private openStream(): HTMLElement {
-    if (this.streamingBody !== null) return this.streamingBody;
+  /** Open the LOGICAL stream for a turn (or for the first bare delta of a
+   * partial replay). No DOM yet — the bubble mounts with the first text. */
+  private openStream(): void {
+    if (this.streamOpen) return;
+    this.streamOpen = true;
+    this.streamingBubble = null;
+    this.streamingBody = null;
+    this.streamText = '';
+  }
+
+  /** Lazily create the Gru bubble for the first text delta of a stream. */
+  private mountStreamBubble(): HTMLElement {
     const bubble = el('div', 'msg msg--gru msg--streaming');
     const body = el('div', 'msg__body');
     bubble.append(body);
     this.streamingBubble = bubble;
     this.streamingBody = body;
-    this.streamText = '';
     this.log.append(bubble);
     return body;
   }
@@ -738,7 +806,13 @@ export class ChatView {
     // Turn end = the document is complete: finalize the render so held
     // streaming fragments (partial fence markers etc.) resolve per GFM.
     if (this.streamingBody !== null) renderMarkdown(this.streamText, this.streamingBody);
+    // Defensive: a stream that never produced text (every delta empty)
+    // must not leave an empty stub behind.
+    if (this.streamingBubble !== null && this.streamText.trim() === '') {
+      this.streamingBubble.remove();
+    }
     this.streamingBubble?.classList.remove('msg--streaming');
+    this.streamOpen = false;
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
@@ -748,8 +822,10 @@ export class ChatView {
   markStreamIncomplete(): void {
     if (this.streamingBubble !== null) {
       this.streamingBubble.append(el('span', 'msg__meta', 'connection lost — resuming…'));
-      this.closeStream();
     }
+    // No bubble (tool-only turn) just closes the logical stream so a later
+    // replayed delta opens a fresh one instead of appending to a ghost.
+    this.closeStream();
   }
 
   private bumpUnread(): void {
@@ -760,7 +836,64 @@ export class ChatView {
     }
   }
 
+  // -----------------------------------------------------------------------
+  // Viewport policy: replay settle + bottom-stickiness
+  // -----------------------------------------------------------------------
+
+  /** User scroll detector. Only an upward move with the bottom still out
+   * of reach disengages: programmatic motion (scrollToEnd and its smooth
+   * animation) only ever moves down, so it can never read as the user
+   * taking over — no echo-guard flag needed. */
+  private readonly onLogScroll = (): void => {
+    const top = this.log.scrollTop;
+    const distance = this.log.scrollHeight - top - this.log.clientHeight;
+    if (distance <= STICK_THRESHOLD_PX) {
+      this.setStuck(true);
+    } else if (top < this.lastLogScrollTop) {
+      this.setStuck(false);
+    }
+    this.lastLogScrollTop = top;
+  };
+
+  /** Show/hide the jump-to-latest pill with the engagement state. */
+  private setStuck(stuck: boolean): void {
+    if (this.stickToBottom === stuck) return;
+    this.stickToBottom = stuck;
+    this.jumpButton.hidden = stuck;
+  }
+
+  /** New content: replay frames coalesce into one settled scroll; live
+   * frames follow only while engaged — a reader in history is never
+   * yanked, the jump-to-latest pill surfaces instead. */
+  private followContent(live: boolean): void {
+    if (!live) {
+      this.scheduleSettleScroll();
+      return;
+    }
+    if (this.stickToBottom) this.scrollToEnd();
+    else this.jumpButton.hidden = false;
+  }
+
+  /** A replay burst re-arms the pending frame while frames keep arriving;
+   * exactly one scroll lands once the burst goes quiet. */
+  private scheduleSettleScroll(): void {
+    this.cancelSettleScroll();
+    this.settleFrame = requestAnimationFrame(() => {
+      this.settleFrame = null;
+      if (this.stickToBottom) this.scrollToEnd();
+    });
+  }
+
+  private cancelSettleScroll(): void {
+    if (this.settleFrame !== null) {
+      cancelAnimationFrame(this.settleFrame);
+      this.settleFrame = null;
+    }
+  }
+
+  /** Programmatic scroll to the bottom; always re-engages. */
   private scrollToEnd(): void {
+    this.setStuck(true);
     this.log.scrollTop = this.log.scrollHeight;
   }
 }
