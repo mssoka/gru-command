@@ -802,7 +802,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
                 ? text
                 : wake
                   ? `${injection.text}\n\n${AWARENESS_WAKE_INSTRUCTION}`
-                  : `${injection.text}\n\n${text}`;
+                  : text === ''
+                    ? injection.text
+                    : `${injection.text}\n\n${text}`;
             const prompt = composeDeliveredPrompt(
               baseText,
               allowed.length > 0 ? allowed : undefined,
@@ -880,7 +882,12 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         broadcastContext();
         maybeWake();
       }
-    })();
+    })().catch((error: unknown) => {
+      // Every operational failure is handled inside the body; this guard is
+      // for a bug in the failure path itself — an unhandled rejection would
+      // kill the service (main exits on unhandled rejections).
+      log('error', 'chat delivery crashed', { error: errorMessage(error) });
+    });
   }
 
   // -----------------------------------------------------------------------
