@@ -355,6 +355,7 @@ export function jobChipTone(status: string): string {
   switch (status) {
     case 'working':
     case 'dispatched':
+    case 'delivered':
       return 'pp-chip--work';
     case 'in-review':
       return 'pp-chip--rev';
