@@ -12,7 +12,7 @@ import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
 import { realpathSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { GruCommandConfig, Role } from '../config.js';
-import { resolveSpawnPolicy } from '../config.js';
+import { resolveModelRefreshPolicy, resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
@@ -127,7 +127,90 @@ export interface PiRuntimeOptions {
   readonly modelRuntime?: ModelRuntime;
   /** Test seam: override the long-tool heartbeat cadence. */
   readonly toolHeartbeatMs?: number;
+  /** Tests inject a bounded "catalog became live" refresh. Production
+   * defaults to one ModelRuntime.refresh({ allowNetwork: true }) bounded by
+   * [runtimes.pi] model_refresh_timeout_ms. */
+  readonly modelCatalogRefresh?: ModelCatalogRefresher;
   readonly log?: Log;
+}
+
+/** Outcome of one bounded model-catalog refresh attempt, shaped for error text. */
+export interface ModelCatalogRefreshOutcome {
+  readonly attempted: boolean;
+  /** One-line result: completed / timed out / failed / skipped. */
+  readonly detail: string;
+}
+
+export interface ModelCatalogRefreshRequest {
+  readonly provider: string;
+  readonly timeoutMs: number;
+}
+
+export type ModelCatalogRefresher = (
+  runtime: ModelRuntime,
+  request: ModelCatalogRefreshRequest,
+) => Promise<ModelCatalogRefreshOutcome>;
+
+/** Levenshtein distance — deterministic, allocation-light at these sizes. */
+function editDistance(left: string, right: string): number {
+  const a = left.toLowerCase();
+  const b = right.toLowerCase();
+  if (a === b) return 0;
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      const substitution = previous[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1);
+      current[j] = Math.min(previous[j]! + 1, current[j - 1]! + 1, substitution);
+    }
+    previous = current;
+  }
+  return previous[b.length]!;
+}
+
+/** Up to `limit` closest candidate ids, ordered by edit distance then name. */
+export function nearestMatches(
+  target: string,
+  candidates: readonly string[],
+  limit = 3,
+): string[] {
+  return [...candidates]
+    .map((candidate) => ({ candidate, distance: editDistance(target, candidate) }))
+    .sort(
+      (left, right) =>
+        left.distance - right.distance ||
+        left.candidate.length - right.candidate.length ||
+        left.candidate.localeCompare(right.candidate),
+    )
+    .slice(0, limit)
+    .map((entry) => entry.candidate);
+}
+
+/**
+ * Actionable near-match hint for an unknown model reference: models of the
+ * provider when it is registered, otherwise the nearest registered provider
+ * ids (a typo'd provider is just as common as a typo'd model).
+ */
+function describeNearestModels(
+  runtime: ModelRuntime,
+  provider: string,
+  modelId: string,
+): string {
+  if (runtime.getProvider(provider) === undefined) {
+    const providers = runtime.getProviders().map((entry) => entry.id);
+    if (providers.length === 0) {
+      return `provider "${provider}" is not registered and no providers are registered`;
+    }
+    return `provider "${provider}" is not registered; nearest registered providers: ${nearestMatches(
+      provider,
+      providers,
+    ).join(', ')}`;
+  }
+  const models = runtime.getModels(provider).map((entry) => entry.id);
+  if (models.length === 0) {
+    return `provider "${provider}" is registered but has no models in the catalog`;
+  }
+  return `nearest registered models for "${provider}": ${nearestMatches(modelId, models).join(', ')}`;
 }
 
 interface QueuedMessage {
@@ -178,10 +261,13 @@ export class PiRuntime implements AgentRuntime {
   /** Long-tool heartbeat cadence override; derived from the supervision
    * window at spawn when unset (construction must not touch config). */
   private readonly toolHeartbeatMs: number | null;
+  private readonly modelCatalogRefresh: ModelCatalogRefresher | undefined;
   private readonly handles = new Set<PiAgentHandle>();
   /** Normalized session paths currently hosted by this process (B4). */
   private readonly activeFiles = new Set<string>();
   private modelRuntime: ModelRuntime | undefined;
+  /** One in-flight refresh shared by every concurrent unknown-model failure. */
+  private catalogRefreshInFlight: Promise<ModelCatalogRefreshOutcome> | null = null;
   private down: string | undefined;
 
   constructor(opts: PiRuntimeOptions) {
@@ -191,6 +277,7 @@ export class PiRuntime implements AgentRuntime {
     this.log = opts.log ?? (() => {});
     this.modelRuntime = opts.modelRuntime;
     this.toolHeartbeatMs = opts.toolHeartbeatMs ?? null;
+    this.modelCatalogRefresh = opts.modelCatalogRefresh;
   }
 
   /** Long-tool heartbeat cadence for a new handle (config-derived). */
@@ -201,9 +288,111 @@ export class PiRuntime implements AgentRuntime {
   private async runtime(): Promise<ModelRuntime> {
     if (this.modelRuntime === undefined) {
       // Offline create: built-in catalogs restored from local cache only.
+      // This is load-bearing beyond latency: pi's own settings-default
+      // resolution is gated on hasConfiguredAuth(), which an offline
+      // create never populates — the adapter resolves settings itself
+      // (see resolveSettingsDefault) to avoid the 2026-09-20 auth bug.
+      // Live-catalog models arrive through the bounded on-failure refresh
+      // below, never by making every spawn wait on the network.
       this.modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
     }
     return this.modelRuntime;
+  }
+
+  /**
+   * One bounded catalog refresh per unknown-model failure (concurrent
+   * failures share the in-flight attempt). Healthy resolutions never call
+   * this, so no network latency is added to the spawn hot path.
+   */
+  private async performCatalogRefresh(provider: string): Promise<ModelCatalogRefreshOutcome> {
+    const policy = resolveModelRefreshPolicy(this.config, 'pi');
+    if (!policy.enabled) {
+      return {
+        attempted: false,
+        detail: 'skipped ([runtimes.pi] model_refresh = false)',
+      };
+    }
+    try {
+      const runtime = await this.runtime();
+      if (this.modelCatalogRefresh !== undefined) {
+        return await this.modelCatalogRefresh(runtime, {
+          provider,
+          timeoutMs: policy.timeoutMs,
+        });
+      }
+      // Provider known → fetch only that provider's live catalog; unknown
+      // provider → full refresh (reloads models.json too, so a provider
+      // configured after boot can become visible).
+      const targeted = runtime.getProvider(provider) !== undefined;
+      const signal = AbortSignal.timeout(policy.timeoutMs);
+      const result = await runtime.refresh({
+        allowNetwork: true,
+        ...(targeted ? { providers: [provider] } : {}),
+        signal,
+      });
+      if (signal.aborted || result.aborted) {
+        return { attempted: true, detail: `timed out after ${policy.timeoutMs} ms` };
+      }
+      const errors = [...result.errors].map(([id, error]) => `${id}: ${error.message}`);
+      if (errors.length > 0) {
+        return { attempted: true, detail: `failed (${errors.join('; ')})` };
+      }
+      return {
+        attempted: true,
+        detail: `completed within the ${policy.timeoutMs} ms budget`,
+      };
+    } catch (error) {
+      return {
+        attempted: true,
+        detail: `failed (${error instanceof Error ? error.message : String(error)})`,
+      };
+    }
+  }
+
+  private async refreshCatalogOnce(provider: string): Promise<ModelCatalogRefreshOutcome> {
+    const inFlight = this.catalogRefreshInFlight;
+    if (inFlight !== null) return inFlight;
+    const refresh = this.performCatalogRefresh(provider).finally(() => {
+      if (this.catalogRefreshInFlight === refresh) this.catalogRefreshInFlight = null;
+    });
+    this.catalogRefreshInFlight = refresh;
+    return refresh;
+  }
+
+  /**
+   * Resolve one concrete provider/model: offline catalog first, then —
+   * only on a miss — one bounded live-catalog refresh and a re-resolve.
+   * Returns the miss details alongside `undefined` so the caller's error
+   * can name the refresh outcome and the nearest registered alternatives.
+   */
+  private async resolveWithCatalogFallback(
+    provider: string,
+    modelId: string,
+    role: Role,
+  ): Promise<{
+    readonly model: Model<Api> | undefined;
+    readonly refresh: ModelCatalogRefreshOutcome;
+    readonly nearest: string;
+  }> {
+    const runtime = await this.runtime();
+    const direct = runtime.getModel(provider, modelId);
+    if (direct !== undefined) {
+      return {
+        model: direct,
+        refresh: { attempted: false, detail: 'not needed' },
+        nearest: '',
+      };
+    }
+    const refresh = await this.refreshCatalogOnce(provider);
+    const model = runtime.getModel(provider, modelId);
+    if (model !== undefined) {
+      this.log('info', 'model resolved after catalog refresh', {
+        role,
+        model: `${provider}/${modelId}`,
+        refresh: refresh.detail,
+      });
+    }
+    return { model, refresh, nearest: describeNearestModels(runtime, provider, modelId) };
   }
 
   /**
@@ -211,23 +400,37 @@ export class PiRuntime implements AgentRuntime {
    * the USER's settings default eagerly (see resolveSettingsDefault) and
    * only falls through to pi's own resolution when settings name nothing;
    * an explicit "provider/model" must resolve or spawn fails naming the
-   * reference.
+   * reference, the catalog-refresh outcome, and the nearest registered
+   * models for the provider.
    */
   private async resolveModel(role: Role, override?: string): Promise<Model<Api> | undefined> {
     const ref =
       override !== undefined
         ? override
         : resolveSpawnPolicy(this.config, 'pi', role).model;
-    if (ref === '' || ref === 'default') return this.resolveSettingsDefault();
+    if (ref === '' || ref === 'default') return this.resolveSettingsDefault(role);
     const slash = ref.indexOf('/');
     if (slash <= 0 || slash >= ref.length - 1) {
       throw new Error(`model reference must be "provider/model" or "default", got: ${ref}`);
     }
     const provider = ref.slice(0, slash);
     const modelId = ref.slice(slash + 1);
-    const model = (await this.runtime()).getModel(provider, modelId);
+    const { model, refresh, nearest } = await this.resolveWithCatalogFallback(
+      provider,
+      modelId,
+      role,
+    );
     if (model === undefined) {
-      throw new Error(`unknown model "${ref}" — no such provider/model is registered`);
+      this.log('warn', 'model reference did not resolve after catalog fallback', {
+        role,
+        model: ref,
+        refresh: refresh.detail,
+      });
+      throw new Error(
+        `unknown model "${ref}" — not in the registered catalog; ` +
+          `catalog refresh ${refresh.attempted ? 'attempted — ' : ''}${refresh.detail}; ` +
+          `${nearest}. Fix the [models]/[runtimes.pi] reference or the provider's model catalog`,
+      );
     }
     return model;
   }
@@ -244,14 +447,26 @@ export class PiRuntime implements AgentRuntime {
    * explicitly-passed model bypasses the stale gate. When settings name
    * nothing, undefined preserves pi's own resolution (fresh installs).
    */
-  private async resolveSettingsDefault(): Promise<Model<Api> | undefined> {
+  private async resolveSettingsDefault(role: Role): Promise<Model<Api> | undefined> {
     const settingsDefault = readSettingsDefault(this.agentDir);
     if (settingsDefault === undefined) return undefined;
-    const model = (await this.runtime()).getModel(settingsDefault.provider, settingsDefault.model);
+    const { provider, model: modelId } = settingsDefault;
+    const { model, refresh, nearest } = await this.resolveWithCatalogFallback(
+      provider,
+      modelId,
+      role,
+    );
     if (model === undefined) {
+      this.log('warn', 'settings default did not resolve after catalog fallback', {
+        role,
+        model: `${provider}/${modelId}`,
+        refresh: refresh.detail,
+      });
       throw new Error(
-        `settings default "${settingsDefault.provider}/${settingsDefault.model}" is not a registered model — ` +
-          `update ${join(this.agentDir, 'settings.json')} or set [models] default to an explicit "provider/model"`,
+        `settings default "${provider}/${modelId}" is not a registered model; ` +
+          `catalog refresh ${refresh.attempted ? 'attempted — ' : ''}${refresh.detail}; ` +
+          `${nearest}. Update ${join(this.agentDir, 'settings.json')} or set [models] default ` +
+          `to an explicit "provider/model"`,
       );
     }
     return model;

@@ -8,6 +8,7 @@ import {
   expandTilde,
   instanceDirFromEnv,
   loadConfig,
+  resolveModelRefreshPolicy,
   resolveSpawnPolicy,
 } from '../src/config.js';
 
@@ -442,6 +443,49 @@ bob = { thinking_level = "medium" }
     writeConfig(home4, '[thinking]\nbananas = "x"\n');
     expect(() => loadConfig({ GRU_COMMAND_HOME: home4 }, '/home/tester')).toThrow(
       /unknown key `bananas` in \[thinking\]/,
+    );
+  });
+
+  it('defaults the pi catalog refresh ON with a bounded timeout; config can pin it off', () => {
+    const home = tmpHome();
+    const defaults = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(resolveModelRefreshPolicy(defaults)).toEqual({ enabled: true, timeoutMs: 10_000 });
+
+    writeConfig(
+      home,
+      '[runtimes.pi]\nmodel_refresh = false\nmodel_refresh_timeout_ms = 2500\n',
+    );
+    const configured = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(configured.runtimes.policies['pi']).toMatchObject({
+      modelRefresh: false,
+      modelRefreshTimeoutMs: 2500,
+    });
+    expect(resolveModelRefreshPolicy(configured)).toEqual({ enabled: false, timeoutMs: 2500 });
+  });
+
+  it('rejects malformed model-refresh knobs (fail-loud, no silent coercion)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[runtimes.pi]\nmodel_refresh = "yes"\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /runtimes\.pi\.model_refresh must be a boolean/,
+    );
+    const home2 = tmpHome();
+    writeConfig(home2, '[runtimes.pi]\nmodel_refresh_timeout_ms = 0\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home2 }, '/home/tester')).toThrow(
+      /runtimes\.pi\.model_refresh_timeout_ms must be a positive integer/,
+    );
+  });
+
+  it('rejects the pi-only refresh knobs under [runtimes.claude-code] instead of ignoring them', () => {
+    const home = tmpHome();
+    writeConfig(home, '[runtimes.claude-code]\nmodel_refresh = false\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /unknown key `model_refresh` in \[runtimes\.claude-code\] \(valid keys: model, thinking_level, roles\)/,
+    );
+    const home2 = tmpHome();
+    writeConfig(home2, '[runtimes.claude-code]\nmodel_refresh_timeout_ms = 2500\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home2 }, '/home/tester')).toThrow(
+      /unknown key `model_refresh_timeout_ms` in \[runtimes\.claude-code\]/,
     );
   });
 });

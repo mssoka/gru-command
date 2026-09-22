@@ -150,6 +150,10 @@ default = "default"
 # # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # # model = "default"
 # # thinking_level = "default"
+# # On an unknown model, allow ONE bounded network catalog refresh before
+# # failing; set false for a strictly offline catalog.
+# # model_refresh = true
+# # model_refresh_timeout_ms = 10000
 
 # [runtimes.pi.roles]
 # # Optional per-role inline tables (at least one field when uncommented).
@@ -259,7 +263,7 @@ example.
 | Unknown runtime id | `unknown runtime \`x\` (valid runtimes: pi, claude-code)` |
 | Unknown role | `unknown role \`x\` (valid roles: gru, silas, minion, perkins, bob)` |
 | Bad port | `server.port must be an integer between 0 and 65535 (0 = ephemeral)` |
-| Unknown runtime policy key | `unknown key \`x\` in [runtimes.pi] (valid keys: model, thinking_level, roles)` |
+| Unknown runtime policy key | `unknown key \`x\` in [runtimes.pi] (valid keys: model, thinking_level, model_refresh, model_refresh_timeout_ms, roles)` |
 | Empty runtime role entry | `[runtimes.pi.roles.gru] must set at least one of model, thinking_level` |
 | Unknown runtime id as a table | `unknown key \`x\` in [runtimes] (valid keys: default, roles, or a runtime id: pi, claude-code)` |
 | Relative `GRU_COMMAND_HOME` | `GRU_COMMAND_HOME must be an absolute path` (an empty value is rejected the same way) |

@@ -393,10 +393,11 @@ async function main(): Promise<number> {
   // loads and boot-settles BEFORE the HTTP server accepts anything (r1
   // N13): a corrupt log refuses boot without ever having listened, and no
   // client can attach to an unsettled log. The Gru spawn is lazy-warm
-  // (warmup is best-effort, first message retries) so a model outage can
-  // never keep the service down. Since E7 the Gru session runs behind a
-  // SUPERVISED slot: the supervisor adopts it, watches turn liveness,
-  // restarts it up the ladder, and trips the crash-loop breaker.
+  // (warmup is best-effort, first message retries under the chat spawn
+  // backoff) so a model outage can never keep the service down. Since E7
+  // the Gru session runs behind a SUPERVISED slot: the supervisor adopts
+  // it, watches turn liveness, restarts it up the ladder, and trips the
+  // crash-loop breaker.
   const chatDir = join(config.dataDir, 'chat');
   const frameLog = ChatFrameLog.load(
     chatDir,

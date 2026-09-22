@@ -31,7 +31,41 @@ export interface RuntimesConfig {
 export interface RuntimeModelPolicy {
   readonly model?: string;
   readonly thinkingLevel?: string;
+  /** pi only: when a model reference misses the offline catalog, allow ONE
+   * bounded network catalog refresh before failing (default true). Set false
+   * for a strictly offline catalog. */
+  readonly modelRefresh?: boolean;
+  /** pi only: deadline for that refresh, in milliseconds (default 10 000). */
+  readonly modelRefreshTimeoutMs?: number;
   readonly roles: Readonly<Partial<Record<Role, RuntimeRolePolicyEntry>>>;
+}
+
+/** Default for [runtimes.pi] model_refresh (network catalog refresh ON). */
+export const DEFAULT_MODEL_REFRESH = true;
+/** Default for [runtimes.pi] model_refresh_timeout_ms. */
+export const DEFAULT_MODEL_REFRESH_TIMEOUT_MS = 10_000;
+
+/** Fully-resolved pi model-catalog refresh policy for one spawn process. */
+export interface ModelRefreshPolicy {
+  readonly enabled: boolean;
+  readonly timeoutMs: number;
+}
+
+/**
+ * Resolve the pi model-catalog refresh policy from [runtimes.pi]. The
+ * product lives on a networked machine, so an unknown model triggers one
+ * bounded refresh by default; `model_refresh = false` keeps the catalog
+ * strictly offline. The timeout bounds the refresh either way.
+ */
+export function resolveModelRefreshPolicy(
+  config: GruCommandConfig,
+  runtimeId: RuntimeId = 'pi',
+): ModelRefreshPolicy {
+  const policy = config.runtimes.policies[runtimeId];
+  return {
+    enabled: policy?.modelRefresh ?? DEFAULT_MODEL_REFRESH,
+    timeoutMs: policy?.modelRefreshTimeoutMs ?? DEFAULT_MODEL_REFRESH_TIMEOUT_MS,
+  };
 }
 
 /** Per-role overrides inside a runtime policy; at least one field set. */
@@ -616,6 +650,7 @@ export function loadConfig(
             table[runtimeId],
             file,
             `runtimes.${runtimeId}`,
+            runtimeId,
           );
         }
       }
@@ -991,21 +1026,30 @@ function readDecisionsConfig(
   return { jev, thresholds };
 }
 
+/** Keys accepted per [runtimes.<id>]; the catalog-refresh knobs are pi-only. */
+const RUNTIME_POLICY_KEYS: Readonly<Record<RuntimeId, readonly string[]>> = {
+  pi: ['model', 'thinking_level', 'model_refresh', 'model_refresh_timeout_ms', 'roles'],
+  'claude-code': ['model', 'thinking_level', 'roles'],
+};
+
 /**
  * Parse one [runtimes.<id>] policy table: optional model + thinking_level,
  * optional per-role inline tables { model?, thinking_level? } with at
- * least one field set (SPEC ruling 16).
+ * least one field set (SPEC ruling 16). A pi-only knob under another
+ * runtime is rejected loudly rather than parsed and ignored.
  */
 function readRuntimePolicy(
   value: unknown,
   file: string,
   field: string,
+  runtimeId: RuntimeId,
 ): RuntimeModelPolicy {
   const table = requireTable(value, file, field);
+  const validKeys = RUNTIME_POLICY_KEYS[runtimeId];
   for (const key of Object.keys(table)) {
-    if (!['model', 'thinking_level', 'roles'].includes(key)) {
+    if (!validKeys.includes(key)) {
       throw new ConfigError(
-        `unknown key \`${key}\` in [${field}] (valid keys: model, thinking_level, roles)`,
+        `unknown key \`${key}\` in [${field}] (valid keys: ${validKeys.join(', ')})`,
         file,
         `${field}.${key}`,
       );
@@ -1013,12 +1057,24 @@ function readRuntimePolicy(
   }
   let model: string | undefined;
   let thinkingLevel: string | undefined;
+  let modelRefresh: boolean | undefined;
+  let modelRefreshTimeoutMs: number | undefined;
   const roles: Partial<Record<Role, RuntimeRolePolicyEntry>> = {};
   if (table['model'] !== undefined) {
     model = requireString(table['model'], file, `${field}.model`);
   }
   if (table['thinking_level'] !== undefined) {
     thinkingLevel = requireString(table['thinking_level'], file, `${field}.thinking_level`);
+  }
+  if (runtimeId === 'pi' && table['model_refresh'] !== undefined) {
+    modelRefresh = requireBool(table['model_refresh'], file, `${field}.model_refresh`);
+  }
+  if (runtimeId === 'pi' && table['model_refresh_timeout_ms'] !== undefined) {
+    modelRefreshTimeoutMs = requirePositiveInt(
+      table['model_refresh_timeout_ms'],
+      file,
+      `${field}.model_refresh_timeout_ms`,
+    );
   }
   if (table['roles'] !== undefined) {
     const rolesTable = requireTable(table['roles'], file, `${field}.roles`);
@@ -1068,6 +1124,8 @@ function readRuntimePolicy(
   return {
     ...(model !== undefined ? { model } : {}),
     ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+    ...(modelRefresh !== undefined ? { modelRefresh } : {}),
+    ...(modelRefreshTimeoutMs !== undefined ? { modelRefreshTimeoutMs } : {}),
     roles,
   };
 }
