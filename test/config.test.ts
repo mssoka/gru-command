@@ -494,7 +494,7 @@ describe('supervision / logging / chat tables (E7)', () => {
       restartBackoffMs: 2_000,
     });
     expect(config.logging).toEqual({ maxBytes: 10_485_760, keep: 5 });
-    expect(config.chat).toEqual({ frameLogMaxBytes: 8_388_608, frameLogKeep: 3 });
+    expect(config.chat).toEqual({ frameLogMaxBytes: 8_388_608, frameLogKeep: 3, notifyWake: 'never' });
   });
 
   it('loads explicit [supervision] / [logging] / [chat] values', () => {
@@ -514,6 +514,7 @@ describe('supervision / logging / chat tables (E7)', () => {
         '[chat]',
         'frame_log_max_bytes = 2048',
         'frame_log_keep = 2',
+        'notify_wake = "action-required"',
         '',
       ].join('\n'),
       'utf-8',
@@ -527,7 +528,20 @@ describe('supervision / logging / chat tables (E7)', () => {
       restartBackoffMs: 250,
     });
     expect(config.logging).toEqual({ maxBytes: 1_024, keep: 1 });
-    expect(config.chat).toEqual({ frameLogMaxBytes: 2_048, frameLogKeep: 2 });
+    expect(config.chat).toEqual({ frameLogMaxBytes: 2_048, frameLogKeep: 2, notifyWake: 'action-required' });
+  });
+
+  it('fail-loud: unknown wake policies are rejected, all documented modes load', () => {
+    const home = tmpHome();
+    writeConfig(home, '[chat]\nnotify_wake = "sometimes"\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /unknown wake policy `sometimes` \(valid: never, action-required, all\)/,
+    );
+    for (const mode of ['never', 'action-required', 'all'] as const) {
+      const modeHome = tmpHome();
+      writeConfig(modeHome, `[chat]\nnotify_wake = "${mode}"\n`);
+      expect(loadConfig({ GRU_COMMAND_HOME: modeHome }, '/home/tester').chat.notifyWake).toBe(mode);
+    }
   });
 
   it('fail-loud: unknown keys and non-positive integers are rejected', () => {

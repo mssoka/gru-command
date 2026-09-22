@@ -1221,6 +1221,9 @@ export class WaveRunner {
         roundId: round.id,
         payload: {
           canonicalVerdict: canonical,
+          // Blocker count for the operator-visible record (the awareness
+          // digest renders it as "verdict with N blocker(s)").
+          blockers: review.findings.filter((finding) => finding.severity === 'blocker').length,
           targetSha: review.targetSha,
           baseRefSha: frozenReview.manifest.baseRefSha,
           diffBaseSha: review.diffBaseSha,

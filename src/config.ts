@@ -74,12 +74,28 @@ export interface LoggingConfig {
   readonly keep: number;
 }
 
-/** Chat frame-log rotation (E4 replay-cost deferral — same ruling). */
+/** Gru awareness wake policy (dispatch briefing 2026-09-22): whether the
+ * service may start a Gru turn by itself when notifications land. */
+export const NOTIFY_WAKE_MODES = ['never', 'action-required', 'all'] as const;
+export type NotifyWakeMode = (typeof NOTIFY_WAKE_MODES)[number];
+
+export function isNotifyWakeMode(value: string): value is NotifyWakeMode {
+  return (NOTIFY_WAKE_MODES as readonly string[]).includes(value);
+}
+
+/** Chat frame-log rotation (E4 replay-cost deferral — same ruling) and the
+ * Gru awareness wake policy. */
 export interface ChatConfig {
   /** Rotate gru.frames.jsonl when it exceeds this many bytes. */
   readonly frameLogMaxBytes: number;
   /** Rotated shards retained; replay spans shards oldest→newest. */
   readonly frameLogKeep: number;
+  /** When the service may start a Gru turn on its own for awareness:
+   * 'never' (default) injects escalations + a ledger digest passively
+   * before the next turn at no turn cost by itself; 'action-required'
+   * also wakes a turn for action-required events; 'all' wakes for every
+   * notification. Each wake is a full model turn — see CONFIG.md. */
+  readonly notifyWake: NotifyWakeMode;
 }
 
 /** Worktree manager policy (E8; SPEC ruling 18). */
@@ -378,6 +394,18 @@ function requireUnitNumber(value: unknown, file: string, field: string): number 
   return value;
 }
 
+function requireNotifyWakeMode(value: unknown, file: string, field: string): NotifyWakeMode {
+  const mode = requireString(value, file, field);
+  if (!isNotifyWakeMode(mode)) {
+    throw new ConfigError(
+      `unknown wake policy \`${mode}\` (valid: ${NOTIFY_WAKE_MODES.join(', ')})`,
+      file,
+      field,
+    );
+  }
+  return mode;
+}
+
 function isInsideOrEqual(outer: string, inner: string): boolean {
   const rel = relative(outer, inner);
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
@@ -438,7 +466,7 @@ export function loadConfig(
     restartBackoffMs: 2_000,
   };
   let logging: LoggingConfig = { maxBytes: 10_485_760, keep: 5 };
-  let chat: ChatConfig = { frameLogMaxBytes: 8_388_608, frameLogKeep: 3 };
+  let chat: ChatConfig = { frameLogMaxBytes: 8_388_608, frameLogKeep: 3, notifyWake: 'never' };
   let worktrees: WorktreesConfig | null = null;
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
   let review: ReviewConfig = { enabled: true };
@@ -655,9 +683,9 @@ export function loadConfig(
     if (raw['chat'] !== undefined) {
       const table = requireTable(raw['chat'], file, 'chat');
       for (const key of Object.keys(table)) {
-        if (!['frame_log_max_bytes', 'frame_log_keep'].includes(key)) {
+        if (!['frame_log_max_bytes', 'frame_log_keep', 'notify_wake'].includes(key)) {
           throw new ConfigError(
-            `unknown key \`${key}\` in [chat] (valid keys: frame_log_max_bytes, frame_log_keep)`,
+            `unknown key \`${key}\` in [chat] (valid keys: frame_log_max_bytes, frame_log_keep, notify_wake)`,
             file,
             `chat.${key}`,
           );
@@ -666,6 +694,10 @@ export function loadConfig(
       chat = {
         frameLogMaxBytes: table['frame_log_max_bytes'] !== undefined ? requirePositiveInt(table['frame_log_max_bytes'], file, 'chat.frame_log_max_bytes') : chat.frameLogMaxBytes,
         frameLogKeep: table['frame_log_keep'] !== undefined ? requirePositiveInt(table['frame_log_keep'], file, 'chat.frame_log_keep') : chat.frameLogKeep,
+        notifyWake:
+          table['notify_wake'] !== undefined
+            ? requireNotifyWakeMode(table['notify_wake'], file, 'chat.notify_wake')
+            : chat.notifyWake,
       };
     }
     if (raw['worktrees'] !== undefined) {

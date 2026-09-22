@@ -80,6 +80,9 @@ keep = 5
 [chat]
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
+# Wake policy for Gru awareness: "never" (default; passive context only),
+# "action-required", or "all" (each wake is a full model turn).
+notify_wake = "never"
 
 [worktrees]
 # root = "~/.gru-command/worktrees" # omitted so it follows data_dir

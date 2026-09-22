@@ -165,6 +165,7 @@ function racedPrompt(handle: { prompt(text: string, options?: { owner?: string }
 }
 import { ChatFrameLog } from './chat/frame-log.js';
 import { createChatServer, type ChatServer } from './chat/server.js';
+import { GruAwareness } from './chat/awareness.js';
 import { BOARD_WS_PATH } from './board/frames.js';
 import { GruSessionPointer } from './chat/session-state.js';
 import { createStaticRoot, defaultStaticRoot } from './static.js';
@@ -488,6 +489,16 @@ async function main(): Promise<number> {
     role: 'gru',
     spawn: (spawnOptions) => registry.spawn('gru', spawnOptions ?? {}),
   });
+  // Gru awareness (dispatch briefing 2026-09-22): ledger-derived escalations
+  // + lane digest for the chat brain. Constructed before the chat server so
+  // each prompt can pull a block; the wake sink binds once chat exists.
+  const awareness = new GruAwareness({
+    dir: chatDir,
+    ledger,
+    bus,
+    wakeMode: config.chat.notifyWake,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   const chat = createChatServer({
     config,
     frameLog,
@@ -500,8 +511,10 @@ async function main(): Promise<number> {
     canAdoptFreshGru: () => gruSlot.canReplace(),
     adoptFreshGru: (handle) => gruSlot.adoptReplacement(handle),
     siblingUpgradePaths: [BOARD_WS_PATH],
+    awareness,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  awareness.setWakeSink(() => chat.wakeAwareness());
   gruSlot.onSwap((handle) => chat.adoptRestartedGru(handle));
   surfaceInChat = (notification) => {
     chat.surfaceNotice(

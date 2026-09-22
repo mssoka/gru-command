@@ -279,6 +279,33 @@ full replay on pair, read-only rejection (ephemeral, unlogged), silent
 pen promotion, send-after-promotion, and incremental `last_seen_seq`
 catch-up.
 
+## Gru awareness (escalations and digests reach the brain)
+
+The chat brain learns what happened on the board without the human
+relaying it. Two mechanisms share one boundary:
+
+- **Passive injection.** Before each Gru prompt the service prepends a
+  bounded service-context block: unacknowledged action-required
+  notifications, plus one digest line per ledger event worth surfacing
+  since the block the brain last received (deliveries, verdicts with
+  fallback blocker counts, aborts/escalations, lane status changes).
+  The block is capped by event count, bytes, and line length; nothing
+  new injects nothing. A durable cursor at
+  `<data_dir>/chat/awareness.json` advances only after the prompt was
+  accepted, so a failed delivery retries the same context. Acked and
+  resolved notifications never inject — the human keeps every ack.
+- **Wake policy** (`[chat] notify_wake`, CONFIG.md): `never` (default)
+  is passive only; `action-required` starts a Gru turn when an
+  action-required notification lands; `all` does so for every
+  notification (FYI included). A wake with nothing to inject does not
+  spawn a session or burn a turn, and a wake requested mid-turn becomes
+  one trailing turn after the conversation goes idle — it is never
+  steered into a live user turn. Each wake is a full model turn.
+
+The client-facing `notice` frame (action-required items, supervisor
+restart notices) is unchanged and independent: it stays the human's
+durable banner, while the awareness block is session context.
+
 ## Limits and notes
 
 - Client messages are capped at 4 000 chars client-side; the server
