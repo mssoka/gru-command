@@ -37,7 +37,7 @@ const PINS: Record<string, number> = {
   'ledger-db.test.ts': 6,
   'logger.test.ts': 3,
   'notifications.test.ts': 15,
-  'perkins-builtin-review.test.ts': 52,
+  'perkins-builtin-review.test.ts': 57,
   'perkins-builtin-wave.test.ts': 34,
   'pi-adapter.test.ts': 46,
   'rehearsal.test.ts': 4,

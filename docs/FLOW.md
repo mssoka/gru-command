@@ -60,16 +60,20 @@ Each lens/chunk attempt is a distinct tracked child; malformed attempts are
 retryable up to the policy limit, so the total child-session count may exceed
 the required coverage cardinality.
 
-- The lead receives only four product-native tools: read a frozen chunk,
-  run tracked lens children, store bounded notes, and submit terminal proof.
-  It owns delegation, investigation, verification, deduplication, prior
-  audit, verdict calculation, and report authorship.
+- The lead receives only five product-native tools: read a frozen chunk,
+  run tracked lens children, store bounded notes, preflight a candidate
+  terminal submission, and submit terminal proof. It owns delegation,
+  investigation, verification, deduplication, prior audit, verdict
+  calculation, and report authorship. Preflight uses the exact terminal
+  validator without spending a terminal attempt, sealing the round, or
+  accepting anything; a rejected terminal submission returns every
+  violation in one bounded response.
 - Lens children are fresh, ambient-free sessions. Blind has no tools or
   repository/spec context; other lenses get confined read/grep/find/list
   tools. No reviewer gets shell, edit, write, ambient skills, extensions,
   settings, unrelated MCP servers, or nested delegation. The only MCP
   exception is the per-session, product-owned Claude lead bridge exposing the
-  same four narrow tools; lens children never receive it.
+  same five narrow tools; lens children never receive it.
 - The integrity-pinned package policy is the sole prompt authority for lead
   and child review behavior; interpolated repository/spec/convention text is
   untrusted evidence, never instruction. The host bounds attempts,

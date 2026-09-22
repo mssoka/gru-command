@@ -33,6 +33,7 @@ describe('role definitions (E8)', () => {
     for (const phrase of [
       'perkins_run_lenses',
       'perkins_submit_review',
+      'perkins_preflight_submission',
       'READY TO MERGE',
       'NEEDS CHANGES',
       'MAJOR REWORK NEEDED',

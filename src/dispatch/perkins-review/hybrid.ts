@@ -32,6 +32,10 @@ const MAX_TOTAL_CANDIDATES = 1_000;
 const MAX_TERMINAL_ATTEMPTS = 2;
 const MAX_LEAD_ARTIFACTS = 20;
 const MAX_LEAD_ARTIFACT_BYTES = 100 * 1024;
+/** Response bound for an aggregated submission-validation rejection. The MCP
+ * transport caps one tool response at 1 MiB; this keeps the exhaustive list
+ * well inside it for every real submission. */
+const MAX_VALIDATION_MESSAGE_BYTES = 256 * 1024;
 export const PERKINS_REPORT_MAX_BYTES = 128 * 1024;
 const REVIEW_OWNER = 'perkins-hybrid-review';
 
@@ -127,6 +131,76 @@ interface LeadSubmission {
   readonly report_markdown: string;
 }
 
+/** One exhaustive submission-validation violation, addressable by the lead. */
+interface SubmissionValidationIssue {
+  /** `candidate_ref`, `prior audit N`, `finding <title>`, `report`, or `submission`. */
+  readonly subject: string;
+  /** Stable rule code naming the violated host rule. */
+  readonly rule: string;
+  /** Actionable detail; the same wording the fail-fast validator used. */
+  readonly message: string;
+}
+
+interface ParsedDecision {
+  readonly index: number;
+  readonly decision: CandidateDecision | null;
+}
+
+interface ParsedAudit {
+  readonly index: number;
+  readonly audit: FixAuditResult | null;
+}
+
+/** Schema-valid parsed pieces plus per-entry violations, never fail-fast. */
+interface ParsedSubmission {
+  readonly verdict: CanonicalReviewVerdict | null;
+  readonly decisions: readonly ParsedDecision[] | null;
+  readonly audits: readonly ParsedAudit[] | null;
+  readonly report: string | null;
+  /** Present only when every schema rule passed (the old parse contract). */
+  readonly submission: LeadSubmission | null;
+  readonly errors: readonly SubmissionValidationIssue[];
+}
+
+interface SubmissionValidationContext {
+  readonly review: FrozenReview;
+  readonly movementRef: string;
+  readonly roundNumber: number;
+  readonly candidates: ReadonlyMap<string, ChildCandidate>;
+  readonly prior: readonly VerifiedFinding[];
+  readonly priorTargetSha: string | null;
+  readonly expected: ReadonlySet<string>;
+  readonly validCoverage: ReadonlySet<string>;
+  readonly readChunks: ReadonlySet<string>;
+  readonly results: ReadonlyMap<string, ChildResult>;
+  readonly lenses: readonly PerkinsLens[];
+}
+
+interface SubmissionValidationSuccess {
+  readonly ok: true;
+  readonly submission: LeadSubmission;
+  readonly findings: readonly VerifiedFinding[];
+  readonly priorAudit: readonly FixAuditResult[];
+  readonly completeness: ReviewCompleteness;
+  readonly canonicalVerdict: CanonicalReviewVerdict;
+  readonly headMoved: boolean;
+  readonly verificationSummary: VerificationSummary;
+}
+
+interface SubmissionValidationFailure {
+  readonly ok: false;
+  /** Best-effort parsed payload; null when a schema rule failed. */
+  readonly submission: LeadSubmission | null;
+  readonly errors: readonly SubmissionValidationIssue[];
+}
+
+type SubmissionValidation = SubmissionValidationSuccess | SubmissionValidationFailure;
+
+const SUBMISSION_KEYS = ['canonical_verdict', 'candidate_decisions', 'prior_audit', 'report_markdown'];
+const CANDIDATE_DECISION_KEYS = ['candidate_ref', 'disposition', 'evidence', 'reason'];
+const PRIOR_AUDIT_KEYS = ['prior_index', 'status', 'evidence', 'reason'];
+const CANONICAL_VERDICTS = ['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'];
+
 function hash(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
@@ -174,6 +248,140 @@ function boundedString(value: unknown, name: string, max: number): string {
   return value;
 }
 
+/** Collecting twin of boundedString: records the violation and keeps going. */
+function collectBoundedString(
+  value: unknown,
+  name: string,
+  max: number,
+  subject: string,
+  rule: string,
+  errors: SubmissionValidationIssue[],
+): string | null {
+  if (typeof value !== 'string' || value.trim() === '') {
+    errors.push({ subject, rule, message: `${name} must be a non-empty string` });
+    return null;
+  }
+  if (Buffer.byteLength(value, 'utf8') > max) {
+    errors.push({ subject, rule, message: `${name} exceeds ${max} UTF-8 bytes` });
+    return null;
+  }
+  return value;
+}
+
+function parseDecisionEntry(entry: unknown, index: number, errors: SubmissionValidationIssue[]): ParsedDecision {
+  const subject = `candidate decision ${index}`;
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+    errors.push({ subject, rule: 'candidate-decision-shape', message: `${subject} must be an object` });
+    return { index, decision: null };
+  }
+  const decision = entry as Record<string, unknown>;
+  if (Object.keys(decision).sort().join('\0') !== [...CANDIDATE_DECISION_KEYS].sort().join('\0')) {
+    errors.push({ subject, rule: 'candidate-decision-schema', message: `${subject} keys do not match the required schema` });
+  }
+  const candidateRef = collectBoundedString(
+    decision.candidate_ref, `${subject} ref`, 240, subject, 'candidate-decision-ref', errors,
+  );
+  const evidence = collectBoundedString(
+    decision.evidence, `${subject} evidence`, 4_000, subject, 'candidate-decision-evidence', errors,
+  );
+  const reason = collectBoundedString(
+    decision.reason, `${subject} reason`, 1_000, subject, 'candidate-decision-reason', errors,
+  );
+  let disposition: VerificationDisposition | null = null;
+  if (typeof decision.disposition !== 'string' || !['confirmed', 'rejected', 'unverifiable-speculative'].includes(decision.disposition)) {
+    errors.push({ subject, rule: 'candidate-decision-disposition', message: `${subject} disposition is invalid` });
+  } else {
+    disposition = decision.disposition as VerificationDisposition;
+  }
+  if (candidateRef === null || evidence === null || reason === null || disposition === null) {
+    return { index, decision: null };
+  }
+  return { index, decision: { candidate_ref: candidateRef, disposition, evidence, reason } };
+}
+
+function parseAuditEntry(
+  entry: unknown,
+  index: number,
+  priorCount: number,
+  errors: SubmissionValidationIssue[],
+): ParsedAudit {
+  const subject = `prior audit ${index}`;
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+    errors.push({ subject, rule: 'prior-audit-shape', message: `${subject} must be an object` });
+    return { index, audit: null };
+  }
+  const audit = entry as Record<string, unknown>;
+  if (Object.keys(audit).sort().join('\0') !== [...PRIOR_AUDIT_KEYS].sort().join('\0')) {
+    errors.push({ subject, rule: 'prior-audit-schema', message: `${subject} keys do not match the required schema` });
+  }
+  let priorIndex: number | null = null;
+  if (
+    !Number.isSafeInteger(audit.prior_index) || Number(audit.prior_index) < 0 || Number(audit.prior_index) >= priorCount
+  ) {
+    errors.push({ subject, rule: 'prior-audit-index', message: `${subject} index is invalid` });
+  } else {
+    priorIndex = Number(audit.prior_index);
+  }
+  let status: FixAuditResult['status'] | null = null;
+  if (typeof audit.status !== 'string' || !['fixed', 'still-present'].includes(audit.status)) {
+    errors.push({ subject, rule: 'prior-audit-status', message: `${subject} status is invalid` });
+  } else {
+    status = audit.status as FixAuditResult['status'];
+  }
+  const evidence = collectBoundedString(audit.evidence, `${subject} evidence`, 4_000, subject, 'prior-audit-evidence', errors);
+  const reason = collectBoundedString(audit.reason, `${subject} reason`, 1_000, subject, 'prior-audit-reason', errors);
+  if (priorIndex === null || status === null || evidence === null || reason === null) {
+    return { index, audit: null };
+  }
+  return { index, audit: { prior_index: priorIndex, status, evidence, reason } };
+}
+
+/** One bounded, line-addressable rejection listing every violation at once. */
+function rejectionMessage(errors: readonly SubmissionValidationIssue[]): string {
+  const lines = [
+    `terminal submission rejected with ${errors.length} error(s); every listed rule must be fixed before a real submission is accepted:`,
+  ];
+  let bytes = Buffer.byteLength(lines[0]!, 'utf8') + 1;
+  let shown = 0;
+  for (const error of errors) {
+    const line = `- [${error.subject}] ${error.rule}: ${error.message}`;
+    const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+    if (bytes + lineBytes > MAX_VALIDATION_MESSAGE_BYTES) break;
+    lines.push(line);
+    bytes += lineBytes;
+    shown += 1;
+  }
+  if (shown < errors.length) lines.push(`- (+${errors.length - shown} further error(s) omitted from this bounded response)`);
+  return lines.join('\n');
+}
+
+/** Thrown rejection carrying the complete issue list for the audit artifact. */
+class SubmissionRejection extends Error {
+  readonly issues: readonly SubmissionValidationIssue[];
+
+  constructor(issues: readonly SubmissionValidationIssue[]) {
+    super(rejectionMessage(issues));
+    this.name = 'SubmissionRejection';
+    this.issues = issues;
+  }
+}
+
+/** Same byte bound for the preflight channel's structured error list. */
+function boundedIssues(errors: readonly SubmissionValidationIssue[]): {
+  readonly errors: readonly SubmissionValidationIssue[];
+  readonly omitted: number;
+} {
+  let bytes = 0;
+  let included = 0;
+  for (const error of errors) {
+    const size = Buffer.byteLength(JSON.stringify(error), 'utf8') + 1;
+    if (bytes + size > MAX_VALIDATION_MESSAGE_BYTES) break;
+    bytes += size;
+    included += 1;
+  }
+  return { errors: errors.slice(0, included), omitted: errors.length - included };
+}
+
 function findingPath(finding: Pick<ReviewFinding, 'location'>): string | null {
   const token = finding.location.split(':', 1)[0]?.trim() ?? '';
   if (
@@ -185,50 +393,92 @@ function findingPath(finding: Pick<ReviewFinding, 'location'>): string | null {
 
 const GIT_PROOF_TIMEOUT_MS = 30_000;
 
-function frozenBlobContains(review: FrozenReview, path: string, evidence: string): boolean {
+/** Per-validation memo for the frozen-tree proof lookups. The round's SHAs are
+ * immutable, so identical queries are wasted subprocesses; one validation pass
+ * (and each repeated preflight) shares this cache. */
+interface ProofCache {
+  readonly blobContains: Map<string, boolean>;
+  readonly pathDiffs: Map<string, string>;
+  readonly pathAbsent: Map<string, boolean>;
+  readonly anywhere: Map<string, boolean>;
+}
+
+function newProofCache(): ProofCache {
+  return { blobContains: new Map(), pathDiffs: new Map(), pathAbsent: new Map(), anywhere: new Map() };
+}
+
+function frozenBlobContains(review: FrozenReview, path: string, evidence: string, cache?: ProofCache): boolean {
+  const key = `${path}\0${evidence}`;
+  const cached = cache?.blobContains.get(key);
+  if (cached !== undefined) return cached;
+  let result = false;
   try {
     const blob = execFileSync('git', ['-C', review.manifest.repoPath, 'show', `${review.manifest.targetSha}:${path}`], {
       encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
     });
-    return blob.includes(evidence);
+    result = blob.includes(evidence);
   } catch {
-    return false;
+    result = false;
   }
+  cache?.blobContains.set(key, result);
+  return result;
 }
 
-function frozenPathDiff(review: FrozenReview, path: string, baseSha = review.manifest.diffBaseSha): string {
+function frozenPathDiff(
+  review: FrozenReview,
+  path: string,
+  baseSha = review.manifest.diffBaseSha,
+  cache?: ProofCache,
+): string {
+  const key = `${baseSha}\0${path}`;
+  const cached = cache?.pathDiffs.get(key);
+  if (cached !== undefined) return cached;
+  let diff = '';
   try {
-    return execFileSync('git', [
+    diff = execFileSync('git', [
       '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--unified=3',
       baseSha, review.manifest.targetSha, '--', `:(literal)${path}`,
     ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
   } catch {
-    return '';
+    diff = '';
   }
+  cache?.pathDiffs.set(key, diff);
+  return diff;
 }
 
-function evidenceAtCitedLocation(review: FrozenReview, finding: ReviewFinding, evidence: string): boolean {
+function evidenceAtCitedLocation(
+  review: FrozenReview,
+  finding: ReviewFinding,
+  evidence: string,
+  cache?: ProofCache,
+): boolean {
   if (evidence === 'N/A' || evidence.trim() === '') return false;
   const path = findingPath(finding);
   // Binding is to the CITED FILE in the frozen tree (blob or its diff), not
   // to the chunk's changed-file list: lens children read the whole frozen
   // tree and may cite an unchanged file with a real defect.
   if (path === null) return false;
-  return frozenBlobContains(review, path, evidence) || frozenPathDiff(review, path).includes(evidence);
+  return frozenBlobContains(review, path, evidence, cache) ||
+    frozenPathDiff(review, path, review.manifest.diffBaseSha, cache).includes(evidence);
 }
 
-function evidenceAnywhere(review: FrozenReview, evidence: string): boolean {
+function evidenceAnywhere(review: FrozenReview, evidence: string, cache?: ProofCache): boolean {
   if (evidence === 'N/A' || evidence.trim() === '') return false;
   if (review.chunks.some((chunk) => chunk.diff.includes(evidence))) return true;
+  const cached = cache?.anywhere.get(evidence);
+  if (cached !== undefined) return cached;
+  let result = false;
   try {
-    return execFileSync('git', [
+    result = execFileSync('git', [
       '-C', review.manifest.repoPath, 'grep', '-F', '--full-name', '--', evidence, review.manifest.targetSha, '--',
     ], {
       encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
     }).trim() !== '';
   } catch {
-    return false;
+    result = false;
   }
+  cache?.anywhere.set(evidence, result);
+  return result;
 }
 
 function fixedAuditEvidence(
@@ -236,20 +486,26 @@ function fixedAuditEvidence(
   finding: VerifiedFinding,
   evidence: string,
   priorTargetSha: string | null,
+  cache?: ProofCache,
 ): boolean {
   const path = findingPath(finding);
   if (path === null) return false;
   if (evidence === `PATH ABSENT: ${path}`) {
+    const cached = cache?.pathAbsent.get(path);
+    if (cached !== undefined) return cached;
+    let absent = false;
     try {
       execFileSync('git', ['-C', review.manifest.repoPath, 'cat-file', '-e', `${review.manifest.targetSha}:${path}`], {
         timeout: GIT_PROOF_TIMEOUT_MS, stdio: 'ignore',
       });
-      return false;
+      absent = false;
     } catch {
-      return true;
+      absent = true;
     }
+    cache?.pathAbsent.set(path, absent);
+    return absent;
   }
-  const diff = frozenPathDiff(review, path, priorTargetSha ?? review.manifest.diffBaseSha);
+  const diff = frozenPathDiff(review, path, priorTargetSha ?? review.manifest.diffBaseSha, cache);
   return diff.split('\n').some((line) => line.startsWith('-') && !line.startsWith('---') && line.slice(1) === evidence);
 }
 
@@ -455,6 +711,7 @@ export class PerkinsHybridReview {
     const agentIds = new Set<string>();
     const sessionFiles = new Set<string>();
     let terminalAttempts = 0;
+    let preflightAttempts = 0;
     let accepted: PerkinsHybridResult | null = null;
 
     const registerIsolatedHandle = (handle: AgentHandle, phase: 'lead' | 'lens'): void => {
@@ -703,188 +960,100 @@ export class PerkinsHybridReview {
       },
     };
 
+    const validationContext: SubmissionValidationContext = {
+      review,
+      movementRef: input.movementRef,
+      roundNumber: input.roundNumber,
+      candidates,
+      prior,
+      priorTargetSha: priorReview.targetSha,
+      expected,
+      validCoverage,
+      readChunks,
+      results,
+      lenses,
+    };
+
+    const submissionSchema = {
+      type: 'object', additionalProperties: false,
+      required: ['canonical_verdict', 'candidate_decisions', 'prior_audit', 'report_markdown'],
+      properties: {
+        canonical_verdict: { type: 'string', enum: ['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'] },
+        candidate_decisions: { type: 'array', maxItems: MAX_TOTAL_CANDIDATES, items: { type: 'object' } },
+        prior_audit: { type: 'array', maxItems: 10_000, items: { type: 'object' } },
+        report_markdown: { type: 'string', minLength: 1, maxLength: PERKINS_REPORT_MAX_BYTES },
+      },
+    };
+
+    /** Validation-only entry point: the exact same validator as submission,
+     * no terminal attempt consumed, no sealing, no termination. */
+    const preflightTool: NativeAgentTool = {
+      name: 'perkins_preflight_submission',
+      description: 'Validate a candidate terminal submission with the exact rules perkins_submit_review enforces, without spending a terminal attempt and without sealing the round. Returns the complete exhaustive error list in one response; ok=true means the same payload would be accepted. Preflight accepts nothing and never terminates.',
+      inputSchema: submissionSchema,
+      execute: async (raw, signal) => {
+        if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
+        if (accepted !== null) throw new Error('review already has an accepted terminal submission');
+        preflightAttempts += 1;
+        const validation = this.validateSubmission(validationContext, raw);
+        const errors = validation.ok ? [] : validation.errors;
+        const bounded = boundedIssues(errors);
+        writeReviewArtifact(review, `lead/preflight-attempt-${preflightAttempts}.json`, {
+          schemaVersion: 1,
+          ok: validation.ok,
+          errorCount: errors.length,
+          errors,
+          submission: validation.submission,
+          ...(validation.submission === null ? { raw_submission: raw } : {}),
+        });
+        return {
+          text: JSON.stringify({
+            preflight: true,
+            ok: validation.ok,
+            errorCount: errors.length,
+            errors: bounded.errors,
+            ...(bounded.omitted > 0 ? { omittedErrorCount: bounded.omitted } : {}),
+          }),
+          details: {
+            preflight: true,
+            ok: validation.ok,
+            errorCount: errors.length,
+            preflightAttempt: preflightAttempts,
+          },
+        };
+      },
+    };
+
     const submitTool: NativeAgentTool = {
       name: 'perkins_submit_review',
-      description: 'Submit the lead-authored terminal proof and report. The host rejects missing coverage, foreign/missing candidates, unsupported verification, incomplete prior audits, changed HEAD, or incorrect verdict arithmetic.',
-      inputSchema: {
-        type: 'object', additionalProperties: false,
-        required: ['canonical_verdict', 'candidate_decisions', 'prior_audit', 'report_markdown'],
-        properties: {
-          canonical_verdict: { type: 'string', enum: ['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'] },
-          candidate_decisions: { type: 'array', maxItems: MAX_TOTAL_CANDIDATES, items: { type: 'object' } },
-          prior_audit: { type: 'array', maxItems: 10_000, items: { type: 'object' } },
-          report_markdown: { type: 'string', minLength: 1, maxLength: PERKINS_REPORT_MAX_BYTES },
-        },
-      },
+      description: 'Submit the lead-authored terminal proof and report. The host rejects missing coverage, foreign/missing candidates, unsupported verification, incomplete prior audits, changed HEAD, or incorrect verdict arithmetic; one rejection lists every violation in a single response.',
+      inputSchema: submissionSchema,
       execute: async (raw, signal) => {
         if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
         terminalAttempts += 1;
         if (terminalAttempts > MAX_TERMINAL_ATTEMPTS) throw new Error('terminal submission attempts exhausted');
+        const attempt = terminalAttempts;
         try {
           if (accepted !== null) throw new Error('review already has an accepted terminal submission');
-          const submission = this.parseSubmission(raw, candidates.size, prior.length);
-          writeReviewArtifact(review, `lead/submission-attempt-${terminalAttempts}.json`, submission);
-          const missingChunks = review.chunks.filter((chunk) => !readChunks.has(chunk.id)).map((chunk) => chunk.id);
-          if (missingChunks.length > 0) throw new Error(`lead has not read every frozen chunk (${missingChunks.join(', ')})`);
-          const missingCoverage = [...expected].filter((key) => !validCoverage.has(key));
-          if (missingCoverage.length > 0) throw new Error(`required lens/chunk coverage is missing (${missingCoverage.length} run(s))`);
-          if (submission.candidate_decisions.length !== candidates.size) throw new Error('terminal submission must decide every child candidate exactly once');
-          const decisionRefs = new Set(submission.candidate_decisions.map((decision) => decision.candidate_ref));
-          if (decisionRefs.size !== candidates.size || [...decisionRefs].some((ref) => !candidates.has(ref))) {
-            throw new Error('terminal submission contains missing, duplicate, or unowned candidate references');
-          }
-          const findings: VerifiedFinding[] = [];
-          let confirmed = 0;
-          let rejected = 0;
-          let speculative = 0;
-          // Carried prior findings enter first so a fresh rediscovery of the
-          // same issue merges INTO the original round marker, never replaces it.
-          const priorAudit = this.validatePriorAudit(
-            review,
-            prior,
-            submission.prior_audit,
-            priorReview.targetSha,
-          );
-          for (const audit of priorAudit) {
-            if (audit.status !== 'still-present') continue;
-            const carried = prior[audit.prior_index]!;
-            findings.push({
-              ...carried,
-              evidence: audit.evidence,
-              verification: {
-                disposition: carried.verification.disposition,
-                evidence: audit.evidence,
-                reason: audit.reason,
-              },
-            });
-          }
-          for (const decision of submission.candidate_decisions) {
-            const candidate = candidates.get(decision.candidate_ref)!;
-            if (decision.disposition === 'rejected') {
-              const anchored = findingPath(candidate) !== null && candidate.location !== 'N/A';
-              const located = anchored
-                ? evidenceAtCitedLocation(review, candidate, decision.evidence)
-                : evidenceAnywhere(review, decision.evidence);
-              if (!located || decision.evidence === candidate.evidence) {
-                throw new Error(`rejected candidate lacks contradictory frozen evidence at its cited location: ${candidate.ref}`);
-              }
-              rejected += 1;
-              continue;
+          const validation = this.validateSubmission(validationContext, raw);
+          if (!validation.ok) {
+            if (validation.submission !== null) {
+              writeReviewArtifact(review, `lead/submission-attempt-${attempt}.json`, validation.submission);
             }
-            const forcedSpeculative = candidate.location === 'N/A' || candidate.evidence === 'N/A' || findingPath(candidate) === null;
-            if (!forcedSpeculative && decision.disposition === 'unverifiable-speculative') {
-              throw new Error(`anchored candidate must be confirmed or rejected: ${candidate.ref}`);
-            }
-            const disposition = forcedSpeculative ? 'unverifiable-speculative' : decision.disposition;
-            if (disposition === 'confirmed') {
-              if (!evidenceAtCitedLocation(review, candidate, candidate.evidence)) {
-                throw new Error(`candidate evidence is not locatable at its cited file/hunk: ${candidate.ref}`);
-              }
-              if (!evidenceAnywhere(review, decision.evidence)) {
-                throw new Error(`lead verification evidence is not locatable in the frozen review: ${candidate.ref}`);
-              }
-              confirmed += 1;
-            } else {
-              speculative += 1;
-            }
-            findings.push({
-              source: candidate.source,
-              severity: disposition === 'unverifiable-speculative' && candidate.severity === 'blocker' ? 'warning' : candidate.severity,
-              category: candidate.category,
-              title: candidate.title,
-              location: candidate.location,
-              evidence: candidate.evidence,
-              detail: candidate.detail,
-              recommended_fix: candidate.recommended_fix,
-              verification: { disposition, evidence: decision.evidence, reason: decision.reason },
-              chunks: [candidate.chunk],
-              sources: [candidate.source],
-              roundOrigin: input.roundNumber,
-            });
+            throw new SubmissionRejection(validation.errors);
           }
-          const deduped = [...dedupeVerifiedFindings(findings)];
-          // Host-carried coverage gates: a FAIL coverage gate is a confirmed
-          // blocker owned by the host, not by lead discretion.
-          for (const result of results.values()) {
-            if (result.status === 'valid' && result.coverageGate === 'FAIL') {
-              deduped.push({
-                source: 'tests',
-                severity: 'blocker',
-                category: 'coverage-gate',
-                title: 'Coverage gate: FAIL',
-                location: `chunk ${result.chunk}`,
-                evidence: 'Coverage gate: FAIL',
-                detail: 'The tests lens reported a failing coverage gate; the review cannot be complete.',
-                recommended_fix: 'Restore the coverage the tests lens requires, then rerun the review.',
-                verification: { disposition: 'confirmed', evidence: 'Coverage gate: FAIL', reason: 'host-carried coverage gate reported FAIL' },
-                chunks: [result.chunk],
-                sources: ['tests'],
-                roundOrigin: input.roundNumber,
-              });
-            }
-          }
-          const finalFindings = dedupeVerifiedFindings(deduped);
-          // A moved source ref never retargets this frozen review, but it also
-          // cannot authorize the now-different head. The lead may correct an
-          // initial conclusive proposal to INCOMPLETE on its second terminal
-          // attempt; only that fail-closed submission can be accepted.
-          const headMoved = headMovedSinceFreeze(review, input.movementRef);
-          const completeness: ReviewCompleteness = {
-            complete: !headMoved,
-            requiredLensRuns: expected.size,
-            validLensRuns: validCoverage.size,
-            failedRuns: [],
-            verificationComplete: true,
-          };
-          const canonicalVerdict = verdictForFindings(finalFindings, completeness);
-          if (submission.canonical_verdict !== canonicalVerdict) {
-            throw new Error(`proposed verdict ${submission.canonical_verdict} conflicts with canonical ${canonicalVerdict}`);
-          }
-          if (!submission.report_markdown.includes(`**Verdict: ${canonicalVerdict}**`)) throw new Error('lead report does not state the canonical verdict');
-          if (!submission.report_markdown.includes(review.manifest.targetSha) || !submission.report_markdown.includes(review.manifest.diffBaseSha)) {
-            throw new Error('lead report omits the frozen target/base identity');
-          }
-          for (const lens of lenses) {
-            if (!submission.report_markdown.includes(lens)) throw new Error(`lead report omits required lens coverage: ${lens}`);
-          }
-          for (const finding of finalFindings) {
-            // Host-carried coverage gates are host evidence, not lead-authored
-            // report content (the lead never receives the gate finding).
-            if (finding.category === 'coverage-gate' && finding.verification.reason.startsWith('host-carried')) continue;
-            // Verbatim proof is anchored: the full evidence must appear, or —
-            // for evidence longer than 200 bytes — its exact 200-byte prefix.
-            // This keeps a 200-candidate report inside the bounded envelope.
-            const evidencePrefix = Buffer.byteLength(finding.evidence, 'utf8') > 200 ? bytePrefix(finding.evidence, 200) : finding.evidence;
-            for (const required of [finding.title, finding.severity, finding.location, evidencePrefix, finding.recommended_fix]) {
-              if (!submission.report_markdown.includes(required)) throw new Error(`lead report omits required finding proof: ${finding.title}`);
-            }
-          }
-          for (const audit of priorAudit) {
-            // Same byte-anchored proof as findings: full evidence, or its
-            // exact 200-byte prefix for long evidence (bounded report).
-            const auditPrefix = Buffer.byteLength(audit.evidence, 'utf8') > 200 ? bytePrefix(audit.evidence, 200) : audit.evidence;
-            if (!submission.report_markdown.includes(audit.status) || !submission.report_markdown.includes(auditPrefix)) {
-              throw new Error(`lead report omits prior audit proof: ${audit.prior_index}`);
-            }
-          }
+          const submission = validation.submission;
+          writeReviewArtifact(review, `lead/submission-attempt-${attempt}.json`, submission);
           const reportFile = writeReviewArtifact(review, 'perkins-report.md', submission.report_markdown.endsWith('\n') ? submission.report_markdown : `${submission.report_markdown}\n`);
-          const verificationSummary: VerificationSummary = {
-            candidates: candidates.size,
-            confirmed,
-            rejected,
-            unverified: speculative,
-            speculative,
-            deduplicated: finalFindings.length,
-          };
           writeReviewArtifact(review, 'consolidated.json', {
             schemaVersion: 2,
             architecture: 'perkins-hybrid',
-            canonicalVerdict,
-            completeness,
-            headMoved,
-            findings: finalFindings,
-            priorAudit,
-            verificationSummary,
+            canonicalVerdict: validation.canonicalVerdict,
+            completeness: validation.completeness,
+            headMoved: validation.headMoved,
+            findings: validation.findings,
+            priorAudit: validation.priorAudit,
+            verificationSummary: validation.verificationSummary,
             frozen: review.manifest,
             childResults: [...results.values()].map((result) => ({
               resultId: result.resultId, agentId: result.agentId, lens: result.lens,
@@ -892,17 +1061,23 @@ export class PerkinsHybridReview {
             })),
           });
           accepted = {
-            canonicalVerdict, findings: finalFindings, completeness,
+            canonicalVerdict: validation.canonicalVerdict, findings: validation.findings,
+            completeness: validation.completeness,
             artifactDirectory: review.directory, reportFile,
             targetSha: review.manifest.targetSha, diffBaseSha: review.manifest.diffBaseSha,
-            headMoved, lensEnvelopes: [...envelopes], priorAudit, verificationSummary,
+            headMoved: validation.headMoved, lensEnvelopes: [...envelopes],
+            priorAudit: validation.priorAudit, verificationSummary: validation.verificationSummary,
           };
           return {
-            text: JSON.stringify({ accepted: true, canonicalVerdict, findingCount: finalFindings.length }),
-            details: { accepted: true, canonicalVerdict, findingCount: finalFindings.length }, terminate: true,
+            text: JSON.stringify({ accepted: true, canonicalVerdict: validation.canonicalVerdict, findingCount: validation.findings.length }),
+            details: { accepted: true, canonicalVerdict: validation.canonicalVerdict, findingCount: validation.findings.length },
+            terminate: true,
           };
         } catch (error) {
-          writeReviewArtifact(review, `lead/submission-attempt-${terminalAttempts}.error.json`, { error: sanitizeError(error) });
+          writeReviewArtifact(review, `lead/submission-attempt-${attempt}.error.json`, {
+            error: sanitizeError(error),
+            ...(error instanceof SubmissionRejection ? { issues: error.issues } : {}),
+          });
           throw error;
         }
       },
@@ -912,7 +1087,7 @@ export class PerkinsHybridReview {
       this.policy.portableContract.leadWorkflow,
       '',
       '--- PRODUCT-NATIVE TOOL CONTRACT ---',
-      'Use perkins_read_chunk to read frozen diff chunks; use perkins_run_lenses to start and receive tracked lens children; use perkins_store_artifact only for optional lead notes; finish by calling perkins_submit_review.',
+      'Use perkins_read_chunk to read frozen diff chunks; use perkins_run_lenses to start and receive tracked lens children; use perkins_store_artifact only for optional lead notes; use perkins_preflight_submission to validate a candidate terminal submission without spending a terminal attempt; finish by calling perkins_submit_review.',
       'Lens children never inherit these tools. You, the lead, must independently inspect and decide every returned candidate. Do not write implementation files.',
     ].join('\n');
     const initialPrompt = this.leadPrompt(review, lenses, prior);
@@ -925,7 +1100,7 @@ export class PerkinsHybridReview {
         reviewLead: {
           systemPrompt,
           tools: ['read', 'grep', 'find', 'ls'],
-          nativeTools: [chunkTool, runTool, artifactTool, submitTool],
+          nativeTools: [chunkTool, runTool, artifactTool, preflightTool, submitTool],
         },
       }), LEAD_SPAWN_TIMEOUT_MS, [input.signal]);
       registerIsolatedHandle(lead, 'lead');
@@ -945,7 +1120,8 @@ export class PerkinsHybridReview {
         leadAgentId: lead.id,
         leadSessionFile: lead.sessionFile,
         turns,
-        nativeTools: [chunkTool.name, runTool.name, artifactTool.name, submitTool.name],
+        preflightCalls: preflightAttempts,
+        nativeTools: [chunkTool.name, runTool.name, artifactTool.name, preflightTool.name, submitTool.name],
       });
       return accepted;
     } finally {
@@ -954,79 +1130,327 @@ export class PerkinsHybridReview {
     }
   }
 
-  private parseSubmission(value: unknown, candidateCount: number, priorCount: number): LeadSubmission {
-    const input = record(value, 'terminal submission');
-    exactKeys(input, ['canonical_verdict', 'candidate_decisions', 'prior_audit', 'report_markdown'], 'terminal submission');
-    if (
-      typeof input.canonical_verdict !== 'string' ||
-      !['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'].includes(input.canonical_verdict)
-    ) {
-      throw new Error('terminal canonical_verdict is invalid');
+  private parseSubmission(value: unknown, candidateCount: number, priorCount: number): ParsedSubmission {
+    const errors: SubmissionValidationIssue[] = [];
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      errors.push({ subject: 'submission', rule: 'submission-shape', message: 'terminal submission must be an object' });
+      return { verdict: null, decisions: null, audits: null, report: null, submission: null, errors };
     }
-    if (!Array.isArray(input.candidate_decisions) || input.candidate_decisions.length > Math.max(candidateCount, MAX_TOTAL_CANDIDATES)) throw new Error('candidate_decisions is invalid');
-    const candidateDecisions = input.candidate_decisions.map((entry, index): CandidateDecision => {
-      const decision = record(entry, `candidate decision ${index}`);
-      exactKeys(decision, ['candidate_ref', 'disposition', 'evidence', 'reason'], `candidate decision ${index}`);
-      if (
-        typeof decision.disposition !== 'string' ||
-        !['confirmed', 'rejected', 'unverifiable-speculative'].includes(decision.disposition)
-      ) throw new Error(`candidate decision ${index} disposition is invalid`);
-      return {
-        candidate_ref: boundedString(decision.candidate_ref, `candidate decision ${index} ref`, 240),
-        disposition: decision.disposition as VerificationDisposition,
-        evidence: boundedString(decision.evidence, `candidate decision ${index} evidence`, 4_000),
-        reason: boundedString(decision.reason, `candidate decision ${index} reason`, 1_000),
-      };
-    });
-    if (!Array.isArray(input.prior_audit) || input.prior_audit.length > Math.max(priorCount, 10_000)) throw new Error('prior_audit is invalid');
-    const priorAudit = input.prior_audit.map((entry, index): FixAuditResult => {
-      const audit = record(entry, `prior audit ${index}`);
-      exactKeys(audit, ['prior_index', 'status', 'evidence', 'reason'], `prior audit ${index}`);
-      if (!Number.isSafeInteger(audit.prior_index) || Number(audit.prior_index) < 0 || Number(audit.prior_index) >= priorCount) throw new Error(`prior audit ${index} index is invalid`);
-      if (typeof audit.status !== 'string' || !['fixed', 'still-present'].includes(audit.status)) {
-        throw new Error(`prior audit ${index} status is invalid`);
-      }
-      return {
-        prior_index: Number(audit.prior_index),
-        status: audit.status as FixAuditResult['status'],
-        evidence: boundedString(audit.evidence, `prior audit ${index} evidence`, 4_000),
-        reason: boundedString(audit.reason, `prior audit ${index} reason`, 1_000),
-      };
-    });
-    return {
-      canonical_verdict: input.canonical_verdict as CanonicalReviewVerdict,
-      candidate_decisions: candidateDecisions,
-      prior_audit: priorAudit,
-      report_markdown: boundedString(input.report_markdown, 'report_markdown', PERKINS_REPORT_MAX_BYTES),
-    };
+    const input = value as Record<string, unknown>;
+    if (Object.keys(input).sort().join('\0') !== [...SUBMISSION_KEYS].sort().join('\0')) {
+      errors.push({ subject: 'submission', rule: 'submission-shape', message: 'terminal submission keys do not match the required schema' });
+    }
+    let verdict: CanonicalReviewVerdict | null = null;
+    if (typeof input.canonical_verdict !== 'string' || !CANONICAL_VERDICTS.includes(input.canonical_verdict)) {
+      errors.push({ subject: 'submission', rule: 'submission-verdict', message: 'terminal canonical_verdict is invalid' });
+    } else {
+      verdict = input.canonical_verdict as CanonicalReviewVerdict;
+    }
+    let decisions: ParsedDecision[] | null = null;
+    if (!Array.isArray(input.candidate_decisions) || input.candidate_decisions.length > Math.max(candidateCount, MAX_TOTAL_CANDIDATES)) {
+      errors.push({ subject: 'submission', rule: 'submission-decisions', message: 'candidate_decisions is invalid' });
+    } else {
+      decisions = input.candidate_decisions.map((entry, index) => parseDecisionEntry(entry, index, errors));
+    }
+    let audits: ParsedAudit[] | null = null;
+    if (!Array.isArray(input.prior_audit) || input.prior_audit.length > Math.max(priorCount, 10_000)) {
+      errors.push({ subject: 'submission', rule: 'submission-prior-audit', message: 'prior_audit is invalid' });
+    } else {
+      audits = input.prior_audit.map((entry, index) => parseAuditEntry(entry, index, priorCount, errors));
+    }
+    const report = collectBoundedString(
+      input.report_markdown, 'report_markdown', PERKINS_REPORT_MAX_BYTES, 'report', 'report-shape', errors,
+    );
+    const submission: LeadSubmission | null =
+      errors.length === 0 && verdict !== null && decisions !== null && audits !== null && report !== null
+        ? {
+            canonical_verdict: verdict,
+            candidate_decisions: decisions.map((entry) => entry.decision as CandidateDecision),
+            prior_audit: audits.map((entry) => entry.audit as FixAuditResult),
+            report_markdown: report,
+          }
+        : null;
+    return { verdict, decisions, audits, report, submission, errors };
   }
 
-  private validatePriorAudit(
-    review: FrozenReview,
-    prior: readonly VerifiedFinding[],
-    audit: readonly FixAuditResult[],
-    priorTargetSha: string | null,
-  ): readonly FixAuditResult[] {
-    if (audit.length !== prior.length || new Set(audit.map((entry) => entry.prior_index)).size !== prior.length) {
-      throw new Error('prior audit must contain every prior finding exactly once');
+  /**
+   * One exhaustive pass over a candidate submission. Collects every rule
+   * violation — schema, host state, candidate decisions, prior audit, verdict
+   * arithmetic, and report structure — in stable order instead of throwing on
+   * the first one, so a single rejection (or preflight) lets the lead fix
+   * everything at once. Same rules and strictness as the original fail-fast
+   * validator; only the reporting changed.
+   */
+  private validateSubmission(context: SubmissionValidationContext, raw: unknown): SubmissionValidation {
+    const parsed = this.parseSubmission(raw, context.candidates.size, context.prior.length);
+    const errors: SubmissionValidationIssue[] = [...parsed.errors];
+    const review = context.review;
+    const report = parsed.report;
+    const proofCache = newProofCache();
+    const push = (subject: string, rule: string, message: string): void => {
+      errors.push({ subject, rule, message });
+    };
+
+    // Host-state facts are independent of the submission body: report all.
+    const missingChunks = review.chunks.filter((chunk) => !context.readChunks.has(chunk.id)).map((chunk) => chunk.id);
+    if (missingChunks.length > 0) {
+      push('submission', 'host-read-missing', `lead has not read every frozen chunk (${missingChunks.join(', ')})`);
     }
-    const ordered = [...audit].sort((left, right) => left.prior_index - right.prior_index);
-    for (const entry of ordered) {
-      const finding = prior[entry.prior_index]!;
-      const speculativeNa = finding.verification.disposition === 'unverifiable-speculative' && entry.evidence === 'N/A';
-      const path = findingPath(finding);
-      const located = speculativeNa || (
-        path !== null && (
-          entry.status === 'still-present'
-            ? frozenBlobContains(review, path, entry.evidence)
-            : fixedAuditEvidence(review, finding, entry.evidence, priorTargetSha)
-        )
-      );
-      if (!located) {
-        throw new Error(`prior audit ${entry.prior_index} evidence is not locatable at the finding's cited frozen file/hunk`);
+    const missingCoverage = [...context.expected].filter((key) => !context.validCoverage.has(key));
+    if (missingCoverage.length > 0) {
+      push('submission', 'coverage-missing', `required lens/chunk coverage is missing (${missingCoverage.length} run(s))`);
+    }
+
+    // Candidate ownership/coverage. The first valid decision per ref is the
+    // one used for semantic checks; every violation is still reported.
+    const decidedByRef = new Map<string, CandidateDecision>();
+    if (parsed.decisions !== null) {
+      const duplicates = new Set<string>();
+      const unowned = new Set<string>();
+      for (const entry of parsed.decisions) {
+        if (entry.decision === null) continue;
+        const ref = entry.decision.candidate_ref;
+        if (!context.candidates.has(ref)) {
+          unowned.add(ref);
+          continue;
+        }
+        if (decidedByRef.has(ref)) {
+          duplicates.add(ref);
+          continue;
+        }
+        decidedByRef.set(ref, entry.decision);
+      }
+      const missing = [...context.candidates.keys()].filter((ref) => !decidedByRef.has(ref));
+      if (parsed.decisions.length !== context.candidates.size) {
+        push('submission', 'decision-coverage', 'terminal submission must decide every child candidate exactly once');
+      }
+      if (duplicates.size > 0 || unowned.size > 0 || missing.length > 0) {
+        push('submission', 'decision-coverage', 'terminal submission contains missing, duplicate, or unowned candidate references');
+      }
+      for (const ref of duplicates) push(ref, 'decision-coverage', 'candidate is decided more than once');
+      for (const ref of unowned) push(ref, 'decision-coverage', 'candidate reference is not owned by this review');
+      for (const ref of missing) push(ref, 'decision-coverage', 'candidate has no decision entry');
+    }
+
+    // Prior audit: exact coverage plus locatable proof for every entry that
+    // parsed, not merely the first failing one.
+    const locatedAudits = new Map<number, FixAuditResult>();
+    if (parsed.audits !== null) {
+      const byIndex = new Map<number, FixAuditResult[]>();
+      for (const entry of parsed.audits) {
+        if (entry.audit === null) continue;
+        const list = byIndex.get(entry.audit.prior_index) ?? [];
+        list.push(entry.audit);
+        byIndex.set(entry.audit.prior_index, list);
+      }
+      let coverageBroken = parsed.audits.length !== context.prior.length;
+      for (let priorIndex = 0; priorIndex < context.prior.length; priorIndex += 1) {
+        const list = byIndex.get(priorIndex) ?? [];
+        if (list.length === 0) {
+          push(`prior audit ${priorIndex}`, 'prior-audit-coverage', `prior finding ${priorIndex} has no audit entry`);
+          coverageBroken = true;
+        } else if (list.length > 1) {
+          push(`prior audit ${priorIndex}`, 'prior-audit-coverage', `prior finding ${priorIndex} is audited more than once`);
+          coverageBroken = true;
+        }
+      }
+      if (coverageBroken) push('submission', 'prior-audit-coverage', 'prior audit must contain every prior finding exactly once');
+      const ordered = [...byIndex.entries()]
+        .sort(([left], [right]) => left - right)
+        .flatMap(([, list]) => list);
+      for (const audit of ordered) {
+        const finding = context.prior[audit.prior_index]!;
+        const speculativeNa = finding.verification.disposition === 'unverifiable-speculative' && audit.evidence === 'N/A';
+        const path = findingPath(finding);
+        const located = speculativeNa || (
+          path !== null && (
+            audit.status === 'still-present'
+              ? frozenBlobContains(review, path, audit.evidence, proofCache)
+              : fixedAuditEvidence(review, finding, audit.evidence, context.priorTargetSha, proofCache)
+          )
+        );
+        if (!located) {
+          push(`prior audit ${audit.prior_index}`, 'prior-audit-evidence', `prior audit ${audit.prior_index} evidence is not locatable at the finding's cited frozen file/hunk`);
+          continue;
+        }
+        if (!locatedAudits.has(audit.prior_index)) locatedAudits.set(audit.prior_index, audit);
       }
     }
-    return ordered;
+    const priorAudit = [...locatedAudits.entries()].sort(([left], [right]) => left - right).map(([, audit]) => audit);
+
+    // Carried prior findings enter first so a fresh rediscovery of the same
+    // issue merges INTO the original round marker, never replaces it.
+    const findings: VerifiedFinding[] = [];
+    for (const audit of priorAudit) {
+      if (audit.status !== 'still-present') continue;
+      const carried = context.prior[audit.prior_index]!;
+      findings.push({
+        ...carried,
+        evidence: audit.evidence,
+        verification: {
+          disposition: carried.verification.disposition,
+          evidence: audit.evidence,
+          reason: audit.reason,
+        },
+      });
+    }
+
+    // Candidate decisions: the exact old disposition/evidence rules, all
+    // errors reported in submission order.
+    let confirmed = 0;
+    let rejected = 0;
+    let speculative = 0;
+    for (const decision of decidedByRef.values()) {
+      const candidate = context.candidates.get(decision.candidate_ref)!;
+      const ref = candidate.ref;
+      const errorMark = errors.length;
+      if (decision.disposition === 'rejected') {
+        const anchored = findingPath(candidate) !== null && candidate.location !== 'N/A';
+        const located = anchored
+          ? evidenceAtCitedLocation(review, candidate, decision.evidence, proofCache)
+          : evidenceAnywhere(review, decision.evidence, proofCache);
+        if (!located || decision.evidence === candidate.evidence) {
+          push(ref, 'rejected-evidence', `rejected candidate lacks contradictory frozen evidence at its cited location: ${ref}`);
+        }
+        if (errors.length === errorMark) rejected += 1;
+        continue;
+      }
+      const forcedSpeculative = candidate.location === 'N/A' || candidate.evidence === 'N/A' || findingPath(candidate) === null;
+      if (!forcedSpeculative && decision.disposition === 'unverifiable-speculative') {
+        push(ref, 'anchored-disposition', `anchored candidate must be confirmed or rejected: ${ref}`);
+        continue;
+      }
+      const disposition = forcedSpeculative ? 'unverifiable-speculative' : decision.disposition;
+      if (disposition === 'confirmed') {
+        if (!evidenceAtCitedLocation(review, candidate, candidate.evidence, proofCache)) {
+          push(ref, 'confirmed-evidence', `candidate evidence is not locatable at its cited file/hunk: ${ref}`);
+        }
+        if (!evidenceAnywhere(review, decision.evidence, proofCache)) {
+          push(ref, 'verification-evidence', `lead verification evidence is not locatable in the frozen review: ${ref}`);
+        }
+        if (errors.length > errorMark) continue;
+        confirmed += 1;
+      } else {
+        speculative += 1;
+      }
+      findings.push({
+        source: candidate.source,
+        severity: disposition === 'unverifiable-speculative' && candidate.severity === 'blocker' ? 'warning' : candidate.severity,
+        category: candidate.category,
+        title: candidate.title,
+        location: candidate.location,
+        evidence: candidate.evidence,
+        detail: candidate.detail,
+        recommended_fix: candidate.recommended_fix,
+        verification: { disposition, evidence: decision.evidence, reason: decision.reason },
+        chunks: [candidate.chunk],
+        sources: [candidate.source],
+        roundOrigin: context.roundNumber,
+      });
+    }
+    const deduped = [...dedupeVerifiedFindings(findings)];
+    // Host-carried coverage gates: a FAIL coverage gate is a confirmed
+    // blocker owned by the host, not by lead discretion.
+    for (const result of context.results.values()) {
+      if (result.status === 'valid' && result.coverageGate === 'FAIL') {
+        deduped.push({
+          source: 'tests',
+          severity: 'blocker',
+          category: 'coverage-gate',
+          title: 'Coverage gate: FAIL',
+          location: `chunk ${result.chunk}`,
+          evidence: 'Coverage gate: FAIL',
+          detail: 'The tests lens reported a failing coverage gate; the review cannot be complete.',
+          recommended_fix: 'Restore the coverage the tests lens requires, then rerun the review.',
+          verification: { disposition: 'confirmed', evidence: 'Coverage gate: FAIL', reason: 'host-carried coverage gate reported FAIL' },
+          chunks: [result.chunk],
+          sources: ['tests'],
+          roundOrigin: context.roundNumber,
+        });
+      }
+    }
+    const finalFindings = dedupeVerifiedFindings(deduped);
+    // A moved source ref never retargets this frozen review, but it also
+    // cannot authorize the now-different head. The lead may correct an
+    // initial conclusive proposal to INCOMPLETE on its second terminal
+    // attempt; only that fail-closed submission can be accepted.
+    const headMoved = headMovedSinceFreeze(review, context.movementRef);
+    const completeness: ReviewCompleteness = {
+      complete: !headMoved,
+      requiredLensRuns: context.expected.size,
+      validLensRuns: context.validCoverage.size,
+      failedRuns: [],
+      verificationComplete: true,
+    };
+    const canonicalVerdict = verdictForFindings(finalFindings, completeness);
+    // Verdict arithmetic is exact only when the finding set is the exact one
+    // the host would accept. While any semantic error stands, the actionable
+    // errors come first; preflight makes the follow-up check free.
+    const exact = parsed.submission;
+    if (errors.length === 0 && exact !== null) {
+      if (exact.canonical_verdict !== canonicalVerdict) {
+        push('submission', 'verdict-arithmetic', `proposed verdict ${exact.canonical_verdict} conflicts with canonical ${canonicalVerdict}`);
+      }
+      if (!exact.report_markdown.includes(`**Verdict: ${canonicalVerdict}**`)) {
+        push('report', 'report-verdict', 'lead report does not state the canonical verdict');
+      }
+    }
+    // Report structure: every violation in this pass too.
+    if (report !== null) {
+      if (!report.includes(review.manifest.targetSha) || !report.includes(review.manifest.diffBaseSha)) {
+        push('report', 'report-identity', 'lead report omits the frozen target/base identity');
+      }
+      for (const lens of context.lenses) {
+        if (!report.includes(lens)) push('report', 'report-lens', `lead report omits required lens coverage: ${lens}`);
+      }
+      for (const finding of finalFindings) {
+        // Host-carried coverage gates are host evidence, not lead-authored
+        // report content (the lead never receives the gate finding).
+        if (finding.category === 'coverage-gate' && finding.verification.reason.startsWith('host-carried')) continue;
+        // Verbatim proof is anchored: the full evidence must appear, or --
+        // for evidence longer than 200 bytes -- its exact 200-byte prefix.
+        // This keeps a 200-candidate report inside the bounded envelope.
+        const evidencePrefix = Buffer.byteLength(finding.evidence, 'utf8') > 200 ? bytePrefix(finding.evidence, 200) : finding.evidence;
+        const required: ReadonlyArray<readonly [string, string]> = [
+          ['title', finding.title],
+          ['severity', finding.severity],
+          ['location', finding.location],
+          ['evidence', evidencePrefix],
+          ['recommended_fix', finding.recommended_fix],
+        ];
+        const missingProof = required.filter(([, value]) => !report.includes(value)).map(([label]) => label);
+        if (missingProof.length > 0) {
+          push(`finding ${finding.title}`, 'report-finding-proof', `lead report omits required finding proof: ${finding.title} (missing: ${missingProof.join(', ')})`);
+        }
+      }
+      for (const audit of priorAudit) {
+        // Same byte-anchored proof as findings: full evidence, or its
+        // exact 200-byte prefix for long evidence (bounded report).
+        const auditPrefix = Buffer.byteLength(audit.evidence, 'utf8') > 200 ? bytePrefix(audit.evidence, 200) : audit.evidence;
+        if (!report.includes(audit.status) || !report.includes(auditPrefix)) {
+          push(`prior audit ${audit.prior_index}`, 'report-prior-proof', `lead report omits prior audit proof: ${audit.prior_index}`);
+        }
+      }
+    }
+    if (errors.length > 0) return { ok: false, submission: parsed.submission, errors };
+    if (parsed.submission === null) throw new Error('internal: schema-clean submission did not parse');
+    return {
+      ok: true,
+      submission: parsed.submission,
+      findings: finalFindings,
+      priorAudit,
+      completeness,
+      canonicalVerdict,
+      headMoved,
+      verificationSummary: {
+        candidates: context.candidates.size,
+        confirmed,
+        rejected,
+        unverified: speculative,
+        speculative,
+        deduplicated: finalFindings.length,
+      },
+    };
   }
 
   private leadPrompt(review: FrozenReview, lenses: readonly PerkinsLens[], prior: readonly VerifiedFinding[]): string {
@@ -1052,6 +1476,8 @@ export class PerkinsHybridReview {
       '',
       'Call perkins_run_lenses until every required lens/chunk has a valid owned result. Read any frozen chunk with perkins_read_chunk. Inspect the returned candidates against the frozen tree. Submit one candidate_decisions entry for every candidate ref and one prior_audit entry for every prior_index.',
       'A rejected candidate still requires a concise reason. confirmed evidence must be one contiguous verbatim current-tree substring. N/A claims are speculative and cannot remain blockers.',
+      'Pairing rules are enforced at cited locations: a rejected candidate needs contradictory evidence locatable at its cited file/hunk, confirmed candidate evidence must be locatable at its cited file/hunk, and your verification evidence must be locatable in the frozen review.',
+      'Before the terminal submission, call perkins_preflight_submission with the exact candidate submission. It spends no terminal attempt, accepts nothing, and returns every violation in one response; fix them all and preflight again until it reports no errors, then submit once.',
       'Write a complete Markdown report containing `**Verdict: ...**` and every retained finding title, then call perkins_submit_review. Never claim completion from missing/failed runs.',
     ].join('\n');
   }

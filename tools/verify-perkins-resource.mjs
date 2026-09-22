@@ -4,7 +4,7 @@ import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'no
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import process from 'node:process';
 
-const PERKINS_POLICY_SHA256 = '9debb01babf453f87771e99d0d76768742e91a568100dfb3389e80075c4b203a';
+const PERKINS_POLICY_SHA256 = '50795b0a3ce76fcfc6e31de7f044e2ff1532ea7f704591373697f42601995e45';
 const PERKINS_CANONICAL_SOURCE_SHA256 = 'f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7';
 const PERKINS_MCP_SERVER_SHA256 = 'badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032';
 const MAX_VERIFIED_FILE_BYTES = 4 * 1024 * 1024;
