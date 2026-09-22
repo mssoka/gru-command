@@ -41,6 +41,39 @@ export interface LeadDecision {
   readonly reason: string;
 }
 
+/** The exact payload the scripted lead sends to preflight/submit. */
+export interface HybridSubmission {
+  readonly canonical_verdict: string;
+  readonly candidate_decisions: ReadonlyArray<{
+    readonly candidate_ref: string;
+    readonly disposition: 'confirmed' | 'rejected' | 'unverifiable-speculative';
+    readonly evidence: string;
+    readonly reason: string;
+  }>;
+  readonly prior_audit: ReadonlyArray<{
+    readonly prior_index: number;
+    readonly status: 'fixed' | 'still-present';
+    readonly evidence: string;
+    readonly reason: string;
+  }>;
+  readonly report_markdown: string;
+}
+
+export interface HybridPreflightOptions {
+  /** Preflight calls issued before the real submission (default 1). */
+  readonly calls?: number;
+  /** Applied to the preflight payload only; the real submission is untouched. */
+  readonly mutate?: (submission: HybridSubmission) => HybridSubmission;
+  /** Skip the real submission after preflight (proves preflight accepts nothing). */
+  readonly withhold?: boolean;
+}
+
+export interface HybridPreflightResult {
+  readonly text: string;
+  readonly details?: Readonly<Record<string, unknown>>;
+  readonly terminate?: boolean;
+}
+
 interface ChildCandidateView {
   readonly ref: string;
   readonly source: string;
@@ -80,6 +113,10 @@ export interface LeadBrainOptions {
   readonly beforeSubmit?: () => void;
   readonly onLeadStart?: () => void;
   readonly transformReport?: (report: string) => string;
+  /** Validate the exact submission through the preflight channel first. */
+  readonly preflight?: HybridPreflightOptions;
+  /** Extra real-submission attempts after a rejection (default 1 retry). */
+  readonly submitRetries?: number;
 }
 
 const SEVERITY_RANK: Record<string, number> = { blocker: 3, warning: 2, note: 1 };
@@ -133,11 +170,13 @@ export function fakeHybridSpawner(
   readonly leadCalls: HybridSpawnCall[];
   readonly childCalls: HybridSpawnCall[];
   readonly toolErrors: ReadonlyArray<{ tool: string; error: string }>;
+  readonly preflightResults: ReadonlyArray<HybridPreflightResult>;
 } {
   const calls: HybridSpawnCall[] = [];
   const leadCalls: HybridSpawnCall[] = [];
   const childCalls: HybridSpawnCall[] = [];
   const toolErrors: { tool: string; error: string }[] = [];
+  const preflightResults: HybridPreflightResult[] = [];
   let next = 0;
 
   let ownGateFail = false;
@@ -148,6 +187,7 @@ export function fakeHybridSpawner(
     const runTool = byName.get('perkins_run_lenses')!;
     const chunkTool = byName.get('perkins_read_chunk')!;
     const artifactTool = byName.get('perkins_store_artifact')!;
+    const preflightTool = byName.get('perkins_preflight_submission');
     const submitTool = byName.get('perkins_submit_review')!;
 
     const coverage = JSON.parse(extractJsonArray(prompt, '--- REQUIRED CHILD COVERAGE ---')) as
@@ -287,24 +327,33 @@ export function fakeHybridSpawner(
     const report = options.transformReport?.(baseReport) ?? baseReport;
 
     options.beforeSubmit?.();
-    const submission = {
+    const submission: HybridSubmission = {
       canonical_verdict: verdict,
       candidate_decisions: decisions,
       prior_audit: priorAudit,
       report_markdown: report,
     };
-    try {
-      return (await submitTool.execute(submission)).text;
-    } catch (error) {
-      toolErrors.push({ tool: 'perkins_submit_review', error: String(error) });
-      // One corrective retry, then surface the host rejection.
+    if (options.preflight !== undefined) {
+      if (preflightTool === undefined) throw new Error('hybrid double expected the perkins_preflight_submission tool');
+      const preflightCalls = options.preflight.calls ?? 1;
+      for (let index = 0; index < preflightCalls; index += 1) {
+        const payload = options.preflight.mutate?.(submission) ?? submission;
+        const result = await preflightTool.execute(payload);
+        preflightResults.push({ text: result.text, details: result.details, terminate: result.terminate });
+      }
+      if (options.preflight.withhold === true) return 'lead preflighted and withheld the real submission';
+    }
+    const attempts = 1 + Math.max(options.submitRetries ?? 1, 0);
+    let lastError: unknown;
+    for (let index = 0; index < attempts; index += 1) {
       try {
         return (await submitTool.execute(submission)).text;
-      } catch (retryError) {
-        toolErrors.push({ tool: 'perkins_submit_review', error: String(retryError) });
-        throw retryError;
+      } catch (error) {
+        lastError = error;
+        toolErrors.push({ tool: 'perkins_submit_review', error: String(error) });
       }
     }
+    throw lastError;
   };
 
   const spawner: AgentSpawner = async (_role, spawnOptions = {}) => {
@@ -363,5 +412,5 @@ export function fakeHybridSpawner(
     return handle;
   };
 
-  return { spawner, calls, leadCalls, childCalls, toolErrors };
+  return { spawner, calls, leadCalls, childCalls, toolErrors, preflightResults };
 }

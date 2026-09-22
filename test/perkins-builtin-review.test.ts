@@ -85,6 +85,7 @@ interface HybridHarness {
   readonly leadCalls: ReturnType<typeof fakeHybridSpawner>['leadCalls'];
   readonly childCalls: ReturnType<typeof fakeHybridSpawner>['childCalls'];
   readonly toolErrors: ReturnType<typeof fakeHybridSpawner>['toolErrors'];
+  readonly preflightResults: ReturnType<typeof fakeHybridSpawner>['preflightResults'];
   run(input?: { noSpec?: boolean; priorConsolidatedFile?: string }): Promise<PerkinsHybridResult>;
 }
 
@@ -118,6 +119,7 @@ function hybridHarness(brain: LeadBrainOptions, options?: { noSpec?: boolean; sp
     leadCalls: fake.leadCalls,
     childCalls: fake.childCalls,
     toolErrors: fake.toolErrors,
+    preflightResults: fake.preflightResults,
     run: (input = {}) => engine.run({
       roundId: 'hybrid-round',
       roundNumber: 1,
@@ -626,7 +628,7 @@ describe('Perkins hybrid lead engine', () => {
     expect(h.leadCalls).toHaveLength(1);
     const lead = h.leadCalls[0]!;
     expect(lead.options.reviewLead?.nativeTools.map((tool) => tool.name)).toEqual([
-      'perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact', 'perkins_submit_review',
+      'perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact', 'perkins_preflight_submission', 'perkins_submit_review',
     ]);
     expect(lead.options.reviewLead?.systemPrompt).toContain('perkins_submit_review');
     expect(lead.options.reviewLead?.tools).toEqual(['read', 'grep', 'find', 'ls']);
@@ -675,9 +677,10 @@ describe('Perkins hybrid lead engine', () => {
     expect(consolidated.childResults).toHaveLength(7);
     expect(consolidated.childResults.every((entry) => typeof entry.agentId === 'string')).toBe(true);
     const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead', 'receipt.json'), 'utf8')) as {
-      nativeTools: string[]; leadAgentId: string;
+      nativeTools: string[]; leadAgentId: string; preflightCalls: number;
     };
-    expect(receipt.nativeTools).toEqual(['perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact', 'perkins_submit_review']);
+    expect(receipt.nativeTools).toEqual(['perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact', 'perkins_preflight_submission', 'perkins_submit_review']);
+    expect(receipt.preflightCalls).toBe(0);
     expect(receipt.leadAgentId).toBe('lead-0');
   });
 
@@ -1041,6 +1044,131 @@ describe('Perkins hybrid lead engine', () => {
     const h = hybridHarness({ childAnswer: () => '[]', neverSubmit: true });
     await expect(h.run()).rejects.toThrow(/without an accepted terminal submission/);
     expect(() => readFileSync(join(h.frozen.directory, 'consolidated.json'))).toThrow();
+  });
+
+  it('reports every simultaneous submission violation in one exhaustive rejection', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security'
+        ? JSON.stringify([
+            finding('security', 'blocker', { title: 'security defect zero' }),
+            finding('security', 'blocker', { title: 'security defect one' }),
+          ])
+        : '[]',
+      decide: () => ({
+        disposition: 'rejected', evidence: 'FABRICATED-CONTRADICTION', reason: 'lead rejects without reading',
+      }),
+      transformReport: (report) => report
+        .replace(/^Frozen target: .+$/m, 'Frozen target: redacted')
+        .replace(/^Frozen base: .+$/m, 'Frozen base: redacted'),
+    });
+    await expect(h.run()).rejects.toThrow(/terminal submission rejected with 3 error\(s\)/);
+    const rejection = h.toolErrors.at(-1)!.error;
+    // Both rejected-candidate pairing errors AND the report identity error
+    // arrive in ONE response instead of one per attempt.
+    expect(rejection).toMatch(/security-\S+#0\b/);
+    expect(rejection).toMatch(/security-\S+#1\b/);
+    expect(rejection.match(/lacks contradictory frozen evidence/g)).toHaveLength(2);
+    expect(rejection).toContain('lead report omits the frozen target/base identity');
+    expect(h.toolErrors.filter((entry) => entry.tool === 'perkins_submit_review')).toHaveLength(2);
+    expect(() => readFileSync(join(h.frozen.directory, 'consolidated.json'))).toThrow();
+  });
+
+  it('preflights a broken submission for free, reporting every error, then accepts the corrected real submission', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      preflight: {
+        calls: 1,
+        mutate: (submission) => ({
+          ...submission,
+          candidate_decisions: submission.candidate_decisions.map((decision) => ({
+            ...decision, evidence: 'FABRICATED-PREFLIGHT-EVIDENCE',
+          })),
+          report_markdown: submission.report_markdown.replace(/^Frozen base: .+$/m, 'Frozen base: gone'),
+        }),
+      },
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(h.preflightResults).toHaveLength(1);
+    expect(h.preflightResults[0]!.terminate).toBeUndefined();
+    const preflight = JSON.parse(h.preflightResults[0]!.text) as {
+      preflight: boolean; ok: boolean; errorCount: number;
+      errors: Array<{ subject: string; rule: string; message: string }>;
+    };
+    expect(preflight).toMatchObject({ preflight: true, ok: false, errorCount: 2 });
+    expect(preflight.errors.some((error) => /verification evidence is not locatable/.test(error.message))).toBe(true);
+    expect(preflight.errors.some((error) => error.message.includes('omits the frozen target/base identity'))).toBe(true);
+    // The preflight was free: the following real submission was attempt 1 and sealed.
+    expect(existsSync(join(h.frozen.directory, 'lead', 'preflight-attempt-1.json'))).toBe(true);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.json'))).toBe(true);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.error.json'))).toBe(false);
+    expect(readFileSync(join(h.frozen.directory, 'consolidated.json'), 'utf8')).toContain('NEEDS CHANGES');
+  });
+
+  it('preflight never seals or terminates: a clean preflight accepts nothing', async () => {
+    const h = hybridHarness({
+      childAnswer: () => '[]',
+      preflight: { calls: 2, withhold: true },
+    });
+    await expect(h.run()).rejects.toThrow(/without an accepted terminal submission/);
+    expect(h.preflightResults).toHaveLength(2);
+    for (const entry of h.preflightResults) {
+      expect(entry.terminate).toBeUndefined();
+      expect(JSON.parse(entry.text)).toMatchObject({ preflight: true, ok: true, errorCount: 0, errors: [] });
+    }
+    expect(existsSync(join(h.frozen.directory, 'lead', 'preflight-attempt-1.json'))).toBe(true);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'preflight-attempt-2.json'))).toBe(true);
+    expect(() => readFileSync(join(h.frozen.directory, 'perkins-report.md'))).toThrow();
+    expect(() => readFileSync(join(h.frozen.directory, 'consolidated.json'))).toThrow();
+  });
+
+  it('preflight is free while the two real attempts stay bound: the third real submit is refused', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      decide: () => ({
+        disposition: 'rejected', evidence: 'FABRICATED-CONTRADICTION', reason: 'lead rejects without reading',
+      }),
+      preflight: { calls: 2 },
+      submitRetries: 2,
+    });
+    await expect(h.run()).rejects.toThrow(/terminal submission attempts exhausted/);
+    expect(h.preflightResults).toHaveLength(2);
+    for (const entry of h.preflightResults) {
+      expect(JSON.parse(entry.text)).toMatchObject({ preflight: true, ok: false });
+    }
+    const submitErrors = h.toolErrors.filter((entry) => entry.tool === 'perkins_submit_review');
+    expect(submitErrors).toHaveLength(3);
+    expect(submitErrors[0]!.error).toMatch(/lacks contradictory frozen evidence/);
+    expect(submitErrors[1]!.error).toMatch(/lacks contradictory frozen evidence/);
+    expect(submitErrors[2]!.error).toMatch(/terminal submission attempts exhausted/);
+    // Two real attempts were spent (and recorded); the third consumed nothing.
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-2.json'))).toBe(true);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-3.json'))).toBe(false);
+    expect(() => readFileSync(join(h.frozen.directory, 'consolidated.json'))).toThrow();
+  });
+
+  it('reports every invalid prior-audit entry in one rejection', async () => {
+    const prior = (index: number): Record<string, unknown> => ({
+      ...finding('security', 'blocker', { title: `prior defect ${index}` }),
+      sources: ['security'],
+      chunks: ['001'],
+      roundOrigin: 1,
+      verification: { disposition: 'confirmed', evidence: 'export function answer(): number {', reason: 'verified in round 1' },
+    });
+    const h = hybridHarness({
+      childAnswer: () => '[]',
+      priorAudit: (entries) => entries.map((_entry, index) => ({
+        prior_index: index, status: 'still-present', evidence: `FABRICATED-PRIOR-PROOF-${index}`, reason: 'fabricated',
+      })),
+    });
+    const priorFile = join(h.root, 'prior-two.json');
+    writeFileSync(priorFile, JSON.stringify({
+      schemaVersion: 2, frozen: { targetSha: h.target }, findings: [prior(0), prior(1)],
+    }), 'utf8');
+    await expect(h.run({ priorConsolidatedFile: priorFile })).rejects.toThrow(/prior audit 0 evidence is not locatable/);
+    const rejection = h.toolErrors.at(-1)!.error;
+    expect(rejection).toContain("prior audit 0 evidence is not locatable at the finding's cited frozen file/hunk");
+    expect(rejection).toContain("prior audit 1 evidence is not locatable at the finding's cited frozen file/hunk");
   });
 
   it('exposes bounded read-chunk and store-artifact tools to the lead', async () => {
