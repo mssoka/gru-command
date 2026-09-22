@@ -20,7 +20,7 @@ import {
   type StreamFrame,
 } from '../src/runtime/stream-json.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
-import type { RuntimeEvent } from '../src/runtime/types.js';
+import type { AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { PerkinsHybridReview } from '../src/dispatch/perkins-review/hybrid.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
@@ -121,6 +121,32 @@ function doubleInvocations(fx: Fixture): {
     .trim()
     .split('\n')
     .map((line) => JSON.parse(line) as never);
+}
+
+/** Direct bridge-socket probe: the same newline-delimited wire the bundled
+ * MCP server speaks, without spawning the CLI. */
+async function bridgeProbe(configFile: string, name: string, input: Record<string, unknown>): Promise<unknown> {
+  const config = JSON.parse(readFileSync(configFile, 'utf8')) as {
+    mcpServers: { gru_perkins: { env: { GRU_REVIEW_BRIDGE_SOCKET: string } } };
+  };
+  const socketPath = config.mcpServers.gru_perkins.env.GRU_REVIEW_BRIDGE_SOCKET;
+  return new Promise((resolveProbe, reject) => {
+    const socket = createConnection(socketPath);
+    let body = '';
+    socket.setEncoding('utf8');
+    socket.once('connect', () => socket.write(`${JSON.stringify({ id: 'probe', name, input })}\n`));
+    socket.on('data', (chunk) => { body += chunk; });
+    socket.once('error', reject);
+    socket.once('end', () => {
+      try {
+        const response = JSON.parse(body) as { ok: boolean; result?: unknown; error?: string };
+        if (!response.ok) reject(new Error(response.error ?? 'bridge probe failed'));
+        else resolveProbe(response.result);
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  });
 }
 
 /** Condition-based wait — never a bare wall-clock sleep (flake doctrine). */
@@ -804,6 +830,165 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(record!.argv[record!.argv.indexOf('--setting-sources') + 1]).toBe('');
     expect(record!.argv).not.toContain('--allowedTools');
     expect(handle.reviewIsolation).toBe(true);
+  });
+
+  it('starts a scoped bridge for an isolated lens child declaring native tools, exposing exactly them', async () => {
+    const fx = fixture();
+    const executed: unknown[] = [];
+    const submitFindings = {
+      name: 'perkins_submit_findings',
+      description: 'submit structured lens findings',
+      inputSchema: {
+        type: 'object', additionalProperties: false, required: ['findings'],
+        properties: { findings: { type: 'array' } },
+      },
+      execute: async (input: unknown) => {
+        executed.push(input);
+        return { text: JSON.stringify({ accepted: true }), details: { accepted: true } };
+      },
+    };
+    const handle = await fx.runtime.spawn('perkins', {
+      cwd: fx.workspace,
+      isolatedReview: {
+        systemPrompt: 'lens policy',
+        tools: ['read', 'grep', 'find', 'ls'],
+        nativeTools: [submitFindings],
+      },
+    });
+    let bridgeDirectory: string | null = null;
+    try {
+      await handle.prompt('frozen lenses only');
+      const [record] = doubleInvocations(fx);
+      // File tools stay the declared read set, mapped to claude built-ins;
+      // the enabled list also names the one bridged MCP tool.
+      expect((record!.argv[record!.argv.indexOf('--tools') + 1] ?? '').split(',')).toEqual([
+        'Read', 'Grep', 'Glob', 'LS', 'mcp__gru_perkins__perkins_submit_findings',
+      ]);
+      const configFile = record!.argv[record!.argv.indexOf('--mcp-config') + 1]!;
+      bridgeDirectory = dirname(configFile);
+      // The allowed native surface is EXACTLY the one declared tool — never
+      // the lead's orchestration five.
+      const allowed = (record!.argv[record!.argv.indexOf('--allowedTools') + 1] ?? '').split(',');
+      expect(allowed.filter((tool) => tool.startsWith('mcp__'))).toEqual([
+        'mcp__gru_perkins__perkins_submit_findings',
+      ]);
+      for (const leadTool of [
+        'perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact',
+        'perkins_preflight_submission', 'perkins_submit_review',
+      ]) {
+        expect(allowed.join(',')).not.toContain(leadTool);
+      }
+      // The bridge itself exposes exactly the declared set...
+      const listed = await bridgeProbe(configFile, '__list__', {}) as Array<{ name: string; description: string }>;
+      expect(listed.map((tool) => tool.name)).toEqual(['perkins_submit_findings']);
+      expect(listed[0]!.description).toBe('submit structured lens findings');
+      // ...and dispatches calls to the declared callback over the wire.
+      await expect(bridgeProbe(configFile, 'perkins_submit_findings', { findings: [] })).resolves.toEqual({
+        text: JSON.stringify({ accepted: true }),
+        details: { accepted: true },
+      });
+      expect(executed).toEqual([{ findings: [] }]);
+    } finally {
+      await handle.dispose();
+    }
+    // Teardown: the bridge owns its temporary directory and removes it.
+    expect(bridgeDirectory).not.toBeNull();
+    expect(existsSync(bridgeDirectory!)).toBe(false);
+  });
+
+  it('starts no bridge and no native allow-list for an isolated review declaring no native tools', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('perkins', {
+      cwd: fx.workspace,
+      isolatedReview: { systemPrompt: 'lens policy', tools: ['read', 'grep', 'find', 'ls'] },
+    });
+    try {
+      await handle.prompt('file tools only');
+      const [record] = doubleInvocations(fx);
+      expect(record!.argv).not.toContain('--mcp-config');
+      const allowed = (record!.argv[record!.argv.indexOf('--allowedTools') + 1] ?? '').split(',');
+      expect(allowed.map((entry) => entry.split('(')[0])).toEqual(['Read', 'Grep', 'Glob', 'LS']);
+      expect(allowed.some((entry) => entry.startsWith('mcp__'))).toBe(false);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('keeps one bridge per child session and closes every bridge on dispose', async () => {
+    const fx = fixture();
+    const handles: AgentHandle[] = [];
+    const configFiles: string[] = [];
+    try {
+      // Concurrency note: a hybrid round runs up to seven lens children at
+      // once; each gets its OWN bridge, and none may outlive its session.
+      for (let index = 0; index < 7; index += 1) {
+        const handle = await fx.runtime.spawn('perkins', {
+          cwd: fx.workspace,
+          isolatedReview: {
+            systemPrompt: `lens ${index}`,
+            tools: ['read'],
+            nativeTools: [{
+              name: `perkins_child_${index}`,
+              description: `child ${index}`,
+              inputSchema: { type: 'object' },
+              execute: async () => ({ text: 'ok' }),
+            }],
+          },
+        });
+        handles.push(handle);
+        await handle.prompt(`child turn ${index}`);
+        const records = doubleInvocations(fx);
+        const record = records[records.length - 1]!;
+        const configFile = record.argv[record.argv.indexOf('--mcp-config') + 1]!;
+        configFiles.push(configFile);
+        expect(existsSync(dirname(configFile))).toBe(true);
+      }
+      // Distinct bridges, one per child — never a shared cross-child bridge.
+      expect(new Set(configFiles).size).toBe(7);
+      for (let index = 0; index < 7; index += 1) {
+        const listed = await bridgeProbe(configFiles[index]!, '__list__', {}) as Array<{ name: string }>;
+        expect(listed.map((tool) => tool.name)).toEqual([`perkins_child_${index}`]);
+      }
+    } finally {
+      await Promise.all(handles.map((handle) => handle.dispose()));
+    }
+    for (const configFile of configFiles) expect(existsSync(dirname(configFile))).toBe(false);
+  });
+
+  it('closes the scoped bridge when the spawn fails after the bridge started', async () => {
+    const fx = fixture();
+    // Deterministic post-bridge failure: a FILE occupies the role's session
+    // directory path, so the scaffold mkdir fails only AFTER the scoped
+    // bridge was started — cleanup must still own the bridge's teardown.
+    const sessionDir = fx.store.sessionDirFor('perkins', fx.workspace);
+    mkdirSync(dirname(sessionDir), { recursive: true });
+    writeFileSync(sessionDir, 'not a directory');
+    // Confine bridge temp dirs to this test's own TMPDIR: the assertion can
+    // never observe a concurrent worker's live bridge.
+    const bridgeTmp = mkdtempSync(join(tmpdir(), 'claude-bridge-tmp-'));
+    cleanupDirs.push(bridgeTmp);
+    const previousTmpdir = process.env['TMPDIR'];
+    process.env['TMPDIR'] = bridgeTmp;
+    try {
+      await expect(fx.runtime.spawn('perkins', {
+        cwd: fx.workspace,
+        isolatedReview: {
+          systemPrompt: 'lens policy',
+          tools: ['read'],
+          nativeTools: [{
+            name: 'perkins_submit_findings',
+            description: 'submit structured lens findings',
+            inputSchema: { type: 'object' },
+            execute: async () => ({ text: 'ok' }),
+          }],
+        },
+      })).rejects.toThrow(/EEXIST|file already exists, mkdir/);
+      // The failed spawn left no bridge temp directory behind.
+      expect(readdirSync(bridgeTmp)).toEqual([]);
+    } finally {
+      if (previousTmpdir === undefined) delete process.env['TMPDIR'];
+      else process.env['TMPDIR'] = previousTmpdir;
+    }
   });
 
   it('runs a hybrid Perkins lead through the real Claude adapter and scoped MCP bridge', async () => {

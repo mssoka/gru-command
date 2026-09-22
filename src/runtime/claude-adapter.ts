@@ -369,7 +369,12 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     let createdNewFile: string | null = null;
     let reviewBridge: ReviewMcpBridge | undefined;
     try {
-      if (reviewLead !== undefined) reviewBridge = await ReviewMcpBridge.start(reviewLead.nativeTools);
+      // ANY isolated-review session that declares native tools gets its own
+      // scoped bridge exposing exactly the declared set — leads and lens
+      // children ride the same seam (SPEC ruling 4: no harness split).
+      if (reviewMode !== undefined && reviewMode.nativeTools !== undefined) {
+        reviewBridge = await ReviewMcpBridge.start(reviewMode.nativeTools);
+      }
       const nativeTools = reviewBridge?.toolNames.map((name) => `mcp__gru_perkins__${name}`) ?? [];
       const tools = [...fileTools, ...nativeTools];
       let sessionId: string;

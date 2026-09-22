@@ -339,6 +339,71 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('injects exactly the declared native tools into an isolated lens session, in-process', async () => {
+    const fx = await fixture([
+      {
+        deltas: [],
+        toolCall: { id: 'submit-1', name: 'perkins_submit_findings', args: { findings: [{ title: 'candidate' }] } },
+      },
+      { deltas: ['lens done'] },
+    ]);
+    const executions: unknown[] = [];
+    const submitFindings = {
+      name: 'perkins_submit_findings',
+      description: 'submit structured lens findings',
+      inputSchema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['findings'],
+        properties: { findings: { type: 'array', items: { type: 'object' } } },
+      },
+      execute: async (input: unknown) => {
+        executions.push(input);
+        return { text: JSON.stringify({ accepted: true }), details: { accepted: true } };
+      },
+    };
+    const handle = await fx.runtime.spawn('perkins', {
+      cwd: fx.workspace,
+      isolatedReview: {
+        systemPrompt: 'isolated lens policy',
+        tools: ['read', 'grep', 'find', 'ls'],
+        nativeTools: [submitFindings],
+      },
+    });
+    try {
+      const options = twinGate.lastOptions as {
+        tools?: string[];
+        customTools?: Array<{ name: string }>;
+      };
+      // The declared set is exposed EXACTLY: confined read tools plus the one
+      // declared native tool — never the lead's orchestration five.
+      expect(options.tools).toEqual([
+        'review_read',
+        'review_grep',
+        'review_find',
+        'review_ls',
+        'perkins_submit_findings',
+      ]);
+      expect(options.customTools!.map((tool) => tool.name)).toEqual([
+        'review_read',
+        'review_grep',
+        'review_find',
+        'review_ls',
+        'perkins_submit_findings',
+      ]);
+      expect(options.customTools!.some((tool) => tool.name === 'perkins_run_lenses')).toBe(false);
+      // The session really calls the injected callback: the stub model emits
+      // the tool call, the SDK executes it, and the next turn sees the result.
+      await handle.prompt('submit the lens findings');
+      expect(executions).toEqual([{ findings: [{ title: 'candidate' }] }]);
+      expect(fx.script.calls).toHaveLength(2);
+      expect(fx.script.calls[1]!.prompt).toContain('[TOOL_RESULT perkins_submit_findings]');
+      expect(fx.script.calls[1]!.prompt).toContain('{"accepted":true}');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it('rejects resume for isolated reviews so ambient history cannot cross the boundary', async () => {
     const fx = await fixture();
     const ordinary = await fx.runtime.spawn('perkins');
