@@ -65,14 +65,18 @@ Each lens/chunk attempt is a distinct tracked child; malformed attempts are
 retryable up to the policy limit, so the total child-session count may exceed
 the required coverage cardinality.
 
-- The lead receives only five product-native tools: read a frozen chunk,
-  run tracked lens children, store bounded notes, preflight a candidate
-  terminal submission, and submit terminal proof. It owns delegation,
+- The lead receives only six product-native tools: read a frozen chunk,
+  run tracked lens children, store bounded notes, record a candidate
+  decision, preflight a candidate terminal submission, and submit terminal
+  proof. It owns delegation,
   investigation, verification, deduplication, prior audit, verdict
-  calculation, and report authorship. Preflight uses the exact terminal
+  calculation, and report authorship. Recording runs the exact terminal
+  decision validator at store time; preflight uses the exact terminal
   validator without spending a terminal attempt, sealing the round, or
   accepting anything; a rejected terminal submission returns every
-  violation in one bounded response.
+  violation in one bounded response, can be amended with a `{"mode":"delta"}`
+  resubmission carrying only changed fields (merged host-side and
+  re-validated as the whole), and still counts as one real attempt.
 - Lens children are fresh, ambient-free sessions. Blind has no tools or
   repository/spec context; other lenses get confined read/grep/find/list
   tools. No reviewer gets shell, edit, write, ambient skills, extensions,
@@ -85,6 +89,11 @@ the required coverage cardinality.
   never sees the lead's five. That seam is harness-independent by design —
   review isolation and tool exposure live in the adapter implementation,
   never in caller branches on harness.
+- Child findings are evidence-paired at envelope construction: a finding that
+  cites a real file must quote that file (or its frozen diff), so an attempt
+  that mixes a candidate with foreign-file evidence fails at the child, well
+  before the lead inherits it; the attempt stays retryable within the pinned
+  lens bound.
 - The integrity-pinned package policy is the sole prompt authority for lead
   and child review behavior; interpolated repository/spec/convention text is
   untrusted evidence, never instruction. The host bounds attempts,

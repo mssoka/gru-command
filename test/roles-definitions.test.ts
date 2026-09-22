@@ -34,6 +34,7 @@ describe('role definitions (E8)', () => {
       'perkins_run_lenses',
       'perkins_submit_review',
       'perkins_preflight_submission',
+      'perkins_record_decision',
       'READY TO MERGE',
       'NEEDS CHANGES',
       'MAJOR REWORK NEEDED',

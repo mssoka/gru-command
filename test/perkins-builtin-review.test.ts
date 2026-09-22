@@ -34,7 +34,7 @@ import {
   type VerifiedFinding,
 } from '../src/dispatch/perkins-review/types.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
-import { fakeHybridSpawner, type LeadBrainOptions } from './helpers/perkins-hybrid-double.js';
+import { fakeHybridSpawner, type HybridSubmission, type LeadBrainOptions } from './helpers/perkins-hybrid-double.js';
 
 const repos: FixtureRepo[] = [];
 const temporaryDirectories: string[] = [];
@@ -86,6 +86,7 @@ interface HybridHarness {
   readonly childCalls: ReturnType<typeof fakeHybridSpawner>['childCalls'];
   readonly toolErrors: ReturnType<typeof fakeHybridSpawner>['toolErrors'];
   readonly preflightResults: ReturnType<typeof fakeHybridSpawner>['preflightResults'];
+  readonly recordResults: ReturnType<typeof fakeHybridSpawner>['recordResults'];
   run(input?: { noSpec?: boolean; priorConsolidatedFile?: string }): Promise<PerkinsHybridResult>;
 }
 
@@ -120,6 +121,7 @@ function hybridHarness(brain: LeadBrainOptions, options?: { noSpec?: boolean; sp
     childCalls: fake.childCalls,
     toolErrors: fake.toolErrors,
     preflightResults: fake.preflightResults,
+    recordResults: fake.recordResults,
     run: (input = {}) => engine.run({
       roundId: 'hybrid-round',
       roundNumber: 1,
@@ -634,7 +636,7 @@ describe('Perkins hybrid lead engine', () => {
     expect(h.leadCalls).toHaveLength(1);
     const lead = h.leadCalls[0]!;
     expect(lead.options.reviewLead?.nativeTools.map((tool) => tool.name)).toEqual([
-      'perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact', 'perkins_preflight_submission', 'perkins_submit_review',
+      'perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact', 'perkins_record_decision', 'perkins_preflight_submission', 'perkins_submit_review',
     ]);
     expect(lead.options.reviewLead?.systemPrompt).toContain('perkins_submit_review');
     expect(lead.options.reviewLead?.tools).toEqual(['read', 'grep', 'find', 'ls']);
@@ -685,7 +687,7 @@ describe('Perkins hybrid lead engine', () => {
     const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead', 'receipt.json'), 'utf8')) as {
       nativeTools: string[]; leadAgentId: string; preflightCalls: number;
     };
-    expect(receipt.nativeTools).toEqual(['perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact', 'perkins_preflight_submission', 'perkins_submit_review']);
+    expect(receipt.nativeTools).toEqual(['perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact', 'perkins_record_decision', 'perkins_preflight_submission', 'perkins_submit_review']);
     expect(receipt.preflightCalls).toBe(0);
     expect(receipt.leadAgentId).toBe('lead-0');
   });
@@ -910,7 +912,17 @@ describe('Perkins hybrid lead engine', () => {
         : '[]',
     });
     symlinkSync(outsideDir, join(h.repo.path, 'linked'));
-    await expect(h.run()).rejects.toThrow(/not (one contiguous locatable substring|locatable)/);
+    // The mispaired evidence is rejected at child envelope construction (the
+    // attempt is invalid and retryable), and the round still fails closed
+    // because the required coverage never validates.
+    await expect(h.run()).rejects.toThrow(/coverage-missing/);
+    const envelopeName = readdirSync(join(h.frozen.directory, 'lenses', '001'))
+      .find((name) => name.startsWith('security.attempt-1-') && name.endsWith('.envelope.json'));
+    const envelope = JSON.parse(readFileSync(join(h.frozen.directory, 'lenses', '001', envelopeName!), 'utf8')) as {
+      status: string; error?: string;
+    };
+    expect(envelope.status).toBe('invalid');
+    expect(envelope.error).toMatch(/evidence is not locatable at its cited file\/hunk: linked\/secret\.ts/u);
   });
 
   it('audits prior findings: fixed findings are not carried and history is immutable', async () => {
@@ -1151,6 +1163,169 @@ describe('Perkins hybrid lead engine', () => {
     expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-2.json'))).toBe(true);
     expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-3.json'))).toBe(false);
     expect(() => readFileSync(join(h.frozen.directory, 'consolidated.json'))).toThrow();
+  });
+
+  it('an amend-delta resubmission merges over the rejected submission and equals a full resubmission of the same content', async () => {
+    const fixture = makeReviewRepo();
+    repos.push(fixture.repo);
+    const base = fixture.repo.git(['rev-parse', 'main']);
+    const root = temp('perkins-delta-equivalence-');
+    const fixedDecisions = (submission: HybridSubmission) => submission.candidate_decisions.map((entry) => ({
+      ...entry, evidence: '  return 43;', reason: 'the frozen line contradicts the candidate',
+    }));
+    const run = async (
+      roundId: string,
+      submitPayload: LeadBrainOptions['submitPayload'],
+    ): Promise<{ result: PerkinsHybridResult; directory: string; toolErrors: ReturnType<typeof fakeHybridSpawner>['toolErrors'] }> => {
+      const frozen = freezeReviewInputs({
+        roundId, repoPath: fixture.repo.path, artifactRoot: root,
+        baseRef: base, targetRef: fixture.target, movementRef: 'feature/review', spec: 'return 43',
+      });
+      const fake = fakeHybridSpawner(temp(`perkins-delta-${roundId}-sessions-`), {
+        childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+        decide: () => ({ disposition: 'rejected', evidence: 'FABRICATED-CONTRADICTION', reason: 'lead rejects without reading' }),
+        submitPayload,
+      });
+      const engine = new PerkinsHybridReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+      const result = await engine.run({
+        roundId, roundNumber: 1, frozenReview: frozen, movementRef: 'feature/review', noSpec: false,
+      });
+      return { result, directory: frozen.directory, toolErrors: fake.toolErrors };
+    };
+
+    const delta = await run('delta-equivalence', (attempt, submission) =>
+      attempt === 1 ? submission : { mode: 'delta', candidate_decisions: fixedDecisions(submission) });
+    const full = await run('full-equivalence', (attempt, submission) =>
+      attempt === 1 ? submission : { ...submission, candidate_decisions: fixedDecisions(submission) });
+
+    expect(delta.result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(full.result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(delta.toolErrors).toHaveLength(1);
+    expect(full.toolErrors).toHaveLength(1);
+    expect(delta.result.verificationSummary).toEqual(full.result.verificationSummary);
+    const deltaArtifact = JSON.parse(readFileSync(join(delta.directory, 'lead', 'submission-attempt-2.delta.json'), 'utf8')) as {
+      delta: { mode: string; candidate_decisions?: ReadonlyArray<{ evidence: string }> };
+    };
+    expect(deltaArtifact.delta.mode).toBe('delta');
+    expect(deltaArtifact.delta.candidate_decisions?.map((entry) => entry.evidence)).toEqual(['  return 43;']);
+    // Merge + validate + seal produced the byte-identical accepted submission
+    // a full resubmission of the same content would have produced.
+    expect(readFileSync(join(delta.directory, 'lead', 'submission-attempt-2.json'), 'utf8'))
+      .toBe(readFileSync(join(full.directory, 'lead', 'submission-attempt-2.json'), 'utf8'));
+  });
+
+  it('record validates one decision at store time with the same exhaustive rules as the terminal submission', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      decide: () => ({ disposition: 'confirmed', evidence: 'FABRICATED-LEAD-EVIDENCE', reason: 'lead never read this' }),
+      recordDecisions: { only: [0] },
+    });
+    await expect(h.run()).rejects.toThrow(/terminal submission rejected/);
+    expect(h.recordResults).toHaveLength(1);
+    const record = JSON.parse(h.recordResults[0]!.text) as {
+      recorded: boolean; ok: boolean; errorCount: number;
+      errors: ReadonlyArray<{ subject: string; rule: string; message: string }>;
+    };
+    expect(record).toMatchObject({ recorded: false, ok: false, errorCount: 1 });
+    const rejection = JSON.parse(readFileSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.error.json'), 'utf8')) as {
+      issues: ReadonlyArray<{ subject: string; rule: string; message: string }>;
+    };
+    const ref = record.errors[0]!.subject;
+    expect(rejection.issues.filter((issue) => issue.subject === ref)).toEqual(record.errors);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'record-attempt-1.json'))).toBe(true);
+  });
+
+  it('seals a pre-rejection decision record through a delta carrying only the report, verdict, and prior audit', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      recordDecisions: {},
+      submitPayload: (attempt, submission) => attempt === 1
+        ? {
+            mode: 'delta',
+            canonical_verdict: submission.canonical_verdict,
+            prior_audit: submission.prior_audit,
+            report_markdown: submission.report_markdown,
+          }
+        : submission,
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(h.recordResults).toHaveLength(1);
+    expect(JSON.parse(h.recordResults[0]!.text)).toMatchObject({ recorded: true, ok: true, recordedCount: 1 });
+    const merged = JSON.parse(readFileSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.json'), 'utf8')) as {
+      candidate_decisions: ReadonlyArray<{ candidate_ref: string }>;
+    };
+    expect(merged.candidate_decisions).toHaveLength(1);
+    const deltaArtifact = JSON.parse(readFileSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.delta.json'), 'utf8')) as {
+      delta: { mode: string; candidate_decisions?: unknown };
+    };
+    expect(deltaArtifact.delta.mode).toBe('delta');
+    expect(deltaArtifact.delta.candidate_decisions).toBeUndefined();
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.error.json'))).toBe(false);
+  });
+
+  it('record and a delta preflight spend no terminal attempt while a delta resubmission consumes one real attempt', async () => {
+    const fixed = (submission: HybridSubmission) => submission.candidate_decisions.map((entry) => ({
+      ...entry, evidence: '  return 43;', reason: 'the frozen line contradicts the candidate',
+    }));
+    const delta = (submission: HybridSubmission) => ({
+      mode: 'delta' as const,
+      candidate_decisions: fixed(submission),
+    });
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security')]) : '[]',
+      decide: () => ({ disposition: 'rejected', evidence: 'FABRICATED-CONTRADICTION', reason: 'lead rejects without reading' }),
+      recordDecisions: { decide: () => ({ disposition: 'rejected', evidence: '  return 43;', reason: 'recorded after re-reading' }) },
+      preflight: { beforeAttempt: 2, payload: (submission) => delta(submission) },
+      submitPayload: (attempt, submission) => attempt === 1 ? submission : delta(submission),
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(JSON.parse(h.recordResults[0]!.text)).toMatchObject({ recorded: true, ok: true });
+    expect(JSON.parse(h.preflightResults[0]!.text)).toMatchObject({ preflight: true, mode: 'delta', ok: true, errorCount: 0 });
+    // Attempt 1 was the rejected full submission; the free calls never moved
+    // the counter, so the delta sealed as attempt 2 and a third never existed.
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.error.json'))).toBe(true);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-2.json'))).toBe(true);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-2.error.json'))).toBe(false);
+    expect(existsSync(join(h.frozen.directory, 'lead', 'submission-attempt-3.json'))).toBe(false);
+    const receipt = JSON.parse(readFileSync(join(h.frozen.directory, 'lead', 'receipt.json'), 'utf8')) as {
+      preflightCalls: number; decisionRecords: number; deltaSubmissions: number;
+    };
+    expect(receipt).toMatchObject({ preflightCalls: 1, decisionRecords: 1, deltaSubmissions: 1 });
+  });
+
+  it('fails a child attempt at construction when cited evidence belongs to another file and retries within the lens bound', async () => {
+    let securityCalls = 0;
+    const h = hybridHarness({
+      childAnswer: (prompt) => {
+        if (lensFrom(prompt) !== 'security') return '[]';
+        securityCalls += 1;
+        return securityCalls === 1
+          ? JSON.stringify([finding('security', 'blocker', {
+              location: 'src/main.ts:1',
+              evidence: 'Fixture repository for dispatch-flow tests.',
+            })])
+          : '[]';
+      },
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.verificationSummary.candidates).toBe(0);
+    expect(securityCalls).toBe(2);
+    const lensDir = join(h.frozen.directory, 'lenses', '001');
+    const envelopeFor = (attempt: string) => JSON.parse(readFileSync(
+      join(lensDir, readdirSync(lensDir).find((name) => name.startsWith(`security.attempt-${attempt}-`) && name.endsWith('.envelope.json'))!),
+      'utf8',
+    )) as { status: string; findings: readonly unknown[]; error?: string };
+    const firstAttempt = envelopeFor('1');
+    expect(firstAttempt.status).toBe('invalid');
+    expect(firstAttempt.error).toMatch(/lens finding 0 evidence is not locatable at its cited file\/hunk: src\/main\.ts:1/u);
+    const secondAttempt = envelopeFor('2');
+    expect(secondAttempt.status).toBe('valid');
+    expect(secondAttempt.findings).toEqual([]);
+    // The lead never inherited the mispaired candidate: nothing to decide.
+    expect(h.toolErrors).toEqual([]);
   });
 
   it('reports every invalid prior-audit entry in one rejection', async () => {
