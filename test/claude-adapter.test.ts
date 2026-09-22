@@ -1034,6 +1034,64 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
+  it('gives an isolated child its own scoped bridge exposing exactly its declared native tools', async () => {
+    const fx = fixture();
+    const tool = {
+      name: 'perkins_submit_findings',
+      description: 'structured findings child tool',
+      inputSchema: { type: 'object' },
+      execute: async () => ({ text: 'ok' }),
+    };
+    const handle = await fx.runtime.spawn('perkins', {
+      isolatedReview: { systemPrompt: 'isolated policy', tools: [], nativeTools: [tool] },
+    });
+    let bridgeDirectory: string | null = null;
+    try {
+      await handle.prompt('frozen diff only');
+      const [record] = doubleInvocations(fx);
+      const configIndex = record!.argv.indexOf('--mcp-config');
+      expect(configIndex).toBeGreaterThan(-1);
+      const configFile = record!.argv[configIndex + 1]!;
+      bridgeDirectory = dirname(configFile);
+      const allowed = record!.argv[record!.argv.indexOf('--allowedTools') + 1] ?? '';
+      expect(allowed).toContain('mcp__gru_perkins__perkins_submit_findings');
+      expect(allowed).not.toContain('mcp__gru_perkins__perkins_submit_review');
+      expect(allowed).not.toContain('mcp__gru_perkins__perkins_run_lenses');
+      expect(handle.reviewTools).toEqual(['perkins_submit_findings']);
+      // The child bridge exposes exactly the declared tool, nothing more.
+      const socketPath = (JSON.parse(readFileSync(configFile, 'utf8')) as {
+        mcpServers: { gru_perkins: { env: { GRU_REVIEW_BRIDGE_SOCKET: string } } };
+      }).mcpServers.gru_perkins.env.GRU_REVIEW_BRIDGE_SOCKET;
+      const listed = await new Promise<string>((resolveResponse, reject) => {
+        const socket = createConnection(socketPath);
+        let body = '';
+        socket.setEncoding('utf8');
+        socket.once('connect', () => socket.write(`${JSON.stringify({ id: 'list', name: '__list__' })}\n`));
+        socket.on('data', (chunk) => { body += chunk; });
+        socket.once('error', reject);
+        socket.once('end', () => resolveResponse(body));
+      });
+      const parsed = JSON.parse(listed) as { ok: boolean; result: Array<{ name: string }> };
+      expect(parsed.ok).toBe(true);
+      expect(parsed.result.map((entry) => entry.name)).toEqual(['perkins_submit_findings']);
+    } finally {
+      await handle.dispose();
+    }
+    await vi.waitFor(() => expect(existsSync(bridgeDirectory!)).toBe(false));
+    // A child that declares no native tools gets no bridge at all.
+    const textOnly = await fx.runtime.spawn('perkins', {
+      isolatedReview: { systemPrompt: 'isolated policy', tools: [] },
+    });
+    try {
+      await textOnly.prompt('frozen diff only');
+      const record = doubleInvocations(fx).find((entry) => entry.sessionId === textOnly.id)!;
+      expect(record.argv).not.toContain('--mcp-config');
+      expect(textOnly.reviewTools).toBeUndefined();
+    } finally {
+      await textOnly.dispose();
+    }
+  });
+
   it('rejects resume for isolated reviews so ambient history cannot cross the boundary', async () => {
     const fx = fixture();
     const ordinary = await fx.runtime.spawn('perkins');

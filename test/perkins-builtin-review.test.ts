@@ -27,6 +27,8 @@ import {
 import {
   dedupeVerifiedFindings,
   parseFindings,
+  parseFindingsSubmission,
+  parseFindingsWithRecovery,
   parseFixAuditResults,
   parseVerificationResults,
   verdictForFindings,
@@ -50,7 +52,9 @@ afterEach(() => {
 
 function lensFrom(prompt: string): string {
   if (prompt.includes('source=blind')) return 'blind';
-  return /"source": "(blind|edge|acceptance|security|architecture|codebase|tests)"/.exec(prompt)?.[1] ?? 'unknown';
+  return /"source": "(blind|edge|acceptance|security|architecture|codebase|tests)"/.exec(prompt)?.[1] ??
+    /Your lens id is "(blind|edge|acceptance|security|architecture|codebase|tests)"/.exec(prompt)?.[1] ??
+    'unknown';
 }
 
 function finding(source: string, severity: 'blocker' | 'warning' | 'note' = 'blocker', overrides: Partial<ReviewFinding> = {}): ReviewFinding {
@@ -143,7 +147,10 @@ describe('bundled Perkins policy and deterministic contracts', () => {
     expect(policy.provenance.sourceSha256).toHaveLength(64);
     expect(PERKINS_POLICY_SHA256).toHaveLength(64);
     expect(policy.hostReplacements.join(' ')).toContain('Herdr');
-    expect(policy.portableContract.blindPrompt).toContain('"recommended_fix": "the concrete change');
+    expect(policy.portableContract.outputContracts.blindText).toContain('"recommended_fix": "the concrete change');
+    expect(policy.portableContract.outputContracts.nativeTool).toContain('perkins_submit_findings');
+    expect(policy.portableContract.outputContracts.blindNativeTool).toContain('perkins_submit_findings');
+    expect(policy.portableContract.sharedPrompt).toContain('{{OUTPUT_CONTRACT}}');
     expect(policy.portableContract.leadWorkflow).toContain('perkins_submit_review');
     expect(policy.portableContract.leadWorkflow).toContain('INCOMPLETE never approves');
   });
@@ -534,7 +541,10 @@ describe('bundled Perkins policy and deterministic contracts', () => {
 
   it('pins canonical schema/accuracy paragraphs and explicit host replacements against drift', () => {
     const policy = loadPerkinsPolicy();
-    expect(policy.portableContract.sharedPrompt).toContain('Return ONE valid JSON array');
+    expect(policy.portableContract.outputContracts.text).toContain('Return ONE valid JSON array');
+    expect(policy.portableContract.outputContracts.text).toContain('No prose, markdown fence, preamble');
+    expect(policy.portableContract.outputContracts.nativeTool).toContain('perkins_submit_findings');
+    expect(policy.portableContract.outputContracts.nativeTool).toContain('no JSON array, markdown fence, preamble, or findings in assistant text');
     expect(policy.portableContract.sharedPrompt).toContain('independently re-verified');
     expect(policy.portableContract.blindPrompt).toContain('no repository, spec, project/global context, skill, or sibling-worktree access');
     expect(policy.portableContract.lenses.edge).toContain('pure path tracer');
@@ -1520,6 +1530,167 @@ describe('Perkins hybrid lead engine', () => {
     expect(readFileSync(join(frozen.directory, 'diff.patch'), 'utf8')).toBe(frozen.diff);
     expect(() => freezeReviewInputs(input)).toThrow(/EEXIST/);
     expect(readFileSync(join(frozen.directory, 'manifest.json'), 'utf8')).toBe(originalManifest);
+  });
+});
+
+describe('Perkins child structured findings (perkins_submit_findings)', () => {
+  interface ChildEnvelopeFile {
+    readonly status: string;
+    readonly outputSha256: string | null;
+    readonly recovery?: string;
+    readonly error?: string;
+    readonly findings: ReadonlyArray<{ readonly title: string; readonly source: string }>;
+  }
+
+  function childEnvelopePaths(directory: string, lens: string, attempt: 1 | 2): { readonly envelope: string; readonly raw: string } {
+    const envelopeDir = join(directory, 'lenses', '001');
+    const entries = readdirSync(envelopeDir);
+    const envelope = entries.find((entry) => new RegExp(`^${lens}\\.attempt-${attempt}-[0-9a-f]+\\.envelope\\.json$`, 'u').test(entry));
+    const raw = entries.find((entry) => new RegExp(`^${lens}\\.attempt-${attempt}-[0-9a-f]+\\.raw\\.json$`, 'u').test(entry));
+    expect(envelope, `missing ${lens} attempt-${attempt} envelope`).toBeDefined();
+    expect(raw, `missing ${lens} attempt-${attempt} raw output`).toBeDefined();
+    return { envelope: join(envelopeDir, envelope!), raw: join(envelopeDir, raw!) };
+  }
+
+  function readChildEnvelope(directory: string, lens: string, attempt: 1 | 2): ChildEnvelopeFile {
+    return JSON.parse(readFileSync(childEnvelopePaths(directory, lens, attempt).envelope, 'utf8')) as ChildEnvelopeFile;
+  }
+
+  it('validates the perkins_submit_findings input exactly, with source host-owned', () => {
+    const entry = { ...finding('security') } as Record<string, unknown>;
+    delete entry.source;
+    expect(parseFindingsSubmission({ findings: [entry] }, 'security')).toEqual([finding('security')]);
+    expect(() => parseFindingsSubmission({ findings: [{ ...entry, source: 'security' }] }, 'security'))
+      .toThrow(/keys do not match the required schema/u);
+    expect(() => parseFindingsSubmission({ findings: [{ ...entry, severity: 'oops' }] }, 'security'))
+      .toThrow(/severity is invalid/u);
+    expect(() => parseFindingsSubmission({ findings: '[]' }, 'security')).toThrow(/must be an array/u);
+    expect(() => parseFindingsSubmission({ findings: [], extra: true }, 'security')).toThrow(/keys do not match/u);
+    expect(() => parseFindingsSubmission(entry, 'security')).toThrow(/keys do not match/u);
+  });
+
+  it('recovers whitespace, fence, preamble, and embedded arrays but never loosens the schema', () => {
+    const bare = JSON.stringify([finding('blind')]);
+    expect(parseFindingsWithRecovery(bare, 'blind').recovery).toBeUndefined();
+    expect(parseFindingsWithRecovery(`\n\n${bare}\n`, 'blind').recovery).toBe('parsed-from-whitespace');
+    expect(parseFindingsWithRecovery(`\`\`\`json\n${bare}\n\`\`\``, 'blind').recovery).toBe('parsed-from-fence');
+    expect(parseFindingsWithRecovery(`Summary follows.\n${bare}`, 'blind').recovery).toBe('parsed-from-preamble');
+    expect(parseFindingsWithRecovery(`Here [see below] is the review:\n${bare}\nDone.`, 'blind').recovery)
+      .toBe('parsed-from-embedded-array');
+    const bad = JSON.stringify([{ ...finding('blind'), severity: 'oops' }]);
+    expect(() => parseFindingsWithRecovery(`\`\`\`json\n${bad}\n\`\`\``, 'blind')).toThrow(/severity is invalid/u);
+    expect(() => parseFindingsWithRecovery('no array anywhere', 'blind')).toThrow(/bare JSON array/u);
+  });
+
+  it('records a schema-valid perkins_submit_findings call as a valid child envelope', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security', 'warning')]) : '[]',
+      childNativeTools: 'tool',
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.completeness).toMatchObject({ complete: true, validLensRuns: 7 });
+    expect(h.childCalls).toHaveLength(7);
+    const security = h.childCalls.find((call) => lensFrom(call.prompt ?? '') === 'security')!;
+    expect(security.options.isolatedReview?.nativeTools?.map((tool) => tool.name)).toEqual(['perkins_submit_findings']);
+    expect(security.prompt).toContain('Findings leave this run ONLY through perkins_submit_findings');
+    expect(security.prompt).toContain('Your lens id is "security"');
+    expect(security.prompt).not.toContain('Return ONE valid JSON array');
+    const blind = h.childCalls.find((call) => lensFrom(call.prompt ?? '') === 'blind')!;
+    expect(blind.prompt).toContain('perkins_submit_findings');
+    expect(blind.prompt).toContain('Do not use tools other than perkins_submit_findings');
+    const envelope = readChildEnvelope(h.frozen.directory, 'security', 1);
+    expect(envelope.status).toBe('valid');
+    expect(envelope.outputSha256).toMatch(/^[0-9a-f]{64}$/u);
+    expect(envelope.findings).toHaveLength(1);
+    // The durable raw artifact is the exact validated submission: the host
+    // injected source; the child never supplied it.
+    const rawSubmission = JSON.parse(readFileSync(childEnvelopePaths(h.frozen.directory, 'security', 1).raw, 'utf8')) as {
+      findings: Array<Record<string, unknown>>;
+    };
+    expect(rawSubmission.findings).toHaveLength(1);
+    expect(rawSubmission.findings[0]).toMatchObject({ title: 'security grounded defect' });
+    expect(rawSubmission.findings[0]).not.toHaveProperty('source');
+  });
+
+  it('rejects a schema-invalid tool call as an invalid envelope naming the precise reason', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security'
+        ? JSON.stringify([{ ...finding('security', 'warning'), severity: 'oops' }])
+        : '[]',
+      childNativeTools: 'tool',
+    });
+    await expect(h.run()).rejects.toThrow(/coverage is missing/u);
+    const envelope = readChildEnvelope(h.frozen.directory, 'security', 2);
+    expect(envelope.status).toBe('invalid');
+    expect(envelope.error).toContain('severity is invalid');
+    expect(envelope.findings).toEqual([]);
+  });
+
+  it('marks a tool-capable child that never calls the tool invalid and retries it through the lead', async () => {
+    let securityCalls = 0;
+    const h = hybridHarness({
+      childAnswer: (prompt) => {
+        if (lensFrom(prompt) !== 'security') return '[]';
+        securityCalls += 1;
+        return securityCalls === 1 ? 'I reviewed the diff but never submitted anything.' : JSON.stringify([finding('security', 'warning')]);
+      },
+      childNativeTools: 'tool',
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(securityCalls).toBe(2);
+    expect(h.childCalls).toHaveLength(8);
+    const first = readChildEnvelope(h.frozen.directory, 'security', 1);
+    expect(first.status).toBe('invalid');
+    expect(first.error).toContain('did not submit findings');
+    expect(readChildEnvelope(h.frozen.directory, 'security', 2).status).toBe('valid');
+  });
+
+  it('never parses assistant JSON back on a tool-capable child: text-only output is invalid', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security', 'warning')]) : '[]',
+      childNativeTools: 'text-only',
+    });
+    await expect(h.run()).rejects.toThrow(/coverage is missing/u);
+    const envelope = readChildEnvelope(h.frozen.directory, 'security', 2);
+    expect(envelope.status).toBe('invalid');
+    expect(envelope.error).toContain('did not submit findings');
+    expect(envelope.findings).toEqual([]);
+  });
+
+  it('recovers fenced and preamble-wrapped output for non-tool (text-path) children', async () => {
+    const h = hybridHarness({
+      childAnswer: (prompt) => {
+        const lens = lensFrom(prompt);
+        if (lens === 'security') return `\`\`\`json\n${JSON.stringify([finding('security', 'warning')])}\n\`\`\``;
+        if (lens === 'edge') return `Here are my findings:\n[]\nEnd of review.`;
+        return '[]';
+      },
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    const security = readChildEnvelope(h.frozen.directory, 'security', 1);
+    expect(security.status).toBe('valid');
+    expect(security.recovery).toBe('parsed-from-fence');
+    expect(security.findings).toHaveLength(1);
+    const edge = readChildEnvelope(h.frozen.directory, 'edge', 1);
+    expect(edge.status).toBe('valid');
+    expect(edge.recovery).toBe('parsed-from-embedded-array');
+  });
+
+  it('keeps the policy pin, the compiler pin, and the verifier pin consistent', () => {
+    const productRoot = join(import.meta.dirname, '..');
+    const policyBytes = readFileSync(join(productRoot, 'resources', 'perkins-code-review', 'policy.json'));
+    const actual = createHash('sha256').update(policyBytes).digest('hex');
+    expect(PERKINS_POLICY_SHA256).toBe(actual);
+    expect(readFileSync(join(productRoot, 'src', 'dispatch', 'perkins-review', 'policy.ts'), 'utf8')).toContain(actual);
+    expect(readFileSync(join(productRoot, 'tools', 'verify-perkins-resource.mjs'), 'utf8')).toContain(actual);
+    // Children are tool-only where the runtime provides the tool; the lead
+    // workflow is unchanged and never sees the child submission tool.
+    const policy = loadPerkinsPolicy();
+    expect(policy.portableContract.outputContracts.nativeTool).toContain('perkins_submit_findings');
+    expect(policy.portableContract.leadWorkflow).not.toContain('perkins_submit_findings');
   });
 });
 

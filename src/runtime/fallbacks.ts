@@ -66,6 +66,7 @@ class FallbackHandle implements AgentHandle {
   readonly id: string;
   readonly sessionFile: string | null;
   readonly reviewIsolation?: true;
+  readonly reviewTools?: readonly string[];
   /** The wrapped handle's declared gaps surface unchanged (SPEC ruling 4). */
   readonly capabilities: AgentRuntime['capabilities'];
   readonly getContextUsage?: () => ContextUsage | null;
@@ -95,6 +96,7 @@ class FallbackHandle implements AgentHandle {
     this.id = inner.id;
     this.sessionFile = inner.sessionFile;
     if (inner.reviewIsolation === true) this.reviewIsolation = true;
+    if (inner.reviewTools !== undefined) this.reviewTools = [...inner.reviewTools];
     this.capabilities = inner.capabilities;
     // E7 pass-throughs: supervision's live-process probe and resume snapshot
     // must survive the queueing wrapper unchanged.

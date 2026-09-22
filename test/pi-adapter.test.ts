@@ -176,12 +176,41 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('wires requested isolated-review native tools and declares them on the handle', async () => {
+    const fx = await fixture();
+    const tool = {
+      name: 'perkins_submit_findings',
+      description: 'structured findings child tool',
+      inputSchema: { type: 'object', additionalProperties: false },
+      execute: async () => ({ text: JSON.stringify({ accepted: true }) }),
+    };
+    const handle = await fx.runtime.spawn('perkins', {
+      isolatedReview: { systemPrompt: 'isolated policy', tools: [], nativeTools: [tool] },
+    });
+    try {
+      const options = twinGate.lastOptions as {
+        tools?: string[];
+        customTools?: Array<{ name: string; execute(...args: unknown[]): Promise<unknown> }>;
+      };
+      expect(options.tools).toEqual(['perkins_submit_findings']);
+      expect(options.customTools?.map((entry) => entry.name)).toEqual(['perkins_submit_findings']);
+      expect(handle.reviewTools).toEqual(['perkins_submit_findings']);
+      await expect(options.customTools![0]!.execute('call', {}, undefined, undefined))
+        .resolves.toSatisfy((result: unknown) => JSON.stringify(result).includes('accepted'));
+    } finally {
+      await handle.dispose();
+    }
+    const textOnly = await fx.runtime.spawn('perkins', {
+      isolatedReview: { systemPrompt: 'isolated policy', tools: [] },
+    });
+    try {
+      expect(textOnly.reviewTools).toBeUndefined();
+    } finally {
+      await textOnly.dispose();
+    }
+  });
+
   it('runs a hybrid Perkins lead through the production registry and real Pi adapter', async () => {
-    const securityFinding = JSON.stringify([{
-      source: 'security', severity: 'warning', category: 'coverage', title: 'Verified adapter finding',
-      location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line is independently reviewable.',
-      recommended_fix: 'Retain verification coverage for this path.',
-    }]);
     let leadTurns = 0;
     const confirmed = new Map<string, { candidate_ref: string }>();
     const harvest = (prompt: string): void => {
@@ -254,13 +283,32 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
           },
         };
       }
-      const lens = /"source": "(blind|edge|acceptance|security|architecture|codebase|tests)"/.exec(prompt)?.[1];
-      const testsGate = JSON.stringify([{
-        source: 'tests', severity: 'warning', category: 'coverage-gate', title: 'Coverage gate: CONCERNS',
-        location: 'N/A', evidence: 'N/A', detail: 'Changed behavior has no executed live-credential smoke proof.',
-        recommended_fix: 'Run the opt-in live-credential smoke test before release.',
-      }]);
-      return { deltas: [lens === 'security' ? securityFinding : lens === 'tests' ? testsGate : '[]'] };
+      const lens = /Your lens id is "(blind|edge|acceptance|security|architecture|codebase|tests)"/u.exec(prompt)?.[1];
+      // Native-tool children submit structured findings through the product
+      // tool; assistant text is never the findings channel on pi.
+      const childFindings = lens === 'security'
+        ? [{
+            severity: 'warning', category: 'coverage', title: 'Verified adapter finding',
+            location: 'src/main.ts:2', evidence: '  return 43;',
+            detail: 'The changed line is independently reviewable.',
+            recommended_fix: 'Retain verification coverage for this path.',
+          }]
+        : lens === 'tests'
+          ? [{
+              severity: 'warning', category: 'coverage-gate', title: 'Coverage gate: CONCERNS',
+              location: 'N/A', evidence: 'N/A',
+              detail: 'Changed behavior has no executed live-credential smoke proof.',
+              recommended_fix: 'Run the opt-in live-credential smoke test before release.',
+            }]
+          : [];
+      return {
+        deltas: [],
+        toolCall: {
+          id: `child-submit-${lens ?? 'unknown'}`,
+          name: 'perkins_submit_findings',
+          args: { findings: childFindings },
+        },
+      };
     });
     const repo = makeFixtureRepo('pi-perkins-hybrid');
     let registry: RuntimeRegistry | null = null;

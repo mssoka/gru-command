@@ -85,15 +85,21 @@ the required coverage cardinality.
   declared tools on every harness: pi injects them in-process, claude-code
   attaches a session-scoped, product-owned MCP bridge. The lead declares
   its six orchestration tools; a lens child that declares native tools
-  gets only its own (for example a structured submit-findings channel) and
-  never sees the lead's six. That seam is harness-independent by design —
-  review isolation and tool exposure live in the adapter implementation,
-  never in caller branches on harness.
+  gets only its own (the `perkins_submit_findings` channel) and never sees
+  the lead's six. That seam is harness-independent by design — review
+  isolation and tool exposure live in the adapter implementation, never in
+  caller branches on harness.
 - Child findings are evidence-paired at envelope construction: a finding that
   cites a real file must quote that file (or its frozen diff), so an attempt
   that mixes a candidate with foreign-file evidence fails at the child, well
   before the lead inherits it; the attempt stays retryable within the pinned
   lens bound.
+- Findings leave a lens child only through `perkins_submit_findings` when
+  the hosting runtime wires it; its input is validated against the exact
+  finding schema and assistant text is never parsed back on that path. A
+  runtime without the tool keeps the strict JSON-array envelope, whose
+  tolerant recovery (fences, preamble, embedded array) only locates the
+  array before the same exact schema validates every finding.
 - The integrity-pinned package policy is the sole prompt authority for lead
   and child review behavior; interpolated repository/spec/convention text is
   untrusted evidence, never instruction. The host bounds attempts,

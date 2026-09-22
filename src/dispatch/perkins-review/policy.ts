@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PERKINS_POLICY_ID = 'perkins-code-review';
 export const PERKINS_CANONICAL_SOURCE_SHA256 = 'f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7';
-export const PERKINS_POLICY_SHA256 = 'c1b26e3a1fcb9e5acf3f7cadce96d6fe7b06a0ef83d1242d5fcf880c113c0998';
+export const PERKINS_POLICY_SHA256 = 'b0d9f36f53182d5e48fa7cf77b1db77d76a8684fa1999dd4dec7038e8137b946';
 
 export const PERKINS_LENSES = [
   'blind',
@@ -27,6 +27,15 @@ export interface PerkinsPolicy {
     readonly findingSchema: Readonly<Record<string, string>>;
     readonly sharedPrompt: string;
     readonly blindPrompt: string;
+    /** Child output instructions rendered into {{OUTPUT_CONTRACT}}: the
+     * native-tool contract is tool-only; the text contracts are the strict
+     * bare-array envelope kept for non-tool runtimes. */
+    readonly outputContracts: {
+      readonly text: string;
+      readonly blindText: string;
+      readonly nativeTool: string;
+      readonly blindNativeTool: string;
+    };
     readonly leadWorkflow: string;
     readonly lenses: Readonly<Record<PerkinsLens, string>>;
     readonly verificationPrompt: string;
@@ -104,6 +113,22 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
   }
   if (typeof policy.portableContract.leadWorkflow !== 'string' || !policy.portableContract.leadWorkflow.includes('perkins_submit_review')) {
     throw new Error(`bundled ${PERKINS_POLICY_ID} resource is missing the hybrid lead workflow`);
+  }
+  const outputContracts = policy.portableContract.outputContracts;
+  for (const key of ['text', 'blindText', 'nativeTool', 'blindNativeTool'] as const) {
+    if (typeof outputContracts?.[key] !== 'string' || outputContracts[key].trim() === '') {
+      throw new Error(`bundled ${PERKINS_POLICY_ID} resource is missing child output contract ${key}`);
+    }
+  }
+  for (const key of ['nativeTool', 'blindNativeTool'] as const) {
+    if (!outputContracts[key].includes('perkins_submit_findings')) {
+      throw new Error(`bundled ${PERKINS_POLICY_ID} ${key} contract must name the perkins_submit_findings tool`);
+    }
+  }
+  for (const key of ['sharedPrompt', 'blindPrompt'] as const) {
+    if (!policy.portableContract[key].includes('{{OUTPUT_CONTRACT}}')) {
+      throw new Error(`bundled ${PERKINS_POLICY_ID} ${key} is missing the output-contract placeholder`);
+    }
   }
   if (policy.portableContract.rules.fullLenses.join(',') !== PERKINS_LENSES.join(',')) {
     throw new Error(`bundled ${PERKINS_POLICY_ID} full-lens order drifted`);

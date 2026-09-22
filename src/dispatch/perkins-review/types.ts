@@ -48,7 +48,24 @@ export interface LensEnvelope {
   readonly status: 'valid' | 'invalid' | 'failed';
   readonly outputSha256: string | null;
   readonly findings: readonly ReviewFinding[];
+  /** Present when a text-path child's output required tolerant recovery
+   * (whitespace/fence/preamble/embedded array) before strict validation. */
+  readonly recovery?: LensOutputRecovery;
   readonly error?: string;
+}
+
+/** How a non-bare text-path child output was recovered before the strict
+ * finding schema validated it. */
+export type LensOutputRecovery =
+  | 'parsed-from-whitespace'
+  | 'parsed-from-fence'
+  | 'parsed-from-preamble'
+  | 'parsed-from-embedded-array';
+
+export interface RecoveredFindings {
+  readonly findings: readonly ReviewFinding[];
+  /** Present only when strict recovery was required and applied. */
+  readonly recovery?: LensOutputRecovery;
 }
 
 export interface ReviewCompleteness {
@@ -67,6 +84,17 @@ export type CanonicalReviewVerdict =
 
 const FINDING_KEYS = [
   'source',
+  'severity',
+  'category',
+  'title',
+  'location',
+  'evidence',
+  'detail',
+  'recommended_fix',
+] as const;
+/** The perkins_submit_findings tool input mirrors the finding shape minus
+ * `source`: the host owns the lens identity on the structured path. */
+const SUBMITTED_FINDING_KEYS = [
   'severity',
   'category',
   'title',
@@ -116,11 +144,148 @@ function parseArray(text: string, name: string): unknown[] {
   return parsed;
 }
 
-export function parseFindings(text: string, expectedLens: PerkinsLens): readonly ReviewFinding[] {
-  const findings = parseArray(text, 'lens output').map((entry, index) => {
+/** First balanced top-level JSON array in arbitrary text. Bracket pairs
+ * that are not valid JSON (prose like "[see below]") are skipped so the
+ * search continues; the returned span is still validated strictly by the
+ * caller after parsing. */
+function firstJsonArraySpan(text: string): { readonly json: string; readonly start: number; readonly end: number } | null {
+  let searchFrom = 0;
+  for (;;) {
+    const start = text.indexOf('[', searchFrom);
+    if (start === -1) return null;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let end = -1;
+    for (let index = start; index < text.length; index += 1) {
+      const character = text[index]!;
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === '\\') escaped = true;
+        else if (character === '"') inString = false;
+        continue;
+      }
+      if (character === '"') {
+        inString = true;
+        continue;
+      }
+      if (character === '[') depth += 1;
+      else if (character === ']') {
+        depth -= 1;
+        if (depth === 0) {
+          end = index + 1;
+          break;
+        }
+      }
+    }
+    if (end === -1) {
+      searchFrom = start + 1;
+      continue;
+    }
+    const json = text.slice(start, end);
+    try {
+      if (Array.isArray(JSON.parse(json))) return { json, start, end };
+    } catch {
+      // Not a JSON array: keep scanning after this bracket pair.
+    }
+    searchFrom = end;
+  }
+}
+
+/** Contents of every closed Markdown code fence, in order. */
+function fencedContents(text: string): readonly string[] {
+  const lines = text.split('\n');
+  const contents: string[] = [];
+  let index = 0;
+  while (index < lines.length) {
+    const open = /^\s*(`{3,}|~{3,})[^\n]*$/u.exec(lines[index]!);
+    if (open === null) {
+      index += 1;
+      continue;
+    }
+    const marker = open[1]!;
+    let matched = false;
+    for (let probe = index + 1; probe < lines.length; probe += 1) {
+      const close = /^\s*(`{3,}|~{3,})\s*$/u.exec(lines[probe]!);
+      if (close !== null && close[1]![0] === marker[0] && close[1]!.length >= marker.length) {
+        contents.push(lines.slice(index + 1, probe).join('\n'));
+        index = probe + 1;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) index += 1;
+  }
+  return contents;
+}
+
+interface FindingsCandidate {
+  readonly json: string;
+  readonly recovery?: LensOutputRecovery;
+}
+
+function findingsCandidates(text: string): readonly FindingsCandidate[] {
+  const candidates: FindingsCandidate[] = [{ json: text }];
+  const trimmed = text.trim();
+  if (trimmed !== text) candidates.push({ json: trimmed, recovery: 'parsed-from-whitespace' });
+  for (const content of fencedContents(text)) {
+    const span = firstJsonArraySpan(content);
+    if (span !== null) candidates.push({ json: span.json, recovery: 'parsed-from-fence' });
+  }
+  const extracted = firstJsonArraySpan(text);
+  if (extracted !== null) {
+    const before = text.slice(0, extracted.start).trim() !== '';
+    const after = text.slice(extracted.end).trim() !== '';
+    candidates.push({
+      json: extracted.json,
+      recovery: before ? (after ? 'parsed-from-embedded-array' : 'parsed-from-preamble') : 'parsed-from-embedded-array',
+    });
+  }
+  return candidates;
+}
+
+/**
+ * Strict tolerant recovery for a NON-tool (text-path) lens child: try the
+ * bare array first, then whitespace/fence/preamble/prose recovery, and
+ * validate every candidate with the exact strict schema. Recovery only
+ * locates the JSON array — a recovered array whose findings fail validation
+ * is still invalid. The primary pi path never uses this: native calls are
+ * validated directly.
+ */
+export function parseFindingsWithRecovery(text: string, expectedLens: PerkinsLens): RecoveredFindings {
+  let structuralError: Error | null = null;
+  let schemaError: Error | null = null;
+  for (const candidate of findingsCandidates(text)) {
+    let entries: unknown[];
+    try {
+      entries = parseArray(candidate.json, 'lens output');
+    } catch (error) {
+      structuralError ??= error instanceof Error ? error : new Error(String(error));
+      continue;
+    }
+    try {
+      const findings = validateFindingEntries(entries, expectedLens, true);
+      return candidate.recovery === undefined ? { findings } : { findings, recovery: candidate.recovery };
+    } catch (error) {
+      // A located array that fails the finding schema outranks the
+      // structural "not a bare array" complaint from the surrounding text.
+      schemaError ??= error instanceof Error ? error : new Error(String(error));
+    }
+  }
+  throw schemaError ?? structuralError ?? new Error('lens output produced no JSON array');
+}
+
+function validateFindingEntries(
+  entries: readonly unknown[],
+  expectedLens: PerkinsLens,
+  sourceIncluded: boolean,
+): readonly ReviewFinding[] {
+  const findings = entries.map((entry, index) => {
     const candidate = object(entry, `finding ${index}`);
-    exactKeys(candidate, FINDING_KEYS, `finding ${index}`);
-    if (candidate.source !== expectedLens) throw new Error(`finding ${index} source must be ${expectedLens}`);
+    exactKeys(candidate, sourceIncluded ? FINDING_KEYS : SUBMITTED_FINDING_KEYS, `finding ${index}`);
+    if (sourceIncluded && candidate.source !== expectedLens) {
+      throw new Error(`finding ${index} source must be ${expectedLens}`);
+    }
     if (typeof candidate.severity !== 'string' || !['blocker', 'warning', 'note'].includes(candidate.severity)) {
       throw new Error(`finding ${index} severity is invalid`);
     }
@@ -160,6 +325,21 @@ export function parseFindings(text: string, expectedLens: PerkinsLens): readonly
     throw new Error('coverage-gate findings are owned only by the tests lens');
   }
   return findings;
+}
+
+export function parseFindings(text: string, expectedLens: PerkinsLens): readonly ReviewFinding[] {
+  return validateFindingEntries(parseArray(text, 'lens output'), expectedLens, true);
+}
+
+/** Validate the exact JSON input of the perkins_submit_findings tool: the
+ * findings array mirrors the finding shape with the host-owned `source`
+ * deliberately absent. Same strictness as the text envelope. */
+export function parseFindingsSubmission(input: unknown, expectedLens: PerkinsLens): readonly ReviewFinding[] {
+  const value = object(input, 'perkins_submit_findings input');
+  exactKeys(value, ['findings'], 'perkins_submit_findings input');
+  if (!Array.isArray(value.findings)) throw new Error('perkins_submit_findings input findings must be an array');
+  if (value.findings.length > 200) throw new Error('perkins_submit_findings input exceeds 200 findings');
+  return validateFindingEntries(value.findings, expectedLens, false);
 }
 
 export function parseFixAuditResults(text: string, findingCount: number): readonly FixAuditResult[] {

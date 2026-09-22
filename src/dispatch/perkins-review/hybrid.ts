@@ -9,11 +9,13 @@ import { finalAssistantText } from './session-output.js';
 import { PERKINS_LENSES, type PerkinsLens, type PerkinsPolicy } from './policy.js';
 import {
   dedupeVerifiedFindings,
-  parseFindings,
+  parseFindingsSubmission,
+  parseFindingsWithRecovery,
   verdictForFindings,
   type CanonicalReviewVerdict,
   type FixAuditResult,
   type LensEnvelope,
+  type LensOutputRecovery,
   type ReviewCompleteness,
   type ReviewFinding,
   type VerifiedFinding,
@@ -44,9 +46,54 @@ export const PERKINS_STORED_SUBMISSION_MAX_BYTES = 1024 * 1024;
 const REVIEW_OWNER = 'perkins-hybrid-review';
 
 const BLIND_SYSTEM_PROMPT =
-  'You are one blind Perkins lens child. The user prompt is your entire context. You have no tools, repository context, skills, extensions, or delegation authority. Return only the required JSON array.';
+  'You are one blind Perkins lens child. The user prompt is your entire context. You have no repository context, skills, extensions, or delegation authority. Follow the user prompt exactly.';
 const LENS_SYSTEM_PROMPT =
-  'You are one Perkins lens child. Use only the read-only frozen-tree tools and the supplied prompt. Return only the required JSON array. Never edit, delegate, invoke skills, or start another review.';
+  'You are one Perkins lens child. Use only the read-only frozen-tree tools and the supplied prompt. Never edit, delegate, invoke skills, or start another review. Follow the user prompt exactly.';
+
+/** The one native channel a lens child may submit structured findings through. */
+export const FINDINGS_TOOL_NAME = 'perkins_submit_findings';
+/** Exact per-finding keys of the structured submission: the host owns the
+ * lens identity, so `source` is deliberately absent from tool input. */
+const SUBMITTED_FINDING_KEYS = [
+  'severity',
+  'category',
+  'title',
+  'location',
+  'evidence',
+  'detail',
+  'recommended_fix',
+] as const;
+/** JSON schema for perkins_submit_findings. Bounds mirror validateFindingEntries
+ * exactly (the runtime enforces JSON shape; the host enforces the schema). */
+const FINDINGS_INPUT_SCHEMA: Readonly<Record<string, unknown>> = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['findings'],
+  properties: {
+    findings: {
+      type: 'array',
+      maxItems: 200,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: [...SUBMITTED_FINDING_KEYS],
+        properties: {
+          severity: { type: 'string', enum: ['blocker', 'warning', 'note'] },
+          category: { type: 'string', minLength: 1, maxLength: 80 },
+          title: { type: 'string', minLength: 1, maxLength: 240 },
+          location: { type: 'string', minLength: 1, maxLength: 500 },
+          evidence: { type: 'string', minLength: 1, maxLength: 4_000 },
+          detail: { type: 'string', minLength: 1, maxLength: 320 },
+          recommended_fix: { type: 'string', minLength: 1, maxLength: 320 },
+        },
+      },
+    },
+  },
+};
+
+/** How a child receives its findings contract: through the native tool when
+ * the hosting runtime wired it, otherwise through the strict text envelope. */
+type ChildOutputMode = 'nativeTool' | 'text';
 
 export interface ReviewProgress {
   readonly lens: PerkinsLens;
@@ -599,11 +646,26 @@ function renderTemplateOnce(template: string, values: Readonly<Record<string, st
   );
 }
 
-function renderLensPrompt(policy: PerkinsPolicy, review: FrozenReview, lens: PerkinsLens, chunk: string): string {
+function renderLensPrompt(
+  policy: PerkinsPolicy,
+  review: FrozenReview,
+  lens: PerkinsLens,
+  chunk: string,
+  output: ChildOutputMode,
+): string {
   const selected = review.chunks.find((candidate) => candidate.id === chunk);
   if (selected === undefined) throw new Error(`missing frozen chunk ${chunk}`);
-  if (lens === 'blind') return renderTemplateOnce(policy.portableContract.blindPrompt, { '{{DIFF}}': selected.diff });
-  return renderTemplateOnce(policy.portableContract.sharedPrompt, {
+  const contracts = policy.portableContract.outputContracts;
+  const rawContract = lens === 'blind'
+    ? (output === 'nativeTool' ? contracts.blindNativeTool : contracts.blindText)
+    : (output === 'nativeTool' ? contracts.nativeTool : contracts.text);
+  const contract = rawContract.split('{{LENS}}').join(lens);
+  if (/\{\{[A-Z_]+\}\}/u.test(contract)) throw new Error('child output contract has unresolved placeholders');
+  const template = lens === 'blind' ? policy.portableContract.blindPrompt : policy.portableContract.sharedPrompt;
+  if (!template.includes('{{OUTPUT_CONTRACT}}')) throw new Error('policy prompt is missing the output contract placeholder');
+  const rendered = template.replace('{{OUTPUT_CONTRACT}}', () => contract);
+  if (lens === 'blind') return renderTemplateOnce(rendered, { '{{DIFF}}': selected.diff });
+  return renderTemplateOnce(rendered, {
     '{{PROJECT_CONVENTIONS}}': review.projectConventions,
     '{{DIFF}}': selected.diff,
     '{{SPEC_CONTEXT}}': review.specContext,
@@ -774,7 +836,52 @@ export class PerkinsHybridReview {
       this.onProgress({ lens, chunk, state: 'running' });
       let handle: AgentHandle | null = null;
       let raw: string | null = null;
+      /** Valid structured submission captured from perkins_submit_findings
+       * (native-tool children); its exact JSON bytes are the durable output. */
+      let submitted: { readonly json: string; readonly findings: readonly ReviewFinding[] } | null = null;
+      /** Read through a getter: the tool handler assigns during the awaited
+       * turn, so outer control flow must not assume the captured value. */
+      const capturedSubmission = (): { readonly json: string; readonly findings: readonly ReviewFinding[] } | null => submitted;
+      /** Last schema rejection the tool reported, so a no-submission run can
+       * name the precise failure instead of a generic absence. */
+      let submissionError: string | null = null;
+      /** Last rejected structured submission, kept as durable audit evidence. */
+      let rejectedSubmission: string | null = null;
+      /** Transport outcome; a captured submission outranks it. */
+      let turnError: unknown = null;
+      let promptResolved = false;
+      let nativeSubmit = false;
       const runToken = randomUUID().slice(0, 8);
+      // The child's only findings channel on a native-tool runtime: the
+      // runtime enforces JSON shape, the host validates the exact schema,
+      // and no assistant text is ever parsed back.
+      const submitFindingsTool: NativeAgentTool = {
+        name: FINDINGS_TOOL_NAME,
+        description:
+          'Submit ALL findings for this lens run as structured JSON: { findings: [...] }. ' +
+          'The host validates every entry against the exact finding schema and records the run; ' +
+          'findings in assistant text are ignored. Call exactly once; an empty findings array is a valid result.',
+        inputSchema: FINDINGS_INPUT_SCHEMA,
+        execute: async (toolInput, toolSignal) => {
+          if (input.signal?.aborted === true || signal?.aborted === true || toolSignal?.aborted === true) {
+            throw new Error('review operation aborted');
+          }
+          if (submitted !== null) throw new Error('findings were already submitted for this lens run');
+          try {
+            const findings = parseFindingsSubmission(toolInput, lens);
+            submitted = { json: JSON.stringify(toolInput), findings };
+            return {
+              text: JSON.stringify({ accepted: true, lens, findingCount: findings.length }),
+              details: { accepted: true, lens, findingCount: findings.length },
+              terminate: true,
+            };
+          } catch (error) {
+            submissionError = sanitizeError(error);
+            rejectedSubmission = JSON.stringify(toolInput);
+            throw error;
+          }
+        },
+      };
       try {
         handle = await boundedSpawn(() => this.spawner('perkins', {
           // The blind child is rooted OUTSIDE the repository: even a future
@@ -784,20 +891,51 @@ export class PerkinsHybridReview {
           isolatedReview: {
             systemPrompt: lens === 'blind' ? BLIND_SYSTEM_PROMPT : LENS_SYSTEM_PROMPT,
             tools: lens === 'blind' ? [] : ['read', 'grep', 'find', 'ls'],
+            nativeTools: [submitFindingsTool],
           },
         }), CHILD_SPAWN_TIMEOUT_MS, [signal, input.signal]);
         registerIsolatedHandle(handle, 'lens');
         this.onAgent({ phase: 'lens', lens, chunk, attempt, handle });
+        // The hosting runtime declares the tools it actually wired: a
+        // native-tool child is tool-only, a text child (non-pi runtimes)
+        // keeps the tolerant text path. The request alone proves nothing.
+        nativeSubmit = handle.reviewTools?.includes(FINDINGS_TOOL_NAME) === true;
         await boundedPrompt(
           handle,
-          renderLensPrompt(this.policy, review, lens, chunk),
+          renderLensPrompt(this.policy, review, lens, chunk, nativeSubmit ? 'nativeTool' : 'text'),
           CHILD_TURN_TIMEOUT_MS,
           [signal, input.signal],
         );
+        promptResolved = true;
+      } catch (error) {
+        turnError = error;
+      }
+      try {
+        if (handle === null) throw turnError ?? new Error('lens child did not spawn');
         if (handle.sessionFile === null) throw new Error('lens child session is not durable');
-        raw = finalAssistantText(handle.sessionFile);
-        const parsed = parseFindings(raw, lens);
-        const reviewFindings = parsed.filter((finding) =>
+        let reviewFindings: readonly ReviewFinding[];
+        let outputBytes: string;
+        let recovery: LensOutputRecovery | undefined;
+        if (nativeSubmit) {
+          const submission = capturedSubmission();
+          if (submission === null) {
+            // A captured submission outranks a later turn failure; a run
+            // without one is invalid (retriable) and names the last schema
+            // rejection rather than a generic absence.
+            throw turnError ?? new Error(submissionError ?? `lens child did not submit findings via ${FINDINGS_TOOL_NAME}`);
+          }
+          reviewFindings = submission.findings;
+          outputBytes = submission.json;
+        } else {
+          if (turnError !== null) throw turnError;
+          const text = finalAssistantText(handle.sessionFile);
+          raw = text;
+          const parsed = parseFindingsWithRecovery(text, lens);
+          reviewFindings = parsed.findings;
+          recovery = parsed.recovery;
+          outputBytes = text;
+        }
+        const visibleFindings = reviewFindings.filter((finding) =>
           !(finding.source === 'tests' && finding.category === 'coverage-gate'),
         );
         // Evidence pairing is enforced at envelope construction: a finding
@@ -817,10 +955,10 @@ export class PerkinsHybridReview {
         }
         // The tests lens's validated coverage gate is host-owned evidence:
         // carried into terminal proof so a FAIL gate blocks the verdict.
-        const gate = parsed.find((finding) => finding.source === 'tests' && finding.category === 'coverage-gate');
+        const gate = reviewFindings.find((finding) => finding.source === 'tests' && finding.category === 'coverage-gate');
         const coverageGate = gate === undefined ? undefined : (/^Coverage gate: (PASS|CONCERNS|FAIL)$/u.exec(gate.title)?.[1] as 'PASS' | 'CONCERNS' | 'FAIL' | undefined);
         const resultId = `${lens}-${chunk}-a${attempt}-${hash(handle.id).slice(0, 16)}`;
-        const childCandidates = reviewFindings.map((finding, findingIndex): ChildCandidate => ({
+        const childCandidates = visibleFindings.map((finding, findingIndex): ChildCandidate => ({
           ...finding,
           ref: `${resultId}#${findingIndex}`,
           chunk,
@@ -828,31 +966,47 @@ export class PerkinsHybridReview {
           findingIndex,
         }));
         const envelope: LensEnvelope = {
-          schemaVersion: 1, lens, chunk, attempt, status: 'valid', outputSha256: hash(raw), findings: reviewFindings,
+          schemaVersion: 1, lens, chunk, attempt, status: 'valid', outputSha256: hash(outputBytes), findings: reviewFindings,
+          ...(recovery !== undefined ? { recovery } : {}),
         };
         envelopes.push(envelope);
-        writeReviewArtifact(review, `lenses/${chunk}/${lens}.attempt-${attempt}-${runToken}.raw.json`, `${raw}\n`);
+        writeReviewArtifact(review, `lenses/${chunk}/${lens}.attempt-${attempt}-${runToken}.raw.json`, `${outputBytes}\n`);
         writeReviewArtifact(review, `lenses/${chunk}/${lens}.attempt-${attempt}-${runToken}.envelope.json`, envelope);
         const result: ChildResult = {
           resultId, agentId: handle.id, lens, chunk, attempt, status: 'valid', findings: childCandidates,
           ...(coverageGate !== undefined ? { coverageGate } : {}),
         };
         writeReviewArtifact(review, `children/${resultId}.json`, result);
-        this.onProgress({ lens, chunk, state: 'done', note: `${reviewFindings.length} candidate(s)` });
+        this.onProgress({ lens, chunk, state: 'done', note: `${visibleFindings.length} candidate(s)` });
         return result;
       } catch (error) {
         const message = sanitizeError(error);
+        // A tool-capable child that finished its turn without submitting still
+        // leaves assistant output behind: keep it as failure evidence (never
+        // parsed back into findings).
+        if (raw === null && nativeSubmit && promptResolved && handle !== null && handle.sessionFile !== null) {
+          try {
+            raw = finalAssistantText(handle.sessionFile);
+          } catch {
+            // No durable assistant text: the tool failure reason stands alone.
+          }
+        }
+        // A child that finished its turn without a recordable result is an
+        // output failure (invalid, retriable); a failed spawn/turn with no
+        // output at all stays a transport failure.
+        const hadOutput = nativeSubmit ? capturedSubmission() !== null || promptResolved : raw !== null;
+        const status: ChildResult['status'] = hadOutput ? 'invalid' : 'failed';
+        const outputBytes = raw ?? capturedSubmission()?.json ?? rejectedSubmission;
         const envelope: LensEnvelope = {
-          schemaVersion: 1, lens, chunk, attempt,
-          status: raw === null ? 'failed' : 'invalid',
-          outputSha256: raw === null ? null : hash(raw), findings: [], error: message,
+          schemaVersion: 1, lens, chunk, attempt, status,
+          outputSha256: outputBytes === null ? null : hash(outputBytes), findings: [], error: message,
         };
         envelopes.push(envelope);
-        if (raw !== null) {
+        if (outputBytes !== null) {
           // The try block may have already written this exact run-token path
           // before a later step threw; tolerate the collision (write-once).
           try {
-            writeReviewArtifact(review, `lenses/${chunk}/${lens}.attempt-${attempt}-${runToken}.raw.json`, `${raw}\n`);
+            writeReviewArtifact(review, `lenses/${chunk}/${lens}.attempt-${attempt}-${runToken}.raw.json`, `${outputBytes}\n`);
           } catch (writeError) {
             if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) throw writeError;
           }
@@ -871,7 +1025,7 @@ export class PerkinsHybridReview {
         return {
           resultId: `failed-${lens}-${chunk}-a${attempt}`,
           agentId: handle?.id ?? 'spawn-failed', lens, chunk, attempt,
-          status: raw === null ? 'failed' : 'invalid', findings: [], error: message,
+          status, findings: [], error: message,
         };
       } finally {
         await handle?.dispose();
