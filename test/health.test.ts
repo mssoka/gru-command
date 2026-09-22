@@ -170,6 +170,7 @@ describe('GET /health', () => {
               restarts: 1,
               breakerOpen: false,
               openTurn: false,
+              openToolCalls: 0,
               lastEventAt: '2026-09-18T00:00:00.000Z',
               lastFileBytes: 1024,
             },

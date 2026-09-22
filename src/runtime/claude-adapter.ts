@@ -40,12 +40,14 @@ import type {
   AgentHandle,
   AgentRuntime,
   AgentState,
+  PendingTurn,
   PromptOptions,
   RuntimeEvent,
   RuntimeEventListener,
   RuntimeHealth,
   SpawnOptions,
 } from './types.js';
+import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -132,6 +134,8 @@ export interface ClaudeCodeRuntimeOptions {
   readonly binary?: string;
   /** Test seam: grace before SIGKILL on dispose. Default 2000ms. */
   readonly killGraceMs?: number;
+  /** Test seam: override the long-tool heartbeat cadence. */
+  readonly toolHeartbeatMs?: number;
   /** Tests may inject an offline catalog; production restores pi's cached model metadata. */
   readonly modelRuntime?: ModelRuntime;
   readonly log?: Log;
@@ -167,6 +171,9 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   private readonly binary: string;
   private readonly killGraceMs: number;
   private readonly log: Log;
+  /** Long-tool heartbeat cadence override; derived from the supervision
+   * window at spawn when unset (construction must not touch config). */
+  private readonly toolHeartbeatMs: number | null;
   private readonly handles = new Set<ClaudeCodeHandle>();
   private modelRuntime: ModelRuntime | undefined;
   /** Normalized session paths currently hosted by this process. */
@@ -182,6 +189,12 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     this.killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     this.log = opts.log ?? (() => {});
     this.modelRuntime = opts.modelRuntime;
+    this.toolHeartbeatMs = opts.toolHeartbeatMs ?? null;
+  }
+
+  /** Long-tool heartbeat cadence for a new handle (config-derived). */
+  private heartbeatMs(): number {
+    return this.toolHeartbeatMs ?? toolHeartbeatIntervalMs(this.config.supervision.turnSilenceMs);
   }
 
   private async runtime(): Promise<ModelRuntime> {
@@ -444,6 +457,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           this.activeFiles.delete(sessionFile);
         },
         (error) => this.onInfraError(error),
+        this.heartbeatMs(),
       );
       this.handles.add(handle);
       this.down = undefined;
@@ -609,6 +623,10 @@ export class ClaudeCodeHandle implements AgentHandle {
   private live: ChildProcess | null = null;
   private liveTranscript: WriteStream | null = null;
   private settleLiveOnDispose: (() => void) | null = null;
+  /** The prompt behind the live CLI turn — supervision's resume snapshot. */
+  private livePrompt: PendingTurn | null = null;
+  /** Long-tool heartbeats: an open tool call keeps the event surface alive. */
+  private readonly toolHeartbeat: ToolHeartbeat;
   private compacting = false;
   private readonly listeners = new Set<RuntimeEventListener>();
   private disposed = false;
@@ -622,6 +640,7 @@ export class ClaudeCodeHandle implements AgentHandle {
     log: Log = () => {},
     onDispose: () => void = () => {},
     onInfraError: (error: unknown) => void = () => {},
+    toolHeartbeatMs = 60_000,
   ) {
     this.role = role;
     this.params = params;
@@ -634,7 +653,18 @@ export class ClaudeCodeHandle implements AgentHandle {
     this.log = log;
     this.onDispose = onDispose;
     this.onInfraError = onInfraError;
+    this.toolHeartbeat = new ToolHeartbeat((event) => this.emit(event), toolHeartbeatMs);
   }
+
+  /**
+   * Live-process probe (E7): the CLI child hosting the turn is running
+   * and at least one tool call is still open — activity, not a hang.
+   */
+  hasLiveProcess = (): boolean =>
+    !this.disposed && this.live !== null && this.toolHeartbeat.openCalls > 0;
+
+  /** The live turn's prompt — snapshotted by supervision before a restart. */
+  pendingTurn = (): PendingTurn | null => this.livePrompt;
 
   subscribe(listener: RuntimeEventListener): () => void {
     this.listeners.add(listener);
@@ -663,7 +693,7 @@ export class ClaudeCodeHandle implements AgentHandle {
           '(the interface fallback serializes product callers; direct callers must wait)',
       );
     }
-    return this.runTurn(text, options.images);
+    return this.runTurn(text, options.owner ?? null, options.images);
   }
 
   /** Raw-handle alias: an idle steer is just a prompt (no mid-turn channel exists). */
@@ -717,6 +747,7 @@ export class ClaudeCodeHandle implements AgentHandle {
 
   private async disposeOnce(): Promise<void> {
     this.disposed = true;
+    this.toolHeartbeat.dispose();
     const live = this.live;
     let killTimer: ReturnType<typeof setTimeout> | null = null;
     let exitDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
@@ -991,11 +1022,16 @@ export class ClaudeCodeHandle implements AgentHandle {
     });
   }
 
-  private runTurn(text: string, images?: PromptOptions['images']): Promise<void> {
+  private runTurn(text: string, owner: string | null, images?: PromptOptions['images']): Promise<void> {
     this.setState('spawning');
     const params = this.params;
     const translator = new ClaudeTurnTranslator();
     let turnStarted = false;
+    this.livePrompt = {
+      text,
+      owner,
+      ...(images !== undefined && images.length > 0 ? { images } : {}),
+    };
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -1010,6 +1046,10 @@ export class ClaudeCodeHandle implements AgentHandle {
         this.live = null;
         this.liveTranscript = null;
         this.settleLiveOnDispose = null;
+        this.livePrompt = null;
+        // The process is gone; a tool whose terminal frame never arrived
+        // must not keep heartbeating a dead turn.
+        this.toolHeartbeat.clear();
         if (error === null) resolve();
         else reject(error);
       };
@@ -1049,7 +1089,11 @@ export class ClaudeCodeHandle implements AgentHandle {
 
       const handleFrame = (frame: StreamFrame): void => {
         transcript.write(`${JSON.stringify(frame)}\n`);
-        for (const event of translator.ingest(frame)) this.emit(event);
+        for (const event of translator.ingest(frame)) {
+          if (event.type === 'tool_start') this.toolHeartbeat.started(event.callId, event.tool);
+          else if (event.type === 'tool_end') this.toolHeartbeat.ended(event.callId);
+          this.emit(event);
+        }
         if (
           !turnStarted &&
           frame['type'] === 'system' &&

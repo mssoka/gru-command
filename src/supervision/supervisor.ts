@@ -1,7 +1,7 @@
 import { statSync } from 'node:fs';
 import type { Role, SupervisionConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { AgentHandle, AgentState, SpawnOptions } from '../runtime/types.js';
+import type { AgentHandle, AgentState, PendingTurn, SpawnOptions } from '../runtime/types.js';
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { NotificationCenter } from '../notifications/center.js';
@@ -35,7 +35,18 @@ export interface SupervisorRegistry {
  *
  * Liveness = events OR bytes: any runtime event, or growth of the
  * session jsonl, resets the turn-silence clock — a slow-but-alive tool
- * run never trips the watchdog.
+ * run never trips the watchdog. On top of that:
+ *
+ * - An OPEN tool call with a live process is activity, never silence:
+ *   runtimes emit long-tool heartbeats (tool_update) and expose a
+ *   live-process probe; supervision consults both and fails toward NOT
+ *   killing a live process.
+ * - A wall-clock gap between watchdog ticks means the machine slept:
+ *   silence accrued while nothing could run, so every open turn gets a
+ *   fresh window instead of a restart.
+ * - A restart that kills an open turn snapshots the pending prompt and
+ *   re-delivers it on the resumed session; when no snapshot is possible
+ *   it posts a durable action-required recoverable-lane note.
  *
  * In-band turn errors (state 'error', next turn recovers — the adapter
  * contract) are NEVER restarts. Only hangs (open turn, silence past the
@@ -43,6 +54,11 @@ export interface SupervisorRegistry {
  */
 
 export type SupervisionState = 'watching' | 'restarting' | 'stopped';
+
+/** A tick gap at least this large (beyond jitter) means the process or
+ * the whole machine was suspended — silence accrued while NOTHING could
+ * run, so it is not hang evidence. */
+const WAKE_GAP_MIN_MS = 30_000;
 
 /** Per-agent supervision view (board + /health). */
 export interface AgentSupervisionView {
@@ -54,6 +70,8 @@ export interface AgentSupervisionView {
   readonly restarts: number;
   readonly breakerOpen: boolean;
   readonly openTurn: boolean;
+  /** Tool calls currently open (a live process here is activity, not a hang). */
+  readonly openToolCalls: number;
   readonly lastEventAt: string | null;
   readonly lastFileBytes: number | null;
 }
@@ -76,6 +94,11 @@ interface SupervisedAgent {
   state: SupervisionState;
   openTurn: boolean;
   openControl: boolean;
+  /** callId → tool name for tool calls currently executing. */
+  openToolCalls: Map<string, string>;
+  /** An interrupted turn awaiting resume on the next live handle. Survives
+   * failed rungs and breaker re-arms — the lane must never be forgotten. */
+  pendingRecovery: InterruptedTurn | null;
   lastEventAt: number;
   lastFileBytes: number | null;
   /** Restart timestamps (epoch ms) — the breaker ring. */
@@ -104,6 +127,18 @@ interface SupervisedAgent {
     activityGeneration: number;
     openTurn: boolean;
   } | null;
+}
+
+/** What a restart rung must know to recover a killed open turn. */
+interface InterruptedTurn {
+  /** The prompt to re-deliver, when the runtime could describe it. */
+  readonly pending: PendingTurn | null;
+  /** The supervisor observed an open turn/control at kill time. */
+  readonly hadOpenTurn: boolean;
+  /** The agent id at kill time — the lane binding every signal names. A
+   * fresh-mint restart may retire the record's current id, but the job /
+   * branch / phase context lives under this one. */
+  readonly originAgentId: string;
 }
 
 /** A declared supervision slot — a stable identity that outlives handles
@@ -149,6 +184,9 @@ export interface SupervisorOptions {
   readonly tickMs?: number;
   /** Test seam: clock (default Date.now). */
   readonly now?: () => number;
+  /** Test seam: wall clock used only for sleep/wake gap detection
+   * (default Date.now; the `now` seam is free to be a fake clock). */
+  readonly wallNow?: () => number;
 }
 
 export class Supervisor {
@@ -159,11 +197,14 @@ export class Supervisor {
   private readonly decisions: DecisionService | null;
   private readonly log: Log;
   private readonly now: () => number;
+  private readonly wallNow: () => number;
   private readonly agents = new Map<string, SupervisedAgent>();
   private readonly slots = new Map<string, SupervisedSlotInternal>();
   private readonly unsubscribeTap: () => void;
-  private readonly tickOverride: number | null;
+  private readonly tickMs: number;
   private ticker: ReturnType<typeof setInterval> | null = null;
+  /** Wall-clock of the previous watchdog tick (sleep/wake detection). */
+  private lastTickWallAt: number | null = null;
   private disposed = false;
 
   constructor(opts: SupervisorOptions) {
@@ -174,17 +215,25 @@ export class Supervisor {
     this.decisions = opts.decisions ?? null;
     this.log = opts.log ?? (() => {});
     this.now = opts.now ?? Date.now;
-    this.tickOverride = opts.tickMs ?? null;
+    this.wallNow = opts.wallNow ?? Date.now;
+    // Cadence: a quarter of the silence window, capped at 5 s so a tight
+    // window still ticks promptly.
+    this.tickMs = opts.tickMs ?? Math.min(this.cfg.turnSilenceMs / 4, 5_000);
     this.unsubscribeTap = this.registry.onAgentEvent((envelope) => this.onEnvelope(envelope));
   }
 
   /** Start the watchdog ticker. */
   start(): void {
     if (this.disposed || this.ticker !== null) return;
-    // Cadence: a quarter of the silence window, capped at 5 s so a tight
-    // window still ticks promptly.
-    const tick = this.tickOverride ?? Math.min(this.cfg.turnSilenceMs / 4, 5_000);
-    this.ticker = setInterval(() => this.tick(), tick);
+    this.ticker = setInterval(() => {
+      try {
+        this.tick();
+      } catch (error) {
+        // The supervisor observes the runtime; its own faults must never
+        // take the service down (unhandled timer throws are fatal in main).
+        this.log('error', 'supervision tick failed', { error: String(error) });
+      }
+    }, this.tickMs);
     this.ticker.unref?.();
   }
 
@@ -478,6 +527,7 @@ export class Supervisor {
           break;
         case 'turn_end':
           agent.openTurn = false;
+          agent.openToolCalls.clear();
           break;
         case 'compaction_start':
           agent.openControl = true;
@@ -485,10 +535,17 @@ export class Supervisor {
         case 'compaction_end':
           agent.openControl = false;
           break;
+        case 'tool_start':
+          agent.openToolCalls.set(event.callId, event.tool);
+          break;
+        case 'tool_end':
+          agent.openToolCalls.delete(event.callId);
+          break;
         case 'state':
           if (event.state === 'disposed') {
             agent.openTurn = false;
             agent.openControl = false;
+            agent.openToolCalls.clear();
           }
           break;
         case 'error':
@@ -566,6 +623,8 @@ export class Supervisor {
       state: 'watching',
       openTurn: false,
       openControl: false,
+      openToolCalls: new Map(),
+      pendingRecovery: null,
       lastEventAt: this.now(),
       lastFileBytes: this.fileSize(sessionFile),
       restartRing: [],
@@ -590,10 +649,10 @@ export class Supervisor {
   private tick(): void {
     if (this.disposed || !this.cfg.enabled) return;
     const now = this.now();
+    this.detectWake(now);
     for (const agent of this.agents.values()) {
       if (agent.handle === null || agent.state !== 'watching' || agent.breakerOpen) continue;
-      const health = this.handleState(agent.handle);
-      const busy = health === 'streaming' || health === 'spawning';
+      const busy = this.handleBusy(agent.handle);
       if (!busy && !agent.openTurn && !agent.openControl) continue;
       // Liveness = events OR bytes: session-file growth also resets the clock.
       const bytes = this.fileSize(agent.sessionFile);
@@ -610,6 +669,18 @@ export class Supervisor {
           this.abortIsolatedReviewAttempt(agent, 'turn hang');
           continue;
         }
+        if (this.hasLiveProcess(agent.handle)) {
+          // An open tool call backed by a live process is ACTIVITY, never
+          // silence. Reset the clock and fail toward NOT killing the work.
+          agent.lastEventAt = now;
+          agent.activityGeneration += 1;
+          this.log('info', 'silence with a live tool process — resetting the silence clock', {
+            agent_id: agent.agentId,
+            silence_ms: silence,
+            open_tool_calls: agent.openToolCalls.size,
+          });
+          continue;
+        }
         const reason = agent.openControl ? 'compaction hang' : 'turn hang';
         this.log('warn', `${reason} detected — climbing restart ladder`, {
           agent_id: agent.agentId,
@@ -618,6 +689,98 @@ export class Supervisor {
         });
         void this.evaluateRecovery(agent, reason);
       }
+    }
+  }
+
+  /**
+   * Sleep/wake (E7 follow-up): a watchdog tick separated from the previous
+   * one by a wall-clock gap far beyond the tick cadence means the process
+   * was suspended — laptop lid closed, system sleep. Silence accrued while
+   * NOTHING could run, so it is not hang evidence: grant every open turn a
+   * fresh silence window and leave a durable lane signal, never a restart.
+   */
+  private detectWake(now: number): void {
+    const wall = this.wallNow();
+    const previous = this.lastTickWallAt;
+    this.lastTickWallAt = wall;
+    if (previous === null) return;
+    const gap = wall - previous;
+    if (gap < Math.max(this.tickMs * 4, WAKE_GAP_MIN_MS)) return;
+    const affected: SupervisedAgent[] = [];
+    for (const agent of this.agents.values()) {
+      if (agent.handle === null || agent.state !== 'watching') continue;
+      if (!agent.openTurn && !agent.openControl && !this.handleBusy(agent.handle)) continue;
+      agent.lastEventAt = now;
+      agent.activityGeneration += 1;
+      affected.push(agent);
+    }
+    this.log('warn', 'wall-clock gap detected (system sleep) — silence grace granted, no restarts', {
+      gap_ms: gap,
+      agents: affected.map((agent) => agent.agentId),
+    });
+    this.recordEvent('supervision.wake', null, {
+      gap_ms: gap,
+      agents: affected.map((agent) => agent.agentId),
+    });
+    if (affected.length > 0) {
+      try {
+        this.notifications.post({
+          kind: 'supervision.wake',
+          routing: 'fyi',
+          severity: 'info',
+          title: `System sleep ended — ${affected.length} open turn(s) granted a fresh silence window`,
+          detail:
+            'Watchdog silence across the sleep was not hang evidence. Lanes with open turns: ' +
+            affected.map((agent) => this.laneContext(agent.agentId)).join('; '),
+        });
+      } catch (error) {
+        this.log('warn', 'wake lane signal could not be posted', { error: String(error) });
+      }
+    }
+  }
+
+  private handleBusy(handle: AgentHandle): boolean {
+    const state = this.handleState(handle);
+    return state === 'streaming' || state === 'spawning';
+  }
+
+  /** Fail toward NOT killing a live process: probe errors read as live. */
+  private hasLiveProcess(handle: AgentHandle | null): boolean {
+    if (handle === null) return false;
+    try {
+      return handle.hasLiveProcess?.() === true;
+    } catch (error) {
+      this.log('warn', 'live-process probe failed — treating the turn as live', {
+        agent_id: handle.id,
+        error: String(error),
+      });
+      return true;
+    }
+  }
+
+  /** Best-effort durable lane context for recoverable-lane signals. */
+  private laneContext(agentId: string): string {
+    try {
+      const agent = this.ledger.getAgent(agentId);
+      if (agent === null) return `agent ${agentId}`;
+      const parts = [`agent ${agentId}`, `role ${agent.role}`];
+      if (agent.jobId !== null) {
+        parts.push(`job ${agent.jobId}`);
+        const job = this.ledger.getJob(agent.jobId);
+        if (job !== null) parts.push(`phase ${job.status}`);
+        const lane = this.ledger
+          .listWorktrees({ jobId: agent.jobId })
+          .find((worktree) => worktree.status !== 'swept');
+        if (lane !== undefined) {
+          if (lane.branch !== null) parts.push(`branch ${lane.branch}`);
+          parts.push(`worktree ${lane.path}`);
+        }
+      }
+      if (agent.roundId !== null) parts.push(`round ${agent.roundId}`);
+      return parts.join(', ');
+    } catch (error) {
+      this.log('warn', 'lane context lookup failed', { agent_id: agentId, error: String(error) });
+      return `agent ${agentId}`;
     }
   }
 
@@ -858,9 +1021,14 @@ export class Supervisor {
     if (agent.breakerOpen) return;
     agent.breakerOpen = true;
     agent.state = 'stopped';
+    const handle = agent.handle;
+    // Snapshot the open turn before the stop disposes it: the ack re-arm
+    // resumes it, or the lane is documented rather than silently dead.
+    const captured = this.captureInterruptedTurn(handle, agent);
+    if (captured !== null) agent.pendingRecovery = captured;
     agent.openTurn = false;
     agent.openControl = false;
-    const handle = agent.handle;
+    agent.openToolCalls.clear();
     agent.handle = null;
     this.ledger.appendCustomEvent({
       kind: 'supervision.escalated',
@@ -954,11 +1122,16 @@ export class Supervisor {
       agent.restartRing.push(this.now());
 
       // Dispose the wedged handle (rejects its pending prompts; the
-      // registry set drops it; the tap reports the disposal).
+      // registry set drops it; the tap reports the disposal). Snapshot the
+      // open turn FIRST: a killed turn must be resumed or visibly orphaned,
+      // never silently dead (E7 false-positive follow-up).
       const old = agent.handle;
+      const captured = this.captureInterruptedTurn(old, agent);
+      if (captured !== null) agent.pendingRecovery = captured;
       agent.handle = null;
       agent.openTurn = false;
       agent.openControl = false;
+      agent.openToolCalls.clear();
       if (old !== null) {
         try {
           await this.registry.disposeHandle(old);
@@ -1011,6 +1184,8 @@ export class Supervisor {
             this.log('error', 'slot swap listener failed', { error: String(error) });
           }
         }
+        // Resume (or visibly orphan) the turn this rung interrupted.
+        this.recoverInterruptedTurn(agent, spawned, reason);
       } catch (error) {
         if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
         // Failed rung: count it, back off, schedule the next.
@@ -1053,8 +1228,141 @@ export class Supervisor {
     adopted.restartRing = old.restartRing;
     adopted.breakerOpen = old.breakerOpen;
     adopted.breakerNotificationId = old.breakerNotificationId;
+    // A turn interrupted by an earlier failed rung (or by the breaker
+    // stop) still awaits resume on the next live handle.
+    adopted.pendingRecovery = old.pendingRecovery;
     this.agents.delete(old.agentId);
     return adopted;
+  }
+
+  /** Snapshot an open turn before a restart kills it. */
+  private captureInterruptedTurn(
+    handle: AgentHandle | null,
+    agent: SupervisedAgent,
+  ): InterruptedTurn | null {
+    if (handle === null) return null;
+    const hadOpenTurn = agent.openTurn || agent.openControl;
+    let pending: PendingTurn | null = null;
+    if (handle.pendingTurn !== undefined) {
+      try {
+        pending = handle.pendingTurn();
+      } catch (error) {
+        this.log('warn', 'pending-turn snapshot failed — the lane will be signalled instead', {
+          agent_id: agent.agentId,
+          error: String(error),
+        });
+      }
+    }
+    if (pending === null && !hadOpenTurn) return null;
+    return { pending, hadOpenTurn, originAgentId: agent.agentId };
+  }
+
+  /**
+   * After a successful restart rung: re-deliver the interrupted turn's
+   * prompt on the resumed session, or — when the runtime could not name
+   * it — post a durable action-required note naming job + branch + phase
+   * so the lane is visibly recoverable, not archaeology.
+   */
+  private recoverInterruptedTurn(
+    agent: SupervisedAgent,
+    handle: AgentHandle,
+    reason: string,
+  ): void {
+    const recovery = agent.pendingRecovery;
+    if (recovery === null) return;
+    agent.pendingRecovery = null;
+    const laneAgentId = recovery.originAgentId;
+    const pending = recovery.pending;
+    if (
+      pending !== null &&
+      (pending.text.trim() !== '' || (pending.images !== undefined && pending.images.length > 0))
+    ) {
+      this.recordEvent('supervision.turn-recovery', laneAgentId, {
+        disposition: 'resume-attempted',
+        reason,
+        owner: pending.owner,
+      });
+      this.log('info', 're-delivering the interrupted turn on the restarted session', {
+        agent_id: laneAgentId,
+        reason,
+        owner: pending.owner,
+      });
+      try {
+        void handle
+          .prompt(pending.text, {
+            ...(pending.owner !== null ? { owner: pending.owner } : {}),
+            ...(pending.images !== undefined ? { images: pending.images } : {}),
+          })
+          .then(() => {
+            this.recordEvent('supervision.turn-recovery', laneAgentId, {
+              disposition: 'resumed',
+              reason,
+            });
+            this.log('info', 'interrupted turn resumed on the restarted session', {
+              agent_id: laneAgentId,
+              reason,
+            });
+          })
+          .catch((error: unknown) => {
+            this.log('error', 'interrupted turn could not be resumed — posting recoverable-lane note', {
+              agent_id: laneAgentId,
+              reason,
+              error: String(error),
+            });
+            this.postOrphanedTurn(laneAgentId, reason, String(error));
+          });
+      } catch (error) {
+        // A synchronous throw still never orphans: fall through to the note.
+        this.postOrphanedTurn(laneAgentId, reason, String(error));
+      }
+      return;
+    }
+    this.postOrphanedTurn(
+      laneAgentId,
+      reason,
+      pending === null
+        ? 'the runtime did not expose the pending prompt'
+        : 'the pending prompt was empty',
+    );
+  }
+
+  private postOrphanedTurn(laneAgentId: string, reason: string, detail: string): void {
+    const lane = this.laneContext(laneAgentId);
+    this.recordEvent('supervision.turn-recovery', laneAgentId, {
+      disposition: 'orphaned',
+      reason,
+      note: detail,
+    });
+    try {
+      this.notifications.postIncident({
+        kind: `supervision.turn-orphaned.${laneAgentId}`,
+        routing: 'action-required',
+        severity: 'error',
+        title: `Interrupted turn not auto-resumed: ${laneAgentId}`,
+        detail:
+          `Supervision interrupted an open turn (${reason}) and could not re-deliver its prompt (${detail}). ` +
+          `The lane is recoverable: ${lane}.`,
+        agentId: laneAgentId,
+        dedupe: 'unacked',
+      });
+    } catch (error) {
+      this.log('warn', 'orphaned-turn note could not be posted', {
+        agent_id: laneAgentId,
+        error: String(error),
+      });
+    }
+  }
+
+  /** Durable ledger event that never breaks the watchdog on a ledger fault. */
+  private recordEvent(kind: string, agentId: string | null, payload: Record<string, unknown>): void {
+    try {
+      this.ledger.appendCustomEvent({ kind, agentId, payload });
+    } catch (error) {
+      this.log('warn', 'supervision ledger event could not be recorded', {
+        kind,
+        error: String(error),
+      });
+    }
   }
 
   /** Trip the crash-loop breaker: stop the agent, escalate, mark. */
@@ -1063,6 +1371,13 @@ export class Supervisor {
     agent.breakerOpen = true;
     agent.state = 'stopped';
     const handle = agent.handle;
+    // The turn this trip kills must survive as a recovery candidate: the
+    // ack re-arm resumes it on the next live handle.
+    const captured = this.captureInterruptedTurn(handle, agent);
+    if (captured !== null) agent.pendingRecovery = captured;
+    agent.openTurn = false;
+    agent.openControl = false;
+    agent.openToolCalls.clear();
     agent.handle = null;
     this.ledger.appendCustomEvent({
       kind: 'supervision.breaker',
@@ -1147,6 +1462,7 @@ export class Supervisor {
         restarts: agent.restartRing.length,
         breakerOpen: agent.breakerOpen,
         openTurn: agent.openTurn,
+        openToolCalls: agent.openToolCalls.size,
         lastEventAt:
           agent.lastEventAt > 0 ? new Date(agent.lastEventAt).toISOString() : null,
         lastFileBytes: agent.lastFileBytes,
@@ -1166,6 +1482,7 @@ export class Supervisor {
       restarts: agent.restartRing.length,
       breakerOpen: agent.breakerOpen,
       openTurn: agent.openTurn,
+      openToolCalls: agent.openToolCalls.size,
       lastEventAt:
         agent.lastEventAt > 0 ? new Date(agent.lastEventAt).toISOString() : null,
       lastFileBytes: agent.lastFileBytes,

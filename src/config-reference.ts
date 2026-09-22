@@ -307,7 +307,7 @@ export function renderReferenceConfig(
     '[supervision]',
     '# Agent watchdog and crash-loop breaker (see SUPERVISION.md).',
     `enabled = ${supervision.enabled}`,
-    `# Open turn with no runtime event and no session growth for this long = hung.`,
+    `# Open turn with no runtime event, no session growth, and no live tool = hung.`,
     `turn_silence_ms = ${supervision.turnSilenceMs}`,
     `# >= max_restarts within this rolling window trips the breaker.`,
     `restart_window_ms = ${supervision.restartWindowMs}`,

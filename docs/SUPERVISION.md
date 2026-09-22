@@ -29,6 +29,35 @@ session jsonl — resets the turn-silence clock. A slow-but-alive tool run
 never trips the watchdog; a turn silent past `turn_silence_ms` (default
 15 min) is hung and climbs the ladder.
 
+**An open tool call is activity, not silence.** A tool that produces no
+output — `npx vitest run` with its output redirected, a quiet build —
+leaves the event surface silent for its whole run. Runtimes therefore
+emit a periodic long-tool heartbeat (`tool_update` "still running" per
+open call, cadence = a quarter of the silence window, capped at 1 min)
+and expose a live-process probe; the supervisor consults the probe at the
+silence threshold and resets the clock rather than killing the process
+(it fails toward NOT killing live work). A turn with no events, no
+growth, and no live tool is still hung and climbs the ladder; a probe
+error reads as live.
+
+**Sleep/wake is not a hang.** A watchdog tick separated from the
+previous one by a wall-clock gap beyond the tick cadence means the
+machine was suspended; every open turn gets a fresh silence window, a
+`supervision.wake` ledger event records the gap, and an FYI notification
+names the affected lanes (job, branch, phase). Nothing is restarted on
+wake.
+
+**Interrupted turns are resumed, never silently orphaned.** Before a
+restart rung (or a wall stop / breaker trip) kills an open turn, the
+supervisor snapshots the runtime's `pendingTurn` (prompt text, owner,
+images). After the resumed session comes up, the prompt is re-delivered
+under the same single-writer owner; the recovery attempt and outcome are
+recorded as `supervision.turn-recovery` events. When the runtime cannot
+name the prompt (or the re-delivery fails), the supervision posts an
+**action-required** `supervision.turn-orphaned.<agent>` note naming the
+lane (job, branch, worktree, job phase), so recovery is a lane action,
+not archaeology.
+
 **Restart ladder.** A hang or a *fatal* runtime error triggers one
 restart rung: dispose the wedged handle (its pending prompts reject),
 respawn with `resumeFile` (crash = resume — the conversation survives),
@@ -67,14 +96,14 @@ agent across a service restart.
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | supervision off = pure registry behavior |
-| `turn_silence_ms` | `900000` | open turn with no event/byte growth this long = hung |
+| `turn_silence_ms` | `900000` | open turn with no event, no byte growth, and no live tool process this long = hung |
 | `restart_window_ms` | `600000` | rolling breaker window |
 | `max_restarts` | `3` | restarts allowed per window before the breaker trips |
 | `restart_backoff_ms` | `2000` | base backoff between failed rungs (doubling, 60 s cap) |
 
 `/health` carries the full supervision state under `supervision`:
 per-agent state (`watching`/`restarting`/`stopped`), restart counts, breaker
-flags, watchdog config.
+flags, open tool-call counts, watchdog config.
 
 ## Notifications
 
@@ -157,7 +186,14 @@ owns un-hanging the turn itself; `timeoutMs` is caller-side relief.
 `test/supervisor.test.ts` drives a controllable runtime: a killed stub
 agent climbs the ladder and is restored (resumed from its session file);
 three fast failures trip the breaker exactly once with an action-required
-notification; an ack re-arms; in-band errors never restart.
+notification; an ack re-arms; in-band errors never restart. The same
+suite pins the hung-turn follow-ups: a live open tool never trips the
+watchdog, heartbeats keep a quiet run alive, an interrupted turn is
+re-delivered on the resumed session, an unresumable turn posts its
+recoverable-lane note, and a sleep/wake gap grants a fresh window.
+`test/tool-heartbeat.test.ts` covers the heartbeat cadence/stop/dispose
+contract; the pi and claude adapter suites prove a long quiet bash run
+heartbeats end to end and answers the live-process probe.
 `test/notifications.test.ts` covers the ack round-trip end to end
 (post → show → ack → events + board snapshot fields). OS units are
 covered by `install.sh --print` rendering tests (path escaping,

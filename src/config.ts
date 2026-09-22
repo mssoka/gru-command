@@ -55,7 +55,8 @@ export interface ThinkingConfig {
 export interface SupervisionConfig {
   readonly enabled: boolean;
   /** A streaming/spawning turn with no runtime event AND no session-file
-   * growth for this long is hung (E3's turn-liveness deferral, E7 home). */
+   * growth AND no live tool process for this long is hung (E3's
+   * turn-liveness deferral, E7 home). */
   readonly turnSilenceMs: number;
   /** Rolling crash-loop window; ≥ max_restarts inside it trips the breaker. */
   readonly restartWindowMs: number;

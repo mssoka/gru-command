@@ -188,6 +188,19 @@ export interface PromptOptions {
   readonly timeoutMs?: number;
 }
 
+/**
+ * The turn a handle is currently executing, as far as the runtime can
+ * describe it. Supervision snapshots this BEFORE killing an open turn so
+ * the restarted session can be handed the same prompt again instead of
+ * silently orphaning the lane (E7 hung-turn false-positive fix).
+ */
+export interface PendingTurn {
+  readonly text: string;
+  /** Single-writer owner the prompt was delivered under, when known. */
+  readonly owner: string | null;
+  readonly images?: PromptOptions['images'];
+}
+
 /** One live agent session hosted by a runtime. */
 export interface AgentHandle {
   readonly role: Role;
@@ -212,6 +225,21 @@ export interface AgentHandle {
   steer(text: string, options?: PromptOptions): Promise<void>;
   /** Queue a message for after the current turn completes. */
   followUp(text: string, options?: PromptOptions): Promise<void>;
+  /**
+   * Live-work probe: does this session have a tool/process genuinely
+   * executing right now? Supervision consults it before treating an open
+   * turn as hung — an open tool call with a live process is activity, not
+   * silence (E7). Runtimes that cannot tell omit it; the event/byte-growth
+   * rule then remains the only evidence.
+   */
+  readonly hasLiveProcess?: () => boolean;
+  /**
+   * The prompt behind the currently-open turn, snapshotted by supervision
+   * before a restart so it can re-deliver it on the resumed session.
+   * Runtimes that cannot name the live prompt omit it; supervision then
+   * posts a durable recoverable-lane note instead of resuming.
+   */
+  readonly pendingTurn?: () => PendingTurn | null;
   /** Current native/provider context usage, or null when unavailable/stale. */
   readonly getContextUsage?: () => ContextUsage | null;
   /** Run the runtime's native context compaction on this same session. */

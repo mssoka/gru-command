@@ -30,12 +30,14 @@ import type {
   AgentState,
   ContextUsage,
   NativeAgentTool,
+  PendingTurn,
   PromptOptions,
   RuntimeEvent,
   RuntimeEventListener,
   RuntimeHealth,
   SpawnOptions,
 } from './types.js';
+import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -123,6 +125,8 @@ export interface PiRuntimeOptions {
   readonly agentDir?: string;
   /** Tests inject a runtime pre-loaded with a stub provider. */
   readonly modelRuntime?: ModelRuntime;
+  /** Test seam: override the long-tool heartbeat cadence. */
+  readonly toolHeartbeatMs?: number;
   readonly log?: Log;
 }
 
@@ -171,6 +175,9 @@ export class PiRuntime implements AgentRuntime {
   private readonly store: SessionStore;
   private readonly agentDir: string;
   private readonly log: Log;
+  /** Long-tool heartbeat cadence override; derived from the supervision
+   * window at spawn when unset (construction must not touch config). */
+  private readonly toolHeartbeatMs: number | null;
   private readonly handles = new Set<PiAgentHandle>();
   /** Normalized session paths currently hosted by this process (B4). */
   private readonly activeFiles = new Set<string>();
@@ -183,6 +190,12 @@ export class PiRuntime implements AgentRuntime {
     this.agentDir = opts.agentDir ?? getAgentDir();
     this.log = opts.log ?? (() => {});
     this.modelRuntime = opts.modelRuntime;
+    this.toolHeartbeatMs = opts.toolHeartbeatMs ?? null;
+  }
+
+  /** Long-tool heartbeat cadence for a new handle (config-derived). */
+  private heartbeatMs(): number {
+    return this.toolHeartbeatMs ?? toolHeartbeatIntervalMs(this.config.supervision.turnSilenceMs);
   }
 
   private async runtime(): Promise<ModelRuntime> {
@@ -403,6 +416,7 @@ export class PiRuntime implements AgentRuntime {
           this.handles.delete(handle);
           this.activeFiles.delete(sessionFile);
         },
+        this.heartbeatMs(),
       );
       this.handles.add(handle);
       this.down = undefined;
@@ -477,6 +491,11 @@ export class PiAgentHandle implements AgentHandle {
   private stateError: string | undefined;
   private liveOwner: string | null = null;
   private liveTurn: Promise<void> | null = null;
+  /** The text/images behind the live turn — supervision's resume snapshot. */
+  private livePromptText: string | null = null;
+  private livePromptImages: PromptOptions['images'] | undefined;
+  /** Long-tool heartbeats: an open tool call keeps the event surface alive. */
+  private readonly toolHeartbeat: ToolHeartbeat;
   private readonly queue: QueuedMessage[] = [];
   private readonly listeners = new Set<RuntimeEventListener>();
   /** Covers the await gap before Pi exposes session.isCompacting. */
@@ -517,6 +536,7 @@ export class PiAgentHandle implements AgentHandle {
     private readonly store: SessionStore,
     private readonly log: Log,
     private readonly onDispose: () => void = () => {},
+    toolHeartbeatMs = 60_000,
   ) {
     this.role = role;
     this.id = session.sessionId;
@@ -527,6 +547,7 @@ export class PiAgentHandle implements AgentHandle {
     // session (SPEC ruling 1). Two distinct sessions always differ, so a
     // stranger's steer/followUp queues instead of passing natively.
     this.principal = `handle:${this.id}`;
+    this.toolHeartbeat = new ToolHeartbeat((event) => this.emit(event), toolHeartbeatMs);
     session.subscribe((event) => this.onPiEvent(event));
   }
 
@@ -536,6 +557,25 @@ export class PiAgentHandle implements AgentHandle {
       this.listeners.delete(listener);
     };
   }
+
+  /**
+   * Live-process probe (E7): supervision consults this before killing a
+   * silent turn. A tool call that has started and not returned is the
+   * runtime's evidence that work is genuinely in flight — for the bash
+   * tool that is a live child process; for in-process tools the loop is
+   * occupied. Either way: activity, never a hang.
+   */
+  hasLiveProcess = (): boolean => !this.disposed && this.toolHeartbeat.openCalls > 0;
+
+  /** The live turn's prompt — snapshotted by supervision before a restart. */
+  pendingTurn = (): PendingTurn | null => {
+    if (this.liveTurn === null || this.livePromptText === null) return null;
+    return {
+      text: this.livePromptText,
+      owner: this.liveOwner,
+      ...(this.livePromptImages !== undefined ? { images: this.livePromptImages } : {}),
+    };
+  };
 
   health() {
     return {
@@ -705,6 +745,7 @@ export class PiAgentHandle implements AgentHandle {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.toolHeartbeat.dispose();
     if (this.compactionEndTimer !== null) clearTimeout(this.compactionEndTimer);
     this.compactionEndTimer = null;
     const abortCompaction =
@@ -785,6 +826,8 @@ export class PiAgentHandle implements AgentHandle {
 
   private runTurn(text: string, owner: string, images?: PromptOptions['images']): Promise<void> {
     this.liveOwner = owner;
+    this.livePromptText = text;
+    this.livePromptImages = images;
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
     if (mapped !== undefined) promptOptions['images'] = mapped;
@@ -803,6 +846,8 @@ export class PiAgentHandle implements AgentHandle {
         if (this.liveTurn === turn) {
           this.liveTurn = null;
           this.liveOwner = null;
+          this.livePromptText = null;
+          this.livePromptImages = undefined;
           if (!this.disposed && this.state !== 'error') this.setState('idle');
           void this.drain();
         }
@@ -895,6 +940,10 @@ export class PiAgentHandle implements AgentHandle {
         return;
       case 'agent_end':
         if (e['willRetry'] === true) return; // retry keeps the turn live
+        // All tool executions are done by now; forget any call whose
+        // terminal event never arrived (error paths) so stale heartbeats
+        // cannot keep a dead turn looking alive.
+        this.toolHeartbeat.clear();
         // An errored turn stays 'error' (sticky until the next turn starts);
         // a clean turn settles to idle (or keeps streaming between turns).
         if (this.state !== 'error') {
@@ -961,6 +1010,7 @@ export class PiAgentHandle implements AgentHandle {
         return;
       }
       case 'tool_execution_start':
+        this.toolHeartbeat.started(String(e['toolCallId']), String(e['toolName']));
         this.emit({
           type: 'tool_start',
           callId: String(e['toolCallId']),
@@ -971,6 +1021,7 @@ export class PiAgentHandle implements AgentHandle {
         this.emit({ type: 'tool_update', callId: String(e['toolCallId']) });
         return;
       case 'tool_execution_end':
+        this.toolHeartbeat.ended(String(e['toolCallId']));
         this.emit({
           type: 'tool_end',
           callId: String(e['toolCallId']),

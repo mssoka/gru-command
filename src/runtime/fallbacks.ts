@@ -4,6 +4,7 @@ import type {
   AgentRuntime,
   AgentState,
   ContextUsage,
+  PendingTurn,
   PromptOptions,
   RuntimeEvent,
   RuntimeEventListener,
@@ -71,6 +72,8 @@ class FallbackHandle implements AgentHandle {
   readonly compact?: () => Promise<void>;
   readonly canCompact?: () => boolean;
   readonly isCompacting?: () => boolean;
+  readonly hasLiveProcess?: () => boolean;
+  readonly pendingTurn?: () => PendingTurn | null;
 
   /** A turn is being delivered by THIS pipeline (set+clear per-path only). */
   private inFlight = false;
@@ -93,6 +96,14 @@ class FallbackHandle implements AgentHandle {
     this.sessionFile = inner.sessionFile;
     if (inner.reviewIsolation === true) this.reviewIsolation = true;
     this.capabilities = inner.capabilities;
+    // E7 pass-throughs: supervision's live-process probe and resume snapshot
+    // must survive the queueing wrapper unchanged.
+    if (inner.hasLiveProcess !== undefined) {
+      this.hasLiveProcess = () => inner.hasLiveProcess!();
+    }
+    if (inner.pendingTurn !== undefined) {
+      this.pendingTurn = () => inner.pendingTurn!();
+    }
     if (inner.getContextUsage !== undefined) {
       this.getContextUsage = () => inner.getContextUsage!();
     }
