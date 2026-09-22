@@ -283,18 +283,26 @@ function startBoard(token: string): void {
   boardClient = new BoardClient(
     { token, host: location.host, secure },
     {
-      connection: () => {
-        /* the board degrades to its last snapshot; no banner needed */
+      connection: (state) => {
+        // The board degrades to its last snapshot; the nav dot carries the
+        // connection truth — including the stale window that used to read
+        // as "open" while the board was frozen.
+        renderConnectionDot(state);
       },
       snapshot: (snapshot) => {
         boardView?.render(snapshot);
         decisionStatusCard.render(snapshot.decisions);
+        // State joins the signature: a live agent turning disposed must
+        // re-list transcripts so the collapsed rows move behind the toggle.
+        const disposedAgents = new Set(
+          snapshot.agents.filter((agent) => agent.state === 'disposed').map((agent) => agent.id),
+        );
         const signature = snapshot.agents
-          .map((agent) => `${agent.id}:${agent.sessionFile ?? ''}`)
+          .map((agent) => `${agent.id}:${agent.state}:${agent.sessionFile ?? ''}`)
           .join('|');
         if (signature !== transcriptSignature) {
           transcriptSignature = signature;
-          transcriptView?.refreshList();
+          transcriptView?.refreshList(disposedAgents);
         }
       },
       fatal: (message) => {
@@ -316,6 +324,25 @@ function pair(token: string): void {
   storage.setItem(TOKEN_KEY, token);
   requestBrowserNotifications();
   startChat(token);
+}
+
+// ---------------------------------------------------------------------
+// Wake hooks: a slept tab resumes the board WITHOUT a manual reload.
+// A sleep-killed socket can fire no close event, so both clients re-verify
+// liveness on wake (force-reopen past the heartbeat window) and the board
+// refetches its snapshot unconditionally before the socket comes back.
+// ---------------------------------------------------------------------
+
+function wakeClients(): void {
+  boardClient?.wake();
+  client?.wake();
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') wakeClients();
+  });
+  window.addEventListener('online', () => wakeClients());
 }
 
 // Theme toggles stay in sync via a window event (nav + settings).

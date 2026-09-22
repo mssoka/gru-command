@@ -13,8 +13,10 @@ import {
   type BoardSnapshot,
   type JobView,
   type NotificationView,
+  type RoundView,
 } from '../lib/board-protocol.js';
 import type { BoardClient } from '../lib/board-client.js';
+import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
 
 const ROLE_EMOJI: Readonly<Record<string, string>> = {
@@ -41,7 +43,16 @@ export class BoardView {
   private readonly mount: HTMLElement;
   private readonly notificationBell: HTMLButtonElement;
   private readonly notificationPanel: HTMLElement;
+  private readonly decisionsChip: HTMLElement;
+  private readonly unackedChip: HTMLElement;
   private readonly onOpenTranscript: (request: TranscriptOpenRequest) => void;
+  /** Disposed rows are collapsed by default; the toggle state survives
+   * snapshot pushes so a live board does not re-open the graveyard. */
+  private disposedExpanded = false;
+  /** Age counters (lane age, round elapsed, streaming turn age): registered
+   * per render and refreshed by one shared ticker. */
+  private readonly ageNodes = new Set<HTMLElement>();
+  private ageTimer: ReturnType<typeof setInterval> | null = null;
   /** E7: notification receipts + acks ride the board client (optional —
    * the mock feed carries ack-ready rows without a client; rebound on
    * re-pair). */
@@ -64,6 +75,8 @@ export class BoardView {
     this.mount = mustGet('board-jobs');
     this.notificationBell = mustGet<HTMLButtonElement>('notification-bell');
     this.notificationPanel = mustGet('notification-panel');
+    this.decisionsChip = mustGet('board-decisions');
+    this.unackedChip = mustGet('board-unacked');
     this.onOpenTranscript = onOpenTranscript;
     this.boardClient = boardClient;
     this.notificationBell.addEventListener('click', () => {
@@ -96,10 +109,64 @@ export class BoardView {
   render(snapshot: BoardSnapshot): void {
     const previous = this.snapshot;
     this.snapshot = snapshot;
+    this.renderTrackers(snapshot);
     this.renderRepos(snapshot);
     this.renderAgents(snapshot.agents);
     this.renderNotifications(snapshot.notifications);
     this.surfaceNewNotifications(previous, snapshot.notifications);
+  }
+
+  // ------------------------------------------------------------------
+  // Trackers: decisions chip + unacked action-required badge
+  // ------------------------------------------------------------------
+
+  private renderTrackers(snapshot: BoardSnapshot): void {
+    const decisions = snapshot.decisions;
+    this.decisionsChip.className = `pp-chip board-decisions ${decisionChipTone(decisions.status)}`;
+    this.decisionsChip.dataset.state = decisions.status;
+    this.decisionsChip.textContent = `Jev: ${DECISION_LABELS[decisions.status]}`;
+    this.decisionsChip.title =
+      decisions.status === 'ready'
+        ? 'Decision routing is active (Jev triage).'
+        : decisions.reason === null
+          ? `Decision routing: ${decisions.status}.`
+          : `Decision routing: ${decisions.status} (${decisions.reason}).`;
+    const unacked = snapshot.unackedActionRequired;
+    this.unackedChip.hidden = unacked === 0;
+    this.unackedChip.textContent = `🔔 ${unacked} action-required`;
+    this.unackedChip.title = `${unacked} action-required notification${unacked === 1 ? '' : 's'} awaiting an ack`;
+  }
+
+  // ------------------------------------------------------------------
+  // Client-side age counters
+  // ------------------------------------------------------------------
+
+  private ageNode(className: string, since: string | null, prefix = '', suffix = ''): HTMLElement {
+    const node = el('span', className);
+    node.dataset.since = since ?? '';
+    node.dataset.prefix = prefix;
+    node.dataset.suffix = suffix;
+    this.refreshAge(node);
+    this.ageNodes.add(node);
+    return node;
+  }
+
+  private refreshAge(node: HTMLElement): void {
+    const since = node.dataset.since !== undefined && node.dataset.since !== '' ? node.dataset.since : null;
+    node.textContent = `${node.dataset.prefix ?? ''}${formatAge(since)}${node.dataset.suffix ?? ''}`;
+  }
+
+  private ensureAgeTicker(): void {
+    if (this.ageTimer !== null) return;
+    this.ageTimer = setInterval(() => {
+      for (const node of this.ageNodes) {
+        if (!node.isConnected) {
+          this.ageNodes.delete(node);
+          continue;
+        }
+        this.refreshAge(node);
+      }
+    }, 1_000);
   }
 
   get current(): BoardSnapshot | null {
@@ -146,28 +213,21 @@ export class BoardView {
     const meta = el('div', 'board-job__meta lbl');
     meta.textContent = `${job.id} · updated ${formatTs(job.updatedAt)}${job.baseBranch !== null ? ` · base ${job.baseBranch}` : ''}`;
     row.append(meta);
-    if (job.note !== null && job.note !== '') row.append(el('div', 'board-job__note', job.note));
-    for (const round of job.rounds) {
-      const roundRow = el('div', 'board-round');
-      const head = el('div', 'board-round__head');
-      head.append(
-        el('span', 'pp-chip pp-chip--perkins', `round ${round.seq}`),
-        el('span', 'lbl', round.status + (round.verdict !== null ? ` · ${round.verdict}` : '')),
+    if (job.lane !== null) {
+      const lane = el('div', 'board-lane');
+      lane.append(
+        el('span', 'pp-chip board-lane__branch', `🌿 ${job.lane.branch ?? 'detached'}`),
+        el('span', 'board-lane__base lbl', `⌂ ${job.lane.sha.slice(0, 8)}`),
+        this.ageNode('board-lane__age lbl', job.lane.createdAt, 'lane ', ''),
+        this.ageNode('board-lane__activity lbl', job.lastAgentActivity, 'agent ', ''),
       );
-      roundRow.append(head);
-      const chips = el('div', 'board-round__lenses');
-      for (const chip of round.lenses) {
-        const node = el(
-          'span',
-          `pp-chip board-lens ${lensChipTone(chip.state)}`,
-          `${LENS_STATE_LABEL[chip.state] ?? '?'} ${chip.lens}`,
-        );
-        if (chip.state === 'error') node.title = chip.note ?? 'lens errored';
-        chips.append(node);
+      if (job.lane.status !== 'active') {
+        lane.append(el('span', 'pp-chip pp-chip--park board-lane__status', job.lane.status));
       }
-      roundRow.append(chips);
-      row.append(roundRow);
+      row.append(lane);
     }
+    if (job.note !== null && job.note !== '') row.append(el('div', 'board-job__note', job.note));
+    for (const round of job.rounds) row.append(this.roundRow(round));
     if (job.prUrl !== null) {
       const link = el('a', 'board-job__pr', 'pull request ↗');
       link.href = job.prUrl;
@@ -178,6 +238,48 @@ export class BoardView {
     return row;
   }
 
+  private roundRow(round: RoundView): HTMLElement {
+    const roundRow = el('div', 'board-round');
+    const head = el('div', 'board-round__head');
+    head.append(
+      el('span', 'pp-chip pp-chip--perkins', `round ${round.seq}`),
+      el('span', 'lbl', round.status + (round.verdict !== null ? ` · ${round.verdict}` : '')),
+    );
+    roundRow.append(head);
+    const attempts = new Map(round.lensAttempts.map((entry) => [entry.lens, entry.attempts]));
+    const done = round.lenses.filter((chip) => chip.state === 'done').length;
+    const progress = el('div', 'board-round__progress');
+    progress.append(
+      el('span', 'lbl', `${done}/${round.lenses.length} lenses`),
+      this.ageNode('lbl board-round__elapsed', round.createdAt, '', ' elapsed'),
+    );
+    if (round.blockers > 0) {
+      progress.append(
+        el(
+          'span',
+          'pp-chip pp-chip--alert board-round__blockers',
+          `⛔ ${round.blockers} blocker${round.blockers === 1 ? '' : 's'}`,
+        ),
+      );
+    }
+    roundRow.append(progress);
+    const chips = el('div', 'board-round__lenses');
+    for (const chip of round.lenses) {
+      const attemptCount = attempts.get(chip.lens) ?? 0;
+      const node = el(
+        'span',
+        `pp-chip board-lens ${lensChipTone(chip.state)}${chip.verdict === 'blocker' ? ' board-lens--blocker' : ''}`,
+        `${LENS_STATE_LABEL[chip.state] ?? '?'} ${chip.lens}${attemptCount > 1 ? ` ×${attemptCount}` : ''}`,
+      );
+      if (chip.verdict === 'blocker') node.title = chip.note ?? 'lens recorded a blocker';
+      else if (chip.state === 'error') node.title = chip.note ?? 'lens errored';
+      else if (attemptCount > 1) node.title = `${attemptCount} attempts`;
+      chips.append(node);
+    }
+    roundRow.append(chips);
+    return roundRow;
+  }
+
   // ------------------------------------------------------------------
   // Agent rail
   // ------------------------------------------------------------------
@@ -185,44 +287,73 @@ export class BoardView {
   private renderAgents(agents: readonly AgentView[]): void {
     const rail = mustGet('board-agents');
     rail.replaceChildren();
+    this.ensureAgeTicker();
     if (agents.length === 0) {
       rail.append(el('div', 'lbl', 'no agents yet'));
       return;
     }
-    for (const agent of agents) {
-      const row = el('button', 'board-agent');
-      row.type = 'button';
-      row.title =
-        agent.sessionFile !== null
-          ? `${agent.id} — open transcript`
-          : `${agent.id} — no session file yet`;
-      row.addEventListener('click', () => {
-        if (agent.sessionFile !== null) {
-          this.onOpenTranscript({ file: agent.sessionFile ?? '', label: agentLabel(agent) });
-        }
-      });
-      row.append(
-        el('span', 'board-agent__emoji', ROLE_EMOJI[agent.role] ?? '🤖'),
-        el('span', 'board-agent__name', agentLabel(agent)),
-        el('span', `pp-chip board-agent__state ${agentStateTone(agent.state)}`, agent.state),
+    // Liveness-first order arrives from the server; disposed rows collapse
+    // behind a toggle so the graveyard never crowds live work.
+    const live = agents.filter((agent) => agent.state !== 'disposed');
+    const disposed = agents.filter((agent) => agent.state === 'disposed');
+    for (const agent of live) rail.append(this.agentRow(agent, false));
+    if (disposed.length > 0) {
+      const toggle = el(
+        'button',
+        'board-agent-toggle',
+        `${this.disposedExpanded ? '▾' : '▸'} ${disposed.length} disposed`,
       );
-      // E7: supervision mark — a stopped (breaker-tripped) or restarting
-      // agent shows its supervision state on the rail.
-      if (agent.supervision !== null && agent.supervision !== undefined) {
-        const supervision = agent.supervision;
-        if (supervision.state === 'stopped' || supervision.state === 'restarting') {
-          row.append(
-            el(
-              'span',
-              `pp-chip board-agent__supervision ${supervision.state === 'stopped' ? 'pp-chip--alert' : 'pp-chip--work'}`,
-              supervision.state === 'stopped' ? '⛔ stopped' : '⏳ restarting',
-            ),
-          );
-          row.title += ` · supervision: ${supervision.state} (${supervision.restarts} restarts)`;
-        }
+      toggle.type = 'button';
+      toggle.setAttribute('aria-expanded', String(this.disposedExpanded));
+      toggle.addEventListener('click', () => {
+        this.disposedExpanded = !this.disposedExpanded;
+        this.renderAgents(agents);
+      });
+      rail.append(toggle);
+      if (this.disposedExpanded) {
+        for (const agent of disposed) rail.append(this.agentRow(agent, true));
       }
-      rail.append(row);
     }
+  }
+
+  private agentRow(agent: AgentView, disposed: boolean): HTMLElement {
+    const row = el('button', `board-agent${disposed ? ' board-agent--disposed' : ''}`);
+    row.type = 'button';
+    row.title =
+      agent.sessionFile !== null
+        ? `${agent.id} — open transcript`
+        : `${agent.id} — no session file yet`;
+    row.addEventListener('click', () => {
+      if (agent.sessionFile !== null) {
+        this.onOpenTranscript({ file: agent.sessionFile ?? '', label: agentLabel(agent) });
+      }
+    });
+    row.append(
+      el('span', 'board-agent__emoji', ROLE_EMOJI[agent.role] ?? '🤖'),
+      el('span', 'board-agent__name', agentLabel(agent)),
+    );
+    // Turn-age counter: a streaming agent shows how long its current turn
+    // has been quiet — the operator's "is it stuck?" glance.
+    if (agent.state === 'streaming') {
+      row.append(this.ageNode('board-agent__age lbl', agent.lastActivity, '', ' quiet'));
+    }
+    row.append(el('span', `pp-chip board-agent__state ${agentStateTone(agent.state)}`, agent.state));
+    // E7: supervision mark — a stopped (breaker-tripped) or restarting
+    // agent shows its supervision state on the rail.
+    if (agent.supervision !== null && agent.supervision !== undefined) {
+      const supervision = agent.supervision;
+      if (supervision.state === 'stopped' || supervision.state === 'restarting') {
+        row.append(
+          el(
+            'span',
+            `pp-chip board-agent__supervision ${supervision.state === 'stopped' ? 'pp-chip--alert' : 'pp-chip--work'}`,
+            supervision.state === 'stopped' ? '⛔ stopped' : '⏳ restarting',
+          ),
+        );
+        row.title += ` · supervision: ${supervision.state} (${supervision.restarts} restarts)`;
+      }
+    }
+    return row;
   }
 
   // ------------------------------------------------------------------
@@ -335,4 +466,19 @@ function formatTs(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+/** Compact age for the live trackers (`12s`, `4m`, `2h`, `3d`); null and
+ * unparseable stamps render an honest em dash, never a fake number. */
+function formatAge(iso: string | null, now = Date.now()): string {
+  if (iso === null) return '—';
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return '—';
+  const seconds = Math.max(0, Math.floor((now - then) / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
 }

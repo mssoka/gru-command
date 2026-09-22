@@ -12,6 +12,14 @@ export interface LensChipView {
   readonly state: string;
   readonly agentId: string | null;
   readonly note: string | null;
+  /** Verdict parsed off the outcome note (`blocker — evidence`); null until one lands. */
+  readonly verdict: string | null;
+}
+
+/** One lens's retry count inside a round. */
+export interface LensAttemptView {
+  readonly lens: string;
+  readonly attempts: number;
 }
 
 export interface RoundView {
@@ -20,8 +28,19 @@ export interface RoundView {
   readonly status: string;
   readonly verdict: string | null;
   readonly targetRef: string | null;
+  readonly createdAt: string;
   readonly updatedAt: string;
   readonly lenses: readonly LensChipView[];
+  readonly lensAttempts: readonly LensAttemptView[];
+  readonly blockers: number;
+}
+
+/** The job's managed worktree lane (branch, base sha, age). */
+export interface LaneView {
+  readonly branch: string | null;
+  readonly sha: string;
+  readonly status: string;
+  readonly createdAt: string;
 }
 
 export interface JobView {
@@ -34,6 +53,8 @@ export interface JobView {
   readonly baseBranch: string | null;
   readonly note: string | null;
   readonly rounds: readonly RoundView[];
+  readonly lane: LaneView | null;
+  readonly lastAgentActivity: string | null;
 }
 
 export interface AgentView {
@@ -86,6 +107,7 @@ export interface BoardSnapshot {
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionStatusView;
+  readonly unackedActionRequired: number;
 }
 
 export interface TranscriptInfo {
@@ -135,6 +157,14 @@ export interface BoardAuthOkFrame {
   readonly type: 'auth_ok';
 }
 
+/** Application-level keepalive: the server proves liveness while the board
+ * is otherwise quiet; the client refreshes its stale clock on ANY frame.
+ * No sequence or snapshot semantics — a dropped ping is simply retried by
+ * the next one. */
+export interface BoardPingFrame {
+  readonly type: 'ping';
+}
+
 export interface BoardSnapshotFrame {
   readonly type: 'board';
   readonly snapshot: BoardSnapshot;
@@ -146,13 +176,14 @@ export interface BoardErrorFrame {
   readonly fatal: boolean;
 }
 
-export type BoardServerFrame = BoardAuthOkFrame | BoardSnapshotFrame | BoardErrorFrame;
+export type BoardServerFrame = BoardAuthOkFrame | BoardPingFrame | BoardSnapshotFrame | BoardErrorFrame;
 
 /** Parse + validate one inbound server frame; null when malformed. */
 export function parseBoardServerFrame(raw: unknown): BoardServerFrame | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const frame = raw as Record<string, unknown>;
   if (frame.type === 'auth_ok') return { type: 'auth_ok' };
+  if (frame.type === 'ping') return { type: 'ping' };
   if (frame.type === 'error' && typeof frame.message === 'string' && typeof frame.fatal === 'boolean') {
     return { type: 'error', message: frame.message, fatal: frame.fatal };
   }
@@ -203,12 +234,39 @@ export function isValidDecisionStatus(value: unknown): value is DecisionStatusVi
     Number(value.generation) >= 0;
 }
 
+function isLensAttempt(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.lens === 'string' &&
+    typeof value.attempts === 'number' &&
+    Number.isSafeInteger(value.attempts) &&
+    value.attempts >= 0
+  );
+}
+
+function isLane(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    (value.branch === null || typeof value.branch === 'string') &&
+    typeof value.sha === 'string' &&
+    typeof value.status === 'string' &&
+    typeof value.createdAt === 'string'
+  );
+}
+
 export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (!isRecord(value)) return false;
   if (!Array.isArray(value.repos) || !Array.isArray(value.agents) || !Array.isArray(value.notifications)) {
     return false;
   }
   if (!isValidDecisionStatus(value.decisions)) return false;
+  if (
+    typeof value.unackedActionRequired !== 'number' ||
+    !Number.isSafeInteger(value.unackedActionRequired) ||
+    value.unackedActionRequired < 0
+  ) {
+    return false;
+  }
   const agentsOk = value.agents.every(
     (agent) =>
       isRecord(agent) &&
@@ -248,15 +306,27 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
           typeof job.id === 'string' &&
           typeof job.title === 'string' &&
           typeof job.status === 'string' &&
+          (job.lane === null || isLane(job.lane)) &&
+          (job.lastAgentActivity === null || typeof job.lastAgentActivity === 'string') &&
           Array.isArray(job.rounds) &&
           job.rounds.every(
             (round) =>
               isRecord(round) &&
               typeof round.id === 'string' &&
               typeof round.status === 'string' &&
+              typeof round.createdAt === 'string' &&
+              typeof round.blockers === 'number' &&
+              Number.isSafeInteger(round.blockers) &&
+              round.blockers >= 0 &&
+              Array.isArray(round.lensAttempts) &&
+              round.lensAttempts.every(isLensAttempt) &&
               Array.isArray(round.lenses) &&
               round.lenses.every(
-                (chip) => isRecord(chip) && typeof chip.lens === 'string' && typeof chip.state === 'string',
+                (chip) =>
+                  isRecord(chip) &&
+                  typeof chip.lens === 'string' &&
+                  typeof chip.state === 'string' &&
+                  (chip.verdict === null || typeof chip.verdict === 'string'),
               ),
           ),
       ),

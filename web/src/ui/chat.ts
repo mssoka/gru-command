@@ -913,11 +913,14 @@ function joinRel(base: string, name: string): string {
   return base === '' ? name : `${base}/${name}`;
 }
 
-/** Map connection state onto the nav dot. */
-export function renderConnectionDot(state: ConnectionState): void {
+/** Map connection state onto the nav dot. 'stale' is the board's
+ * liveness-window state: the last snapshot is on screen but the socket is
+ * presumed dead (recovery already under way). */
+export function renderConnectionDot(state: ConnectionState | 'stale'): void {
   const dot = mustGet<HTMLElement>('conn-dot');
   dot.className = 'conn-dot';
   if (state === 'open') dot.classList.add('conn-dot--open');
+  else if (state === 'stale') dot.classList.add('conn-dot--stale');
   else if (state === 'connecting' || state === 'authenticating' || state === 'reconnecting')
     dot.classList.add('conn-dot--busy');
   else dot.classList.add('conn-dot--down');

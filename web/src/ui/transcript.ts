@@ -23,6 +23,11 @@ export class TranscriptView {
   private file: string | null = null;
   private nextCursor: number | null = null;
   private wrap = true;
+  /** Disposed sessions collapse behind a toggle (same convention as the
+   * agent rail); the toggle state survives list refreshes. */
+  private disposedExpanded = false;
+  private lastInfos: readonly TranscriptInfo[] = [];
+  private lastDisposed: ReadonlySet<string> = new Set();
 
   constructor(
     private readonly client: BoardClient,
@@ -53,25 +58,52 @@ export class TranscriptView {
     });
   }
 
-  /** Populate the transcript picker (agent rail → transcript list). */
-  renderList(infos: readonly TranscriptInfo[]): void {
+  /** Populate the transcript picker (agent rail → transcript list).
+   * Rows whose owner is a disposed agent collapse behind a toggle; rows
+   * with no known agent (old sessions) stay visible. */
+  renderList(infos: readonly TranscriptInfo[], disposedAgentIds: ReadonlySet<string> = new Set()): void {
+    this.lastInfos = infos;
+    this.lastDisposed = disposedAgentIds;
     this.listMount.replaceChildren();
     if (infos.length === 0) {
       this.listMount.append(el('div', 'lbl', 'no session transcripts yet'));
       return;
     }
-    for (const info of infos) {
-      const row = el('button', 'board-agent');
-      row.type = 'button';
-      row.addEventListener('click', () => void this.open(info));
-      const label = info.agentLabel !== null && info.agentLabel !== '' ? info.agentLabel : `${info.role || 'session'} · ${info.file.split('/').pop() ?? info.file}`;
-      row.append(
-        el('span', 'board-agent__emoji', info.role === '' ? '📄' : '🧾'),
-        el('span', 'board-agent__name', label),
-        el('span', 'lbl', formatSize(info.sizeBytes)),
+    const isDisposed = (info: TranscriptInfo): boolean =>
+      info.agentId !== null && disposedAgentIds.has(info.agentId);
+    const visible = infos.filter((info) => !isDisposed(info));
+    const disposed = infos.filter(isDisposed);
+    for (const info of visible) this.listMount.append(this.transcriptRow(info));
+    if (disposed.length > 0) {
+      const toggle = el(
+        'button',
+        'board-agent-toggle',
+        `${this.disposedExpanded ? '▾' : '▸'} ${disposed.length} disposed`,
       );
-      this.listMount.append(row);
+      toggle.type = 'button';
+      toggle.setAttribute('aria-expanded', String(this.disposedExpanded));
+      toggle.addEventListener('click', () => {
+        this.disposedExpanded = !this.disposedExpanded;
+        this.renderList(this.lastInfos, this.lastDisposed);
+      });
+      this.listMount.append(toggle);
+      if (this.disposedExpanded) {
+        for (const info of disposed) this.listMount.append(this.transcriptRow(info, true));
+      }
     }
+  }
+
+  private transcriptRow(info: TranscriptInfo, disposed = false): HTMLElement {
+    const row = el('button', `board-agent${disposed ? ' board-agent--disposed' : ''}`);
+    row.type = 'button';
+    row.addEventListener('click', () => void this.open(info));
+    const label = info.agentLabel !== null && info.agentLabel !== '' ? info.agentLabel : `${info.role || 'session'} · ${info.file.split('/').pop() ?? info.file}`;
+    row.append(
+      el('span', 'board-agent__emoji', info.role === '' ? '📄' : '🧾'),
+      el('span', 'board-agent__name', label),
+      el('span', 'lbl', formatSize(info.sizeBytes)),
+    );
+    return row;
   }
 
   async open(info: TranscriptInfo): Promise<void> {
@@ -215,10 +247,10 @@ export class TranscriptView {
     this.file = null;
   }
 
-  refreshList(): void {
+  refreshList(disposedAgentIds: ReadonlySet<string> = new Set()): void {
     void this.client
       .listTranscripts()
-      .then((res) => this.renderList(res.transcripts))
+      .then((res) => this.renderList(res.transcripts, disposedAgentIds))
       .catch(() => {
         /* the banner surface carries connection state */
       });

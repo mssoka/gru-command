@@ -199,15 +199,35 @@ function sampleSnapshot(): unknown {
                 status: 'live',
                 verdict: null,
                 targetRef: 'abc1234',
+                createdAt: new Date(Date.now() - 900_000).toISOString(),
                 updatedAt: new Date().toISOString(),
+                lensAttempts: [
+                  { lens: 'blind', attempts: 2 },
+                  { lens: 'edge', attempts: 1 },
+                  { lens: 'acceptance', attempts: 1 },
+                ],
+                blockers: 1,
                 lenses: LENSES.map((lens, index) => ({
                   lens,
                   state: index < 3 ? 'done' : index === 3 ? 'live' : index === 4 ? 'error' : 'pending',
                   agentId: `mock-lens-${lens}`,
-                  note: index === 4 ? 'provider cap hit' : null,
+                  note:
+                    index === 2
+                      ? 'blocker — retry path can double-charge'
+                      : index === 4
+                        ? 'provider cap hit'
+                        : null,
+                  verdict: index === 2 ? 'blocker' : null,
                 })),
               },
             ],
+            lane: {
+              branch: 'gru/demo-api-payment-fix',
+              sha: 'abc1234def5678',
+              status: 'active',
+              createdAt: new Date(Date.now() - 3_600_000).toISOString(),
+            },
+            lastAgentActivity: new Date(Date.now() - 45_000).toISOString(),
           },
           {
             id: 'demo-api-docs-pass',
@@ -219,6 +239,8 @@ function sampleSnapshot(): unknown {
             baseBranch: 'main',
             note: null,
             rounds: [],
+            lane: null,
+            lastAgentActivity: null,
           },
         ],
       },
@@ -235,16 +257,19 @@ function sampleSnapshot(): unknown {
             baseBranch: 'main',
             note: null,
             rounds: [],
+            lane: null,
+            lastAgentActivity: null,
           },
         ],
       },
     ],
     agents: [
       { id: 'mock-gru', role: 'gru', label: 'gru · chat', state: 'idle', lastActivity: new Date().toISOString(), sessionFile: 'gru/--demo--aa111111/mock-session.jsonl', jobId: null, roundId: null, supervision: { state: 'watching', restarts: 0, breakerOpen: false } },
-      { id: 'mock-silas', role: 'silas', label: 'silas · ops', state: 'streaming', lastActivity: new Date().toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: { state: 'watching', restarts: 1, breakerOpen: false } },
-      { id: 'mock-lens-blind', role: 'perkins', label: 'lens: blind', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: 'demo-api-payment-fix-r2', supervision: null },
+      { id: 'mock-silas', role: 'silas', label: 'silas · ops', state: 'streaming', lastActivity: new Date(Date.now() - 12_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: { state: 'watching', restarts: 1, breakerOpen: false } },
+      { id: 'mock-lens-blind', role: 'perkins', label: 'blind:001', state: 'idle', lastActivity: new Date(Date.now() - 300_000).toISOString(), sessionFile: null, jobId: null, roundId: 'demo-api-payment-fix-r2', supervision: null },
       { id: 'mock-minion', role: 'minion', label: 'demo-api-payment-fix', state: 'idle', lastActivity: null, sessionFile: null, jobId: 'demo-api-payment-fix', roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true } },
       { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: null, supervision: null },
+      { id: 'mock-gru-old', role: 'gru', label: 'gru · chat (retired)', state: 'disposed', lastActivity: new Date(Date.now() - 7_200_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
     ],
     notifications: [
       { id: 'mock-n1', ts: new Date().toISOString(), kind: 'job.status', routing: 'fyi', severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
@@ -263,6 +288,7 @@ function sampleSnapshot(): unknown {
       incarnation: 'mock-incarnation',
       generation: 1,
     },
+    unackedActionRequired: 1,
   };
 }
 
@@ -599,6 +625,16 @@ httpServer.on('upgrade', (request, socket, head) => {
   socket.destroy();
 });
 
+// Application-level keepalive parity with the service: the board client
+// refreshes its liveness clock on ANY frame, so a quiet dev board must see
+// pings or it would (correctly) declare its socket stale every window.
+const mockBoardHeartbeat = setInterval(() => {
+  for (const socket of boardClients) {
+    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping' }));
+  }
+}, 20_000);
+mockBoardHeartbeat.unref();
+
 boardServer.on('connection', (socket) => {
   let authed = false;
   const deadline = setTimeout(() => {
@@ -868,6 +904,7 @@ function handleUserFrame(socket: WebSocket, frame: UserFrame): boolean {
 }
 
 const shutdown = (): void => {
+  clearInterval(mockBoardHeartbeat);
   server.close();
   boardServer.close();
   httpServer.close(() => process.exit(0));

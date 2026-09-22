@@ -283,7 +283,11 @@ function makeClient(
   server: TestServer,
   storage: StorageLike,
   token = TOKEN,
-  options: { readonly contextTimeoutMs?: number } = {},
+  options: {
+    readonly contextTimeoutMs?: number;
+    readonly livenessWindowMs?: number;
+    readonly livenessCheckMs?: number;
+  } = {},
 ): Harness {
   const frames: LoggedFrame[] = [];
   const statuses: ChatMessage[] = [];
@@ -820,6 +824,41 @@ describe('ChatClient', () => {
     }
     await waitFor(() => h.frames.some((f) => f.type === 'error'));
     expect(h.client.getState()).toBe('open');
+  });
+
+  it('LIVENESS: a socket silent past the window force-reconnects and replays missed history exactly once', async () => {
+    const storage = memStorage();
+    const harness = makeClient(server, storage, TOKEN, { livenessWindowMs: 150, livenessCheckMs: 25 });
+    harness.client.connect();
+    await waitFor(() => harness.client.getState() === 'open');
+    await waitFor(() => harness.contexts.length >= 1);
+    expect(server.authCount).toBe(1);
+    const sent = harness.client.send('before sleep');
+    await waitFor(() =>
+      harness.statuses.some((m) => m.client_msg_id === sent.client_msg_id && m.status === 'acked'),
+    );
+    const frameCountBefore = harness.frames.length;
+    // Others chat while this tab sleeps: logged server-side, never delivered.
+    server.injectBackgroundTraffic('while-away');
+    // No frames reach the client; the liveness clock fires and recovery
+    // happens WITHOUT a manual reload (re-auth replays the missed turn).
+    await waitFor(() => server.authCount >= 2);
+    await waitFor(() => harness.frames.length > frameCountBefore);
+    expect(harness.frames.filter((f) => f.type === 'delta' && f.text === 'echo:while-away')).toHaveLength(1);
+    expect(harness.client.getState()).toBe('open');
+    // The already-acked word is not resurrected into a duplicate bubble.
+    expect(server.log.filter((l) => l.type === 'user' && l.client_msg_id === sent.client_msg_id)).toHaveLength(1);
+  });
+
+  it('LIVENESS: wake() re-opens a socket silent past the window without waiting out the backoff', async () => {
+    const storage = memStorage();
+    const harness = makeClient(server, storage, TOKEN, { livenessWindowMs: 100, livenessCheckMs: 60_000 });
+    harness.client.connect();
+    await waitFor(() => harness.client.getState() === 'open');
+    await new Promise((resolve) => setTimeout(resolve, 160)); // silence past the window
+    harness.client.wake();
+    await waitFor(() => server.authCount >= 2);
+    await waitFor(() => harness.client.getState() === 'open');
   });
 
   it('malformed frames are ignored without killing the session', async () => {

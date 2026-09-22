@@ -82,6 +82,13 @@ export interface ChatClientOptions {
   readonly initialMessages?: readonly ChatMessage[];
   /** Test/embedding seam; production default remains 5 seconds. */
   readonly contextTimeoutMs?: number;
+  /** No inbound frame for this long ⇒ the socket is presumed dead (the
+   * sleep-killed/zombie shape that fires no close event) and is force-
+   * reopened through the standard reconnect path. Default 2.5× the
+   * server's 30 s ping cadence. */
+  readonly livenessWindowMs?: number;
+  /** How often the liveness clock is checked. */
+  readonly livenessCheckMs?: number;
 }
 
 /** Minimal structural type over the browser WebSocket (and `ws` in tests). */
@@ -131,6 +138,8 @@ export const MAX_MESSAGE_CHARS = 4_000;
 /** A socket that never finishes handshaking is treated as down. */
 const CONNECT_TIMEOUT_MS = 10_000;
 const CONTEXT_TIMEOUT_MS = 5_000;
+const DEFAULT_LIVENESS_WINDOW_MS = 75_000;
+const DEFAULT_LIVENESS_CHECK_MS = 5_000;
 
 const BACKOFF_MS = [800, 1_600, 3_200, 6_400, 12_000] as const;
 
@@ -167,6 +176,10 @@ export class ChatClient {
   private readonly outbox: string[] = [];
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
   private contextDeadline: ReturnType<typeof setTimeout> | null = null;
+  /** Last inbound frame (any data, ping frames included). */
+  private lastFrameAt = 0;
+  private livenessTimer: ReturnType<typeof setInterval> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly options: ChatClientOptions,
@@ -210,8 +223,10 @@ export class ChatClient {
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
     this.contextDeadline = null;
+    this.reconnectTimer = null;
     this.socket?.close();
     this.socket = null;
+    this.startLivenessWatch();
     // Surface restored queued messages so the UI renders them as bubbles.
     for (const id of this.outbox) {
       const message = this.messages.get(id);
@@ -225,11 +240,82 @@ export class ChatClient {
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
     this.contextDeadline = null;
+    this.reconnectTimer = null;
+    this.stopLivenessWatch();
     this.socket?.close();
     this.socket = null;
     // onclose's stale-socket check returns early after nulling, so the
     // terminal transition is made here explicitly.
     this.setState('idle');
+  }
+
+  /**
+   * Wake hook (document visibilitychange → visible, window 'online').
+   * Re-verifies socket liveness without touching outbox/seq state: a
+   * socket silent past the window is force-reconnected, and a pending
+   * backoff timer is accelerated so a slept tab does not wait it out.
+   * Chat's missing history is recovered by the normal auth replay.
+   */
+  wake(): void {
+    if (this.stopped) return;
+    if (this.socket !== null) {
+      if (Date.now() - this.lastFrameAt > this.livenessWindowMs) this.forceReconnect();
+      return;
+    }
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.timers.delete(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.openSocket();
+    }
+  }
+
+  private get livenessWindowMs(): number {
+    return this.options.livenessWindowMs ?? DEFAULT_LIVENESS_WINDOW_MS;
+  }
+
+  private startLivenessWatch(): void {
+    if (this.livenessTimer !== null) return;
+    this.livenessTimer = setInterval(
+      () => this.checkLiveness(),
+      this.options.livenessCheckMs ?? DEFAULT_LIVENESS_CHECK_MS,
+    );
+  }
+
+  private stopLivenessWatch(): void {
+    if (this.livenessTimer !== null) clearInterval(this.livenessTimer);
+    this.livenessTimer = null;
+  }
+
+  /** A sleep-killed socket fires no close event — detect the silence and
+   * hand it to the reconnect path (which re-auths with last_seen_seq, so
+   * missed history replays and queued words still flush exactly once). */
+  private checkLiveness(): void {
+    if (this.stopped || this.socket === null) return;
+    if (Date.now() - this.lastFrameAt <= this.livenessWindowMs) return;
+    this.forceReconnect();
+  }
+
+  /** Detach + close a presumed-dead socket and schedule the standard
+   * reconnect. Detaching matters: a zombie close() may never fire, and a
+   * late close from the old socket must not double-schedule. */
+  private forceReconnect(): void {
+    const socket = this.socket;
+    this.socket = null;
+    if (socket !== null) {
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onclose = null;
+      socket.onerror = null;
+      try {
+        socket.close();
+      } catch {
+        /* already gone */
+      }
+    }
+    if (this.pendingCompactRequest !== null) this.pendingCompactRecovery = true;
+    this.setState('offline');
+    this.scheduleReconnect();
   }
 
   /** Queue-or-send a user message. An attachment-only message is legal
@@ -355,6 +441,9 @@ export class ChatClient {
     };
 
     socket.onmessage = (event) => {
+      // Bytes on the wire are the liveness proof; the parse decides whether
+      // there is anything to do with them.
+      this.lastFrameAt = Date.now();
       const frame = parseServerFrame(String(event.data));
       if (frame === null) {
         // Malformed frames are ignored loudly in devtools, never fatal.
@@ -383,6 +472,7 @@ export class ChatClient {
 
   private handleFrame(socket: SocketLike, frame: ServerFrame): void {
     if (socket !== this.socket) return; // stale socket from a prior attempt
+    if (frame.type === 'ping') return; // keepalive only — no seq, no state
     if (frame.type === 'auth_ok') {
       // Server restarted with a truncated/reset log: its high-water mark is
       // below what we already saw — resync with a full replay instead of
@@ -767,9 +857,11 @@ export class ChatClient {
     this.attempts += 1;
     const timer = setTimeout(() => {
       this.timers.delete(timer);
+      if (this.reconnectTimer === timer) this.reconnectTimer = null;
       this.openSocket();
     }, delay);
     this.timers.add(timer);
+    this.reconnectTimer = timer;
   }
 
   private readOutbox(): Array<{
