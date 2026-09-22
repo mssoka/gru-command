@@ -59,6 +59,10 @@ export interface PerkinsHybridReviewOptions {
     readonly phase: 'lead' | 'lens';
     readonly lens?: PerkinsLens;
     readonly chunk?: string;
+    /** Which wave attempt spawned this child (the retry-bound counter;
+     * 1 = first run). Callers minting agent labels suffix it on retries so
+     * two attempts on one chunk never mint duplicate rows. */
+    readonly attempt?: 1 | 2;
     readonly handle: AgentHandle;
   }) => void;
 }
@@ -741,7 +745,7 @@ export class PerkinsHybridReview {
           },
         }), CHILD_SPAWN_TIMEOUT_MS, [signal, input.signal]);
         registerIsolatedHandle(handle, 'lens');
-        this.onAgent({ phase: 'lens', lens, chunk, handle });
+        this.onAgent({ phase: 'lens', lens, chunk, attempt, handle });
         await boundedPrompt(
           handle,
           renderLensPrompt(this.policy, review, lens, chunk),

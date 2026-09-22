@@ -28,6 +28,7 @@ import type { AgentHandle } from '../src/runtime/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeHybridSpawner, type LeadBrainOptions } from './helpers/perkins-hybrid-double.js';
 
@@ -688,6 +689,16 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(outcome.round.lenses.every((chip) => chip.state === 'done' && chip.agentId === null)).toBe(true);
     expect(outcome.headMoved).toBe(false);
     expect(order.filter((entry) => entry.startsWith('model:'))).toHaveLength(9);
+    // The retried security lens registers TWO distinct agent rows: the
+    // second attempt is attempt-suffixed, never a duplicate label.
+    const roundLabels = ledger
+      .listAgents()
+      .filter((agent) => agent.roundId === outcome.round.id)
+      .map((agent) => agent.label);
+    const securityLabels = roundLabels.filter((label) => label?.startsWith('security:'));
+    expect(securityLabels).toHaveLength(2);
+    expect(securityLabels.some((label) => label?.endsWith('#2'))).toBe(true);
+    expect(new Set(roundLabels).size).toBe(roundLabels.length);
     expect(order[0]).toBe('model:lead');
     expect(poster.post).toHaveBeenCalledTimes(1);
     expect(poster.post.mock.calls[0]![0]).toMatchObject({ targetSha: target });
@@ -1414,5 +1425,15 @@ describe('fallback review timeout constant is exported and positive (V4 pin)', (
     const { FALLBACK_REVIEW_TIMEOUT_MS } = await import('../src/dispatch/perkins.js');
     expect(FALLBACK_REVIEW_TIMEOUT_MS).toBe(15 * 60 * 1_000);
     expect(FALLBACK_REVIEW_TIMEOUT_MS).toBeGreaterThan(0);
+  });
+});
+
+describe('lens agent labels are unique across retries', () => {
+  it('mints the classic label on attempt 1 and the attempt-suffixed label on retry', () => {
+    expect(lensAgentLabel('blind', '001', 1)).toBe('blind:001');
+    expect(lensAgentLabel('blind', '001', 2)).toBe('blind:001#2');
+    // A retry never collides with its first attempt.
+    expect(lensAgentLabel('blind', '001', 2)).not.toBe(lensAgentLabel('blind', '001', 1));
+    expect(lensAgentLabel('edge', 'a-01', 2)).toBe('edge:a-01#2');
   });
 });

@@ -35,6 +35,15 @@ import {
 
 export const FALLBACK_REVIEW_TIMEOUT_MS = 15 * 60 * 1_000;
 
+/** The agent-rail label for one Perkins lens child. First attempts mint
+ * the classic `${lens}:${chunk}`; a RETRY suffixes the wave's attempt
+ * counter (`blind:001#2`) so two attempts on one chunk can never collide
+ * into duplicate agent rows and transcript labels. */
+export function lensAgentLabel(lens: string, chunk: string, attempt: number): string {
+  const base = `${lens}:${chunk}`;
+  return attempt > 1 ? `${base}#${attempt}` : base;
+}
+
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 function redaction(_value: string): string {
@@ -1048,11 +1057,14 @@ export class WaveRunner {
     const workflow = new PerkinsHybridReview({
       spawner: this.opts.spawner,
       policy,
-      onAgent: ({ phase, lens, chunk, handle }) => {
+      onAgent: ({ phase, lens, chunk, attempt, handle }) => {
         this.opts.ledger.registerAgent({
           id: handle.id,
           role: 'perkins',
-          label: phase === 'lens' && lens !== undefined ? `${lens}:${chunk}` : 'lead',
+          label:
+            phase === 'lens' && lens !== undefined
+              ? lensAgentLabel(lens, chunk ?? '', attempt ?? 1)
+              : 'lead',
           sessionFile: handle.sessionFile,
           roundId: round.id,
           jobId: job.id,
