@@ -867,14 +867,14 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const configFile = record!.argv[record!.argv.indexOf('--mcp-config') + 1]!;
       bridgeDirectory = dirname(configFile);
       // The allowed native surface is EXACTLY the one declared tool — never
-      // the lead's orchestration five.
+      // the lead's orchestration tools.
       const allowed = (record!.argv[record!.argv.indexOf('--allowedTools') + 1] ?? '').split(',');
       expect(allowed.filter((tool) => tool.startsWith('mcp__'))).toEqual([
         'mcp__gru_perkins__perkins_submit_findings',
       ]);
       for (const leadTool of [
         'perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact',
-        'perkins_preflight_submission', 'perkins_submit_review',
+        'perkins_record_decision', 'perkins_preflight_submission', 'perkins_submit_review',
       ]) {
         expect(allowed.join(',')).not.toContain(leadTool);
       }

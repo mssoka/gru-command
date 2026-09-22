@@ -376,7 +376,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         customTools?: Array<{ name: string }>;
       };
       // The declared set is exposed EXACTLY: confined read tools plus the one
-      // declared native tool — never the lead's orchestration five.
+      // declared native tool — never the lead's orchestration tools.
       expect(options.tools).toEqual([
         'review_read',
         'review_grep',
