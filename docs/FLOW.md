@@ -84,9 +84,9 @@ the required coverage cardinality.
   may declare product-native tools, and the ADAPTER exposes exactly those
   declared tools on every harness: pi injects them in-process, claude-code
   attaches a session-scoped, product-owned MCP bridge. The lead declares
-  its five orchestration tools; a lens child that declares native tools
+  its six orchestration tools; a lens child that declares native tools
   gets only its own (for example a structured submit-findings channel) and
-  never sees the lead's five. That seam is harness-independent by design —
+  never sees the lead's six. That seam is harness-independent by design —
   review isolation and tool exposure live in the adapter implementation,
   never in caller branches on harness.
 - Child findings are evidence-paired at envelope construction: a finding that
