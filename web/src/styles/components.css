@@ -60,7 +60,7 @@ body {
 .pp-chip--done { background: var(--done); color: var(--on-state); }
 .pp-chip--rev { background: var(--rev); color: var(--on-state); }
 .pp-chip--alert { background: var(--alert); color: var(--on-state); }
-.pp-chip--park { background: var(--park); color: var(--faint); }
+.pp-chip--park { background: var(--park); color: var(--ink); }
 .pp-chip--perkins { background: var(--perkins); color: var(--on-state); }
 
 .pp-btn {
@@ -109,7 +109,7 @@ body {
 }
 
 .lbl {
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.18em;
   text-transform: uppercase;
   font-weight: 800;
@@ -159,7 +159,7 @@ body {
 
 .app-nav__title {
   font-size: 17px;
-  font-weight: 900;
+  font-weight: 800;
   letter-spacing: 0.01em;
 }
 
@@ -197,11 +197,120 @@ body {
 }
 
 .app-main {
-  max-width: 920px;
+  max-width: none;
   margin: 0 auto;
-  padding: 20px 16px 96px;
+  padding: 20px 20px 96px;
   display: grid;
-  gap: 18px;
+  gap: 16px;
+}
+
+/* The unpaired/settings cards stay a comfortable reading column even on
+   the full-estate console (the console itself is the wide surface). */
+#pairing-view,
+#settings-view {
+  width: min(920px, 100%);
+  justify-self: center;
+}
+/* ── The console (v5): full-estate, three panes on a wide viewport ── */
+
+.console {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+  min-width: 0;
+}
+
+/* The collapsed chat pane's slim rail: 🧠 + the unread pulse dot. */
+.console__rail {
+  display: none;
+  position: relative;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 88px;
+  padding: 0;
+  border: var(--outline);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  box-shadow: var(--shadow-card);
+  font-size: 24px;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+
+.console__rail:hover {
+  transform: translateY(-2px);
+}
+
+.console__rail:active {
+  transform: scale(0.94);
+}
+
+.console__rail-dot {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  background: var(--alert);
+  opacity: 0;
+}
+
+.console__rail[data-unread]:not([data-unread='0']) .console__rail-dot {
+  opacity: 1;
+  animation: rail-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes rail-pulse {
+  50% { opacity: 0.45; transform: scale(1.35); }
+}
+
+@media (min-width: 1280px) {
+  .console {
+    grid-template-columns: var(--console-chat-col, 380px) minmax(0, 1fr);
+    transition: grid-template-columns 0.18s ease;
+  }
+
+  .console--chat-collapsed {
+    --console-chat-col: 56px;
+  }
+
+  /* Chat pane: full height and pinned — the board scrolls, chat does not
+     leave the corner of the eye. 124px ≈ nav (72) + page padding +
+     breathing room, so the composer sits above the fold before pinning. */
+  .console__chat {
+    grid-area: 1 / 1;
+    min-width: 0;
+    position: sticky;
+    top: 84px;
+    height: calc(100vh - 124px);
+  }
+
+  .console--chat-collapsed .console__chat {
+    display: none;
+  }
+
+  .console__rail {
+    grid-area: 1 / 1;
+    position: sticky;
+    top: 84px;
+  }
+
+  .console--chat-collapsed .console__rail {
+    display: flex;
+  }
+
+  .console #chat-view {
+    height: 100%;
+  }
+
+  #board-view {
+    grid-area: 1 / 2;
+    min-width: 0;
+  }
 }
 
 /* Degraded-mode banner */
@@ -286,7 +395,9 @@ body {
 
 .chat-panel {
   display: grid;
-  grid-template-rows: minmax(240px, 52vh) auto auto;
+  /* Pane face: head, scrollable log, context controls, compose. Inside
+     the overlay sheet the head hides and row 1 collapses to 0. */
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
   overflow: hidden;
   position: relative;
 }
@@ -302,11 +413,57 @@ body {
 /* Panel children occupy one cell each, explicitly: the jump pill must
    OVERLAP the log's cell, and an explicitly placed grid item otherwise
    displaces auto-placed siblings into new rows — the log would leave its
-   capped 52vh scroll box and grow to its full content height (which also
+   capped scroll box and grow to its full content height (which also
    broke the bottom-distance math that drives auto-follow). */
-.chat-panel > .chat-log { grid-area: 1 / 1; }
-.chat-panel > .chat-context { grid-area: 2 / 1; }
-.chat-panel > .chat-compose { grid-area: 3 / 1; }
+.chat-panel > .chat-panel__head { grid-area: 1 / 1; }
+.chat-panel > .chat-log { grid-area: 2 / 1; }
+.chat-panel > .chat-context { grid-area: 3 / 1; }
+.chat-panel > .chat-compose { grid-area: 4 / 1; }
+
+/* The pane head: 🧠 Gru + the collapse affordance (v5). */
+.chat-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px 10px 16px;
+  border-bottom: var(--outline-thin);
+  background: var(--card);
+}
+
+.chat-panel__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+
+.chat-panel__glyph {
+  font-size: 16px;
+}
+
+.chat-panel__collapse {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  background: var(--soft);
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.chat-panel__collapse:hover {
+  background: var(--work);
+  color: var(--on-state);
+}
 
 .chat-log {
   overflow-y: auto;
@@ -321,11 +478,21 @@ body {
   overflow-anchor: none;
 }
 
+/* v5 empty state: a fresh console pane says hello instead of staring
+   blank (the log is `:empty` until the first message/frame lands). */
+.chat-log:empty::before {
+  content: 'Ask Gru anything, boss…';
+  margin: auto;
+  color: var(--faint);
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
 /* Jump-to-latest: overlays the log's bottom edge while auto-follow is
    disengaged (the reader is in history). It sits in the log's grid cell
    and never takes layout from the message column. */
 .chat-jump {
-  grid-area: 1 / 1;
+  grid-area: 2 / 1;
   align-self: end;
   justify-self: center;
   z-index: 2;
@@ -428,7 +595,7 @@ body {
   max-width: 100%;
   overflow-x: auto;
   border-collapse: collapse;
-  font-weight: 500;
+  font-weight: 600;
   font-size: 0.95em;
   line-height: 1.4;
 }
@@ -457,7 +624,7 @@ body {
   padding: 10px 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12.5px;
-  font-weight: 500;
+  font-weight: 600;
   line-height: 1.5;
   white-space: pre;
   tab-size: 2;
@@ -603,105 +770,127 @@ body {
   line-height: 1.45;
 }
 
-/* Mobile: chat becomes a corner bubble */
-.chat-bubble {
+/* The Gru FAB (v5): bottom-right, everywhere. At/above the console
+   breakpoint it toggles the chat pane; below it opens the overlay. */
+.gru-fab {
+  display: flex;
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 24;
+  width: 56px;
+  height: 56px;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  background: var(--work);
+  color: var(--on-state);
+  border: var(--outline);
+  border-radius: 999px;
+  box-shadow: var(--shadow-card);
+  cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.gru-fab:hover {
+  transform: translate(-1px, -1px);
+}
+
+.gru-fab:active {
+  transform: scale(0.92);
+  box-shadow: var(--shadow-btn-pressed);
+}
+
+.gru-fab__badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: var(--outline-thin);
+  background: var(--alert);
+  color: var(--on-state);
+  font-size: 11px;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gru-fab[data-unread='0'] .gru-fab__badge {
   display: none;
 }
 
-@media (max-width: 768px) {
-  .chat-panel--desktop {
-    display: none;
-  }
+/* Overlay chat (below the console breakpoint): the board stays visible
+   behind, dimmed by the scrim; the sheet carries the one chat panel. */
+.chat-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 28;
+  padding: 0;
+  border: 0;
+  background: rgba(20, 26, 43, 0.44);
+  cursor: pointer;
+  animation: scrim-in 0.18s ease;
+}
 
-  .chat-bubble {
-    display: flex;
-    position: fixed;
-    right: 16px;
-    bottom: 16px;
-    z-index: 20;
-    width: 62px;
-    height: 62px;
-    align-items: center;
-    justify-content: center;
-    font-size: 28px;
-    background: var(--work);
-    border: var(--outline);
-    border-radius: 999px;
-    box-shadow: var(--shadow-card);
-    cursor: pointer;
-    transition: transform 0.15s var(--ease-pop);
-  }
+@keyframes scrim-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 
-  .chat-bubble:active {
-    transform: scale(0.92);
-  }
+.chat-sheet {
+  position: fixed;
+  z-index: 30;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--paper);
+  transition: transform 0.18s ease;
+}
 
-  .chat-bubble__badge {
-    position: absolute;
-    top: -4px;
-    right: -4px;
-    min-width: 22px;
-    height: 22px;
-    padding: 0 6px;
-    border-radius: 999px;
-    border: var(--outline-thin);
-    background: var(--alert);
-    font-size: 11px;
-    font-weight: 900;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
+/* The mount constrains the panel; the log scrolls inside it. */
+.chat-sheet #chat-sheet-mount {
+  min-height: 0;
+  display: grid;
+}
 
-  .chat-bubble[data-unread='0'] .chat-bubble__badge {
-    display: none;
-  }
+.chat-sheet .chat-panel {
+  height: 100%;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: hidden;
+}
 
+.chat-sheet__grip {
+  justify-self: center;
+  width: 52px;
+  height: 8px;
+  margin: 10px 0 2px;
+  border-radius: 999px;
+  background: var(--line);
+  opacity: 0.35;
+  cursor: pointer;
+}
+
+/* Phone: the overlay is a bottom sheet. */
+@media (max-width: 899px) {
   .chat-sheet {
-    position: fixed;
     inset: auto 0 0 0;
-    z-index: 30;
     height: 82vh;
     max-height: 82vh;
-    background: var(--paper);
     border-top: var(--outline);
     border-radius: 22px 22px 0 0;
     box-shadow: 0 -6px 0 rgba(34, 48, 74, 0.13);
-    display: grid;
-    grid-template-rows: auto minmax(0, 1fr);
     transform: translateY(105%);
-    transition: transform 0.28s var(--ease-pop);
   }
 
   .chat-sheet[data-open='true'] {
     transform: translateY(0);
-  }
-
-  .chat-sheet__grip {
-    justify-self: center;
-    width: 52px;
-    height: 8px;
-    margin: 10px 0 2px;
-    border-radius: 999px;
-    background: var(--line);
-    opacity: 0.35;
-    cursor: pointer;
-  }
-
-  /* The mount constrains the panel; the log scrolls inside it. */
-  .chat-sheet #chat-sheet-mount {
-    min-height: 0;
-    display: grid;
-  }
-
-  .chat-sheet .chat-panel {
-    height: 100%;
-    min-height: 0;
-    grid-template-rows: minmax(0, 1fr) auto auto;
-    border: none;
-    border-radius: 0;
-    box-shadow: none;
-    overflow: hidden;
   }
 
   .chat-context {
@@ -716,6 +905,30 @@ body {
 
   .chat-context__button {
     flex: 1 1 130px;
+  }
+}
+
+/* Tablet/laptop overlay: a right drawer over the board + rail. The
+   panel head carries the ✕ close button here (the grip is a phone
+   affordance). */
+@media (min-width: 900px) and (max-width: 1279px) {
+  .chat-sheet {
+    top: 12px;
+    right: 12px;
+    bottom: 12px;
+    width: min(430px, 42vw);
+    border: var(--outline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-card);
+    transform: translateX(calc(100% + 24px));
+  }
+
+  .chat-sheet[data-open='true'] {
+    transform: translateX(0);
+  }
+
+  .chat-sheet .chat-sheet__grip {
+    display: none;
   }
 }
 
@@ -765,7 +978,7 @@ body {
   position: absolute;
   right: -4px;
   bottom: -15px;
-  font-weight: 950;
+  font-weight: 800;
   font-size: 54px;
   letter-spacing: -0.08em;
   color: var(--line);
@@ -791,7 +1004,7 @@ body {
   background: var(--park);
   text-align: center;
   font-size: 11px;
-  font-weight: 950;
+  font-weight: 800;
   letter-spacing: 0.16em;
 }
 
@@ -804,7 +1017,7 @@ body {
   margin: 0;
   max-width: 62ch;
   font-size: 13px;
-  font-weight: 750;
+  font-weight: 600;
   line-height: 1.4;
 }
 
@@ -885,11 +1098,20 @@ body {
 .board-view {
   display: grid;
   gap: 16px;
+  min-width: 0;
+}
+
+/* Center column: KPI strip + health row + trackers + bands. The side
+   rail (agents + transcripts) is the right pane of the board. */
+.board-main {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
 }
 
 .board-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 280px;
+  grid-template-columns: minmax(0, 1fr) var(--side-rail-col, 280px);
   gap: 16px;
   align-items: start;
 }
@@ -899,35 +1121,37 @@ body {
   gap: 16px;
 }
 
-/* v4 KPI strip: compact stat cards above the bands. All counts derive
-   from the same snapshot the cards render — never a second data source. */
+/* v4 KPI strip, v5 scale: calm cards, big tabular numerals, small-caps
+   labels. All counts derive from the same snapshot the cards render. */
 .board-kpis {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
 }
 
 .board-kpi {
-  flex: 1 1 180px;
-  min-width: 160px;
   display: grid;
-  gap: 4px;
-  padding: 10px 14px;
+  gap: 8px;
+  padding: 14px 16px;
 }
 
 .board-kpi__row {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 14px;
-  align-items: baseline;
+  gap: 8px 24px;
+  /* Top-aligned, not baseline-aligned: a stat with an extra age line must
+     not shift its whole row upward (the numbers all start on one line). */
+  align-items: start;
 }
 
+/* Number over label (over age): each stat is one calm stack, so the
+   numerals share a baseline and the labels never ripple into them. */
 .board-kpi__stat {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  font-size: 12px;
-  font-weight: 700;
+  display: inline-grid;
+  justify-items: start;
+  gap: 2px;
+  font-size: 11px;
+  font-weight: 600;
   color: var(--muted);
 }
 
@@ -935,54 +1159,85 @@ body {
   color: var(--ink);
 }
 
+/* The alert stat keeps ONE accent: the numeral itself. A filled pill
+   around a 28px digit read as a badge, not a KPI. */
 .board-kpi__stat--alert .board-kpi__value {
-  background: var(--alert);
-  border-radius: 999px;
-  padding: 0 8px;
+  color: var(--band-needs-you-ink);
 }
 
 .board-kpi__value {
-  font-size: 17px;
-  font-weight: 900;
+  font-size: 28px;
+  line-height: 1;
+  font-weight: 800;
   color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* v5 live-feel: a changed number ticks once (micro crossfade). */
+.board-kpi__value--tick {
+  animation: kpi-tick 0.16s ease;
+}
+
+@keyframes kpi-tick {
+  from { opacity: 0.2; transform: translateY(-2px); }
+  to { opacity: 1; transform: none; }
+}
+
+.board-kpi__label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
 }
 
 .board-kpi__age {
   color: var(--muted);
+  font-size: 11px;
 }
 
-/* v4 health row: one slim card per incident the operator must not
-   re-learn the hard way. `n/a` cards stay muted — absence is a fact,
-   not a zero. */
+/* v4 health row, v5 rhythm: one slim card per incident the operator
+   must not re-learn the hard way. `n/a` cards stay muted — absence is a
+   fact, not a zero. */
 .board-health {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
 }
 
 .board-health__card {
   position: relative;
-  flex: 1 1 150px;
-  min-width: 140px;
   display: grid;
-  gap: 3px;
-  padding: 9px 12px;
+  gap: 4px;
+  padding: 12px 14px;
+}
+
+.board-health__title {
+  font-size: 11px;
 }
 
 .board-health__value {
-  font-size: 15px;
-  font-weight: 900;
+  font-size: 20px;
+  line-height: 1.1;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
 }
 
 .board-health__detail {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--muted);
   overflow-wrap: anywhere;
+  /* Up to two lines, then ellipsis; the full sentence lives in the title
+     attr. One line clipped most cards mid-word. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .board-health__flag {
   justify-self: start;
-  font-size: 9px;
+  font-size: 10px;
   padding: 2px 8px;
 }
 
@@ -1003,64 +1258,151 @@ body {
 }
 
 .board-health__card--muted {
-  border-left: 6px solid var(--park);
+  border-left: 6px solid var(--muted);
 }
 
-/* v4 attention bands: priority first, repo grouping inside. */
+/* v4 attention bands, v5 estate: priority first, repo grouping inside.
+   Each band carries ONE accent (left edge + label pill only, never a
+   fill): NEEDS YOU warm red, IN FLIGHT yellow, SETTLED green, COLD gray. */
 .board-band {
   display: grid;
-  gap: 10px;
+  gap: 12px;
+  --band-accent: var(--park);
 }
+
+.board-band--needs-you { --band-accent: var(--band-needs-you); }
+.board-band--in-flight { --band-accent: var(--work); }
+.board-band--settled { --band-accent: var(--done); }
+.board-band--cold { --band-accent: var(--park); }
 
 .board-band__head {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: 10px;
   margin: 0;
   font-size: 13px;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
 }
 
 .board-band__label {
-  font-weight: 900;
-}
-
-.board-band--needs-you .board-band__label {
-  color: var(--ink);
-  background: var(--alert);
-  border-radius: 999px;
+  font-weight: 800;
   padding: 2px 10px;
+  border: var(--outline-thin);
+  border-radius: 999px;
+  background: var(--band-accent);
+  color: var(--on-state);
 }
 
 .board-band--cold .board-band__label {
-  color: var(--muted);
+  background: var(--park);
+  color: var(--ink);
 }
 
 .board-band__count {
   color: var(--muted);
 }
 
+/* The band's jobs: full-width + loud for the operator's queue, a calm
+   auto-fill card grid (JS mirrors the column math) for the rest. */
+.board-band__list {
+  display: grid;
+  gap: 16px;
+}
+
+.board-band__grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  align-items: start;
+}
+
+/* One accent per band as the card's left edge — the status chip keeps
+   its own tone; a fill would drown the dashboard. */
+.board-band .board-job {
+  border-left: 6px solid var(--band-accent);
+}
+
+/* Rolling settled window (v5): the older tail lives behind this. */
+.board-band__more {
+  justify-self: start;
+  padding: 6px 14px;
+  border: var(--outline-thin);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.board-band__more:hover {
+  background: var(--soft);
+  color: var(--ink);
+}
+
+/* An empty NEEDS YOU band is good news: calm green, never hidden. */
+.board-band__clear {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border: var(--outline-thin);
+  border-left: 6px solid var(--done);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+}
+
+.board-band__clear-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--done);
+  color: var(--on-state);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.board-band__clear-text {
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.board-band__clear-hint {
+  color: var(--muted);
+}
+
+/* v5: new cards slide in 8px; known cards never re-animate. */
+.board-job--enter {
+  animation: card-enter 0.18s ease;
+}
+
+@keyframes card-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* A streaming agent's dot pulses — the rail's live heartbeat. */
+.board-agent[data-state='streaming']::before {
+  content: '';
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--work);
+  border: 2px solid var(--line);
+  animation: conn-pulse 1.2s ease-in-out infinite;
+}
+
 .board-job__stale {
   flex: none;
-  font-size: 10px;
+  font-size: 11px;
   padding: 2px 8px;
-}
-
-.board-repo {
-  display: grid;
-  gap: 12px;
-}
-
-.board-repo__head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.board-repo__name {
-  margin: 0;
-  font-size: 17px;
 }
 
 .board-job {
@@ -1147,6 +1489,12 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Each card credits its repo (v5: no wrapper card to strand grid cells). */
+.board-job__repo {
+  font-weight: 800;
+  color: var(--muted);
 }
 
 .board-job__note {
@@ -1341,7 +1689,7 @@ body {
 }
 
 .board-agent__name {
-  font-weight: 700;
+  font-weight: 600;
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -1601,19 +1949,23 @@ body {
   flex-shrink: 0;
 }
 
-/* Phone: the board IS the app; the side rail stacks below the cards. */
-@media (max-width: 768px) {
-  .app-main {
-    max-width: none;
-    padding: 14px 10px 96px;
-  }
-
+/* Single-column board below the two-pane breakpoint: the side rail
+   stacks under the cards. */
+@media (max-width: 899px) {
   .board-layout {
     grid-template-columns: 1fr;
   }
 
   .board-side {
     position: static;
+  }
+}
+
+/* Phone: the board IS the app. */
+@media (max-width: 768px) {
+  .app-main {
+    max-width: none;
+    padding: 14px 10px 96px;
   }
 
   .notification-panel {
@@ -1832,7 +2184,7 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
   direction: rtl;
   text-align: left;
 }
@@ -1859,7 +2211,7 @@ body {
 
 .attach-picker__truncated {
   border-top: 1px dashed var(--border, #ccc);
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .attach-row {

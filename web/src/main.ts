@@ -15,6 +15,7 @@ import { applyTheme, getTheme, setTheme } from './theme.js';
 import { clearBanner, showBanner } from './ui/banner.js';
 import { ChatView, renderConnectionDot } from './ui/chat.js';
 import { BoardView } from './ui/board.js';
+import { ConsoleShell, type ChatPaneHandle } from './ui/console.js';
 import { ToastStack } from './ui/toast.js';
 import { TranscriptView } from './ui/transcript.js';
 import { mustGet } from './ui/dom.js';
@@ -108,56 +109,71 @@ function failPairing(message: string): void {
 }
 
 // ---------------------------------------------------------------------
-// Views: desktop defaults to chat; a phone opens board-first (SPEC
-// ruling 11 — the board is the dashboard, chat is the corner bubble).
+// Console shell (board UX v5): board first, chat as pane or overlay.
+// At/above 1280px the estate is three panes — chat | board | rail — and
+// the FAB toggles the chat pane; below it the board carries the page and
+// the FAB opens the chat overlay (SPEC ruling 11's dashboard-first
+// stance, extended to laptop widths).
 // ---------------------------------------------------------------------
 
-const mobileQuery = window.matchMedia('(max-width: 768px)');
+const consoleQuery = window.matchMedia('(min-width: 1280px)');
+
+/** The shell drives the chat through this handle; the view is created at
+ * pair time, so before that every call is a no-op. */
+const chatPaneHandle: ChatPaneHandle = {
+  focusComposer: () => chatView?.focusComposer(),
+  openSheet: () => chatView?.openSheet(),
+  closeSheet: () => chatView?.closeSheet(),
+  setPaneCollapsed: (collapsed) => chatView?.setPaneCollapsed(collapsed),
+};
+
+const consoleShell = new ConsoleShell({
+  root: mustGet('console'),
+  fab: mustGet<HTMLButtonElement>('gru-fab'),
+  rail: mustGet<HTMLButtonElement>('chat-rail'),
+  collapseButton: mustGet<HTMLButtonElement>('chat-collapse'),
+  chat: chatPaneHandle,
+  storage,
+});
+
+// Pairing replaces the whole app surface (it precedes any authed view).
+function showPairing(): void {
+  mustGet('pairing-view').hidden = false;
+  mustGet('console').hidden = true;
+  mustGet('chat-view').hidden = true;
+  mustGet('board-view').hidden = true;
+  mustGet('gru-fab').hidden = true;
+}
+
 type ViewId = 'chat' | 'board';
 
-function showView(id: ViewId): void {
-  // On a phone the chat panel lives inside the bottom SHEET (its own
-  // open/close mechanics) — the section itself must stay un-hidden there
-  // or the sheet's input goes invisible; the desktop mount is tab-toggled.
-  if (!mobileQuery.matches) {
-    mustGet('chat-view').hidden = id !== 'chat';
-    mustGet('chat-main-mount').hidden = id !== 'chat';
-  }
-  mustGet('board-view').hidden = id !== 'board';
+function setActiveTab(id: ViewId): void {
   mustGet('tab-chat').classList.toggle('app-nav__tab--active', id === 'chat');
   mustGet('tab-board').classList.toggle('app-nav__tab--active', id === 'board');
 }
 
-/** Pairing replaces the whole app surface (it precedes any authed view). */
-function showPairing(): void {
-  mustGet('pairing-view').hidden = false;
-  if (!mobileQuery.matches) {
-    mustGet('chat-view').hidden = true;
-    mustGet('chat-main-mount').hidden = true;
-  }
-  mustGet('board-view').hidden = true;
-}
-
-let activeView: ViewId = 'chat';
-
-function switchView(id: ViewId): void {
-  activeView = id;
-  if (mobileQuery.matches && id === 'chat') {
-    // Phone: chat lives in the corner bubble/sheet — the tab opens it.
+/** Nav Chat: console focuses the pane; below it the sheet opens. */
+function focusChat(): void {
+  setActiveTab('chat');
+  if (consoleQuery.matches) {
+    consoleShell.setCollapsed(false);
+    chatView?.focusComposer();
+  } else {
     chatView?.openSheet();
-    return;
   }
-  showView(id);
 }
 
-mustGet<HTMLButtonElement>('tab-chat').addEventListener('click', () => switchView('chat'));
-mustGet<HTMLButtonElement>('tab-board').addEventListener('click', () => switchView('board'));
-const initialView: ViewId = mobileQuery.matches ? 'board' : 'chat';
-activeView = initialView;
-showView(initialView);
-// Resizing across the phone/desktop breakpoint re-runs placement so the
-// hidden-state invariants hold in both layouts (ChatView reparents itself).
-mobileQuery.addEventListener('change', () => showView(activeView));
+/** Nav Board: the board is always on the page; this dismisses the
+ * overlay when one is open and marks the board tab. */
+function focusBoard(): void {
+  setActiveTab('board');
+  chatView?.closeSheet();
+}
+
+mustGet<HTMLButtonElement>('tab-chat').addEventListener('click', () => focusChat());
+mustGet<HTMLButtonElement>('tab-board').addEventListener('click', () => focusBoard());
+// Board-first below the console breakpoint; chat-first on the console.
+setActiveTab(consoleQuery.matches ? 'chat' : 'board');
 
 function onConnection(state: ConnectionState): void {
   renderConnectionDot(state);
@@ -183,12 +199,13 @@ function onConnection(state: ConnectionState): void {
 function startChat(token: string): void {
   pairingFailed = false;
   mustGet('pairing-view').hidden = true;
-  // The chat SECTION must be un-hidden in both layouts: on desktop the
-  // main mount shows it; on a phone the panel is reparented into the
-  // bottom sheet whose own open/close mechanics govern visibility.
+  // v5: the board is always on the page; the chat panel is the console
+  // pane (>=1280) or the overlay sheet (below). The FAB is live once
+  // paired — there is no unpaired app surface to float over.
+  mustGet('console').hidden = false;
   mustGet('chat-view').hidden = false;
-  if (!mobileQuery.matches) showView('chat');
-  else showView('board');
+  mustGet('board-view').hidden = false;
+  mustGet('gru-fab').hidden = false;
   chatView ??= new ChatView((text, attachments) => {
     if (client === null) return false;
     client.send(text, attachments); // throws surface in the composer's guard
