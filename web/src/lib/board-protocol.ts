@@ -43,6 +43,12 @@ export interface LaneView {
   readonly createdAt: string;
 }
 
+/** PR state the board buckets and counts on (board UX v4). `open` and
+ * `merged` derive from the record today; `conflicting` is the
+ * cascade-promoter signal the PR-state sweep will write — the board
+ * consumes it the day it appears and never invents it. */
+export type JobPrState = 'open' | 'conflicting' | 'merged';
+
 export interface JobView {
   readonly id: string;
   readonly repo: string;
@@ -50,6 +56,7 @@ export interface JobView {
   readonly status: string;
   readonly updatedAt: string;
   readonly prUrl: string | null;
+  readonly prState: JobPrState | null;
   readonly baseBranch: string | null;
   readonly note: string | null;
   readonly rounds: readonly RoundView[];
@@ -102,12 +109,56 @@ export interface DecisionStatusView {
   readonly generation: number;
 }
 
+/** Deploy drift (board UX v4): the running service build vs origin/main.
+ * Computed service-side (git) and shipped on the live snapshot; null
+ * blocks render an honest unknown, never a guessed count. */
+export interface BuildView {
+  /** Git rev the running service was built from. */
+  readonly buildRev: string | null;
+  readonly buildCommittedAt: string | null;
+  readonly originMainRev: string | null;
+  readonly originMainCommittedAt: string | null;
+  /** origin/main commits not reachable from the build. */
+  readonly commitsBehind: number | null;
+  readonly checkedAt: string | null;
+  /** Why the last check could not fully prove the count (null = clean). */
+  readonly checkError: string | null;
+}
+
+/** Silas ops health (board UX v4), derived from the durable event stream. */
+export interface SilasView {
+  readonly lastWakeAt: string | null;
+  readonly reconciliationsToday: number;
+  readonly checkedAt: string;
+}
+
+/** Verification scheduler queue (board UX v4, from the #52 scheduler). */
+export interface VerifyQueueView {
+  readonly lockInUse: boolean;
+  readonly activeRuns: number;
+  readonly queuedRuns: number;
+  readonly workerBudget: number;
+  readonly workersPerRun: number;
+}
+
+/** Self-healing session stats (board UX v4; null until a producer exists). */
+export interface SelfHealView {
+  readonly sessionsResumed: number;
+  readonly sessionsOrphaned: number;
+  readonly since: string | null;
+}
+
 export interface BoardSnapshot {
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionStatusView;
   readonly unackedActionRequired: number;
+  /** Absent on pre-v4 servers (validator tolerates; consumers render n/a). */
+  readonly build?: BuildView | null;
+  readonly silas?: SilasView | null;
+  readonly verify?: VerifyQueueView | null;
+  readonly selfHeal?: SelfHealView | null;
 }
 
 export interface TranscriptInfo {
@@ -254,6 +305,57 @@ function isLane(value: unknown): boolean {
   );
 }
 
+function isPrState(value: unknown): value is JobPrState {
+  return value === 'open' || value === 'conflicting' || value === 'merged';
+}
+
+/** Tolerant null checks for the v4 optional blocks: absent/null passes
+ * (pre-v4 servers), a present block must match its full shape. */
+function isBuildView(value: unknown): value is BuildView {
+  return (
+    isRecord(value) &&
+    (value.buildRev === null || typeof value.buildRev === 'string') &&
+    (value.buildCommittedAt === null || typeof value.buildCommittedAt === 'string') &&
+    (value.originMainRev === null || typeof value.originMainRev === 'string') &&
+    (value.originMainCommittedAt === null || typeof value.originMainCommittedAt === 'string') &&
+    (value.commitsBehind === null ||
+      (typeof value.commitsBehind === 'number' && Number.isSafeInteger(value.commitsBehind) && value.commitsBehind >= 0)) &&
+    (value.checkedAt === null || typeof value.checkedAt === 'string') &&
+    (value.checkError === null || typeof value.checkError === 'string')
+  );
+}
+
+function isSilasView(value: unknown): value is SilasView {
+  return (
+    isRecord(value) &&
+    (value.lastWakeAt === null || typeof value.lastWakeAt === 'string') &&
+    typeof value.reconciliationsToday === 'number' &&
+    Number.isSafeInteger(value.reconciliationsToday) &&
+    value.reconciliationsToday >= 0 &&
+    typeof value.checkedAt === 'string'
+  );
+}
+
+function isVerifyQueueView(value: unknown): value is VerifyQueueView {
+  return (
+    isRecord(value) &&
+    typeof value.lockInUse === 'boolean' &&
+    (typeof value.activeRuns === 'number' && Number.isSafeInteger(value.activeRuns) && value.activeRuns >= 0) &&
+    (typeof value.queuedRuns === 'number' && Number.isSafeInteger(value.queuedRuns) && value.queuedRuns >= 0) &&
+    (typeof value.workerBudget === 'number' && Number.isSafeInteger(value.workerBudget) && value.workerBudget >= 0) &&
+    (typeof value.workersPerRun === 'number' && Number.isSafeInteger(value.workersPerRun) && value.workersPerRun >= 0)
+  );
+}
+
+function isSelfHealView(value: unknown): value is SelfHealView {
+  return (
+    isRecord(value) &&
+    (typeof value.sessionsResumed === 'number' && Number.isSafeInteger(value.sessionsResumed) && value.sessionsResumed >= 0) &&
+    (typeof value.sessionsOrphaned === 'number' && Number.isSafeInteger(value.sessionsOrphaned) && value.sessionsOrphaned >= 0) &&
+    (value.since === null || typeof value.since === 'string')
+  );
+}
+
 export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (!isRecord(value)) return false;
   if (!Array.isArray(value.repos) || !Array.isArray(value.agents) || !Array.isArray(value.notifications)) {
@@ -267,6 +369,12 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   ) {
     return false;
   }
+  // v4 blocks are absent on pre-v4 servers (tolerated) but a present
+  // block must match its shape — a malformed health read is a server bug.
+  if (value.build !== undefined && value.build !== null && !isBuildView(value.build)) return false;
+  if (value.silas !== undefined && value.silas !== null && !isSilasView(value.silas)) return false;
+  if (value.verify !== undefined && value.verify !== null && !isVerifyQueueView(value.verify)) return false;
+  if (value.selfHeal !== undefined && value.selfHeal !== null && !isSelfHealView(value.selfHeal)) return false;
   const agentsOk = value.agents.every(
     (agent) =>
       isRecord(agent) &&
@@ -306,6 +414,7 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
           typeof job.id === 'string' &&
           typeof job.title === 'string' &&
           typeof job.status === 'string' &&
+          (job.prState === null || job.prState === undefined || isPrState(job.prState)) &&
           (job.lane === null || isLane(job.lane)) &&
           (job.lastAgentActivity === null || typeof job.lastAgentActivity === 'string') &&
           Array.isArray(job.rounds) &&

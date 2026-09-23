@@ -26,6 +26,7 @@ function job(overrides: Partial<JobView> = {}): JobView {
     status: 'working',
     updatedAt: '2026-01-01T00:00:00.000Z',
     prUrl: null,
+    prState: null,
     baseBranch: 'main',
     note: null,
     rounds: [],

@@ -411,6 +411,13 @@ describe('ChatClient', () => {
     await waitFor(() =>
       server.log.some((frame) => frame.type === 'user' && frame.text === afterFailedReset.text),
     );
+    // The ack frame arrives after the server receipt: wait for the CLIENT
+    // state before asserting, or the assertion races the socket (flake).
+    await waitFor(() =>
+      h.client
+        .getMessages()
+        .find((message) => message.client_msg_id === afterFailedReset.client_msg_id)?.status === 'acked',
+    );
     expect(
       h.client.getMessages().find((message) => message.client_msg_id === afterFailedReset.client_msg_id),
     ).toMatchObject({ status: 'acked', epoch: 0 });
@@ -424,6 +431,12 @@ describe('ChatClient', () => {
     await waitFor(() =>
       server.log.some((frame) => frame.type === 'user' && frame.text === duringReset.text),
     );
+    await waitFor(() => {
+      const settled = h.client
+        .getMessages()
+        .find((message) => message.client_msg_id === duringReset.client_msg_id);
+      return settled?.status === 'acked' && settled.epoch === 1;
+    });
     expect(
       h.client.getMessages().find((message) => message.client_msg_id === duringReset.client_msg_id),
     ).toMatchObject({ status: 'acked', epoch: 1 });
