@@ -13,6 +13,7 @@ import {
   type WaveOutcome,
 } from '../src/dispatch/perkins.js';
 import { preflightFailure, type FallbackFinding } from '../src/dispatch/review-path.js';
+import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
 
 /** These suites exercise the Perkins route (no pre-flight configured), so
  * every runRound result must be a wave outcome; the helper pins that. */
@@ -31,45 +32,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeHybridSpawner, type LeadBrainOptions } from './helpers/perkins-hybrid-double.js';
-
-class GitReviewPort implements WorktreePort {
-  private readonly lanes = new Map<string, WorktreeLane>();
-  constructor(private readonly root: string, private readonly branch: string, private readonly sha: string) {}
-
-  async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
-    const lane: WorktreeLane = {
-      id: input.jobId, kind: 'job', repoPath: input.repoPath, repoName: 'fixture', path: input.repoPath,
-      branch: this.branch, sha: this.sha, jobId: input.jobId, roundId: null, status: 'active',
-    };
-    this.lanes.set(lane.id, lane);
-    return lane;
-  }
-
-  async createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): Promise<WorktreeLane> {
-    const path = join(this.root, input.roundId);
-    execFileSync('git', ['-C', input.repoPath, 'worktree', 'add', '--detach', path, input.ref], { stdio: 'ignore' });
-    const lane: WorktreeLane = {
-      id: input.roundId, kind: 'review', repoPath: input.repoPath, repoName: 'fixture', path,
-      branch: null, sha: input.ref, jobId: input.jobId ?? null, roundId: input.roundId, status: 'active',
-    };
-    this.lanes.set(lane.id, lane);
-    return lane;
-  }
-
-  getWorktree(id: string): WorktreeLane | null { return this.lanes.get(id) ?? null; }
-  listWorktrees(options: { jobId?: string } = {}): readonly WorktreeLane[] {
-    return [...this.lanes.values()].filter((lane) => options.jobId === undefined || lane.jobId === options.jobId);
-  }
-  async release(input: { worktreeId: string }): Promise<WorktreeSweepResult> {
-    const lane = this.lanes.get(input.worktreeId);
-    if (lane === undefined) throw new Error('missing lane');
-    if (lane.kind === 'review' && existsSync(lane.path)) {
-      execFileSync('git', ['-C', lane.repoPath, 'worktree', 'remove', '--force', lane.path], { stdio: 'ignore' });
-    }
-    this.lanes.set(lane.id, { ...lane, status: 'swept' });
-    return { status: 'swept', preserved: null, branch: 'none', freshHead: this.sha };
-  }
-}
+import { GitReviewPort } from './helpers/git-review-port.js';
 
 class DeferredReviewPort implements WorktreePort {
   constructor(
@@ -92,6 +55,25 @@ class DeferredReviewPort implements WorktreePort {
   getWorktree(id: string): WorktreeLane | null { return this.delegate.getWorktree(id); }
   listWorktrees(options: { jobId?: string } = {}): readonly WorktreeLane[] { return this.delegate.listWorktrees(options); }
   release(input: { worktreeId: string }): Promise<WorktreeSweepResult> { return this.delegate.release(input); }
+}
+
+/** Attach a fetchable bare origin inside the test's port root and push the
+ * reviewed branch: the fresh-head freeze reads THIS tip, never the local
+ * ref left behind by the fixture. */
+function attachOrigin(repo: FixtureRepo, branch: string, root: string): void {
+  const origin = join(root, 'origin.git');
+  execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+  repo.git(['remote', 'add', 'origin', origin]);
+  repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+}
+
+/** Probe double for PR rounds: report the reviewed branch's local tip (the
+ * same commit pushed to origin before the freeze). */
+function localHeadProbe(branch: string): PrHeadProbe {
+  return async ({ repoPath }) => ({
+    headRefName: branch,
+    headSha: execFileSync('git', ['-C', repoPath, 'rev-parse', `refs/heads/${branch}`], { encoding: 'utf-8' }).trim(),
+  });
 }
 
 function sourceFor(prompt: string): string {
@@ -631,6 +613,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     });
     ledger.setJobStatus(job.id, 'working');
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/10');
+    attachOrigin(repo, `feature/post-${mode}`, root);
     const escalations: string[] = [];
     const poster = mode === 'rejecting'
       ? { post: vi.fn(async () => { throw new Error('posting denied'); }) }
@@ -640,6 +623,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       worktrees: port,
       spawner: makeSpawner(sessions, []),
       reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe(`feature/post-${mode}`),
       ...(poster === undefined ? {} : { poster }),
       escalate: (title) => escalations.push(title),
     });
@@ -678,6 +662,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     });
     ledger.setJobStatus(job.id, 'working');
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/9');
+    attachOrigin(repo, 'feature/review', root);
     const order: string[] = [];
     // The poster's receipt simulates a PR whose recorded base has drifted
     // past the round's frozen base: the delivery record must refresh to the
@@ -693,6 +678,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       spawner: makeSpawner(sessions, order),
       poster,
       reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/review'),
     });
 
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
@@ -804,14 +790,20 @@ describe('WaveRunner built-in Perkins production path', () => {
     });
     ledger.setJobStatus(job.id, 'working');
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/10');
+    attachOrigin(repo, 'feature/review', root);
     let moved = false;
     const poster = { post: vi.fn(async () => ({ headSha: 'unused-head', baseSha: 'unused-base' })) };
     const spawner = makeSpawner(sessions, [], () => {
       if (moved) return;
       moved = true;
       repo.commitFile('src/later.ts', 'export const later = true;\n', 'move during review');
+      // The PR head MOVES: origin advances past the frozen tip.
+      repo.git(['push', '--quiet', 'origin', 'feature/review']);
     });
-    const wave = new WaveRunner({ ledger, worktrees: port, spawner, poster, reviewArtifactRoot: artifacts });
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner, poster, reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/review'),
+    });
 
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
     expect(moved).toBe(true);

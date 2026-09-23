@@ -18,7 +18,8 @@ import { createDispatchServer } from '../src/dispatch/server.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 import type { Role } from '../src/config.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
+import { originHeadProbe } from './helpers/pr-head-probe.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
   streaming: true,
@@ -130,6 +131,7 @@ async function bootFollowThrough(input: {
 }): Promise<FollowThroughHarness> {
   const repo = makeFixtureRepo(input.fixtureName);
   cleanupRepos.push(repo);
+  attachBareOrigin(repo);
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-silas-follow-'));
   cleanupDirs.push(dir);
   writeFileSync(
@@ -182,6 +184,10 @@ async function bootFollowThrough(input: {
           ['-C', options.cwd, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', `test: minion turn ${minionTurns}`],
           { stdio: 'ignore' },
         );
+        // Each turn lands on the PR branch: the review freeze reads the
+        // pushed tip, never the recorded lane pointer.
+        const branch = execFileSync('git', ['-C', options.cwd, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf-8' }).trim();
+        execFileSync('git', ['-C', options.cwd, 'push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`], { stdio: 'ignore' });
       },
       async steer() {},
       async followUp() {},
@@ -202,6 +208,7 @@ async function bootFollowThrough(input: {
     spawner,
     poster: { async post(input) { return { headSha: input.targetSha, baseSha: 'stub-base' }; } },
     reviewArtifactRoot: join(dir, 'reviews'),
+    prHeadProbe: originHeadProbe(),
   });
   const silasPrompts: Promise<void>[] = [];
   const silasHandle: AgentHandle = {

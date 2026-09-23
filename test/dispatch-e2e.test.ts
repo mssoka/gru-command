@@ -29,7 +29,8 @@ const FAKE_CAPABILITIES: AgentCapabilities = {
   followUp: false,
 };
 import type { Role } from '../src/config.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
+import { originHeadProbe } from './helpers/pr-head-probe.js';
 
 /**
  * End-to-end dispatch on a fixture repo (EPICS E8 story 4): briefing →
@@ -94,6 +95,7 @@ function makeDispatchHarness(opts: {
   minionSettle?: (text: string, cwd: string) => Promise<void>;
 } = {}): DispatchHarness {
   const repo = makeFixtureRepo('fixture-app');
+  attachBareOrigin(repo);
   const dataDir = mkdtempSync(join(tmpdir(), 'gru-command-e2edata-'));
   const ledgerDb = new LedgerDb(dataDir);
   const bus = new EventBus({});
@@ -119,7 +121,13 @@ function makeDispatchHarness(opts: {
       id,
       role,
       role === 'minion'
-        ? (text: string) => (opts.minionSettle ?? defaultMinionSettle)(text, cwd)
+        ? async (text: string) => {
+            await (opts.minionSettle ?? defaultMinionSettle)(text, cwd);
+            // Every minion turn lands on the PR branch: the review freeze
+            // fetches THIS tip, not a recorded lane pointer.
+            const branch = execFileSync('git', ['-C', cwd, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf-8' }).trim();
+            execFileSync('git', ['-C', cwd, 'push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`], { stdio: 'ignore' });
+          }
         : async () => {},
     );
     handles.push(handle);
@@ -134,6 +142,7 @@ function makeDispatchHarness(opts: {
     spawner,
     poster,
     reviewArtifactRoot: join(dataDir, 'reviews'),
+    prHeadProbe: originHeadProbe(),
   });
   return {
     ledger,
