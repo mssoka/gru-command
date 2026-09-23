@@ -485,7 +485,7 @@ body {
   width: 2px;
   border-radius: 999px;
   background: var(--line);
-  opacity: 0.16;
+  opacity: 0.32;
   transition: opacity 0.15s ease, background 0.15s ease, width 0.15s ease,
     left 0.15s ease;
 }
@@ -495,7 +495,7 @@ body {
 .console[data-pane-dragging] .splitter::after {
   left: 0.5px;
   width: 3px;
-  opacity: 0.75;
+  opacity: 0.85;
   background: var(--work);
 }
 
