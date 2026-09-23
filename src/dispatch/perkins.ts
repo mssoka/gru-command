@@ -1046,7 +1046,12 @@ export class WaveRunner {
     }
     const artifactRoot = this.artifactRoot();
     const candidateRef = input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
-    const { targetSha, movementRef } = await this.resolveFreezeTarget({ job, jobWorktree, candidateRef });
+    const { targetSha, movementRef } = await this.resolveFreezeTarget({
+      job,
+      jobWorktree,
+      candidateRef,
+      explicitTarget: input.targetRef !== undefined && input.targetRef.trim() !== '',
+    });
     const baseRef = resolveReviewBaseRef(jobWorktree.path, job.baseBranch);
     // Recorded verification evidence (2026-09-22 fix): a completed
     // scheduler run on the exact frozen target (clean tree) is handed to
@@ -1181,20 +1186,31 @@ export class WaveRunner {
   }
 
   /** Resolve the exact SHA a round will freeze. A round reviewing a PR
-   * branch fetches that branch from origin and cross-checks the fetched tip
-   * against the live pull/merge-request head: the recorded lane identity is
-   * only a hint, never the freeze source. A disagreement aborts before a
-   * round row, a review worktree, or any lens exists. Non-PR rounds and
-   * explicit commit pins keep the local resolution. */
+   * branch reads the PR's own head branch from the code host and fetches
+   * that branch from origin — the caller's candidate ref (for a default arm
+   * the lane branch `gru/<jobId>`, for an explicit target whatever the
+   * caller named) is a hint only, never the freeze source, so a job lane
+   * that never pushed its own name cannot fail the round and a stale lane
+   * can never be frozen. The fetched tip must equal the live PR head, or
+   * the request aborts before a round row, a review worktree, or any lens
+   * exists. Non-PR rounds and explicit commit pins keep the local
+   * resolution. */
   private async resolveFreezeTarget(input: {
     job: { readonly id: string; readonly prUrl: string | null };
     jobWorktree: { readonly path: string; readonly repoPath: string };
     candidateRef: string;
+    /** True when the caller explicitly named `candidateRef` (target_ref). */
+    explicitTarget: boolean;
   }): Promise<{ readonly targetSha: string; readonly movementRef: string }> {
-    const branchRef = input.job.prUrl === null
+    const candidateBranch = input.job.prUrl === null
       ? null
       : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
-    if (input.job.prUrl === null || branchRef === null) {
+    // An explicit commit pin (a SHA, a tag, a revision expression) stays a
+    // pin even for a PR round. Everything else on a PR-linked job resolves
+    // from the PR's live head branch — never from a lane name synthesized
+    // from the job id.
+    const explicitPin = input.explicitTarget && candidateBranch === null;
+    if (input.job.prUrl === null || explicitPin) {
       return {
         targetSha: resolveGitCommit(input.jobWorktree.path, input.candidateRef),
         movementRef: input.candidateRef,
@@ -1204,12 +1220,12 @@ export class WaveRunner {
       const fresh = await resolveFreshPrHead({
         repoPath: input.jobWorktree.repoPath,
         prUrl: input.job.prUrl,
-        branchRef,
+        branchRef: candidateBranch ?? '',
         ...(this.opts.prHeadProbe !== undefined ? { probe: this.opts.prHeadProbe } : {}),
       });
       this.log('info', 'freeze target refreshed from the live PR head', {
         job: input.job.id,
-        branch: branchRef,
+        branch: fresh.prHeadRefName,
         localCandidate: input.candidateRef,
         fetched: fresh.targetSha,
         movementRef: fresh.movementRef,
@@ -1224,7 +1240,7 @@ export class WaveRunner {
           payload: {
             code: error.code,
             prUrl: input.job.prUrl,
-            branchRef,
+            branchRef: candidateBranch,
             candidateRef: input.candidateRef,
             detail,
           },

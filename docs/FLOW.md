@@ -68,11 +68,14 @@ human override; a forced round is tagged in its frozen manifest
 (`branchIdle`) and the event log (`branch-idle.forced`), refusals land as
 `branch-idle.refused`, and a Silas auto-arm deferral lands as
 `silas.review-deferred` (retry on the next sweep). For a job
-with a registered PR, the target is resolved from the LIVE branch: the
-review branch is fetched from `origin` and cross-checked against the code
-host's pull/merge-request head. The recorded lane pointer is a hint only;
-any disagreement aborts the request before a round or lens exists (an
-action-required escalation names the mismatch). A round has
+with a registered PR, the target is resolved from the pull request's own
+live head: the code host's `headRefName` decides WHICH branch is fetched
+from `origin` — a lane ref synthesized from the job id (`gru/<jobId>`) is
+never the freeze source — and the fetched tip must equal the live
+pull/merge-request head. A resolved ref that fetches nothing, a moved
+head, or an unverifiable host answer aborts the request before a round or
+lens exists (an action-required escalation names the resolved mismatch).
+A round has
 one real Perkins lead and exactly seven required lens types per frozen diff
 chunk (blind, edge, acceptance, security, architecture, codebase, tests), or
 six types per chunk only when `no_spec: true` explicitly removes acceptance.
