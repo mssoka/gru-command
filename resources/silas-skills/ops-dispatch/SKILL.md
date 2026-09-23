@@ -44,7 +44,32 @@ through the ops surface, never by improvising side channels.
    `bmad-review-fallback` route no round is created — the gate runs its own
    fix loop — and the digest retires the row once your request lands as a
    `job.fallback-review` event. If the digest still lists the job, the
-   request did not land: fix the call, never re-fire blind.
+   request did not land: fix the call, never re-fire blind. A `409`
+   `branch_busy` answer is the ONE exception — that is a deferral, not a
+   failed request (see below).
+
+### The branch-idle guard (409 `branch_busy`) — defer, never force blind
+
+A review arm is refused while a lane is actively working/pushing the
+branch it would freeze: the round would race the push and die obsolete.
+The API owns this guard — your arm path needs NO special logic. When the
+answer is `409` with `{"error":"branch_busy","blockers":[...]}`:
+
+- **Defer the arm to the next sweep.** The service records the refusal
+  (`branch-idle.refused`) and, because you pass `"by":"silas"`, your
+  deferral as `silas.review-deferred` on the job — that is the deferred-arm
+  note. Retry when the lane is idle: the digest recomputes from the ledger
+  every sweep, so the row stays listed until the arm lands. Never retry in
+  a tight loop inside one sweep.
+- **Never arm with `"force":true` on your own.** Force is the human
+  escape hatch for a deliberate judgment call; a forced round freezes a
+  branch that may still be moving and carries the override tag in its
+  manifest for exactly that reason. If a lane looks wedged, escalate — do
+  not force the gate.
+- The blockers name each busy lane (`job_id`, `status`, `branch`); a
+  blocker on the reviewed job itself means its fix loop has not delivered
+  yet. Wait for that delivery — that delivery is what re-arms the
+  re-review.
 
 3. **NEEDS CHANGES verdict awaiting follow-through.** The digest lists the
    round's blockers with `consecutive_rounds` and the advised rung:
