@@ -220,7 +220,7 @@ test('service restart drops the socket; reconnect keeps history and flushes the 
 test('mobile viewport: board-first, corner bubble, sheet, unread badge over the real socket', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await pairMobile(page);
-  await expect(page.locator('#chat-bubble')).toBeVisible();
+  await expect(page.locator('#gru-fab')).toBeVisible();
   // The board (not chat) is the phone's landing view; the bubble opens chat.
   await expect(page.locator('#board-view')).toBeVisible();
 
@@ -230,7 +230,7 @@ test('mobile viewport: board-first, corner bubble, sheet, unread badge over the 
   const releaseFile = `${releaseDir}/release`;
   const stalled = `hold:${releaseFile}`;
 
-  await page.locator('#chat-bubble').click();
+  await page.locator('#gru-fab').click();
   await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
   await page.locator('#chat-input').fill(stalled);
   await page.locator('#chat-send').click();
@@ -242,7 +242,7 @@ test('mobile viewport: board-first, corner bubble, sheet, unread badge over the 
   writeFileSync(releaseFile, 'go');
   await expect(page.locator('#chat-badge')).not.toHaveText('0');
 
-  await page.locator('#chat-bubble').click();
+  await page.locator('#gru-fab').click();
   await expect(page.locator('#chat-badge')).toHaveText('0');
   const reply = page.locator('.msg--gru', { hasText: `echo: ${stalled}` });
   await expect(reply).toBeVisible();
@@ -280,21 +280,21 @@ test.describe('board (E6)', () => {
     await pair(page);
     await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
-    const repoCard = page.locator('.board-repo', { hasText: 'e2e-repo' });
-    await expect(repoCard).toBeVisible();
-    const jobCard = repoCard.locator('.board-job', { hasText: 'Board e2e job' });
+    // v5: each job card is its own grid cell and credits its repo on the face.
+    const jobCard = page.locator('.board-job', { hasText: 'Board e2e job' });
     await expect(jobCard).toBeVisible();
+    await expect(jobCard.locator('.board-job__repo')).toHaveText('📦 e2e-repo');
     // Collapsed by default; the round's 7 lens chips are behind the disclosures.
     await expect(jobCard).toHaveAttribute('data-expanded', 'false');
-    await expect(repoCard.locator('.board-lens')).toHaveCount(0);
+    await expect(jobCard.locator('.board-lens')).toHaveCount(0);
     await jobCard.locator('.board-job__toggle').click();
     await jobCard.locator('.board-round__toggle').click();
-    await expect(repoCard.locator('.board-lens')).toHaveCount(7);
+    await expect(jobCard.locator('.board-lens')).toHaveCount(7);
 
     // A status transition through the API pushes a fresh snapshot live.
     const blocked = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs/e2e-board-job/status`, { headers: base, data: { status: 'working' } });
     expect(blocked.status()).toBe(200);
-    await expect(repoCard.locator('.board-job', { hasText: 'Board e2e job' }).locator('.pp-chip', { hasText: 'working' })).toBeVisible();
+    await expect(jobCard.locator('.pp-chip', { hasText: 'working' })).toBeVisible();
   });
 
   test('agent rail lists the gru session; transcripts open, search, page', async ({ page }) => {
@@ -555,7 +555,7 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
   test('B2 fails-pre-fix discriminator — PHONE full gesture: attach → device button → chooser → chip → send → agent receives THAT path', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await pairMobile(page);
-    await page.locator('#chat-bubble').click();
+    await page.locator('#gru-fab').click();
     await page.locator('#chat-attach').click();
     await expect(page.locator('#attach-picker')).toBeVisible();
 

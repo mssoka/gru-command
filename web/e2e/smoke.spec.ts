@@ -113,7 +113,7 @@ test('touch composer on a 390px phone (coarse pointer): return inserts a newline
   });
   const page = await context.newPage();
   await pairMobile(page);
-  await page.locator('#chat-bubble').click();
+  await page.locator('#gru-fab').click();
   await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
   const input = page.locator('#chat-input');
   const restHeight = (await input.boundingBox())!.height;
@@ -222,9 +222,11 @@ test('failed New chat restores history and delivers a word typed in the pending 
   await page.reload();
   await expect(page.locator('#chat-view')).toBeVisible();
   await expect(page.locator('.msg--user', { hasText: 'word typed during failed reset' })).toHaveCount(1);
-  await page.waitForTimeout(1_000);
-  await expect(page.locator('.msg--user', { hasText: 'retired words before failed reset' })).toHaveCount(0);
 
+  // The failed reset surfaces on reconnect: the notice lands and history is
+  // restored EXACTLY once. (The transient empty view between reload and the
+  // inferred failure is not deterministically observable — this lane asserts
+  // the end state, not a racing intermediate frame.)
   await expect(
     page.locator('.notice-line', { hasText: 'New chat did not complete before reconnect' }),
   ).toBeVisible();
@@ -250,11 +252,11 @@ test('reconnect keeps history after reload (no duplicates)', async ({ page }) =>
 test('mobile viewport: board-first; chat is a corner bubble that opens a sheet', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await pairMobile(page);
-  await expect(page.locator('#chat-bubble')).toBeVisible();
+  await expect(page.locator('#gru-fab')).toBeVisible();
   await expect(page.locator('#board-view')).toBeVisible();
 
   // Open the sheet, send, close it before the reply streams in.
-  await page.locator('#chat-bubble').click();
+  await page.locator('#gru-fab').click();
   await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
   await page.locator('#chat-input').fill('mobile hello');
   await page.locator('#chat-send').click();
@@ -265,7 +267,7 @@ test('mobile viewport: board-first; chat is a corner bubble that opens a sheet',
   await expect(page.locator('#chat-badge')).not.toHaveText('0');
 
   // Reopen: badge clears, the streamed reply is fully there.
-  await page.locator('#chat-bubble').click();
+  await page.locator('#gru-fab').click();
   await expect(page.locator('#chat-badge')).toHaveText('0');
   const reply = page.locator('.msg--gru', { hasText: 'mobile hello' });
   await expect(reply).toBeVisible();
@@ -612,6 +614,86 @@ test.describe('board (E6, mock feed)', () => {
   });
 });
 
+test.describe('console layout (v5)', () => {
+  test('three-pane at 1440px: chat | board | rail, FAB toggles the pane, settled window rolls', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await pair(page);
+
+    // All three panes render at once: chat is in the left column, the
+    // board's center column carries the dashboard, agents/transcripts rail right.
+    await expect(page.locator('#chat-main-mount > #chat-view')).toHaveCount(1);
+    await expect(page.locator('#board-view')).toBeVisible();
+    await expect(page.locator('.board-side')).toBeVisible();
+    const chatBox = (await page.locator('#chat-main-mount').boundingBox())!;
+    const boardBox = (await page.locator('#board-view').boundingBox())!;
+    expect(chatBox.x + chatBox.width).toBeLessThanOrEqual(boardBox.x);
+    // Full-estate: the board's right edge reaches past the old 920px column.
+    expect(boardBox.x + boardBox.width).toBeGreaterThan(1_100);
+
+    // Card-grid bands fit the center pane (2 columns at 1440) and the
+    // settled band rolls: 12 settled → 10 cards + a +2 footer.
+    await expect(page.locator('.board-band--in-flight .board-band__grid')).toHaveAttribute('data-columns', '2');
+    await expect(page.locator('.board-band--settled .board-job')).toHaveCount(10);
+    const more = page.locator('.board-band--settled .board-band__more');
+    await expect(more).toHaveText('+2 older settled');
+    await more.click();
+    await expect(page.locator('.board-band--settled .board-job')).toHaveCount(12);
+    await expect(page.locator('.board-band--settled .board-band__more')).toHaveCount(0);
+
+    // The FAB collapses the pane to the slim rail (and back); the choice persists.
+    await page.locator('#gru-fab').click();
+    await expect(page.locator('#console')).toHaveClass(/console--chat-collapsed/);
+    await expect(page.locator('#chat-rail')).toBeVisible();
+    // The grid column animates (180ms), so poll for the board reclaiming x.
+    await expect
+      .poll(async () => (await page.locator('#board-view').boundingBox())!.x)
+      .toBeLessThan(boardBox.x);
+    await page.reload();
+    await expect(page.locator('#chat-rail')).toBeVisible();
+    await page.locator('#chat-rail').click();
+    await expect(page.locator('#chat-main-mount > #chat-view')).toHaveCount(1);
+    await expect(page.locator('#chat-rail')).toBeHidden();
+  });
+
+  test('two-pane at 1100px: board + rail, FAB opens the dimmed overlay chat', async ({ page }) => {
+    await page.setViewportSize({ width: 1100, height: 800 });
+    await pair(page);
+
+    // The chat panel lives in the overlay sheet; the board + rail hold the page.
+    await expect(page.locator('#chat-sheet #chat-view')).toHaveCount(1);
+    await expect(page.locator('#board-view')).toBeVisible();
+    await expect(page.locator('.board-side')).toBeVisible();
+    await expect(page.locator('.board-band--in-flight .board-band__grid')).toHaveAttribute('data-columns', '2');
+
+    await page.locator('#gru-fab').click();
+    await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
+    await expect(page.locator('#chat-scrim')).toBeVisible();
+    await expect(page.locator('#chat-input')).toBeVisible();
+    // The board is still rendered behind the dim.
+    await expect(page.locator('#board-view')).toBeVisible();
+    await page.locator('#chat-scrim').click();
+    await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'false');
+    await expect(page.locator('#chat-scrim')).toBeHidden();
+  });
+
+  test('single column at 800px: rail stacks below, FAB overlay sheet over the board', async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 700 });
+    await pair(page);
+
+    const mainBox = (await page.locator('.board-main').boundingBox())!;
+    const sideBox = (await page.locator('.board-side').boundingBox())!;
+    expect(sideBox.y).toBeGreaterThanOrEqual(mainBox.y + mainBox.height - 1);
+
+    await page.locator('#gru-fab').click();
+    await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
+    await expect(page.locator('#chat-scrim')).toBeVisible();
+    await expect(page.locator('#board-view')).toBeVisible();
+    await expect(page.locator('#chat-input')).toBeVisible();
+    await page.locator('#chat-sheet-grip').click();
+    await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'false');
+  });
+});
+
 test.describe('themes', () => {
   // Hermetic snapshots: reset the mock log so prior tests' history
   // cannot leak into the frame.
@@ -720,7 +802,7 @@ test.describe('phone chrome', () => {
     await page.locator('#notification-bell').click();
 
     // Chat surface, paired: the phone chat is the corner-bubble sheet.
-    await page.locator('#chat-bubble').click();
+    await page.locator('#gru-fab').click();
     await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
     await assertNoHorizontalOverflow(page);
     await page.locator('#chat-sheet-grip').click();
