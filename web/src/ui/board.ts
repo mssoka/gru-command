@@ -1,25 +1,28 @@
 /**
- * Board view (E6): the live dashboard — repo-grouped job cards with state
- * chips and per-lens round chips, the agent rail (the standing crew), and
- * the notification center. Read-only by design: authorship arrives with
- * the dispatch flow epic.
+ * Board view (E6): the live dashboard. v6 ("the cockpit") renders the
+ * board as a DENSE ROW LIST, not a card grid: one single-line row pair
+ * per job, sticky attention-band separators, inline disclosure.
  *
- * v3: job cards are collapsed by default — title + status + one compact
- * signal + one meta line. Clicking the card expands v2's full detail
- * (lane strip, rounds whose lens chips reveal per round). The expanded
- * set persists per job; actionable state (unacked action-required
- * notifications, failed/aborted rounds) rides the collapsed face and is
- * never hidden by the collapse.
+ * The surface stack:
+ *   - the status chip rail (v4 health row relocated; `board-rail.ts`)
+ *     under the command bar carries whole-system state incl. the folded
+ *     jobs/PRs/lane counts and the Jev/unacked trackers;
+ *   - attention-bucketed job rows (NEEDS YOU / IN FLIGHT / SETTLED /
+ *     COLD) with sticky headers and counts;
+ *   - the agents/transcripts rail (tabs, dense rows, disposed overflow);
+ *   - the notification center (bell + panel).
  *
- * v4: the board answers WHAT TO DO NEXT — a KPI strip (status/PR/lane
- * counts), a health row (deploy drift first), and attention-bucketed job
- * ordering (NEEDS YOU / IN FLIGHT / SETTLED / COLD) with recency inside
- * each band.
+ * v3 semantics survive the redesign: rows collapse to their summary face
+ * and expand inline; actionable state (unacked action-required, failed or
+ * aborted rounds) rides the collapsed face. v4.1's rolling settled window
+ * (latest 10 + expand footer, stale pills suppressed on concluded jobs)
+ * is carried here; the v5 fill/hover restraint stays.
  */
 
 import {
   agentStateTone,
   jobChipTone,
+  jobStatusTone,
   lensChipTone,
   type AgentView,
   type BoardSnapshot,
@@ -35,9 +38,7 @@ import {
   settledWindow,
   type BandId,
 } from '../lib/board-bands.js';
-import { bandColumnsForWidth, estimatedCenterWidth } from '../lib/console-layout.js';
-import { healthCards } from '../lib/board-health.js';
-import { boardKpis } from '../lib/board-kpi.js';
+import { railChips, type RailChip } from '../lib/board-rail.js';
 import { formatAge } from '../lib/board-time.js';
 import { jobSignal, pluralCount, roundSummary, unackedByJob } from '../lib/board-signals.js';
 import type { BoardClient } from '../lib/board-client.js';
@@ -67,13 +68,15 @@ export interface TranscriptOpenRequest {
 
 export class BoardView {
   private readonly mount: HTMLElement;
+  private readonly chipRail: HTMLElement;
+  private readonly agentsCount: HTMLElement;
   private readonly notificationBell: HTMLButtonElement;
   private readonly notificationBadge: HTMLElement;
   private readonly notificationPanel: HTMLElement;
   private readonly decisionsChip: HTMLElement;
   private readonly unackedChip: HTMLElement;
   private readonly onOpenTranscript: (request: TranscriptOpenRequest) => void;
-  /** v3: collapsed-by-default job cards. The expanded set loads once from
+  /** v3: collapsed-by-default job rows. The expanded set loads once from
    * the injected storage (null = session-only) and persists on every
    * operator toggle; a snapshot push re-reads it and never auto-expands. */
   private readonly collapseStorage: StorageLike | null;
@@ -102,12 +105,10 @@ export class BoardView {
   /** E7: display receipts already sent (id → surfaces sent). */
   private readonly sentShown = new Map<string, Set<string>>();
   /** E7: notification ids previously seen (new arrivals toast). */
-  private knownNotificationIds = new Set<string>();
-  /** v5: the SETTLED rolling window — expanded for this session only. */
+  private readonly knownNotificationIds = new Set<string>();
+  /** v4.1/v5: the SETTLED rolling window — expanded for this session only. */
   private settledExpanded = false;
-  /** v5: KPI values from the previous render (micro-tick on change). */
-  private readonly lastKpiValues = new Map<string, string>();
-  /** v5: job ids already on screen (new cards slide in; old ones do not). */
+  /** v5: job ids already on screen (new rows slide in; old ones do not). */
   private readonly knownJobIds = new Set<string>();
   private firstJobsRender = true;
 
@@ -117,6 +118,8 @@ export class BoardView {
     collapseStorage: StorageLike | null = null,
   ) {
     this.mount = mustGet('board-jobs');
+    this.chipRail = mustGet('chip-rail');
+    this.agentsCount = mustGet('rail-agents-count');
     this.notificationBell = mustGet<HTMLButtonElement>('notification-bell');
     this.notificationBadge = mustGet('notification-badge');
     this.notificationPanel = mustGet('notification-panel');
@@ -139,11 +142,6 @@ export class BoardView {
         this.updateBadge(this.snapshot?.notifications ?? []);
       }
     });
-    // v5: the band grid re-fits when the window (and with it the center
-    // pane) resizes; cheap enough to run on every resize event.
-    if (typeof window !== 'undefined') {
-      window.addEventListener('resize', () => this.applyBandColumns());
-    }
   }
 
   /** E7: wire the live toast surface (main wires toasts + browser
@@ -161,108 +159,68 @@ export class BoardView {
   render(snapshot: BoardSnapshot): void {
     const previous = this.snapshot;
     this.snapshot = snapshot;
-    this.renderKpis(snapshot);
-    this.renderHealth(snapshot);
-    this.renderTrackers(snapshot);
-    this.renderRepos(snapshot);
+    this.renderRail(snapshot);
+    this.renderJobs(snapshot);
     this.renderAgents(snapshot.agents);
     this.renderNotifications(snapshot.notifications);
     this.surfaceNewNotifications(previous, snapshot.notifications);
   }
 
   // ------------------------------------------------------------------
-  // KPI strip + health row (v4)
+  // Status chip rail (v6: the v4 health row, relocated + counts folded)
   // ------------------------------------------------------------------
 
-  /** The top-of-board strip: status counts, PR state, lane activity.
-   * Every number is derived from the SAME snapshot the cards render, so
-   * the strip can never disagree with the board below it. */
-  private renderKpis(snapshot: BoardSnapshot): void {
-    const mount = mustGet('board-kpis');
-    mount.replaceChildren();
-    const kpis = boardKpis(snapshot);
-    mount.append(
-      this.kpiGroup('Jobs', [
-        { label: 'working', value: kpis.jobs.working },
-        { label: 'in-review', value: kpis.jobs.inReview },
-        { label: 'merged', value: kpis.jobs.merged },
-        { label: 'done', value: kpis.jobs.done },
-        { label: 'parked', value: kpis.jobs.parked },
-      ], `${kpis.jobs.total} jobs on the board`),
-      this.kpiGroup('PRs', [
-        { label: 'open', value: kpis.prs.open },
-        {
-          label: 'conflicting',
-          value: kpis.prs.conflicting,
-          tone: kpis.prs.conflicting > 0 ? 'alert' : null,
-        },
-        { label: 'merged today', value: kpis.prs.mergedToday },
-      ]),
-      this.kpiGroup('Lanes', [
-        { label: 'live minions', value: kpis.lanes.liveMinions },
-        {
-          label: 'mid-turn',
-          value: kpis.lanes.midTurn,
-          ageSince: kpis.lanes.midTurnOldestAt,
-        },
-        { label: 'disposed', value: kpis.lanes.disposed },
-      ]),
+  /** The global rail: seven chips — deploy → reviews → silas → alerts →
+   * verify → cure → trackers. Same snapshot as the rows below, so the
+   * rail can never disagree with the board. */
+  private renderRail(snapshot: BoardSnapshot): void {
+    this.chipRail.hidden = false;
+    this.renderTrackers(snapshot);
+    this.chipRail.replaceChildren();
+    for (const chip of railChips(snapshot)) {
+      this.chipRail.append(chip.id === 'trackers' ? this.trackersChipNode(chip) : this.railChipNode(chip));
+    }
+  }
+
+  private railChipNode(chip: RailChip): HTMLElement {
+    const node = el('span', `rail-chip rail-chip--${chip.tone}`);
+    node.dataset.chip = chip.id;
+    node.title = chip.titleAttr;
+    node.append(
+      el('span', 'rail-chip__label', chip.label),
+      el('span', 'rail-chip__value', chip.value),
     );
-  }
-
-  private kpiGroup(
-    title: string,
-    stats: readonly { label: string; value: number; tone?: 'alert' | null; ageSince?: string | null }[],
-    titleAttr?: string,
-  ): HTMLElement {
-    const card = el('div', 'board-kpi pp-soft');
-    const head = el('div', 'lbl board-kpi__title', title);
-    if (titleAttr !== undefined) head.title = titleAttr;
-    card.append(head);
-    const row = el('div', 'board-kpi__row');
-    for (const stat of stats) {
-      const node = el(
+    if (chip.flag !== null) {
+      node.append(el('span', 'pp-chip pp-chip--alert rail-chip__flag', chip.flag));
+    }
+    for (const badge of chip.subs) {
+      const sub = el(
         'span',
-        `board-kpi__stat${stat.tone === 'alert' ? ' board-kpi__stat--alert' : ''}`,
+        `rail-chip__sub${badge.tone === 'plain' ? '' : ` rail-chip__sub--${badge.tone}`}`,
+        badge.label,
       );
-      const valueNode = el('b', 'board-kpi__value', String(stat.value));
-      // v5 live-feel: a changed number ticks once (micro crossfade); the
-      // first render never animates — the page load has its own reveal.
-      const key = `${title}:${stat.label}`;
-      const previous = this.lastKpiValues.get(key);
-      this.lastKpiValues.set(key, String(stat.value));
-      if (previous !== undefined && previous !== String(stat.value)) {
-        valueNode.classList.add('board-kpi__value--tick');
-      }
-      node.append(valueNode, el('span', 'board-kpi__label', stat.label));
-      if (stat.ageSince !== undefined && stat.ageSince !== null) {
-        node.append(this.ageNode('board-kpi__age lbl', stat.ageSince, 'oldest ', ''));
-      }
-      row.append(node);
+      sub.dataset.kpi = badge.kpi;
+      sub.title = badge.title;
+      node.append(sub);
     }
-    card.append(row);
-    return card;
+    return node;
   }
 
-  /** The slim health row: each card earned by a real incident; sources
-   * not yet wired render `n/a` (never a fabricated zero). */
-  private renderHealth(snapshot: BoardSnapshot): void {
-    const mount = mustGet('board-health');
-    mount.replaceChildren();
-    for (const card of healthCards(snapshot)) {
-      const node = el('div', `board-health__card pp-soft board-health__card--${card.tone}`);
-      node.dataset.card = card.id;
-      node.title = card.titleAttr;
-      node.append(
-        el('div', 'lbl board-health__title', card.title),
-        el('div', 'board-health__value', card.value),
-        el('div', 'lbl board-health__detail', card.detail),
-      );
-      if (card.flag !== null) {
-        node.append(el('span', 'pp-chip pp-chip--alert board-health__flag', card.flag));
-      }
-      mount.append(node);
+  /** TRACKERS: the count headline plus the Jev + unacked chips the v4
+   * tracker strip carried (their ids/behavior survive the move). */
+  private trackersChipNode(chip: RailChip): HTMLElement {
+    const node = el('span', `rail-chip rail-chip--trackers rail-chip--${chip.tone}`);
+    node.dataset.chip = 'trackers';
+    node.title = chip.titleAttr;
+    node.append(el('span', 'rail-chip__label', chip.label), el('span', 'rail-chip__value', chip.value));
+    for (const badge of chip.subs) {
+      const sub = el('span', 'rail-chip__sub', badge.label);
+      sub.dataset.kpi = badge.kpi;
+      sub.title = badge.title;
+      node.append(sub);
     }
+    node.append(this.decisionsChip, this.unackedChip);
+    return node;
   }
 
   // ------------------------------------------------------------------
@@ -323,20 +281,16 @@ export class BoardView {
   }
 
   // ------------------------------------------------------------------
-  // Repo-grouped job cards
+  // Attention-bucketed dense job rows
   // ------------------------------------------------------------------
 
-  /** Banded job cards: NEEDS YOU / IN FLIGHT / SETTLED / COLD, recency
-   * within each band. v5 flattens v4's repo wrapper: each job card is
-   * its own grid cell (a dashboard glance, not a scroll) and credits its
-   * repo on the card face, so grouping stays legible without a
-   * wrapper that would strand multi-job repos in one column.
-   *
-   * NEEDS YOU is always on screen (its clear state is information) and
-   * full-width; the other bands are card grids (`auto-fill`, ~340px
-   * cards) sized to the center pane. The SETTLED band is a rolling
-   * window over its recency-sorted tail. */
-  private renderRepos(snapshot: BoardSnapshot): void {
+  /** Banded job rows: NEEDS YOU / IN FLIGHT / SETTLED / COLD, recency
+   * within each band. Every band is a full-width row list; band headers
+   * are sticky separators with counts, so the operator never loses the
+   * band they are reading. NEEDS YOU is always on screen (its clear
+   * state is information); SETTLED is a rolling window over its
+   * recency-sorted tail (v4.1). */
+  private renderJobs(snapshot: BoardSnapshot): void {
     this.mount.replaceChildren();
     if (snapshot.repos.length === 0 || snapshot.repos.every((repo) => repo.jobs.length === 0)) {
       const empty = el('div', 'board-empty');
@@ -366,20 +320,13 @@ export class BoardView {
       section.append(head);
       if (band === 'needs-you' && jobs.length === 0) {
         section.append(this.clearNeedsYou());
-      } else if (band === 'needs-you') {
-        // Full-width and loud: the operator's queue, one card per row.
-        const list = el('div', 'board-band__list');
-        for (const entry of jobs) {
-          list.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, band));
-        }
-        section.append(list);
       } else {
         const window = band === 'settled' ? settledWindow(jobs, this.settledExpanded) : { jobs, hidden: 0 };
-        const grid = el('div', 'board-band__grid');
+        const rows = el('div', 'board-band__rows');
         for (const entry of window.jobs) {
-          grid.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, band));
+          rows.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, band));
         }
-        section.append(grid);
+        section.append(rows);
         if (window.hidden > 0) {
           const more = el('button', 'board-band__more', `+${window.hidden} older settled`);
           more.type = 'button';
@@ -396,7 +343,6 @@ export class BoardView {
     for (const group of bands) for (const entry of group.jobs) seenIds.add(entry.job.id);
     for (const id of seenIds) this.knownJobIds.add(id);
     this.firstJobsRender = false;
-    this.applyBandColumns();
   }
 
   /** An empty NEEDS YOU band is good news, not absence: a calm green
@@ -411,33 +357,21 @@ export class BoardView {
     return node;
   }
 
-  /** v5: fit each band's card grid to the measured center pane — the JS
-   * mirror of the CSS auto-fill rule. Before any layout has run (unit
-   * tests, a hidden mount) the viewport-derived estimate stands in. */
-  private applyBandColumns(): void {
-    for (const grid of this.mount.querySelectorAll<HTMLElement>('.board-band__grid')) {
-      const measured = grid.clientWidth;
-      const width = measured > 0 ? measured : estimatedCenterWidth(this.viewportWidth());
-      const columns = bandColumnsForWidth(width);
-      grid.dataset.columns = String(columns);
-      grid.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
-    }
-  }
-
-  private viewportWidth(): number {
-    return typeof window === 'undefined' ? 0 : window.innerWidth;
-  }
-
-  /** One collapsed-by-default card. Collapsed DOM is exactly: title +
-   * status chip + optional stale flag + optional PR link + optional one
-   * compact signal chip + one meta line. The detail body is built only
-   * when expanded. */
+  /**
+   * One dense row. Line 1: status dot + chevron + title + (stale flag /
+   * compact signal) + status chip, right-aligned. Line 2 (small, muted):
+   * repo + branch + lane age + agent age + PR link. Clicking anywhere on
+   * the summary expands the v3 detail inline — the row is never a card
+   * until it is expanded. Error/failing rows carry the alert accent.
+   */
   private jobRow(job: JobView, unackedActionRequired: number, stale: boolean, band: BandId): HTMLElement {
     const row = el('article', 'board-job');
     row.dataset.jobId = job.id;
     row.dataset.band = band;
+    row.dataset.status = job.status;
+    if (jobFailing(job)) row.classList.add('board-job--alert');
     // v5: a job that was not on screen slides in (8px); a snapshot push
-    // re-rendering known cards stays still.
+    // re-rendering known rows stays still.
     if (!this.firstJobsRender && !this.knownJobIds.has(job.id)) {
       row.classList.add('board-job--enter');
     }
@@ -447,19 +381,35 @@ export class BoardView {
     toggle.type = 'button';
     const chevron = el('span', 'board-job__chevron', '▸');
     chevron.setAttribute('aria-hidden', 'true');
+    const dot = el('span', `board-job__dot board-job__dot--${jobStatusTone(job.status)}`);
+    dot.setAttribute('aria-hidden', 'true');
     const name = el('span', 'board-job__name', job.title);
     name.title = job.title;
-    toggle.append(
-      chevron,
-      name,
-      el('span', `pp-chip board-job__status ${jobChipTone(job.status)}`, job.status),
-    );
+    toggle.append(dot, chevron, name);
     if (stale) {
       const flag = el('span', 'pp-chip pp-chip--alert board-job__stale', 'stalled');
       flag.title = 'working with no agent frames past the stall window';
       toggle.append(flag);
     }
+    const signal = jobSignal(job, unackedActionRequired);
+    if (signal !== null) {
+      const chip = el('span', `pp-chip board-job__signal pp-chip--${signal.tone}`, signal.label);
+      chip.title = signal.title;
+      toggle.append(chip);
+    }
+    toggle.append(el('span', `pp-chip board-job__status ${jobChipTone(job.status)}`, job.status));
     head.append(toggle);
+    row.append(head);
+
+    const meta = el('div', 'board-job__meta lbl');
+    meta.append(el('span', 'board-job__repo', `📦 ${job.repo}`));
+    if (job.lane !== null) {
+      meta.append(el('span', 'board-job__branch', `🌿 ${job.lane.branch ?? 'detached'}`));
+      meta.append(this.ageNode('board-job__age board-job__lane-age', job.lane.createdAt, 'lane ', ''));
+      meta.append(this.ageNode('board-job__age board-job__agent-age', job.lastAgentActivity, 'agent ', ''));
+    } else if (job.baseBranch !== null) {
+      meta.append(el('span', 'board-job__branch', `⌂ ${job.baseBranch}`));
+    }
     if (job.prUrl !== null) {
       const link = el('a', 'board-job__pr', 'PR ↗');
       link.href = job.prUrl;
@@ -467,24 +417,9 @@ export class BoardView {
       link.rel = 'noreferrer';
       // Opening the PR is not a disclosure gesture.
       link.addEventListener('click', (event) => event.stopPropagation());
-      head.append(link);
+      meta.append(link);
     }
-    row.append(head);
-
-    const signal = jobSignal(job, unackedActionRequired);
-    if (signal !== null) {
-      const chip = el('span', `pp-chip board-job__signal pp-chip--${signal.tone}`, signal.label);
-      chip.title = signal.title;
-      row.append(chip);
-    }
-
-    const meta = el('div', 'board-job__meta lbl');
-    const metaText = `${job.id} · updated ${formatTs(job.updatedAt)}${job.baseBranch !== null ? ` · base ${job.baseBranch}` : ''}`;
-    meta.append(
-      el('span', 'board-job__repo', `📦 ${job.repo}`),
-      document.createTextNode(` · ${metaText}`),
-    );
-    meta.title = `${job.repo} · ${metaText}`;
+    meta.title = `${job.repo}${job.lane !== null ? ` · ${job.lane.branch ?? 'detached'}` : ''} · ${job.id}`;
     row.append(meta);
 
     let body: HTMLElement | null = null;
@@ -497,13 +432,13 @@ export class BoardView {
         body.remove();
       }
       toggle.setAttribute('aria-expanded', String(expanded));
-      chevron.textContent = expanded ? '▾' : '▸';
       row.dataset.expanded = String(expanded);
+      chevron.textContent = expanded ? '▾' : '▸';
       if (persist) this.setJobExpanded(job.id, expanded);
     };
     const flip = (): void => setExpanded(row.dataset.expanded !== 'true');
     toggle.addEventListener('click', flip);
-    // Whole-card click target for the summary face; interactive children
+    // Whole-row click target for the summary face; interactive children
     // (PR link, controls) and the expanded body keep their own behavior.
     row.addEventListener('click', (event) => {
       const target = event.target;
@@ -515,7 +450,10 @@ export class BoardView {
     return row;
   }
 
-  /** Expanded detail (the v2 surface): lane strip, note, condensed rounds. */
+  /** Expanded detail (the v2/v3 surface): lane strip, note, condensed
+   * rounds. Concluded jobs (merged/done) suppress their round history
+   * here — a merged job's aborted round is noise, not live state
+   * (v4.1 stale-pill suppression). */
   private jobBody(job: JobView): HTMLElement {
     const body = el('div', 'board-job__body');
     this.nextRegionId += 1;
@@ -534,7 +472,12 @@ export class BoardView {
       body.append(lane);
     }
     if (job.note !== null && job.note !== '') body.append(el('div', 'board-job__note', job.note));
-    for (const round of job.rounds) body.append(this.roundRow(round));
+    const concluded = job.status === 'merged' || job.status === 'done';
+    const rounds = concluded ? job.rounds.slice(-1) : job.rounds;
+    for (const round of rounds) body.append(this.roundRow(round, concluded));
+    if (concluded && rounds.length > 0) {
+      body.append(el('div', 'lbl board-job__reviewed', 'review history on the ledger'));
+    }
     return body;
   }
 
@@ -542,8 +485,9 @@ export class BoardView {
    * summary with failures counted inline. The per-lens chips are revealed
    * by clicking the row — seven near-identical pills per round were the
    * noise v3 removes, so they are never default-open. */
-  private roundRow(round: RoundView): HTMLElement {
+  private roundRow(round: RoundView, quiescent = false): HTMLElement {
     const roundRow = el('div', 'board-round');
+    if (quiescent) roundRow.classList.add('board-round--quiescent');
     const summary = roundSummary(round);
     const toggle = el('button', 'board-round__toggle');
     toggle.type = 'button';
@@ -557,12 +501,12 @@ export class BoardView {
       toggle.append(el('span', 'lbl board-round__verdict', `· ${round.verdict}`));
     }
     toggle.append(el('span', 'lbl board-round__lens-progress', `${summary.done}/${summary.total} lenses`));
-    if (summary.blockers > 0) {
+    if (summary.blockers > 0 && !quiescent) {
       toggle.append(
         el('span', 'pp-chip pp-chip--alert board-round__blockers', `⛔ ${pluralCount(summary.blockers, 'blocker')}`),
       );
     }
-    if (summary.failures > 0) {
+    if (summary.failures > 0 && !quiescent) {
       toggle.append(
         el('span', 'pp-chip pp-chip--alert board-round__failures', `✕ ${pluralCount(summary.failures, 'lens failure')}`),
       );
@@ -621,21 +565,22 @@ export class BoardView {
   }
 
   // ------------------------------------------------------------------
-  // Agent rail
+  // Agent rail (dense rows, tabs, disposed overflow)
   // ------------------------------------------------------------------
 
   private renderAgents(agents: readonly AgentView[]): void {
     const rail = mustGet('board-agents');
     rail.replaceChildren();
     this.ensureAgeTicker();
+    const live = agents.filter((agent) => agent.state !== 'disposed');
+    const disposed = agents.filter((agent) => agent.state === 'disposed');
+    this.agentsCount.textContent = String(live.length);
     if (agents.length === 0) {
       rail.append(el('div', 'lbl', 'no agents yet'));
       return;
     }
     // Liveness-first order arrives from the server; disposed rows collapse
     // behind a toggle so the graveyard never crowds live work.
-    const live = agents.filter((agent) => agent.state !== 'disposed');
-    const disposed = agents.filter((agent) => agent.state === 'disposed');
     for (const agent of live) rail.append(this.agentRow(agent, false));
     if (disposed.length > 0) {
       const toggle = el(
@@ -661,10 +606,15 @@ export class BoardView {
     }
   }
 
+  /** One dense agent row: status dot, name + short hash, role·state
+   * subline, right-aligned status chip. Error rows carry the alert
+   * accent (tint + left border) so a fault never hides in the list. */
   private agentRow(agent: AgentView, disposed: boolean): HTMLElement {
     const row = el('button', `board-agent${disposed ? ' board-agent--disposed' : ''}`);
     row.type = 'button';
     row.dataset.state = agent.state;
+    row.dataset.role = agent.role;
+    if (agent.state === 'error') row.classList.add('board-agent--error');
     row.title =
       agent.sessionFile !== null
         ? `${agent.id} — open transcript`
@@ -674,15 +624,24 @@ export class BoardView {
         this.onOpenTranscript({ file: agent.sessionFile ?? '', label: agentLabel(agent) });
       }
     });
-    row.append(
-      el('span', 'board-agent__emoji', ROLE_EMOJI[agent.role] ?? '🤖'),
+    const body = el('span', 'board-agent__body');
+    const top = el('span', 'board-agent__top');
+    top.append(
       el('span', 'board-agent__name', agentLabel(agent)),
+      el('span', 'board-agent__hash lbl', agent.id.slice(0, 12)),
+    );
+    const subline = el('span', 'board-agent__sub lbl');
+    subline.append(
+      el('span', 'board-agent__emoji', ROLE_EMOJI[agent.role] ?? '🤖'),
+      document.createTextNode(` ${agent.role} · ${agent.state}`),
     );
     // Turn-age counter: a streaming agent shows how long its current turn
     // has been quiet — the operator's "is it stuck?" glance.
     if (agent.state === 'streaming') {
-      row.append(this.ageNode('board-agent__age lbl', agent.lastActivity, '', ' quiet'));
+      subline.append(this.ageNode('board-agent__age lbl', agent.lastActivity, '', ' quiet'));
     }
+    body.append(top, subline);
+    row.append(el('span', 'board-agent__dot'), body);
     row.append(el('span', `pp-chip board-agent__state ${agentStateTone(agent.state)}`, agent.state));
     // E7: supervision mark — a stopped (breaker-tripped) or restarting
     // agent shows its supervision state on the rail.
@@ -805,6 +764,19 @@ export class BoardView {
   }
 }
 
+/** A row is "failing" when the record itself says so: blocked/error
+ * status, an aborted newest round, or errored lenses in a round that has
+ * not posted a verdict. Conflicting-PR-only rows stay calm — the band
+ * already shouts. */
+export function jobFailing(job: JobView): boolean {
+  if (job.status === 'blocked' || job.status === 'error') return true;
+  const round = job.rounds.at(-1) ?? null;
+  if (round === null) return false;
+  if (round.status === 'aborted') return true;
+  if (round.status !== 'verdict-posted' && round.lenses.some((lens) => lens.state === 'error')) return true;
+  return false;
+}
+
 function agentLabel(agent: AgentView): string {
   if (agent.label !== null && agent.label !== '') return agent.label;
   return `${agent.role} · ${agent.id.slice(0, 12)}`;
@@ -815,4 +787,3 @@ function formatTs(iso: string): string {
   if (Number.isNaN(date.getTime())) return iso;
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
-

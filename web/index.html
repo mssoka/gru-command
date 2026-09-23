@@ -7,22 +7,33 @@
   <meta name="description" content="One window into the whole operation — chat with the single Gru.">
 </head>
 <body>
-  <header class="app-nav">
-    <div class="app-nav__logo" aria-hidden="true">🪐</div>
-    <div>
-      <div class="app-nav__title">Gru Command</div>
-      <div class="lbl app-nav__tagline">one Gru · one window</div>
+  <!-- Global command bar (v6): brand + ticker + Chat/Board lenses + bell. -->
+  <header class="command-bar" id="command-bar">
+    <div class="command-bar__brand">
+      <span class="command-bar__logo" aria-hidden="true">🧠</span>
+      <span class="command-bar__names">
+        <span class="command-bar__title">Gru Command</span>
+        <span class="command-bar__tagline">ONE GRU · ONE WINDOW</span>
+      </span>
     </div>
-    <nav class="app-nav__tabs" aria-label="Views">
-      <button id="tab-chat" class="pp-btn pp-btn--secondary app-nav__tab" type="button">💬 Chat</button>
-      <button id="tab-board" class="pp-btn pp-btn--secondary app-nav__tab" type="button">🗺️ Board</button>
+    <div class="command-bar__ticker" id="command-ticker" role="status" aria-live="polite"></div>
+    <nav class="command-bar__tabs" aria-label="Views">
+      <button id="tab-chat" class="command-bar__tab" type="button">💬 Chat</button>
+      <button id="tab-board" class="command-bar__tab" type="button">🗺️ Board</button>
     </nav>
     <span class="conn-dot" id="conn-dot" title="socket: idle" role="status"></span>
-    <div class="app-nav__spacer"></div>
     <button id="notification-bell" class="pp-btn pp-btn--secondary pp-btn--icon board-bell" title="Notifications" hidden data-unread="0" data-open="false">🔔<span class="board-bell__badge" id="notification-badge">0</span></button>
     <button id="theme-toggle" class="pp-btn pp-btn--secondary pp-btn--icon" title="Toggle theme">🌙</button>
     <button id="settings-toggle" class="pp-btn pp-btn--secondary pp-btn--icon" title="Settings">⚙️</button>
   </header>
+
+  <!-- Status chip rail (v6): the v4 health row relocated global, with the
+       jobs/PRs/lane KPI counts folded into its chips. Rendered by BoardView
+       once the first snapshot lands (hidden until then). -->
+  <div class="chip-rail" id="chip-rail" aria-label="System status" hidden>
+    <span class="pp-chip board-decisions" id="board-decisions" data-state="disabled">Jev: OFF</span>
+    <span class="pp-chip pp-chip--alert board-unacked" id="board-unacked" hidden>🔔 0 action-required</span>
+  </div>
 
   <main class="app-main">
     <div class="banner-stack" id="banners"></div>
@@ -81,7 +92,8 @@
       <div id="chat-main-mount" class="console__chat">
         <section id="chat-view" class="pp-card chat-panel" hidden>
           <div class="chat-panel__head">
-            <span class="chat-panel__title"><span class="chat-panel__glyph" aria-hidden="true">🧠</span> Gru</span>
+            <span class="chat-panel__title"><span class="chat-panel__glyph" aria-hidden="true">🧠</span> GRU BRAIN ENGINE</span>
+            <span class="chat-panel__online" id="chat-online" data-state="offline">OFFLINE</span>
             <button id="chat-collapse" class="chat-panel__collapse" type="button"
                     title="Collapse chat" aria-label="Collapse chat">⇤</button>
           </div>
@@ -127,34 +139,40 @@
         🧠<span class="console__rail-dot" aria-hidden="true"></span>
       </button>
 
+      <!-- Cockpit drag splitters (v6): 4px boundaries between the panes
+           (>=1100px). Drag resizes, double-click resets, arrows nudge. -->
+      <div id="splitter-chat" class="splitter" role="separator" aria-orientation="vertical"
+           aria-label="Resize chat pane" title="Drag to resize · double-click to reset" tabindex="0"></div>
+
       <section id="board-view" class="board-view" hidden>
-        <div class="board-layout">
-          <div class="board-main">
-            <div class="board-kpis" id="board-kpis" aria-label="Board KPIs"></div>
-            <div class="board-health" id="board-health" aria-label="Service health"></div>
-            <div class="board-trackers" id="board-trackers">
-              <span class="lbl">Trackers</span>
-              <span class="pp-chip board-decisions" id="board-decisions" data-state="disabled">Jev: OFF</span>
-              <span class="pp-chip pp-chip--alert board-unacked" id="board-unacked" hidden>🔔 0 action-required</span>
-            </div>
-            <div id="board-jobs" class="board-jobs"></div>
-          </div>
-          <aside class="board-side">
-            <section class="pp-soft board-side__section">
-              <div class="lbl">Agents</div>
-              <div id="board-agents" class="board-agents"></div>
-            </section>
-            <section class="pp-soft board-side__section">
-              <div class="lbl">Transcripts</div>
-              <div id="board-transcripts" class="board-agents"></div>
-            </section>
-          </aside>
+        <div class="board-main">
+          <div id="board-jobs" class="board-jobs"></div>
         </div>
         <div id="notification-panel" class="pp-card notification-panel" hidden>
           <div class="lbl">Notifications</div>
           <div id="notification-list" class="notification-list"></div>
         </div>
       </section>
+
+      <div id="splitter-rail" class="splitter" role="separator" aria-orientation="vertical"
+           aria-label="Resize agents rail" title="Drag to resize · double-click to reset" tabindex="0"></div>
+
+      <!-- Agents rail (v6): AGENTS / TRANSCRIPTS tabs, dense rows, dashed
+           disposed overflow. -->
+      <aside id="agents-rail" class="board-side agents-rail">
+        <div class="agents-rail__tabs" role="tablist" aria-label="Agents and transcripts">
+          <button id="rail-tab-agents" class="agents-rail__tab agents-rail__tab--active" type="button"
+                  role="tab" aria-selected="true" aria-controls="board-agents" data-rail-tab="agents">
+            AGENTS <span class="agents-rail__count" id="rail-agents-count">0</span>
+          </button>
+          <button id="rail-tab-transcripts" class="agents-rail__tab" type="button"
+                  role="tab" aria-selected="false" aria-controls="board-transcripts" data-rail-tab="transcripts">
+            TRANSCRIPTS
+          </button>
+        </div>
+        <div id="board-agents" class="board-agents rail-panel" role="tabpanel" aria-labelledby="rail-tab-agents"></div>
+        <div id="board-transcripts" class="board-agents rail-panel" role="tabpanel" aria-labelledby="rail-tab-transcripts" hidden></div>
+      </aside>
     </div>
 
     <div id="transcript-drawer" class="transcript-drawer" hidden>
@@ -182,8 +200,8 @@
     <div id="chat-sheet-mount"></div>
   </div>
 
-  <!-- The Gru FAB (v5): toggles the console pane at >=1280px, opens the
-       chat overlay below it. Never hidden while paired. -->
+  <!-- The Gru FAB (v5): toggles the console pane at cockpit width, opens
+       the chat overlay below it. Never hidden while paired. -->
   <button class="gru-fab" id="gru-fab" data-unread="0" type="button"
           aria-label="Chat with Gru" title="Chat with Gru" hidden>
     🧠<span class="gru-fab__badge" id="chat-badge">0</span>

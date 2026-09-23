@@ -1,6 +1,6 @@
 /**
- * Chat view: one DOM tree, two placements (board UX v5). At/above the
- * console breakpoint the panel is the left console pane; below it the
+ * Chat view: one DOM tree, two placements (board UX v5/v6). At/above the
+ * cockpit breakpoint the panel is the left console pane; below it the
  * panel is reparented into the overlay sheet (bottom sheet on a phone,
  * right drawer on a tablet) opened by the Gru FAB. One message log, one
  * socket, one composer either way.
@@ -26,11 +26,13 @@ import type {
   LoggedFrame,
 } from '../lib/protocol.js';
 import { imageKindFor, type BrowseResult, type UploadedFile } from '../lib/attach-client.js';
+import { COCKPIT_MIN_WIDTH } from '../lib/console-layout.js';
 import { MAX_ATTACHMENTS_PER_MESSAGE } from '../lib/protocol.js';
 import { renderMarkdown } from '../lib/markdown.js';
 import { el, mustGet } from './dom.js';
 
-const OVERLAY_QUERY = '(max-width: 1279px)';
+/** The chat overlay takes over below the cockpit width (v6). */
+const OVERLAY_QUERY = `(max-width: ${COCKPIT_MIN_WIDTH - 1}px)`;
 
 /** Touch devices: the return key inserts a newline (composer fork 1,
  * user ruling 2026-09-20) — the send gesture is the always-visible Send
