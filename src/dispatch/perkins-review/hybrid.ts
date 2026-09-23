@@ -175,6 +175,22 @@ interface ChildResult {
   readonly error?: string;
 }
 
+/** One host-recorded non-valid attempt for a required lens/chunk. */
+export interface CoverageAttemptFailure {
+  readonly attempt: number;
+  readonly status: 'invalid' | 'failed';
+  readonly failureKind: ChildFailureKind;
+  readonly error: string;
+}
+
+/** A required lens/chunk whose full attempt budget was spent without a valid
+ * result: no further attempt can satisfy the coverage gate. */
+export interface ExhaustedCoverage {
+  readonly lens: PerkinsLens;
+  readonly chunk: string;
+  readonly attempts: readonly CoverageAttemptFailure[];
+}
+
 interface CandidateDecision {
   readonly candidate_ref: string;
   readonly disposition: VerificationDisposition;
@@ -655,6 +671,7 @@ function renderLensPrompt(
   lens: PerkinsLens,
   chunk: string,
   output: ChildOutputMode,
+  retry?: { readonly attempt: 1 | 2; readonly previous: CoverageAttemptFailure },
 ): string {
   const selected = review.chunks.find((candidate) => candidate.id === chunk);
   if (selected === undefined) throw new Error(`missing frozen chunk ${chunk}`);
@@ -667,14 +684,81 @@ function renderLensPrompt(
   const template = lens === 'blind' ? policy.portableContract.blindPrompt : policy.portableContract.sharedPrompt;
   if (!template.includes('{{OUTPUT_CONTRACT}}')) throw new Error('policy prompt is missing the output contract placeholder');
   const rendered = template.replace('{{OUTPUT_CONTRACT}}', () => contract);
-  if (lens === 'blind') return renderTemplateOnce(rendered, { '{{DIFF}}': selected.diff });
-  return renderTemplateOnce(rendered, {
-    '{{PROJECT_CONVENTIONS}}': review.projectConventions,
-    '{{DIFF}}': selected.diff,
-    '{{SPEC_CONTEXT}}': review.specContext,
-    '{{LENS_BRIEF}}': policy.portableContract.lenses[lens],
-    '{{LENS}}': lens,
-  });
+  const prompt = lens === 'blind'
+    ? renderTemplateOnce(rendered, { '{{DIFF}}': selected.diff })
+    : renderTemplateOnce(rendered, {
+      '{{PROJECT_CONVENTIONS}}': review.projectConventions,
+      '{{DIFF}}': selected.diff,
+      '{{SPEC_CONTEXT}}': review.specContext,
+      '{{LENS_BRIEF}}': policy.portableContract.lenses[lens],
+      '{{LENS}}': lens,
+    });
+  // A retry is corrective, not a blind repeat: the host delivers the previous
+  // attempt's exact failure class and reason in the child's own contract.
+  if (retry === undefined || retry.attempt <= 1) return prompt;
+  return `${prompt}\n\n--- RETRY CORRECTION (attempt ${retry.attempt}) ---\n${retryCorrection(output, retry.previous)}`;
+}
+
+/** The reason carried by an abort signal, or the generic cancellation error
+ * for signals aborted without one. */
+function abortReasonFor(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error('review operation aborted');
+}
+
+function coverageAttemptLine(failure: CoverageAttemptFailure): string {
+  const reason = failure.error.replace(/[\r\n]+/gu, ' ').trim().slice(0, 200);
+  return `attempt ${failure.attempt} ${failure.status} (${failure.failureKind}): ${reason}`;
+}
+
+/** Thrown the moment a required lens/chunk has spent every allowed attempt
+ * without a valid result: the round cannot complete, so the host aborts it
+ * before the lead can consume terminal submissions against a dead gate. */
+export class CoverageExhaustedError extends Error {
+  readonly roundId: string;
+  readonly exhausted: readonly ExhaustedCoverage[];
+
+  constructor(roundId: string, exhausted: readonly ExhaustedCoverage[]) {
+    const details = exhausted
+      .map((entry) => `${entry.lens}/${entry.chunk} (${entry.attempts.map(coverageAttemptLine).join('; ')})`)
+      .join(' | ');
+    super(`round cannot complete: coverage exhausted (round ${roundId}): ${details}`);
+    this.name = 'CoverageExhaustedError';
+    this.roundId = roundId;
+    this.exhausted = exhausted;
+  }
+}
+
+/** Corrective instruction for a retry attempt, built from the host's exact
+ * previous rejection so the child can fix what failed. The instruction keeps
+ * the child's own output contract (native tool vs. bare text array). */
+function retryCorrection(output: ChildOutputMode, previous: CoverageAttemptFailure): string {
+  const reason = previous.error.replace(/[\r\n]+/gu, ' ').trim().slice(0, 400);
+  if (output === 'nativeTool') {
+    return `Previous attempt rejected (${previous.failureKind}): ${reason}. Retry the same task and call ${FINDINGS_TOOL_NAME} exactly once with the full corrected { "findings": [...] } payload; findings in assistant text are ignored.`;
+  }
+  return `Previous output rejected (${previous.failureKind}): ${reason}; output ONLY the bare JSON array.`;
+}
+
+/** Every required coverage key whose full attempt budget was spent without a
+ * valid result: those keys can never become valid again. */
+function exhaustedRequiredCoverage(
+  expected: ReadonlySet<string>,
+  attempts: ReadonlyMap<string, number>,
+  validCoverage: ReadonlySet<string>,
+  failureLog: ReadonlyMap<string, readonly CoverageAttemptFailure[]>,
+  maxAttempts: number,
+): readonly ExhaustedCoverage[] {
+  const exhausted: ExhaustedCoverage[] = [];
+  for (const key of expected) {
+    if (validCoverage.has(key) || (attempts.get(key) ?? 0) < maxAttempts) continue;
+    const separator = key.indexOf('\0');
+    exhausted.push({
+      lens: key.slice(0, separator) as PerkinsLens,
+      chunk: key.slice(separator + 1),
+      attempts: failureLog.get(key) ?? [],
+    });
+  }
+  return exhausted;
 }
 
 /** A review turn exceeded its host budget. Classified separately from output
@@ -700,10 +784,10 @@ async function boundedPrompt(
     for (const signal of signals) {
       if (signal === undefined) continue;
       if (signal.aborted) {
-        reject(new Error('review operation aborted'));
+        reject(abortReasonFor(signal));
         return;
       }
-      const listener = () => rejectAbort?.(new Error('review operation aborted'));
+      const listener = () => rejectAbort?.(abortReasonFor(signal));
       listeners.push({ signal, listener });
       signal.addEventListener('abort', listener, { once: true });
     }
@@ -729,7 +813,8 @@ async function boundedSpawn(
   timeoutMs: number,
   signals: readonly (AbortSignal | undefined)[],
 ): Promise<AgentHandle> {
-  if (signals.some((signal) => signal?.aborted === true)) throw new Error('review operation aborted');
+  const preAborted = signals.find((signal) => signal?.aborted === true);
+  if (preAborted !== undefined) throw abortReasonFor(preAborted);
   const spawning = spawn();
   let timer: ReturnType<typeof setTimeout> | null = null;
   const listeners: Array<{ signal: AbortSignal; listener: () => void }> = [];
@@ -737,10 +822,10 @@ async function boundedSpawn(
     for (const signal of signals) {
       if (signal === undefined) continue;
       if (signal.aborted) {
-        reject(new Error('review operation aborted'));
+        reject(abortReasonFor(signal));
         return;
       }
-      const listener = () => reject(new Error('review operation aborted'));
+      const listener = () => reject(abortReasonFor(signal));
       listeners.push({ signal, listener });
       signal.addEventListener('abort', listener, { once: true });
     }
@@ -817,6 +902,14 @@ export class PerkinsHybridReview {
     const validCoverage = new Set<string>();
     const results = new Map<string, ChildResult>();
     const candidates = new Map<string, ChildCandidate>();
+    // Host-recorded non-valid attempts per coverage key: the corrective retry
+    // instruction and the round-abort escalation both read from here.
+    const failureLog = new Map<string, CoverageAttemptFailure[]>();
+    // The host's immediate stop signal: aborting it cancels the lead turn and
+    // every child prompt the moment the round can no longer complete.
+    const roundAbort = new AbortController();
+    const roundAbortReason = (): Error => abortReasonFor(roundAbort.signal);
+    const externallyAborted = (): boolean => input.signal?.aborted === true;
     const envelopes: LensEnvelope[] = [];
     const leadArtifacts = new Set<string>();
     const readChunks = new Set<string>();
@@ -844,7 +937,13 @@ export class PerkinsHybridReview {
       sessionFiles.add(sessionFile);
     };
 
-    const runChild = async (lens: PerkinsLens, chunk: string, attempt: 1 | 2, signal?: AbortSignal): Promise<ChildResult> => {
+    const runChild = async (
+      lens: PerkinsLens,
+      chunk: string,
+      attempt: 1 | 2,
+      previous: CoverageAttemptFailure | undefined,
+      signal?: AbortSignal,
+    ): Promise<ChildResult> => {
       this.onProgress({ lens, chunk, state: 'running' });
       let handle: AgentHandle | null = null;
       let raw: string | null = null;
@@ -908,7 +1007,7 @@ export class PerkinsHybridReview {
             tools: lens === 'blind' ? [] : ['read', 'grep', 'find', 'ls'],
             nativeTools: [submitFindingsTool],
           },
-        }), CHILD_SPAWN_TIMEOUT_MS, [signal, input.signal]);
+        }), CHILD_SPAWN_TIMEOUT_MS, [signal, input.signal, roundAbort.signal]);
         registerIsolatedHandle(handle, 'lens');
         this.onAgent({ phase: 'lens', lens, chunk, attempt, handle });
         // The hosting runtime declares the tools it actually wired: a
@@ -917,9 +1016,12 @@ export class PerkinsHybridReview {
         nativeSubmit = handle.reviewTools?.includes(FINDINGS_TOOL_NAME) === true;
         await boundedPrompt(
           handle,
-          renderLensPrompt(this.policy, review, lens, chunk, nativeSubmit ? 'nativeTool' : 'text'),
+          renderLensPrompt(
+            this.policy, review, lens, chunk, nativeSubmit ? 'nativeTool' : 'text',
+            attempt > 1 && previous !== undefined ? { attempt, previous } : undefined,
+          ),
           CHILD_TURN_TIMEOUT_MS,
-          [signal, input.signal],
+          [signal, input.signal, roundAbort.signal],
         );
         promptResolved = true;
       } catch (error) {
@@ -1090,6 +1192,7 @@ export class PerkinsHybridReview {
         },
       },
       execute: (raw, signal) => serializeRunTool(async () => {
+        if (roundAbort.signal.aborted) throw roundAbortReason();
         if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
         if (accepted !== null) throw new Error('review already has an accepted terminal submission');
         const value = record(raw, 'perkins_run_lenses input');
@@ -1112,12 +1215,12 @@ export class PerkinsHybridReview {
           if (validCoverage.has(key)) throw new Error(`coverage ${run.lens}/${run.chunk} is already valid`);
           const priorAttempt = attempts.get(key) ?? 0;
           if (priorAttempt >= this.policy.portableContract.rules.maxLensAttempts) throw new Error(`coverage ${run.lens}/${run.chunk} exhausted its attempts`);
-          return { ...run, key, attempt: (priorAttempt + 1) as 1 | 2 };
+          return { ...run, key, attempt: (priorAttempt + 1) as 1 | 2, previous: failureLog.get(key)?.at(-1) };
         });
         for (const run of scheduled) attempts.set(run.key, run.attempt);
         let childResults: readonly ChildResult[];
         try {
-          childResults = await pool(scheduled, CHILD_CONCURRENCY, (run) => runChild(run.lens, run.chunk, run.attempt, signal));
+          childResults = await pool(scheduled, CHILD_CONCURRENCY, (run) => runChild(run.lens, run.chunk, run.attempt, run.previous, signal));
         } catch (error) {
           restoreAttempts(scheduled);
           throw error;
@@ -1149,9 +1252,47 @@ export class PerkinsHybridReview {
         // satisfy terminal proof.
         for (const result of childResults) {
           results.set(result.resultId, result);
-          if (result.status !== 'valid') continue;
-          validCoverage.add(`${result.lens}\0${result.chunk}`);
+          const key = `${result.lens}\0${result.chunk}`;
+          if (result.status !== 'valid') {
+            const failures = failureLog.get(key) ?? [];
+            failureLog.set(key, [...failures, {
+              attempt: result.attempt,
+              status: result.status,
+              failureKind: result.failureKind ?? 'error',
+              error: result.error ?? 'no host-recorded reason',
+            }]);
+            continue;
+          }
+          validCoverage.add(key);
           for (const candidate of result.findings) candidates.set(candidate.ref, candidate);
+        }
+        // A required lens/chunk that spent its whole attempt budget without a
+        // valid result can never satisfy the coverage gate. Abort the round
+        // now — before the lead burns terminal submissions on a dead gate —
+        // and hand the lead turn the exact per-attempt failure record.
+        if (!externallyAborted() && !roundAbort.signal.aborted) {
+          const exhausted = exhaustedRequiredCoverage(
+            expected,
+            attempts,
+            validCoverage,
+            failureLog,
+            this.policy.portableContract.rules.maxLensAttempts,
+          );
+          if (exhausted.length > 0) {
+            const error = new CoverageExhaustedError(input.roundId, exhausted);
+            try {
+              writeReviewArtifact(review, 'coverage-exhausted.json', {
+                schemaVersion: 1,
+                roundId: input.roundId,
+                reason: 'coverage_exhausted',
+                exhausted,
+              });
+            } catch (writeError) {
+              if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) throw writeError;
+            }
+            roundAbort.abort(error);
+            throw error;
+          }
         }
         return {
           text: payload,
@@ -1445,7 +1586,7 @@ export class PerkinsHybridReview {
           tools: ['read', 'grep', 'find', 'ls'],
           nativeTools: [chunkTool, runTool, artifactTool, recordTool, preflightTool, submitTool],
         },
-      }), LEAD_SPAWN_TIMEOUT_MS, [input.signal]);
+      }), LEAD_SPAWN_TIMEOUT_MS, [input.signal, roundAbort.signal]);
       registerIsolatedHandle(lead, 'lead');
       this.onAgent({ phase: 'lead', handle: lead });
       unsubscribe = lead.subscribe((event) => {
@@ -1454,7 +1595,8 @@ export class PerkinsHybridReview {
           if (turns > MAX_LEAD_TURNS) void lead?.dispose();
         }
       });
-      await boundedPrompt(lead, initialPrompt, LEAD_TOTAL_TIMEOUT_MS, [input.signal]);
+      await boundedPrompt(lead, initialPrompt, LEAD_TOTAL_TIMEOUT_MS, [input.signal, roundAbort.signal]);
+      if (roundAbort.signal.aborted) throw roundAbortReason();
       if (input.signal?.aborted === true) throw new Error('review operation aborted');
       if (turns > MAX_LEAD_TURNS) throw new Error(`Perkins lead exceeded ${MAX_LEAD_TURNS} turns`);
       if (accepted === null) throw new Error('Perkins lead exited without an accepted terminal submission');
