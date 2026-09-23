@@ -47,7 +47,7 @@ key `gru-theme`).
 | `--soft` | `#fdf8ee` | `#182033` | wells, composer, user bubbles |
 | `--ink` | `#22304a` | `#e8ecf4` | primary text |
 | `--line` | `#22304a` | `#313c58` | chunky outlines |
-| `--muted` / `--faint` | `#6b7a94` / `#8a8678` | `#93a0b8` / `#6d7890` | secondary text |
+| `--muted` / `--faint` | `#5b6a84` / `#6d6a5d` | `#93a0b8` / `#8b96ac` | secondary text (AA-pinned in `web/src/lib/palette-contrast.test.ts`) |
 | `--work` | `#ffd54a` | `#ffd54a` | minion yellow: working/delivered, Gru bubbles |
 | `--done` | `#7ee08a` | `#6fd68a` | merged/done states |
 | `--rev` | `#9ad7f5` | `#7cc4ef` | review states |
@@ -56,6 +56,8 @@ key `gru-theme`).
 | `--perkins` | `#c9b8ff` | `#b7a3ff` | Perkins rounds |
 | `--accent` | `#22304a` | `#ffd54a` | primary buttons |
 | `--on-state` | `#22304a` | `#1a2236` | text ON saturated state colors |
+| `--band-needs-you` / `-ink` | `#f2868f` / `#b03e4a` | `#ff8f9c` / `#ff9fae` | NEEDS YOU accent (edge/pill · readable ink) |
+| `--band-in-flight` / `--band-settled` / `--band-cold` | work / done / park | work / done / park | IN FLIGHT / SETTLED / COLD band accents |
 
 Shape language: 2.5–3px ink outlines (`--outline*`), 14–22px radii,
 hard offset shadows (`--shadow-card`, `--shadow-btn`), `--ease-pop`
@@ -226,6 +228,39 @@ Renderer construct coverage is pinned in `web/src/lib/markdown.test.ts`.
 shows entry text as plain text — a different surface; GFM there is a
 follow-up lane, not part of this contract.
 
+## Console layout (board UX v5)
+
+The estate is a full-width console, not a centered column. Breakpoints
+(`web/src/lib/console-layout.ts` owns the numbers; CSS mirrors them):
+
+- **≥ 1280px — three panes:** `[ chat | board | rail ]`. The chat pane
+  (380px, full height, sticky) is open by default and collapses to a
+  slim 🧠 rail (persisted: `gru-chat-pane-collapsed`); new messages pulse
+  the rail's unread dot. The board's center column carries the KPI strip
+  + health row full-width, then the attention bands; the right rail
+  (agents + transcripts) is part of the board's own grid.
+- **900–1279px — two panes:** board + rail; the chat panel reparents
+  into the overlay sheet and the Gru FAB (bottom-right, 🧠) opens it over
+  a dimmed board (scrim).
+- **< 900px — single column:** board-first (SPEC ruling 11) with the
+  side rail stacked below; the FAB opens the bottom-sheet chat.
+
+The FAB is mounted once: at ≥1280px it toggles/focuses the chat pane
+(collapse state persists in localStorage); below that it opens the
+overlay. `web/src/ui/console.ts` owns the behavior; `ChatView` owns the
+unread math (a message counts only while no chat surface is in sight).
+
+### Attention bands (v4 → v5)
+
+Jobs bucket NEEDS YOU → IN FLIGHT → SETTLED → COLD (recency inside each
+band; see [BOARD.md](./BOARD.md)). v5 renders each band's **job cards**
+as a responsive card grid (`auto-fill`, ~340px cards, capped at 3
+columns — the JS mirror sets explicit columns from the measured pane).
+NEEDS YOU is always visible and full-width (an empty band shows a calm
+“nothing needs you” state); SETTLED is a rolling window — the latest 10
+cards, then `+K older settled` (session-expanded). Each band carries ONE
+accent (left edge + label pill only): warm red / yellow / green / gray.
+
 ## Views
 
 - **Pairing** — token field + QR (encodes `{url, token}` JSON payload
@@ -233,9 +268,12 @@ follow-up lane, not part of this contract.
   against the served UI; the wizard's token generation arrives with E9).
   Bad token → inline error. The field starts EMPTY everywhere — mock or
   real, localhost or LAN — the token is per-install, never a guess.
-- **Chat** — desktop: panel (default tab); mobile (≤768px): corner
-  bubble that opens a bottom sheet (same DOM reparented via matchMedia;
-  unread badge counts deltas arriving while closed). Gru replies render as
+- **Chat** — one DOM tree, two placements. **≥1280px:** the left console
+  pane (collapsible to the 🧠 rail). **<1280px:** reparented into the
+  overlay sheet — bottom sheet on a phone, right drawer on a tablet —
+  opened by the Gru FAB (scrim dims the board behind); unread badge
+  counts frames arriving while closed or while the pane is collapsed.
+  Gru replies render as
   GFM markdown (see the [rendering contract](#message-rendering-gfm-contract--issue-10));
   streaming deltas re-render token-by-token with a caret; tool activity is
   a live status line. User messages stay plain text. A quiet row above the
@@ -248,11 +286,13 @@ follow-up lane, not part of this contract.
   stay visible and are sent once to the authoritative winning epoch.
   Compact success/failure and unsolicited provider outcomes are announced in
   a dedicated persistent live region that idle usage refreshes cannot erase.
-- **Board (E6)** — desktop tab `🗺️ Board`: repo-grouped job cards, round
-  rows with 7 per-lens live chips, agent rail, transcripts list,
-  notification center (see [BOARD.md](./BOARD.md)). **Phone:
-  board-first** (SPEC ruling 11) — the board is the landing view, chat
-  stays one tap away via the bubble; the Chat tab opens the sheet.
+- **Board (E6)** — always on the page (v5): KPI strip + health row +
+  attention-banded job cards + agent/transcript rail. At ≥1280px the
+  chat pane joins it on the left; below that the board is the full page
+  and chat overlays. Round rows carry 7 per-lens live chips behind the
+  card's disclosure; the notification center rides the bell (see
+  [BOARD.md](./BOARD.md)). **Phone:** board-first (SPEC ruling 11) — the
+  landing view, with chat one FAB tap away.
 - **Transcripts (E6)** — drawer from the agent rail / transcripts list:
   newest-first paging, server-side search with jump-to-entry, wrap
   toggle (long lines unwrap, never clip), collapsed thinking.
