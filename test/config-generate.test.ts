@@ -74,6 +74,7 @@ describe('config-generate CLI', () => {
       'dispatch',
       'silas',
       'review',
+      'verify',
     ]);
     for (const section of [
       '[server]',

@@ -169,6 +169,50 @@ recorded only after SHA-bound delivery proof succeeds; delivery failure
 terminalizes the round as durable INCOMPLETE alongside the preserved
 report — it never erases already-preserved findings.
 
+## 4c. Verification scheduler — one global test budget (contention fix 2026-09-22)
+
+Concurrent lanes used to each run their full suite with a worker pool
+sized to the machine's cores; N co-tenant lanes oversubscribed the box
+(observed load 15–22, vitest RPC timeouts killing green runs). That is a
+coordination problem, not a capacity one: the service owns ONE cross-lane
+verification budget.
+
+- **Lanes request a run** through the authenticated ops surface —
+  `POST /api/verify {job_id, scope}` (`scope` defaults to `full`) —
+  instead of running the suite themselves. The command comes from the
+  project's own declaration in `.gru-command/worktree.toml` (`[verify]`,
+  `scope = "command"` pairs), and it runs inside the job's lane worktree.
+  A repo that declares no verify command gets a loud 409 — no guessed
+  command, ever.
+- **The scheduler owns concurrency.** At most `[verify] max_concurrent`
+  runs (default 1) run at once; further requests queue FIFO. A request
+  that waits past `lock_wait_timeout_ms` (default 15 min) fails LOUD: the
+  lane receives a typed `error` frame and the ledger a
+  `verification.lock-timeout` record — nothing hangs silently.
+- **One worker budget across runs.** Total test workers stay within
+  `[verify] worker_budget` (default: CPU cores − 2), enforced by the run
+  wrapper through the vitest pool knobs and `GRU_VERIFY_*` variables for
+  other runners.
+- **Holders are durable and self-healing.** Active holders persist at
+  `<data_dir>/verify/scheduler.json` with the runner pid; a persisted
+  holder whose pid is dead — or was never recorded — is released
+  (stale-holder detection), and each run is
+  wall-clock bounded (`run_timeout_ms`) with the whole process group
+  killed on expiry.
+- **Outcomes are recorded evidence.** Every run lands as
+  `verification.started` / `verification.completed` with ok, exit code,
+  duration, sha, worker count, and bounded output hash/tail. Review
+  consumes the RECORDED run: when a completed run binds to the exact
+  frozen review target SHA (clean tracked tree), the host freezes a
+  clearly-delimited evidence block into the review spec context, so the
+  tests lens weighs ledger-backed evidence instead of a pasted report.
+- **Progress streams** back as NDJSON: `queued` → `started` → `output…`
+  → `completed` (or `error`).
+
+Managed repos still own their CI: this endpoint coordinates LOCAL
+verification runs inside lane worktrees — the orchestrator never hosts a
+tenant's CI.
+
 ## 5. Release (the sweep)
 
 `POST /api/dispatch/release` `{job_id, confirm_kill?, base_branch?}` —
@@ -300,4 +344,12 @@ never blocking a live operation.
 # directive_at = 2
 # rebrief_at = 3
 # escalate_at = 4
+
+[verify]
+# Verification scheduler (see §4c); lanes request runs, the service owns
+# the machine's one global test budget.
+# max_concurrent = 1               # concurrent runs; further requests queue FIFO
+# worker_budget = 0                # total test workers across runs; 0 = auto (cores - 2)
+# lock_wait_timeout_ms = 900000    # queued request past this fails loud
+# run_timeout_ms = 1800000         # per-run wall clock; expiry kills the process group
 ```

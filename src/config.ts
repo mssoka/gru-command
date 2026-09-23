@@ -175,6 +175,30 @@ export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   escalateAt: 4,
 };
 
+/** Verification scheduler policy (contention fix 2026-09-22): lanes request
+ * verification runs through the service (POST /api/verify); the scheduler owns
+ * the machine's GLOBAL test budget so co-tenant lanes cannot oversubscribe it.
+ * One shared budget, FIFO queue, recorded evidence for review. */
+export interface VerifyConfig {
+  /** Concurrent verification runs across ALL lanes; further requests queue
+   * FIFO. Default 1 keeps full suites from starving each other. */
+  readonly maxConcurrent: number;
+  /** Total concurrent test workers across runs; 0 = auto (cores - 2). */
+  readonly workerBudget: number;
+  /** How long a queued request may wait before failing loud (never a silent
+   * hang) — the timeout lands on the lane and in the ledger. */
+  readonly lockWaitTimeoutMs: number;
+  /** Wall-clock cap per run; the process group is terminated on expiry. */
+  readonly runTimeoutMs: number;
+}
+
+export const DEFAULT_VERIFY_CONFIG: VerifyConfig = {
+  maxConcurrent: 1,
+  workerBudget: 0,
+  lockWaitTimeoutMs: 900_000,
+  runTimeoutMs: 1_800_000,
+};
+
 /** Review gate policy (Perkins primary; bmad-review fallback gate per the
  * 2026-09-20 amendment, fork-3). */
 export interface ReviewConfig {
@@ -238,6 +262,7 @@ export interface GruCommandConfig {
   readonly dispatch: DispatchConfig;
   readonly silas: SilasConfig;
   readonly review: ReviewConfig;
+  readonly verify: VerifyConfig;
   readonly decisions: DecisionsConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
@@ -343,6 +368,7 @@ const TOP_LEVEL_KEYS = [
   'dispatch',
   'silas',
   'review',
+  'verify',
   'decisions',
 ] as const;
 
@@ -534,6 +560,7 @@ export function loadConfig(
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let review: ReviewConfig = { enabled: true };
+  let verify: VerifyConfig = DEFAULT_VERIFY_CONFIG;
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
   let sourceFile: string | null = null;
 
@@ -858,6 +885,37 @@ export function loadConfig(
             : review.enabled,
       };
     }
+    if (raw['verify'] !== undefined) {
+      const table = requireTable(raw['verify'], file, 'verify');
+      const VALID = ['max_concurrent', 'worker_budget', 'lock_wait_timeout_ms', 'run_timeout_ms'];
+      for (const key of Object.keys(table)) {
+        if (!VALID.includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [verify] (valid keys: ${VALID.join(', ')})`,
+            file,
+            `verify.${key}`,
+          );
+        }
+      }
+      verify = {
+        maxConcurrent:
+          table['max_concurrent'] !== undefined
+            ? requirePositiveInt(table['max_concurrent'], file, 'verify.max_concurrent')
+            : verify.maxConcurrent,
+        workerBudget:
+          table['worker_budget'] !== undefined
+            ? requireNonNegativeInt(table['worker_budget'], file, 'verify.worker_budget')
+            : verify.workerBudget,
+        lockWaitTimeoutMs:
+          table['lock_wait_timeout_ms'] !== undefined
+            ? requirePositiveInt(table['lock_wait_timeout_ms'], file, 'verify.lock_wait_timeout_ms')
+            : verify.lockWaitTimeoutMs,
+        runTimeoutMs:
+          table['run_timeout_ms'] !== undefined
+            ? requirePositiveInt(table['run_timeout_ms'], file, 'verify.run_timeout_ms')
+            : verify.runTimeoutMs,
+      };
+    }
     if (raw['decisions'] !== undefined) {
       decisions = readDecisionsConfig(raw['decisions'], file, decisions);
     }
@@ -912,6 +970,7 @@ export function loadConfig(
     dispatch,
     silas,
     review,
+    verify,
     decisions,
     sourceFile,
     instanceDir,

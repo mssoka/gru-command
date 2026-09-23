@@ -21,6 +21,10 @@ to = ".env.local"        #   worktree-relative (no ..)
 
 [[setup]]                # one-time command, cwd = the worktree
 command = "npm install"
+
+[verify]                 # verification commands by scope (POST /api/verify;
+full = "npm test"        #   see FLOW.md §4c — default scope `full`)
+quick = "npm run lint"
 ```
 
 A missing manifest is a no-op; a malformed one fails loud and rolls the

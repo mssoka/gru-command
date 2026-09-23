@@ -32,6 +32,11 @@ import {
   type ReviewCapabilityFailure,
   type ReviewPreflightResult,
 } from './review-path.js';
+import {
+  appendRecordedVerification,
+  renderRecordedVerification,
+  VERIFICATION_COMPLETED_EVENT,
+} from '../verify/evidence.js';
 
 export const FALLBACK_REVIEW_TIMEOUT_MS = 15 * 60 * 1_000;
 
@@ -926,6 +931,24 @@ export class WaveRunner {
     const movementRef = input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
     const targetSha = resolveGitCommit(jobWorktree.path, movementRef);
     const baseRef = resolveReviewBaseRef(jobWorktree.path, job.baseBranch);
+    // Recorded verification evidence (2026-09-22 fix): a completed
+    // scheduler run on the exact frozen target (clean tree) is handed to
+    // the review as ledger-backed context, so the tests lens weighs the
+    // host's record over any pasted report. No binding run -> no block.
+    let spec = job.briefing ?? undefined;
+    if (input.noSpec !== true && spec !== undefined) {
+      const evidence = renderRecordedVerification(
+        this.opts.ledger.latestJobEvent(job.id, VERIFICATION_COMPLETED_EVENT),
+        targetSha,
+      );
+      if (evidence !== null) {
+        spec = appendRecordedVerification({
+          spec,
+          evidence,
+          log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
+        });
+      }
+    }
     const flippedFrom = job.status === 'working' || job.status === 'blocked' ? job.status : null;
     let round: RoundRecord;
     try {
@@ -956,7 +979,7 @@ export class WaveRunner {
         targetRef: targetSha,
         movementRef,
         chunkLineThreshold: policy.portableContract.rules.chunkLineThreshold,
-        ...(input.noSpec === true ? { noSpec: true } : { spec: job.briefing ?? undefined }),
+        ...(input.noSpec === true ? { noSpec: true } : { spec }),
       });
       this.opts.ledger.setRoundStatus(round.id, 'live');
     } catch (error) {

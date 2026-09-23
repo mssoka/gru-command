@@ -6,6 +6,7 @@ import {
   loadWorktreeManifest,
   MANIFEST_PATH,
   parseWorktreeManifest,
+  resolveVerifyCommand,
 } from '../src/worktrees/manifest.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
@@ -47,6 +48,20 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
     expect(() => parseWorktreeManifest('[[copy]]\nfrom = "a"\nto = "/abs"')).toThrowError(/relative/);
     expect(() => parseWorktreeManifest('[[link]]\nat = "../up"\nto = "x"')).toThrowError(/no \.\./);
     expect(() => parseWorktreeManifest('unknown_key = 1')).toThrowError(/unknown key/);
+  });
+
+  it('parses [verify] scopes and resolves them fail-loud', () => {
+    const manifest = parseWorktreeManifest(
+      ['[verify]', 'full = "npm test"', 'quick = "npm run lint"'].join('\n'),
+    );
+    expect(manifest.verify).toEqual({ full: 'npm test', quick: 'npm run lint' });
+    expect(parseWorktreeManifest('').verify).toEqual({});
+    expect(resolveVerifyCommand(manifest, 'quick')).toBe('npm run lint');
+    expect(() => resolveVerifyCommand(manifest, 'nope')).toThrowError(/declared scopes: full, quick/);
+    expect(() => parseWorktreeManifest('[verify]\nFull = "x"')).toThrowError(/lowercase identifier/);
+    expect(() => parseWorktreeManifest('[verify]\nfull = ""')).toThrowError(/non-empty/);
+    expect(() => parseWorktreeManifest('[verify]\nfull = 3')).toThrowError(/non-empty/);
+    expect(() => parseWorktreeManifest('[verify]\nfull = ["x"]')).toThrowError(/non-empty/);
   });
 
   it('is a no-op warn when the repo ships no manifest', () => {

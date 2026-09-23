@@ -713,6 +713,62 @@ describe('WaveRunner built-in Perkins production path', () => {
     rmSync(sessions, { recursive: true, force: true });
   });
 
+  it('freezes recorded verification evidence into the review spec context (tests lens ground truth)', async () => {
+    const repo = makeFixtureRepo('perkins-verification-evidence');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/evidence']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-evidence-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-evidence-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-evidence-sessions-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-evidence-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/evidence', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-evidence' });
+    const job = ledger.addJob({
+      id: 'job-evidence', repo: 'fixture', title: 'evidence', baseBranch: 'main',
+      briefing: 'Acceptance: answer returns 43.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    // The scheduler's recorded run on the exact frozen target.
+    ledger.appendCustomEvent({
+      kind: 'verification.completed',
+      jobId: job.id,
+      payload: {
+        run_id: 'run-evidence',
+        scope: 'full',
+        command: 'npm test',
+        sha: target,
+        tracked_dirty: false,
+        ok: true,
+        exit_code: 0,
+        signal: null,
+        timed_out: false,
+        duration_ms: 4321,
+        workers: 6,
+        output_bytes: 128,
+        output_sha256: 'c'.repeat(64),
+      },
+    });
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: makeSpawner(sessions, []),
+      reviewArtifactRoot: artifacts,
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    const specContext = readFileSync(join(outcome.artifactDirectory, 'spec-context.md'), 'utf-8');
+    expect(specContext).toContain('Acceptance: answer returns 43.');
+    expect(specContext).toContain('HOST-RECORDED VERIFICATION');
+    expect(specContext).toContain('result: PASS (exit 0)');
+    expect(specContext).toContain(`sha: ${target} (matches the frozen review target)`);
+    expect(specContext).toContain('duration_ms: 4321');
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+    rmSync(sessions, { recursive: true, force: true });
+  });
+
   it('invalidates a round when the source ref moves during lead work and never posts approval', async () => {
     const repo = makeFixtureRepo('perkins-wave-head-move');
     repos.push(repo);

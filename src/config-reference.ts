@@ -68,6 +68,7 @@ export const CONFIG_SECTION_HEADERS: readonly string[] = [
   '[dispatch]',
   '[silas]',
   '[review]',
+  '[verify]',
 ];
 
 /** Tables that must be ACTIVE (parseable) in every generated config —
@@ -88,6 +89,7 @@ export const CONFIG_ACTIVE_TABLES: readonly string[] = [
   'dispatch',
   'silas',
   'review',
+  'verify',
 ];
 
 export interface CompleteConfigValues {
@@ -403,6 +405,18 @@ export function renderReferenceConfig(
     '# gate (findings triaged; blockers routed to the implementing minion as fix',
     '# directives; 0 blockers = clear to merge; merge stays user-held).',
     `enabled = ${preserved?.review.enabled ?? true}`,
+    '',
+    '[verify]',
+    '# Verification scheduler: lanes request their project\'s verify command',
+    '# through POST /api/verify; the scheduler owns ONE global test budget',
+    '# across lanes. Requests beyond max_concurrent queue FIFO, a queued',
+    '# request past lock_wait_timeout_ms fails loud, a holder whose pid is',
+    '# dead is released, and every run is recorded for review evidence.',
+    `max_concurrent = ${preserved?.verify.maxConcurrent ?? 1}`,
+    '# Total test workers across runs; 0 = auto (CPU cores - 2).',
+    `worker_budget = ${preserved?.verify.workerBudget ?? 0}`,
+    `lock_wait_timeout_ms = ${preserved?.verify.lockWaitTimeoutMs ?? 900_000}`,
+    `run_timeout_ms = ${preserved?.verify.runTimeoutMs ?? 1_800_000}`,
     '',
   );
   return `${lines.join('\n')}\n`;
