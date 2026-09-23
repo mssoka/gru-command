@@ -660,7 +660,7 @@ function loadPriorReview(file: string | undefined): PriorReview {
 }
 
 function renderTemplateOnce(template: string, values: Readonly<Record<string, string>>): string {
-  return template.replace(/\{\{(?:PROJECT_CONVENTIONS|DIFF|SPEC_CONTEXT|LENS_BRIEF|LENS)\}\}/g, (placeholder) =>
+  return template.replace(/\{\{(?:PROJECT_CONVENTIONS|DIFF|SPEC_CONTEXT|LENS_BRIEF|LENS|CHUNK_FILES)\}\}/g, (placeholder) =>
     values[placeholder] ?? placeholder,
   );
 }
@@ -685,7 +685,13 @@ function renderLensPrompt(
   if (!template.includes('{{OUTPUT_CONTRACT}}')) throw new Error('policy prompt is missing the output contract placeholder');
   const rendered = template.replace('{{OUTPUT_CONTRACT}}', () => contract);
   const prompt = lens === 'blind'
-    ? renderTemplateOnce(rendered, { '{{DIFF}}': selected.diff })
+    ? renderTemplateOnce(rendered, {
+      // The blind child's only grounding: the exact paths its location
+      // fields may cite, alongside the diff those citations are checked
+      // against. Prose in location was the recurring blind failure.
+      '{{CHUNK_FILES}}': selected.files.map((file) => `- ${file}`).join('\n'),
+      '{{DIFF}}': selected.diff,
+    })
     : renderTemplateOnce(rendered, {
       '{{PROJECT_CONVENTIONS}}': review.projectConventions,
       '{{DIFF}}': selected.diff,
@@ -696,7 +702,12 @@ function renderLensPrompt(
   // A retry is corrective, not a blind repeat: the host delivers the previous
   // attempt's exact failure class and reason in the child's own contract.
   if (retry === undefined || retry.attempt <= 1) return prompt;
-  return `${prompt}\n\n--- RETRY CORRECTION (attempt ${retry.attempt}) ---\n${retryCorrection(output, retry.previous)}`;
+  const correction = retryCorrection(output, retry.previous);
+  if (lens !== 'blind') return `${prompt}\n\n--- RETRY CORRECTION (attempt ${retry.attempt}) ---\n${correction}`;
+  // Blind children cannot re-read anything, so their retry restates the
+  // locatable-evidence contract on top of the exact rejection: the recurring
+  // failure is prose inside location even when the snippet was verbatim.
+  return `${prompt}\n\n--- RETRY CORRECTION (attempt ${retry.attempt}) ---\n${correction}\n${blindEvidenceCorrection(retry.previous)}`;
 }
 
 /** The reason carried by an abort signal, or the generic cancellation error
@@ -737,6 +748,16 @@ function retryCorrection(output: ChildOutputMode, previous: CoverageAttemptFailu
     return `Previous attempt rejected (${previous.failureKind}): ${reason}. Retry the same task and call ${FINDINGS_TOOL_NAME} exactly once with the full corrected { "findings": [...] } payload; findings in assistant text are ignored.`;
   }
   return `Previous output rejected (${previous.failureKind}): ${reason}; output ONLY the bare JSON array.`;
+}
+
+/** Blind retries reply to the exact rejection with the locatable-evidence
+ * contract instead of only naming it. The host's own check failed the cited
+ * location; the child must re-cite as `<path>:<line>` and recite the snippet. */
+function blindEvidenceCorrection(previous: CoverageAttemptFailure): string {
+  const reason = previous.error.replace(/[\r\n]+/gu, ' ').trim().slice(0, 400);
+  return `Your previous submission was rejected because ${reason}. Re-cite every finding with ` +
+    '"location" as "<path>:<line>" — the exact file path from FILES IN THIS CHUNK, a colon, then the line or line range, with NO function names or prose inside location — and ' +
+    '"evidence" as ONE contiguous snippet recited verbatim from that path\'s hunks.';
 }
 
 /** Every required coverage key whose full attempt budget was spent without a
