@@ -13,6 +13,7 @@ import {
   parseFindingsWithRecovery,
   verdictForFindings,
   type CanonicalReviewVerdict,
+  type ChildFailureKind,
   type FixAuditResult,
   type LensEnvelope,
   type LensOutputRecovery,
@@ -167,6 +168,8 @@ interface ChildResult {
   readonly attempt: 1 | 2;
   readonly status: 'valid' | 'invalid' | 'failed';
   readonly findings: readonly ChildCandidate[];
+  /** Present when status is not valid: the precise failure class. */
+  readonly failureKind?: ChildFailureKind;
   /** Host-carried tests-lens coverage gate status (undefined for other lenses). */
   readonly coverageGate?: 'PASS' | 'CONCERNS' | 'FAIL';
   readonly error?: string;
@@ -674,6 +677,15 @@ function renderLensPrompt(
   });
 }
 
+/** A review turn exceeded its host budget. Classified separately from output
+ * failures so the audit distinguishes load from a rejected output. */
+class ReviewTurnTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`review turn timed out after ${timeoutMs}ms`);
+    this.name = 'ReviewTurnTimeoutError';
+  }
+}
+
 async function boundedPrompt(
   handle: AgentHandle,
   prompt: string,
@@ -700,7 +712,7 @@ async function boundedPrompt(
     await Promise.race([
       handle.prompt(prompt, { owner: REVIEW_OWNER }),
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`review turn timed out after ${timeoutMs}ms`)), timeoutMs);
+        timer = setTimeout(() => reject(new ReviewTurnTimeoutError(timeoutMs)), timeoutMs);
         timer.unref?.();
       }),
       abort,
@@ -836,6 +848,9 @@ export class PerkinsHybridReview {
       this.onProgress({ lens, chunk, state: 'running' });
       let handle: AgentHandle | null = null;
       let raw: string | null = null;
+      /** Set only when the child's own output failed recovery/validation or
+       * construction-time evidence pairing: host errors stay 'error'. */
+      let outputRejected = false;
       /** Valid structured submission captured from perkins_submit_findings
        * (native-tool children); its exact JSON bytes are the durable output. */
       let submitted: { readonly json: string; readonly findings: readonly ReviewFinding[] } | null = null;
@@ -922,7 +937,9 @@ export class PerkinsHybridReview {
             // A captured submission outranks a later turn failure; a run
             // without one is invalid (retriable) and names the last schema
             // rejection rather than a generic absence.
-            throw turnError ?? new Error(submissionError ?? `lens child did not submit findings via ${FINDINGS_TOOL_NAME}`);
+            if (turnError !== null) throw turnError;
+            outputRejected = true;
+            throw new Error(submissionError ?? `lens child did not submit findings via ${FINDINGS_TOOL_NAME}`);
           }
           reviewFindings = submission.findings;
           outputBytes = submission.json;
@@ -930,7 +947,13 @@ export class PerkinsHybridReview {
           if (turnError !== null) throw turnError;
           const text = finalAssistantText(handle.sessionFile);
           raw = text;
-          const parsed = parseFindingsWithRecovery(text, lens);
+          let parsed: ReturnType<typeof parseFindingsWithRecovery>;
+          try {
+            parsed = parseFindingsWithRecovery(text, lens);
+          } catch (error) {
+            outputRejected = true;
+            throw error;
+          }
           reviewFindings = parsed.findings;
           recovery = parsed.recovery;
           outputBytes = text;
@@ -948,6 +971,7 @@ export class PerkinsHybridReview {
           const citedPath = findingPath(finding);
           if (citedPath === null || finding.location === 'N/A') continue;
           if (!evidenceAtCitedLocation(review, finding, finding.evidence, proofCache)) {
+            outputRejected = true;
             throw new Error(
               `lens finding ${findingIndex} evidence is not locatable at its cited file/hunk: ${finding.location}`,
             );
@@ -993,13 +1017,18 @@ export class PerkinsHybridReview {
         }
         // A child that finished its turn without a recordable result is an
         // output failure (invalid, retriable); a failed spawn/turn with no
-        // output at all stays a transport failure.
+        // output at all stays a transport failure. The failure kind records
+        // precisely which class fired: timeout (host turn budget), output
+        // (rejected/submitted output), or error (host/runtime).
+        const failureKind: ChildFailureKind = error instanceof ReviewTurnTimeoutError
+          ? 'timeout'
+          : outputRejected ? 'output' : 'error';
         const hadOutput = nativeSubmit ? capturedSubmission() !== null || promptResolved : raw !== null;
         const status: ChildResult['status'] = hadOutput ? 'invalid' : 'failed';
         const outputBytes = raw ?? capturedSubmission()?.json ?? rejectedSubmission;
         const envelope: LensEnvelope = {
           schemaVersion: 1, lens, chunk, attempt, status,
-          outputSha256: outputBytes === null ? null : hash(outputBytes), findings: [], error: message,
+          outputSha256: outputBytes === null ? null : hash(outputBytes), findings: [], failureKind, error: message,
         };
         envelopes.push(envelope);
         if (outputBytes !== null) {
@@ -1021,11 +1050,11 @@ export class PerkinsHybridReview {
             if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) throw writeError;
           }
         }
-        this.onProgress({ lens, chunk, state: 'error', note: message });
+        this.onProgress({ lens, chunk, state: 'error', note: `${failureKind}: ${message}` });
         return {
           resultId: `failed-${lens}-${chunk}-a${attempt}`,
           agentId: handle?.id ?? 'spawn-failed', lens, chunk, attempt,
-          status, findings: [], error: message,
+          status, findings: [], failureKind, error: message,
         };
       } finally {
         await handle?.dispose();
