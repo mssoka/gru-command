@@ -159,8 +159,10 @@ everywhere. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (install BMAD via
 onboarding / restore Perkins) are escalated and recorded on the job as
 `job.fallback-review` events. GitLab merge requests get the same SHA-bound
-delivery discipline as GitHub (head + base verified before a note is
-posted), and the GitLab probe and poster resolve their token
+delivery discipline as GitHub (the frozen HEAD is verified before a note is
+posted; a PR's recorded base is refreshed into the delivery record rather
+than gating, since a pinned base is expected to trail a moving main), and
+the GitLab probe and poster resolve their token
 identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`); GitHub
 authenticates through the `gh` CLI.
 

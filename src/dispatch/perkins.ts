@@ -77,6 +77,17 @@ type ReviewLensResult =
   | { readonly state: 'done'; readonly verdict: 'blocker' | 'warning' | 'note' | 'clean'; readonly evidence: string }
   | { readonly state: 'error'; readonly note: string };
 
+/** The PR identity a verdict delivery was proven against. HEAD equality is
+ * the delivery invariant: `headSha` is the round's frozen target on any
+ * successful delivery, while `baseSha` is the PR's LIVE base at delivery —
+ * a pinned PR base is recorded at open/link time and is expected to trail
+ * a moving main, so base age never gates delivery. The receipt is what the
+ * ledger refreshes the round's recorded delivery identity from. */
+export interface PrIdentity {
+  readonly headSha: string;
+  readonly baseSha: string;
+}
+
 export interface VerdictPoster {
   post(input: {
     readonly prUrl: string;
@@ -85,7 +96,7 @@ export interface VerdictPoster {
     readonly body: string;
     readonly targetSha: string;
     readonly baseSha: string;
-  }): Promise<void>;
+  }): Promise<PrIdentity>;
 }
 
 /** GitHub poster using a commit-bound pull-request review, not an unbound
@@ -100,7 +111,7 @@ export class GhPrPoster implements VerdictPoster {
     readonly body: string;
     readonly targetSha: string;
     readonly baseSha: string;
-  }): Promise<void> {
+  }): Promise<PrIdentity> {
     let url: URL;
     try {
       url = new URL(input.prUrl.trim());
@@ -137,10 +148,14 @@ export class GhPrPoster implements VerdictPoster {
       throw new Error(`gh api pull identity exited ${identity.status}: ${(identity.stderr ?? '').trim().slice(0, 500)}`);
     }
     const [observedHead = '', observedBase = ''] = (identity.stdout ?? '').trim().split('\t');
-    if (observedHead !== input.targetSha || observedBase !== input.baseSha) {
+    // Only HEAD equality gates delivery. The PR's recorded base (GitHub
+    // pins `.base.sha` at open/link time) is expected to trail the round's
+    // frozen base as main moves during a long round; the frozen diff is
+    // immutable, so a stale recorded base is never a refusal reason.
+    if (observedHead !== input.targetSha) {
       throw new Error(
-        `pull request identity moved before delivery (expected head/base ${input.targetSha}/${input.baseSha}, ` +
-        `got ${observedHead || 'unknown'}/${observedBase || 'unknown'})`,
+        `pull request identity moved before delivery (expected head ${input.targetSha}, ` +
+        `got ${observedHead || 'unknown'})`,
       );
     }
     const result = spawnSync(
@@ -158,6 +173,7 @@ export class GhPrPoster implements VerdictPoster {
     if (result.status !== 0) {
       throw new Error(`gh api review delivery exited ${result.status}: ${(result.stderr ?? '').trim().slice(0, 500)}`);
     }
+    return { headSha: observedHead, baseSha: observedBase };
   }
 }
 
@@ -190,7 +206,7 @@ export class GitLabMrPoster implements VerdictPoster {
     readonly body: string;
     readonly targetSha: string;
     readonly baseSha: string;
-  }): Promise<void> {
+  }): Promise<PrIdentity> {
     const token = this.token ?? this.tokenResolver();
     if (token === undefined || token.trim() === '') {
       throw new Error('GitLab delivery requires GITLAB_TOKEN — review not delivered');
@@ -241,10 +257,14 @@ export class GitLabMrPoster implements VerdictPoster {
       throw new Error('GitLab merge request identity response was not valid JSON');
     }
     const observedHead = typeof identity.sha === 'string' ? identity.sha : '';
-    const observedBase = typeof identity.diff_refs?.base_sha === 'string' ? identity.diff_refs.base_sha : '';
-    if (observedHead !== input.targetSha || observedBase !== input.baseSha) {
+    // HEAD equality is the delivery invariant. The MR's recorded base
+    // (diff_refs.base_sha is pinned at open/link time) is expected to trail
+    // the round's frozen base as main moves during a long round, so base
+    // age is refreshed into the delivery record below, never a refusal
+    // reason.
+    if (observedHead !== input.targetSha) {
       throw new Error(
-        `merge request identity moved before delivery (expected head/base ${input.targetSha}/${input.baseSha}, got ${observedHead || 'unknown'}/${observedBase || 'unknown'})`,
+        `merge request identity moved before delivery (expected head ${input.targetSha}, got ${observedHead || 'unknown'})`,
       );
     }
     let noteResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
@@ -262,7 +282,9 @@ export class GitLabMrPoster implements VerdictPoster {
       throw new Error(`GitLab merge request note delivery exited HTTP ${noteResponse.status}: ${(await noteResponse.text()).slice(0, 300)}`);
     }
     // GitLab notes are not commit-bound server-side; re-probe the MR after
-    // delivery and fail loudly when the head/base moved under the note.
+    // delivery and fail loudly when the HEAD moved under the note. The
+    // re-probe IS the refreshed record: whatever base the MR now reports is
+    // delivered onward, so a moving main never refuses a proven head.
     let confirmResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
     try {
       confirmResponse = await this.fetchImpl(mrUrl, { headers, signal: AbortSignal.timeout(15_000) });
@@ -280,11 +302,12 @@ export class GitLabMrPoster implements VerdictPoster {
     }
     const confirmedHead = typeof confirmed.sha === 'string' ? confirmed.sha : '';
     const confirmedBase = typeof confirmed.diff_refs?.base_sha === 'string' ? confirmed.diff_refs.base_sha : '';
-    if (confirmedHead !== input.targetSha || confirmedBase !== input.baseSha) {
+    if (confirmedHead !== observedHead) {
       throw new Error(
-        `merge request identity moved after delivery (expected head/base ${input.targetSha}/${input.baseSha}, got ${confirmedHead || 'unknown'}/${confirmedBase || 'unknown'})`,
+        `merge request identity moved after delivery (expected head ${observedHead}, got ${confirmedHead || 'unknown'})`,
       );
     }
+    return { headSha: confirmedHead, baseSha: confirmedBase };
   }
 }
 
@@ -297,7 +320,7 @@ export class AutoVerdictPoster implements VerdictPoster {
     private readonly gitlab: VerdictPoster = new GitLabMrPoster(),
   ) {}
 
-  async post(input: Parameters<VerdictPoster['post']>[0]): Promise<void> {
+  async post(input: Parameters<VerdictPoster['post']>[0]): Promise<PrIdentity> {
     let host = '';
     try {
       host = new URL(input.prUrl.trim()).host;
@@ -1198,7 +1221,7 @@ export class WaveRunner {
         const publicationBody = redactReviewForPublication(privateBody);
         const publicationFile = writeReviewArtifact(frozenReview, 'perkins-report.publication.md', publicationBody);
         const publicationSha256 = createHash('sha256').update(publicationBody).digest('hex');
-        await this.opts.poster.post({
+        const delivered = await this.opts.poster.post({
           prUrl: job.prUrl,
           host: prUrl.host,
           repoPath: frozenReview.manifest.repoPath,
@@ -1214,7 +1237,12 @@ export class WaveRunner {
           roundId: round.id,
           payload: {
             verdict, canonicalVerdict: canonical, url: job.prUrl, host: prUrl.host,
-            targetSha: review.targetSha, baseSha: frozenReview.manifest.baseRefSha,
+            // The delivery record carries the identity the poster PROVED:
+            // the frozen head it delivered against and the PR's live base
+            // at delivery. The frozen base stays in round.perkins-review;
+            // recording it here asserted a pairing the PR never had once
+            // main moved on.
+            targetSha: delivered.headSha, baseSha: delivered.baseSha,
             publicationFile, publicationSha256,
           },
         });
