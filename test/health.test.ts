@@ -527,4 +527,31 @@ describe('W-C (E9 r3 carry): /health disclosure split', () => {
       await handle.stop();
     }
   });
+
+  it('reports the running build identity (sha + built_at); unauthenticated stays without it', async () => {
+    const home = tmpHome();
+    writeFileSync(
+      configPathFor(home),
+      '[server]\nhost = "127.0.0.1"\nport = 0\n[auth]\ntoken = "health-test-token"\n',
+      'utf-8',
+    );
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const identity = loadOrCreateIdentity(config.dataDir);
+    const service = createService(config, identity, () => {}, () => null, {
+      buildInfo: () => ({ rev: 'f'.repeat(40), committedAt: null, builtAt: '2026-09-23T00:00:00.000Z' }),
+    });
+    const handle = await service.start();
+    try {
+      const authed = (await (await authedHealth(handle.port)).json()) as Record<string, unknown>;
+      expect(authed['build']).toEqual({
+        rev: 'f'.repeat(40),
+        committed_at: null,
+        built_at: '2026-09-23T00:00:00.000Z',
+      });
+      const publicBody = (await (await fetch(`http://127.0.0.1:${handle.port}/health`)).json()) as Record<string, unknown>;
+      expect(publicBody['build']).toBeUndefined();
+    } finally {
+      await handle.stop();
+    }
+  });
 });

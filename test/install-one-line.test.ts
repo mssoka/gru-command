@@ -113,6 +113,9 @@ function buildFixtureRepo(): { fixture: string; home: string } {
       'mkdirSync("dist/runtime", { recursive: true });',
       'writeFileSync("dist/main.js", "// fixture service stub\\n");',
       'writeFileSync("dist/cli/config-generate.js", "// fixture config CLI stub\\n");',
+      // The self-roll CLI stub the installer delegates to when it detects an
+      // in-service (agent-owned) update: records its argv on stdout.
+      'writeFileSync("dist/cli/service.js", "#!/usr/bin/env node\\nconsole.log(\'FIXTURE-ROLL-RAN \' + process.argv.slice(2).join(\' \'));\\n");',
       'if (process.env.GRU_FIXTURE_OMIT_MCP !== "1") writeFileSync("dist/runtime/review-mcp-server.mjs", "// fixture scoped review MCP bridge\\n");',
       // The fixture wizard stub: records that it ran + the answers it got,
       // into the instance dir — the real wizard is covered by the
@@ -213,6 +216,62 @@ function serviceManagerSeam(home: string): {
       GRU_COMMAND_SYSTEMCTL: manager,
     },
   };
+}
+
+/** Fake service manager that reports THE CALLER'S PROCESS GROUP as the
+ * running service main pid — i.e. the installer really is a descendant of
+ * the managed service (the agent-owned shape). On macOS `launchctl list`
+ * carries `<pid>\t<status>\t<label>`; on Linux `systemctl show -p MainPID`
+ * answers the pid. Everything else is logged like the plain seam. */
+function inServiceManagerSeam(home: string): {
+  manager: string;
+  managerLog: string;
+  unit: string;
+  env: NodeJS.ProcessEnv;
+} {
+  const managerLog = join(home, 'in-service-manager.log');
+  const manager = join(home, 'in-service-manager');
+  writeFileSync(
+    manager,
+    [
+      '#!/usr/bin/env bash',
+      'printf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"',
+      'pgid="$(ps -o pgid= -p "$PPID" | tr -d " ")"',
+      'case "$*" in',
+      '  *"show -p MainPID"*) printf "%s" "$pgid" ;;',
+      '  list*) printf "%s\\t0\\tcom.gru-command.service\\n" "$pgid" ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n'),
+    { encoding: 'utf-8', mode: 0o755 },
+  );
+  const unit = process.platform === 'darwin'
+    ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
+    : join(home, '.config', 'systemd', 'user', 'gru-command.service');
+  return {
+    manager,
+    managerLog,
+    unit,
+    env: {
+      GRU_MANAGER_LOG: managerLog,
+      GRU_COMMAND_LAUNCHCTL: manager,
+      GRU_COMMAND_SYSTEMCTL: manager,
+    },
+  };
+}
+
+/** True when the manager log holds no unit-registration/restart calls —
+ * the in-service `list`/`show` probe is allowed, a registration is not. */
+function noRegistrationCalls(managerLog: string): boolean {
+  if (!existsSync(managerLog)) return true;
+  const calls = readFileSync(managerLog, 'utf-8');
+  return (
+    !/^(unload|load)\b/m.test(calls) &&
+    !calls.includes('daemon-reload') &&
+    !calls.includes('enable gru-command') &&
+    !calls.includes('restart gru-command')
+  );
 }
 
 /** REAL-effect proof that the absent-unit path registered the service:
@@ -645,7 +704,9 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(output).toContain('no service installed or running — ./install.sh --service registers it later');
     expect(output).not.toContain(`installed: ${seam.unit}`);
     expect(existsSync(seam.unit)).toBe(false);
-    expect(existsSync(seam.managerLog)).toBe(false);
+    // The in-service probe may consult the manager (`list`), but a decline
+    // must never register or touch the unit.
+    expect(noRegistrationCalls(seam.managerLog)).toBe(true);
   }, 400_000);
 
   it.skipIf(!expectAvailable())('piped cat|bash updater + absent unit: prompt reads the TTY, not the script pipe (decline)', () => {
@@ -688,7 +749,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(output).toContain('no service installed or running — ./install.sh --service registers it later');
     expect(output).not.toContain(`installed: ${seam.unit}`);
     expect(existsSync(seam.unit)).toBe(false);
-    expect(existsSync(seam.managerLog)).toBe(false);
+    expect(noRegistrationCalls(seam.managerLog)).toBe(true);
   }, 400_000);
 
   it.skipIf(!python3Available())('headless run (no terminal, no --no-interact): defaults to REGISTER with a stderr notice', () => {
@@ -729,6 +790,103 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(proc.stdout).toContain('update complete; existing config preserved');
     expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
   }, 400_000);
+
+  it('in-service restart delegates to gru-service roll and never unload/loads', () => {
+    // Function-level pin for the delegation branch: the in-service process
+    // group IS detected (fake manager reports our own pgid), the unit IS
+    // owned, and the served restart must be the roll CLI — never the unit
+    // lifecycle calls. Ownership itself is covered by its own tests; this
+    // exercises the branch on every pty-less machine (Linux CI included).
+    const home = tempDir('gru-command-in-service-fn-');
+    const instance = join(home, '.gru-command');
+    const managerLog = join(home, 'manager.log');
+    const manager = join(home, 'service-manager');
+    writeFileSync(
+      manager,
+      [
+        '#!/usr/bin/env bash',
+        'printf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"',
+        'pgid="$(ps -o pgid= -p "$PPID" | tr -d " ")"',
+        'case "$*" in',
+        '  *"show -p MainPID"*) printf "%s" "$pgid" ;;',
+        '  list*) printf "%s\\t0\\tcom.gru-command.service\\n" "$pgid" ;;',
+        'esac',
+        'exit 0',
+        '',
+      ].join('\n'),
+      { encoding: 'utf-8', mode: 0o755 },
+    );
+    const rollLog = join(home, 'roll.log');
+    const repoRoot = tempDir('gru-command-in-service-repo-');
+    const installScript = join(import.meta.dirname, '..', 'install.sh');
+    mkdirSync(join(repoRoot, 'dist', 'cli'), { recursive: true });
+    writeFileSync(
+      join(repoRoot, 'dist', 'cli', 'service.js'),
+      [
+        '#!/usr/bin/env node',
+        "require('node:fs').appendFileSync(process.env.GRU_ROLL_LOG, `argv:${process.argv.slice(2).join(' ')}\n`);",
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+    const script = [
+      `REPO_ROOT=${shellQuote(repoRoot)}`,
+      `OS=${process.platform === 'darwin' ? 'darwin' : 'linux'}`,
+      `LABEL=com.gru-command.service`,
+      `INSTANCE_DIR=${shellQuote(instance)}`,
+      `NODE_BIN=${shellQuote(process.execPath)}`,
+      `LAUNCHCTL_BIN=${shellQuote(manager)}`,
+      `SYSTEMCTL_BIN=${shellQuote(manager)}`,
+      `GRU_MANAGER_LOG=${shellQuote(managerLog)}`,
+      `GRU_ROLL_LOG=${shellQuote(rollLog)}`,
+      `export GRU_MANAGER_LOG GRU_ROLL_LOG`,
+      `eval "$(sed -n '/^managed_service_pid()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^inside_managed_service_pgroup()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^restart_owned_service_in_service()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^restart_owned_service_if_present()/,/^}/p' ${shellQuote(installScript)})"`,
+      `service_ownership() { echo owned; }`,
+      `restart_owned_service_if_present`,
+      '',
+    ].join('\n');
+    const stdout = execFileSync('bash', ['-c', script], {
+      env: { ...process.env, HOME: home },
+      encoding: 'utf-8',
+    });
+    expect(stdout).toContain("delegating the restart to 'gru-service roll'");
+    expect(readFileSync(rollLog, 'utf-8')).toBe('argv:roll\n');
+    const calls = existsSync(managerLog) ? readFileSync(managerLog, 'utf-8') : '';
+    expect(calls).not.toMatch(/^unload/m);
+    expect(calls).not.toMatch(/^load/m);
+    expect(calls).not.toContain('daemon-reload');
+    expect(calls).not.toContain('restart gru-command');
+  });
+
+  it.skipIf(!expectAvailable())('in-service pty update (absent unit): no prompt hang — auto-registers with a notice', () => {
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const target = join(home, 'gru-command');
+    execFileSync('git', ['clone', '-q', `file://${fixture}`, target], { stdio: 'pipe' });
+    const instance = join(home, '.gru-command');
+    mkdirSync(instance, { recursive: true });
+    writeFileSync(join(instance, 'config.toml'), 'preserved\n');
+    const seam = inServiceManagerSeam(home);
+    const launcher = ptyUpdaterLauncher(home, target, instance, seam);
+    // A REAL pty (no human on it): the exact shape that used to block the
+    // register prompt forever on /dev/tty reads.
+    const expectScript = [
+      'set timeout 240',
+      `spawn bash ${launcher}`,
+      'expect eof',
+      'set result [wait]',
+      'exit [lindex $result 3]',
+    ].join('\n');
+    const output = execFileSync('expect', ['-c', expectScript], {
+      encoding: 'utf-8',
+      timeout: 300_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).replace(/\r/g, '');
+    expect(output).toContain('running inside the managed service');
+    expect(output).not.toContain('register one now');
+    expect(output).toContain('update complete; existing config preserved');
+    expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
+  }, 340_000);
 
   it('direct --service/--uninstall also enforce exact unit ownership', () => {
     const { fixture, home } = buildFixtureRepo();

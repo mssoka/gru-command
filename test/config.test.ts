@@ -751,3 +751,29 @@ describe('verify config (contention fix 2026-09-22)', () => {
     }
   });
 });
+
+describe('self-roll table', () => {
+  it('defaults to a 15-minute drain and accepts an explicit drain_timeout_ms', () => {
+    const home = tmpHome();
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').roll).toEqual({
+      drainTimeoutMs: 900_000,
+    });
+    writeConfig(home, '[roll]\ndrain_timeout_ms = 0\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').roll.drainTimeoutMs).toBe(0);
+    writeConfig(home, '[roll]\ndrain_timeout_ms = 120000\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').roll.drainTimeoutMs).toBe(120_000);
+  });
+
+  it('rejects unknown [roll] keys and invalid values', () => {
+    const bad: readonly string[] = [
+      '[roll]\nunknown = 1\n',
+      '[roll]\ndrain_timeout_ms = -1\n',
+      '[roll]\ndrain_timeout_ms = 1.5\n',
+    ];
+    for (const text of bad) {
+      const home = tmpHome();
+      writeFileSync(join(home, 'config.toml'), text, 'utf-8');
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
+});

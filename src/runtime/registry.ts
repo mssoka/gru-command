@@ -225,6 +225,11 @@ export class RuntimeRegistry {
     return null;
   }
 
+  /** Snapshot of every live handle (roll drain probe: mid-turn sessions). */
+  listHandles(): readonly AgentHandle[] {
+    return [...this.handles];
+  }
+
 
   status(): RuntimeStatus {
     let anySession = false;

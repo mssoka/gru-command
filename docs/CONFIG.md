@@ -235,6 +235,14 @@ directive_at = 2
 rebrief_at = 3
 escalate_at = 4
 
+[roll]
+# Graceful self-roll drain policy: how long the service waits for
+# in-flight review rounds and mid-turn agent sessions to settle before it
+# swaps the build and lets the OS service manager relaunch the unit.
+# 0 = snapshot the in-flight work and swap now (recovery marks
+# interrupted rounds INCOMPLETE and resumes sessions).
+drain_timeout_ms = 900000
+
 [review]
 # Review gate policy. true keeps Perkins as the primary gate behind the
 # fail-closed four-leg pre-flight (bundled resource integrity, review-model

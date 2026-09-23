@@ -13,7 +13,13 @@
 #                                    unit is absent, register it (prompted;
 #                                    automatic with --no-interact or with
 #                                    no terminal; a decline prints the
-#                                    --service hint)
+#                                    --service hint). Run from inside the
+#                                    managed service (an agent-owned shell),
+#                                    the restart is delegated to
+#                                    `gru-service roll` — never unload/load:
+#                                    launchd SIGTERMs the job's whole process
+#                                    group, killing the updater before it can
+#                                    reload the unit (observed 2026-09-23)
 #   ./install.sh --no-interact       fresh setup with documented defaults
 #   ./install.sh --answers '<json>'  fresh non-interactive setup overrides;
 #                                    secrets are forbidden in answers
@@ -259,6 +265,53 @@ assert_service_owned_or_absent() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# In-service (agent-owned) detection — the install.sh --update hang guard.
+#
+# The service spawns agent sessions as ordinary children: same process
+# group as the launchd/systemd unit. launchd teardown of a job SIGTERMs
+# every process in that group, and systemd stops the whole cgroup — so an
+# `unload`/`stop` issued from an agent-owned shell kills the updater
+# itself before it can reload the unit, leaving the service down until a
+# manual bounce. Reproduced on macOS 2026-09-23 with a scratch job: the
+# in-group child trapped SIGTERM during `launchctl unload` and never
+# reached its `launchctl load`; an out-of-group process (human terminal)
+# completed both calls.
+#
+# The service's main pid IS the group leader for launchd jobs and for
+# systemd units (Type=simple); comparing OUR process group against it is
+# the exact, race-free discriminator.
+#
+# On Linux, systemd's own kill semantics are cgroup-based (KillMode=
+# control-group), so check the unit cgroup FIRST (descendants inherit it);
+# the pgid comparison remains as the fallback for non-systemd launchers.
+# ---------------------------------------------------------------------------
+managed_service_pid() {
+  local pid=""
+  case "$OS" in
+    darwin)
+      pid="$("$LAUNCHCTL_BIN" list 2>/dev/null | awk -v label="$LABEL" '$3 == label { print $1; exit }')"
+      ;;
+    linux)
+      pid="$("$SYSTEMCTL_BIN" --user show -p MainPID --value gru-command.service 2>/dev/null)"
+      ;;
+  esac
+  printf '%s' "${pid//[[:space:]]/}"
+}
+
+inside_managed_service_pgroup() {
+  local service_pid own_pgid
+  if [[ "$OS" == "linux" && -r /proc/self/cgroup ]] && \
+     grep -q 'gru-command\.service' /proc/self/cgroup 2>/dev/null; then
+    return 0
+  fi
+  service_pid="$(managed_service_pid)" || return 1
+  [[ "$service_pid" =~ ^[0-9]+$ ]] || return 1
+  (( service_pid > 1 )) || return 1
+  own_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "$own_pgid" && "$own_pgid" == "$service_pid" ]]
+}
+
 install_launchd() {
   local target_dir="$HOME/Library/LaunchAgents"
   local target="$target_dir/$LABEL.plist"
@@ -427,7 +480,13 @@ build_product() {
 prompt_register_service() {
   local reply=""
   local prompt="No service unit installed — register one now? [Y/n] "
-  if [[ -t 0 ]]; then
+  if inside_managed_service_pgroup; then
+    # An agent-owned shell inside the managed service: no human is at the
+    # keyboard, and a /dev/tty read can block forever on an agent pty.
+    # Take the documented default (register) and say so — never silent.
+    echo "install.sh: running inside the managed service with no human to prompt — auto-registering (pass --no-interact to acknowledge, or run ./install.sh --service later)" >&2
+    reply=""
+  elif [[ -t 0 ]]; then
     read -r -p "$prompt" reply || true
   elif { exec 3< /dev/tty; } 2>/dev/null; then
     read -r -p "$prompt" reply <&3 || true
@@ -444,6 +503,24 @@ prompt_register_service() {
       return 1
       ;;
   esac
+}
+
+# The in-service restart: NEVER unload/load (the job's process-group
+# teardown SIGTERMs this updater first — the observed hang). Delegate to
+# the service's own roll path: preflight already ran here, the roll drains,
+# writes the swap marker, exits 75 (restart-worthy for launchd KeepAlive
+# {SuccessfulExit=false} and systemd Restart=on-failure), and the
+# relaunched build verifies itself; the CLI waits for /health to report
+# the target build SHA and only then exits 0.
+restart_owned_service_in_service() {
+  local cli="$REPO_ROOT/dist/cli/service.js"
+  if [[ ! -f "$cli" ]]; then
+    err "cannot restart from inside the managed service: $cli is missing"
+    err "a successful build produces it; run this update from a terminal instead"
+    exit 1
+  fi
+  echo "update is running inside the managed service — delegating the restart to 'gru-service roll'…"
+  "$NODE_BIN" "$cli" roll
 }
 
 restart_owned_service_if_present() {
@@ -471,11 +548,15 @@ restart_owned_service_if_present() {
       exit 1
       ;;
     owned)
-      echo "restarting owned Gru Command service…"
-      case "$OS" in
-        darwin) install_launchd ;;
-        linux) install_systemd ;;
-      esac
+      if inside_managed_service_pgroup; then
+        restart_owned_service_in_service
+      else
+        echo "restarting owned Gru Command service…"
+        case "$OS" in
+          darwin) install_launchd ;;
+          linux) install_systemd ;;
+        esac
+      fi
       ;;
   esac
 }

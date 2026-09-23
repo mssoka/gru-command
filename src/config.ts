@@ -148,6 +148,14 @@ export interface DispatchConfig {
   readonly bobIntervalMs: number;
 }
 
+/** Graceful self-roll policy (issue #34 graduation heist). */
+export interface RollConfig {
+  /** Bounded drain wait before a swap (ms); 0 snapshots and swaps now. */
+  readonly drainTimeoutMs: number;
+}
+
+export const DEFAULT_ROLL_CONFIG: RollConfig = { drainTimeoutMs: 900_000 };
+
 /** Silas ops-hosting policy (E8 follow-through; owner ruling 2026-09-21).
  * Silas closes the delivered→PR→review loop himself and breaks recurring
  * blocker loops; this section tunes his watchtower, never his authority. */
@@ -261,6 +269,7 @@ export interface GruCommandConfig {
   readonly worktrees: WorktreesConfig;
   readonly dispatch: DispatchConfig;
   readonly silas: SilasConfig;
+  readonly roll: RollConfig;
   readonly review: ReviewConfig;
   readonly verify: VerifyConfig;
   readonly decisions: DecisionsConfig;
@@ -367,6 +376,7 @@ const TOP_LEVEL_KEYS = [
   'worktrees',
   'dispatch',
   'silas',
+  'roll',
   'review',
   'verify',
   'decisions',
@@ -559,6 +569,7 @@ export function loadConfig(
   let worktrees: WorktreesConfig | null = null;
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
+  let roll: RollConfig = DEFAULT_ROLL_CONFIG;
   let review: ReviewConfig = { enabled: true };
   let verify: VerifyConfig = DEFAULT_VERIFY_CONFIG;
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
@@ -867,6 +878,24 @@ export function loadConfig(
         escalateAt,
       };
     }
+    if (raw['roll'] !== undefined) {
+      const table = requireTable(raw['roll'], file, 'roll');
+      for (const key of Object.keys(table)) {
+        if (!['drain_timeout_ms'].includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [roll] (valid keys: drain_timeout_ms)`,
+            file,
+            `roll.${key}`,
+          );
+        }
+      }
+      roll = {
+        drainTimeoutMs:
+          table['drain_timeout_ms'] !== undefined
+            ? requireNonNegativeInt(table['drain_timeout_ms'], file, 'roll.drain_timeout_ms')
+            : roll.drainTimeoutMs,
+      };
+    }
     if (raw['review'] !== undefined) {
       const table = requireTable(raw['review'], file, 'review');
       for (const key of Object.keys(table)) {
@@ -969,6 +998,7 @@ export function loadConfig(
     },
     dispatch,
     silas,
+    roll,
     review,
     verify,
     decisions,

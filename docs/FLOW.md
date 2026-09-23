@@ -332,6 +332,81 @@ on the bob role's supervised slot with consolidation instructions; the
 role's persona (`roles/bob.md`) governs the craft. Never overlapping,
 never blocking a live operation.
 
+## Self-roll (the service deploys itself)
+
+The service rolls ITSELF — there is no shelf-stable restart path that a
+non-interactive shell can drive safely by hand. Two triggers, one state
+machine:
+
+- `gru-service roll` (CLI; `dist/cli/service.js`, also the `gru-service`
+  bin) — wait mode follows the roll to verified completion.
+- `POST /api/roll` (operator-guarded, pairing token).
+
+Both write a disk record at `<data_dir>/roll-state.json` and drive four
+idempotent phases:
+
+1. **preflight** — in the deploy clone (the checkout containing this
+   `dist`): refuse a dirty tree; `git pull --ff-only` (divergence refuses,
+   never resets); `npm ci` + `npm run build` + `npm run build:web` while
+   the OLD process keeps serving (the build replaces files under `dist/`;
+   the old binary holds its own inodes). The build stamps
+   `dist/build-rev.json` (via `tools/write-build-rev.mjs`) with the
+   checkout SHA; when the clone is already stamped at the target SHA the
+   rebuild is skipped.
+2. **drain** — bounded wait (`[roll] drain_timeout_ms`, default 15 min)
+   for non-terminal review rounds (`pending`/`live`) and mid-turn agent
+   sessions (`spawning`/`streaming`) to settle. Early settle → immediate
+   swap. Deadline reached → the in-flight work is logged, recorded as
+   `abandoned` in the roll record, and the swap proceeds; startup recovery
+   terminalizes interrupted rounds INCOMPLETE and resumes interrupted
+   turns (#42).
+3. **swap** — re-check the target SHA, write `<data_dir>/roll-marker.json`
+   (the built SHA), then exit with code **75**. The marker is the only
+   handoff state — no launchctl/systemctl juggling, no TTY.
+4. **verify** — the relaunched binary consumes the marker at boot: logs
+   `rolled to <sha>`, flips the record to `done` with the boot pid + build
+   sha, clears the marker, and logs a post-listen self-check
+   (uptime + sha). `/health` reports the running build identity in the
+   token-gated payload (`build: { rev, committed_at, built_at }`); the CLI exits 0 only
+   once `/health` reports the target SHA.
+
+**Why exit 75 and not exit(0).** The shipped units are
+`launchd KeepAlive {SuccessfulExit=false}` and `systemd Restart=on-failure`:
+a clean exit is a stop and stays down, so a roll that exited 0 would leave
+the service dead until a manual bounce. A non-zero maintenance exit is
+restart-worthy for both managers while `launchctl unload` /
+`systemctl stop` still stop the unit for real. Verified against launchd
+with a scratch job (exit 0 stayed down; exit 75 relaunched).
+
+**The bug this lane removes (diagnosed 2026-09-23).** `install.sh --update`
+from an agent-owned shell used `launchctl unload`/`load` to restart the
+unit. The service spawns agent sessions as ordinary children — same
+process group as the launchd job / systemd cgroup. launchd teardown of a
+job SIGTERMs every remaining process in that group (default
+`AbandonProcessGroup=false`), so the updater was killed *during* `unload`:
+the unit was left unloaded and the `load` that would re-register it never
+ran. Reproduced with a scratch job: the in-group child trapped SIGTERM
+during unload and never reached load; an out-of-group process (the human
+terminal case) completed both calls and the service came back. The same
+shape leaves a `/dev/tty` register prompt blocking forever on an
+agent-owned pty.
+
+**install.sh --update is now a client of this path.** When the updater
+detects it is running inside the managed service's process group (the
+service main pid IS the group leader), it delegates the restart to
+`gru-service roll` and never calls `unload`/`load`; the register prompt is
+skipped with an announced default instead of reading `/dev/tty`. Run from
+a human terminal, the update path is unchanged.
+
+**Rollback safety (no auto-rollback v1).** If the new build fails to boot,
+launchd throttles (5 s `ThrottleInterval`) and systemd backs off
+(`RestartSec`) while the existing alerts fire; the operator bails
+manually — the old dist is git, so re-pulling/rebuilding and restarting
+the unit restores service. The bail command is printed by the CLI on
+failure. An in-service trigger (an agent running the roll as a tool call)
+counts its own open turn as in-flight work; run the CLI from a terminal
+or an outside shell to avoid waiting out the drain bound.
+
 ## Configuration
 
 ```toml
@@ -351,6 +426,10 @@ never blocking a live operation.
 # directive_at = 2
 # rebrief_at = 3
 # escalate_at = 4
+
+[roll]
+# bounded drain wait before a self-roll swaps the build (0 = swap now)
+# drain_timeout_ms = 900000
 
 [verify]
 # Verification scheduler (see §4c); lanes request runs, the service owns

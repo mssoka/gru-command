@@ -730,6 +730,18 @@ export class LedgerApi {
     return rows.map((row) => this.getRound(str(row.id)) as RoundRecord);
   }
 
+  /**
+   * Every round still in flight (pending/live), across all jobs — the roll
+   * drain probe. Rounds are terminal at verdict-posted/aborted; anything
+   * non-terminal is work the service should finish or abandon before a swap.
+   */
+  listActiveRounds(): readonly RoundRecord[] {
+    const rows = this.db
+      .prepare("SELECT id FROM rounds WHERE status IN ('pending', 'live') ORDER BY created_at, id")
+      .all() as Row[];
+    return rows.map((row) => this.getRound(str(row.id)) as RoundRecord);
+  }
+
   setRoundStatus(id: string, status: string): RoundRecord {
     if (!isRoundStatus(status)) throw new Error(`unknown round status "${status}"`);
     return this.transaction(() => {

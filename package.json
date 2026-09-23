@@ -24,6 +24,9 @@
     "node": ">=22.19.0"
   },
   "main": "dist/main.js",
+  "bin": {
+    "gru-service": "dist/cli/service.js"
+  },
   "scripts": {
     "build": "tsc && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs",
     "prepack": "node -e \"const fs=require('node:fs'); for (const path of ['dist','web/dist']) fs.rmSync(path,{recursive:true,force:true})\" && npm run build:web && npm run build",

@@ -9,6 +9,7 @@ import type { RuntimeStatus } from './runtime/registry.js';
 import type { SupervisionStatus } from './supervision/supervisor.js';
 import type { DecisionRuntimeStatus } from './decisions/runtime.js';
 import type { StaticRoot } from './static.js';
+import type { BuildInfo } from './build-info.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
 /**
@@ -55,6 +56,12 @@ export interface HealthPayload {
     readonly path: string;
     readonly declared: boolean;
     readonly note: string;
+  };
+  /** The running dist's own build identity (self-roll verification). */
+  readonly build: {
+    readonly rev: string | null;
+    readonly committed_at: string | null;
+    readonly built_at: string | null;
   };
 }
 
@@ -153,6 +160,7 @@ export function buildHealthPayload(
   runtimeStatus: RuntimeStatus | null = null,
   supervisionStatus: SupervisionStatus | null = null,
   decisionsStatus: DecisionRuntimeStatus | null = null,
+  buildInfo: BuildInfo | null = null,
 ): HealthPayload {
   const liveness: LivenessBlock =
     runtimeStatus === null
@@ -208,6 +216,11 @@ export function buildHealthPayload(
     liveness,
     supervision: supervisionStatus,
     decisions: decisionsStatus,
+    build: {
+      rev: buildInfo?.rev ?? null,
+      committed_at: buildInfo?.committedAt ?? null,
+      built_at: buildInfo?.builtAt ?? null,
+    },
     session: {
       path: join(config.dataDir, 'sessions'),
       declared: true,
@@ -233,6 +246,9 @@ export interface ServiceOptions {
    * Null (or omitted) reports `supervision: null` — pre-E7 shape. */
   readonly supervisionStatus?: () => SupervisionStatus | null;
   readonly decisionsStatus?: () => DecisionRuntimeStatus | null;
+  /** Build stamp of the running dist (self-roll verification); null when
+   * unknown. Full (token-gated) payload only — never the public shape. */
+  readonly buildInfo?: () => BuildInfo | null;
   /** First claim hook after /health, before static (E6: the board's
    * /api/* routes). Returning true means the request was handled — the
    * service skips static + 404 and does not log it (the hook owns that). */
@@ -298,6 +314,7 @@ export function createService(
             runtimeStatus(),
             options.supervisionStatus !== undefined ? options.supervisionStatus() : null,
             options.decisionsStatus !== undefined ? options.decisionsStatus() : null,
+            options.buildInfo !== undefined ? options.buildInfo() : null,
           );
           // W-C (E9 r3 carry): the pairing surface gets LIVENESS ONLY —
           // workspace_root / data_dir / install fingerprint / session

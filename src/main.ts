@@ -27,6 +27,11 @@ import { createDispatchServer } from './dispatch/server.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
 import { createService, type ServiceHandle } from './server.js';
+import { adoptRollMarker, reconcileStaleRoll } from './roll/adopt.js';
+import { RollController, ROLL_SWAP_EXIT_CODE } from './roll/controller.js';
+import { createRollProbes } from './roll/probes.js';
+import { createRollServer } from './roll/server.js';
+import { readRollState } from './roll/state.js';
 import { createAttachmentsServer } from './attachments/server.js';
 import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import { DecisionRuntime } from './decisions/runtime.js';
@@ -131,6 +136,7 @@ import { createStaticRoot, defaultStaticRoot } from './static.js';
 import { SERVICE_NAME, VERSION } from './version.js';
 
 async function main(): Promise<number> {
+  const bootHr = process.hrtime.bigint();
   // Capture once, then remove the provider key from the ambient process
   // environment before probes, agents, setup hooks, git, or gh can spawn.
   const decisionEnvironment = isolateDecisionEnvironment();
@@ -157,6 +163,8 @@ async function main(): Promise<number> {
     keep: config.logging.keep,
   });
   const identity = loadOrCreateIdentity(config.dataDir);
+  const buildInfo = readBuildInfo();
+  const repoRoot = defaultPackageRoot();
   logger.info('boot', {
     service: SERVICE_NAME,
     version: VERSION,
@@ -167,6 +175,23 @@ async function main(): Promise<number> {
     config_loaded: config.sourceFile !== null,
     default_runtime: config.runtimes.default,
     install_id: identity.installId,
+    build_sha: buildInfo.rev,
+  });
+  // Self-roll adoption (issue #34): the previous process wrote the swap
+  // marker and exited for relaunch; this boot consumes it — logs
+  // "rolled to <sha>", marks the record done, clears the marker. Sessions
+  // resume through the existing boot path (#42 cure); the roll's drain
+  // phase is what keeps a swap from interrupting a live turn by design.
+  const rollAdoption = adoptRollMarker({
+    dataDir: config.dataDir,
+    runningSha: buildInfo.rev,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  // A roll record that never swapped (restart for another reason mid-roll)
+  // must not read as live: reconcile it to failed after adoption.
+  reconcileStaleRoll({
+    dataDir: config.dataDir,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // E9 / SPEC ruling 19: uploads-dir scaffolding next to the other
   // instance dirs (logs/, chat/) — DIRECTORY CREATION ONLY in E9; the
@@ -233,10 +258,10 @@ async function main(): Promise<number> {
     deployDrift?: DeployDriftTracker;
   } = {};
   let shuttingDown = false;
-  const shutdown = (signal: string) => {
+  const shutdown = (signal: string, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    logger.info('shutdown begin', { signal });
+    logger.info('shutdown begin', { signal, exit_code: exitCode });
     const forceExit = setTimeout(() => {
       logger.error('shutdown timeout — forcing exit', { signal });
       process.exit(1);
@@ -245,7 +270,7 @@ async function main(): Promise<number> {
     if (state.handle === undefined) {
       clearTimeout(forceExit);
       logger.info('shutdown complete', { signal, note: 'signal arrived during boot' });
-      process.exit(0);
+      process.exit(exitCode);
     }
     const handle = state.handle;
     void Promise.resolve()
@@ -340,7 +365,10 @@ async function main(): Promise<number> {
       .then(() => {
         clearTimeout(forceExit);
         logger.info('shutdown complete', { signal });
-        process.exit(0);
+        // A roll swap exits with ROLL_SWAP_EXIT_CODE (75, non-zero): the
+        // shipped launchd/systemd units restart on an unsuccessful exit
+        // and stay down on a clean one. A normal stop keeps exit 0.
+        process.exit(exitCode);
       })
       .catch((error: unknown) => {
         clearTimeout(forceExit);
@@ -653,6 +681,37 @@ async function main(): Promise<number> {
   });
   state.bob = bob;
 
+  // Graceful self-roll (issue #34): the operator surface + the state
+  // machine. preflight/drain run in-process while the old build serves;
+  // swap writes the marker and calls shutdown('roll') so the supervisor
+  // relaunches the unit into the new build (exit 75 = restart-worthy).
+  const rollController = new RollController({
+    dataDir: config.dataDir,
+    repoRoot,
+    drainTimeoutMs: config.roll.drainTimeoutMs,
+    probeInFlight: createRollProbes({ ledger, registry }),
+    readBuiltSha: () => readBuildInfo(repoRoot).rev ?? buildInfo.rev,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+    onSwap: () => shutdown('roll', ROLL_SWAP_EXIT_CODE),
+  });
+  const rollServer = createRollServer({
+    config,
+    controller: rollController,
+    // Post-restart GETs read the record from disk: this process has no
+    // in-memory roll of its own, but the previous one left the file.
+    loadState: () => {
+      const live = rollController.state();
+      if (live !== null) return live;
+      try {
+        return readRollState(config.dataDir);
+      } catch (error) {
+        logger.warn('roll state record unreadable', { error: String(error) });
+        return null;
+      }
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+
   const service = createService(
     config,
     identity,
@@ -662,7 +721,9 @@ async function main(): Promise<number> {
       staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)),
       supervisionStatus: () => supervisorLive.status(),
       decisionsStatus: () => decisionRuntime.status(),
+      buildInfo: () => buildInfo,
       requestHook: (req, res, path) =>
+        rollServer.requestHook(req, res, path) ||
         attachmentsServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||
         dispatchServer.requestHook(req, res, path) ||
@@ -675,6 +736,17 @@ async function main(): Promise<number> {
   chat.attach(handle.httpServer);
   board.attach(handle.httpServer); // last: its upgrade handler terminates unclaimed paths
   state.chat = chat;
+  // Post-roll self-check (phase d): the relaunched build logs uptime+sha
+  // once the socket is actually serving.
+  if (rollAdoption.marker !== null) {
+    logger.info('post-roll self-check', {
+      build_sha: buildInfo.rev,
+      uptime_ms: Number(process.hrtime.bigint() - bootHr) / 1_000_000,
+      from_sha: rollAdoption.marker.fromSha,
+      to_sha: rollAdoption.marker.toSha,
+      port: handle.port,
+    });
+  }
   chat.warmup();
   supervisorLive.start();
   bob.start();
