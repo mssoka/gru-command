@@ -94,6 +94,18 @@ setup_timeout_ms = 120000
 [dispatch]                        # dispatch flow (E8) — all optional
 bob_interval_ms = 3600000         # Bob's consolidation interval; 0 disables
 
+[lessons]                         # Book of Lessons — all optional, live by default
+# Deliberate journal entries (Gru/Silas via /api/journal, minion lessons blocks)
+# are distilled by Bob's dream pass into a capped, deduped bible; briefings
+# carry pointer lines only (chapter bodies are read on demand, never inlined).
+enabled = true                    # false disables the dream cadence and pointer injection
+                                  # (the journal API stays available — capture is never lost)
+dream_interval_ms = 43200000      # 12h; on boot plus every interval, 0 = no periodic pass
+dream_on_boot = true              # one catch-up pass when the service boots
+chapter_cap_bytes = 4096          # hard cap per chapter; the dream trims to fit
+index_cap_bytes = 1024           # hard cap for INDEX.md — the only part ever embedded
+max_references = 3                # pointer lines injected into one briefing/directive max
+
 [silas]                           # hosted ops session — all optional, live by default
 # Silas closes the delivered→PR→review loop without a human ping and breaks
 # recurring blocker loops (directive → re-brief fresh minion → escalate).

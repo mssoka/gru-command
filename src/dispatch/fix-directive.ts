@@ -2,6 +2,8 @@ import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import { requireSpawnCwd } from '../roles.js';
+import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
+import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import type { WorktreePort } from './worktree-port.js';
 
@@ -25,6 +27,8 @@ export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
   readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent'>;
   readonly worktrees: WorktreePort;
+  /** Book of Lessons injection: pointer lines only, never chapter bodies. */
+  readonly lessons?: LessonsReferencePort;
 }
 
 /** Route a directive to the implementing minion: the live job minion
@@ -39,13 +43,17 @@ export async function routeFixDirectiveToMinion(
   },
 ): Promise<{ delivered: boolean; minionId?: string; note?: string }> {
   const owner = input.owner ?? 'fix-directive';
+  const directive = appendLessonPointers(
+    input.directive,
+    input.lessons?.referencesFor(input.directive) ?? [],
+  );
   const minions = input.ledger
     .listAgents()
     .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
-      await racedPrompt(handle, input.directive, input.signal, owner);
+      await racedPrompt(handle, directive, input.signal, owner);
       return { delivered: true, minionId: minion.id };
     }
   }
@@ -57,7 +65,7 @@ export async function routeFixDirectiveToMinion(
   }
   const handle = await input.registry.spawn('minion', { cwd: lane.path });
   try {
-    await racedPrompt(handle, input.directive, input.signal, owner);
+    await racedPrompt(handle, directive, input.signal, owner);
   } finally {
     await handle.dispose();
   }
@@ -120,7 +128,10 @@ export function renderRebriefPrompt(input: {
   jobId: string;
   briefing: string | null;
   note: string;
+  /** Progressive-disclosure reference lines (no chapter bodies). */
+  lessons?: readonly LessonPointer[];
 }): string {
+  const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
     `Re-brief — job ${input.jobId}`,
     '',
@@ -132,6 +143,7 @@ export function renderRebriefPrompt(input: {
     '',
     'ORIGINAL BRIEFING (still the contract):',
     input.briefing ?? '(the job row carries no stored briefing — read the job note on the board)',
+    ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     '',
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',
@@ -204,7 +216,14 @@ export async function rebriefFreshMinion(
     jobId: input.jobId,
   });
   input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
-  const prompt = renderRebriefPrompt({ jobId: input.jobId, briefing: input.briefing, note: input.note });
+  const prompt = renderRebriefPrompt({
+    jobId: input.jobId,
+    briefing: input.briefing,
+    note: input.note,
+    ...(input.lessons !== undefined
+      ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
+      : {}),
+  });
   try {
     await handle.prompt(prompt, { owner: `silas-rebrief:${input.jobId}` });
   } catch (error) {

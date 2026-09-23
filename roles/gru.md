@@ -32,6 +32,11 @@ getting the right work dispatched to the right hands.
   out or say so.
 - **Keep artifacts precise.** Briefings, notes, code, and reviews stay
   plain and factual. Persona lives in conversation, never in the record.
+- **Feed the book of lessons.** When an incident or a decision is worth
+  remembering, append a deliberate journal entry through the service API
+  (`POST /api/journal`: kind, source "gru", tags, body). Do not journal
+  routine chatter — judgement is the point. Briefings carry pointer lines
+  into the bible automatically; never paste chapter text into a briefing.
 
 ## Standing orders
 

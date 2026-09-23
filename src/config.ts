@@ -161,6 +161,35 @@ export interface DispatchConfig {
   readonly bobIntervalMs: number;
 }
 
+/** Book of Lessons policy (owner design 2026-09-23): journal capture →
+ * dream distillation → bible references. */
+export interface LessonsConfig {
+  /** Master switch for the dream cadence and briefing injection. The
+   * journal API stays available either way (capture is deliberate, and a
+   * disabled dream must never lose entries). */
+  readonly enabled: boolean;
+  /** Dream cadence in ms: on boot plus every interval; 0 disables the
+   * periodic trigger (the on-boot pass still runs). Default 12 h. */
+  readonly dreamIntervalMs: number;
+  /** Run one dream pass at service boot when new journal entries exist. */
+  readonly dreamOnBoot: boolean;
+  /** Hard cap per chapter file; the dream trims to fit. */
+  readonly chapterCapBytes: number;
+  /** Hard cap for INDEX.md (the only part ever embedded in briefings). */
+  readonly indexCapBytes: number;
+  /** Maximum pointer lines injected into one briefing/directive. */
+  readonly maxReferences: number;
+}
+
+export const DEFAULT_LESSONS_CONFIG: LessonsConfig = {
+  enabled: true,
+  dreamIntervalMs: 43_200_000,
+  dreamOnBoot: true,
+  chapterCapBytes: 4_096,
+  indexCapBytes: 1_024,
+  maxReferences: 3,
+};
+
 /** Graceful self-roll policy (issue #34 graduation heist). */
 export interface RollConfig {
   /** Bounded drain wait before a swap (ms); 0 snapshots and swaps now. */
@@ -287,6 +316,7 @@ export interface GruCommandConfig {
   readonly chat: ChatConfig;
   readonly worktrees: WorktreesConfig;
   readonly dispatch: DispatchConfig;
+  readonly lessons: LessonsConfig;
   readonly silas: SilasConfig;
   readonly roll: RollConfig;
   readonly review: ReviewConfig;
@@ -409,6 +439,7 @@ const TOP_LEVEL_KEYS = [
   'chat',
   'worktrees',
   'dispatch',
+  'lessons',
   'silas',
   'roll',
   'review',
@@ -602,6 +633,7 @@ export function loadConfig(
   let chat: ChatConfig = { frameLogMaxBytes: 8_388_608, frameLogKeep: 3, notifyWake: 'never' };
   let worktrees: WorktreesConfig | null = null;
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
+  let lessons: LessonsConfig = DEFAULT_LESSONS_CONFIG;
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let roll: RollConfig = DEFAULT_ROLL_CONFIG;
   let review: ReviewConfig = { enabled: true };
@@ -872,6 +904,52 @@ export function loadConfig(
             : dispatch.bobIntervalMs,
       };
     }
+    if (raw['lessons'] !== undefined) {
+      const table = requireTable(raw['lessons'], file, 'lessons');
+      const VALID = [
+        'enabled',
+        'dream_interval_ms',
+        'dream_on_boot',
+        'chapter_cap_bytes',
+        'index_cap_bytes',
+        'max_references',
+      ];
+      for (const key of Object.keys(table)) {
+        if (!VALID.includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [lessons] (valid keys: ${VALID.join(', ')})`,
+            file,
+            `lessons.${key}`,
+          );
+        }
+      }
+      lessons = {
+        enabled:
+          table['enabled'] !== undefined
+            ? requireBool(table['enabled'], file, 'lessons.enabled')
+            : lessons.enabled,
+        dreamIntervalMs:
+          table['dream_interval_ms'] !== undefined
+            ? requireNonNegativeInt(table['dream_interval_ms'], file, 'lessons.dream_interval_ms')
+            : lessons.dreamIntervalMs,
+        dreamOnBoot:
+          table['dream_on_boot'] !== undefined
+            ? requireBool(table['dream_on_boot'], file, 'lessons.dream_on_boot')
+            : lessons.dreamOnBoot,
+        chapterCapBytes:
+          table['chapter_cap_bytes'] !== undefined
+            ? requirePositiveInt(table['chapter_cap_bytes'], file, 'lessons.chapter_cap_bytes')
+            : lessons.chapterCapBytes,
+        indexCapBytes:
+          table['index_cap_bytes'] !== undefined
+            ? requirePositiveInt(table['index_cap_bytes'], file, 'lessons.index_cap_bytes')
+            : lessons.indexCapBytes,
+        maxReferences:
+          table['max_references'] !== undefined
+            ? requireNonNegativeInt(table['max_references'], file, 'lessons.max_references')
+            : lessons.maxReferences,
+      };
+    }
     if (raw['silas'] !== undefined) {
       const table = requireTable(raw['silas'], file, 'silas');
       const VALID = ['enabled', 'sweep_interval_ms', 'poll_interval_ms', 'stall_threshold_ms', 'directive_at', 'rebrief_at', 'escalate_at'];
@@ -1039,6 +1117,7 @@ export function loadConfig(
       setupTimeoutMs: worktrees?.setupTimeoutMs ?? 120_000,
     },
     dispatch,
+    lessons,
     silas,
     roll,
     review,

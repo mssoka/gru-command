@@ -756,6 +756,54 @@ describe('verify config (contention fix 2026-09-22)', () => {
   });
 });
 
+describe('lessons config (Book of Lessons)', () => {
+  it('dreams on boot + every 12h by default, with the pinned caps', () => {
+    const home = tmpHome();
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.lessons).toEqual({
+      enabled: true,
+      dreamIntervalMs: 43_200_000,
+      dreamOnBoot: true,
+      chapterCapBytes: 4_096,
+      indexCapBytes: 1_024,
+      maxReferences: 3,
+    });
+  });
+
+  it('a full [lessons] section parses; interval 0 + on-boot false are legal shutdowns', () => {
+    const home = tmpHome();
+    writeConfig(
+      home,
+      '[lessons]\nenabled = false\ndream_interval_ms = 0\ndream_on_boot = false\nchapter_cap_bytes = 2048\nindex_cap_bytes = 512\nmax_references = 0\n',
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').lessons).toEqual({
+      enabled: false,
+      dreamIntervalMs: 0,
+      dreamOnBoot: false,
+      chapterCapBytes: 2_048,
+      indexCapBytes: 512,
+      maxReferences: 0,
+    });
+  });
+
+  it('unknown keys, negative intervals, and non-integer caps refuse boot', () => {
+    const bad: readonly string[] = [
+      '[lessons]\nunknown = 1\n',
+      '[lessons]\ndream_interval_ms = -1\n',
+      '[lessons]\nchapter_cap_bytes = 0\n',
+      '[lessons]\nindex_cap_bytes = 1.5\n',
+      '[lessons]\nmax_references = -3\n',
+      '[lessons]\nenabled = "yes"\n',
+      '[lessons]\ndream_on_boot = "later"\n',
+    ];
+    for (const text of bad) {
+      const h2 = tmpHome();
+      writeFileSync(join(h2, 'config.toml'), text, 'utf-8');
+      expect(() => loadConfig({ GRU_COMMAND_HOME: h2 }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
+});
+
 describe('self-roll table', () => {
   it('defaults to a 15-minute drain and accepts an explicit drain_timeout_ms', () => {
     const home = tmpHome();
