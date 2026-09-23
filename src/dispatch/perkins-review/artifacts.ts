@@ -555,11 +555,38 @@ export function baseMovedSinceFreeze(review: FrozenReview): boolean {
   }
 }
 
+/** The configured-remote branch a movement ref names, or null when the ref
+ * is not a remote-tracking ref (a SHA, a tag, or a local branch whose
+ * leading segment is not a configured remote — a local `feature/x` is NOT
+ * `remote feature`). Mirrors the base-drift rule for target refs. */
+function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string; branch: string } | null {
+  const remoteRef = ref.startsWith('refs/remotes/') ? ref.slice('refs/remotes/'.length) : ref;
+  const slash = remoteRef.indexOf('/');
+  if (slash <= 0 || slash === remoteRef.length - 1) return null;
+  const remote = remoteRef.slice(0, slash);
+  const branch = remoteRef.slice(slash + 1);
+  let configured = false;
+  try {
+    configured = git(repoPath, ['remote']).split('\n').includes(remote);
+  } catch {
+    return null;
+  }
+  return configured ? { remote, branch } : null;
+}
+
 export function refMovedSinceFreeze(review: FrozenReview): boolean {
   try {
     if (baseMovedSinceFreeze(review)) return true;
     if (git(review.manifest.repoPath, ['rev-parse', '--verify', `${review.manifest.targetRef}^{commit}`]) !== review.manifest.targetSha) {
       return true;
+    }
+    // A remote-tracking movement ref can move on the host without the local
+    // ref moving (a push during the round): verify the live advertised tip,
+    // mirroring the base drift check. Fail closed on an unreachable remote.
+    const remoteTarget = advertisedRemoteBranch(review.manifest.repoPath, review.manifest.targetRef);
+    if (remoteTarget !== null) {
+      const advertised = gitRaw(review.manifest.repoPath, ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`]).trim();
+      if ((advertised.split(/\s+/u)[0] ?? '') !== review.manifest.targetSha) return true;
     }
     if (git(review.manifest.repoPath, ['rev-parse', '--verify', 'HEAD^{commit}']) !== review.manifest.targetSha) {
       return true;

@@ -37,6 +37,12 @@ import {
   renderRecordedVerification,
   VERIFICATION_COMPLETED_EVENT,
 } from '../verify/evidence.js';
+import {
+  PrHeadVerificationError,
+  prBranchCandidate,
+  resolveFreshPrHead,
+  type PrHeadProbe,
+} from './perkins-review/fresh-head.js';
 
 export const FALLBACK_REVIEW_TIMEOUT_MS = 15 * 60 * 1_000;
 
@@ -436,6 +442,10 @@ export interface WaveRunnerOptions {
   /** bmad-review fallback gate configuration. Required for fallback routing
    * to be available; without it a failed pre-flight reports both options. */
   readonly fallbackGate?: FallbackGateOptions;
+  /** PR-branch freeze guard seam: reads the live code-host head identity a
+   * round's fetched branch tip is validated against. Production probes the
+   * code host; tests inject a deterministic double. */
+  readonly prHeadProbe?: PrHeadProbe;
   readonly log?: Log;
 }
 
@@ -951,8 +961,8 @@ export class WaveRunner {
       throw new Error('Perkins review lens set is canonical and cannot be reduced or reordered');
     }
     const artifactRoot = this.artifactRoot();
-    const movementRef = input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
-    const targetSha = resolveGitCommit(jobWorktree.path, movementRef);
+    const candidateRef = input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
+    const { targetSha, movementRef } = await this.resolveFreezeTarget({ job, jobWorktree, candidateRef });
     const baseRef = resolveReviewBaseRef(jobWorktree.path, job.baseBranch);
     // Recorded verification evidence (2026-09-22 fix): a completed
     // scheduler run on the exact frozen target (clean tree) is handed to
@@ -1070,6 +1080,64 @@ export class WaveRunner {
       runController,
     );
     return { round, run };
+  }
+
+  /** Resolve the exact SHA a round will freeze. A round reviewing a PR
+   * branch fetches that branch from origin and cross-checks the fetched tip
+   * against the live pull/merge-request head: the recorded lane identity is
+   * only a hint, never the freeze source. A disagreement aborts before a
+   * round row, a review worktree, or any lens exists. Non-PR rounds and
+   * explicit commit pins keep the local resolution. */
+  private async resolveFreezeTarget(input: {
+    job: { readonly id: string; readonly prUrl: string | null };
+    jobWorktree: { readonly path: string; readonly repoPath: string };
+    candidateRef: string;
+  }): Promise<{ readonly targetSha: string; readonly movementRef: string }> {
+    const branchRef = input.job.prUrl === null
+      ? null
+      : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
+    if (input.job.prUrl === null || branchRef === null) {
+      return {
+        targetSha: resolveGitCommit(input.jobWorktree.path, input.candidateRef),
+        movementRef: input.candidateRef,
+      };
+    }
+    try {
+      const fresh = await resolveFreshPrHead({
+        repoPath: input.jobWorktree.repoPath,
+        prUrl: input.job.prUrl,
+        branchRef,
+        ...(this.opts.prHeadProbe !== undefined ? { probe: this.opts.prHeadProbe } : {}),
+      });
+      this.log('info', 'freeze target refreshed from the live PR head', {
+        job: input.job.id,
+        branch: branchRef,
+        localCandidate: input.candidateRef,
+        fetched: fresh.targetSha,
+        movementRef: fresh.movementRef,
+      });
+      return { targetSha: fresh.targetSha, movementRef: fresh.movementRef };
+    } catch (error) {
+      if (error instanceof PrHeadVerificationError) {
+        const detail = error.message.replace(/[\r\n]+/gu, ' ').slice(0, 1000);
+        this.opts.ledger.appendCustomEvent({
+          kind: 'job.review-freeze-blocked',
+          jobId: input.job.id,
+          payload: {
+            code: error.code,
+            prUrl: input.job.prUrl,
+            branchRef,
+            candidateRef: input.candidateRef,
+            detail,
+          },
+        });
+        this.opts.escalate?.(
+          `Perkins review for job ${input.job.id} was blocked before any round: the PR head could not be verified`,
+          detail,
+        );
+      }
+      throw error;
+    }
   }
 
   private async runBuiltInReview(
