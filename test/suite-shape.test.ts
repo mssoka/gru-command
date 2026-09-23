@@ -44,7 +44,7 @@ const PINS: Record<string, number> = {
   'ledger-db.test.ts': 6,
   'lessons-bible.test.ts': 13,
   'lessons-capture.test.ts': 5,
-  'lessons-dream.test.ts': 9,
+  'lessons-dream.test.ts': 12,
   'lessons-e2e.test.ts': 2,
   'lessons-injection.test.ts': 5,
   'lessons-journal.test.ts': 5,

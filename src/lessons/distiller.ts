@@ -148,7 +148,7 @@ export function parseDreamOutput(raw: string, entries: readonly JournalEntry[]):
   }
   const known = new Set(entries.map((entry) => entry.id));
   const chapters: ProposedChapter[] = chaptersRaw.map((value, index) =>
-    parseChapter(value, index, known),
+    parseProposedChapter(value, index, known),
   );
   return { chapters };
 }
@@ -183,7 +183,7 @@ function optionalTags(value: unknown, where: string): readonly string[] | undefi
   return value as readonly string[];
 }
 
-function parseLesson(value: unknown, where: string, known: ReadonlySet<string>): ProposedLesson {
+function parseProposedLesson(value: unknown, where: string, known: ReadonlySet<string>): ProposedLesson {
   const row = requireObject(value, where);
   const slug = requireSlug(row['slug'], `${where}.slug`);
   const body = requireString(row['body'], `${where}.body`);
@@ -214,7 +214,7 @@ function parseLesson(value: unknown, where: string, known: ReadonlySet<string>):
   };
 }
 
-function parseChapter(value: unknown, index: number, known: ReadonlySet<string>): ProposedChapter {
+function parseProposedChapter(value: unknown, index: number, known: ReadonlySet<string>): ProposedChapter {
   const where = `chapters[${index}]`;
   const row = requireObject(value, where);
   const slug = requireSlug(row['slug'], `${where}.slug`);
@@ -225,12 +225,12 @@ function parseChapter(value: unknown, index: number, known: ReadonlySet<string>)
   if (retire !== undefined && retire !== true && retire !== false) {
     throw new DreamError(`dream output ${where}.retire must be a boolean`);
   }
-  const lessonsRaw = row['lessons'];
+  const lessonsRaw = row['lessons'] ?? (retire === true ? [] : undefined);
   if (!Array.isArray(lessonsRaw)) {
     throw new DreamError(`dream output ${where}.lessons must be an array`);
   }
   const lessons = lessonsRaw.map((lesson, lessonIndex) =>
-    parseLesson(lesson, `${where}.lessons[${lessonIndex}]`, known),
+    parseProposedLesson(lesson, `${where}.lessons[${lessonIndex}]`, known),
   );
   return {
     slug,

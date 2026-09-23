@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BibleStore } from '../src/lessons/bible.js';
 import { DreamEngine, DreamScheduler, loadDreamState, type DreamDistiller, type DistillInput, type DistillResult, type DreamOutcome } from '../src/lessons/dream.js';
+import { DREAM_PROMPT_BODY_CLAMP, parseDreamOutput, renderDreamPrompt } from '../src/lessons/distiller.js';
 import { JournalStore } from '../src/lessons/journal.js';
 import { DreamError, type JournalEntry, type ProposedChapter } from '../src/lessons/types.js';
 
@@ -164,6 +165,78 @@ describe('dream engine', () => {
     const second = await h.engine.run();
     expect(second.entries).toBe(1);
     expect(second.coveredThroughSeq).toBe(2);
+  });
+});
+
+describe('dream distiller protocol (one Bob pass)', () => {
+  function entry(id: string, body: string): JournalEntry {
+    return { seq: 1, id, ts: '2026-09-23T00:00:00.000Z', kind: 'finding', source: 'gru', tags: [], body };
+  }
+
+  it('renders the entries, the bible location, the caps, and the exact output file', () => {
+    const long = 'x'.repeat(DREAM_PROMPT_BODY_CLAMP + 500);
+    const prompt = renderDreamPrompt({
+      entries: [entry('j-1', 'short finding'), entry('j-2', long)],
+      index: '# Book of Lessons — index',
+      bibleDir: '/tmp/bible',
+      chapterCapBytes: 4096,
+      indexCapBytes: 1024,
+      outputFile: '/tmp/bible/.dream-output-abc.json',
+    });
+    expect(prompt).toContain('"id":"j-1"');
+    expect(prompt).toContain('entry truncated for the dream prompt');
+    expect(prompt).toContain('/tmp/bible/.dream-output-abc.json');
+    expect(prompt).toContain('Chapters are capped at 4096 bytes');
+    expect(prompt).toContain('1024 bytes');
+    expect(prompt).toContain('mergeInto');
+  });
+
+  it('parses a valid update and rejects invented provenance / malformed shapes', () => {
+    const entries = [entry('j-1', 'finding')];
+    const valid = parseDreamOutput(
+      JSON.stringify({
+        chapters: [
+          {
+            slug: 'ops-restarts',
+            title: 'Ops restarts',
+            summary: 'One line.',
+            tags: ['ops'],
+            lessons: [{ slug: 'shell-hang', body: 'Kill the shell.', tags: ['shell'], journalIds: ['j-1'] }],
+          },
+        ],
+      }),
+      entries,
+    );
+    expect(valid.chapters).toHaveLength(1);
+    expect(valid.chapters[0]!.lessons[0]).toMatchObject({ slug: 'shell-hang', journalIds: ['j-1'] });
+
+    expect(() => parseDreamOutput('not json', entries)).toThrowError(/not valid JSON/);
+    expect(() =>
+      parseDreamOutput(
+        JSON.stringify({ chapters: [{ slug: 'x', title: 'x', summary: 'x', lessons: [{ slug: 'y', body: 'b', journalIds: ['j-9'] }] }] }),
+        entries,
+      ),
+    ).toThrowError(/provenance may not be invented/);
+    expect(() =>
+      parseDreamOutput(
+        JSON.stringify({ chapters: [{ slug: 'x', title: 'x', summary: 'x', lessons: [{ slug: 'y', body: 'b', journalIds: [] }] }] }),
+        entries,
+      ),
+    ).toThrowError(/cites no journal id/);
+    expect(() =>
+      parseDreamOutput(
+        JSON.stringify({ chapters: [{ slug: 'Not A Slug', title: 'x', summary: 'x', lessons: [] }] }),
+        entries,
+      ),
+    ).toThrowError(/kebab-case slug/);
+  });
+
+  it('accepts a retire update without a lessons array', () => {
+    const result = parseDreamOutput(
+      JSON.stringify({ chapters: [{ slug: 'old-chapter', title: 'Old', summary: 'retired', retire: true }] }),
+      [],
+    );
+    expect(result.chapters[0]).toMatchObject({ slug: 'old-chapter', retire: true, lessons: [] });
   });
 });
 
