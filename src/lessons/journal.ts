@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import {
   isJournalKind,
+  JOURNAL_KINDS,
   JournalError,
   type JournalEntry,
   type JournalKind,
@@ -62,7 +63,7 @@ export class JournalStore {
   append(input: JournalAppendInput, now: Date = new Date()): JournalEntry {
     if (!isJournalKind(input.kind)) {
       throw new JournalError(
-        `journal kind must be one of: ${'finding, ruling, observation'} (got ${JSON.stringify(input.kind)})`,
+        `journal kind must be one of: ${JOURNAL_KINDS.join(', ')} (got ${JSON.stringify(input.kind)})`,
       );
     }
     const source = input.source;
