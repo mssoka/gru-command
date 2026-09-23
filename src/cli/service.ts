@@ -3,6 +3,7 @@ import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, type GruCommandConfig } from '../config.js';
+import { defaultListenerProbe, type ListenerOwner, type ListenerProbe } from '../listener-probe.js';
 import type { RollState } from '../roll/state.js';
 
 /**
@@ -101,6 +102,10 @@ export interface ServiceCliDeps {
   readonly stderr: (line: string) => void;
   readonly sleep: (ms: number) => Promise<void>;
   readonly now: () => number;
+  /** Listener ownership probe (owner incident 2026-09-23): after a roll
+   * reports done, the /health answer is only trusted when the port's
+   * listener is the adopted process (pid match), never a squatter. */
+  readonly probeListeners: ListenerProbe;
 }
 
 function defaultDeps(): ServiceCliDeps {
@@ -111,6 +116,7 @@ function defaultDeps(): ServiceCliDeps {
     stderr: (line) => process.stderr.write(`${line}\n`),
     sleep: (ms) => new Promise((resolveSleep) => { setTimeout(resolveSleep, ms); }),
     now: Date.now,
+    probeListeners: (host, port) => defaultListenerProbe(host, port),
   };
 }
 
@@ -252,6 +258,22 @@ export async function runServiceCli(
     if (state !== null && state.phase === 'done' && healthDeadline !== null) {
       const health = await readHealthSha(deps, base, config);
       if (health !== undefined && expectedSha !== null && health === expectedSha) {
+        // The /health build matches — but WHO answered? (owner incident
+        // 2026-09-23): require the port's listener to be the adopted
+        // process. A foreign pid means the squatter may have answered; a
+        // 200 alone is never read as success.
+        const foreign = await foreignHealthListener(deps, config, state);
+        if (foreign !== null) {
+          deps.stderr(
+            `gru-service: /health reports the target build but the listener on ` +
+              `${dialHost(config.server.host)}:${config.server.port} is pid ${foreign.pid}` +
+              `${foreign.command === '' ? '' : ` (${foreign.command})`}, not the relaunched service ` +
+              `(pid ${state.verify?.pid ?? 'unknown'}) — a foreign listener answered. ` +
+              'Action required: stop the squatter process and re-run gru-service roll.',
+          );
+          bailHint(deps.stderr, state);
+          return 1;
+        }
         if (options.json) {
           deps.stdout(JSON.stringify({ event: 'verified', roll: state, build_sha: health }));
         } else {
@@ -299,6 +321,24 @@ async function readHealthSha(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The listener on the instance port when it is NOT the adopted process —
+ * the `/health` 200 of a squatter must never read as a verified roll.
+ * Returns null when the record carries no pid, nobody listens, or the
+ * platform has no probe (the build-sha match then stands as before).
+ */
+async function foreignHealthListener(
+  deps: ServiceCliDeps,
+  config: GruCommandConfig,
+  state: RollState,
+): Promise<ListenerOwner | null> {
+  const verifyPid = state.verify?.pid;
+  if (typeof verifyPid !== 'number') return null;
+  const owners = await deps.probeListeners(dialHost(config.server.host), config.server.port);
+  if (owners === null) return null;
+  return owners.find((owner) => owner.pid !== verifyPid) ?? null;
 }
 
 /** Rollback safety: no auto-rollback v1 — the old dist is git; name the bail. */

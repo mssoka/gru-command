@@ -812,6 +812,90 @@ describe('Perkins r4 B1: manifest [[link]] lanes are releasable (the link is a d
 });
 
 
+describe('owner incident 2026-09-23: the sweep reaps its OWN spawned services', () => {
+  it('DISCRIMINATOR: a registry-tracked lane service is reaped on release — no ask, killed for real', async () => {
+    const h = harness(true); // production enumerator: the in-tree cross-check is real
+    const repo = h.make();
+    ledgerJob(h, 'job-track', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-track' });
+    // A detached service the verification scheduler would spawn for the
+    // lane: cwd = the tree, own process group.
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+      cwd: row.path,
+      stdio: 'ignore',
+      detached: true,
+    });
+    try {
+      await vi.waitFor(
+        () => {
+          expect(psEnumerator(row.path).some((p) => p.pid === child.pid)).toBe(true);
+        },
+        { timeout: 5_000 },
+      );
+      // Exactly what POST /api/verify records at spawn (evidence 'registry').
+      h.ledger.recordWorktreeProcesses({
+        worktreeId: 'job-track',
+        processes: [
+          { pid: child.pid as number, command: `node -e track-${child.pid}`, evidence: 'registry' },
+        ],
+        state: 'live',
+      });
+
+      const swept = await h.manager.release({ worktreeId: 'job-track' });
+      expect(swept.status).toBe('swept');
+      // Our own child never became a human ask…
+      expect(h.escalations).toHaveLength(0);
+      // …and it is gone for real (SIGTERM grace → SIGKILL if needed).
+      expect(child.kill(0)).toBe(false);
+      expect(h.ledger.listWorktreeProcesses('job-track').find((p) => p.pid === child.pid)?.state).toBe(
+        'killed',
+      );
+      const event = h.ledger
+        .listEvents({ limit: 200 })
+        .find((candidate) => candidate.kind === 'worktree.service-reaped');
+      expect(event?.payload).toMatchObject({ pids: [child.pid] });
+      expect(existsSync(row.path)).toBe(false);
+    } finally {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* reaped by the sweep */
+      }
+    }
+  });
+
+  it('NEVER signals a tracked pid that is alive but no longer rooted in the tree (pid-reuse guard)', async () => {
+    const h = harness(); // injected enumerator returns [] — nothing rooted in the lane
+    const repo = h.make();
+    ledgerJob(h, 'job-reuse', repo);
+    await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-reuse' });
+    const outsider = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    try {
+      h.ledger.recordWorktreeProcesses({
+        worktreeId: 'job-reuse',
+        processes: [
+          { pid: outsider.pid as number, command: `node -e reused-${outsider.pid}`, evidence: 'registry' },
+        ],
+        state: 'live',
+      });
+      const swept = await h.manager.release({ worktreeId: 'job-reuse' });
+      expect(swept.status).toBe('swept');
+      // The outsider was never signalled; the stale row is reconciled so it
+      // can never be killed by a later confirm either.
+      expect(outsider.kill(0)).toBe(true);
+      expect(
+        h.ledger.listWorktreeProcesses('job-reuse').find((p) => p.pid === outsider.pid)?.state,
+      ).toBe('killed');
+    } finally {
+      try {
+        outsider.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+});
+
 // Perkins r5: the REAL manager satisfies the core's WorktreePort contract
 // (same suite the in-memory double runs on PR #12) — the cross-lane
 // handshake. If the manager ever minted its own ids or invented statuses,

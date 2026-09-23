@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
+import type { ListenerOwner } from '../listener-probe.js';
 import { readBuildInfo } from '../build-info.js';
 import { runRollCommand, type RollCommandResult } from './runner.js';
 import {
@@ -80,6 +81,17 @@ export interface RollControllerOptions {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly newId?: () => string;
   readonly log?: Log;
+  /**
+   * Preflight ownership probe (owner incident 2026-09-23): returns the
+   * process LISTENING on the instance port when it is not this process
+   * (null when none / the platform has no probe). A foreign listener means
+   * macOS's specific+wildcard coexistence may route loopback clients to a
+   * squatter — the roll refuses instead of misreading a /health 200.
+   */
+  readonly probeForeignListener?: () => Promise<ListenerOwner | null>;
+  /** Escalation hook fired when a foreign listener blocks a roll
+   * (production posts an action-required notification). */
+  readonly onForeignListener?: (owner: ListenerOwner) => void;
   /**
    * Invoked after the swap marker is durably on disk: production initiates
    * the graceful shutdown and exits with ROLL_SWAP_EXIT_CODE so the OS
@@ -204,6 +216,26 @@ export class RollController {
   private async preflight(state: RollState, forceBuild: boolean): Promise<RollState> {
     const started = this.now();
     const cwd = this.opts.repoRoot;
+
+    // (0) Port ownership FIRST (owner incident 2026-09-23): a foreign
+    // listener on the instance port makes the post-swap /health
+    // verification meaningless (the squatter answers). Refuse before any
+    // pull/build — the old service keeps serving.
+    const foreign = await this.opts.probeForeignListener?.();
+    if (foreign !== undefined && foreign !== null) {
+      try {
+        this.opts.onForeignListener?.(foreign);
+      } catch (error) {
+        this.log('error', 'foreign-listener escalation failed', {
+          roll_id: state.rollId,
+          error: detailOf(error),
+        });
+      }
+      throw new Error(
+        `the instance port is held by a foreign process (pid ${foreign.pid}` +
+          `${foreign.command === '' ? '' : `, ${foreign.command}`}) — refusing to roll; stop the squatter first (action required)`,
+      );
+    }
 
     const fromSha = await this.git(cwd, ['rev-parse', 'HEAD'], 'preflight');
     const dirty = await this.run('git', ['status', '--porcelain', '--untracked-files=normal'], {

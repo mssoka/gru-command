@@ -139,6 +139,14 @@ export class VerificationDisposedError extends Error {
   }
 }
 
+/** A spawn/settle callback payload: the lease plus the spawned child. */
+export interface VerificationSpawnInfo {
+  readonly lease: VerificationLease;
+  readonly pid: number | null;
+  /** The exact argv the child runs (the pid's command evidence). */
+  readonly command: string;
+}
+
 /** The queue view the board's health row renders (board UX v4): one shared
  * budget, FIFO queue — lock state, depth, and worker headroom at a glance. */
 export interface VerificationQueueView {
@@ -194,6 +202,17 @@ export interface VerificationSchedulerOptions {
   readonly limits: VerificationLimits;
   readonly record?: VerificationRecorder;
   readonly log?: Log;
+  /**
+   * Fired once a run's child process exists (owner incident 2026-09-23):
+   * the caller records the pid against the lane worktree so a later
+   * teardown reaps it (src/worktrees/manager.ts reaps 'registry' evidence).
+   * A `pid` of null means the spawn never produced a pid. Errors are
+   * logged, never allowed to fail the run.
+   */
+  readonly onSpawn?: (info: VerificationSpawnInfo) => void;
+  /** Fired after the child exited (normal exit, failure, or timeout kill):
+   * the lane's process record can be reconciled. Errors are logged. */
+  readonly onSettled?: (info: VerificationSpawnInfo) => void;
   /** Stale-sweep cadence while runs wait (default 15 s). */
   readonly sweepIntervalMs?: number;
   /** How long a holder without an in-process child may live before it is
@@ -712,6 +731,9 @@ export class VerificationScheduler {
     });
     slot.pid = child.pid ?? null;
     slot.child = child;
+    this.callbackSafe('onSpawn', () =>
+      this.opts.onSpawn?.({ lease, pid: child.pid ?? null, command: child.spawnargs.join(' ') }),
+    );
     // Decode at the stream boundary so multi-byte characters split across
     // OS pipe chunks never corrupt the streamed output or the tail.
     child.stdout?.setEncoding('utf8');
@@ -796,6 +818,10 @@ export class VerificationScheduler {
       child.stdout?.destroy();
       child.stderr?.destroy();
     }
+    // The child is gone (exit or spawn error): reconcile the lane record.
+    this.callbackSafe('onSettled', () =>
+      this.opts.onSettled?.({ lease, pid: child.pid ?? null, command: child.spawnargs.join(' ') }),
+    );
 
     const durationMs = this.now() - startedAt;
     const ok = !timedOut && runError === null && exitCode === 0 && signal === null;
@@ -889,6 +915,15 @@ export class VerificationScheduler {
         job: record.jobId,
         error: String(error),
       });
+    }
+  }
+
+  /** A spawn/settle callback must never fail the run it reports on. */
+  private callbackSafe(name: string, call: () => void): void {
+    try {
+      call();
+    } catch (error) {
+      this.log('error', `verification ${name} callback failed`, { error: String(error) });
     }
   }
 }

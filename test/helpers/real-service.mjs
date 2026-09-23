@@ -32,6 +32,33 @@ const REPO_ROOT = resolve(HERE, '..', '..');
 export const REAL_SERVICE_PORT = Number(process.env.REAL_SERVICE_PORT ?? 7790);
 export const REAL_SERVICE_TOKEN = process.env.REAL_SERVICE_TOKEN ?? 'e2e-real-pairing-token';
 
+/** The documented instance port (src/config.ts DEFAULT_INSTANCE_PORT): the
+ *  one port a test-spawned service must NEVER bind (owner incident
+ *  2026-09-23). Duplicated as a literal — this helper is plain JS and the
+ *  guard test pins the two against each other. */
+export const INSTANCE_PORT = 7665;
+
+/**
+ * The harness-side leg of the port-squat prevention: every test/e2e
+ * service port must be ephemeral (0) or an explicit high-range override.
+ * Refuses privileged ports and the instance port outright, so no harness
+ * knob can ever point a spawned service at the real instance's address.
+ */
+export function assertSafeTestServicePort(port, label = 'test service') {
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    failLoud(`${label}: port must be an integer 0-65535, got ${String(port)}`);
+  }
+  if (port === INSTANCE_PORT) {
+    failLoud(
+      `${label}: refusing the instance port ${INSTANCE_PORT} — spawn with an ephemeral port (0) ` +
+        'or a high-range explicit REAL_SERVICE_PORT override',
+    );
+  }
+  if (port !== 0 && port < 1024) {
+    failLoud(`${label}: refusing privileged port ${port} — use 0 or a high-range explicit override`);
+  }
+}
+
 /** A TCP port the OS confirms free right now (race-tolerant for tests). */
 export function pickFreePort() {
   return new Promise((resolvePort, reject) => {
@@ -47,6 +74,20 @@ export function pickFreePort() {
 function failLoud(message) {
   process.stderr.write(`real-service: ${message}\n`);
   throw new Error(message);
+}
+
+/** Extract the bound port from the service's JSON log stream (stderr). */
+export function parseListeningPort(stderrText) {
+  for (const line of stderrText.split('\n')) {
+    if (line.trim() === '') continue;
+    try {
+      const record = JSON.parse(line);
+      if (record.msg === 'listening' && typeof record.port === 'number') return record.port;
+    } catch {
+      /* not a JSON line — ignore */
+    }
+  }
+  return null;
 }
 
 /** Resolves true once /health answers 2xx (never throws; 1s cap so a
@@ -85,6 +126,9 @@ export async function startRealService({
   nodeImport,
   extraEnv = {},
 } = {}) {
+  // Port-squat prevention: ephemeral or an explicit high-range override —
+  // never the instance port, never privileged.
+  assertSafeTestServicePort(port, 'startRealService');
   const mainJs = join(REPO_ROOT, 'dist', 'main.js');
   if (!existsSync(mainJs)) {
     failLoud(`dist/main.js not found — run \`npm run build\` at the repo root first (tried ${mainJs})`);
@@ -143,6 +187,9 @@ export async function startRealService({
     ...process.env,
     ...extraEnv,
     GRU_COMMAND_HOME: home,
+    // The explicit override the worktree listen-port guard requires for a
+    // fixed port (src/service-port-guard.ts). Port 0 rides along harmlessly.
+    GRU_SERVICE_PORT: String(port),
     PATH: `${binDir}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH ?? ''}`,
   };
   delete childEnv.OPENROUTER_API_KEY;
@@ -161,8 +208,29 @@ export async function startRealService({
   });
   const exited = new Promise((resolveExit) => child.once('exit', resolveExit));
 
-  const baseUrl = `http://127.0.0.1:${port}`;
+  // Port 0 = ephemeral: discover the OS-assigned port from the service's
+  // own `listening` log line before polling /health.
   const deadline = Date.now() + 20_000;
+  if (port === 0) {
+    let discovered = null;
+    while (discovered === null) {
+      discovered = parseListeningPort(stderrTail);
+      if (discovered !== null) break;
+      if (child.exitCode !== null) {
+        cleanup();
+        failLoud(`service exited before listening (code ${child.exitCode})\n${stderrTail}`);
+      }
+      if (Date.now() > deadline) {
+        child.kill('SIGKILL');
+        cleanup();
+        failLoud(`service never reported a listening port (ephemeral config)\n${stderrTail}`);
+      }
+      await delay(100);
+    }
+    port = discovered;
+  }
+
+  const baseUrl = `http://127.0.0.1:${port}`;
   for (;;) {
     if (child.exitCode !== null) {
       cleanup();

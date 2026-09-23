@@ -39,6 +39,11 @@ paths ONLY — never id-proximity, never labels. Every pid a pause or a
 confirmed kill is grounded on lands in the registry, so the ask always
 names exactly what was live.
 
+The orchestrator's OWN spawned services land there too: the verification
+scheduler records every run it spawns for a lane (pid + argv, evidence
+`registry`) and reconciles it on exit. A service the orchestrator started
+for a lane is the lane's to tear down — not a stranger's.
+
 ## 3. Preserve-first ordered sweep (18c)
 
 `release()` order is law:
@@ -47,21 +52,26 @@ names exactly what was live.
    C-quoted paths; symlinks are preserved AS LINKS; a genuine mid-sweep
    vanish is skipped+logged; any other preserve failure ABORTS the sweep
    with the tree intact — deliverables are never sacrificed).
-2. **Enumerate** processes rooted in the tree: argv **path-boundary**
+2. **Reap tracked services** — live `registry`-evidence processes are
+   signalled (process group SIGTERM → grace → SIGKILL) and recorded
+   killed, with a `worktree.service-reaped` event. Dual-keyed: a pid is
+   signalled only when its registry row is live AND it still enumerates
+   as rooted in the tree (a recycled pid can never redirect the kill).
+3. **Enumerate** processes rooted in the tree: argv **path-boundary**
    match (a sibling lane `job-a-2` is never confused with `job-a`) OR
    the process's actual **cwd** (lsof on macOS, procfs on Linux; other
    platforms argv-only, declared).
-3. **Pause and ask** — any live process pauses the sweep (action-required
-   escalation) and touches nothing. `confirm_kill` answers the RECORDED
-   ask: it kills exactly the acknowledged pids (never a fresh
-   enumeration — later arrivals were never acknowledged), with a SIGTERM
-   grace before SIGKILL. Survivors re-pause; newcomers get their own
-   ask; `confirm_kill` without a recorded pause is not honored. Silent
-   kills do not exist.
-4. **Remove** the worktree; **containment-verified** branch delete (a
+4. **Pause and ask** — any other live process pauses the sweep
+   (action-required escalation) and touches nothing. `confirm_kill`
+   answers the RECORDED ask: it kills exactly the acknowledged pids
+   (never a fresh enumeration — later arrivals were never acknowledged),
+   with a SIGTERM grace before SIGKILL. Survivors re-pause; newcomers get
+   their own ask; `confirm_kill` without a recorded pause is not honored.
+   Silent kills do not exist for processes the orchestrator did not spawn.
+5. **Remove** the worktree; **containment-verified** branch delete (a
    branch dies only when provably contained in an existing ref;
    otherwise retained and noted).
-5. **Re-resolve the fresh head** — follow-on work starts from now.
+6. **Re-resolve the fresh head** — follow-on work starts from now.
 
 ## 4. Detached-for-reviews, branch-for-jobs (18d)
 

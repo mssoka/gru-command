@@ -26,4 +26,10 @@ if (process.env['GRU_COMMAND_SMOKE'] !== '1') {
   ]) {
     if (key in process.env) delete process.env[key];
   }
+  // Port-squat prevention (owner incident 2026-09-23): a GLOBAL
+  // GRU_SERVICE_PORT would force every spawned test/e2e service onto the
+  // same fixed port (loadConfig applies it verbatim) — the suite's spawns
+  // each need their own port. Tests that exercise the override set it on
+  // the CHILD env explicitly, never through this process's environment.
+  delete process.env['GRU_SERVICE_PORT'];
 }

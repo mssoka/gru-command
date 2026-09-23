@@ -24,7 +24,7 @@ import { existsSync, openSync, realpathSync } from 'node:fs';
 import { ReadStream, WriteStream } from 'node:tty';
 import { fileURLToPath } from 'node:url';
 import * as QRCode from 'qrcode';
-import { configPathFor, expandTilde, instanceDirFromEnv, RUNTIME_IDS } from '../config.js';
+import { configPathFor, expandTilde, instanceDirFromEnv, DEFAULT_INSTANCE_PORT, RUNTIME_IDS } from '../config.js';
 import { probeRuntimes, type RuntimeProbeResult } from '../runtime/probe.js';
 import {
   AnswersError,
@@ -259,7 +259,7 @@ async function interactiveAnswers(
     }
   }
 
-  let port = prior?.server.port ?? 7665;
+  let port = prior?.server.port ?? DEFAULT_INSTANCE_PORT;
   for (;;) {
     const answer = await ask(rl, `Bind port (0 = ephemeral) [${port}]: `);
     if (answer === '') break;

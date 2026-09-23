@@ -128,6 +128,8 @@ function makeController(fix: Fixture, overrides: {
   readBuiltSha?: () => string | null;
   drainTimeoutMs?: number;
   clock?: { now: number };
+  probeForeignListener?: () => Promise<{ pid: number; command: string } | null>;
+  onForeignListener?: (owner: { pid: number; command: string }) => void;
 }): { controller: RollController; swaps: string[] } {
   const clock = overrides.clock ?? { now: 1_000_000 };
   const swaps: string[] = [];
@@ -143,11 +145,39 @@ function makeController(fix: Fixture, overrides: {
     sleep: async (ms) => { clock.now += ms; },
     newId: () => 'roll-test-1',
     onSwap: (state) => { swaps.push(state.phase); },
+    ...(overrides.probeForeignListener !== undefined
+      ? { probeForeignListener: overrides.probeForeignListener }
+      : {}),
+    ...(overrides.onForeignListener !== undefined
+      ? { onForeignListener: overrides.onForeignListener }
+      : {}),
   });
   return { controller, swaps };
 }
 
 describe('roll controller preflight', () => {
+  it('REFUSES a roll when a foreign listener owns the instance port — before any git call, action-required', async () => {
+    const fix = fixture();
+    const scripted = scriptedRunner({ heads: [SHA_A] });
+    const escalations: { pid: number; command: string }[] = [];
+    const { controller, swaps } = makeController(fix, {
+      runner: scripted.run,
+      probeForeignListener: async () => ({ pid: 987, command: 'node /squat/dist/main.js' }),
+      onForeignListener: (owner) => escalations.push(owner),
+    });
+    const state = await controller.roll();
+    expect(state.phase).toBe('failed');
+    expect(state.error?.phase).toBe('preflight');
+    expect(state.error?.detail).toContain('foreign process');
+    expect(state.error?.detail).toContain('pid 987');
+    expect(state.error?.detail).toContain('action required');
+    expect(escalations).toEqual([{ pid: 987, command: 'node /squat/dist/main.js' }]);
+    // The squatter never got a build or a swap; the old service keeps serving.
+    expect(scripted.calls.some((call) => call.startsWith('git pull'))).toBe(false);
+    expect(readRollMarker(fix.dataDir)).toBeNull();
+    expect(swaps).toEqual([]);
+  });
+
   it('refuses a dirty deploy clone before any pull, leaving no marker and no swap', async () => {
     const fix = fixture();
     const scripted = scriptedRunner({ heads: [SHA_A], status: '?? local-notes.txt\n' });

@@ -14,7 +14,7 @@ import {
 import { join } from 'node:path';
 import { parse } from 'smol-toml';
 import { homedir } from 'node:os';
-import { configPathFor, expandTilde, type GruCommandConfig, loadConfig } from '../config.js';
+import { configPathFor, DEFAULT_INSTANCE_PORT, expandTilde, type GruCommandConfig, loadConfig } from '../config.js';
 import {
   renderReferenceConfig,
   tomlString,
@@ -218,7 +218,7 @@ const PROMPT_DEFAULTS = {
   model: 'default',
   thinkingLevel: 'default',
   host: '127.0.0.1',
-  port: 7665,
+  port: DEFAULT_INSTANCE_PORT,
   token: '',
 };
 

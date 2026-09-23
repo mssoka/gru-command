@@ -38,7 +38,13 @@ import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { isolateDecisionEnvironment } from './decisions/credentials.js';
 import type { Role } from './config.js';
-import { resolveSpawnPolicy } from './config.js';
+import { resolveSpawnPolicy, type GruCommandConfig } from './config.js';
+import { defaultListenerProbe, foreignListener, type ListenerOwner } from './listener-probe.js';
+import { dialHost } from './cli/service.js';
+import {
+  assertWorktreeListenPort,
+  WorktreePortSquatRefused,
+} from './service-port-guard.js';
 import {
   buildClaudeCodeAuthArgs,
   isGitHubRemote,
@@ -72,6 +78,50 @@ function resolveBmadReviewSkillPath(): string {
   // Return the pi agent dir path as the default — the gate will report
   // 'not installed' if neither location has it.
   return join(getAgentDir(), 'skills', 'bmad-review', 'SKILL.md');
+}
+
+/** The process LISTENING on the configured instance port when it is not us
+ * (null: free, ours, ephemeral, or the platform has no probe). Port-squat
+ * prevention, owner incident 2026-09-23 — see src/listener-probe.ts. */
+function instancePortForeignListener(config: GruCommandConfig): Promise<ListenerOwner | null> {
+  if (config.server.port === 0) return Promise.resolve(null);
+  return foreignListener({
+    probe: defaultListenerProbe,
+    host: dialHost(config.server.host),
+    port: config.server.port,
+    selfPid: process.pid,
+  });
+}
+
+/** Hard error + action-required for a foreign listener on the instance port
+ * (never a silent loopback 503). `when` distinguishes the pre-bind check
+ * from the post-bind pid check in the log/detail. */
+function reportForeignListener(
+  foreign: ListenerOwner,
+  config: GruCommandConfig,
+  port: number,
+  logger: Logger,
+  notifications: NotificationCenter,
+  when: 'before' | 'while',
+): void {
+  logger.log('error', 'foreign listener owns the instance port — refusing to serve', {
+    host: config.server.host,
+    port,
+    foreign_pid: foreign.pid,
+    foreign_command: foreign.command,
+    detected: when,
+  });
+  notifications.post({
+    kind: 'port-squat',
+    routing: 'action-required',
+    severity: 'error',
+    title: `Foreign process holds port ${port} (pid ${foreign.pid})`,
+    detail:
+      `${foreign.command === '' ? 'unknown command' : foreign.command} (pid ${foreign.pid}) ` +
+      `owns ${dialHost(config.server.host)}:${port} ` +
+      `${when === 'before' ? 'before this service could bind it' : 'while this service bound the same port'} ` +
+      '— loopback clients would reach the squatter. Stop it, then restart the service.',
+  });
 }
 
 /** Fail-closed four-leg review pre-flight (user amendment 2026-09-20). */
@@ -151,6 +201,31 @@ async function main(): Promise<number> {
           ts: new Date().toISOString(),
           level: 'error',
           msg: 'configuration invalid — refusing to start',
+          detail: error.message,
+        })}\n`,
+      );
+      return 1;
+    }
+    throw error;
+  }
+
+  // Port-squat prevention (owner incident 2026-09-23): a service spawned
+  // from a git worktree must never bind the instance port — macOS lets a
+  // loopback squatter coexist with the real wildcard/LAN bind, so this is
+  // refused BEFORE any instance state is touched or any socket binds.
+  try {
+    assertWorktreeListenPort({
+      checkoutRoot: defaultPackageRoot(),
+      port: config.server.port,
+      env: process.env,
+    });
+  } catch (error) {
+    if (error instanceof WorktreePortSquatRefused) {
+      process.stderr.write(
+        `${JSON.stringify({
+          ts: new Date().toISOString(),
+          level: 'error',
+          msg: 'refusing to listen from a worktree checkout',
           detail: error.message,
         })}\n`,
       );
@@ -692,6 +767,22 @@ async function main(): Promise<number> {
     drainTimeoutMs: config.roll.drainTimeoutMs,
     probeInFlight: createRollProbes({ ledger, registry }),
     readBuiltSha: () => readBuildInfo(repoRoot).rev ?? buildInfo.rev,
+    // Port-squat prevention (owner incident 2026-09-23): a roll swaps the
+    // build and then verifies /health — if a foreign process owns the
+    // port, the verification reads the squatter. Refuse the roll instead.
+    probeForeignListener: () => instancePortForeignListener(config),
+    onForeignListener: (owner) => {
+      notifications.post({
+        kind: 'roll-port-squat',
+        routing: 'action-required',
+        severity: 'error',
+        title: `Roll refused: port ${config.server.port} is held by a foreign process (pid ${owner.pid})`,
+        detail:
+          `${owner.command === '' ? 'unknown command' : owner.command} (pid ${owner.pid}) owns ` +
+          `${dialHost(config.server.host)}:${config.server.port}, so the post-roll /health check would ` +
+          'read the squatter. Kill it and re-run the roll.',
+      });
+    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
     onSwap: () => shutdown('roll', ROLL_SWAP_EXIT_CODE),
   });
@@ -732,11 +823,37 @@ async function main(): Promise<number> {
         board.requestHook(req, res, path),
     },
   );
+  // Foreign-listener boot checks (owner incident 2026-09-23): on macOS a
+  // loopback squatter coexists with our wildcard/LAN bind, so a clean
+  // listen is NOT proof that clients reach us. The listener pid is.
+  //
+  // (a) PRE-bind: while this process is not yet listening, ANY listener on
+  // the port is foreign — refuse before the socket exists (this also keeps
+  // /health from being answered by a squatter during boot).
+  if (config.server.port !== 0) {
+    const prebind = await instancePortForeignListener(config);
+    if (prebind !== null) {
+      reportForeignListener(prebind, config, config.server.port, logger, notifications, 'before');
+      return 1;
+    }
+  }
   state.handle = await service.start();
   const handle = state.handle;
   chat.attach(handle.httpServer);
   board.attach(handle.httpServer); // last: its upgrade handler terminates unclaimed paths
   state.chat = chat;
+  // (b) POST-bind: the literal listener-pid check (selfPid filtered), run
+  // after the socket handlers are attached so a healthy /health answer is
+  // never served while /ws is still unattached. Catches a squatter that
+  // appeared in the (tiny) pre-bind race window.
+  if (config.server.port !== 0) {
+    const foreign = await instancePortForeignListener(config);
+    if (foreign !== null) {
+      reportForeignListener(foreign, config, handle.port, logger, notifications, 'while');
+      await handle.stop();
+      return 1;
+    }
+  }
   // Post-roll self-check (phase d): the relaunched build logs uptime+sha
   // once the socket is actually serving.
   if (rollAdoption.marker !== null) {

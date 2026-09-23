@@ -55,6 +55,13 @@ function rollState(phase: RollState['phase'], toSha = 'b'.repeat(40)): RollState
   };
 }
 
+function doneStateWithPid(pid: number): RollState {
+  return {
+    ...rollState('done'),
+    verify: { at: '2026-09-23T00:01:00.000Z', sha: 'b'.repeat(40), pid, uptimeMs: 1_000 },
+  };
+}
+
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(`${JSON.stringify(body)}\n`, {
     status,
@@ -74,6 +81,8 @@ async function harness(script: {
   post: Response | 'unreachable';
   polls?: readonly (Response | 'unreachable')[];
   health?: Response | 'unreachable';
+  /** Listener owners the probe reports (owner incident 2026-09-23). */
+  listeners?: readonly { pid: number; command: string }[] | null;
 }): Promise<CliHarness> {
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -104,6 +113,7 @@ async function harness(script: {
       stderr: (line) => stderr.push(line),
       sleep: async (ms) => { clock.now += ms; },
       now: () => clock.now,
+      probeListeners: async () => script.listeners ?? [],
     },
     stdout,
     stderr,
@@ -232,6 +242,34 @@ describe('gru-service roll follow loop', () => {
     expect(code).toBe(1);
     expect(h.stderr.join('\n')).toContain('does not report the target build');
     expect(h.stderr.join('\n')).toContain('bail:');
+  });
+
+  it('REFUSES a foreign listener answering /health even when the build sha matches (pid evidence, not a 200)', async () => {
+    const h = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: doneStateWithPid(42_424) })],
+      health: jsonResponse(200, { build: { rev: 'b'.repeat(40) } }),
+      listeners: [{ pid: 999, command: 'node /fixture/worktree/dist/main.js' }],
+    });
+    const code = await runServiceCli(['roll'], h.deps);
+    expect(code).toBe(1);
+    expect(h.stdout.join('\n')).not.toContain('verified on /health');
+    expect(h.stderr.join('\n')).toContain('is pid 999');
+    expect(h.stderr.join('\n')).toContain('foreign listener answered');
+    expect(h.stderr.join('\n')).toContain('Action required');
+  });
+
+  it('verifies when the port listener IS the adopted process', async () => {
+    const h = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: doneStateWithPid(42_424) })],
+      health: jsonResponse(200, { build: { rev: 'b'.repeat(40) } }),
+      listeners: [{ pid: 42_424, command: 'node dist/main.js' }],
+    });
+    const code = await runServiceCli(['roll'], h.deps);
+    expect(code).toBe(0);
+    expect(h.stdout.join('\n')).toContain(`rolled ${'a'.repeat(40)} → ${'b'.repeat(40)} (verified on /health)`);
+    expect(h.stderr).toEqual([]);
   });
 
   it('a swap that never returns times out with the last phase named', async () => {

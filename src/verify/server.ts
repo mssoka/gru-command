@@ -9,6 +9,7 @@ import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifes
 import {
   VerificationLockTimeoutError,
   VerificationScheduler,
+  type VerificationLease,
   type VerificationProgress,
   type VerificationQueueView,
   type VerificationSchedulerOptions,
@@ -93,9 +94,53 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
           payload: event.payload,
         });
       },
+      // Lane process tracking (owner incident 2026-09-23): a verification
+      // run is the orchestrator's own spawned service. Its pid is recorded
+      // against the lane worktree here and reaped by the sweep on teardown
+      // (evidence 'registry'); without this a leaked run paused the sweep on
+      // a human ask nobody answered, for hours.
+      onSpawn: ({ lease, pid, command }) => {
+        trackLaneProcess(lease, pid, command, 'live');
+      },
+      onSettled: ({ lease, pid, command }) => {
+        trackLaneProcess(lease, pid, command, 'killed');
+      },
       log,
     } satisfies VerificationSchedulerOptions);
   scheduler.start();
+
+  /** Best-effort lane-process registration; never fails the run it reports. */
+  function trackLaneProcess(
+    lease: VerificationLease,
+    pid: number | null,
+    command: string,
+    state: 'live' | 'killed',
+  ): void {
+    if (pid === null) return;
+    try {
+      const lane = worktrees
+        .listWorktrees({ jobId: lease.jobId })
+        .find(
+          (candidate) =>
+            candidate.kind === 'job' && candidate.path === lease.cwd && candidate.status !== 'swept',
+        );
+      if (lane === undefined) return;
+      // Ports that are not ledger-backed (test doubles) have no row to hold
+      // the process record; nothing to protect there either.
+      if (ledger.getWorktree(lane.id) === null) return;
+      ledger.recordWorktreeProcesses({
+        worktreeId: lane.id,
+        processes: [{ pid, command, evidence: 'registry' }],
+        state,
+      });
+    } catch (error) {
+      log('error', 'verification lane process tracking failed', {
+        job: lease.jobId,
+        pid,
+        error: String(error),
+      });
+    }
+  }
 
   function authed(req: IncomingMessage, res: ServerResponse): boolean {
     if (!configured) {
