@@ -45,6 +45,7 @@ const PINS: Record<string, number> = {
   'notifications.test.ts': 15,
   'perkins-builtin-review.test.ts': 72,
   'perkins-builtin-wave.test.ts': 36,
+  'perkins-freeze-freshhead.test.ts': 10,
   'perkins-lead-schema-compat.test.ts': 5,
   'pi-adapter.test.ts': 54,
   'rehearsal.test.ts': 4,

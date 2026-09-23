@@ -28,7 +28,8 @@ const FAKE_CAPABILITIES: AgentCapabilities = {
   followUp: false,
 };
 import type { Role } from '../src/config.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
+import { originHeadProbe } from './helpers/pr-head-probe.js';
 
 /**
  * Dispatch HTTP surface (E8 story 2): authenticated flow endpoints —
@@ -104,6 +105,13 @@ async function boot(opts: {
         writeFileSync(file, 'review me\n');
         execFileSync('git', ['-C', options.cwd, 'add', file]);
         execFileSync('git', ['-C', options.cwd, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'test: http deliverable'], { stdio: 'ignore' });
+        // Lanes with an origin publish each turn: the review freeze reads
+        // the pushed tip, never the recorded lane pointer.
+        const remotes = execFileSync('git', ['-C', options.cwd, 'remote'], { encoding: 'utf-8' }).trim().split('\n');
+        if (remotes.includes('origin')) {
+          const branch = execFileSync('git', ['-C', options.cwd, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf-8' }).trim();
+          execFileSync('git', ['-C', options.cwd, 'push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`], { stdio: 'ignore' });
+        }
       },
       async steer() {},
       async followUp() {},
@@ -131,6 +139,7 @@ async function boot(opts: {
     spawner,
     poster: { async post(input) { return { headSha: input.targetSha, baseSha: 'stub-base' }; } },
     reviewArtifactRoot: join(dir, 'reviews'),
+    prHeadProbe: originHeadProbe(),
     ...(opts.reviewPreflight !== undefined ? { reviewPreflight: opts.reviewPreflight } : {}),
     ...(opts.fallbackGate !== undefined ? { fallbackGate: opts.fallbackGate } : {}),
   });
@@ -259,6 +268,7 @@ describe('dispatch server (E8)', () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http-review');
     cleanupRepos.push(repo);
+    attachBareOrigin(repo);
     try {
       await call(
         h.port,
@@ -472,6 +482,7 @@ describe('dispatch server (E8)', () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-by');
     cleanupRepos.push(repo);
+    attachBareOrigin(repo);
     try {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-silas-job', repo_path: repo.path, title: 'attribution', briefing: 'b',

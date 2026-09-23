@@ -57,7 +57,12 @@ groups by repo; the phone is board-first.
 ## 4. Review waves (Perkins)
 
 `POST /api/dispatch/review` `{job_id, target_ref?, no_spec?}` freezes one
-exact target/base/diff/spec set in a detached review worktree. A round has
+exact target/base/diff/spec set in a detached review worktree. For a job
+with a registered PR, the target is resolved from the LIVE branch: the
+review branch is fetched from `origin` and cross-checked against the code
+host's pull/merge-request head. The recorded lane pointer is a hint only;
+any disagreement aborts the request before a round or lens exists (an
+action-required escalation names the mismatch). A round has
 one real Perkins lead and exactly seven required lens types per frozen diff
 chunk (blind, edge, acceptance, security, architecture, codebase, tests), or
 six types per chunk only when `no_spec: true` explicitly removes acceptance.

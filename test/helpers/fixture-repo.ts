@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from 'node:fs';
 
@@ -19,6 +19,16 @@ export interface FixtureRepo {
   head(): string;
   git(args: readonly string[], cwd?: string): string;
   cleanup(): void;
+}
+
+/** Attach a bare `origin` remote for the fixture, created inside the
+ * fixture's temp root so it is cleaned up with the repository. Branches
+ * are pushed by the caller (the timing matters for freeze tests). */
+export function attachBareOrigin(repo: FixtureRepo): string {
+  const origin = join(dirname(repo.path), `${basename(repo.path)}-origin.git`);
+  execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+  repo.git(['remote', 'add', 'origin', origin]);
+  return origin;
 }
 
 export function makeFixtureRepo(name = 'fixture-app'): FixtureRepo {
