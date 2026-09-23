@@ -8,7 +8,7 @@ import { requireSafeRecordId } from '../ledger/api.js';
 import type { WorktreePort } from './worktree-port.js';
 import type { AgentSpawner } from './service.js';
 import type { CanonicalReviewVerdict, LensEnvelope, VerifiedFinding } from './perkins-review/types.js';
-import { PerkinsHybridReview, type PerkinsHybridResult } from './perkins-review/hybrid.js';
+import { CoverageExhaustedError, PerkinsHybridReview, type PerkinsHybridResult } from './perkins-review/hybrid.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
 import {
   freezeReviewInputs,
@@ -1228,13 +1228,39 @@ export class WaveRunner {
       if (!existsSync(primaryReport)) {
         writeFileSync(primaryReport, incompleteContents, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
       }
-      this.opts.ledger.appendCustomEvent({
-        kind: 'round.perkins-incomplete',
-        jobId: job.id,
-        roundId: round.id,
-        payload: { reason: signal.aborted ? 'cancelled' : 'workflow_error', error: detail.slice(0, 500), reportFile },
-      });
-      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail);
+      if (error instanceof CoverageExhaustedError) {
+        // Host-detected dead coverage: the hybrid engine already aborted the
+        // round before the lead could spend a terminal submission. Escalate
+        // action-required with the round, lens/chunk, and each attempt's
+        // failureKind and error, and record the same exhaustive reasons.
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.perkins-incomplete',
+          jobId: job.id,
+          roundId: round.id,
+          payload: {
+            reason: 'coverage_exhausted',
+            error: detail.slice(0, 500),
+            exhausted: error.exhausted.map((entry) => ({
+              lens: entry.lens,
+              chunk: entry.chunk,
+              attempts: entry.attempts,
+            })),
+            reportFile,
+          },
+        });
+        this.opts.escalate?.(
+          `Action required: review round ${round.id} cannot complete — coverage exhausted for ${error.exhausted.map((entry) => `${entry.lens}/${entry.chunk}`).join(', ')}`,
+          `${error.message}. The host aborted the round immediately; no terminal submission was consumed. Restore the lens output path, then rerun a complete review against a newly frozen target.`,
+        );
+      } else {
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.perkins-incomplete',
+          jobId: job.id,
+          roundId: round.id,
+          payload: { reason: signal.aborted ? 'cancelled' : 'workflow_error', error: detail.slice(0, 500), reportFile },
+        });
+        this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail);
+      }
       return {
         round: this.opts.ledger.getRound(round.id) as RoundRecord,
         results: lenses.map(() => ({ state: 'error' as const, note: detail })),

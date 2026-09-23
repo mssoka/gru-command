@@ -51,6 +51,8 @@ export interface LensEnvelope {
   /** Present when a text-path child's output required tolerant recovery
    * (whitespace/fence/preamble/embedded array) before strict validation. */
   readonly recovery?: LensOutputRecovery;
+  /** Present when status is not valid: the precise failure class. */
+  readonly failureKind?: ChildFailureKind;
   readonly error?: string;
 }
 
@@ -61,6 +63,11 @@ export type LensOutputRecovery =
   | 'parsed-from-fence'
   | 'parsed-from-preamble'
   | 'parsed-from-embedded-array';
+
+/** Precise class of a child run that produced no valid output: a review turn
+ * that spent its budget ('timeout'), a rejected/invalid output ('output'), or
+ * a host/runtime failure before any valid output existed ('error'). */
+export type ChildFailureKind = 'timeout' | 'output' | 'error';
 
 export interface RecoveredFindings {
   readonly findings: readonly ReviewFinding[];
