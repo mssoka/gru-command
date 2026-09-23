@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PERKINS_POLICY_ID = 'perkins-code-review';
 export const PERKINS_CANONICAL_SOURCE_SHA256 = 'f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7';
-export const PERKINS_POLICY_SHA256 = 'b0d9f36f53182d5e48fa7cf77b1db77d76a8684fa1999dd4dec7038e8137b946';
+export const PERKINS_POLICY_SHA256 = '19363ea99561d9d748c3394f0d43063e1c3af2eb73fb4af9f56b1be7982bf6cc';
 
 export const PERKINS_LENSES = [
   'blind',
@@ -128,6 +128,17 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
   for (const key of ['sharedPrompt', 'blindPrompt'] as const) {
     if (!policy.portableContract[key].includes('{{OUTPUT_CONTRACT}}')) {
       throw new Error(`bundled ${PERKINS_POLICY_ID} ${key} is missing the output-contract placeholder`);
+    }
+  }
+  // The blind child has no tools: the chunk-file inventory and the
+  // locatable-evidence discipline are the only grounding that keeps its
+  // citations verifiable, so the policy cannot silently drop either.
+  if (!policy.portableContract.blindPrompt.includes('{{CHUNK_FILES}}')) {
+    throw new Error(`bundled ${PERKINS_POLICY_ID} blindPrompt is missing the chunk-file inventory placeholder`);
+  }
+  for (const key of ['blindText', 'blindNativeTool'] as const) {
+    if (!outputContracts[key].includes('FILES IN THIS CHUNK') || !outputContracts[key].includes('recited verbatim')) {
+      throw new Error(`bundled ${PERKINS_POLICY_ID} ${key} is missing the locatable-evidence discipline`);
     }
   }
   if (policy.portableContract.rules.fullLenses.join(',') !== PERKINS_LENSES.join(',')) {

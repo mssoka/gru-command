@@ -71,6 +71,38 @@ function finding(source: string, severity: 'blocker' | 'warning' | 'note' = 'blo
   };
 }
 
+/** The blind prose-citation shape that killed three review rounds: verbatim
+ * evidence, but a description where the contract demands "<path>:<line>". */
+function proseCitation(): ReviewFinding {
+  return finding('blind', 'warning', {
+    location: 'src/main.ts (answer, return branch)',
+    evidence: 'export function answer(): number {',
+  });
+}
+
+interface ChildEnvelopeFile {
+  readonly status: string;
+  readonly outputSha256: string | null;
+  readonly recovery?: string;
+  readonly failureKind?: string;
+  readonly error?: string;
+  readonly findings: ReadonlyArray<{ readonly title: string; readonly source: string }>;
+}
+
+function childEnvelopePaths(directory: string, lens: string, attempt: 1 | 2): { readonly envelope: string; readonly raw: string } {
+  const envelopeDir = join(directory, 'lenses', '001');
+  const entries = readdirSync(envelopeDir);
+  const envelope = entries.find((entry) => new RegExp(`^${lens}\\.attempt-${attempt}-[0-9a-f]+\\.envelope\\.json$`, 'u').test(entry));
+  const raw = entries.find((entry) => new RegExp(`^${lens}\\.attempt-${attempt}-[0-9a-f]+\\.raw\\.json$`, 'u').test(entry));
+  expect(envelope, `missing ${lens} attempt-${attempt} envelope`).toBeDefined();
+  expect(raw, `missing ${lens} attempt-${attempt} raw output`).toBeDefined();
+  return { envelope: join(envelopeDir, envelope!), raw: join(envelopeDir, raw!) };
+}
+
+function readChildEnvelope(directory: string, lens: string, attempt: 1 | 2): ChildEnvelopeFile {
+  return JSON.parse(readFileSync(childEnvelopePaths(directory, lens, attempt).envelope, 'utf8')) as ChildEnvelopeFile;
+}
+
 function makeReviewRepo(name = 'perkins-hybrid'): { repo: FixtureRepo; base: string; target: string } {
   const repo = makeFixtureRepo(name);
   const base = repo.head();
@@ -682,7 +714,7 @@ describe('Perkins hybrid lead engine', () => {
     expect(promptHashes).toEqual({
       acceptance: '1c5d4e92b1636b792a25bcc52b8c0876109ae859b16d3f89250e7334ba53aed6',
       architecture: '3df902f91ae88bdae56cc5f55991834fa1d7e54aefcc1eccd66f04d688704eab',
-      blind: 'f77456657e85f99b7d9f1bde1e5309601421943f961c74d9ef3c9fd67385167a',
+      blind: '30df1577d0ccea26a608c97a5a2d0e986f2d0042f10b3981b8177097a058f599',
       codebase: '4102b98a8ec64484bd44f3f0fd708a350b1384c2b7cb55e121eec41c8f3cfccb',
       edge: '55d7ef8eea062e7d846a32a2673f5154a00c0c23ae269bc813079c1b003bb8e3',
       security: '7fbf3d7ed29ea2e3211264d397c5e3fa2c0da7828ba86c8eb0b278dc011347b8',
@@ -762,6 +794,109 @@ describe('Perkins hybrid lead engine', () => {
     expect(blind[1]!.prompt).toContain(
       'Previous output rejected (output): lens output must be a bare JSON array with no preamble or markdown fence; output ONLY the bare JSON array.',
     );
+  });
+
+  it('rejects a prose citation in location and serves the exact reason on the text retry', async () => {
+    let blindCalls = 0;
+    const h = hybridHarness({ childAnswer: (prompt) => {
+      if (lensFrom(prompt) !== 'blind') return '[]';
+      blindCalls += 1;
+      return blindCalls === 1 ? JSON.stringify([proseCitation()]) : '[]';
+    } });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    const first = readChildEnvelope(h.frozen.directory, 'blind', 1);
+    expect(first).toMatchObject({ status: 'invalid', failureKind: 'output' });
+    // The snippet is verbatim; only the prose in location fails the host's
+    // cited-file/hunk check, exactly as in the recurring round.
+    expect(first.error).toBe(
+      'lens finding 0 evidence is not locatable at its cited file/hunk: src/main.ts (answer, return branch)',
+    );
+    const blind = h.childCalls.filter((call) => lensFrom(call.prompt ?? '') === 'blind');
+    expect(blind).toHaveLength(2);
+    expect(blind[0]!.prompt).not.toContain('RETRY CORRECTION');
+    expect(blind[1]!.prompt).toContain('--- RETRY CORRECTION (attempt 2) ---');
+    expect(blind[1]!.prompt).toContain(
+      'Previous output rejected (output): lens finding 0 evidence is not locatable at its cited file/hunk: src/main.ts (answer, return branch); output ONLY the bare JSON array.',
+    );
+    // The blind retry answers the exact rejection instead of repeating the task.
+    expect(blind[1]!.prompt).toContain(
+      'Your previous submission was rejected because lens finding 0 evidence is not locatable at its cited file/hunk: src/main.ts (answer, return branch).',
+    );
+    expect(blind[1]!.prompt).toContain('Re-cite every finding with "location" as "<path>:<line>"');
+    expect(readChildEnvelope(h.frozen.directory, 'blind', 2)).toMatchObject({ status: 'valid' });
+  });
+
+  it('serves the exact reason and blind evidence correction on the native-tool retry', async () => {
+    let blindCalls = 0;
+    const h = hybridHarness({
+      childAnswer: (prompt) => {
+        if (lensFrom(prompt) !== 'blind') return '[]';
+        blindCalls += 1;
+        return blindCalls === 1 ? JSON.stringify([proseCitation()]) : '[]';
+      },
+      childNativeTools: 'tool',
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(readChildEnvelope(h.frozen.directory, 'blind', 1)).toMatchObject({ status: 'invalid', failureKind: 'output' });
+    const blind = h.childCalls.filter((call) => lensFrom(call.prompt ?? '') === 'blind');
+    expect(blind).toHaveLength(2);
+    expect(blind[1]!.prompt).toContain(
+      'Previous attempt rejected (output): lens finding 0 evidence is not locatable at its cited file/hunk: src/main.ts (answer, return branch).',
+    );
+    expect(blind[1]!.prompt).toContain('call perkins_submit_findings exactly once with the full corrected');
+    expect(blind[1]!.prompt).toContain(
+      'Your previous submission was rejected because lens finding 0 evidence is not locatable at its cited file/hunk: src/main.ts (answer, return branch).',
+    );
+    expect(readChildEnvelope(h.frozen.directory, 'blind', 2)).toMatchObject({ status: 'valid' });
+  });
+
+  it('demands the locatable-evidence contract with the chunk-file inventory in every blind prompt', async () => {
+    const h = hybridHarness({ childAnswer: () => '[]' });
+    await h.run();
+    const blind = h.childCalls.find((call) => lensFrom(call.prompt ?? '') === 'blind')!;
+    const prompt = blind.prompt ?? '';
+    expect(prompt).toContain('--- FILES IN THIS CHUNK ---');
+    expect(prompt).toContain('- src/main.ts');
+    expect(prompt).not.toContain('{{CHUNK_FILES}}');
+    expect(prompt).toContain('location MUST start with one exact file path from FILES IN THIS CHUNK');
+    expect(prompt).toContain('"<path>:<line>" or "<path>:<startLine>-<endLine>"');
+    expect(prompt).toContain('Never put a function name, symbol, branch description, or any other prose inside location');
+    expect(prompt).toContain('ONE contiguous snippet recited verbatim');
+    const policy = loadPerkinsPolicy();
+    for (const contract of [
+      policy.portableContract.outputContracts.blindText,
+      policy.portableContract.outputContracts.blindNativeTool,
+    ]) {
+      expect(contract).toContain('Never put a function name');
+      expect(contract).toContain('recited verbatim');
+    }
+  });
+
+  it('pins the rebrief-restart-safety blind prose-citation fixtures that killed both attempts', () => {
+    const fixtureDir = join(import.meta.dirname, 'fixtures', 'perkins-blind-evidence');
+    const load = <T>(name: string): T => JSON.parse(readFileSync(join(fixtureDir, name), 'utf8')) as T;
+    const expectedError = 'lens finding 0 evidence is not locatable at its cited file/hunk: ' +
+      'src/dispatch/rebrief-recovery.ts (reconcilePendingRebriefs, delivery-only branch)';
+    for (const attempt of [1, 2] as const) {
+      const envelope = load<{ lens: string; chunk: string; attempt: number; status: string; failureKind: string; error: string }>(
+        `rebrief-restart-safety-r1.blind.attempt-${attempt}.envelope.json`,
+      );
+      expect(envelope).toMatchObject({ lens: 'blind', chunk: '001', attempt, status: 'invalid', failureKind: 'output' });
+      expect(envelope.error).toBe(expectedError);
+      const raw = load<{ findings: Array<{ location: string; evidence: string }> }>(
+        `rebrief-restart-safety-r1.blind.attempt-${attempt}.raw.json`,
+      );
+      expect(raw.findings.length).toBeGreaterThan(0);
+      // The cited file and snippet were real; only the citation format was
+      // not locatable. The envelope names exactly the location the child wrote.
+      expect(raw.findings[0]!.location).toBe(
+        'src/dispatch/rebrief-recovery.ts (reconcilePendingRebriefs, delivery-only branch)',
+      );
+      expect(envelope.error).toContain(raw.findings[0]!.location);
+      expect(raw.findings[0]!.evidence).toBe("if (missing.every((marker) => marker.kind === 'job.delivered')) {");
+    }
   });
 
   it('aborts immediately when a child exhausts coverage instead of letting the lead submit', async () => {
@@ -1622,29 +1757,6 @@ describe('Perkins hybrid lead engine', () => {
 });
 
 describe('Perkins child structured findings (perkins_submit_findings)', () => {
-  interface ChildEnvelopeFile {
-    readonly status: string;
-    readonly outputSha256: string | null;
-    readonly recovery?: string;
-    readonly failureKind?: string;
-    readonly error?: string;
-    readonly findings: ReadonlyArray<{ readonly title: string; readonly source: string }>;
-  }
-
-  function childEnvelopePaths(directory: string, lens: string, attempt: 1 | 2): { readonly envelope: string; readonly raw: string } {
-    const envelopeDir = join(directory, 'lenses', '001');
-    const entries = readdirSync(envelopeDir);
-    const envelope = entries.find((entry) => new RegExp(`^${lens}\\.attempt-${attempt}-[0-9a-f]+\\.envelope\\.json$`, 'u').test(entry));
-    const raw = entries.find((entry) => new RegExp(`^${lens}\\.attempt-${attempt}-[0-9a-f]+\\.raw\\.json$`, 'u').test(entry));
-    expect(envelope, `missing ${lens} attempt-${attempt} envelope`).toBeDefined();
-    expect(raw, `missing ${lens} attempt-${attempt} raw output`).toBeDefined();
-    return { envelope: join(envelopeDir, envelope!), raw: join(envelopeDir, raw!) };
-  }
-
-  function readChildEnvelope(directory: string, lens: string, attempt: 1 | 2): ChildEnvelopeFile {
-    return JSON.parse(readFileSync(childEnvelopePaths(directory, lens, attempt).envelope, 'utf8')) as ChildEnvelopeFile;
-  }
-
   it('validates the perkins_submit_findings input exactly, with source host-owned', () => {
     const entry = { ...finding('security') } as Record<string, unknown>;
     delete entry.source;

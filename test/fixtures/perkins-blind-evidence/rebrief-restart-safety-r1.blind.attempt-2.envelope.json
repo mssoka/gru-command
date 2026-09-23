@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "lens": "blind",
+  "chunk": "001",
+  "attempt": 2,
+  "status": "invalid",
+  "outputSha256": "5ea1456635cdd8d13b3c04d954241a1ee7bfaafbc957db78ff918ab238e688fe",
+  "findings": [],
+  "failureKind": "output",
+  "error": "lens finding 0 evidence is not locatable at its cited file/hunk: src/dispatch/rebrief-recovery.ts (reconcilePendingRebriefs, delivery-only branch)"
+}
