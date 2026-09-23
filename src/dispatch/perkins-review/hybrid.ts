@@ -1210,7 +1210,16 @@ export class PerkinsHybridReview {
         report_markdown: { type: 'string', minLength: 1, maxLength: PERKINS_REPORT_MAX_BYTES },
       },
     };
-    const submissionSchema = { oneOf: [fullSubmissionSchema, deltaSubmissionSchema] };
+    // Provider-facing declaration only: the code validator is the exhaustive
+    // authority. The root MUST carry `type: 'object'`: OpenAI-compatible
+    // providers (deepseek) reject any function whose schema root has no
+    // object type before reading the `oneOf` branches, with a 400 that
+    // misreports the root as `type: null`. Both submission shapes remain
+    // declared beneath the typed root.
+    const submissionSchema = {
+      type: 'object',
+      oneOf: [fullSubmissionSchema, deltaSubmissionSchema],
+    };
 
     /** Validate-at-store entry point: the same single decision validator the
      * terminal pass runs, applied to one candidate decision. Clean decisions
