@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
@@ -176,6 +177,40 @@ export interface WorktreeRecord {
   readonly note: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+}
+
+// ------------------------------------------------------------------
+// Pending re-briefs (Silas follow-through restart safety): the durable
+// request marker written BEFORE a re-brief worker is spawned. Each marker
+// guards ONE ledger event; it clears only when that event lands. A boot
+// reconciliation consumes any marker whose event never landed, so a
+// service restart mid-turn can never silence the lane.
+// ------------------------------------------------------------------
+
+export const PENDING_REBRIEF_KINDS = ['silas.rebrief', 'job.delivered'] as const;
+export type PendingRebriefKind = (typeof PENDING_REBRIEF_KINDS)[number];
+
+export function isPendingRebriefKind(value: string): value is PendingRebriefKind {
+  return (PENDING_REBRIEF_KINDS as readonly string[]).includes(value);
+}
+
+export interface PendingRebriefRecord {
+  readonly id: string;
+  readonly jobId: string;
+  /** The ledger event this marker guards. */
+  readonly kind: PendingRebriefKind;
+  /** Note handed to the re-brief worker (what stalled, what to do differently). */
+  readonly note: string | null;
+  /** The job briefing at request time — the re-brief prompt's contract half. */
+  readonly briefing: string | null;
+  /** sha256 of the exact request payload (audit identity). */
+  readonly payloadHash: string;
+  /** events.seq high-water at request time; the guarded event must post-date it. */
+  readonly baselineSeq: number;
+  /** The spawned re-brief worker, once known (resume hint after a crash). */
+  readonly agentId: string | null;
+  readonly sessionFile: string | null;
+  readonly requestedAt: string;
 }
 
 function nowIso(): string {
@@ -995,6 +1030,87 @@ export class LedgerApi {
   }
 
   // ------------------------------------------------------------------
+  // Pending re-briefs (see the type block above)
+  // ------------------------------------------------------------------
+
+  /** Persist a re-brief REQUEST before any worker is spawned: one durable
+   * marker per guarded event (`silas.rebrief` + `job.delivered`), carrying
+   * the request payload, its hash, and the event-sequence watermark below
+   * which an event cannot answer this request. A newer request for the
+   * same job+kind supersedes the older marker (upsert) — the latest note
+   * is the one the current worker runs. */
+  beginPendingRebrief(input: {
+    jobId: string;
+    note: string | null;
+    briefing: string | null;
+  }): readonly PendingRebriefRecord[] {
+    if (this.getJob(input.jobId) === null) {
+      throw new RecordNotFound(`job "${input.jobId}" not found — a re-brief marker belongs to a real job`);
+    }
+    const payload = JSON.stringify({ note: input.note, briefing: input.briefing });
+    const payloadHash = createHash('sha256').update(payload).digest('hex');
+    const baselineSeq = this.latestEventSeq();
+    const ts = nowIso();
+    return this.transaction(() => {
+      const upsert = this.db.prepare(
+        `INSERT INTO pending_rebriefs
+           (id, job_id, kind, payload, payload_hash, baseline_seq, agent_id, session_file, requested_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+         ON CONFLICT (job_id, kind) DO UPDATE SET
+           id = excluded.id,
+           payload = excluded.payload,
+           payload_hash = excluded.payload_hash,
+           baseline_seq = excluded.baseline_seq,
+           agent_id = NULL,
+           session_file = NULL,
+           requested_at = excluded.requested_at,
+           updated_at = excluded.updated_at`,
+      );
+      for (const kind of PENDING_REBRIEF_KINDS) {
+        upsert.run(randomUUID(), input.jobId, kind, payload, payloadHash, baselineSeq, ts, ts);
+      }
+      return this.listPendingRebriefs({ jobId: input.jobId });
+    });
+  }
+
+  /** Bind the spawned re-brief worker to its markers (before its prompt is
+   * delivered) so a crash mid-turn can resume the exact session. */
+  bindPendingRebriefWorker(input: {
+    ids: readonly string[];
+    agentId: string;
+    sessionFile: string | null;
+  }): void {
+    if (input.agentId === '') throw new Error('pending-rebrief worker id must be non-empty');
+    this.transaction(() => {
+      const update = this.db.prepare(
+        'UPDATE pending_rebriefs SET agent_id = ?, session_file = ?, updated_at = ? WHERE id = ?',
+      );
+      const ts = nowIso();
+      for (const id of input.ids) update.run(input.agentId, input.sessionFile, ts, id);
+    });
+  }
+
+  listPendingRebriefs(opts: { jobId?: string } = {}): readonly PendingRebriefRecord[] {
+    const rows =
+      opts.jobId === undefined
+        ? (this.db.prepare('SELECT * FROM pending_rebriefs ORDER BY job_id, kind').all() as Row[])
+        : (this.db
+            .prepare('SELECT * FROM pending_rebriefs WHERE job_id = ? ORDER BY kind')
+            .all(opts.jobId) as Row[]);
+    return rows.map((row) => this.pendingRebriefFromRow(row));
+  }
+
+  /** Clear markers ONLY once their guarded events landed. Deleting is the
+   * clearing: the events table remains the durable history. */
+  clearPendingRebriefs(ids: readonly string[]): void {
+    if (ids.length === 0) return;
+    this.transaction(() => {
+      const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
+      for (const id of ids) remove.run(id);
+    });
+  }
+
+  // ------------------------------------------------------------------
   // Notifications (EPICS E7 story 2) — the durable notification log.
   // Every mutation is atomic with its event row and bus-published so all
   // surfaces (board push, chat notices, toasts) converge on one record.
@@ -1223,6 +1339,31 @@ export class LedgerApi {
       sessionFile: nstr(row.session_file),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
+    };
+  }
+
+  private pendingRebriefFromRow(row: Row): PendingRebriefRecord {
+    const kind = str(row.kind);
+    if (!isPendingRebriefKind(kind)) {
+      throw new Error(`pending_rebriefs row has unknown kind "${kind}"`);
+    }
+    let payload: { note?: unknown; briefing?: unknown };
+    try {
+      payload = JSON.parse(str(row.payload)) as { note?: unknown; briefing?: unknown };
+    } catch (error) {
+      throw new Error(`pending_rebriefs row ${str(row.id)} payload is not valid JSON: ${String(error)}`);
+    }
+    return {
+      id: str(row.id),
+      jobId: str(row.job_id),
+      kind,
+      note: nstr(payload.note),
+      briefing: nstr(payload.briefing),
+      payloadHash: str(row.payload_hash),
+      baselineSeq: Number(row.baseline_seq),
+      agentId: nstr(row.agent_id),
+      sessionFile: nstr(row.session_file),
+      requestedAt: str(row.requested_at),
     };
   }
 

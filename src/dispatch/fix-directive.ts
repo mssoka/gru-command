@@ -140,17 +140,40 @@ export function renderRebriefPrompt(input: {
   ].join('\n');
 }
 
+/** Re-open the lane for a Silas follow-through: the follow-up turn is the
+ * lane working again. `in-review` is the pre-verdict review window; a
+ * `delivered` lane (settled before a PR/review request) re-opens the same
+ * way — the fresh directive/re-brief supersedes the prior delivery. */
+export function flipJobToWorking(
+  ledger: Pick<LedgerApi, 'getJob' | 'setJobStatus' | 'noteJob'>,
+  jobId: string,
+): void {
+  const job = ledger.getJob(jobId);
+  if (job === null || (job.status !== 'in-review' && job.status !== 'delivered')) return;
+  ledger.setJobStatus(jobId, 'working');
+  ledger.noteJob(jobId, 'silas follow-through: fix loop re-opened, lane back to working');
+}
+
 /** Re-brief a FRESH minion on the job's lane (the second rung of the
  * recurrence ladder): live minion handles for the job are disposed first
  * (their sessions are preserved on disk — only the live handles go), then
- * a new minion is spawned rooted in the SAME worktree with the re-brief. */
+ * a new minion is spawned rooted in the SAME worktree with the re-brief.
+ * Restart recovery may pass `resumeFile` to re-enter the interrupted
+ * worker's session (the #42 orphan-cure shape: resume, then re-deliver the
+ * pending prompt) instead of minting a fresh one. */
 export async function rebriefFreshMinion(
   input: DirectiveRoutingDeps & {
     jobId: string;
     note: string;
     briefing: string | null;
+    /** Resume this session file instead of minting fresh (boot recovery). */
+    resumeFile?: string | null;
+    /** Called after the worker is registered and BEFORE its prompt is
+     * delivered — the durable re-brief marker binds the worker here, so a
+     * crash mid-turn leaves a resumable pointer behind. */
+    onSpawned?: (worker: { readonly id: string; readonly sessionFile: string | null }) => void;
   },
-): Promise<{ minionId: string; lanePath: string; prompt: string }> {
+): Promise<{ minionId: string; lanePath: string; prompt: string; sessionFile: string | null }> {
   const jobMinions = input.ledger
     .listAgents()
     .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
@@ -170,18 +193,22 @@ export async function rebriefFreshMinion(
     throw new Error(`job "${input.jobId}" has no active job lane — a re-brief needs its worktree`);
   }
   const cwd = requireSpawnCwd('minion', lane.path);
-  const handle = await input.registry.spawn('minion', { cwd });
+  const handle = await input.registry.spawn('minion', {
+    cwd,
+    ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
+  });
   input.ledger.registerAgent({
     id: handle.id,
     role: 'minion',
     sessionFile: handle.sessionFile,
     jobId: input.jobId,
   });
+  input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
   const prompt = renderRebriefPrompt({ jobId: input.jobId, briefing: input.briefing, note: input.note });
   try {
     await handle.prompt(prompt, { owner: `silas-rebrief:${input.jobId}` });
   } catch (error) {
     throw new Error(`re-brief turn failed on ${handle.id}: ${String(error)}`);
   }
-  return { minionId: handle.id, lanePath: lane.path, prompt };
+  return { minionId: handle.id, lanePath: lane.path, prompt, sessionFile: handle.sessionFile };
 }
