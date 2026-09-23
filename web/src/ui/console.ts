@@ -12,7 +12,7 @@
  */
 
 import {
-  CONSOLE_MIN_WIDTH,
+  COCKPIT_MIN_WIDTH,
   loadChatPaneCollapsed,
   saveChatPaneCollapsed,
 } from '../lib/console-layout.js';
@@ -50,7 +50,7 @@ export interface ConsoleShellOptions {
   readonly matchMedia?: (query: string) => MediaQueryLike;
 }
 
-export const CONSOLE_QUERY = `(min-width: ${CONSOLE_MIN_WIDTH}px)`;
+export const CONSOLE_QUERY = `(min-width: ${COCKPIT_MIN_WIDTH}px)`;
 
 export class ConsoleShell {
   private readonly root: HTMLElement;

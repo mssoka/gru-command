@@ -460,24 +460,34 @@ export function lensChipTone(state: string): string {
   }
 }
 
-export function jobChipTone(status: string): string {
+/** One status → tone mapping for every surface that renders it (chip
+ * fills, job-row dots): a status can never be two colors in one view. */
+export type JobTone = 'work' | 'rev' | 'done' | 'alert' | 'park' | 'none';
+
+export function jobStatusTone(status: string): JobTone {
   switch (status) {
     case 'working':
     case 'dispatched':
     case 'delivered':
-      return 'pp-chip--work';
+      return 'work';
     case 'in-review':
-      return 'pp-chip--rev';
+      return 'rev';
     case 'merged':
     case 'done':
-      return 'pp-chip--done';
+      return 'done';
     case 'blocked':
-      return 'pp-chip--alert';
+    case 'error':
+      return 'alert';
     case 'parked':
-      return 'pp-chip--park';
+      return 'park';
     default:
-      return '';
+      return 'none';
   }
+}
+
+export function jobChipTone(status: string): string {
+  const tone = jobStatusTone(status);
+  return tone === 'none' ? '' : `pp-chip--${tone}`;
 }
 
 export function agentStateTone(state: string): string {

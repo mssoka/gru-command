@@ -90,7 +90,7 @@ function installChatDom(): void {
       // Evaluated at read time: a test can flip the mode and ChatView's
       // captured MediaQueryList sees it (the stub is live, like the real one).
       get matches() {
-        return query === '(max-width: 1279px)' ? overlayMatches : false;
+        return query === '(max-width: 1099px)' ? overlayMatches : false;
       },
       addEventListener: () => {},
       removeEventListener: () => {},

@@ -228,38 +228,66 @@ Renderer construct coverage is pinned in `web/src/lib/markdown.test.ts`.
 shows entry text as plain text — a different surface; GFM there is a
 follow-up lane, not part of this contract.
 
-## Console layout (board UX v5)
+## Cockpit layout (board UX v6)
 
-The estate is a full-width console, not a centered column. Breakpoints
-(`web/src/lib/console-layout.ts` owns the numbers; CSS mirrors them):
+The estate is a full-width cockpit — dense but calm, monospace data
+readouts, hairline structure. Breakpoints (`web/src/lib/console-layout.ts`
+owns the numbers; CSS mirrors them):
 
-- **≥ 1280px — three panes:** `[ chat | board | rail ]`. The chat pane
-  (380px, full height, sticky) is open by default and collapses to a
-  slim 🧠 rail (persisted: `gru-chat-pane-collapsed`); new messages pulse
-  the rail's unread dot. The board's center column carries the KPI strip
-  + health row full-width, then the attention bands; the right rail
-  (agents + transcripts) is part of the board's own grid.
-- **900–1279px — two panes:** board + rail; the chat panel reparents
+- **≥ 1100px — cockpit:** `[ chat | board | agents-rail ]`, every
+  boundary a **4px drag splitter**. Dragging resizes the pane live; the
+  pair persists per breakpoint in localStorage (`gru-pane-sizes`),
+  double-click resets to the defaults, Arrow keys nudge a focused handle
+  (Home resets). Minimums: chat 420px, board 480px, rail 240px — at the
+  1100px edge the three numbers sum past the viewport, so the board (the
+  `1fr` remainder) takes the soft squeeze rather than the page
+  overflowing. The chat pane defaults to ~30% of the viewport and
+  collapses to the slim 🧠 rail (persisted: `gru-chat-pane-collapsed`);
+  new messages pulse the rail's unread dot.
+- **900–1099px — two panes:** board + rail; the chat panel reparents
   into the overlay sheet and the Gru FAB (bottom-right, 🧠) opens it over
   a dimmed board (scrim).
 - **< 900px — single column:** board-first (SPEC ruling 11) with the
-  side rail stacked below; the FAB opens the bottom-sheet chat.
+  rail stacked below; the FAB opens the bottom-sheet chat. The chip rail
+  becomes one horizontally scrollable row.
 
-The FAB is mounted once: at ≥1280px it toggles/focuses the chat pane
-(collapse state persists in localStorage); below that it opens the
-overlay. `web/src/ui/console.ts` owns the behavior; `ChatView` owns the
-unread math (a message counts only while no chat surface is in sight).
+The **global command bar** (sticky, ~56px) is one flat row: logo +
+product + `ONE GRU · ONE WINDOW`, the inline monospace status **ticker**
+(`MODE: COCKPIT · BOARD | RADAR: LIVE | ROUND 4 ACTIVE` — active lens +
+layout, the board socket's radar state, the top live/pending review
+round), the Chat/Board segmented lens toggle, the notification bell,
+theme and settings. Below it the **status chip rail** (sticky, one
+wrapping row on desktop) relocates the v4 health row globally: DEPLOY →
+REVIEWS → SILAS → ALERTS → VERIFY → CURE → TRACKERS, each with one
+accent edge and its own flags (e.g. REVIEWS carries `12 FAILED`). The
+TRACKERS chip folds the v4 KPI counts in as three compact count groups
+(`JOBS 17 2/2/1/0/0`, `PRS 1/1/0`, `LANES 2/0/410`; every number is a
+`data-kpi` span tied to the same `boardKpis` derivation the v4 strip
+used) plus the Jev decisions chip and the unacked action-required badge.
 
-### Attention bands (v4 → v5)
+`web/src/ui/console.ts` owns the FAB contract; `web/src/ui/splitters.ts`
+owns pane sizes; `web/src/ui/command-bar.ts` owns the ticker;
+`web/src/ui/rail-tabs.ts` owns the AGENTS/TRANSCRIPTS tabs. `ChatView`
+owns the unread math (a message counts only while no chat surface is in
+sight).
+
+### Attention bands (v4 → v6: dense rows)
 
 Jobs bucket NEEDS YOU → IN FLIGHT → SETTLED → COLD (recency inside each
-band; see [BOARD.md](./BOARD.md)). v5 renders each band's **job cards**
-as a responsive card grid (`auto-fill`, ~340px cards, capped at 3
-columns — the JS mirror sets explicit columns from the measured pane).
-NEEDS YOU is always visible and full-width (an empty band shows a calm
-“nothing needs you” state); SETTLED is a rolling window — the latest 10
-cards, then `+K older settled` (session-expanded). Each band carries ONE
-accent (left edge + label pill only): warm red / yellow / green / gray.
+band; see [BOARD.md](./BOARD.md)). v6 renders every band as a full-width
+**dense row list**, not a card grid: line 1 = status dot + title +
+status chip (right-aligned, with the compact signal/stale chips inline);
+line 2 = repo + branch + lane age + agent age + PR link, small and muted
+in monospace. Band headers are **sticky separators with counts**;
+dividers are hairlines (zebra-free); failing rows (blocked/error status,
+aborted newest round, unresolved lens errors) are tinted with a left
+alert accent. Clicking anywhere on a row expands the v3 detail inline —
+a row is never a card until it is expanded. NEEDS YOU is always visible
+(an empty band shows a calm “nothing needs you” state); SETTLED is a
+rolling window — the latest 10 rows, then `+K older settled`
+(session-expanded), and a concluded job's round history renders
+quiescent (no blocker/failure pills; a “review history on the ledger”
+pointer).
 
 ## Views
 
@@ -268,11 +296,13 @@ accent (left edge + label pill only): warm red / yellow / green / gray.
   against the served UI; the wizard's token generation arrives with E9).
   Bad token → inline error. The field starts EMPTY everywhere — mock or
   real, localhost or LAN — the token is per-install, never a guess.
-- **Chat** — one DOM tree, two placements. **≥1280px:** the left console
-  pane (collapsible to the 🧠 rail). **<1280px:** reparented into the
-  overlay sheet — bottom sheet on a phone, right drawer on a tablet —
-  opened by the Gru FAB (scrim dims the board behind); unread badge
-  counts frames arriving while closed or while the pane is collapsed.
+- **Chat** — one DOM tree, two placements. **≥1100px:** the left cockpit
+  pane — head reads `GRU BRAIN ENGINE` + the live `ONLINE` badge —
+  collapsible to the 🧠 rail, resizable via the drag splitter.
+  **<1100px:** reparented into the overlay sheet — bottom sheet on a
+  phone, right drawer on a tablet — opened by the Gru FAB (scrim dims
+  the board behind); unread badge counts frames arriving while closed or
+  while the pane is collapsed.
   Gru replies render as
   GFM markdown (see the [rendering contract](#message-rendering-gfm-contract--issue-10));
   streaming deltas re-render token-by-token with a caret; tool activity is
@@ -286,11 +316,12 @@ accent (left edge + label pill only): warm red / yellow / green / gray.
   stay visible and are sent once to the authoritative winning epoch.
   Compact success/failure and unsolicited provider outcomes are announced in
   a dedicated persistent live region that idle usage refreshes cannot erase.
-- **Board (E6)** — always on the page (v5): KPI strip + health row +
-  attention-banded job cards + agent/transcript rail. At ≥1280px the
-  chat pane joins it on the left; below that the board is the full page
-  and chat overlays. Round rows carry 7 per-lens live chips behind the
-  card's disclosure; the notification center rides the bell (see
+- **Board (E6/v6)** — always on the page: the global status chip rail
+  above, then attention-banded dense job rows + the AGENTS (n) /
+  TRANSCRIPTS rail. At ≥1100px the chat pane joins it on the left with
+  drag splitters; below that the board is the full page and chat
+  overlays. Round rows carry 7 per-lens live chips behind the row's
+  disclosure; the notification center rides the bell (see
   [BOARD.md](./BOARD.md)). **Phone:** board-first (SPEC ruling 11) — the
   landing view, with chat one FAB tap away.
 - **Transcripts (E6)** — drawer from the agent rail / transcripts list:

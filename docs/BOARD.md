@@ -73,27 +73,38 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 
 ## The UI (`web/`)
 
-- **Console (v5):** the estate is full-width. At ≥1280px it is three
-  panes — chat (380px, collapsible) | dashboard | agents/transcripts
-  rail. At 900–1279px the board + rail hold the page and chat overlays
-  via the Gru FAB (right drawer, dimmed board behind); below 900px the
-  rail stacks under the board and the FAB opens a bottom sheet. The nav
-  tabs stay as focus switches: `💬 Chat` opens/focuses chat, `🗺️ Board`
-  dismisses the overlay and marks the board.
-- **Dashboard:** KPI strip (job/PR/lane counts) + health row (deploy
-  drift first) full-width, then **attention bands** — NEEDS YOU → IN
-  FLIGHT → SETTLED → COLD, recency inside each band. v5 renders job
-  cards as a responsive card grid (~340px, max 3 columns); NEEDS YOU is
-  full-width (empty = calm “nothing needs you”); SETTLED is a rolling
-  window (latest 10 + `+K older settled`, session-expanded). Each card:
-  title, status chip, one compact signal chip, repo/id/meta line, PR
-  link; click to disclose lane + rounds (v3 collapse, persisted per
-  job). Round rows carry per-lens chips (`○ pending` gray · `◉ live`
-  yellow · `✓ done` green · `✕ error` red) behind a click. Each band
-  carries ONE accent — left edge + label pill only (v5).
-- **Agent rail:** every ledger agent with a live state chip (🧠 gru ·
-  📋 silas · 🔧 minion · 🔍 perkins · 🌙 bob); clicking an agent with a
-  session file opens its transcript. The silas chip is LIVE when
+- **Cockpit (v6):** the estate is full-width. The sticky **command bar**
+  carries the brand + `ONE GRU · ONE WINDOW`, the monospace ticker
+  (`MODE` · `RADAR` · top review round), the Chat/Board lens toggle,
+  bell, theme and settings; below it the sticky **status chip rail**
+  relocates the v4 health row globally (DEPLOY → REVIEWS → SILAS →
+  ALERTS → VERIFY → CURE → TRACKERS) with the job/PR/lane KPI counts
+  folded into TRACKERS as `data-kpi` count groups. At ≥1100px it is
+  three panes — chat (~30%, collapsible, resizable) | board | agents
+  rail — with 4px drag splitters (sizes persist per breakpoint;
+  double-click resets). At 900–1099px the board + rail hold the page and
+  chat overlays via the Gru FAB (right drawer, dimmed board behind);
+  below 900px the rail stacks under the board and the FAB opens a bottom
+  sheet. The nav tabs stay as focus switches: `💬 Chat` opens/focuses
+  chat, `🗺️ Board` dismisses the overlay and marks the board.
+- **Dashboard:** **attention bands** — NEEDS YOU → IN FLIGHT → SETTLED →
+  COLD, recency inside each band — rendered as full-width **dense rows**
+  (line 1: dot + title + status chip; line 2: repo + branch + lane/agent
+  ages + PR link), with sticky band headers carrying counts and hairline
+  dividers. Failing rows (blocked/error, aborted round, errored lenses
+  without a verdict) are tinted with a left alert accent. NEEDS YOU is
+  always visible (empty = calm “nothing needs you”); SETTLED is a rolling
+  window (latest 10 + `+K older settled`, session-expanded; concluded
+  jobs render their last round quiescent — no stale blocker pills). Click
+  a row to disclose lane + rounds (v3 collapse, persisted per job).
+  Round rows carry per-lens chips (`○ pending` gray · `◉ live` yellow ·
+  `✓ done` green · `✕ error` red) behind a click.
+- **Agent rail:** AGENTS (n) / TRANSCRIPTS tabs above dense rows — a
+  status dot + name + short hash, a `role · state` subline (with turn
+  age and supervision marks), and a right-aligned state chip; error rows
+  carry the alert accent; disposed rows collapse behind a dashed `+N
+  disposed` footer. Clicking an agent with a session file opens its
+  transcript. The silas chip is LIVE when
   `[silas] enabled` (default): the hosted ops session (`silas-ops` slot)
   appears there whenever its wake turns run, and its follow-through lands
   on the ledger as `silas.*` events (`silas.pr-registered`,

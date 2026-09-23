@@ -140,31 +140,116 @@ body {
 /* App shell                                                           */
 /* ------------------------------------------------------------------ */
 
-.app-nav {
+/* ── Global command bar (v6): one flat row — brand + ticker + lenses ── */
+
+.command-bar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 14px 20px;
+  gap: 14px;
+  min-height: 56px;
+  padding: 8px 16px;
   border-bottom: var(--outline);
   background: var(--card);
   position: sticky;
   top: 0;
-  z-index: 10;
+  z-index: 30;
 }
 
-.app-nav__logo {
-  font-size: 26px;
+.command-bar__brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.command-bar__logo {
+  font-size: 24px;
   filter: drop-shadow(2px 2px 0 rgba(34, 48, 74, 0.2));
 }
 
-.app-nav__title {
-  font-size: 17px;
-  font-weight: 800;
-  letter-spacing: 0.01em;
+.command-bar__names {
+  display: grid;
+  gap: 1px;
+  line-height: 1.1;
+  min-width: 0;
 }
 
-.app-nav__spacer {
+.command-bar__title {
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.command-bar__tagline {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+/* The ticker: monospace, pipe-separated, one calm line. */
+.command-bar__ticker {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.command-ticker__segment {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.command-ticker__segment--ok { color: var(--ink); }
+.command-ticker__segment--warn { color: var(--band-needs-you-ink); }
+.command-ticker__segment--alert { color: var(--band-needs-you-ink); }
+.command-ticker__sep { color: var(--faint); }
+
+/* The Chat/Board segmented lens toggle. */
+.command-bar__tabs {
+  display: flex;
+  gap: 0;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  flex: none;
+}
+
+.command-bar__tab {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 6px 12px;
+  border: 0;
+  background: var(--card);
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.command-bar__tab + .command-bar__tab {
+  border-left: var(--outline-thin);
+}
+
+.command-bar__tab:hover {
+  background: var(--soft);
+  color: var(--ink);
+}
+
+.command-bar__tab--active {
+  background: var(--work);
+  color: var(--on-state);
 }
 
 .conn-dot {
@@ -196,10 +281,124 @@ body {
   50% { opacity: 0.35; }
 }
 
+/* ── Status chip rail (v6): the v4 health row, relocated global ── */
+
+.chip-rail {
+  position: sticky;
+  top: var(--command-bar-h, 56px);
+  z-index: 29;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--paper);
+  border-bottom: 1.5px solid var(--line);
+}
+
+/* Phone: one calm scrollable row instead of stacked chrome. */
+@media (max-width: 899px) {
+  .chip-rail {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .chip-rail::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+.rail-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  padding: 4px 11px;
+  border: var(--outline-thin);
+  border-radius: 999px;
+  background: var(--card);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.rail-chip__label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--faint);
+}
+
+.rail-chip__value {
+  font-weight: 800;
+  color: var(--ink);
+}
+
+/* ONE accent per chip state: a colored left edge, never a fill. */
+.rail-chip--ok { border-left: 5px solid var(--done); }
+.rail-chip--warn { border-left: 5px solid var(--work); }
+.rail-chip--alert { border-left: 5px solid var(--alert); }
+.rail-chip--muted { border-left: 5px solid var(--muted); }
+
+.rail-chip__flag {
+  font-size: 9px;
+  padding: 1px 8px;
+}
+
+/* Folded KPI count strips (TRACKERS): label + total, slash-separated
+   numbers in the mockup's telemetry style. */
+.rail-kpi {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.rail-kpi__label {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: var(--faint);
+}
+
+.rail-kpi__total {
+  font-size: 10px;
+  color: var(--ink);
+}
+
+.rail-kpi__nums {
+  display: inline-flex;
+  align-items: baseline;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.rail-kpi__sep {
+  padding: 0 1px;
+  color: var(--faint);
+}
+
+.rail-kpi__num--alert {
+  color: var(--band-needs-you-ink);
+  font-weight: 800;
+}
+
+.rail-chip--trackers {
+  gap: 6px;
+}
+
+.rail-chip--trackers .board-decisions,
+.rail-chip--trackers .board-unacked {
+  margin-left: 2px;
+}
+
 .app-main {
   max-width: none;
   margin: 0 auto;
-  padding: 20px 20px 96px;
+  padding: 16px 20px 96px;
   display: grid;
   gap: 16px;
 }
@@ -211,7 +410,7 @@ body {
   width: min(920px, 100%);
   justify-self: center;
 }
-/* ── The console (v5): full-estate, three panes on a wide viewport ── */
+/* ── The cockpit (v6): [ chat | board | agents-rail ] at ≥1100px ── */
 
 .console {
   display: grid;
@@ -268,25 +467,91 @@ body {
   50% { opacity: 0.45; transform: scale(1.35); }
 }
 
-@media (min-width: 1280px) {
+/* Drag splitters: 4px boundaries; a hairline at rest, accent on hover/drag. */
+.splitter {
+  display: none;
+  position: relative;
+  cursor: col-resize;
+  touch-action: none;
+  border-radius: 999px;
+}
+
+.splitter::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 1px;
+  width: 2px;
+  border-radius: 999px;
+  background: var(--line);
+  opacity: 0.32;
+  transition: opacity 0.15s ease, background 0.15s ease, width 0.15s ease,
+    left 0.15s ease;
+}
+
+.splitter:hover::after,
+.splitter:focus-visible::after,
+.console[data-pane-dragging] .splitter::after {
+  left: 0.5px;
+  width: 3px;
+  opacity: 0.85;
+  background: var(--work);
+}
+
+.splitter:focus-visible {
+  outline: none;
+}
+
+/* Cockpit: three panes + two drag boundaries. Sizes arrive from the JS
+   splitter controller via --pane-chat-width / --pane-rail-width; the
+   fallbacks cover the first paint before the controller's constructor. */
+@media (min-width: 1100px) {
   .console {
-    grid-template-columns: var(--console-chat-col, 380px) minmax(0, 1fr);
+    --console-chat-col: var(--pane-chat-width, 432px);
+    --console-side-col: var(--pane-rail-width, 280px);
+    grid-template-columns:
+      var(--console-chat-col) 4px minmax(0, 1fr) 4px var(--console-side-col);
+    grid-template-areas: 'chat s1 board s2 rail';
+    gap: 0;
     transition: grid-template-columns 0.18s ease;
+  }
+
+  /* While a boundary is dragged the tracks follow the pointer directly —
+     a 180ms tween on a live drag reads as lag. */
+  .console[data-pane-dragging] {
+    transition: none;
+    user-select: none;
   }
 
   .console--chat-collapsed {
     --console-chat-col: 56px;
   }
 
+  .console--chat-collapsed #splitter-chat {
+    display: none;
+  }
+
+  .console__chat { grid-area: chat; }
+  .console__rail { grid-area: chat; }
+  #splitter-chat { grid-area: s1; }
+  #board-view { grid-area: board; min-width: 0; }
+  #splitter-rail { grid-area: s2; }
+  .agents-rail { grid-area: rail; }
+
+  .splitter {
+    display: block;
+    align-self: stretch;
+  }
+
   /* Chat pane: full height and pinned — the board scrolls, chat does not
-     leave the corner of the eye. 124px ≈ nav (72) + page padding +
-     breathing room, so the composer sits above the fold before pinning. */
+     leave the corner of the eye. --chrome-h is the measured command bar
+     + chip rail height (main.ts), 100px until measured. */
   .console__chat {
-    grid-area: 1 / 1;
     min-width: 0;
     position: sticky;
-    top: 84px;
-    height: calc(100vh - 124px);
+    top: calc(var(--chrome-h, 100px) + 12px);
+    height: calc(100vh - var(--chrome-h, 100px) - 24px);
   }
 
   .console--chat-collapsed .console__chat {
@@ -294,9 +559,8 @@ body {
   }
 
   .console__rail {
-    grid-area: 1 / 1;
     position: sticky;
-    top: 84px;
+    top: calc(var(--chrome-h, 100px) + 12px);
   }
 
   .console--chat-collapsed .console__rail {
@@ -307,9 +571,45 @@ body {
     height: 100%;
   }
 
-  #board-view {
-    grid-area: 1 / 2;
-    min-width: 0;
+  .console .agents-rail {
+    position: sticky;
+    top: calc(var(--chrome-h, 100px) + 12px);
+    max-height: calc(100vh - var(--chrome-h, 100px) - 24px);
+    overflow: hidden auto;
+  }
+}
+
+/* Desktop two-pane (900–1099): board + rail; chat overlays via the FAB. */
+@media (min-width: 900px) and (max-width: 1099px) {
+  .console {
+    grid-template-columns: minmax(0, 1fr) var(--pane-rail-width, 280px);
+    grid-template-areas: 'board rail';
+    gap: 16px;
+  }
+
+  .console__chat,
+  .console__rail,
+  #splitter-chat,
+  #splitter-rail {
+    display: none;
+  }
+
+  #board-view { grid-area: board; min-width: 0; }
+  .agents-rail { grid-area: rail; }
+}
+
+/* Single column (<900): board first, rail stacked under it (v5). */
+@media (max-width: 899px) {
+  .console {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+
+  .console__chat,
+  .console__rail,
+  #splitter-chat,
+  #splitter-rail {
+    display: none;
   }
 }
 
@@ -443,6 +743,24 @@ body {
 .chat-panel__glyph {
   font-size: 16px;
 }
+
+/* GRU BRAIN ENGINE · ONLINE (v6): the pane's own liveness badge. */
+.chat-panel__online {
+  margin-left: auto;
+  margin-right: 8px;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  padding: 3px 9px;
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--park);
+}
+
+.chat-panel__online[data-state='online'] { background: var(--done); color: var(--on-state); }
+.chat-panel__online[data-state='syncing'] { background: var(--work); color: var(--on-state); }
+.chat-panel__online[data-state='offline'] { background: var(--alert); color: var(--on-state); }
 
 .chat-panel__collapse {
   display: inline-flex;
@@ -911,7 +1229,7 @@ body {
 /* Tablet/laptop overlay: a right drawer over the board + rail. The
    panel head carries the ✕ close button here (the grip is a phone
    affordance). */
-@media (min-width: 900px) and (max-width: 1279px) {
+@media (min-width: 900px) and (max-width: 1099px) {
   .chat-sheet {
     top: 12px;
     right: 12px;
@@ -1077,43 +1395,21 @@ body {
   }
 }
 
-/* ═══════════════════════ Board (E6) ═══════════════════════ */
-
-.app-nav__tabs {
-  display: flex;
-  gap: 6px;
-  margin-left: 14px;
-}
-
-.app-nav__tab {
-  padding: 7px 12px;
-  font-size: 13px;
-}
-
-.app-nav__tab--active {
-  background: var(--work);
-  color: var(--on-state);
-}
+/* ═══════════════════════ Board (E6, v6 cockpit) ═══════════════════════ */
 
 .board-view {
   display: grid;
   gap: 16px;
   min-width: 0;
+  align-content: start;
 }
 
-/* Center column: KPI strip + health row + trackers + bands. The side
-   rail (agents + transcripts) is the right pane of the board. */
+/* Center column: the dense job-row list. */
 .board-main {
   display: grid;
   gap: 16px;
   min-width: 0;
-}
-
-.board-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) var(--side-rail-col, 280px);
-  gap: 16px;
-  align-items: start;
+  align-content: start;
 }
 
 .board-jobs {
@@ -1121,152 +1417,12 @@ body {
   gap: 16px;
 }
 
-/* v4 KPI strip, v5 scale: calm cards, big tabular numerals, small-caps
-   labels. All counts derive from the same snapshot the cards render. */
-.board-kpis {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 12px;
-}
-
-.board-kpi {
-  display: grid;
-  gap: 8px;
-  padding: 14px 16px;
-}
-
-.board-kpi__row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 24px;
-  /* Top-aligned, not baseline-aligned: a stat with an extra age line must
-     not shift its whole row upward (the numbers all start on one line). */
-  align-items: start;
-}
-
-/* Number over label (over age): each stat is one calm stack, so the
-   numerals share a baseline and the labels never ripple into them. */
-.board-kpi__stat {
-  display: inline-grid;
-  justify-items: start;
-  gap: 2px;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--muted);
-}
-
-.board-kpi__stat--alert {
-  color: var(--ink);
-}
-
-/* The alert stat keeps ONE accent: the numeral itself. A filled pill
-   around a 28px digit read as a badge, not a KPI. */
-.board-kpi__stat--alert .board-kpi__value {
-  color: var(--band-needs-you-ink);
-}
-
-.board-kpi__value {
-  font-size: 28px;
-  line-height: 1;
-  font-weight: 800;
-  color: var(--ink);
-  font-variant-numeric: tabular-nums;
-}
-
-/* v5 live-feel: a changed number ticks once (micro crossfade). */
-.board-kpi__value--tick {
-  animation: kpi-tick 0.16s ease;
-}
-
-@keyframes kpi-tick {
-  from { opacity: 0.2; transform: translateY(-2px); }
-  to { opacity: 1; transform: none; }
-}
-
-.board-kpi__label {
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--faint);
-}
-
-.board-kpi__age {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-/* v4 health row, v5 rhythm: one slim card per incident the operator
-   must not re-learn the hard way. `n/a` cards stay muted — absence is a
-   fact, not a zero. */
-.board-health {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 12px;
-}
-
-.board-health__card {
-  position: relative;
-  display: grid;
-  gap: 4px;
-  padding: 12px 14px;
-}
-
-.board-health__title {
-  font-size: 11px;
-}
-
-.board-health__value {
-  font-size: 20px;
-  line-height: 1.1;
-  font-weight: 800;
-  font-variant-numeric: tabular-nums;
-}
-
-.board-health__detail {
-  font-size: 11px;
-  color: var(--muted);
-  overflow-wrap: anywhere;
-  /* Up to two lines, then ellipsis; the full sentence lives in the title
-     attr. One line clipped most cards mid-word. */
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.board-health__flag {
-  justify-self: start;
-  font-size: 10px;
-  padding: 2px 8px;
-}
-
-.board-health__card--alert {
-  border-left: 6px solid var(--alert);
-}
-
-.board-health__card--alert .board-health__value {
-  color: var(--ink);
-}
-
-.board-health__card--warn {
-  border-left: 6px solid var(--work);
-}
-
-.board-health__card--ok {
-  border-left: 6px solid var(--done);
-}
-
-.board-health__card--muted {
-  border-left: 6px solid var(--muted);
-}
-
-/* v4 attention bands, v5 estate: priority first, repo grouping inside.
-   Each band carries ONE accent (left edge + label pill only, never a
-   fill): NEEDS YOU warm red, IN FLIGHT yellow, SETTLED green, COLD gray. */
+/* v4 attention bands, v6 cockpit: priority first. Band headers are
+   STICKY separators with counts; each band carries ONE accent (the
+   label pill only — rows stay calm until they fail). */
 .board-band {
   display: grid;
-  gap: 12px;
+  gap: 0;
   --band-accent: var(--park);
 }
 
@@ -1275,11 +1431,18 @@ body {
 .board-band--settled { --band-accent: var(--done); }
 .board-band--cold { --band-accent: var(--park); }
 
+/* A sticky band separator: the label + count pin under the global chrome
+   while the rows scroll beneath them. */
 .board-band__head {
+  position: sticky;
+  top: var(--chrome-h, 100px);
+  z-index: 5;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 10px;
   margin: 0;
+  padding: 8px 4px 6px;
+  background: var(--paper);
   font-size: 13px;
   letter-spacing: 0.1em;
 }
@@ -1302,29 +1465,17 @@ body {
   color: var(--muted);
 }
 
-/* The band's jobs: full-width + loud for the operator's queue, a calm
-   auto-fill card grid (JS mirrors the column math) for the rest. */
-.board-band__list {
+/* The band's rows: full-width dense rows on hairline dividers — the
+   "table without a table" the cockpit asks for. */
+.board-band__rows {
   display: grid;
-  gap: 16px;
+  border-top: 1.5px solid var(--line);
 }
 
-.board-band__grid {
-  display: grid;
-  gap: 16px;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
-  align-items: start;
-}
-
-/* One accent per band as the card's left edge — the status chip keeps
-   its own tone; a fill would drown the dashboard. */
-.board-band .board-job {
-  border-left: 6px solid var(--band-accent);
-}
-
-/* Rolling settled window (v5): the older tail lives behind this. */
+/* Rolling settled window (v4.1/v5): the older tail lives behind this. */
 .board-band__more {
   justify-self: start;
+  margin-top: 10px;
   padding: 6px 14px;
   border: var(--outline-thin);
   border-radius: 999px;
@@ -1377,7 +1528,7 @@ body {
   color: var(--muted);
 }
 
-/* v5: new cards slide in 8px; known cards never re-animate. */
+/* v5: new rows slide in 8px; known rows never re-animate. */
 .board-job--enter {
   animation: card-enter 0.18s ease;
 }
@@ -1387,49 +1538,52 @@ body {
   to { opacity: 1; transform: none; }
 }
 
-/* A streaming agent's dot pulses — the rail's live heartbeat. */
-.board-agent[data-state='streaming']::before {
-  content: '';
-  flex: none;
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--work);
-  border: 2px solid var(--line);
-  animation: conn-pulse 1.2s ease-in-out infinite;
-}
-
 .board-job__stale {
   flex: none;
-  font-size: 11px;
+  font-size: 10px;
   padding: 2px 8px;
 }
 
+/* One dense job row: line 1 (dot + chevron + title + signal + status),
+   line 2 (repo + branch + ages + PR link), inline disclosure below.
+   No card box until expanded — hairline dividers only, zebra-free. */
 .board-job {
   display: grid;
-  gap: 7px;
-  border: var(--outline-thin);
-  border-radius: var(--radius-sm);
-  padding: 12px 14px;
-  background: var(--soft);
+  gap: 3px;
+  padding: 7px 6px 8px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 22%, transparent);
+  border-radius: 0;
   cursor: pointer;
 }
 
 .board-job:hover {
-  background: var(--card);
+  background: color-mix(in srgb, var(--work) 14%, transparent);
 }
 
-/* Collapsed face: chevron + title + status chip on one row; the optional
-   signal chip and the meta line follow. The detail body is disclosed. */
+/* Error/failing rows: tinted with a left accent border — the row's one
+   signal that something is wrong, louder than any chip. */
+.board-job--alert {
+  border-left: 4px solid var(--alert);
+  background: color-mix(in srgb, var(--alert) 13%, transparent);
+}
+
+.board-job--alert:hover {
+  background: color-mix(in srgb, var(--alert) 22%, transparent);
+}
+
+/* Line 1: dot + chevron + title on the left, right-aligned chips. */
 .board-job__head {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
 .board-job__toggle {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 8px;
   flex: 1;
   min-width: 0;
@@ -1452,48 +1606,83 @@ body {
 .board-job__chevron {
   flex: none;
   width: 1em;
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: 12px;
   color: var(--muted);
 }
 
+/* Status dot: the row's ONE state color (the chip repeats it as text). */
+.board-job__dot {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  background: var(--park);
+}
+
+.board-job__dot--work { background: var(--work); }
+.board-job__dot--rev { background: var(--rev); }
+.board-job__dot--done { background: var(--done); }
+.board-job__dot--alert { background: var(--alert); }
+.board-job__dot--park { background: var(--park); }
+
 .board-job__name {
   font-weight: 800;
+  font-size: 13.5px;
   flex: 1;
   min-width: 0;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
   overflow: hidden;
-  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .board-job__status {
   flex: none;
 }
 
-/* The one compact signal a collapsed card may carry (live round,
-   blockers/failures, unacked action-required). It wraps instead of
-   overflowing on narrow viewports. */
+/* The one compact signal a collapsed row may carry (live round,
+   blockers/failures, unacked action-required). A chip is an inline-FLEX
+   by default, on which text-overflow is inert — it renders inline-block
+   here so a squeezed label ellipsizes instead of slicing mid-word. */
 .board-job__signal {
-  justify-self: start;
-  max-width: 100%;
-  white-space: normal;
-  text-align: left;
-  font-size: 10px;
-  padding: 3px 10px;
-}
-
-.board-job__meta {
-  color: var(--muted);
+  display: inline-block;
+  flex: none;
+  max-width: 32%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  vertical-align: bottom;
+  font-size: 10px;
+  padding: 2px 9px;
 }
 
-/* Each card credits its repo (v5: no wrapper card to strand grid cells). */
+/* Line 2: small, muted, monospace data readout. */
+.board-job__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-left: 42px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+}
+
+/* Each row credits its repo — grouping rides the rows, not wrappers. */
 .board-job__repo {
   font-weight: 800;
+  color: var(--muted);
+}
+
+.board-job__branch {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 32ch;
+}
+
+.board-job__age {
   color: var(--muted);
 }
 
@@ -1504,24 +1693,40 @@ body {
 }
 
 .board-job__pr {
-  flex: none;
-  align-self: flex-start;
-  margin-top: 2px;
-  font-size: 13px;
+  margin-left: auto;
+  font-family: var(--font-body);
+  font-size: 11px;
   font-weight: 800;
   color: var(--ink);
 }
 
+/* The expanded row: the v3 detail in one box — the only card allowed. */
 .board-job__body {
   display: grid;
   gap: 7px;
   cursor: auto;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  background: var(--soft);
+}
+
+/* Concluded-job review history (v4.1 stale-pill suppression): kept but
+   quiescent — no alarm chips, a one-line pointer to the ledger. */
+.board-round--quiescent {
+  opacity: 0.72;
+}
+
+.board-job__reviewed {
+  font-size: 10px;
+  color: var(--faint);
 }
 
 .board-round {
   display: grid;
   gap: 6px;
-  border-top: 2px dashed var(--line);
+  border-top: 1px solid color-mix(in srgb, var(--line) 30%, transparent);
   padding-top: 8px;
   margin-top: 2px;
 }
@@ -1566,14 +1771,7 @@ body {
   color: var(--on-state);
 }
 
-/* Tracker strip (decisions chip + unacked badge) */
-
-.board-trackers {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-}
+/* Tracker chips (inside the rail's TRACKERS chip) */
 
 .board-decisions,
 .board-unacked {
@@ -1644,26 +1842,63 @@ body {
   font-size: 13px;
 }
 
+/* Right rail (v6): AGENTS / TRANSCRIPTS tabs above dense agent rows. */
 .board-side {
   display: grid;
-  gap: 14px;
-  position: sticky;
-  top: 16px;
+  gap: 10px;
+  align-content: start;
+  min-width: 0;
 }
 
-.board-side__section {
-  display: grid;
-  gap: 8px;
-  padding: 12px 14px;
+.agents-rail__tabs {
+  display: flex;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  overflow: hidden;
+}
+
+.agents-rail__tab {
+  flex: 1;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  padding: 8px 8px;
+  border: 0;
+  background: var(--card);
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.agents-rail__tab + .agents-rail__tab {
+  border-left: var(--outline-thin);
+}
+
+.agents-rail__tab:hover {
+  background: var(--soft);
+  color: var(--ink);
+}
+
+.agents-rail__tab--active {
+  background: var(--work);
+  color: var(--on-state);
+}
+
+.agents-rail__count {
+  font-variant-numeric: tabular-nums;
 }
 
 .board-agents {
   display: grid;
-  gap: 5px;
+  gap: 4px;
+  align-content: start;
   /* Tall enough that the liveness rail + one disclosed disposed band fit
      without fighting the scroll; it still scrolls for long graveyards. */
   max-height: 420px;
   overflow-y: auto;
+  padding-right: 2px;
 }
 
 .board-agent {
@@ -1673,10 +1908,10 @@ body {
   border: var(--outline-thin);
   border-radius: var(--radius-sm);
   background: var(--card);
-  padding: 7px 10px;
+  padding: 5px 9px;
   cursor: pointer;
   text-align: left;
-  font-size: 12.5px;
+  font-size: 12px;
   min-width: 0;
 }
 
@@ -1684,26 +1919,107 @@ body {
   transform: translate(-1px, -1px);
 }
 
+/* Status dot: idle (done green), streaming (pulsing work), error (alert). */
+.board-agent__dot {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  background: var(--done);
+}
+
+.board-agent[data-state='streaming'] .board-agent__dot {
+  background: var(--work);
+  animation: conn-pulse 1.2s ease-in-out infinite;
+}
+
+.board-agent[data-state='error'] .board-agent__dot { background: var(--alert); }
+.board-agent[data-state='spawning'] .board-agent__dot { background: var(--park); }
+.board-agent[data-state='disposed'] .board-agent__dot { background: var(--park); }
+
+/* Error rows are tinted with a left accent — a fault never hides. */
+.board-agent--error {
+  border-left: 4px solid var(--alert);
+  background: color-mix(in srgb, var(--alert) 14%, var(--card));
+}
+
+.board-agent__body {
+  display: grid;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.board-agent__top {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
 .board-agent__emoji {
-  font-size: 16px;
+  font-size: 11px;
 }
 
 .board-agent__name {
-  font-weight: 600;
-  flex: 1;
-  min-width: 0;
+  font-weight: 700;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.board-agent__hash {
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+}
+
+.board-agent__sub {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9px;
+  /* The .lbl default (0.18em) is tuned for big headings; in an 240px rail
+     it squeezes the role·state out of the line. */
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  overflow: hidden;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.board-agent__role {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.board-agent__supervision {
+  flex: none;
+}
+
+.board-agent__supervision--alert {
+  color: var(--band-needs-you-ink);
+  font-weight: 800;
+}
+
+.board-agent__supervision--warn {
+  color: var(--muted);
+}
+
 .board-agent__state {
-  font-size: 10px;
-  padding: 2px 8px;
+  font-size: 9.5px;
+  padding: 1px 6px;
+  flex: none;
 }
 
 /* Turn-age counter on a streaming agent — quiet for N seconds/minutes. */
 .board-agent__age {
+  flex: none;
   color: var(--muted);
   letter-spacing: 0.04em;
   white-space: nowrap;
@@ -1718,7 +2034,7 @@ body {
   font: inherit;
   font-size: 11px;
   font-weight: 800;
-  text-align: left;
+  text-align: center;
   padding: 5px 10px;
   cursor: pointer;
 }
@@ -1763,7 +2079,7 @@ body {
 .notification-panel {
   position: absolute;
   right: 16px;
-  top: 64px;
+  top: calc(var(--chrome-h, 100px) + 8px);
   width: min(420px, calc(100vw - 32px));
   z-index: 40;
   display: grid;
@@ -1949,18 +2265,6 @@ body {
   flex-shrink: 0;
 }
 
-/* Single-column board below the two-pane breakpoint: the side rail
-   stacks under the cards. */
-@media (max-width: 899px) {
-  .board-layout {
-    grid-template-columns: 1fr;
-  }
-
-  .board-side {
-    position: static;
-  }
-}
-
 /* Phone: the board IS the app. */
 @media (max-width: 768px) {
   .app-main {
@@ -1969,7 +2273,6 @@ body {
   }
 
   .notification-panel {
-    top: 58px;
     right: 10px;
   }
 
@@ -1985,7 +2288,7 @@ body {
 
 .toast-stack {
   position: fixed;
-  top: 64px;
+  top: calc(var(--chrome-h, 100px) + 8px);
   right: 14px;
   z-index: 60;
   display: flex;
@@ -2268,50 +2571,39 @@ body {
 /* row (shrink floor ≈ 519px < 561px, e2e-pinned), so no rules there.  */
 /* ------------------------------------------------------------------ */
 @media (max-width: 560px) {
-  .app-nav {
+  .command-bar {
     flex-wrap: wrap;
     column-gap: 10px;
     row-gap: 8px;
-    padding: 10px 14px;
+    padding: 8px 12px;
   }
 
-  .app-nav__logo {
-    font-size: 22px;
+  .command-bar__logo {
+    font-size: 20px;
   }
 
-  .app-nav__title {
+  .command-bar__title {
     font-size: 15px;
   }
 
-  /* The tagline is decorative; dropping it buys row 1 the icon room.
+  /* The tagline is decorative; dropping it buys row 1 the control room.
      Scoped to the tagline itself — other .lbl uses must keep rendering. */
-  .app-nav__tagline {
+  .command-bar__tagline {
     display: none;
   }
 
-  .app-nav__tabs {
+  /* The ticker is a wide-viewport instrument; the chip rail below still
+     carries whole-system state on a phone. */
+  .command-bar__ticker {
+    display: none;
+  }
+
+  .command-bar__tabs {
     order: 10;
     flex: 1 1 100%;
-    margin-left: 0;
-    gap: 8px;
   }
 
-  .app-nav__tab {
+  .command-bar__tab {
     flex: 1 1 0;
-  }
-
-  /* Overlays tuned for the single-row nav height need the two-row
-     clearance so they do not pile on top of the chrome. Measured two-row
-     nav height at 390px: 110px (headless chromium) → token + margin. */
-  :root {
-    --phone-nav-clearance: 116px;
-  }
-
-  .notification-panel {
-    top: var(--phone-nav-clearance);
-  }
-
-  .toast-stack {
-    top: var(--phone-nav-clearance);
   }
 }

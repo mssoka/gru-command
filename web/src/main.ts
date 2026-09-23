@@ -11,11 +11,15 @@ import { migrateLegacyOutbox, safeStorage } from './lib/chat-storage.js';
 import { AttachClient, readFileBytes } from './lib/attach-client.js';
 import { WS_PATH, type LoggedFrame } from './lib/protocol.js';
 import { BoardClient } from './lib/board-client.js';
+import { consoleModeForWidth } from './lib/console-layout.js';
 import { applyTheme, getTheme, setTheme } from './theme.js';
 import { clearBanner, showBanner } from './ui/banner.js';
 import { ChatView, renderConnectionDot } from './ui/chat.js';
 import { BoardView } from './ui/board.js';
-import { ConsoleShell, type ChatPaneHandle } from './ui/console.js';
+import { CommandBar, renderChatOnline } from './ui/command-bar.js';
+import { ConsoleShell, CONSOLE_QUERY, type ChatPaneHandle } from './ui/console.js';
+import { RailTabs } from './ui/rail-tabs.js';
+import { SplitterController } from './ui/splitters.js';
 import { ToastStack } from './ui/toast.js';
 import { TranscriptView } from './ui/transcript.js';
 import { mustGet } from './ui/dom.js';
@@ -109,14 +113,57 @@ function failPairing(message: string): void {
 }
 
 // ---------------------------------------------------------------------
-// Console shell (board UX v5): board first, chat as pane or overlay.
-// At/above 1280px the estate is three panes — chat | board | rail — and
-// the FAB toggles the chat pane; below it the board carries the page and
-// the FAB opens the chat overlay (SPEC ruling 11's dashboard-first
-// stance, extended to laptop widths).
+// Command bar + cockpit chrome (board UX v6): the ticker segments, the
+// measured chrome height (sticky offsets), and the drag splitters.
 // ---------------------------------------------------------------------
 
-const consoleQuery = window.matchMedia('(min-width: 1280px)');
+const commandBar = new CommandBar();
+renderChatOnline('idle');
+
+/** Feed the sticky offsets their real height: the command bar + chip rail
+ * (CSS carries a 100px fallback for the pre-measure first paint). */
+function measureChrome(): void {
+  const barHeight = document.getElementById('command-bar')?.offsetHeight ?? 0;
+  const rail = document.getElementById('chip-rail');
+  const railHeight = rail === null || rail.hidden ? 0 : rail.offsetHeight;
+  const total = barHeight + railHeight;
+  if (total > 0) {
+    document.documentElement.style.setProperty('--chrome-h', `${total}px`);
+    document.documentElement.style.setProperty('--command-bar-h', `${barHeight}px`);
+  }
+}
+measureChrome();
+
+const splitterController = new SplitterController({
+  root: mustGet('console'),
+  chatHandle: mustGet('splitter-chat'),
+  railHandle: mustGet('splitter-rail'),
+  storage,
+});
+
+// The agents rail's AGENTS / TRANSCRIPTS tabs (v6).
+new RailTabs(mustGet('agents-rail'));
+
+/** Keep the ticker's layout segment and the splitter bounds in step with
+ * the viewport (the shell's matchMedia owns the FAB contract; both read
+ * the same console-layout thresholds). */
+function syncCockpit(): void {
+  commandBar.setLayout(consoleModeForWidth(window.innerWidth));
+  splitterController.sync();
+  measureChrome();
+}
+syncCockpit();
+window.addEventListener('resize', syncCockpit);
+
+// ---------------------------------------------------------------------
+// Console shell (board UX v5/v6): board first, chat as pane or overlay.
+// At/above 1100px the estate is the cockpit — chat | board | agents-rail
+// with drag splitters — and the FAB toggles the chat pane; below it the
+// board carries the page and the FAB opens the chat overlay (SPEC ruling
+// 11's dashboard-first stance, extended to laptop widths).
+// ---------------------------------------------------------------------
+
+const consoleQuery = window.matchMedia(CONSOLE_QUERY);
 
 /** The shell drives the chat through this handle; the view is created at
  * pair time, so before that every call is a no-op. */
@@ -148,8 +195,9 @@ function showPairing(): void {
 type ViewId = 'chat' | 'board';
 
 function setActiveTab(id: ViewId): void {
-  mustGet('tab-chat').classList.toggle('app-nav__tab--active', id === 'chat');
-  mustGet('tab-board').classList.toggle('app-nav__tab--active', id === 'board');
+  mustGet('tab-chat').classList.toggle('command-bar__tab--active', id === 'chat');
+  mustGet('tab-board').classList.toggle('command-bar__tab--active', id === 'board');
+  commandBar.setView(id);
 }
 
 /** Nav Chat: console focuses the pane; below it the sheet opens. */
@@ -177,6 +225,7 @@ setActiveTab(consoleQuery.matches ? 'chat' : 'board');
 
 function onConnection(state: ConnectionState): void {
   renderConnectionDot(state);
+  renderChatOnline(state);
   // `open` is emitted at auth_ok, just before the required fresh context
   // snapshot. Keep stale controls disabled until that snapshot arrives.
   if (state !== 'open') chatView?.setControlsConnected(false);
@@ -206,6 +255,9 @@ function startChat(token: string): void {
   mustGet('chat-view').hidden = false;
   mustGet('board-view').hidden = false;
   mustGet('gru-fab').hidden = false;
+  // The console has real layout now: re-clamp/refresh the pane sizes and
+  // the measured chrome (the constructor ran while the console was hidden).
+  syncCockpit();
   chatView ??= new ChatView((text, attachments) => {
     if (client === null) return false;
     client.send(text, attachments); // throws surface in the composer's guard
@@ -306,9 +358,14 @@ function startBoard(token: string): void {
         // connection truth — including the stale window that used to read
         // as "open" while the board was frozen.
         renderConnectionDot(state);
+        commandBar.setBoardState(state);
       },
       snapshot: (snapshot) => {
         boardView?.render(snapshot);
+        commandBar.setSnapshot(snapshot);
+        // The first snapshot discloses the chip rail — the chrome just
+        // grew, so the sticky offsets re-measure.
+        measureChrome();
         decisionStatusCard.render(snapshot.decisions);
         // State joins the signature: a live agent turning disposed must
         // re-list transcripts so the collapsed rows move behind the toggle.

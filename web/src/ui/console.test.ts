@@ -77,14 +77,14 @@ function mountShell(options: { consoleMatches?: boolean; storage?: ReturnType<ty
   };
 }
 
-describe('console shell — FAB mode switch (v5)', () => {
+describe('console shell — FAB mode switch (v6)', () => {
   let fixture: ShellFixture;
 
   beforeEach(() => {
     fixture = mountShell();
   });
 
-  it('at >=1280px the FAB toggles the chat pane; expanding focuses the composer', () => {
+  it('at cockpit width the FAB toggles the chat pane; expanding focuses the composer', () => {
     expect(fixture.shell.collapsed).toBe(false);
 
     fixture.fab.click();
@@ -100,7 +100,7 @@ describe('console shell — FAB mode switch (v5)', () => {
     expect(fixture.chat.focusComposer).toHaveBeenCalledTimes(1);
   });
 
-  it('below 1280px the FAB opens the overlay sheet and leaves the pane state alone', () => {
+  it('below the cockpit breakpoint the FAB opens the overlay sheet and leaves the pane state alone', () => {
     fixture = mountShell({ consoleMatches: false });
     fixture.fab.click();
     expect(fixture.chat.openSheet).toHaveBeenCalledTimes(1);
