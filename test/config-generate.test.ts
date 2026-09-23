@@ -72,6 +72,7 @@ describe('config-generate CLI', () => {
       'chat',
       'worktrees',
       'dispatch',
+      'lessons',
       'silas',
       'roll',
       'review',
@@ -88,6 +89,7 @@ describe('config-generate CLI', () => {
       '[chat]',
       '[worktrees]',
       '[dispatch]',
+      '[lessons]',
     ]) {
       expect(text).toContain(section);
     }
