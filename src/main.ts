@@ -40,6 +40,10 @@ import { isolateDecisionEnvironment } from './decisions/credentials.js';
 import type { Role } from './config.js';
 import { resolveSpawnPolicy } from './config.js';
 import {
+  assertWorktreeListenPort,
+  WorktreePortSquatRefused,
+} from './service-port-guard.js';
+import {
   buildClaudeCodeAuthArgs,
   isGitHubRemote,
   isGitLabRemote,
@@ -151,6 +155,31 @@ async function main(): Promise<number> {
           ts: new Date().toISOString(),
           level: 'error',
           msg: 'configuration invalid — refusing to start',
+          detail: error.message,
+        })}\n`,
+      );
+      return 1;
+    }
+    throw error;
+  }
+
+  // Port-squat prevention (owner incident 2026-09-23): a service spawned
+  // from a git worktree must never bind the instance port — macOS lets a
+  // loopback squatter coexist with the real wildcard/LAN bind, so this is
+  // refused BEFORE any instance state is touched or any socket binds.
+  try {
+    assertWorktreeListenPort({
+      checkoutRoot: defaultPackageRoot(),
+      port: config.server.port,
+      env: process.env,
+    });
+  } catch (error) {
+    if (error instanceof WorktreePortSquatRefused) {
+      process.stderr.write(
+        `${JSON.stringify({
+          ts: new Date().toISOString(),
+          level: 'error',
+          msg: 'refusing to listen from a worktree checkout',
           detail: error.message,
         })}\n`,
       );

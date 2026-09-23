@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { expandTilde, ROLES, RUNTIME_IDS, type Role, type RuntimeId } from '../config.js';
+import { DEFAULT_INSTANCE_PORT, expandTilde, ROLES, RUNTIME_IDS, type Role, type RuntimeId } from '../config.js';
 
 /**
  * Setup wizard answers (E9): the non-interactive contract. Every field is
@@ -62,7 +62,7 @@ const ANSWER_KEYS = [
 
 export const DEFAULT_WORKSPACE_ROOT = '~/code';
 export const DEFAULT_HOST = '127.0.0.1';
-export const DEFAULT_PORT = 7665;
+export const DEFAULT_PORT = DEFAULT_INSTANCE_PORT;
 
 /** Random pairing token (URL-safe, no ambiguous padding). */
 export function generateToken(): string {

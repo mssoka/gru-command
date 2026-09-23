@@ -1,4 +1,5 @@
 import { defineConfig } from '@playwright/test';
+import { assertSafeTestServicePort } from '../test/helpers/real-service.mjs';
 
 /**
  * Two smoke surfaces, one serial run:
@@ -20,6 +21,12 @@ import { defineConfig } from '@playwright/test';
 const MOCK_PORT = 8788;
 const PREVIEW_PORT = 4173;
 const REAL_PORT = Number(process.env.REAL_SERVICE_PORT ?? 7790);
+// Port-squat prevention (owner incident 2026-09-23): the e2e service is a
+// test service — ephemeral or an explicit high-range override, never the
+// instance port. Refuse before a single browser spec runs.
+assertSafeTestServicePort(REAL_PORT, 'playwright real service');
+assertSafeTestServicePort(MOCK_PORT, 'playwright mock service');
+assertSafeTestServicePort(PREVIEW_PORT, 'playwright preview service');
 
 export default defineConfig({
   testDir: './e2e',

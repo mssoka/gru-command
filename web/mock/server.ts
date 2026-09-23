@@ -15,6 +15,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
+import { assertSafeTestServicePort } from '../../test/helpers/real-service.mjs';
 import { DEFAULT_MOCK_TOKEN, resolveMockExposure } from './safety.js';
 import {
   parseClientFrame,
@@ -28,6 +29,8 @@ import {
 } from '../src/lib/protocol.js';
 
 const PORT = Number(process.env.GRU_MOCK_PORT ?? 8787);
+// Dev/test tooling never squats the instance port (owner incident 2026-09-23).
+assertSafeTestServicePort(PORT, 'mock server');
 const EXPOSURE = resolveMockExposure(process.env);
 const HOST = EXPOSURE.host;
 const TOKEN = EXPOSURE.token;

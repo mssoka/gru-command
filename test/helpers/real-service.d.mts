@@ -5,8 +5,17 @@
 
 export declare const REAL_SERVICE_PORT: number;
 export declare const REAL_SERVICE_TOKEN: string;
+/** The documented instance port (src/config.ts DEFAULT_INSTANCE_PORT). */
+export declare const INSTANCE_PORT: number;
+
+/** Refuse a test/e2e service port that is not ephemeral or an explicit
+ * high-range override (never the instance port, never privileged). */
+export declare function assertSafeTestServicePort(port: number, label?: string): void;
 
 export declare function pickFreePort(): Promise<number>;
+
+/** Extract the bound port from the service's `listening` JSON log line. */
+export declare function parseListeningPort(stderrText: string): number | null;
 
 export interface RealServiceHandle {
   /** The real service child process (node dist/main.js). */

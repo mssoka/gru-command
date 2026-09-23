@@ -16,6 +16,19 @@ export interface ServerConfig {
   readonly port: number;
 }
 
+/** The documented default instance port (wizard default / config reference). */
+export const DEFAULT_INSTANCE_PORT = 7665;
+
+/**
+ * Explicit service-port override for SPAWNED instances (owner incident
+ * 2026-09-23, port-squat prevention): `GRU_SERVICE_PORT` beats the config
+ * file's `[server] port`. The test/e2e harness hands every spawned service
+ * its port through this env var so a worktree-spawned service can never
+ * inherit the real instance port; `src/service-port-guard.ts` refuses a
+ * fixed port without it from a git worktree.
+ */
+export const SERVICE_PORT_ENV = 'GRU_SERVICE_PORT';
+
 export interface AuthConfig {
   readonly token: string;
 }
@@ -362,6 +375,21 @@ export function configPathFor(instanceDir: string): string {
   return join(instanceDir, 'config.toml');
 }
 
+/** Parse the GRU_SERVICE_PORT override; null when unset. Fail loud on junk. */
+function servicePortOverride(env: NodeJS.ProcessEnv, file: string): number | null {
+  const raw = env[SERVICE_PORT_ENV];
+  if (raw === undefined || raw.trim() === '') return null;
+  const port = Number(raw);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new ConfigError(
+      `${SERVICE_PORT_ENV} must be an integer between 0 and 65535 (0 = ephemeral), got: ${raw}`,
+      file,
+      SERVICE_PORT_ENV,
+    );
+  }
+  return port;
+}
+
 export function expandTilde(path: string, home: string = homedir()): string {
   if (path === '~') return home;
   if (path.startsWith('~/')) return join(home, path.slice(2));
@@ -558,7 +586,7 @@ export function loadConfig(
   const defaultWorkspaceRoot = join(home, 'code');
   let workspaceRoot = defaultWorkspaceRoot;
   let dataDir = instanceDir;
-  let server: ServerConfig = { host: '127.0.0.1', port: 7665 };
+  let server: ServerConfig = { host: '127.0.0.1', port: DEFAULT_INSTANCE_PORT };
   let auth: AuthConfig = { token: '' };
   let runtimes: RuntimesConfig = { default: 'pi', roles: {}, policies: {} };
   let models: ModelsConfig = { default: MODEL_DEFAULT_SENTINEL, roles: {} };
@@ -984,6 +1012,13 @@ export function loadConfig(
       'data_dir',
     );
   }
+
+  // The explicit env override wins over whatever the config file said —
+  // the test/e2e harness's one sanctioned way to hand a spawned service a
+  // port (src/service-port-guard.ts refuses un-overridden fixed ports from
+  // a worktree checkout).
+  const envPort = servicePortOverride(env, file);
+  if (envPort !== null) server = { ...server, port: envPort };
 
   return {
     workspaceRoot: resolve(workspaceRoot),
