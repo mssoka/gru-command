@@ -139,6 +139,19 @@ export class VerificationDisposedError extends Error {
   }
 }
 
+/** The queue view the board's health row renders (board UX v4): one shared
+ * budget, FIFO queue — lock state, depth, and worker headroom at a glance. */
+export interface VerificationQueueView {
+  /** True while any run holds the single global lock. */
+  readonly lockInUse: boolean;
+  readonly activeRuns: number;
+  readonly queuedRuns: number;
+  /** Total workers allowed across all concurrent runs. */
+  readonly workerBudget: number;
+  /** Workers handed to each run (budget split across concurrency). */
+  readonly workersPerRun: number;
+}
+
 interface PersistedSlot {
   readonly run_id: string;
   readonly pid: number | null;
@@ -373,6 +386,17 @@ export class VerificationScheduler {
 
   activeCount(): number {
     return this.slots.size;
+  }
+
+  /** Board health-row view: a pure read of the scheduler's live counters. */
+  view(): VerificationQueueView {
+    return {
+      lockInUse: this.slots.size > 0,
+      activeRuns: this.activeCount(),
+      queuedRuns: this.queuedCount(),
+      workerBudget: this.budget,
+      workersPerRun: this.workersPerRun,
+    };
   }
 
   queuedCount(): number {

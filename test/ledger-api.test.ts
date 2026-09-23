@@ -295,6 +295,23 @@ describe('ledger api — the record of state', () => {
     expect(api.latestJobEvent('scoped-events', 'never-happened')).toBeNull();
     expect(api.latestJobEvent('no-such-job', 'silas.wake')).toBeNull();
   });
+  it('latestEventOfKinds/countEventsSince answer the board health cards (Silas wake + today)', () => {
+    api.appendCustomEvent({ kind: 'silas.wake', payload: { marker: 'health-test' } });
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId: 'scoped-events', payload: { marker: 'health-test' } });
+    const latestWake = api.latestEventOfKinds(['silas.wake']);
+    expect(latestWake?.kind).toBe('silas.wake');
+    expect((latestWake?.payload as { marker?: string }).marker).toBe('health-test');
+    expect(api.latestEventOfKinds(['never.happened'])).toBeNull();
+    expect(() => api.latestEventOfKinds([])).toThrow(/at least one kind/u);
+    expect(
+      api.countEventsSince(['silas.wake', 'silas.rebrief'], '1970-01-01T00:00:00.000Z'),
+    ).toBeGreaterThanOrEqual(2);
+    expect(api.countEventsSince(['silas.wake'], '2999-01-01T00:00:00.000Z')).toBe(0);
+    expect(
+      api.countEventsSince(['silas.rebrief'], '1970-01-01T00:00:00.000Z'),
+    ).toBeGreaterThanOrEqual(1);
+    expect(() => api.countEventsSince([], '1970-01-01T00:00:00.000Z')).toThrow(/at least one kind/u);
+  });
   it('a restarted ledger (same file) serves the full record — the board rebuilds from it', () => {
     db.close();
     const dataDir = cleanupDirs[0] as string; // the dir from beforeAll

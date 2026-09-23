@@ -10,6 +10,11 @@
  * set persists per job; actionable state (unacked action-required
  * notifications, failed/aborted rounds) rides the collapsed face and is
  * never hidden by the collapse.
+ *
+ * v4: the board answers WHAT TO DO NEXT — a KPI strip (status/PR/lane
+ * counts), a health row (deploy drift first), and attention-bucketed job
+ * ordering (NEEDS YOU / IN FLIGHT / SETTLED / COLD) with recency inside
+ * each band.
  */
 
 import {
@@ -23,6 +28,10 @@ import {
   type RoundView,
 } from '../lib/board-protocol.js';
 import { loadExpandedJobs, saveExpandedJobs } from '../lib/board-collapse.js';
+import { BAND_LABELS, bucketSnapshot, type BandedJob, type BandId } from '../lib/board-bands.js';
+import { healthCards } from '../lib/board-health.js';
+import { boardKpis } from '../lib/board-kpi.js';
+import { formatAge } from '../lib/board-time.js';
 import { jobSignal, pluralCount, roundSummary, unackedByJob } from '../lib/board-signals.js';
 import type { BoardClient } from '../lib/board-client.js';
 import type { StorageLike } from '../theme.js';
@@ -133,11 +142,102 @@ export class BoardView {
   render(snapshot: BoardSnapshot): void {
     const previous = this.snapshot;
     this.snapshot = snapshot;
+    this.renderKpis(snapshot);
+    this.renderHealth(snapshot);
     this.renderTrackers(snapshot);
     this.renderRepos(snapshot);
     this.renderAgents(snapshot.agents);
     this.renderNotifications(snapshot.notifications);
     this.surfaceNewNotifications(previous, snapshot.notifications);
+  }
+
+  // ------------------------------------------------------------------
+  // KPI strip + health row (v4)
+  // ------------------------------------------------------------------
+
+  /** The top-of-board strip: status counts, PR state, lane activity.
+   * Every number is derived from the SAME snapshot the cards render, so
+   * the strip can never disagree with the board below it. */
+  private renderKpis(snapshot: BoardSnapshot): void {
+    const mount = mustGet('board-kpis');
+    mount.replaceChildren();
+    const kpis = boardKpis(snapshot);
+    mount.append(
+      this.kpiGroup('Jobs', [
+        { label: 'working', value: kpis.jobs.working },
+        { label: 'in-review', value: kpis.jobs.inReview },
+        { label: 'merged', value: kpis.jobs.merged },
+        { label: 'done', value: kpis.jobs.done },
+        { label: 'parked', value: kpis.jobs.parked },
+      ], `${kpis.jobs.total} jobs on the board`),
+      this.kpiGroup('PRs', [
+        { label: 'open', value: kpis.prs.open },
+        {
+          label: 'conflicting',
+          value: kpis.prs.conflicting,
+          tone: kpis.prs.conflicting > 0 ? 'alert' : null,
+        },
+        { label: 'merged today', value: kpis.prs.mergedToday },
+      ]),
+      this.kpiGroup('Lanes', [
+        { label: 'live minions', value: kpis.lanes.liveMinions },
+        {
+          label: 'mid-turn',
+          value: kpis.lanes.midTurn,
+          ageSince: kpis.lanes.midTurnOldestAt,
+        },
+        { label: 'disposed', value: kpis.lanes.disposed },
+      ]),
+    );
+  }
+
+  private kpiGroup(
+    title: string,
+    stats: readonly { label: string; value: number; tone?: 'alert' | null; ageSince?: string | null }[],
+    titleAttr?: string,
+  ): HTMLElement {
+    const card = el('div', 'board-kpi pp-soft');
+    const head = el('div', 'lbl board-kpi__title', title);
+    if (titleAttr !== undefined) head.title = titleAttr;
+    card.append(head);
+    const row = el('div', 'board-kpi__row');
+    for (const stat of stats) {
+      const node = el(
+        'span',
+        `board-kpi__stat${stat.tone === 'alert' ? ' board-kpi__stat--alert' : ''}`,
+      );
+      node.append(
+        el('b', 'board-kpi__value', String(stat.value)),
+        el('span', 'board-kpi__label', stat.label),
+      );
+      if (stat.ageSince !== undefined && stat.ageSince !== null) {
+        node.append(this.ageNode('board-kpi__age lbl', stat.ageSince, 'oldest ', ''));
+      }
+      row.append(node);
+    }
+    card.append(row);
+    return card;
+  }
+
+  /** The slim health row: each card earned by a real incident; sources
+   * not yet wired render `n/a` (never a fabricated zero). */
+  private renderHealth(snapshot: BoardSnapshot): void {
+    const mount = mustGet('board-health');
+    mount.replaceChildren();
+    for (const card of healthCards(snapshot)) {
+      const node = el('div', `board-health__card pp-soft board-health__card--${card.tone}`);
+      node.dataset.card = card.id;
+      node.title = card.titleAttr;
+      node.append(
+        el('div', 'lbl board-health__title', card.title),
+        el('div', 'board-health__value', card.value),
+        el('div', 'lbl board-health__detail', card.detail),
+      );
+      if (card.flag !== null) {
+        node.append(el('span', 'pp-chip pp-chip--alert board-health__flag', card.flag));
+      }
+      mount.append(node);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -201,9 +301,13 @@ export class BoardView {
   // Repo-grouped job cards
   // ------------------------------------------------------------------
 
+  /** Banded repo cards: NEEDS YOU / IN FLIGHT / SETTLED / COLD, recency
+   * within each band. A repo's jobs can appear under several bands — the
+   * repo card repeats with only the jobs in that band, so the operator
+   * reads priority first and grouping second. */
   private renderRepos(snapshot: BoardSnapshot): void {
     this.mount.replaceChildren();
-    if (snapshot.repos.length === 0) {
+    if (snapshot.repos.length === 0 || snapshot.repos.every((repo) => repo.jobs.length === 0)) {
       const empty = el('div', 'board-empty');
       empty.append(
         el('div', 'board-empty__title', 'The board is quiet'),
@@ -217,22 +321,40 @@ export class BoardView {
       return;
     }
     const unacked = unackedByJob(snapshot);
-    for (const repo of snapshot.repos) {
-      const card = el('section', 'pp-card board-repo reveal');
-      const head = el('div', 'board-repo__head');
-      head.append(el('h2', 'board-repo__name', `📦 ${repo.name}`), el('span', 'lbl', `${repo.jobs.length} job${repo.jobs.length === 1 ? '' : 's'}`));
-      card.append(head);
-      for (const job of repo.jobs) card.append(this.jobRow(job, unacked.get(job.id) ?? 0));
-      this.mount.append(card);
+    const bands = bucketSnapshot(snapshot, { now: Date.now(), unackedByJob: unacked });
+    for (const group of bands) {
+      const section = el('section', `board-band board-band--${group.band}`);
+      const head = el('h2', 'board-band__head');
+      head.append(
+        el('span', 'board-band__label', BAND_LABELS[group.band]),
+        el('span', 'board-band__count lbl', `${group.jobs.length} job${group.jobs.length === 1 ? '' : 's'}`),
+      );
+      section.append(head);
+      for (const repo of groupBandedByRepo(group.jobs)) {
+        const card = el('section', 'pp-card board-repo reveal');
+        const repoHead = el('div', 'board-repo__head');
+        repoHead.append(
+          el('h2', 'board-repo__name', `📦 ${repo.name}`),
+          el('span', 'lbl', `${repo.jobs.length} job${repo.jobs.length === 1 ? '' : 's'}`),
+        );
+        card.append(repoHead);
+        for (const entry of repo.jobs) {
+          card.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, group.band));
+        }
+        section.append(card);
+      }
+      this.mount.append(section);
     }
   }
 
   /** One collapsed-by-default card. Collapsed DOM is exactly: title +
-   * status chip + optional PR link + optional one compact signal chip +
-   * one meta line. The detail body is built only when expanded. */
-  private jobRow(job: JobView, unackedActionRequired: number): HTMLElement {
+   * status chip + optional stale flag + optional PR link + optional one
+   * compact signal chip + one meta line. The detail body is built only
+   * when expanded. */
+  private jobRow(job: JobView, unackedActionRequired: number, stale: boolean, band: BandId): HTMLElement {
     const row = el('article', 'board-job');
     row.dataset.jobId = job.id;
+    row.dataset.band = band;
 
     const head = el('div', 'board-job__head');
     const toggle = el('button', 'board-job__toggle');
@@ -246,6 +368,11 @@ export class BoardView {
       name,
       el('span', `pp-chip board-job__status ${jobChipTone(job.status)}`, job.status),
     );
+    if (stale) {
+      const flag = el('span', 'pp-chip pp-chip--alert board-job__stale', 'stalled');
+      flag.title = 'working with no agent frames past the stall window';
+      toggle.append(flag);
+    }
     head.append(toggle);
     if (job.prUrl !== null) {
       const link = el('a', 'board-job__pr', 'PR ↗');
@@ -597,17 +724,17 @@ function formatTs(iso: string): string {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-/** Compact age for the live trackers (`12s`, `4m`, `2h`, `3d`); null and
- * unparseable stamps render an honest em dash, never a fake number. */
-function formatAge(iso: string | null, now = Date.now()): string {
-  if (iso === null) return '—';
-  const then = Date.parse(iso);
-  if (Number.isNaN(then)) return '—';
-  const seconds = Math.max(0, Math.floor((now - then) / 1_000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours}h`;
-  return `${Math.floor(hours / 24)}d`;
+/** Re-group one band's recency-sorted jobs by repo (alphabetical repo
+ * order); the band ordering carries priority, grouping stays legible. */
+function groupBandedByRepo(jobs: readonly BandedJob[]): { name: string; jobs: readonly BandedJob[] }[] {
+  const byRepo = new Map<string, BandedJob[]>();
+  for (const entry of jobs) {
+    const group = byRepo.get(entry.job.repo);
+    if (group === undefined) byRepo.set(entry.job.repo, [entry]);
+    else group.push(entry);
+  }
+  return [...byRepo.entries()]
+    .map(([name, grouped]) => ({ name, jobs: grouped }))
+    .sort((left, right) => left.name.localeCompare(right.name));
 }
+

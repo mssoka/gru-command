@@ -4,9 +4,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   AgentView,
   BoardSnapshot,
+  BuildView,
   JobView,
   NotificationView,
   RoundView,
+  SelfHealView,
+  SilasView,
+  VerifyQueueView,
 } from '../lib/board-protocol.js';
 import { memoryStorage } from '../lib/chat-storage.js';
 import { BoardView } from './board.js';
@@ -76,6 +80,7 @@ function baseJob(overrides: Partial<JobView> = {}): JobView {
     status: 'in-review',
     updatedAt: '2026-01-01T00:00:00.000Z',
     prUrl: null,
+    prState: null,
     baseBranch: 'main',
     note: null,
     rounds: [baseRound()],
@@ -97,10 +102,15 @@ function snapshot(
     jobs?: readonly JobView[];
     decisions?: DecisionsOverrides;
     unackedActionRequired?: number;
+    build?: BuildView | null;
+    silas?: SilasView | null;
+    verify?: VerifyQueueView | null;
+    selfHeal?: SelfHealView | null;
+    repos?: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   } = {},
 ): BoardSnapshot {
   return {
-    repos: [{ name: 'demo', jobs: options.jobs ?? [baseJob()] }],
+    repos: options.repos ?? [{ name: 'demo', jobs: options.jobs ?? [baseJob()] }],
     agents: options.agents ?? [],
     notifications: options.notifications ?? [],
     decisions: {
@@ -117,11 +127,17 @@ function snapshot(
       ...options.decisions,
     },
     unackedActionRequired: options.unackedActionRequired ?? 0,
+    build: options.build ?? null,
+    silas: options.silas ?? null,
+    verify: options.verify ?? null,
+    selfHeal: options.selfHeal ?? null,
   };
 }
 
 function mountBoardDom(): void {
   document.body.innerHTML = `
+    <div id="board-kpis"></div>
+    <div id="board-health"></div>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
     <button id="notification-bell"><span id="notification-badge">0</span></button>
@@ -433,5 +449,211 @@ describe('board card collapse (v3)', () => {
     expect(card?.dataset.expanded).toBe('false');
     expect(card?.querySelector('.board-job__body')).toBeNull();
     expect(card?.querySelector('.board-job__signal')?.textContent).toContain('live');
+  });
+});
+
+describe('board v4 — KPI strip', () => {
+  beforeEach(mountBoardDom);
+
+  it('renders job status, PR, and lane counts derived from the same snapshot', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ id: 'w1', status: 'working' }),
+          baseJob({ id: 'w2', status: 'working' }),
+          baseJob({ id: 'r1', status: 'in-review' }),
+          baseJob({ id: 'm1', status: 'merged', prUrl: 'https://x/1', prState: 'merged' }),
+          baseJob({ id: 'p1', status: 'parked' }),
+          baseJob({ id: 'i1', status: 'in-review', prUrl: 'https://x/2', prState: 'conflicting' }),
+        ],
+        agents: [
+          agent('minion-live', { role: 'minion', state: 'streaming', lastActivity: new Date(Date.now() - 30_000).toISOString() }),
+          agent('minion-idle', { role: 'minion', state: 'idle' }),
+          agent('minion-dead', { role: 'minion', state: 'disposed' }),
+          agent('lens', { role: 'perkins', state: 'streaming', lastActivity: new Date(Date.now() - 600_000).toISOString() }),
+        ],
+      }),
+    );
+    const groups = [...document.querySelectorAll('#board-kpis .board-kpi')];
+    expect(groups).toHaveLength(3);
+    const text = document.getElementById('board-kpis')?.textContent ?? '';
+    expect(text).toContain('working');
+    expect(text).toContain('in-review');
+    expect(text).toContain('merged today');
+    expect(text).toContain('live minions');
+    expect(text).toContain('disposed');
+
+    const stats = [...document.querySelectorAll<HTMLElement>('#board-kpis .board-kpi__stat')].map((node) => ({
+      label: node.querySelector('.board-kpi__label')?.textContent ?? '',
+      value: node.querySelector('.board-kpi__value')?.textContent ?? '',
+    }));
+    const byLabel = new Map(stats.map((stat) => [stat.label, stat.value]));
+    expect(byLabel.get('working')).toBe('2');
+    expect(byLabel.get('in-review')).toBe('2');
+    expect(byLabel.get('merged')).toBe('1');
+    expect(byLabel.get('parked')).toBe('1');
+    expect(byLabel.get('conflicting')).toBe('1');
+    expect(byLabel.get('open')).toBe('0');
+    expect(byLabel.get('live minions')).toBe('2');
+    expect(byLabel.get('mid-turn')).toBe('2');
+    expect(byLabel.get('disposed')).toBe('1');
+    // Mid-turn carries the oldest quiet age.
+    const midTurn = [...document.querySelectorAll<HTMLElement>('#board-kpis .board-kpi__stat')].find(
+      (node) => node.querySelector('.board-kpi__label')?.textContent === 'mid-turn',
+    );
+    expect(midTurn?.querySelector('.board-kpi__age')?.textContent).toMatch(/oldest \d+[smhd]/);
+  });
+});
+
+describe('board v4 — health row', () => {
+  beforeEach(mountBoardDom);
+
+  it('renders the deploy-drift card with the restart-pending flag when behind', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        build: {
+          buildRev: 'a'.repeat(40),
+          buildCommittedAt: new Date(Date.now() - 6 * 3_600_000).toISOString(),
+          originMainRev: 'b'.repeat(40),
+          originMainCommittedAt: new Date().toISOString(),
+          commitsBehind: 43,
+          checkedAt: new Date().toISOString(),
+          checkError: null,
+        },
+      }),
+    );
+    const deploy = document.querySelector<HTMLElement>('.board-health__card[data-card="deploy"]');
+    expect(deploy?.querySelector('.board-health__value')?.textContent).toBe('43 behind');
+    expect(deploy?.querySelector('.board-health__flag')?.textContent).toBe('RESTART PENDING');
+    expect(deploy?.classList.contains('board-health__card--alert')).toBe(true);
+    expect(document.querySelectorAll('.board-health__card')).toHaveLength(6);
+  });
+
+  it('renders n/a honestly for unwired sources (verify queue, cure efficacy)', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot());
+    const valueOf = (card: string): string | undefined =>
+      document
+        .querySelector<HTMLElement>(`.board-health__card[data-card="${card}"] .board-health__value`)
+        ?.textContent ?? undefined;
+    expect(valueOf('deploy')).toBe('n/a');
+    expect(valueOf('verify')).toBe('n/a');
+    expect(valueOf('cure')).toBe('n/a');
+    expect(valueOf('alerts')).toBe('0');
+    expect(valueOf('reviews')).toBe('1 active'); // the base job carries a live round
+  });
+
+  it('renders the verify queue from the snapshot when the scheduler is wired', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        verify: { lockInUse: true, activeRuns: 1, queuedRuns: 2, workerBudget: 8, workersPerRun: 4 },
+      }),
+    );
+    const verify = document.querySelector<HTMLElement>('.board-health__card[data-card="verify"]');
+    expect(verify?.querySelector('.board-health__value')?.textContent).toBe('lock held');
+    expect(verify?.querySelector('.board-health__detail')?.textContent).toContain('2 queued');
+  });
+});
+
+describe('board v4 — attention-bucketed job ordering', () => {
+  beforeEach(mountBoardDom);
+
+  it('renders bands in NEEDS YOU → IN FLIGHT → SETTLED → COLD order with visible headers', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ id: 'cold-1', status: 'parked' }),
+          baseJob({ id: 'settled-1', status: 'delivered' }),
+          baseJob({ id: 'flight-1', status: 'in-review' }),
+          baseJob({ id: 'needs-1', status: 'blocked' }),
+        ],
+      }),
+    );
+    const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
+    expect(bands.map((band) => band.querySelector('.board-band__label')?.textContent)).toEqual([
+      'NEEDS YOU',
+      'IN FLIGHT',
+      'SETTLED',
+      'COLD',
+    ]);
+    expect(bands[0]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('needs-1');
+    expect(bands[1]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('flight-1');
+    expect(bands[2]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('settled-1');
+    expect(bands[3]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('cold-1');
+    // Band membership rides the row too.
+    expect(bands[0]?.querySelector('.board-job')?.getAttribute('data-band')).toBe('needs-you');
+  });
+
+  it('promotes a conflicting PR to NEEDS YOU and demotes a stalled working lane to COLD with a stale flag', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'conflicting-job',
+            status: 'in-review',
+            prUrl: 'https://x/1',
+            prState: 'conflicting',
+          }),
+          baseJob({
+            id: 'stalled-job',
+            status: 'working',
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+          baseJob({ id: 'fresh-job', status: 'working' }),
+        ],
+      }),
+    );
+    const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
+    expect(bands.map((band) => band.querySelector('.board-band__label')?.textContent)).toEqual(['NEEDS YOU', 'IN FLIGHT', 'COLD']);
+    expect(bands[0]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('conflicting-job');
+    expect(bands[1]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('fresh-job');
+    const stalled = bands[2]?.querySelector<HTMLElement>('.board-job');
+    expect(stalled?.getAttribute('data-job-id')).toBe('stalled-job');
+    expect(stalled?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+  });
+
+  it('attributes unacked action-required notifications through agent bindings', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'quiet-job', status: 'parked' })],
+        agents: [agent('minion-1', { role: 'minion', jobId: 'quiet-job' })],
+        notifications: [notification('n1', { agentId: 'minion-1' })],
+        unackedActionRequired: 1,
+      }),
+    );
+    const band = document.querySelector<HTMLElement>('#board-jobs .board-band');
+    expect(band?.querySelector('.board-band__label')?.textContent).toBe('NEEDS YOU');
+    expect(band?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('quiet-job');
+  });
+
+  it('keeps repo grouping inside a band (a repo appears once per band it has jobs in)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        repos: [
+          {
+            name: 'alpha',
+            jobs: [
+              baseJob({ id: 'a-needs', repo: 'alpha', status: 'blocked' }),
+              baseJob({ id: 'a-flight', repo: 'alpha', status: 'in-review' }),
+            ],
+          },
+          { name: 'beta', jobs: [baseJob({ id: 'b-needs', repo: 'beta', status: 'blocked' })] },
+        ],
+      }),
+    );
+    const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
+    const needsYou = bands[0];
+    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS YOU');
+    const repoNames = [...(needsYou?.querySelectorAll('.board-repo__name') ?? [])].map((node) => node.textContent);
+    expect(repoNames).toEqual(['📦 alpha', '📦 beta']);
+    const flight = bands[1];
+    expect(flight?.querySelector('.board-repo__name')?.textContent).toBe('📦 alpha');
   });
 });

@@ -440,7 +440,11 @@ test.describe('board (E6, mock feed)', () => {
     await pair(page);
     await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
-    await expect(page.locator('.board-repo', { hasText: 'demo-api' })).toBeVisible();
+    // v4: bands lead the board; a repo card repeats per band it has jobs in.
+    await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS YOU');
+    await expect(
+      page.locator('.board-band--needs-you .board-job', { hasText: 'Merge main into the retry branch' }),
+    ).toBeVisible();
 
     // Collapsed default: summary only — no detail nodes in the DOM.
     const job = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
@@ -467,6 +471,37 @@ test.describe('board (E6, mock feed)', () => {
     await page.locator('#notification-bell').click();
     await expect(page.locator('.board-notification').first()).toBeVisible();
     await page.locator('#notification-bell').click();
+  });
+
+  test('v4: KPI strip, health row, and attention-bucketed ordering', async ({ page }) => {
+    await pair(page);
+    await page.locator('#tab-board').click();
+    await expect(page.locator('#board-view')).toBeVisible();
+
+    // KPI strip renders the three groups with live counts.
+    await expect(page.locator('#board-kpis .board-kpi')).toHaveCount(3);
+    const stats = page.locator('#board-kpis .board-kpi__stat');
+    await expect(stats).toHaveCount(11); // 5 jobs + 3 PRs + 3 lane stats
+    const text = await page.locator('#board-kpis').textContent();
+    for (const label of ['working', 'in-review', 'merged', 'done', 'parked', 'open', 'conflicting', 'merged today', 'live minions', 'mid-turn', 'disposed']) {
+      expect(text).toContain(label);
+    }
+
+    // Health row: deploy drift is mandatory and reads the mock's 3-behind build.
+    const deploy = page.locator('.board-health__card[data-card="deploy"]');
+    await expect(deploy).toContainText('3 behind');
+    await expect(deploy.locator('.board-health__flag')).toHaveText('RESTART PENDING');
+    await expect(page.locator('.board-health__card[data-card="verify"]')).toContainText('lock free');
+    await expect(
+      page.locator('.board-health__card[data-card="cure"] .board-health__value'),
+    ).toHaveText('n/a');
+
+    // Bands in priority order, headers visible.
+    await expect(page.locator('.board-band__label')).toHaveText(['NEEDS YOU', 'IN FLIGHT', 'SETTLED', 'COLD']);
+    // The stalled working lane sank to COLD carrying the stale flag.
+    const stalled = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
+    await expect(stalled).toBeVisible();
+    await expect(stalled.locator('.board-job__stale')).toHaveText('stalled');
   });
 
   test('card disclosure persists per job across a reload (v3)', async ({ page }) => {

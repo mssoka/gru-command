@@ -10,6 +10,7 @@ import {
   VerificationLockTimeoutError,
   VerificationScheduler,
   type VerificationProgress,
+  type VerificationQueueView,
   type VerificationSchedulerOptions,
 } from './scheduler.js';
 
@@ -39,6 +40,8 @@ export interface VerificationServerOptions {
 export interface VerificationServer {
   /** First-mounted hook: claims POST /api/verify, passes everything else. */
   requestHook(req: IncomingMessage, res: ServerResponse, path: string): boolean;
+  /** Board health row (board UX v4): live lock/queue/budget counters. */
+  view(): VerificationQueueView;
   dispose(): Promise<void>;
 }
 
@@ -246,6 +249,10 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
   }
 
   return {
+    view(): VerificationQueueView {
+      return scheduler.view();
+    },
+
     requestHook(req, res, path): boolean {
       if (path !== '/api/verify') return false;
       if (req.method !== 'POST') {

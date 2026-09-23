@@ -122,6 +122,31 @@ describe('verification scheduler — global budget', () => {
     expect(scheduler.activeCount()).toBe(0);
   });
 
+  it('view() reports lock/queue/budget counters for the board health row', async () => {
+    const { scheduler } = makeScheduler({ maxConcurrent: 1, workerBudget: 8 });
+    scheduler.start();
+    expect(scheduler.view()).toEqual({
+      lockInUse: false,
+      activeRuns: 0,
+      queuedRuns: 0,
+      workerBudget: 8,
+      workersPerRun: 8,
+    });
+    const lease = await scheduler.acquire(spec('job-a'));
+    const queued = scheduler.acquire(spec('job-b'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(scheduler.view()).toEqual({
+      lockInUse: true,
+      activeRuns: 1,
+      queuedRuns: 1,
+      workerBudget: 8,
+      workersPerRun: 8,
+    });
+    scheduler.release(lease);
+    scheduler.release(await queued);
+    expect(scheduler.view()).toMatchObject({ lockInUse: false, activeRuns: 0, queuedRuns: 0 });
+  });
+
   it('never grants two runs from racing requests (atomic claim under an async sink)', async () => {
     const { scheduler } = makeScheduler({ maxConcurrent: 1 });
     scheduler.start();

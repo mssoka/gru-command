@@ -899,6 +899,153 @@ body {
   gap: 16px;
 }
 
+/* v4 KPI strip: compact stat cards above the bands. All counts derive
+   from the same snapshot the cards render — never a second data source. */
+.board-kpis {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.board-kpi {
+  flex: 1 1 180px;
+  min-width: 160px;
+  display: grid;
+  gap: 4px;
+  padding: 10px 14px;
+}
+
+.board-kpi__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  align-items: baseline;
+}
+
+.board-kpi__stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.board-kpi__stat--alert {
+  color: var(--ink);
+}
+
+.board-kpi__stat--alert .board-kpi__value {
+  background: var(--alert);
+  border-radius: 999px;
+  padding: 0 8px;
+}
+
+.board-kpi__value {
+  font-size: 17px;
+  font-weight: 900;
+  color: var(--ink);
+}
+
+.board-kpi__age {
+  color: var(--muted);
+}
+
+/* v4 health row: one slim card per incident the operator must not
+   re-learn the hard way. `n/a` cards stay muted — absence is a fact,
+   not a zero. */
+.board-health {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.board-health__card {
+  position: relative;
+  flex: 1 1 150px;
+  min-width: 140px;
+  display: grid;
+  gap: 3px;
+  padding: 9px 12px;
+}
+
+.board-health__value {
+  font-size: 15px;
+  font-weight: 900;
+}
+
+.board-health__detail {
+  font-size: 10px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.board-health__flag {
+  justify-self: start;
+  font-size: 9px;
+  padding: 2px 8px;
+}
+
+.board-health__card--alert {
+  border-left: 6px solid var(--alert);
+}
+
+.board-health__card--alert .board-health__value {
+  color: var(--ink);
+}
+
+.board-health__card--warn {
+  border-left: 6px solid var(--work);
+}
+
+.board-health__card--ok {
+  border-left: 6px solid var(--done);
+}
+
+.board-health__card--muted {
+  border-left: 6px solid var(--park);
+}
+
+/* v4 attention bands: priority first, repo grouping inside. */
+.board-band {
+  display: grid;
+  gap: 10px;
+}
+
+.board-band__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+}
+
+.board-band__label {
+  font-weight: 900;
+}
+
+.board-band--needs-you .board-band__label {
+  color: var(--ink);
+  background: var(--alert);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+
+.board-band--cold .board-band__label {
+  color: var(--muted);
+}
+
+.board-band__count {
+  color: var(--muted);
+}
+
+.board-job__stale {
+  flex: none;
+  font-size: 10px;
+  padding: 2px 8px;
+}
+
 .board-repo {
   display: grid;
   gap: 12px;

@@ -11,6 +11,8 @@ import { LedgerApi, type NotificationRecord } from './ledger/api.js';
 import { EventBus } from './events/bus.js';
 import { BoardEngine } from './board/engine.js';
 import { createBoardServer } from './board/server.js';
+import { DeployDriftTracker } from './board/deploy-drift.js';
+import { defaultPackageRoot, readBuildInfo } from './build-info.js';
 import { NotificationCenter } from './notifications/center.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
@@ -23,6 +25,7 @@ import { SilasDriver } from './dispatch/silas-driver.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { createVerificationServer } from './verify/server.js';
+import type { VerificationQueueView } from './verify/scheduler.js';
 import { createService, type ServiceHandle } from './server.js';
 import { createAttachmentsServer } from './attachments/server.js';
 import { uploadsDirNeedsHardening } from './attachments/resolver.js';
@@ -227,6 +230,7 @@ async function main(): Promise<number> {
     silas?: SilasDriver;
     wave?: WaveRunner;
     verify?: ReturnType<typeof createVerificationServer>;
+    deployDrift?: DeployDriftTracker;
   } = {};
   let shuttingDown = false;
   const shutdown = (signal: string) => {
@@ -308,6 +312,7 @@ async function main(): Promise<number> {
             logger.error('verification scheduler shutdown failed', { error: String(error) });
           }
         }
+        state.deployDrift?.stop();
         if (state.registry !== undefined) {
           try {
             await state.registry.dispose();
@@ -378,6 +383,17 @@ async function main(): Promise<number> {
   // the supervisor exists; the closure resolves per snapshot.
   let supervisor: Supervisor | null = null;
   let decisions: DecisionRuntime | null = null;
+  // Deploy drift (board UX v4): the running build's revision vs
+  // origin/main. The tracker checks in the background (boot is never
+  // blocked by git/network) and the snapshot carries the cached view.
+  const deployDrift = new DeployDriftTracker({
+    repoRoot: defaultPackageRoot(),
+    build: readBuildInfo(),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  // Late-bound (the verification server lands below) — same pattern as
+  // supervisionFor / decisionsStatus above.
+  let verificationView: () => VerificationQueueView | null = () => null;
   const engine = new BoardEngine({
     ledger,
     bus,
@@ -394,9 +410,13 @@ async function main(): Promise<number> {
       incarnation: 'service-not-started',
       generation: 0,
     },
+    buildDrift: () => deployDrift.view(),
+    verifyQueue: () => verificationView(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   registry.onAgentEvent((envelope) => engine.onRuntimeEvent(envelope));
+  deployDrift.start();
+  state.deployDrift = deployDrift;
 
   // Chat (E4): the single Gru session behind /ws. The durable frame log
   // loads and boot-settles BEFORE the HTTP server accepts anything (r1
@@ -621,6 +641,7 @@ async function main(): Promise<number> {
     worktrees: worktreeManager,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  verificationView = () => verifyServer.view();
   state.verify = verifyServer;
   // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
   // same seam chat and dispatch both ride — workspace browse (on-disk

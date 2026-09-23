@@ -22,6 +22,7 @@ function snapshot(): BoardSnapshot {
             status: 'working',
             updatedAt: '2026-01-01T00:00:00.000Z',
             prUrl: null,
+            prState: null,
             baseBranch: null,
             note: null,
             rounds: [
@@ -116,6 +117,51 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(badUnacked)).toBe(false);
     const empty: Record<string, unknown> = {};
     expect(isValidSnapshot(empty)).toBe(false);
+  });
+
+  it('tolerates absent v4 blocks (pre-v4 servers) and validates present ones', () => {
+    // Absent → fine (rollout tolerance). Null → fine (explicit "not wired").
+    expect(isValidSnapshot(snapshot())).toBe(true);
+    const nullBlocks = { ...snapshot(), build: null, silas: null, verify: null, selfHeal: null } as unknown;
+    expect(isValidSnapshot(nullBlocks)).toBe(true);
+
+    const wired = {
+      ...snapshot(),
+      build: {
+        buildRev: 'a'.repeat(40),
+        buildCommittedAt: '2026-01-01T00:00:00.000Z',
+        originMainRev: 'b'.repeat(40),
+        originMainCommittedAt: null,
+        commitsBehind: 43,
+        checkedAt: '2026-01-01T00:00:00.000Z',
+        checkError: null,
+      },
+      silas: { lastWakeAt: null, reconciliationsToday: 2, checkedAt: '2026-01-01T00:00:00.000Z' },
+      verify: { lockInUse: true, activeRuns: 1, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 },
+      selfHeal: { sessionsResumed: 1, sessionsOrphaned: 0, since: null },
+    } as unknown;
+    expect(isValidSnapshot(wired)).toBe(true);
+
+    // A present-but-malformed block is a server bug — reject loudly.
+    for (const [field, broken] of [
+      ['build', { ...(wired as { build: object }).build, commitsBehind: '43' }],
+      ['silas', { ...(wired as { silas: object }).silas, reconciliationsToday: -1 }],
+      ['verify', { ...(wired as { verify: object }).verify, lockInUse: 'yes' }],
+      ['selfHeal', { ...(wired as { selfHeal: object }).selfHeal, sessionsResumed: 1.5 }],
+    ] as const) {
+      expect(isValidSnapshot({ ...(wired as object), [field]: broken }), field).toBe(false);
+    }
+  });
+
+  it('accepts prState present, null, or absent; rejects junk states', () => {
+    for (const prState of ['open', 'conflicting', 'merged', null, undefined]) {
+      const candidate = snapshot();
+      (candidate.repos[0]!.jobs[0] as unknown as { prState: unknown }).prState = prState;
+      expect(isValidSnapshot(candidate), String(prState)).toBe(true);
+    }
+    const junk = snapshot();
+    (junk.repos[0]!.jobs[0] as unknown as { prState: unknown }).prState = 'draft';
+    expect(isValidSnapshot(junk)).toBe(false);
   });
 
   it('tone mapping covers every chip state with a design-token class', () => {

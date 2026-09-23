@@ -5,6 +5,8 @@ import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { EventBus } from '../events/bus.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
+import type { DeployDriftView } from './deploy-drift.js';
+import type { VerificationQueueView } from '../verify/scheduler.js';
 import {
   DEFAULT_LENSES,
   LedgerApi,
@@ -66,6 +68,12 @@ export interface LaneView {
   readonly createdAt: string;
 }
 
+/** PR state the board buckets on (board UX v4). `open`/`merged` are
+ * derived from the record today; `conflicting` is the cascade-promoter
+ * signal the PR-state sweep will write — the board consumes it the day
+ * it appears, and never invents it. */
+export type JobPrState = 'open' | 'conflicting' | 'merged';
+
 export interface JobView {
   readonly id: string;
   readonly repo: string;
@@ -73,6 +81,7 @@ export interface JobView {
   readonly status: JobStatus;
   readonly updatedAt: string;
   readonly prUrl: string | null;
+  readonly prState: JobPrState | null;
   readonly baseBranch: string | null;
   readonly note: string | null;
   readonly rounds: readonly RoundView[];
@@ -110,6 +119,24 @@ export interface NotificationView {
   readonly resolvedBy: string | null;
 }
 
+/** Silas ops health (board UX v4): the newest wake (sweep or event) and
+ * how many reconciliation events landed today. Derived from the durable
+ * event stream — the ledger is the record. */
+export interface SilasView {
+  readonly lastWakeAt: string | null;
+  readonly reconciliationsToday: number;
+  readonly checkedAt: string;
+}
+
+/** Self-healing stats (board UX v4): sessions resumed vs orphaned since
+ * boot. Null until a producer exists — the board renders `n/a` rather
+ * than a fabricated zero. */
+export interface SelfHealView {
+  readonly sessionsResumed: number;
+  readonly sessionsOrphaned: number;
+  readonly since: string | null;
+}
+
 export interface BoardSnapshot {
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
@@ -119,6 +146,14 @@ export interface BoardSnapshot {
    * system-resolved incident no longer needs human action). Counted from
    * the table, not the 30-row feed window, so the badge stays true. */
   readonly unackedActionRequired: number;
+  /** Running build vs origin/main (null when the tracker is unwired). */
+  readonly build: DeployDriftView | null;
+  /** Silas ops health, derived from the ledger event stream. */
+  readonly silas: SilasView;
+  /** Verification scheduler queue (null until its API is wired). */
+  readonly verify: VerificationQueueView | null;
+  /** Self-healing session stats (null until its producer exists). */
+  readonly selfHeal: SelfHealView | null;
 }
 
 /** Agent-rail ordering: the standing crew first, workers after. */
@@ -140,6 +175,28 @@ const STATE_ORDER: Readonly<Record<AgentState, number>> = {
  * wave); the verdict prefix is the only structured part, so it is parsed
  * ONCE here and every board surface sees one shape. */
 const LENS_VERDICTS = ['blocker', 'warning', 'note', 'clean'] as const;
+
+/** Silas event kinds the health card reads: the wake is the activity
+ * marker, reconciliations are the state-correction events that moved the
+ * board (registering a PR, triggering review, directives, rebriefs,
+ * escalations). */
+const SILAS_WAKE_KINDS = ['silas.wake'] as const;
+const SILAS_RECONCILE_KINDS = [
+  'silas.pr-registered',
+  'silas.review-triggered',
+  'silas.directive-sent',
+  'silas.rebrief',
+  'silas.escalated',
+] as const;
+
+/** PR state from the record: a terminal `merged` job is merged; a
+ * registered URL is open. `conflicting` has no writer yet — the PR-state
+ * sweep will land it, and the board already buckets on it. */
+function prStateOf(job: Pick<JobRecord, 'status' | 'prUrl'>): JobView['prState'] {
+  if (job.status === 'merged') return 'merged';
+  if (job.prUrl !== null) return 'open';
+  return null;
+}
 
 function lensVerdictFromNote(note: string | null): string | null {
   if (note === null) return null;
@@ -167,6 +224,14 @@ export interface BoardEngineOptions {
    * to the supervisor after both exist). */
   readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
+  /** Board UX v4: deploy drift view (late-bound tracker). */
+  readonly buildDrift?: () => DeployDriftView | null;
+  /** Board UX v4: verification queue view (late-bound scheduler). */
+  readonly verifyQueue?: () => VerificationQueueView | null;
+  /** Board UX v4: self-heal stats (no producer yet; null renders n/a). */
+  readonly selfHeal?: () => SelfHealView | null;
+  /** Clock seam for the day-boundary health derivations. */
+  readonly now?: () => number;
 }
 
 export class BoardEngine {
@@ -193,11 +258,19 @@ export class BoardEngine {
       incarnation: 'board-not-started',
       generation: 0,
     }));
+    this.buildDrift = opts.buildDrift ?? (() => null);
+    this.verifyQueue = opts.verifyQueue ?? (() => null);
+    this.selfHeal = opts.selfHeal ?? (() => null);
+    this.now = opts.now ?? Date.now;
     this.bus.subscribe(() => this.notifyChanged());
   }
 
   private readonly supervisionFor: (agentId: string) => AgentSupervisionView | null;
   private readonly decisionsStatus: () => DecisionRuntimeStatus;
+  private readonly buildDrift: () => DeployDriftView | null;
+  private readonly verifyQueue: () => VerificationQueueView | null;
+  private readonly selfHeal: () => SelfHealView | null;
+  private readonly now: () => number;
 
   /** Fired after any event that may have changed the board. */
   onChange(listener: () => void): () => void {
@@ -355,6 +428,23 @@ export class BoardEngine {
       notifications: this.notifications(),
       decisions: this.decisionsStatus(),
       unackedActionRequired: this.ledger.countPendingActionRequired(),
+      build: this.buildDrift(),
+      silas: this.silasView(),
+      verify: this.verifyQueue(),
+      selfHeal: this.selfHeal(),
+    };
+  }
+
+  /** Silas ops health from the durable event stream: newest wake + today's
+   * reconciliations (state-correction events, not the wake itself). */
+  private silasView(): SilasView {
+    const now = this.now();
+    const dayStart = new Date(now);
+    dayStart.setHours(0, 0, 0, 0);
+    return {
+      lastWakeAt: this.ledger.latestEventOfKinds(SILAS_WAKE_KINDS)?.ts ?? null,
+      reconciliationsToday: this.ledger.countEventsSince(SILAS_RECONCILE_KINDS, dayStart.toISOString()),
+      checkedAt: new Date(now).toISOString(),
     };
   }
 
@@ -390,6 +480,7 @@ export class BoardEngine {
       status: job.status,
       updatedAt: job.updatedAt,
       prUrl: job.prUrl,
+      prState: prStateOf(job),
       baseBranch: job.baseBranch,
       note: job.note,
       rounds: this.ledger
