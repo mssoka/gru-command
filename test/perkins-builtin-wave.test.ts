@@ -143,7 +143,7 @@ afterEach(() => {
 });
 
 describe('GitHub SHA-bound Perkins delivery', () => {
-  it('validates host/head/base and posts a commit-bound review payload', async () => {
+  it('delivers on head equality even when the recorded base is stale, and refuses a moved head', async () => {
     const root = mkdtempSync(join(tmpdir(), 'perkins-gh-poster-'));
     const log = join(root, 'calls.jsonl');
     const binary = join(root, 'gh-double.mjs');
@@ -155,23 +155,30 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nif (!process.argv.includes('--method')) process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n`, 'utf8');
     chmodSync(binary, 0o755);
     const poster = new GhPrPoster(binary);
-    await poster.post({
+    // (a) The PR's recorded base (GitHub pins it at open/link time) trails
+    // the frozen base as main moves during a long round; head equality is
+    // the delivery invariant, so a stale recorded base must NOT refuse.
+    await expect(poster.post({
       prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
-      body: 'review body\n', targetSha: head, baseSha: base,
-    });
+      body: 'review body\n', targetSha: head, baseSha: '3'.repeat(40),
+    })).resolves.toEqual({ headSha: head, baseSha: base });
     const calls = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[]; input: string });
     expect(calls).toHaveLength(2);
     expect(calls[0]?.argv).toEqual(['api', '--hostname', 'git.example.test', 'repos/acme/widget/pulls/42', '--jq', '[.head.sha,.base.sha] | @tsv']);
     expect(calls[1]?.argv).toEqual(['api', '--hostname', 'git.example.test', '--method', 'POST', 'repos/acme/widget/pulls/42/reviews', '--input', '-']);
     expect(JSON.parse(calls[1]!.input)).toEqual({ body: 'review body\n', event: 'COMMENT', commit_id: head });
+    // (b) A moved head is real movement and still fails closed — before any
+    // review is posted.
+    await expect(poster.post({
+      prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
+      body: 'x', targetSha: '4'.repeat(40), baseSha: base,
+    })).rejects.toThrow(/identity moved/);
+    const callsAfterRefusal = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[]; input: string });
+    expect(callsAfterRefusal.filter((call) => call.argv.includes('--method'))).toHaveLength(1);
     await expect(poster.post({
       prUrl: 'https://evil.example/acme/widget/pull/42', host: 'git.example.test', repoPath,
       body: 'x', targetSha: head, baseSha: base,
     })).rejects.toThrow(/host-mismatched/);
-    await expect(poster.post({
-      prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
-      body: 'x', targetSha: head, baseSha: '3'.repeat(40),
-    })).rejects.toThrow(/identity moved/);
     execFileSync('git', ['-C', repoPath, 'remote', 'set-url', 'origin', 'https://git.example.test/acme/other.git']);
     await expect(poster.post({
       prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
@@ -672,8 +679,13 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobStatus(job.id, 'working');
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/9');
     const order: string[] = [];
-    const poster = { post: vi.fn(async (_input: { readonly prUrl: string; readonly body: string; readonly targetSha: string }) => {
+    // The poster's receipt simulates a PR whose recorded base has drifted
+    // past the round's frozen base: the delivery record must refresh to the
+    // delivered identity, never echo the frozen base.
+    const deliveredBase = '9'.repeat(40);
+    const poster = { post: vi.fn(async (input: { readonly prUrl: string; readonly body: string; readonly targetSha: string }) => {
       expect(ledger.listRounds(job.id).at(-1)).toMatchObject({ status: 'live', verdict: null });
+      return { headSha: input.targetSha, baseSha: deliveredBase };
     }) };
     const wave = new WaveRunner({
       ledger,
@@ -703,6 +715,11 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(poster.post).toHaveBeenCalledTimes(1);
     expect(poster.post.mock.calls[0]![0]).toMatchObject({ targetSha: target });
     expect(poster.post.mock.calls[0]![0].body).toContain('NEEDS CHANGES');
+    // The posted record carries the refreshed PR identity (the live base at
+    // delivery), not the frozen review base.
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')?.payload).toMatchObject({
+      targetSha: target, baseSha: deliveredBase,
+    });
     expect(port.getWorktree(outcome.round.id)?.status).toBe('swept');
     expect(existsSync(outcome.reportFile)).toBe(true);
     const events = ledger.listEvents({ limit: 200 });
@@ -732,7 +749,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobStatus(job.id, 'working');
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/10');
     let moved = false;
-    const poster = { post: vi.fn(async () => {}) };
+    const poster = { post: vi.fn(async () => ({ headSha: 'unused-head', baseSha: 'unused-base' })) };
     const spawner = makeSpawner(sessions, [], () => {
       if (moved) return;
       moved = true;
@@ -966,15 +983,33 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     };
   }
 
-  it('binds host/origin/head/base and posts a commit-bound note', async () => {
+  function fetchSequence(responses: ReadonlyArray<{ status: number; body?: string }>, calls: Array<{ url: string; init?: unknown }>) {
+    let index = 0;
+    return async (url: string, init?: unknown): Promise<{ ok: boolean; status: number; text(): Promise<string> }> => {
+      calls.push({ url, init });
+      const response = responses[Math.min(index, responses.length - 1)]!;
+      index += 1;
+      return {
+        ok: response.status >= 200 && response.status < 300,
+        status: response.status,
+        text: async () => response.body ?? '',
+      };
+    };
+  }
+
+  it('delivers on head equality — the recorded base is refreshed, never a refusal', async () => {
     const { repoPath, cleanup } = fixture();
     try {
       const calls: Array<{ url: string; init?: unknown }> = [];
+      // The MR's recorded base (diff_refs.base_sha is pinned at open/link
+      // time) trails the round's frozen base; head equality still delivers.
+      const recordedBase = 'c'.repeat(40);
       const poster = new GitLabMrPoster({
         token: 'glpat-token',
-        fetchImpl: fetchDouble({ status: 200, body: JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) }, calls),
+        fetchImpl: fetchDouble({ status: 200, body: JSON.stringify({ sha: head, diff_refs: { base_sha: recordedBase } }) }, calls),
       });
-      await poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'review body\n', targetSha: head, baseSha: base });
+      await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'review body\n', targetSha: head, baseSha: base }))
+        .resolves.toEqual({ headSha: head, baseSha: recordedBase });
       // identity probe, note POST, post-delivery confirmation probe
       expect(calls).toHaveLength(3);
       expect(calls[0]?.url).toBe('https://gitlab.example.test/api/v4/projects/acme%2Fwidget/merge_requests/7');
@@ -987,17 +1022,30 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     }
   });
 
-  it('fails closed on moved identity, missing token, origin mismatch, and HTTP failure', async () => {
+  it('fails closed on a moved head — before and under the note — plus missing token, origin mismatch, and HTTP failure', async () => {
     const { repoPath, cleanup } = fixture();
     try {
-      const calls: Array<{ url: string; init?: unknown }> = [];
+      const movedCalls: Array<{ url: string; init?: unknown }> = [];
       const moved = new GitLabMrPoster({
         token: 'glpat-token',
-        fetchImpl: fetchDouble({ status: 200, body: JSON.stringify({ sha: head, diff_refs: { base_sha: 'c'.repeat(40) } }) }, calls),
+        fetchImpl: fetchDouble({ status: 200, body: JSON.stringify({ sha: 'd'.repeat(40), diff_refs: { base_sha: base } }) }, movedCalls),
       });
       await expect(moved.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base }))
         .rejects.toThrow(/identity moved/u);
-      expect(calls).toHaveLength(1);
+      expect(movedCalls).toHaveLength(1);
+
+      const racedCalls: Array<{ url: string; init?: unknown }> = [];
+      const raced = new GitLabMrPoster({
+        token: 'glpat-token',
+        fetchImpl: fetchSequence([
+          { status: 200, body: JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) },
+          { status: 200, body: '{}' },
+          { status: 200, body: JSON.stringify({ sha: 'e'.repeat(40), diff_refs: { base_sha: 'f'.repeat(40) } }) },
+        ], racedCalls),
+      });
+      await expect(raced.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base }))
+        .rejects.toThrow(/moved after delivery/u);
+      expect(racedCalls).toHaveLength(3);
 
       const noToken = new GitLabMrPoster({ fetchImpl: fetchDouble({ status: 200, body: '{}' }, []) });
       await expect(noToken.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base }))
@@ -1006,7 +1054,7 @@ describe('GitLab SHA-bound merge-request delivery', () => {
       const poster = new GitLabMrPoster({ token: 't', fetchImpl: fetchDouble({ status: 200, body: JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) }, []) });
       await expect(poster.post({
         prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base,
-      })).resolves.toBeUndefined();
+      })).resolves.toEqual({ headSha: head, baseSha: base });
 
       const wrongRepo = mkdtempSync(join(tmpdir(), 'perkins-gl-wrong-'));
       try {
@@ -1028,13 +1076,15 @@ describe('GitLab SHA-bound merge-request delivery', () => {
   });
 
   it('routes by code host and refuses unsupported hosts', async () => {
-    const github = { post: vi.fn(async () => {}) };
-    const gitlab = { post: vi.fn(async () => {}) };
+    const github = { post: vi.fn(async () => ({ headSha: 'github-head', baseSha: 'github-base' })) };
+    const gitlab = { post: vi.fn(async () => ({ headSha: 'gitlab-head', baseSha: 'gitlab-base' })) };
     const poster = new AutoVerdictPoster(github, gitlab);
     const base = { prUrl: 'https://x', host: 'x', repoPath: '/r', body: 'b', targetSha: 'h', baseSha: 'b' };
-    await poster.post({ ...base, prUrl: 'https://github.com/acme/widget/pull/1', host: 'github.com' });
+    await expect(poster.post({ ...base, prUrl: 'https://github.com/acme/widget/pull/1', host: 'github.com' }))
+      .resolves.toEqual({ headSha: 'github-head', baseSha: 'github-base' });
     expect(github.post).toHaveBeenCalledTimes(1);
-    await poster.post({ ...base, prUrl: 'https://gitlab.com/acme/widget/-/merge_requests/2', host: 'gitlab.com' });
+    await expect(poster.post({ ...base, prUrl: 'https://gitlab.com/acme/widget/-/merge_requests/2', host: 'gitlab.com' }))
+      .resolves.toEqual({ headSha: 'gitlab-head', baseSha: 'gitlab-base' });
     expect(gitlab.post).toHaveBeenCalledTimes(1);
     await expect(poster.post({ ...base, prUrl: 'https://code.company.test/acme/widget/-/merge_requests/3', host: 'code.company.test' }))
       .rejects.toThrow(/unsupported code host/u);
@@ -1114,7 +1164,7 @@ describe('WaveRunner request guards', () => {
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-no-pr' });
     const job = ledger.addJob({ id: 'job-no-pr', repo: 'fixture', title: 'no pr', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
-    const poster = { post: vi.fn(async () => {}) };
+    const poster = { post: vi.fn(async () => ({ headSha: 'unused-head', baseSha: 'unused-base' })) };
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster, reviewArtifactRoot: artifacts,
     });

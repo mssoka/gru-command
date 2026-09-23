@@ -200,7 +200,7 @@ async function bootFollowThrough(input: {
     ledger,
     worktrees,
     spawner,
-    poster: { async post() {} },
+    poster: { async post(input) { return { headSha: input.targetSha, baseSha: 'stub-base' }; } },
     reviewArtifactRoot: join(dir, 'reviews'),
   });
   const silasPrompts: Promise<void>[] = [];

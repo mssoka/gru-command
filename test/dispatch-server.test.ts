@@ -129,7 +129,7 @@ async function boot(opts: {
     ledger,
     worktrees,
     spawner,
-    poster: { async post() {} },
+    poster: { async post(input) { return { headSha: input.targetSha, baseSha: 'stub-base' }; } },
     reviewArtifactRoot: join(dir, 'reviews'),
     ...(opts.reviewPreflight !== undefined ? { reviewPreflight: opts.reviewPreflight } : {}),
     ...(opts.fallbackGate !== undefined ? { fallbackGate: opts.fallbackGate } : {}),

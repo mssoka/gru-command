@@ -127,7 +127,7 @@ function makeDispatchHarness(opts: {
     return handle;
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
-  const poster = { post: vi.fn(async () => {}) };
+  const poster = { post: vi.fn(async (input: { readonly targetSha: string }) => ({ headSha: input.targetSha, baseSha: 'e2e-delivered-base' })) };
   const wave = new WaveRunner({
     ledger,
     worktrees,
