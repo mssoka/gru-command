@@ -230,6 +230,16 @@ bob_interval_ms = 3600000
 # CONSECUTIVE verdict rounds carrying the SAME canonical blocker.
 enabled = true
 sweep_interval_ms = 300000
+# GitHub signal poll (POLL-ONLY; webhooks are not built). Once per tick
+# every tracked branch is read through authenticated `gh api` — merged
+# PR state, mergeable_state conflicts, and check-run conclusions — and
+# the state-change mappings apply once per observed change (merged PR
+# closes the lane; conflict cascades an action-required notification;
+# CI failure posts a tiered notification with the run URL; CI green
+# records the review-gate signal event). 0 disables the poll; requires
+# an authenticated `gh` (see README Prerequisites). Rate-limit headroom:
+# calls are capped per tick — at most 3000 of the authenticated 5000/h.
+poll_interval_ms = 60000
 stall_threshold_ms = 1800000
 directive_at = 2
 rebrief_at = 3

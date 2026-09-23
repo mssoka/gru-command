@@ -100,6 +100,8 @@ bob_interval_ms = 3600000         # Bob's consolidation interval; 0 disables
 # No review-round cap: while blockers evolve, the loop continues.
 enabled = true                    # false hosts no silas slot and fires no wakes
 sweep_interval_ms = 300000        # periodic ops sweep; 0 disables (event wakes stay live)
+poll_interval_ms = 60000          # GitHub signal poll (POLL-ONLY): merged PRs, conflicts, CI
+                                  # conclusions via authenticated `gh api`; 0 disables
 stall_threshold_ms = 1800000      # working lane with a silent minion for this long is stalled
 directive_at = 2                  # consecutive same-blocker rounds before a fix directive
 rebrief_at = 3                    # …before a re-brief to a fresh minion on the lane

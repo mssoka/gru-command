@@ -50,6 +50,52 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
 *(placeholder — the chat window, the board, and the phone layout land
 here before the v1.0.0 tag)*
 
+## Prerequisites
+
+- **Node.js ≥ 22.19** — the service runtime and build toolchain.
+- **git** — per-job worktree lanes and branch inspection.
+- **GitHub CLI (`gh`), authenticated for every managed repo** — the
+  GitHub signal poll and SHA-bound Perkins verdict delivery both ride
+  `gh`. Run `gh auth login` with a token that can read the repositories
+  (`repo` scope for private repos) and confirm with `gh auth status`.
+
+GitHub signal ingestion is poll-only — no webhooks, no inbound tunnel.
+
+## Setup
+
+1. **Install** — the one-liner (or clone + `./install.sh`) below installs
+   dependencies, builds the service and web UI, and runs the wizard. The
+   wizard writes the live config at `~/.gru-command/config.toml` and
+   smoke-tests first boot. Re-running the one-liner is a safe updater.
+2. **Register the service** — `./install.sh --service` registers and
+   starts the login OS service (see [Run](#run)); `./install.sh
+   --uninstall` removes it.
+3. **GitHub signal poll** — the Silas watchtower polls every tracked job
+   branch through authenticated `gh api` (`[silas] poll_interval_ms`,
+   default 60000 ms; `0` disables). Once per tick it reads
+   `repos/{owner}/{repo}/pulls` for merged state and `mergeable_state`,
+   and `repos/{owner}/{repo}/commits/{sha}/check-runs` for the latest
+   check-run conclusions. Each observed state CHANGE applies exactly
+   once: a merged PR closes its lane (`github.pr-merged`), a conflicting
+   PR (`mergeable_state: dirty`) cascades an action-required
+   notification, a CI failure posts a notification carrying the run URL
+   (mechanical checks → fyi, judgment checks → action-required), and CI
+   green records the review-gate signal event (`github.ci-green`). The
+   per-tick call budget caps usage at 3 000 of the authenticated
+   5 000 requests/hour GitHub budget. Webhooks remain a possible future
+   option and are not built.
+
+   Verify the same data by hand:
+
+   ```bash
+   gh auth status
+   gh api "repos/{owner}/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=5" \
+     --jq '.[] | {number, state, merged_at, mergeable_state, head: .head.ref}'
+   gh api "repos/{owner}/{repo}/commits/{sha}/check-runs" \
+     --jq '.check_runs[] | {name, status, conclusion, url: .details_url}'
+   gh api rate_limit --jq '.resources.core'
+   ```
+
 ## Install
 
 One line (macOS + Linux, Node ≥ 22.19, git):

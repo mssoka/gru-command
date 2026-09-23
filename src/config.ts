@@ -164,6 +164,11 @@ export interface SilasConfig {
   readonly enabled: boolean;
   /** Periodic sweep interval; 0 disables the sweep (event wakes still fire). */
   readonly sweepIntervalMs: number;
+  /** GitHub signal poll interval (owner ruling 2026-09-23, POLL-ONLY):
+   * tracked branches are observed through authenticated `gh api` for PR
+   * merged state, mergeable_state (conflicts), and check-run conclusions.
+   * 0 disables the poll (the sweep and event wakes stay live). */
+  readonly pollIntervalMs: number;
   /** A working job whose minion shows no activity for this long is stalled. */
   readonly stallThresholdMs: number;
   /** Consecutive same-blocker rounds before a fix directive is advised. */
@@ -177,6 +182,7 @@ export interface SilasConfig {
 export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   enabled: true,
   sweepIntervalMs: 300_000,
+  pollIntervalMs: 60_000,
   stallThresholdMs: 1_800_000,
   directiveAt: 2,
   rebriefAt: 3,
@@ -840,7 +846,7 @@ export function loadConfig(
     }
     if (raw['silas'] !== undefined) {
       const table = requireTable(raw['silas'], file, 'silas');
-      const VALID = ['enabled', 'sweep_interval_ms', 'stall_threshold_ms', 'directive_at', 'rebrief_at', 'escalate_at'];
+      const VALID = ['enabled', 'sweep_interval_ms', 'poll_interval_ms', 'stall_threshold_ms', 'directive_at', 'rebrief_at', 'escalate_at'];
       for (const key of Object.keys(table)) {
         if (!VALID.includes(key)) {
           throw new ConfigError(
@@ -872,6 +878,7 @@ export function loadConfig(
       silas = {
         enabled: table['enabled'] !== undefined ? requireBool(table['enabled'], file, 'silas.enabled') : silas.enabled,
         sweepIntervalMs: table['sweep_interval_ms'] !== undefined ? requireNonNegativeInt(table['sweep_interval_ms'], file, 'silas.sweep_interval_ms') : silas.sweepIntervalMs,
+        pollIntervalMs: table['poll_interval_ms'] !== undefined ? requireNonNegativeInt(table['poll_interval_ms'], file, 'silas.poll_interval_ms') : silas.pollIntervalMs,
         stallThresholdMs: table['stall_threshold_ms'] !== undefined ? requirePositiveInt(table['stall_threshold_ms'], file, 'silas.stall_threshold_ms') : silas.stallThresholdMs,
         directiveAt,
         rebriefAt,

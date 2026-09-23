@@ -16,6 +16,7 @@ import {
   loadSilasSkills,
   SilasDriver,
   type DigestLedger,
+  type GitHubPollPort,
   type RoundBlocker,
   type SilasSlot,
   type SkillModule,
@@ -634,6 +635,8 @@ interface DriverHarness {
 function makeDriver(opts: {
   enabled?: boolean;
   sweepIntervalMs?: number;
+  pollIntervalMs?: number;
+  githubPoll?: GitHubPollPort;
   bus?: boolean;
   skills?: readonly SkillModule[];
   timers?: {
@@ -678,9 +681,11 @@ function makeDriver(opts: {
       ...DEFAULT_SILAS_CONFIG,
       enabled: opts.enabled ?? true,
       sweepIntervalMs: opts.sweepIntervalMs ?? 0,
+      pollIntervalMs: opts.pollIntervalMs ?? DEFAULT_SILAS_CONFIG.pollIntervalMs,
     },
     ops: { baseUrl: 'http://127.0.0.1:7665', configPath: '/instance/config.toml' },
     ...(opts.bus === false ? {} : { bus: h.bus }),
+    ...(opts.githubPoll !== undefined ? { githubPoll: opts.githubPoll } : {}),
     ...(opts.skills !== undefined ? { skills: opts.skills } : {}),
     ...(opts.timers !== undefined ? { setInterval: opts.timers.setInterval, clearInterval: opts.timers.clearInterval } : {}),
     log: () => {},
@@ -926,6 +931,98 @@ describe('silas driver sweep timer and wake kinds', () => {
       });
       await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
       expect(h.prompts[1]?.text).toContain('trigger: job.minion-error');
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ------------------------------------------------------------------
+// Driver: the fast github signal poll timer
+// ------------------------------------------------------------------
+
+describe('silas driver github signal poll', () => {
+  const emptyTick = {
+    tracked: 0,
+    observed: 0,
+    calls: 0,
+    budgetExhausted: false,
+    rateLimited: false,
+    signals: [],
+  };
+
+  it('ticks the poll on poll_interval_ms and stops with the driver; 0 disables the timer', async () => {
+    const ticks: Array<() => void> = [];
+    let polls = 0;
+    let clears = 0;
+    const githubPoll: GitHubPollPort = {
+      pollOnce: async () => {
+        polls += 1;
+        return emptyTick;
+      },
+    };
+    const timers = {
+      setInterval: ((callback: () => void) => {
+        ticks.push(callback);
+        return { unref() {} } as unknown as ReturnType<typeof setInterval>;
+      }) as unknown as typeof setInterval,
+      clearInterval: (() => {
+        clears += 1;
+      }) as unknown as typeof clearInterval,
+    };
+    const h = makeDriver({ sweepIntervalMs: 0, pollIntervalMs: 5_000, githubPoll, timers });
+    try {
+      h.driver.start();
+      expect(h.driver.pollRunning).toBe(true);
+      expect(ticks).toHaveLength(1);
+      ticks[0]?.();
+      await vi.waitFor(() => expect(polls).toBe(1));
+      h.driver.stop();
+      expect(h.driver.pollRunning).toBe(false);
+      expect(clears).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+
+    const off = makeDriver({ sweepIntervalMs: 0, pollIntervalMs: 0, githubPoll, timers });
+    try {
+      off.driver.start();
+      expect(off.driver.pollRunning).toBe(false);
+      expect(ticks).toHaveLength(1); // nothing new registered
+    } finally {
+      off.cleanup();
+    }
+  });
+
+  it('a failing poll tick is logged and never thrown; the next tick retries', async () => {
+    const ticks: Array<() => void> = [];
+    let polls = 0;
+    const githubPoll: GitHubPollPort = {
+      pollOnce: async () => {
+        polls += 1;
+        throw new Error('gh down');
+      },
+    };
+    const h = makeDriver({
+      sweepIntervalMs: 0,
+      pollIntervalMs: 5_000,
+      githubPoll,
+      timers: {
+        setInterval: ((callback: () => void) => {
+          ticks.push(callback);
+          return { unref() {} } as unknown as ReturnType<typeof setInterval>;
+        }) as unknown as typeof setInterval,
+        clearInterval: (() => {}) as unknown as typeof clearInterval,
+      },
+    });
+    try {
+      h.driver.start();
+      ticks[0]?.();
+      await vi.waitFor(() => expect(polls).toBe(1));
+      // the failure settled without throwing and the next interval retried
+      ticks[0]?.();
+      await vi.waitFor(() => expect(polls).toBe(2));
+      expect(h.driver.pollRunning).toBe(true);
     } finally {
       h.cleanup();
     }
