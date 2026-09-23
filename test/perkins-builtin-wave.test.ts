@@ -22,6 +22,14 @@ function asWave(outcome: WaveOutcome | FallbackGateOutcome): WaveOutcome {
   throw new Error(`expected a Perkins wave outcome, got ${outcome.route}`);
 }
 
+/** Branch-idle guard (2026-09-23): a review arm is refused while the target
+ * lane is busy — a dispatched/working job with no settled delivery for its
+ * current attempt. These suites review already-delivered lanes, so record
+ * the delivery each fixture implies and let the guard see an idle lane. */
+function settleLane(ledger: LedgerApi, jobId: string): void {
+  ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'fixture-settled' } });
+}
+
 
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 import type { AgentSpawner } from '../src/dispatch/service.js';
@@ -217,6 +225,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       id: 'job-policy-error', repo: 'fixture', title: 'policy error', baseBranch: 'main', briefing: 'review this',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     const spawner = vi.fn() as unknown as AgentSpawner;
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner, reviewArtifactRoot: artifacts,
@@ -246,6 +255,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       id: 'job-empty', repo: 'fixture', title: 'empty review', baseBranch: 'main', briefing: 'review this',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     const spawner = vi.fn() as unknown as AgentSpawner;
     const wave = new WaveRunner({ ledger, worktrees: port, spawner, reviewArtifactRoot: artifacts });
     await expect(wave.beginRound({ jobId: job.id })).rejects.toThrow(/frozen review diff is empty/);
@@ -279,6 +289,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       id: 'job-setup-shutdown', repo: 'fixture', title: 'setup shutdown', baseBranch: 'main', briefing: 'review',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: artifacts,
     });
@@ -321,6 +332,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       id: 'job-blocked-shutdown', repo: 'fixture', title: 'blocked shutdown', baseBranch: 'main', briefing: 'review',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     let leadStarted!: () => void;
     const started = new Promise<void>((resolve) => { leadStarted = resolve; });
     const never = new Promise<void>(() => {});
@@ -511,6 +523,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-workflow-error' });
     const job = ledger.addJob({ id: 'job-workflow-error', repo: 'fixture', title: 'workflow error', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     const wave = new WaveRunner({ ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts });
     const first = asWave(await wave.runRound({ jobId: job.id }));
     expect(first.round.status).toBe('verdict-posted');
@@ -545,6 +558,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       id: 'job-coverage-exhausted', repo: 'fixture', title: 'coverage exhausted', baseBranch: 'main', briefing: 'review',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger,
@@ -598,6 +612,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       id: 'job-prior-continuity', repo: 'fixture', title: 'prior continuity', baseBranch: 'main', briefing: 'review',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
 
     const firstSessions = mkdtempSync(join(tmpdir(), 'perkins-prior-first-'));
     const first = asWave(await new WaveRunner({
@@ -667,6 +682,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       id: `job-post-${mode}`, repo: 'fixture', title: 'delivery gate', baseBranch: 'main', briefing: 'review',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/10');
     attachOrigin(repo, `feature/post-${mode}`, root);
     const escalations: string[] = [];
@@ -716,6 +732,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       briefing: 'Acceptance: answer returns 43.',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/9');
     attachOrigin(repo, 'feature/review', root);
     const order: string[] = [];
@@ -789,6 +806,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       briefing: 'Acceptance: answer returns 43.',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     // The scheduler's recorded run on the exact frozen target.
     ledger.appendCustomEvent({
       kind: 'verification.completed',
@@ -844,6 +862,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       id: 'job-head-move', repo: 'fixture', title: 'movement', baseBranch: 'main', briefing: 'review',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/10');
     attachOrigin(repo, 'feature/review', root);
     let moved = false;
@@ -934,6 +953,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
     const job = ledger.addJob({ id: 'job-fallback-gate', repo: 'fixture', title: 'fallback', baseBranch: 'main' });
+    settleLane(ledger, job.id);
     return { wave, job, ledger, port, root, artifacts, sessions, db, escalations, reviews, directives, repo };
   }
 
@@ -1018,6 +1038,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     const port = new GitReviewPort(root, 'main', repo.head());
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-no-skill' });
     const job = ledger.addJob({ id: 'job-no-skill', repo: 'fixture', title: 'no skill', baseBranch: 'main' });
+    settleLane(ledger, job.id);
     let reviewed = 0;
     const wave = new WaveRunner({
       ledger,
@@ -1246,6 +1267,7 @@ describe('WaveRunner request guards', () => {
     await expect(wave.runRound({ jobId: laneless.id })).rejects.toThrow(/no job worktree lane/u);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-missing-briefing' });
     const noBriefing = ledger.addJob({ id: 'job-missing-briefing', repo: 'fixture', title: 'no briefing', baseBranch: 'main' });
+    settleLane(ledger, noBriefing.id);
     await expect(wave.runRound({ jobId: noBriefing.id })).rejects.toThrow(/requires the job briefing\/spec or explicit noSpec/u);
     await expect(wave.runRound({ jobId: noBriefing.id, noSpec: true, lenses: ['blind'] }))
       .rejects.toThrow(/canonical and cannot be reduced/u);
@@ -1267,6 +1289,7 @@ describe('WaveRunner request guards', () => {
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-no-pr' });
     const job = ledger.addJob({ id: 'job-no-pr', repo: 'fixture', title: 'no pr', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     const poster = { post: vi.fn(async () => ({ headSha: 'unused-head', baseSha: 'unused-base' })) };
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster, reviewArtifactRoot: artifacts,
@@ -1340,6 +1363,7 @@ describe('poster transport negatives and fallback-gate terminals', () => {
     const port = new GitReviewPort(root, 'main', repo.head());
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-unconfigured' });
     const job = ledger.addJob({ id: 'job-unconfigured', repo: 'fixture', title: 'unconfigured', baseBranch: 'main' });
+    settleLane(ledger, job.id);
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(mkdtempSync(join(tmpdir(), 'perkins-gate-unconf-sessions-')), []),
       reviewArtifactRoot: artifacts,
@@ -1389,6 +1413,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const port = new GitReviewPort(root, 'feature/prod-gate', repo.head());
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-prod-gate' });
     const job = ledger.addJob({ id: 'job-prod-gate', repo: 'fixture', title: 'prod gate', baseBranch: 'main' });
+    settleLane(ledger, job.id);
     const skillPath = join(artifacts, 'skills', 'bmad-review', 'SKILL.md');
     mkdirSync(dirname(skillPath), { recursive: true });
     writeFileSync(skillPath, options.skillContent ?? '---\nname: bmad-review\n---\nreview skill bytes', 'utf8');
@@ -1474,6 +1499,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const port = new GitReviewPort(root, 'main', makeFixtureRepo('perkins-prod-gate-nores-repo').head());
     await port.createJobWorktree({ repoPath: makeFixtureRepo('perkins-prod-gate-nores-repo2').path, jobId: 'job-nores' });
     const job = ledger.addJob({ id: 'job-nores', repo: 'fixture', title: 'no report', baseBranch: 'main' });
+    settleLane(ledger, job.id);
     const skillPath = join(artifacts, 'SKILL.md');
     writeFileSync(skillPath, 'skill', 'utf8');
     let promptText = '';
@@ -1534,6 +1560,7 @@ describe('fallback diff includes untracked files (V3 revert-mutation pin)', () =
     const port = new GitReviewPort(root, 'feature/untracked', repo.head());
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-untracked-fix' });
     const job = ledger.addJob({ id: 'job-untracked-fix', repo: 'fixture', title: 'untracked', baseBranch: 'main' });
+    settleLane(ledger, job.id);
     const skillFile = join(artifacts, 'SKILL.md');
     writeFileSync(skillFile, 'skill', 'utf8');
     const escalations: string[] = [];

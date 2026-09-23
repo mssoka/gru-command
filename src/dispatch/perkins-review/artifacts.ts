@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, linkSync, lstatSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import type { BranchIdleTag } from '../branch-idle.js';
 
 /** Tool-transport ceiling any frozen chunk may reach (perkins_read_chunk bound). */
 export const MAX_TRANSPORT_CHUNK_BYTES = 900 * 1024;
@@ -35,6 +36,9 @@ export interface FrozenReviewInputs {
   readonly conventionsSha256: string;
   readonly createdAt: string;
   readonly chunks: readonly Omit<ReviewChunk, 'diff'>[];
+  /** Present only for a `force: true` arm: the branch-idle blockers the
+   * override bypassed (the audit tag for a forced round). */
+  readonly branchIdle?: BranchIdleTag;
 }
 
 export interface FreezeReviewInput {
@@ -51,6 +55,8 @@ export interface FreezeReviewInput {
   /** Policy-pinned chunking threshold (SPEC: the pinned policy is the
    * operative source for review sizing). Defaults to 3000 lines. */
   readonly chunkLineThreshold?: number;
+  /** Forced-arm tag (branch-idle override) recorded in the manifest. */
+  readonly branchIdle?: BranchIdleTag;
 }
 
 export interface FrozenReview {
@@ -522,6 +528,7 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
     conventionsSha256: hash(projectConventions),
     createdAt: (input.now ?? (() => new Date()))().toISOString(),
     chunks: chunks.map(({ diff: _diff, ...chunk }) => chunk),
+    ...(input.branchIdle !== undefined ? { branchIdle: input.branchIdle } : {}),
   };
   atomicWrite(join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, directory);
   return { directory, manifest, diff, specContext, projectConventions, chunks };

@@ -16,6 +16,7 @@ const PINS: Record<string, number> = {
   'build-info.test.ts': 5,
   'deploy-drift.test.ts': 10,
   'bob-scheduler.test.ts': 5,
+  'branch-idle-guard.test.ts': 6,
   'chat-frame-log.test.ts': 20,
   'chat-frames.test.ts': 4,
   'attachments.test.ts': 28,

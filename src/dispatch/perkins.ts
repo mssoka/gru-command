@@ -3,9 +3,16 @@ import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
-import type { LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
+import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
-import type { WorktreePort } from './worktree-port.js';
+import type { WorktreeLane, WorktreePort } from './worktree-port.js';
+import {
+  BranchBusyError,
+  findBusyLanes,
+  resolveReviewTargetBranch,
+  type BranchIdleBlocker,
+  type BranchIdlePhase,
+} from './branch-idle.js';
 import type { AgentSpawner } from './service.js';
 import type { CanonicalReviewVerdict, LensEnvelope, VerifiedFinding } from './perkins-review/types.js';
 import { CoverageExhaustedError, PerkinsHybridReview, type PerkinsHybridResult } from './perkins-review/hybrid.js';
@@ -635,6 +642,9 @@ export class WaveRunner {
     targetRef?: string;
     lenses?: readonly string[];
     noSpec?: boolean;
+    /** Human escape hatch: arm even while the target branch is busy; the
+     * round is tagged in the manifest and the event log. */
+    force?: boolean;
   }): Promise<WaveOutcome | FallbackGateOutcome> {
     const outcome = await this.requestReview(input);
     if (outcome.route === 'perkins') return outcome.run;
@@ -650,8 +660,12 @@ export class WaveRunner {
     targetRef?: string;
     lenses?: readonly string[];
     noSpec?: boolean;
+    force?: boolean;
   }): Promise<ReviewRequestOutcome> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
+    // Branch-idle guard FIRST, before any route decision: manual, Silas, and
+    // integration callers all inherit one rule, Perkins and fallback alike.
+    this.enforceBranchIdleForRequest(input);
     const repoPath = this.resolveReviewRequestRepo(input);
     const preflight = this.opts.reviewPreflight;
     const result: ReviewPreflightResult = preflight !== undefined && repoPath !== null
@@ -669,7 +683,9 @@ export class WaveRunner {
     targetRef?: string;
     lenses?: readonly string[];
     noSpec?: boolean;
+    force?: boolean;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
+    this.enforceBranchIdleForRequest(input);
     if (this.opts.reviewPreflight !== undefined) {
       const repoPath = this.resolveReviewRequestRepo(input);
       if (repoPath !== null) {
@@ -689,11 +705,78 @@ export class WaveRunner {
     return lane?.path ?? null;
   }
 
+  /** Arm-intake branch-idle check. An unknown job is left to the round setup
+   * (it reports the canonical not-found error), and so is a job with no job
+   * lane yet — without a lane there is no target branch to protect, and the
+   * round setup names the missing lane loudly. A known, laned job is refused
+   * here before any round, worktree, or pre-flight work exists. */
+  private enforceBranchIdleForRequest(input: {
+    jobId: string;
+    targetRef?: string;
+    force?: boolean;
+  }): void {
+    const job = this.opts.ledger.getJob(input.jobId);
+    if (job === null) return;
+    const jobLane = this.opts.worktrees
+      .listWorktrees({ jobId: input.jobId })
+      .find((candidate) => candidate.kind === 'job') ?? null;
+    if (jobLane === null) return;
+    this.enforceBranchIdle({
+      job,
+      jobLane,
+      ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+      ...(input.force !== undefined ? { force: input.force } : {}),
+      phase: 'arm',
+    });
+  }
+
+  /** Branch-idle guard for one review target (rule 2026-09-23): resolve the
+   * branch under review, scan the ledger for lanes still pushing it, and
+   * refuse (typed, mapped to 409 at the API) unless the request carries the
+   * human `force` override. A forced arm is tagged in the event log here;
+   * the freeze-phase caller also writes the manifest tag. Runs before any
+   * route decision so every caller inherits one rule. */
+  private enforceBranchIdle(input: {
+    job: { readonly id: string };
+    jobLane: WorktreeLane | null;
+    targetRef?: string | undefined;
+    force?: boolean | undefined;
+    phase: BranchIdlePhase;
+    roundId?: string;
+    /** Pre-setup status when this round itself flipped the reviewed job
+     * (working|blocked → in-review): the flip is bookkeeping and must not
+     * mask the lane it moved. */
+    reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
+  }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] } {
+    const targetBranch = resolveReviewTargetBranch({
+      jobId: input.job.id,
+      ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+      lanePath: input.jobLane?.path ?? null,
+      laneBranch: input.jobLane?.branch ?? null,
+    });
+    const blockers = findBusyLanes({
+      ledger: this.opts.ledger,
+      lanes: this.opts.worktrees.listWorktrees(),
+      targetBranch,
+      ...(input.reviewedStatus !== undefined ? { reviewedStatus: input.reviewedStatus } : {}),
+    });
+    if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers };
+    this.opts.ledger.appendCustomEvent({
+      kind: input.force === true ? 'branch-idle.forced' : 'branch-idle.refused',
+      jobId: input.job.id,
+      ...(input.roundId !== undefined ? { roundId: input.roundId } : {}),
+      payload: { phase: input.phase, forced: input.force === true, targetBranch, blockers },
+    });
+    if (input.force !== true) throw new BranchBusyError(targetBranch, blockers, input.phase);
+    return { targetBranch, blockers };
+  }
+
   private async beginPerkinsRound(input: {
     jobId: string;
     targetRef?: string;
     lenses?: readonly string[];
     noSpec?: boolean;
+    force?: boolean;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     const controller = new AbortController();
@@ -937,6 +1020,7 @@ export class WaveRunner {
     targetRef?: string;
     lenses?: readonly string[];
     noSpec?: boolean;
+    force?: boolean;
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
     const policy = (this.opts.reviewPolicyLoader ?? loadPerkinsPolicy)();
@@ -1004,6 +1088,17 @@ export class WaveRunner {
       if (this.shuttingDown || setupSignal.aborted) {
         throw new Error('Perkins review service shut down during review setup');
       }
+      // Freeze-time close of the race window: a lane may have re-opened
+      // between the arm intake and this freeze. The same refusal applies.
+      const idle = this.enforceBranchIdle({
+        job,
+        jobLane: jobWorktree,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        ...(input.force !== undefined ? { force: input.force } : {}),
+        phase: 'freeze',
+        roundId: round.id,
+        ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
+      });
       frozenReview = freezeReviewInputs({
         roundId: round.id,
         repoPath: reviewWorktree.path,
@@ -1013,6 +1108,9 @@ export class WaveRunner {
         movementRef,
         chunkLineThreshold: policy.portableContract.rules.chunkLineThreshold,
         ...(input.noSpec === true ? { noSpec: true } : { spec }),
+        ...(input.force === true
+          ? { branchIdle: { forced: true as const, targetBranch: idle.targetBranch, blockers: idle.blockers } }
+          : {}),
       });
       this.opts.ledger.setRoundStatus(round.id, 'live');
     } catch (error) {

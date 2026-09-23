@@ -57,7 +57,17 @@ groups by repo; the phone is board-first.
 ## 4. Review waves (Perkins)
 
 `POST /api/dispatch/review` `{job_id, target_ref?, no_spec?}` freezes one
-exact target/base/diff/spec set in a detached review worktree. For a job
+exact target/base/diff/spec set in a detached review worktree. The arm
+first passes the **branch-idle guard**: while any lane is actively
+working/pushing the target branch (`dispatched`/`working` with no settled
+delivery for its current attempt), the API answers `409 branch_busy` with
+`blockers: [{job_id, status, branch}]` and the same check re-runs
+immediately before the freeze, so a lane re-opened mid-setup is refused
+the same way. The arm passes once the lane delivers. `force: true` is the
+human override; a forced round is tagged in its frozen manifest
+(`branchIdle`) and the event log (`branch-idle.forced`), refusals land as
+`branch-idle.refused`, and a Silas auto-arm deferral lands as
+`silas.review-deferred` (retry on the next sweep). For a job
 with a registered PR, the target is resolved from the LIVE branch: the
 review branch is fetched from `origin` and cross-checked against the code
 host's pull/merge-request head. The recorded lane pointer is a hint only;

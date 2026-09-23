@@ -99,6 +99,8 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |
 | `verification.started` / `verification.completed` | run id, scope, command, sha, workers, queued ms / ok, exit code, duration, bounded output hash+tail |
 | `verification.lock-timeout` / `verification.stale-released` | wait ms + holder counts / pid, reason (`holder-dead` \| `no-runner` \| `max-age`), age |
+| `branch-idle.refused` / `branch-idle.forced` | phase (`arm`/`freeze`), targetBranch, blockers — the review-arm branch-idle guard (forced rounds also carry the tag in their frozen manifest) |
+| `silas.review-deferred` | target_branch, phase, blockers — Silas defers a refused arm to its next sweep |
 
 Events are appended for **state changes**; idempotent enrichment writes
 (re-registering an agent, same-state activity refreshes) update rows

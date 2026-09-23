@@ -42,6 +42,14 @@ function asWave(outcome: WaveOutcome | FallbackGateOutcome): WaveOutcome {
   throw new Error(`expected a Perkins wave outcome, got ${outcome.route}`);
 }
 
+/** Branch-idle guard (2026-09-23): a review arm is refused while the target
+ * lane is busy — a dispatched/working job with no settled delivery for its
+ * current attempt. These fixtures review already-delivered lanes, so record
+ * the delivery each fixture implies and let the guard see an idle lane. */
+function settleLane(ledger: LedgerApi, jobId: string): void {
+  ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'fixture-settled' } });
+}
+
 function fixedProbe(headRefName: string, headSha: string): PrHeadProbe {
   return async () => ({ headRefName, headSha });
 }
@@ -236,6 +244,7 @@ describe('freeze-time integration on PR rounds', () => {
       briefing: 'Acceptance: two returns 2.',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/13');
     const poster = {
       post: vi.fn(async (_input: { readonly targetSha: string }) => ({
@@ -276,6 +285,7 @@ describe('freeze-time integration on PR rounds', () => {
       briefing: 'Acceptance: two returns 2.',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/14');
     const spawner = vi.fn() as unknown as AgentSpawner;
     const escalations: { title: string; detail: string }[] = [];
@@ -319,6 +329,7 @@ describe('freeze-time integration on PR rounds', () => {
       briefing: 'Acceptance: one returns 1.',
     });
     ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/15');
     const probe = vi.fn(async () => {
       throw new Error('the host probe must not be reached for a commit pin');
