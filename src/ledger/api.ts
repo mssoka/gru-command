@@ -350,6 +350,30 @@ export class LedgerApi {
     return row === undefined ? null : this.eventFromRow(row);
   }
 
+  /** Newest event among an explicit kind set (board health cards: the
+   * last Silas wake). An empty kind set is a caller bug — throw loudly. */
+  latestEventOfKinds(kinds: readonly string[]): EventRecord | null {
+    if (kinds.length === 0) throw new Error('latestEventOfKinds requires at least one kind');
+    const placeholders = kinds.map(() => '?').join(', ');
+    const row = this.db
+      .prepare(`SELECT * FROM events WHERE kind IN (${placeholders}) ORDER BY seq DESC LIMIT 1`)
+      .get(...kinds) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** Count of events among an explicit kind set at/after an ISO timestamp
+   * (board health cards: today's Silas reconciliations). ISO stamps share
+   * one shape, so lexicographic `>=` is the same boundary the ledger
+   * writes. An empty kind set is a caller bug — throw loudly. */
+  countEventsSince(kinds: readonly string[], since: string): number {
+    if (kinds.length === 0) throw new Error('countEventsSince requires at least one kind');
+    const placeholders = kinds.map(() => '?').join(', ');
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM events WHERE ts >= ? AND kind IN (${placeholders})`)
+      .get(since, ...kinds) as Row;
+    return Number(row.count);
+  }
+
   private eventFromRow(row: Row): EventRecord {
     return {
       seq: Number(row.seq),
