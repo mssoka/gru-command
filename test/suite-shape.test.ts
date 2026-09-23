@@ -35,7 +35,7 @@ const PINS: Record<string, number> = {
   'fix-directive.test.ts': 5,
   'health.test.ts': 19,
   'identity.test.ts': 3,
-  'install-one-line.test.ts': 29,
+  'install-one-line.test.ts': 31,
   'install.test.ts': 12,
   'lan-phone-raw-client.test.ts': 6,
   'ledger-api.test.ts': 23,
