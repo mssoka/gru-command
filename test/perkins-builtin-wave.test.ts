@@ -527,6 +527,61 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(port.getWorktree(second.round.id)?.status).toBe('swept');
   });
 
+  it('aborts immediately with an action-required escalation when required coverage is exhausted', async () => {
+    const repo = makeFixtureRepo('perkins-coverage-exhausted');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/coverage-exhausted']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-cov-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-cov-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-cov-sessions-'));
+    dirs.push(sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-cov-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/coverage-exhausted', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-coverage-exhausted' });
+    const job = ledger.addJob({
+      id: 'job-coverage-exhausted', repo: 'fixture', title: 'coverage exhausted', baseBranch: 'main', briefing: 'review',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: makeSpawner(sessions, [], undefined, (prompt) => sourceFor(prompt) === 'security' ? 'malformed' : undefined),
+      reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(outcome.round.status).toBe('aborted');
+    // The abort consumes the failureKind record: the durable event carries
+    // every attempt's class and error, not only a status name.
+    const payload = ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload as Record<string, unknown>;
+    expect(payload['reason']).toBe('coverage_exhausted');
+    expect(payload['error']).toContain('coverage exhausted');
+    expect(payload['exhausted']).toEqual([expect.objectContaining({ lens: 'security', chunk: '001' })]);
+    const attempts = (payload['exhausted'] as Array<{
+      attempts: Array<{ attempt: number; failureKind: string; error: string }>;
+    }>)[0]!.attempts;
+    expect(attempts.map((entry) => [entry.attempt, entry.failureKind])).toEqual([[1, 'output'], [2, 'output']]);
+    expect(attempts.every((entry) => entry.error.length > 0)).toBe(true);
+    // The escalation is action-required, names the round and lens/chunk, and
+    // spells out each attempt's failureKind and error.
+    expect(escalations.some((line) =>
+      line.includes('Action required') && line.includes(`review round ${outcome.round.id}`) && line.includes('security/001'),
+    )).toBe(true);
+    expect(escalations.some((line) =>
+      line.includes('attempt 1 invalid (output):') && line.includes('attempt 2 invalid (output):'),
+    )).toBe(true);
+    expect(existsSync(join(artifacts, outcome.round.id, 'coverage-exhausted.json'))).toBe(true);
+    expect(port.getWorktree(outcome.round.id)?.status).toBe('swept');
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+    rmSync(sessions, { recursive: true, force: true });
+  });
+
   it('audits the last complete predecessor across an incomplete middle round', async () => {
     const repo = makeFixtureRepo('perkins-wave-prior-continuity');
     repos.push(repo);

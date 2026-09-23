@@ -747,23 +747,64 @@ describe('Perkins hybrid lead engine', () => {
     expect(h.toolErrors).toHaveLength(0);
   });
 
-  it('fails closed when a child never validates: missing coverage rejects the terminal submission', async () => {
+  it('delivers the host rejection as a corrective instruction on the text retry', async () => {
+    let blindCalls = 0;
+    const h = hybridHarness({ childAnswer: (prompt) => {
+      if (lensFrom(prompt) === 'blind' && blindCalls++ === 0) return 'not json';
+      return '[]';
+    } });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    const blind = h.childCalls.filter((call) => lensFrom(call.prompt ?? '') === 'blind');
+    expect(blind).toHaveLength(2);
+    expect(blind[0]!.prompt).not.toContain('RETRY CORRECTION');
+    expect(blind[1]!.prompt).toContain('--- RETRY CORRECTION (attempt 2) ---');
+    expect(blind[1]!.prompt).toContain(
+      'Previous output rejected (output): lens output must be a bare JSON array with no preamble or markdown fence; output ONLY the bare JSON array.',
+    );
+  });
+
+  it('aborts immediately when a child exhausts coverage instead of letting the lead submit', async () => {
     const h = hybridHarness({ childAnswer: (prompt) => lensFrom(prompt) === 'security' ? 'malformed' : '[]' });
-    await expect(h.run()).rejects.toThrow(/coverage is missing/);
-    expect(h.toolErrors.some((entry) => /coverage is missing/.test(entry.error))).toBe(true);
+    await expect(h.run()).rejects.toThrow(
+      /round cannot complete: coverage exhausted \(round hybrid-round\): security\/001 \(attempt 1 invalid \(output\): .*attempt 2 invalid \(output\): /,
+    );
     expect(h.frozen.directory).toBeDefined();
     const envelopeDir = join(h.frozen.directory, 'lenses', '001');
     const envelopeName = readdirSync(envelopeDir).find((entry) => /^security\.attempt-2-[0-9a-f]+\.envelope\.json$/u.test(entry));
     expect(envelopeName).toBeDefined();
     const envelope = JSON.parse(readFileSync(join(envelopeDir, envelopeName!), 'utf8')) as {
-      attempt: number; status: string;
+      attempt: number; status: string; failureKind: string; error: string;
     };
-    expect(envelope).toMatchObject({ attempt: 2, status: 'invalid' });
-    expect(readFileSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.error.json'), 'utf8')).toContain('coverage is missing');
+    expect(envelope).toMatchObject({ attempt: 2, status: 'invalid', failureKind: 'output' });
+    // The dead gate is durable and exhaustive: every attempt's failureKind and
+    // error survives in the host artifact, not only in the error message.
+    const exhausted = JSON.parse(readFileSync(join(h.frozen.directory, 'coverage-exhausted.json'), 'utf8')) as {
+      roundId: string;
+      reason: string;
+      exhausted: Array<{
+        lens: string;
+        chunk: string;
+        attempts: Array<{ attempt: number; status: string; failureKind: string; error: string }>;
+      }>;
+    };
+    expect(exhausted).toMatchObject({ roundId: 'hybrid-round', reason: 'coverage_exhausted' });
+    expect(exhausted.exhausted).toHaveLength(1);
+    expect(exhausted.exhausted[0]).toMatchObject({ lens: 'security', chunk: '001' });
+    expect(exhausted.exhausted[0]!.attempts.map((entry) => [entry.attempt, entry.status, entry.failureKind])).toEqual([
+      [1, 'invalid', 'output'], [2, 'invalid', 'output'],
+    ]);
+    expect(exhausted.exhausted[0]!.attempts.every((entry) => entry.error.includes('bare JSON array'))).toBe(true);
+    // The lead never consumed a terminal submission against the dead gate.
+    expect(() => readFileSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.error.json'))).toThrow();
+    expect(() => readFileSync(join(h.frozen.directory, 'lead', 'submission-attempt-1.json'))).toThrow();
+    expect(h.toolErrors.some((entry) => /coverage exhausted/.test(entry.error))).toBe(true);
+    expect(h.childCalls.filter((call) => lensFrom(call.prompt ?? '') === 'security')).toHaveLength(2);
+    expect(h.leadCalls.every((call) => call.disposed === true)).toBe(true);
     expect(() => readFileSync(join(h.frozen.directory, 'perkins-report.md'))).toThrow();
   });
 
-  it('classifies a timed-out lens attempt by failure kind, not as an output rejection', async () => {
+  it('records a double timeout as the abort reason when coverage dies to load', async () => {
     vi.useFakeTimers();
     try {
       const h = hybridHarness({
@@ -774,7 +815,9 @@ describe('Perkins hybrid lead engine', () => {
       for (let tick = 0; tick < 6; tick += 1) await vi.advanceTimersByTimeAsync(600_000);
       const error = await settled;
       expect(error).toBeInstanceOf(Error);
-      expect((error as Error).message).toMatch(/coverage is missing/u);
+      expect((error as Error).message).toMatch(
+        /security\/001 \(attempt 1 failed \(timeout\): review turn timed out after 600000ms; attempt 2 failed \(timeout\): review turn timed out after 600000ms\)/u,
+      );
       const envelopeDir = join(h.frozen.directory, 'lenses', '001');
       const envelopeFor = (attempt: number) => {
         const name = readdirSync(envelopeDir)
@@ -791,6 +834,17 @@ describe('Perkins hybrid lead engine', () => {
       expect(first.error).toContain('review turn timed out after 600000ms');
       const second = envelopeFor(2);
       expect(second).toMatchObject({ attempt: 2, status: 'failed', failureKind: 'timeout' });
+      // The retry is corrective about the timeout, not a blind repeat.
+      const security = h.childCalls.filter((call) => lensFrom(call.prompt ?? '') === 'security');
+      expect(security).toHaveLength(2);
+      expect(security[1]!.prompt).toContain('--- RETRY CORRECTION (attempt 2) ---');
+      expect(security[1]!.prompt).toContain('Previous output rejected (timeout): review turn timed out after 600000ms');
+      const exhausted = JSON.parse(readFileSync(join(h.frozen.directory, 'coverage-exhausted.json'), 'utf8')) as {
+        exhausted: Array<{ attempts: Array<{ attempt: number; status: string; failureKind: string }> }>;
+      };
+      expect(exhausted.exhausted[0]!.attempts.map((entry) => [entry.attempt, entry.status, entry.failureKind])).toEqual([
+        [1, 'failed', 'timeout'], [2, 'failed', 'timeout'],
+      ]);
     } finally {
       vi.useRealTimers();
     }
@@ -958,9 +1012,9 @@ describe('Perkins hybrid lead engine', () => {
     });
     symlinkSync(outsideDir, join(h.repo.path, 'linked'));
     // The mispaired evidence is rejected at child envelope construction (the
-    // attempt is invalid and retryable), and the round still fails closed
-    // because the required coverage never validates.
-    await expect(h.run()).rejects.toThrow(/coverage-missing/);
+    // attempt is invalid and retryable), and when the retry cannot validate
+    // either, the host aborts the round instead of consuming submissions.
+    await expect(h.run()).rejects.toThrow(/coverage exhausted/);
     const envelopeName = readdirSync(join(h.frozen.directory, 'lenses', '001'))
       .find((name) => name.startsWith('security.attempt-1-') && name.endsWith('.envelope.json'));
     const envelope = JSON.parse(readFileSync(join(h.frozen.directory, 'lenses', '001', envelopeName!), 'utf8')) as {
@@ -1655,12 +1709,13 @@ describe('Perkins child structured findings (perkins_submit_findings)', () => {
         : '[]',
       childNativeTools: 'tool',
     });
-    await expect(h.run()).rejects.toThrow(/coverage is missing/u);
+    await expect(h.run()).rejects.toThrow(/coverage exhausted/u);
     const envelope = readChildEnvelope(h.frozen.directory, 'security', 2);
     expect(envelope.status).toBe('invalid');
     expect(envelope.failureKind).toBe('output');
     expect(envelope.error).toContain('severity is invalid');
     expect(envelope.findings).toEqual([]);
+    expect(readFileSync(join(h.frozen.directory, 'coverage-exhausted.json'), 'utf8')).toContain('severity is invalid');
   });
 
   it('marks a tool-capable child that never calls the tool invalid and retries it through the lead', async () => {
@@ -1683,13 +1738,41 @@ describe('Perkins child structured findings (perkins_submit_findings)', () => {
     expect(readChildEnvelope(h.frozen.directory, 'security', 2).status).toBe('valid');
   });
 
+  it('delivers the host rejection as native-tool corrective context on the submission retry', async () => {
+    let securityCalls = 0;
+    const h = hybridHarness({
+      childAnswer: (prompt) => {
+        if (lensFrom(prompt) !== 'security') return '[]';
+        securityCalls += 1;
+        return securityCalls === 1
+          ? 'I reviewed the diff but never submitted anything.'
+          : JSON.stringify([finding('security', 'warning')]);
+      },
+      childNativeTools: 'tool',
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    const security = h.childCalls.filter((call) => lensFrom(call.prompt ?? '') === 'security');
+    expect(security).toHaveLength(2);
+    expect(security[0]!.prompt).not.toContain('RETRY CORRECTION');
+    expect(security[1]!.prompt).toContain('--- RETRY CORRECTION (attempt 2) ---');
+    expect(security[1]!.prompt).toContain('Previous attempt rejected (output):');
+    expect(security[1]!.prompt).toContain('did not submit findings via perkins_submit_findings');
+    expect(security[1]!.prompt).toContain('call perkins_submit_findings exactly once');
+    expect(readChildEnvelope(h.frozen.directory, 'security', 1)).toMatchObject({
+      status: 'invalid', failureKind: 'output',
+    });
+  });
+
   it('never parses assistant JSON back on a tool-capable child: text-only output is invalid', async () => {
     const h = hybridHarness({
       childAnswer: (prompt) => lensFrom(prompt) === 'security' ? JSON.stringify([finding('security', 'warning')]) : '[]',
       childNativeTools: 'text-only',
     });
-    await expect(h.run()).rejects.toThrow(/coverage is missing/u);
-    const envelope = readChildEnvelope(h.frozen.directory, 'security', 2);
+    await expect(h.run()).rejects.toThrow(/coverage exhausted/u);
+    // The blind lens answers a valid JSON array as assistant text, yet the
+    // tool-capable contract rejects it: only perkins_submit_findings counts.
+    const envelope = readChildEnvelope(h.frozen.directory, 'blind', 2);
     expect(envelope.status).toBe('invalid');
     expect(envelope.error).toContain('did not submit findings');
     expect(envelope.findings).toEqual([]);
