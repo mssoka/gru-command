@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   assertFrozenPromptBounds,
   baseMovedSinceFreeze,
@@ -763,6 +763,39 @@ describe('Perkins hybrid lead engine', () => {
     expect(() => readFileSync(join(h.frozen.directory, 'perkins-report.md'))).toThrow();
   });
 
+  it('classifies a timed-out lens attempt by failure kind, not as an output rejection', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = hybridHarness({
+        childAnswer: (prompt) => lensFrom(prompt) === 'security' ? new Promise<string>(() => {}) : '[]',
+      });
+      const running = h.run();
+      const settled = running.then(() => null, (error: unknown) => error);
+      for (let tick = 0; tick < 6; tick += 1) await vi.advanceTimersByTimeAsync(600_000);
+      const error = await settled;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/coverage is missing/u);
+      const envelopeDir = join(h.frozen.directory, 'lenses', '001');
+      const envelopeFor = (attempt: number) => {
+        const name = readdirSync(envelopeDir)
+          .find((entry) => entry.startsWith(`security.attempt-${attempt}-`) && entry.endsWith('.envelope.json'));
+        expect(name).toBeDefined();
+        return JSON.parse(readFileSync(join(envelopeDir, name!), 'utf8')) as {
+          attempt: number; status: string; failureKind?: string; error?: string;
+        };
+      };
+      // Both attempts spent the full 600s turn budget under load: each
+      // envelope records the timeout class instead of blaming the output.
+      const first = envelopeFor(1);
+      expect(first).toMatchObject({ attempt: 1, status: 'failed', failureKind: 'timeout' });
+      expect(first.error).toContain('review turn timed out after 600000ms');
+      const second = envelopeFor(2);
+      expect(second).toMatchObject({ attempt: 2, status: 'failed', failureKind: 'timeout' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('runs a complete child wave for every deterministic diff chunk', async () => {
     const fixture = makeFixtureRepo('perkins-chunk-wave');
     repos.push(fixture);
@@ -1329,9 +1362,10 @@ describe('Perkins hybrid lead engine', () => {
     const envelopeFor = (attempt: string) => JSON.parse(readFileSync(
       join(lensDir, readdirSync(lensDir).find((name) => name.startsWith(`security.attempt-${attempt}-`) && name.endsWith('.envelope.json'))!),
       'utf8',
-    )) as { status: string; findings: readonly unknown[]; error?: string };
+    )) as { status: string; failureKind?: string; findings: readonly unknown[]; error?: string };
     const firstAttempt = envelopeFor('1');
     expect(firstAttempt.status).toBe('invalid');
+    expect(firstAttempt.failureKind).toBe('output');
     expect(firstAttempt.error).toMatch(/lens finding 0 evidence is not locatable at its cited file\/hunk: src\/main\.ts:1/u);
     const secondAttempt = envelopeFor('2');
     expect(secondAttempt.status).toBe('valid');
@@ -1538,6 +1572,7 @@ describe('Perkins child structured findings (perkins_submit_findings)', () => {
     readonly status: string;
     readonly outputSha256: string | null;
     readonly recovery?: string;
+    readonly failureKind?: string;
     readonly error?: string;
     readonly findings: ReadonlyArray<{ readonly title: string; readonly source: string }>;
   }
@@ -1623,6 +1658,7 @@ describe('Perkins child structured findings (perkins_submit_findings)', () => {
     await expect(h.run()).rejects.toThrow(/coverage is missing/u);
     const envelope = readChildEnvelope(h.frozen.directory, 'security', 2);
     expect(envelope.status).toBe('invalid');
+    expect(envelope.failureKind).toBe('output');
     expect(envelope.error).toContain('severity is invalid');
     expect(envelope.findings).toEqual([]);
   });
@@ -1911,5 +1947,10 @@ describe('EEXIST guards: write-once collision in catch path (Blocker 3: mutation
     expect(result.completeness).toMatchObject({ complete: true, requiredLensRuns: 7, validLensRuns: 7 });
     // doneCalls: first lens/chunk throws, the remaining 6 succeed normally
     expect(doneCalls).toBeGreaterThanOrEqual(7);
+    // A post-parse host error is not a child output rejection: it records
+    // failureKind 'error', never 'output'.
+    const exploded = result.lensEnvelopes.find((envelope) => envelope.error?.includes('progress listener exploded'));
+    expect(exploded).toBeDefined();
+    expect(exploded).toMatchObject({ status: 'invalid', failureKind: 'error' });
   });
 });

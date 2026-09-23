@@ -43,7 +43,7 @@ const PINS: Record<string, number> = {
   'logger.test.ts': 3,
   'native-tools-parity.test.ts': 2,
   'notifications.test.ts': 15,
-  'perkins-builtin-review.test.ts': 72,
+  'perkins-builtin-review.test.ts': 73,
   'perkins-builtin-wave.test.ts': 36,
   'perkins-freeze-freshhead.test.ts': 10,
   'perkins-lead-schema-compat.test.ts': 5,
