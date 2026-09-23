@@ -7,6 +7,7 @@ import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
 import { rebriefFreshMinion, recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
+import { BranchBusyError } from './branch-idle.js';
 import type { WorktreePort } from './worktree-port.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -214,13 +215,39 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (!authed(req, res)) return true;
       const body = await readBody(req);
       const by = byField(body);
+      const force = optBoolField(body, 'force');
       const input = {
         jobId: strField(body, 'job_id'),
         ...(optStrField(body, 'target_ref') !== undefined ? { targetRef: optStrField(body, 'target_ref') } : {}),
         ...(optStrArray(body, 'lenses') !== undefined ? { lenses: optStrArray(body, 'lenses') } : {}),
         ...(optBoolField(body, 'no_spec') !== undefined ? { noSpec: optBoolField(body, 'no_spec') } : {}),
+        ...(force !== undefined ? { force } : {}),
       };
-      const outcome = await options.wave.requestReview(input);
+      let outcome: Awaited<ReturnType<WaveRunner['requestReview']>>;
+      try {
+        outcome = await options.wave.requestReview(input);
+      } catch (error) {
+        if (error instanceof BranchBusyError) {
+          const refusal = error.refusal();
+          if (by === 'silas') {
+            // The deferred-arm note: Silas retries on the next sweep once
+            // the busy lane delivers; the ledger keeps the deferral trail.
+            options.ledger.appendCustomEvent({
+              kind: 'silas.review-deferred',
+              jobId: input.jobId,
+              payload: {
+                target_branch: error.targetBranch,
+                phase: error.phase,
+                blockers: refusal.blockers,
+                hint: refusal.hint,
+              },
+            });
+          }
+          json(res, 409, refusal);
+          return true;
+        }
+        throw error;
+      }
       if (by === 'silas') {
         options.ledger.appendCustomEvent({
           kind: 'silas.review-triggered',
