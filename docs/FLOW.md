@@ -376,7 +376,11 @@ Both write a disk record at `<data_dir>/roll-state.json` and drive four
 idempotent phases:
 
 1. **preflight** — in the deploy clone (the checkout containing this
-   `dist`): refuse a dirty tree; `git pull --ff-only` (divergence refuses,
+   `dist`): refuse a dirty tree; **refuse a foreign listener on the
+   instance port** (owner incident 2026-09-23: a loopback squatter would
+   make the post-swap `/health` verification read the wrong process —
+   the roll fails loud + action-required before any pull/build);
+   `git pull --ff-only` (divergence refuses,
    never resets); `npm ci` + `npm run build` + `npm run build:web` while
    the OLD process keeps serving (the build replaces files under `dist/`;
    the old binary holds its own inodes). The build stamps
@@ -398,7 +402,9 @@ idempotent phases:
    sha, clears the marker, and logs a post-listen self-check
    (uptime + sha). `/health` reports the running build identity in the
    token-gated payload (`build: { rev, committed_at, built_at }`); the CLI exits 0 only
-   once `/health` reports the target SHA.
+   once `/health` reports the target SHA **and the port's listener pid is
+   the process that adopted the roll** (a squatter answering a matching
+   `/health` is caught by pid, not trusted).
 
 **Why exit 75 and not exit(0).** The shipped units are
 `launchd KeepAlive {SuccessfulExit=false}` and `systemd Restart=on-failure`:

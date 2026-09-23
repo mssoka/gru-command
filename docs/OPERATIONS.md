@@ -67,6 +67,30 @@ loginctl enable-linger $USER               # keep it running when logged out
 Without the OS service: `npm start` (or `node dist/main.js`) in the
 repo. Sessions resume from disk on every start (SPEC ruling 12).
 
+## Port-squat prevention (owner incident 2026-09-23)
+
+macOS lets a specific bind (`127.0.0.1:7665`) coexist with a wildcard bind
+(`0.0.0.0:7665`), so a stray service can sit on the loopback address while
+the real instance serves the LAN — loopback clients then hit the squatter
+(`503 not_configured`) for as long as nobody notices. Three durable
+defenses, each with its own loud failure:
+
+- **Worktree-spawned services never bind the instance port.** A service
+  started from a linked git worktree (or with
+  `GRU_COMMAND_WORKTREE_CONTEXT=1`) must use an ephemeral port
+  (`port = 0`) or an explicit `GRU_SERVICE_PORT=<high port>` handoff;
+  anything else refuses at boot, named. The test/e2e harness does exactly
+  this for every service it spawns.
+- **The roll preflight checks listener ownership.** If any pid other than
+  the service itself listens on the instance port, `gru-service roll`
+  (and `POST /api/roll`) fails in preflight with an action-required
+  notification; the old service keeps serving. The `gru-service` follow-up
+  trusts `/health` only when the listener pid is the process that adopted
+  the roll — a squatter answering 200 is never read as success.
+- **Boot checks the listener pid.** A service that binds but finds a
+  foreign listener on its port logs the squatter pid + command, posts an
+  action-required notification, and exits — never a silent loopback 503.
+
 ## Supervision and the crash-loop breaker
 
 The in-process supervisor watches every hosted agent (liveness = runtime
