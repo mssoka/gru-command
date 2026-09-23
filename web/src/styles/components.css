@@ -289,17 +289,24 @@ body {
   z-index: 29;
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-height: 40px;
+  flex-wrap: wrap;
+  gap: 6px;
   padding: 6px 12px;
   background: var(--paper);
   border-bottom: 1.5px solid var(--line);
-  overflow-x: auto;
-  scrollbar-width: none;
 }
 
-.chip-rail::-webkit-scrollbar {
-  display: none;
+/* Phone: one calm scrollable row instead of stacked chrome. */
+@media (max-width: 899px) {
+  .chip-rail {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .chip-rail::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 .rail-chip {
@@ -307,7 +314,7 @@ body {
   align-items: center;
   gap: 7px;
   flex: none;
-  padding: 4px 12px;
+  padding: 4px 11px;
   border: var(--outline-thin);
   border-radius: 999px;
   background: var(--card);
@@ -340,30 +347,52 @@ body {
   padding: 1px 8px;
 }
 
-/* Nested sub-badges carry the folded v4 KPI counts (monospace readouts). */
-.rail-chip__sub {
+/* Folded KPI count strips (TRACKERS): label + total, slash-separated
+   numbers in the mockup's telemetry style. */
+.rail-kpi {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.rail-kpi__label {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: var(--faint);
+}
+
+.rail-kpi__total {
+  font-size: 10px;
+  color: var(--ink);
+}
+
+.rail-kpi__nums {
+  display: inline-flex;
+  align-items: baseline;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 10px;
   font-weight: 700;
-  letter-spacing: 0.02em;
   color: var(--muted);
-  background: var(--soft);
-  border-radius: 999px;
-  padding: 1px 7px;
 }
 
-.rail-chip__sub--alert {
-  background: var(--alert);
-  color: var(--on-state);
+.rail-kpi__sep {
+  padding: 0 1px;
+  color: var(--faint);
 }
 
-.rail-chip__sub--warn {
-  background: var(--work);
-  color: var(--on-state);
+.rail-kpi__num--alert {
+  color: var(--band-needs-you-ink);
+  font-weight: 800;
 }
 
 .rail-chip--trackers {
   gap: 6px;
+}
+
+.rail-chip--trackers .board-decisions,
+.rail-chip--trackers .board-unacked {
+  margin-left: 2px;
 }
 
 .app-main {
@@ -510,7 +539,10 @@ body {
   #splitter-rail { grid-area: s2; }
   .agents-rail { grid-area: rail; }
 
-  .splitter { display: block; }
+  .splitter {
+    display: block;
+    align-self: stretch;
+  }
 
   /* Chat pane: full height and pinned — the board scrolls, chat does not
      leave the corner of the eye. --chrome-h is the measured command bar
@@ -1609,13 +1641,17 @@ body {
 }
 
 /* The one compact signal a collapsed row may carry (live round,
-   blockers/failures, unacked action-required). */
+   blockers/failures, unacked action-required). A chip is an inline-FLEX
+   by default, on which text-overflow is inert — it renders inline-block
+   here so a squeezed label ellipsizes instead of slicing mid-word. */
 .board-job__signal {
+  display: inline-block;
   flex: none;
-  max-width: 42%;
+  max-width: 32%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  vertical-align: bottom;
   font-size: 10px;
   padding: 2px 9px;
 }
@@ -1937,6 +1973,7 @@ body {
   flex: none;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 9px;
+  letter-spacing: 0.04em;
   color: var(--faint);
 }
 
@@ -1945,19 +1982,44 @@ body {
   align-items: center;
   gap: 4px;
   font-size: 9px;
+  /* The .lbl default (0.18em) is tuned for big headings; in an 240px rail
+     it squeezes the role·state out of the line. */
+  letter-spacing: 0.05em;
   color: var(--muted);
   overflow: hidden;
   white-space: nowrap;
+  min-width: 0;
+}
+
+.board-agent__role {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.board-agent__supervision {
+  flex: none;
+}
+
+.board-agent__supervision--alert {
+  color: var(--band-needs-you-ink);
+  font-weight: 800;
+}
+
+.board-agent__supervision--warn {
+  color: var(--muted);
 }
 
 .board-agent__state {
   font-size: 9.5px;
-  padding: 1px 7px;
+  padding: 1px 6px;
   flex: none;
 }
 
 /* Turn-age counter on a streaming agent — quiet for N seconds/minutes. */
 .board-agent__age {
+  flex: none;
   color: var(--muted);
   letter-spacing: 0.04em;
   white-space: nowrap;

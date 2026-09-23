@@ -5,8 +5,8 @@ import type { AgentView, BoardSnapshot, JobView } from './board-protocol.js';
 
 /**
  * The v6 status chip rail: seven chips in fixed order, the v4 health
- * cards' data, and the jobs/PRs/lane counts folded in from the SAME
- * `boardKpis` derivation the v4 KPI strip used.
+ * cards' data, and the jobs/PRs/lane counts folded into the TRACKERS
+ * chip from the SAME `boardKpis` derivation the v4 KPI strip used.
  */
 
 const NOW = Date.now();
@@ -58,6 +58,17 @@ function snapshot(jobs: readonly JobView[], agents: readonly AgentView[] = []): 
   };
 }
 
+function kpiValues(chips: ReturnType<typeof railChips>): Map<string, number> {
+  const values = new Map<string, number>();
+  for (const chip of chips) {
+    for (const group of chip.kpis ?? []) {
+      if (group.total !== undefined) values.set(group.total.kpi, group.total.value);
+      for (const value of group.values) values.set(value.kpi, value.value);
+    }
+  }
+  return values;
+}
+
 describe('board rail — chips (v6)', () => {
   it('renders the seven chips in the fixed deploy→trackers order', () => {
     const chips = railChips(snapshot([job('w1', 'working')]), NOW);
@@ -70,7 +81,6 @@ describe('board rail — chips (v6)', () => {
       'cure',
       'trackers',
     ]);
-    // Titles are uppercased for the rail face.
     expect(chips.map((chip) => chip.label)).toEqual([
       'DEPLOY',
       'REVIEWS',
@@ -80,6 +90,20 @@ describe('board rail — chips (v6)', () => {
       'CURE',
       'TRACKERS',
     ]);
+  });
+
+  it('folds three KPI groups (jobs/PRs/lanes) into the trackers chip', () => {
+    const chips = railChips(snapshot([job('w1', 'working')]), NOW);
+    const trackers = chips.find((chip) => chip.id === 'trackers');
+    expect(trackers?.kpis?.map((group) => group.label)).toEqual(['JOBS', 'PRS', 'LANES']);
+    expect(trackers?.kpis?.map((group) => group.title)).toEqual([
+      'working / in-review / merged / done / parked',
+      'open / conflicting / merged today',
+      'live minions / mid-turn / disposed',
+    ]);
+    // The health chips carry no folded counts (their flags are the health
+    // card's own sub-badge — e.g. REVIEWS carries "12 FAILED").
+    expect(chips.filter((chip) => chip.id !== 'trackers').every((chip) => chip.kpis === undefined)).toBe(true);
   });
 
   it('every folded count equals the v4 KPI derivation (same snapshot)', () => {
@@ -102,48 +126,41 @@ describe('board rail — chips (v6)', () => {
       ],
     );
     const kpis = boardKpis(snap, new Date(NOW));
-    const chips = railChips(snap, NOW);
-    const subs = new Map(chips.flatMap((chip) => chip.subs).map((sub) => [sub.kpi, sub.label]));
+    const values = kpiValues(railChips(snap, NOW));
 
-    expect(subs.get('jobs.total')).toBe(`${kpis.jobs.total} jobs`);
-    expect(subs.get('jobs.working')).toBe(`${kpis.jobs.working} working`);
-    expect(subs.get('jobs.inReview')).toBe(`${kpis.jobs.inReview} in-review`);
-    expect(subs.get('jobs.merged')).toBe(`${kpis.jobs.merged} merged`);
-    expect(subs.get('jobs.done')).toBe(`${kpis.jobs.done} done`);
-    expect(subs.get('jobs.parked')).toBe(`${kpis.jobs.parked} parked`);
-    expect(subs.get('prs.open')).toBe(`${kpis.prs.open} open PRs`);
-    expect(subs.get('prs.conflicting')).toBe(`${kpis.prs.conflicting} conflicting`);
-    expect(subs.get('prs.mergedToday')).toBe(`${kpis.prs.mergedToday} merged today`);
-    expect(subs.get('lanes.liveMinions')).toBe(`${kpis.lanes.liveMinions} live minions`);
-    expect(subs.get('lanes.midTurn')).toBe(`${kpis.lanes.midTurn} mid-turn`);
-    expect(subs.get('lanes.disposed')).toBe(`${kpis.lanes.disposed} disposed`);
+    expect(values.get('jobs.total')).toBe(kpis.jobs.total);
+    expect(values.get('jobs.working')).toBe(kpis.jobs.working);
+    expect(values.get('jobs.inReview')).toBe(kpis.jobs.inReview);
+    expect(values.get('jobs.merged')).toBe(kpis.jobs.merged);
+    expect(values.get('jobs.done')).toBe(kpis.jobs.done);
+    expect(values.get('jobs.parked')).toBe(kpis.jobs.parked);
+    expect(values.get('prs.open')).toBe(kpis.prs.open);
+    expect(values.get('prs.conflicting')).toBe(kpis.prs.conflicting);
+    expect(values.get('prs.mergedToday')).toBe(kpis.prs.mergedToday);
+    expect(values.get('lanes.liveMinions')).toBe(kpis.lanes.liveMinions);
+    expect(values.get('lanes.midTurn')).toBe(kpis.lanes.midTurn);
+    expect(values.get('lanes.disposed')).toBe(kpis.lanes.disposed);
 
     // Spot-check the derivation itself so the comparison is not vacuous.
-    expect(subs.get('jobs.total')).toBe('8 jobs');
-    expect(subs.get('jobs.working')).toBe('2 working');
-    expect(subs.get('prs.conflicting')).toBe('1 conflicting');
-    expect(subs.get('lanes.liveMinions')).toBe('2 live minions');
-    expect(subs.get('lanes.disposed')).toBe('1 disposed');
+    expect(values.get('jobs.total')).toBe(8);
+    expect(values.get('jobs.working')).toBe(2);
+    expect(values.get('prs.conflicting')).toBe(1);
+    expect(values.get('lanes.liveMinions')).toBe(2);
+    expect(values.get('lanes.disposed')).toBe(1);
   });
 
-  it('marks the loud states: a conflicting PR sub-badge and an unacked tracker flag', () => {
+  it('marks the loud states: an unacked tracker chip flags the count', () => {
     const snap = snapshot([job('i1', 'in-review', { prUrl: 'https://x/2', prState: 'conflicting' })]);
-    const conflicting = railChips({ ...snap, unackedActionRequired: 2 }, NOW)
-      .flatMap((chip) => chip.subs)
-      .find((sub) => sub.kpi === 'prs.conflicting');
-    expect(conflicting?.tone).toBe('alert');
     const trackers = railChips({ ...snap, unackedActionRequired: 2 }, NOW).find((chip) => chip.id === 'trackers');
     expect(trackers?.tone).toBe('alert');
-    expect(trackers?.flag).toBe('2 ACK');
+    expect(trackers?.detail).toContain('2 action-required');
   });
 
-  it('carries the health cards verbatim: reviews flags 12 failed, deploy stays n/a honestly', () => {
-    const snap = snapshot([]);
-    const chips = railChips(snap, NOW);
+  it('carries the health cards verbatim: unwired feeds stay an honest n/a', () => {
+    const chips = railChips(snapshot([]), NOW);
     const deploy = chips.find((chip) => chip.id === 'deploy');
     const reviews = chips.find((chip) => chip.id === 'reviews');
     const verify = chips.find((chip) => chip.id === 'verify');
-    // Unwired feeds render an honest n/a, never a fabricated zero.
     expect(deploy?.value).toBe('n/a');
     expect(verify?.value).toBe('n/a');
     expect(reviews?.value).toBe('0 active');

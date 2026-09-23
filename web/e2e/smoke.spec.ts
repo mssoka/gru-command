@@ -438,27 +438,30 @@ test('socket drop shows a degraded banner that clears on recovery', async ({ pag
 });
 
 test.describe('board (E6, mock feed)', () => {
-  test('repo cards collapse by default; expanding reveals the round lens chips', async ({ page }) => {
+  test('dense rows collapse by default; expanding reveals the round lens chips', async ({ page }) => {
     await pair(page);
     await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
-    // v4: bands lead the board; a repo card repeats per band it has jobs in.
+    // v4 bands lead the board; rows group under sticky band separators.
     await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS YOU');
     await expect(
       page.locator('.board-band--needs-you .board-job', { hasText: 'Merge main into the retry branch' }),
     ).toBeVisible();
 
-    // Collapsed default: summary only — no detail nodes in the DOM.
+    // Collapsed default: summary face only — no detail nodes in the DOM.
     const job = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
     await expect(job).toHaveAttribute('data-expanded', 'false');
     await expect(job.locator('.board-job__body')).toHaveCount(0);
     await expect(page.locator('.board-lens')).toHaveCount(0);
+    // Line 1 carries the status dot + chip; line 2 the repo/branch/ages.
+    await expect(job.locator('.board-job__dot')).toBeVisible();
+    await expect(job.locator('.board-job__branch')).toContainText('gru/demo-api-payment-fix');
     // The one compact signal carries the live round + the unacked notice.
     const signal = job.locator('.board-job__signal');
     await expect(signal).toContainText('live');
     await expect(signal).toContainText('action-required');
 
-    // Expand the card, then the round row: all 7 lens chips appear.
+    // Expand the row, then the round row: all 7 lens chips appear.
     await job.locator('.board-job__toggle').click();
     await expect(job).toHaveAttribute('data-expanded', 'true');
     await expect(job.locator('.board-lane')).toBeVisible();
@@ -475,38 +478,53 @@ test.describe('board (E6, mock feed)', () => {
     await page.locator('#notification-bell').click();
   });
 
-  test('v4: KPI strip, health row, and attention-bucketed ordering', async ({ page }) => {
+  test('v6: the chip rail carries the v4 health row + folded KPI counts, bands stay ordered', async ({ page }) => {
     await pair(page);
     await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
 
-    // KPI strip renders the three groups with live counts.
-    await expect(page.locator('#board-kpis .board-kpi')).toHaveCount(3);
-    const stats = page.locator('#board-kpis .board-kpi__stat');
-    await expect(stats).toHaveCount(11); // 5 jobs + 3 PRs + 3 lane stats
-    const text = await page.locator('#board-kpis').textContent();
-    for (const label of ['working', 'in-review', 'merged', 'done', 'parked', 'open', 'conflicting', 'merged today', 'live minions', 'mid-turn', 'disposed']) {
-      expect(text).toContain(label);
+    // The global rail replaces the old KPI strip + health row: seven chips.
+    await expect(page.locator('#chip-rail')).toBeVisible();
+    await expect(page.locator('#chip-rail .rail-chip')).toHaveCount(7);
+    const railText = (await page.locator('#chip-rail').textContent()) ?? '';
+    for (const label of ['DEPLOY', 'REVIEWS', 'SILAS', 'ALERTS', 'VERIFY', 'CURE', 'TRACKERS']) {
+      expect(railText).toContain(label);
+    }
+    // The folded counts are the v4 KPI values (data-kpi keys).
+    for (const kpi of [
+      'jobs.total',
+      'jobs.working',
+      'jobs.inReview',
+      'jobs.merged',
+      'jobs.done',
+      'jobs.parked',
+      'prs.open',
+      'prs.conflicting',
+      'prs.mergedToday',
+      'lanes.liveMinions',
+      'lanes.midTurn',
+      'lanes.disposed',
+    ]) {
+      await expect(page.locator(`#chip-rail [data-kpi="${kpi}"]`)).toHaveCount(1);
     }
 
-    // Health row: deploy drift is mandatory and reads the mock's 3-behind build.
-    const deploy = page.locator('.board-health__card[data-card="deploy"]');
+    // Deploy drift is mandatory and reads the mock's 3-behind build.
+    const deploy = page.locator('.rail-chip[data-chip="deploy"]');
     await expect(deploy).toContainText('3 behind');
-    await expect(deploy.locator('.board-health__flag')).toHaveText('RESTART PENDING');
-    await expect(page.locator('.board-health__card[data-card="verify"]')).toContainText('lock free');
-    await expect(
-      page.locator('.board-health__card[data-card="cure"] .board-health__value'),
-    ).toHaveText('n/a');
+    await expect(deploy.locator('.rail-chip__flag')).toHaveText('RESTART PENDING');
+    await expect(page.locator('.rail-chip[data-chip="verify"]')).toContainText('lock free');
+    await expect(page.locator('.rail-chip[data-chip="cure"] .rail-chip__value')).toHaveText('n/a');
 
-    // Bands in priority order, headers visible.
+    // Bands in priority order, headers sticky separators with counts.
     await expect(page.locator('.board-band__label')).toHaveText(['NEEDS YOU', 'IN FLIGHT', 'SETTLED', 'COLD']);
+    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('12 jobs');
     // The stalled working lane sank to COLD carrying the stale flag.
     const stalled = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
     await expect(stalled).toBeVisible();
     await expect(stalled.locator('.board-job__stale')).toHaveText('stalled');
   });
 
-  test('card disclosure persists per job across a reload (v3)', async ({ page }) => {
+  test('row disclosure persists per job across a reload (v3)', async ({ page }) => {
     await pair(page);
     await page.locator('#tab-board').click();
     const job = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
@@ -562,11 +580,11 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('.board-lens', { hasText: 'blind ×2' })).toBeVisible();
     await expect(page.locator('.board-lens--blocker')).toHaveCount(1);
 
-    // Jev decisions chip + unacked action-required badge stay global.
+    // Jev decisions chip + unacked action-required badge stay global in the rail.
     await expect(page.locator('#board-decisions')).toContainText('Jev: READY');
     await expect(page.locator('#board-unacked')).toBeVisible();
 
-    // Disposed rows collapse by default behind the toggle.
+    // Disposed rows collapse by default behind the toggle on the AGENTS tab.
     const rail = page.locator('#board-agents');
     await expect(rail.locator('.board-agent--disposed')).toHaveCount(0);
     const toggle = rail.locator('.board-agent-toggle');
@@ -590,7 +608,7 @@ test.describe('board (E6, mock feed)', () => {
     await expect(card.locator('.board-round__toggle')).toBeVisible();
     await expect(card.locator('.board-lane__age')).toBeVisible();
     await page.setViewportSize({ width: 390, height: 844 });
-    await expect(page.locator('.board-trackers')).toBeVisible();
+    await expect(page.locator('#chip-rail')).toBeVisible();
     await expect(page.locator('#board-unacked')).toBeVisible();
     await expect(page.locator('#board-agents .board-agent').first()).toBeVisible();
     const fits = await page.evaluate(
@@ -602,6 +620,8 @@ test.describe('board (E6, mock feed)', () => {
   test('transcript drawer: mock transcript lists, opens, searches', async ({ page }) => {
     await pair(page);
     await page.locator('#tab-board').click();
+    // Transcripts live behind the rail's TRANSCRIPTS tab (v6).
+    await page.locator('#rail-tab-transcripts').click();
     const row = page.locator('#board-transcripts .board-agent', { hasText: 'gru' }).first();
     await expect(row).toBeVisible();
     await row.click();
@@ -614,25 +634,60 @@ test.describe('board (E6, mock feed)', () => {
   });
 });
 
-test.describe('console layout (v5)', () => {
-  test('three-pane at 1440px: chat | board | rail, FAB toggles the pane, settled window rolls', async ({ page }) => {
+test.describe('cockpit layout (v6)', () => {
+  test('1440px: three panes + drag splitters; the drag persists, double-click resets, settled window rolls', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await pair(page);
 
-    // All three panes render at once: chat is in the left column, the
-    // board's center column carries the dashboard, agents/transcripts rail right.
+    // All three panes render at once: chat left, board center, agents rail right.
     await expect(page.locator('#chat-main-mount > #chat-view')).toHaveCount(1);
     await expect(page.locator('#board-view')).toBeVisible();
-    await expect(page.locator('.board-side')).toBeVisible();
+    await expect(page.locator('#agents-rail')).toBeVisible();
     const chatBox = (await page.locator('#chat-main-mount').boundingBox())!;
     const boardBox = (await page.locator('#board-view').boundingBox())!;
+    const railBox = (await page.locator('#agents-rail').boundingBox())!;
     expect(chatBox.x + chatBox.width).toBeLessThanOrEqual(boardBox.x);
-    // Full-estate: the board's right edge reaches past the old 920px column.
-    expect(boardBox.x + boardBox.width).toBeGreaterThan(1_100);
+    expect(boardBox.x + boardBox.width).toBeLessThanOrEqual(railBox.x + 1);
 
-    // Card-grid bands fit the center pane (2 columns at 1440) and the
-    // settled band rolls: 12 settled → 10 cards + a +2 footer.
-    await expect(page.locator('.board-band--in-flight .board-band__grid')).toHaveAttribute('data-columns', '2');
+    // Both drag boundaries are live handles.
+    const splitter = page.locator('#splitter-chat');
+    const railSplitter = page.locator('#splitter-rail');
+    await expect(splitter).toBeVisible();
+    await expect(railSplitter).toBeVisible();
+
+    // Default chat is ~30% of the container (floored at 420) — wider than v5's 380.
+    expect(chatBox.width).toBeGreaterThanOrEqual(420);
+
+    // Drag the chat boundary right: the pane resizes and the pair persists.
+    const handle = (await splitter.boundingBox())!;
+    await page.mouse.move(handle.x + 2, handle.y + 80);
+    await page.mouse.down();
+    await page.mouse.move(handle.x + 2 + 140, handle.y + 80, { steps: 6 });
+    await page.mouse.up();
+    const widened = (await page.locator('#chat-main-mount').boundingBox())!;
+    expect(widened.width).toBeGreaterThan(chatBox.width + 100);
+    const persisted = await page.evaluate(() => localStorage.getItem('gru-pane-sizes'));
+    expect(persisted).not.toBeNull();
+    expect(JSON.parse(persisted ?? '{}')).toHaveProperty('cockpit.chat');
+
+    // Reload: the user's widths come back (poll through the 180ms grid tween).
+    await page.reload();
+    await page.locator('#tab-board').click();
+    await expect
+      .poll(async () => Math.abs((await page.locator('#chat-main-mount').boundingBox())!.width - widened.width))
+      .toBeLessThanOrEqual(2);
+    const reloaded = (await page.locator('#chat-main-mount').boundingBox())!;
+    expect(Math.abs(reloaded.width - widened.width)).toBeLessThanOrEqual(2);
+
+    // Double-click resets both panes to their defaults (settle first so the
+    // reset target is measured, not the tween's midpoint).
+    const handleAgain = (await splitter.boundingBox())!;
+    await page.mouse.dblclick(handleAgain.x + 2, handleAgain.y + 80);
+    await expect
+      .poll(async () => Math.abs((await page.locator('#chat-main-mount').boundingBox())!.width - chatBox.width))
+      .toBeLessThanOrEqual(2);
+
+    // The settled window rolls: 12 settled → 10 rows + a +2 footer.
     await expect(page.locator('.board-band--settled .board-job')).toHaveCount(10);
     const more = page.locator('.board-band--settled .board-band__more');
     await expect(more).toHaveText('+2 older settled');
@@ -655,15 +710,32 @@ test.describe('console layout (v5)', () => {
     await expect(page.locator('#chat-rail')).toBeHidden();
   });
 
-  test('two-pane at 1100px: board + rail, FAB opens the dimmed overlay chat', async ({ page }) => {
+  test('1100px cockpit edge: three panes, floor widths hold, no horizontal overflow', async ({ page }) => {
     await page.setViewportSize({ width: 1100, height: 800 });
+    await pair(page);
+
+    await expect(page.locator('#chat-main-mount > #chat-view')).toHaveCount(1);
+    await expect(page.locator('#splitter-chat')).toBeVisible();
+    await expect(page.locator('#splitter-rail')).toBeVisible();
+    const chatBox = (await page.locator('#chat-main-mount').boundingBox())!;
+    expect(chatBox.width).toBeGreaterThanOrEqual(420);
+    const railBox = (await page.locator('#agents-rail').boundingBox())!;
+    expect(railBox.width).toBeGreaterThanOrEqual(240);
+    const fits = await page.evaluate(
+      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    );
+    expect(fits).toBe(true);
+  });
+
+  test('1000px two-pane: board + rail, FAB opens the dimmed overlay chat', async ({ page }) => {
+    await page.setViewportSize({ width: 1000, height: 800 });
     await pair(page);
 
     // The chat panel lives in the overlay sheet; the board + rail hold the page.
     await expect(page.locator('#chat-sheet #chat-view')).toHaveCount(1);
     await expect(page.locator('#board-view')).toBeVisible();
-    await expect(page.locator('.board-side')).toBeVisible();
-    await expect(page.locator('.board-band--in-flight .board-band__grid')).toHaveAttribute('data-columns', '2');
+    await expect(page.locator('#agents-rail')).toBeVisible();
+    await expect(page.locator('#splitter-chat')).toBeHidden();
 
     await page.locator('#gru-fab').click();
     await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
@@ -681,7 +753,7 @@ test.describe('console layout (v5)', () => {
     await pair(page);
 
     const mainBox = (await page.locator('.board-main').boundingBox())!;
-    const sideBox = (await page.locator('.board-side').boundingBox())!;
+    const sideBox = (await page.locator('#agents-rail').boundingBox())!;
     expect(sideBox.y).toBeGreaterThanOrEqual(mainBox.y + mainBox.height - 1);
 
     await page.locator('#gru-fab').click();
@@ -762,7 +834,7 @@ test.describe('phone chrome', () => {
       { timeout: 5_000 },
     );
     const m = await page.evaluate(() => ({
-      navBottom: document.querySelector('.app-nav')!.getBoundingClientRect().bottom,
+      navBottom: document.querySelector('.command-bar')!.getBoundingClientRect().bottom,
       panelTop: document.querySelector('#notification-panel')!.getBoundingClientRect().top,
       toastTop: document.querySelector('#toasts')!.getBoundingClientRect().top,
     }));
@@ -780,7 +852,7 @@ test.describe('phone chrome', () => {
     await expect(page.locator('#pairing-view')).toBeVisible();
     await assertNoHorizontalOverflow(page);
     // Direct tagline-suppression coverage: the decorative line is phone-off.
-    await expect(page.locator('.app-nav__tagline')).toBeHidden();
+    await expect(page.locator('.command-bar__tagline')).toBeHidden();
     for (const selector of CHROME_CONTROLS) {
       await assertReachable(page, selector);
     }
@@ -818,7 +890,7 @@ test.describe('phone chrome', () => {
     await expect(page.locator('#pairing-view')).toBeVisible();
     await assertNoHorizontalOverflow(page);
     // The tagline only drops under the phone breakpoint.
-    await expect(page.locator('.app-nav__tagline')).toBeVisible();
+    await expect(page.locator('.command-bar__tagline')).toBeVisible();
     for (const selector of CHROME_CONTROLS) {
       await assertReachable(page, selector);
     }

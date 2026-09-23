@@ -193,31 +193,40 @@ export class BoardView {
     if (chip.flag !== null) {
       node.append(el('span', 'pp-chip pp-chip--alert rail-chip__flag', chip.flag));
     }
-    for (const badge of chip.subs) {
-      const sub = el(
-        'span',
-        `rail-chip__sub${badge.tone === 'plain' ? '' : ` rail-chip__sub--${badge.tone}`}`,
-        badge.label,
-      );
-      sub.dataset.kpi = badge.kpi;
-      sub.title = badge.title;
-      node.append(sub);
-    }
     return node;
   }
 
-  /** TRACKERS: the count headline plus the Jev + unacked chips the v4
-   * tracker strip carried (their ids/behavior survive the move). */
+  /** TRACKERS: the folded KPI count strips plus the Jev + unacked chips the
+   * v4 tracker strip carried (their ids/behavior survive the move). */
   private trackersChipNode(chip: RailChip): HTMLElement {
     const node = el('span', `rail-chip rail-chip--trackers rail-chip--${chip.tone}`);
     node.dataset.chip = 'trackers';
     node.title = chip.titleAttr;
-    node.append(el('span', 'rail-chip__label', chip.label), el('span', 'rail-chip__value', chip.value));
-    for (const badge of chip.subs) {
-      const sub = el('span', 'rail-chip__sub', badge.label);
-      sub.dataset.kpi = badge.kpi;
-      sub.title = badge.title;
-      node.append(sub);
+    node.append(el('span', 'rail-chip__label', chip.label));
+    for (const group of chip.kpis ?? []) {
+      const groupNode = el('span', 'rail-kpi');
+      groupNode.title = group.title;
+      const label = el('span', 'rail-kpi__label', group.label);
+      if (group.total !== undefined) {
+        const total = el('b', 'rail-kpi__total', String(group.total.value));
+        total.dataset.kpi = group.total.kpi;
+        total.title = group.total.title;
+        label.append(document.createTextNode(' '), total);
+      }
+      groupNode.append(label);
+      const nums = el('span', 'rail-kpi__nums');
+      group.values.forEach((value, index) => {
+        if (index > 0) nums.append(el('span', 'rail-kpi__sep', '/'));
+        const number = el('span', 'rail-kpi__num', String(value.value));
+        number.dataset.kpi = value.kpi;
+        number.title = value.title;
+        if (value.kpi === 'prs.conflicting' && value.value > 0) {
+          number.classList.add('rail-kpi__num--alert');
+        }
+        nums.append(number);
+      });
+      groupNode.append(nums);
+      node.append(groupNode);
     }
     node.append(this.decisionsChip, this.unackedChip);
     return node;
@@ -628,36 +637,37 @@ export class BoardView {
     const top = el('span', 'board-agent__top');
     top.append(
       el('span', 'board-agent__name', agentLabel(agent)),
-      el('span', 'board-agent__hash lbl', agent.id.slice(0, 12)),
+      el('span', 'board-agent__hash lbl', agent.id.slice(0, 8)),
     );
     const subline = el('span', 'board-agent__sub lbl');
     subline.append(
       el('span', 'board-agent__emoji', ROLE_EMOJI[agent.role] ?? '🤖'),
-      document.createTextNode(` ${agent.role} · ${agent.state}`),
+      el('span', 'board-agent__role', `${agent.role} · ${agent.state}`),
     );
     // Turn-age counter: a streaming agent shows how long its current turn
     // has been quiet — the operator's "is it stuck?" glance.
     if (agent.state === 'streaming') {
       subline.append(this.ageNode('board-agent__age lbl', agent.lastActivity, '', ' quiet'));
     }
-    body.append(top, subline);
-    row.append(el('span', 'board-agent__dot'), body);
-    row.append(el('span', `pp-chip board-agent__state ${agentStateTone(agent.state)}`, agent.state));
     // E7: supervision mark — a stopped (breaker-tripped) or restarting
-    // agent shows its supervision state on the rail.
+    // agent carries its supervision state on the subline (the right chip
+    // stays the single status surface the row reads on).
     if (agent.supervision !== null && agent.supervision !== undefined) {
       const supervision = agent.supervision;
       if (supervision.state === 'stopped' || supervision.state === 'restarting') {
-        row.append(
+        subline.append(
           el(
             'span',
-            `pp-chip board-agent__supervision ${supervision.state === 'stopped' ? 'pp-chip--alert' : 'pp-chip--work'}`,
+            `board-agent__supervision ${supervision.state === 'stopped' ? 'board-agent__supervision--alert' : 'board-agent__supervision--warn'}`,
             supervision.state === 'stopped' ? '⛔ stopped' : '⏳ restarting',
           ),
         );
         row.title += ` · supervision: ${supervision.state} (${supervision.restarts} restarts)`;
       }
     }
+    body.append(top, subline);
+    row.append(el('span', 'board-agent__dot'), body);
+    row.append(el('span', `pp-chip board-agent__state ${agentStateTone(agent.state)}`, agent.state));
     return row;
   }
 

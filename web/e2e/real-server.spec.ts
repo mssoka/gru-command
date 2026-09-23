@@ -98,11 +98,22 @@ async function pairMobile(page: Page): Promise<void> {
   await expect(page.locator('#board-view')).toBeVisible();
 }
 
+/**
+ * The double echoes the full prompt as `echo: <prompt>`. With service
+ * awareness enabled (chat awareness rides prompts) a bounded digest can
+ * precede the user's words, so match on the echo prefix AND the user's
+ * text rather than the contiguous `echo: <text>` string. Filtering on
+ * `.msg--gru` keeps user bubbles out.
+ */
+function echoReplies(page: Page, text: string): ReturnType<Page['locator']> {
+  return page.locator('.msg--gru').filter({ hasText: 'echo:' }).filter({ hasText: text });
+}
+
 async function sendAndWaitReply(page: Page, text: string): Promise<void> {
   await page.locator('#chat-input').fill(text);
   await page.locator('#chat-send').click();
   await expect(page.locator('.msg--user', { hasText: text })).toBeVisible();
-  const reply = page.locator('.msg--gru', { hasText: `echo: ${text}` });
+  const reply = echoReplies(page, text).last();
   await expect(reply).toBeVisible();
   await expect(reply).not.toHaveClass(/msg--streaming/);
 }
@@ -123,7 +134,7 @@ test('multi-line prompt rides the real socket intact (agent receives the newline
   await page.keyboard.type(line2);
   await page.keyboard.press('Enter');
   await expect(page.locator('.msg--user', { hasText: line2 })).toBeVisible();
-  const reply = page.locator('.msg--gru', { hasText: `echo: ${line1}` });
+  const reply = echoReplies(page, line1).last();
   await expect(reply).toBeVisible();
   await expect(reply).not.toHaveClass(/msg--streaming/);
   // The rendered user bubble keeps the newline (display side).
@@ -179,7 +190,7 @@ test('reload keeps history from the real frame log (no duplicates)', async ({ pa
     page.locator('.msg--user', { hasText: 'remember this over the wire' }),
   ).toHaveCount(1);
   await expect(
-    page.locator('.msg--gru', { hasText: 'echo: remember this over the wire' }),
+    echoReplies(page, 'remember this over the wire'),
   ).toHaveCount(1);
 });
 
@@ -210,7 +221,7 @@ test('service restart drops the socket; reconnect keeps history and flushes the 
     extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
   });
   await expect(page.locator('#banners .banner')).toBeHidden({ timeout: 15_000 });
-  const flushedReply = page.locator('.msg--gru', { hasText: 'echo: typed while down' });
+  const flushedReply = echoReplies(page, 'typed while down').last();
   await expect(flushedReply).toBeVisible();
   await expect(flushedReply).toHaveCount(1);
   await expect(page.locator('.msg--user', { hasText: 'before the restart' })).toHaveCount(1);
@@ -244,7 +255,7 @@ test('mobile viewport: board-first, corner bubble, sheet, unread badge over the 
 
   await page.locator('#gru-fab').click();
   await expect(page.locator('#chat-badge')).toHaveText('0');
-  const reply = page.locator('.msg--gru', { hasText: `echo: ${stalled}` });
+  const reply = echoReplies(page, stalled).last();
   await expect(reply).toBeVisible();
   await expect(reply).not.toHaveClass(/msg--streaming/);
   rmSync(releaseDir, { recursive: true, force: true });
@@ -345,7 +356,9 @@ test.describe('board (E6)', () => {
     });
     expect(agent.status()).toBe(201);
 
-    // The seeded transcript appears in the transcripts list; open it.
+    // The seeded transcript appears in the transcripts list; open it
+    // (v6: transcripts live behind the rail's second tab).
+    await page.locator('#rail-tab-transcripts').click();
     const seedRow = page.locator('#board-transcripts .board-agent', { hasText: 'seeded transcript' });
     await expect(seedRow).toBeVisible();
     await seedRow.click();

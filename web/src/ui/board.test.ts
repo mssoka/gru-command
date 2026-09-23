@@ -241,7 +241,7 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     expect(verify?.querySelector('.rail-chip__flag')?.textContent).toBe('2 QUEUED');
   });
 
-  it('folds the v4 KPI counts into the rail as data-kpi sub-badges matching boardKpis', () => {
+  it('folds the v4 KPI counts into the rail as data-kpi numbers matching boardKpis', () => {
     const jobs = [
       baseJob({ id: 'w1', status: 'working' }),
       baseJob({ id: 'w2', status: 'working' }),
@@ -261,30 +261,33 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     const view = new BoardView(() => {});
     view.render(snapshotValue);
 
-    const subs = new Map(
-      [...document.querySelectorAll<HTMLElement>('.rail-chip__sub[data-kpi]')].map((node) => [
+    const values = new Map(
+      [...document.querySelectorAll<HTMLElement>('[data-kpi]')].map((node) => [
         node.dataset.kpi ?? '',
-        node.textContent ?? '',
+        Number(node.textContent),
       ]),
     );
-    expect(subs.get('jobs.total')).toBe(`${kpis.jobs.total} jobs`);
-    expect(subs.get('jobs.working')).toBe(`${kpis.jobs.working} working`);
-    expect(subs.get('jobs.inReview')).toBe(`${kpis.jobs.inReview} in-review`);
-    expect(subs.get('jobs.merged')).toBe(`${kpis.jobs.merged} merged`);
-    expect(subs.get('jobs.done')).toBe(`${kpis.jobs.done} done`);
-    expect(subs.get('jobs.parked')).toBe(`${kpis.jobs.parked} parked`);
-    expect(subs.get('prs.open')).toBe(`${kpis.prs.open} open PRs`);
-    expect(subs.get('prs.conflicting')).toBe(`${kpis.prs.conflicting} conflicting`);
-    expect(subs.get('prs.mergedToday')).toBe(`${kpis.prs.mergedToday} merged today`);
-    expect(subs.get('lanes.liveMinions')).toBe(`${kpis.lanes.liveMinions} live minions`);
-    expect(subs.get('lanes.midTurn')).toBe(`${kpis.lanes.midTurn} mid-turn`);
-    expect(subs.get('lanes.disposed')).toBe(`${kpis.lanes.disposed} disposed`);
+    expect(values.get('jobs.total')).toBe(kpis.jobs.total);
+    expect(values.get('jobs.working')).toBe(kpis.jobs.working);
+    expect(values.get('jobs.inReview')).toBe(kpis.jobs.inReview);
+    expect(values.get('jobs.merged')).toBe(kpis.jobs.merged);
+    expect(values.get('jobs.done')).toBe(kpis.jobs.done);
+    expect(values.get('jobs.parked')).toBe(kpis.jobs.parked);
+    expect(values.get('prs.open')).toBe(kpis.prs.open);
+    expect(values.get('prs.conflicting')).toBe(kpis.prs.conflicting);
+    expect(values.get('prs.mergedToday')).toBe(kpis.prs.mergedToday);
+    expect(values.get('lanes.liveMinions')).toBe(kpis.lanes.liveMinions);
+    expect(values.get('lanes.midTurn')).toBe(kpis.lanes.midTurn);
+    expect(values.get('lanes.disposed')).toBe(kpis.lanes.disposed);
     // The numbers themselves (not a vacuous mirror).
-    expect(subs.get('jobs.total')).toBe('6 jobs');
-    expect(subs.get('jobs.working')).toBe('2 working');
-    expect(subs.get('prs.conflicting')).toBe('1 conflicting');
-    expect(subs.get('lanes.liveMinions')).toBe('2 live minions');
-    expect(subs.get('lanes.disposed')).toBe('1 disposed');
+    expect(values.get('jobs.total')).toBe(6);
+    expect(values.get('jobs.working')).toBe(2);
+    expect(values.get('prs.conflicting')).toBe(1);
+    expect(values.get('lanes.liveMinions')).toBe(2);
+    expect(values.get('lanes.disposed')).toBe(1);
+    // A conflict is the loudest PR state: the number carries the alert ink.
+    const conflicting = [...document.querySelectorAll<HTMLElement>('[data-kpi="prs.conflicting"]')][0];
+    expect(conflicting?.classList.contains('rail-kpi__num--alert')).toBe(true);
   });
 
   it('keeps the Jev decisions chip and unacked badge inside the TRACKERS chip', () => {
@@ -733,7 +736,7 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     expect(row?.dataset.state).toBe('streaming');
     expect(row?.querySelector('.board-agent__dot')).not.toBeNull();
     expect(row?.querySelector('.board-agent__name')?.textContent).toBe('Payment lane');
-    expect(row?.querySelector('.board-agent__hash')?.textContent).toBe('minion-live'.slice(0, 12));
+    expect(row?.querySelector('.board-agent__hash')?.textContent).toBe('minion-live'.slice(0, 8));
     expect(row?.querySelector('.board-agent__sub')?.textContent).toContain('minion · streaming');
     expect(row?.querySelector('.board-agent__state')?.textContent).toBe('streaming');
   });

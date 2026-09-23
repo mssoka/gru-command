@@ -62,8 +62,9 @@ interface DragState {
 }
 
 function fallbackContainerWidth(viewportWidth: number): number {
-  // Mirrors .app-main's cockpit padding (12px each side).
-  return Math.max(0, viewportWidth - 24);
+  // Mirrors .app-main's side padding (20px each side) — used only before
+  // the console has been laid out (hidden mount / unit tests).
+  return Math.max(0, viewportWidth - 40);
 }
 
 export class SplitterController {
@@ -140,7 +141,11 @@ export class SplitterController {
       containerWidth: this.containerWidth(),
     };
     this.root.dataset.paneDragging = 'true';
-    event.preventDefault();
+    // NOTE: no preventDefault() here — pointerdown's default action is the
+    // compatibility mouse-event chain; cancelling it suppresses click AND
+    // dblclick, which would kill the double-click reset on a real pointer.
+    // Native panning/selection are handled by touch-action: none and the
+    // transient user-select: none while dragging.
   }
 
   private readonly onPointerMove = (event: PointerEvent): void => {

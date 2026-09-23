@@ -163,15 +163,15 @@
         <div class="agents-rail__tabs" role="tablist" aria-label="Agents and transcripts">
           <button id="rail-tab-agents" class="agents-rail__tab agents-rail__tab--active" type="button"
                   role="tab" aria-selected="true" aria-controls="board-agents" data-rail-tab="agents">
-            AGENTS <span class="agents-rail__count" id="rail-agents-count">0</span>
+            AGENTS (<span class="agents-rail__count" id="rail-agents-count">0</span>)
           </button>
           <button id="rail-tab-transcripts" class="agents-rail__tab" type="button"
                   role="tab" aria-selected="false" aria-controls="board-transcripts" data-rail-tab="transcripts">
             TRANSCRIPTS
           </button>
         </div>
-        <div id="board-agents" class="board-agents rail-panel" role="tabpanel" aria-labelledby="rail-tab-agents"></div>
-        <div id="board-transcripts" class="board-agents rail-panel" role="tabpanel" aria-labelledby="rail-tab-transcripts" hidden></div>
+        <div id="board-agents" class="board-agents rail-panel" role="tabpanel" aria-labelledby="rail-tab-agents" data-rail-panel="agents"></div>
+        <div id="board-transcripts" class="board-agents rail-panel" role="tabpanel" aria-labelledby="rail-tab-transcripts" data-rail-panel="transcripts" hidden></div>
       </aside>
     </div>
 

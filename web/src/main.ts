@@ -18,6 +18,7 @@ import { ChatView, renderConnectionDot } from './ui/chat.js';
 import { BoardView } from './ui/board.js';
 import { CommandBar, renderChatOnline } from './ui/command-bar.js';
 import { ConsoleShell, CONSOLE_QUERY, type ChatPaneHandle } from './ui/console.js';
+import { RailTabs } from './ui/rail-tabs.js';
 import { SplitterController } from './ui/splitters.js';
 import { ToastStack } from './ui/toast.js';
 import { TranscriptView } from './ui/transcript.js';
@@ -140,6 +141,9 @@ const splitterController = new SplitterController({
   storage,
 });
 
+// The agents rail's AGENTS / TRANSCRIPTS tabs (v6).
+new RailTabs(mustGet('agents-rail'));
+
 /** Keep the ticker's layout segment and the splitter bounds in step with
  * the viewport (the shell's matchMedia owns the FAB contract; both read
  * the same console-layout thresholds). */
@@ -251,6 +255,9 @@ function startChat(token: string): void {
   mustGet('chat-view').hidden = false;
   mustGet('board-view').hidden = false;
   mustGet('gru-fab').hidden = false;
+  // The console has real layout now: re-clamp/refresh the pane sizes and
+  // the measured chrome (the constructor ran while the console was hidden).
+  syncCockpit();
   chatView ??= new ChatView((text, attachments) => {
     if (client === null) return false;
     client.send(text, attachments); // throws surface in the composer's guard
