@@ -77,72 +77,85 @@
       </div>
     </section>
 
-    <div id="chat-main-mount" class="reveal">
-      <section id="chat-view" class="pp-card chat-panel chat-panel--desktop" hidden>
-        <div class="chat-log" id="chat-log"></div>
-        <div class="chat-context" id="chat-context-controls" aria-label="Chat context controls">
-          <span class="pp-chip chat-context__status" id="chat-context-status" role="status" aria-live="polite">Context unavailable</span>
-          <span class="chat-context__announcement" id="chat-context-announcement" role="status" aria-live="polite" aria-atomic="true"></span>
-          <button class="pp-btn pp-btn--secondary chat-context__button" type="button" id="chat-compact" disabled>Compact context</button>
-          <button class="pp-btn pp-btn--secondary chat-context__button" type="button" id="chat-new" disabled>New chat</button>
+    <div id="console" class="console" hidden>
+      <div id="chat-main-mount" class="console__chat">
+        <section id="chat-view" class="pp-card chat-panel" hidden>
+          <div class="chat-panel__head">
+            <span class="chat-panel__title"><span class="chat-panel__glyph" aria-hidden="true">🧠</span> Gru</span>
+            <button id="chat-collapse" class="chat-panel__collapse" type="button"
+                    title="Collapse chat" aria-label="Collapse chat">⇤</button>
+          </div>
+          <div class="chat-log" id="chat-log"></div>
+          <div class="chat-context" id="chat-context-controls" aria-label="Chat context controls">
+            <span class="pp-chip chat-context__status" id="chat-context-status" role="status" aria-live="polite">Context unavailable</span>
+            <span class="chat-context__announcement" id="chat-context-announcement" role="status" aria-live="polite" aria-atomic="true"></span>
+            <button class="pp-btn pp-btn--secondary chat-context__button" type="button" id="chat-compact" disabled>Compact context</button>
+            <button class="pp-btn pp-btn--secondary chat-context__button" type="button" id="chat-new" disabled>New chat</button>
+          </div>
+          <form class="chat-compose" id="chat-form">
+            <div class="chat-chips" id="chat-chips" hidden></div>
+            <div class="chat-compose__row">
+              <button class="pp-btn pp-btn--icon chat-attach-btn" type="button" id="chat-attach"
+                      title="Attach files" aria-haspopup="dialog" aria-expanded="false">📎</button>
+              <textarea class="pp-input" id="chat-input" rows="1"
+                        placeholder="Tell Gru, boss…"
+                        autocomplete="off" maxlength="4000" aria-label="Message Gru"></textarea>
+              <button class="pp-btn" type="submit" id="chat-send">Send 🚀</button>
+            </div>
+            <!-- The ONE attach flow (SPEC ruling 19): device files (phone
+                 camera/gallery, clipboard materialization) — bytes → the
+                 instance uploads dir → that path. On-disk workspace picks
+                 ride the browse picker below. The user never types paths. -->
+            <input type="file" id="chat-attach-file" multiple hidden aria-label="Pick files from this device">
+          </form>
+          <div class="attach-picker" id="attach-picker" role="dialog" aria-label="Attach files" hidden>
+            <div class="attach-picker__head">
+              <button id="attach-picker-up" class="pp-btn pp-btn--secondary" type="button" title="Up one directory">⬆</button>
+              <div class="attach-picker__path" id="attach-picker-path" title="Current directory">/</div>
+              <button id="attach-picker-device" class="pp-btn pp-btn--secondary" type="button">📁 from this device…</button>
+              <button id="attach-picker-close" class="pp-btn pp-btn--secondary" type="button" aria-label="Close picker">✕</button>
+            </div>
+            <div class="attach-picker__error" id="attach-picker-error" hidden></div>
+            <div class="attach-picker__list" id="attach-picker-list"></div>
+          </div>
+        </section>
+      </div>
+
+      <!-- The collapsed chat pane's slim rail (v5): 🧠 + unread pulse. -->
+      <button id="chat-rail" class="console__rail" type="button"
+              aria-label="Open Gru chat" title="Open Gru chat">
+        🧠<span class="console__rail-dot" aria-hidden="true"></span>
+      </button>
+
+      <section id="board-view" class="board-view" hidden>
+        <div class="board-layout">
+          <div class="board-main">
+            <div class="board-kpis" id="board-kpis" aria-label="Board KPIs"></div>
+            <div class="board-health" id="board-health" aria-label="Service health"></div>
+            <div class="board-trackers" id="board-trackers">
+              <span class="lbl">Trackers</span>
+              <span class="pp-chip board-decisions" id="board-decisions" data-state="disabled">Jev: OFF</span>
+              <span class="pp-chip pp-chip--alert board-unacked" id="board-unacked" hidden>🔔 0 action-required</span>
+            </div>
+            <div id="board-jobs" class="board-jobs"></div>
+          </div>
+          <aside class="board-side">
+            <section class="pp-soft board-side__section">
+              <div class="lbl">Agents</div>
+              <div id="board-agents" class="board-agents"></div>
+            </section>
+            <section class="pp-soft board-side__section">
+              <div class="lbl">Transcripts</div>
+              <div id="board-transcripts" class="board-agents"></div>
+            </section>
+          </aside>
         </div>
-        <form class="chat-compose" id="chat-form">
-          <div class="chat-chips" id="chat-chips" hidden></div>
-          <div class="chat-compose__row">
-            <button class="pp-btn pp-btn--icon chat-attach-btn" type="button" id="chat-attach"
-                    title="Attach files" aria-haspopup="dialog" aria-expanded="false">📎</button>
-            <textarea class="pp-input" id="chat-input" rows="1"
-                      placeholder="Tell Gru what you need, boss…"
-                      autocomplete="off" maxlength="4000" aria-label="Message Gru"></textarea>
-            <button class="pp-btn" type="submit" id="chat-send">Send 🚀</button>
-          </div>
-          <!-- The ONE attach flow (SPEC ruling 19): device files (phone
-               camera/gallery, clipboard materialization) — bytes → the
-               instance uploads dir → that path. On-disk workspace picks
-               ride the browse picker below. The user never types paths. -->
-          <input type="file" id="chat-attach-file" multiple hidden aria-label="Pick files from this device">
-        </form>
-        <div class="attach-picker" id="attach-picker" role="dialog" aria-label="Attach files" hidden>
-          <div class="attach-picker__head">
-            <button id="attach-picker-up" class="pp-btn pp-btn--secondary" type="button" title="Up one directory">⬆</button>
-            <div class="attach-picker__path" id="attach-picker-path" title="Current directory">/</div>
-            <button id="attach-picker-device" class="pp-btn pp-btn--secondary" type="button">📁 from this device…</button>
-            <button id="attach-picker-close" class="pp-btn pp-btn--secondary" type="button" aria-label="Close picker">✕</button>
-          </div>
-          <div class="attach-picker__error" id="attach-picker-error" hidden></div>
-          <div class="attach-picker__list" id="attach-picker-list"></div>
+        <div id="notification-panel" class="pp-card notification-panel" hidden>
+          <div class="lbl">Notifications</div>
+          <div id="notification-list" class="notification-list"></div>
         </div>
       </section>
     </div>
-
-    <section id="board-view" class="board-view reveal" hidden>
-      <div class="board-kpis" id="board-kpis" aria-label="Board KPIs"></div>
-      <div class="board-health" id="board-health" aria-label="Service health"></div>
-      <div class="board-trackers" id="board-trackers">
-        <span class="lbl">Trackers</span>
-        <span class="pp-chip board-decisions" id="board-decisions" data-state="disabled">Jev: OFF</span>
-        <span class="pp-chip pp-chip--alert board-unacked" id="board-unacked" hidden>🔔 0 action-required</span>
-      </div>
-      <div class="board-layout">
-        <div class="board-main">
-          <div id="board-jobs" class="board-jobs"></div>
-        </div>
-        <aside class="board-side">
-          <section class="pp-soft board-side__section">
-            <div class="lbl">Agents</div>
-            <div id="board-agents" class="board-agents"></div>
-          </section>
-          <section class="pp-soft board-side__section">
-            <div class="lbl">Transcripts</div>
-            <div id="board-transcripts" class="board-agents"></div>
-          </section>
-        </aside>
-      </div>
-      <div id="notification-panel" class="pp-card notification-panel" hidden>
-        <div class="lbl">Notifications</div>
-        <div id="notification-list" class="notification-list"></div>
-      </div>
-    </section>
 
     <div id="transcript-drawer" class="transcript-drawer" hidden>
       <div class="pp-card transcript-card">
@@ -163,13 +176,18 @@
     </div>
   </main>
 
-  <button class="chat-bubble" id="chat-bubble" data-unread="0" aria-label="Open chat">
-    💬<span class="chat-bubble__badge" id="chat-badge">0</span>
-  </button>
+  <button class="chat-scrim" id="chat-scrim" type="button" aria-label="Close chat" hidden></button>
   <div class="chat-sheet" id="chat-sheet" data-open="false">
     <div class="chat-sheet__grip" id="chat-sheet-grip" role="button" tabindex="0" aria-label="Close chat"></div>
     <div id="chat-sheet-mount"></div>
   </div>
+
+  <!-- The Gru FAB (v5): toggles the console pane at >=1280px, opens the
+       chat overlay below it. Never hidden while paired. -->
+  <button class="gru-fab" id="gru-fab" data-unread="0" type="button"
+          aria-label="Chat with Gru" title="Chat with Gru" hidden>
+    🧠<span class="gru-fab__badge" id="chat-badge">0</span>
+  </button>
 
   <script type="module" src="/src/main.ts"></script>
   <div class="toast-stack" id="toasts" aria-live="polite"></div>

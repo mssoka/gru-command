@@ -12,8 +12,8 @@
   --paper: #faf6ef;
   --card: #ffffff;
   --soft: #fdf8ee;
-  --muted: #6b7a94;
-  --faint: #8a8678;
+  --muted: #5b6a84;
+  --faint: #6d6a5d;
   --line: #22304a;
 
   /* State colors */
@@ -23,6 +23,15 @@
   --park: #e8e3d8;
   --alert: #ffb3ba;
   --perkins: #c9b8ff;
+
+  /* Attention-band accents (v5): one accent per band, edge + pill only.
+     The INK pair is the accent's readable text tone on paper surfaces
+     (the edge/pill tones themselves are decorative). */
+  --band-needs-you: #f2868f;
+  --band-needs-you-ink: #b03e4a;
+  --band-in-flight: var(--work);
+  --band-settled: var(--done);
+  --band-cold: var(--park);
 
   /* Accent (flips to minion yellow in dark) */
   --accent: #22304a;
@@ -56,7 +65,7 @@
   --card: #1c2438;
   --soft: #182033;
   --muted: #93a0b8;
-  --faint: #6d7890;
+  --faint: #8b96ac;
   --line: #313c58;
 
   --work: #ffd54a;
@@ -65,6 +74,12 @@
   --park: #2a3350;
   --alert: #ff8f9c;
   --perkins: #b7a3ff;
+
+  --band-needs-you: #ff8f9c;
+  --band-needs-you-ink: #ff9fae;
+  --band-in-flight: var(--work);
+  --band-settled: var(--done);
+  --band-cold: var(--park);
 
   --accent: #ffd54a;
   --accent-text: #1a2236;

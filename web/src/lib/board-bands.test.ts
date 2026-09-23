@@ -7,11 +7,13 @@ import type {
 import {
   BAND_LABELS,
   JOB_STALLED_AFTER_MS,
+  SETTLED_WINDOW_SIZE,
   bandForJob,
   bucketJobs,
   isStalledWorking,
   jobRecency,
   needsYouReasons,
+  settledWindow,
 } from './board-bands.js';
 
 const NOW = new Date(2026, 8, 23, 12, 0, 0).getTime(); // local noon — day-boundary tests stay timezone-robust
@@ -200,5 +202,38 @@ describe('board bands — deterministic bucketing', () => {
       lane: { branch: null, sha: 'abc', status: 'active', createdAt: ISO(-30_000) },
     });
     expect(jobRecency(laneNewer)).toBe(ISO(-30_000));
+  });
+});
+
+describe('board bands — settled rolling window (v5)', () => {
+  /** Recency-sorted settled band, newest first (bucketJobs order). */
+  function settledBand(count: number) {
+    return bucketJobs(
+      Array.from({ length: count }, (_, index) =>
+        job({ id: `settled-${String(index).padStart(2, '0')}`, status: 'delivered', updatedAt: ISO(-index * 60_000) }),
+      ),
+      { now: NOW },
+    )[0]!.jobs;
+  }
+
+  it('shows the latest N settled jobs and reports the hidden tail', () => {
+    const jobs = settledBand(12);
+    const window = settledWindow(jobs, false);
+    expect(SETTLED_WINDOW_SIZE).toBe(10);
+    expect(window.jobs).toHaveLength(10);
+    expect(window.jobs[0]?.job.id).toBe('settled-00'); // newest first
+    expect(window.jobs[9]?.job.id).toBe('settled-09');
+    expect(window.hidden).toBe(2);
+  });
+
+  it('expanded (or at/below the limit) shows everything with nothing held back', () => {
+    expect(settledWindow(settledBand(12), true).hidden).toBe(0);
+    expect(settledWindow(settledBand(12), true).jobs).toHaveLength(12);
+    expect(settledWindow(settledBand(10), false)).toEqual({ jobs: settledBand(10), hidden: 0 });
+    expect(settledWindow(settledBand(3), false).jobs).toHaveLength(3);
+  });
+
+  it('never needs a window for an empty band', () => {
+    expect(settledWindow([], false)).toEqual({ jobs: [], hidden: 0 });
   });
 });

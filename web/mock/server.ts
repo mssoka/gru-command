@@ -310,6 +310,22 @@ function sampleSnapshot(): unknown {
             lane: null,
             lastAgentActivity: null,
           },
+          // v5 rolling window: 12 settled jobs total (hero + 11 older), so
+          // the mock renders 10 cards + a "+2 older settled" footer.
+          ...Array.from({ length: 11 }, (_, index) => ({
+            id: `sample-site-settled-${index + 1}`,
+            repo: 'sample-site',
+            title: `Settled batch ${index + 1}`,
+            status: 'delivered',
+            updatedAt: new Date(Date.now() - (index + 2) * 3_600_000).toISOString(),
+            prUrl: null,
+            prState: null,
+            baseBranch: 'main',
+            note: null,
+            rounds: [],
+            lane: null,
+            lastAgentActivity: null,
+          })),
         ],
       },
     ],

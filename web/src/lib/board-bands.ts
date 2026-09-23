@@ -142,3 +142,27 @@ export function bucketSnapshot(snapshot: BoardSnapshot, opts: BucketOptions = {}
     opts,
   );
 }
+
+/** Board UX v5: the SETTLED band is a rolling window — the latest N
+ * settled jobs render, the older tail lives behind a "+K older settled"
+ * footer (expanded for the session). KPI counts are never capped; only
+ * the band's glance is. */
+export const SETTLED_WINDOW_SIZE = 10;
+
+export interface SettledWindowView {
+  readonly jobs: readonly BandedJob[];
+  /** Jobs held back behind the expander (0 = fully shown). */
+  readonly hidden: number;
+}
+
+/** Slice a recency-sorted settled band (newest first) to the rolling
+ * window; `expanded` (or a band at/below the limit) shows everything. */
+export function settledWindow(
+  jobs: readonly BandedJob[],
+  expanded: boolean,
+  limit = SETTLED_WINDOW_SIZE,
+): SettledWindowView {
+  if (expanded || jobs.length <= limit) return { jobs, hidden: 0 };
+  const shown = Math.max(0, limit);
+  return { jobs: jobs.slice(0, shown), hidden: jobs.length - shown };
+}

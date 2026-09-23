@@ -632,7 +632,7 @@ describe('board v4 — attention-bucketed job ordering', () => {
     expect(band?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('quiet-job');
   });
 
-  it('keeps repo grouping inside a band (a repo appears once per band it has jobs in)', () => {
+  it('credits every card with its repo — grouping rides the cards, not wrapper shells (v5)', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -651,9 +651,125 @@ describe('board v4 — attention-bucketed job ordering', () => {
     const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
     const needsYou = bands[0];
     expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS YOU');
-    const repoNames = [...(needsYou?.querySelectorAll('.board-repo__name') ?? [])].map((node) => node.textContent);
-    expect(repoNames).toEqual(['📦 alpha', '📦 beta']);
+    const needsRepos = [...(needsYou?.querySelectorAll('.board-job__repo') ?? [])].map((node) => node.textContent);
+    expect(needsRepos).toContain('📦 alpha');
+    expect(needsRepos).toContain('📦 beta');
     const flight = bands[1];
-    expect(flight?.querySelector('.board-repo__name')?.textContent).toBe('📦 alpha');
+    expect(flight?.querySelector('.board-job__repo')?.textContent).toBe('📦 alpha');
+  });
+});
+
+describe('board v5 — full-estate console', () => {
+  beforeEach(mountBoardDom);
+
+  function setViewportWidth(width: number): void {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
+  }
+
+  it('fits the band card grid to the viewport width: 2 columns at 1440, 3 at 1920, 1 at 390', () => {
+    const view = new BoardView(() => {});
+    const jobs = [
+      baseJob({ id: 'f1', status: 'in-review' }),
+      baseJob({ id: 'f2', status: 'in-review' }),
+    ];
+
+    setViewportWidth(1440);
+    view.render(snapshot({ jobs }));
+    const grid = document.querySelector<HTMLElement>('.board-band--in-flight .board-band__grid');
+    expect(grid?.dataset.columns).toBe('2');
+    expect(grid?.style.gridTemplateColumns).toBe('repeat(2, minmax(0, 1fr))');
+
+    setViewportWidth(1920);
+    view.render(snapshot({ jobs }));
+    expect(document.querySelector<HTMLElement>('.board-band--in-flight .board-band__grid')?.dataset.columns).toBe('3');
+
+    setViewportWidth(390);
+    view.render(snapshot({ jobs }));
+    expect(document.querySelector<HTMLElement>('.board-band--in-flight .board-band__grid')?.dataset.columns).toBe('1');
+    // NEEDS YOU is full-width, not a grid: it holds a list, never a data-columns attr.
+    expect(document.querySelector('.board-band--needs-you .board-band__grid')).toBeNull();
+  });
+
+  it('renders the latest 10 settled jobs with a +K footer that expands the tail for the session', () => {
+    const jobs = Array.from({ length: 12 }, (_, index) =>
+      baseJob({
+        id: `settled-${String(index).padStart(2, '0')}`,
+        status: 'delivered',
+        updatedAt: new Date(Date.now() - index * 60_000).toISOString(),
+      }),
+    );
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs }));
+
+    const settled = document.querySelector('.board-band--settled');
+    expect(settled?.querySelectorAll('.board-job')).toHaveLength(10);
+    expect(settled?.querySelector('.board-band__count')?.textContent).toBe('12 jobs');
+    const more = settled?.querySelector<HTMLButtonElement>('.board-band__more');
+    expect(more?.textContent).toBe('+2 older settled');
+
+    more?.click();
+    const expanded = document.querySelector('.board-band--settled');
+    expect(expanded?.querySelectorAll('.board-job')).toHaveLength(12);
+    expect(expanded?.querySelector('.board-band__more')).toBeNull();
+
+    // Expanded is a session state: the next snapshot push keeps it open.
+    view.render(snapshot({ jobs }));
+    expect(document.querySelectorAll('.board-band--settled .board-job')).toHaveLength(12);
+  });
+
+  it('never hides an empty NEEDS YOU — a calm satisfied state carries the good news', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [baseJob({ id: 'flight', status: 'in-review' })] }));
+    const needsYou = document.querySelector('.board-band--needs-you');
+    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS YOU');
+    expect(needsYou?.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs you');
+    expect(needsYou?.querySelector('.board-band__clear-mark')?.textContent).toBe('✓');
+  });
+
+  it('ticks a KPI numeral only when its value changes', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [baseJob({ id: 'w1', status: 'working' })] }));
+    expect(document.querySelector('.board-kpi__value--tick')).toBeNull();
+
+    view.render(
+      snapshot({ jobs: [baseJob({ id: 'w1', status: 'working' }), baseJob({ id: 'w2', status: 'working' })] }),
+    );
+    const ticking = [...document.querySelectorAll<HTMLElement>('.board-kpi__value--tick')].map(
+      (node) => node.textContent,
+    );
+    expect(ticking).toContain('2');
+
+    view.render(
+      snapshot({ jobs: [baseJob({ id: 'w1', status: 'working' }), baseJob({ id: 'w2', status: 'working' })] }),
+    );
+    expect(document.querySelector('.board-kpi__value--tick')).toBeNull();
+  });
+
+  it('slides in only the cards new to the view (8px enter animation)', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [baseJob({ id: 'first', status: 'in-review' })] }));
+    expect(document.querySelector('.board-job--enter')).toBeNull();
+
+    view.render(
+      snapshot({ jobs: [baseJob({ id: 'first', status: 'in-review' }), baseJob({ id: 'second', status: 'in-review' })] }),
+    );
+    const entering = [...document.querySelectorAll<HTMLElement>('.board-job--enter')].map(
+      (node) => node.dataset.jobId,
+    );
+    expect(entering).toEqual(['second']);
+  });
+
+  it('suppresses stale review pills on merged/done cards', () => {
+    const view = new BoardView(() => {});
+    const quietRound = { blockers: 0, lenses: [], lensAttempts: [] } as const;
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ id: 'merged-live', status: 'merged', rounds: [baseRound({ ...quietRound, status: 'live' })] }),
+          baseJob({ id: 'done-pending', status: 'done', rounds: [baseRound({ ...quietRound, status: 'pending' })] }),
+        ],
+      }),
+    );
+    expect(document.querySelector('.board-job__signal')).toBeNull();
   });
 });

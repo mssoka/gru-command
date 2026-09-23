@@ -69,6 +69,10 @@ export function pluralCount(count: number, noun: string): string {
  * or pending round's blockers/errored lenses, or an aborted round. A
  * verdict-posted round's verdict already carried its outcome; a merged or
  * finished job must not keep alarming from review history.
+ *
+ * v5: a merged/done card also suppresses REVIEW LIVENESS pills ("round N
+ * live/pending") — a concluded job cannot have a review in flight; the
+ * pill is stale data, not a live state.
  */
 export function jobSignal(job: JobView, unackedActionRequired: number): JobSignal | null {
   const parts: string[] = [];
@@ -82,6 +86,10 @@ export function jobSignal(job: JobView, unackedActionRequired: number): JobSigna
   }
 
   const round = job.rounds.at(-1) ?? null;
+  // A concluded job's review liveness pill is stale (merged/done cards
+  // never claim an in-flight review). Attention pills still explain why a
+  // concluded card landed in NEEDS YOU.
+  const concluded = job.status === 'merged' || job.status === 'done';
   if (round !== null) {
     const summary = roundSummary(round);
     if (round.status === 'aborted') {
@@ -100,12 +108,14 @@ export function jobSignal(job: JobView, unackedActionRequired: number): JobSigna
         attention = true;
       }
     }
-    if (round.status === 'live') {
-      parts.push(`◉ round ${round.seq} · live · ${summary.done}/${summary.total}`);
-      details.push(`round ${round.seq} live — ${summary.done}/${summary.total} lenses done`);
-    } else if (round.status === 'pending') {
-      parts.push(`○ round ${round.seq} pending`);
-      details.push(`round ${round.seq} pending`);
+    if (!concluded) {
+      if (round.status === 'live') {
+        parts.push(`◉ round ${round.seq} · live · ${summary.done}/${summary.total}`);
+        details.push(`round ${round.seq} live — ${summary.done}/${summary.total} lenses done`);
+      } else if (round.status === 'pending') {
+        parts.push(`○ round ${round.seq} pending`);
+        details.push(`round ${round.seq} pending`);
+      }
     }
   }
 

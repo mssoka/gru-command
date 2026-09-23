@@ -28,7 +28,14 @@ import {
   type RoundView,
 } from '../lib/board-protocol.js';
 import { loadExpandedJobs, saveExpandedJobs } from '../lib/board-collapse.js';
-import { BAND_LABELS, bucketSnapshot, type BandedJob, type BandId } from '../lib/board-bands.js';
+import {
+  BAND_LABELS,
+  BAND_ORDER,
+  bucketSnapshot,
+  settledWindow,
+  type BandId,
+} from '../lib/board-bands.js';
+import { bandColumnsForWidth, estimatedCenterWidth } from '../lib/console-layout.js';
 import { healthCards } from '../lib/board-health.js';
 import { boardKpis } from '../lib/board-kpi.js';
 import { formatAge } from '../lib/board-time.js';
@@ -96,6 +103,13 @@ export class BoardView {
   private readonly sentShown = new Map<string, Set<string>>();
   /** E7: notification ids previously seen (new arrivals toast). */
   private knownNotificationIds = new Set<string>();
+  /** v5: the SETTLED rolling window — expanded for this session only. */
+  private settledExpanded = false;
+  /** v5: KPI values from the previous render (micro-tick on change). */
+  private readonly lastKpiValues = new Map<string, string>();
+  /** v5: job ids already on screen (new cards slide in; old ones do not). */
+  private readonly knownJobIds = new Set<string>();
+  private firstJobsRender = true;
 
   constructor(
     onOpenTranscript: (request: TranscriptOpenRequest) => void,
@@ -125,6 +139,11 @@ export class BoardView {
         this.updateBadge(this.snapshot?.notifications ?? []);
       }
     });
+    // v5: the band grid re-fits when the window (and with it the center
+    // pane) resizes; cheap enough to run on every resize event.
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', () => this.applyBandColumns());
+    }
   }
 
   /** E7: wire the live toast surface (main wires toasts + browser
@@ -206,10 +225,16 @@ export class BoardView {
         'span',
         `board-kpi__stat${stat.tone === 'alert' ? ' board-kpi__stat--alert' : ''}`,
       );
-      node.append(
-        el('b', 'board-kpi__value', String(stat.value)),
-        el('span', 'board-kpi__label', stat.label),
-      );
+      const valueNode = el('b', 'board-kpi__value', String(stat.value));
+      // v5 live-feel: a changed number ticks once (micro crossfade); the
+      // first render never animates — the page load has its own reveal.
+      const key = `${title}:${stat.label}`;
+      const previous = this.lastKpiValues.get(key);
+      this.lastKpiValues.set(key, String(stat.value));
+      if (previous !== undefined && previous !== String(stat.value)) {
+        valueNode.classList.add('board-kpi__value--tick');
+      }
+      node.append(valueNode, el('span', 'board-kpi__label', stat.label));
       if (stat.ageSince !== undefined && stat.ageSince !== null) {
         node.append(this.ageNode('board-kpi__age lbl', stat.ageSince, 'oldest ', ''));
       }
@@ -301,10 +326,16 @@ export class BoardView {
   // Repo-grouped job cards
   // ------------------------------------------------------------------
 
-  /** Banded repo cards: NEEDS YOU / IN FLIGHT / SETTLED / COLD, recency
-   * within each band. A repo's jobs can appear under several bands — the
-   * repo card repeats with only the jobs in that band, so the operator
-   * reads priority first and grouping second. */
+  /** Banded job cards: NEEDS YOU / IN FLIGHT / SETTLED / COLD, recency
+   * within each band. v5 flattens v4's repo wrapper: each job card is
+   * its own grid cell (a dashboard glance, not a scroll) and credits its
+   * repo on the card face, so grouping stays legible without a
+   * wrapper that would strand multi-job repos in one column.
+   *
+   * NEEDS YOU is always on screen (its clear state is information) and
+   * full-width; the other bands are card grids (`auto-fill`, ~340px
+   * cards) sized to the center pane. The SETTLED band is a rolling
+   * window over its recency-sorted tail. */
   private renderRepos(snapshot: BoardSnapshot): void {
     this.mount.replaceChildren();
     if (snapshot.repos.length === 0 || snapshot.repos.every((repo) => repo.jobs.length === 0)) {
@@ -322,29 +353,79 @@ export class BoardView {
     }
     const unacked = unackedByJob(snapshot);
     const bands = bucketSnapshot(snapshot, { now: Date.now(), unackedByJob: unacked });
-    for (const group of bands) {
-      const section = el('section', `board-band board-band--${group.band}`);
+    const seenIds = new Set<string>();
+    for (const band of BAND_ORDER) {
+      const jobs = bands.find((group) => group.band === band)?.jobs ?? [];
+      if (band !== 'needs-you' && jobs.length === 0) continue;
+      const section = el('section', `board-band board-band--${band}`);
       const head = el('h2', 'board-band__head');
       head.append(
-        el('span', 'board-band__label', BAND_LABELS[group.band]),
-        el('span', 'board-band__count lbl', `${group.jobs.length} job${group.jobs.length === 1 ? '' : 's'}`),
+        el('span', 'board-band__label', BAND_LABELS[band]),
+        el('span', 'board-band__count lbl', `${jobs.length} job${jobs.length === 1 ? '' : 's'}`),
       );
       section.append(head);
-      for (const repo of groupBandedByRepo(group.jobs)) {
-        const card = el('section', 'pp-card board-repo reveal');
-        const repoHead = el('div', 'board-repo__head');
-        repoHead.append(
-          el('h2', 'board-repo__name', `📦 ${repo.name}`),
-          el('span', 'lbl', `${repo.jobs.length} job${repo.jobs.length === 1 ? '' : 's'}`),
-        );
-        card.append(repoHead);
-        for (const entry of repo.jobs) {
-          card.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, group.band));
+      if (band === 'needs-you' && jobs.length === 0) {
+        section.append(this.clearNeedsYou());
+      } else if (band === 'needs-you') {
+        // Full-width and loud: the operator's queue, one card per row.
+        const list = el('div', 'board-band__list');
+        for (const entry of jobs) {
+          list.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, band));
         }
-        section.append(card);
+        section.append(list);
+      } else {
+        const window = band === 'settled' ? settledWindow(jobs, this.settledExpanded) : { jobs, hidden: 0 };
+        const grid = el('div', 'board-band__grid');
+        for (const entry of window.jobs) {
+          grid.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, band));
+        }
+        section.append(grid);
+        if (window.hidden > 0) {
+          const more = el('button', 'board-band__more', `+${window.hidden} older settled`);
+          more.type = 'button';
+          more.setAttribute('aria-expanded', 'false');
+          more.addEventListener('click', () => {
+            this.settledExpanded = true;
+            if (this.snapshot !== null) this.render(this.snapshot);
+          });
+          section.append(more);
+        }
       }
       this.mount.append(section);
     }
+    for (const group of bands) for (const entry of group.jobs) seenIds.add(entry.job.id);
+    for (const id of seenIds) this.knownJobIds.add(id);
+    this.firstJobsRender = false;
+    this.applyBandColumns();
+  }
+
+  /** An empty NEEDS YOU band is good news, not absence: a calm green
+   * satisfied state (never hidden, never a false alarm). */
+  private clearNeedsYou(): HTMLElement {
+    const node = el('div', 'board-band__clear');
+    node.append(
+      el('span', 'board-band__clear-mark', '✓'),
+      el('div', 'board-band__clear-text', 'nothing needs you'),
+      el('div', 'lbl board-band__clear-hint', 'the crew is on it'),
+    );
+    return node;
+  }
+
+  /** v5: fit each band's card grid to the measured center pane — the JS
+   * mirror of the CSS auto-fill rule. Before any layout has run (unit
+   * tests, a hidden mount) the viewport-derived estimate stands in. */
+  private applyBandColumns(): void {
+    for (const grid of this.mount.querySelectorAll<HTMLElement>('.board-band__grid')) {
+      const measured = grid.clientWidth;
+      const width = measured > 0 ? measured : estimatedCenterWidth(this.viewportWidth());
+      const columns = bandColumnsForWidth(width);
+      grid.dataset.columns = String(columns);
+      grid.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
+    }
+  }
+
+  private viewportWidth(): number {
+    return typeof window === 'undefined' ? 0 : window.innerWidth;
   }
 
   /** One collapsed-by-default card. Collapsed DOM is exactly: title +
@@ -355,6 +436,11 @@ export class BoardView {
     const row = el('article', 'board-job');
     row.dataset.jobId = job.id;
     row.dataset.band = band;
+    // v5: a job that was not on screen slides in (8px); a snapshot push
+    // re-rendering known cards stays still.
+    if (!this.firstJobsRender && !this.knownJobIds.has(job.id)) {
+      row.classList.add('board-job--enter');
+    }
 
     const head = el('div', 'board-job__head');
     const toggle = el('button', 'board-job__toggle');
@@ -393,7 +479,12 @@ export class BoardView {
     }
 
     const meta = el('div', 'board-job__meta lbl');
-    meta.textContent = `${job.id} · updated ${formatTs(job.updatedAt)}${job.baseBranch !== null ? ` · base ${job.baseBranch}` : ''}`;
+    const metaText = `${job.id} · updated ${formatTs(job.updatedAt)}${job.baseBranch !== null ? ` · base ${job.baseBranch}` : ''}`;
+    meta.append(
+      el('span', 'board-job__repo', `📦 ${job.repo}`),
+      document.createTextNode(` · ${metaText}`),
+    );
+    meta.title = `${job.repo} · ${metaText}`;
     row.append(meta);
 
     let body: HTMLElement | null = null;
@@ -573,6 +664,7 @@ export class BoardView {
   private agentRow(agent: AgentView, disposed: boolean): HTMLElement {
     const row = el('button', `board-agent${disposed ? ' board-agent--disposed' : ''}`);
     row.type = 'button';
+    row.dataset.state = agent.state;
     row.title =
       agent.sessionFile !== null
         ? `${agent.id} — open transcript`
@@ -722,19 +814,5 @@ function formatTs(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-/** Re-group one band's recency-sorted jobs by repo (alphabetical repo
- * order); the band ordering carries priority, grouping stays legible. */
-function groupBandedByRepo(jobs: readonly BandedJob[]): { name: string; jobs: readonly BandedJob[] }[] {
-  const byRepo = new Map<string, BandedJob[]>();
-  for (const entry of jobs) {
-    const group = byRepo.get(entry.job.repo);
-    if (group === undefined) byRepo.set(entry.job.repo, [entry]);
-    else group.push(entry);
-  }
-  return [...byRepo.entries()]
-    .map(([name, grouped]) => ({ name, jobs: grouped }))
-    .sort((left, right) => left.name.localeCompare(right.name));
 }
 

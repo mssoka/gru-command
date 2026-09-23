@@ -73,13 +73,24 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 
 ## The UI (`web/`)
 
-- **Desktop:** nav tabs `💬 Chat` (default) / `🗺️ Board`. Board = repo
-  cards (title, status chip, note, PR link) + round rows with per-lens
-  chips (`○ pending` gray · `◉ live` yellow · `✓ done` green · `✕ error`
-  red) + agent rail + transcripts list + notification bell.
-- **Phone (≤768 px):** board-first (SPEC ruling 11) — chat stays one tap
-  away via the existing corner bubble → bottom sheet; the Chat tab opens
-  the sheet.
+- **Console (v5):** the estate is full-width. At ≥1280px it is three
+  panes — chat (380px, collapsible) | dashboard | agents/transcripts
+  rail. At 900–1279px the board + rail hold the page and chat overlays
+  via the Gru FAB (right drawer, dimmed board behind); below 900px the
+  rail stacks under the board and the FAB opens a bottom sheet. The nav
+  tabs stay as focus switches: `💬 Chat` opens/focuses chat, `🗺️ Board`
+  dismisses the overlay and marks the board.
+- **Dashboard:** KPI strip (job/PR/lane counts) + health row (deploy
+  drift first) full-width, then **attention bands** — NEEDS YOU → IN
+  FLIGHT → SETTLED → COLD, recency inside each band. v5 renders job
+  cards as a responsive card grid (~340px, max 3 columns); NEEDS YOU is
+  full-width (empty = calm “nothing needs you”); SETTLED is a rolling
+  window (latest 10 + `+K older settled`, session-expanded). Each card:
+  title, status chip, one compact signal chip, repo/id/meta line, PR
+  link; click to disclose lane + rounds (v3 collapse, persisted per
+  job). Round rows carry per-lens chips (`○ pending` gray · `◉ live`
+  yellow · `✓ done` green · `✕ error` red) behind a click. Each band
+  carries ONE accent — left edge + label pill only (v5).
 - **Agent rail:** every ledger agent with a live state chip (🧠 gru ·
   📋 silas · 🔧 minion · 🔍 perkins · 🌙 bob); clicking an agent with a
   session file opens its transcript. The silas chip is LIVE when

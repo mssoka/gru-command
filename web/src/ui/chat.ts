@@ -1,7 +1,9 @@
 /**
- * Chat view: desktop panel + mobile corner-bubble sheet over one DOM tree.
- * A matchMedia listener reparents the panel into the sheet on small
- * screens, so there is exactly one message log to keep in sync.
+ * Chat view: one DOM tree, two placements (board UX v5). At/above the
+ * console breakpoint the panel is the left console pane; below it the
+ * panel is reparented into the overlay sheet (bottom sheet on a phone,
+ * right drawer on a tablet) opened by the Gru FAB. One message log, one
+ * socket, one composer either way.
  *
  * The composer owns the ONE attach flow (SPEC ruling 19): an attach
  * button opens a picker that browses the service's workspace root
@@ -9,6 +11,9 @@
  * (phone/camera; bytes materialize into the instance uploads dir and
  * THAT path becomes the chip). Clipboard image paste materializes the
  * same way. The user NEVER types or pastes paths.
+ *
+ * Unread (v5): a message that lands while no chat surface is in sight
+ * counts; the FAB badge and the collapsed console rail's pulse follow.
  */
 
 import type { ChatMessage, ConnectionState } from '../lib/chat-client.js';
@@ -25,7 +30,7 @@ import { MAX_ATTACHMENTS_PER_MESSAGE } from '../lib/protocol.js';
 import { renderMarkdown } from '../lib/markdown.js';
 import { el, mustGet } from './dom.js';
 
-const MOBILE_QUERY = '(max-width: 768px)';
+const OVERLAY_QUERY = '(max-width: 1279px)';
 
 /** Touch devices: the return key inserts a newline (composer fork 1,
  * user ruling 2026-09-20) — the send gesture is the always-visible Send
@@ -65,7 +70,8 @@ export class ChatView {
   private readonly panel = mustGet<HTMLElement>('chat-view');
   private readonly sheet = mustGet<HTMLElement>('chat-sheet');
   private readonly sheetMount = mustGet<HTMLElement>('chat-sheet-mount');
-  private readonly bubble = mustGet<HTMLButtonElement>('chat-bubble');
+  private readonly scrim = mustGet<HTMLElement>('chat-scrim');
+  private readonly fab = mustGet<HTMLButtonElement>('gru-fab');
   private readonly badge = mustGet<HTMLElement>('chat-badge');
   private readonly mainMount = mustGet<HTMLElement>('chat-main-mount');
   private readonly form = mustGet<HTMLFormElement>('chat-form');
@@ -99,8 +105,10 @@ export class ChatView {
   /** Pending coalesced replay-settle animation frame. */
   private settleFrame: number | null = null;
   private readonly jumpButton: HTMLButtonElement;
-  private mobile = window.matchMedia(MOBILE_QUERY);
+  private overlay = window.matchMedia(OVERLAY_QUERY);
   private coarse = window.matchMedia(COARSE_QUERY);
+  /** Console pane collapsed to its rail (v5): unread counts follow. */
+  private paneCollapsed = false;
   /** Ready-to-send chips (SPEC ruling 19). */
   private pending: AttachmentChip[] = [];
   /** Uploads in flight, keyed by gesture identity (same-name files may overlap). */
@@ -200,7 +208,7 @@ export class ChatView {
     this.panel.append(this.jumpButton);
     this.log.addEventListener('scroll', this.onLogScroll);
 
-    this.bubble.addEventListener('click', () => this.setSheetOpen(true));
+    this.scrim.addEventListener('click', () => this.setSheetOpen(false));
     const grip = mustGet<HTMLElement>('chat-sheet-grip');
     grip.addEventListener('click', () => this.setSheetOpen(false));
     grip.addEventListener('keydown', (event) => {
@@ -211,21 +219,23 @@ export class ChatView {
     });
 
     const place = (): void => {
-      if (this.mobile.matches) {
-        this.panel.classList.remove('chat-panel--desktop');
+      if (this.overlay.matches) {
+        // Overlay sheet: bottom sheet on a phone, right drawer on a tablet.
         this.sheetMount.append(this.panel);
       } else {
-        this.panel.classList.add('chat-panel--desktop');
+        // Console pane: the left column of the three-pane estate.
         this.mainMount.append(this.panel);
         this.setSheetOpen(false);
       }
       // New container width reflows lines — re-measure the composer.
       this.autosize();
     };
-    this.mobile.addEventListener('change', place);
+    this.overlay.addEventListener('change', place);
     place();
     // Sheet starts closed: inert until first opened.
     this.sheet.toggleAttribute('inert', this.sheet.dataset.open !== 'true');
+    // Unread surfaces start at zero (FAB badge + rail dot).
+    this.renderUnread();
   }
 
   /** The virtual keyboard's return key is labeled for its actual job:
@@ -308,8 +318,7 @@ export class ChatView {
     this.stickToBottom = true;
     this.jumpButton.hidden = true;
     this.lastLogScrollTop = 0;
-    this.bubble.dataset.unread = '0';
-    this.badge.textContent = '0';
+    this.clearUnread();
   }
 
   private rollbackPendingResetView(): void {
@@ -326,8 +335,7 @@ export class ChatView {
     this.streamOpen = prior.streamOpen;
     this.activeTool = prior.activeTool;
     this.unread = prior.unread;
-    this.bubble.dataset.unread = String(this.unread);
-    this.badge.textContent = String(this.unread);
+    this.renderUnread();
     this.pendingResetView = null;
     this.scrollToEnd();
   }
@@ -627,19 +635,44 @@ export class ChatView {
     setTimeout(() => line.remove(), 6_000);
   }
 
-  /** Open the phone chat sheet (the nav Chat tab on mobile does this). */
+  /** Open the phone/tablet chat overlay (the nav Chat tab and the FAB). */
   openSheet(): void {
     this.setSheetOpen(true);
+  }
+
+  /** Dismiss the overlay (the nav Board tab, the scrim, the grip). */
+  closeSheet(): void {
+    this.setSheetOpen(false);
+  }
+
+  /** Hand the composer focus (the FAB/rail expanding the console pane). */
+  focusComposer(): void {
+    this.input.focus();
+    this.scrollToEnd();
+  }
+
+  /** Console (v5): the pane collapsed to its slim rail. Unread counting
+   * follows the collapsed rail, and expanding the pane clears it. */
+  setPaneCollapsed(collapsed: boolean): void {
+    this.paneCollapsed = collapsed;
+    if (!collapsed && !this.overlay.matches) this.clearUnread();
+  }
+
+  /** Is a chat surface in sight right now? Overlay mode follows the sheet;
+   * the console follows the pane. */
+  private chatVisible(): boolean {
+    if (this.overlay.matches) return this.sheet.dataset.open === 'true';
+    return !this.paneCollapsed;
   }
 
   private setSheetOpen(open: boolean): void {
     this.sheet.dataset.open = String(open);
     // A closed sheet is visually hidden AND unfocusable/unannounced.
     this.sheet.toggleAttribute('inert', !open);
+    // The board stays visible behind, dimmed (v5).
+    this.scrim.hidden = !open;
     if (open) {
-      this.unread = 0;
-      this.bubble.dataset.unread = '0';
-      this.badge.textContent = '0';
+      this.clearUnread();
       this.scrollToEnd();
     }
   }
@@ -649,9 +682,7 @@ export class ChatView {
     this.pendingResetView = null;
     this.log.replaceChildren();
     this.bubbles.clear();
-    this.unread = 0;
-    this.bubble.dataset.unread = '0';
-    this.badge.textContent = '0';
+    this.clearUnread();
     this.streamingBubble = null;
     this.streamingBody = null;
     this.streamText = '';
@@ -829,11 +860,23 @@ export class ChatView {
   }
 
   private bumpUnread(): void {
-    if (this.mobile.matches && this.sheet.dataset.open !== 'true') {
-      this.unread += 1;
-      this.bubble.dataset.unread = String(this.unread);
-      this.badge.textContent = String(this.unread);
-    }
+    if (this.chatVisible()) return;
+    this.unread += 1;
+    this.renderUnread();
+  }
+
+  /** Reset unread on every surface (FAB badge + collapsed console rail). */
+  private clearUnread(): void {
+    this.unread = 0;
+    this.renderUnread();
+  }
+
+  private renderUnread(): void {
+    this.fab.dataset.unread = String(this.unread);
+    this.badge.textContent = String(this.unread);
+    // The collapsed console rail pulses on unread — a subtle dot, not a
+    // second counter (the FAB badge carries the number).
+    document.getElementById('chat-rail')?.setAttribute('data-unread', String(this.unread));
   }
 
   // -----------------------------------------------------------------------
