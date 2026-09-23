@@ -12,6 +12,16 @@ import { isGitHubRemote, isGitLabRemote } from '../review-path.js';
  * only a hint: the freeze source is `git fetch origin <branch>` cross-
  * checked against the code host's live pull/merge-request head, and any
  * disagreement aborts before a review worktree or lens exists.
+ *
+ * Regression the second round closes (job `rebase-60`): the branch to
+ * fetch was derived from the caller's candidate ref, which for a default
+ * arm is the job lane branch `gru/<jobId>`. A lane that never pushed its
+ * own name — a rebase lane pushing the PR branch instead — made the round
+ * fail on `fatal: couldn't find remote ref refs/heads/<jobId>`, even
+ * though the pull request's real head branch existed. A PR round now reads
+ * the source branch from the PR identity (`headRefName`) itself: the
+ * candidate ref is a hint for the probe double only and is never used as
+ * the freeze target.
  */
 
 const GIT_TIMEOUT_MS = 30_000;
@@ -31,11 +41,14 @@ export interface PrHeadIdentity {
 export type PrHeadProbe = (input: {
   readonly prUrl: string;
   readonly repoPath: string;
-  /** The normalized source branch the round intends to freeze. */
+  /** The candidate branch the caller had in hand (the lane ref or an
+   * explicit `target_ref`). A hint for probe doubles only: production reads
+   * the branch from the PR itself, and the result is never the freeze
+   * source. */
   readonly branchRef: string;
 }) => Promise<PrHeadIdentity>;
 
-export type PrHeadFailure = 'fetch-failed' | 'probe-failed' | 'branch-mismatch' | 'head-mismatch';
+export type PrHeadFailure = 'fetch-failed' | 'probe-failed' | 'head-mismatch';
 
 /** A PR round could not prove the head it was about to freeze. The round
  * must not start; the message names the concrete next action. */
@@ -222,7 +235,9 @@ export interface FreshPrHead {
 export interface FreshPrHeadInput {
   readonly repoPath: string;
   readonly prUrl: string;
-  /** The source branch under review (a local branch or `origin/<branch>`). */
+  /** The candidate branch the caller had in hand (the lane ref or an
+   * explicit `target_ref`) — a probe hint only. The PR's own `headRefName`
+   * is the freeze source, never a name synthesized from the job id. */
   readonly branchRef: string;
   readonly gitBinary?: string;
   /** Test seam; production probes the code host. */
@@ -230,21 +245,20 @@ export interface FreshPrHeadInput {
 }
 
 /**
- * Resolve the exact SHA a PR round may freeze. The fetch is the source of
- * truth; the code-host head is the cross-check. `targetSha == fetched tip
- * == PR head` or this throws — no caller may run a round on a mystery SHA.
+ * Resolve the exact SHA a PR round may freeze. The code host's live head
+ * identity decides WHICH branch is sourced (its `headRefName`); the fetch
+ * of that branch is the source of truth for the SHA, and the PR's live
+ * head cross-checks it. `targetSha == fetched tip == PR head` or this
+ * throws — no caller may run a round on a mystery SHA, and no caller may
+ * freeze a lane ref the PR was never opened from.
  */
 export async function resolveFreshPrHead(input: FreshPrHeadInput): Promise<FreshPrHead> {
-  const branch = input.branchRef.trim();
-  if (branch === '') {
-    throw new PrHeadVerificationError('fetch-failed', 'the review target branch is empty; request the review with a branch target');
-  }
+  const candidate = input.branchRef.trim();
   const gitBinary = input.gitBinary ?? 'git';
-  const targetSha = fetchOriginBranchTip({ repoPath: input.repoPath, branch, gitBinary });
   const probe = input.probe ?? defaultPrHeadProbe;
   let identity: PrHeadIdentity;
   try {
-    identity = await probe({ prUrl: input.prUrl, repoPath: input.repoPath, branchRef: branch });
+    identity = await probe({ prUrl: input.prUrl, repoPath: input.repoPath, branchRef: candidate });
   } catch (error) {
     if (error instanceof PrHeadVerificationError) throw error;
     throw new PrHeadVerificationError(
@@ -257,19 +271,17 @@ export async function resolveFreshPrHead(input: FreshPrHeadInput): Promise<Fresh
   if (!COMMIT_SHA.test(prHeadSha) || prHeadRefName === '') {
     throw new PrHeadVerificationError('probe-failed', `the pull request head probe returned an incomplete identity for ${input.prUrl}`);
   }
-  if (prHeadRefName !== branch) {
-    throw new PrHeadVerificationError(
-      'branch-mismatch',
-      `the pull request (${input.prUrl}) is opened from branch "${prHeadRefName}", but the review target resolves to branch "${branch}". ` +
-        'The round was not started; verify the review target, then request the review again.',
-    );
-  }
+  // The PR's own head branch is the freeze source. The caller's candidate
+  // (a lane ref like `gru/<jobId>`, or an explicit target) is a hint only:
+  // a lane that was never pushed must not fail the round, and a lane that
+  // trails origin must never be frozen.
+  const targetSha = fetchOriginBranchTip({ repoPath: input.repoPath, branch: prHeadRefName, gitBinary });
   if (prHeadSha !== targetSha) {
     throw new PrHeadVerificationError(
       'head-mismatch',
-      `origin/${branch} fetched at ${targetSha}, but the pull request (${input.prUrl}) reports head ${prHeadSha} — the branch moved under the freeze. ` +
+      `origin/${prHeadRefName} fetched at ${targetSha}, but the pull request (${input.prUrl}) reports head ${prHeadSha} — the branch moved under the freeze. ` +
         'The round was not started; request the review again to freeze the current head.',
     );
   }
-  return { targetSha, movementRef: `origin/${branch}`, prHeadSha, prHeadRefName };
+  return { targetSha, movementRef: `origin/${prHeadRefName}`, prHeadSha, prHeadRefName };
 }
