@@ -36,6 +36,13 @@ import { createRollServer } from './roll/server.js';
 import { readRollState } from './roll/state.js';
 import { createAttachmentsServer } from './attachments/server.js';
 import { uploadsDirNeedsHardening } from './attachments/resolver.js';
+import { JournalStore } from './lessons/journal.js';
+import { BibleStore } from './lessons/bible.js';
+import { createBibleReferences } from './lessons/references.js';
+import { DreamEngine, DreamScheduler } from './lessons/dream.js';
+import { AgentLessonsDistiller } from './lessons/distiller.js';
+import { createSessionLessonsCapture } from './lessons/capture.js';
+import { createLessonsServer } from './lessons/server.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { isolateDecisionEnvironment } from './decisions/credentials.js';
 import type { Role } from './config.js';
@@ -329,6 +336,7 @@ async function main(): Promise<number> {
     supervisor?: Supervisor;
     decisions?: DecisionRuntime;
     bob?: BobScheduler;
+    dream?: DreamScheduler;
     silas?: SilasDriver;
     wave?: WaveRunner;
     verify?: ReturnType<typeof createVerificationServer>;
@@ -391,6 +399,13 @@ async function main(): Promise<number> {
             state.bob.stop();
           } catch (error) {
             logger.error('bob scheduler stop failed', { error: String(error) });
+          }
+        }
+        if (state.dream !== undefined) {
+          try {
+            state.dream.stop();
+          } catch (error) {
+            logger.error('lesson dream scheduler stop failed', { error: String(error) });
           }
         }
         if (state.silas !== undefined) {
@@ -484,6 +499,35 @@ async function main(): Promise<number> {
     onListenerError: (message) => logger.log('error', 'event bus listener failed', { detail: message }),
   });
   const ledger = new LedgerApi(ledgerDb.handle, { bus });
+  // Book of Lessons (owner design 2026-09-23): the journal is deliberate
+  // capture; the bible is the distilled, pointer-referenceable memory. The
+  // store is created here so the HTTP surface and the dispatch injection
+  // share one instance; the dream cadence starts with Bob's slot below.
+  const journal = new JournalStore(join(config.dataDir, 'journal'), {
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const bible = new BibleStore(join(config.dataDir, 'bible'), {
+    chapterCapBytes: config.lessons.chapterCapBytes,
+    indexCapBytes: config.lessons.indexCapBytes,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  bible.ensureSeeded();
+  const lessonReferences = createBibleReferences({
+    bible,
+    maxReferences: config.lessons.maxReferences,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const lessonsCapture = createSessionLessonsCapture({
+    journal,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const lessonsServer = createLessonsServer({
+    config,
+    journal,
+    bible,
+    references: lessonReferences,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   // E7: late-bound supervision feed — the engine is constructed before
   // the supervisor exists; the closure resolves per snapshot.
   let supervisor: Supervisor | null = null;
@@ -677,6 +721,7 @@ async function main(): Promise<number> {
     ledger,
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
+    ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const wave = new WaveRunner({
@@ -737,6 +782,25 @@ async function main(): Promise<number> {
     slot: bobSlot,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // The dream pass shares Bob's supervised slot (one memory agent, two
+  // triggers): the scheduled consolidation knock and the structured dream.
+  const dream = new DreamScheduler({
+    intervalMs: config.lessons.dreamIntervalMs,
+    dreamOnBoot: config.lessons.dreamOnBoot,
+    run: () =>
+      new DreamEngine({
+        journal,
+        bible,
+        distiller: new AgentLessonsDistiller({
+          slot: bobSlot,
+          bibleDir: bible.dir,
+          log: (level, msg, fields) => logger.log(level, msg, fields),
+        }),
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+      }).run(),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  state.dream = dream;
   // Silas ops hosting (E8 follow-through; owner ruling 2026-09-21): the
   // supervised slot follows the gru-main / bob-consolidator pattern exactly
   // — model and thinking resolve from config ([models.roles] silas /
@@ -756,6 +820,7 @@ async function main(): Promise<number> {
     ...(config.silas.enabled && silasSlot !== null
       ? { silasOps: { registry, worktrees: worktreeManager, notifications } }
       : {}),
+    ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // The verification surface (contention fix, 2026-09-22): lanes request
@@ -838,6 +903,7 @@ async function main(): Promise<number> {
       decisionsStatus: () => decisionRuntime.status(),
       buildInfo: () => buildInfo,
       requestHook: (req, res, path) =>
+        lessonsServer.requestHook(req, res, path) ||
         rollServer.requestHook(req, res, path) ||
         attachmentsServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||
@@ -891,6 +957,8 @@ async function main(): Promise<number> {
   chat.warmup();
   supervisorLive.start();
   bob.start();
+  if (config.lessons.enabled) dream.start();
+  else logger.info('lesson dream disabled by config', {});
   if (silasSlot !== null) {
     // The driver starts after listen so its wake prompt carries the real
     // bound port (config port 0 = ephemeral); until then no sweeps run and

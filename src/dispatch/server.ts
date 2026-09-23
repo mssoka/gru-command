@@ -8,6 +8,7 @@ import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
 import { flipJobToWorking, rebriefFreshMinion, recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
 import { finalizeRebriefRequest } from './rebrief-recovery.js';
+import type { LessonsReferencePort } from '../lessons/types.js';
 import { BranchBusyError } from './branch-idle.js';
 import type { WorktreePort } from './worktree-port.js';
 
@@ -38,6 +39,8 @@ export interface DispatchServerOptions {
   readonly ledger: LedgerApi;
   /** Absent = /api/silas/* answers 503 (silas ops not hosted). */
   readonly silasOps?: SilasOpsSurface;
+  /** Book of Lessons injection for directives/re-briefs (pointers only). */
+  readonly lessons?: LessonsReferencePort;
   readonly log?: Log;
 }
 
@@ -302,6 +305,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           directive,
           signal: controller.signal,
           owner: 'silas-ops',
+          ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
         });
       } finally {
         directiveControllers.delete(controller);
@@ -373,6 +377,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
               sessionFile: worker.sessionFile,
             });
           },
+          ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
         });
       } finally {
         directiveControllers.delete(controller);

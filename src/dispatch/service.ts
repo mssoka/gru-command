@@ -4,6 +4,9 @@ import { isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import { requireSpawnCwd } from '../roles.js';
+import { renderLessonsSection } from '../lessons/references.js';
+import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
+import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -37,6 +40,10 @@ export interface DispatchServiceOptions {
    * split: the manager implementation is its own lane. */
   readonly worktrees: WorktreePort;
   readonly spawner: AgentSpawner;
+  /** Book of Lessons injection: pointer lines only, never chapter bodies. */
+  readonly lessons?: LessonsReferencePort;
+  /** Extracts a minion's opt-in lessons block at delivery settle. */
+  readonly lessonsCapture?: LessonCapturePort;
   readonly log?: Log;
 }
 
@@ -48,7 +55,10 @@ export function renderMinionBriefing(input: {
   worktreePath: string;
   sha: string;
   briefing: string;
+  /** Progressive-disclosure reference lines (no chapter bodies). */
+  lessons?: readonly LessonPointer[];
 }): string {
+  const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
     `Dispatch briefing — job ${input.jobId}`,
     `Repo: ${input.repoName}`,
@@ -57,6 +67,7 @@ export function renderMinionBriefing(input: {
     '',
     'BRIEFING:',
     input.briefing,
+    ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     '',
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',
@@ -150,6 +161,7 @@ export class DispatchService {
 
       // (5) Deliver the briefing. The turn runs in the background; the
       // board shows the arc through ledger events, not this await.
+      const lessons = this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
       const settled = handle
         .prompt(
           renderMinionBriefing({
@@ -159,17 +171,19 @@ export class DispatchService {
             worktreePath: worktree.path,
             sha: worktree.sha,
             briefing: input.briefing,
+            ...(lessons.length > 0 ? { lessons } : {}),
           }),
           { owner: `dispatch:${job.id}` },
         )
         .then(
-          () => {
+          async () => {
             this.opts.ledger.appendCustomEvent({
               kind: 'job.delivered',
               jobId: job.id,
               payload: { agentId: handle.id },
             });
             this.recordSettleOutcome(job.id, 'delivered');
+            this.captureLessons(handle, job.id);
             this.log('info', 'minion briefing turn completed', { job: job.id, agent: handle.id });
             return { ok: true as const };
           },
@@ -194,6 +208,17 @@ export class DispatchService {
       this.opts.ledger.setJobStatus(job.id, 'blocked');
       this.opts.ledger.noteJob(job.id, `dispatch failed: ${String(error)}`);
       throw error;
+    }
+  }
+
+  /** Capture the minion's opt-in lessons block (a bonus, never the
+   * delivery contract — a failure is logged, not surfaced). */
+  private captureLessons(handle: AgentHandle, jobId: string): void {
+    if (this.opts.lessonsCapture === undefined) return;
+    try {
+      this.opts.lessonsCapture.capture({ sessionFile: handle.sessionFile, source: `minion:${jobId}` });
+    } catch (error) {
+      this.log('error', 'minion lessons capture failed', { job: jobId, error: String(error) });
     }
   }
 
