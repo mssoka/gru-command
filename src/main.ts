@@ -70,7 +70,8 @@ async function modelRuntimeForProbe(): Promise<ModelRuntime> {
 
 /** Locate the installed bmad-review skill: check both the pi agent dir
  * and ~/.agents (the BMAD default install root) for maximum compatibility. */
-function resolveBmadReviewSkillPath(): string {  for (const base of [getAgentDir(), join(homedir(), '.agents')]) {
+function resolveBmadReviewSkillPath(): string {
+  for (const base of [getAgentDir(), join(homedir(), '.agents')]) {
     const candidate = join(base, 'skills', 'bmad-review', 'SKILL.md');
     if (existsSync(candidate)) return candidate;
   }
@@ -89,6 +90,37 @@ function instancePortForeignListener(config: GruCommandConfig): Promise<Listener
     host: dialHost(config.server.host),
     port: config.server.port,
     selfPid: process.pid,
+  });
+}
+
+/** Hard error + action-required for a foreign listener on the instance port
+ * (never a silent loopback 503). `when` distinguishes the pre-bind check
+ * from the post-bind pid check in the log/detail. */
+function reportForeignListener(
+  foreign: ListenerOwner,
+  config: GruCommandConfig,
+  port: number,
+  logger: Logger,
+  notifications: NotificationCenter,
+  when: 'before' | 'while',
+): void {
+  logger.log('error', 'foreign listener owns the instance port — refusing to serve', {
+    host: config.server.host,
+    port,
+    foreign_pid: foreign.pid,
+    foreign_command: foreign.command,
+    detected: when,
+  });
+  notifications.post({
+    kind: 'port-squat',
+    routing: 'action-required',
+    severity: 'error',
+    title: `Foreign process holds port ${port} (pid ${foreign.pid})`,
+    detail:
+      `${foreign.command === '' ? 'unknown command' : foreign.command} (pid ${foreign.pid}) ` +
+      `owns ${dialHost(config.server.host)}:${port} ` +
+      `${when === 'before' ? 'before this service could bind it' : 'while this service bound the same port'} ` +
+      '— loopback clients would reach the squatter. Stop it, then restart the service.',
   });
 }
 
@@ -791,39 +823,37 @@ async function main(): Promise<number> {
         board.requestHook(req, res, path),
     },
   );
+  // Foreign-listener boot checks (owner incident 2026-09-23): on macOS a
+  // loopback squatter coexists with our wildcard/LAN bind, so a clean
+  // listen is NOT proof that clients reach us. The listener pid is.
+  //
+  // (a) PRE-bind: while this process is not yet listening, ANY listener on
+  // the port is foreign — refuse before the socket exists (this also keeps
+  // /health from being answered by a squatter during boot).
+  if (config.server.port !== 0) {
+    const prebind = await instancePortForeignListener(config);
+    if (prebind !== null) {
+      reportForeignListener(prebind, config, config.server.port, logger, notifications, 'before');
+      return 1;
+    }
+  }
   state.handle = await service.start();
   const handle = state.handle;
-  // Foreign-listener boot check (owner incident 2026-09-23): on macOS a
-  // loopback squatter coexists with our wildcard/LAN bind, so a clean
-  // listen is NOT proof that clients reach us. The listener pid is; a
-  // foreign pid is a hard error plus an action-required notification —
-  // never a silent /health misread.
+  chat.attach(handle.httpServer);
+  board.attach(handle.httpServer); // last: its upgrade handler terminates unclaimed paths
+  state.chat = chat;
+  // (b) POST-bind: the literal listener-pid check (selfPid filtered), run
+  // after the socket handlers are attached so a healthy /health answer is
+  // never served while /ws is still unattached. Catches a squatter that
+  // appeared in the (tiny) pre-bind race window.
   if (config.server.port !== 0) {
     const foreign = await instancePortForeignListener(config);
     if (foreign !== null) {
-      logger.log('error', 'foreign listener owns the instance port — refusing to serve', {
-        host: config.server.host,
-        port: handle.port,
-        foreign_pid: foreign.pid,
-        foreign_command: foreign.command,
-      });
-      notifications.post({
-        kind: 'port-squat',
-        routing: 'action-required',
-        severity: 'error',
-        title: `Foreign process holds port ${handle.port} (pid ${foreign.pid})`,
-        detail:
-          `${foreign.command === '' ? 'unknown command' : foreign.command} (pid ${foreign.pid}) ` +
-          `owns ${dialHost(config.server.host)}:${handle.port} while this service just bound the same ` +
-          'port — loopback clients would reach the squatter. Stop it, then restart the service.',
-      });
+      reportForeignListener(foreign, config, handle.port, logger, notifications, 'while');
       await handle.stop();
       return 1;
     }
   }
-  chat.attach(handle.httpServer);
-  board.attach(handle.httpServer); // last: its upgrade handler terminates unclaimed paths
-  state.chat = chat;
   // Post-roll self-check (phase d): the relaunched build logs uptime+sha
   // once the socket is actually serving.
   if (rollAdoption.marker !== null) {

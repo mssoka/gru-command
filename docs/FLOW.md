@@ -237,7 +237,12 @@ the ordered, preserve-first sweep (ruling 18c):
 
 1. **Preserve** untracked deliverables into the instance data dir
    (before anything else; deliverables are never hostages).
-2. **Enumerate** processes rooted in the tree: a process counts when
+2. **Reap tracked services** — processes the orchestrator itself spawned
+   for the lane (verification runs, recorded in the ledger with evidence
+   `registry`) are signalled on teardown: process-group SIGTERM, grace,
+   then SIGKILL. Dual-keyed on the live registry row AND a current
+   in-tree enumeration, so a recycled pid can never redirect the kill.
+3. **Enumerate** processes rooted in the tree: a process counts when
    the registered path appears in its ARGV as a whole path
    (path-boundary match — a sibling lane `job-a-2` is never confused
    with `job-a`) OR when the process's actual working directory is
@@ -245,15 +250,16 @@ the ordered, preserve-first sweep (ruling 18c):
    platforms are argv-only, declared). Every pid a pause or confirmed
    kill is grounded on lands in the ledger's worktree-process records —
    the ask always names exactly what was live.
-3. **Pause and ask** — any live process pauses the sweep, records an
-   action-required escalation, and touches nothing. `confirm_kill` is
+4. **Pause and ask** — any other live process pauses the sweep, records
+   an action-required escalation, and touches nothing. `confirm_kill` is
    the human's answer to the RECORDED ask: it kills exactly the pids the
    pause put on the record (never a fresh enumeration — pids that
    appeared since were never acknowledged), with a SIGTERM grace before
    SIGKILL. Processes that survive both signals re-pause; processes that
    appeared after the acknowledged kill get their own ask.
    `confirm_kill` without a recorded pause is not honored — the ask
-   always comes first. Silent kills do not exist.
+   always comes first. Silent kills do not exist for processes the
+   orchestrator did not spawn.
 4. **Remove** the worktree; **containment-verified** branch delete (a
    branch is deleted only when its commits are provably contained in an
    existing ref — otherwise it is retained and noted, never

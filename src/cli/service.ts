@@ -308,7 +308,8 @@ async function readHealthSha(
   deps: ServiceCliDeps,
   base: string,
   config: GruCommandConfig,
-): Promise<string | null | undefined> {  try {
+): Promise<string | null | undefined> {
+  try {
     const res = await deps.fetchFn(`${base}/health`, {
       method: 'GET',
       headers: { authorization: `Bearer ${config.auth.token}` },
@@ -341,7 +342,8 @@ async function foreignHealthListener(
 }
 
 /** Rollback safety: no auto-rollback v1 — the old dist is git; name the bail. */
-function bailHint(stderr: (line: string) => void, state: RollState | null): void {  const root = state?.repoRoot ?? '<deploy clone>';
+function bailHint(stderr: (line: string) => void, state: RollState | null): void {
+  const root = state?.repoRoot ?? '<deploy clone>';
   stderr(
     `bail: the swap marker is the only handoff state — to return the service, restore the ` +
       `checkout, rebuild (npm ci && npm run build && npm run build:web in ${root}), and ` +
