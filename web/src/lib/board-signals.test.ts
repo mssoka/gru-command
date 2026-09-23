@@ -193,6 +193,32 @@ describe('jobSignal', () => {
   });
 });
 
+describe('jobSignal — v5 stale review pills on concluded cards', () => {
+  it('suppresses live/pending review liveness on merged and done cards', () => {
+    for (const status of ['merged', 'done']) {
+      expect(jobSignal(job({ status, rounds: [round({ seq: 2, status: 'live' })] }), 0)).toBeNull();
+      expect(jobSignal(job({ status, rounds: [round({ seq: 2, status: 'pending' })] }), 0)).toBeNull();
+    }
+    // The same rounds still read as live on an in-flight card.
+    expect(jobSignal(job({ status: 'in-review', rounds: [round({ seq: 2, status: 'live' })] }), 0)?.label).toContain('live');
+  });
+
+  it('keeps attention pills that explain why a concluded card needs you', () => {
+    const unacked = jobSignal(job({ status: 'merged' }), 2);
+    expect(unacked?.label).toBe('🔔 2 action-required');
+    const aborted = jobSignal(job({ status: 'done', rounds: [round({ seq: 3, status: 'aborted' })] }), 0);
+    expect(aborted?.label).toBe('⛔ round 3 aborted');
+    const failed = jobSignal(
+      job({
+        status: 'merged',
+        rounds: [round({ status: 'live', lenses: [{ lens: 'tests', state: 'error', agentId: null, note: 'boom', verdict: null }] })],
+      }),
+      0,
+    );
+    expect(failed?.label).toBe('✕ 1 lens failure');
+  });
+});
+
 describe('pluralCount', () => {
   it('singularizes exactly one', () => {
     expect(pluralCount(1, 'blocker')).toBe('1 blocker');
