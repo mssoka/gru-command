@@ -73,6 +73,33 @@ function cwdInsideTree(cwd: string, treePath: string): boolean {
   return cwd === treePath || cwd.startsWith(`${treePath}/`);
 }
 
+/** Liveness without EPERM confusion (EPERM still proves the pid exists). */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** Signal the process GROUP first (spawned verification runs are detached
+ * group leaders, so workers cannot survive the shell), then the pid itself.
+ * Returns true when a signal was delivered. */
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch {
+    try {
+      process.kill(pid, signal);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
 /** Per-process working directories, or null where the platform cannot
  * resolve them (argv-only then — the gap is declared, never guessed). */
 function processCwds(): Map<number, string> | null {
@@ -467,8 +494,17 @@ export class WorktreeManager {
       // decision, before any removal. Deliverables are never hostages.
       const preserved = this.preserveUntracked(row);
 
+      // (1.5) Reap services THIS orchestrator spawned for the lane (owner
+      // incident 2026-09-23): verification runs are recorded in
+      // worktree_processes with evidence 'registry' at spawn, so a sweep
+      // reaps its own children instead of pausing forever on them. The kill
+      // is dual-keyed (registry row live AND still enumerated in the tree)
+      // so a recycled pid can never redirect it; foreign processes keep the
+      // full pause-and-ask contract below.
+      const reaped = await this.reapTrackedServiceProcesses(row);
+
       // (2) Enumerate processes rooted in the tree BEFORE removal.
-      const processes = this.enumerate(row.path);
+      const processes = this.enumerate(row.path).filter((proc) => !reaped.includes(proc.pid));
       if (processes.length > 0) {
         // Perkins r2 B2: confirmKill is answered against the RECORDED set
         // (ruling 18b rows from a prior pause), never a fresh enumeration
@@ -518,6 +554,74 @@ export class WorktreeManager {
       // No live processes: straight to the removal tail.
       return this.finishSweep(row, preserved, input.baseBranch);
     });
+  }
+
+  /**
+   * Reap the lane's orchestrator-spawned services (owner incident
+   * 2026-09-23): rows the verification scheduler recorded at spawn carry
+   * evidence 'registry' — they are OUR children, so teardown does not wait
+   * for a human. A pid is signalled only when BOTH the ledger row says
+   * live AND the process currently enumerates as rooted in the tree (a
+   * recycled pid can never redirect the kill). Dead or no-longer-rooted
+   * rows are reconciled to 'killed' without a signal; survivors stay live
+   * and fall through to the normal pause-and-ask. Returns the pids proven
+   * dead by the grace ladder.
+   */
+  private async reapTrackedServiceProcesses(row: WorktreeRecord): Promise<readonly number[]> {
+    const tracked = this.opts.ledger
+      .listWorktreeProcesses(row.id)
+      .filter((proc) => proc.state === 'live' && proc.evidence === 'registry');
+    if (tracked.length === 0) return [];
+    const inTree = new Set(this.enumerate(row.path).map((proc) => proc.pid));
+    const targets = tracked.filter((proc) => inTree.has(proc.pid) && pidAlive(proc.pid));
+    const targetPids = new Set(targets.map((proc) => proc.pid));
+    const stranded = tracked.filter((proc) => !targetPids.has(proc.pid));
+    if (stranded.length > 0) {
+      // Never signal a pid that is dead or no longer belongs to this lane:
+      // reconcile the registry row and move on (the row's truth ends here).
+      this.opts.ledger.recordWorktreeProcesses({
+        worktreeId: row.id,
+        processes: stranded.map((proc) => ({
+          pid: proc.pid,
+          command: proc.command,
+          evidence: proc.evidence,
+        })),
+        state: 'killed',
+      });
+    }
+    if (targets.length === 0) return [];
+    const pids = targets.map((proc) => proc.pid);
+    for (const pid of pids) {
+      if (!signalProcessGroup(pid, 'SIGTERM')) {
+        this.log('warn', 'tracked service SIGTERM failed (already gone?)', { id: row.id, pid });
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, this.opts.killGraceMs ?? 1_500));
+    for (const pid of pids) {
+      if (pidAlive(pid)) signalProcessGroup(pid, 'SIGKILL');
+    }
+    // Settle, then confirm: only pids actually dead are reported reaped;
+    // survivors stay 'live' and the caller's enumeration re-asks on them.
+    await new Promise((resolve) => setTimeout(resolve, Math.min(this.opts.killGraceMs ?? 1_500, 300)));
+    const killed = pids.filter((pid) => !pidAlive(pid));
+    if (killed.length > 0) {
+      const killedSet = new Set(killed);
+      this.opts.ledger.recordWorktreeProcesses({
+        worktreeId: row.id,
+        processes: targets
+          .filter((proc) => killedSet.has(proc.pid))
+          .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence })),
+        state: 'killed',
+      });
+    }
+    this.opts.ledger.appendCustomEvent({
+      kind: 'worktree.service-reaped',
+      jobId: row.jobId,
+      roundId: row.roundId,
+      payload: { id: row.id, path: row.path, pids: killed, survivors: pids.filter((pid) => !killed.includes(pid)) },
+    });
+    this.log('info', 'tracked service processes reaped on sweep', { id: row.id, pids: killed });
+    return killed;
   }
 
   /** Roll back a failed creation: remove the tree; delete a branch only

@@ -400,6 +400,30 @@ describe('verification scheduler — global budget', () => {
     expect(pidAlive(await deadPid())).toBe(false);
   });
 
+  it('reports the spawned child (pid + argv) to onSpawn/onSettled so lane teardown can reap it', async () => {
+    const storageDir = join(tempDir(), 'verify');
+    const spawns: { pid: number | null; command: string }[] = [];
+    const settled: { pid: number | null; command: string }[] = [];
+    const scheduler = new VerificationScheduler({
+      storageDir,
+      limits: { maxConcurrent: 1, workerBudget: 2, lockWaitTimeoutMs: 5_000, runTimeoutMs: 20_000 },
+      onSpawn: (info) => spawns.push({ pid: info.pid, command: info.command }),
+      onSettled: (info) => settled.push({ pid: info.pid, command: info.command }),
+      sweepIntervalMs: 20,
+    });
+    scheduler.start();
+    const outcome = await scheduler.run(spec('job-track', 'node -e "process.exit(0)"'));
+    expect(outcome.ok).toBe(true);
+    expect(spawns).toHaveLength(1);
+    const spawnedPid = spawns[0]?.pid;
+    expect(spawnedPid).toBeTypeOf('number');
+    expect(spawns[0]?.command).toContain('/bin/sh -c');
+    expect(spawns[0]?.command).toContain('process.exit(0)');
+    expect(settled).toHaveLength(1);
+    expect(settled[0]?.pid).toBe(spawnedPid);
+    expect(pidAlive(spawnedPid as number)).toBe(false); // settled means exited
+  });
+
   it('starts idempotently and keeps the holder file inside the instance storage dir', async () => {
     const { scheduler, storageDir } = makeScheduler();
     scheduler.start();
