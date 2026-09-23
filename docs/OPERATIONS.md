@@ -33,7 +33,19 @@ The OS service manager is the SERVICE's out-of-band watcher (SPEC ruling
 ./install.sh --service    # register + start the service (launchd/systemd)
 ./install.sh --print      # render the platform unit; change nothing
 ./install.sh --uninstall  # stop the service and remove the unit
+gru-service roll          # self-roll: pull + rebuild + relaunch + verify
 ```
+
+The service can also roll **itself** — `gru-service roll` (CLI) or
+`POST /api/roll` (pairing-token guarded) pulls and rebuilds the deploy
+clone while the old process keeps serving, drains in-flight review
+rounds and agent turns (bounded), writes the swap marker, exits 75 so
+the service manager relaunches the unit, and verifies the new build SHA
+on `/health` before the CLI exits 0. `install.sh --update` delegates to
+this path when it detects it is running inside the managed service (an
+agent-owned shell), where `launchctl unload`/`load` would kill the
+updater before it could reload the unit. Design, phases, drain bounds,
+and rollback safety: [FLOW.md](./FLOW.md#self-roll-the-service-deploys-itself).
 
 macOS (launchd):
 

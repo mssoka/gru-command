@@ -312,6 +312,26 @@ describe('ledger api — the record of state', () => {
     ).toBeGreaterThanOrEqual(1);
     expect(() => api.countEventsSince([], '1970-01-01T00:00:00.000Z')).toThrow(/at least one kind/u);
   });
+  it('listActiveRounds reports exactly the pending/live rounds across jobs (roll drain probe)', () => {
+    api.addJob({ id: 'roll-probe-a', repo: 'roll-probe', title: 'roll probe A' });
+    api.addJob({ id: 'roll-probe-b', repo: 'roll-probe', title: 'roll probe B' });
+    const pending = api.addRound({ jobId: 'roll-probe-a', targetRef: 't1', lenses: ['alpha'] });
+    const live = api.addRound({ jobId: 'roll-probe-b', targetRef: 't2', lenses: ['alpha'] });
+    api.setRoundStatus(live.id, 'live');
+    const posted = api.addRound({ jobId: 'roll-probe-a', targetRef: 't3', lenses: ['alpha'] });
+    api.setRoundStatus(posted.id, 'live');
+    api.setRoundVerdict(posted.id, 'approved');
+    const aborted = api.addRound({ jobId: 'roll-probe-b', targetRef: 't4', lenses: ['alpha'] });
+    api.setRoundStatus(aborted.id, 'aborted');
+    const active = api.listActiveRounds();
+    // Other suites' rounds may still be non-terminal on the shared ledger:
+    // assert the probe contract (only pending/live) and membership, not a
+    // global count.
+    expect(active.every((round) => round.status === 'pending' || round.status === 'live')).toBe(true);
+    expect(active.map((round) => round.id)).toEqual(expect.arrayContaining([pending.id, live.id]));
+    expect(active.map((round) => round.id)).not.toContain(posted.id);
+    expect(active.map((round) => round.id)).not.toContain(aborted.id);
+  });
   it('a restarted ledger (same file) serves the full record — the board rebuilds from it', () => {
     db.close();
     const dataDir = cleanupDirs[0] as string; // the dir from beforeAll

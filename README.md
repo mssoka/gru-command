@@ -135,6 +135,7 @@ marked BMAD-ready.
 npm start               # serve the web UI + /health on the configured bind
 ./install.sh --service  # register + start as a login OS service
 ./install.sh --uninstall
+gru-service roll        # graceful self-roll: pull + rebuild + relaunch + verify
 ```
 
 Open `http://127.0.0.1:7665`, enter the pairing token from the wizard

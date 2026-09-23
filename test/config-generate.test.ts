@@ -73,6 +73,7 @@ describe('config-generate CLI', () => {
       'worktrees',
       'dispatch',
       'silas',
+      'roll',
       'review',
       'verify',
     ]);
