@@ -517,6 +517,10 @@ test.describe('board (E6, mock feed)', () => {
 
     // Bands in priority order, headers sticky separators with counts.
     await expect(page.locator('.board-band__label')).toHaveText(['NEEDS YOU', 'IN FLIGHT', 'SETTLED', 'COLD']);
+    const bandSticky = await page
+      .locator('.board-band--in-flight .board-band__head')
+      .evaluate((node) => getComputedStyle(node).position);
+    expect(bandSticky).toBe('sticky');
     await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('12 jobs');
     // The stalled working lane sank to COLD carrying the stale flag.
     const stalled = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
