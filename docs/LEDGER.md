@@ -119,6 +119,8 @@ row, appends the event, and (with a bus attached) publishes it:
 - lenses: `bindLens` · `setLensOutcome` · `markLensLive`
 - agents: `registerAgent` (upsert) · `setAgentState`
 - events: `appendCustomEvent` · `listEvents`
+- re-briefs: `beginPendingRebrief` · `bindPendingRebriefWorker` ·
+  `listPendingRebriefs` · `clearPendingRebriefs`
 - reads: `getJob` · `listJobs(repo?)` · `getRound` · `listRounds` ·
   `getAgent` · `listAgents`
 
@@ -141,3 +143,19 @@ event and publishes on the bus — the board pushes, the chat surfaces
 action-required items, and the breaker re-arm rides the ack. The
 board's notification center renders this table directly; nothing is
 derived per-snapshot.
+
+### E8: pending re-briefs (migration 8)
+
+The `pending_rebriefs` table is the restart-safety marker for Silas
+re-brief requests (finding 2026-09-23: an in-flight re-brief lost both
+its worker and its event recording at restart). One row per guarded
+event — `kind` is `silas.rebrief` or `job.delivered` — with `job_id`,
+the request `payload` (note + briefing) and its sha256 `payload_hash`,
+the `baseline_seq` event watermark the request must post-date, the bound
+worker (`agent_id`, `session_file`), and `requested_at`. The marker pair
+is written BEFORE any worker spawns and cleared ONLY when its events
+land; `UNIQUE (job_id, kind)` means a newer request supersedes an older
+marker. Boot reconciliation (`src/dispatch/rebrief-recovery.ts`)
+consumes leftovers: resume the interrupted session (or re-dispatch fresh
+on the same lane), record the missing events, or escalate
+action-required when recovery fails.

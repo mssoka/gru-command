@@ -287,4 +287,27 @@ export const MIGRATIONS: readonly Migration[] = [
         ON notifications(kind, resolved_at, acked_at);
     `,
   },
+  {
+    // Restart-safe re-brief requests: the marker is persisted BEFORE a
+    // worker is spawned and clears only when its guarded ledger event
+    // lands, so a service restart mid-turn cannot silence the lane.
+    id: 8,
+    name: 'silas-pending-rebriefs',
+    sql: `
+      CREATE TABLE pending_rebriefs (
+        id           TEXT PRIMARY KEY,
+        job_id       TEXT NOT NULL REFERENCES jobs(id),
+        kind         TEXT NOT NULL CHECK (kind IN ('silas.rebrief','job.delivered')),
+        payload      TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        baseline_seq INTEGER NOT NULL,
+        agent_id     TEXT,
+        session_file TEXT,
+        requested_at TEXT NOT NULL,
+        updated_at   TEXT NOT NULL,
+        UNIQUE (job_id, kind)
+      );
+      CREATE INDEX idx_pending_rebriefs_job ON pending_rebriefs(job_id);
+    `,
+  },
 ];

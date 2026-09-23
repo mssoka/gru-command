@@ -6,7 +6,8 @@ import type { LedgerApi } from '../ledger/api.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
-import { rebriefFreshMinion, recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
+import { flipJobToWorking, rebriefFreshMinion, recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
+import { finalizeRebriefRequest } from './rebrief-recovery.js';
 import { BranchBusyError } from './branch-idle.js';
 import type { WorktreePort } from './worktree-port.js';
 
@@ -160,17 +161,6 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       return null;
     }
     return options.silasOps;
-  }
-
-  /** Re-open the lane for a Silas follow-through: the follow-up turn is the
-   * lane working again. `in-review` is the pre-verdict review window; a
-   * `delivered` lane (settled before a PR/review request) re-opens the same
-   * way — the fresh directive/re-brief supersedes the prior delivery. */
-  function flipJobToWorking(ledger: LedgerApi, jobId: string): void {
-    const job = ledger.getJob(jobId);
-    if (job === null || (job.status !== 'in-review' && job.status !== 'delivered')) return;
-    ledger.setJobStatus(jobId, 'working');
-    ledger.noteJob(jobId, 'silas follow-through: fix loop re-opened, lane back to working');
   }
 
   async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
@@ -361,9 +351,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (job.status === 'merged' || job.status === 'done') {
         throw new Error(`job "${jobId}" is ${job.status} — terminal lanes are never re-briefed`);
       }
+      // Restart-safe by construction: the request markers are durable
+      // BEFORE any worker exists, and clear only when their events land.
+      // A restart mid-turn leaves them for the boot reconciler.
+      const markers = options.ledger.beginPendingRebrief({ jobId, note, briefing: job.briefing });
       const controller = new AbortController();
       directiveControllers.add(controller);
-      let result: { minionId: string; lanePath: string; prompt: string };
+      let result: { minionId: string; lanePath: string; prompt: string; sessionFile: string | null };
       try {
         result = await rebriefFreshMinion({
           registry: ops.registry,
@@ -372,33 +366,36 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           jobId,
           note,
           briefing: job.briefing,
+          onSpawned: (worker) => {
+            options.ledger.bindPendingRebriefWorker({
+              ids: markers.map((marker) => marker.id),
+              agentId: worker.id,
+              sessionFile: worker.sessionFile,
+            });
+          },
         });
       } finally {
         directiveControllers.delete(controller);
       }
-      options.ledger.appendCustomEvent({
-        kind: 'silas.rebrief',
-        jobId,
-        payload: { minion_id: result.minionId, lane: result.lanePath, note },
-      });
-      flipJobToWorking(options.ledger, jobId);
       // The follow-up delivery signal: the fresh minion's re-brief turn
-      // settled; record the delivery that re-arms the re-review.
-      const followUp = recordFollowUpDelivery({
+      // settled; record the delivery that re-arms the re-review. Both
+      // events land before their markers clear (idempotent on replay).
+      const followUp = finalizeRebriefRequest({
         ledger: options.ledger,
         worktrees: ops.worktrees,
         jobId,
-        agentId: result.minionId,
-        source: 'silas-rebrief',
+        minionId: result.minionId,
+        lanePath: result.lanePath,
+        note,
       });
-      if (followUp.note !== null) {
+      if (followUp.deliveryNote !== null) {
         log('warn', 'silas follow-up delivery has no resolvable lane head', {
           job: jobId,
-          lane: followUp.lanePath,
-          note: followUp.note,
+          lane: result.lanePath,
+          note: followUp.deliveryNote,
         });
       }
-      json(res, 200, { job_id: jobId, minion_id: result.minionId, lane: result.lanePath, delivered_sha: followUp.sha });
+      json(res, 200, { job_id: jobId, minion_id: result.minionId, lane: result.lanePath, delivered_sha: followUp.deliveredSha });
       return true;
     }
     if (req.method === 'POST' && path === '/api/silas/escalate') {

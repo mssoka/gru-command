@@ -65,6 +65,8 @@ async function boot(opts: {
   fallbackGate?: ConstructorParameters<typeof WaveRunner>[0]['fallbackGate'];
   /** false = boot without the silas ops surface (endpoints answer 503). */
   silasOps?: boolean;
+  /** Gate selected minion turns before they settle (in-flight assertions). */
+  minionPromptGate?: (text: string) => Promise<void> | undefined;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -99,6 +101,8 @@ async function boot(opts: {
         if (role !== 'minion' || options?.cwd === undefined) return;
         minionPrompts.push(`cwd=${options.cwd}`);
         minionTurnTexts.push(text);
+        const gate = opts.minionPromptGate?.(text);
+        if (gate !== undefined) await gate;
         // idempotent per prompt: a fresh file per turn, so a second minion
         // turn on the same lane (silas re-brief) always has a commit to make.
         const file = join(options.cwd, `http-deliverable-${spawns.length}.txt`);
@@ -624,6 +628,58 @@ describe('dispatch server (E8)', () => {
       expect(head).not.toBe(lane?.sha);
       expect(field<string>(res.json, 'delivered_sha')).toBe(head);
     } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief persists request markers before the worker and clears them only when the events land', async () => {
+    let releasePrompt!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      releasePrompt = resolveGate;
+    });
+    const h = await boot({ minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined) });
+    const repo = makeFixtureRepo('fixture-silas-rebrief-markers');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'marker-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
+      }, TOKEN);
+      // Let the initial briefing turn settle before the re-brief: the fresh
+      // worker must not race the first minion's git commit on the lane.
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('marker-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'marker-job', note: 're-open with the marker cure',
+      }, TOKEN);
+      // While the turn is in flight the durable marker pair exists and is
+      // bound to the spawned worker — before its prompt can settle.
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.listPendingRebriefs({ jobId: 'marker-job' }).length !== 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const markers = h.ledger.listPendingRebriefs({ jobId: 'marker-job' });
+      expect(markers).toHaveLength(2);
+      const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief');
+      expect(rebriefMarker?.note).toBe('re-open with the marker cure');
+      expect(rebriefMarker?.agentId).not.toBeNull();
+      // No event has answered the request yet (the initial dispatch delivery
+      // predates the marker's watermark and cannot count as the re-brief's).
+      const baseline = rebriefMarker?.baselineSeq ?? Number.NaN;
+      expect(h.ledger.latestJobEvent('marker-job', 'silas.rebrief')).toBeNull();
+      const inFlightDelivery = h.ledger.latestJobEvent('marker-job', 'job.delivered');
+      expect(inFlightDelivery === null || inFlightDelivery.seq <= baseline).toBe(true);
+
+      releasePrompt();
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.json)).toBe(200);
+      // Markers clear ONLY once both guarded events landed.
+      expect(h.ledger.listPendingRebriefs({ jobId: 'marker-job' })).toHaveLength(0);
+      expect(h.ledger.latestJobEvent('marker-job', 'silas.rebrief')?.seq).toBeGreaterThan(baseline);
+      expect(h.ledger.latestJobEvent('marker-job', 'job.delivered')?.seq).toBeGreaterThan(baseline);
+    } finally {
+      releasePrompt();
       await h.close();
     }
   });

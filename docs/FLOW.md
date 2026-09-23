@@ -348,6 +348,15 @@ the judgment; the dispatch surface is the mechanical hand.
   (default 4) → action-required notification surfaced to the Gru chat.
   Escalation always beats an endless loop. Every rung lands as
   `silas.directive-sent`, `silas.rebrief`, or `silas.escalated`.
+- **Restart safety.** A re-brief REQUEST is durable BEFORE any worker
+  spawns (`pending_rebriefs`): a marker pair (`silas.rebrief` +
+  `job.delivered`) that clears only when its guarded events land. A
+  service restart mid-turn loses the worker but never the request — at
+  boot the reconciler resumes the interrupted worker's session (or
+  re-dispatches a fresh worker on the same lane) and records the missing
+  events when that turn settles; a failed recovery escalates
+  action-required and keeps the markers for the next boot, so the lane
+  can never stall silently on a lost turn.
 - **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,
   track, close; never product code; never merge; preserve before remove;
   escalate with pointers. Silas acts only through the authenticated ops

@@ -24,6 +24,7 @@ import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver } from './dispatch/silas-driver.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
+import { reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
@@ -704,6 +705,28 @@ async function main(): Promise<number> {
   });
   state.wave = wave;
   await wave.recoverInterruptedRounds();
+  // Re-brief restart safety (Silas finding 2026-09-23): a re-brief request
+  // mid-flight at restart left no events and no worker. The durable
+  // markers written before each worker spawned are consumed here — the
+  // interrupted session is resumed (or a fresh worker re-dispatched on the
+  // same lane) and the missing events are recorded when that turn settles.
+  // Never awaited beyond dispatch: a re-brief turn is long; failures
+  // escalate action-required from the background.
+  const rebriefRecovery = await reconcilePendingRebriefs({
+    registry,
+    ledger,
+    worktrees: worktreeManager,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+    stopping: () => shuttingDown,
+  });
+  if (rebriefRecovery.examined > 0) {
+    logger.info('re-brief reconciliation', {
+      examined: rebriefRecovery.examined,
+      completed: rebriefRecovery.completed,
+      redispatched: rebriefRecovery.redispatched,
+    });
+  }
   const bobSlot = supervisorLive.declareSlot({
     id: 'bob-consolidator',
     role: 'bob',
