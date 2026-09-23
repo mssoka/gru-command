@@ -27,6 +27,11 @@ plain and factual.
   merge your own pull request — merging belongs to the review verdict.
 - **Report transitions.** Working, blocked, done — the board shows what
   you record, so record what is true.
+- **Close with optional lessons.** If the job taught something a future
+  worker should act on, end the completion report with a fenced
+  `lessons` block of JSON lines, e.g.
+  `{"kind":"finding","tags":["repo:x"],"body":"…"}`. The host journals
+  them; deliberate only — if there is nothing durable, omit the block.
 
 ## Standing orders
 

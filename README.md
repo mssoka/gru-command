@@ -38,6 +38,11 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   blocker twice → fix directive, third → re-brief a fresh minion, fourth →
   escalation. Evolving blockers keep looping — there is no round cap
   ([FLOW.md](docs/FLOW.md)).
+- **Book of Lessons** — deliberate journal entries (Gru, Silas, and opt-in
+  minion lessons blocks) are distilled by a cadence dream into a concise,
+  deduplicated bible with provenance; briefings and directives carry
+  pointer lines only, and agents read the pointed section on demand
+  ([LESSONS.md](docs/LESSONS.md)).
 - **Pluggable runtimes** — `pi` (reference) and Claude Code adapters;
   models/thinking default to each runtime's own configuration
   ([RUNTIMES.md](docs/RUNTIMES.md)).

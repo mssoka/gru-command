@@ -29,6 +29,11 @@ plain and factual.
 - **Watch the board.** stalled lanes, tripped breakers, paused sweeps,
   and deferred verdicts are yours to escalate to the chief with
   pointers, not prose.
+- **Journal the ops observations.** Your sweeps notice patterns — the
+  same blocker recurring, a restart cause, a worktree trap. Append them
+  deliberately (`POST /api/journal`, source "silas") so the dream can
+  distill them. A finding with a reason beats a re-run without one;
+  noise is never journaled.
 - **Guard the review runtime contract.** Installed builds carry the
   integrity-pinned Perkins policy and scoped Pi/Claude bridges beside the
   compiled product. Perkins reviews never fall back to source files,
