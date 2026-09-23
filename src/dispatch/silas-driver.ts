@@ -6,6 +6,7 @@ import type { EventBus } from '../events/bus.js';
 import type { AgentRecord, EventRecord, JobRecord, LedgerApi, RoundRecord } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import type { GitHubPollTickResult } from './github-poll.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -23,6 +24,14 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   a NEEDS CHANGES verdict awaiting follow-through, with same-blocker
  *   recurrence analysis; working lanes whose minion has gone idle) and
  *   wakes Silas only when the digest is non-empty.
+ * - A config-driven fast poll (`[silas] poll_interval_ms`, default 60 s;
+ *   0 disables) observes tracked branches through authenticated `gh api`
+ *   (POLL-ONLY — the webhook route is descoped) and mechanically applies
+ *   the GitHub state-change mappings: a merged PR closes its lane, a
+ *   conflicting PR cascades an action-required notification, CI failure
+ *   posts a tiered notification with the run URL, CI green records the
+ *   review-gate signal event. Dedupe is by observed state-change; the tier
+ *   ladder and the wake kinds are unchanged.
  * - Concurrency follows the decisions runtime's one-slot replay: a trigger
  *   arriving mid-turn is never dropped and never stacks — only the LATEST
  *   queued trigger runs after the open turn settles.
@@ -547,6 +556,11 @@ export interface SilasTrigger {
   readonly jobId?: string;
 }
 
+/** The GitHub signal poll's single entry point (`GitHubSignalPoll` satisfies it). */
+export interface GitHubPollPort {
+  pollOnce(): Promise<GitHubPollTickResult>;
+}
+
 export interface SilasDriverOptions {
   readonly slot: SilasSlot;
   readonly ledger: DigestLedger & Pick<LedgerApi, 'appendCustomEvent'>;
@@ -555,6 +569,8 @@ export interface SilasDriverOptions {
   /** The ops surface Silas acts through: base URL + where the pairing token lives. */
   readonly ops: { readonly baseUrl: string; readonly configPath: string };
   readonly bus?: EventBus;
+  /** The fast GitHub signal poll, ticked on `[silas] poll_interval_ms`. */
+  readonly githubPoll?: GitHubPollPort;
   /** Operating skills injected into every wake prompt (default: shipped resources). */
   readonly skills?: readonly SkillModule[];
   readonly blockersForRound?: BlockersForRound;
@@ -576,6 +592,8 @@ export class SilasDriver {
   private readonly clearIntervalImpl: typeof clearInterval;
   private readonly unsubscribe: (() => void) | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private pollInFlight = false;
   private wakeInFlight: Promise<void> | null = null;
   private queuedTrigger: SilasTrigger | null = null;
   private disposed = false;
@@ -599,22 +617,35 @@ export class SilasDriver {
     return this.timer !== null;
   }
 
-  /** Start the periodic sweep (event wakes are live from construction). */
+  /** The fast GitHub signal poll timer (independent of the sweep). */
+  get pollRunning(): boolean {
+    return this.pollTimer !== null;
+  }
+
+  /** Start the periodic sweep and the fast GitHub signal poll (both
+   * independent; event wakes are live from construction). */
   start(): void {
     if (!this.opts.config.enabled) {
       this.log('info', 'silas ops driver disabled by config — no slot wakes', {});
       return;
     }
-    if (this.timer !== null) return;
+    if (this.timer !== null || this.pollTimer !== null) return;
     if (this.opts.config.sweepIntervalMs <= 0) {
       this.log('info', 'silas sweep disabled (interval 0); event wakes stay live', {});
-      return;
+    } else {
+      this.timer = this.setIntervalImpl(() => {
+        void this.trigger({ kind: 'sweep' });
+      }, this.opts.config.sweepIntervalMs);
+      this.timer.unref?.();
+      this.log('info', 'silas ops driver started', { sweepIntervalMs: this.opts.config.sweepIntervalMs });
     }
-    this.timer = this.setIntervalImpl(() => {
-      void this.trigger({ kind: 'sweep' });
-    }, this.opts.config.sweepIntervalMs);
-    this.timer.unref?.();
-    this.log('info', 'silas ops driver started', { sweepIntervalMs: this.opts.config.sweepIntervalMs });
+    if (this.opts.githubPoll !== undefined && this.opts.config.pollIntervalMs > 0) {
+      this.pollTimer = this.setIntervalImpl(() => {
+        void this.runPoll();
+      }, this.opts.config.pollIntervalMs);
+      this.pollTimer.unref?.();
+      this.log('info', 'silas github signal poll started', { pollIntervalMs: this.opts.config.pollIntervalMs });
+    }
   }
 
   stop(): void {
@@ -622,8 +653,45 @@ export class SilasDriver {
       this.clearIntervalImpl(this.timer);
       this.timer = null;
     }
+    if (this.pollTimer !== null) {
+      this.clearIntervalImpl(this.pollTimer);
+      this.pollTimer = null;
+    }
     this.unsubscribe?.();
     this.disposed = true;
+  }
+
+  /**
+   * One fast-poll tick. The poll applies its mechanical mappings itself
+   * (tier 0/1 within the existing mandate); this driver only owns the timer
+   * and the loud failure surface. A tick arriving while the previous one is
+   * still running is skipped — the next interval re-observes from the ledger.
+   */
+  private async runPoll(): Promise<void> {
+    const poll = this.opts.githubPoll;
+    if (poll === undefined || this.disposed) return;
+    if (this.pollInFlight) {
+      this.log('info', 'github signal poll still running — tick skipped', {});
+      return;
+    }
+    this.pollInFlight = true;
+    try {
+      const result = await poll.pollOnce();
+      if (result.signals.length > 0) {
+        this.log('info', 'github signal poll applied signals', {
+          tracked: result.tracked,
+          observed: result.observed,
+          calls: result.calls,
+          signals: result.signals.map((signal) => signal.kind),
+        });
+      }
+    } catch (error) {
+      // A failed poll must never take the service down: the next tick retries
+      // and the ledger dedupe cursor makes a re-observation idempotent.
+      this.log('error', 'github signal poll failed', { error: String(error).slice(0, 300) });
+    } finally {
+      this.pollInFlight = false;
+    }
   }
 
   /**

@@ -279,6 +279,26 @@ the judgment; the dispatch surface is the mechanical hand.
   (`[silas] sweep_interval_ms`, default 5 min). A trigger arriving while a
   silas turn is open queues ONE latest trigger (the decisions runtime's
   one-slot replay) — never dropped, never stacked.
+- **The GitHub signal poll (POLL-ONLY; owner ruling 2026-09-23)** rides
+  the same driver on its own faster interval (`[silas] poll_interval_ms`,
+  default 60 s; 0 disables) and needs no model turn: every tracked job
+  branch is read through authenticated `gh api` (`repos/{o}/{r}/pulls`
+  for merged state and `mergeable_state`;
+  `repos/{o}/{r}/commits/{sha}/check-runs` for conclusions), batched one
+  call per repo per tick where possible. Each observed state CHANGE
+  applies exactly once: PR merged → `in-review → merged` transition plus
+  a `github.pr-merged` event; PR conflicting (`mergeable_state: dirty`) →
+  `github.pr-conflict` plus an action-required cascade notification
+  (mechanical tier — Silas may arm a rebase lane within mandate); CI
+  failed → `github.ci-failed` plus a notification carrying the run URL,
+  routed by check kind (mechanical → fyi, judgment → wake-eligible
+  action-required); CI green → `github.ci-green` review-gate signal.
+  Dedupe is by the last recorded `github.branch-state` event — restarts
+  re-read the same cursor, so nothing double-applies. The per-tick call
+  budget keeps the poll under 40 % of the authenticated GitHub rate
+  limit; a rate-limit response aborts the tick instead of hammering.
+  Webhooks are not built (no inbound tunnel). The tier ladder is
+  unchanged: no new autonomy.
 - **The digest** handed to every wake carries the actionable states,
   computed from the ledger: delivered jobs with no PR registered; PRs
   whose follow-up delivery proves the lane head moved past the newest

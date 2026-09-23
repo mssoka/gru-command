@@ -22,6 +22,7 @@ import { createWorktreeServer } from './worktrees/server.js';
 import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver } from './dispatch/silas-driver.js';
+import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { createVerificationServer } from './verify/server.js';
@@ -754,6 +755,16 @@ async function main(): Promise<number> {
     // The driver starts after listen so its wake prompt carries the real
     // bound port (config port 0 = ephemeral); until then no sweeps run and
     // event wakes wait for the first sweep — the sweep is the safety net.
+    // The GitHub signal poll rides the same driver (POLL-ONLY; owner ruling
+    // 2026-09-23): it observes tracked lanes through `gh api` and applies
+    // the state-change mappings mechanically. A missing `gh` auth fails per
+    // tick, loudly, and never takes the service down.
+    const remoteCache = new Map<string, ReturnType<typeof repoRemote>>();
+    const resolveLaneRemote: LaneRemoteResolver = (repoPath) => {
+      if (!remoteCache.has(repoPath)) remoteCache.set(repoPath, repoRemote(repoPath));
+      const remote = remoteCache.get(repoPath) ?? null;
+      return remote === null ? null : { host: remote.host, owner: remote.owner, repo: remote.repo };
+    };
     const silas = new SilasDriver({
       slot: silasSlot,
       ledger,
@@ -764,6 +775,13 @@ async function main(): Promise<number> {
         configPath: configPathFor(config.instanceDir),
       },
       bus,
+      githubPoll: new GitHubSignalPoll({
+        ledger,
+        notifications,
+        api: new GhCliApi(),
+        resolveRemote: resolveLaneRemote,
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+      }),
       log: (level, msg, fields) => logger.log(level, msg, fields),
     });
     state.silas = silas;
