@@ -222,6 +222,24 @@ setup_timeout_ms = 120000
 # Bob consolidation interval; 0 disables the periodic trigger.
 bob_interval_ms = 3600000
 
+[lessons]
+# Book of Lessons: deliberate journal entries → dream distillation →
+# concise bible chapters → progressive-disclosure pointer lines in
+# briefings (chapter bodies are never inlined). enabled = false disables
+# the dream cadence and pointer injection; the journal API stays
+# available because capture is deliberate and must never be lost.
+enabled = true
+# Dream cadence: on boot plus every interval (ms); 0 = no periodic pass.
+dream_interval_ms = 43200000
+dream_on_boot = true
+# Hard caps (bytes): each chapter file, and the index — the only part
+# ever embedded in briefings. The dream trims to fit; when the index
+# cannot hold the chapters, the pass fails loud until they consolidate.
+chapter_cap_bytes = 4096
+index_cap_bytes = 1024
+# Maximum pointer lines injected into one briefing/directive.
+max_references = 3
+
 [silas]
 # Hosted ops session (Silas): closes the delivered→PR→review loop and
 # breaks recurring blocker loops. enabled = false hosts no silas slot and
