@@ -779,7 +779,13 @@ function indirectFixEvidence(
       for (const line of patch.split('\n')) {
         if (line.startsWith('diff --git ')) inHunk = false;
         else if (/^@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@/u.test(line)) inHunk = true;
-        else if (inHunk && line.startsWith(location.change === 'added' ? '+' : '-')) changed.add(line.slice(1));
+        else if (inHunk && line.startsWith(location.change === 'added' ? '+' : '-')) {
+          const text = line.slice(1);
+          // A CR immediately before the diff's LF terminates a CRLF blob
+          // line. Keep all other whitespace intact; audit evidence remains
+          // a single line with no embedded CR or LF.
+          changed.add(text.endsWith('\r') ? text.slice(0, -1) : text);
+        }
       }
       lines = changed;
       cache.changedLines.set(key, lines);
@@ -2393,7 +2399,7 @@ export class PerkinsHybridReview {
       'A rejected candidate still requires a concise reason. confirmed evidence must be one contiguous verbatim current-tree substring. N/A claims are speculative and cannot remain blockers.',
       'Pairing rules are enforced at cited locations: a rejected candidate needs contradictory evidence locatable at its cited file/hunk, confirmed candidate evidence must be locatable at its cited file/hunk, and your verification evidence must be locatable in the frozen review.',
       ...(priorTargetSha === null ? [] : ['Call perkins_read_prior_delta with {} to list changed paths and {"path":"relative/caller.ts"} to read a selected frozen prior-target hunk; deleted callers are absent from the current tree but their removed lines remain available here. The tool is read-only, bounded, and rejects binary callers.']),
-      'For a fixed prior finding whose cited file remains unchanged, optionally give fix_location: {path: "relative/changed-caller.ts", change: "added" or "removed"} with evidence equal to ONE actual added or removed line in the prior-target-to-frozen-target delta. The location must differ from the original citation; explain in reason why this caller change fixes that finding and name both paths in the report. A path alone, unchanged diff context, a rename with no changed hunk, or another revision is not proof. Old cited deletion/PATH ABSENT proofs remain valid without fix_location.',
+      'For a fixed prior finding whose cited file remains unchanged, optionally give fix_location: {path: "relative/changed-caller.ts", change: "added" or "removed"} with evidence equal to ONE actual added or removed line in the prior-target-to-frozen-target delta. For CRLF blob lines omit only the CR terminator from evidence; retain other whitespace and never include an embedded CR or LF. The location must differ from the original citation; explain in reason why this caller change fixes that finding and name both paths in the report. A path alone, unchanged diff context, a rename with no changed hunk, or another revision is not proof. Old cited deletion/PATH ABSENT proofs remain valid without fix_location.',
       'Before the terminal submission, call perkins_preflight_submission with the exact candidate submission (full, or {"mode":"delta", ...} to amend the rejection record after a failed attempt). It spends no terminal attempt, accepts nothing, and returns every violation in one response; fix them all and preflight again until it reports no errors, then submit once.',
       'After a rejected terminal submission, resubmit a delta: {"mode":"delta", "candidate_decisions": [only the changed/added decisions], ...changed report fields}. The host applies it over the rejected submission and re-validates the merged whole with the same rules. A delta is still a real terminal attempt.',
       'Write a complete Markdown report containing `**Verdict: ...**` and every retained finding title, then call perkins_submit_review. Never claim completion from missing/failed runs.',
