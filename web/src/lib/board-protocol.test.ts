@@ -121,6 +121,23 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(empty)).toBe(false);
   });
 
+  it('rejects missing and malformed owner-bell/wake snapshot fields', () => {
+    for (const field of ['unackedNeedsOwner', 'wakes'] as const) {
+      const candidate = { ...snapshot() } as Record<string, unknown>;
+      delete candidate[field];
+      expect(parseBoardServerFrame({ type: 'board', snapshot: candidate })).toBeNull();
+    }
+    for (const value of [null, '1', -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+      const candidate = { ...snapshot(), unackedNeedsOwner: value };
+      expect(isValidSnapshot(candidate)).toBe(false);
+      const wakes = { ...snapshot(), wakes: { count: value, lastAt: null } };
+      expect(isValidSnapshot(wakes)).toBe(false);
+    }
+    for (const lastAt of [1, {}, false]) {
+      expect(isValidSnapshot({ ...snapshot(), wakes: { count: 1, lastAt } })).toBe(false);
+    }
+  });
+
   it('tolerates absent v4 blocks (pre-v4 servers) and validates present ones', () => {
     // Absent → fine (rollout tolerance). Null → fine (explicit "not wired").
     expect(isValidSnapshot(snapshot())).toBe(true);

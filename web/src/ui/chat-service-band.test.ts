@@ -183,7 +183,8 @@ describe('service band — consecutive service frames collapse', () => {
     view.addFrame(tool('start', 'read_file'), true);
 
     const bands = log().querySelectorAll('.service-band');
-    expect(bands).toHaveLength(2);
+    expect(bands).toHaveLength(1);
+    expect(log().querySelectorAll('.service-band__head')).toHaveLength(1); // no empty replaced band
     const errorLine = log().querySelector(':scope > .tool-line');
     expect(errorLine?.textContent).toContain('message delivery failed');
   });

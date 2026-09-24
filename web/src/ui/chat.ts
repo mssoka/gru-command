@@ -797,7 +797,13 @@ export class ChatView {
           this.activeTool?.remove();
           if (this.activeToolBand !== null) {
             this.activeToolBand.running = false;
-            this.renderServiceHead(this.activeToolBand);
+            if (this.activeToolBand.detail.childElementCount === 0) {
+              this.activeToolBand.root.remove();
+              if (this.serviceBand === this.activeToolBand) this.serviceBand = null;
+            } else {
+              this.renderServiceHead(this.activeToolBand);
+            }
+            this.activeToolBand = null;
           }
           const line = el('div', 'tool-line tool-line--active', `⚙️ ${frame.name}`);
           line.dataset.toolName = frame.name;
@@ -858,7 +864,10 @@ export class ChatView {
   /** Append a service-context line to the open band (opening one if the
    * previous frame was conversation); returns the band for head updates. */
   private appendServiceLine(node: HTMLElement): ServiceBand {
-    const band = this.serviceBand ?? this.openServiceBand();
+    // Reset rollback can restore an older band with a newer user bubble
+    // after it. Never append a notice before that intervening conversation.
+    const band = this.serviceBand?.root === this.log.lastElementChild
+      ? this.serviceBand : this.openServiceBand();
     band.detail.append(node);
     this.renderServiceHead(band);
     return band;

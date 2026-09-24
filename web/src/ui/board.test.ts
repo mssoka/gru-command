@@ -211,19 +211,21 @@ describe('board view resolved-notification rendering', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});
     view.setToastHandler(toast);
-    view.render(snapshot({ notifications: [notification('machine')] }));
+    view.render(snapshot({ notifications: [] })); // first snapshot suppresses history only
+    view.render(snapshot({ notifications: [notification('machine'), notification('info', { routing: 'fyi' })] }));
     expect(toast).not.toHaveBeenCalled();
     expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('0');
     expect(document.querySelector('.board-notification-section__head')?.textContent).toContain('FOR YOU');
     const sections = [...document.querySelectorAll('.board-notification-section__head')].map(
       (head) => head.textContent,
     );
-    expect(sections).toEqual(['FOR YOU', 'NEEDS GRU']);
+    expect(sections).toEqual(['FOR YOU', 'NEEDS GRU', 'FEED']);
 
     view.render(
       snapshot({
         notifications: [
           notification('machine'),
+          notification('info', { routing: 'fyi' }),
           notification('owner', { routing: 'needs-owner' }),
         ],
       }),

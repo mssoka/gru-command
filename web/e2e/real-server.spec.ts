@@ -409,9 +409,37 @@ test.describe('board (E6)', () => {
     const job2 = { id: 'e2e-ack-job-2', repo: 'e2e-repo', title: 'Toast probe job' };
     await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs`, { headers, data: job2 });
     await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs/e2e-ack-job-2/status`, { headers, data: { status: 'blocked' } });
-    await expect(page.locator('.toast', { hasText: 'e2e-ack-job-2 blocked' })).toHaveCount(0);
     await bell.click();
     await expect(panel.locator('.board-notification', { hasText: 'e2e-ack-job-2 blocked' })).toBeVisible();
+    await expect(page.locator('.toast', { hasText: 'e2e-ack-job-2 blocked' })).toHaveCount(0);
+  });
+
+  test('Gru can escalate a machine stop to FOR YOU through the authenticated route', async ({ page }) => {
+    const headers = { authorization: `Bearer ${REAL_TOKEN}` };
+    await pair(page);
+    const bell = page.locator('#notification-bell');
+    const unreadBefore = Number(await bell.getAttribute('data-unread'));
+    const unauthorized = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/notifications/needs-owner`, {
+      data: { title: 'Owner decision probe', detail: 'Merge outside Gru authority' },
+    });
+    expect(unauthorized.status()).toBe(401);
+    const posted = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/notifications/needs-owner`, {
+      headers, data: { title: 'Owner decision probe', detail: 'Merge outside Gru authority' },
+    });
+    expect(posted.status()).toBe(201);
+    const row = await posted.json();
+    expect(row).toMatchObject({ routing: 'needs-owner', severity: 'error' });
+    await expect.poll(async () => Number(await bell.getAttribute('data-unread'))).toBe(unreadBefore + 1);
+    await expect(page.locator('.toast', { hasText: 'Owner decision probe' })).toHaveCount(1);
+    await expect(page.locator('#chat-log .service-band', { hasText: 'Owner decision probe' })).toHaveCount(1);
+    await bell.click();
+    const ownerRow = page.locator('.board-notification', { hasText: 'Owner decision probe' });
+    await expect(ownerRow).toBeVisible();
+    await expect(ownerRow.locator('.board-notification__ack')).toBeVisible();
+    const board = await (await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers })).json();
+    expect(board.notifications.find((item: { id: string }) => item.id === row.id).shownAt).not.toBeNull();
+    await ownerRow.locator('.board-notification__ack').click();
+    await expect(ownerRow.locator('.board-notification__ack')).toHaveText('✓');
   });
 
   test('unauthenticated board API is a locked door', async ({ page }) => {
