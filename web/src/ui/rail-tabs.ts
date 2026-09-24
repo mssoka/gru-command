@@ -1,9 +1,10 @@
 /**
- * Agents-rail tabs (board UX v6): AGENTS / TRANSCRIPTS swap the rail's two
+ * Crew-rail tabs (board UX v6.1): CREW / TRANSCRIPTS swap the rail's two
  * dense lists without leaving the cockpit. One controller, no state
  * beyond the DOM: clicking a tab flips `aria-selected` and toggles the
- * `[data-rail-panel]` sections. The AGENTS count itself is written by
- * BoardView (`#rail-agents-count`), never here.
+ * `[data-rail-panel]` sections. The CREW count itself is written by
+ * BoardView (`#rail-agents-count`), never here. Internal identifiers keep
+ * their stable names; only the rendered word is CREW.
  */
 
 export class RailTabs {

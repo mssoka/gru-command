@@ -1,20 +1,20 @@
 /**
- * Command bar (board UX v6): the full-width cockpit chrome — brand +
- * tagline, the inline status ticker, the Chat/Board lens toggle, the
- * notification bell, theme and settings. The bar itself lives in
- * index.html; this controller owns the ticker's content (the three
- * pipe-separated segments) and survives every snapshot push.
+ * Command bar (board UX v6.1): the full-width cockpit chrome — brand +
+ * tagline, the inline status ticker, the notification bell, theme and
+ * settings. The bar itself lives in index.html; this controller owns the
+ * ticker's content (the three pipe-separated segments) and survives every
+ * snapshot push. There is no lens toggle: chat is always docked on
+ * desktop and the FAB owns mobile chat.
  */
 
 import type { BoardConnectionState } from '../lib/board-client.js';
 import type { BoardSnapshot } from '../lib/board-protocol.js';
-import { tickerSegments, type ActiveView } from '../lib/command-ticker.js';
+import { tickerSegments } from '../lib/command-ticker.js';
 import { consoleModeForWidth, type ConsoleMode } from '../lib/console-layout.js';
 import { el, mustGet } from './dom.js';
 
 export class CommandBar {
   private readonly ticker: HTMLElement;
-  private view: ActiveView = 'board';
   private layout: ConsoleMode;
   private boardState: BoardConnectionState | null = null;
   private snapshot: BoardSnapshot | null = null;
@@ -22,12 +22,6 @@ export class CommandBar {
   constructor() {
     this.ticker = mustGet('command-ticker');
     this.layout = consoleModeForWidth(typeof window === 'undefined' ? 0 : window.innerWidth);
-    this.render();
-  }
-
-  setView(view: ActiveView): void {
-    if (this.view === view) return;
-    this.view = view;
     this.render();
   }
 
@@ -50,7 +44,6 @@ export class CommandBar {
 
   private render(): void {
     const segments = tickerSegments({
-      view: this.view,
       layout: this.layout,
       boardState: this.boardState,
       snapshot: this.snapshot,

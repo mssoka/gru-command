@@ -440,7 +440,6 @@ test('socket drop shows a degraded banner that clears on recovery', async ({ pag
 test.describe('board (E6, mock feed)', () => {
   test('dense rows collapse by default; expanding reveals the round lens chips', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
     // v4 bands lead the board; rows group under sticky band separators.
     await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS YOU');
@@ -480,7 +479,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('v6: the chip rail carries the v4 health row + folded KPI counts, bands stay ordered', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
 
     // The global rail replaces the old KPI strip + health row: seven chips.
@@ -521,7 +519,7 @@ test.describe('board (E6, mock feed)', () => {
       .locator('.board-band--in-flight .board-band__head')
       .evaluate((node) => getComputedStyle(node).position);
     expect(bandSticky).toBe('sticky');
-    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('12 jobs');
+    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('12 heists');
     // The stalled working lane sank to COLD carrying the stale flag.
     const stalled = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
     await expect(stalled).toBeVisible();
@@ -530,7 +528,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('row disclosure persists per job across a reload (v3)', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     const job = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
     await expect(job).toHaveAttribute('data-expanded', 'false');
 
@@ -548,21 +545,18 @@ test.describe('board (E6, mock feed)', () => {
 
     // Reload: the expanded job comes back expanded (per-job localStorage).
     await page.reload();
-    await page.locator('#tab-board').click();
     await expect(job).toHaveAttribute('data-expanded', 'true');
 
     // Collapse it again; the next reload comes back collapsed.
     await job.locator('.board-job__toggle').click();
     await expect(job).toHaveAttribute('data-expanded', 'false');
     await page.reload();
-    await page.locator('#tab-board').click();
     await expect(job).toHaveAttribute('data-expanded', 'false');
     await expect(job.locator('.board-job__body')).toHaveCount(0);
   });
 
   test('trackers: lane strip, round progress, decisions + unacked, disposed collapse', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
 
     // The lane strip lives in the expanded detail (v2 surface, v3 default).
@@ -572,8 +566,8 @@ test.describe('board (E6, mock feed)', () => {
     await expect(lane).toBeVisible();
     await expect(lane.locator('.board-lane__branch')).toContainText('gru/demo-api-payment-fix');
     await expect(lane.locator('.board-lane__base')).toContainText('abc1234');
-    await expect(lane.locator('.board-lane__age')).toContainText('lane');
-    await expect(lane.locator('.board-lane__activity')).toContainText('agent');
+    await expect(lane.locator('.board-lane__age')).toContainText('heist');
+    await expect(lane.locator('.board-lane__activity')).toContainText('minion');
 
     // Round header: lens count, blockers, elapsed; chips behind the row.
     const round = card.locator('.board-round__toggle');
@@ -588,7 +582,7 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('#board-decisions')).toContainText('Jev: READY');
     await expect(page.locator('#board-unacked')).toBeVisible();
 
-    // Disposed rows collapse by default behind the toggle on the AGENTS tab.
+    // Disposed rows collapse by default behind the toggle on the CREW tab.
     const rail = page.locator('#board-agents');
     await expect(rail.locator('.board-agent--disposed')).toHaveCount(0);
     const toggle = rail.locator('.board-agent-toggle');
@@ -601,7 +595,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('trackers render in dark theme and on a narrow phone viewport', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     const card = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
     await card.locator('.board-job__toggle').click();
     await expect(card.locator('.board-lane')).toBeVisible();
@@ -623,7 +616,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('transcript drawer: mock transcript lists, opens, searches', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     // Transcripts live behind the rail's TRANSCRIPTS tab (v6).
     await page.locator('#rail-tab-transcripts').click();
     const row = page.locator('#board-transcripts .board-agent', { hasText: 'gru' }).first();
@@ -676,7 +668,6 @@ test.describe('cockpit layout (v6)', () => {
 
     // Reload: the user's widths come back (poll through the 180ms grid tween).
     await page.reload();
-    await page.locator('#tab-board').click();
     await expect
       .poll(async () => Math.abs((await page.locator('#chat-main-mount').boundingBox())!.width - widened.width))
       .toBeLessThanOrEqual(2);
@@ -820,7 +811,7 @@ test.describe('phone chrome', () => {
     expect(box!.x + box!.width, `${selector} right edge on screen`).toBeLessThanOrEqual(vw);
   }
 
-  const CHROME_CONTROLS = ['#tab-chat', '#tab-board', '#theme-toggle', '#settings-toggle'];
+  const CHROME_CONTROLS = ['#theme-toggle', '#settings-toggle'];
 
   /** Top-anchored overlays must clear the nav, whatever its wrapped
    * height: kills any mutation of --phone-nav-clearance to less than the

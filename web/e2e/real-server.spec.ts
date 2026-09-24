@@ -289,7 +289,6 @@ test.describe('board (E6)', () => {
     expect(lenses.length).toBe(7);
 
     await pair(page);
-    await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
     // v5: each job card is its own grid cell and credits its repo on the face.
     const jobCard = page.locator('.board-job', { hasText: 'Board e2e job' });
@@ -311,7 +310,6 @@ test.describe('board (E6)', () => {
   test('agent rail lists the gru session; transcripts open, search, page', async ({ page }) => {
     await pair(page);
     await sendAndWaitReply(page, 'board transcript probe');
-    await page.locator('#tab-board').click();
     // The gru agent row (the live chat session) appears on the rail; its
     // transcript (claude-code raw-frame forensics) renders the turn.
     const gruRow = page.locator('#board-agents .board-agent', { hasText: 'gru' }).first();
@@ -380,7 +378,6 @@ test.describe('board (E6)', () => {
     await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs/e2e-ack-job/status`, { headers, data: { status: 'blocked' } });
 
     await pair(page);
-    await page.locator('#tab-board').click();
     const bell = page.locator('#notification-bell');
     await expect(bell).toBeVisible();
     // The badge shows while an unseen error exists (CSS keys on data-unread).
@@ -497,8 +494,7 @@ test('missing-key enabled startup is durable degraded: a browser connected AFTER
     await expect(page.locator('#decisions-summary')).toContainText('credential');
     // And the durable incident is on the authenticated BOARD surface for a
     // browser that connected after startup (no CLI-only error, no phantom
-    // receipt). The panel lives inside #board-view — open the Board tab.
-    await page.locator('#tab-board').click();
+    // receipt). The panel lives inside #board-view — open it from the bell.
     await page.locator('#notification-bell').click();
     await expect(page.locator('.board-notification', { hasText: 'Jev degraded' }).first()).toBeVisible();
     await expect(page.locator('.board-notification', { hasText: 'Jev degraded' }).first().locator('.board-notification__ack')).toBeVisible();

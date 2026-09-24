@@ -92,10 +92,10 @@ describe('board rail — chips (v6)', () => {
     ]);
   });
 
-  it('folds three KPI groups (jobs/PRs/lanes) into the trackers chip', () => {
+  it('folds three KPI groups (heists/PRs/minions) into the trackers chip', () => {
     const chips = railChips(snapshot([job('w1', 'working')]), NOW);
     const trackers = chips.find((chip) => chip.id === 'trackers');
-    expect(trackers?.kpis?.map((group) => group.label)).toEqual(['JOBS', 'PRS', 'LANES']);
+    expect(trackers?.kpis?.map((group) => group.label)).toEqual(['HEISTS', 'PRS', 'MINIONS']);
     expect(trackers?.kpis?.map((group) => group.title)).toEqual([
       'working / in-review / merged / done / parked',
       'open / conflicting / merged today',
@@ -104,6 +104,32 @@ describe('board rail — chips (v6)', () => {
     // The health chips carry no folded counts (their flags are the health
     // card's own sub-badge — e.g. REVIEWS carries "12 FAILED").
     expect(chips.filter((chip) => chip.id !== 'trackers').every((chip) => chip.kpis === undefined)).toBe(true);
+  });
+
+  it('labels every folded count beside its number (v6.1 ruling 5)', () => {
+    const chips = railChips(snapshot([job('w1', 'working')]), NOW);
+    const trackers = chips.find((chip) => chip.id === 'trackers');
+    for (const group of trackers?.kpis ?? []) {
+      for (const value of group.values) {
+        expect(value.label, value.kpi).not.toBe('');
+      }
+    }
+    const labels = (trackers?.kpis ?? []).flatMap((group) => group.values.map((value) => value.label));
+    expect(labels).toEqual([
+      'working',
+      'in review',
+      'merged',
+      'done',
+      'parked',
+      'open',
+      'conflicting',
+      'merged today',
+      'live',
+      'mid-turn',
+      'disposed',
+    ]);
+    // No bare slash counters survive — the operator reads the label order.
+    expect(trackers?.kpis?.every((group) => group.values.every((value) => value.label !== undefined))).toBe(true);
   });
 
   it('every folded count equals the v4 KPI derivation (same snapshot)', () => {

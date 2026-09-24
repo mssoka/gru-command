@@ -5,11 +5,11 @@
  *
  * The surface stack:
  *   - the status chip rail (v4 health row relocated; `board-rail.ts`)
- *     under the command bar carries whole-system state incl. the folded
- *     jobs/PRs/lane counts and the Jev/unacked trackers;
+ *     under the command bar carries whole-system state incl. the labeled
+ *     heist/PR/minion counts and the Jev/unacked trackers;
  *   - attention-bucketed job rows (NEEDS YOU / IN FLIGHT / SETTLED /
  *     COLD) with sticky headers and counts;
- *   - the agents/transcripts rail (tabs, dense rows, disposed overflow);
+ *   - the crew rail (CREW/TRANSCRIPTS tabs, dense rows, disposed overflow);
  *   - the notification center (bell + panel).
  *
  * v3 semantics survive the redesign: rows collapse to their summary face
@@ -39,6 +39,7 @@ import {
   type BandId,
 } from '../lib/board-bands.js';
 import { railChips, type RailChip } from '../lib/board-rail.js';
+import { BOARD_WORDS, heistCount } from '../lib/board-vocabulary.js';
 import { formatAge } from '../lib/board-time.js';
 import { jobSignal, pluralCount, roundSummary, unackedByJob } from '../lib/board-signals.js';
 import type { BoardClient } from '../lib/board-client.js';
@@ -197,7 +198,8 @@ export class BoardView {
   }
 
   /** TRACKERS: the folded KPI count strips plus the Jev + unacked chips the
-   * v4 tracker strip carried (their ids/behavior survive the move). */
+   * v4 tracker strip carried (their ids/behavior survive the move). v6.1:
+   * every count renders as a labeled field — no bare slash counters. */
   private trackersChipNode(chip: RailChip): HTMLElement {
     const node = el('span', `rail-chip rail-chip--trackers rail-chip--${chip.tone}`);
     node.dataset.chip = 'trackers';
@@ -206,26 +208,27 @@ export class BoardView {
     for (const group of chip.kpis ?? []) {
       const groupNode = el('span', 'rail-kpi');
       groupNode.title = group.title;
-      const label = el('span', 'rail-kpi__label', group.label);
+      const label = el('b', 'rail-kpi__label', group.label);
       if (group.total !== undefined) {
-        const total = el('b', 'rail-kpi__total', String(group.total.value));
+        const total = el('span', 'rail-kpi__total', String(group.total.value));
         total.dataset.kpi = group.total.kpi;
         total.title = group.total.title;
         label.append(document.createTextNode(' '), total);
       }
       groupNode.append(label);
-      const nums = el('span', 'rail-kpi__nums');
-      group.values.forEach((value, index) => {
-        if (index > 0) nums.append(el('span', 'rail-kpi__sep', '/'));
+      for (const value of group.values) {
+        const field = el('span', 'rail-kpi__field');
+        const fieldLabel = el('span', 'rail-kpi__field-label', value.label);
+        fieldLabel.title = value.title;
         const number = el('span', 'rail-kpi__num', String(value.value));
         number.dataset.kpi = value.kpi;
         number.title = value.title;
         if (value.kpi === 'prs.conflicting' && value.value > 0) {
           number.classList.add('rail-kpi__num--alert');
         }
-        nums.append(number);
-      });
-      groupNode.append(nums);
+        field.append(fieldLabel, number);
+        groupNode.append(field);
+      }
       node.append(groupNode);
     }
     node.append(this.decisionsChip, this.unackedChip);
@@ -308,7 +311,7 @@ export class BoardView {
         el(
           'div',
           'board-empty__hint',
-          'Jobs land here once work is dispatched — the ledger is the record, this board is the window.',
+          'Heists land here once work is dispatched — the ledger is the record, this board is the window.',
         ),
       );
       this.mount.append(empty);
@@ -324,7 +327,7 @@ export class BoardView {
       const head = el('h2', 'board-band__head');
       head.append(
         el('span', 'board-band__label', BAND_LABELS[band]),
-        el('span', 'board-band__count lbl', `${jobs.length} job${jobs.length === 1 ? '' : 's'}`),
+        el('span', 'board-band__count lbl', heistCount(jobs.length)),
       );
       section.append(head);
       if (band === 'needs-you' && jobs.length === 0) {
@@ -397,7 +400,7 @@ export class BoardView {
     toggle.append(dot, chevron, name);
     if (stale) {
       const flag = el('span', 'pp-chip pp-chip--alert board-job__stale', 'stalled');
-      flag.title = 'working with no agent frames past the stall window';
+      flag.title = 'working with no minion frames past the stall window';
       toggle.append(flag);
     }
     const signal = jobSignal(job, unackedActionRequired);
@@ -414,8 +417,8 @@ export class BoardView {
     meta.append(el('span', 'board-job__repo', `📦 ${job.repo}`));
     if (job.lane !== null) {
       meta.append(el('span', 'board-job__branch', `🌿 ${job.lane.branch ?? 'detached'}`));
-      meta.append(this.ageNode('board-job__age board-job__lane-age', job.lane.createdAt, 'lane ', ''));
-      meta.append(this.ageNode('board-job__age board-job__agent-age', job.lastAgentActivity, 'agent ', ''));
+      meta.append(this.ageNode('board-job__age board-job__lane-age', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''));
+      meta.append(this.ageNode('board-job__age board-job__agent-age', job.lastAgentActivity, `${BOARD_WORDS.minion} `, ''));
     } else if (job.baseBranch !== null) {
       meta.append(el('span', 'board-job__branch', `⌂ ${job.baseBranch}`));
     }
@@ -472,8 +475,8 @@ export class BoardView {
       lane.append(
         el('span', 'pp-chip board-lane__branch', `🌿 ${job.lane.branch ?? 'detached'}`),
         el('span', 'board-lane__base lbl', `⌂ ${job.lane.sha.slice(0, 8)}`),
-        this.ageNode('board-lane__age lbl', job.lane.createdAt, 'lane ', ''),
-        this.ageNode('board-lane__activity lbl', job.lastAgentActivity, 'agent ', ''),
+        this.ageNode('board-lane__age lbl', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''),
+        this.ageNode('board-lane__activity lbl', job.lastAgentActivity, `${BOARD_WORDS.minion} `, ''),
       );
       if (job.lane.status !== 'active') {
         lane.append(el('span', 'pp-chip pp-chip--park board-lane__status', job.lane.status));
@@ -574,7 +577,7 @@ export class BoardView {
   }
 
   // ------------------------------------------------------------------
-  // Agent rail (dense rows, tabs, disposed overflow)
+  // Crew rail (dense rows, tabs, disposed overflow)
   // ------------------------------------------------------------------
 
   private renderAgents(agents: readonly AgentView[]): void {
@@ -585,7 +588,7 @@ export class BoardView {
     const disposed = agents.filter((agent) => agent.state === 'disposed');
     this.agentsCount.textContent = String(live.length);
     if (agents.length === 0) {
-      rail.append(el('div', 'lbl', 'no agents yet'));
+      rail.append(el('div', 'lbl', 'no crew yet'));
       return;
     }
     // Liveness-first order arrives from the server; disposed rows collapse
