@@ -27,6 +27,10 @@ export interface FixAuditResult {
   readonly status: 'fixed' | 'still-present';
   readonly evidence: string;
   readonly reason: string;
+  readonly fix_location?: {
+    readonly path: string;
+    readonly change: 'added' | 'removed';
+  };
 }
 
 export interface VerifiedFinding extends ReviewFinding {
@@ -112,6 +116,17 @@ const SUBMITTED_FINDING_KEYS = [
 ] as const;
 const VERIFICATION_KEYS = ['candidate', 'disposition', 'evidence', 'reason'] as const;
 const FIX_AUDIT_KEYS = ['prior_index', 'status', 'evidence', 'reason'] as const;
+
+/** Literal Git path only; no pathspecs, escape components or control bytes. */
+export function safeFixPath(path: string): boolean {
+  return path !== '' && Buffer.byteLength(path, 'utf8') <= 500 &&
+    !path.startsWith('/') && !path.startsWith('-') && !path.includes('\\') &&
+    !path.includes(':') && ![...path].some((character) => {
+      const code = character.codePointAt(0)!;
+      return code < 32 || code === 127;
+    }) &&
+    path.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
+}
 
 function object(value: unknown, name: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`${name} must be an object`);
@@ -352,7 +367,17 @@ export function parseFindingsSubmission(input: unknown, expectedLens: PerkinsLen
 export function parseFixAuditResults(text: string, findingCount: number): readonly FixAuditResult[] {
   const results = parseArray(text, 'fix-audit output').map((entry, index) => {
     const result = object(entry, `fix audit ${index}`);
-    exactKeys(result, FIX_AUDIT_KEYS, `fix audit ${index}`);
+    exactKeys(result, result.fix_location === undefined ? FIX_AUDIT_KEYS : [...FIX_AUDIT_KEYS, 'fix_location'], `fix audit ${index}`);
+    if (result.fix_location !== undefined) {
+      const location = object(result.fix_location, `fix audit ${index} fix_location`);
+      exactKeys(location, ['path', 'change'], `fix audit ${index} fix_location`);
+      if (result.status !== 'fixed') throw new Error(`fix audit ${index} fix_location requires fixed status`);
+      if (typeof location.path !== 'string' || !safeFixPath(location.path)) throw new Error(`fix audit ${index} fix_location path must be a bounded relative file path`);
+      if (location.change !== 'added' && location.change !== 'removed') throw new Error(`fix audit ${index} fix_location change must be added or removed`);
+      if (typeof result.evidence !== 'string' || /[\r\n]/u.test(result.evidence) || result.evidence === 'N/A' || result.evidence.startsWith('PATH ABSENT: ')) {
+        throw new Error(`fix audit ${index} fix_location requires one changed-line evidence payload`);
+      }
+    }
     if (!Number.isSafeInteger(result.prior_index) || Number(result.prior_index) < 0 || Number(result.prior_index) >= findingCount) {
       throw new Error(`fix audit ${index} prior_index is invalid`);
     }
@@ -362,6 +387,7 @@ export function parseFixAuditResults(text: string, findingCount: number): readon
       status: result.status as FixAuditResult['status'],
       evidence: boundedString(result.evidence, `fix audit ${index} evidence`, 4_000),
       reason: boundedString(result.reason, `fix audit ${index} reason`, 1_000),
+      ...(result.fix_location !== undefined ? { fix_location: result.fix_location as NonNullable<FixAuditResult['fix_location']> } : {}),
     };
   });
   if (results.length !== findingCount || new Set(results.map((result) => result.prior_index)).size !== findingCount) {

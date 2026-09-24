@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createConnection } from 'node:net';
 import { readStoredCredential } from '@earendil-works/pi-coding-agent';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
@@ -8,6 +9,7 @@ import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js'
 import { PerkinsHybridReview } from '../src/dispatch/perkins-review/hybrid.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { PiRuntime } from '../src/runtime/pi-adapter.js';
+import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import type { NativeAgentTool, SpawnOptions } from '../src/runtime/types.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -94,6 +96,19 @@ async function capturedPolicies(): Promise<{ readonly lead: LeadPolicy; readonly
 }
 
 /** Root-type guarantee every OpenAI-compatible provider validates first. */
+function expectProofSchema(schema: Record<string, unknown>): void {
+  const branches = schema['oneOf'] as Array<{ properties: { prior_audit: { items: { properties: Record<string, unknown>; required: string[] } } } }>;
+  expect(branches).toHaveLength(2);
+  for (const branch of branches) {
+    const audit = branch.properties.prior_audit.items;
+    expect(audit.required).toEqual(['prior_index', 'status', 'evidence', 'reason']);
+    expect(audit.properties['fix_location']).toMatchObject({
+      type: 'object', additionalProperties: false, required: ['path', 'change'],
+      properties: { path: { type: 'string' }, change: { enum: ['added', 'removed'] } },
+    });
+  }
+}
+
 function expectObjectRoot(toolName: string, schema: unknown): Record<string, unknown> {
   expect(typeof schema, `${toolName}: schema present`).toBe('object');
   expect(schema, `${toolName}: schema not null`).not.toBeNull();
@@ -237,7 +252,32 @@ describe('declared native tool schemas are provider-compatible', () => {
       const tool = lead.nativeTools.find((entry) => entry.name === name)!;
       const root = expectObjectRoot(tool.name, tool.inputSchema);
       expect(Array.isArray(root['oneOf']), `${name}: both payload shapes retained`).toBe(true);
+      expectProofSchema(root);
     }
+  });
+
+  it('serializes the same nested proof schema through the Claude MCP bridge', async () => {
+    const bridge = await ReviewMcpBridge.start(lead.nativeTools);
+    try {
+      const tools = await new Promise<Array<{ name: string; inputSchema: unknown }>>((resolve, reject) => {
+        const socket = createConnection(bridge.socketPath);
+        let body = '';
+        socket.setEncoding('utf8');
+        socket.once('connect', () => socket.end(`${JSON.stringify({ id: 'proof-schema', name: '__list__', input: {} })}\n`));
+        socket.on('data', (data: string) => { body += data; });
+        socket.once('error', reject);
+        socket.once('end', () => {
+          try { resolve((JSON.parse(body) as { result: Array<{ name: string; inputSchema: unknown }> }).result); }
+          catch (error) { reject(error); }
+        });
+      });
+      for (const name of ['perkins_preflight_submission', 'perkins_submit_review']) {
+        const declared = lead.nativeTools.find((tool) => tool.name === name)!;
+        const bridged = tools.find((tool) => tool.name === name)!;
+        expect(bridged.inputSchema).toEqual(declared.inputSchema);
+        expectProofSchema(expectObjectRoot(name, bridged.inputSchema));
+      }
+    } finally { await bridge.close(); }
   });
 
   it('the exact lead wire payload carries an object root for every declared function', async () => {
@@ -250,6 +290,7 @@ describe('declared native tool schemas are provider-compatible', () => {
       const root = expectObjectRoot(entry.name, entry.parameters);
       if (entry.name === 'perkins_preflight_submission' || entry.name === 'perkins_submit_review') {
         expect(Array.isArray(root['oneOf']), `${entry.name}: both payload shapes retained on the wire`).toBe(true);
+        expectProofSchema(root);
       }
     }
   });

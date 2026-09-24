@@ -55,6 +55,7 @@ export interface HybridSubmission {
     readonly status: 'fixed' | 'still-present';
     readonly evidence: string;
     readonly reason: string;
+    readonly fix_location?: { readonly path: string; readonly change: 'added' | 'removed' };
   }>;
   readonly report_markdown: string;
 }
@@ -123,7 +124,7 @@ export interface LeadBrainOptions {
   readonly decide?: (candidate: ChildCandidateView) => LeadDecision;
   readonly priorAudit?: (
     prior: readonly unknown[],
-  ) => ReadonlyArray<{ prior_index: number; status: 'fixed' | 'still-present'; evidence: string; reason: string }>;
+  ) => ReadonlyArray<{ prior_index: number; status: 'fixed' | 'still-present'; evidence: string; reason: string; fix_location?: { path: string; change: 'added' | 'removed' } }>;
   readonly skipLenses?: readonly string[];
   readonly verdictOverride?: string;
   readonly foreignCandidate?: boolean;

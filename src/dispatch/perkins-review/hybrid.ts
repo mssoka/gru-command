@@ -11,6 +11,7 @@ import {
   dedupeVerifiedFindings,
   parseFindingsSubmission,
   parseFindingsWithRecovery,
+  safeFixPath,
   verdictForFindings,
   type CanonicalReviewVerdict,
   type ChildFailureKind,
@@ -415,8 +416,32 @@ function parseAuditEntry(
     return { index, audit: null };
   }
   const audit = entry as Record<string, unknown>;
-  if (Object.keys(audit).sort().join('\0') !== [...PRIOR_AUDIT_KEYS].sort().join('\0')) {
+  const expectedKeys = audit.fix_location === undefined ? PRIOR_AUDIT_KEYS : [...PRIOR_AUDIT_KEYS, 'fix_location'];
+  if (Object.keys(audit).sort().join('\0') !== [...expectedKeys].sort().join('\0')) {
     errors.push({ subject, rule: 'prior-audit-schema', message: `${subject} keys do not match the required schema` });
+  }
+  let fixLocation: FixAuditResult['fix_location'];
+  if (audit.fix_location !== undefined) {
+    const location = audit.fix_location;
+    if (typeof location !== 'object' || location === null || Array.isArray(location) ||
+        Object.keys(location).sort().join('\0') !== 'change\0path') {
+      errors.push({ subject, rule: 'prior-audit-fix-location', message: `${subject} fix_location requires exactly path and change` });
+    } else {
+      const value = location as Record<string, unknown>;
+      if (typeof value.path !== 'string' || !safeFixPath(value.path)) {
+        errors.push({ subject, rule: 'prior-audit-fix-location', message: `${subject} fix_location path must be a bounded safe relative file path` });
+      } else if (value.change !== 'added' && value.change !== 'removed') {
+        errors.push({ subject, rule: 'prior-audit-fix-location', message: `${subject} fix_location change must be added or removed` });
+      } else {
+        fixLocation = { path: value.path, change: value.change };
+      }
+    }
+    if (audit.status !== 'fixed') {
+      errors.push({ subject, rule: 'prior-audit-fix-location', message: `${subject} fix_location is supported only for fixed status` });
+    }
+    if (typeof audit.evidence !== 'string' || /[\r\n]/u.test(audit.evidence) || audit.evidence === 'N/A' || audit.evidence.startsWith('PATH ABSENT: ')) {
+      errors.push({ subject, rule: 'prior-audit-fix-location', message: `${subject} fix_location requires a single changed-line evidence payload` });
+    }
   }
   let priorIndex: number | null = null;
   if (
@@ -437,7 +462,7 @@ function parseAuditEntry(
   if (priorIndex === null || status === null || evidence === null || reason === null) {
     return { index, audit: null };
   }
-  return { index, audit: { prior_index: priorIndex, status, evidence, reason } };
+  return { index, audit: { prior_index: priorIndex, status, evidence, reason, ...(fixLocation === undefined ? {} : { fix_location: fixLocation }) } };
 }
 
 /** One bounded, line-addressable rejection listing every violation at once. */
@@ -505,10 +530,20 @@ interface ProofCache {
   readonly pathDiffs: Map<string, string>;
   readonly pathAbsent: Map<string, boolean>;
   readonly anywhere: Map<string, boolean>;
+  readonly changeStatus: Map<string, readonly DeltaPath[]>;
+  readonly changedLines: Map<string, ReadonlySet<string>>;
+}
+
+interface DeltaPath {
+  readonly oldPath: string | null;
+  readonly newPath: string | null;
 }
 
 function newProofCache(): ProofCache {
-  return { blobContains: new Map(), pathDiffs: new Map(), pathAbsent: new Map(), anywhere: new Map() };
+  return {
+    blobContains: new Map(), pathDiffs: new Map(), pathAbsent: new Map(), anywhere: new Map(),
+    changeStatus: new Map(), changedLines: new Map(),
+  };
 }
 
 function frozenBlobContains(review: FrozenReview, path: string, evidence: string, cache?: ProofCache): boolean {
@@ -611,6 +646,123 @@ function fixedAuditEvidence(
   }
   const diff = frozenPathDiff(review, path, priorTargetSha ?? review.manifest.diffBaseSha, cache);
   return diff.split('\n').some((line) => line.startsWith('-') && !line.startsWith('---') && line.slice(1) === evidence);
+}
+
+const MAX_INDIRECT_PROOF_BYTES = 8 * 1024 * 1024;
+
+/** Read bounded Git bytes at two fixed commits, never from the checkout. A
+ * failed query must fail proof, not devolve into a weaker current-tree check. */
+function proofGit(review: FrozenReview, args: readonly string[]): string {
+  const raw = execFileSync('git', ['-C', review.manifest.repoPath, ...args], {
+    maxBuffer: MAX_INDIRECT_PROOF_BYTES, timeout: GIT_PROOF_TIMEOUT_MS,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (raw.byteLength > MAX_INDIRECT_PROOF_BYTES) throw new Error('frozen delta exceeds the proof byte bound');
+  return new TextDecoder('utf-8', { fatal: true }).decode(raw);
+}
+
+/** Rename detection runs BEFORE path selection. Filtering first reclassifies
+ * an unchanged renamed file as a wholly added file. */
+function deltaPaths(review: FrozenReview, priorSha: string, cache: ProofCache): readonly DeltaPath[] {
+  const cached = cache.changeStatus.get(priorSha);
+  if (cached !== undefined) return cached;
+  const fields = proofGit(review, [
+    'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--find-renames',
+    '--name-status', '-z', priorSha, review.manifest.targetSha, '--',
+  ]).split('\0');
+  if (fields.at(-1) !== '') throw new Error('frozen delta path metadata is incomplete');
+  fields.pop();
+  const paths: DeltaPath[] = [];
+  for (let i = 0; i < fields.length;) {
+    const status = fields[i++];
+    if (status === undefined) throw new Error('frozen delta path metadata is incomplete');
+    if (/^R[0-9]{1,3}$/u.test(status)) {
+      const oldPath = fields[i++];
+      const newPath = fields[i++];
+      if (!oldPath || !newPath) throw new Error('frozen rename metadata is incomplete');
+      paths.push({ oldPath, newPath });
+    } else if (status === 'A' || status === 'D' || status === 'M') {
+      const path = fields[i++];
+      if (!path) throw new Error('frozen delta path metadata is incomplete');
+      paths.push({ oldPath: status === 'A' ? null : path, newPath: status === 'D' ? null : path });
+    } else {
+      // Unknown types are never usable as indirect proof, but other files in
+      // the delta must not prevent a genuine changed caller being inspected.
+      const path = fields[i++];
+      if (!path) throw new Error('frozen delta path metadata is incomplete');
+    }
+  }
+  cache.changeStatus.set(priorSha, paths);
+  return paths;
+}
+
+function regularFrozenBlob(review: FrozenReview, sha: string, path: string): boolean {
+  const entries = proofGit(review, ['ls-tree', '-z', sha, '--', `:(literal)${path}`]);
+  return /^(?:100644|100755) blob [0-9a-f]{40}\t/u.test(entries) &&
+    entries.slice(entries.indexOf('\t') + 1) === `${path}\0`;
+}
+
+/** Null means located; otherwise return a specific, bounded rejection. */
+function indirectFixEvidence(
+  review: FrozenReview, finding: VerifiedFinding, audit: FixAuditResult,
+  priorSha: string | null, cache: ProofCache,
+): string | null {
+  const location = audit.fix_location!;
+  const citedPath = findingPath(finding);
+  if (citedPath === null || location.path === citedPath) return 'fix_location must name a changed file distinct from the original cited path';
+  if (priorSha === null) return 'fix_location requires a frozen prior target revision';
+  try {
+    if (!regularFrozenBlob(review, priorSha, citedPath) ||
+        !proofGit(review, ['show', `${priorSha}:${citedPath}`]).includes(finding.evidence)) {
+      return `fix_location ${location.path} prior target revision does not contain the original cited finding`;
+    }
+    const paths = deltaPaths(review, priorSha, cache);
+    const matches = paths.filter((entry) => location.change === 'added'
+      ? entry.newPath === location.path : entry.oldPath === location.path);
+    if (matches.length !== 1) return `fix_location ${location.path} has no unique ${location.change} path in the frozen prior-target delta`;
+    const entry = matches[0]!;
+    // The pair is diffed with two literal pathspecs. If another changed file
+    // also occupies either path (e.g. a renamed caller's old name reused for
+    // a new file), its hunk could otherwise satisfy this caller's proof.
+    if (paths.some((other) => other !== entry && [entry.oldPath, entry.newPath].some((path) =>
+      path !== null && (other.oldPath === path || other.newPath === path)))) {
+      return `fix_location ${location.path} overlaps another changed path in the frozen delta`;
+    }
+    if (entry.oldPath !== null && !regularFrozenBlob(review, priorSha, entry.oldPath)) {
+      return `fix_location ${location.path} has no regular prior text file`;
+    }
+    if (entry.newPath !== null && !regularFrozenBlob(review, review.manifest.targetSha, entry.newPath)) {
+      return `fix_location ${location.path} has no regular frozen target text file`;
+    }
+    const key = `${priorSha}\0${entry.oldPath ?? ''}\0${entry.newPath ?? ''}\0${location.change}`;
+    let lines = cache.changedLines.get(key);
+    if (lines === undefined) {
+      const pathspecs = [...new Set([entry.oldPath, entry.newPath].filter((path): path is string => path !== null))]
+        .map((path) => `:(literal)${path}`);
+      const args = ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--find-renames', '--unified=0',
+        priorSha, review.manifest.targetSha, '--', ...pathspecs];
+      // Git's binary numstat indicator is authoritative even when a binary
+      // happens to contain printable lines; a binary never supplies text proof.
+      const numstat = proofGit(review, [
+        'diff', '--no-ext-diff', '--no-textconv', '--find-renames', '--numstat',
+        priorSha, review.manifest.targetSha, '--', ...pathspecs,
+      ]);
+      if (numstat.split('\n').some((row) => row.startsWith('-\t-\t'))) return `fix_location ${location.path} is binary, not textual changed-line proof`;
+      const patch = proofGit(review, args);
+      const changed = new Set<string>();
+      let inHunk = false;
+      for (const line of patch.split('\n')) {
+        if (line.startsWith('diff --git ')) inHunk = false;
+        else if (/^@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@/u.test(line)) inHunk = true;
+        else if (inHunk && line.startsWith(location.change === 'added' ? '+' : '-')) changed.add(line.slice(1));
+      }
+      lines = changed;
+      cache.changedLines.set(key, lines);
+    }
+    return lines.has(audit.evidence) ? null : `fix_location ${location.path} evidence is not an actual ${location.change} changed hunk line in the frozen prior-target delta`;
+  } catch {
+    return `fix_location ${location.path} frozen delta is unavailable or exceeds bounds at the prior target revision`;
+  }
 }
 
 interface PriorReview {
@@ -1380,13 +1532,30 @@ export class PerkinsHybridReview {
       lenses,
     };
 
+    const priorAuditItemSchema = {
+      type: 'object', additionalProperties: false,
+      required: [...PRIOR_AUDIT_KEYS],
+      properties: {
+        prior_index: { type: 'integer', minimum: 0 },
+        status: { type: 'string', enum: ['fixed', 'still-present'] },
+        evidence: { type: 'string', minLength: 1, maxLength: 4_000 },
+        reason: { type: 'string', minLength: 1, maxLength: 1_000 },
+        fix_location: {
+          type: 'object', additionalProperties: false, required: ['path', 'change'],
+          properties: {
+            path: { type: 'string', minLength: 1, maxLength: 500 },
+            change: { type: 'string', enum: ['added', 'removed'] },
+          },
+        },
+      },
+    };
     const fullSubmissionSchema = {
       type: 'object', additionalProperties: false,
       required: ['canonical_verdict', 'candidate_decisions', 'prior_audit', 'report_markdown'],
       properties: {
         canonical_verdict: { type: 'string', enum: ['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'] },
         candidate_decisions: { type: 'array', maxItems: MAX_TOTAL_CANDIDATES, items: { type: 'object' } },
-        prior_audit: { type: 'array', maxItems: 10_000, items: { type: 'object' } },
+        prior_audit: { type: 'array', maxItems: 10_000, items: priorAuditItemSchema },
         report_markdown: { type: 'string', minLength: 1, maxLength: PERKINS_REPORT_MAX_BYTES },
       },
     };
@@ -1397,7 +1566,7 @@ export class PerkinsHybridReview {
         mode: { type: 'string', enum: ['delta'] },
         canonical_verdict: { type: 'string', enum: ['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'] },
         candidate_decisions: { type: 'array', maxItems: MAX_TOTAL_CANDIDATES, items: { type: 'object' } },
-        prior_audit: { type: 'array', maxItems: 10_000, items: { type: 'object' } },
+        prior_audit: { type: 'array', maxItems: 10_000, items: priorAuditItemSchema },
         report_markdown: { type: 'string', minLength: 1, maxLength: PERKINS_REPORT_MAX_BYTES },
       },
     };
@@ -1957,15 +2126,18 @@ export class PerkinsHybridReview {
         const finding = context.prior[audit.prior_index]!;
         const speculativeNa = finding.verification.disposition === 'unverifiable-speculative' && audit.evidence === 'N/A';
         const path = findingPath(finding);
-        const located = speculativeNa || (
-          path !== null && (
+        const indirectIssue = audit.fix_location === undefined ? null :
+          indirectFixEvidence(review, finding, audit, context.priorTargetSha, proofCache);
+        const located = speculativeNa || (indirectIssue === null && (
+          audit.fix_location !== undefined || (path !== null && (
             audit.status === 'still-present'
               ? frozenBlobContains(review, path, audit.evidence, proofCache)
               : fixedAuditEvidence(review, finding, audit.evidence, context.priorTargetSha, proofCache)
-          )
-        );
+          ))
+        ));
         if (!located) {
-          push(`prior audit ${audit.prior_index}`, 'prior-audit-evidence', `prior audit ${audit.prior_index} evidence is not locatable at the finding's cited frozen file/hunk`);
+          push(`prior audit ${audit.prior_index}`, 'prior-audit-evidence', indirectIssue ??
+            `prior audit ${audit.prior_index} evidence is not locatable at the finding's cited frozen file/hunk`);
           continue;
         }
         if (!locatedAudits.has(audit.prior_index)) locatedAudits.set(audit.prior_index, audit);
@@ -2108,6 +2280,10 @@ export class PerkinsHybridReview {
         if (!report.includes(audit.status) || !report.includes(auditPrefix)) {
           push(`prior audit ${audit.prior_index}`, 'report-prior-proof', `lead report omits prior audit proof: ${audit.prior_index}`);
         }
+        if (audit.fix_location !== undefined &&
+            (!report.includes(audit.fix_location.path) || !report.includes(context.prior[audit.prior_index]!.location))) {
+          push(`prior audit ${audit.prior_index}`, 'report-prior-proof', `lead report must identify both the original citation and fix_location ${audit.fix_location.path}`);
+        }
       }
     }
     if (errors.length > 0) return { ok: false, submission: parsed.submission, errors };
@@ -2156,6 +2332,7 @@ export class PerkinsHybridReview {
       'Record each decision with perkins_record_decision as you verify it: it validates the decision immediately with the same exhaustive rules and keeps clean decisions in the round record, so the final submission can carry only what is still missing.',
       'A rejected candidate still requires a concise reason. confirmed evidence must be one contiguous verbatim current-tree substring. N/A claims are speculative and cannot remain blockers.',
       'Pairing rules are enforced at cited locations: a rejected candidate needs contradictory evidence locatable at its cited file/hunk, confirmed candidate evidence must be locatable at its cited file/hunk, and your verification evidence must be locatable in the frozen review.',
+      'For a fixed prior finding whose cited file remains unchanged, optionally give fix_location: {path: "relative/changed-caller.ts", change: "added" or "removed"} with evidence equal to ONE actual added or removed line in the prior-target-to-frozen-target delta. The location must differ from the original citation; explain in reason why this caller change fixes that finding and name both paths in the report. A path alone, unchanged diff context, a rename with no changed hunk, or another revision is not proof. Old cited deletion/PATH ABSENT proofs remain valid without fix_location.',
       'Before the terminal submission, call perkins_preflight_submission with the exact candidate submission (full, or {"mode":"delta", ...} to amend the rejection record after a failed attempt). It spends no terminal attempt, accepts nothing, and returns every violation in one response; fix them all and preflight again until it reports no errors, then submit once.',
       'After a rejected terminal submission, resubmit a delta: {"mode":"delta", "candidate_decisions": [only the changed/added decisions], ...changed report fields}. The host applies it over the rejected submission and re-validates the merged whole with the same rules. A delta is still a real terminal attempt.',
       'Write a complete Markdown report containing `**Verdict: ...**` and every retained finding title, then call perkins_submit_review. Never claim completion from missing/failed runs.',

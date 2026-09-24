@@ -171,6 +171,59 @@ function hybridHarness(brain: LeadBrainOptions, options?: { noSpec?: boolean; sp
   };
 }
 
+function indirectFixHarness(options: {
+  readonly audit?: Record<string, unknown>;
+  readonly priorSha?: string;
+  readonly afterPrior?: (repo: FixtureRepo) => void;
+  readonly useBaseAsPrior?: boolean;
+  readonly submitPayload?: LeadBrainOptions['submitPayload'];
+  readonly preflight?: LeadBrainOptions['preflight'];
+  readonly transformReport?: LeadBrainOptions['transformReport'];
+} = {}) {
+  const repo = makeFixtureRepo('indirect-audit');
+  repos.push(repo);
+  const base = repo.head();
+  repo.git(['checkout', '-b', 'feature/review']);
+  repo.commitFile('src/helper.ts', 'export function helper(ref: string): string { return ref.slice(ref.indexOf("/") + 1); }\n');
+  const priorTarget = repo.commitFile('src/caller.ts', 'const unchanged = true;\nconst selected = nativeRef;\n');
+  options.afterPrior?.(repo);
+  if (options.afterPrior === undefined) repo.commitFile('src/caller.ts', 'const unchanged = true;\nconst selected = nativeSetting;\n');
+  const root = temp('perkins-indirect-');
+  const priorFile = join(root, 'prior.json');
+  writeFileSync(priorFile, JSON.stringify({
+    schemaVersion: 2,
+    frozen: { targetSha: options.useBaseAsPrior === true ? base : options.priorSha ?? priorTarget },
+    findings: [{
+      ...finding('security', 'warning', {
+        title: 'Native settings token reaches the prefix stripper', location: 'src/helper.ts:1',
+        evidence: 'return ref.slice(ref.indexOf("/") + 1);',
+      }),
+      sources: ['security'], chunks: ['001'], roundOrigin: 1,
+      verification: { disposition: 'confirmed', evidence: 'return ref.slice(ref.indexOf("/") + 1);', reason: 'verified in prior round' },
+    }],
+  }));
+  const frozen = freezeReviewInputs({
+    roundId: 'indirect-audit-round', repoPath: repo.path, artifactRoot: root,
+    baseRef: base, targetRef: repo.head(), movementRef: 'feature/review', spec: 'preserve native settings selection',
+  });
+  const fake = fakeHybridSpawner(temp('perkins-indirect-sessions-'), {
+    childAnswer: () => '[]', preflight: options.preflight ?? { calls: 1 },
+    submitRetries: options.submitPayload === undefined ? 0 : 1,
+    ...(options.submitPayload === undefined ? {} : { submitPayload: options.submitPayload }),
+    ...(options.transformReport === undefined ? {} : { transformReport: options.transformReport }),
+    priorAudit: () => [{
+      prior_index: 0, status: 'fixed', evidence: 'const selected = nativeSetting;',
+      reason: 'The caller now supplies the native setting without passing it through the unchanged helper.',
+      fix_location: { path: 'src/caller.ts', change: 'added' }, ...options.audit,
+    } as HybridSubmission['prior_audit'][number]],
+  });
+  const engine = new PerkinsHybridReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+  return { repo, priorFile, frozen, fake, run: () => engine.run({
+    roundId: 'indirect-audit-round', roundNumber: 2, frozenReview: frozen,
+    movementRef: 'feature/review', noSpec: false, priorConsolidatedFile: priorFile,
+  }) };
+}
+
 describe('bundled Perkins policy and deterministic contracts', () => {
   it('loads the integrity-pinned canonical seven-lens resource with the hybrid lead workflow', () => {
     const policy = loadPerkinsPolicy();
@@ -636,6 +689,21 @@ describe('bundled Perkins policy and deterministic contracts', () => {
     expect(() => parseFindings(JSON.stringify([{
       ...finding('tests', 'warning'), category: 'coverage-gate', title: 'Coverage gate: PASS',
     }]), 'tests')).toThrow(/matching note\|warning\|blocker severity/);
+  });
+
+  it('keeps four-key text audits and validates optional structured fix locations strictly', () => {
+    const legacy = { prior_index: 0, status: 'fixed', evidence: 'old line', reason: 'removed' };
+    expect(parseFixAuditResults(JSON.stringify([legacy]), 1)).toEqual([legacy]);
+    const indirect = { ...legacy, fix_location: { path: 'src/caller.ts', change: 'added' } };
+    expect(parseFixAuditResults(JSON.stringify([indirect]), 1)).toEqual([indirect]);
+    for (const bad of [
+      { ...indirect, fix_location: { path: 'src/caller.ts' } },
+      { ...indirect, fix_location: { path: 'src/caller.ts', change: 'added', extra: true } },
+      { ...indirect, fix_location: { path: '../caller.ts', change: 'added' } },
+      { ...indirect, evidence: 'old\nline' },
+      { ...indirect, evidence: 'N/A' },
+      { ...indirect, status: 'still-present' },
+    ]) expect(() => parseFixAuditResults(JSON.stringify([bad]), 1)).toThrow();
   });
 
   it('deduplicates by normalized title/location and applies exact blocker thresholds', () => {
@@ -1185,6 +1253,110 @@ describe('Perkins hybrid lead engine', () => {
     expect(result.findings).toEqual([]);
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
     expect(readFileSync(join(firstResult.artifactDirectory, 'consolidated.json'), 'utf8')).toBe(historical);
+  });
+
+  it('accepts an explicit changed-caller proof while preserving the original helper citation', async () => {
+    const h = indirectFixHarness();
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.priorAudit).toEqual([expect.objectContaining({
+      status: 'fixed', fix_location: { path: 'src/caller.ts', change: 'added' },
+    })]);
+    expect(result.findings).toEqual([]);
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
+    expect(readFileSync(h.priorFile, 'utf8')).toContain('src/helper.ts:1');
+  });
+
+  const rejectIndirect = async (audit: Record<string, unknown>, message: RegExp): Promise<void> => {
+    const h = indirectFixHarness({ audit });
+    await expect(h.run()).rejects.toThrow(message);
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":false');
+    expect(existsSync(join(h.frozen.directory, 'consolidated.json'))).toBe(false);
+  };
+  it('rejects invented caller evidence', async () => {
+    await rejectIndirect({ evidence: 'const selected = invented;' }, /changed.*line|locatable/u);
+  });
+  it('rejects unchanged caller context', async () => {
+    await rejectIndirect({ evidence: 'const unchanged = true;' }, /changed.*line|locatable/u);
+  });
+  it('rejects a proof line on the wrong side of the hunk', async () => {
+    await rejectIndirect({ fix_location: { path: 'src/caller.ts', change: 'removed' }, evidence: 'const selected = nativeSetting;' }, /changed.*line|locatable/u);
+  });
+  it('rejects missing explicit location for an unchanged cited helper', async () => {
+    await rejectIndirect({ fix_location: undefined }, /cited frozen file|locatable/u);
+  });
+  it('rejects absolute fix paths', async () => {
+    await rejectIndirect({ fix_location: { path: '/src/caller.ts', change: 'added' } }, /fix_location.*path|relative/u);
+  });
+  it('rejects traversal fix paths', async () => {
+    await rejectIndirect({ fix_location: { path: '../caller.ts', change: 'added' } }, /fix_location.*path|relative/u);
+  });
+  it('rejects a path declaration with fabricated evidence', async () => {
+    await rejectIndirect({ evidence: 'made-up' }, /changed.*line|locatable/u);
+  });
+  it('rejects an explicit location on still-present status', async () => {
+    await rejectIndirect({ status: 'still-present' }, /fix_location.*fixed|unsupported/u);
+  });
+
+  it('requires both fix and original citation in an indirect-fix report', async () => {
+    const h = indirectFixHarness({ transformReport: (report) => report.replaceAll('src/caller.ts', 'redacted') });
+    await expect(h.run()).rejects.toThrow(/report must identify both the original citation and fix_location/u);
+  });
+
+  it('rejects a wrong prior revision instead of falling back to the PR base', async () => {
+    const missing = indirectFixHarness({ priorSha: 'f'.repeat(40) });
+    await expect(missing.run()).rejects.toThrow(/prior target revision/u);
+    const wrongCommit = indirectFixHarness({ useBaseAsPrior: true });
+    await expect(wrongCommit.run()).rejects.toThrow(/prior target revision does not contain the original cited finding/u);
+  });
+
+  it('revalidates an indirect proof in a delta over a rejected full submission', async () => {
+    const h = indirectFixHarness({
+      submitPayload: (attempt, submission) => attempt === 1
+        ? { ...submission, prior_audit: submission.prior_audit.map(({ fix_location: _location, ...rest }) => rest) }
+        : { mode: 'delta', prior_audit: submission.prior_audit },
+      preflight: { beforeAttempt: 2, calls: 1, payload: (submission) => ({ mode: 'delta', prior_audit: submission.prior_audit }) },
+    });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
+  });
+
+  it('rejects an unchanged rename as added-line proof and accepts a genuinely edited rename', async () => {
+    const rename = (changed: boolean) => indirectFixHarness({
+      afterPrior: (repo) => {
+        repo.git(['mv', 'src/caller.ts', 'src/renamed.ts']);
+        if (changed) writeFileSync(join(repo.path, 'src/renamed.ts'), 'const unchanged = true;\nconst selected = nativeSetting;\n');
+        repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-am', 'rename caller']);
+      },
+      audit: { fix_location: { path: 'src/renamed.ts', change: 'added' } },
+    });
+    const unchanged = rename(false);
+    await expect(unchanged.run()).rejects.toThrow(/changed.*line|locatable/u);
+    const edited = rename(true);
+    expect((await edited.run()).canonicalVerdict).toBe('READY TO MERGE');
+  });
+
+  it('does not attribute a reused rename source path to the renamed caller', async () => {
+    const h = indirectFixHarness({
+      afterPrior: (repo) => {
+        repo.git(['mv', 'src/caller.ts', 'src/renamed.ts']);
+        repo.commitFile('src/caller.ts', 'const selected = nativeSetting;\n');
+      },
+      audit: { fix_location: { path: 'src/renamed.ts', change: 'added' } },
+    });
+    await expect(h.run()).rejects.toThrow(/overlaps another changed path|not an actual added changed hunk line/u);
+  });
+
+  it('accepts removed-line evidence in a deleted caller and rejects binary proof', async () => {
+    const deleted = indirectFixHarness({
+      afterPrior: (repo) => { repo.git(['rm', 'src/caller.ts']); repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'remove caller']); },
+      audit: { evidence: 'const selected = nativeRef;', fix_location: { path: 'src/caller.ts', change: 'removed' } },
+    });
+    expect((await deleted.run()).canonicalVerdict).toBe('READY TO MERGE');
+    const binary = indirectFixHarness({
+      afterPrior: (repo) => { repo.commitFile('src/caller.ts', '\u0000const selected = nativeSetting;\n'); },
+    });
+    await expect(binary.run()).rejects.toThrow(/binary|text|changed.*line/u);
   });
 
   it('carries still-present findings with original round markers and dedupes fresh rediscovery', async () => {
