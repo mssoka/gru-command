@@ -154,6 +154,10 @@ test('real native compact preserves history and New chat starts unresumed behind
 
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
+  await page
+    .locator('.service-band', { has: page.locator('.notice-line', { hasText: 'context compacted' }) })
+    .locator('.service-band__head')
+    .click();
   await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
   await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(1);
   const oldPointer = JSON.parse(readFileSync(pointerFile, 'utf-8')) as {

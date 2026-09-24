@@ -40,6 +40,13 @@ async function sendAndWaitReply(page: Page, text: string): Promise<void> {
 test('pair, send, streamed reply with tool line', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'build me a rocket');
+  // Clean-chat clause: the tool line sits in a collapsed service band —
+  // one tap reveals the machinery.
+  const toolBand = page.locator('.service-band', {
+    has: page.locator('.tool-line', { hasText: 'mock-echo' }),
+  });
+  await expect(toolBand).toHaveCount(1);
+  await toolBand.locator('.service-band__head').click();
   await expect(page.locator('.tool-line', { hasText: 'mock-echo' })).toBeVisible();
 });
 
@@ -178,6 +185,10 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
   await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(1);
+  await page
+    .locator('.service-band', { has: page.locator('.notice-line', { hasText: 'context compacted' }) })
+    .locator('.service-band__head')
+    .click();
   await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
 
   const compactFailure = await page.request.post('http://localhost:8788/__compact-fail', {
@@ -187,6 +198,12 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
+  await page
+    .locator('.service-band', {
+      has: page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
+    })
+    .locator('.service-band__head')
+    .click();
   await expect(
     page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
   ).toBeVisible();
@@ -223,10 +240,14 @@ test('failed New chat restores history and delivers a word typed in the pending 
   await expect(page.locator('#chat-view')).toBeVisible();
   await expect(page.locator('.msg--user', { hasText: 'word typed during failed reset' })).toHaveCount(1);
 
-  // The failed reset surfaces on reconnect: the notice lands and history is
-  // restored EXACTLY once. (The transient empty view between reload and the
-  // inferred failure is not deterministically observable — this lane asserts
-  // the end state, not a racing intermediate frame.)
+  // The failed reset surfaces on reconnect; reveal the service notice and
+  // assert that the restored history is present exactly once.
+  await page
+    .locator('.service-band', {
+      has: page.locator('.notice-line', { hasText: 'New chat did not complete before reconnect' }),
+    })
+    .locator('.service-band__head')
+    .click();
   await expect(
     page.locator('.notice-line', { hasText: 'New chat did not complete before reconnect' }),
   ).toBeVisible();
