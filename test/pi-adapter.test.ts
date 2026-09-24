@@ -1023,6 +1023,24 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('preflight rejects the pi default when neither config nor settings select a model', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-pi-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
+    const agentDir = mkdtempSync(join(tmpdir(), 'gru-command-agentdir-'));
+    cleanupDirs.push(home, workspace, agentDir);
+    writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n`, 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const runtime = new PiRuntime({
+      config,
+      store: new SessionStore(config.dataDir),
+      agentDir,
+      modelRuntime: await makeIsolatedModelRuntime(),
+    });
+    await expect(runtime.checkReviewModel('perkins')).rejects.toThrow(
+      /no selected pi default model; configure a settings default or \[models\] default for review/,
+    );
+  });
+
   it('the sentinel path fails LOUD when nothing is configured (no silent fallback)', async () => {
     // Stub-FREE isolated runtime: no provider is configured at all, so the
     // "default" sentinel resolves to nothing and prompt fails loudly

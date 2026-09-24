@@ -764,6 +764,44 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     await expect(runtime.checkReviewModel('perkins')).rejects.toThrow(/claude-code is not configured\/authed/);
   });
 
+  it('rejects an installed CLI that exits nonzero with an auth or model error on stderr', async () => {
+    const fx = fixture();
+    const binary = join(fx.home, 'failing-claude');
+    writeFileSync(binary, '#!/bin/sh\necho "invalid credentials for selected model" >&2\nexit 23\n');
+    chmodSync(binary, 0o755);
+    const runtime = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: fx.store,
+      binary,
+    });
+    await expect(runtime.checkReviewModel('perkins')).rejects.toThrow(
+      /claude-code is not configured\/authed for the review model: invalid credentials for selected model/,
+    );
+  });
+
+  it('registry preflight uses the perkins runtime override, not the default pi adapter', async () => {
+    const fx = fixture();
+    writeFileSync(configPathFor(fx.home),
+      `workspace_root = "${fx.workspace}"\n[runtimes]\ndefault = "pi"\n[runtimes.roles]\nperkins = "claude-code"\n[models.roles]\nperkins = "sonnet"\n`);
+    const config = loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester');
+    const registry = new RuntimeRegistry({ config, store: fx.store, claude: { binary: DOUBLE } });
+    try {
+      expect(registry.runtimeIdFor('gru')).toBe('pi');
+      expect(registry.runtimeIdFor('perkins')).toBe('claude-code');
+      await expect(registry.checkReviewModel('perkins')).resolves.toBeUndefined();
+      const handle = await registry.spawn('perkins');
+      await handle.prompt('review');
+      await handle.dispose();
+      const calls = doubleInvocations(fx);
+      expect(calls).toHaveLength(2);
+      for (const call of calls) {
+        expect(call.argv[call.argv.indexOf('--model') + 1]).toBe('sonnet');
+      }
+    } finally {
+      await registry.dispose();
+    }
+  });
+
   it('fails loud on malformed model references', async () => {
     const fx = fixture();
     // Native CLI aliases are legitimate even when absent from pi metadata.
