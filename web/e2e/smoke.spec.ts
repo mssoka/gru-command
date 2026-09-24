@@ -665,6 +665,30 @@ test.describe('board (E6, mock feed)', () => {
     await expect(rail.locator('.board-agent__age').first()).toContainText('quiet');
   });
 
+  test('minion heist names fit the crew rail on desktop and phone in light and dark', async ({ page }, testInfo) => {
+    await pair(page);
+    await page.locator('#tab-board').click();
+    const row = page.locator('#board-agents .board-agent[data-role="minion"]');
+    await expect(row.locator('.board-agent__name')).toHaveText('fix the payment retry');
+    await expect(row.locator('.board-agent__hash')).toHaveText('nion');
+    await expect(row).toHaveAttribute('title', /Fix the payment retry loop.*mock-minion/u);
+    for (const theme of ['light', 'dark'] as const) {
+      if (theme === 'dark') await page.locator('#theme-toggle').click();
+      for (const [viewport, width, height] of [['desktop', 1280, 900], ['phone', 390, 844]] as const) {
+        await page.setViewportSize({ width, height });
+        if (viewport === 'phone') await row.scrollIntoViewIfNeeded();
+        await expect(row).toBeVisible();
+        const fits = await row.evaluate((node) => {
+          const hash = node.querySelector('.board-agent__hash')!;
+          return hash.getBoundingClientRect().right <= node.getBoundingClientRect().right;
+        });
+        expect(fits).toBe(true);
+        await page.screenshot({ path: testInfo.outputPath(`crew-${theme}-${viewport}.png`) });
+      }
+      await page.setViewportSize({ width: 1280, height: 900 });
+    }
+  });
+
   test('trackers render in dark theme and on a narrow phone viewport', async ({ page }) => {
     await pair(page);
     const card = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });

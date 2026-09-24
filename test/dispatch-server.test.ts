@@ -248,6 +248,7 @@ describe('dispatch server (E8)', () => {
           job_id: 'http-job',
           repo_path: repo.path,
           title: 'http dispatched',
+          display_name: 'Wake Alerts',
           briefing: 'do the thing via http',
         },
         TOKEN,
@@ -258,7 +259,7 @@ describe('dispatch server (E8)', () => {
       expect(field<string>(res.json, 'status')).toBe('working');
       // Ruling 17: the minion spawn carried the worktree as cwd.
       expect(h.spawns[0]?.options.cwd).toBe(field<string>(res.json, 'worktree'));
-      expect(h.ledger.getJob('http-job')?.briefing).toBe('do the thing via http');
+      expect(h.ledger.getJob('http-job')).toMatchObject({ briefing: 'do the thing via http', title: 'http dispatched', displayName: 'Wake Alerts' });
       // Worktree rows are queryable through the flow API.
       const wt = await call(h.port, 'GET', '/api/dispatch/jobs/http-job/worktrees', undefined, TOKEN);
       expect(wt.status).toBe(200);
@@ -411,6 +412,13 @@ describe('dispatch server (E8)', () => {
       const bad = await call(h.port, 'POST', '/api/dispatch', { job_id: 'x' }, TOKEN);
       expect(bad.status).toBe(400);
       expect(field<string>(bad.json, 'error')).toBe('bad_request');
+      for (const display_name of ['', '  ', 42, null]) {
+        const invalid = await call(h.port, 'POST', '/api/dispatch', {
+          job_id: 'invalid-name', repo_path: '/fixture', title: 'T', briefing: 'B', display_name,
+        }, TOKEN);
+        expect(invalid.status).toBe(400);
+      }
+      expect(h.ledger.getJob('invalid-name')).toBeNull();
     } finally {
       await h.close();
     }
@@ -689,6 +697,7 @@ describe('dispatch server (E8)', () => {
       const freshMinion = h.spawns.filter((spawn) => spawn.role === 'minion')[freshBefore];
       expect(freshMinion).toBeDefined();
       expect(field<string>(res.json, 'minion_id')).toBe(`agent-${h.spawns.length}`);
+      expect(h.ledger.getAgent(`agent-${h.spawns.length}`)?.jobId).toBe('rebrief-job');
       const job = h.ledger.getJob('rebrief-job');
       expect(job?.status).toBe('working');
       const event = h.ledger.listJobEvents('rebrief-job').find((candidate) => candidate.kind === 'silas.rebrief');
@@ -896,6 +905,7 @@ describe('dispatch server (E8)', () => {
       expect(fresh?.options.cwd).toBe(lane?.path);
       expect(field<string>(res.json, 'minion_id')).toBe(`agent-${h.spawns.length}`);
       expect(h.disposedHandles).toContain(`agent-${h.spawns.length}`);
+      expect(h.ledger.getAgent(`agent-${h.spawns.length}`)?.jobId).toBe('dir-fresh');
     } finally {
       await h.close();
     }

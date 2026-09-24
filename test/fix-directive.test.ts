@@ -4,7 +4,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
-import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { EventBus } from '../src/events/bus.js';
+import type { AgentHandle } from '../src/runtime/types.js';
+import type { WorktreeLane, WorktreePort } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
@@ -62,6 +66,40 @@ function laneAt(path: string, status: WorktreeLane['status'] = 'active'): Worktr
     status,
   };
 }
+
+describe('fresh fix worker association', () => {
+  it('binds the owning job before a failed prompt and keeps it after disposal', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-binding-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'owner-lane', repo: 'fixture', title: 'Full owner title' });
+      let disposed = false;
+      const handle = {
+        id: 'worker-uuid-0001', role: 'minion', sessionFile: '/fixture/session',
+        async prompt() {
+          expect(ledger.getAgent('worker-uuid-0001')?.jobId).toBe('owner-lane');
+          throw new Error('prompt failed');
+        },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: '/fixture/session' }; },
+        async dispose() { disposed = true; },
+      } satisfies AgentHandle;
+      await expect(routeFixDirectiveToMinion({
+        jobId: 'owner-lane', directive: 'repair', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
+      })).rejects.toThrow('prompt failed');
+      expect(disposed).toBe(true);
+      expect(ledger.getAgent(handle.id)).toMatchObject({ role: 'minion', jobId: 'owner-lane', sessionFile: '/fixture/session' });
+    } finally {
+      db.close();
+    }
+  });
+});
 
 describe('recordFollowUpDelivery (the loop-closing signal)', () => {
   it('records job.delivered with the lane head the settled turn produced', async () => {

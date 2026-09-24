@@ -28,8 +28,10 @@ stranger could execute: goal, boundaries, acceptance, verification.
 
 ## 2. Ops handoff (dispatch)
 
-`POST /api/dispatch` `{job_id, repo_path, title, briefing}` — the
-mechanical handoff behind the chat surface:
+`POST /api/dispatch` `{job_id, repo_path, title, briefing, display_name?}` — the
+mechanical handoff behind the chat surface. `display_name` is an optional
+short heist label authored at handoff; it does not replace the full title or
+worker identity. Older jobs without it use a shortened title on minion cards:
 
 1. **Job row** — briefing recorded verbatim; status `dispatched`.
 2. **Lane** — one git worktree per job on branch `gru/<job>` at the

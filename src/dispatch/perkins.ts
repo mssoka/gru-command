@@ -1925,6 +1925,12 @@ export class WaveRunner {
   private async defaultFallbackReview(input: FallbackReviewRunInput): Promise<readonly FallbackFinding[]> {
     const handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
     try {
+      this.opts.ledger.registerAgent({
+        id: handle.id,
+        role: 'minion',
+        sessionFile: handle.sessionFile,
+        jobId: input.jobId,
+      });
       const prompt = [
         `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
         'This session runs ONE review pass inside a release gate. The host performs triage and every gate decision afterwards: do NOT approve, merge, or gate anything yourself, and do not modify implementation code.',

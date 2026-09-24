@@ -310,4 +310,9 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_pending_rebriefs_job ON pending_rebriefs(job_id);
     `,
   },
+  {
+    id: 9,
+    name: 'job-display-name',
+    sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;',
+  },
 ];

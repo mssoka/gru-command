@@ -157,6 +157,64 @@ function mountBoardDom(): void {
   `;
 }
 
+describe('minion heist identity in the crew rail', () => {
+  beforeEach(mountBoardDom);
+
+  it('shows stable names and distinct suffixes for all states, without changing full-ID transcript selection', () => {
+    const opened = vi.fn();
+    const view = new BoardView(opened);
+    const jobs = [baseJob({ id: 'wake', title: 'Full wake alert contract', displayName: 'Wake Alerts' }), baseJob({ id: 'model', title: 'Model repair with full details' })];
+    const agents = [
+      agent('worker-1234dec9', { role: 'minion', label: null, jobId: 'wake', state: 'idle' }),
+      agent('worker-5678dec9', { role: 'minion', label: null, jobId: 'wake', state: 'error' }),
+      agent('worker-9999dec9', { role: 'minion', label: null, jobId: 'wake', state: 'disposed' }),
+      agent('worker-00009b2b', { role: 'minion', label: null, jobId: 'model', state: 'streaming' }),
+      agent('unlinked-1111', { role: 'minion', label: null, jobId: null }),
+      agent('orphaned-1111', { role: 'minion', label: null, jobId: 'missing-job' }),
+      agent('lead-1234', { role: 'perkins', label: 'blind:001', jobId: 'wake' }),
+    ];
+    const board = snapshot({ jobs, agents });
+    view.render(board);
+    document.querySelector<HTMLButtonElement>('.board-agent-toggle')?.click();
+    const rows = [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')];
+    const byId = (id: string) => rows.find((row) => row.title.includes(id))!;
+    for (const id of ['worker-1234dec9', 'worker-5678dec9', 'worker-9999dec9']) {
+      const row = byId(id);
+      expect(row.querySelector('.board-agent__name')?.textContent).toBe('wake alerts');
+      expect(row.querySelector('.board-agent__sub')?.textContent).toContain('minion ·');
+      expect(row.title).toContain('Full wake alert contract');
+      expect(row.getAttribute('aria-label')).toContain(id);
+    }
+    const collisions = ['worker-1234dec9', 'worker-5678dec9', 'worker-9999dec9'];
+    const originalSuffixes = collisions.map((id) => byId(id).querySelector('.board-agent__hash')?.textContent);
+    expect(new Set(originalSuffixes).size).toBe(3);
+    expect(originalSuffixes.every((suffix) => suffix?.length === 5)).toBe(true);
+    expect(byId('worker-00009b2b').querySelector('.board-agent__name')?.textContent).toBe('model repair with full');
+    expect(byId('unlinked-1111').querySelector('.board-agent__name')?.textContent).toBe('unassigned');
+    expect(byId('orphaned-1111').querySelector('.board-agent__name')?.textContent).toBe('unassigned');
+    expect(byId('unlinked-1111').querySelector('.board-agent__hash')?.textContent).not.toBe(byId('orphaned-1111').querySelector('.board-agent__hash')?.textContent);
+    expect(byId('lead-1234').querySelector('.board-agent__name')?.textContent).toBe('blind:001');
+    byId('worker-5678dec9').click();
+    expect(opened).toHaveBeenCalledWith({ file: '/sessions/worker-5678dec9.jsonl', label: expect.any(String) });
+    view.render({ ...board, agents: [...agents].reverse() });
+    const reordered = [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')];
+    expect(collisions.map((id) => reordered.find((row) => row.title.includes(id))?.querySelector('.board-agent__hash')?.textContent)).toEqual(originalSuffixes);
+    expect(document.querySelectorAll('.board-agent__hash')).toHaveLength(7);
+  });
+
+  it('escapes and bounds special and grapheme-rich names, retaining full title and id for keyboard users', () => {
+    const view = new BoardView(() => {});
+    const title = '<img src=x onerror=alert(1)> 🧑‍🚀'.repeat(5);
+    view.render(snapshot({ jobs: [baseJob({ id: 'unicode', title, displayName: '🧑‍🚀 Café <script> Hello extra words beyond the limit' })], agents: [agent('full-worker-id-fff1', { role: 'minion', jobId: 'unicode', label: null })] }));
+    const row = document.querySelector<HTMLButtonElement>('#board-agents .board-agent')!;
+    expect(row.querySelector('script')).toBeNull();
+    expect(row.querySelector('.board-agent__name')?.textContent).toContain('🧑‍🚀 café <script>');
+    expect(row.title).toContain(title);
+    expect(row.getAttribute('aria-label')).toContain('full-worker-id-fff1');
+    expect(row.querySelector('.board-agent__hash')?.textContent).toBe('fff1');
+  });
+});
+
 describe('board view resolved-notification rendering', () => {
   beforeEach(mountBoardDom);
 
@@ -915,8 +973,8 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     const row = document.querySelector<HTMLElement>('#board-agents .board-agent');
     expect(row?.dataset.state).toBe('streaming');
     expect(row?.querySelector('.board-agent__dot')).not.toBeNull();
-    expect(row?.querySelector('.board-agent__name')?.textContent).toBe('Payment lane');
-    expect(row?.querySelector('.board-agent__hash')?.textContent).toBe('minion-live'.slice(0, 8));
+    expect(row?.querySelector('.board-agent__name')?.textContent).toBe('unassigned');
+    expect(row?.querySelector('.board-agent__hash')?.textContent).toBe('live');
     expect(row?.querySelector('.board-agent__sub')?.textContent).toContain('minion · streaming');
     expect(row?.querySelector('.board-agent__state')?.textContent).toBe('streaming');
   });

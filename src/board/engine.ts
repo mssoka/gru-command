@@ -78,6 +78,7 @@ export interface JobView {
   readonly id: string;
   readonly repo: string;
   readonly title: string;
+  readonly displayName: string | null;
   readonly status: JobStatus;
   readonly updatedAt: string;
   readonly prUrl: string | null;
@@ -510,6 +511,7 @@ export class BoardEngine {
       id: job.id,
       repo: job.repo,
       title: job.title,
+      displayName: job.displayName,
       status: job.status,
       updatedAt: job.updatedAt,
       prUrl: job.prUrl,

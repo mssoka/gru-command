@@ -2,7 +2,8 @@
 title: 'Short heist names on minion cards'
 type: 'feature'
 created: '2026-09-24'
-status: 'draft'
+status: 'in-review'
+baseline_commit: '05514215fc2125024a30279e59375fff35184148'
 route: 'dispatch'
 review_loop_iteration: 0
 context: []
@@ -45,12 +46,12 @@ context: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `src/ledger/db.ts`, `src/ledger/api.ts`: additive nullable job display-name field, validation, legacy reads; no updates to existing job titles.
-- [ ] `src/dispatch/server.ts`, `src/dispatch/service.ts`: accept/pass optional `display_name` at dispatch (reject blank authored value); never require it or change briefing.
-- [ ] `src/dispatch/fix-directive.ts`, `src/dispatch/perkins.ts`: register fresh spawned minions with known `jobId` before prompt/disposal; leave rebrief and lens labels intact.
-- [ ] `src/board/engine.ts`, `web/src/lib/board-protocol.ts`: expose/validate nullable short name alongside full job title, tolerate legacy absence.
-- [ ] `web/src/ui/board.ts`, `web/src/styles/components.css`: minion-only name/suffix, collision logic (all states including disposed), accessible full identity and overflow-safe text; preserve full-ID transcript target.
-- [ ] `test/ledger-db.test.ts`, `test/ledger-api.test.ts`, `test/dispatch-e2e.test.ts`, `test/dispatch-server.test.ts`, `test/fix-directive.test.ts`, `test/perkins-builtin-wave.test.ts`, `test/board-engine.test.ts`, `web/src/lib/board-protocol.test.ts`, `web/src/ui/board.test.ts`: deterministic red/green migration/restart, associations, lifecycle, collisions, escaping and transcript/non-minion regressions.
+- [x] `src/ledger/db.ts`, `src/ledger/api.ts`: additive nullable job display-name field, validation, legacy reads; no updates to existing job titles.
+- [x] `src/dispatch/server.ts`, `src/dispatch/service.ts`: accept/pass optional `display_name` at dispatch (reject blank authored value); never require it or change briefing.
+- [x] `src/dispatch/fix-directive.ts`, `src/dispatch/perkins.ts`: register fresh spawned minions with known `jobId` before prompt/disposal; leave rebrief and lens labels intact.
+- [x] `src/board/engine.ts`, `web/src/lib/board-protocol.ts`: expose/validate nullable short name alongside full job title, tolerate legacy absence.
+- [x] `web/src/ui/board.ts`, `web/src/styles/components.css`: minion-only name/suffix, collision logic (all states including disposed), accessible full identity and overflow-safe text; preserve full-ID transcript target.
+- [x] `test/ledger-db.test.ts`, `test/ledger-api.test.ts`, `test/dispatch-e2e.test.ts`, `test/dispatch-server.test.ts`, `test/fix-directive.test.ts`, `test/perkins-builtin-wave.test.ts`, `test/board-engine.test.ts`, `web/src/lib/board-protocol.test.ts`, `web/src/ui/board.test.ts`: deterministic red/green migration/restart, associations, lifecycle, collisions, escaping and transcript/non-minion regressions.
 
 **Acceptance Criteria:**
 - Given workers bound to one job, when state changes or service restarts, then the same heist name, unique suffixes, original title/IDs and existing role/state UI persist.
@@ -59,6 +60,8 @@ context: []
 - Given long, Unicode or special names, when rendered at mobile/desktop in light/dark, then text is escaped, bounded and readable with full details available.
 
 ## Implementation Notes
+
+Plan checkpoint approved by owner (journals j-24/j-25); continuation authorized after verified maintenance in re-brief. The checkpoint commit is not implementation. Main is still at e86d92e; #68/#71/#72/#73 remain open at resumption. Integrate landed dependencies before final-head verification/review.
 
 ## Spec Change Log
 
@@ -69,5 +72,7 @@ context: []
 Optional metadata permits authored examples without hardcoded IDs; old jobs derive truthful title fallback. Normalize case/whitespace, truncate at a Unicode-safe word boundary and keep full title separately. Persistent nullable migration waits until approval. Resolve suffix collisions by job ID (unlinked separately), independent of row order. Fallback PASS is not an exact-head Perkins verdict.
 
 ## Verification
+
+Focused checks on the feature tree: `npm run typecheck`; `npm run build`; `npm run build:web`; targeted `npx eslint` on affected files; backend Vitest: ledger-db/api, board-engine, lessons-injection (56 passing), dispatch-server dispatch/validation/fresh directive (3), Perkins fallback (1), fix-directive association (1), dispatch-e2e full heist arc (1); web Vitest board/protocol (38 passing); Playwright mock heist names desktop/mobile light/dark (1 passing; four captures inspected). Initial parallel backend/server run hit co-tenant timeouts and exposed a missing test fixture job; fixture repaired and targeted tests re-ran green. `git diff --check` clean. Full `npm run lint` fails on 40 existing generated BMAD hook errors (`tea-enforce.cjs` in `.agents`/`.claude`), assigned to #72; targeted eslint for changed files passes. Full `npm test` and exact-head Linux CI remain pending: #72 owns the missing `.gru-command/worktree.toml` scheduler full scope and shared CI fixes; #73 owns runtime model resolver; #68/#71 are open incoming UI/board changes. Do not bypass scheduler or claim fallback PASS as exact-head review. No service restart, live config edit, or merge.
 
 - Run affected Vitest suites above, `npm run test:web`, `npm run lint`, `npm run typecheck`, `npm run build`, `npm run build:web`; obtain scheduler-backed full run via `POST /api/verify {job_id,scope:"full"}` after implementation, then exact-head Linux PR CI and independent review. Inspect desktop/mobile light/dark captures, including focus/tooltip and clipping. Deliver PR; never merge/deploy or reopen ended design sessions.

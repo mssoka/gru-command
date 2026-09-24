@@ -2148,6 +2148,7 @@ body {
 }
 
 .board-agent__name {
+  min-width: 0;
   font-weight: 700;
   overflow: hidden;
   text-overflow: ellipsis;

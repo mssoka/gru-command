@@ -35,6 +35,24 @@ describe('ledger api — the record of state', () => {
     expect(events.some((e) => e.kind === 'job.created' && e.jobId === 'fix-login-flow')).toBe(true);
   });
 
+  it('retains optional heist names and bound worker identity through restart and observer updates', () => {
+    const dir = tmpDir();
+    const firstDb = new LedgerDb(dir);
+    const first = new LedgerApi(firstDb.handle, { bus: new EventBus() });
+    first.addJob({ id: 'named-heist', repo: 'fixture', title: 'Full & Detailed Heist Title', displayName: ' Wake Alerts ' });
+    first.addJob({ id: 'legacy-heist', repo: 'fixture', title: 'Original title' });
+    first.registerAgent({ id: 'worker-full-id', role: 'minion', jobId: 'named-heist', sessionFile: '/session' });
+    first.registerAgent({ id: 'worker-full-id', role: 'minion' }); // runtime observer cannot erase the binding
+    firstDb.close();
+    const reopenedDb = new LedgerDb(dir);
+    const reopened = new LedgerApi(reopenedDb.handle, { bus: new EventBus() });
+    expect(reopened.getJob('named-heist')).toMatchObject({ title: 'Full & Detailed Heist Title', displayName: 'Wake Alerts' });
+    expect(reopened.getJob('legacy-heist')?.displayName).toBeNull();
+    expect(reopened.getAgent('worker-full-id')).toMatchObject({ id: 'worker-full-id', jobId: 'named-heist', sessionFile: '/session' });
+    expect(() => reopened.addJob({ id: 'blank-name', repo: 'fixture', title: 'T', displayName: '  ' })).toThrow(/display name/u);
+    reopenedDb.close();
+  });
+
   it('duplicate job ids and empty fields are rejected', () => {
     expect(() => api.addJob({ id: 'fix-login-flow', repo: 'x', title: 'dup' })).toThrow(/already exists/u);
     expect(() => api.addJob({ id: '', repo: 'x', title: 'empty id' })).toThrow(/non-empty/u);

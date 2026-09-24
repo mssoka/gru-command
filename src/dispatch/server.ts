@@ -175,6 +175,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
         title: strField(body, 'title'),
+        ...(body.display_name !== undefined ? { displayName: strField(body, 'display_name') } : {}),
         briefing: strField(body, 'briefing'),
       });
       // The minion's turn runs in the background; the board carries the

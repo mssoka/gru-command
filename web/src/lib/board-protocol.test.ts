@@ -81,6 +81,20 @@ describe('board server-frame validator', () => {
     expect(error).toEqual({ type: 'error', message: 'bad token', fatal: true });
   });
 
+  it('accepts legacy absent and nullable heist metadata, rejects malformed authored names', () => {
+    const board = snapshot();
+    const job = board.repos[0]!.jobs[0]! as { displayName?: unknown };
+    expect(isValidSnapshot(board)).toBe(true); // older server
+    job.displayName = null;
+    expect(isValidSnapshot(board)).toBe(true);
+    job.displayName = 'Wake & alerts';
+    expect(isValidSnapshot(board)).toBe(true);
+    job.displayName = '   ';
+    expect(isValidSnapshot(board)).toBe(false);
+    job.displayName = 123;
+    expect(isValidSnapshot(board)).toBe(false);
+  });
+
   it('rejects malformed frames (wrong shapes, missing fields, non-objects)', () => {
     expect(parseBoardServerFrame(null)).toBeNull();
     expect(parseBoardServerFrame('board')).toBeNull();

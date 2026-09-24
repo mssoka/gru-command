@@ -790,9 +790,13 @@ export class BoardView {
       rail.append(el('div', 'lbl', 'no crew yet'));
       return;
     }
+    // Resolve identities across live AND disposed workers so a collapsed
+    // row cannot change the suffix of a visible worker.
+    const jobs = new Map(this.snapshot?.repos.flatMap((repo) => repo.jobs.map((job) => [job.id, job] as const)) ?? []);
+    const suffixes = minionSuffixes(agents, jobs);
     // Liveness-first order arrives from the server; disposed rows collapse
     // behind a toggle so the graveyard never crowds live work.
-    for (const agent of live) rail.append(this.agentRow(agent, false));
+    for (const agent of live) rail.append(this.agentRow(agent, false, jobs, suffixes));
     if (disposed.length > 0) {
       const toggle = el(
         'button',
@@ -812,7 +816,7 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.disposedExpanded) {
-        for (const agent of disposed) rail.append(this.agentRow(agent, true));
+        for (const agent of disposed) rail.append(this.agentRow(agent, true, jobs, suffixes));
       }
     }
   }
@@ -820,26 +824,30 @@ export class BoardView {
   /** One dense agent row: status dot, name + short hash, role·state
    * subline, right-aligned status chip. Error rows carry the alert
    * accent (tint + left border) so a fault never hides in the list. */
-  private agentRow(agent: AgentView, disposed: boolean): HTMLElement {
+  private agentRow(agent: AgentView, disposed: boolean, jobs: ReadonlyMap<string, JobView>, suffixes: ReadonlyMap<string, string>): HTMLElement {
+    const job = agent.role === 'minion' ? jobs.get(agent.jobId ?? '') : undefined;
+    const name = agent.role === 'minion' ? heistName(job?.displayName ?? job?.title) : agentLabel(agent);
     const row = el('button', `board-agent${disposed ? ' board-agent--disposed' : ''}`);
     row.type = 'button';
     row.dataset.state = agent.state;
     row.dataset.role = agent.role;
     if (agent.state === 'error') row.classList.add('board-agent--error');
-    row.title =
-      agent.sessionFile !== null
-        ? `${agent.id} — open transcript`
-        : `${agent.id} — no session file yet`;
+    row.title = [
+      ...(job !== undefined ? [job.title] : []),
+      agent.id,
+      agent.sessionFile !== null ? 'open transcript' : 'no session file yet',
+    ].join(' — ');
+    if (agent.role === 'minion') row.setAttribute('aria-label', `${name} · ${agent.id}${job !== undefined ? ` — ${job.title}` : ''} — ${agent.role} · ${agent.state}`);
     row.addEventListener('click', () => {
       if (agent.sessionFile !== null) {
-        this.onOpenTranscript({ file: agent.sessionFile ?? '', label: agentLabel(agent) });
+        this.onOpenTranscript({ file: agent.sessionFile, label: agentLabel(agent) });
       }
     });
     const body = el('span', 'board-agent__body');
     const top = el('span', 'board-agent__top');
     top.append(
-      el('span', 'board-agent__name', agentLabel(agent)),
-      el('span', 'board-agent__hash lbl', agent.id.slice(0, 8)),
+      el('span', 'board-agent__name', name),
+      el('span', 'board-agent__hash lbl', agent.role === 'minion' ? (suffixes.get(agent.id) ?? agent.id.slice(-4)) : agent.id.slice(0, 8)),
     );
     const subline = el('span', 'board-agent__sub lbl');
     subline.append(
@@ -1041,6 +1049,47 @@ export function jobFailing(job: JobView): boolean {
   if (round.status === 'aborted') return true;
   if (round.status !== 'verdict-posted' && round.lenses.some((lens) => lens.state === 'error')) return true;
   return false;
+}
+
+// The authored name is shared by a heist. Older titles are shortened only
+// for display; the full title stays on the job and in the row's tooltip.
+function heistName(source: string | undefined): string {
+  if (source === undefined || source.trim() === '') return 'unassigned';
+  const words = source.toLowerCase().trim().split(/\s+/u);
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  const graphemes = (text: string) => [...segmenter.segment(text)]
+    .map((part) => part.segment);
+  let result = '';
+  for (const word of words) {
+    const next = result === '' ? word : `${result} ${word}`;
+    if (graphemes(next).length > 24 && result !== '') break;
+    result = next;
+    if (graphemes(result).length >= 24) break;
+  }
+  // Don't split emoji sequences or combining marks in a long first word.
+  return graphemes(result).slice(0, 24).join('');
+}
+
+function minionSuffixes(agents: readonly AgentView[], jobs: ReadonlyMap<string, JobView>): ReadonlyMap<string, string> {
+  const groups = new Map<string, string[]>();
+  for (const agent of agents) {
+    if (agent.role !== 'minion') continue;
+    // Missing jobs share the neutral label with null bindings; distinguish
+    // their IDs against every other unassigned worker in that one group.
+    const key = agent.jobId !== null && jobs.has(agent.jobId) ? agent.jobId : '';
+    groups.set(key, [...(groups.get(key) ?? []), agent.id]);
+  }
+  const suffixes = new Map<string, string>();
+  for (const ids of groups.values()) {
+    // For each ID find the shortest suffix which distinguishes it from
+    // every peer's suffix at that length, independent of row ordering.
+    for (const id of ids) {
+      let length = Math.min(4, id.length);
+      while (length < id.length && ids.some((peer) => peer !== id && peer.slice(-length) === id.slice(-length))) length++;
+      suffixes.set(id, id.slice(-length));
+    }
+  }
+  return suffixes;
 }
 
 function agentLabel(agent: AgentView): string {

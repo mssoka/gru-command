@@ -43,6 +43,8 @@ export interface JobRecord {
   readonly id: string;
   readonly repo: string;
   readonly title: string;
+  /** Optional short heist name; the full title remains authoritative. */
+  readonly displayName: string | null;
   readonly status: JobStatus;
   readonly baseBranch: string | null;
   readonly prUrl: string | null;
@@ -453,6 +455,7 @@ export class LedgerApi {
     id: string;
     repo: string;
     title: string;
+    displayName?: string | null;
     baseBranch?: string | null;
     briefing?: string | null;
   }): JobRecord {
@@ -460,6 +463,9 @@ export class LedgerApi {
       throw new Error('job id, repo, and title must be non-empty');
     }
     requireSafeRecordId(input.id, 'job id');
+    if (input.displayName !== undefined && input.displayName !== null && input.displayName.trim() === '') {
+      throw new Error('job display name must be a non-empty string');
+    }
     return this.transaction(() => {
       if (this.getJob(input.id) !== null) {
         throw new Error(`job "${input.id}" already exists`);
@@ -467,10 +473,10 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, created_at, updated_at)
-           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?)`,
+          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, display_name, created_at, updated_at)
+           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?)`,
         )
-        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, ts, ts);
+        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, input.displayName?.trim() ?? null, ts, ts);
       this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title } });
       return this.getJob(input.id) as JobRecord;
     });
@@ -1402,6 +1408,7 @@ export class LedgerApi {
       id: str(row.id),
       repo: str(row.repo),
       title: str(row.title),
+      displayName: nstr(row.display_name),
       status: str(row.status) as JobStatus,
       baseBranch: nstr(row.base_branch),
       prUrl: nstr(row.pr_url),

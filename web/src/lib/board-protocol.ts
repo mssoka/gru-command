@@ -53,6 +53,8 @@ export interface JobView {
   readonly id: string;
   readonly repo: string;
   readonly title: string;
+  /** Absent on older servers; null for jobs without an authored name. */
+  readonly displayName?: string | null;
   readonly status: string;
   readonly updatedAt: string;
   readonly prUrl: string | null;
@@ -482,6 +484,7 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
           isRecord(job) &&
           typeof job.id === 'string' &&
           typeof job.title === 'string' &&
+          (job.displayName === undefined || job.displayName === null || (typeof job.displayName === 'string' && job.displayName.trim() !== '')) &&
           typeof job.status === 'string' &&
           (job.prState === null || job.prState === undefined || isPrState(job.prState)) &&
           (job.lane === null || isLane(job.lane)) &&
