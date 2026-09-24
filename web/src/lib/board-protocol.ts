@@ -361,6 +361,16 @@ function isSelfHealView(value: unknown): value is SelfHealView {
   );
 }
 
+function isWakesView(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.count === 'number' &&
+    Number.isSafeInteger(value.count) &&
+    value.count >= 0 &&
+    (value.lastAt === null || typeof value.lastAt === 'string')
+  );
+}
+
 export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (!isRecord(value)) return false;
   if (!Array.isArray(value.repos) || !Array.isArray(value.agents) || !Array.isArray(value.notifications)) {
@@ -374,14 +384,7 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
     typeof value.unackedNeedsOwner !== 'number' ||
     !Number.isSafeInteger(value.unackedNeedsOwner) ||
     value.unackedNeedsOwner < 0 ||
-    !isRecord(value.wakes) ||
-    typeof (value.wakes as Record<string, unknown>).count !== 'number' ||
-    !Number.isSafeInteger((value.wakes as Record<string, unknown>).count) ||
-    ((value.wakes as Record<string, unknown>).count as number) < 0 ||
-    !(
-      (value.wakes as Record<string, unknown>).lastAt === null ||
-      typeof (value.wakes as Record<string, unknown>).lastAt === 'string'
-    )
+    !isWakesView(value.wakes)
   ) {
     return false;
   }
