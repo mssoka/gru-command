@@ -51,6 +51,8 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT',
   'CLAUDE_DOUBLE_COMPACT_HOLD_FILE',
   'CLAUDE_DOUBLE_WORKFLOW_CANDIDATE',
+  'CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL',
+  'CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH',
 ] as const;
 
 const cleanupDirs: string[] = [];
@@ -71,7 +73,7 @@ interface Fixture {
   runtime: ClaudeCodeRuntime;
 }
 
-function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number } = {}): Fixture {
+function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number; reviewSettingsFile?: string } = {}): Fixture {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
   const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
   cleanupDirs.push(home, workspace);
@@ -88,6 +90,7 @@ function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; too
     ...(knobs.killGraceMs !== undefined ? { killGraceMs: knobs.killGraceMs } : {}),
     ...(knobs.toolHeartbeatMs !== undefined ? { toolHeartbeatMs: knobs.toolHeartbeatMs } : {}),
     ...(knobs.modelRuntime !== undefined ? { modelRuntime: knobs.modelRuntime } : {}),
+    ...(knobs.reviewSettingsFile !== undefined ? { reviewSettingsFile: knobs.reviewSettingsFile } : {}),
     log: (level, msg, fields) => logs.push({ level, msg, fields }),
   });
   return { home, workspace, store, logs, doubleLog, runtime };
@@ -752,6 +755,63 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(modelToken(calls[0]!.argv)).toBe(ref.startsWith('bedrock/') ? ref.slice(8) : ref);
       }
     }
+  });
+
+  it('pins the user settings-selected default and env credential for probe, lead and lens without ambient settings', async () => {
+    const fx = fixture();
+    const settingsFile = join(fx.home, 'settings.json');
+    writeFileSync(settingsFile, JSON.stringify({
+      model: 'settings-sonnet', env: { ANTHROPIC_API_KEY: 'test-key', NODE_OPTIONS: '--import=hostile' },
+      hooks: { PreToolUse: [{ hooks: [{ command: 'hostile' }] }] },
+    }));
+    writeFileSync(configPathFor(fx.home), `workspace_root = "${fx.workspace}"\n[runtimes]\ndefault = "claude-code"\n`);
+    const config = loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester');
+    const registry = new RuntimeRegistry({ config, store: fx.store, claude: { binary: DOUBLE, reviewSettingsFile: settingsFile } });
+    process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL'] = 'settings-sonnet';
+    process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'] = 'env';
+    await registry.checkReviewModel('perkins');
+    // An edit after preflight cannot switch the model/credentials mid-review.
+    writeFileSync(settingsFile, JSON.stringify({ model: 'different-model', env: { ANTHROPIC_API_KEY: 'changed' } }));
+    for (const mode of ['reviewLead', 'isolatedReview'] as const) {
+      const handle = await registry.spawn('perkins', { [mode]: { systemPrompt: 'frozen review', tools: [] } });
+      try {
+        await handle.prompt('review');
+      } finally {
+        await handle.dispose();
+      }
+    }
+    await registry.dispose();
+    const calls = doubleInvocations(fx);
+    expect(calls).toHaveLength(3);
+    for (const call of calls) {
+      expect(call.argv[call.argv.indexOf('--model') + 1]).toBe('settings-sonnet');
+      const settingsPath = call.argv[call.argv.indexOf('--settings') + 1]!;
+      expect(settingsPath).not.toBe(settingsFile);
+      expect(existsSync(settingsPath)).toBe(false);
+    }
+  });
+
+  it('pins a settings-based apiKeyHelper across isolated review preflight and child turn', async () => {
+    const fx = fixture();
+    const settingsFile = join(fx.home, 'settings.json');
+    writeFileSync(settingsFile, JSON.stringify({ apiKeyHelper: 'test-auth-helper', model: 'settings-custom-id' }));
+    const runtime = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
+      binary: DOUBLE, reviewSettingsFile: settingsFile,
+    });
+    process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL'] = 'settings-custom-id';
+    process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'] = 'helper';
+    await runtime.checkReviewModel('perkins');
+    await expect(runtime.spawn('perkins', {
+      model: 'different-model', isolatedReview: { systemPrompt: 'lens', tools: [] },
+    })).rejects.toThrow(/differs from the preflighted model/);
+    const handle = await runtime.spawn('perkins', { isolatedReview: { systemPrompt: 'lens', tools: [] } });
+    try {
+      await handle.prompt('review');
+    } finally {
+      await handle.dispose();
+    }
+    expect(doubleInvocations(fx)).toHaveLength(2);
   });
 
   it('rejects a native CLI that cannot authenticate even when metadata is optional', async () => {

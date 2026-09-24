@@ -34,6 +34,7 @@ type PiRuntimeOptionsModelRuntime = ConstructorParameters<typeof PiRuntime>[0]['
 export interface ClaudeKnobs {
   readonly binary?: string;
   readonly killGraceMs?: number;
+  readonly reviewSettingsFile?: string;
 }
 
 export interface RuntimeRegistryOptions {
@@ -154,6 +155,7 @@ export class RuntimeRegistry {
           store: this.opts.store,
           ...(this.opts.claude?.binary !== undefined ? { binary: this.opts.claude.binary } : {}),
           ...(this.opts.claude?.killGraceMs !== undefined ? { killGraceMs: this.opts.claude.killGraceMs } : {}),
+          ...(this.opts.claude?.reviewSettingsFile !== undefined ? { reviewSettingsFile: this.opts.claude.reviewSettingsFile } : {}),
           ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
         });
         this.nativeAdapters.set(id, native);

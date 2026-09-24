@@ -314,6 +314,24 @@ async function writeChunked(obj) {
 
 async function run() {
   const { prompt, images } = promptFromStdin();
+  // A test-only fail-closed stand-in for Claude's review settings resolution.
+  // Never log the settings content (it may hold actual credentials).
+  const expectedModel = process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL'];
+  const expectedAuth = process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'];
+  if (expectedModel !== undefined || expectedAuth !== undefined) {
+    const file = flagValue('--settings');
+    const settings = file === undefined ? {} : JSON.parse(readFileSync(file, 'utf8'));
+    if (!argv.includes('--safe-mode') || flagValue('--setting-sources') !== '' ||
+        !argv.includes('--strict-mcp-config') || !argv.includes('--disable-slash-commands') ||
+        !argv.includes('--no-chrome') || !argv.includes('--tools') ||
+        settings.hooks !== undefined || settings.plugins !== undefined || settings.env?.NODE_OPTIONS !== undefined ||
+        (expectedModel !== undefined && flagValue('--model') !== expectedModel) ||
+        (expectedAuth === 'env' && (settings.env?.ANTHROPIC_API_KEY !== 'test-key' || process.env.ANTHROPIC_API_KEY !== 'test-key')) ||
+        (expectedAuth === 'helper' && settings.apiKeyHelper !== 'test-auth-helper')) {
+      process.stderr.write('review model/auth isolation mismatch\n');
+      process.exit(19);
+    }
+  }
   recordInvocation(prompt, images);
 
   if (prompt.includes('crash')) {
