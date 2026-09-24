@@ -267,8 +267,10 @@ export class PiRuntime implements AgentRuntime {
   private readonly activeFiles = new Set<string>();
   private modelRuntime: ModelRuntime | undefined;
   private modelRuntimePending: Promise<ModelRuntime> | undefined;
-  /** One in-flight refresh shared by every concurrent unknown-model failure. */
-  private catalogRefreshInFlight: Promise<ModelCatalogRefreshOutcome> | null = null;
+  /** Only matching provider refreshes (or a full-catalog refresh) can share
+   * their result. Different providers queue behind one another for the SDK. */
+  private readonly catalogRefreshes = new Map<string, Promise<ModelCatalogRefreshOutcome>>();
+  private catalogRefreshTail: Promise<void> = Promise.resolve();
   private down: string | undefined;
 
   constructor(opts: PiRuntimeOptions) {
@@ -350,13 +352,18 @@ export class PiRuntime implements AgentRuntime {
   }
 
   private async refreshCatalogOnce(provider: string): Promise<ModelCatalogRefreshOutcome> {
-    const inFlight = this.catalogRefreshInFlight;
-    if (inFlight !== null) return inFlight;
-    const refresh = this.performCatalogRefresh(provider).finally(() => {
-      if (this.catalogRefreshInFlight === refresh) this.catalogRefreshInFlight = null;
-    });
-    this.catalogRefreshInFlight = refresh;
-    return refresh;
+    const runtime = await this.runtime();
+    const scope = runtime.getProvider(provider) === undefined ? '*' : provider;
+    const inFlight = this.catalogRefreshes.get('*') ?? this.catalogRefreshes.get(scope);
+    if (inFlight !== undefined) return inFlight;
+    const refresh = this.catalogRefreshTail.then(() => this.performCatalogRefresh(provider));
+    this.catalogRefreshTail = refresh.then(() => {}, () => {});
+    this.catalogRefreshes.set(scope, refresh);
+    try {
+      return await refresh;
+    } finally {
+      if (this.catalogRefreshes.get(scope) === refresh) this.catalogRefreshes.delete(scope);
+    }
   }
 
   /**

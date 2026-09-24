@@ -1,3 +1,4 @@
+import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -833,12 +834,83 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     const b = fx.runtime.checkReviewModel('perkins');
     const spawned = fx.runtime.spawn('perkins');
     await missGate;
-    expect(calls).toBe(1);
+    await vi.waitFor(() => expect(calls).toBe(1));
     release();
     const handle = await spawned;
     await expect(Promise.all([a, b])).resolves.toEqual([undefined, undefined]);
     expect(calls).toBe(1);
     await handle.dispose();
+  });
+
+  it('shares cold catalog initialization across probes and retries a rejected initialization', async () => {
+    const fx = await fixture();
+    let release!: () => void;
+    const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
+    const create = vi.spyOn(ModelRuntime, 'create');
+    let attempts = 0;
+    create.mockImplementation(async () => {
+      attempts += 1;
+      await gate;
+      if (attempts === 1) throw new Error('cold catalog unavailable');
+      return fx.modelRuntime;
+    });
+    const runtime = new PiRuntime({ config: fx.config, store: fx.store, agentDir: fx.agentDir });
+    try {
+      const a = runtime.checkReviewModel('perkins');
+      const b = runtime.checkReviewModel('perkins');
+      const spawn = runtime.spawn('perkins');
+      await vi.waitFor(() => expect(attempts).toBe(1));
+      release();
+      await expect(Promise.allSettled([a, b, spawn])).resolves.toEqual([
+        expect.objectContaining({ status: 'rejected' }),
+        expect.objectContaining({ status: 'rejected' }),
+        expect.objectContaining({ status: 'rejected' }),
+      ]);
+      await expect(runtime.checkReviewModel('perkins')).resolves.toBeUndefined();
+      const handle = await runtime.spawn('perkins');
+      await handle.dispose();
+      expect(create).toHaveBeenCalledTimes(2);
+    } finally {
+      create.mockRestore();
+      await runtime.dispose();
+    }
+  });
+
+  it('does not share a provider-scoped refresh with another provider while preflight and spawn overlap', async () => {
+    let releaseA!: () => void;
+    const aGate = new Promise<void>((resolveGate) => { releaseA = resolveGate; });
+    const refreshed = new Set<string>();
+    const calls: string[] = [];
+    const fx = await fixture([], ['text'], {
+      configExtra: '[models.roles]\nperkins = "gru-stub/live-A"\ngru = "other/live-B"\n',
+      modelCatalogRefresh: async (_runtime, request) => {
+        calls.push(request.provider);
+        if (request.provider === 'gru-stub') await aGate;
+        refreshed.add(request.provider);
+        return { attempted: true, detail: 'completed' };
+      },
+    });
+    const originalProvider = fx.modelRuntime.getProvider('gru-stub')!;
+    const originalModel = fx.modelRuntime.getModel('gru-stub', 'stub-model')!;
+    fx.modelRuntime.registerNativeProvider({
+      ...originalProvider, id: 'other',
+      getModels: () => [{ ...originalModel, provider: 'other', id: 'live-B' }],
+    });
+    await fx.modelRuntime.refresh({ allowNetwork: false, providers: ['other'] });
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) =>
+      refreshed.has(provider) ? { ...originalModel, provider, id } : undefined);
+    const a = fx.runtime.checkReviewModel('perkins');
+    await vi.waitFor(() => expect(calls).toEqual(['gru-stub']));
+    const b = fx.runtime.checkReviewModel('gru');
+    const anotherB = fx.runtime.spawn('gru');
+    await new Promise<void>((resolveGate) => setImmediate(resolveGate));
+    expect(calls).toEqual(['gru-stub']);
+    releaseA();
+    await expect(a).resolves.toBeUndefined();
+    await expect(b).resolves.toBeUndefined();
+    const handle = await anotherB;
+    await handle.dispose();
+    expect(calls).toEqual(['gru-stub', 'other']);
   });
 
   it('preflight fails on real miss, offline mode and refresh failure, never substitutes a model', async () => {

@@ -60,7 +60,7 @@ import {
   probeGitLabRemote,
   probeReviewPolicy,
   repoRemote,
-  runReviewPreflight,
+  runRuntimeReviewPreflight,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
@@ -127,13 +127,11 @@ async function reviewPreflightCheck(
   config: ReturnType<typeof loadConfig>,
   registry: RuntimeRegistry,
   repoPath: string,
-): Promise<Awaited<ReturnType<typeof runReviewPreflight>>> {
-  let reviewModel: Awaited<ReturnType<RuntimeRegistry['prepareReviewModel']>>;
-  const result = await runReviewPreflight({
+): Promise<Awaited<ReturnType<typeof runRuntimeReviewPreflight>>> {
+  return runRuntimeReviewPreflight(() => registry.prepareReviewModel('perkins'), {
     'resource-integrity': () => {
       loadPerkinsPolicy();
     },
-    'model-provider': async () => { reviewModel = await registry.prepareReviewModel('perkins'); },
     'code-host': async () => {
       const remote = repoRemote(repoPath);
       if (remote === null) throw new Error(`repository origin is not a parseable https/ssh remote: ${repoPath}`);
@@ -147,7 +145,6 @@ async function reviewPreflightCheck(
     },
     'review-policy': () => probeReviewPolicy({ reviewEnabled: () => config.review.enabled }),
   });
-  return { ...result, ...(result.ok && reviewModel !== undefined ? { reviewModel } : {}) };
 }
 import { ChatFrameLog } from './chat/frame-log.js';
 import { createChatServer, type ChatServer } from './chat/server.js';

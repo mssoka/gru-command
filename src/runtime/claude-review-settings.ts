@@ -1,6 +1,7 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { Role } from '../config.js';
 
 /** Only model selection and credential/provider environment are permitted
@@ -25,7 +26,7 @@ export interface ClaudeReviewSnapshot extends ClaudeReviewConfiguration {
   readonly role: Role;
 }
 
-const AUTH_ENV = /^(?:ANTHROPIC_(?:API_KEY|AUTH_TOKEN|BASE_URL|CUSTOM_HEADERS|VERTEX_PROJECT_ID|FOUNDRY_RESOURCE|FOUNDRY_BASE_URL|MODEL|DEFAULT_(?:OPUS|SONNET|HAIKU)_MODEL)|CLAUDE_CODE_USE_(?:BEDROCK|VERTEX|FOUNDRY)|AWS_[A-Z0-9_]+|GOOGLE_[A-Z0-9_]+|CLOUD_ML_REGION)$/u;
+const AUTH_ENV = /^(?:ANTHROPIC_(?:API_KEY|AUTH_TOKEN|BASE_URL|CUSTOM_HEADERS|VERTEX_PROJECT_ID|FOUNDRY_RESOURCE|FOUNDRY_BASE_URL|MODEL|DEFAULT_(?:OPUS|SONNET|HAIKU)_MODEL)|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_USE_(?:BEDROCK|VERTEX|FOUNDRY)|AWS_[A-Z0-9_]+|GOOGLE_[A-Z0-9_]+|CLOUD_ML_REGION)$/u;
 
 export function userClaudeSettingsFile(): string {
   return join(process.env['CLAUDE_CONFIG_DIR'] ?? join(homedir(), '.claude'), 'settings.json');
@@ -39,6 +40,8 @@ export function resolveClaudeReviewConfiguration(modelRef: string, file: string)
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return { modelRef, settings: {}, authEnv: capturedAuthEnv({}) };
     }
+    // JSON syntax errors can quote credential bytes from the malformed file.
+    if (error instanceof SyntaxError) throw new Error(`malformed Claude review model/auth settings JSON at ${file}`);
     throw new Error(`cannot read Claude review model/auth settings at ${file}: ${String(error)}`);
   }
   if (typeof source !== 'object' || source === null || Array.isArray(source)) {
@@ -74,6 +77,37 @@ export function resolveClaudeReviewConfiguration(modelRef: string, file: string)
       ...(Object.keys(env).length > 0 ? { env } : {}),
     },
     authEnv: capturedAuthEnv(env),
+  };
+}
+
+/** Resolve a user-owned helper once, outside the frozen review tree. Only its
+ * credential (not an executable setting) crosses the preflight/turn boundary.
+ * A request snapshot retains this value even if the user's settings rotate. */
+export function materializeClaudeReviewCredentials(
+  configuration: ClaudeReviewConfiguration, settingsFile: string,
+): ClaudeReviewConfiguration {
+  const { apiKeyHelper, ...safeSettings } = configuration.settings;
+  if (apiKeyHelper === undefined) return configuration;
+  // The settings source is user-controlled, never the review cwd. Resolve
+  // symlinks before starting the helper so a relative command cannot pick up
+  // a same-named executable checked into the reviewed branch.
+  const cwd = realpathSync(dirname(settingsFile));
+  const result = spawnSync(apiKeyHelper, {
+    shell: true, cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 8_192,
+    env: claudeReviewProcessEnv(configuration), windowsHide: true,
+  });
+  if (result.error !== undefined || result.status !== 0 || result.stdout.trim() === '') {
+    // Neither stderr nor error text may include the helper's credential.
+    throw new Error(`Claude review apiKeyHelper from ${settingsFile} failed in the user settings directory`);
+  }
+  const { ANTHROPIC_API_KEY: _settingsKey, ...settingsEnv } = safeSettings.env ?? {};
+  return {
+    ...configuration,
+    settings: {
+      ...safeSettings,
+      ...(safeSettings.env !== undefined ? { env: settingsEnv } : {}),
+    },
+    authEnv: { ...configuration.authEnv, ANTHROPIC_API_KEY: result.stdout.trim() },
   };
 }
 

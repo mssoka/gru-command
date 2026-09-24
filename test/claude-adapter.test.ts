@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createConnection } from 'node:net';
-import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import {
   CLAUDE_CODE_CAPABILITIES,
@@ -56,12 +56,22 @@ const DOUBLE_ENV_KEYS = [
 ] as const;
 
 const cleanupDirs: string[] = [];
+const isAuthKey = (key: string) =>
+  /^(?:ANTHROPIC_|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_USE_|AWS_|GOOGLE_|CLOUD_ML_REGION)/u.test(key);
+const hostAuthEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => isAuthKey(key)));
+const clearAuthEnv = () => {
+  for (const key of Object.keys(process.env).filter(isAuthKey)) delete process.env[key];
+};
+beforeEach(clearAuthEnv);
 afterAll(() => {
+  clearAuthEnv();
+  Object.assign(process.env, hostAuthEnv);
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
 });
 afterEach(() => {
-  // Double env knobs must never leak between tests.
+  // Double knobs and credentials must never leak between tests.
   for (const key of DOUBLE_ENV_KEYS) delete process.env[key];
+  clearAuthEnv();
 });
 
 interface Fixture {
@@ -90,7 +100,7 @@ function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; too
     ...(knobs.killGraceMs !== undefined ? { killGraceMs: knobs.killGraceMs } : {}),
     ...(knobs.toolHeartbeatMs !== undefined ? { toolHeartbeatMs: knobs.toolHeartbeatMs } : {}),
     ...(knobs.modelRuntime !== undefined ? { modelRuntime: knobs.modelRuntime } : {}),
-    ...(knobs.reviewSettingsFile !== undefined ? { reviewSettingsFile: knobs.reviewSettingsFile } : {}),
+    reviewSettingsFile: knobs.reviewSettingsFile ?? join(home, 'absent-review-settings.json'),
     log: (level, msg, fields) => logs.push({ level, msg, fields }),
   });
   return { home, workspace, store, logs, doubleLog, runtime };
@@ -621,6 +631,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       config: (fx.runtime as never as { config: never }).config,
       store: fx.store,
       binary: join(fx.home, 'no-such-claude'),
+      reviewSettingsFile: join(fx.home, 'absent-review-settings.json'),
     });
     await expect(missing.spawn('gru')).rejects.toThrow(/no-such-claude/);
     expect(missing.health().state).toBe('down');
@@ -656,6 +667,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: fx.store,
       binary,
+      reviewSettingsFile: join(fx.home, 'absent-review-settings.json'),
     });
     const handle = await runtime.spawn('gru');
     await handle.prompt('first turn fine');
@@ -741,7 +753,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       // Preflight must use the same role policy as the subsequent spawn.
       writeFileSync(configPathFor(fx.home), `workspace_root = "${fx.workspace}"\n[models.roles]\nperkins = "${ref}"\n`);
       const config = loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester');
-      const runtime = new ClaudeCodeRuntime({ config, store: fx.store, binary: DOUBLE });
+      const runtime = new ClaudeCodeRuntime({ config, store: fx.store, binary: DOUBLE, reviewSettingsFile: join(fx.home, 'absent-review-settings.json') });
       await runtime.checkReviewModel('perkins');
       const handle = await runtime.spawn('perkins');
       await handle.prompt('hello');
@@ -792,10 +804,17 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('pins a settings-based apiKeyHelper across isolated review preflight and child turn', async () => {
+  it('runs a relative credential helper only in the trusted settings directory, never in the review tree', async () => {
     const fx = fixture();
     const settingsFile = join(fx.home, 'settings.json');
-    writeFileSync(settingsFile, JSON.stringify({ apiKeyHelper: 'test-auth-helper', model: 'settings-custom-id', env: { ANTHROPIC_MODEL: 'settings-custom-id' } }));
+    const trustedMarker = join(fx.home, 'helper-ran');
+    const hostileMarker = join(fx.home, 'hostile-ran');
+    const helperName = 'review-key-helper';
+    writeFileSync(join(fx.home, helperName), `#!/bin/sh\nprintf helper-key\ntouch "${trustedMarker}"\n`);
+    chmodSync(join(fx.home, helperName), 0o700);
+    writeFileSync(join(fx.workspace, helperName), `#!/bin/sh\ntouch "${hostileMarker}"\nprintf hostile-key\n`);
+    chmodSync(join(fx.workspace, helperName), 0o700);
+    writeFileSync(settingsFile, JSON.stringify({ apiKeyHelper: `./${helperName}`, model: 'settings-custom-id' }));
     const runtime = new ClaudeCodeRuntime({
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
       binary: DOUBLE, reviewSettingsFile: settingsFile,
@@ -803,15 +822,134 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL'] = 'settings-custom-id';
     process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'] = 'helper';
     const reviewModel = await runtime.prepareReviewModel('perkins');
+    expect(existsSync(trustedMarker)).toBe(true);
+    // Rotating the source after preflight must not execute another helper.
+    rmSync(trustedMarker);
+    writeFileSync(settingsFile, JSON.stringify({ apiKeyHelper: './not-present' }));
     await expect(runtime.spawn('perkins', {
       model: 'different-model', isolatedReview: { systemPrompt: 'lens', tools: [] }, reviewModel,
     })).rejects.toThrow(/differs from the preflighted model/);
-    const handle = await runtime.spawn('perkins', { isolatedReview: { systemPrompt: 'lens', tools: [] }, reviewModel });
-    try {
-      await handle.prompt('review');
-    } finally {
-      await handle.dispose();
+    for (const mode of ['reviewLead', 'isolatedReview'] as const) {
+      const handle = await runtime.spawn('perkins', {
+        cwd: fx.workspace, [mode]: { systemPrompt: 'review', tools: [], nativeTools: [] }, reviewModel,
+      });
+      try { await handle.prompt('review'); } finally { await handle.dispose(); }
     }
+    expect(existsSync(hostileMarker)).toBe(false);
+    expect(existsSync(trustedMarker)).toBe(false);
+    expect(doubleInvocations(fx)).toHaveLength(3);
+  });
+
+  it('preserves settings OAuth credentials through probe, lead and lens without an inherited API key', async () => {
+    const fx = fixture();
+    const settingsFile = join(fx.home, 'oauth-settings.json');
+    writeFileSync(settingsFile, JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'oauth-test-token' } }));
+    const runtime = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
+      binary: DOUBLE, reviewSettingsFile: settingsFile,
+    });
+    process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'] = 'oauth';
+    const snapshot = await runtime.prepareReviewModel('perkins');
+    expect(snapshot.authEnv['CLAUDE_CODE_OAUTH_TOKEN']).toBe('oauth-test-token');
+    writeFileSync(settingsFile, '{}');
+    process.env['CLAUDE_CODE_OAUTH_TOKEN'] = 'rotated-token';
+    for (const mode of ['reviewLead', 'isolatedReview'] as const) {
+      const handle = await runtime.spawn('perkins', { [mode]: { systemPrompt: 'review', tools: [] }, reviewModel: snapshot });
+      try { await handle.prompt('review'); } finally { await handle.dispose(); }
+    }
+    delete process.env['CLAUDE_CODE_OAUTH_TOKEN'];
+    expect(doubleInvocations(fx)).toHaveLength(3);
+  });
+
+  it('direct isolated overrides honor native model tokens and pin the supplied snapshot', async () => {
+    const fx = fixture();
+    const settingsFile = join(fx.home, 'settings.json');
+    writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'test-key' } }));
+    const runtime = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
+      binary: DOUBLE, reviewSettingsFile: settingsFile,
+    });
+    process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'] = 'env';
+    process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL'] = 'sonnet';
+    const direct = await runtime.spawn('perkins', {
+      model: 'anthropic/sonnet', isolatedReview: { systemPrompt: 'lens', tools: [] },
+    });
+    try { await direct.prompt('review'); } finally { await direct.dispose(); }
+    writeFileSync(configPathFor(fx.home), `workspace_root = "${fx.workspace}"\n[models.roles]\nperkins = "anthropic/sonnet"\n`);
+    const configured = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
+      binary: DOUBLE, reviewSettingsFile: settingsFile,
+    });
+    const original = await configured.prepareReviewModel('perkins');
+    const equivalent = await configured.spawn('perkins', {
+      model: 'sonnet', reviewModel: original, reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] },
+    });
+    try { await equivalent.prompt('review'); } finally { await equivalent.dispose(); }
+    await expect(configured.spawn('perkins', {
+      model: 'opus', reviewModel: original, isolatedReview: { systemPrompt: 'lens', tools: [] },
+    })).rejects.toThrow(/differs from the preflighted model/);
+    delete process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL'];
+    const defaultHandle = await runtime.spawn('perkins', {
+      model: 'default', isolatedReview: { systemPrompt: 'lens', tools: [] },
+    });
+    try { await defaultHandle.prompt('review'); } finally { await defaultHandle.dispose(); }
+    expect(doubleInvocations(fx).map((call) => call.argv.includes('--model'))).toEqual([true, true, true, false]);
+  });
+
+  it('rejects malformed credential JSON without disclosing its input in diagnostics', async () => {
+    const fx = fixture();
+    const settingsFile = join(fx.home, 'broken-settings.json');
+    const secret = 'credential-canary-private';
+    writeFileSync(settingsFile, `{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"${secret}"}, invalid}`);
+    const runtime = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
+      binary: DOUBLE, reviewSettingsFile: settingsFile,
+    });
+    let detail = '';
+    try { await runtime.prepareReviewModel('perkins'); }
+    catch (error) { detail = String(error); }
+    expect(detail).toContain('malformed Claude review model/auth settings JSON');
+    expect(detail).not.toContain(secret);
+    expect(doubleInvocations(fx)).toEqual([]);
+  });
+
+  it('cleans credential-bearing probe and failed bridge settings without spawning a session', async () => {
+    const fx = fixture();
+    const settingsFile = join(fx.home, 'credential-settings.json');
+    const runtime = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
+      binary: DOUBLE, reviewSettingsFile: settingsFile,
+    });
+    const reviewDirs = () => readdirSync(tmpdir()).filter((name) => name.startsWith('gru-claude-review-')).sort();
+    const before = new Set(reviewDirs());
+    const newlyRetained = () => reviewDirs().filter((name) => !before.has(name));
+    process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'] = 'env';
+    writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'bad-key' } }));
+    await expect(runtime.prepareReviewModel('perkins')).rejects.toThrow(/not configured\/authed/);
+    expect(newlyRetained()).toEqual([]);
+    writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'test-key' } }));
+    const snapshot = await runtime.prepareReviewModel('perkins');
+    expect(newlyRetained()).toEqual([]);
+    const goodProbe = doubleInvocations(fx)[0]!;
+    const settingsPath = goodProbe.argv[goodProbe.argv.indexOf('--settings') + 1]!;
+    expect(existsSync(settingsPath)).toBe(false);
+    await expect(runtime.spawn('perkins', {
+      reviewModel: { ...snapshot, role: 'gru' },
+      isolatedReview: { systemPrompt: 'lens', tools: [] },
+    })).rejects.toThrow(/snapshot belongs to gru/);
+    await expect(runtime.spawn('perkins', {
+      reviewModel: snapshot,
+      reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [
+        { name: 'invalid', description: 'rejected', inputSchema: {}, execute: async () => ({ text: '' }) },
+      ] },
+    })).rejects.toThrow(/invalid or duplicate native review tool name/);
+    expect(newlyRetained()).toEqual([]);
+    expect(doubleInvocations(fx)).toHaveLength(1);
+    const recovered = await runtime.spawn('perkins', {
+      reviewModel: snapshot, isolatedReview: { systemPrompt: 'lens', tools: [] },
+    });
+    try { await recovered.prompt('review'); } finally { await recovered.dispose(); }
+    expect(newlyRetained()).toEqual([]);
     expect(doubleInvocations(fx)).toHaveLength(2);
   });
 
@@ -883,6 +1021,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: fx.store,
       binary: join(fx.home, 'missing-claude'),
+      reviewSettingsFile: join(fx.home, 'absent-review-settings.json'),
     });
     await expect(runtime.checkReviewModel('perkins')).rejects.toThrow(/claude-code is not configured\/authed/);
   });
@@ -896,6 +1035,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: fx.store,
       binary,
+      reviewSettingsFile: join(fx.home, 'absent-review-settings.json'),
     });
     await expect(runtime.checkReviewModel('perkins')).rejects.toThrow(
       /claude-code is not configured\/authed for the review model: invalid credentials for selected model/,
@@ -907,7 +1047,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     writeFileSync(configPathFor(fx.home),
       `workspace_root = "${fx.workspace}"\n[runtimes]\ndefault = "pi"\n[runtimes.roles]\nperkins = "claude-code"\n[models.roles]\nperkins = "sonnet"\n`);
     const config = loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester');
-    const registry = new RuntimeRegistry({ config, store: fx.store, claude: { binary: DOUBLE } });
+    const registry = new RuntimeRegistry({ config, store: fx.store, claude: { binary: DOUBLE, reviewSettingsFile: join(fx.home, 'absent-review-settings.json') } });
     try {
       expect(registry.runtimeIdFor('gru')).toBe('pi');
       expect(registry.runtimeIdFor('perkins')).toBe('claude-code');
@@ -1333,6 +1473,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: new SessionStore(fx.store.dataDir),
       binary: DOUBLE,
+      reviewSettingsFile: join(fx.home, 'absent-review-settings.json'),
     });
     const resumed = await secondRuntime.spawn('gru', { resumeFile: file });
     try {
@@ -1402,6 +1543,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: new SessionStore(fx.store.dataDir),
       binary: DOUBLE,
+      reviewSettingsFile: join(fx.home, 'absent-review-settings.json'),
     });
     const resumed = await secondRuntime.spawn('gru', { resumeFile: file });
     try {
@@ -1486,6 +1628,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: fx.store, // SAME store instance — the in-process single-writer hole
       binary: DOUBLE,
+      reviewSettingsFile: join(fx.home, 'absent-review-settings.json'),
     });
     await expect(sibling.spawn('gru', { resumeFile: file })).rejects.toThrow(
       /already hosted by this process/,
@@ -1507,6 +1650,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: poisoned,
       binary: DOUBLE,
+      reviewSettingsFile: join(fx.home, 'absent-review-settings.json'),
     });
     await expect(runtime.spawn('gru')).rejects.toThrow('staged lock failure');
     const dir = fx.store.sessionDirFor('gru', fx.workspace);
@@ -1527,7 +1671,7 @@ describe('RuntimeRegistry + claude-code (fallback-wrapped)', () => {
     const registry = new RuntimeRegistry({
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: fx.store,
-      claude: { binary: DOUBLE },
+      claude: { binary: DOUBLE, reviewSettingsFile: join(fx.home, 'absent-review-settings.json') },
     });
     return { fx, registry };
   }
@@ -1640,7 +1784,7 @@ describe('RuntimeRegistry + claude-code (fallback-wrapped)', () => {
     const registry = new RuntimeRegistry({
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
       store: fx.store,
-      claude: { binary: DOUBLE },
+      claude: { binary: DOUBLE, reviewSettingsFile: join(fx.home, 'absent-review-settings.json') },
     });
     try {
       const gru = await registry.spawn('gru');

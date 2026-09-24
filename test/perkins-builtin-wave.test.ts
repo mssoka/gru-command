@@ -12,7 +12,10 @@ import {
   type FallbackGateOutcome,
   type WaveOutcome,
 } from '../src/dispatch/perkins.js';
-import { preflightFailure, type FallbackFinding } from '../src/dispatch/review-path.js';
+import { preflightFailure, runRuntimeReviewPreflight, type FallbackFinding } from '../src/dispatch/review-path.js';
+import { configPathFor, loadConfig } from '../src/config.js';
+import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { SessionStore } from '../src/sessions/store.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
 
 /** These suites exercise the Perkins route (no pre-flight configured), so
@@ -984,6 +987,66 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     rmSync(harness.artifacts, { recursive: true, force: true });
     rmSync(harness.sessions, { recursive: true, force: true });
   }
+
+  it('routes a native preflight failure to persisted fallback history and forwards a recovered snapshot', async () => {
+    const harness = gateHarness([[]]);
+    const home = mkdtempSync(join(tmpdir(), 'perkins-native-preflight-home-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'perkins-native-preflight-ws-'));
+    const settingsFile = join(home, 'claude-settings.json');
+    writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n[runtimes]\ndefault = "claude-code"\n`);
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const registry = new RuntimeRegistry({
+      config, store: new SessionStore(config.dataDir),
+      claude: { binary: join(import.meta.dirname, 'helpers', 'claude-double.mjs'), reviewSettingsFile: settingsFile },
+    });
+    const seen: boolean[] = [];
+    const spawner = makeSpawner(harness.sessions, []);
+    const wave = new WaveRunner({
+      ledger: harness.ledger, worktrees: harness.port, reviewArtifactRoot: harness.artifacts,
+      reviewPreflight: () => runRuntimeReviewPreflight(
+        () => registry.prepareReviewModel('perkins'),
+        { 'resource-integrity': () => {}, 'code-host': () => {}, 'review-policy': () => {} },
+      ),
+      spawner: (role, options) => {
+        if (options?.reviewLead !== undefined || options?.isolatedReview !== undefined) {
+          seen.push(options.reviewModel?.role === 'perkins');
+        }
+        return spawner(role, options);
+      },
+      fallbackGate: {
+        skillPath: join(harness.artifacts, 'skills', 'bmad-review', 'SKILL.md'),
+        runFallbackReview: async () => [],
+        fixDirectiveSink: async () => ({ delivered: true }),
+      },
+    });
+    try {
+      await harness.port.createJobWorktree({ repoPath: harness.repo.path, jobId: harness.job.id });
+      writeFileSync(settingsFile, '{"env": {"CLAUDE_CODE_OAUTH_TOKEN":"private-canary"}, broken');
+      const failed = await wave.runRound({ jobId: harness.job.id });
+      expect('route' in failed && failed.route).toBe('bmad-review-fallback');
+      expect(seen).toEqual([]);
+      expect(harness.ledger.listRounds(harness.job.id)).toEqual([]);
+      const history = gateEvents(harness);
+      expect(history.some((payload) => payload['phase'] === 'pass')).toBe(true);
+      expect(JSON.stringify(history)).toContain('malformed Claude review model/auth settings JSON');
+      expect(JSON.stringify(history)).not.toContain('private-canary');
+      writeFileSync(settingsFile, JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-oauth' } }));
+      const recoveredJob = harness.ledger.addJob({
+        id: 'job-native-recovered', repo: 'fixture', title: 'recovered model', baseBranch: 'main', briefing: 'review',
+      });
+      settleLane(harness.ledger, recoveredJob.id);
+      await harness.port.createJobWorktree({ repoPath: harness.repo.path, jobId: recoveredJob.id });
+      const recovered = await wave.runRound({ jobId: recoveredJob.id });
+      expect('route' in recovered).toBe(false);
+      expect(seen.length).toBeGreaterThan(1);
+      expect(seen.every(Boolean)).toBe(true);
+    } finally {
+      await registry.dispose();
+      cleanupGate(harness);
+      rmSync(home, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   it('triages, routes the blocker fix directive to the minion, re-reviews, and passes clean', async () => {
     const harness = gateHarness([

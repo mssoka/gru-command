@@ -43,7 +43,7 @@
  */
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { spawn as childSpawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -321,6 +321,10 @@ async function run() {
   if (expectedModel !== undefined || expectedAuth !== undefined) {
     const file = flagValue('--settings');
     const settings = file === undefined ? {} : JSON.parse(readFileSync(file, 'utf8'));
+    if (file !== undefined && (statSync(file).mode & 0o077) !== 0) {
+      process.stderr.write('review settings are not private\n');
+      process.exit(19);
+    }
     const selected = flagValue('--model') ?? process.env.ANTHROPIC_MODEL ?? settings.model;
     if (!argv.includes('--safe-mode') || flagValue('--setting-sources') !== '' ||
         !argv.includes('--strict-mcp-config') || !argv.includes('--disable-slash-commands') ||
@@ -328,7 +332,9 @@ async function run() {
         settings.hooks !== undefined || settings.plugins !== undefined || settings.env?.NODE_OPTIONS !== undefined ||
         (expectedModel !== undefined && selected !== expectedModel) ||
         (expectedAuth === 'env' && (settings.env?.ANTHROPIC_API_KEY !== 'test-key' || process.env.ANTHROPIC_API_KEY !== 'test-key')) ||
-        (expectedAuth === 'helper' && settings.apiKeyHelper !== 'test-auth-helper')) {
+        (expectedAuth === 'helper' && (settings.apiKeyHelper !== undefined || process.env.ANTHROPIC_API_KEY !== 'helper-key')) ||
+        (expectedAuth === 'oauth' && (settings.env?.CLAUDE_CODE_OAUTH_TOKEN !== 'oauth-test-token' ||
+          process.env.CLAUDE_CODE_OAUTH_TOKEN !== 'oauth-test-token'))) {
       process.stderr.write('review model/auth isolation mismatch\n');
       process.exit(19);
     }

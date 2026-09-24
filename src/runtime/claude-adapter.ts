@@ -24,7 +24,8 @@ import { LockBusyError, type SessionStore } from '../sessions/store.js';
 import { resolveSpawnCwd } from './cwd.js';
 import { buildClaudeCodeAuthArgs, claudeCliModel, claudeReviewIsolationArgs } from './claude-model.js';
 import {
-  claudeReviewProcessEnv, privateClaudeReviewSettings, resolveClaudeReviewConfiguration, userClaudeSettingsFile,
+  claudeReviewProcessEnv, materializeClaudeReviewCredentials, privateClaudeReviewSettings,
+  resolveClaudeReviewConfiguration, userClaudeSettingsFile,
   type ClaudeReviewSnapshot,
 } from './claude-review-settings.js';
 import { ReviewMcpBridge } from './review-mcp-bridge.js';
@@ -296,9 +297,9 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   /** Probe under the request-owned settings given to this review's lead
    * and lenses. Never store the proof on the shared adapter. */
   async prepareReviewModel(role: Role): Promise<ClaudeReviewSnapshot> {
-    const configuration = resolveClaudeReviewConfiguration(
+    const configuration = materializeClaudeReviewCredentials(resolveClaudeReviewConfiguration(
       resolveSpawnPolicy(this.config, 'claude-code', role).model, this.reviewSettingsFile,
-    );
+    ), this.reviewSettingsFile);
     claudeCliModel(configuration.modelRef);
     const settings = privateClaudeReviewSettings(configuration.settings);
     try {
@@ -350,9 +351,11 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     // supplies the request's snapshot to every lead/lens in that round.
     const configuredReviewModel = resolveSpawnPolicy(this.config, 'claude-code', role).model;
     const reviewConfiguration = reviewMode === undefined ? undefined :
-      options.reviewModel ?? resolveClaudeReviewConfiguration(configuredReviewModel, this.reviewSettingsFile);
-    if (reviewConfiguration !== undefined && options.model !== undefined &&
-        options.model !== configuredReviewModel && options.model !== reviewConfiguration.modelRef) {
+      options.reviewModel ?? materializeClaudeReviewCredentials(resolveClaudeReviewConfiguration(
+        options.model ?? configuredReviewModel, this.reviewSettingsFile,
+      ), this.reviewSettingsFile);
+    if (options.reviewModel !== undefined && options.model !== undefined &&
+        claudeCliModel(options.model) !== claudeCliModel(options.reviewModel.modelRef)) {
       throw new Error(`review model override "${options.model}" differs from the preflighted model; re-run preflight with the selected model`);
     }
     // Validation failures are caller-facing, never adapter health.

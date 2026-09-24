@@ -71,6 +71,20 @@ export async function runReviewPreflight(checks: Readonly<Record<ReviewCapabilit
   return { ok: failures.length === 0, failures };
 }
 
+/** Production model leg composition: a successful native adapter probe hands
+ * its request-owned proof to the same review wave that was just checked. */
+export async function runRuntimeReviewPreflight(
+  prepareReviewModel: () => Promise<ClaudeReviewSnapshot | undefined>,
+  otherChecks: Readonly<Omit<Record<ReviewCapabilityLeg, ReviewLegCheck>, 'model-provider'>>,
+): Promise<ReviewPreflightResult> {
+  let reviewModel: ClaudeReviewSnapshot | undefined;
+  const result = await runReviewPreflight({
+    ...otherChecks,
+    'model-provider': async () => { reviewModel = await prepareReviewModel(); },
+  });
+  return { ...result, ...(result.ok && reviewModel !== undefined ? { reviewModel } : {}) };
+}
+
 export interface RepoRemote {
   readonly host: string;
   readonly owner: string;

@@ -2,7 +2,9 @@ import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ConfigError, loadConfig } from '../src/config.js';
+import { ConfigError, configPathFor, loadConfig } from '../src/config.js';
+import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { SessionStore } from '../src/sessions/store.js';
 import { buildClaudeCodeAuthArgs, isGitLabRemote } from '../src/dispatch/review-path.js';
 import {
   boundedDiff,
@@ -12,6 +14,7 @@ import {
   probeGitLabRemote,
   renderFixDirective,
   runReviewPreflight,
+  runRuntimeReviewPreflight,
   skillInstalled,
   triageFallbackFindings,
   type FallbackFinding,
@@ -61,6 +64,46 @@ describe('four-leg review pre-flight', () => {
     });
     expect(result.ok).toBe(false);
     expect(result.failures[0]?.leg).toBe('model-provider');
+  });
+
+  it('routes the production native model leg through the same registry used by isolated children', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'native-review-preflight-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'native-review-workspace-'));
+    try {
+      writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n[runtimes]\ndefault = "claude-code"\n`);
+      const config = loadConfig({ GRU_COMMAND_HOME: home }, home);
+      const settings = join(home, 'review-settings.json');
+      const double = join(import.meta.dirname, 'helpers', 'claude-double.mjs');
+      const registry = new RuntimeRegistry({
+        config, store: new SessionStore(config.dataDir),
+        claude: { binary: double, reviewSettingsFile: settings },
+      });
+      const otherChecks = {
+        'resource-integrity': () => {},
+        'code-host': () => {},
+        'review-policy': () => {},
+      };
+      // An absent selected runtime cannot manufacture a proof or a review.
+      writeFileSync(settings, '{broken');
+      const failed = await runRuntimeReviewPreflight(() => registry.prepareReviewModel('perkins'), otherChecks);
+      expect(failed.ok).toBe(false);
+      expect(failed.reviewModel).toBeUndefined();
+      expect(failed.failures.map((failure) => failure.leg)).toEqual(['model-provider']);
+      writeFileSync(settings, JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-oauth' } }));
+      const passed = await runRuntimeReviewPreflight(() => registry.prepareReviewModel('perkins'), otherChecks);
+      expect(passed).toMatchObject({ ok: true, failures: [] });
+      expect(passed.reviewModel?.authEnv['CLAUDE_CODE_OAUTH_TOKEN']).toBe('fixture-oauth');
+      for (const mode of ['reviewLead', 'isolatedReview'] as const) {
+        const handle = await registry.spawn('perkins', {
+          reviewModel: passed.reviewModel, [mode]: { systemPrompt: 'review', tools: [], nativeTools: [] },
+        });
+        try { await handle.prompt('offline native check'); } finally { await handle.dispose(); }
+      }
+      await registry.dispose();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
 
   it('builds failures through the preflightFailure helper', () => {
