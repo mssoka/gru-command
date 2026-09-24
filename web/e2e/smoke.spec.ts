@@ -185,10 +185,7 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
   await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(1);
-  await page
-    .locator('.service-band', { has: page.locator('.notice-line', { hasText: 'context compacted' }) })
-    .locator('.service-band__head')
-    .click();
+  // Ephemeral UI note (not a frame): stays directly visible, never banded.
   await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
 
   const compactFailure = await page.request.post('http://localhost:8788/__compact-fail', {
@@ -198,12 +195,6 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
-  await page
-    .locator('.service-band', {
-      has: page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
-    })
-    .locator('.service-band__head')
-    .click();
   await expect(
     page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
   ).toBeVisible();

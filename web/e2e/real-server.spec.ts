@@ -113,6 +113,7 @@ async function sendAndWaitReply(page: Page, text: string): Promise<void> {
   await page.locator('#chat-input').fill(text);
   await page.locator('#chat-send').click();
   await expect(page.locator('.msg--user', { hasText: text })).toBeVisible();
+  // Awareness may prepend service context; match the echo with the user's words.
   const reply = echoReplies(page, text).last();
   await expect(reply).toBeVisible();
   await expect(reply).not.toHaveClass(/msg--streaming/);
@@ -154,10 +155,6 @@ test('real native compact preserves history and New chat starts unresumed behind
 
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
-  await page
-    .locator('.service-band', { has: page.locator('.notice-line', { hasText: 'context compacted' }) })
-    .locator('.service-band__head')
-    .click();
   await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
   await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(1);
   const oldPointer = JSON.parse(readFileSync(pointerFile, 'utf-8')) as {
@@ -375,7 +372,7 @@ test.describe('board (E6)', () => {
     await expect(drawer).toBeHidden();
   });
 
-  test('notification ack round-trip (E7): a blocked job feeds the bell; ack clears it', async ({ page }) => {
+  test('notification round-trip (E7 + routing split): a blocked job lands in the feed, never the bell; ack clears it', async ({ page }) => {
     // Seed a blocked job through the real API — the FYI derivation posts a
     // durable notification row server-side.
     const headers = { authorization: `Bearer ${REAL_TOKEN}` };
@@ -387,8 +384,8 @@ test.describe('board (E6)', () => {
     await page.locator('#tab-board').click();
     const bell = page.locator('#notification-bell');
     await expect(bell).toBeVisible();
-    // The badge shows while an unseen error exists (CSS keys on data-unread).
-    await expect(bell).not.toHaveAttribute('data-unread', '0');
+    // Routing split: FYI (machine/feed) rows never ring the owner bell.
+    await expect(bell).toHaveAttribute('data-unread', '0');
     await bell.click();
     const panel = page.locator('#notification-panel');
     await expect(panel).toBeVisible();
@@ -407,12 +404,14 @@ test.describe('board (E6)', () => {
     expect(ackedRow.ackedAt).not.toBeNull();
     await bell.click(); // close the panel
 
-    // A NEW notification arriving while paired earns the live toast.
+    // A NEW FYI row arriving while paired stays off the owner's shoulder:
+    // no toast (the FOR YOU band owns the live surface).
     const job2 = { id: 'e2e-ack-job-2', repo: 'e2e-repo', title: 'Toast probe job' };
     await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs`, { headers, data: job2 });
     await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs/e2e-ack-job-2/status`, { headers, data: { status: 'blocked' } });
-    const toast = page.locator('.toast', { hasText: 'e2e-ack-job-2 blocked' });
-    await expect(toast).toBeVisible();
+    await expect(page.locator('.toast', { hasText: 'e2e-ack-job-2 blocked' })).toHaveCount(0);
+    await bell.click();
+    await expect(panel.locator('.board-notification', { hasText: 'e2e-ack-job-2 blocked' })).toBeVisible();
   });
 
   test('unauthenticated board API is a locked door', async ({ page }) => {
