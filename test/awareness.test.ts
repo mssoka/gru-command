@@ -421,6 +421,22 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
     }
   });
 
+  it('persists the delivery stamp so the gap survives a restart', () => {
+    const dir = tmpDir();
+    const rig = boot({ dir });
+    rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+    const block = rig.awareness.prepare();
+    rig.awareness.commit(block!);
+    const state = JSON.parse(readFileSync(join(dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+      digest: { lastDeliveredAt: number | null };
+    };
+    expect(typeof state.digest.lastDeliveredAt).toBe('number');
+    // A restarted awareness reads the same stamp (gap base preserved).
+    const restarted = boot({ dir });
+    restarted.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+    expect(restarted.awareness.prepare()?.text).not.toContain('While you were away');
+  });
+
   it('no digest on a fresh install (no delivery stamp yet) or when disabled', () => {
     vi.useFakeTimers();
     try {

@@ -575,6 +575,7 @@ export class GruAwareness {
     const state: AwarenessState = {
       coveredThroughSeq: this.cursor,
       wake: this.wakePolicy.snapshot(),
+      digest: { lastDeliveredAt: this.lastDeliveredAt },
     };
     const staging = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
     try {

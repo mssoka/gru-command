@@ -20,7 +20,7 @@ const PINS: Record<string, number> = {
   'chat-frame-log.test.ts': 20,
   'chat-frames.test.ts': 4,
   'attachments.test.ts': 28,
-  'awareness.test.ts': 19,
+  'awareness.test.ts': 20,
   'bmad-onboarding.test.ts': 13,
   'chat-server.test.ts': 80,
   'chat-session-state.test.ts': 6,

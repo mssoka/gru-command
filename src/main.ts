@@ -291,6 +291,7 @@ async function main(): Promise<number> {
     registry?: RuntimeRegistry;
     store?: SessionStore;
     chat?: ChatServer;
+    awareness?: GruAwareness;
     board?: Awaited<ReturnType<typeof createBoardServer>>;
     ledgerDb?: LedgerDb;
     supervisor?: Supervisor;
@@ -331,6 +332,15 @@ async function main(): Promise<number> {
             await state.chat.dispose();
           } catch (error) {
             logger.error('chat server shutdown failed', { error: String(error) });
+          }
+        }
+        // After chat: the awareness layer's deferred-wake timer must not
+        // outlive the sink it would call (idempotent, never fatal).
+        if (state.awareness !== undefined) {
+          try {
+            state.awareness.dispose();
+          } catch (error) {
+            logger.error('awareness shutdown failed', { error: String(error) });
           }
         }
         if (state.board !== undefined) {
@@ -623,6 +633,7 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   awareness.setWakeSink(() => chat.wakeAwareness());
+  state.awareness = awareness;
   gruSlot.onSwap((handle) => chat.adoptRestartedGru(handle));
   surfaceInChat = (notification) => {
     chat.surfaceNotice(
