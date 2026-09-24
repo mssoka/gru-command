@@ -6,6 +6,7 @@ import { ClaudeCodeRuntime } from './claude-adapter.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
 import type { AgentHandle, AgentRuntime, RuntimeEvent, SpawnOptions } from './types.js';
+import { ResidentBudget } from './resident-budget.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -46,6 +47,8 @@ export interface RuntimeRegistryOptions {
   readonly pi?: PiKnobs;
   /** claude-code adapter overrides (binary path / kill grace — test seams). */
   readonly claude?: ClaudeKnobs;
+  /** Test/ops quiescence probe: the supervisor's open turn/tool/control truth. */
+  readonly canReclaim?: (agentId: string) => boolean;
 }
 
 /**
@@ -64,6 +67,15 @@ export interface AgentEventEnvelope {
 
 export type AgentEventListener = (envelope: AgentEventEnvelope) => void;
 
+/** A round owns two permits atomically (lead + first child). Optional child
+ * permits are taken only when spare capacity exists and no older request is
+ * waiting; a tool batch releases them after its last child settles. */
+export interface ResidentReviewRound {
+  spawn(options: SpawnOptions): Promise<AgentHandle>;
+  beginChildren(maxChildren: number): { readonly concurrency: number; finish(): void };
+  close(): Promise<void>;
+}
+
 /**
  * Runtime registry (EPICS E2 story 4/5; lands E1-deferred N4): resolves
  * which adapter hosts a role from config (default + per-role overrides),
@@ -78,11 +90,18 @@ export class RuntimeRegistry {
   private readonly opts: RuntimeRegistryOptions;
   private readonly log: Log;
   private growth: GrowthReport | null = null;
+  readonly residents: ResidentBudget;
+  private reclaimProbe: (agentId: string) => boolean;
 
   constructor(opts: RuntimeRegistryOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    this.residents = new ResidentBudget(opts.config.concurrency.maxWorkers);
+    this.reclaimProbe = opts.canReclaim ?? (() => false);
   }
+
+  /** Installed after the supervisor is wired; no reclaim is allowed before it. */
+  setReclaimProbe(probe: (agentId: string) => boolean): void { this.reclaimProbe = probe; }
 
   /** Boot sequence: growth detection first (SPEC ruling 12), then backups. */
   boot(): GrowthReport {
@@ -174,6 +193,93 @@ export class RuntimeRegistry {
   }
 
   async spawn(role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
+    const release = role === 'gru' || role === 'silas' || role === 'bob'
+      ? null : await this.residents.acquire(1, options.signal);
+    try {
+      return await this.spawnReserved(role, options, release);
+    } catch (error) {
+      release?.();
+      throw error;
+    }
+  }
+
+  async reserveReviewRound(signal?: AbortSignal): Promise<ResidentReviewRound> {
+    const releasePair = await this.residents.acquire(2, signal);
+    const live = new Set<AgentHandle>();
+    const pending = new Set<Promise<AgentHandle>>();
+    let leading = false;
+    let childRunning = false;
+    let closed = false;
+    const extras: Array<() => void> = [];
+    let closePromise: Promise<void> | null = null;
+    const spawn = async (options: SpawnOptions): Promise<AgentHandle> => {
+      if (closed) throw new Error('review reservation is closed');
+      const lead = options.reviewLead !== undefined;
+      if (lead && leading) throw new Error('review reservation already has a lead');
+      if (lead) leading = true;
+      let release: (() => void) | null = null;
+      if (!lead) {
+        if (!childRunning) childRunning = true;
+        else {
+          release = extras.shift() ?? null;
+          if (release === null) throw new Error('review child exceeded admitted parallelism');
+        }
+      }
+      const spare = release;
+      const operation = this.spawnReserved('perkins', options, spare);
+      pending.add(operation);
+      try {
+        const handle = await operation;
+        live.add(handle);
+        handle.subscribe((event) => {
+          if (event.type === 'state' && event.state === 'disposed') {
+            live.delete(handle);
+            if (!lead && spare === null) childRunning = false;
+          }
+        });
+        return handle;
+      } catch (error) {
+        if (lead) leading = false;
+        else if (spare === null) childRunning = false;
+        spare?.();
+        throw error;
+      } finally {
+        pending.delete(operation);
+      }
+    };
+    return {
+      spawn,
+      beginChildren: (maxChildren) => {
+        if (closed || extras.length > 0 || childRunning) throw new Error('review child batch overlaps an active batch');
+        for (let i = 1; i < maxChildren; i += 1) {
+          const extra = this.residents.tryAcquire();
+          if (extra === null) break;
+          extras.push(extra);
+        }
+        const concurrency = 1 + extras.length;
+        return {
+          concurrency,
+          finish: () => {
+            for (const extra of extras.splice(0)) extra();
+          },
+        };
+      },
+      close: () => {
+        if (closePromise !== null) return closePromise;
+        closed = true;
+        closePromise = (async () => {
+          await Promise.allSettled([...pending]);
+          await Promise.all([...live].map((handle) => handle.dispose()));
+          for (const extra of extras.splice(0)) extra();
+          releasePair();
+        })();
+        return closePromise;
+      },
+    };
+  }
+
+  private async spawnReserved(role: Role, options: SpawnOptions, release: (() => void) | null): Promise<AgentHandle> {
+    if (options.signal?.aborted) throw new Error('resident admission cancelled before spawn');
     if (options.reviewModel !== undefined && this.runtimeIdFor(role) !== 'claude-code') {
       throw new Error('Claude review model snapshot cannot be used with a different runtime');
     }
@@ -202,7 +308,60 @@ export class RuntimeRegistry {
       model: policy.model,
       thinkingLevel,
     });
-    this.handles.add(handle);
+    let pending = 0;
+    let completedPrompt = false;
+    let disposing: Promise<void> | null = null;
+    let disposingNow = false;
+    let released = false;
+    const releaseHandle = (): void => {
+      if (released) return;
+      released = true;
+      this.handles.delete(resident);
+      this.residents.unwatch(resident);
+      release?.();
+    };
+    const budget = this.residents;
+    const resident: AgentHandle = new Proxy(handle, {
+      get(target, property) {
+        if (property === 'dispose') return (): Promise<void> => {
+          if (disposing !== null) return disposing;
+          disposingNow = true;
+          disposing = Promise.resolve().then(() => target.dispose()).then(() => releaseHandle(), (error: unknown) => {
+            // A runtime may reject after actually disposing; its terminal
+            // health truth, not the rejected promise alone, owns the slot.
+            if (target.health().state === 'disposed') releaseHandle();
+            disposing = null;
+            disposingNow = false;
+            throw error;
+          });
+          return disposing;
+        };
+        if (['prompt', 'steer', 'followUp', 'compact'].includes(String(property))) {
+          const method = Reflect.get(target, property) as ((...args: unknown[]) => Promise<unknown>) | undefined;
+          if (method === undefined) return undefined;
+          return (...args: unknown[]) => {
+            if (disposingNow || released) return Promise.reject(new Error('worker is being disposed'));
+            pending += 1;
+            budget.changed();
+            return Promise.resolve().then(() => method.apply(target, args)).finally(() => {
+              pending -= 1;
+              if (property !== 'compact') completedPrompt = true;
+              budget.changed();
+            });
+          };
+        }
+        const value: unknown = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    this.handles.add(resident);
+    if (release !== null && role === 'minion') {
+      this.residents.watch(resident, () =>
+        completedPrompt && pending === 0 && !disposingNow && !released &&
+        handle.hasLiveProcess?.() !== true && handle.isCompacting?.() !== true &&
+        this.reclaimProbe(handle.id),
+      );
+    }
     // E6 event tap: surface spawn/dispose + forward every runtime event to
     // registry-level subscribers (the board engine's feed).
     this.emitAgentEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
@@ -217,19 +376,23 @@ export class RuntimeRegistry {
       if (event.type === 'state' && event.state === 'disposed') {
         this.emitAgentEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'disposed' });
       }
+      if (event.type === 'state' || event.type === 'turn_start' || event.type === 'turn_end' ||
+        event.type === 'tool_start' || event.type === 'tool_end' ||
+        event.type === 'compaction_start' || event.type === 'compaction_end') {
+        this.residents.changed();
+      }
     });
     // Self-healing membership: a handle disposed by ANY caller leaves the
     // registry set — the status surface must never contradict itself.
     handle.subscribe((event) => {
-      if (event.type === 'state' && event.state === 'disposed') {
-        this.handles.delete(handle);
+      if (event.type === 'state' && event.state === 'disposed' && !disposingNow) {
+        releaseHandle();
       }
     });
-    return handle;
+    return resident;
   }
 
   async disposeHandle(handle: AgentHandle): Promise<void> {
-    this.handles.delete(handle);
     await handle.dispose();
   }
 
@@ -278,6 +441,7 @@ export class RuntimeRegistry {
   }
 
   async dispose(): Promise<void> {
+    this.residents.shutdown();
     for (const handle of [...this.handles]) await this.disposeHandle(handle);
     for (const adapter of this.adapters.values()) await adapter.dispose();
     this.adapters.clear();

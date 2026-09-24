@@ -14,6 +14,8 @@ import {
   type BranchIdlePhase,
 } from './branch-idle.js';
 import type { AgentSpawner } from './service.js';
+import type { EventBus } from '../events/bus.js';
+import type { ResidentReviewRound } from '../runtime/registry.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
@@ -944,6 +946,7 @@ export interface FallbackGateOutcome {
 
 export type ReviewRequestOutcome =
   | { readonly route: 'perkins'; readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }
+  | { readonly route: 'queued'; readonly jobId: string; readonly requestSeq: number; readonly run: Promise<void> }
   | FallbackGateOutcome;
 
 /** Thrown when a direct beginRound caller bypasses requestReview while the
@@ -966,6 +969,11 @@ export interface WaveRunnerOptions {
   readonly ledger: LedgerApi;
   readonly worktrees: WorktreePort;
   readonly spawner: AgentSpawner;
+  /** Service-wide paired resident admission; omitted by standalone workflow tests. */
+  readonly reserveReviewRound?: (signal: AbortSignal) => Promise<ResidentReviewRound>;
+  readonly maxConcurrentChildren?: number;
+  /** Ledger bus used to admit a worker's durable handoff after its turn delivers. */
+  readonly bus?: EventBus;
   readonly poster?: VerdictPoster;
   readonly escalate?: (title: string, detail: string) => void;
   /** Stable service-owned root. Required for every production review. */
@@ -1002,14 +1010,57 @@ export class WaveRunner {
   private readonly activeOperations = new Set<Promise<unknown>>();
   private readonly activeControllers = new Set<AbortController>();
   private readonly activeFallbackGates = new Set<string>();
+  private readonly handoffs = new Map<string, {
+    readonly input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean };
+    readonly seq: number;
+    starting: boolean;
+    readonly run: Promise<void>;
+    readonly resolve: () => void;
+  }>();
+  private readonly stopHandoffListener: () => void;
   private shuttingDown = false;
 
   constructor(opts: WaveRunnerOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    this.stopHandoffListener = opts.bus?.subscribe((event) => {
+      if (event.kind !== 'job.delivered' || event.jobId === null) return;
+      const pending = this.handoffs.get(event.jobId);
+      if (pending !== undefined && event.seq > pending.seq) void this.startHandoff(event.jobId, pending);
+    }) ?? (() => {});
+  }
+
+  /** Restore acknowledged handoffs after restart; never freeze a branch
+   * until a delivery newer than the handoff has cleared the idle guard. */
+  resumeQueuedHandoffs(): void {
+    for (const job of this.opts.ledger.listJobs()) {
+      const queued = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-queued');
+      if (queued === null) continue;
+      const started = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-started');
+      const failed = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-failed');
+      if ((started?.seq ?? 0) > queued.seq || (failed?.seq ?? 0) > queued.seq) continue;
+      if (this.handoffs.has(job.id)) continue;
+      const payload = queued.payload as { input?: unknown } | null;
+      const input = payload?.input;
+      if (typeof input !== 'object' || input === null || (input as { jobId?: unknown }).jobId !== job.id) {
+        const error = 'malformed queued review handoff requires operator repair';
+        this.log('error', error, { job: job.id, seq: queued.seq });
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId: job.id,
+          payload: { requestSeq: queued.seq, error },
+        });
+        this.opts.escalate?.(`Queued review handoff failed for job ${job.id}`, error);
+        continue;
+      }
+      const pending = this.trackHandoff(input as { jobId: string }, queued.seq);
+      const delivered = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
+      if (delivered !== null && delivered.seq > queued.seq) void this.startHandoff(job.id, pending);
+    }
   }
 
   async shutdown(): Promise<void> {
+    this.stopHandoffListener();
+    for (const pending of this.handoffs.values()) pending.resolve();
+    this.handoffs.clear();
     this.shuttingDown = true;
     const deadline = Date.now() + 30_000;
     while (this.activeOperations.size > 0) {
@@ -1290,6 +1341,9 @@ export class WaveRunner {
   }): Promise<WaveOutcome | FallbackGateOutcome> {
     const outcome = await this.requestReview(input);
     if (outcome.route === 'perkins') return outcome.run;
+    if (outcome.route === 'queued') {
+      throw new Error('direct round invocation cannot await a deferred worker handoff');
+    }
     await outcome.run;
     return outcome;
   }
@@ -1303,11 +1357,35 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    /** Worker tool handoff: acknowledge without waiting for its own turn. */
+    handoff?: boolean;
+    /** Internal replay marker; never accepted from the public HTTP endpoint. */
+    fromHandoff?: boolean;
   }): Promise<ReviewRequestOutcome> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
-    // Branch-idle guard FIRST, before any route decision: manual, Silas, and
-    // integration callers all inherit one rule, Perkins and fallback alike.
-    this.enforceBranchIdleForRequest(input);
+    // Branch-idle still gates the freeze. A minion's own busy turn may
+    // acknowledge an intent now; it is armed only after job.delivered.
+    try {
+      this.enforceBranchIdleForRequest(input);
+    } catch (error) {
+      if (!(error instanceof BranchBusyError) || input.handoff !== true || input.force === true ||
+        error.blockers.length === 0 || error.blockers.some((blocker) => blocker.jobId !== input.jobId)) throw error;
+      if (this.opts.bus === undefined) throw new Error('worker review handoff requires a ledger event bus');
+      const existing = this.handoffs.get(input.jobId);
+      if (existing !== undefined) return { route: 'queued', jobId: input.jobId, requestSeq: existing.seq, run: existing.run };
+      const safeInput = { jobId: input.jobId,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
+        ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+      };
+      const event = this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-queued', jobId: input.jobId, payload: { input: safeInput } });
+      const pending = this.trackHandoff(safeInput, event.seq);
+      return { route: 'queued', jobId: input.jobId, requestSeq: event.seq, run: pending.run };
+    }
+    const pendingHandoff = this.handoffs.get(input.jobId);
+    if (pendingHandoff !== undefined && input.fromHandoff !== true) {
+      return { route: 'queued', jobId: input.jobId, requestSeq: pendingHandoff.seq, run: pendingHandoff.run };
+    }
     const repoPath = this.resolveReviewRequestRepo(input);
     const preflight = this.opts.reviewPreflight;
     const result: ReviewPreflightResult = preflight !== undefined && repoPath !== null
@@ -1316,6 +1394,44 @@ export class WaveRunner {
     if (!result.ok) return this.beginFallbackGate(input, result.failures, repoPath);
     const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel });
     return { route: 'perkins', round: begun.round, run: begun.run };
+  }
+
+  private trackHandoff(input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean }, seq: number) {
+    let resolve!: () => void;
+    const run = new Promise<void>((done) => { resolve = done; });
+    const pending = { input, seq, starting: false, run, resolve };
+    this.handoffs.set(input.jobId, pending);
+    return pending;
+  }
+
+  private async startHandoff(jobId: string, pending: NonNullable<ReturnType<WaveRunner['trackHandoff']>>): Promise<void> {
+    if (pending.starting || this.shuttingDown || this.handoffs.get(jobId) !== pending) return;
+    pending.starting = true;
+    try {
+      const outcome = await this.requestReview({ ...pending.input, fromHandoff: true });
+      if (this.shuttingDown) return; // boot recovery retains the queued event
+      if (outcome.route === 'bmad-review-fallback' && !outcome.skillInstalled) {
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId,
+          payload: { requestSeq: pending.seq, error: outcome.note },
+        });
+        return;
+      }
+      this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-started', jobId, payload: {
+        requestSeq: pending.seq, route: outcome.route,
+        ...(outcome.route === 'perkins' ? { roundId: outcome.round.id } : {}),
+      } });
+      void outcome.run.catch((error: unknown) => {
+        this.log('error', 'queued review run failed after admission', { job: jobId, error: String(error) });
+      });
+    } catch (error) {
+      if (!this.shuttingDown) {
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId, payload: { requestSeq: pending.seq, error: String(error) } });
+        this.opts.escalate?.(`Queued review handoff failed for job ${jobId}`, String(error));
+      }
+    } finally {
+      if (this.handoffs.get(jobId) === pending) this.handoffs.delete(jobId);
+      pending.resolve();
+    }
   }
 
   /** Legacy direct entry: a failed pre-flight never silently starts a
@@ -1631,7 +1747,7 @@ export class WaveRunner {
   }
 
   private async defaultFallbackReview(input: FallbackReviewRunInput): Promise<readonly FallbackFinding[]> {
-    const handle = await this.opts.spawner('minion', { cwd: input.lanePath });
+    const handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
     try {
       const prompt = [
         `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
@@ -1762,7 +1878,7 @@ export class WaveRunner {
           ? { branchIdle: { forced: true as const, targetBranch: idle.targetBranch, blockers: idle.blockers } }
           : {}),
       });
-      this.opts.ledger.setRoundStatus(round.id, 'live');
+      if (this.opts.reserveReviewRound === undefined) this.opts.ledger.setRoundStatus(round.id, 'live');
     } catch (error) {
       const failures: unknown[] = [error];
       const interrupted = this.shuttingDown || setupSignal.aborted;
@@ -1805,7 +1921,13 @@ export class WaveRunner {
       throw error;
     }
 
-    this.log('info', 'review round live', {
+    if (this.opts.reserveReviewRound !== undefined) {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.residency-queued', jobId: job.id, roundId: round.id,
+        payload: { reason: 'awaiting lead and child resident slots', targetSha },
+      });
+    }
+    this.log('info', 'review round queued or live', {
       job: job.id,
       round: round.id,
       lenses: canonicalLenses.length,
@@ -1912,10 +2034,37 @@ export class WaveRunner {
     signal: AbortSignal,
     reviewModel?: ReviewPreflightResult['reviewModel'],
   ): Promise<WaveOutcome> {
+    let reservation: ResidentReviewRound | undefined;
     try {
-      return await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel);
+      reservation = this.opts.reserveReviewRound === undefined
+        ? undefined : await this.opts.reserveReviewRound(signal);
+      if (reservation !== undefined) {
+        if (signal.aborted) {
+          await reservation.close();
+          throw new Error('review cancelled before admission');
+        }
+        this.opts.ledger.setRoundStatus(round.id, 'live');
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.residency-admitted', jobId: job.id, roundId: round.id,
+          payload: { reason: 'lead and child resident slots admitted' },
+        });
+      }
+      return await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, reservation);
+    } catch (error) {
+      if (this.opts.ledger.getRound(round.id)?.status === 'pending') {
+        this.abortRound(this.opts.ledger.getRound(round.id) ?? round, `review admission cancelled: ${String(error)}`);
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.residency-cancelled', jobId: job.id, roundId: round.id,
+          payload: { error: String(error) },
+        });
+      }
+      throw error;
     } finally {
-      await this.sweepReviewWorktree(reviewLaneId);
+      try {
+        await reservation?.close();
+      } finally {
+        await this.sweepReviewWorktree(reviewLaneId);
+      }
     }
   }
 
@@ -1929,15 +2078,25 @@ export class WaveRunner {
     policy: PerkinsPolicy,
     signal: AbortSignal,
     reviewModel?: ReviewPreflightResult['reviewModel'],
+    reservation?: ResidentReviewRound,
   ): Promise<WaveOutcome> {
-    const workflow = new PerkinsWholeReview({
-      // This closure belongs to one round. A concurrent preflight cannot
-      // replace the proof used by its lead or specialist children.
-      spawner: (role, options) => this.opts.spawner(role, {
+    // The model-resolution closure belongs to one round. A concurrent
+    // preflight cannot replace the proof used by its lead or specialist
+    // children, and a reserved round routes through its own admission.
+    const spawnWithOptions: AgentSpawner = (role, options) => {
+      const resolved = {
         ...options,
         ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
           ? { reviewModel } : {}),
-      }),
+      };
+      return reservation === undefined
+        ? this.opts.spawner(role, resolved)
+        : reservation.spawn(resolved);
+    };
+    const workflow = new PerkinsWholeReview({
+      spawner: spawnWithOptions,
+      ...(reservation !== undefined ? { beginChildren: () => reservation.beginChildren(this.opts.maxConcurrentChildren ?? 2) } : {}),
+      ...(this.opts.maxConcurrentChildren !== undefined ? { maxConcurrentChildren: this.opts.maxConcurrentChildren } : {}),
       policy,
       onAgent: ({ phase, lens, attempt, handle }) => {
         this.opts.ledger.registerAgent({

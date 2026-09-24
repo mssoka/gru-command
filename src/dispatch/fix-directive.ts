@@ -25,7 +25,7 @@ export interface DirectiveRegistry {
 
 export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
-  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent'>;
+  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent' | 'getJob'>;
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
@@ -63,9 +63,27 @@ export async function routeFixDirectiveToMinion(
   if (lane === undefined) {
     return { delivered: false, note: 'no implementing minion session and no job lane' };
   }
-  const handle = await input.registry.spawn('minion', { cwd: lane.path });
+  const previous = [...minions].reverse().find((minion) => minion.sessionFile !== null);
+  const resumeFile = previous?.sessionFile ?? null;
+  let handle: AgentHandle;
+  let prompt = directive;
   try {
-    await racedPrompt(handle, directive, input.signal, owner);
+    handle = await input.registry.spawn('minion', {
+      cwd: lane.path, signal: input.signal,
+      ...(resumeFile !== null ? { resumeFile } : {}),
+    });
+  } catch (error) {
+    if (resumeFile === null || input.signal.aborted) throw error;
+    const job = input.ledger.getJob(input.jobId);
+    if (job?.briefing === null || job === null) {
+      throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
+    }
+    handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal });
+    prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
+  }
+  try {
+    input.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: input.jobId, sessionFile: handle.sessionFile });
+    await racedPrompt(handle, prompt, input.signal, owner);
   } finally {
     await handle.dispose();
   }

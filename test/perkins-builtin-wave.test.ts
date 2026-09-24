@@ -323,6 +323,42 @@ describe('review publication redaction', () => {
 });
 
 describe('WaveRunner built-in Perkins production path', () => {
+  it('acknowledges a busy implementing minion without an open review turn, and restores the queued handoff after restart', async () => {
+    const repo = makeFixtureRepo('perkins-handoff-recovery');
+    repos.push(repo);
+    const root = mkdtempSync(join(tmpdir(), 'perkins-handoff-port-'));
+    dirs.push(root);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-handoff-db-')));
+    dbs.push(db);
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    const port = new GitReviewPort(root, 'main', repo.head());
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-handoff' });
+    const job = ledger.addJob({ id: 'job-handoff', repo: 'fixture', title: 'handoff', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    const options = {
+      ledger, worktrees: port, bus, spawner: vi.fn() as unknown as AgentSpawner,
+      reviewPreflight: async () => ({ ok: false as const, failures: [preflightFailure('review-policy', 'disabled')] }),
+    };
+    const first = new WaveRunner(options);
+    const accepted = await first.requestReview({ jobId: job.id, handoff: true });
+    expect(accepted.route).toBe('queued');
+    expect(ledger.listRounds(job.id)).toHaveLength(0); // no freeze while the branch is busy
+    const duplicate = await first.requestReview({ jobId: job.id, handoff: true });
+    expect(duplicate.route).toBe('queued');
+    if (duplicate.route === 'queued' && accepted.route === 'queued') expect(duplicate.requestSeq).toBe(accepted.requestSeq);
+    await first.shutdown();
+    const resumed = new WaveRunner(options);
+    resumed.resumeQueuedHandoffs();
+    expect(ledger.latestJobEvent(job.id, 'job.review-handoff-failed')).toBeNull();
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: { sha: repo.head() } });
+    for (let tick = 0; tick < 20 && ledger.latestJobEvent(job.id, 'job.review-handoff-failed') === null; tick += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(ledger.latestJobEvent(job.id, 'job.review-handoff-failed')?.payload).toMatchObject({ error: expect.stringContaining('not configured') });
+    expect(ledger.listRounds(job.id)).toHaveLength(0); // fallback unavailable: no phantom approval
+    await resumed.shutdown();
+  });
   it('fails closed on bundled-policy setup errors before a round or reviewer spawn', async () => {
     const repo = makeFixtureRepo('perkins-policy-setup-error');
     repos.push(repo);

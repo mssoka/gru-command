@@ -82,6 +82,8 @@ export interface AgentSupervisionView {
   readonly restarts: number;
   readonly breakerOpen: boolean;
   readonly openTurn: boolean;
+  /** Control operations are always emitted by the real supervisor. */
+  readonly openControl?: boolean;
   /** Tool calls currently open (a live process here is activity, not a hang). */
   readonly openToolCalls: number;
   readonly lastEventAt: string | null;
@@ -1753,6 +1755,7 @@ export class Supervisor {
         restarts: agent.restartRing.length,
         breakerOpen: agent.breakerOpen,
         openTurn: agent.openTurn,
+        openControl: agent.openControl,
         openToolCalls: agent.openToolCalls.size,
         lastEventAt:
           agent.lastEventAt > 0 ? new Date(agent.lastEventAt).toISOString() : null,
@@ -1776,6 +1779,7 @@ export class Supervisor {
       restarts: agent.restartRing.length,
       breakerOpen: agent.breakerOpen,
       openTurn: agent.openTurn,
+      openControl: agent.openControl,
       openToolCalls: agent.openToolCalls.size,
       lastEventAt:
         agent.lastEventAt > 0 ? new Date(agent.lastEventAt).toISOString() : null,

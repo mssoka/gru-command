@@ -116,6 +116,8 @@ export interface IsolatedReviewPolicy {
 
 /** Options for spawn(). */
 export interface SpawnOptions {
+  /** Cancel a queued resident admission without starting an adapter spawn. */
+  readonly signal?: AbortSignal;
   /**
    * Resume an existing session file instead of creating a new one.
    * When omitted a fresh session is created.

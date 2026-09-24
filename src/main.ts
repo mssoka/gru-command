@@ -598,6 +598,11 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   supervisor = supervisorLive;
+  registry.setReclaimProbe((agentId) => {
+    const view = supervisorLive.viewFor(agentId);
+    return view !== null && view.state === 'watching' && view.slotId === null &&
+      !view.openTurn && view.openControl === false && view.openToolCalls === 0;
+  });
   const gruSlot = supervisorLive.declareSlot({
     id: 'gru-main',
     role: 'gru',
@@ -715,6 +720,9 @@ async function main(): Promise<number> {
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
     poster: new AutoVerdictPoster(),
+    reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
+    maxConcurrentChildren: config.review.maxConcurrentChildren,
+    bus,
     reviewArtifactRoot: join(config.dataDir, 'reviews'),
     reviewPreflight: (input) => reviewPreflightCheck(config, registry, input.repoPath),
     fallbackGate: {
@@ -736,6 +744,7 @@ async function main(): Promise<number> {
   });
   state.wave = wave;
   await wave.recoverInterruptedRounds();
+  wave.resumeQueuedHandoffs();
   // Re-brief restart safety (Silas finding 2026-09-23): a re-brief request
   // mid-flight at restart left no events and no worker. The durable
   // markers written before each worker spawned are consumed here — the
