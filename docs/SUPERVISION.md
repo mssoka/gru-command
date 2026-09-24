@@ -83,8 +83,8 @@ fatal errors climb.
 
 **Crash-loop breaker.** ≥ `max_restarts` (default 3) restarts within a
 rolling `restart_window_ms` (default 10 min) trips the breaker: the agent
-is **stopped** (no further restarts), an **action-required** notification
-escalates, and the board marks the agent (`⛔ stopped` on the rail + the
+is **stopped** (no further restarts), a **needs-owner** notification
+escalates (re-arm is the human's ack), and the board marks the agent (`⛔ stopped` on the rail + the
 notification). Acking that notification **re-arms** supervision: the ring
 clears, a fresh window opens, one restart attempt resumes the agent. A
 service restart also resets breaker state (in-memory by design) — the ack
@@ -128,12 +128,13 @@ bell panel, a browser notification — it posts
 receipt (`shown_at`, one per surface, idempotent). An **ack**
 (`POST /api/notifications/:id/ack`) is the human clearance: it clears the
 row (and, for a breaker row, re-arms supervision). The bell badge counts
-unacked errors; ack buttons live on every row.
+unacked needs-owner errors; the NEEDS GRU machine queue is tracked
+separately and never rings the bell; ack buttons live on every row.
 
 **Surfaces:** in-app toasts (always — the floor), the browser
 Notification API (permission requested at pairing; toasts carry the load
 when denied), the board bell panel, and chat notices for
-action-required items.
+needs-owner items.
 
 The log is append-only by design (the record of what was escalated and
 when). Retention/pruning of very old notification rows is a known
@@ -185,7 +186,7 @@ owns un-hanging the turn itself; `timeoutMs` is caller-side relief.
 
 `test/supervisor.test.ts` drives a controllable runtime: a killed stub
 agent climbs the ladder and is restored (resumed from its session file);
-three fast failures trip the breaker exactly once with an action-required
+three fast failures trip the breaker exactly once with a needs-owner
 notification; an ack re-arms; in-band errors never restart. The same
 suite pins the hung-turn follow-ups: a live open tool never trips the
 watchdog, heartbeats keep a quiet run alive, an interrupted turn is

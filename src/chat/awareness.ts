@@ -37,7 +37,8 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * The cursor (`coveredThroughSeq`) is durable under the chat dir, so a
  * restart never replays context the brain already received. Content is
  * derived from the ledger only — an acked or resolved notification is
- * never injected, and the human still owns every acknowledgement.
+ * never injected; action-required rows are Gru's machine queue while
+ * needs-owner rows keep the owner's acknowledgement.
  */
 
 export const AWARENESS_STATE_NAME = 'awareness.json';

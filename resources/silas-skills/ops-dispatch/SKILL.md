@@ -8,12 +8,37 @@ through the ops surface, never by improvising side channels.
 ## Authority (hard boundaries)
 
 - You dispatch, track, and close. You NEVER write product code yourself.
-- You NEVER merge a pull request. Perkins owns verdict authority; the human
-  holds the merge for the fallback gate.
+- You NEVER merge a pull request. The chief holds merge authority for the
+  gru-command repository; the human holds the merge everywhere else and for
+  the fallback gate. Perkins owns verdict authority.
 - Preserve before remove: prefer notes and escalation over deleting or
   killing anything. Sweeps pause on live processes; do not fight that.
 - Never act on the Gru chat session itself.
 - Escalate with pointers (job id, round id, artifact path), not prose.
+
+## Mechanical reactions vs judgment (owner mandate split 2026-09-23)
+
+The chief keeps the judgments: rulings, merges, and novel failures. The
+mechanical reactions are YOURS — execute them without asking:
+
+- **Re-arm clean aborts.** A review round that aborted without a live lane
+  racing its target is re-armed by a fresh review request once the lane
+  delivery settles.
+- **Respin known failure patterns.** When a failure class has a recorded
+  rule (a documented retry, a re-brief on a known protocol break, a lens
+  retry), apply the rule and record the action — do not escalate what the
+  rule already answers.
+- **Sweep acks under the recorded rules.** Close out swept lanes that meet
+  the recorded rules; preserve-before-remove and the pause-and-ask rule
+  remain absolute.
+- **One standing gate (freeze-r1).** Never arm a review round on a branch
+  while a rebase/force-push lane is ACTIVE on the same target — the round
+  races the push and dies obsolete. Wait for the lane delivery (and its
+  push) to settle, then arm. If you cannot tell whether the lane is still
+  moving, wait one sweep and re-read the record.
+- **Novel failures are not yours to improvise around.** Name what you saw
+  with pointers and escalate to the chief; the chief rules, merges, or
+  opens the fix lane.
 
 ## The follow-through loop (no human ping required)
 
@@ -22,7 +47,9 @@ through the ops surface, never by improvising side channels.
    digest) for a pull-request or merge-request URL, or run
    `git -C <lane_path> log --oneline -5` and
    `gh pr list --head <branch> --json url,number,title` in the lane. Pick
-   the PR whose head branch is the job's lane branch. Then register it and
+   the PR whose head branch is the job's lane branch. Before arming,
+   confirm no rebase/force-push lane is active on the target (freeze-r1 —
+   an armed round races the push and dies obsolete). Then register it and
    trigger the wave, in this order:
 
    ```
@@ -38,7 +65,9 @@ through the ops surface, never by improvising side channels.
    yours — post an escalation instead) and leave the lane untouched. Do not
    guess a URL; a wrong registration poisons the review.
 
-2. **PR registered, review overdue.** Trigger the wave exactly as above.
+2. **PR registered, review overdue.** Trigger the wave exactly as above —
+   after confirming the branch is idle (no active rebase/force-push lane
+   on the target; freeze-r1).
    Never trigger twice for the same state: on the Perkins route a round
    exists afterwards and the digest stops listing the job. On the
    `bmad-review-fallback` route no round is created — the gate runs its own

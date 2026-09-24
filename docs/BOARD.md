@@ -111,15 +111,17 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `silas.review-triggered`, `silas.directive-sent`, `silas.rebrief`,
   `silas.escalated`, `silas.wake`) — visible in the event stream like
   every other transition.
-- **Notification center (E7):** the bell panel renders the durable
-  notification log — FYI rows (blocked jobs, errored agents/lenses,
-  verdicts, supervisor events) and action-required rows (crash-loop
-  breaker trips) with ack buttons. The badge counts unacked error-severity
-  rows not yet viewed here (an ack from any device clears it); every
-  displayed row earns a shown receipt per surface (nothing "shown" without
-  an ack record); acking an action-required row clears it and re-arms an
-  open breaker. Live arrivals toast (plus a browser notification when
-  permission was granted).
+- **Notification center (E7; routing split 2026-09-23):** the bell panel
+  renders the durable notification log in three bands — FOR YOU
+  (needs-owner rows: owner-only decisions and stops whose ack re-arms
+  supervision), NEEDS GRU (the self-clearing machine queue that wakes
+  Gru; it never rings the bell), and FEED (FYI rows). The badge and live
+  toasts serve needs-owner only; every displayed row earns a shown receipt
+  per surface (nothing "shown" without an ack record); acking a row clears
+  it where an ack has meaning (a breaker row re-arms supervision). The
+  wake tracker chip counts durable Gru wakes (`gru.wake` events). Live
+  needs-owner arrivals toast (plus a browser notification when permission
+  was granted).
 - **Transcripts:** drawer with newest-first pages (`load older` by entry
   cursor), debounced server-side search with snippet matches that
   scroll+flash the entry, a wrap toggle (default `pre-wrap` — long lines
