@@ -680,6 +680,38 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(realpathSync(npm.stdout.split('\n')[0]!)).toBe(realpathSync(join(stableBin, 'npm')));
   });
 
+  it.skipIf(process.platform !== 'linux')('systemd PATH escapes quotes, backslashes and percent specifiers without losing the stable bin', () => {
+    const home = tempDir('gru-command-path-escape-');
+    const odd = join(home, 'quoted"back\\slash%bin');
+    const supplied = `${process.env.PATH ?? '/usr/bin:/bin'}:${odd}`;
+    const result = run(join(repoRoot, 'install.sh'), ['--print'], { HOME: home, PATH: supplied });
+    expect(result.status, result.stderr).toBe(0);
+    const encoded = supplied.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('%', '%%');
+    expect(result.stdout).toContain(`Environment="PATH=${dirname(realpathSync(process.execPath))}:${encoded}:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"`);
+    expect(result.stdout).not.toContain('{{PATH}}');
+  });
+
+  it.skipIf(process.platform !== 'linux')('newline PATH fails before writing a unit or calling the service manager', () => {
+    const { fixture, home } = buildFixtureRepo();
+    mkdirSync(join(fixture, 'dist'), { recursive: true });
+    writeFileSync(join(fixture, 'dist', 'main.js'), '// fixture service\n');
+    const seam = serviceManagerSeam(home);
+    const env = { HOME: home, GRU_COMMAND_HOME: join(home, '.gru-command'), ...seam.env };
+    const rendered = run(join(fixture, 'install.sh'), ['--print'], env);
+    expect(rendered.status, rendered.stderr).toBe(0);
+    mkdirSync(dirname(seam.unit), { recursive: true });
+    writeFileSync(seam.unit, rendered.stdout);
+    const result = run(join(fixture, 'install.sh'), ['--service'], {
+      ...env,
+      PATH: `${process.env.PATH ?? '/usr/bin:/bin'}\nmalformed`,
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('PATH contains a newline');
+    expect(readFileSync(seam.unit, 'utf-8')).toBe(rendered.stdout);
+    expect(existsSync(`${seam.unit}.r`)).toBe(false);
+    expect(existsSync(seam.managerLog)).toBe(false);
+  });
+
   it.skipIf(process.platform !== 'linux')('fixture HOME contains service units even with a foreign XDG config home', () => {
     const home = tempDir('gru-command-sandbox-home-');
     const outside = tempDir('gru-command-foreign-xdg-');

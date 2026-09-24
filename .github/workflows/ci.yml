@@ -13,10 +13,8 @@ jobs:
     name: Full suite (Node 22)
     runs-on: ubuntu-latest
     steps:
-      # Test the exact PR head under review, not GitHub's synthetic merge ref.
+      # PRs test GitHub's merge result against the current base branch.
       - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - uses: actions/setup-node@v6
         with:

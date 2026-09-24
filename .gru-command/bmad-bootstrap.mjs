@@ -34,15 +34,16 @@ const assertSafeDestination = (to) => {
 const copyTree = (from, to) => {
   const unresolved = resolve(from);
   if (!inside(source, unresolved)) throw new Error('BMAD bootstrap source escapes the selected repo: ' + from);
+  // Only these lexical derived-cache paths are excluded. All other entries
+  // still pass through the source symlink and realpath confinement checks.
+  const rel = relative(source, unresolved);
+  if (rel === '_bmad/render' ||
+      (rel.startsWith('_bmad/') && rel.split('/').includes('__pycache__'))) return;
   const unresolvedInfo = lstatSync(unresolved);
   if (unresolvedInfo.isSymbolicLink()) throw new Error('BMAD bootstrap refuses source symlink: ' + from);
   const src = realpathSync(unresolved);
   if (!inside(source, src)) throw new Error('BMAD bootstrap source escapes the selected repo: ' + from);
   const info = lstatSync(src);
-  // Derived renderer/bytecode output is local to each lane, not source code.
-  const rel = relative(source, src);
-  if (rel === '_bmad/render' ||
-      (rel.startsWith('_bmad/') && rel.split('/').includes('__pycache__'))) return;
   assertSafeDestination(to);
   if (info.isDirectory()) {
     const dest = lstatIfPresent(to);
@@ -71,6 +72,29 @@ if (sourceHash !== record.official_manifest_sha256) throw new Error('BMAD bootst
 if (record.source_payload_format !== undefined && record.source_payload_format !== 'without-derived-caches-v1') {
   throw new Error('BMAD bootstrap record has unsupported source payload format');
 }
+// Validate ALL recorded bindings before hashing any owned payload. A record
+// cannot use a relative skill name or symlinked ancestor to read outside it.
+const skillPaths = [];
+for (const tool of Object.keys(record.runtime_skills ?? {}).sort()) {
+  if (tool !== 'pi' && tool !== 'claude-code') throw new Error('BMAD bootstrap record has unsafe runtime tool: ' + tool);
+  const dir = tool === 'claude-code' ? '.claude' : '.agents';
+  const names = record.runtime_skills[tool];
+  if (!Array.isArray(names)) throw new Error('BMAD bootstrap record has invalid skills for ' + tool);
+  const skillsRoot = join(source, dir, 'skills');
+  for (const name of [...names].sort()) {
+    if (typeof name !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) || name === '..') {
+      throw new Error('BMAD bootstrap record has unsafe skill name for ' + tool);
+    }
+    const path = join(skillsRoot, name);
+    for (const part of [join(source, dir), skillsRoot, path]) {
+      if (lstatSync(part).isSymbolicLink()) throw new Error('BMAD bootstrap refuses source skill symlink: ' + part);
+    }
+    if (!inside(realpathSync(skillsRoot), realpathSync(path)) || !lstatSync(path).isDirectory()) {
+      throw new Error('BMAD bootstrap record has unsafe skill path: ' + path);
+    }
+    skillPaths.push(path);
+  }
+}
 const hashPayload = () => {
   const hash = createHash('sha256');
   const visit = (path) => {
@@ -91,10 +115,7 @@ const hashPayload = () => {
     } else throw new Error('BMAD owned payload contains unsupported entry: ' + path);
   };
   visit(join(source, '_bmad'));
-  for (const tool of Object.keys(record.runtime_skills ?? {}).sort()) {
-    const dir = tool === 'claude-code' ? '.claude' : '.agents';
-    for (const skillName of [...record.runtime_skills[tool]].sort()) visit(join(source, dir, 'skills', skillName));
-  }
+  for (const path of skillPaths) visit(path);
   return hash.digest('hex');
 };
 if (hashPayload() !== record.source_payload_sha256) throw new Error('BMAD bootstrap source payload changed since onboarding');

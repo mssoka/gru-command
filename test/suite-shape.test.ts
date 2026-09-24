@@ -21,7 +21,7 @@ const PINS: Record<string, number> = {
   'chat-frames.test.ts': 4,
   'attachments.test.ts': 28,
   'awareness.test.ts': 13,
-  'bmad-onboarding.test.ts': 12,
+  'bmad-onboarding.test.ts': 13,
   'chat-server.test.ts': 80,
   'chat-session-state.test.ts': 6,
   'claude-adapter.test.ts': 77,
@@ -37,7 +37,7 @@ const PINS: Record<string, number> = {
   'github-poll.test.ts': 22,
   'health.test.ts': 19,
   'identity.test.ts': 3,
-  'install-one-line.test.ts': 33,
+  'install-one-line.test.ts': 35,
   'install.test.ts': 13,
   'lan-phone-raw-client.test.ts': 6,
   'ledger-api.test.ts': 23,
@@ -100,9 +100,10 @@ const PINS: Record<string, number> = {
 };
 
 describe('suite shape', () => {
-  it('checks out the exact PR head for the Linux full gate', () => {
+  it('runs the full PR gate on the default merge-result checkout', () => {
     const workflow = readFileSync(join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf-8');
-    expect(workflow).toContain('ref: ${{ github.event.pull_request.head.sha || github.sha }}');
+    expect(workflow).toMatch(/- uses: actions\/checkout@v6\s*\n\s*- uses: actions\/setup-node@v6/);
+    expect(workflow).not.toContain('github.event.pull_request.head.sha');
     expect(workflow).toContain('run: npm test');
   });
 
