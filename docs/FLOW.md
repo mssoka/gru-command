@@ -33,7 +33,9 @@ mechanical handoff behind the chat surface:
 
 1. **Job row** — briefing recorded verbatim; status `dispatched`.
 2. **Lane** — one git worktree per job on branch `gru/<job>` at the
-   CURRENT fresh head (worktree manager, below). Status `working`.
+   FETCHED origin default-branch head (worktree manager, below; a fetch
+   failure degrades to local HEAD with `base_source:
+   'local-head-fallback'` recorded, never silently). Status `working`.
 3. **Minion** — a fresh agent session spawned with `cwd` = the worktree
    (SPEC ruling 17: dispatch cwd is the PROJECT root on every runtime;
    the minion discovers the project's own skills/bmad from there). The
