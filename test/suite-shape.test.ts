@@ -81,7 +81,7 @@ const PINS: Record<string, number> = {
   'spec-rulings-drift.test.ts': 5,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
-  'suite-shape.test.ts': 1,
+  'suite-shape.test.ts': 2,
   'supervisor.test.ts': 42,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 13,
@@ -100,6 +100,12 @@ const PINS: Record<string, number> = {
 };
 
 describe('suite shape', () => {
+  it('checks out the exact PR head for the Linux full gate', () => {
+    const workflow = readFileSync(join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf-8');
+    expect(workflow).toContain('ref: ${{ github.event.pull_request.head.sha || github.sha }}');
+    expect(workflow).toContain('run: npm test');
+  });
+
   it('every test file is pinned and registers exactly its expected test count', () => {
     const dir = import.meta.dirname;
     const files = readdirSync(dir)
