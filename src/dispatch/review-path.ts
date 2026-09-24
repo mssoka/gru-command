@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
+export { buildClaudeCodeAuthArgs } from '../runtime/claude-model.js';
 
 /**
  * Review-path selection (user amendment 2026-09-20, bmad-review fallback
@@ -164,40 +165,6 @@ export async function probeGitLabRemote(
   }
 }
 
-/** Leg 2 probe seam. pi-ai's ModelRuntime satisfies this structurally. */
-export interface ModelProviderProbe {
-  /** "provider/model" or "default". */
-  modelRef: string;
-  getModel(provider: string, id: string): unknown;
-  checkAuth(provider: string): Promise<{ type: string } | undefined>;
-  availableProviders(): readonly string[];
-}
-
-/** Cheap model-provider probe: the configured review model must resolve
- * and its provider must hold configured credentials (api key or OAuth).
- * No network generation call is made. */
-export async function probeModelProvider(probe: ModelProviderProbe): Promise<void> {
-  const ref = probe.modelRef.trim();
-  if (ref === '' || ref === 'default') {
-    const providers = probe.availableProviders();
-    for (const provider of providers) {
-      if (await probe.checkAuth(provider)) return;
-    }
-    throw new Error('no configured/authed model provider is available for the default review model');
-  }
-  const separator = ref.indexOf('/');
-  const provider = separator === -1 ? ref : ref.slice(0, separator);
-  const modelId = separator === -1 ? '' : ref.slice(separator + 1);
-  if (provider === '' || modelId === '') throw new Error(`review model reference is invalid: ${ref}`);
-  if (probe.getModel(provider, modelId) === undefined) {
-    throw new Error(`review model does not resolve: ${ref}`);
-  }
-  const auth = await probe.checkAuth(provider);
-  if (auth === undefined) {
-    throw new Error(`review model provider is not authenticated: ${provider} (model ${ref})`);
-  }
-}
-
 /** Leg 4 seam. */
 export interface ReviewPolicyProbe {
   reviewEnabled(): boolean;
@@ -332,13 +299,4 @@ export function skillInstalled(skillPath: string): boolean {
   } catch {
     return false;
   }
-}
-
-/** Build the argv tokens for a claude-code auth probe. The --model flag and
- * its value MUST be separate argv tokens — the combined single-token form
- * (e.g. '--model claude-sonnet-4') is rejected by the CLI. */
-export function buildClaudeCodeAuthArgs(modelRef: string): string[] {
-  const resolved = modelRef.trim();
-  const modelArgs = resolved === '' || resolved === 'default' ? [] : ['--model', resolved];
-  return ['-p', 'reply with exactly: ok', '--max-turns', '1', '--no-session-persistence', ...modelArgs];
 }

@@ -266,6 +266,7 @@ export class PiRuntime implements AgentRuntime {
   /** Normalized session paths currently hosted by this process (B4). */
   private readonly activeFiles = new Set<string>();
   private modelRuntime: ModelRuntime | undefined;
+  private modelRuntimePending: Promise<ModelRuntime> | undefined;
   /** One in-flight refresh shared by every concurrent unknown-model failure. */
   private catalogRefreshInFlight: Promise<ModelCatalogRefreshOutcome> | null = null;
   private down: string | undefined;
@@ -286,17 +287,16 @@ export class PiRuntime implements AgentRuntime {
   }
 
   private async runtime(): Promise<ModelRuntime> {
-    if (this.modelRuntime === undefined) {
-      // Offline create: built-in catalogs restored from local cache only.
-      // This is load-bearing beyond latency: pi's own settings-default
-      // resolution is gated on hasConfiguredAuth(), which an offline
-      // create never populates — the adapter resolves settings itself
-      // (see resolveSettingsDefault) to avoid the 2026-09-20 auth bug.
-      // Live-catalog models arrive through the bounded on-failure refresh
-      // below, never by making every spawn wait on the network.
-      this.modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
+    if (this.modelRuntime !== undefined) return this.modelRuntime;
+    // Share initial offline creation as well as refresh: concurrent probe
+    // and spawn must never resolve against different catalogue instances.
+    this.modelRuntimePending ??= ModelRuntime.create({ refreshOnCreate: false });
+    try {
+      this.modelRuntime = await this.modelRuntimePending;
+      return this.modelRuntime;
+    } finally {
+      this.modelRuntimePending = undefined;
     }
-    return this.modelRuntime;
   }
 
   /**
@@ -470,6 +470,20 @@ export class PiRuntime implements AgentRuntime {
       );
     }
     return model;
+  }
+
+  /** Check the very model spawn resolves, without creating a session or
+   * sending a generation request. Do not accept auth for another provider. */
+  async checkReviewModel(role: Role): Promise<void> {
+    const model = await this.resolveModel(role);
+    if (model === undefined) {
+      // With no settings default the offline SDK snapshot cannot choose a
+      // model. Do not treat an arbitrary authenticated provider as success.
+      throw new Error('no selected pi default model; configure a settings default or [models] default for review');
+    }
+    if (await (await this.runtime()).checkAuth(model.provider) === undefined) {
+      throw new Error(`review model provider is not authenticated: ${model.provider} (model ${model.provider}/${model.id})`);
+    }
   }
 
   /** Thinking levels pi's session API accepts (fail-loud on typos: pi CAN set it). */

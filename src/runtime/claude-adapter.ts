@@ -1,5 +1,5 @@
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
@@ -22,6 +22,7 @@ import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
 import { resolveSpawnCwd } from './cwd.js';
+import { buildClaudeCodeAuthArgs, claudeCliModel } from './claude-model.js';
 import { ReviewMcpBridge } from './review-mcp-bridge.js';
 import {
   normalizeSessionPath,
@@ -248,13 +249,8 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     }
   }
 
-  /**
-   * Fail-loud model resolution (SPEC ruling 16): "default"/"" omits the
-   * flag (the CLI's own configured model); an explicit "provider/model"
-   * strips the provider segment — claude's --model takes an alias or a
-   * bare model id (Bedrock-style dotted ids survive: provider is the
-   * FIRST segment only).
-   */
+  /** The CLI, not pi's catalog, is authoritative for model names.
+   * Metadata is advisory for conservative vision capability reporting. */
   private async resolveModel(
     role: Role,
     override?: string,
@@ -263,17 +259,15 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       override !== undefined
         ? override
         : resolveSpawnPolicy(this.config, 'claude-code', role).model;
-    if (ref === '' || ref === 'default') return {};
+    const cliModel = claudeCliModel(ref);
+    if (cliModel === undefined) return {};
     const slash = ref.indexOf('/');
-    if (slash <= 0 || slash >= ref.length - 1) {
-      throw new Error(`model reference must be "provider/model" or "default", got: ${ref}`);
-    }
-    const provider = ref.slice(0, slash);
-    const modelId = ref.slice(slash + 1);
+    const provider = slash < 0 ? undefined : ref.slice(0, slash);
+    const modelId = cliModel;
     let declared: ReturnType<ModelRuntime['getModel']> = undefined;
     let metadataError: unknown;
     try {
-      declared = (await this.runtime()).getModel(provider, modelId);
+      if (provider !== undefined) declared = (await this.runtime()).getModel(provider, modelId);
     } catch (error) {
       // Metadata enriches the CLI spawn but is not its transport. A torn
       // cache must decline vision conservatively, not take Claude offline.
@@ -286,9 +280,23 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       });
     }
     return {
-      cliModel: modelId,
+      cliModel,
       ...(declared !== undefined ? { input: declared.input } : {}),
     };
+  }
+
+  /** Probe the same native CLI model token spawn will send. Successful
+   * authenticated invocation, not pi metadata, proves availability. */
+  async checkReviewModel(role: Role): Promise<void> {
+    const model = resolveSpawnPolicy(this.config, 'claude-code', role).model;
+    // Validate with the same normalizer used by spawn before invoking CLI.
+    claudeCliModel(model);
+    const probe = spawnSync(this.binary, buildClaudeCodeAuthArgs(model), {
+      encoding: 'utf8', timeout: 30_000, input: '', windowsHide: true,
+    });
+    if (probe.error !== undefined || probe.status !== 0) {
+      throw new Error(`claude-code is not configured/authed for the review model: ${String(probe.error ?? probe.stderr ?? `exit ${probe.status}`).trim().slice(0, 300)}`);
+    }
   }
 
   /** Thinking level → --effort value (fail-loud: claude CAN set the level). */

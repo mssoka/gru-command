@@ -10,7 +10,6 @@ import {
   parseRepoRemote,
   preflightFailure,
   probeGitLabRemote,
-  probeModelProvider,
   renderFixDirective,
   runReviewPreflight,
   skillInstalled,
@@ -68,47 +67,6 @@ describe('four-leg review pre-flight', () => {
     const failure = preflightFailure('code-host', 'token expired');
     expect(failure).toMatchObject({ leg: 'code-host', detail: 'token expired' });
     expect(failure.remediation).toContain('GITLAB_TOKEN');
-  });
-});
-
-describe('model-provider probe', () => {
-  it('accepts a resolvable model whose provider holds credentials', async () => {
-    await expect(probeModelProvider({
-      modelRef: 'acme/fast-model',
-      getModel: () => ({ id: 'fast-model' }),
-      checkAuth: () => Promise.resolve({ type: 'oauth' }),
-      availableProviders: () => ['acme'],
-    })).resolves.toBeUndefined();
-  });
-
-  it('rejects an unresolvable model and an unauthenticated provider', async () => {
-    await expect(probeModelProvider({
-      modelRef: 'acme/missing',
-      getModel: () => undefined,
-      checkAuth: () => Promise.resolve({ type: 'api_key' }),
-      availableProviders: () => ['acme'],
-    })).rejects.toThrow(/does not resolve/u);
-    await expect(probeModelProvider({
-      modelRef: 'acme/fast-model',
-      getModel: () => ({ id: 'fast-model' }),
-      checkAuth: () => Promise.resolve(undefined),
-      availableProviders: () => ['acme'],
-    })).rejects.toThrow(/not authenticated/u);
-  });
-
-  it('resolves the default reference through any authed provider', async () => {
-    await expect(probeModelProvider({
-      modelRef: 'default',
-      getModel: () => undefined,
-      checkAuth: (provider) => Promise.resolve(provider === 'authed' ? { type: 'api_key' } : undefined),
-      availableProviders: () => ['locked', 'authed'],
-    })).resolves.toBeUndefined();
-    await expect(probeModelProvider({
-      modelRef: '',
-      getModel: () => undefined,
-      checkAuth: () => Promise.resolve(undefined),
-      availableProviders: () => ['locked'],
-    })).rejects.toThrow(/no configured\/authed model provider/u);
   });
 });
 

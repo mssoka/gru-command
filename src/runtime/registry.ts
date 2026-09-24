@@ -70,6 +70,7 @@ export type AgentEventListener = (envelope: AgentEventEnvelope) => void;
  */
 export class RuntimeRegistry {
   private readonly adapters = new Map<RuntimeId, AgentRuntime>();
+  private readonly nativeAdapters = new Map<RuntimeId, PiRuntime | ClaudeCodeRuntime>();
   private readonly handles = new Set<AgentHandle>();
   private readonly agentListeners = new Set<AgentEventListener>();
   private readonly opts: RuntimeRegistryOptions;
@@ -120,6 +121,14 @@ export class RuntimeRegistry {
     }
   }
 
+  /** Preflight against the exact adapter instance that will spawn the role.
+   * Neither wrapper nor probe constructs a review session. */
+  async checkReviewModel(role: Role): Promise<void> {
+    const id = this.runtimeIdFor(role);
+    this.runtimeFor(id);
+    await this.nativeAdapters.get(id)!.checkReviewModel(role);
+  }
+
   /** The fallback-wrapped adapter for a runtime id (created on first use). */
   runtimeFor(id: RuntimeId): AgentRuntime {
     if (!(RUNTIME_IDS as readonly string[]).includes(id)) {
@@ -128,33 +137,27 @@ export class RuntimeRegistry {
     let adapter = this.adapters.get(id);
     if (adapter === undefined) {
       if (id === 'pi') {
-        adapter = withFallbacks(
-          new PiRuntime({
-            config: this.opts.config,
-            store: this.opts.store,
-            ...(this.opts.pi?.agentDir !== undefined ? { agentDir: this.opts.pi.agentDir } : {}),
-            ...(this.opts.pi?.modelRuntime !== undefined
-              ? { modelRuntime: this.opts.pi.modelRuntime }
-              : {}),
-            ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
-          }),
-        );
+        const native = new PiRuntime({
+          config: this.opts.config,
+          store: this.opts.store,
+          ...(this.opts.pi?.agentDir !== undefined ? { agentDir: this.opts.pi.agentDir } : {}),
+          ...(this.opts.pi?.modelRuntime !== undefined ? { modelRuntime: this.opts.pi.modelRuntime } : {}),
+          ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
+        });
+        this.nativeAdapters.set(id, native);
+        adapter = withFallbacks(native);
       } else {
         // E3: the claude-code adapter hosts sessions on the headless CLI;
         // steer-unable, so the interface fallback wrapper serializes it.
-        adapter = withFallbacks(
-          new ClaudeCodeRuntime({
-            config: this.opts.config,
-            store: this.opts.store,
-            ...(this.opts.claude?.binary !== undefined
-              ? { binary: this.opts.claude.binary }
-              : {}),
-            ...(this.opts.claude?.killGraceMs !== undefined
-              ? { killGraceMs: this.opts.claude.killGraceMs }
-              : {}),
-            ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
-          }),
-        );
+        const native = new ClaudeCodeRuntime({
+          config: this.opts.config,
+          store: this.opts.store,
+          ...(this.opts.claude?.binary !== undefined ? { binary: this.opts.claude.binary } : {}),
+          ...(this.opts.claude?.killGraceMs !== undefined ? { killGraceMs: this.opts.claude.killGraceMs } : {}),
+          ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
+        });
+        this.nativeAdapters.set(id, native);
+        adapter = withFallbacks(native);
       }
       this.adapters.set(id, adapter);
     }

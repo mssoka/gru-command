@@ -46,7 +46,7 @@ import { createLessonsServer } from './lessons/server.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { isolateDecisionEnvironment } from './decisions/credentials.js';
 import type { Role } from './config.js';
-import { resolveSpawnPolicy, type GruCommandConfig } from './config.js';
+import type { GruCommandConfig } from './config.js';
 import { defaultListenerProbe, foreignListener, type ListenerOwner } from './listener-probe.js';
 import { dialHost } from './cli/service.js';
 import {
@@ -54,27 +54,17 @@ import {
   WorktreePortSquatRefused,
 } from './service-port-guard.js';
 import {
-  buildClaudeCodeAuthArgs,
   isGitHubRemote,
   isGitLabRemote,
   probeGitHubRemote,
   probeGitLabRemote,
-  probeModelProvider,
   probeReviewPolicy,
   repoRemote,
   runReviewPreflight,
-  type ModelProviderProbe,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
-import { spawnSync } from 'node:child_process';
-import { getAgentDir, ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import type { SpawnOptions } from './runtime/types.js';
-
-let cachedModelRuntime: ModelRuntime | null = null;
-async function modelRuntimeForProbe(): Promise<ModelRuntime> {
-  cachedModelRuntime ??= await ModelRuntime.create({ refreshOnCreate: false });
-  return cachedModelRuntime;
-}
 
 /** Locate the installed bmad-review skill: check both the pi agent dir
  * and ~/.agents (the BMAD default install root) for maximum compatibility. */
@@ -135,43 +125,14 @@ function reportForeignListener(
 /** Fail-closed four-leg review pre-flight (user amendment 2026-09-20). */
 async function reviewPreflightCheck(
   config: ReturnType<typeof loadConfig>,
+  registry: RuntimeRegistry,
   repoPath: string,
 ): Promise<Awaited<ReturnType<typeof runReviewPreflight>>> {
-  const runtimeId = config.runtimes.roles['perkins'] ?? config.runtimes.default;
   return runReviewPreflight({
     'resource-integrity': () => {
       loadPerkinsPolicy();
     },
-    'model-provider': async () => {
-      const modelRef = resolveSpawnPolicy(config, runtimeId, 'perkins').model;
-      if (runtimeId === 'claude-code') {
-        // Probe binary presence AND auth: a cheap authenticated call proves
-        // the provider is configured and reachable. --version alone is
-        // insufficient (succeeds without credentials).
-        const authArgs = buildClaudeCodeAuthArgs(modelRef);
-        const probe = spawnSync(
-          'claude',
-          authArgs,
-          { encoding: 'utf-8', timeout: 30_000, input: '' },
-        );
-        if (probe.error !== undefined) {
-          throw new Error(`claude-code probe failed: ${String(probe.error)}`);
-        }
-        if (probe.status !== 0) {
-          const stderr = (probe.stderr ?? '').trim().slice(0, 300);
-          throw new Error(`claude-code is not configured/authed for the review model (exit ${probe.status}): ${stderr}`);
-        }
-        return;
-      }
-      const runtime = await modelRuntimeForProbe();
-      const probe: ModelProviderProbe = {
-        modelRef,
-        getModel: (provider, id) => runtime.getModel(provider, id),
-        checkAuth: (provider) => runtime.checkAuth(provider),
-        availableProviders: () => runtime.getProviders().map((provider) => provider.id),
-      };
-      await probeModelProvider(probe);
-    },
+    'model-provider': () => registry.checkReviewModel('perkins'),
     'code-host': async () => {
       const remote = repoRemote(repoPath);
       if (remote === null) throw new Error(`repository origin is not a parseable https/ssh remote: ${repoPath}`);
@@ -730,7 +691,7 @@ async function main(): Promise<number> {
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
     poster: new AutoVerdictPoster(),
     reviewArtifactRoot: join(config.dataDir, 'reviews'),
-    reviewPreflight: (input) => reviewPreflightCheck(config, input.repoPath),
+    reviewPreflight: (input) => reviewPreflightCheck(config, registry, input.repoPath),
     fallbackGate: {
       skillPath: resolveBmadReviewSkillPath(),
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({

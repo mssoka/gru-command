@@ -732,11 +732,45 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(third!.argv[third!.argv.indexOf('--model') + 1]).toBe('us.anthropic.claude-x');
   });
 
+  it('preflight and spawn pass identical native CLI model tokens without pi metadata', async () => {
+    const fx = fixture();
+    for (const ref of ['sonnet', 'claude-custom-v2', 'bedrock/us.anthropic.claude-x', 'default']) {
+      // Preflight must use the same role policy as the subsequent spawn.
+      writeFileSync(configPathFor(fx.home), `workspace_root = "${fx.workspace}"\n[models.roles]\nperkins = "${ref}"\n`);
+      const config = loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester');
+      const runtime = new ClaudeCodeRuntime({ config, store: fx.store, binary: DOUBLE });
+      await runtime.checkReviewModel('perkins');
+      const handle = await runtime.spawn('perkins');
+      await handle.prompt('hello');
+      await handle.dispose();
+      const calls = doubleInvocations(fx).slice(-2);
+      const modelToken = (argv: string[]) => argv[argv.indexOf('--model') + 1];
+      expect(calls[0]?.argv.includes('--model')).toBe(ref !== 'default');
+      expect(calls[1]?.argv.includes('--model')).toBe(ref !== 'default');
+      if (ref !== 'default') {
+        expect(modelToken(calls[0]!.argv)).toBe(modelToken(calls[1]!.argv));
+        expect(modelToken(calls[0]!.argv)).toBe(ref.startsWith('bedrock/') ? ref.slice(8) : ref);
+      }
+    }
+  });
+
+  it('rejects a native CLI that cannot authenticate even when metadata is optional', async () => {
+    const fx = fixture();
+    const runtime = new ClaudeCodeRuntime({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: fx.store,
+      binary: join(fx.home, 'missing-claude'),
+    });
+    await expect(runtime.checkReviewModel('perkins')).rejects.toThrow(/claude-code is not configured\/authed/);
+  });
+
   it('fails loud on malformed model references', async () => {
     const fx = fixture();
-    await expect(fx.runtime.spawn('gru', { model: 'badshape' })).rejects.toThrow(
-      /model reference must be "provider\/model" or "default", got: badshape/,
-    );
+    // Native CLI aliases are legitimate even when absent from pi metadata.
+    const native = await fx.runtime.spawn('gru', { model: 'badshape' });
+    await native.prompt('hello');
+    await native.dispose();
+    expect(doubleInvocations(fx).at(-1)?.argv).toContain('badshape');
     await expect(fx.runtime.spawn('gru', { model: 'anthropic/' })).rejects.toThrow(
       /model reference/,
     );
