@@ -1,0 +1,4 @@
+# BEGIN GRU COMMAND BMAD BOOTSTRAP
+[[setup]]
+command = "node .gru-command/bmad-bootstrap.mjs"
+# END GRU COMMAND BMAD BOOTSTRAP
