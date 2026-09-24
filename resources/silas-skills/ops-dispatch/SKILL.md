@@ -21,9 +21,16 @@ through the ops surface, never by improvising side channels.
 The chief keeps the judgments: rulings, merges, and novel failures. The
 mechanical reactions are YOURS — execute them without asking:
 
-- **Re-arm clean aborts.** A review round that aborted without a live lane
-  racing its target is re-armed by a fresh review request once the lane
-  delivery settles.
+- **Re-arm proven clean aborts.** The digest marks only an aborted round with
+  `round.perkins-incomplete.reason = service_restart` or
+  `service_restart_missing_review_lane` on the unchanged delivered head.
+  Once its target branch is idle and the push has settled, request ONE new
+  review with `"by":"silas","rule_id":"clean-abort-service-restart",` and
+  `"source_round_id":"<digest.cleanAbort.roundId>"`. The service records
+  the rule/round on `silas.review-triggered`; a 409 branch-busy deferral also
+  records them and remains eligible on the next sweep. Never force it.
+  Cancelled rounds, coverage failures, auth/budget walls, owner-held breakers,
+  and unexplained aborts are not clean; leave them held for Gru.
 - **Respin known failure patterns.** When a failure class has a recorded
   rule (a documented retry, a re-brief on a known protocol break, a lens
   retry), apply the rule and record the action — do not escalate what the
@@ -67,7 +74,9 @@ mechanical reactions are YOURS — execute them without asking:
 
 2. **PR registered, review overdue.** Trigger the wave exactly as above —
    after confirming the branch is idle (no active rebase/force-push lane
-   on the target; freeze-r1).
+   on the target; freeze-r1). If the digest row has `cleanAbort`, include
+   its `rule_id` and `source_round_id` in the review request; never repeat
+   an accepted request for that abort.
    Never trigger twice for the same state: on the Perkins route a round
    exists afterwards and the digest stops listing the job. On the
    `bmad-review-fallback` route no round is created — the gate runs its own

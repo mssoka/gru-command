@@ -147,7 +147,7 @@ export interface SupervisedSlot {
   readonly id: string;
   readonly role: Role;
   /** Spawn (adopting the result); usually wraps registry.spawn. */
-  ensure(options?: SpawnOptions): Promise<AgentHandle>;
+  ensure(options?: SpawnOptions & { readonly intent?: 'user' | 'autonomous' }): Promise<AgentHandle>;
   /** The current live handle, or null between restarts. */
   current(): AgentHandle | null;
   /** Fired when a supervisor restart produced a new live handle. */
@@ -285,9 +285,12 @@ export class Supervisor {
 
   private async ensureSlot(
     slot: SupervisedSlotInternal,
-    options?: SpawnOptions,
+    options?: SpawnOptions & { readonly intent?: 'user' | 'autonomous' },
   ): Promise<AgentHandle> {
     const existing = this.slotAgent(slot);
+    if (existing?.breakerOpen && options?.intent === 'autonomous') {
+      throw new Error(`supervised slot "${slot.id}" owner-held breaker is open; autonomous ensure cannot re-arm it`);
+    }
     if (existing !== null && existing.handle !== null) return existing.handle;
     if (existing !== null && existing.inRestart) {
       // A restart rung owns the respawn; wait for it by polling the slot.
@@ -323,7 +326,8 @@ export class Supervisor {
       }
     }
     const ensureGeneration = slot.generation;
-    const handle = await slot.spawn(options);
+    const { intent: _intent, ...spawnOptions } = options ?? {};
+    const handle = await slot.spawn(spawnOptions);
     if (this.disposed || this.slots.get(slot.id) !== slot) {
       await this.registry.disposeHandle(handle).catch(() => {});
       throw new Error(`supervised slot "${slot.id}" is not active`);

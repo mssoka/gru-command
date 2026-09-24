@@ -111,7 +111,9 @@ export interface ChatServerOptions {
   readonly pointer: GruSessionPointer;
   /** Spawn (or resume) the single Gru session. Injected: the chat layer
    * never touches a concrete adapter or the registry (runtime-agnostic). */
-  readonly spawnGru: (resumeFile: string | null) => Promise<AgentHandle>;
+  readonly spawnGru: (resumeFile: string | null, source?: 'chat' | 'wake') => Promise<AgentHandle>;
+  /** Supervisor owner-held breaker gate: machine turns never re-arm it. */
+  readonly canWakeGru?: () => boolean;
   /** Mint a native session without resume/transcript context. This is
    * mandatory: reusing spawnGru(null) could return the supervised old handle. */
   readonly spawnFreshGru: () => Promise<AgentHandle>;
@@ -277,7 +279,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   // Gru session lifecycle
   // -----------------------------------------------------------------------
 
-  function ensureGru(): Promise<AgentHandle> {
+  function ensureGru(source: 'chat' | 'wake' = 'wake'): Promise<AgentHandle> {
+    if (source === 'wake' && options.canWakeGru?.() === false) {
+      return Promise.reject(new Error('owner-held Gru breaker is open; wake waits for authorized re-arm'));
+    }
     if (handle !== null) return Promise.resolve(handle);
     // Bounded retries: after a failure, a reconnect (or a fresh message)
     // inside the backoff window must NOT reach the spawner again. The gate
@@ -286,7 +291,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       return Promise.reject(new SpawnBackoffError(spawnGate.blockedFor()));
     }
     if (spawning === null) {
-      const attempt = spawnGru();
+      const attempt = spawnGru(source);
       // Assign the gate BEFORE any settlement callback can run: a
       // synchronous throw inside spawnGru (corrupt resume pointer) would
       // otherwise complete its cleanup before the assignment lands —
@@ -305,7 +310,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     return spawning;
   }
 
-  async function spawnGru(): Promise<AgentHandle> {
+  async function spawnGru(source: 'chat' | 'wake'): Promise<AgentHandle> {
     try {
       // Inside the try (r1 W4): a corrupt resume pointer must surface as
       // a spawn failure and CLEAR the spawn gate — not wedge it forever.
@@ -318,7 +323,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         resume: resumeFile !== null,
         replacing_unrecoverable_boundary: replacingUnrecoverableBoundary,
       });
-      const spawned = await options.spawnGru(resumeFile);
+      const spawned = await options.spawnGru(resumeFile, source);
       if (disposed) {
         // The server went down while the spawn was in flight — release the
         // session instead of wiring it into a dead server (r1 N9).
@@ -688,10 +693,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
   /** Awareness context for one prompt; fail-soft — a broken awareness layer
    * must never take message delivery down. */
-  function awarenessPrepare(): AwarenessInjection | null {
+  function awarenessPrepare(source: 'chat' | 'wake' = 'chat'): AwarenessInjection | null {
     if (options.awareness === undefined) return null;
     try {
-      return options.awareness.prepare();
+      return options.awareness.prepare(source);
     } catch (error) {
       log('error', 'gru awareness prepare failed — delivering without service context', {
         error: errorMessage(error),
@@ -715,9 +720,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
    * steering into a live conversation; settle hooks call back here. */
   function maybeWake(): void {
     if (disposed || !wakeRequested || wakeRunning || options.awareness === undefined) return;
-    if (recoveryBlockedReason !== null) {
+    if (recoveryBlockedReason !== null || options.canWakeGru?.() === false) {
       wakeRequested = false;
-      options.awareness.noteWakeBlocked?.(recoveryBlockedReason);
+      options.awareness.noteWakeBlocked?.(recoveryBlockedReason ?? 'owner-held Gru breaker is open; authorized re-arm required');
       return;
     }
     if (
@@ -731,6 +736,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       return;
     }
     wakeRequested = false;
+    if (options.awareness.admitWake?.() === false) return;
     wakeRunning = true;
     void deliver(null, '', undefined, true).finally(() => {
       wakeRunning = false;
@@ -784,7 +790,8 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         // inject, do not spawn a session or burn a model turn.
         let wakeInjection: AwarenessInjection | null = null;
         if (wake) {
-          wakeInjection = awarenessPrepare();
+          if (options.awareness?.admitWake?.() === false) return;
+          wakeInjection = awarenessPrepare('wake');
           if (wakeInjection === null) {
             // Claimed by the policy but nothing left to say (the row was
             // closed in between): report it so the tracker sees the miss.
@@ -829,14 +836,16 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         let gru: AgentHandle;
         for (;;) {
           try {
-            gru = await ensureGru();
+            gru = await ensureGru(wake ? 'wake' : 'chat');
           } catch (error) {
             // Ephemeral: a transient spawn failure must not replay forever.
             if (client !== null) {
               send(client, ephemeralError('Gru is temporarily unavailable; retry after reconnect.'));
             }
             log('error', 'Gru delivery spawn failed', { error: errorMessage(error) });
-            if (wake) options.awareness?.noteWakeOutcome?.(false, errorMessage(error));
+            if (wake && options.canWakeGru?.() === false) {
+              options.awareness?.noteWakeBlocked?.('owner-held Gru breaker is open; authorized re-arm required');
+            } else if (wake) options.awareness?.noteWakeOutcome?.(false, errorMessage(error));
             return;
           }
           const barriers = activeDeliveryBarriers();
@@ -882,6 +891,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               { owner: CHAT_OWNER },
             );
           } else {
+            if (wake && options.canWakeGru?.() === false) {
+              options.awareness?.noteWakeBlocked?.('owner-held Gru breaker is open; authorized re-arm required');
+              return;
+            }
+            if (wake && options.awareness?.admitWake?.() === false) return;
             const injection = wake ? wakeInjection : awarenessPrepare();
             const baseText =
               injection === null
@@ -896,6 +910,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               allowed.length > 0 ? allowed : undefined,
               visionUnavailable,
             );
+            if (wake) options.awareness?.noteWakeAttempt?.();
             ownedOpenTurn = true;
             turnLive = true; // optimistic: the turn_start event confirms
             if (wake && injection !== null) {
@@ -1554,7 +1569,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         pendingDeliveries += 1;
         broadcastContext();
         try {
-          await ensureGru();
+          await ensureGru('chat');
         } finally {
           pendingDeliveries -= 1;
           broadcastContext();

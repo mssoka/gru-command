@@ -131,8 +131,10 @@ receipt (`shown_at`, one per surface, idempotent). An **ack**
 rows. The bell badge counts all unseen needs-owner rows, including info;
 the NEEDS GRU machine queue is tracked separately and never rings the bell.
 Only owner/FYI rows expose Ack or Mark seen controls; Gru dispositions
-machine rows through the notification disposition endpoint. A blocked wake
-creates a durable needs-owner stop asking for manual service recovery.
+machine rows through the notification disposition endpoint. Existing routing
+never changes by age or at boot. Gru may post an explicit needs-owner decision
+through the authenticated endpoint; a blocked wake creates a durable
+needs-owner stop asking for manual service recovery.
 
 **Surfaces:** in-app toasts (always — the floor), the browser
 Notification API (permission requested at pairing; toasts carry the load

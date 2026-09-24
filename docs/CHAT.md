@@ -310,17 +310,20 @@ relaying it. Two mechanisms share one boundary:
   `never` is passive-only. `wake_min_severity` floors the wake,
   `wake_min_interval_ms` (default 5 min) bounds autonomous turns while
   candidates inside the window coalesce into ONE trailing wake,
-  `wake_quiet_hours` defers wakes to the end of a local-time window, and
-  per-id dedupe (persisted) ensures one wake per notification. Unacked
+  `wake_quiet_hours` defers wakes to the next real local-time window end
+  (including DST changes); admission is rechecked after any queued user
+  turn. Per-id dedupe is reconciled from durable ledger receipts on boot
+  so a torn awareness sidecar write cannot redeliver a received wake. Unacked
   machine rows at boot are seeded as Gru's backlog. A wake with nothing to
   inject does not spawn a session or burn a turn, and a wake requested
   mid-turn becomes one trailing turn after the conversation goes idle — it
   is never steered into a live user turn. Each wake is a full model turn.
 - **Morning digest** (`[chat] morning_digest_gap_ms`, default 8 h; 0
   disables): the first delivered block after a quiet gap adds a bounded
-  "while you were away" digest — fires (wakes acted on), actions, merges,
-  staged PRs — derived from the ledger, so the chief catches up without
-  the owner relaying anything.
+  "while you were away" digest — fires (wakes delivered), actions with
+  disposition details, merges, staged PRs — derived from the ledger with
+  a separate owner cursor, so autonomous turns cannot consume it. Capped
+  counts are shown as lower bounds (e.g. `100+`).
 
 The client-facing `notice` frame is now the needs-owner channel only:
 action-required rows never render in a human-facing band or ring the owner

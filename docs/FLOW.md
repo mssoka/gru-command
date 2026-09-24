@@ -172,7 +172,8 @@ fallback session is a full-capability minion by design — it must load the
 ambient BMAD skill — and is instructed never to gate, approve, merge, or
 modify implementation code; every gate decision is the host's. The fallback
 never records a Perkins verdict and never moves merge authority: only an
-exact-head Perkins READY can authorize a merge, and merge stays user-held
+exact-head Perkins READY can authorize a merge; Gru merges this repository
+only after that gate, while the owner holds merges elsewhere
 everywhere. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (install BMAD via
 onboarding / restore Perkins) are escalated and recorded on the job as
@@ -322,10 +323,12 @@ the judgment; the dispatch surface is the mechanical hand.
 - **The digest** handed to every wake carries the actionable states,
   computed from the ledger: delivered jobs with no PR registered; PRs
   whose follow-up delivery proves the lane head moved past the newest
-  round's reviewed target (first review AND re-review after a fix round;
-  an unchanged head warrants no round; and a review already REQUESTED for
+  round's reviewed target (first review AND re-review after a fix round);
+  or a proven `service_restart` abort on the unchanged delivered head,
+  once per source round under `clean-abort-service-restart`. Other aborts
+  and unchanged heads warrant no round. A review already REQUESTED for
   the current state retires the row — including the bmad-review fallback
-  route, which creates no round and owns its own fix loop); NEEDS CHANGES
+  route, which creates no round and owns its own fix loop. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
   plus recent minion errors for context.
@@ -394,17 +397,18 @@ awareness layer batches, persists, and calls the chat wake sink.
   bounds autonomous turns; candidates inside the window coalesce into ONE
   trailing wake carrying the whole batch.
 - **Quiet hours** — `wake_quiet_hours = "HH:MM-HH:MM"` (local time, may wrap
-  midnight; default off) defers wakes to the window's end.
+  midnight; default off) defers wakes to the next real local window end,
+  including DST transitions. Admission is checked again after a queued
+  user turn and immediately before a wake starts; no turn opens in-window.
 - **Dedupe** — one wake per open notification id, persisted (`awareness.json`);
   open receipts are never evicted after an arbitrary number of other wakes.
   Closed IDs are pruned. A failed attempt consumes the configured interval
   (including across restarts) but never claims the notification ID.
-- **Backlog migration** — before scanning old unacked rows, persisted
-  provider/credential stops, supervision breakers and foreign-listener /
-  destructive-op stops are moved to `needs-owner` only while unacknowledged.
-  Historical human Acks are retained: an already re-armed breaker must not
-  ring again. Remaining open machine rows seed bounded wake turns; all mode
-  includes FYI/owner context too.
+- **Backlog migration** — existing routing is immutable: even legacy rows
+  with owner-like kinds remain machine attention if recorded as
+  `action-required`. Open machine rows seed bounded wake turns; an owner
+  decision is a new explicit `needs-owner` post, never an automatic rewrite.
+  All mode includes FYI/owner context too.
 
 **Mechanics.** A wake calls the chat server's `wakeAwareness()`: when the
 lane is idle it opens one ordinary turn whose prompt is the awareness
@@ -417,8 +421,8 @@ inject neither spawns a session nor burns a model turn; a failed wake is a
 durable notice, never a message-delivery error. Notification IDs stay
 pending independently of the event cursor until a durable turn-start frame
 confirms the prompt accepted a block containing those IDs. This receipt
-arms the unresolved-attention deadline immediately, even if Gru's turn is
-still running or hung. A later turn failure is logged separately without
+survives sidecar-write failure because boot reconciles delivered IDs from
+ledger `gru.wake` events. A later turn failure is logged separately without
 re-waking an already delivered ID; pre-acceptance spawn/prompt failures
 retry after at least five
 seconds AND the configured wake interval. Long intervals use safe timer
@@ -451,17 +455,15 @@ next user-directed context block:
 **Unresolved follow-up.** A successful prompt is delivery, not resolution.
 Open machine and owner stops remain eligible for bounded context in later
 user turns even after the ledger event cursor advances; both routing classes
-receive space when each has pending rows. If a delivered machine alert remains unresolved
-for 30 minutes, a durable one-time `needs-owner` follow-up rings the owner bell
-without re-waking that ID. The due time survives restart; a later Gru
-machine disposition resolves the follow-up automatically. Normal machine
-alerts never ring the owner bell merely for being posted.
+receive space when each has pending rows. No age-based owner escalation is
+made: only Gru's explicit, justified `POST /api/notifications/needs-owner`
+creates an owner stop. A machine disposition closes the original incident.
 
 **Machine disposition.** A successful prompt is delivery, not resolution.
 After acting on an `action-required` row Gru calls the authenticated
 `POST /api/notifications/{id}/disposition` with a nonempty JSON `detail`
 (the action taken or why no safe action was possible). The ledger records
-`notification.resolved` by `gru`; the endpoint refuses `needs-owner` and
+`notification.resolved` by `gru` with the action detail; the endpoint refuses `needs-owner` and
 FYI rows. The authenticated `/ack` API itself refuses machine rows, not
 just the web UI. Both open machine alerts and owner stops remain in their
 board bands regardless of newer feed traffic. Only the owner Ack clears

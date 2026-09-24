@@ -194,7 +194,9 @@ describe('board server — HTTP API', () => {
     const owner = api.recordNotification({ id: 'owner-disposition', kind: 'test', routing: 'needs-owner', severity: 'info', title: 'Ask owner' });
     const path = `/api/notifications/${machine.id}/disposition`;
     expect((await postJson(port, path, null, { detail: 'Fixed' })).status).toBe(401);
+    expect((await postJson(port, path, 'wrong-token', { detail: 'Fixed' })).status).toBe(401);
     expect((await postJson(port, path, 'board-test-token', {})).status).toBe(400);
+    expect((await postJson(port, path, 'board-test-token', { detail: '   ' })).status).toBe(400);
     expect((await postJson(port, `/api/notifications/${owner.id}/disposition`, 'board-test-token', { detail: 'No' })).status).toBe(400);
     expect(api.getNotification(machine.id)?.resolvedAt).toBeNull();
     const resolved = await postJson(port, path, 'board-test-token', { detail: 'Opened repair lane' });
@@ -202,7 +204,27 @@ describe('board server — HTTP API', () => {
     expect(api.getNotification(machine.id)?.resolvedAt).not.toBeNull();
     expect(api.getNotification(owner.id)?.resolvedAt).toBeNull();
     expect((await postJson(port, path, 'board-test-token', { detail: 'duplicate' })).status).toBe(200);
-    expect(api.listEventsAfter(0, { kinds: ['notification.resolved'] }).filter((e) => (e.payload as { id?: string }).id === machine.id)).toHaveLength(1);
+    expect(api.listEventsAfter(0, { kinds: ['notification.resolved'] }).filter((e) => (e.payload as { id?: string }).id === machine.id)).toMatchObject([
+      { payload: { id: machine.id, by: 'gru', detail: 'Opened repair lane' } },
+    ]);
+  });
+
+  it('validates authenticated Gru owner escalation and places it only in FOR YOU', async () => {
+    const { api, port } = harness;
+    const path = '/api/notifications/needs-owner';
+    for (const token of [null, 'wrong-token']) {
+      expect((await postJson(port, path, token, { title: 'Owner call', detail: 'Approve external merge' })).status).toBe(401);
+    }
+    for (const body of [{}, { title: '  ', detail: 'x' }, { title: 'x', detail: '\n' }, { title: 'x'.repeat(501), detail: 'y' }]) {
+      expect((await postJson(port, path, 'board-test-token', body)).status).toBe(400);
+    }
+    const before = api.countPendingActionRequired();
+    const created = await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge' });
+    expect(created).toMatchObject({ status: 201, body: { kind: 'gru.owner-escalation', routing: 'needs-owner', title: 'Owner call', ackedAt: null } });
+    expect(api.countPendingActionRequired()).toBe(before); // never loops into Gru's machine queue
+    const row = created.body as { id: string };
+    expect(api.getNotification(row.id)).toMatchObject({ detail: 'Approve external merge', shownAt: null });
+    expect((await getJson(port, '/api/board', 'board-test-token')).body).toMatchObject({ unackedNeedsOwner: expect.any(Number) });
   });
 
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {

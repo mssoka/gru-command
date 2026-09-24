@@ -1275,6 +1275,25 @@ describe('supervisor — Perkins r1 fixes', () => {
     h.dispose();
   });
 
+  it('autonomous slot use cannot re-arm or Ack an owner-held Gru breaker', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({ id: 'gru-autonomous-stop', role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options) });
+    const first = (await slot.ensure({ intent: 'autonomous' })) as FakeHandle;
+    h.registry.spawnImpl = async () => { throw new Error('spawn exploded'); };
+    hang(first);
+    h.advance(60);
+    await sleep(250);
+    const escalation = h.notificationsOfKind('supervision.breaker')[0]!;
+    expect(escalation).toBeDefined();
+    h.registry.spawnImpl = async (role) => new FakeHandle(role, 'should-not-spawn', null);
+    await expect(slot.ensure({ intent: 'autonomous' })).rejects.toThrow(/owner-held breaker is open/);
+    expect(h.api.getNotification(escalation.id)).toMatchObject({ ackedAt: null, routing: 'needs-owner' });
+    expect(h.api.listEventsAfter(0, { kinds: ['supervision.rearmed'] })).toEqual([]);
+    expect(h.supervisor.viewFor(first.id)?.breakerOpen).toBe(true);
+    h.dispose();
+  });
+
   it('r1-17/#24: slot use on an open breaker re-arms supervision AND acks the escalation row', async () => {
     const h = boot();
     const slot = h.supervisor.declareSlot({

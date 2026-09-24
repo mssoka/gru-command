@@ -1243,27 +1243,6 @@ export class LedgerApi {
     });
   }
 
-  /** Reclassify only still-unacknowledged legacy owner stops. An old human
-   * Ack may already have re-armed a breaker; never resurrect it on boot. */
-  migrateOwnerHeldNotifications(): readonly NotificationRecord[] {
-    return this.transaction(() => {
-      const rows = this.db.prepare(`
-        SELECT * FROM notifications
-        WHERE resolved_at IS NULL AND acked_at IS NULL AND routing = 'action-required'
-          AND (kind LIKE 'decisions.degraded.%'
-            OR kind LIKE 'supervision.provider-wall.%'
-            OR kind IN ('port-squat', 'roll-port-squat', 'worktree-sweep-paused', 'supervision.breaker'))
-        ORDER BY ts, id
-      `).all() as Row[];
-      return rows.map((raw) => {
-        const id = str(raw.id);
-        this.db.prepare("UPDATE notifications SET routing = 'needs-owner' WHERE id = ? AND acked_at IS NULL AND resolved_at IS NULL").run(id);
-        this.appendEvent({ kind: 'notification.triaged', agentId: nstr(raw.agent_id), payload: { id, routing: 'needs-owner', reason: 'legacy owner-held incident migration' } });
-        return this.getNotification(id) as NotificationRecord;
-      });
-    });
-  }
-
   findNotificationByKind(kind: string, mode: 'any' | 'unacked' | 'active' | boolean = 'any'): NotificationRecord | null {
     const normalized = mode === true ? 'unacked' : mode === false ? 'any' : mode;
     const sql = normalized === 'unacked'

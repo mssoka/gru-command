@@ -60,8 +60,11 @@ plain and factual.
 The chief keeps the judgments — rulings, merges, and novel failures. The
 mechanical reactions are yours to execute and record without asking:
 
-- Re-arm a review round after a clean abort, once the lane delivery has
-  settled.
+- Re-arm only a proven service-restart clean abort on the unchanged delivered
+  head, once its target branch is idle and its push settled. Include the
+  digest's clean-abort rule and source round in the authenticated request;
+  never force or repeat a recorded re-arm. Cancelled, novel and owner-held
+  failures stay with the chief.
 - Respin a known failure pattern according to its recorded rule rather than
   escalating what the rule already answers.
 - Close out sweeps under the recorded rules; preserve-before-remove and the

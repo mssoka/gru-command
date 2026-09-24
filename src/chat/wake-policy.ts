@@ -96,16 +96,17 @@ export function quietHoursActive(window: QuietHours | null, atMs: number): boole
  */
 export function quietHoursEnd(window: QuietHours | null, atMs: number): number | null {
   if (!quietHoursActive(window, atMs)) return null;
-  const windowResolved = window as QuietHours;
-  const date = new Date(atMs);
-  const end = new Date(atMs);
-  end.setHours(Math.floor(windowResolved.endMinute / 60), windowResolved.endMinute % 60, 0, 0);
-  // Wrapping windows: a late-evening start ends on the NEXT morning.
-  const minute = localMinuteOfDay(atMs);
-  if (windowResolved.startMinute > windowResolved.endMinute && minute >= windowResolved.startMinute) {
-    end.setDate(date.getDate() + 1);
+  // Walk epoch minutes rather than using Date.setHours: on fall-back it
+  // chooses the *first* occurrence of an ambiguous hour, which can be in
+  // the past while the second occurrence is still quiet. On spring-forward
+  // the configured end minute may not exist at all. Find the first future
+  // non-quiet instant (at most one local day plus DST adjustment).
+  const minuteMs = 60_000;
+  for (let next = Math.floor(atMs / minuteMs) * minuteMs + minuteMs;
+    next <= atMs + 26 * 60 * minuteMs; next += minuteMs) {
+    if (!quietHoursActive(window, next)) return next;
   }
-  return end.getTime();
+  throw new Error('wake quiet window has no future endpoint within 26 hours');
 }
 
 /** Validate the operator's `"HH:MM-HH:MM"` quiet window; empty = off. */

@@ -163,6 +163,24 @@ describe('wake policy — quiet hours', () => {
     expect(quietHoursEnd(night, new Date('2026-09-23T12:00:00').getTime())).toBeNull();
   });
 
+  it('finds a future quiet-hours endpoint across both DST transitions', () => {
+    const prior = process.env.TZ;
+    process.env.TZ = 'America/New_York';
+    try {
+      const spring = quietHoursEnd({ startMinute: 30, endMinute: 2 * 60 + 30 },
+        new Date('2026-03-08T01:45:00-05:00').getTime());
+      expect(new Date(spring!).toISOString()).toBe('2026-03-08T07:00:00.000Z'); // 03:00 EDT
+      const fallWindow = { startMinute: 30, endMinute: 90 };
+      const secondOneAm = new Date('2026-11-01T01:10:00-05:00').getTime();
+      expect(quietHoursActive(fallWindow, secondOneAm)).toBe(true);
+      expect(new Date(quietHoursEnd(fallWindow, secondOneAm)!).toISOString())
+        .toBe('2026-11-01T06:30:00.000Z'); // second 01:30 EST, not first 01:30 EDT
+    } finally {
+      if (prior === undefined) delete process.env.TZ;
+      else process.env.TZ = prior;
+    }
+  });
+
   it('defers a wake inside the window to the window end', () => {
     const policy = new WakePolicy({
       ...BASE,

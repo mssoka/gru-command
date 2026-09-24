@@ -370,6 +370,18 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           json(res, 200, suffix === '/status' ? ledger.setRoundStatus(id, value) : ledger.setRoundVerdict(id, value));
           return;
         }
+        if (req.method === 'POST' && path === '/api/notifications/needs-owner') {
+          if (!authed(req, res)) return;
+          const body = (await readBody(req)) as Record<string, unknown>;
+          const title = strField(body, 'title').trim();
+          const detail = strField(body, 'detail').trim();
+          if (title === '' || title.length > 500 || detail === '' || detail.length > 4_000) {
+            throw new Error('owner escalation title (1-500) and detail (1-4000) must be non-blank');
+          }
+          const row = notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title, detail });
+          json(res, 201, row);
+          return;
+        }
         if (req.method === 'POST' && path.startsWith('/api/notifications/') && (path.endsWith('/shown') || path.endsWith('/ack') || path.endsWith('/disposition'))) {
           if (!authed(req, res)) return;
           const suffix = path.endsWith('/shown') ? '/shown' : path.endsWith('/disposition') ? '/disposition' : '/ack';

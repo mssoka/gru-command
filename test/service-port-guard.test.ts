@@ -47,8 +47,12 @@ describe('wake boot ordering', () => {
   it('binds backlog wake only after the HTTP listener, board routes and post-bind foreign-listener check', () => {
     const source = readFileSync(join(repoRoot, 'src', 'main.ts'), 'utf-8');
     const bind = source.indexOf('awareness.setWakeSink(() => chat.wakeAwareness())');
-    expect(bind).toBeGreaterThan(source.indexOf('board.attach(handle.httpServer)'));
-    expect(bind).toBeGreaterThan(source.indexOf('const foreign = await instancePortForeignListener(config)', source.indexOf('state.handle = await service.start()')));
+    const listen = source.indexOf('state.handle = await service.start()');
+    const routes = source.indexOf('board.attach(handle.httpServer)');
+    const foreign = source.indexOf('const foreign = await instancePortForeignListener(config)', listen);
+    for (const prerequisite of [bind, listen, routes, foreign]) expect(prerequisite).toBeGreaterThanOrEqual(0);
+    expect(bind).toBeGreaterThan(routes);
+    expect(bind).toBeGreaterThan(foreign);
     expect(source.indexOf('awareness.setWakeSink(', bind + 1)).toBe(-1);
   });
 });

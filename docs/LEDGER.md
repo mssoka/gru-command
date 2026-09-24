@@ -141,7 +141,9 @@ The `notifications` table is the durable notification log (SPEC ruling
 `notification.created` / `notification.shown` / `notification.acked`
 event and publishes on the bus — the board pushes, machine-attention
 rows wake Gru, needs-owner rows surface in chat, and the breaker re-arm
-rides the ack. The
+rides the ack. Legacy row routing is never promoted on boot or by age;
+`notification.resolved` with Gru's action detail closes machine work,
+while only an explicit `needs-owner` post creates a human decision stop. The
 board's notification center renders this table directly; nothing is
 derived per-snapshot.
 

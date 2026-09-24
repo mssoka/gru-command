@@ -3438,6 +3438,38 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
     }
   });
 
+  it('rechecks wake admission after a held user turn before opening the trailing turn', async () => {
+    let releaseTurn!: () => void;
+    const held = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    let allowed = true;
+    const outcomes: boolean[] = [];
+    const harness = await makeHarness({ awareness: {
+      admitWake: () => allowed,
+      prepare: () => sampleInjection(),
+      commit: () => {},
+      noteWakeOutcome: (ok) => outcomes.push(ok),
+    } });
+    harness.handle.nextHold = held;
+    try {
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('busy before quiet hours', 'm1');
+      await pollUntil(() => harness.handle.calls.length === 1, 'held user turn');
+      harness.chat.wakeAwareness();
+      allowed = false; // time entered quiet hours while wake was queued
+      releaseTurn();
+      await done;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(harness.handle.calls).toHaveLength(1);
+      expect(outcomes).toEqual([]);
+      allowed = true; // awareness timer opens the next eligible window
+      harness.chat.wakeAwareness();
+      await pollUntil(() => harness.handle.calls.length === 2, 'admitted trailing wake');
+      expect(outcomes).toEqual([true]);
+      await client.close();
+    } finally { await harness.close(); }
+  });
+
   it('a wake with nothing to inject neither spawns a session nor burns a turn', async () => {
     const harness = await makeHarness({
       awareness: {

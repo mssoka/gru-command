@@ -99,9 +99,8 @@ export class NotificationCenter {
     this.onActionRequired = opts.onActionRequired ?? (() => {});
     this.onNeedsOwner = opts.onNeedsOwner ?? (() => {});
     this.log = opts.log ?? (() => {});
-    // Upgrade persisted owner-held stops BEFORE decision-runtime dedupe and
-    // the awareness backlog bind. The snapshot/bell reads the migrated rows.
-    this.ledger.migrateOwnerHeldNotifications();
+    // Existing machine-routed rows stay in Gru's first-wake backlog. Only
+    // newly posted owner stops or explicit Gru escalations ring the bell.
     // Derive AFTER the write that published the event: the bus delivers
     // synchronously in write order, so the source row is already durable
     // when the FYI row lands.
@@ -156,18 +155,8 @@ export class NotificationCenter {
       input.dedupe === 'all' ? 'any' : input.dedupe,
     );
     if (existing !== null) {
-      // An active legacy incident may be returned by kind instead of posted
-      // anew. Never preserve an obsolete machine routing for an owner stop.
-      if (existing.resolvedAt === null && existing.ackedAt === null &&
-          (input.routing === 'needs-owner' || isOwnerHeldNotificationKind(input.kind)) &&
-          existing.routing === 'action-required') {
-        this.ledger.migrateOwnerHeldNotifications();
-        const migrated = this.ledger.getNotification(existing.id);
-        if (migrated?.routing !== 'needs-owner') {
-          throw new Error(`owner-held incident ${existing.kind} retained machine routing; migrate its kind before reuse`);
-        }
-        return migrated;
-      }
+      // Do not grandfather an old machine row into FOR YOU merely because
+      // a newer post of the same kind is owner-held. Gru triages the old ID.
       return existing;
     }
     return this.post(input);

@@ -518,6 +518,47 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('re-arms one proven same-head service-restart abort through the guarded Silas review API', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: 'clean-abort', repo_path: repo.path, title: 'clean', briefing: 'b' }, TOKEN);
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('clean-abort', 'job.delivered') === null && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(h.ledger.latestJobEvent('clean-abort', 'job.delivered')).not.toBeNull();
+      expect((await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'clean-abort', url: PR_URL }, TOKEN)).status).toBe(200);
+      const lane = h.worktrees.listWorktrees({ jobId: 'clean-abort' }).find((row) => row.kind === 'job')!;
+      const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: lane.path, encoding: 'utf8' }).trim();
+      expect(h.ledger.latestJobEvent('clean-abort', 'job.delivered')?.payload).toMatchObject({ sha, source: 'dispatch' });
+      const round = h.ledger.addRound({ jobId: 'clean-abort', targetRef: sha, lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      const body = { job_id: 'clean-abort', by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: round.id };
+      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean-abort', roundId: round.id, payload: { reason: 'cancelled' } });
+      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean-abort', roundId: round.id, payload: { reason: 'service_restart' } });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'clean-abort', payload: { sha: 'new-unreviewed-head' } });
+      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'clean-abort', payload: { sha } });
+      expect((await call(h.port, 'POST', '/api/dispatch/review', { ...body, force: true }, TOKEN)).status).toBe(400);
+      expect((await call(h.port, 'POST', '/api/dispatch/review', { ...body, by: 'gru' }, TOKEN)).status).toBe(400);
+      const digest = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      expect(digest.prWithoutReview).toMatchObject([{ jobId: 'clean-abort', cleanAbort: { roundId: round.id } }]);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);
+      expect(review).toMatchObject({ status: 202, json: { route: 'perkins', round_id: 'clean-abort-r2',
+        rule_id: 'clean-abort-service-restart', source_round_id: round.id } });
+      expect(h.ledger.latestJobEvent('clean-abort', 'silas.review-triggered')?.payload).toMatchObject({
+        rule_id: 'clean-abort-service-restart', source_round_id: round.id, round_id: 'clean-abort-r2',
+      });
+      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+    } finally { await h.close(); }
+  }, 90_000);
+
   it('/api/silas/directive routes to the live minion, flips the lane back to working, records the event', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-directive');
