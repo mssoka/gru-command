@@ -37,7 +37,7 @@ const PINS: Record<string, number> = {
   'github-poll.test.ts': 22,
   'health.test.ts': 19,
   'identity.test.ts': 3,
-  'install-one-line.test.ts': 32,
+  'install-one-line.test.ts': 33,
   'install.test.ts': 12,
   'lan-phone-raw-client.test.ts': 6,
   'ledger-api.test.ts': 23,

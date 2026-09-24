@@ -109,8 +109,10 @@ fi
 # breaks on the next shell. The resolved install path is stable.
 NODE_BIN="$(command -v node || true)"
 if [[ -n "$NODE_BIN" ]]; then
-  resolved="$(cd "$(dirname "$NODE_BIN")" && pwd -P)/$(basename "$NODE_BIN")"
-  [[ -x "$resolved" ]] && NODE_BIN="$resolved"
+  # Resolve the executable symlink too, not just its parent directory:
+  # fnm's per-shell bin can disappear after the installing shell exits.
+  resolved="$("$NODE_BIN" -p 'require("node:fs").realpathSync(process.execPath)' 2>/dev/null || true)"
+  [[ -n "$resolved" && -x "$resolved" ]] && NODE_BIN="$resolved"
 fi
 
 if [[ -z "$NODE_BIN" ]]; then
@@ -170,11 +172,22 @@ render_unit() {
     [[ "$repo" == *" "* ]] && repo_arg="\"$repo_arg\""
     [[ "$home" == *" "* ]] && home_arg="\"$home_arg\""
   fi
-  # The launchd unit carries the INSTALL-TIME PATH so runtime CLIs the
-  # adapters spawn (resolved via PATH, possibly under a version manager
-  # like fnm/nvm) stay findable outside any shell.
+  # Service managers do not inherit a shell's version-manager PATH. Put
+  # the stable Node installation's bin first (npm lives beside Node), then
+  # retain the install-time PATH for any other runtime CLIs.
+  local runtime_path="$(dirname "$NODE_BIN"):$PATH:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
+  if [[ "$runtime_path" == *$'\n'* ]]; then
+    err "PATH contains a newline which the unit renderer cannot escape"
+    exit 1
+  fi
+  if [[ "$template" == *.service.template ]]; then
+    # systemd Environment= is quoted; escape its string syntax and specifiers.
+    runtime_path="${runtime_path//\\/\\\\}"
+    runtime_path="${runtime_path//\"/\\\"}"
+    runtime_path="${runtime_path//%/%%}"
+  fi
   local path_value=""
-  path_value="$(esc_for_sed "$PATH:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin")"
+  path_value="$(esc_for_sed "$runtime_path")"
   sed -e "s|{{NODE}}|$node_arg|g" \
       -e "s|{{REPO_ROOT}}|$repo_arg|g" \
       -e "s|{{GRU_COMMAND_HOME}}|$home_arg|g" \
