@@ -604,6 +604,7 @@ async function main(): Promise<number> {
     wakeMinIntervalMs: config.chat.wakeMinIntervalMs,
     wakeMinSeverity: config.chat.wakeMinSeverity,
     wakeQuietHours: config.chat.wakeQuietHours,
+    morningDigestGapMs: config.chat.morningDigestGapMs,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const chat = createChatServer({

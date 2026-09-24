@@ -173,6 +173,11 @@ export interface ChatConfig {
   /** Local-time quiet window (empty/off by default). Inside it, wakes
    * defer to the window's end. */
   readonly wakeQuietHours: QuietHours | null;
+  /** Morning digest gap (ms): the first delivered block after this much
+   * quiet time carries a "while you were away" digest (fires, actions,
+   * merges, staged PRs) so the chief catches up without the owner
+   * relaying. 0 disables the digest. */
+  readonly morningDigestGapMs: number;
 }
 
 /** Worktree manager policy (E8; SPEC ruling 18). */
@@ -694,6 +699,7 @@ export function loadConfig(
     wakeMinIntervalMs: 300_000,
     wakeMinSeverity: 'info',
     wakeQuietHours: null,
+    morningDigestGapMs: 28_800_000,
   };
   let worktrees: WorktreesConfig | null = null;
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
@@ -922,6 +928,7 @@ export function loadConfig(
         'wake_min_interval_ms',
         'wake_min_severity',
         'wake_quiet_hours',
+        'morning_digest_gap_ms',
       ];
       for (const key of Object.keys(table)) {
         if (!VALID.includes(key)) {
@@ -951,6 +958,10 @@ export function loadConfig(
           table['wake_quiet_hours'] !== undefined
             ? requireQuietHours(table['wake_quiet_hours'], file, 'chat.wake_quiet_hours')
             : chat.wakeQuietHours,
+        morningDigestGapMs:
+          table['morning_digest_gap_ms'] !== undefined
+            ? requireNonNegativeInt(table['morning_digest_gap_ms'], file, 'chat.morning_digest_gap_ms')
+            : chat.morningDigestGapMs,
       };
     }
     if (raw['worktrees'] !== undefined) {

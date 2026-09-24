@@ -373,6 +373,9 @@ export function renderReferenceConfig(
         `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
       return tomlString(`${hhmm(window.startMinute)}-${hhmm(window.endMinute)}`);
     })()}`,
+    '# First delivered block after this much quiet time carries a "while you',
+    '# were away" digest (wakes, actions, merges, staged PRs). 0 disables it.',
+    `morning_digest_gap_ms = ${preserved?.chat.morningDigestGapMs ?? 28_800_000}`,
     '',
     '[worktrees]',
     '# Job/review worktree roots follow data_dir by default; uncomment only to relocate.',

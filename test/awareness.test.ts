@@ -46,6 +46,7 @@ function boot(options: {
   wakeMinIntervalMs?: number;
   wakeMinSeverity?: WakeMinSeverity;
   wakeQuietHours?: QuietHours | null;
+  morningDigestGapMs?: number;
   now?: () => number;
 } = {}): Rig {
   const dir = options.dir ?? tmpDir();
@@ -62,6 +63,7 @@ function boot(options: {
     wakeMinIntervalMs: options.wakeMinIntervalMs ?? 0,
     ...(options.wakeMinSeverity !== undefined ? { wakeMinSeverity: options.wakeMinSeverity } : {}),
     ...(options.wakeQuietHours !== undefined ? { wakeQuietHours: options.wakeQuietHours } : {}),
+    ...(options.morningDigestGapMs !== undefined ? { morningDigestGapMs: options.morningDigestGapMs } : {}),
     ...(options.now !== undefined ? { now: options.now } : {}),
     ...(options.limits !== undefined ? { limits: options.limits } : {}),
   });
@@ -373,5 +375,68 @@ describe('gru awareness — wake policy', () => {
     expect(restarted.woke).toHaveLength(0); // backlog seed: already claimed
     restarted.api.updateNotificationTriage(posted.id, 'action-required', 'retriage');
     expect(restarted.woke).toHaveLength(0); // live triage event: still claimed
+  });
+});
+
+describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
+  it('the first block after a quiet gap carries fires, actions, merges, and staged PRs', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00'));
+      const dir = tmpDir();
+      const rig = boot({ dir, now: () => Date.now() });
+      // Last night's delivered block stamps the gap start.
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'working', to: 'in-review' } });
+      const evening = rig.awareness.prepare();
+      expect(evening).not.toBeNull();
+      rig.awareness.commit(evening!);
+      expect(rig.awareness.prepare()).toBeNull(); // evening block consumed
+
+      // Overnight: a wake fired, a job progressed, one merged, one PR staged.
+      vi.setSystemTime(new Date('2026-09-23T07:00:00'));
+      rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+      rig.api.addJob({ id: 'j-merge', repo: 'demo', title: 'Merge me' });
+      rig.api.setJobStatus('j-merge', 'working');
+      rig.api.setJobPr('j-merge', 'https://example.invalid/pr/1');
+      rig.api.setJobStatus('j-merge', 'in-review');
+      rig.api.setJobStatus('j-merge', 'merged');
+      rig.api.addJob({ id: 'j-staged', repo: 'demo', title: 'Review me' });
+      rig.api.setJobStatus('j-staged', 'working');
+      rig.api.setJobPr('j-staged', 'https://example.invalid/pr/2');
+
+      const morning = rig.awareness.prepare();
+      expect(morning).not.toBeNull();
+      expect(morning?.text).toContain('While you were away (since 2026-09-22T');
+      expect(morning?.text).toContain('- fires: 1 wake acted on');
+      expect(morning?.text).toContain('- actions:');
+      expect(morning?.text).toContain('- merges: j-merge');
+      expect(morning?.text).toContain('- staged PRs: j-staged');
+
+      // Committing consumes the digest: the next nearby block has none.
+      rig.awareness.commit(morning!);
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j-staged', payload: { from: 'working', to: 'blocked' } });
+      expect(rig.awareness.prepare() ?? { text: '' }).not.toMatchObject({ text: expect.stringContaining('While you were away') });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('no digest on a fresh install (no delivery stamp yet) or when disabled', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T07:00:00'));
+      const fresh = boot({ now: () => Date.now() });
+      fresh.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      expect(fresh.awareness.prepare()?.text).not.toContain('While you were away');
+
+      const disabled = boot({ now: () => Date.now(), morningDigestGapMs: 0 });
+      disabled.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      const first = disabled.awareness.prepare();
+      disabled.awareness.commit(first!);
+      disabled.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+      expect(disabled.awareness.prepare()?.text).not.toContain('While you were away');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

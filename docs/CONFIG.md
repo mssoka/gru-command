@@ -216,6 +216,9 @@ wake_min_severity = "info"
 # Local-time quiet window ("HH:MM-HH:MM", may wrap midnight); wakes
 # inside it defer to the window end. Empty string = off.
 wake_quiet_hours = ""
+# First delivered block after this much quiet time carries a "while you
+# were away" digest (wakes, actions, merges, staged PRs). 0 disables it.
+morning_digest_gap_ms = 28800000
 
 [worktrees]
 # Job/review worktree roots follow data_dir by default; uncomment only to relocate.

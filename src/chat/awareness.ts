@@ -97,6 +97,7 @@ export type GruAwarenessLedger = Pick<
   | 'latestEventSeq'
   | 'appendCustomEvent'
   | 'listNotifications'
+  | 'listJobs'
 >;
 
 export interface GruAwarenessOptions {
@@ -114,6 +115,8 @@ export interface GruAwarenessOptions {
   readonly wakeMinSeverity?: WakeMinSeverity;
   /** Local-time quiet window (null/off). */
   readonly wakeQuietHours?: QuietHours | null;
+  /** First-block-after-gap morning digest threshold; 0 disables. */
+  readonly morningDigestGapMs?: number;
   readonly limits?: Partial<AwarenessLimits>;
   readonly log?: Log;
   /** Clock seam (tests advance fake timers through this closure). */
@@ -126,6 +129,9 @@ interface AwarenessState {
     readonly woken: readonly string[];
     readonly lastFiredAt: number | null;
   };
+  readonly digest?: {
+    readonly lastDeliveredAt: number | null;
+  };
 }
 
 /** Notification event kinds that carry a routing decision. */
@@ -135,6 +141,12 @@ const MAX_NOTIFICATION_SCAN = 200;
 /** Backlog seeding scope on first wake (migration: unacked machine rows
  * are Gru's backlog, not grandfathered to the owner bell). */
 const MAX_BACKLOG_SEED = 50;
+/** Default morning-digest gap (8 h): first block after a quiet night. */
+export const DEFAULT_MORNING_DIGEST_GAP_MS = 28_800_000;
+/** Morning-digest kernel kinds — the "actions" count. */
+const MORNING_ACTION_KINDS = ['job.delivered', 'job.status', 'round.verdict'] as const;
+/** Bounded morning-digest lines (fires/actions/merges/staged PRs). */
+const MAX_MORNING_LINES = 6;
 
 function payloadOf(event: EventRecord | BusEvent): Record<string, unknown> {
   const payload = event.payload;
@@ -263,9 +275,12 @@ export class GruAwareness {
   private readonly limits: AwarenessLimits;
   private readonly wakePolicy: WakePolicy;
   private readonly wakeMode: NotifyWakeMode;
+  private readonly morningDigestGapMs: number;
   private readonly log: Log;
   private readonly now: () => number;
   private cursor: number;
+  /** Epoch ms of the last delivered awareness block (morning-digest base). */
+  private lastDeliveredAt: number | null;
   private wakeSink: (() => void) | null = null;
   /** Candidate ids waiting to be released as ONE coalesced wake. */
   private readonly pendingWakeIds = new Set<string>();
@@ -278,10 +293,12 @@ export class GruAwareness {
     this.ledger = opts.ledger;
     this.limits = { ...AWARENESS_LIMITS, ...(opts.limits ?? {}) };
     this.wakeMode = opts.wakeMode ?? 'action-required';
+    this.morningDigestGapMs = opts.morningDigestGapMs ?? DEFAULT_MORNING_DIGEST_GAP_MS;
     this.log = opts.log ?? (() => {});
     this.now = opts.now ?? (() => Date.now());
     const state = GruAwareness.loadState(this.file);
     this.cursor = state.coveredThroughSeq;
+    this.lastDeliveredAt = state.digest?.lastDeliveredAt ?? null;
     this.wakePolicy = new WakePolicy(
       {
         mode: this.wakeMode,
@@ -347,7 +364,25 @@ export class GruAwareness {
           'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
       );
     }
-    return { coveredThroughSeq: value, wake: { woken, lastFiredAt } };
+    const digestRecord = record['digest'];
+    let digest: AwarenessState['digest'];
+    if (digestRecord !== undefined) {
+      if (typeof digestRecord !== 'object' || digestRecord === null || Array.isArray(digestRecord)) {
+        throw new Error(
+          `gru awareness state ${file} has an invalid digest section; ` +
+            'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
+        );
+      }
+      const delivered = (digestRecord as Record<string, unknown>)['lastDeliveredAt'];
+      if (!(delivered === null || (typeof delivered === 'number' && Number.isFinite(delivered)))) {
+        throw new Error(
+          `gru awareness state ${file} has an invalid digest section; ` +
+            'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
+        );
+      }
+      digest = { lastDeliveredAt: delivered };
+    }
+    return { coveredThroughSeq: value, wake: { woken, lastFiredAt }, ...(digest !== undefined ? { digest } : {}) };
   }
 
   /** Attach the wake action once the chat server exists (late-bound).
@@ -423,15 +458,18 @@ export class GruAwareness {
     }
     notes.reverse();
 
-    const text = this.render(notes, digestLines, overflow);
+    const text = this.render(notes, digestLines, overflow, this.morningDigest());
     if (text === null) return null;
     return { text, coveredThroughSeq: latest };
   }
 
   /** Commit a delivered block: advance the durable cursor to exactly the
-   * seq the block accounted for. Never regresses on out-of-order commits. */
+   * seq the block accounted for. Never regresses on out-of-order commits.
+   * The delivery stamp powers the morning digest (the next block after a
+   * quiet gap carries "while you were away"). */
   commit(injection: AwarenessInjection): void {
     this.cursor = Math.max(this.cursor, injection.coveredThroughSeq);
+    this.lastDeliveredAt = this.now();
     try {
       this.persist();
     } catch (error) {
@@ -462,6 +500,7 @@ export class GruAwareness {
     actionNotes: readonly string[],
     digestLines: readonly string[],
     overflow: boolean,
+    morning: readonly string[] | null,
   ): string | null {
     const parts: string[] = [AWARENESS_BLOCK_HEADER];
     let bytes = Buffer.byteLength(AWARENESS_BLOCK_HEADER, 'utf8');
@@ -480,6 +519,9 @@ export class GruAwareness {
       bytes += size;
     };
 
+    if (morning !== null) {
+      for (const line of morning) push(line);
+    }
     if (actionNotes.length > 0) {
       push('Action required (unacknowledged):');
       for (const note of actionNotes) push(note);
@@ -491,6 +533,41 @@ export class GruAwareness {
     if (parts.length === 1) return null;
     if (truncated) push('- (further context omitted…)', true);
     return parts.join('\n');
+  }
+
+  /** "While you were away" digest (owner ruling 2026-09-23): the first
+   * delivered block after a quiet gap summarises wakes (fires), actions,
+   * merges, and staged PRs from the ledger — the morning catch-up. Derived
+   * from the ledger alone; null when the gap was short or nothing landed. */
+  private morningDigest(): readonly string[] | null {
+    if (this.morningDigestGapMs <= 0 || this.lastDeliveredAt === null) return null;
+    const since = this.lastDeliveredAt;
+    if (this.now() - since < this.morningDigestGapMs) return null;
+    const lines: string[] = [];
+    const push = (line: string): void => {
+      if (lines.length < MAX_MORNING_LINES) lines.push(line);
+    };
+    const bounded = (label: string, count: number, noun: string): void => {
+      if (count > 0) push(`- ${label}: ${count} ${noun}${count === 1 ? '' : 's'}`);
+    };
+    const wakes = this.ledger.listEventsAfter(this.cursor, { kinds: ['gru.wake'], limit: 100 }).length;
+    bounded('fires', wakes, 'wake acted on');
+    const actions = this.ledger.listEventsAfter(this.cursor, {
+      kinds: [...MORNING_ACTION_KINDS],
+      limit: 100,
+    }).length;
+    bounded('actions', actions, 'board event');
+    const jobs = this.ledger.listJobs();
+    const list = (ids: readonly string[]): string =>
+      `${ids.slice(0, 3).join(', ')}${ids.length > 3 ? ` +${ids.length - 3} more` : ''}`;
+    const merges = jobs.filter((job) => job.status === 'merged' && Date.parse(job.updatedAt) > since);
+    if (merges.length > 0) push(`- merges: ${list(merges.map((job) => job.id))}`);
+    const staged = jobs.filter(
+      (job) => job.prUrl !== null && job.status !== 'merged' && job.status !== 'done',
+    );
+    if (staged.length > 0) push(`- staged PRs: ${list(staged.map((job) => job.id))}`);
+    if (lines.length === 0) return null;
+    return [`While you were away (since ${new Date(since).toISOString()}):`, ...lines];
   }
 
   private persist(): void {
