@@ -699,6 +699,21 @@ async function main(): Promise<number> {
     root: config.worktrees.root,
     preserveRoot: config.worktrees.preserveRoot,
     setupTimeoutMs: config.worktrees.setupTimeoutMs,
+    onBaseFallback: ({ repoName, worktreeId, defaultBranch, sha, detail }) => {
+      // Degraded lane creation (owner incident 2026-09-23): origin could
+      // not be fetched, so the lane branched from the host clone's local
+      // HEAD. The registry row carries base_source; this FYI makes the
+      // staleness visible on the operator's surfaces instead of silent.
+      notifications.post({
+        kind: 'worktree-base-fallback',
+        routing: 'fyi',
+        severity: 'info',
+        title: `Worktree base fell back to local HEAD: ${repoName}`,
+        detail:
+          `${defaultBranch === null ? 'origin default branch unresolvable' : `origin/${defaultBranch} fetch failed`} (${detail}) — ` +
+          `lane ${worktreeId} branched from local HEAD ${sha}; its base may be stale until origin is reachable`,
+      });
+    },
     onSweepPaused: ({ worktree, processes }) => {
       notifications.post({
         kind: 'worktree-sweep-paused',
