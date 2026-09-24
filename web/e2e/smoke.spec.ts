@@ -455,7 +455,7 @@ test.describe('board (E6, mock feed)', () => {
     await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
     // v4 bands lead the board; rows group under sticky band separators.
-    await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS YOU');
+    await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS GRU');
     await expect(
       page.locator('.board-band--needs-you .board-job', { hasText: 'Merge main into the retry branch' }),
     ).toBeVisible();
@@ -468,10 +468,12 @@ test.describe('board (E6, mock feed)', () => {
     // Line 1 carries the status dot + chip; line 2 the repo/branch/ages.
     await expect(job.locator('.board-job__dot')).toBeVisible();
     await expect(job.locator('.board-job__branch')).toContainText('gru/demo-api-payment-fix');
-    // The one compact signal carries the live round + the unacked notice.
+    // The one compact signal carries this job's live round; the mock's
+    // unbound machine notification stays in the global NEEDS GRU tracker.
     const signal = job.locator('.board-job__signal');
     await expect(signal).toContainText('live');
-    await expect(signal).toContainText('action-required');
+    await expect(signal).toContainText('1 blocker');
+    await expect(page.locator('#board-unacked')).toContainText('needs Gru');
 
     // Expand the row, then the round row: all 7 lens chips appear.
     await job.locator('.board-job__toggle').click();
@@ -528,7 +530,7 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('.rail-chip[data-chip="cure"] .rail-chip__value')).toHaveText('n/a');
 
     // Bands in priority order, headers sticky separators with counts.
-    await expect(page.locator('.board-band__label')).toHaveText(['NEEDS YOU', 'IN FLIGHT', 'SETTLED', 'COLD']);
+    await expect(page.locator('.board-band__label')).toHaveText(['NEEDS GRU', 'IN FLIGHT', 'SETTLED', 'COLD']);
     const bandSticky = await page
       .locator('.board-band--in-flight .board-band__head')
       .evaluate((node) => getComputedStyle(node).position);

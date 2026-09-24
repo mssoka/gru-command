@@ -505,7 +505,7 @@ describe('board v6 — dense job rows', () => {
       }),
     );
     const signal = document.querySelector('.board-job__signal');
-    expect(signal?.textContent).toContain('1 action-required');
+    expect(signal?.textContent).toContain('1 needs Gru');
     expect(signal?.textContent).toContain('1 blocker');
     expect(signal?.textContent).toContain('1 lens failure');
     expect(signal?.classList.contains('pp-chip--alert')).toBe(true);
@@ -551,7 +551,7 @@ describe('board v6 — dense job rows', () => {
 describe('board v6 — bands', () => {
   beforeEach(mountBoardDom);
 
-  it('renders sticky band headers with counts in NEEDS YOU → IN FLIGHT → SETTLED → COLD order', () => {
+  it('renders sticky band headers with counts in NEEDS GRU → IN FLIGHT → SETTLED → COLD order', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -565,7 +565,7 @@ describe('board v6 — bands', () => {
     );
     const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
     expect(bands.map((band) => band.querySelector('.board-band__label')?.textContent)).toEqual([
-      'NEEDS YOU',
+      'NEEDS GRU',
       'IN FLIGHT',
       'SETTLED',
       'COLD',
@@ -585,7 +585,7 @@ describe('board v6 — bands', () => {
     expect(document.querySelector('.board-band__rows')).not.toBeNull();
   });
 
-  it('promotes a conflicting PR to NEEDS YOU and demotes a stalled working lane to COLD with a stale flag', () => {
+  it('promotes a conflicting PR to NEEDS GRU and demotes a stalled working lane to COLD with a stale flag', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -606,7 +606,7 @@ describe('board v6 — bands', () => {
       }),
     );
     const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
-    expect(bands.map((band) => band.querySelector('.board-band__label')?.textContent)).toEqual(['NEEDS YOU', 'IN FLIGHT', 'COLD']);
+    expect(bands.map((band) => band.querySelector('.board-band__label')?.textContent)).toEqual(['NEEDS GRU', 'IN FLIGHT', 'COLD']);
     expect(bands[0]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('conflicting-job');
     expect(bands[1]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('fresh-job');
     const stalled = bands[2]?.querySelector<HTMLElement>('.board-job');
@@ -625,7 +625,7 @@ describe('board v6 — bands', () => {
       }),
     );
     const band = document.querySelector<HTMLElement>('#board-jobs .board-band');
-    expect(band?.querySelector('.board-band__label')?.textContent).toBe('NEEDS YOU');
+    expect(band?.querySelector('.board-band__label')?.textContent).toBe('NEEDS GRU');
     expect(band?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('quiet-job');
   });
 
@@ -647,7 +647,7 @@ describe('board v6 — bands', () => {
     );
     const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
     const needsYou = bands[0];
-    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS YOU');
+    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS GRU');
     const needsRepos = [...(needsYou?.querySelectorAll('.board-job__repo') ?? [])].map((node) => node.textContent);
     expect(needsRepos).toContain('📦 alpha');
     expect(needsRepos).toContain('📦 beta');
@@ -682,12 +682,12 @@ describe('board v6 — bands', () => {
     expect(document.querySelectorAll('.board-band--settled .board-job')).toHaveLength(12);
   });
 
-  it('never hides an empty NEEDS YOU — a calm satisfied state carries the good news', () => {
+  it('never hides an empty NEEDS GRU — a calm satisfied state carries the good news', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ jobs: [baseJob({ id: 'flight', status: 'in-review' })] }));
     const needsYou = document.querySelector('.board-band--needs-you');
-    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS YOU');
-    expect(needsYou?.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs you');
+    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS GRU');
+    expect(needsYou?.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs Gru');
     expect(needsYou?.querySelector('.board-band__clear-mark')?.textContent).toBe('✓');
   });
 });

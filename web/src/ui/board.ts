@@ -7,7 +7,7 @@
  *   - the status chip rail (v4 health row relocated; `board-rail.ts`)
  *     under the command bar carries whole-system state incl. the folded
  *     jobs/PRs/lane counts and the Jev/unacked trackers;
- *   - attention-bucketed job rows (NEEDS YOU / IN FLIGHT / SETTLED /
+ *   - attention-bucketed job rows (NEEDS GRU / IN FLIGHT / SETTLED /
  *     COLD) with sticky headers and counts;
  *   - the agents/transcripts rail (tabs, dense rows, disposed overflow);
  *   - the notification center (bell + panel).
@@ -309,10 +309,10 @@ export class BoardView {
   // Attention-bucketed dense job rows
   // ------------------------------------------------------------------
 
-  /** Banded job rows: NEEDS YOU / IN FLIGHT / SETTLED / COLD, recency
+  /** Banded job rows: NEEDS GRU / IN FLIGHT / SETTLED / COLD, recency
    * within each band. Every band is a full-width row list; band headers
    * are sticky separators with counts, so the operator never loses the
-   * band they are reading. NEEDS YOU is always on screen (its clear
+   * band they are reading. NEEDS GRU is always on screen (its clear
    * state is information); SETTLED is a rolling window over its
    * recency-sorted tail (v4.1). */
   private renderJobs(snapshot: BoardSnapshot): void {
@@ -370,13 +370,13 @@ export class BoardView {
     this.firstJobsRender = false;
   }
 
-  /** An empty NEEDS YOU band is good news, not absence: a calm green
+  /** An empty NEEDS GRU band is good news, not absence: a calm green
    * satisfied state (never hidden, never a false alarm). */
   private clearNeedsYou(): HTMLElement {
     const node = el('div', 'board-band__clear');
     node.append(
       el('span', 'board-band__clear-mark', '✓'),
-      el('div', 'board-band__clear-text', 'nothing needs you'),
+      el('div', 'board-band__clear-text', 'nothing needs Gru'),
       el('div', 'lbl board-band__clear-hint', 'the crew is on it'),
     );
     return node;

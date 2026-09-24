@@ -87,13 +87,14 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   below 900px the rail stacks under the board and the FAB opens a bottom
   sheet. The nav tabs stay as focus switches: `💬 Chat` opens/focuses
   chat, `🗺️ Board` dismisses the overlay and marks the board.
-- **Dashboard:** **attention bands** — NEEDS YOU → IN FLIGHT → SETTLED →
+- **Dashboard:** **attention bands** — NEEDS GRU → IN FLIGHT → SETTLED →
   COLD, recency inside each band — rendered as full-width **dense rows**
   (line 1: dot + title + status chip; line 2: repo + branch + lane/agent
   ages + PR link), with sticky band headers carrying counts and hairline
   dividers. Failing rows (blocked/error, aborted round, errored lenses
-  without a verdict) are tinted with a left alert accent. NEEDS YOU is
-  always visible (empty = calm “nothing needs you”); SETTLED is a rolling
+  without a verdict) are tinted with a left alert accent. NEEDS GRU is
+  always visible (empty = calm “nothing needs Gru”); FOR YOU belongs only
+  to the owner notification band. SETTLED is a rolling
   window (latest 10 + `+K older settled`, session-expanded; concluded
   jobs render their last round quiescent — no stale blocker pills). Click
   a row to disclose lane + rounds (v3 collapse, persisted per job).

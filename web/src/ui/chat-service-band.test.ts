@@ -78,6 +78,10 @@ function installChatDom(): void {
   badge.id = 'chat-badge';
   badge.textContent = '0';
   bubble.append(badge);
+  const scrim = document.createElement('button');
+  scrim.id = 'chat-scrim';
+  const fab = document.createElement('button');
+  fab.id = 'gru-fab';
   const sheet = document.createElement('div');
   sheet.id = 'chat-sheet';
   const grip = document.createElement('div');
@@ -85,7 +89,7 @@ function installChatDom(): void {
   const sheetMount = document.createElement('div');
   sheetMount.id = 'chat-sheet-mount';
   sheet.append(grip, sheetMount);
-  document.body.append(mainMount, view, bubble, sheet);
+  document.body.append(mainMount, view, bubble, scrim, fab, sheet);
   Object.defineProperty(window, 'matchMedia', {
     configurable: true,
     value: () => ({
