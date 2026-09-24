@@ -1243,15 +1243,13 @@ export class LedgerApi {
     });
   }
 
-  /** Reclassify legacy owner-held incidents before any wake backlog scan.
-   * Earlier releases persisted these as machine attention. Resetting a
-   * legacy machine Ack on an active stop restores the owner's pending
-   * decision; resolved incidents are never reopened. Idempotent. */
+  /** Reclassify only still-unacknowledged legacy owner stops. An old human
+   * Ack may already have re-armed a breaker; never resurrect it on boot. */
   migrateOwnerHeldNotifications(): readonly NotificationRecord[] {
     return this.transaction(() => {
       const rows = this.db.prepare(`
         SELECT * FROM notifications
-        WHERE resolved_at IS NULL AND routing = 'action-required'
+        WHERE resolved_at IS NULL AND acked_at IS NULL AND routing = 'action-required'
           AND (kind LIKE 'decisions.degraded.%'
             OR kind LIKE 'supervision.provider-wall.%'
             OR kind IN ('port-squat', 'roll-port-squat', 'worktree-sweep-paused', 'supervision.breaker'))
@@ -1259,7 +1257,7 @@ export class LedgerApi {
       `).all() as Row[];
       return rows.map((raw) => {
         const id = str(raw.id);
-        this.db.prepare("UPDATE notifications SET routing = 'needs-owner', acked_at = NULL, acked_by = NULL WHERE id = ?").run(id);
+        this.db.prepare("UPDATE notifications SET routing = 'needs-owner' WHERE id = ? AND acked_at IS NULL AND resolved_at IS NULL").run(id);
         this.appendEvent({ kind: 'notification.triaged', agentId: nstr(raw.agent_id), payload: { id, routing: 'needs-owner', reason: 'legacy owner-held incident migration' } });
         return this.getNotification(id) as NotificationRecord;
       });
@@ -1304,6 +1302,19 @@ export class LedgerApi {
         resolved.push(this.getNotification(id) as NotificationRecord);
       }
       return resolved;
+    });
+  }
+
+  /** Resolve one exact incident ID without acknowledging it for the owner. */
+  resolveNotificationById(id: string, by: string): NotificationRecord | null {
+    if (by.trim() === '') throw new Error('resolution by must be non-empty');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null || current.resolvedAt !== null) return current;
+      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
+        .run(nowIso(), by, id);
+      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by } });
+      return this.getNotification(id);
     });
   }
 

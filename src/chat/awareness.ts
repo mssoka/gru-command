@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { NotifyWakeMode, QuietHours, WakeMinSeverity } from '../config.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { LogLevel } from '../logger.js';
-import type { EventRecord, LedgerApi } from '../ledger/api.js';
+import type { EventRecord, LedgerApi, NotificationRecord } from '../ledger/api.js';
 import { WakePolicy, type WakeCandidate } from './wake-policy.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -104,6 +104,8 @@ export type GruAwarenessLedger = Pick<
   | 'appendCustomEvent'
   | 'listNotifications'
   | 'migrateOwnerHeldNotifications'
+  | 'recordNotification'
+  | 'resolveNotificationById'
   | 'listJobs'
 >;
 
@@ -125,6 +127,8 @@ export interface GruAwarenessOptions {
   /** First-block-after-gap morning digest threshold; 0 disables. */
   readonly morningDigestGapMs?: number;
   readonly limits?: Partial<AwarenessLimits>;
+  /** Forward a newly persisted owner follow-up to the chat notice surface. */
+  readonly onFollowUpPosted?: (row: NotificationRecord) => void;
   readonly log?: Log;
   /** Clock seam (tests advance fake timers through this closure). */
   readonly now?: () => number;
@@ -137,6 +141,8 @@ interface AwarenessState {
     readonly version?: 2;
     readonly woken: readonly string[];
     readonly pending?: readonly string[];
+    /** Delivered but unresolved machine alerts awaiting owner escalation. */
+    readonly followUp?: readonly { readonly id: string; readonly dueAtMs: number }[];
     readonly lastFiredAt: number | null;
     readonly lastAttemptAt?: number | null;
   };
@@ -155,6 +161,8 @@ const MAX_NOTIFICATION_SCAN = 200;
 const MAX_BACKLOG_SEED = 50;
 /** Node clamps longer setTimeout delays to 1 ms; chain safe slices. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const UNRESOLVED_FOLLOW_UP_MS = 30 * 60_000;
+const FOLLOW_UP_RETRY_MS = 5 * 60_000;
 /** Default morning-digest gap (8 h): first block after a quiet night. */
 export const DEFAULT_MORNING_DIGEST_GAP_MS = 28_800_000;
 /** Morning-digest kernel kinds — the "actions" count. */
@@ -291,6 +299,7 @@ export class GruAwareness {
   private readonly wakeMode: NotifyWakeMode;
   private readonly morningDigestGapMs: number;
   private readonly log: Log;
+  private readonly onFollowUpPosted: (row: NotificationRecord) => void;
   private readonly now: () => number;
   private cursor: number;
   /** Epoch ms of the last delivered block (legacy state compatibility). */
@@ -301,6 +310,8 @@ export class GruAwareness {
   private wakeSink: (() => void) | null = null;
   /** Candidate ids waiting to be released as ONE coalesced wake. */
   private readonly pendingWakeIds: Set<string>;
+  private readonly followUpDue: Map<string, number>;
+  private followUpTimer: ReturnType<typeof setTimeout> | null = null;
   /** One in-flight bounded batch. Its IDs stay pending until prompt receipt. */
   private activeWakeIds: readonly string[] | null = null;
   private failedRetryAtMs = 0;
@@ -318,6 +329,7 @@ export class GruAwareness {
     this.wakeMode = opts.wakeMode ?? 'action-required';
     this.morningDigestGapMs = opts.morningDigestGapMs ?? DEFAULT_MORNING_DIGEST_GAP_MS;
     this.log = opts.log ?? (() => {});
+    this.onFollowUpPosted = opts.onFollowUpPosted ?? (() => {});
     this.now = opts.now ?? (() => Date.now());
     const state = GruAwareness.loadState(this.file);
     this.cursor = state.coveredThroughSeq;
@@ -325,6 +337,7 @@ export class GruAwareness {
     this.lastOwnerAt = state.digest?.lastOwnerAt !== undefined ? state.digest.lastOwnerAt : this.lastDeliveredAt;
     this.lastOwnerSeq = state.digest?.lastOwnerSeq ?? state.coveredThroughSeq;
     this.pendingWakeIds = new Set(state.wake?.pending ?? []);
+    this.followUpDue = new Map((state.wake?.followUp ?? []).map(({ id, dueAtMs }) => [id, dueAtMs]));
     this.wakePolicy = new WakePolicy(
       {
         mode: this.wakeMode,
@@ -380,12 +393,17 @@ export class GruAwareness {
     const woken = wakeRecord['woken'];
     const lastFiredAt = wakeRecord['lastFiredAt'];
     const pending = wakeRecord['pending'];
+    const followUp = wakeRecord['followUp'];
     const version = wakeRecord['version'];
     const lastAttemptAt = wakeRecord['lastAttemptAt'];
     if (
       !Array.isArray(woken) ||
       !woken.every((id): id is string => typeof id === 'string' && id !== '') ||
       !(pending === undefined || (Array.isArray(pending) && pending.every((id): id is string => typeof id === 'string' && id !== ''))) ||
+      !(followUp === undefined || (Array.isArray(followUp) && followUp.every((entry): entry is { id: string; dueAtMs: number } =>
+        typeof entry === 'object' && entry !== null && typeof (entry as { id?: unknown }).id === 'string' &&
+        (entry as { id: string }).id !== '' && Number.isSafeInteger((entry as { dueAtMs?: unknown }).dueAtMs) &&
+        (entry as { dueAtMs: number }).dueAtMs >= 0))) ||
       !(version === undefined || version === 2) ||
       !(lastAttemptAt === undefined || lastAttemptAt === null || (typeof lastAttemptAt === 'number' && Number.isFinite(lastAttemptAt))) ||
       !(lastFiredAt === null || (typeof lastFiredAt === 'number' && Number.isFinite(lastFiredAt)))
@@ -431,6 +449,7 @@ export class GruAwareness {
       lastFiredAt: version === 2 ? lastFiredAt : null,
       lastAttemptAt: version === 2 && typeof lastAttemptAt === 'number' ? lastAttemptAt : null,
       ...(pending !== undefined ? { pending: pending as string[] } : {}),
+      ...(followUp !== undefined ? { followUp: followUp as { id: string; dueAtMs: number }[] } : {}),
     }, ...(digest !== undefined ? { digest } : {}) };
   }
 
@@ -440,6 +459,7 @@ export class GruAwareness {
   setWakeSink(sink: () => void): void {
     this.ledger.migrateOwnerHeldNotifications();
     this.wakeSink = sink;
+    this.restoreFollowUps();
     this.seedBacklog();
     this.flushPendingWakes();
   }
@@ -448,6 +468,8 @@ export class GruAwareness {
   dispose(): void {
     this.disposed = true;
     this.cancelWakeTimer();
+    if (this.followUpTimer !== null) clearTimeout(this.followUpTimer);
+    this.followUpTimer = null;
   }
 
   /**
@@ -458,7 +480,22 @@ export class GruAwareness {
   prepare(): AwarenessInjection | null {
     const latest = this.ledger.latestEventSeq();
     const morning = this.activeWakeIds === null ? this.morningDigest() : null;
-    if (latest <= this.cursor && this.pendingWakeIds.size === 0 && morning === null) return null;
+    // A delivered context block is not a disposition. Open machine and
+    // owner stops remain in subsequent user turns even after the event
+    // cursor advanced; only an active wake uses its exclusive bounded batch.
+    const openAttention = (() => {
+      if (this.activeWakeIds !== null) return [];
+      const owners = this.ledger.listNotifications({ routing: 'needs-owner', unackedOnly: true, limit: this.limits.maxActionNotes });
+      const machines = this.ledger.listNotifications({ routing: 'action-required', unackedOnly: true, limit: this.limits.maxActionNotes });
+      // Keep both queues represented in a bounded user block. One busy
+      // category must not silently crowd out the other indefinitely.
+      const ownerSlots = machines.length > 0 && this.limits.maxActionNotes > 1
+        ? Math.ceil(this.limits.maxActionNotes / 2) : this.limits.maxActionNotes;
+      const selectedOwners = owners.slice(0, ownerSlots);
+      return [...selectedOwners, ...machines.slice(0, this.limits.maxActionNotes - selectedOwners.length),
+        ...owners.slice(ownerSlots, this.limits.maxActionNotes)];
+    })();
+    if (latest <= this.cursor && this.pendingWakeIds.size === 0 && morning === null && openAttention.length === 0) return null;
 
     const reverse = <T>(items: readonly T[]): T[] => [...items].reverse();
     // Overfetch, then keep the newest maxEvents DIGESTIBLE lines: derived
@@ -502,17 +539,22 @@ export class GruAwareness {
       const icon = row.routing === 'action-required' ? '⚠' : row.routing === 'needs-owner' ? '🔔' : 'ℹ';
       notes.push({ id, line: `- ${icon} [${id}] ${row.title}${detail} (routing: ${row.routing})` });
     };
-    for (const id of this.activeWakeIds ?? this.pendingWakeIds) addNote(id);
+    if (this.activeWakeIds !== null) {
+      for (const id of this.activeWakeIds) addNote(id);
+    } else {
+      for (const row of openAttention) addNote(row.id);
+      for (const id of this.pendingWakeIds) addNote(id);
+    }
     if (this.activeWakeIds === null && notes.length < this.limits.maxActionNotes) {
-      // Passive injection retains the original event scan, but only new
-      // machine rows; all-mode direct posts use the pending-ID path above.
+      // The event scan covers newly triaged rows as well as the SQL-backed
+      // open queue; older events cannot hide unresolved attention.
       const notificationEvents = this.ledger.listEventsAfter(this.cursor, {
         limit: MAX_NOTIFICATION_SCAN,
         order: 'desc',
         kinds: [...NOTIFICATION_EVENT_KINDS],
       });
       const eventIds = notificationEvents
-        .filter((event) => payloadOf(event)['routing'] === 'action-required')
+        .filter((event) => payloadOf(event)['routing'] === 'action-required' || payloadOf(event)['routing'] === 'needs-owner')
         .map((event) => textOf(payloadOf(event)['id']))
         .filter((id): id is string => id !== null);
       for (const id of [...eventIds].reverse()) addNote(id);
@@ -561,6 +603,13 @@ export class GruAwareness {
       for (const id of delivered) this.pendingWakeIds.delete(id);
       const at = this.now();
       this.wakePolicy.fired(delivered, at);
+      for (const id of delivered) {
+        const row = this.ledger.getNotification(id);
+        if (row?.routing === 'action-required' && row.ackedAt === null && row.resolvedAt === null &&
+            this.ledger.getNotification(this.followUpId(id)) === null) {
+          this.followUpDue.set(id, at + UNRESOLVED_FOLLOW_UP_MS);
+        }
+      }
       this.failedRetryAtMs = 0;
       this.log('info', 'gru wake opened', { notification_ids: delivered, count: delivered.length, mode: this.wakeMode });
       try {
@@ -569,6 +618,7 @@ export class GruAwareness {
         this.log('error', 'gru wake ledger event failed', { error: String(error) });
       }
       this.persistWakeState();
+      this.scheduleFollowUps();
       this.flushPendingWakes();
       return;
     }
@@ -668,7 +718,8 @@ export class GruAwareness {
   private persist(): void {
     const state: AwarenessState = {
       coveredThroughSeq: this.cursor,
-      wake: { version: 2, ...this.wakePolicy.snapshot(), pending: [...this.pendingWakeIds] },
+      wake: { version: 2, ...this.wakePolicy.snapshot(), pending: [...this.pendingWakeIds],
+        followUp: [...this.followUpDue].map(([id, dueAtMs]) => ({ id, dueAtMs })) },
       digest: { lastDeliveredAt: this.lastDeliveredAt, lastOwnerAt: this.lastOwnerAt, lastOwnerSeq: this.lastOwnerSeq },
     };
     const staging = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
@@ -690,12 +741,27 @@ export class GruAwareness {
    * and severity: `notification.triaged` carries no severity, and a row
    * acked/resolved in the write that published the event must never wake. */
   private onBusEvent(event: BusEvent): void {
-    if (this.wakeMode === 'never' || this.disposed) return;
+    if (this.disposed) return;
     if (event.kind === 'notification.acked' || event.kind === 'notification.resolved') {
       const closedId = textOf(payloadOf(event)['id']);
-      if (closedId !== null && this.wakePolicy.forget(closedId)) this.persistWakeState();
+      if (closedId !== null) {
+        const row = this.ledger.getNotification(closedId);
+        const wasDelivered = this.wakePolicy.forget(closedId);
+        const wasPending = this.followUpDue.delete(closedId);
+        if (wasDelivered || wasPending) this.persistWakeState();
+        if (wasPending) this.scheduleFollowUps();
+        // Once Gru dispositions the machine row, clear any owner escalation
+        // opened by the unresolved-attention timer without forging an Ack.
+        if (row?.routing === 'action-required') {
+          const followUp = this.ledger.getNotification(this.followUpId(closedId));
+          if (followUp?.kind === this.followUpKind(closedId)) {
+            this.ledger.resolveNotificationById(followUp.id, 'gru-disposition');
+          }
+        }
+      }
       return;
     }
+    if (this.wakeMode === 'never') return;
     if (event.kind !== 'notification.created' && event.kind !== 'notification.triaged') return;
     const payload = payloadOf(event);
     const id = textOf(payload['id']);
@@ -726,6 +792,90 @@ export class GruAwareness {
       return;
     }
     this.scheduleWake(decision.retryAtMs, decision.reason);
+  }
+
+  private followUpId(id: string): string {
+    return `gru-follow-up:${id}`;
+  }
+
+  private followUpKind(id: string): string {
+    return `gru.attention-unresolved.${id}`;
+  }
+
+  /** One durable, delayed owner escalation if a delivered machine wake is
+   * still unresolved. A prompt receipt alone cannot finish attention. */
+  private restoreFollowUps(): void {
+    let changed = false;
+    for (const [id] of this.followUpDue) {
+      const row = this.ledger.getNotification(id);
+      if (row?.routing === 'action-required' && row.ackedAt === null && row.resolvedAt === null &&
+          this.ledger.getNotification(this.followUpId(id)) === null) continue;
+      this.followUpDue.delete(id);
+      changed = true;
+    }
+    // v2 receipts predate the follow-up field: grandfather each still-open
+    // machine row into a grace period, never into a new automatic Gru wake.
+    for (const id of this.wakePolicy.snapshot().woken) {
+      const row = this.ledger.getNotification(id);
+      if (row?.routing !== 'action-required' || row.ackedAt !== null || row.resolvedAt !== null ||
+          this.followUpDue.has(id) || this.ledger.getNotification(this.followUpId(id)) !== null) continue;
+      this.followUpDue.set(id, this.now() + UNRESOLVED_FOLLOW_UP_MS);
+      changed = true;
+    }
+    if (changed) this.persistWakeState();
+    this.scheduleFollowUps();
+  }
+
+  private scheduleFollowUps(): void {
+    if (this.followUpTimer !== null) clearTimeout(this.followUpTimer);
+    this.followUpTimer = null;
+    if (this.disposed || this.wakeSink === null || this.followUpDue.size === 0) return;
+    let due = Infinity;
+    for (const at of this.followUpDue.values()) due = Math.min(due, at);
+    const delay = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, due - this.now()));
+    const timer = setTimeout(() => {
+      this.followUpTimer = null;
+      for (const [id, at] of this.followUpDue) {
+        if (at > this.now()) continue;
+        const row = this.ledger.getNotification(id);
+        if (row?.routing !== 'action-required' || row.ackedAt !== null || row.resolvedAt !== null) {
+          this.followUpDue.delete(id);
+          continue;
+        }
+        const escalationId = this.followUpId(id);
+        try {
+          const existing = this.ledger.getNotification(escalationId);
+          if (existing !== null && (existing.kind !== this.followUpKind(id) || existing.routing !== 'needs-owner')) {
+            throw new Error(`Gru follow-up ID ${escalationId} is already assigned to another notification`);
+          }
+          if (existing === null) {
+            const posted = this.ledger.recordNotification({
+              id: escalationId,
+              kind: this.followUpKind(id),
+              routing: 'needs-owner',
+              severity: 'error',
+              title: `Gru attention unresolved: ${row.title}`,
+              detail: `Notification ${id} was delivered to Gru but remains open after 30 minutes. Check the incident and authorize the next step if needed.`,
+            });
+            try {
+              this.onFollowUpPosted(posted);
+            } catch (error) {
+              // The durable owner row/bell already exists. A chat notice
+              // failure cannot duplicate or retract that escalation.
+              this.log('error', 'gru owner follow-up chat notice failed', { notification_id: id, error: String(error) });
+            }
+          }
+          this.followUpDue.delete(id);
+        } catch (error) {
+          this.log('error', 'gru unresolved attention escalation failed; retrying', { notification_id: id, error: String(error) });
+          this.followUpDue.set(id, this.now() + FOLLOW_UP_RETRY_MS);
+        }
+      }
+      this.persistWakeState();
+      this.scheduleFollowUps();
+    }, delay);
+    (timer as { unref?: () => void }).unref?.();
+    this.followUpTimer = timer;
   }
 
   /** Seed unresolved rows that predate boot. The normal mode filters

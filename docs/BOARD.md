@@ -36,7 +36,7 @@ record.
 | `POST /api/agents/state` | `{id, state}` |
 | `POST /api/notifications/:id/shown` | `{surface}` — display receipt (idempotent per surface; the shown:true doctrine) |
 | `POST /api/notifications/:id/ack` | `{by?}` — owner/FYI ack; refuses machine rows (400), and owner ack re-arms an open breaker |
-| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event; never clears an owner stop |
+| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
 | `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
@@ -118,7 +118,9 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   (all pending needs-owner rows, even older than the bounded latest feed:
   owner-only decisions and stops whose ack re-arms supervision), NEEDS GRU
   (all pending machine rows, including those older than the recent feed;
-  it wakes Gru, never rings the bell and refuses human Ack), and FEED (FYI rows). The badge and live
+  it wakes Gru once and refuses human Ack), and FEED (FYI rows). A machine
+  alert left unresolved 30 minutes after delivery opens a separate
+  owner-only follow-up in FOR YOU; Gru's later disposition resolves it. The badge and live
   toasts serve needs-owner only; every displayed row earns a shown receipt
   per surface (a display receipt is not an acknowledgement); acking an
   owner row clears it where an ack has meaning (a breaker row re-arms

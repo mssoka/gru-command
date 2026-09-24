@@ -704,7 +704,9 @@ export class BoardView {
     // human-facing band; NEEDS GRU is the self-clearing machine queue
     // (Gru dispositions, the owner bell stays quiet); everything else is
     // the standing feed.
-    const unresolved = (item: NotificationView): boolean => item.resolvedAt === null;
+    // A pre-disposition release could Ack machine rows. Those legacy rows
+    // are closed receipts, not active NEEDS GRU work, even if unresolved.
+    const unresolved = (item: NotificationView): boolean => item.resolvedAt === null && item.ackedAt === null;
     const forYou = notifications.filter((item) => item.routing === 'needs-owner' && unresolved(item));
     const needsGru = notifications.filter((item) => item.routing === 'action-required' && unresolved(item));
     const feed = notifications.filter(

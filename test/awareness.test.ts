@@ -99,7 +99,10 @@ describe('gru awareness — passive injection', () => {
     // prepare is read-only: the same block returns until it was delivered.
     expect(rig.awareness.prepare()?.text).toBe(first?.text);
     rig.awareness.commit(first!);
-    // Nothing new happened — inject nothing.
+    // Delivery is not disposition: unresolved machine attention stays in
+    // subsequent user turns even after the event cursor has advanced.
+    expect(rig.awareness.prepare()?.text).toContain('Round j1-r1 is INCOMPLETE');
+    rig.api.disposeMachineNotification(first!.notificationIds![0]!, 'Handled review blocker');
     expect(rig.awareness.prepare()).toBeNull();
   });
 
@@ -125,6 +128,30 @@ describe('gru awareness — passive injection', () => {
     // A machine disposition AFTER injection must not bring the note back.
     rig.api.disposeMachineNotification(live.id, 'Handled');
     expect(rig.awareness.prepare()).toBeNull();
+  });
+
+  it('passive mode carries owner-only stops in every user turn without autonomously waking', () => {
+    const rig = boot({ wakeMode: 'never' });
+    const stop = rig.notifications.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Owner re-arm required' });
+    expect(rig.woke).toHaveLength(0);
+    const first = rig.awareness.prepare();
+    expect(first?.text).toContain('Owner re-arm required');
+    expect(first?.notificationIds).toContain(stop.id);
+    rig.awareness.commit(first!);
+    expect(rig.awareness.prepare()?.text).toContain('Owner re-arm required');
+    rig.notifications.ack(stop.id, 'owner');
+    expect(rig.awareness.prepare()).toBeNull();
+  });
+
+  it('retains a machine follow-up in the user block even with more than eight open owner stops', () => {
+    const rig = boot({ wakeMode: 'never' });
+    for (let i = 0; i < 10; i += 1) {
+      rig.notifications.post({ kind: `owner-${i}`, routing: 'needs-owner', severity: 'error', title: `Owner ${i}` });
+    }
+    const machine = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Still needs Gru' });
+    rig.awareness.commit(rig.awareness.prepare()!);
+    expect(rig.awareness.prepare()?.notificationIds).toContain(machine.id);
+    expect(rig.woke).toHaveLength(0);
   });
 
   it('digests deliveries, verdicts, aborts, and lane changes one line each', () => {
@@ -379,7 +406,7 @@ describe('gru awareness — wake policy', () => {
     const passive = boot({ dir });
     const row = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Old unresolved machine alert' });
     passive.awareness.commit(passive.awareness.prepare()!);
-    expect(passive.awareness.prepare()).toBeNull();
+    expect(passive.awareness.prepare()?.notificationIds).toContain(row.id);
     const active = boot({ dir, wakeMode: 'action-required' });
     expect(active.woke).toHaveLength(1);
     expect(active.wakeBlocks[0]).toContain('Old unresolved machine alert');
@@ -481,10 +508,55 @@ describe('gru awareness — wake policy', () => {
       vi.advanceTimersByTime(5_000);
       expect(prompts).toHaveLength(2);
       expect(prompts[1]).toContain('Retry this alert');
-      expect(awareness.prepare()).toBeNull();
+      expect(awareness.prepare()?.notificationIds).toContain(row.id);
       const state = JSON.parse(readFileSync(awareness.file, 'utf-8')) as { wake: { woken: string[] } };
       expect(state.wake.woken).toContain(row.id);
       expect(api.getNotification(row.id)?.resolvedAt).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('persists a delayed owner follow-up for an unresolved delivered wake without re-waking the same ID', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      const dir = tmpDir();
+      const first = boot({ dir, wakeMode: 'action-required', now: () => Date.now() });
+      const alert = first.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Repair failed in-turn' });
+      expect(first.woke).toHaveLength(1);
+      first.awareness.commit(first.awareness.prepare()!, 'wake');
+      expect(first.awareness.prepare()?.text).toContain('Repair failed in-turn');
+      first.awareness.dispose();
+      vi.advanceTimersByTime(10 * 60_000);
+      const restored = boot({ dir, wakeMode: 'action-required', now: () => Date.now() });
+      expect(restored.woke).toHaveLength(0);
+      vi.advanceTimersByTime(20 * 60_000 - 1);
+      expect(restored.api.getNotification(`gru-follow-up:${alert.id}`)).toBeNull();
+      vi.advanceTimersByTime(1);
+      expect(restored.woke).toHaveLength(0);
+      expect(restored.api.getNotification(`gru-follow-up:${alert.id}`)).toMatchObject({
+        routing: 'needs-owner', ackedAt: null, resolvedAt: null,
+      });
+      restored.api.disposeMachineNotification(alert.id, 'Remediated after escalation');
+      expect(restored.api.getNotification(`gru-follow-up:${alert.id}`)).toMatchObject({ resolvedBy: 'gru-disposition' });
+      expect(restored.awareness.prepare()).toBeNull();
+      restored.awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resolving a delivered machine alert before follow-up prevents owner escalation', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      const rig = boot({ wakeMode: 'action-required', now: () => Date.now() });
+      const alert = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Fixed promptly' });
+      rig.api.disposeMachineNotification(alert.id, 'Fixed promptly');
+      vi.advanceTimersByTime(30 * 60_000);
+      expect(rig.api.getNotification(`gru-follow-up:${alert.id}`)).toBeNull();
+      rig.awareness.dispose();
     } finally {
       vi.useRealTimers();
     }
@@ -700,7 +772,7 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       api.appendCustomEvent({ kind: 'job.status', payload: { from: 'a', to: 'b' } });
       awareness.commit(awareness.prepare()!, 'chat');
       vi.setSystemTime(new Date('2026-09-22T22:00:00Z'));
-      center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Night alert' });
+      const alert = center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Night alert' });
       api.appendCustomEvent({ kind: 'job.delivered', payload: { agentId: 'm1' } });
       awareness.setWakeSink(() => {
         const injection = awareness.prepare()!;
@@ -717,6 +789,7 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       expect(morning?.text).toContain('- fires: 1 wake acted on');
       expect(morning?.text).toContain('- actions: 1 board event');
       next.commit(morning!, 'chat');
+      api.disposeMachineNotification(alert.id, 'Night alert fixed');
       expect(next.prepare()).toBeNull();
     } finally {
       vi.useRealTimers();

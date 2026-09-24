@@ -197,6 +197,16 @@ describe('board view resolved-notification rendering', () => {
     expect(sections[1]?.querySelector('.board-notification__ack')).toBeNull();
   });
 
+  it('places pre-disposition acknowledged machine rows in FEED, not an unresolvable NEEDS GRU queue', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [notification('legacy-machine', { ackedAt: '2026-01-01T00:01:00.000Z' })] }));
+    const sections = [...document.querySelectorAll<HTMLElement>('.board-notification-section')];
+    expect(sections[1]?.textContent).toContain('machine queue is clear');
+    expect(sections[1]?.textContent).not.toContain('Notice legacy-machine');
+    expect(sections[2]?.textContent).toContain('Notice legacy-machine');
+    expect(sections[2]?.querySelector('.board-notification__ack')).toBeNull();
+  });
+
   it('routing split: machine rows never ring the bell or toast; needs-owner rows do', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});

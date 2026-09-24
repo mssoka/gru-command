@@ -158,7 +158,7 @@ export class NotificationCenter {
     if (existing !== null) {
       // An active legacy incident may be returned by kind instead of posted
       // anew. Never preserve an obsolete machine routing for an owner stop.
-      if (existing.resolvedAt === null &&
+      if (existing.resolvedAt === null && existing.ackedAt === null &&
           (input.routing === 'needs-owner' || isOwnerHeldNotificationKind(input.kind)) &&
           existing.routing === 'action-required') {
         this.ledger.migrateOwnerHeldNotifications();

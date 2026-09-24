@@ -615,6 +615,7 @@ async function main(): Promise<number> {
     wakeMinSeverity: config.chat.wakeMinSeverity,
     wakeQuietHours: config.chat.wakeQuietHours,
     morningDigestGapMs: config.chat.morningDigestGapMs,
+    onFollowUpPosted: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const chat = createChatServer({
@@ -632,7 +633,8 @@ async function main(): Promise<number> {
     awareness,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  awareness.setWakeSink(() => chat.wakeAwareness());
+  // Bind the backlog wake only after the HTTP listener and the board/chat
+  // routes are ready; Gru must be able to disposition the alert in-turn.
   state.awareness = awareness;
   gruSlot.onSwap((handle) => chat.adoptRestartedGru(handle));
   surfaceInChat = (notification) => {
@@ -934,6 +936,7 @@ async function main(): Promise<number> {
       port: handle.port,
     });
   }
+  awareness.setWakeSink(() => chat.wakeAwareness());
   chat.warmup();
   supervisorLive.start();
   bob.start();

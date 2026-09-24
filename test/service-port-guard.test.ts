@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -42,6 +42,16 @@ function tempDir(prefix: string): string {
   cleanupDirs.push(dir);
   return dir;
 }
+
+describe('wake boot ordering', () => {
+  it('binds backlog wake only after the HTTP listener, board routes and post-bind foreign-listener check', () => {
+    const source = readFileSync(join(repoRoot, 'src', 'main.ts'), 'utf-8');
+    const bind = source.indexOf('awareness.setWakeSink(() => chat.wakeAwareness())');
+    expect(bind).toBeGreaterThan(source.indexOf('board.attach(handle.httpServer)'));
+    expect(bind).toBeGreaterThan(source.indexOf('const foreign = await instancePortForeignListener(config)', source.indexOf('state.handle = await service.start()')));
+    expect(source.indexOf('awareness.setWakeSink(', bind + 1)).toBe(-1);
+  });
+});
 
 describe('the harness guard (test/e2e spawned services)', () => {
   it('pins the harness instance-port literal against the product default', () => {

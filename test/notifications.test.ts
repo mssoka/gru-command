@@ -315,26 +315,29 @@ describe('notification center — durable log + receipts + acks', () => {
     for (const [index, kind] of legacyKinds.entries()) {
       api.recordNotification({ id: `legacy-${index}`, kind, routing: 'action-required', severity: 'error', title: kind });
     }
-    // Simulate an old machine Ack; an active owner stop must ring again.
-    db.handle.prepare("UPDATE notifications SET acked_at = '2026-01-01T00:00:00Z', acked_by = 'old' WHERE id = 'legacy-0'").run();
+    // Historical human Acks already re-armed these stops; migration must
+    // not turn them back into pending owner decisions.
+    db.handle.prepare("UPDATE notifications SET acked_at = '2026-01-01T00:00:00Z', acked_by = 'operator' WHERE id IN ('legacy-0', 'legacy-2')").run();
     api.recordNotification({ id: 'true-machine', kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Machine' });
     const center = new NotificationCenter({ ledger: api, bus });
-    expect(api.countPendingNeedsOwner()).toBe(legacyKinds.length);
+    expect(api.countPendingNeedsOwner()).toBe(legacyKinds.length - 2);
     expect(api.countPendingActionRequired()).toBe(1);
     const ownerSnapshot = new BoardEngine({ ledger: api, bus }).snapshot();
-    expect(ownerSnapshot.unackedNeedsOwner).toBe(legacyKinds.length);
-    expect(ownerSnapshot.notifications.filter((row) => row.routing === 'needs-owner')).toHaveLength(legacyKinds.length);
+    expect(ownerSnapshot.unackedNeedsOwner).toBe(legacyKinds.length - 2);
+    expect(ownerSnapshot.notifications.filter((row) => row.routing === 'needs-owner')).toHaveLength(legacyKinds.length - 2);
     for (const [index] of legacyKinds.entries()) {
-      expect(api.getNotification(`legacy-${index}`)).toMatchObject({ routing: 'needs-owner', ackedAt: null, resolvedAt: null });
+      const row = api.getNotification(`legacy-${index}`);
+      if (index === 0 || index === 2) expect(row).toMatchObject({ routing: 'action-required', ackedBy: 'operator', resolvedAt: null });
+      else expect(row).toMatchObject({ routing: 'needs-owner', ackedAt: null, resolvedAt: null });
     }
     const reused = center.postIncident({ kind: legacyKinds[0]!, routing: 'needs-owner', severity: 'error', title: 'Same stop', dedupe: 'active' });
-    expect(reused).toMatchObject({ id: 'legacy-0', routing: 'needs-owner' });
+    expect(reused).toMatchObject({ id: 'legacy-0', ackedBy: 'operator' });
     for (const kind of ['port-squat', 'roll-port-squat', 'supervision.provider-wall.a.quota_wall']) {
       expect(center.post({ kind, routing: 'action-required', severity: 'error', title: 'Owner remedy' }).routing).toBe('needs-owner');
     }
     new NotificationCenter({ ledger: api, bus }); // repeat migration is idempotent
     expect(api.listEventsAfter(0, { kinds: ['notification.triaged'] }).filter((e) =>
-      (e.payload as { reason?: string }).reason === 'legacy owner-held incident migration')).toHaveLength(legacyKinds.length);
+      (e.payload as { reason?: string }).reason === 'legacy owner-held incident migration')).toHaveLength(legacyKinds.length - 2);
   });
 
   it('does not duplicate an acknowledged but unresolved active incident', () => {

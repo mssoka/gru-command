@@ -401,9 +401,10 @@ awareness layer batches, persists, and calls the chat wake sink.
   (including across restarts) but never claims the notification ID.
 - **Backlog migration** — before scanning old unacked rows, persisted
   provider/credential stops, supervision breakers and foreign-listener /
-  destructive-op stops are moved to `needs-owner` (FOR YOU and bell), even
-  when an old machine Ack had hidden an active stop. Remaining open machine
-  rows seed bounded wake turns; all mode includes FYI/owner context too.
+  destructive-op stops are moved to `needs-owner` only while unacknowledged.
+  Historical human Acks are retained: an already re-armed breaker must not
+  ring again. Remaining open machine rows seed bounded wake turns; all mode
+  includes FYI/owner context too.
 
 **Mechanics.** A wake calls the chat server's `wakeAwareness()`: when the
 lane is idle it opens one ordinary turn whose prompt is the awareness
@@ -418,7 +419,9 @@ pending independently of the event cursor until the prompt accepts a block
 containing those IDs; spawn/prompt failures retry after at least five
 seconds AND the configured wake interval. Long intervals use safe timer
 slices rather than Node's overflowing timeout. Only the IDs actually present in the bounded block count as woken; overflow
-travels in later, rate-limited turns.
+travels in later, rate-limited turns. The backlog sink binds only after
+listen, chat and board route attachment, and the foreign-listener check:
+Gru's in-turn disposition API is available before any boot wake opens.
 
 **Mandate — act (tier-2).** A wake is machine attention meant to be acted
 on in-turn: Gru diagnoses the incident and takes one substantive step per
@@ -428,13 +431,24 @@ authority for this repository; the owner retains it elsewhere. The owner
 is reached only through `needs-owner` — and sparingly; an empty FOR YOU
 band is the healthy state.
 
-**Routing split** (same ruling). Routing is the attention channel:
+**Routing split** (same ruling). Routing is the attention channel; `never`
+disables autonomous wakes but still carries pending owner stops in Gru's
+next user-directed context block:
 
 | routing | meaning | surface |
 |---|---|---|
 | `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue; wakes Gru; never rings the owner bell |
 | `needs-owner` | owner-only decisions (merges outside this repo, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
 | `fyi` | standing feed | board feed only |
+
+**Unresolved follow-up.** A successful prompt is delivery, not resolution.
+Open machine and owner stops remain eligible for bounded context in later
+user turns even after the ledger event cursor advances; both routing classes
+receive space when each has pending rows. If a delivered machine alert remains unresolved
+for 30 minutes, a durable one-time `needs-owner` follow-up rings the owner bell
+without re-waking that ID. The due time survives restart; a later Gru
+machine disposition resolves the follow-up automatically. Normal machine
+alerts never ring the owner bell merely for being posted.
 
 **Machine disposition.** A successful prompt is delivery, not resolution.
 After acting on an `action-required` row Gru calls the authenticated
