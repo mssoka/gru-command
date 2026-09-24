@@ -21,7 +21,7 @@ const PINS: Record<string, number> = {
   'chat-frames.test.ts': 4,
   'attachments.test.ts': 28,
   'awareness.test.ts': 13,
-  'bmad-onboarding.test.ts': 10,
+  'bmad-onboarding.test.ts': 13,
   'chat-server.test.ts': 80,
   'chat-session-state.test.ts': 6,
   'claude-adapter.test.ts': 77,
@@ -37,8 +37,8 @@ const PINS: Record<string, number> = {
   'github-poll.test.ts': 22,
   'health.test.ts': 19,
   'identity.test.ts': 3,
-  'install-one-line.test.ts': 31,
-  'install.test.ts': 12,
+  'install-one-line.test.ts': 35,
+  'install.test.ts': 13,
   'lan-phone-raw-client.test.ts': 6,
   'ledger-api.test.ts': 23,
   'ledger-db.test.ts': 6,
@@ -81,7 +81,7 @@ const PINS: Record<string, number> = {
   'spec-rulings-drift.test.ts': 5,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
-  'suite-shape.test.ts': 1,
+  'suite-shape.test.ts': 2,
   'supervisor.test.ts': 42,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 13,
@@ -89,17 +89,24 @@ const PINS: Record<string, number> = {
   'verify-perkins-resource.test.ts': 3,
   'verification-evidence.test.ts': 5,
   'verification-scheduler.test.ts': 18,
-  'verification-server.test.ts': 11,
+  'verification-server.test.ts': 12,
   'wizard.test.ts': 24,
   'wizard-interactive.test.ts': 8,
   'wizard-register.test.ts': 2,
-  'worktree-manager.test.ts': 38,
+  'worktree-manager.test.ts': 40,
   'worktree-manifest.test.ts': 7,
   'worktree-port.test.ts': 4,
   'worktrees-server.test.ts': 3,
 };
 
 describe('suite shape', () => {
+  it('runs the full PR gate on the default merge-result checkout', () => {
+    const workflow = readFileSync(join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf-8');
+    expect(workflow).toMatch(/- uses: actions\/checkout@v6\s*\n\s*- uses: actions\/setup-node@v6/);
+    expect(workflow).not.toContain('github.event.pull_request.head.sha');
+    expect(workflow).toContain('run: npm test');
+  });
+
   it('every test file is pinned and registers exactly its expected test count', () => {
     const dir = import.meta.dirname;
     const files = readdirSync(dir)

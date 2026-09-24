@@ -671,7 +671,7 @@ describe('Perkins hybrid lead engine', () => {
         repo.git(['add', 'repository-only-canary.txt']);
         repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'test: add tracked review context']);
         repo.git(['checkout', 'feature/review']);
-        repo.git(['rebase', 'main']);
+        repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'rebase', 'main']);
       },
     });
     const result = await h.run();
@@ -1971,7 +1971,9 @@ describe('review base resolution and remote base drift', () => {
     expect(baseMovedSinceFreeze(frozen)).toBe(false);
     // Remote-only movement: the local branch still matches, the remote moved.
     const advance = temp('perkins-drift-clone-');
-    execFileSync('git', ['clone', '--quiet', remoteBare, advance], { stdio: 'ignore' });
+    // Bare git init may leave HEAD pointing at master; explicitly check out
+    // the remote's main before committing or pushing remote-only drift.
+    execFileSync('git', ['clone', '--quiet', '--branch', 'main', remoteBare, advance], { stdio: 'ignore' });
     writeFileSync(join(advance, 'drift.ts'), 'export const drift = true;\n', 'utf8');
     execFileSync('git', ['-C', advance, 'add', 'drift.ts'], { stdio: 'ignore' });
     execFileSync('git', ['-C', advance, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'drift'], { stdio: 'ignore' });

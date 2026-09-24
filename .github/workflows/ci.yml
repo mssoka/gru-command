@@ -13,12 +13,22 @@ jobs:
     name: Full suite (Node 22)
     runs-on: ubuntu-latest
     steps:
+      # PRs test GitHub's merge result against the current base branch.
       - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: npm
+
+      # BMAD onboarding exercises the real uv bootstrap; PTY suites exercise
+      # expect(1). Install on the disposable runner, not on user machines.
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.8.22'
+
+      - name: Install PTY test prerequisite
+        run: sudo apt-get update && sudo apt-get install -y expect
 
       - name: Install dependencies
         run: npm ci

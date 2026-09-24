@@ -1,7 +1,7 @@
-import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 /**
@@ -65,6 +65,28 @@ describe('install.sh --print rendering', () => {
       expect(stdout).toContain('Restart=on-failure');
       expect(stdout).toContain('WantedBy=default.target');
     }
+  });
+
+  it('renders a launchd PATH with stable Node/npm after the session bin disappears', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-launchd-path-'));
+    cleanupDirs.push(home);
+    const sessionBin = join(home, 'ephemeral version manager', 'bin');
+    mkdirSync(sessionBin, { recursive: true });
+    symlinkSync(process.execPath, join(sessionBin, 'node'));
+    // Render launchd even on Linux CI by selecting the installer OS seam.
+    writeFileSync(join(sessionBin, 'uname'), '#!/bin/sh\necho Darwin\n', { mode: 0o755 });
+    const stableBin = dirname(realpathSync(process.execPath));
+    const { status, stdout } = print({ PATH: `${sessionBin}:/usr/local/bin:/usr/bin:/bin` });
+    expect(status).toBe(0);
+    const servicePath = stdout.match(/<key>PATH<\/key>\s*<string>([^<]+)<\/string>/)?.[1];
+    expect(servicePath).toBeDefined();
+    expect(servicePath!.split(':')[0]).toBe(stableBin);
+    rmSync(sessionBin, { recursive: true, force: true });
+    const npm = spawnSync('sh', ['-c', 'command -v npm && npm --version'], {
+      env: { PATH: servicePath! }, encoding: 'utf-8',
+    });
+    expect(npm.status, `${npm.stdout}\n${npm.stderr}`).toBe(0);
+    expect(realpathSync(npm.stdout.split('\n')[0]!)).toBe(realpathSync(join(stableBin, 'npm')));
   });
 
   it('honors GRU_COMMAND_HOME for the instance dir', () => {

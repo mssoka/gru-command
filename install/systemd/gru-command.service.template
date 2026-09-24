@@ -1,6 +1,6 @@
 # Gru Command — systemd USER unit template. install.sh renders
-# {{NODE}}, {{REPO_ROOT}}, and {{GRU_COMMAND_HOME}} to absolute paths and
-# installs to ~/.config/systemd/user/. Restart=on-failure restarts the
+# {{NODE}}, {{REPO_ROOT}}, {{GRU_COMMAND_HOME}}, and {{PATH}} at install time
+# and installs to ~/.config/systemd/user/. Restart=on-failure restarts the
 # service on crash (a clean exit(0) — a manual stop — stays down, SPEC
 # ruling 5: the OS service manager is the out-of-band watcher).
 #
@@ -16,6 +16,9 @@ After=network-online.target
 Type=simple
 ExecStart={{NODE}} {{REPO_ROOT}}/dist/main.js
 Environment=GRU_COMMAND_HOME={{GRU_COMMAND_HOME}}
+# Keep the installed Node/npm bin on PATH for job bootstrap and verification
+# even when the service manager did not inherit the user's shell setup.
+Environment="PATH={{PATH}}"
 Restart=on-failure
 RestartSec=2
 # The service writes its own structured log under the instance data dir;

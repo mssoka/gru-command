@@ -10,6 +10,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { EventBus } from '../src/events/bus.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { createVerificationServer, type VerificationServer } from '../src/verify/server.js';
+import { loadWorktreeManifest, resolveVerifyCommand } from '../src/worktrees/manifest.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
@@ -182,6 +183,13 @@ async function waitFor(predicate: () => boolean, timeoutMs = 4_000): Promise<voi
 }
 
 describe('POST /api/verify', () => {
+  it('resolves the checked-in full gate through the same manifest resolver as the endpoint', () => {
+    const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'));
+    expect(manifest).not.toBeNull();
+    expect(resolveVerifyCommand(manifest!, 'full')).toBe('npm test');
+    expect(() => resolveVerifyCommand(manifest!, 'typo')).toThrow(/not declared/);
+  });
+
   it('runs the declared command in the lane worktree and records the outcome + duration', async () => {
     const harness = await boot();
     const { status, frames } = await call(harness.port, { job_id: harness.jobId, scope: 'full' });
