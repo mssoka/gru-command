@@ -26,6 +26,7 @@ import { mustGet } from './ui/dom.js';
 import { initPairing, showPairingError } from './ui/pairing.js';
 import { initSettings, THEME_EVENT } from './ui/settings.js';
 import { DecisionStatusCard } from './ui/decisions-status.js';
+import { OwnerChime } from './ui/owner-chime.js';
 
 const TOKEN_KEY = 'gru-pairing-token';
 
@@ -51,6 +52,13 @@ let transcriptView: TranscriptView | null = null;
 const decisionStatusCard = new DecisionStatusCard(() => boardClient?.recheckDecisions() ?? null);
 /** E7: the live toast surface — one stack, reused across re-pairs. */
 const toastStack = new ToastStack(document.getElementById('toasts'));
+/** Owner chime: the ONE sound — needs-owner arrivals only (owner ruling
+ * 2026-09-23). Armed by the first user interaction; mute is persisted. */
+const ownerChime = new OwnerChime({
+  storage,
+  indicator: mustGet<HTMLButtonElement>('sound-toggle'),
+  bell: mustGet<HTMLButtonElement>('notification-bell'),
+});
 /** E7: browser Notification permission — requested on the pair gesture,
  * used opportunistically when granted (toasts remain the in-app floor). */
 let browserNotifications: NotificationPermission = typeof Notification === 'undefined' ? 'denied' : Notification.permission;
@@ -386,9 +394,13 @@ function startBoard(token: string): void {
     },
   );
   // E7: the view gains the live client (receipts + acks) and the toast
-  // surface for newly-arrived notifications.
+  // surface for newly-arrived notifications. New arrivals also ring the
+  // owner chime — it decides on routing (needs-owner only) and throttle.
   boardView.bindClient(boardClient);
-  boardView.setToastHandler((notification) => surfaceNotification(notification));
+  boardView.setToastHandler((notification) => {
+    surfaceNotification(notification);
+    ownerChime.notify(notification.routing);
+  });
   // Rebound on EVERY startBoard: a re-pair mints a fresh client, and a
   // stale view holding the old client would 401-and-bounce valid sessions.
   transcriptView = new TranscriptView(boardClient, mustGet('board-transcripts'));

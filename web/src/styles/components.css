@@ -2056,6 +2056,46 @@ body {
   position: relative;
 }
 
+/* Owner chime speaker: subtle by design. Unarmed = dimmed (the first
+   gesture enables it), armed = full icon, muted = crossed speaker. */
+.board-sound {
+  opacity: 0.6;
+  transition: opacity 0.15s ease, filter 0.15s ease;
+}
+
+.board-sound[data-armed='true'] {
+  opacity: 1;
+}
+
+.board-sound[data-muted='true'] {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+
+/* Unarmed fallback: a needs-owner arrival pulses the bell harder (the
+   chime could not play yet). Bounded — the class is removed by the
+   chime service; reduced-motion tames it globally. */
+.board-bell--nudge {
+  animation: bell-nudge 0.8s var(--ease-pop) 3;
+}
+
+.board-bell--nudge .board-bell__badge {
+  animation: bell-badge-nudge 0.8s var(--ease-pop) 3;
+}
+
+@keyframes bell-nudge {
+  0%, 100% { transform: rotate(0deg) scale(1); }
+  20% { transform: rotate(-6deg) scale(1.05); }
+  45% { transform: rotate(5deg) scale(1.05); }
+  70% { transform: rotate(-3deg) scale(1.02); }
+}
+
+@keyframes bell-badge-nudge {
+  0%, 100% { transform: scale(1); }
+  40% { transform: scale(1.5); }
+  70% { transform: scale(1.15); }
+}
+
 .board-bell__badge {
   position: absolute;
   top: -6px;
@@ -2555,20 +2595,18 @@ body {
 }
 
 /* ------------------------------------------------------------------ */
-/* Phone chrome: compact two-row nav (≤560px)                          */
+/* Phone chrome: compact bar (≤640px) + two-row fit (≤560px)           */
 /*                                                                     */
-/* Below ~560px the single-row header (logo + title + tabs + status +  */
-/* bell/theme/settings) does not fit: on a 390px phone it measured     */
-/* scrollWidth 519 on the board view with theme/settings clipped       */
-/* off-screen (natural width 581 unpaired / 643 paired; 519 is the     */
-/* flex-shrink floor). Phone-only treatment: tabs wrap onto their own  */
-/* full-width row, the title block tightens, spacing shrinks — the     */
-/* header's minimum width drops under the phone budget. flex-wrap      */
-/* lets the header grow rows instead of pushing sideways; it is        */
-/* layout, not a CSS overflow guarantee — the e2e is the guarantee     */
-/* (scrollWidth <= clientWidth asserted on chat + board at 390px and   */
-/* 561px). Desktop (≥768px) is untouched; 561–768px still fits on one  */
-/* row (shrink floor ≈ 519px < 561px, e2e-pinned), so no rules there.  */
+/* The v6 command bar (brand + ticker + lens toggle + status +         */
+/* speaker/bell/theme/settings) must stay inside a phone budget:       */
+/* below ~560px the ticker drops and the lens toggle wraps onto its    */
+/* own full-width row; below 640px the icon controls compact so the    */
+/* owner-chime speaker fits row 1 (the ticker regains room above       */
+/* 561px, where it is edge-to-edge). flex-wrap lets the bar grow rows  */
+/* sideways; it is layout, not a CSS overflow guarantee — the e2e is   */
+/* the guarantee (scrollWidth <= clientWidth asserted on chat + board  */
+/* at 390px and 561px, every control pinned reachable). Desktop        */
+/* (≥768px) is untouched.                                              */
 /* ------------------------------------------------------------------ */
 @media (max-width: 560px) {
   .command-bar {
@@ -2605,5 +2643,19 @@ body {
 
   .command-bar__tab {
     flex: 1 1 0;
+  }
+}
+
+/* ≤640px: command-bar icon controls compact so the owner-chime speaker
+   fits the phone row-1 budget (≤560px) and the bar has control-room to
+   spare at 561–640px. Height stays full — only padding tightens. */
+@media (max-width: 640px) {
+  .command-bar {
+    gap: 8px;
+  }
+
+  .command-bar .pp-btn--icon {
+    padding: 8px 6px;
+    font-size: 15px;
   }
 }
