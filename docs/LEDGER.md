@@ -180,3 +180,16 @@ observation — the failed
 worker keeps its permit; `resident.open-control-unknown` records (once
 per affected handle) that supervision lacked openControl evidence, which
 makes the handle non-reclaimable rather than presumed idle.
+
+### E8: worktree base provenance (migration 9)
+
+`worktrees.base_source` records HOW a lane's registered `sha` was
+resolved: `origin` = the freshly-fetched origin default-branch tip;
+`local-head-fallback` = the declared degraded path (the fetch failed, so
+the lane branched from the host clone's local HEAD and may be stale).
+Rows written before this migration keep NULL — a legacy lane's
+provenance is genuinely unknown, never guessed. The manager declares the
+source on every lane it creates, the `worktree.created` event carries
+it, and a `local-head-fallback` creation also posts a
+`worktree-base-fallback` FYI (owner incident 2026-09-23: lanes branched
+up to hours stale, silently).
