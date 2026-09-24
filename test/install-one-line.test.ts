@@ -36,7 +36,9 @@ function run(
   try {
     const stdout = execFileSync('bash', [script, ...args], {
       encoding: 'utf-8',
-      env: { ...process.env, ...env },
+      // Each simulated installation owns its config home even when the test
+      // runner supplies an XDG_CONFIG_HOME outside the fixture's HOME.
+      env: { ...process.env, ...env, ...(env.HOME ? { XDG_CONFIG_HOME: join(env.HOME, '.config') } : {}) },
       timeout: 120_000,
     });
     lastStderr = '';
@@ -320,6 +322,7 @@ function ptyUpdaterLauncher(home: string, target: string, instance: string, seam
       '#!/usr/bin/env bash',
       'set -euo pipefail',
       `export HOME=${shellQuote(home)}`,
+      `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
       `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
       `export GRU_MANAGER_LOG=${shellQuote(seam.managerLog)}`,
       `export GRU_COMMAND_LAUNCHCTL=${shellQuote(seam.manager)}`,
@@ -430,6 +433,7 @@ describe('install.sh setup mode (one-line path)', () => {
         '#!/usr/bin/env bash',
         'set -euo pipefail',
         `export HOME=${shellQuote(home)}`,
+        `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
         `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
         `export GRU_COMMAND_ORIGIN=${shellQuote(`file://${fixture}`)}`,
         `export GRU_COMMAND_TARGET=${shellQuote(join(home, 'gru-command'))}`,
@@ -646,6 +650,21 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(readFileSync(unit, 'utf-8')).toContain(`${target}/dist/main.js`);
   });
 
+  it.skipIf(process.platform !== 'linux')('fixture HOME contains service units even with a foreign XDG config home', () => {
+    const home = tempDir('gru-command-sandbox-home-');
+    const outside = tempDir('gru-command-foreign-xdg-');
+    const outsideUnit = join(outside, 'systemd', 'user', 'gru-command.service');
+    mkdirSync(dirname(outsideUnit), { recursive: true });
+    writeFileSync(outsideUnit, 'unrelated-user-unit\n');
+    const result = run(join(repoRoot, 'install.sh'), ['--uninstall'], {
+      HOME: home,
+      XDG_CONFIG_HOME: outside,
+    });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('not installed');
+    expect(readFileSync(outsideUnit, 'utf-8')).toBe('unrelated-user-unit\n');
+  });
+
   it('--no-interact + absent unit: the updater REGISTERS the service (unit written + manager called)', () => {
     const { home, target, instance, seam } = stageConfiguredAbsentUnit();
     const result = run(join(target, 'install.sh'), ['--no-interact'], {
@@ -718,6 +737,7 @@ describe('install.sh setup mode (one-line path)', () => {
         '#!/usr/bin/env bash',
         'set -euo pipefail',
         `export HOME=${shellQuote(home)}`,
+        `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
         `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
         `export GRU_MANAGER_LOG=${shellQuote(seam.managerLog)}`,
         `export GRU_COMMAND_LAUNCHCTL=${shellQuote(seam.manager)}`,
@@ -761,6 +781,7 @@ describe('install.sh setup mode (one-line path)', () => {
         '#!/usr/bin/env bash',
         'set -euo pipefail',
         `export HOME=${shellQuote(home)}`,
+        `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
         `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
         `export GRU_MANAGER_LOG=${shellQuote(seam.managerLog)}`,
         `export GRU_COMMAND_LAUNCHCTL=${shellQuote(seam.manager)}`,
@@ -779,6 +800,7 @@ describe('install.sh setup mode (one-line path)', () => {
       env: {
         ...process.env,
         HOME: home,
+        XDG_CONFIG_HOME: join(home, '.config'),
         GRU_COMMAND_HOME: instance,
       },
     });

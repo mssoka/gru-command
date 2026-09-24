@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Managed by Gru Command BMAD bootstrap v1
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import process from 'node:process';
+import console from 'node:console';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, relative, resolve, isAbsolute } from 'node:path';
 const childEnv = { ...process.env };
