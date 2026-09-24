@@ -234,7 +234,8 @@ The estate is a full-width cockpit — dense but calm, monospace data
 readouts, hairline structure. Breakpoints (`web/src/lib/console-layout.ts`
 owns the numbers; CSS mirrors them):
 
-- **≥ 1100px — cockpit:** `[ chat | board | agents-rail ]`, every
+- **≥ 1100px — cockpit:** `[ chat | board | crew-rail ]` (the rail element
+  keeps its stable `agents-rail` id/class), every
   boundary a **4px drag splitter**. Dragging resizes the pane live; the
   pair persists per breakpoint in localStorage (`gru-pane-sizes`),
   double-click resets to the defaults, Arrow keys nudge a focused handle
@@ -253,21 +254,30 @@ owns the numbers; CSS mirrors them):
 
 The **global command bar** (sticky, ~56px) is one flat row: logo +
 product + `ONE GRU · ONE WINDOW`, the inline monospace status **ticker**
-(`MODE: COCKPIT · BOARD | RADAR: LIVE | ROUND 4 ACTIVE` — active lens +
-layout, the board socket's radar state, the top live/pending review
-round), the Chat/Board segmented lens toggle, the notification bell,
-theme and settings. Below it the **status chip rail** (sticky, one
-wrapping row on desktop) relocates the v4 health row globally: DEPLOY →
-REVIEWS → SILAS → ALERTS → VERIFY → CURE → TRACKERS, each with one
-accent edge and its own flags (e.g. REVIEWS carries `12 FAILED`). The
-TRACKERS chip folds the v4 KPI counts in as three compact count groups
-(`JOBS 17 2/2/1/0/0`, `PRS 1/1/0`, `LANES 2/0/410`; every number is a
-`data-kpi` span tied to the same `boardKpis` derivation the v4 strip
-used) plus the Jev decisions chip and the unacked action-required badge.
+(`MODE: COCKPIT | RADAR: LIVE | ROUND 4 ACTIVE` — layout, the board
+socket's radar state, the top live/pending review round), the
+notification bell, theme and settings. No Chat/Board lens toggle (v6.1):
+chat is always docked on desktop and the FAB owns mobile chat. Below it
+the **status chip rail** (sticky, wrapping on desktop) relocates the v4
+health row globally: DEPLOY → REVIEWS → SILAS → ALERTS → VERIFY → CURE →
+TRACKERS, each with one accent edge and its own flags (e.g. REVIEWS
+carries `12 FAILED`). The TRACKERS chip folds the v4 KPI counts in as
+labeled fields (`HEISTS 17 working 2 in review 2 merged 0 done 0 parked 1`,
+`PRS 1 open 1 conflicting 0 merged today 0`, `MINIONS 1 live 1 mid-turn 1
+disposed 1`; every number is a `data-kpi` span tied to the same
+`boardKpis` derivation the v4 strip used) plus the Jev decisions chip and
+the unacked action-required badge. No bare slash counters survive: every
+value carries its label beside it.
+
+**Display vocabulary (v6.1):** the render boundary renders `lane` /
+`job(s)` as **heist(s)** and the worker-meta word as **minion**; the
+agents rail renders as **CREW** (`web/src/lib/board-vocabulary.ts`). This
+is display-only: API payloads, code identifiers, and the ledger keep
+`lane`, `job`, and `agent`.
 
 `web/src/ui/console.ts` owns the FAB contract; `web/src/ui/splitters.ts`
 owns pane sizes; `web/src/ui/command-bar.ts` owns the ticker;
-`web/src/ui/rail-tabs.ts` owns the AGENTS/TRANSCRIPTS tabs. `ChatView`
+`web/src/ui/rail-tabs.ts` owns the CREW/TRANSCRIPTS tabs. `ChatView`
 owns the unread math (a message counts only while no chat surface is in
 sight).
 
@@ -277,7 +287,7 @@ Jobs bucket NEEDS YOU → IN FLIGHT → SETTLED → COLD (recency inside each
 band; see [BOARD.md](./BOARD.md)). v6 renders every band as a full-width
 **dense row list**, not a card grid: line 1 = status dot + title +
 status chip (right-aligned, with the compact signal/stale chips inline);
-line 2 = repo + branch + lane age + agent age + PR link, small and muted
+line 2 = repo + branch + heist age + minion age + PR link, small and muted
 in monospace. Band headers are **sticky separators with counts**;
 dividers are hairlines (zebra-free); failing rows (blocked/error status,
 aborted newest round, unresolved lens errors) are tinted with a left
@@ -317,14 +327,14 @@ pointer).
   Compact success/failure and unsolicited provider outcomes are announced in
   a dedicated persistent live region that idle usage refreshes cannot erase.
 - **Board (E6/v6)** — always on the page: the global status chip rail
-  above, then attention-banded dense job rows + the AGENTS (n) /
+  above, then attention-banded dense job rows + the CREW (n) /
   TRANSCRIPTS rail. At ≥1100px the chat pane joins it on the left with
   drag splitters; below that the board is the full page and chat
   overlays. Round rows carry 7 per-lens live chips behind the row's
   disclosure; the notification center rides the bell (see
   [BOARD.md](./BOARD.md)). **Phone:** board-first (SPEC ruling 11) — the
   landing view, with chat one FAB tap away.
-- **Transcripts (E6)** — drawer from the agent rail / transcripts list:
+- **Transcripts (E6)** — drawer from the crew rail / transcripts list:
   newest-first paging, server-side search with jump-to-entry, wrap
   toggle (long lines unwrap, never clip), collapsed thinking.
 - **Degraded modes** — banners for connecting/reconnecting/offline; the
