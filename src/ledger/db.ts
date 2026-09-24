@@ -310,4 +310,18 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_pending_rebriefs_job ON pending_rebriefs(job_id);
     `,
   },
+  {
+    // Worktree base provenance (owner incident 2026-09-23): a lane's base
+    // sha is only trustworthy when its SOURCE is recorded. 'origin' = the
+    // freshly-fetched origin default-branch tip; 'local-head-fallback' =
+    // the declared degraded path (the fetch failed, the lane may be stale,
+    // and the FYI must be visible). Rows written before this migration
+    // keep NULL — a legacy lane's provenance is genuinely unknown.
+    id: 9,
+    name: 'worktree-base-source',
+    sql: `
+      ALTER TABLE worktrees ADD COLUMN base_source TEXT
+        CHECK (base_source IN ('origin','local-head-fallback'));
+    `,
+  },
 ];

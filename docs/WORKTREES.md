@@ -85,6 +85,20 @@ every pause is answerable by construction (job id or round id).
 Same-repo creation is sequential (git index/refs contention); every
 creation resolves the CURRENT head — never a held sha.
 
+## 5a. Base provenance (owner incident 2026-09-23)
+
+A lane's base is the `git fetch origin <default-branch>` tip of the
+remote's default branch (resolved per-repo: `origin/HEAD`, else the
+remote's live HEAD symref, else the repo's checked-out branch — never a
+hardcoded `main`). The registry row records the base SOURCE: `origin`
+for a fetched base, `local-head-fallback` when the fetch failed and the
+lane branched from the host clone's local HEAD instead. The fallback is
+never silent: the row carries it, the `worktree.created` event carries
+it, and an `worktree-base-fallback` FYI notification names the stale
+risk. Review lanes apply the same fetch discipline to `origin/<branch>`
+refs; an unfetchable origin ref refuses outright — a stale review is a
+wrong review, not an offline one.
+
 ## Endpoints
 
 `POST /api/dispatch/release` — `{ job_id | round_id | worktree_id,
