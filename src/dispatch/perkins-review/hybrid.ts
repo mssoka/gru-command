@@ -532,6 +532,7 @@ interface ProofCache {
   readonly anywhere: Map<string, boolean>;
   readonly changeStatus: Map<string, readonly DeltaPath[]>;
   readonly changedLines: Map<string, ReadonlySet<string>>;
+  readonly canonicalPatches: Map<string, string>;
 }
 
 interface DeltaPath {
@@ -542,7 +543,7 @@ interface DeltaPath {
 function newProofCache(): ProofCache {
   return {
     blobContains: new Map(), pathDiffs: new Map(), pathAbsent: new Map(), anywhere: new Map(),
-    changeStatus: new Map(), changedLines: new Map(),
+    changeStatus: new Map(), changedLines: new Map(), canonicalPatches: new Map(),
   };
 }
 
@@ -652,13 +653,29 @@ const MAX_INDIRECT_PROOF_BYTES = 8 * 1024 * 1024;
 
 /** Read bounded Git bytes at two fixed commits, never from the checkout. A
  * failed query must fail proof, not devolve into a weaker current-tree check. */
-function proofGit(review: FrozenReview, args: readonly string[]): string {
+function proofGitBytes(review: FrozenReview, args: readonly string[]): Buffer {
   const raw = execFileSync('git', ['-C', review.manifest.repoPath, ...args], {
     maxBuffer: MAX_INDIRECT_PROOF_BYTES, timeout: GIT_PROOF_TIMEOUT_MS,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (raw.byteLength > MAX_INDIRECT_PROOF_BYTES) throw new Error('frozen delta exceeds the proof byte bound');
-  return new TextDecoder('utf-8', { fatal: true }).decode(raw);
+  return raw;
+}
+
+function proofGit(review: FrozenReview, args: readonly string[]): string {
+  return new TextDecoder('utf-8', { fatal: true }).decode(proofGitBytes(review, args));
+}
+
+/** Git attributes can label a binary blob as text (or text as binary). The
+ * objects, not the diff driver's classification, decide whether proof exists. */
+function canonicalTextBlob(review: FrozenReview, sha: string, path: string): string | null {
+  const bytes = proofGitBytes(review, ['cat-file', 'blob', `${sha}:${path}`]);
+  if (bytes.some((byte) => byte === 0 || byte === 127 || (byte < 32 && byte !== 9 && byte !== 10 && byte !== 13))) return null;
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
 }
 
 /** Rename detection runs BEFORE path selection. Filtering first reclassifies
@@ -702,6 +719,41 @@ function regularFrozenBlob(review: FrozenReview, sha: string, path: string): boo
     entries.slice(entries.indexOf('\t') + 1) === `${path}\0`;
 }
 
+/** Do not mix another file's hunks into a renamed caller's path pair. */
+function isolatedDeltaPath(paths: readonly DeltaPath[], path: string, change?: 'added' | 'removed'): DeltaPath {
+  const matches = paths.filter((entry) => change === 'added' ? entry.newPath === path :
+    change === 'removed' ? entry.oldPath === path : entry.oldPath === path || entry.newPath === path);
+  if (matches.length !== 1) throw new Error(`fix_location ${path} has no unique changed path in the frozen prior-target delta`);
+  const entry = matches[0]!;
+  if (paths.some((other) => other !== entry && [entry.oldPath, entry.newPath].some((candidate) =>
+    candidate !== null && (other.oldPath === candidate || other.newPath === candidate)))) {
+    throw new Error(`fix_location ${path} overlaps another changed path in the frozen delta`);
+  }
+  return entry;
+}
+
+/** The same path-paired zero-context patch is supplied to the lead and checked
+ * at submission. Both blobs must be regular canonical UTF-8 text regardless
+ * of `.gitattributes`, diff drivers or textconv; --text then defeats -diff. */
+function canonicalPathPatch(review: FrozenReview, priorSha: string, entry: DeltaPath, cache: ProofCache): string | null {
+  const key = `${priorSha}\0${entry.oldPath ?? ''}\0${entry.newPath ?? ''}`;
+  const cached = cache.canonicalPatches.get(key);
+  if (cached !== undefined) return cached;
+  for (const [sha, path] of [[priorSha, entry.oldPath], [review.manifest.targetSha, entry.newPath]] as const) {
+    if (path === null) continue;
+    if (!regularFrozenBlob(review, sha, path)) throw new Error(`frozen delta path ${path} is not a regular blob`);
+    if (canonicalTextBlob(review, sha, path) === null) return null;
+  }
+  const paths = [...new Set([entry.oldPath, entry.newPath].filter((path): path is string => path !== null))]
+    .map((path) => `:(literal)${path}`);
+  const patch = proofGit(review, [
+    'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--text', '--find-renames', '--unified=0',
+    priorSha, review.manifest.targetSha, '--', ...paths,
+  ]);
+  cache.canonicalPatches.set(key, patch);
+  return patch;
+}
+
 /** Null means located; otherwise return a specific, bounded rejection. */
 function indirectFixEvidence(
   review: FrozenReview, finding: VerifiedFinding, audit: FixAuditResult,
@@ -716,39 +768,12 @@ function indirectFixEvidence(
         !proofGit(review, ['show', `${priorSha}:${citedPath}`]).includes(finding.evidence)) {
       return `fix_location ${location.path} prior target revision does not contain the original cited finding`;
     }
-    const paths = deltaPaths(review, priorSha, cache);
-    const matches = paths.filter((entry) => location.change === 'added'
-      ? entry.newPath === location.path : entry.oldPath === location.path);
-    if (matches.length !== 1) return `fix_location ${location.path} has no unique ${location.change} path in the frozen prior-target delta`;
-    const entry = matches[0]!;
-    // The pair is diffed with two literal pathspecs. If another changed file
-    // also occupies either path (e.g. a renamed caller's old name reused for
-    // a new file), its hunk could otherwise satisfy this caller's proof.
-    if (paths.some((other) => other !== entry && [entry.oldPath, entry.newPath].some((path) =>
-      path !== null && (other.oldPath === path || other.newPath === path)))) {
-      return `fix_location ${location.path} overlaps another changed path in the frozen delta`;
-    }
-    if (entry.oldPath !== null && !regularFrozenBlob(review, priorSha, entry.oldPath)) {
-      return `fix_location ${location.path} has no regular prior text file`;
-    }
-    if (entry.newPath !== null && !regularFrozenBlob(review, review.manifest.targetSha, entry.newPath)) {
-      return `fix_location ${location.path} has no regular frozen target text file`;
-    }
+    const entry = isolatedDeltaPath(deltaPaths(review, priorSha, cache), location.path, location.change);
+    const patch = canonicalPathPatch(review, priorSha, entry, cache);
+    if (patch === null) return `fix_location ${location.path} has a binary caller blob, not canonical text proof`;
     const key = `${priorSha}\0${entry.oldPath ?? ''}\0${entry.newPath ?? ''}\0${location.change}`;
     let lines = cache.changedLines.get(key);
     if (lines === undefined) {
-      const pathspecs = [...new Set([entry.oldPath, entry.newPath].filter((path): path is string => path !== null))]
-        .map((path) => `:(literal)${path}`);
-      const args = ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--find-renames', '--unified=0',
-        priorSha, review.manifest.targetSha, '--', ...pathspecs];
-      // Git's binary numstat indicator is authoritative even when a binary
-      // happens to contain printable lines; a binary never supplies text proof.
-      const numstat = proofGit(review, [
-        'diff', '--no-ext-diff', '--no-textconv', '--find-renames', '--numstat',
-        priorSha, review.manifest.targetSha, '--', ...pathspecs,
-      ]);
-      if (numstat.split('\n').some((row) => row.startsWith('-\t-\t'))) return `fix_location ${location.path} is binary, not textual changed-line proof`;
-      const patch = proofGit(review, args);
       const changed = new Set<string>();
       let inHunk = false;
       for (const line of patch.split('\n')) {
@@ -760,7 +785,8 @@ function indirectFixEvidence(
       cache.changedLines.set(key, lines);
     }
     return lines.has(audit.evidence) ? null : `fix_location ${location.path} evidence is not an actual ${location.change} changed hunk line in the frozen prior-target delta`;
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('fix_location ')) return error.message;
     return `fix_location ${location.path} frozen delta is unavailable or exceeds bounds at the prior target revision`;
   }
 }
@@ -1518,6 +1544,37 @@ export class PerkinsHybridReview {
       },
     };
 
+    const priorDeltaTool: NativeAgentTool | null = priorReview.targetSha === null ? null : {
+      name: 'perkins_read_prior_delta',
+      description: 'List changed paths between the prior frozen target and this frozen target with {}, or read one path-paired canonical text hunk with {"path":"relative/file"}. Read-only; binary callers cannot supply proof.',
+      inputSchema: {
+        type: 'object', additionalProperties: false,
+        properties: { path: { type: 'string', minLength: 1, maxLength: 500 } },
+      },
+      execute: async (raw, signal) => {
+        if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
+        const value = record(raw, 'perkins_read_prior_delta input');
+        exactKeys(value, value.path === undefined ? [] : ['path'], 'perkins_read_prior_delta input');
+        const priorTargetSha = priorReview.targetSha!;
+        const changes = deltaPaths(review, priorTargetSha, proofCache);
+        const selection = value.path;
+        let payload: string;
+        if (selection === undefined) {
+          payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, changes });
+        } else {
+          if (typeof selection !== 'string' || !safeFixPath(selection)) throw new Error('prior delta path must be a bounded safe relative file path');
+          const entry = isolatedDeltaPath(changes, selection);
+          const patch = canonicalPathPatch(review, priorTargetSha, entry, proofCache);
+          if (patch === null) throw new Error(`prior delta path ${selection} has a binary caller blob`);
+          payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, ...entry, diff: patch });
+        }
+        if (Buffer.byteLength(payload, 'utf8') > MAX_TRANSPORT_CHUNK_BYTES) {
+          throw new Error('prior delta response exceeds the bounded tool transport; select a smaller caller path');
+        }
+        return { text: payload, details: { priorTargetSha, targetSha: review.manifest.targetSha } };
+      },
+    };
+
     const validationContext: SubmissionValidationContext = {
       review,
       movementRef: input.movementRef,
@@ -1756,15 +1813,17 @@ export class PerkinsHybridReview {
       },
     };
 
+    const leadTools = [chunkTool, ...(priorDeltaTool === null ? [] : [priorDeltaTool]), runTool, artifactTool, recordTool, preflightTool, submitTool];
     const systemPrompt = [
       this.policy.portableContract.leadWorkflow,
       '',
       '--- PRODUCT-NATIVE TOOL CONTRACT ---',
       'Use perkins_read_chunk to read frozen diff chunks; use perkins_run_lenses to start and receive tracked lens children; use perkins_store_artifact only for optional lead notes; use perkins_record_decision to validate and record each candidate decision as you verify it; use perkins_preflight_submission to validate a candidate terminal submission (full or delta) without spending a terminal attempt; finish by calling perkins_submit_review.',
+      ...(priorReview.targetSha === null ? [] : ['On a re-review use perkins_read_prior_delta to list prior-target changes and read canonical caller hunks, including removed files.']),
       'A terminal submission is either a full payload or {"mode":"delta", ...} carrying only changed fields; recorded decisions and the last rejected submission are applied host-side, then the merged whole is validated with the same exhaustive rules. An accepted delta is indistinguishable from an accepted full submission of the same content.',
       'Lens children never inherit these tools. You, the lead, must independently inspect and decide every returned candidate. Do not write implementation files.',
     ].join('\n');
-    const initialPrompt = this.leadPrompt(review, lenses, prior);
+    const initialPrompt = this.leadPrompt(review, lenses, prior, priorReview.targetSha);
     let lead: AgentHandle | null = null;
     let unsubscribe = (): void => {};
     let turns = 0;
@@ -1774,7 +1833,7 @@ export class PerkinsHybridReview {
         reviewLead: {
           systemPrompt,
           tools: ['read', 'grep', 'find', 'ls'],
-          nativeTools: [chunkTool, runTool, artifactTool, recordTool, preflightTool, submitTool],
+          nativeTools: leadTools,
         },
       }), LEAD_SPAWN_TIMEOUT_MS, [input.signal, roundAbort.signal]);
       registerIsolatedHandle(lead, 'lead');
@@ -1798,7 +1857,7 @@ export class PerkinsHybridReview {
         preflightCalls: preflightAttempts,
         decisionRecords: recordAttempts,
         deltaSubmissions,
-        nativeTools: [chunkTool.name, runTool.name, artifactTool.name, recordTool.name, preflightTool.name, submitTool.name],
+        nativeTools: leadTools.map((tool) => tool.name),
       });
       return accepted;
     } finally {
@@ -2307,13 +2366,14 @@ export class PerkinsHybridReview {
     };
   }
 
-  private leadPrompt(review: FrozenReview, lenses: readonly PerkinsLens[], prior: readonly VerifiedFinding[]): string {
+  private leadPrompt(review: FrozenReview, lenses: readonly PerkinsLens[], prior: readonly VerifiedFinding[], priorTargetSha: string | null): string {
     const coverage = review.chunks.flatMap((chunk) => lenses.map((lens) => ({ lens, chunk: chunk.id, files: chunk.files })));
     return [
       'Conduct the complete Perkins review as the lead. You own scheduling, investigation, candidate verification, prior-finding audit, synthesis and report authorship. The host owns safety and terminal proof validation.',
       '',
       `Frozen target SHA: ${review.manifest.targetSha}`,
       `Frozen diff base SHA: ${review.manifest.diffBaseSha}`,
+      ...(priorTargetSha === null ? [] : [`Frozen prior target SHA: ${priorTargetSha}`]),
       `Spec mode: ${review.manifest.specMode}`,
       '',
       '--- FROZEN SPECIFICATION / CONTEXT ---',
@@ -2332,6 +2392,7 @@ export class PerkinsHybridReview {
       'Record each decision with perkins_record_decision as you verify it: it validates the decision immediately with the same exhaustive rules and keeps clean decisions in the round record, so the final submission can carry only what is still missing.',
       'A rejected candidate still requires a concise reason. confirmed evidence must be one contiguous verbatim current-tree substring. N/A claims are speculative and cannot remain blockers.',
       'Pairing rules are enforced at cited locations: a rejected candidate needs contradictory evidence locatable at its cited file/hunk, confirmed candidate evidence must be locatable at its cited file/hunk, and your verification evidence must be locatable in the frozen review.',
+      ...(priorTargetSha === null ? [] : ['Call perkins_read_prior_delta with {} to list changed paths and {"path":"relative/caller.ts"} to read a selected frozen prior-target hunk; deleted callers are absent from the current tree but their removed lines remain available here. The tool is read-only, bounded, and rejects binary callers.']),
       'For a fixed prior finding whose cited file remains unchanged, optionally give fix_location: {path: "relative/changed-caller.ts", change: "added" or "removed"} with evidence equal to ONE actual added or removed line in the prior-target-to-frozen-target delta. The location must differ from the original citation; explain in reason why this caller change fixes that finding and name both paths in the report. A path alone, unchanged diff context, a rename with no changed hunk, or another revision is not proof. Old cited deletion/PATH ABSENT proofs remain valid without fix_location.',
       'Before the terminal submission, call perkins_preflight_submission with the exact candidate submission (full, or {"mode":"delta", ...} to amend the rejection record after a failed attempt). It spends no terminal attempt, accepts nothing, and returns every violation in one response; fix them all and preflight again until it reports no errors, then submit once.',
       'After a rejected terminal submission, resubmit a delta: {"mode":"delta", "candidate_decisions": [only the changed/added decisions], ...changed report fields}. The host applies it over the rejected submission and re-validates the merged whole with the same rules. A delta is still a real terminal attempt.',

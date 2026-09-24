@@ -179,6 +179,7 @@ function indirectFixHarness(options: {
   readonly submitPayload?: LeadBrainOptions['submitPayload'];
   readonly preflight?: LeadBrainOptions['preflight'];
   readonly transformReport?: LeadBrainOptions['transformReport'];
+  readonly onPriorDelta?: LeadBrainOptions['onPriorDelta'];
 } = {}) {
   const repo = makeFixtureRepo('indirect-audit');
   repos.push(repo);
@@ -211,6 +212,7 @@ function indirectFixHarness(options: {
     submitRetries: options.submitPayload === undefined ? 0 : 1,
     ...(options.submitPayload === undefined ? {} : { submitPayload: options.submitPayload }),
     ...(options.transformReport === undefined ? {} : { transformReport: options.transformReport }),
+    ...(options.onPriorDelta === undefined ? {} : { onPriorDelta: options.onPriorDelta }),
     priorAudit: () => [{
       prior_index: 0, status: 'fixed', evidence: 'const selected = nativeSetting;',
       reason: 'The caller now supplies the native setting without passing it through the unchanged helper.',
@@ -1357,6 +1359,71 @@ describe('Perkins hybrid lead engine', () => {
       afterPrior: (repo) => { repo.commitFile('src/caller.ts', '\u0000const selected = nativeSetting;\n'); },
     });
     await expect(binary.run()).rejects.toThrow(/binary|text|changed.*line/u);
+  });
+
+  it('gives the isolated rereview lead frozen prior-target deleted-caller hunks on demand', async () => {
+    let observed = false;
+    const h = indirectFixHarness({
+      afterPrior: (repo) => {
+        repo.git(['rm', 'src/caller.ts']);
+        repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'remove caller']);
+      },
+      audit: { evidence: 'const selected = nativeRef;', fix_location: { path: 'src/caller.ts', change: 'removed' } },
+      onPriorDelta: (list, selected, prompt) => {
+        const inventory = list as { priorTargetSha: string; targetSha: string; changes: Array<{ oldPath: string; newPath: string | null }> };
+        const proof = selected as { priorTargetSha: string; targetSha: string; oldPath: string; newPath: string | null; diff: string };
+        expect(prompt).toContain('perkins_read_prior_delta');
+        expect(prompt).toContain(`Frozen prior target SHA: ${inventory.priorTargetSha}`);
+        expect(inventory.targetSha).toBe(h.frozen.manifest.targetSha);
+        expect(inventory.changes).toContainEqual({ oldPath: 'src/caller.ts', newPath: null });
+        expect(proof).toMatchObject({ priorTargetSha: inventory.priorTargetSha, targetSha: inventory.targetSha, oldPath: 'src/caller.ts', newPath: null });
+        expect(proof.diff).toContain('-const selected = nativeRef;');
+        observed = true;
+      },
+    });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(observed).toBe(true);
+    expect(h.fake.leadCalls[0]?.options.reviewLead?.nativeTools.some((tool) => tool.name === 'perkins_read_prior_delta')).toBe(true);
+    expect(h.fake.childCalls.every((call) => call.options.isolatedReview?.nativeTools?.every((tool) => tool.name !== 'perkins_read_prior_delta') ?? true)).toBe(true);
+  });
+
+  it('accepts canonical text caller hunks even when Git attributes suppress diffs', async () => {
+    const h = indirectFixHarness({
+      afterPrior: (repo) => {
+        repo.commitFile('.gitattributes', 'src/caller.ts -diff\n');
+        repo.commitFile('src/caller.ts', 'const unchanged = true;\nconst selected = nativeSetting;\n');
+      },
+    });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+  });
+
+  it('ignores a configured textconv driver when proving a canonical caller line', async () => {
+    const converter = join(temp('perkins-textconv-'), 'converter.mjs');
+    const marker = `${converter}.executed`;
+    writeFileSync(converter, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'executed');\n`);
+    const h = indirectFixHarness({
+      afterPrior: (repo) => {
+        repo.git(['config', 'diff.poison.textconv', `node ${converter}`]);
+        repo.commitFile('.gitattributes', 'src/caller.ts diff=poison\n');
+        repo.commitFile('src/caller.ts', 'const unchanged = true;\nconst selected = nativeSetting;\n');
+      },
+    });
+    // Freeze's pre-existing general PR diff may run a configured converter;
+    // the new prior-target proof must not invoke it during the review run.
+    if (existsSync(marker)) unlinkSync(marker);
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('rejects a binary caller despite forced-text Git attributes', async () => {
+    const h = indirectFixHarness({
+      afterPrior: (repo) => {
+        repo.commitFile('.gitattributes', 'src/caller.ts text diff\n');
+        repo.commitFile('src/caller.ts', 'const selected = nativeSetting;\n\u0000BINARY\n');
+      },
+    });
+    await expect(h.run()).rejects.toThrow(/binary|canonical text/u);
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":false');
   });
 
   it('carries still-present findings with original round markers and dedupes fresh rediscovery', async () => {

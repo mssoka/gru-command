@@ -138,6 +138,7 @@ export interface LeadBrainOptions {
   readonly duplicateRun?: boolean;
   readonly beforeSubmit?: () => void;
   readonly onLeadStart?: () => void;
+  readonly onPriorDelta?: (list: unknown, selected: unknown, prompt: string) => void | Promise<void>;
   readonly transformReport?: (report: string) => string;
   /** Validate the exact submission through the preflight channel first. */
   readonly preflight?: HybridPreflightOptions;
@@ -226,6 +227,7 @@ export function fakeHybridSpawner(
     const byName = new Map(tools.map((tool) => [tool.name, tool]));
     const runTool = byName.get('perkins_run_lenses')!;
     const chunkTool = byName.get('perkins_read_chunk')!;
+    const priorDeltaTool = byName.get('perkins_read_prior_delta');
     const artifactTool = byName.get('perkins_store_artifact')!;
     const preflightTool = byName.get('perkins_preflight_submission');
     const recordTool = byName.get('perkins_record_decision');
@@ -234,6 +236,12 @@ export function fakeHybridSpawner(
     const coverage = JSON.parse(extractJsonArray(prompt, '--- REQUIRED CHILD COVERAGE ---')) as
       Array<{ lens: string; chunk: string }>;
     const prior = JSON.parse(extractJsonArray(prompt, '--- PRIOR VERIFIED FINDINGS TO AUDIT ---')) as unknown[];
+    if (options.onPriorDelta !== undefined) {
+      if (priorDeltaTool === undefined) throw new Error('rereview lead needs perkins_read_prior_delta');
+      const list = JSON.parse((await priorDeltaTool.execute({})).text) as unknown;
+      const selected = JSON.parse((await priorDeltaTool.execute({ path: 'src/caller.ts' })).text) as unknown;
+      await options.onPriorDelta(list, selected, prompt);
+    }
 
     if (options.readChunks !== false) {
       for (const chunk of new Set(coverage.map((entry) => entry.chunk))) {
