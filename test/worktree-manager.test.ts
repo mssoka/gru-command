@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -76,6 +76,22 @@ function harness(useDefaultEnumerator = false): Harness {
   return h;
 }
 
+function seedOfflineNpmFixture(repo: FixtureRepo): void {
+  repo.commitFile('fixture-dep/package.json', JSON.stringify({ name: 'fixture-dep', version: '1.0.0', main: 'index.js' }));
+  repo.commitFile('fixture-dep/index.js', 'module.exports = 1;\n');
+  repo.commitFile('package.json', JSON.stringify({
+    name: 'fixture-wt',
+    version: '1.0.0',
+    scripts: { test: 'node -e "if (require(\'fixture-dep\') !== 1) process.exit(1)"' },
+    dependencies: { 'fixture-dep': 'file:./fixture-dep' },
+  }));
+  execFileSync('npm', ['install', '--package-lock-only', '--offline', '--ignore-scripts', '--no-audit', '--no-fund'], {
+    cwd: repo.path,
+    stdio: 'pipe',
+  });
+  repo.commitFile('package-lock.json', readFileSync(join(repo.path, 'package-lock.json'), 'utf-8'));
+}
+
 describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
   it('creates a job worktree on its own branch at the CURRENT fresh head, registered in the ledger', async () => {
     const h = harness();
@@ -107,15 +123,19 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
     expect(existsSync(join(row.path, '.boot-marker'))).toBe(true);
   });
 
-  it('allows a fresh clone with the tracked BMAD setup but no local onboarding source', async () => {
+  it('provisions full verification in a fresh job lane without local BMAD onboarding', async () => {
     const h = harness();
     const repo = h.make('fixture-unonboarded');
+    seedOfflineNpmFixture(repo);
     const root = join(import.meta.dirname, '..');
     repo.commitFile('.gru-command/worktree.toml', readFileSync(join(root, '.gru-command', 'worktree.toml'), 'utf-8'));
     repo.commitFile('.gru-command/bmad-bootstrap.mjs', readFileSync(join(root, '.gru-command', 'bmad-bootstrap.mjs'), 'utf-8'));
     ledgerJob(h, 'job-unonboarded', repo);
     const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-unonboarded' });
     expect(existsSync(join(row.path, '.gru-command', 'bmad-bootstrap.mjs'))).toBe(true);
+    expect(existsSync(join(repo.path, 'node_modules'))).toBe(false);
+    expect(existsSync(join(row.path, 'node_modules', 'fixture-dep', 'index.js'))).toBe(true);
+    expect(execFileSync('npm', ['test'], { cwd: row.path, encoding: 'utf-8' })).toContain('fixture-wt');
     expect(row.status).toBe('active');
   });
 

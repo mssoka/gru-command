@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Managed by Gru Command BMAD bootstrap v1
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import process from 'node:process';
 import console from 'node:console';
 import { execFileSync } from 'node:child_process';
@@ -15,13 +15,18 @@ const common = (dir) => realpathSync(execFileSync('git', ['-C', dir, 'rev-parse'
 if (common(root) !== common(source)) throw new Error('BMAD bootstrap source belongs to a different Git repository');
 if (root === source) process.exit(0);
 const inside = (base, child) => { const rel = relative(base, child); return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel)); };
+// lstat sees dangling symlinks that existsSync follows and misses.
+const lstatIfPresent = (path) => {
+  try { return lstatSync(path); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+};
 const assertSafeDestination = (to) => {
   const target = resolve(to);
   if (!inside(root, target)) throw new Error('BMAD bootstrap destination escapes worktree: ' + to);
   let current = root;
   for (const part of relative(root, target).split('/').filter(Boolean)) {
     current = join(current, part);
-    if (existsSync(current) && lstatSync(current).isSymbolicLink()) {
+    if (lstatIfPresent(current)?.isSymbolicLink()) {
       throw new Error('BMAD bootstrap refuses destination symlink: ' + current);
     }
   }
@@ -36,18 +41,24 @@ const copyTree = (from, to) => {
   const info = lstatSync(src);
   assertSafeDestination(to);
   if (info.isDirectory()) {
-    mkdirSync(to, { recursive: true });
+    const dest = lstatIfPresent(to);
+    if (dest && !dest.isDirectory()) throw new Error('BMAD bootstrap destination collision: ' + to);
+    if (!dest) mkdirSync(to, { recursive: true, mode: 0o700 });
+    // Copy under owner-only permissions, then restore the source directory's
+    // permission bits. A failed partial copy remains private, never wider.
+    chmodSync(to, 0o700);
     for (const name of readdirSync(src)) copyTree(join(src, name), join(to, name));
+    chmodSync(to, info.mode & 0o777);
     return;
   }
   if (!info.isFile()) throw new Error('BMAD bootstrap supports only files/directories: ' + from);
-  if (existsSync(to)) {
-    const dest = lstatSync(to);
+  const dest = lstatIfPresent(to);
+  if (dest) {
     if (!dest.isFile() || dest.isSymbolicLink()) throw new Error('BMAD bootstrap destination collision: ' + to);
     if (!readFileSync(src).equals(readFileSync(to))) throw new Error('BMAD bootstrap destination differs from source: ' + to);
     return;
   }
-  mkdirSync(dirname(to), { recursive: true });
+  mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
   cpSync(src, to, { errorOnExist: true, force: false });
 };
 const record = JSON.parse(readFileSync(join(root, '.gru-command', 'bmad-install.json'), 'utf-8'));

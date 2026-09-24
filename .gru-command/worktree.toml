@@ -5,5 +5,9 @@
 command = "if git config --local --get gru-command.bmad-source >/dev/null 2>&1; then node .gru-command/bmad-bootstrap.mjs; fi"
 # END GRU COMMAND BMAD BOOTSTRAP
 
+# The scheduler runs inside each fresh job lane, never in the source checkout.
+[[setup]]
+command = "npm ci"
+
 [verify]
 full = "npm test"
