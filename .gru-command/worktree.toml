@@ -1,6 +1,8 @@
 # BEGIN GRU COMMAND BMAD BOOTSTRAP
 [[setup]]
-command = "node .gru-command/bmad-bootstrap.mjs"
+# Fresh clones have no git-local BMAD source. Only onboarded repositories
+# run the generated copier; a configured but invalid source still fails loud.
+command = "if git config --local --get gru-command.bmad-source >/dev/null 2>&1; then node .gru-command/bmad-bootstrap.mjs; fi"
 # END GRU COMMAND BMAD BOOTSTRAP
 
 [verify]

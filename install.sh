@@ -347,11 +347,11 @@ uninstall_launchd() {
 install_systemd() {
   local target_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   local target="$target_dir/gru-command.service"
-  local rendered
   assert_service_owned_or_absent
-  rendered="$(render_unit "$REPO_ROOT/install/systemd/gru-command.service.template" "$NODE_BIN" "$REPO_ROOT" "$INSTANCE_DIR")"
   mkdir -p "$target_dir" "$INSTANCE_DIR/logs"
-  printf '%s' "$rendered" > "$target.r"
+  # Command substitution strips trailing newlines; write the rendered unit
+  # directly so --service installs exactly the bytes --print exposes.
+  render_unit "$REPO_ROOT/install/systemd/gru-command.service.template" "$NODE_BIN" "$REPO_ROOT" "$INSTANCE_DIR" > "$target.r"
   verify_unit "$target.r" "$target"
   mv "$target.r" "$target"
   "$SYSTEMCTL_BIN" --user daemon-reload

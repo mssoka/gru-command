@@ -107,6 +107,31 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
     expect(existsSync(join(row.path, '.boot-marker'))).toBe(true);
   });
 
+  it('allows a fresh clone with the tracked BMAD setup but no local onboarding source', async () => {
+    const h = harness();
+    const repo = h.make('fixture-unonboarded');
+    const root = join(import.meta.dirname, '..');
+    repo.commitFile('.gru-command/worktree.toml', readFileSync(join(root, '.gru-command', 'worktree.toml'), 'utf-8'));
+    repo.commitFile('.gru-command/bmad-bootstrap.mjs', readFileSync(join(root, '.gru-command', 'bmad-bootstrap.mjs'), 'utf-8'));
+    ledgerJob(h, 'job-unonboarded', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-unonboarded' });
+    expect(existsSync(join(row.path, '.gru-command', 'bmad-bootstrap.mjs'))).toBe(true);
+    expect(row.status).toBe('active');
+  });
+
+  it('rejects a configured but invalid BMAD source rather than skipping bootstrap', async () => {
+    const h = harness();
+    const repo = h.make('fixture-invalid-bmad');
+    const root = join(import.meta.dirname, '..');
+    repo.commitFile('.gru-command/worktree.toml', readFileSync(join(root, '.gru-command', 'worktree.toml'), 'utf-8'));
+    repo.commitFile('.gru-command/bmad-bootstrap.mjs', readFileSync(join(root, '.gru-command', 'bmad-bootstrap.mjs'), 'utf-8'));
+    repo.git(['config', '--local', 'gru-command.bmad-source', join(repo.path, 'missing-source')]);
+    ledgerJob(h, 'job-invalid-bmad', repo);
+    await expect(h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-invalid-bmad' }))
+      .rejects.toThrow(/worktree setup command exited/);
+    expect(h.ledger.getWorktree('job-invalid-bmad')).toBeNull();
+  });
+
   it('rolls the worktree back when the bootstrap manifest fails', async () => {
     const h = harness();
     const repo = h.make('fixture-bootfail');
