@@ -768,7 +768,12 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         let wakeInjection: AwarenessInjection | null = null;
         if (wake) {
           wakeInjection = awarenessPrepare();
-          if (wakeInjection === null) return;
+          if (wakeInjection === null) {
+            // Claimed by the policy but nothing left to say (the row was
+            // closed in between): report it so the tracker sees the miss.
+            options.awareness?.noteWakeOutcome?.(false, 'no awareness context to inject');
+            return;
+          }
         }
         // Chip-path provenance (review r1): only workspace/uploads paths
         // ride the manifest — a handcrafted chip pointing elsewhere drops
@@ -876,6 +881,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             // Receipt only after the turn accepted the block: a failed
             // delivery retries the same context on the next turn.
             if (injection !== null) awarenessCommit(injection);
+            // The policy-started turn opened — the wake-observability
+            // receipt the self-heal trackers count.
+            if (wake) options.awareness?.noteWakeOutcome?.(true);
           }
         } catch (error) {
           const message = (error as Error).message;
@@ -885,6 +893,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             // An autonomous turn failing is an operational degradation, not
             // a user message failure — say so durably; the queued context
             // rides the next user message.
+            options.awareness?.noteWakeOutcome?.(false, message);
             emitLogged({
               type: 'notice',
               text:

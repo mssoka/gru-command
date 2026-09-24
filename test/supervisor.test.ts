@@ -383,7 +383,7 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(handle.disposed).toBe(true);
   });
 
-  it('breaker trips after 3 failed rungs in the window: stop + action-required + board mark', async () => {
+  it('breaker trips after 3 failed rungs in the window: stop + needs-owner + board mark', async () => {
     const dir = tmpDir();
     const db = new LedgerDb(dir);
     const bus = new EventBus();
@@ -423,7 +423,7 @@ describe('supervisor — watchdog + restart ladder', () => {
       .listNotifications({ limit: 50 })
       .filter((n) => n.kind === 'supervision.breaker');
     expect(escalations.length).toBe(1);
-    expect(escalations[0]?.routing).toBe('action-required');
+    expect(escalations[0]?.routing).toBe('needs-owner');
     expect(escalations[0]?.agentId).toBe('minion-crashloop');
     // Exactly 3 spawns attempted, then STOPPED.
     expect(registry.spawnCalls.length).toBe(3);
@@ -609,7 +609,7 @@ describe('supervisor — decision-backed failure guidance', () => {
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     const incident = h.api.listNotifications({ limit: 50 }).find((row) => row.kind.includes('restart_confirmation_required'));
-    expect(incident).toMatchObject({ routing: 'action-required' });
+    expect(incident).toMatchObject({ routing: 'needs-owner' });
     h.center.ack(incident!.id, 'test-human');
     h.supervisor.onNotificationAcked(incident!.id);
     await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
@@ -674,7 +674,7 @@ describe('supervisor — decision-backed failure guidance', () => {
       class: 'authentication_wall', restart_advised: false, source: 'deterministic_guard', route: 'fallback',
     });
     const incident = h.api.listNotifications({ limit: 50 }).find((row) => row.kind.includes('provider-wall'));
-    expect(incident).toMatchObject({ routing: 'action-required' });
+    expect(incident).toMatchObject({ routing: 'needs-owner' });
 
     h.center.ack(incident!.id, 'test-human');
     h.supervisor.onNotificationAcked(incident!.id);

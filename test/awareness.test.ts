@@ -1,13 +1,13 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import {
   AWARENESS_STATE_NAME,
   GruAwareness,
   type AwarenessLimits,
 } from '../src/chat/awareness.js';
-import type { NotifyWakeMode } from '../src/config.js';
+import type { NotifyWakeMode, QuietHours, WakeMinSeverity } from '../src/config.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -43,6 +43,10 @@ function boot(options: {
   wakeMode?: NotifyWakeMode;
   limits?: Partial<AwarenessLimits>;
   dir?: string;
+  wakeMinIntervalMs?: number;
+  wakeMinSeverity?: WakeMinSeverity;
+  wakeQuietHours?: QuietHours | null;
+  now?: () => number;
 } = {}): Rig {
   const dir = options.dir ?? tmpDir();
   const db = new LedgerDb(dir);
@@ -54,6 +58,11 @@ function boot(options: {
     ledger: api,
     bus,
     wakeMode: options.wakeMode ?? 'never',
+    // Unit rig: no rate cap unless a test asks for one.
+    wakeMinIntervalMs: options.wakeMinIntervalMs ?? 0,
+    ...(options.wakeMinSeverity !== undefined ? { wakeMinSeverity: options.wakeMinSeverity } : {}),
+    ...(options.wakeQuietHours !== undefined ? { wakeQuietHours: options.wakeQuietHours } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
     ...(options.limits !== undefined ? { limits: options.limits } : {}),
   });
   const woke: number[] = [];
@@ -282,5 +291,87 @@ describe('gru awareness — wake policy', () => {
     const rig = boot({ wakeMode: 'all' });
     rig.notifications.post({ kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'FYI' });
     expect(rig.woke).toHaveLength(1);
+  });
+
+  it('rate limit: candidates inside the min interval coalesce into ONE trailing wake', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00'));
+      const rig = boot({
+        wakeMode: 'action-required',
+        wakeMinIntervalMs: 300_000,
+        now: () => Date.now(),
+      });
+      rig.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'First' });
+      expect(rig.woke).toHaveLength(1);
+      rig.notifications.post({ kind: 'b', routing: 'action-required', severity: 'error', title: 'Second' });
+      rig.notifications.post({ kind: 'c', routing: 'action-required', severity: 'error', title: 'Third' });
+      expect(rig.woke).toHaveLength(1); // deferred, batched
+      vi.advanceTimersByTime(300_000);
+      expect(rig.woke).toHaveLength(2); // one coalesced trailing wake
+      vi.advanceTimersByTime(600_000);
+      expect(rig.woke).toHaveLength(2); // no re-fire after the claim
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('quiet hours: a wake inside the window defers to the window end', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T23:00:00'));
+      const rig = boot({
+        wakeMode: 'action-required',
+        wakeQuietHours: { startMinute: 22 * 60, endMinute: 7 * 60 },
+        now: () => Date.now(),
+      });
+      rig.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Night alert' });
+      expect(rig.woke).toHaveLength(0);
+      vi.advanceTimersByTime(8 * 3_600_000);
+      expect(rig.woke).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('backlog: unacked machine rows seed ONE wake when the sink binds (migration rule)', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const notifications = new NotificationCenter({ ledger: api, bus });
+    notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Old A' });
+    notifications.post({ kind: 'b', routing: 'action-required', severity: 'error', title: 'Old B' });
+    const awareness = new GruAwareness({
+      dir,
+      ledger: api,
+      bus,
+      wakeMode: 'action-required',
+      wakeMinIntervalMs: 0,
+    });
+    const woke: number[] = [];
+    awareness.setWakeSink(() => woke.push(woke.length));
+    expect(woke).toHaveLength(1);
+    const state = JSON.parse(readFileSync(awareness.file, 'utf-8')) as {
+      wake: { woken: string[]; lastFiredAt: number | null };
+    };
+    expect(state.wake.woken).toHaveLength(2);
+    expect(state.wake.lastFiredAt).not.toBeNull();
+  });
+
+  it('dedupe persists across restart: the same notification id never wakes twice', () => {
+    const dir = tmpDir();
+    const first = boot({ dir, wakeMode: 'action-required' });
+    const posted = first.notifications.post({
+      kind: 'a',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'One wake only',
+    });
+    expect(first.woke).toHaveLength(1);
+    const restarted = boot({ dir, wakeMode: 'action-required' });
+    expect(restarted.woke).toHaveLength(0); // backlog seed: already claimed
+    restarted.api.updateNotificationTriage(posted.id, 'action-required', 'retriage');
+    expect(restarted.woke).toHaveLength(0); // live triage event: still claimed
   });
 });

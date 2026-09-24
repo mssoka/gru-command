@@ -108,7 +108,7 @@ export interface NotificationView {
   readonly id: string;
   readonly ts: string;
   readonly kind: string;
-  readonly routing: 'fyi' | 'action-required';
+  readonly routing: 'fyi' | 'action-required' | 'needs-owner';
   readonly severity: 'info' | 'error';
   readonly title: string;
   readonly detail: string | null;
@@ -142,10 +142,15 @@ export interface BoardSnapshot {
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionRuntimeStatus;
-  /** Action-required notifications still awaiting a human ack (a
-   * system-resolved incident no longer needs human action). Counted from
-   * the table, not the 30-row feed window, so the badge stays true. */
+  /** NEEDS GRU: machine-attention rows still awaiting a disposition
+   * (self-clearing machine queue; never rings the owner bell). Counted
+   * from the table, not the 30-row feed window, so the tracker is true. */
   readonly unackedActionRequired: number;
+  /** FOR YOU: needs-owner rows still awaiting a human ack — the only
+   * class that rings the bell. */
+  readonly unackedNeedsOwner: number;
+  /** Autonomous Gru turns recorded as durable `gru.wake` events. */
+  readonly wakes: { readonly count: number; readonly lastAt: string | null };
   /** Running build vs origin/main (null when the tracker is unwired). */
   readonly build: DeployDriftView | null;
   /** Silas ops health, derived from the ledger event stream. */
@@ -428,6 +433,11 @@ export class BoardEngine {
       notifications: this.notifications(),
       decisions: this.decisionsStatus(),
       unackedActionRequired: this.ledger.countPendingActionRequired(),
+      unackedNeedsOwner: this.ledger.countPendingNeedsOwner(),
+      wakes: {
+        count: this.ledger.countEvents('gru.wake'),
+        lastAt: this.ledger.latestEventOfKind('gru.wake')?.ts ?? null,
+      },
       build: this.buildDrift(),
       silas: this.silasView(),
       verify: this.verifyQueue(),

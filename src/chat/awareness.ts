@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { NotifyWakeMode } from '../config.js';
+import type { NotifyWakeMode, QuietHours, WakeMinSeverity } from '../config.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { LogLevel } from '../logger.js';
 import type { EventRecord, LedgerApi } from '../ledger/api.js';
+import { WakePolicy, type WakeCandidate } from './wake-policy.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -23,9 +24,15 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *      was accepted, so a failed delivery never eats context.
  *
  *   2. WAKE POLICY — `onBusEvent` watches notification events; with
- *      notify_wake = 'action-required' an action-required row may start a
- *      turn through the wake sink, with 'all' every notification may. The
- *      default 'never' never wakes: no model turn runs by itself.
+ *      notify_wake = 'action-required' (the default since the owner ruling
+ *      2026-09-23) a machine-attention row OPENS a turn through the wake
+ *      sink so a critical alert is acted on without the user pinging.
+ *      The decision (routing/severity gate, per-id dedupe, minimum
+ *      interval, quiet hours) lives in `wake-policy.ts`; this layer owns
+ *      batching (candidates inside the window coalesce into ONE trailing
+ *      wake), persistence, and the timer that releases a deferred wake.
+ *      Every opened wake is logged and appended to the ledger as
+ *      `gru.wake` so the board / self-heal trackers can count them.
  *
  * The cursor (`coveredThroughSeq`) is durable under the chat dir, so a
  * restart never replays context the brain already received. Content is
@@ -39,9 +46,11 @@ export const AWARENESS_BLOCK_HEADER = '[gru awareness · service context — not
 
 /** Prompt suffix for a policy-started turn (the block itself is prepended). */
 export const AWARENESS_WAKE_INSTRUCTION =
-  'This turn was started by the service notify_wake policy — no user message is waiting. ' +
-  'Review the service context above; if the human must be told something, say it plainly now; ' +
-  'otherwise reply briefly.';
+  'This turn was started by the service wake policy — no user message is waiting. ' +
+  'This is machine attention and it is meant to be acted on in-turn: diagnose the item, ' +
+  'take one substantive step per incident (a fix lane, a re-arm, or a disposition), and ' +
+  'stage the rest. Escalate to the owner only when the decision is theirs; if nothing ' +
+  'is actionable, say so briefly.';
 
 export interface AwarenessLimits {
   /** Newest digest events per block (older overflow is dropped). */
@@ -75,11 +84,19 @@ export interface AwarenessInjection {
 export interface GruAwarenessPort {
   prepare(): AwarenessInjection | null;
   commit(injection: AwarenessInjection): void;
+  /** Wake outcome receipt (observability): the chat server reports whether
+   * a policy-started turn actually opened. A failed wake records a durable
+   * `gru.wake-failed` so the self-heal trackers can count wakes acted on. */
+  noteWakeOutcome?(ok: boolean, detail?: string): void;
 }
 
 export type GruAwarenessLedger = Pick<
   LedgerApi,
-  'getNotification' | 'listEventsAfter' | 'latestEventSeq'
+  | 'getNotification'
+  | 'listEventsAfter'
+  | 'latestEventSeq'
+  | 'appendCustomEvent'
+  | 'listNotifications'
 >;
 
 export interface GruAwarenessOptions {
@@ -88,22 +105,36 @@ export interface GruAwarenessOptions {
   readonly ledger: GruAwarenessLedger;
   /** Notification events drive the wake decision. */
   readonly bus?: Pick<EventBus, 'subscribe'>;
-  /** Default 'never' (passive injection only). */
+  /** Default 'action-required' (owner ruling 2026-09-23: machine
+   * attention opens a turn; 'never' is passive-only). */
   readonly wakeMode?: NotifyWakeMode;
+  /** Minimum interval between autonomous wake turns; 0 disables it. */
+  readonly wakeMinIntervalMs?: number;
+  /** Severity floor for a wake ('info' = every routed row). */
+  readonly wakeMinSeverity?: WakeMinSeverity;
+  /** Local-time quiet window (null/off). */
+  readonly wakeQuietHours?: QuietHours | null;
   readonly limits?: Partial<AwarenessLimits>;
   readonly log?: Log;
+  /** Clock seam (tests advance fake timers through this closure). */
+  readonly now?: () => number;
 }
 
 interface AwarenessState {
   readonly coveredThroughSeq: number;
+  readonly wake?: {
+    readonly woken: readonly string[];
+    readonly lastFiredAt: number | null;
+  };
 }
 
 /** Notification event kinds that carry a routing decision. */
 const NOTIFICATION_EVENT_KINDS = ['notification.created', 'notification.triaged'] as const;
 /** Scan cap for notification events; the render cap is maxActionNotes. */
 const MAX_NOTIFICATION_SCAN = 200;
-/** Wake-dedupe memory (id set) — bounded so a long-lived service cannot grow forever. */
-const MAX_WAKE_IDS = 256;
+/** Backlog seeding scope on first wake (migration: unacked machine rows
+ * are Gru's backlog, not grandfathered to the owner bell). */
+const MAX_BACKLOG_SEED = 50;
 
 function payloadOf(event: EventRecord | BusEvent): Record<string, unknown> {
   const payload = event.payload;
@@ -230,31 +261,48 @@ export class GruAwareness {
   readonly file: string;
   private readonly ledger: GruAwarenessLedger;
   private readonly limits: AwarenessLimits;
+  private readonly wakePolicy: WakePolicy;
   private readonly wakeMode: NotifyWakeMode;
   private readonly log: Log;
+  private readonly now: () => number;
   private cursor: number;
   private wakeSink: (() => void) | null = null;
-  /** Notification ids that already drove a wake (bounded insertion order). */
-  private readonly woken = new Set<string>();
+  /** Candidate ids waiting to be released as ONE coalesced wake. */
+  private readonly pendingWakeIds = new Set<string>();
+  private wakeTimer: ReturnType<typeof setTimeout> | null = null;
+  private wakeTimerAt: number | null = null;
+  private disposed = false;
 
   constructor(opts: GruAwarenessOptions) {
     this.file = join(opts.dir, AWARENESS_STATE_NAME);
     this.ledger = opts.ledger;
     this.limits = { ...AWARENESS_LIMITS, ...(opts.limits ?? {}) };
-    this.wakeMode = opts.wakeMode ?? 'never';
+    this.wakeMode = opts.wakeMode ?? 'action-required';
     this.log = opts.log ?? (() => {});
-    this.cursor = GruAwareness.loadCursor(this.file);
+    this.now = opts.now ?? (() => Date.now());
+    const state = GruAwareness.loadState(this.file);
+    this.cursor = state.coveredThroughSeq;
+    this.wakePolicy = new WakePolicy(
+      {
+        mode: this.wakeMode,
+        minSeverity: opts.wakeMinSeverity ?? 'info',
+        minIntervalMs: opts.wakeMinIntervalMs ?? 300_000,
+        quietHours: opts.wakeQuietHours ?? null,
+      },
+      state.wake ?? { woken: [], lastFiredAt: null },
+    );
     opts.bus?.subscribe((event) => this.onBusEvent(event));
   }
 
   /**
-   * Read the durable cursor. An absent file is the documented start state
-   * (cursor 0 = the first prepared block covers the newest bounded window).
-   * A present-but-invalid file fails loud — a silent reset would re-inject
-   * context the brain already received.
+   * Read the durable state. An absent file is the documented start state
+   * (cursor 0 = the first prepared block covers the newest bounded window;
+   * no wakes claimed). A present-but-invalid file fails loud — a silent
+   * reset would re-inject context the brain already received and re-burn
+   * wakes the policy already claimed.
    */
-  private static loadCursor(file: string): number {
-    if (!existsSync(file)) return 0;
+  private static loadState(file: string): AwarenessState {
+    if (!existsSync(file)) return { coveredThroughSeq: 0 };
     let parsed: unknown;
     try {
       parsed = JSON.parse(readFileSync(file, 'utf-8'));
@@ -270,19 +318,51 @@ export class GruAwareness {
           'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
       );
     }
-    const value = (parsed as Record<string, unknown>)['coveredThroughSeq'];
+    const record = parsed as Record<string, unknown>;
+    const value = record['coveredThroughSeq'];
     if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
       throw new Error(
         `gru awareness state ${file} has an invalid coveredThroughSeq; ` +
           'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
       );
     }
-    return value;
+    const wake = record['wake'];
+    if (wake === undefined) return { coveredThroughSeq: value };
+    if (typeof wake !== 'object' || wake === null || Array.isArray(wake)) {
+      throw new Error(
+        `gru awareness state ${file} has an invalid wake section; ` +
+          'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
+      );
+    }
+    const wakeRecord = wake as Record<string, unknown>;
+    const woken = wakeRecord['woken'];
+    const lastFiredAt = wakeRecord['lastFiredAt'];
+    if (
+      !Array.isArray(woken) ||
+      !woken.every((id): id is string => typeof id === 'string' && id !== '') ||
+      !(lastFiredAt === null || (typeof lastFiredAt === 'number' && Number.isFinite(lastFiredAt)))
+    ) {
+      throw new Error(
+        `gru awareness state ${file} has an invalid wake section; ` +
+          'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
+      );
+    }
+    return { coveredThroughSeq: value, wake: { woken, lastFiredAt } };
   }
 
-  /** Attach the wake action once the chat server exists (late-bound). */
+  /** Attach the wake action once the chat server exists (late-bound).
+   * Seeding the backlog here is the migration rule: unacked machine rows
+   * are Gru's backlog on first wake, never the owner's. */
   setWakeSink(sink: () => void): void {
     this.wakeSink = sink;
+    this.seedBacklog();
+    this.flushPendingWakes();
+  }
+
+  /** Stop the deferred-wake timer (service shutdown / test teardown). */
+  dispose(): void {
+    this.disposed = true;
+    this.cancelWakeTimer();
   }
 
   /**
@@ -364,6 +444,20 @@ export class GruAwareness {
     }
   }
 
+  /** Wake outcome receipt from the chat server (observability). The
+   * `gru.wake` event records the attempt; a failed turn appends a durable
+   * `gru.wake-failed` so the trackers can count wakes that actually ran. */
+  noteWakeOutcome(ok: boolean, detail?: string): void {
+    if (ok || this.disposed) return;
+    const reason = detail !== undefined && detail !== '' ? detail : 'unknown';
+    this.log('error', 'gru wake turn failed', { error: reason });
+    try {
+      this.ledger.appendCustomEvent({ kind: 'gru.wake-failed', payload: { error: reason } });
+    } catch (error) {
+      this.log('error', 'gru wake failure event failed', { error: String(error) });
+    }
+  }
+
   private render(
     actionNotes: readonly string[],
     digestLines: readonly string[],
@@ -400,7 +494,10 @@ export class GruAwareness {
   }
 
   private persist(): void {
-    const state: AwarenessState = { coveredThroughSeq: this.cursor };
+    const state: AwarenessState = {
+      coveredThroughSeq: this.cursor,
+      wake: this.wakePolicy.snapshot(),
+    };
     const staging = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
     try {
       writeFileSync(staging, `${JSON.stringify(state, null, 2)}\n`, 'utf-8');
@@ -415,25 +512,137 @@ export class GruAwareness {
     }
   }
 
-  /** Wake policy decision on one bus event (notification rows only). */
+  /** Wake policy decision on one bus event (notification rows only). The
+   * persisted row — not the event payload — is the authority for routing
+   * and severity: `notification.triaged` carries no severity, and a row
+   * acked/resolved in the write that published the event must never wake. */
   private onBusEvent(event: BusEvent): void {
-    if (this.wakeMode === 'never') return;
+    if (this.wakeMode === 'never' || this.disposed) return;
     if (event.kind !== 'notification.created' && event.kind !== 'notification.triaged') return;
     const payload = payloadOf(event);
     const id = textOf(payload['id']);
-    if (id === null || this.woken.has(id)) return;
-    const routing = payload['routing'];
-    const wake =
-      routing === 'action-required' || (this.wakeMode === 'all' && routing === 'fyi');
-    if (!wake) return;
+    if (id === null) return;
     // Terminal rows never wake — the human already closed the item.
     const row = this.ledger.getNotification(id);
     if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
-    this.woken.add(id);
-    if (this.woken.size > MAX_WAKE_IDS) {
-      const oldest = this.woken.values().next().value;
-      if (oldest !== undefined) this.woken.delete(oldest);
+    this.considerCandidate({ id: row.id, routing: row.routing, severity: row.severity });
+  }
+
+  /** Route/severity/dedupe gate, then claim or defer — never fire twice for
+   * the same id, never fire through the cap of the rate limit. */
+  private considerCandidate(candidate: WakeCandidate): void {
+    const decision = this.wakePolicy.decide(candidate, this.now());
+    if (decision.action === 'skip') {
+      this.log('debug', 'gru wake suppressed', {
+        notification_id: candidate.id,
+        routing: candidate.routing,
+        severity: candidate.severity,
+        reason: decision.reason,
+      });
+      return;
     }
-    this.wakeSink?.();
+    this.pendingWakeIds.add(candidate.id);
+    if (decision.action === 'wake') {
+      this.flushPendingWakes();
+      return;
+    }
+    this.scheduleWake(decision.retryAtMs, decision.reason);
+  }
+
+  /** Migration seed: unacked machine-attention rows that predate this boot
+   * are the backlog the first wake must carry — one batch, one turn. */
+  private seedBacklog(): void {
+    if (this.wakeMode === 'never' || this.disposed) return;
+    let rows;
+    try {
+      rows = this.ledger.listNotifications({ unackedOnly: true, limit: MAX_BACKLOG_SEED });
+    } catch (error) {
+      this.log('error', 'gru wake backlog scan failed', { error: String(error) });
+      return;
+    }
+    let seeded = false;
+    for (const row of rows) {
+      if (row.routing !== 'action-required') continue; // the owner's queue is not a machine wake
+      if (this.wakePolicy.decide({ id: row.id, routing: row.routing, severity: row.severity }, this.now()).action === 'skip') {
+        continue;
+      }
+      this.pendingWakeIds.add(row.id);
+      seeded = true;
+    }
+    if (seeded) this.flushPendingWakes();
+  }
+
+  /** Release the pending batch as ONE turn when the schedule allows; while
+   * it does not, arm the timer for the earliest allowed instant. */
+  private flushPendingWakes(): void {
+    if (this.disposed || this.pendingWakeIds.size === 0) return;
+    const decision = this.wakePolicy.scheduleDecision(this.now());
+    if (decision.action === 'defer') {
+      this.scheduleWake(decision.retryAtMs, decision.reason);
+      return;
+    }
+    if (this.wakeSink === null) {
+      // The chat server is not bound yet (boot order): keep the batch —
+      // setWakeSink() re-enters here, so a wake is never dropped.
+      return;
+    }
+    const ids = [...this.pendingWakeIds];
+    this.pendingWakeIds.clear();
+    this.cancelWakeTimer();
+    const at = this.now();
+    this.wakePolicy.fired(ids, at);
+    try {
+      this.persist();
+    } catch (error) {
+      // The claim is in-memory for this process; a restart may re-wake the
+      // same rows once (bounded). Never lose the wake over the sidecar.
+      this.log('error', 'gru wake state persist failed', { file: this.file, error: String(error) });
+    }
+    this.log('info', 'gru wake opened', {
+      notification_ids: ids,
+      count: ids.length,
+      mode: this.wakeMode,
+    });
+    try {
+      this.ledger.appendCustomEvent({
+        kind: 'gru.wake',
+        payload: { notification_ids: ids, count: ids.length, mode: this.wakeMode },
+      });
+    } catch (error) {
+      this.log('error', 'gru wake ledger event failed', { error: String(error) });
+    }
+    try {
+      this.wakeSink();
+    } catch (error) {
+      this.log('error', 'gru wake sink failed', { error: String(error) });
+    }
+  }
+
+  /** Arm the deferred-wake timer; the earliest pending deadline wins. */
+  private scheduleWake(retryAtMs: number, reason: 'rate' | 'quiet'): void {
+    const delay = Math.max(0, retryAtMs - this.now());
+    if (this.wakeTimer !== null && this.wakeTimerAt !== null && this.wakeTimerAt <= retryAtMs) {
+      return;
+    }
+    this.cancelWakeTimer();
+    this.wakeTimerAt = retryAtMs;
+    this.log('info', 'gru wake deferred', {
+      reason,
+      retry_in_ms: delay,
+      pending: this.pendingWakeIds.size,
+    });
+    const timer = setTimeout(() => {
+      this.wakeTimer = null;
+      this.wakeTimerAt = null;
+      this.flushPendingWakes();
+    }, delay);
+    (timer as { unref?: () => void }).unref?.();
+    this.wakeTimer = timer;
+  }
+
+  private cancelWakeTimer(): void {
+    if (this.wakeTimer !== null) clearTimeout(this.wakeTimer);
+    this.wakeTimer = null;
+    this.wakeTimerAt = null;
   }
 }

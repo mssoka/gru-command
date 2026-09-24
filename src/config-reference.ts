@@ -352,15 +352,27 @@ export function renderReferenceConfig(
     '# gru.frames.jsonl rotation; reconnect replay spans retained shards.',
     `frame_log_max_bytes = ${preserved?.chat.frameLogMaxBytes ?? 8_388_608}`,
     `frame_log_keep = ${preserved?.chat.frameLogKeep ?? 3}`,
-    '# Gru awareness wake policy. "never" (default) injects action-required',
-    '# escalations and a compact ledger digest into the NEXT Gru turn passively',
-    '# — no model turn runs by itself, so it adds no turn cost. Wake modes',
-    '# start a Gru turn when a notification lands: "action-required" only for',
-    '# action-required notifications; "all" for every notification (FYI',
-    '# included). Each wake is a full model turn (provider tokens + latency),',
-    '# so it costs whenever the lane is noisy. Wakes never acknowledge',
-    '# anything: the human still holds every ack.',
-    `notify_wake = ${tomlString(preserved?.chat.notifyWake ?? 'never')}`,
+    '# Gru awareness wake policy. Wakes OPEN a Gru turn so a critical alert',
+    '# is acted on without the user pinging. "action-required" (default) wakes',
+    '# for machine-attention rows; "all" also for FYI/needs-owner; "never"',
+    '# injects context passively before the next turn only (no autonomous',
+    '# turn). Each wake is a full model turn (provider tokens + latency).',
+    `notify_wake = ${tomlString(preserved?.chat.notifyWake ?? 'action-required')}`,
+    '# Minimum interval between autonomous wakes; candidates inside the',
+    '# window coalesce into ONE trailing wake. 0 disables the cap.',
+    `wake_min_interval_ms = ${preserved?.chat.wakeMinIntervalMs ?? 300_000}`,
+    '# Severity floor for a wake: "info" wakes for every routed row,',
+    '# "error" only for error-severity rows.',
+    `wake_min_severity = ${tomlString(preserved?.chat.wakeMinSeverity ?? 'info')}`,
+    '# Local-time quiet window ("HH:MM-HH:MM", may wrap midnight); wakes',
+    '# inside it defer to the window end. Empty string = off.',
+    `wake_quiet_hours = ${(() => {
+      const window = preserved?.chat.wakeQuietHours;
+      if (window === null || window === undefined) return tomlString('');
+      const hhmm = (minute: number): string =>
+        `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
+      return tomlString(`${hhmm(window.startMinute)}-${hhmm(window.endMinute)}`);
+    })()}`,
     '',
     '[worktrees]',
     '# Job/review worktree roots follow data_dir by default; uncomment only to relocate.',

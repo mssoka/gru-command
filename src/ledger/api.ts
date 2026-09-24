@@ -97,9 +97,12 @@ export interface EventRecord {
   readonly payload: unknown;
 }
 
-/** Notification routing (SPEC ruling 13): FYI → notification;
- * action-required → a queued item Gru surfaces in chat. */
-export const NOTIFICATION_ROUTINGS = ['fyi', 'action-required'] as const;
+/** Notification routing (SPEC ruling 13; owner routing split 2026-09-23):
+ * 'fyi' → the standing feed; 'action-required' → MACHINE attention — it
+ * wakes Gru (per the wake policy) and never rings the owner bell;
+ * 'needs-owner' → the ONLY human-facing class (FOR YOU band + bell +
+ * morning digest). */
+export const NOTIFICATION_ROUTINGS = ['fyi', 'action-required', 'needs-owner'] as const;
 export type NotificationRouting = (typeof NOTIFICATION_ROUTINGS)[number];
 
 export const NOTIFICATION_SEVERITIES = ['info', 'error'] as const;
@@ -357,6 +360,20 @@ export class LedgerApi {
   latestEventSeq(): number {
     const row = this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get() as Row;
     return Number(row.seq);
+  }
+
+  /** How many durable events of one kind exist (the board's wake tracker). */
+  countEvents(kind: string): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM events WHERE kind = ?').get(kind) as Row;
+    return Number(row.n);
+  }
+
+  /** Newest durable event of one kind (the board's wake tracker stamp). */
+  latestEventOfKind(kind: string): EventRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM events WHERE kind = ? ORDER BY seq DESC LIMIT 1')
+      .get(kind) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
   }
 
   /** Latest durable event for one review round/kind (restart reconciliation). */
@@ -1170,14 +1187,25 @@ export class LedgerApi {
     return (this.db.prepare(sql).all(limit) as Row[]).map((row) => this.notificationFromRow(row));
   }
 
-  /** Count action-required notifications still awaiting a human ack (a
-   * system-resolved incident no longer needs human action). Read straight
-   * from the TABLE — not the bounded feed window — so the board's badge
-   * stays true even when old rows have scrolled past the feed's limit. */
+  /** Count action-required notifications still awaiting a machine
+   * disposition — the NEEDS GRU queue (self-clearing; the human bell is
+   * not rung by these). Read straight from the TABLE — not the bounded
+   * feed window — so the tracker stays true. */
   countPendingActionRequired(): number {
     const row = this.db
       .prepare(
         "SELECT COUNT(*) AS n FROM notifications WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL",
+      )
+      .get() as Row;
+    return Number(row.n);
+  }
+
+  /** Count needs-owner notifications still awaiting a human ack — the FOR
+   * YOU queue (the only class that rings the bell). */
+  countPendingNeedsOwner(): number {
+    const row = this.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM notifications WHERE routing = 'needs-owner' AND acked_at IS NULL AND resolved_at IS NULL",
       )
       .get() as Row;
     return Number(row.n);

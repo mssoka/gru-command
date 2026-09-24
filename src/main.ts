@@ -542,13 +542,15 @@ async function main(): Promise<number> {
     (level, msg, fields) => logger.log(level, msg, fields),
     { maxBytes: config.chat.frameLogMaxBytes, keep: config.chat.frameLogKeep },
   );
-  // Action-required notifications surface in chat (SPEC ruling 13) — the
-  // chat server arrives one step below; late-bind the callback.
+  // Needs-owner notifications surface in chat (SPEC ruling 13; owner routing
+  // split 2026-09-23: action-required is MACHINE attention and never renders
+  // in a human-facing band — the awareness wake carries it to Gru instead).
+  // The chat server arrives one step below; late-bind the callback.
   let surfaceInChat: (notification: NotificationRecord) => void = () => {};
   const notifications = new NotificationCenter({
     ledger,
     bus,
-    onActionRequired: (notification) => surfaceInChat(notification),
+    onNeedsOwner: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const decisionRuntime = new DecisionRuntime(config.decisions, {
@@ -599,6 +601,9 @@ async function main(): Promise<number> {
     ledger,
     bus,
     wakeMode: config.chat.notifyWake,
+    wakeMinIntervalMs: config.chat.wakeMinIntervalMs,
+    wakeMinSeverity: config.chat.wakeMinSeverity,
+    wakeQuietHours: config.chat.wakeQuietHours,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const chat = createChatServer({
@@ -620,7 +625,7 @@ async function main(): Promise<number> {
   gruSlot.onSwap((handle) => chat.adoptRestartedGru(handle));
   surfaceInChat = (notification) => {
     chat.surfaceNotice(
-      `⚠ Action required: ${notification.title}${notification.detail !== null ? ` — ${notification.detail}` : ''}`,
+      `🔔 For you: ${notification.title}${notification.detail !== null ? ` — ${notification.detail}` : ''}`,
       () => {
         // Receipt follows durable persistence/broadcast, including notices
         // queued across a reset boundary. Rejected/failed notices stay unshown.
@@ -662,7 +667,10 @@ async function main(): Promise<number> {
     onSweepPaused: ({ worktree, processes }) => {
       notifications.post({
         kind: 'worktree-sweep-paused',
-        routing: 'action-required',
+        // Destructive-op confirmation: the sweep waits for the OWNER's
+        // ruling (preserve-before-remove), so it is needs-owner — never a
+        // machine wake and never an auto-clear.
+        routing: 'needs-owner',
         severity: 'info',
         title: `Worktree sweep paused: live processes in ${worktree.repoName}`,
         detail:

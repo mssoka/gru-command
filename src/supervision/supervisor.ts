@@ -1037,7 +1037,10 @@ export class Supervisor {
     });
     const notification = this.notifications.postIncident({
       kind: `supervision.provider-wall.${agent.agentId}.${failureClass}`,
-      routing: 'action-required',
+      // Re-arm is an ACK with side effects (supervisor.onNotificationAcked),
+      // so this stop must stay human-facing: FOR YOU + bell. The machine
+      // queue never self-arms a walled provider condition.
+      routing: 'needs-owner',
       severity: 'error',
       title: `Agent ${agent.agentId} stopped: ${failureClass.replaceAll('_', ' ')}`,
       detail: 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.',
@@ -1390,7 +1393,9 @@ export class Supervisor {
     });
     const notification = this.notifications.post({
       kind: 'supervision.breaker',
-      routing: 'action-required',
+      // Re-arm is an ACK with side effects (supervisor.onNotificationAcked),
+      // so a tripped breaker must stay human-facing: FOR YOU + bell.
+      routing: 'needs-owner',
       severity: 'error',
       title: `Crash-loop breaker tripped: agent ${agent.agentId} stopped`,
       detail:

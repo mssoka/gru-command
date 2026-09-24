@@ -410,4 +410,28 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(api.getNotification(resolved.id)?.resolvedAt).not.toBeNull();
     expect(engine.snapshot().unackedActionRequired).toBe(0);
   });
+
+  it('counts needs-owner rows separately (the FOR YOU band never borrows the machine queue)', () => {
+    const { api, engine } = fresh();
+    api.recordNotification({ id: 'n-machine', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Machine' });
+    api.recordNotification({ id: 'n-owner', kind: 'test.notice', routing: 'needs-owner', severity: 'error', title: 'Owner' });
+    let snapshot = engine.snapshot();
+    expect(snapshot.unackedActionRequired).toBe(1);
+    expect(snapshot.unackedNeedsOwner).toBe(1);
+    api.ackNotification('n-owner', 'web');
+    snapshot = engine.snapshot();
+    expect(snapshot.unackedActionRequired).toBe(1);
+    expect(snapshot.unackedNeedsOwner).toBe(0);
+  });
+
+  it('tracks autonomous wakes from the durable gru.wake events', () => {
+    const { api, engine } = fresh();
+    expect(engine.snapshot().wakes).toEqual({ count: 0, lastAt: null });
+    api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+    const first = engine.snapshot().wakes;
+    expect(first.count).toBe(1);
+    expect(first.lastAt).not.toBeNull();
+    api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n2'], count: 1 } });
+    expect(engine.snapshot().wakes.count).toBe(2);
+  });
 });

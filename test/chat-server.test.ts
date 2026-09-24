@@ -3316,10 +3316,12 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
   it('wakeAwareness starts a turn from the injected block plus the wake instruction', async () => {
     const injection = sampleInjection();
     const commits: AwarenessInjection[] = [];
+    const outcomes: { ok: boolean; detail?: string }[] = [];
     const harness = await makeHarness({
       awareness: {
         prepare: () => injection,
         commit: (value) => commits.push(value),
+        noteWakeOutcome: (ok, detail) => outcomes.push({ ok, ...(detail !== undefined ? { detail } : {}) }),
       },
     });
     try {
@@ -3333,6 +3335,7 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
       expect(
         harness.frameLog.history.some((frame) => frame.type === 'turn' && frame.state === 'start'),
       ).toBe(true);
+      expect(outcomes).toEqual([{ ok: true }]);
     } finally {
       await harness.close();
     }

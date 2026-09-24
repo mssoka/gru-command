@@ -108,6 +108,8 @@ function snapshot(
     verify?: VerifyQueueView | null;
     selfHeal?: SelfHealView | null;
     repos?: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
+    unackedNeedsOwner?: number;
+    wakes?: { readonly count: number; readonly lastAt: string | null };
   } = {},
 ): BoardSnapshot {
   return {
@@ -132,6 +134,8 @@ function snapshot(
     silas: options.silas ?? null,
     verify: options.verify ?? null,
     selfHeal: options.selfHeal ?? null,
+    unackedNeedsOwner: options.unackedNeedsOwner ?? 0,
+    wakes: options.wakes ?? { count: 0, lastAt: null },
   };
 }
 
@@ -140,6 +144,7 @@ function mountBoardDom(): void {
     <div id="chip-rail" hidden>
       <span id="board-decisions"></span>
       <span id="board-unacked" hidden></span>
+      <span id="board-wakes" hidden></span>
     </div>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
@@ -156,7 +161,7 @@ describe('board view resolved-notification rendering', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});
     view.setToastHandler(toast);
-    const first = notification('first');
+    const first = notification('first', { routing: 'needs-owner' });
     view.render(snapshot({ notifications: [first] }));
     expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1);
 
@@ -173,13 +178,42 @@ describe('board view resolved-notification rendering', () => {
         notifications: [
           resolved,
           notification('arrived-resolved', { resolvedAt: '2026-01-01T00:02:00.000Z', resolvedBy: 'runtime' }),
-          notification('active'),
+          notification('active', { routing: 'needs-owner' }),
         ],
       }),
     );
     expect(toast).toHaveBeenCalledTimes(1);
     expect(toast).toHaveBeenCalledWith(expect.objectContaining({ id: 'active' }));
     expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1);
+  });
+
+  it('routing split: machine rows never ring the bell or toast; needs-owner rows do', () => {
+    const toast = vi.fn();
+    const view = new BoardView(() => {});
+    view.setToastHandler(toast);
+    view.render(snapshot({ notifications: [notification('machine')] }));
+    expect(toast).not.toHaveBeenCalled();
+    expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('0');
+    expect(document.querySelector('.board-notification-section__head')?.textContent).toContain('FOR YOU');
+    const sections = [...document.querySelectorAll('.board-notification-section__head')].map(
+      (head) => head.textContent,
+    );
+    expect(sections).toEqual(['FOR YOU', 'NEEDS GRU']);
+
+    view.render(
+      snapshot({
+        notifications: [
+          notification('machine'),
+          notification('owner', { routing: 'needs-owner' }),
+        ],
+      }),
+    );
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ id: 'owner' }));
+    const forYou = document.querySelector('.board-notification-section');
+    expect(forYou?.querySelector('.board-notification__title')?.textContent).toContain('Notice owner');
+    const needsGru = document.querySelectorAll('.board-notification-section')[1];
+    expect(needsGru?.querySelector('.board-notification__title')?.textContent).toContain('Notice machine');
   });
 });
 
@@ -314,7 +348,28 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     expect(chip?.classList.contains('pp-chip--done')).toBe(true);
     const unacked = trackers?.querySelector<HTMLElement>('#board-unacked');
     expect(unacked?.hidden).toBe(false);
-    expect(unacked?.textContent).toContain('2 action-required');
+    expect(unacked?.textContent).toContain('2 needs Gru');
+  });
+
+  it('shows the NEEDS GRU machine-queue chip only when the table has pending rows', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ unackedActionRequired: 0 }));
+    const chip = document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-unacked');
+    expect(chip?.hidden).toBe(true);
+    view.render(snapshot({ unackedActionRequired: 2 }));
+    expect(chip?.hidden).toBe(false);
+    expect(chip?.textContent).toContain('2 needs Gru');
+  });
+
+  it('shows the wake tracker inside TRACKERS with the durable count and last-fire stamp', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ wakes: { count: 0, lastAt: null } }));
+    expect(document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-wakes')?.hidden).toBe(true);
+    view.render(snapshot({ wakes: { count: 3, lastAt: '2026-01-01T00:00:00.000Z' } }));
+    const chip = document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-wakes');
+    expect(chip?.hidden).toBe(false);
+    expect(chip?.textContent).toContain('3 wakes');
+    expect(chip?.title).toContain('wake turn');
   });
 });
 

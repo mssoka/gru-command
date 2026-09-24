@@ -1774,7 +1774,8 @@ body {
 /* Tracker chips (inside the rail's TRACKERS chip) */
 
 .board-decisions,
-.board-unacked {
+.board-unacked,
+.board-wakes {
   font-size: 10px;
   padding: 3px 10px;
 }
@@ -2092,6 +2093,21 @@ body {
   gap: 8px;
   max-height: 320px;
   overflow-y: auto;
+}
+
+.board-notification-section {
+  display: grid;
+  gap: 6px;
+}
+
+.board-notification-section__head {
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  opacity: 0.75;
+}
+
+.board-notification-section__empty {
+  opacity: 0.6;
 }
 
 .board-notification {

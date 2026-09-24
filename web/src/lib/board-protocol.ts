@@ -85,7 +85,7 @@ export interface NotificationView {
   readonly id: string;
   readonly ts: string;
   readonly kind: string;
-  readonly routing: 'fyi' | 'action-required';
+  readonly routing: 'fyi' | 'action-required' | 'needs-owner';
   readonly severity: 'info' | 'error';
   readonly title: string;
   readonly detail: string | null;
@@ -153,7 +153,12 @@ export interface BoardSnapshot {
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionStatusView;
+  /** NEEDS GRU: machine-attention rows awaiting a disposition. */
   readonly unackedActionRequired: number;
+  /** FOR YOU: needs-owner rows awaiting a human ack (the bell class). */
+  readonly unackedNeedsOwner: number;
+  /** Autonomous Gru wakes fired by the policy (`gru.wake` events). */
+  readonly wakes: { readonly count: number; readonly lastAt: string | null };
   /** Absent on pre-v4 servers (validator tolerates; consumers render n/a). */
   readonly build?: BuildView | null;
   readonly silas?: SilasView | null;
@@ -365,7 +370,18 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (
     typeof value.unackedActionRequired !== 'number' ||
     !Number.isSafeInteger(value.unackedActionRequired) ||
-    value.unackedActionRequired < 0
+    value.unackedActionRequired < 0 ||
+    typeof value.unackedNeedsOwner !== 'number' ||
+    !Number.isSafeInteger(value.unackedNeedsOwner) ||
+    value.unackedNeedsOwner < 0 ||
+    !isRecord(value.wakes) ||
+    typeof (value.wakes as Record<string, unknown>).count !== 'number' ||
+    !Number.isSafeInteger((value.wakes as Record<string, unknown>).count) ||
+    ((value.wakes as Record<string, unknown>).count as number) < 0 ||
+    !(
+      (value.wakes as Record<string, unknown>).lastAt === null ||
+      typeof (value.wakes as Record<string, unknown>).lastAt === 'string'
+    )
   ) {
     return false;
   }
@@ -393,7 +409,9 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       typeof notification.ts === 'string' &&
       typeof notification.kind === 'string' &&
       (notification.severity === 'info' || notification.severity === 'error') &&
-      (notification.routing === 'fyi' || notification.routing === 'action-required') &&
+      (notification.routing === 'fyi' ||
+        notification.routing === 'action-required' ||
+        notification.routing === 'needs-owner') &&
       typeof notification.title === 'string' &&
       (notification.detail === null || typeof notification.detail === 'string') &&
       (notification.agentId === null || typeof notification.agentId === 'string') &&
