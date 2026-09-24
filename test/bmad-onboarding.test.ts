@@ -267,6 +267,49 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(existsSync(join(clone, '_bmad'))).toBe(false);
   });
 
+  it('explicit reuse upgrades only a verified legacy fingerprint, not changed tooling or legacy caches', () => {
+    const fixture = fixtureRepo('legacy-proof');
+    const installed = onboardBmadRepo(fixture.name, 'install', {
+      workspaceRoot: fixture.workspace,
+      answers: answers(fixture.workspace, fixture.name, 'install'),
+      run: successfulInstaller(fixture.repo, []),
+    });
+    expect(installed.ready, installed.message).toBe(true);
+    const recordPath = join(fixture.repo, '.gru-command', 'bmad-install.json');
+    const record = JSON.parse(readFileSync(recordPath, 'utf-8')) as Record<string, unknown>;
+    delete record.source_payload_format;
+    writeFileSync(recordPath, `${JSON.stringify(record)}\n`);
+    const reused = onboardBmadRepo(fixture.name, 'reuse', {
+      workspaceRoot: fixture.workspace,
+      answers: answers(fixture.workspace, fixture.name, 'reuse'),
+    });
+    expect(reused.ready, reused.message).toBe(true);
+    expect(JSON.parse(readFileSync(recordPath, 'utf-8')).source_payload_format).toBe('without-derived-caches-v1');
+    const source = join(fixture.repo, '_bmad', 'gds', 'marker.txt');
+    writeFileSync(source, 'changed source\n');
+    const fingerprint = readFileSync(recordPath, 'utf-8');
+    const refused = onboardBmadRepo(fixture.name, 'reuse', {
+      workspaceRoot: fixture.workspace,
+      answers: answers(fixture.workspace, fixture.name, 'reuse'),
+    });
+    expect(refused.ready).toBe(false);
+    expect(refused.message).toContain('source payload changed');
+    expect(readFileSync(recordPath, 'utf-8')).toBe(fingerprint);
+    // For an old record, even a cache-only mismatch cannot establish which
+    // bytes changed. Refuse to silently adopt a new executable baseline.
+    writeFileSync(source, 'gds\n');
+    writeFileSync(recordPath, `${JSON.stringify(record)}\n`);
+    mkdirSync(join(fixture.repo, '_bmad', 'render'), { recursive: true });
+    writeFileSync(join(fixture.repo, '_bmad', 'render', 'snapshot.md'), 'derived\n');
+    const stale = onboardBmadRepo(fixture.name, 'reuse', {
+      workspaceRoot: fixture.workspace,
+      answers: answers(fixture.workspace, fixture.name, 'reuse'),
+    });
+    expect(stale.ready).toBe(false);
+    expect(stale.message).toContain('legacy render caches');
+    expect(readFileSync(recordPath, 'utf-8')).toBe(`${JSON.stringify(record)}\n`);
+  });
+
   it('reuses an existing customized install without changing custom bytes, modules, versions, or local excludes', () => {
     const fixture = fixtureRepo();
     materializeOfficialInstall(fixture.repo, '  - name: custom-extra\n    version: v9.4.1');
@@ -585,6 +628,63 @@ describe('per-selected-repo BMAD onboarding', () => {
     writeFileSync(join(worktree, '_bmad', 'gds', 'marker.txt'), 'worktree-only\n');
     expect(readFileSync(join(fixture.repo, '_bmad', 'gds', 'marker.txt'), 'utf-8')).toBe('gds\n');
     git(fixture.repo, ['worktree', 'remove', '--force', worktree]);
+
+    // The copied source root is public, but a pre-existing lane directory
+    // with extra private contents must never inherit that source mode.
+    const privateWorktree = join(fixture.workspace, 'private-worktree');
+    git(fixture.repo, ['worktree', 'add', privateWorktree, 'HEAD']);
+    const privateDir = join(privateWorktree, '_bmad');
+    mkdirSync(privateDir, { mode: 0o700 });
+    writeFileSync(join(privateDir, 'private.txt'), 'unrelated secret\n', { mode: 0o600 });
+    chmodSync(privateDir, 0o700);
+    const privateConfig = join(privateDir, '_config');
+    mkdirSync(privateConfig, { mode: 0o700 });
+    writeFileSync(join(privateConfig, 'extra.txt'), 'private config\n', { mode: 0o600 });
+    chmodSync(privateConfig, 0o700);
+    expect(lstatSync(join(fixture.repo, '_bmad')).mode & 0o777).toBe(0o755);
+    expect(lstatSync(join(fixture.repo, '_bmad', '_config')).mode & 0o777).toBe(0o755);
+    applyWorktreeManifest(manifest!, {
+      sourceRoot: fixture.repo,
+      worktreePath: privateWorktree,
+      setupTimeoutMs: 60_000,
+    });
+    expect(lstatSync(privateDir).mode & 0o777).toBe(0o700);
+    expect(readFileSync(join(privateDir, 'private.txt'), 'utf-8')).toBe('unrelated secret\n');
+    expect(lstatSync(privateConfig).mode & 0o777).toBe(0o700);
+    expect(readFileSync(join(privateConfig, 'extra.txt'), 'utf-8')).toBe('private config\n');
+    expect(lstatSync(join(privateDir, 'bmm')).mode & 0o777).toBe(
+      lstatSync(join(fixture.repo, '_bmad', 'bmm')).mode & 0o777,
+    );
+    git(fixture.repo, ['worktree', 'remove', '--force', privateWorktree]);
+
+    const renderCache = join(fixture.repo, '_bmad', 'render');
+    const pythonCache = join(fixture.repo, '_bmad', 'gds', '__pycache__');
+    mkdirSync(renderCache, { recursive: true });
+    mkdirSync(pythonCache, { recursive: true });
+    writeFileSync(join(renderCache, 'generated.md'), 'mutable render\n');
+    writeFileSync(join(pythonCache, 'render.pyc'), 'mutable bytecode\n');
+    const cacheWorktree = join(fixture.workspace, 'cache-worktree');
+    git(fixture.repo, ['worktree', 'add', cacheWorktree, 'HEAD']);
+    applyWorktreeManifest(manifest!, {
+      sourceRoot: fixture.repo,
+      worktreePath: cacheWorktree,
+      setupTimeoutMs: 60_000,
+    });
+    expect(existsSync(join(cacheWorktree, '_bmad', 'render'))).toBe(false);
+    expect(existsSync(join(cacheWorktree, '_bmad', 'gds', '__pycache__'))).toBe(false);
+    git(fixture.repo, ['worktree', 'remove', '--force', cacheWorktree]);
+
+    // Executable source changes remain integrity failures despite cache exclusions.
+    writeFileSync(join(fixture.repo, '_bmad', 'gds', 'marker.txt'), 'changed source\n');
+    const changedWorktree = join(fixture.workspace, 'changed-worktree');
+    git(fixture.repo, ['worktree', 'add', changedWorktree, 'HEAD']);
+    expect(() => applyWorktreeManifest(manifest!, {
+      sourceRoot: fixture.repo,
+      worktreePath: changedWorktree,
+      setupTimeoutMs: 60_000,
+    })).toThrow(/source payload changed/);
+    git(fixture.repo, ['worktree', 'remove', '--force', changedWorktree]);
+    writeFileSync(join(fixture.repo, '_bmad', 'gds', 'marker.txt'), 'gds\n');
 
     const escapedWorktree = join(fixture.workspace, 'escaped-worktree');
     const outsideDestination = tempDir('gru-command-bmad-bootstrap-outside-');

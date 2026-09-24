@@ -39,16 +39,19 @@ const copyTree = (from, to) => {
   const src = realpathSync(unresolved);
   if (!inside(source, src)) throw new Error('BMAD bootstrap source escapes the selected repo: ' + from);
   const info = lstatSync(src);
+  // Derived renderer/bytecode output is local to each lane, not source code.
+  const rel = relative(source, src);
+  if (rel === '_bmad/render' ||
+      (rel.startsWith('_bmad/') && rel.split('/').includes('__pycache__'))) return;
   assertSafeDestination(to);
   if (info.isDirectory()) {
     const dest = lstatIfPresent(to);
     if (dest && !dest.isDirectory()) throw new Error('BMAD bootstrap destination collision: ' + to);
     if (!dest) mkdirSync(to, { recursive: true, mode: 0o700 });
-    // Copy under owner-only permissions, then restore the source directory's
-    // permission bits. A failed partial copy remains private, never wider.
-    chmodSync(to, 0o700);
+    // Never alter a directory already present in the lane: it may contain
+    // private, unrelated files. New directories stay private until complete.
     for (const name of readdirSync(src)) copyTree(join(src, name), join(to, name));
-    chmodSync(to, info.mode & 0o777);
+    if (!dest) chmodSync(to, info.mode & 0o777);
     return;
   }
   if (!info.isFile()) throw new Error('BMAD bootstrap supports only files/directories: ' + from);
@@ -65,10 +68,17 @@ const record = JSON.parse(readFileSync(join(root, '.gru-command', 'bmad-install.
 const sourceManifest = readFileSync(join(source, '_bmad', '_config', 'manifest.yaml'));
 const sourceHash = createHash('sha256').update(sourceManifest).digest('hex');
 if (sourceHash !== record.official_manifest_sha256) throw new Error('BMAD bootstrap source manifest changed since onboarding');
+if (record.source_payload_format !== undefined && record.source_payload_format !== 'without-derived-caches-v1') {
+  throw new Error('BMAD bootstrap record has unsupported source payload format');
+}
 const hashPayload = () => {
   const hash = createHash('sha256');
   const visit = (path) => {
     const relativePath = relative(source, path);
+    // Old records still verify against the full payload until explicitly refreshed.
+    if (record.source_payload_format === 'without-derived-caches-v1' &&
+        (relativePath === '_bmad/render' ||
+          (relativePath.startsWith('_bmad/') && relativePath.split('/').includes('__pycache__')))) return;
     const info = lstatSync(path);
     if (info.isSymbolicLink()) throw new Error('BMAD owned payload contains symlink: ' + path);
     if (info.isDirectory()) {
