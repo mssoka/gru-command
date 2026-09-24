@@ -2414,7 +2414,7 @@ describe('chat context controls and durable new-chat boundaries', () => {
       controlTimeoutMs: 25,
       replaceDisposedOnResume: true,
       awareness: {
-        prepare: () => sampleInjection(),
+        prepare: () => ({ text: '[gru awareness · service context — not a user message]', coveredThroughSeq: 1 }),
         commit: () => {},
         noteWakeBlocked: (reason) => { blocked.push(reason); },
       },
