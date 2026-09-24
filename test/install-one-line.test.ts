@@ -652,6 +652,9 @@ describe('install.sh setup mode (one-line path)', () => {
 
   it.skipIf(process.platform !== 'linux')('systemd unit retains stable Node/npm PATH after a version-manager session expires', () => {
     const { fixture, home } = buildFixtureRepo();
+    // Direct --service requires an already-built service entrypoint.
+    mkdirSync(join(fixture, 'dist'), { recursive: true });
+    writeFileSync(join(fixture, 'dist', 'main.js'), '// fixture service\n');
     const sessionBin = join(home, 'ephemeral version manager', 'bin');
     mkdirSync(sessionBin, { recursive: true });
     symlinkSync(process.execPath, join(sessionBin, 'node'));
