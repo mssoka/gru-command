@@ -100,9 +100,9 @@ export class BoardView {
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
-  /** Error notification ids the user has already seen (panel opened with
-   * them present) — the badge counts only UNSEEN errors. */
-  private readonly seenErrorIds = new Set<string>();
+  /** Owner notification ids seen in the panel; every pending owner stop,
+   * including informational destructive-op asks, earns a bell badge. */
+  private readonly seenOwnerIds = new Set<string>();
   /** E7: display receipts already sent (id → surfaces sent). */
   private readonly sentShown = new Map<string, Set<string>>();
   /** E7: notification ids previously seen (new arrivals toast). */
@@ -138,8 +138,8 @@ export class BoardView {
         // Opening the panel proves display of every current row: mark
         // seen (badge) AND send one receipt per surface (shown:true).
         for (const notification of this.snapshot?.notifications ?? []) {
-          if (notification.routing === 'needs-owner' && notification.severity === 'error') {
-            this.seenErrorIds.add(notification.id);
+          if (notification.routing === 'needs-owner') {
+            this.seenOwnerIds.add(notification.id);
           }
           this.sendShown(notification, 'web-panel');
         }
@@ -746,10 +746,10 @@ export class BoardView {
         `${formatTs(item.ts)} · ${item.routing}${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
       ),
     );
-    // Ack control: clears the row (and, for a stopped supervision slot,
-    // re-arms the restart ladder server-side — that is why those rows are
-    // needs-owner). Resolved incidents take no control.
-    if (item.ackedAt === null && item.resolvedAt === null) {
+    // Only an owner stop or FYI row has a human Ack/Mark seen control.
+    // Gru records a machine disposition through the authenticated API
+    // after acting; a human click must not silently clear NEEDS GRU.
+    if (item.routing !== 'action-required' && item.ackedAt === null && item.resolvedAt === null) {
       const ack = document.createElement('button');
       ack.type = 'button';
       ack.className = 'board-notification__ack';
@@ -758,7 +758,7 @@ export class BoardView {
         void this.boardClient
           ?.ackNotification(item.id)
           .then(() => {
-            this.seenErrorIds.add(item.id);
+            this.seenOwnerIds.add(item.id);
             ack.textContent = '✓';
             ack.disabled = true;
           })
@@ -810,7 +810,7 @@ export class BoardView {
     });
   }
 
-  /** Badge = unacked needs-owner error-severity items not yet seen here
+  /** Badge = unacked needs-owner items not yet seen here, at ANY severity
    * (panel-open marks seen; an ack from ANY device clears it via ackedAt).
    * Machine (action-required) and FYI rows never count — they are not the
    * owner's shoulder. */
@@ -818,10 +818,9 @@ export class BoardView {
     const unseen = notifications.filter(
       (n) =>
         n.routing === 'needs-owner' &&
-        n.severity === 'error' &&
         n.ackedAt === null &&
         n.resolvedAt === null &&
-        !this.seenErrorIds.has(n.id),
+        !this.seenOwnerIds.has(n.id),
     ).length;
     this.notificationBell.dataset.unread = String(unseen);
     this.notificationBadge.textContent = String(unseen);

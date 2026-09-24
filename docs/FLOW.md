@@ -409,7 +409,11 @@ unchanged — the wake rides the same session and the same frame log as any
 other turn (chat renders its machinery as a collapsed service band). A
 wake requested mid-turn becomes one trailing turn; a wake with nothing to
 inject neither spawns a session nor burns a model turn; a failed wake is a
-durable notice, never a message-delivery error.
+durable notice, never a message-delivery error. Notification IDs stay
+pending independently of the event cursor until the prompt accepts a block
+containing those IDs; spawn/prompt failures retry after a bounded backoff.
+Only the IDs actually present in the bounded block count as woken; overflow
+travels in later, rate-limited turns.
 
 **Mandate — act (tier-2).** A wake is machine attention meant to be acted
 on in-turn: Gru diagnoses the incident and takes one substantive step per
@@ -427,12 +431,21 @@ band is the healthy state.
 | `needs-owner` | owner-only decisions (merges outside this repo, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
 | `fyi` | standing feed | board feed only |
 
+**Machine disposition.** A successful prompt is delivery, not resolution.
+After acting on an `action-required` row Gru calls the authenticated
+`POST /api/notifications/{id}/disposition` with a nonempty JSON `detail`
+(the action taken or why no safe action was possible). The ledger records
+`notification.resolved` by `gru`; the endpoint refuses `needs-owner` and
+FYI rows, and the web UI offers no human Ack for machine alerts. Owner
+stops remain in the bell/panel regardless of how many newer feed items
+arrive; only their owner Ack clears them.
+
 **Morning digest.** The first delivered block after `morning_digest_gap_ms`
 (default 8 h; 0 disables) carries a ledger-derived "while you were away"
 digest — fires (wakes acted on), actions, merges, staged PRs — so the
 chief catches up without the owner relaying anything.
 
-**Observability.** Every wake is logged, appended to the ledger as a
+**Observability.** Every successful wake is logged, appended to the ledger as a
 `gru.wake` event (a failed turn adds `gru.wake-failed`), and counted by the
 board's wake tracker — the self-heal/CURE trackers can count wakes acted
 on straight from the record.

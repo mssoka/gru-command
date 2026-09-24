@@ -424,6 +424,17 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(snapshot.unackedNeedsOwner).toBe(0);
   });
 
+  it('keeps pending owner-only stops visible despite thirty newer machine/FYI rows', () => {
+    const { api, engine } = fresh();
+    const owner = api.recordNotification({ id: 'owner-stop', kind: 'supervision.breaker', routing: 'needs-owner', severity: 'info', title: 'Owner-only re-arm' });
+    for (let i = 0; i < 35; i += 1) {
+      api.recordNotification({ id: `noise-${i}`, kind: 'noise', routing: i % 2 ? 'fyi' : 'action-required', severity: 'info', title: `Noise ${i}` });
+    }
+    const snap = engine.snapshot();
+    expect(snap.unackedNeedsOwner).toBe(1);
+    expect(snap.notifications.find((row) => row.id === owner.id)).toMatchObject({ routing: 'needs-owner', ackedAt: null });
+  });
+
   it('tracks autonomous wakes from the durable gru.wake events', () => {
     const { api, engine } = fresh();
     expect(engine.snapshot().wakes).toEqual({ count: 0, lastAt: null });

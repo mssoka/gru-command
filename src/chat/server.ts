@@ -819,6 +819,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               send(client, ephemeralError('Gru is temporarily unavailable; retry after reconnect.'));
             }
             log('error', 'Gru delivery spawn failed', { error: errorMessage(error) });
+            if (wake) options.awareness?.noteWakeOutcome?.(false, errorMessage(error));
             return;
           }
           const barriers = activeDeliveryBarriers();
@@ -883,7 +884,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             if (injection !== null) awarenessCommit(injection);
             // The policy-started turn opened — the wake-observability
             // receipt the self-heal trackers count.
-            if (wake) options.awareness?.noteWakeOutcome?.(true);
+            if (wake) options.awareness?.noteWakeOutcome?.(true, undefined, injection ?? undefined);
           }
         } catch (error) {
           const message = (error as Error).message;
@@ -921,6 +922,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         // only the turn THIS delivery opened, and report a bounded error
         // frame through whichever channel still works.
         log('error', 'chat delivery failed', { error: errorMessage(error) });
+        if (wake) options.awareness?.noteWakeOutcome?.(false, errorMessage(error));
         if (ownedOpenTurn && turnLive) {
           try {
             settleOpenTurn();

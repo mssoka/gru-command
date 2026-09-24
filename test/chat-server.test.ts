@@ -3341,6 +3341,31 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
     }
   });
 
+  it('reports an automatic spawn failure so the awareness policy can retry the same notification', async () => {
+    const injection = { ...sampleInjection(), notificationIds: ['machine-id'] };
+    const outcomes: { ok: boolean; ids?: readonly string[] }[] = [];
+    const harness = await makeHarness({
+      failFirstSpawn: new Error('provider unavailable'),
+      awareness: {
+        prepare: () => injection,
+        commit: () => {},
+        noteWakeOutcome: (ok, _detail, delivered) => outcomes.push({ ok, ...(delivered?.notificationIds !== undefined ? { ids: delivered.notificationIds } : {}) }),
+      },
+    });
+    try {
+      harness.chat.wakeAwareness();
+      await pollUntil(() => outcomes.length === 1, 'failed automatic spawn reported');
+      expect(outcomes).toEqual([{ ok: false }]);
+      expect(harness.handle.calls).toHaveLength(0);
+      harness.chat.wakeAwareness();
+      await pollUntil(() => outcomes.length === 2, 'automatic spawn retry');
+      expect(outcomes[1]).toEqual({ ok: true, ids: ['machine-id'] });
+      expect(harness.handle.calls[0]?.text).toContain('machine attention');
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('a wake requested mid-turn waits and runs as one trailing turn', async () => {
     const injection = sampleInjection();
     let releaseTurn!: () => void;

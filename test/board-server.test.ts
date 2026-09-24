@@ -188,6 +188,23 @@ describe('board server — HTTP API', () => {
     expect(ok.body).toHaveProperty('decisions', expect.objectContaining({ status: 'disabled' }));
   });
 
+  it('machine disposition is authenticated, requires an action detail, and never resolves an owner stop', async () => {
+    const { api, port } = harness;
+    const machine = api.recordNotification({ id: 'machine-disposition', kind: 'test', routing: 'action-required', severity: 'error', title: 'Fix me' });
+    const owner = api.recordNotification({ id: 'owner-disposition', kind: 'test', routing: 'needs-owner', severity: 'info', title: 'Ask owner' });
+    const path = `/api/notifications/${machine.id}/disposition`;
+    expect((await postJson(port, path, null, { detail: 'Fixed' })).status).toBe(401);
+    expect((await postJson(port, path, 'board-test-token', {})).status).toBe(400);
+    expect((await postJson(port, `/api/notifications/${owner.id}/disposition`, 'board-test-token', { detail: 'No' })).status).toBe(400);
+    expect(api.getNotification(machine.id)?.resolvedAt).toBeNull();
+    const resolved = await postJson(port, path, 'board-test-token', { detail: 'Opened repair lane' });
+    expect(resolved).toMatchObject({ status: 200, body: { resolvedBy: 'gru', ackedAt: null } });
+    expect(api.getNotification(machine.id)?.resolvedAt).not.toBeNull();
+    expect(api.getNotification(owner.id)?.resolvedAt).toBeNull();
+    expect((await postJson(port, path, 'board-test-token', { detail: 'duplicate' })).status).toBe(200);
+    expect(api.listEventsAfter(0, { kinds: ['notification.resolved'] }).filter((e) => (e.payload as { id?: string }).id === machine.id)).toHaveLength(1);
+  });
+
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {
     expect((await getJson(harness.port, '/api/decisions/status', null)).status).toBe(401);
     expect((await postJson(harness.port, '/api/decisions/recheck', null, {})).status).toBe(401);

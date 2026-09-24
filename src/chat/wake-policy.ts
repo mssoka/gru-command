@@ -59,7 +59,7 @@ export interface WakePolicyConfig {
 }
 
 export interface WakePolicyState {
-  /** Notification ids that already drove (or are already claimed by) a wake. */
+  /** Notification IDs present in a successfully delivered wake turn. */
   readonly woken: readonly string[];
   /** Epoch ms of the newest fired wake (null before the first one). */
   readonly lastFiredAt: number | null;

@@ -37,6 +37,7 @@ interface Rig {
   readonly notifications: NotificationCenter;
   readonly awareness: GruAwareness;
   readonly woke: number[];
+  readonly wakeBlocks: string[];
 }
 
 function boot(options: {
@@ -68,8 +69,14 @@ function boot(options: {
     ...(options.limits !== undefined ? { limits: options.limits } : {}),
   });
   const woke: number[] = [];
-  awareness.setWakeSink(() => woke.push(woke.length));
-  return { dir, api, notifications, awareness, woke };
+  const wakeBlocks: string[] = [];
+  awareness.setWakeSink(() => {
+    const injection = awareness.prepare();
+    woke.push(woke.length);
+    wakeBlocks.push(injection?.text ?? '');
+    if (injection !== null) awareness.noteWakeOutcome(true, undefined, injection);
+  });
+  return { dir, api, notifications, awareness, woke, wakeBlocks };
 }
 
 describe('gru awareness — passive injection', () => {
@@ -86,7 +93,8 @@ describe('gru awareness — passive injection', () => {
     expect(first).not.toBeNull();
     expect(first?.text).toContain('[gru awareness · service context — not a user message]');
     expect(first?.text).toContain('Action required (unacknowledged):');
-    expect(first?.text).toContain('- ⚠ Round j1-r1 is INCOMPLETE — delivery proof failed');
+    expect(first?.text).toContain('Round j1-r1 is INCOMPLETE — delivery proof failed');
+    expect(first?.text).toContain(`[${first?.notificationIds?.[0]}]`);
     expect(first?.coveredThroughSeq).toBeGreaterThan(0);
     // prepare is read-only: the same block returns until it was delivered.
     expect(rig.awareness.prepare()?.text).toBe(first?.text);
@@ -352,13 +360,174 @@ describe('gru awareness — wake policy', () => {
       wakeMinIntervalMs: 0,
     });
     const woke: number[] = [];
-    awareness.setWakeSink(() => woke.push(woke.length));
+    awareness.setWakeSink(() => {
+      const injection = awareness.prepare()!;
+      woke.push(woke.length);
+      awareness.commit(injection);
+      awareness.noteWakeOutcome(true, undefined, injection);
+    });
     expect(woke).toHaveLength(1);
     const state = JSON.parse(readFileSync(awareness.file, 'utf-8')) as {
       wake: { woken: string[]; lastFiredAt: number | null };
     };
     expect(state.wake.woken).toHaveLength(2);
     expect(state.wake.lastFiredAt).not.toBeNull();
+  });
+
+  it('boot migration wakes an alert even when a passive turn already covered its event', () => {
+    const dir = tmpDir();
+    const passive = boot({ dir });
+    const row = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Old unresolved machine alert' });
+    passive.awareness.commit(passive.awareness.prepare()!);
+    expect(passive.awareness.prepare()).toBeNull();
+    const active = boot({ dir, wakeMode: 'action-required' });
+    expect(active.woke).toHaveLength(1);
+    expect(active.wakeBlocks[0]).toContain('Old unresolved machine alert');
+    expect(active.wakeBlocks[0]).toContain(row.id);
+  });
+
+  it('does not trust pre-receipt wake claims from the previous state format', () => {
+    const dir = tmpDir();
+    const passive = boot({ dir });
+    const row = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Legacy failed spawn' });
+    passive.awareness.commit(passive.awareness.prepare()!);
+    writeFileSync(passive.awareness.file, JSON.stringify({
+      coveredThroughSeq: passive.api.latestEventSeq(),
+      wake: { woken: [row.id], lastFiredAt: Date.now() },
+    }));
+    const upgraded = boot({ dir, wakeMode: 'action-required', wakeMinIntervalMs: 300_000 });
+    expect(upgraded.woke).toHaveLength(1);
+    expect(upgraded.wakeBlocks[0]).toContain(row.id);
+  });
+
+  it('backlog SQL filters machine attention before limiting to fifty rows', () => {
+    const dir = tmpDir();
+    const passive = boot({ dir });
+    const row = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Old machine alert' });
+    for (let i = 0; i < 55; i += 1) passive.notifications.post({ kind: 'noise', routing: i % 2 ? 'fyi' : 'needs-owner', severity: 'info', title: `Noise ${i}` });
+    passive.awareness.commit(passive.awareness.prepare()!);
+    const active = boot({ dir, wakeMode: 'action-required' });
+    expect(active.woke).toHaveLength(1);
+    expect(active.wakeBlocks[0]).toContain(row.id);
+  });
+
+  it('all mode includes FYI and needs-owner rows in the turn payload', () => {
+    const rig = boot({ wakeMode: 'all' });
+    for (const routing of ['fyi', 'needs-owner'] as const) {
+      const row = rig.notifications.post({ kind: routing, routing, severity: 'info', title: `Alert ${routing}` });
+      expect(rig.wakeBlocks.at(-1)).toContain(`Alert ${routing}`);
+      expect(rig.wakeBlocks.at(-1)).toContain(row.id);
+    }
+  });
+
+  it('a failed wake does not consume the id and retries after the runtime recovers', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const center = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0, now: () => Date.now() });
+      const prompts: string[] = [];
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare();
+        if (prompts.length === 0) {
+          prompts.push('failed');
+          awareness.noteWakeOutcome(false, 'runtime unavailable');
+        } else {
+          prompts.push(injection!.text);
+          awareness.commit(injection!);
+          awareness.noteWakeOutcome(true, undefined, injection!);
+        }
+      });
+      const row = center.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Retry this alert' });
+      expect(prompts).toHaveLength(1);
+      expect(api.getNotification(row.id)?.ackedAt).toBeNull();
+      expect(api.getNotification(row.id)?.resolvedAt).toBeNull();
+      const pending = JSON.parse(readFileSync(awareness.file, 'utf-8')) as { wake: { pending: string[]; woken: string[] } };
+      expect(pending.wake.pending).toContain(row.id);
+      expect(pending.wake.woken).not.toContain(row.id);
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake-failed'] })).toHaveLength(1);
+      vi.advanceTimersByTime(5_000);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[1]).toContain('Retry this alert');
+      expect(awareness.prepare()).toBeNull();
+      const state = JSON.parse(readFileSync(awareness.file, 'utf-8')) as { wake: { woken: string[] } };
+      expect(state.wake.woken).toContain(row.id);
+      expect(api.getNotification(row.id)?.resolvedAt).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('nine coalesced machine alerts travel in bounded subsequent turns without silently claiming the ninth', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const center = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 300_000, now: () => Date.now() });
+      const delivered: string[][] = [];
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare()!;
+        delivered.push([...(injection.notificationIds ?? [])]);
+        awareness.commit(injection);
+        awareness.noteWakeOutcome(true, undefined, injection);
+      });
+      center.post({ kind: 'first', routing: 'action-required', severity: 'error', title: 'First' });
+      const later = Array.from({ length: 9 }, (_, index) => center.post({ kind: 'later', routing: 'action-required', severity: 'error', title: `Later ${index}` }));
+      expect(delivered).toHaveLength(1);
+      vi.advanceTimersByTime(300_000);
+      expect(delivered[1]).toHaveLength(8);
+      expect(delivered[1]).not.toContain(later[8]!.id);
+      vi.advanceTimersByTime(300_000);
+      expect(delivered[2]).toEqual([later[8]!.id]);
+      expect(new Set(delivered.flat()).size).toBe(10);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a byte-capped batch claims only identifiers visible in the prompt and retries overflow', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const center = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, limits: { maxBytes: 190 }, wakeMinIntervalMs: 300_000, now: () => Date.now() });
+      const delivered: string[][] = [];
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare()!;
+        expect(Buffer.byteLength(injection.text)).toBeLessThanOrEqual(190);
+        const ids = [...(injection.notificationIds ?? [])];
+        for (const id of ids) expect(injection.text).toContain(`[${id}]`);
+        delivered.push(ids);
+        awareness.commit(injection);
+        awareness.noteWakeOutcome(true, undefined, injection);
+      });
+      center.post({ kind: 'first', routing: 'action-required', severity: 'error', title: 'First' });
+      const later = Array.from({ length: 3 }, (_, index) => center.post({ kind: 'later', routing: 'action-required', severity: 'error', title: `Later ${index}` }));
+      vi.advanceTimersByTime(300_000);
+      expect(delivered[1]?.length).toBeGreaterThan(0);
+      expect(delivered[1]?.length).toBeLessThan(3);
+      const state = JSON.parse(readFileSync(awareness.file, 'utf-8')) as { wake: { pending: string[]; woken: string[] } };
+      for (const row of later.filter((row) => !delivered[1]?.includes(row.id))) {
+        expect(state.wake.pending).toContain(row.id);
+        expect(state.wake.woken).not.toContain(row.id);
+      }
+      vi.advanceTimersByTime(900_000);
+      expect(new Set(delivered.flat())).toEqual(new Set(later.map((row) => row.id).concat(delivered[0]!)));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('dedupe persists across restart: the same notification id never wakes twice', () => {

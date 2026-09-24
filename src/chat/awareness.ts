@@ -50,8 +50,11 @@ export const AWARENESS_WAKE_INSTRUCTION =
   'This turn was started by the service wake policy — no user message is waiting. ' +
   'This is machine attention and it is meant to be acted on in-turn: diagnose the item, ' +
   'take one substantive step per incident (a fix lane, a re-arm, or a disposition), and ' +
-  'stage the rest. Escalate to the owner only when the decision is theirs; if nothing ' +
-  'is actionable, say so briefly.';
+  'stage the rest. After acting on an action-required alert, explicitly resolve its ' +
+  'notification ID with POST /api/notifications/{id}/disposition and a nonempty detail; ' +
+  'prompt delivery alone never clears it. In all mode, FYI and needs-owner ' +
+  'rows can also wake you; do not act on or Ack an owner-only stop on the ' +
+  'owner’s behalf. Escalate decisions that are theirs; if nothing is actionable, say so briefly.';
 
 export interface AwarenessLimits {
   /** Newest digest events per block (older overflow is dropped). */
@@ -78,6 +81,8 @@ export const AWARENESS_LIMITS: AwarenessLimits = {
 export interface AwarenessInjection {
   readonly text: string;
   readonly coveredThroughSeq: number;
+  /** Only IDs actually rendered in this bounded block may be claimed. */
+  readonly notificationIds?: readonly string[];
 }
 
 /** The chat server's narrow view of the awareness layer (injection provider
@@ -85,10 +90,10 @@ export interface AwarenessInjection {
 export interface GruAwarenessPort {
   prepare(): AwarenessInjection | null;
   commit(injection: AwarenessInjection): void;
-  /** Wake outcome receipt (observability): the chat server reports whether
-   * a policy-started turn actually opened. A failed wake records a durable
-   * `gru.wake-failed` so the self-heal trackers can count wakes acted on. */
-  noteWakeOutcome?(ok: boolean, detail?: string): void;
+  /** Wake outcome receipt: only a successful turn with the delivered
+   * injection may claim its visible IDs. Failed wakes remain pending and
+   * record `gru.wake-failed` for operational diagnosis. */
+  noteWakeOutcome?(ok: boolean, detail?: string, injection?: AwarenessInjection): void;
 }
 
 export type GruAwarenessLedger = Pick<
@@ -127,7 +132,10 @@ export interface GruAwarenessOptions {
 interface AwarenessState {
   readonly coveredThroughSeq: number;
   readonly wake?: {
+    /** v2 means woken IDs were confirmed by a delivered prompt, not merely claimed. */
+    readonly version?: 2;
     readonly woken: readonly string[];
+    readonly pending?: readonly string[];
     readonly lastFiredAt: number | null;
   };
   readonly digest?: {
@@ -284,7 +292,10 @@ export class GruAwareness {
   private lastDeliveredAt: number | null;
   private wakeSink: (() => void) | null = null;
   /** Candidate ids waiting to be released as ONE coalesced wake. */
-  private readonly pendingWakeIds = new Set<string>();
+  private readonly pendingWakeIds: Set<string>;
+  /** One in-flight bounded batch. Its IDs stay pending until prompt receipt. */
+  private activeWakeIds: readonly string[] | null = null;
+  private failedRetryAtMs = 0;
   private wakeTimer: ReturnType<typeof setTimeout> | null = null;
   private wakeTimerAt: number | null = null;
   private disposed = false;
@@ -293,6 +304,9 @@ export class GruAwareness {
     this.file = join(opts.dir, AWARENESS_STATE_NAME);
     this.ledger = opts.ledger;
     this.limits = { ...AWARENESS_LIMITS, ...(opts.limits ?? {}) };
+    if (!Number.isSafeInteger(this.limits.maxActionNotes) || this.limits.maxActionNotes < 1) {
+      throw new Error('awareness maxActionNotes must be a positive integer');
+    }
     this.wakeMode = opts.wakeMode ?? 'action-required';
     this.morningDigestGapMs = opts.morningDigestGapMs ?? DEFAULT_MORNING_DIGEST_GAP_MS;
     this.log = opts.log ?? (() => {});
@@ -300,6 +314,7 @@ export class GruAwareness {
     const state = GruAwareness.loadState(this.file);
     this.cursor = state.coveredThroughSeq;
     this.lastDeliveredAt = state.digest?.lastDeliveredAt ?? null;
+    this.pendingWakeIds = new Set(state.wake?.pending ?? []);
     this.wakePolicy = new WakePolicy(
       {
         mode: this.wakeMode,
@@ -355,9 +370,13 @@ export class GruAwareness {
     const wakeRecord = wake as Record<string, unknown>;
     const woken = wakeRecord['woken'];
     const lastFiredAt = wakeRecord['lastFiredAt'];
+    const pending = wakeRecord['pending'];
+    const version = wakeRecord['version'];
     if (
       !Array.isArray(woken) ||
       !woken.every((id): id is string => typeof id === 'string' && id !== '') ||
+      !(pending === undefined || (Array.isArray(pending) && pending.every((id): id is string => typeof id === 'string' && id !== ''))) ||
+      !(version === undefined || version === 2) ||
       !(lastFiredAt === null || (typeof lastFiredAt === 'number' && Number.isFinite(lastFiredAt)))
     ) {
       throw new Error(
@@ -383,7 +402,15 @@ export class GruAwareness {
       }
       digest = { lastDeliveredAt: delivered };
     }
-    return { coveredThroughSeq: value, wake: { woken, lastFiredAt }, ...(digest !== undefined ? { digest } : {}) };
+    // v1 claimed IDs before the model turn. Its woken set cannot prove
+    // receipt (a failed spawn may have stranded a live alert). Prefer one
+    // extra wake to losing an unresolved machine incident on upgrade.
+    return { coveredThroughSeq: value, wake: {
+      version: 2,
+      woken: version === 2 ? woken : [],
+      lastFiredAt: version === 2 ? lastFiredAt : null,
+      ...(pending !== undefined ? { pending: pending as string[] } : {}),
+    }, ...(digest !== undefined ? { digest } : {}) };
   }
 
   /** Attach the wake action once the chat server exists (late-bound).
@@ -408,7 +435,7 @@ export class GruAwareness {
    */
   prepare(): AwarenessInjection | null {
     const latest = this.ledger.latestEventSeq();
-    if (latest <= this.cursor) return null;
+    if (latest <= this.cursor && this.pendingWakeIds.size === 0) return null;
 
     const reverse = <T>(items: readonly T[]): T[] => [...items].reverse();
     // Overfetch, then keep the newest maxEvents DIGESTIBLE lines: derived
@@ -435,33 +462,44 @@ export class GruAwareness {
     }
     const digestLines = reverse(digestLinesNewestFirst);
 
-    // Action notes ride a kind-filtered scan so a busy digest window can
-    // never hide an escalation older than maxEvents. Newest ids are kept
-    // under the note cap, then rendered oldest-first.
-    const notificationEvents = this.ledger.listEventsAfter(this.cursor, {
-      limit: MAX_NOTIFICATION_SCAN,
-      order: 'desc',
-      kinds: [...NOTIFICATION_EVENT_KINDS],
-    });
+    // Pending IDs are independent of the cursor: a passive delivery may
+    // have covered an event before the wake policy was enabled. The active
+    // batch is exclusive — never include/claim an unrelated new row in it.
+    const notes: { id: string; line: string }[] = [];
     const seenIds = new Set<string>();
-    const notes: string[] = [];
-    for (const event of notificationEvents) {
-      const payload = payloadOf(event);
-      if (payload['routing'] !== 'action-required') continue;
-      const id = textOf(payload['id']);
-      if (id === null || seenIds.has(id)) continue;
+    const addNote = (id: string): void => {
+      if (seenIds.has(id) || notes.length >= this.limits.maxActionNotes) return;
       seenIds.add(id);
       const row = this.ledger.getNotification(id);
-      if (row === null || row.ackedAt !== null || row.resolvedAt !== null) continue;
+      if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
       const detail = row.detail !== null && row.detail !== '' ? ` — ${row.detail}` : '';
-      notes.push(`- ⚠ ${row.title}${detail}`);
-      if (notes.length >= this.limits.maxActionNotes) break;
+      const icon = row.routing === 'action-required' ? '⚠' : row.routing === 'needs-owner' ? '🔔' : 'ℹ';
+      notes.push({ id, line: `- ${icon} [${id}] ${row.title}${detail} (routing: ${row.routing})` });
+    };
+    for (const id of this.activeWakeIds ?? this.pendingWakeIds) addNote(id);
+    if (this.activeWakeIds === null && notes.length < this.limits.maxActionNotes) {
+      // Passive injection retains the original event scan, but only new
+      // machine rows; all-mode direct posts use the pending-ID path above.
+      const notificationEvents = this.ledger.listEventsAfter(this.cursor, {
+        limit: MAX_NOTIFICATION_SCAN,
+        order: 'desc',
+        kinds: [...NOTIFICATION_EVENT_KINDS],
+      });
+      const eventIds = notificationEvents
+        .filter((event) => payloadOf(event)['routing'] === 'action-required')
+        .map((event) => textOf(payloadOf(event)['id']))
+        .filter((id): id is string => id !== null);
+      for (const id of [...eventIds].reverse()) addNote(id);
     }
-    notes.reverse();
-
-    const text = this.render(notes, digestLines, overflow, this.morningDigest());
-    if (text === null) return null;
-    return { text, coveredThroughSeq: latest };
+    const rendered = this.render(notes, digestLines, overflow, this.morningDigest());
+    if (rendered === null) return null;
+    if (this.activeWakeIds !== null && rendered.ids.length === 0) {
+      this.log('error', 'wake context has no visible notification IDs; increase awareness line/byte limits', {
+        notification_ids: this.activeWakeIds,
+      });
+      return null;
+    }
+    return { text: rendered.text, coveredThroughSeq: latest, notificationIds: rendered.ids };
   }
 
   /** Commit a delivered block: advance the durable cursor to exactly the
@@ -486,54 +524,83 @@ export class GruAwareness {
   /** Wake outcome receipt from the chat server (observability). The
    * `gru.wake` event records the attempt; a failed turn appends a durable
    * `gru.wake-failed` so the trackers can count wakes that actually ran. */
-  noteWakeOutcome(ok: boolean, detail?: string): void {
-    if (ok || this.disposed) return;
-    const reason = detail !== undefined && detail !== '' ? detail : 'unknown';
-    this.log('error', 'gru wake turn failed', { error: reason });
+  noteWakeOutcome(ok: boolean, detail?: string, injection?: AwarenessInjection): void {
+    if (this.disposed) return;
+    const active = this.activeWakeIds ?? [];
+    const delivered = active.filter((id) => injection?.notificationIds?.includes(id));
+    this.activeWakeIds = null;
+    this.prunePending();
+    if (ok && delivered.length > 0) {
+      for (const id of delivered) this.pendingWakeIds.delete(id);
+      const at = this.now();
+      this.wakePolicy.fired(delivered, at);
+      this.failedRetryAtMs = 0;
+      this.log('info', 'gru wake opened', { notification_ids: delivered, count: delivered.length, mode: this.wakeMode });
+      try {
+        this.ledger.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: delivered, count: delivered.length, mode: this.wakeMode } });
+      } catch (error) {
+        this.log('error', 'gru wake ledger event failed', { error: String(error) });
+      }
+      this.persistWakeState();
+      this.flushPendingWakes();
+      return;
+    }
+    const reason = detail !== undefined && detail !== '' ? detail : 'no alert context delivered';
+    this.log('error', 'gru wake turn failed', { error: reason, notification_ids: active });
     try {
-      this.ledger.appendCustomEvent({ kind: 'gru.wake-failed', payload: { error: reason } });
+      this.ledger.appendCustomEvent({ kind: 'gru.wake-failed', payload: { error: reason, notification_ids: active } });
     } catch (error) {
       this.log('error', 'gru wake failure event failed', { error: String(error) });
+    }
+    this.persistWakeState();
+    // A failed spawn/prompt must not burn the id. Bound retries so a broken
+    // runtime cannot storm when the configured minimum interval is zero.
+    if (this.pendingWakeIds.size > 0) {
+      this.failedRetryAtMs = this.now() + 5_000;
+      this.scheduleWake(this.failedRetryAtMs, 'rate');
     }
   }
 
   private render(
-    actionNotes: readonly string[],
+    actionNotes: readonly { id: string; line: string }[],
     digestLines: readonly string[],
     overflow: boolean,
     morning: readonly string[] | null,
-  ): string | null {
+  ): { text: string; ids: readonly string[] } | null {
     const parts: string[] = [AWARENESS_BLOCK_HEADER];
+    const ids: string[] = [];
     let bytes = Buffer.byteLength(AWARENESS_BLOCK_HEADER, 'utf8');
     let truncated = overflow;
     let exhausted = false;
-    const push = (line: string, force = false): void => {
-      if (exhausted && !force) return;
+    const push = (line: string, force = false): boolean => {
+      if (exhausted && !force) return false;
       const sized = clampLine(line, this.limits.maxLineChars);
       const size = Buffer.byteLength(sized, 'utf8') + 1; // newline
       if (bytes + size > this.limits.maxBytes) {
         truncated = true;
         exhausted = true;
-        return;
+        return false;
       }
       parts.push(sized);
       bytes += size;
+      return true;
     };
 
-    if (morning !== null) {
-      for (const line of morning) push(line);
+    if (actionNotes.length > 0 && push(this.wakeMode === 'all' ? 'Notifications (unacknowledged):' : 'Action required (unacknowledged):')) {
+      for (const note of actionNotes) {
+        // Never claim an ID whose identifier was clipped by the line/byte
+        // bounds. A truncated title is fine; an invisible ID is not.
+        if (push(note.line) && parts.at(-1)?.includes(`[${note.id}]`)) ids.push(note.id);
+      }
     }
-    if (actionNotes.length > 0) {
-      push('Action required (unacknowledged):');
-      for (const note of actionNotes) push(note);
-    }
+    if (morning !== null) for (const line of morning) push(line);
     if (digestLines.length > 0) {
       push('Since your last turn:');
       for (const line of digestLines) push(line);
     }
     if (parts.length === 1) return null;
     if (truncated) push('- (further context omitted…)', true);
-    return parts.join('\n');
+    return { text: parts.join('\n'), ids };
   }
 
   /** "While you were away" digest (owner ruling 2026-09-23): the first
@@ -574,7 +641,7 @@ export class GruAwareness {
   private persist(): void {
     const state: AwarenessState = {
       coveredThroughSeq: this.cursor,
-      wake: this.wakePolicy.snapshot(),
+      wake: { version: 2, ...this.wakePolicy.snapshot(), pending: [...this.pendingWakeIds] },
       digest: { lastDeliveredAt: this.lastDeliveredAt },
     };
     const staging = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
@@ -621,6 +688,7 @@ export class GruAwareness {
       return;
     }
     this.pendingWakeIds.add(candidate.id);
+    this.persistWakeState();
     if (decision.action === 'wake') {
       this.flushPendingWakes();
       return;
@@ -628,72 +696,79 @@ export class GruAwareness {
     this.scheduleWake(decision.retryAtMs, decision.reason);
   }
 
-  /** Migration seed: unacked machine-attention rows that predate this boot
-   * are the backlog the first wake must carry — one batch, one turn. */
+  /** Seed unresolved rows that predate boot. The normal mode filters
+   * machine routing in SQL; explicit all mode includes FYI/owner rows. */
   private seedBacklog(): void {
     if (this.wakeMode === 'never' || this.disposed) return;
-    let rows;
+    let seeded = false;
     try {
-      rows = this.ledger.listNotifications({ unackedOnly: true, limit: MAX_BACKLOG_SEED });
+      // Filter in SQL BEFORE LIMIT in machine-only mode and page every
+      // matching row. Unrelated owner/FYI rows may outnumber this page.
+      for (let offset = 0;; offset += MAX_BACKLOG_SEED) {
+        const rows = this.ledger.listNotifications({
+          unackedOnly: true, ...(this.wakeMode === 'action-required' ? { routing: 'action-required' as const } : {}),
+          limit: MAX_BACKLOG_SEED, offset,
+        });
+        for (const row of rows) {
+          if (this.wakePolicy.decide({ id: row.id, routing: row.routing, severity: row.severity }, this.now()).action === 'skip') continue;
+          this.pendingWakeIds.add(row.id);
+          seeded = true;
+        }
+        if (rows.length < MAX_BACKLOG_SEED) break;
+      }
     } catch (error) {
       this.log('error', 'gru wake backlog scan failed', { error: String(error) });
       return;
     }
-    let seeded = false;
-    for (const row of rows) {
-      if (row.routing !== 'action-required') continue; // the owner's queue is not a machine wake
-      if (this.wakePolicy.decide({ id: row.id, routing: row.routing, severity: row.severity }, this.now()).action === 'skip') {
-        continue;
-      }
-      this.pendingWakeIds.add(row.id);
-      seeded = true;
-    }
-    if (seeded) this.flushPendingWakes();
+    if (seeded) this.persistWakeState();
+    this.flushPendingWakes();
   }
 
   /** Release the pending batch as ONE turn when the schedule allows; while
    * it does not, arm the timer for the earliest allowed instant. */
   private flushPendingWakes(): void {
-    if (this.disposed || this.pendingWakeIds.size === 0) return;
+    if (this.disposed || this.activeWakeIds !== null) return;
+    this.prunePending();
+    if (this.pendingWakeIds.size === 0) return;
+    if (this.now() < this.failedRetryAtMs) {
+      this.scheduleWake(this.failedRetryAtMs, 'rate');
+      return;
+    }
     const decision = this.wakePolicy.scheduleDecision(this.now());
     if (decision.action === 'defer') {
       this.scheduleWake(decision.retryAtMs, decision.reason);
       return;
     }
-    if (this.wakeSink === null) {
-      // The chat server is not bound yet (boot order): keep the batch —
-      // setWakeSink() re-enters here, so a wake is never dropped.
-      return;
-    }
-    const ids = [...this.pendingWakeIds];
-    this.pendingWakeIds.clear();
+    if (this.wakeSink === null) return; // boot binds this later
     this.cancelWakeTimer();
-    const at = this.now();
-    this.wakePolicy.fired(ids, at);
-    try {
-      this.persist();
-    } catch (error) {
-      // The claim is in-memory for this process; a restart may re-wake the
-      // same rows once (bounded). Never lose the wake over the sidecar.
-      this.log('error', 'gru wake state persist failed', { file: this.file, error: String(error) });
-    }
-    this.log('info', 'gru wake opened', {
-      notification_ids: ids,
-      count: ids.length,
-      mode: this.wakeMode,
-    });
-    try {
-      this.ledger.appendCustomEvent({
-        kind: 'gru.wake',
-        payload: { notification_ids: ids, count: ids.length, mode: this.wakeMode },
-      });
-    } catch (error) {
-      this.log('error', 'gru wake ledger event failed', { error: String(error) });
-    }
+    this.activeWakeIds = [...this.pendingWakeIds].slice(0, this.limits.maxActionNotes);
     try {
       this.wakeSink();
     } catch (error) {
-      this.log('error', 'gru wake sink failed', { error: String(error) });
+      this.noteWakeOutcome(false, String(error));
+    }
+  }
+
+  /** Closed or rerouted candidates must not hold a retry timer open. */
+  private prunePending(): void {
+    let changed = false;
+    for (const id of this.pendingWakeIds) {
+      const row = this.ledger.getNotification(id);
+      if (row !== null && row.ackedAt === null && row.resolvedAt === null &&
+          this.wakePolicy.decide({ id, routing: row.routing, severity: row.severity }, this.now()).action !== 'skip') continue;
+      this.pendingWakeIds.delete(id);
+      changed = true;
+    }
+    if (changed) this.persistWakeState();
+  }
+
+  private persistWakeState(): void {
+    try {
+      this.persist();
+    } catch (error) {
+      this.log('error', 'gru wake state persist failed — pending alerts will be rescanned on boot', {
+        file: this.file, error: String(error),
+      });
     }
   }
 

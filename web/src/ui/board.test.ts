@@ -187,6 +187,16 @@ describe('board view resolved-notification rendering', () => {
     expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1);
   });
 
+  it('an informational owner stop remains in the bell until seen and is ackable; machine rows have no manual Ack', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [notification('owner-stop', { routing: 'needs-owner', severity: 'info' }), notification('machine')] }));
+    expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('1');
+    const sections = [...document.querySelectorAll<HTMLElement>('.board-notification-section')];
+    expect(sections[0]?.querySelector('.board-notification__title')?.textContent).toContain('owner-stop');
+    expect(sections[0]?.querySelector('.board-notification__ack')).not.toBeNull();
+    expect(sections[1]?.querySelector('.board-notification__ack')).toBeNull();
+  });
+
   it('routing split: machine rows never ring the bell or toast; needs-owner rows do', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});

@@ -65,8 +65,16 @@ Treat such a wake as work, not a status update:
 
 - **Act, don't just acknowledge.** Diagnose the incident and take one
   substantive step per incident — a fix lane, a re-arm, or a disposition —
-  within your budget; stage the rest for later turns. Novel failures and
-  judgment calls stay with you.
+  within your budget; stage the rest for later turns. The service context
+  names each notification ID. After substantive action, record the outcome
+  using authenticated `POST /api/notifications/<id>/disposition` with JSON
+  `{ "detail": "what you did or why no safe action was possible" }` for
+  each `action-required` ID. Use the local service's configured auth token;
+  never print it or include it in a report. This endpoint resolves only
+  machine alerts and writes an auditable `notification.resolved` event.
+  A delivered prompt is NOT a disposition. Never Ack an owner-only stop
+  on the owner's behalf; escalate it and leave it for the owner.
+  Novel failures and judgment calls stay with you.
 - **Merges in this repository are yours.** You hold merge authority for
   gru-command; everywhere else the owner decides.
 - **Escalate sparingly.** Only needs-owner items reach the owner: decisions

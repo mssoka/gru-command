@@ -35,7 +35,8 @@ record.
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
 | `POST /api/agents/state` | `{id, state}` |
 | `POST /api/notifications/:id/shown` | `{surface}` — display receipt (idempotent per surface; the shown:true doctrine) |
-| `POST /api/notifications/:id/ack` | `{by?}` — human ack; clears the row and re-arms an open breaker |
+| `POST /api/notifications/:id/ack` | `{by?}` — owner ack; clears the row and re-arms an open breaker |
+| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event; never clears an owner stop |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
 | `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
@@ -114,12 +115,15 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   every other transition.
 - **Notification center (E7; routing split 2026-09-23):** the bell panel
   renders the durable notification log in three bands — FOR YOU
-  (needs-owner rows: owner-only decisions and stops whose ack re-arms
-  supervision), NEEDS GRU (the self-clearing machine queue that wakes
-  Gru; it never rings the bell), and FEED (FYI rows). The badge and live
+  (all pending needs-owner rows, even older than the bounded latest feed:
+  owner-only decisions and stops whose ack re-arms supervision), NEEDS GRU
+  (the Gru-disposition machine queue that wakes Gru; it never rings the
+  bell or offers a human Ack), and FEED (FYI rows). The badge and live
   toasts serve needs-owner only; every displayed row earns a shown receipt
-  per surface (nothing "shown" without an ack record); acking a row clears
-  it where an ack has meaning (a breaker row re-arms supervision). The
+  per surface (a display receipt is not an acknowledgement); acking an
+  owner row clears it where an ack has meaning (a breaker row re-arms
+  supervision). Informational owner stops earn the same unread badge as
+  errors. The
   wake tracker chip counts durable Gru wakes (`gru.wake` events). Live
   needs-owner arrivals toast (plus a browser notification when permission
   was granted).

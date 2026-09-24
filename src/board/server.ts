@@ -370,9 +370,9 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           json(res, 200, suffix === '/status' ? ledger.setRoundStatus(id, value) : ledger.setRoundVerdict(id, value));
           return;
         }
-        if (req.method === 'POST' && path.startsWith('/api/notifications/') && (path.endsWith('/shown') || path.endsWith('/ack'))) {
+        if (req.method === 'POST' && path.startsWith('/api/notifications/') && (path.endsWith('/shown') || path.endsWith('/ack') || path.endsWith('/disposition'))) {
           if (!authed(req, res)) return;
-          const suffix = path.endsWith('/shown') ? '/shown' : '/ack';
+          const suffix = path.endsWith('/shown') ? '/shown' : path.endsWith('/disposition') ? '/disposition' : '/ack';
           const id = decodeURIComponent(path.slice('/api/notifications/'.length, -suffix.length));
           const body = (await readBody(req)) as Record<string, unknown>;
           if (suffix === '/shown') {
@@ -385,6 +385,16 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               return;
             }
             const row = notifications.markShown(id, surface);
+            if (row === null) {
+              json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+              return;
+            }
+            json(res, 200, row);
+            return;
+          }
+          if (suffix === '/disposition') {
+            const detail = strField(body, 'detail');
+            const row = ledger.disposeMachineNotification(id, detail);
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;

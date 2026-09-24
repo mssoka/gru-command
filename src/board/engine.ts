@@ -550,9 +550,20 @@ export class BoardEngine {
    * them), action-required rows carry acks; nothing is computed here.
    */
   notifications(limit = 30): readonly NotificationView[] {
-    return this.ledger
-      .listNotifications({ limit })
-      .map((row: NotificationRecord) => ({
+    // The newest feed is bounded; owner-only stops are NOT. Every pending
+    // needs-owner row must remain reachable for the bell/panel/ack even
+    // after arbitrarily many newer FYI or machine notifications.
+    const pendingOwner: NotificationRecord[] = [];
+    for (let offset = 0;; offset += 50) {
+      const page = this.ledger.listNotifications({ unackedOnly: true, routing: 'needs-owner', limit: 50, offset });
+      pendingOwner.push(...page);
+      if (page.length < 50) break;
+    }
+    const byId = new Map(this.ledger.listNotifications({ limit }).map((row) => [row.id, row]));
+    for (const row of pendingOwner) byId.set(row.id, row);
+    return [...byId.values()]
+      .sort((a, b) => b.ts.localeCompare(a.ts) || a.id.localeCompare(b.id))
+      .map((row) => ({
         id: row.id,
         ts: row.ts,
         kind: row.kind,

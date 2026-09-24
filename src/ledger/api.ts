@@ -1179,12 +1179,20 @@ export class LedgerApi {
     return row === undefined ? null : this.notificationFromRow(row);
   }
 
-  listNotifications(opts: { limit?: number; unackedOnly?: boolean } = {}): readonly NotificationRecord[] {
+  listNotifications(opts: { limit?: number; offset?: number; unackedOnly?: boolean; routing?: NotificationRouting } = {}): readonly NotificationRecord[] {
     const limit = opts.limit ?? 50;
-    const sql = opts.unackedOnly
-      ? 'SELECT * FROM notifications WHERE acked_at IS NULL AND resolved_at IS NULL ORDER BY ts DESC, id LIMIT ?'
-      : 'SELECT * FROM notifications ORDER BY ts DESC, id LIMIT ?';
-    return (this.db.prepare(sql).all(limit) as Row[]).map((row) => this.notificationFromRow(row));
+    const offset = opts.offset ?? 0;
+    if (!Number.isSafeInteger(limit) || limit <= 0 || !Number.isSafeInteger(offset) || offset < 0) {
+      throw new Error('notification page limit must be positive and offset must be non-negative');
+    }
+    const clauses = [
+      ...(opts.unackedOnly ? ['acked_at IS NULL', 'resolved_at IS NULL'] : []),
+      ...(opts.routing !== undefined ? ['routing = ?'] : []),
+    ];
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '';
+    return (this.db.prepare(`SELECT * FROM notifications${where} ORDER BY ts DESC, id LIMIT ? OFFSET ?`)
+      .all(...(opts.routing !== undefined ? [opts.routing] : []), limit, offset) as Row[])
+      .map((row) => this.notificationFromRow(row));
   }
 
   /** Count action-required notifications still awaiting a machine
@@ -1295,6 +1303,24 @@ export class LedgerApi {
         agentId: current.agentId,
         payload: { id, surface },
       });
+      return this.getNotification(id) as NotificationRecord;
+    });
+  }
+
+  /** Explicit machine disposition, distinct from the owner's Ack.
+   * A successful wake prompt by itself never calls this method. */
+  disposeMachineNotification(id: string, detail: string): NotificationRecord | null {
+    if (detail.trim() === '') throw new Error('machine disposition detail must be non-empty');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null) return null;
+      if (current.routing !== 'action-required') {
+        throw new Error('only action-required notifications accept a Gru disposition; owner stops require owner acknowledgement');
+      }
+      if (current.resolvedAt !== null || current.ackedAt !== null) return current;
+      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
+        .run(nowIso(), 'gru', id);
+      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'gru', detail } });
       return this.getNotification(id) as NotificationRecord;
     });
   }
