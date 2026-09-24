@@ -108,6 +108,12 @@ export type NotificationRouting = (typeof NOTIFICATION_ROUTINGS)[number];
 export const NOTIFICATION_SEVERITIES = ['info', 'error'] as const;
 export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number];
 
+export function isOwnerHeldNotificationKind(kind: string): boolean {
+  return kind.startsWith('decisions.degraded.') ||
+    kind.startsWith('supervision.provider-wall.') ||
+    ['supervision.breaker', 'port-squat', 'roll-port-squat', 'worktree-sweep-paused'].includes(kind);
+}
+
 export function isNotificationRouting(value: string): value is NotificationRouting {
   return (NOTIFICATION_ROUTINGS as readonly string[]).includes(value);
 }
@@ -1237,6 +1243,29 @@ export class LedgerApi {
     });
   }
 
+  /** Reclassify legacy owner-held incidents before any wake backlog scan.
+   * Earlier releases persisted these as machine attention. Resetting a
+   * legacy machine Ack on an active stop restores the owner's pending
+   * decision; resolved incidents are never reopened. Idempotent. */
+  migrateOwnerHeldNotifications(): readonly NotificationRecord[] {
+    return this.transaction(() => {
+      const rows = this.db.prepare(`
+        SELECT * FROM notifications
+        WHERE resolved_at IS NULL AND routing = 'action-required'
+          AND (kind LIKE 'decisions.degraded.%'
+            OR kind LIKE 'supervision.provider-wall.%'
+            OR kind IN ('port-squat', 'roll-port-squat', 'worktree-sweep-paused', 'supervision.breaker'))
+        ORDER BY ts, id
+      `).all() as Row[];
+      return rows.map((raw) => {
+        const id = str(raw.id);
+        this.db.prepare("UPDATE notifications SET routing = 'needs-owner', acked_at = NULL, acked_by = NULL WHERE id = ?").run(id);
+        this.appendEvent({ kind: 'notification.triaged', agentId: nstr(raw.agent_id), payload: { id, routing: 'needs-owner', reason: 'legacy owner-held incident migration' } });
+        return this.getNotification(id) as NotificationRecord;
+      });
+    });
+  }
+
   findNotificationByKind(kind: string, mode: 'any' | 'unacked' | 'active' | boolean = 'any'): NotificationRecord | null {
     const normalized = mode === true ? 'unacked' : mode === false ? 'any' : mode;
     const sql = normalized === 'unacked'
@@ -1325,12 +1354,15 @@ export class LedgerApi {
     });
   }
 
-  /** Human ack — the action-required clearance. Idempotent. */
+  /** Human ack for owner/FYI only. Machine alerts require a disposition. */
   ackNotification(id: string, by: string): NotificationRecord | null {
     if (by === '') throw new Error('acked-by must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
+      if (current.routing === 'action-required') {
+        throw new Error('action-required notifications require a Gru disposition; Ack cannot clear machine attention');
+      }
       if (current.ackedAt !== null) return current;
       this.db
         .prepare('UPDATE notifications SET acked_at = ?, acked_by = ? WHERE id = ?')

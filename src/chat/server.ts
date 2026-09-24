@@ -692,9 +692,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     }
   }
 
-  function awarenessCommit(injection: AwarenessInjection): void {
+  function awarenessCommit(injection: AwarenessInjection, source: 'chat' | 'wake' = 'chat'): void {
     try {
-      options.awareness?.commit(injection);
+      options.awareness?.commit(injection, source);
     } catch (error) {
       log('error', 'gru awareness commit failed — context may re-inject', {
         error: errorMessage(error),
@@ -881,7 +881,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             turnLive = false;
             // Receipt only after the turn accepted the block: a failed
             // delivery retries the same context on the next turn.
-            if (injection !== null) awarenessCommit(injection);
+            if (injection !== null) awarenessCommit(injection, wake ? 'wake' : 'chat');
             // The policy-started turn opened — the wake-observability
             // receipt the self-heal trackers count.
             if (wake) options.awareness?.noteWakeOutcome?.(true, undefined, injection ?? undefined);

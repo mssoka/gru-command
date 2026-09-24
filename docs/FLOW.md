@@ -395,11 +395,15 @@ awareness layer batches, persists, and calls the chat wake sink.
   trailing wake carrying the whole batch.
 - **Quiet hours** — `wake_quiet_hours = "HH:MM-HH:MM"` (local time, may wrap
   midnight; default off) defers wakes to the window's end.
-- **Dedupe** — one wake per notification id, persisted (`awareness.json`)
-  and bounded; repeated events for the same row never burn a second turn.
-- **Backlog migration** — unacked action-required rows that predate a boot
-  are Gru's backlog: the first wake carries the batch. Nothing is
-  grandfathered into the owner bell.
+- **Dedupe** — one wake per open notification id, persisted (`awareness.json`);
+  open receipts are never evicted after an arbitrary number of other wakes.
+  Closed IDs are pruned. A failed attempt consumes the configured interval
+  (including across restarts) but never claims the notification ID.
+- **Backlog migration** — before scanning old unacked rows, persisted
+  provider/credential stops, supervision breakers and foreign-listener /
+  destructive-op stops are moved to `needs-owner` (FOR YOU and bell), even
+  when an old machine Ack had hidden an active stop. Remaining open machine
+  rows seed bounded wake turns; all mode includes FYI/owner context too.
 
 **Mechanics.** A wake calls the chat server's `wakeAwareness()`: when the
 lane is idle it opens one ordinary turn whose prompt is the awareness
@@ -411,8 +415,9 @@ wake requested mid-turn becomes one trailing turn; a wake with nothing to
 inject neither spawns a session nor burns a model turn; a failed wake is a
 durable notice, never a message-delivery error. Notification IDs stay
 pending independently of the event cursor until the prompt accepts a block
-containing those IDs; spawn/prompt failures retry after a bounded backoff.
-Only the IDs actually present in the bounded block count as woken; overflow
+containing those IDs; spawn/prompt failures retry after at least five
+seconds AND the configured wake interval. Long intervals use safe timer
+slices rather than Node's overflowing timeout. Only the IDs actually present in the bounded block count as woken; overflow
 travels in later, rate-limited turns.
 
 **Mandate — act (tier-2).** A wake is machine attention meant to be acted
@@ -436,14 +441,17 @@ After acting on an `action-required` row Gru calls the authenticated
 `POST /api/notifications/{id}/disposition` with a nonempty JSON `detail`
 (the action taken or why no safe action was possible). The ledger records
 `notification.resolved` by `gru`; the endpoint refuses `needs-owner` and
-FYI rows, and the web UI offers no human Ack for machine alerts. Owner
-stops remain in the bell/panel regardless of how many newer feed items
-arrive; only their owner Ack clears them.
+FYI rows. The authenticated `/ack` API itself refuses machine rows, not
+just the web UI. Both open machine alerts and owner stops remain in their
+board bands regardless of newer feed traffic. Only the owner Ack clears
+owner stops.
 
 **Morning digest.** The first delivered block after `morning_digest_gap_ms`
 (default 8 h; 0 disables) carries a ledger-derived "while you were away"
 digest — fires (wakes acted on), actions, merges, staged PRs — so the
-chief catches up without the owner relaying anything.
+chief catches up without the owner relaying anything. The persisted owner
+watermark is independent of the wake/event cursor: overnight wake turns
+never consume actions or fires from the next owner-directed digest.
 
 **Observability.** Every successful wake is logged, appended to the ledger as a
 `gru.wake` event (a failed turn adds `gru.wake-failed`), and counted by the

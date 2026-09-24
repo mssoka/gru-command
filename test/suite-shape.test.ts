@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
  * Adding a test? Bump this pin — that is the point.
  */
 const PINS: Record<string, number> = {
-  'board-engine.test.ts': 22,
+  'board-engine.test.ts': 23,
   'board-engine-v4.test.ts': 4,
   'board-frames.test.ts': 3,
   'board-server.test.ts': 16,
@@ -20,7 +20,7 @@ const PINS: Record<string, number> = {
   'chat-frame-log.test.ts': 20,
   'chat-frames.test.ts': 4,
   'attachments.test.ts': 28,
-  'awareness.test.ts': 27,
+  'awareness.test.ts': 33,
   'bmad-onboarding.test.ts': 13,
   'chat-server.test.ts': 81,
   'chat-session-state.test.ts': 6,
@@ -53,7 +53,7 @@ const PINS: Record<string, number> = {
   'listener-probe.test.ts': 5,
   'logger.test.ts': 3,
   'native-tools-parity.test.ts': 2,
-  'notifications.test.ts': 15,
+  'notifications.test.ts': 16,
   'perkins-builtin-review.test.ts': 148,
   'perkins-builtin-wave.test.ts': 38,
   'perkins-freeze-freshhead.test.ts': 13,
@@ -97,7 +97,7 @@ const PINS: Record<string, number> = {
   'worktree-manifest.test.ts': 7,
   'worktree-port.test.ts': 4,
   'wake-e2e.test.ts': 1,
-  'wake-policy.test.ts': 15,
+  'wake-policy.test.ts': 16,
   'worktrees-server.test.ts': 3,
 };
 

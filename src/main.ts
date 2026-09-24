@@ -111,7 +111,7 @@ function reportForeignListener(
   });
   notifications.post({
     kind: 'port-squat',
-    routing: 'action-required',
+    routing: 'needs-owner',
     severity: 'error',
     title: `Foreign process holds port ${port} (pid ${foreign.pid})`,
     detail:
@@ -842,7 +842,7 @@ async function main(): Promise<number> {
     onForeignListener: (owner) => {
       notifications.post({
         kind: 'roll-port-squat',
-        routing: 'action-required',
+        routing: 'needs-owner',
         severity: 'error',
         title: `Roll refused: port ${config.server.port} is held by a foreign process (pid ${owner.pid})`,
         detail:

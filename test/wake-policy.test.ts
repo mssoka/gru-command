@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  MAX_WAKE_IDS,
   WakePolicy,
   localMinuteOfDay,
   parseQuietHours,
@@ -84,14 +83,15 @@ describe('wake policy — dedupe', () => {
     expect(policy.decide(candidate({ id: 'n2' }), 1_000 + 300_000)).toEqual({ action: 'wake' });
   });
 
-  it('bounds the claimed set (insertion order, oldest drops first)', () => {
+  it('keeps all 257 open IDs until explicitly closed, across restart', () => {
     const policy = new WakePolicy(BASE);
-    const ids = Array.from({ length: MAX_WAKE_IDS + 5 }, (_, index) => `n${index}`);
+    const ids = Array.from({ length: 257 }, (_, index) => `n${index}`);
     policy.fired(ids, 0);
-    const snapshot = policy.snapshot();
-    expect(snapshot.woken).toHaveLength(MAX_WAKE_IDS);
-    expect(snapshot.woken).not.toContain('n0');
-    expect(snapshot.woken).toContain(`n${MAX_WAKE_IDS + 4}`);
+    const restarted = new WakePolicy(BASE, policy.snapshot());
+    expect(restarted.snapshot().woken).toHaveLength(257);
+    expect(restarted.decide(candidate({ id: 'n0' }), 300_000)).toEqual({ action: 'skip', reason: 'dedupe' });
+    expect(restarted.forget('n0')).toBe(true);
+    expect(restarted.decide(candidate({ id: 'n0' }), 300_000)).toEqual({ action: 'wake' });
   });
 
   it('round-trips its durable state', () => {
@@ -112,6 +112,15 @@ describe('wake policy — rate limit', () => {
       retryAtMs: 10_000 + 300_000,
     });
     expect(policy.scheduleDecision(10_000 + 300_000)).toEqual({ action: 'wake' });
+  });
+
+  it('counts a failed attempt against the interval, durably, without claiming its id', () => {
+    const policy = new WakePolicy(BASE);
+    policy.attempted(10_000);
+    const restarted = new WakePolicy(BASE, policy.snapshot());
+    expect(restarted.decide(candidate(), 15_000)).toEqual({ action: 'defer', reason: 'rate', retryAtMs: 310_000 });
+    expect(restarted.decide(candidate(), 310_000)).toEqual({ action: 'wake' });
+    expect(restarted.snapshot().woken).toEqual([]);
   });
 
   it('0 disables the cap', () => {

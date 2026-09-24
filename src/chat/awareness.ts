@@ -34,9 +34,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *      Every opened wake is logged and appended to the ledger as
  *      `gru.wake` so the board / self-heal trackers can count them.
  *
- * The cursor (`coveredThroughSeq`) is durable under the chat dir, so a
- * restart never replays context the brain already received. Content is
- * derived from the ledger only — an acked or resolved notification is
+ * The event cursor and the owner-directed morning watermark are separately
+ * durable under the chat dir; wake turns never consume the owner's digest.
+ * Content is derived from the ledger only — an acked or resolved notification is
  * never injected; action-required rows are Gru's machine queue while
  * needs-owner rows keep the owner's acknowledgement.
  */
@@ -89,7 +89,7 @@ export interface AwarenessInjection {
  * + delivery receipt). The wake decision stays inside the layer. */
 export interface GruAwarenessPort {
   prepare(): AwarenessInjection | null;
-  commit(injection: AwarenessInjection): void;
+  commit(injection: AwarenessInjection, source?: 'chat' | 'wake'): void;
   /** Wake outcome receipt: only a successful turn with the delivered
    * injection may claim its visible IDs. Failed wakes remain pending and
    * record `gru.wake-failed` for operational diagnosis. */
@@ -103,6 +103,7 @@ export type GruAwarenessLedger = Pick<
   | 'latestEventSeq'
   | 'appendCustomEvent'
   | 'listNotifications'
+  | 'migrateOwnerHeldNotifications'
   | 'listJobs'
 >;
 
@@ -137,9 +138,12 @@ interface AwarenessState {
     readonly woken: readonly string[];
     readonly pending?: readonly string[];
     readonly lastFiredAt: number | null;
+    readonly lastAttemptAt?: number | null;
   };
   readonly digest?: {
     readonly lastDeliveredAt: number | null;
+    readonly lastOwnerAt?: number | null;
+    readonly lastOwnerSeq?: number;
   };
 }
 
@@ -147,9 +151,10 @@ interface AwarenessState {
 const NOTIFICATION_EVENT_KINDS = ['notification.created', 'notification.triaged'] as const;
 /** Scan cap for notification events; the render cap is maxActionNotes. */
 const MAX_NOTIFICATION_SCAN = 200;
-/** Backlog seeding scope on first wake (migration: unacked machine rows
- * are Gru's backlog, not grandfathered to the owner bell). */
+/** Backlog page size after owner-held legacy rows are reclassified. */
 const MAX_BACKLOG_SEED = 50;
+/** Node clamps longer setTimeout delays to 1 ms; chain safe slices. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 /** Default morning-digest gap (8 h): first block after a quiet night. */
 export const DEFAULT_MORNING_DIGEST_GAP_MS = 28_800_000;
 /** Morning-digest kernel kinds — the "actions" count. */
@@ -288,8 +293,11 @@ export class GruAwareness {
   private readonly log: Log;
   private readonly now: () => number;
   private cursor: number;
-  /** Epoch ms of the last delivered awareness block (morning-digest base). */
+  /** Epoch ms of the last delivered block (legacy state compatibility). */
   private lastDeliveredAt: number | null;
+  /** Only an owner-directed user turn advances the morning boundary. */
+  private lastOwnerAt: number | null;
+  private lastOwnerSeq: number;
   private wakeSink: (() => void) | null = null;
   /** Candidate ids waiting to be released as ONE coalesced wake. */
   private readonly pendingWakeIds: Set<string>;
@@ -314,6 +322,8 @@ export class GruAwareness {
     const state = GruAwareness.loadState(this.file);
     this.cursor = state.coveredThroughSeq;
     this.lastDeliveredAt = state.digest?.lastDeliveredAt ?? null;
+    this.lastOwnerAt = state.digest?.lastOwnerAt !== undefined ? state.digest.lastOwnerAt : this.lastDeliveredAt;
+    this.lastOwnerSeq = state.digest?.lastOwnerSeq ?? state.coveredThroughSeq;
     this.pendingWakeIds = new Set(state.wake?.pending ?? []);
     this.wakePolicy = new WakePolicy(
       {
@@ -359,8 +369,7 @@ export class GruAwareness {
           'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
       );
     }
-    const wake = record['wake'];
-    if (wake === undefined) return { coveredThroughSeq: value };
+    const wake = record['wake'] === undefined ? { woken: [], lastFiredAt: null } : record['wake'];
     if (typeof wake !== 'object' || wake === null || Array.isArray(wake)) {
       throw new Error(
         `gru awareness state ${file} has an invalid wake section; ` +
@@ -372,11 +381,13 @@ export class GruAwareness {
     const lastFiredAt = wakeRecord['lastFiredAt'];
     const pending = wakeRecord['pending'];
     const version = wakeRecord['version'];
+    const lastAttemptAt = wakeRecord['lastAttemptAt'];
     if (
       !Array.isArray(woken) ||
       !woken.every((id): id is string => typeof id === 'string' && id !== '') ||
       !(pending === undefined || (Array.isArray(pending) && pending.every((id): id is string => typeof id === 'string' && id !== ''))) ||
       !(version === undefined || version === 2) ||
+      !(lastAttemptAt === undefined || lastAttemptAt === null || (typeof lastAttemptAt === 'number' && Number.isFinite(lastAttemptAt))) ||
       !(lastFiredAt === null || (typeof lastFiredAt === 'number' && Number.isFinite(lastFiredAt)))
     ) {
       throw new Error(
@@ -393,14 +404,23 @@ export class GruAwareness {
             'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
         );
       }
-      const delivered = (digestRecord as Record<string, unknown>)['lastDeliveredAt'];
-      if (!(delivered === null || (typeof delivered === 'number' && Number.isFinite(delivered)))) {
+      const record = digestRecord as Record<string, unknown>;
+      const delivered = record['lastDeliveredAt'];
+      const ownerAt = record['lastOwnerAt'];
+      const ownerSeq = record['lastOwnerSeq'];
+      if (!(delivered === null || (typeof delivered === 'number' && Number.isFinite(delivered))) ||
+          !(ownerAt === undefined || ownerAt === null || (typeof ownerAt === 'number' && Number.isFinite(ownerAt))) ||
+          !(ownerSeq === undefined || (typeof ownerSeq === 'number' && Number.isSafeInteger(ownerSeq) && ownerSeq >= 0))) {
         throw new Error(
           `gru awareness state ${file} has an invalid digest section; ` +
             'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
         );
       }
-      digest = { lastDeliveredAt: delivered };
+      digest = {
+        lastDeliveredAt: delivered as number | null,
+        ...(ownerAt !== undefined ? { lastOwnerAt: ownerAt as number | null } : {}),
+        ...(ownerSeq !== undefined ? { lastOwnerSeq: ownerSeq as number } : {}),
+      };
     }
     // v1 claimed IDs before the model turn. Its woken set cannot prove
     // receipt (a failed spawn may have stranded a live alert). Prefer one
@@ -409,14 +429,16 @@ export class GruAwareness {
       version: 2,
       woken: version === 2 ? woken : [],
       lastFiredAt: version === 2 ? lastFiredAt : null,
+      lastAttemptAt: version === 2 && typeof lastAttemptAt === 'number' ? lastAttemptAt : null,
       ...(pending !== undefined ? { pending: pending as string[] } : {}),
     }, ...(digest !== undefined ? { digest } : {}) };
   }
 
   /** Attach the wake action once the chat server exists (late-bound).
-   * Seeding the backlog here is the migration rule: unacked machine rows
-   * are Gru's backlog on first wake, never the owner's. */
+   * Reclassify legacy owner stops BEFORE scanning for machine wakes even
+   * if composition bound awareness before the notification center. */
   setWakeSink(sink: () => void): void {
+    this.ledger.migrateOwnerHeldNotifications();
     this.wakeSink = sink;
     this.seedBacklog();
     this.flushPendingWakes();
@@ -435,7 +457,8 @@ export class GruAwareness {
    */
   prepare(): AwarenessInjection | null {
     const latest = this.ledger.latestEventSeq();
-    if (latest <= this.cursor && this.pendingWakeIds.size === 0) return null;
+    const morning = this.activeWakeIds === null ? this.morningDigest() : null;
+    if (latest <= this.cursor && this.pendingWakeIds.size === 0 && morning === null) return null;
 
     const reverse = <T>(items: readonly T[]): T[] => [...items].reverse();
     // Overfetch, then keep the newest maxEvents DIGESTIBLE lines: derived
@@ -472,6 +495,9 @@ export class GruAwareness {
       seenIds.add(id);
       const row = this.ledger.getNotification(id);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
+      // A stop reclassified while a wake was waiting must never ride a
+      // machine-only turn; all mode explicitly opts into owner context.
+      if (this.activeWakeIds !== null && this.wakeMode === 'action-required' && row.routing !== 'action-required') return;
       const detail = row.detail !== null && row.detail !== '' ? ` — ${row.detail}` : '';
       const icon = row.routing === 'action-required' ? '⚠' : row.routing === 'needs-owner' ? '🔔' : 'ℹ';
       notes.push({ id, line: `- ${icon} [${id}] ${row.title}${detail} (routing: ${row.routing})` });
@@ -491,7 +517,7 @@ export class GruAwareness {
         .filter((id): id is string => id !== null);
       for (const id of [...eventIds].reverse()) addNote(id);
     }
-    const rendered = this.render(notes, digestLines, overflow, this.morningDigest());
+    const rendered = this.render(notes, digestLines, overflow, morning);
     if (rendered === null) return null;
     if (this.activeWakeIds !== null && rendered.ids.length === 0) {
       this.log('error', 'wake context has no visible notification IDs; increase awareness line/byte limits', {
@@ -502,13 +528,15 @@ export class GruAwareness {
     return { text: rendered.text, coveredThroughSeq: latest, notificationIds: rendered.ids };
   }
 
-  /** Commit a delivered block: advance the durable cursor to exactly the
-   * seq the block accounted for. Never regresses on out-of-order commits.
-   * The delivery stamp powers the morning digest (the next block after a
-   * quiet gap carries "while you were away"). */
-  commit(injection: AwarenessInjection): void {
+  /** Commit a delivered block: advance the event cursor. Only a user chat
+   * turn advances the independent owner watermark used by the morning digest. */
+  commit(injection: AwarenessInjection, source: 'chat' | 'wake' = 'chat'): void {
     this.cursor = Math.max(this.cursor, injection.coveredThroughSeq);
     this.lastDeliveredAt = this.now();
+    if (source === 'chat') {
+      this.lastOwnerAt = this.lastDeliveredAt;
+      this.lastOwnerSeq = Math.max(this.lastOwnerSeq, injection.coveredThroughSeq);
+    }
     try {
       this.persist();
     } catch (error) {
@@ -521,9 +549,8 @@ export class GruAwareness {
     }
   }
 
-  /** Wake outcome receipt from the chat server (observability). The
-   * `gru.wake` event records the attempt; a failed turn appends a durable
-   * `gru.wake-failed` so the trackers can count wakes that actually ran. */
+  /** Wake receipt: `gru.wake` records only successful delivery. A failed
+   * attempt leaves IDs pending and appends a durable `gru.wake-failed`. */
   noteWakeOutcome(ok: boolean, detail?: string, injection?: AwarenessInjection): void {
     if (this.disposed) return;
     const active = this.activeWakeIds ?? [];
@@ -557,7 +584,7 @@ export class GruAwareness {
     // runtime cannot storm when the configured minimum interval is zero.
     if (this.pendingWakeIds.size > 0) {
       this.failedRetryAtMs = this.now() + 5_000;
-      this.scheduleWake(this.failedRetryAtMs, 'rate');
+      this.flushPendingWakes();
     }
   }
 
@@ -608,8 +635,8 @@ export class GruAwareness {
    * merges, and staged PRs from the ledger — the morning catch-up. Derived
    * from the ledger alone; null when the gap was short or nothing landed. */
   private morningDigest(): readonly string[] | null {
-    if (this.morningDigestGapMs <= 0 || this.lastDeliveredAt === null) return null;
-    const since = this.lastDeliveredAt;
+    if (this.morningDigestGapMs <= 0 || this.lastOwnerAt === null) return null;
+    const since = this.lastOwnerAt;
     if (this.now() - since < this.morningDigestGapMs) return null;
     const lines: string[] = [];
     const push = (line: string): void => {
@@ -618,9 +645,9 @@ export class GruAwareness {
     const bounded = (label: string, count: number, noun: string): void => {
       if (count > 0) push(`- ${label}: ${count} ${noun}${count === 1 ? '' : 's'}`);
     };
-    const wakes = this.ledger.listEventsAfter(this.cursor, { kinds: ['gru.wake'], limit: 100 }).length;
+    const wakes = this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: ['gru.wake'], limit: 100 }).length;
     bounded('fires', wakes, 'wake acted on');
-    const actions = this.ledger.listEventsAfter(this.cursor, {
+    const actions = this.ledger.listEventsAfter(this.lastOwnerSeq, {
       kinds: [...MORNING_ACTION_KINDS],
       limit: 100,
     }).length;
@@ -642,7 +669,7 @@ export class GruAwareness {
     const state: AwarenessState = {
       coveredThroughSeq: this.cursor,
       wake: { version: 2, ...this.wakePolicy.snapshot(), pending: [...this.pendingWakeIds] },
-      digest: { lastDeliveredAt: this.lastDeliveredAt },
+      digest: { lastDeliveredAt: this.lastDeliveredAt, lastOwnerAt: this.lastOwnerAt, lastOwnerSeq: this.lastOwnerSeq },
     };
     const staging = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
     try {
@@ -664,6 +691,11 @@ export class GruAwareness {
    * acked/resolved in the write that published the event must never wake. */
   private onBusEvent(event: BusEvent): void {
     if (this.wakeMode === 'never' || this.disposed) return;
+    if (event.kind === 'notification.acked' || event.kind === 'notification.resolved') {
+      const closedId = textOf(payloadOf(event)['id']);
+      if (closedId !== null && this.wakePolicy.forget(closedId)) this.persistWakeState();
+      return;
+    }
     if (event.kind !== 'notification.created' && event.kind !== 'notification.triaged') return;
     const payload = payloadOf(event);
     const id = textOf(payload['id']);
@@ -701,6 +733,15 @@ export class GruAwareness {
   private seedBacklog(): void {
     if (this.wakeMode === 'never' || this.disposed) return;
     let seeded = false;
+    // Keep every still-open receipt (no 256-ID eviction), but discard
+    // terminal IDs from pre-upgrade state or a missed close event.
+    for (const id of this.wakePolicy.snapshot().woken) {
+      const row = this.ledger.getNotification(id);
+      if (row === null || row.ackedAt !== null || row.resolvedAt !== null) {
+        this.wakePolicy.forget(id);
+        seeded = true;
+      }
+    }
     try {
       // Filter in SQL BEFORE LIMIT in machine-only mode and page every
       // matching row. Unrelated owner/FYI rows may outnumber this page.
@@ -731,7 +772,9 @@ export class GruAwareness {
     this.prunePending();
     if (this.pendingWakeIds.size === 0) return;
     if (this.now() < this.failedRetryAtMs) {
-      this.scheduleWake(this.failedRetryAtMs, 'rate');
+      const gate = this.wakePolicy.scheduleDecision(this.now());
+      this.scheduleWake(Math.max(this.failedRetryAtMs, gate.action === 'defer' ? gate.retryAtMs : 0),
+        gate.action === 'defer' ? gate.reason : 'rate');
       return;
     }
     const decision = this.wakePolicy.scheduleDecision(this.now());
@@ -742,6 +785,11 @@ export class GruAwareness {
     if (this.wakeSink === null) return; // boot binds this later
     this.cancelWakeTimer();
     this.activeWakeIds = [...this.pendingWakeIds].slice(0, this.limits.maxActionNotes);
+    // The interval limits attempted autonomous turns, not only successes.
+    // Persist before calling the sink so a failed spawn and process restart
+    // cannot reset the budget or burn the pending notification IDs.
+    this.wakePolicy.attempted(this.now());
+    this.persistWakeState();
     try {
       this.wakeSink();
     } catch (error) {
@@ -774,7 +822,7 @@ export class GruAwareness {
 
   /** Arm the deferred-wake timer; the earliest pending deadline wins. */
   private scheduleWake(retryAtMs: number, reason: 'rate' | 'quiet'): void {
-    const delay = Math.max(0, retryAtMs - this.now());
+    const delay = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, retryAtMs - this.now()));
     if (this.wakeTimer !== null && this.wakeTimerAt !== null && this.wakeTimerAt <= retryAtMs) {
       return;
     }

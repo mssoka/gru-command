@@ -103,17 +103,17 @@ describe('gru awareness — passive injection', () => {
     expect(rig.awareness.prepare()).toBeNull();
   });
 
-  it('never injects an acknowledged or resolved action-required notification', () => {
+  it('never injects a disposed machine row or acknowledged owner stop', () => {
     const rig = boot();
     const acked = rig.notifications.post({
       kind: 'supervision.breaker',
-      routing: 'action-required',
+      routing: 'needs-owner',
       severity: 'error',
       title: 'Ack me first',
     });
     rig.notifications.ack(acked.id, 'human');
     const live = rig.notifications.post({
-      kind: 'worktree-sweep-paused',
+      kind: 'test.machine',
       routing: 'action-required',
       severity: 'info',
       title: 'Act on me',
@@ -122,8 +122,8 @@ describe('gru awareness — passive injection', () => {
     expect(block?.text).toContain('Act on me');
     expect(block?.text).not.toContain('Ack me first');
     rig.awareness.commit(block!);
-    // An ack AFTER injection must not bring the note back either.
-    rig.notifications.ack(live.id, 'human');
+    // A machine disposition AFTER injection must not bring the note back.
+    rig.api.disposeMachineNotification(live.id, 'Handled');
     expect(rig.awareness.prepare()).toBeNull();
   });
 
@@ -386,6 +386,34 @@ describe('gru awareness — wake policy', () => {
     expect(active.wakeBlocks[0]).toContain(row.id);
   });
 
+  it('migrates unresolved legacy owner incidents before choosing boot wake candidates', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle, { bus: new EventBus() });
+    const owner = api.recordNotification({ id: 'legacy-provider', kind: 'decisions.degraded.credential_missing', routing: 'action-required', severity: 'error', title: 'Credential unavailable' });
+    const machine = api.recordNotification({ id: 'machine', kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Fix review' });
+    const active = boot({ dir, wakeMode: 'action-required' });
+    expect(active.api.getNotification(owner.id)?.routing).toBe('needs-owner');
+    expect(active.woke).toHaveLength(1);
+    expect(active.wakeBlocks[0]).toContain(machine.id);
+    expect(active.wakeBlocks[0]).not.toContain(owner.id);
+  });
+
+  it('reclassifies a late legacy provider candidate before binding the wake sink, even without a notification center', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0 });
+    const owner = api.recordNotification({ id: 'late-owner', kind: 'supervision.provider-wall.a.quota_wall', routing: 'action-required', severity: 'error', title: 'Owner re-arm' });
+    let wakes = 0;
+    awareness.setWakeSink(() => { wakes += 1; });
+    expect(api.getNotification(owner.id)?.routing).toBe('needs-owner');
+    expect(wakes).toBe(0);
+    expect(JSON.parse(readFileSync(awareness.file, 'utf-8')) as { wake: { pending: string[] } }).toMatchObject({ wake: { pending: [] } });
+    awareness.dispose();
+  });
+
   it('does not trust pre-receipt wake claims from the previous state format', () => {
     const dir = tmpDir();
     const passive = boot({ dir });
@@ -530,6 +558,75 @@ describe('gru awareness — wake policy', () => {
     }
   });
 
+  it('restarts without re-waking the oldest of 257 unresolved delivered alerts', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle, { bus: new EventBus() });
+    const ids = Array.from({ length: 257 }, (_, index) => `open-${index}`);
+    for (const id of ids) api.recordNotification({ id, kind: 'test.machine', routing: 'action-required', severity: 'error', title: id });
+    writeFileSync(join(dir, AWARENESS_STATE_NAME), JSON.stringify({
+      coveredThroughSeq: api.latestEventSeq(),
+      wake: { version: 2, woken: ids, lastFiredAt: 0 },
+      digest: { lastDeliveredAt: null },
+    }));
+    const restarted = boot({ dir, wakeMode: 'action-required' });
+    expect(restarted.woke).toHaveLength(0);
+    restarted.api.disposeMachineNotification(ids[0]!, 'Fixed');
+    const state = JSON.parse(readFileSync(restarted.awareness.file, 'utf-8')) as { wake: { woken: string[] } };
+    expect(state.wake.woken).toHaveLength(256);
+    expect(state.wake.woken).not.toContain(ids[0]);
+    expect(boot({ dir, wakeMode: 'action-required' }).woke).toHaveLength(0);
+  });
+
+  it('slices very long wake intervals instead of spinning on Node timer overflow', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00'));
+      const rig = boot({ wakeMode: 'action-required', wakeMinIntervalMs: 30 * 24 * 60 * 60_000, now: () => Date.now() });
+      rig.notifications.post({ kind: 'first', routing: 'action-required', severity: 'error', title: 'First' });
+      rig.notifications.post({ kind: 'second', routing: 'action-required', severity: 'error', title: 'Second' });
+      expect(rig.woke).toHaveLength(1);
+      vi.advanceTimersByTime(2_147_483_647);
+      expect(rig.woke).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(30 * 24 * 60 * 60_000 - 2_147_483_647);
+      expect(rig.woke).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a failed spawn respects the configured five-minute turn interval even after restart', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const center = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 300_000, now: () => Date.now() });
+      let attempts = 0;
+      awareness.setWakeSink(() => { attempts += 1; awareness.noteWakeOutcome(false, 'provider unavailable'); });
+      const row = center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Retry under cap' });
+      expect(attempts).toBe(1);
+      vi.advanceTimersByTime(5_000);
+      expect(attempts).toBe(1);
+      awareness.dispose();
+      const restarted = new GruAwareness({ dir, ledger: api, bus: new EventBus(), wakeMinIntervalMs: 300_000, now: () => Date.now() });
+      restarted.setWakeSink(() => { attempts += 1; restarted.noteWakeOutcome(false, 'still down'); });
+      expect(attempts).toBe(1);
+      vi.advanceTimersByTime(295_000);
+      expect(attempts).toBe(2);
+      const state = JSON.parse(readFileSync(restarted.file, 'utf-8')) as { wake: { woken: string[]; pending: string[] } };
+      expect(state.wake.woken).not.toContain(row.id);
+      expect(state.wake.pending).toContain(row.id);
+      restarted.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('dedupe persists across restart: the same notification id never wakes twice', () => {
     const dir = tmpDir();
     const first = boot({ dir, wakeMode: 'action-required' });
@@ -585,6 +682,42 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       rig.awareness.commit(morning!);
       rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j-staged', payload: { from: 'working', to: 'blocked' } });
       expect(rig.awareness.prepare() ?? { text: '' }).not.toMatchObject({ text: expect.stringContaining('While you were away') });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps overnight wake actions and fires for the owner even when wake commits advance the event cursor', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const center = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0, now: () => Date.now() });
+      api.appendCustomEvent({ kind: 'job.status', payload: { from: 'a', to: 'b' } });
+      awareness.commit(awareness.prepare()!, 'chat');
+      vi.setSystemTime(new Date('2026-09-22T22:00:00Z'));
+      center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Night alert' });
+      api.appendCustomEvent({ kind: 'job.delivered', payload: { agentId: 'm1' } });
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare()!;
+        expect(injection.text).toContain('briefing delivered');
+        expect(injection.text).not.toContain('While you were away');
+        awareness.commit(injection, 'wake');
+        awareness.noteWakeOutcome(true, undefined, injection);
+      });
+      awareness.dispose();
+      vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+      const next = new GruAwareness({ dir, ledger: api, bus: new EventBus(), now: () => Date.now() });
+      const morning = next.prepare();
+      expect(morning?.text).toContain('While you were away (since 2026-09-22T21:00:00.000Z)');
+      expect(morning?.text).toContain('- fires: 1 wake acted on');
+      expect(morning?.text).toContain('- actions: 1 board event');
+      next.commit(morning!, 'chat');
+      expect(next.prepare()).toBeNull();
     } finally {
       vi.useRealTimers();
     }

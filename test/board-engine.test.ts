@@ -402,7 +402,9 @@ describe('board engine — liveness-first rail and job trackers', () => {
     api.recordNotification({ id: 'n-action', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Ack me' });
     api.recordNotification({ id: 'n-fyi', kind: 'test.notice', routing: 'fyi', severity: 'info', title: 'FYI' });
     expect(engine.snapshot().unackedActionRequired).toBe(1);
-    api.ackNotification('n-action', 'web');
+    expect(() => api.ackNotification('n-action', 'web')).toThrow(/require a Gru disposition/);
+    expect(engine.snapshot().unackedActionRequired).toBe(1);
+    api.disposeMachineNotification('n-action', 'Fixed the cause');
     expect(engine.snapshot().unackedActionRequired).toBe(0);
     const resolved = api.recordNotification({ id: 'n-resolved', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Resolved' });
     expect(engine.snapshot().unackedActionRequired).toBe(1);
@@ -433,6 +435,17 @@ describe('board engine — liveness-first rail and job trackers', () => {
     const snap = engine.snapshot();
     expect(snap.unackedNeedsOwner).toBe(1);
     expect(snap.notifications.find((row) => row.id === owner.id)).toMatchObject({ routing: 'needs-owner', ackedAt: null });
+  });
+
+  it('keeps pending machine incidents visible beyond the recent feed while closed rows stay bounded', () => {
+    const { api, engine } = fresh();
+    api.recordNotification({ id: 'old-machine', kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Still needs Gru' });
+    for (let i = 0; i < 35; i += 1) {
+      api.recordNotification({ id: `feed-${i}`, kind: 'noise', routing: 'fyi', severity: 'info', title: `Noise ${i}` });
+    }
+    expect(engine.snapshot().notifications.find((row) => row.id === 'old-machine')).toMatchObject({ routing: 'action-required', resolvedAt: null });
+    api.disposeMachineNotification('old-machine', 'Remediated');
+    expect(engine.snapshot().notifications.some((row) => row.id === 'old-machine')).toBe(false);
   });
 
   it('tracks autonomous wakes from the durable gru.wake events', () => {

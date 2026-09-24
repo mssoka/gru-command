@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { BoardEngine } from '../src/board/engine.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { DEFAULT_DECISIONS_CONFIG } from '../src/config.js';
 import type { DecisionService } from '../src/decisions/types.js';
@@ -134,14 +135,14 @@ describe('notification center — durable log + receipts + acks', () => {
     });
     const row = rig.center.post({
       kind: 'supervision.breaker',
-      routing: 'action-required',
+      routing: 'needs-owner',
       severity: 'error',
       title: 'Crash-loop breaker tripped: agent a2 stopped',
       detail: 'ack to re-arm',
       agentId: 'a2',
     });
-    // Action-required rows fire the chat-surface callback (SPEC ruling 13).
-    expect(rig.actionRequired.map((n) => n.id)).toContain(row.id);
+    // Owner stops never enter the machine callback.
+    expect(rig.actionRequired.map((n) => n.id)).not.toContain(row.id);
     const acked = rig.center.ack(row.id, 'web');
     expect(acked?.ackedAt).not.toBeNull();
     expect(acked?.ackedBy).toBe('web');
@@ -278,15 +279,15 @@ describe('notification center — durable log + receipts + acks', () => {
   it('resolves literal incident prefixes without SQL wildcards and allows a later recurrence', () => {
     const incidents = boot();
     const literal = incidents.center.postIncident({
-      kind: 'decisions.degraded.a_b%', routing: 'action-required', severity: 'error', title: 'literal', dedupe: 'unacked',
+      kind: 'decisions.degraded.a_b%', routing: 'needs-owner', severity: 'error', title: 'literal', dedupe: 'unacked',
     });
     const neighbor = incidents.center.postIncident({
-      kind: 'decisions.degraded.axbX', routing: 'action-required', severity: 'error', title: 'neighbor', dedupe: 'unacked',
+      kind: 'decisions.degraded.axbX', routing: 'needs-owner', severity: 'error', title: 'neighbor', dedupe: 'unacked',
     });
     expect(incidents.center.resolveIncidents('decisions.degraded.a_b%', 'runtime').map((item) => item.id)).toEqual([literal.id]);
     expect(incidents.api.getNotification(neighbor.id)?.resolvedAt).toBeNull();
     const recurrence = incidents.center.postIncident({
-      kind: 'decisions.degraded.a_b%', routing: 'action-required', severity: 'error', title: 'literal again', dedupe: 'unacked',
+      kind: 'decisions.degraded.a_b%', routing: 'needs-owner', severity: 'error', title: 'literal again', dedupe: 'unacked',
     });
     expect(recurrence.id).not.toBe(literal.id);
     expect(recurrence.ackedAt).toBeNull();
@@ -302,19 +303,53 @@ describe('notification center — durable log + receipts + acks', () => {
     expect(resolutionEventsAfter).toHaveLength(resolutionEventsBefore.length);
   });
 
+  it('migrates legacy owner-held rows before deduping active incidents and preserves machine rows', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const legacyKinds = [
+      'decisions.degraded.credential_missing', 'supervision.provider-wall.a.authentication_wall',
+      'supervision.breaker', 'port-squat', 'roll-port-squat', 'worktree-sweep-paused',
+    ];
+    for (const [index, kind] of legacyKinds.entries()) {
+      api.recordNotification({ id: `legacy-${index}`, kind, routing: 'action-required', severity: 'error', title: kind });
+    }
+    // Simulate an old machine Ack; an active owner stop must ring again.
+    db.handle.prepare("UPDATE notifications SET acked_at = '2026-01-01T00:00:00Z', acked_by = 'old' WHERE id = 'legacy-0'").run();
+    api.recordNotification({ id: 'true-machine', kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Machine' });
+    const center = new NotificationCenter({ ledger: api, bus });
+    expect(api.countPendingNeedsOwner()).toBe(legacyKinds.length);
+    expect(api.countPendingActionRequired()).toBe(1);
+    const ownerSnapshot = new BoardEngine({ ledger: api, bus }).snapshot();
+    expect(ownerSnapshot.unackedNeedsOwner).toBe(legacyKinds.length);
+    expect(ownerSnapshot.notifications.filter((row) => row.routing === 'needs-owner')).toHaveLength(legacyKinds.length);
+    for (const [index] of legacyKinds.entries()) {
+      expect(api.getNotification(`legacy-${index}`)).toMatchObject({ routing: 'needs-owner', ackedAt: null, resolvedAt: null });
+    }
+    const reused = center.postIncident({ kind: legacyKinds[0]!, routing: 'needs-owner', severity: 'error', title: 'Same stop', dedupe: 'active' });
+    expect(reused).toMatchObject({ id: 'legacy-0', routing: 'needs-owner' });
+    for (const kind of ['port-squat', 'roll-port-squat', 'supervision.provider-wall.a.quota_wall']) {
+      expect(center.post({ kind, routing: 'action-required', severity: 'error', title: 'Owner remedy' }).routing).toBe('needs-owner');
+    }
+    new NotificationCenter({ ledger: api, bus }); // repeat migration is idempotent
+    expect(api.listEventsAfter(0, { kinds: ['notification.triaged'] }).filter((e) =>
+      (e.payload as { reason?: string }).reason === 'legacy owner-held incident migration')).toHaveLength(legacyKinds.length);
+  });
+
   it('does not duplicate an acknowledged but unresolved active incident', () => {
     const incidents = boot();
     const first = incidents.center.postIncident({
-      kind: 'decisions.degraded.timeout', routing: 'action-required', severity: 'error', title: 'degraded', dedupe: 'active',
+      kind: 'decisions.degraded.timeout', routing: 'needs-owner', severity: 'error', title: 'degraded', dedupe: 'active',
     });
     incidents.center.ack(first.id, 'operator');
     const repeated = incidents.center.postIncident({
-      kind: 'decisions.degraded.timeout', routing: 'action-required', severity: 'error', title: 'degraded again', dedupe: 'active',
+      kind: 'decisions.degraded.timeout', routing: 'needs-owner', severity: 'error', title: 'degraded again', dedupe: 'active',
     });
     expect(repeated.id).toBe(first.id);
     incidents.center.resolveIncidents('decisions.degraded.', 'runtime');
     const recurrence = incidents.center.postIncident({
-      kind: 'decisions.degraded.timeout', routing: 'action-required', severity: 'error', title: 'degraded later', dedupe: 'active',
+      kind: 'decisions.degraded.timeout', routing: 'needs-owner', severity: 'error', title: 'degraded later', dedupe: 'active',
     });
     expect(recurrence.id).not.toBe(first.id);
   });
@@ -368,7 +403,7 @@ describe('notification center — durable log + receipts + acks', () => {
     // A direct action-required post never passes through Jev triage at all:
     // no answer can ack, resolve, downgrade or delete it.
     const incident = rig.center.postIncident({
-      kind: 'supervision.provider-wall.x.authentication_wall',
+      kind: 'test.machine.authentication_wall',
       routing: 'action-required',
       severity: 'error',
       title: 'Agent x stopped: authentication wall',
@@ -416,7 +451,7 @@ describe('notification center — durable log + receipts + acks', () => {
     const rig3 = boot();
     const a = rig3.center.post({ kind: 't.a', routing: 'fyi', severity: 'info', title: 'A' });
     const b = rig3.center.post({ kind: 't.b', routing: 'action-required', severity: 'error', title: 'B' });
-    rig3.center.ack(b.id, 'web');
+    rig3.api.disposeMachineNotification(b.id, 'Done');
     const unacked = rig3.api.listNotifications({ limit: 10, unackedOnly: true });
     expect(unacked.map((n) => n.id)).toEqual([a.id]);
   });

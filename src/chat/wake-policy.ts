@@ -18,8 +18,8 @@ import type { NotifyWakeMode, QuietHours } from '../config.js';
  *     without changing routing ('error' wakes only on error-severity
  *     rows).
  *   - DEDUPE — one wake per notification id; a repeated event for the
- *     same unacked row (or a restart) never burns a second turn. The id
- *     set is bounded and persisted by the awareness layer.
+ *     same unacked row (or a restart) never burns a second turn. IDs of
+ *     open incidents persist; terminal rows are pruned by awareness.
  *   - RATE LIMIT — `wake_min_interval_ms` (default 5 min) bounds
  *     autonomous turns; candidates inside the window coalesce into ONE
  *     trailing wake (the awareness layer batches their ids).
@@ -27,8 +27,8 @@ import type { NotifyWakeMode, QuietHours } from '../config.js';
  *     the window's end. Off by default; local time; windows may wrap
  *     midnight.
  *
- * The policy is pure decision logic plus a tiny bounded state (fired ids +
- * last fire time). Timers, persistence, and the actual turn live in
+ * The policy is pure decision logic plus delivered IDs and the latest
+ * attempted/successful wake time. Timers, persistence, and turns live in
  * GruAwareness / the chat server.
  */
 
@@ -61,12 +61,11 @@ export interface WakePolicyConfig {
 export interface WakePolicyState {
   /** Notification IDs present in a successfully delivered wake turn. */
   readonly woken: readonly string[];
-  /** Epoch ms of the newest fired wake (null before the first one). */
+  /** Epoch ms of the newest successful wake (null before the first one). */
   readonly lastFiredAt: number | null;
+  /** Epoch ms of the newest attempted turn, including failed spawns/prompts. */
+  readonly lastAttemptAt?: number | null;
 }
-
-/** Wake-id memory bound — a long-lived service must not grow forever. */
-export const MAX_WAKE_IDS = 256;
 
 const SEVERITY_RANK: Readonly<Record<WakeSeverity, number>> = { info: 0, error: 1 };
 
@@ -151,11 +150,13 @@ export class WakePolicy {
   private readonly config: WakePolicyConfig;
   private readonly woken: Set<string>;
   private lastFiredAt: number | null;
+  private lastAttemptAt: number | null;
 
   constructor(config: WakePolicyConfig, state: WakePolicyState = { woken: [], lastFiredAt: null }) {
     this.config = config;
     this.woken = new Set(state.woken);
     this.lastFiredAt = state.lastFiredAt;
+    this.lastAttemptAt = state.lastAttemptAt ?? null;
   }
 
   /** Full decision for one candidate at one instant (candidate gate +
@@ -169,8 +170,9 @@ export class WakePolicy {
   /** Rate-limit + quiet-hours decision for a pending batch at one instant
    * (no candidate gates; the batch members already passed them). */
   scheduleDecision(atMs: number): WakeDecision {
-    if (this.config.minIntervalMs > 0 && this.lastFiredAt !== null) {
-      const earliest = this.lastFiredAt + this.config.minIntervalMs;
+    const newestAttempt = Math.max(this.lastFiredAt ?? -Infinity, this.lastAttemptAt ?? -Infinity);
+    if (this.config.minIntervalMs > 0 && Number.isFinite(newestAttempt)) {
+      const earliest = newestAttempt + this.config.minIntervalMs;
       if (atMs < earliest) return { action: 'defer', reason: 'rate', retryAtMs: earliest };
     }
     if (quietHoursActive(this.config.quietHours, atMs)) {
@@ -185,19 +187,23 @@ export class WakePolicy {
     return { action: 'wake' };
   }
 
-  /** Claim ids as woken by an actually-opened turn and stamp the fire time. */
+  /** An attempted turn consumes the autonomous-turn budget even on error. */
+  attempted(atMs: number): void {
+    this.lastAttemptAt = atMs;
+  }
+
+  /** Claim only IDs delivered in a successful turn. */
   fired(ids: readonly string[], atMs: number): void {
     for (const id of ids) this.woken.add(id);
-    // Bounded insertion-order memory: the oldest claim drops first.
-    while (this.woken.size > MAX_WAKE_IDS) {
-      const oldest = this.woken.values().next().value;
-      if (oldest === undefined) break;
-      this.woken.delete(oldest);
-    }
     this.lastFiredAt = atMs;
   }
 
+  /** Terminal rows no longer need dedupe memory; live IDs never age out. */
+  forget(id: string): boolean {
+    return this.woken.delete(id);
+  }
+
   snapshot(): WakePolicyState {
-    return { woken: [...this.woken], lastFiredAt: this.lastFiredAt };
+    return { woken: [...this.woken], lastFiredAt: this.lastFiredAt, lastAttemptAt: this.lastAttemptAt };
   }
 }

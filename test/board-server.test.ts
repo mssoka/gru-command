@@ -459,7 +459,7 @@ describe('board server — empty token config locks every door', () => {
     try {
       const row = notifications.post({
         kind: 'supervision.breaker',
-        routing: 'action-required',
+        routing: 'needs-owner',
         severity: 'error',
         title: 'Crash-loop breaker tripped: agent a1 stopped',
         detail: 'ack to re-arm',
@@ -480,7 +480,12 @@ describe('board server — empty token config locks every door', () => {
       // Missing surface is a 400.
       const bad = await postJson(port, `/api/notifications/${row.id}/shown`, 'ack-token', {});
       expect(bad.status).toBe(400);
-      // Ack fires the hook exactly once, idempotently.
+      const machine = notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Gru repair required' });
+      const illegal = await postJson(port, `/api/notifications/${machine.id}/ack`, 'ack-token', { by: 'web' });
+      expect(illegal.status).toBe(400);
+      expect(api.getNotification(machine.id)).toMatchObject({ ackedAt: null, resolvedAt: null });
+      expect(api.countPendingActionRequired()).toBeGreaterThan(0);
+      // Owner Ack fires the hook exactly once, idempotently.
       const ack1 = await postJson(port, `/api/notifications/${row.id}/ack`, 'ack-token', { by: 'web' });
       expect(ack1.status).toBe(200);
       expect((ack1.body as { ackedAt: string | null }).ackedAt).not.toBeNull();

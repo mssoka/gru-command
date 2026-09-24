@@ -5,6 +5,7 @@ import type { DecisionService } from '../decisions/types.js';
 import { eventDecisionRequest, redactedText } from '../decisions/questions.js';
 import {
   LedgerApi,
+  isOwnerHeldNotificationKind,
   type NotificationRecord,
   type NotificationRouting,
   type NotificationSeverity,
@@ -98,6 +99,9 @@ export class NotificationCenter {
     this.onActionRequired = opts.onActionRequired ?? (() => {});
     this.onNeedsOwner = opts.onNeedsOwner ?? (() => {});
     this.log = opts.log ?? (() => {});
+    // Upgrade persisted owner-held stops BEFORE decision-runtime dedupe and
+    // the awareness backlog bind. The snapshot/bell reads the migrated rows.
+    this.ledger.migrateOwnerHeldNotifications();
     // Derive AFTER the write that published the event: the bus delivers
     // synchronously in write order, so the source row is already durable
     // when the FYI row lands.
@@ -122,6 +126,7 @@ export class NotificationCenter {
     const record = this.ledger.recordNotification({
       id: randomUUID(),
       ...input,
+      routing: isOwnerHeldNotificationKind(input.kind) ? 'needs-owner' : input.routing,
     });
     this.log(input.severity === 'error' ? 'warn' : 'info', 'notification posted', {
       id: record.id,
@@ -150,7 +155,21 @@ export class NotificationCenter {
       input.kind,
       input.dedupe === 'all' ? 'any' : input.dedupe,
     );
-    if (existing !== null) return existing;
+    if (existing !== null) {
+      // An active legacy incident may be returned by kind instead of posted
+      // anew. Never preserve an obsolete machine routing for an owner stop.
+      if (existing.resolvedAt === null &&
+          (input.routing === 'needs-owner' || isOwnerHeldNotificationKind(input.kind)) &&
+          existing.routing === 'action-required') {
+        this.ledger.migrateOwnerHeldNotifications();
+        const migrated = this.ledger.getNotification(existing.id);
+        if (migrated?.routing !== 'needs-owner') {
+          throw new Error(`owner-held incident ${existing.kind} retained machine routing; migrate its kind before reuse`);
+        }
+        return migrated;
+      }
+      return existing;
+    }
     return this.post(input);
   }
 
