@@ -321,7 +321,8 @@ pointer).
   TRANSCRIPTS rail. At ≥1100px the chat pane joins it on the left with
   drag splitters; below that the board is the full page and chat
   overlays. Round rows carry 7 per-lens live chips behind the row's
-  disclosure; the notification center rides the bell (see
+  disclosure; the notification center rides the bell, and the header
+  speaker enables/mutes the `needs-owner` owner chime (see
   [BOARD.md](./BOARD.md)). **Phone:** board-first (SPEC ruling 11) — the
   landing view, with chat one FAB tap away.
 - **Transcripts (E6)** — drawer from the agent rail / transcripts list:
