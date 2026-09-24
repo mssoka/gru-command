@@ -24,6 +24,17 @@
   --alert: #ffb3ba;
   --perkins: #c9b8ff;
 
+  /* E7/chat surface palette: soft fills, notice inks, and the picker
+     hairline. Named here because the light fallbacks used to be baked
+     into components.css and never flipped — dark mode must own every
+     one of these (v6.1 owner ruling 4). */
+  --danger-soft: #ffe3d8;   /* error toast fill */
+  --accent-soft: #ffe9a8;   /* ack button fill */
+  --ink-soft: #7a6a5f;      /* notice dashes */
+  --paper-soft: #fdf3e4;    /* notice fill */
+  --border: #ccc;           /* attach chip/picker hairline */
+  --danger: #c0392b;        /* remove-hover / picker error ink */
+
   /* Attention-band accents (v5): one accent per band, edge + pill only.
      The INK pair is the accent's readable text tone on paper surfaces
      (the edge/pill tones themselves are decorative). */
@@ -74,6 +85,15 @@
   --park: #2a3350;
   --alert: #ff8f9c;
   --perkins: #b7a3ff;
+
+  /* E7/chat surfaces darken with the theme (v6.1 ruling 4): soft fills
+     stay saturated enough to read, notice inks stay legible on paper. */
+  --danger-soft: #4a2730;
+  --accent-soft: #4a4123;
+  --ink-soft: #8b96ac;
+  --paper-soft: #262b1e;
+  --border: var(--line);
+  --danger: var(--alert);
 
   --band-needs-you: #ff8f9c;
   --band-needs-you-ink: #ff9fae;

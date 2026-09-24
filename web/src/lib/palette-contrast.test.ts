@@ -68,6 +68,9 @@ const TEXT_PAIRS: readonly (readonly [string, string])[] = [
   ['accent-text', 'accent'], // primary buttons
   ['band-needs-you-ink', 'card'], // alert KPI numeral
   ['band-needs-you-ink', 'soft'],
+  ['ink', 'accent-soft'], // ack button (v6.1 themed fill)
+  ['ink', 'danger-soft'], // error toast (v6.1 themed fill)
+  ['muted', 'paper-soft'], // notice line (v6.1 themed fill)
 ];
 
 describe('palette contrast (v5)', () => {

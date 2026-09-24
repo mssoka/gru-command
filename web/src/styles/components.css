@@ -2312,7 +2312,7 @@ body {
 }
 
 .toast--error {
-  background: var(--danger-soft, #ffe3d8);
+  background: var(--danger-soft);
 }
 
 .toast__text { flex: 1; min-width: 0; }
@@ -2344,11 +2344,11 @@ body {
   margin: 6px 0;
   padding: 8px 10px;
   border-radius: 10px;
-  border: 2px dashed var(--ink-soft, #7a6a5f);
-  background: var(--paper-soft, #fdf3e4);
+  border: 2px dashed var(--ink-soft);
+  background: var(--paper-soft);
   font-size: 13px;
   font-weight: 600;
-  color: var(--muted, #6b5e56);
+  color: var(--muted);
   overflow-wrap: anywhere;
 }
 
@@ -2359,8 +2359,9 @@ body {
   font-weight: 800;
   padding: 4px 10px;
   border-radius: 999px;
-  border: 2px solid var(--ink, #2b2320);
-  background: var(--accent-soft, #ffe9a8);
+  border: 2px solid var(--ink);
+  background: var(--accent-soft);
+  color: var(--ink);
   cursor: pointer;
 }
 
@@ -2408,8 +2409,8 @@ body {
   max-width: 100%;
   padding: 3px 8px;
   border-radius: 999px;
-  background: var(--card, #fff);
-  border: var(--outline-width, 1px) solid var(--border, #ccc);
+  background: var(--card);
+  border: var(--outline-width, 1px) solid var(--border);
   font-size: 12px;
   font-weight: 600;
   line-height: 1.4;
@@ -2437,7 +2438,7 @@ body {
 }
 
 .attach-chip__remove:hover {
-  color: var(--danger, #c0392b);
+  color: var(--danger);
 }
 
 .attach-chip--busy {
@@ -2464,8 +2465,8 @@ body {
   max-height: min(52vh, 380px);
   display: flex;
   flex-direction: column;
-  background: var(--card, #fff);
-  border: var(--outline-width, 1px) solid var(--border, #ccc);
+  background: var(--card);
+  border: var(--outline-width, 1px) solid var(--border);
   border-radius: 12px;
   box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
   z-index: 30;
@@ -2477,7 +2478,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
-  border-bottom: var(--outline-width, 1px) solid var(--border, #ccc);
+  border-bottom: var(--outline-width, 1px) solid var(--border);
 }
 
 .attach-picker__path {
@@ -2494,7 +2495,7 @@ body {
 
 .attach-picker__error {
   padding: 8px 12px;
-  color: var(--danger, #c0392b);
+  color: var(--danger);
   font-size: 12px;
   font-weight: 600;
 }
@@ -2508,12 +2509,12 @@ body {
 .attach-picker__empty,
 .attach-picker__truncated {
   padding: 10px 12px;
-  color: var(--muted, #888);
+  color: var(--muted);
   font-size: 13px;
 }
 
 .attach-picker__truncated {
-  border-top: 1px dashed var(--border, #ccc);
+  border-top: 1px dashed var(--border);
   font-weight: 600;
 }
 
@@ -2532,7 +2533,7 @@ body {
 }
 
 .attach-row:hover {
-  background: var(--soft, #f3f4f6);
+  background: var(--soft);
 }
 
 .attach-row:disabled {
