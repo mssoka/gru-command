@@ -3,6 +3,7 @@ import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
 import { PiRuntime } from './pi-adapter.js';
 import { ClaudeCodeRuntime } from './claude-adapter.js';
+import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
 import type { AgentHandle, AgentRuntime, RuntimeEvent, SpawnOptions } from './types.js';
 
@@ -122,12 +123,18 @@ export class RuntimeRegistry {
     }
   }
 
-  /** Preflight against the exact adapter instance that will spawn the role.
-   * Neither wrapper nor probe constructs a review session. */
-  async checkReviewModel(role: Role): Promise<void> {
+  /** A request-owned review model proof; no adapter stores it by role. */
+  async prepareReviewModel(role: Role): Promise<ClaudeReviewSnapshot | undefined> {
     const id = this.runtimeIdFor(role);
     this.runtimeFor(id);
-    await this.nativeAdapters.get(id)!.checkReviewModel(role);
+    const native = this.nativeAdapters.get(id)!;
+    if (native instanceof ClaudeCodeRuntime) return native.prepareReviewModel(role);
+    await native.checkReviewModel(role);
+    return undefined;
+  }
+
+  async checkReviewModel(role: Role): Promise<void> {
+    await this.prepareReviewModel(role);
   }
 
   /** The fallback-wrapped adapter for a runtime id (created on first use). */
@@ -167,6 +174,9 @@ export class RuntimeRegistry {
   }
 
   async spawn(role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
+    if (options.reviewModel !== undefined && this.runtimeIdFor(role) !== 'claude-code') {
+      throw new Error('Claude review model snapshot cannot be used with a different runtime');
+    }
     const adapter = this.runtimeFor(this.runtimeIdFor(role));
     // SPEC ruling 16: resolve the model & thinking policy from config
     // (most specific wins) with spawn options overriding, "default"
@@ -188,6 +198,7 @@ export class RuntimeRegistry {
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),
+      ...(options.reviewModel !== undefined ? { reviewModel: options.reviewModel } : {}),
       model: policy.model,
       thinkingLevel,
     });

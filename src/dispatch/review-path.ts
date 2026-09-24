@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import type { ClaudeReviewSnapshot } from '../runtime/claude-review-settings.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 export { buildClaudeCodeAuthArgs } from '../runtime/claude-model.js';
 
@@ -33,6 +34,8 @@ export interface ReviewCapabilityFailure {
 export interface ReviewPreflightResult {
   readonly ok: boolean;
   readonly failures: readonly ReviewCapabilityFailure[];
+  /** In-memory request-owned proof, never included in fallback findings. */
+  readonly reviewModel?: ClaudeReviewSnapshot;
 }
 
 const LEG_REMEDIATION: Readonly<Record<ReviewCapabilityLeg, string>> = {

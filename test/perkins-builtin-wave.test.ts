@@ -524,9 +524,24 @@ describe('WaveRunner built-in Perkins production path', () => {
     const job = ledger.addJob({ id: 'job-workflow-error', repo: 'fixture', title: 'workflow error', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
     settleLane(ledger, job.id);
-    const wave = new WaveRunner({ ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts });
+    const reviewModel = { role: 'perkins' as const, modelRef: 'default', settings: { model: 'native-model' }, authEnv: {} };
+    const seen: { lead: boolean; sameSnapshot: boolean }[] = [];
+    const underlying = makeSpawner(sessions, []);
+    const wave = new WaveRunner({
+      ledger, worktrees: port, reviewArtifactRoot: artifacts,
+      reviewPreflight: async () => ({ ok: true, failures: [], reviewModel }),
+      spawner: (role, options) => {
+        if (options?.reviewLead !== undefined || options?.isolatedReview !== undefined) {
+          seen.push({ lead: options.reviewLead !== undefined, sameSnapshot: options.reviewModel === reviewModel });
+        }
+        return underlying(role, options);
+      },
+    });
     const first = asWave(await wave.runRound({ jobId: job.id }));
     expect(first.round.status).toBe('verdict-posted');
+    expect(seen.some((entry) => entry.lead)).toBe(true);
+    expect(seen.some((entry) => !entry.lead)).toBe(true);
+    expect(seen.every((entry) => entry.sameSnapshot)).toBe(true);
     const priorFile = join(first.artifactDirectory!, 'consolidated.json');
     const prior = JSON.parse((await import('node:fs')).readFileSync(priorFile, 'utf8')) as Record<string, unknown>;
     writeFileSync(priorFile, `${JSON.stringify({ ...prior, findings: [{}] }, null, 2)}\n`, 'utf8');

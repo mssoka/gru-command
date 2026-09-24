@@ -24,8 +24,8 @@ import { LockBusyError, type SessionStore } from '../sessions/store.js';
 import { resolveSpawnCwd } from './cwd.js';
 import { buildClaudeCodeAuthArgs, claudeCliModel, claudeReviewIsolationArgs } from './claude-model.js';
 import {
-  privateClaudeReviewSettings, resolveClaudeReviewConfiguration, userClaudeSettingsFile,
-  type ClaudeReviewConfiguration,
+  claudeReviewProcessEnv, privateClaudeReviewSettings, resolveClaudeReviewConfiguration, userClaudeSettingsFile,
+  type ClaudeReviewSnapshot,
 } from './claude-review-settings.js';
 import { ReviewMcpBridge } from './review-mcp-bridge.js';
 import {
@@ -179,9 +179,6 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   private readonly killGraceMs: number;
   private readonly log: Log;
   private readonly reviewSettingsFile: string;
-  /** A successful preflight pins the permitted model/auth snapshot for its
-   * review lead and lens children until the next preflight. */
-  private readonly reviewConfigurations = new Map<Role, ClaudeReviewConfiguration>();
   /** Long-tool heartbeat cadence override; derived from the supervision
    * window at spawn when unset (construction must not touch config). */
   private readonly toolHeartbeatMs: number | null;
@@ -296,12 +293,9 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     };
   }
 
-  /** Probe the same native CLI model token spawn will send. Successful
-   * authenticated invocation, not pi metadata, proves availability. */
-  async checkReviewModel(role: Role): Promise<void> {
-    // A failed re-probe must never leave a previously approved snapshot in
-    // place for subsequent review spawning.
-    this.reviewConfigurations.delete(role);
+  /** Probe under the request-owned settings given to this review's lead
+   * and lenses. Never store the proof on the shared adapter. */
+  async prepareReviewModel(role: Role): Promise<ClaudeReviewSnapshot> {
     const configuration = resolveClaudeReviewConfiguration(
       resolveSpawnPolicy(this.config, 'claude-code', role).model, this.reviewSettingsFile,
     );
@@ -310,15 +304,19 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     try {
       const probe = spawnSync(this.binary, buildClaudeCodeAuthArgs(configuration.modelRef, settings.file), {
         encoding: 'utf8', timeout: 30_000, input: '', windowsHide: true,
-        env: { ...process.env, ...configuration.settings.env },
+        env: claudeReviewProcessEnv(configuration),
       });
       if (probe.error !== undefined || probe.status !== 0) {
         throw new Error(`claude-code is not configured/authed for the review model: ${String(probe.error ?? probe.stderr ?? `exit ${probe.status}`).trim().slice(0, 300)}`);
       }
-      this.reviewConfigurations.set(role, configuration);
+      return { role, ...configuration };
     } finally {
       settings.dispose();
     }
+  }
+
+  async checkReviewModel(role: Role): Promise<void> {
+    await this.prepareReviewModel(role);
   }
 
   /** Thinking level → --effort value (fail-loud: claude CAN set the level). */
@@ -342,13 +340,17 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     // serves (the dispatch flow's worktree); absent = workspace root.
     const cwd = resolveSpawnCwd(this.config.workspaceRoot, options.cwd);
     const reviewMode = options.reviewLead ?? options.isolatedReview;
-    // A direct review spawn (without a prior preflight) resolves the same
-    // restricted user settings. A preflighted review reuses its frozen copy.
+    if (options.reviewModel !== undefined && reviewMode === undefined) {
+      throw new Error('a review model snapshot requires an isolated review lead or lens');
+    }
+    if (options.reviewModel !== undefined && options.reviewModel.role !== role) {
+      throw new Error(`review model snapshot belongs to ${options.reviewModel.role}, not ${role}`);
+    }
+    // Direct isolated spawns resolve independently; production preflight
+    // supplies the request's snapshot to every lead/lens in that round.
     const configuredReviewModel = resolveSpawnPolicy(this.config, 'claude-code', role).model;
     const reviewConfiguration = reviewMode === undefined ? undefined :
-      this.reviewConfigurations.get(role) ?? resolveClaudeReviewConfiguration(
-        configuredReviewModel, this.reviewSettingsFile,
-      );
+      options.reviewModel ?? resolveClaudeReviewConfiguration(configuredReviewModel, this.reviewSettingsFile);
     if (reviewConfiguration !== undefined && options.model !== undefined &&
         options.model !== configuredReviewModel && options.model !== reviewConfiguration.modelRef) {
       throw new Error(`review model override "${options.model}" differs from the preflighted model; re-run preflight with the selected model`);
@@ -489,7 +491,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           systemPrompt: reviewMode?.systemPrompt ?? roleDef.systemPrompt,
           isolatedReview: reviewMode !== undefined,
           ...(reviewSettings?.file !== undefined ? { reviewSettingsFile: reviewSettings.file } : {}),
-          ...(reviewConfiguration?.settings.env !== undefined ? { reviewAuthEnv: reviewConfiguration.settings.env } : {}),
+          ...(reviewConfiguration !== undefined ? { reviewAuthEnv: claudeReviewProcessEnv(reviewConfiguration) } : {}),
           fileTools,
           nativeTools,
           ...(reviewBridge !== undefined ? {
@@ -560,7 +562,6 @@ export class ClaudeCodeRuntime implements AgentRuntime {
 
   async dispose(): Promise<void> {
     for (const handle of [...this.handles]) await handle.dispose();
-    this.reviewConfigurations.clear();
   }
 }
 
@@ -573,7 +574,7 @@ interface HandleParams {
   readonly systemPrompt: string;
   readonly isolatedReview?: boolean;
   readonly reviewSettingsFile?: string;
-  readonly reviewAuthEnv?: Readonly<Record<string, string>>;
+  readonly reviewAuthEnv?: NodeJS.ProcessEnv;
   readonly fileTools?: readonly string[];
   readonly nativeTools?: readonly string[];
   /** Raw perkins_* names wired through the bridge (capability declaration). */
@@ -1014,7 +1015,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         child = spawn(params.binary, claudeTurnArgs(params, true), {
           cwd: params.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
-          ...(params.reviewAuthEnv !== undefined ? { env: { ...process.env, ...params.reviewAuthEnv } } : {}),
+          ...(params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {}),
         });
       } catch (error) {
         this.onInfraError(error);
@@ -1189,7 +1190,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         child = spawn(params.binary, claudeTurnArgs(params, this.sessionEstablished), {
           cwd: params.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
-          ...(params.reviewAuthEnv !== undefined ? { env: { ...process.env, ...params.reviewAuthEnv } } : {}),
+          ...(params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {}),
         });
       } catch (error) {
         // Synchronous spawn faults (async ENOENT arrives via 'error').

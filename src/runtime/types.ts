@@ -1,4 +1,5 @@
 import type { Role } from '../config.js';
+import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 
 /**
  * Runtime adapter interface (EPICS E2 story 1; SPEC ruling 4).
@@ -142,6 +143,9 @@ export interface SpawnOptions {
    * tools, disables project/global resources, and forbids resume.
    */
   readonly isolatedReview?: IsolatedReviewPolicy;
+  /** Request-owned Claude preflight proof, forwarded only to this round's
+   * lead and lenses. Never persisted or cached by role on the adapter. */
+  readonly reviewModel?: ClaudeReviewSnapshot;
   /** Fresh ambient-free Perkins lead with product-owned orchestration tools. */
   readonly reviewLead?: IsolatedReviewPolicy & {
     readonly nativeTools: readonly NativeAgentTool[];
