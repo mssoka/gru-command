@@ -283,6 +283,11 @@ escalate_at = 4
 # interrupted rounds INCOMPLETE and resumes sessions).
 drain_timeout_ms = 900000
 
+[concurrency]
+# Service-wide resident worker sessions (including idle minions, review
+# leads and lens children). Gru, Silas and Bob do not use this pool.
+max_workers = 4
+
 [review]
 # Review gate policy. true keeps Perkins as the primary gate behind the
 # fail-closed four-leg pre-flight (bundled resource integrity, review-model
@@ -292,6 +297,9 @@ drain_timeout_ms = 900000
 # gate (findings triaged; blockers routed to the implementing minion as fix
 # directives; 0 blockers = clear to merge; merge stays user-held).
 enabled = true
+# Simultaneous lens children inside the global resident pool (not extra slots).
+# Positive integer <= 32; effective concurrency also depends on spare global slots.
+max_concurrent_children = 2
 
 [verify]
 # Verification scheduler: lanes request their project's verify command

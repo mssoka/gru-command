@@ -295,6 +295,16 @@ export const DEFAULT_VERIFY_CONFIG: VerifyConfig = {
   runTimeoutMs: 1_800_000,
 };
 
+export interface ConcurrencyConfig {
+  /** Live non-core worker sessions across all jobs, including idle sessions. */
+  readonly maxWorkers: number;
+}
+
+export const DEFAULT_CONCURRENCY_CONFIG: ConcurrencyConfig = { maxWorkers: 4 };
+export const DEFAULT_REVIEW_CHILDREN = 2;
+/** Explicit finite tool-batch bound; higher settings are rejected at load time. */
+export const MAX_REVIEW_CHILDREN = 32;
+
 /** Review gate policy (Perkins primary; bmad-review fallback gate per the
  * 2026-09-20 amendment, fork-3). */
 export interface ReviewConfig {
@@ -305,6 +315,8 @@ export interface ReviewConfig {
    * pre-flight capability check. A failed pre-flight is always reported, never
    * a silent downgrade. */
   readonly enabled: boolean;
+  /** Maximum simultaneously resident lens children within the global pool. */
+  readonly maxConcurrentChildren: number;
 }
 
 export interface JevConfig {
@@ -359,6 +371,7 @@ export interface GruCommandConfig {
   readonly lessons: LessonsConfig;
   readonly silas: SilasConfig;
   readonly roll: RollConfig;
+  readonly concurrency: ConcurrencyConfig;
   readonly review: ReviewConfig;
   readonly verify: VerifyConfig;
   readonly decisions: DecisionsConfig;
@@ -482,6 +495,7 @@ const TOP_LEVEL_KEYS = [
   'lessons',
   'silas',
   'roll',
+  'concurrency',
   'review',
   'verify',
   'decisions',
@@ -570,7 +584,7 @@ function requireBool(value: unknown, file: string, field: string): boolean {
 }
 
 function requirePositiveInt(value: unknown, file: string, field: string): number {
-  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
     throw new ConfigError(
       `${field} must be a positive integer, got: ${String(value)}`,
       file,
@@ -723,7 +737,8 @@ export function loadConfig(
   let lessons: LessonsConfig = DEFAULT_LESSONS_CONFIG;
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let roll: RollConfig = DEFAULT_ROLL_CONFIG;
-  let review: ReviewConfig = { enabled: true };
+  let concurrency: ConcurrencyConfig = DEFAULT_CONCURRENCY_CONFIG;
+  let review: ReviewConfig = { enabled: true, maxConcurrentChildren: DEFAULT_REVIEW_CHILDREN };
   let verify: VerifyConfig = DEFAULT_VERIFY_CONFIG;
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
   let sourceFile: string | null = null;
@@ -1122,12 +1137,25 @@ export function loadConfig(
             : roll.drainTimeoutMs,
       };
     }
+    if (raw['concurrency'] !== undefined) {
+      const table = requireTable(raw['concurrency'], file, 'concurrency');
+      for (const key of Object.keys(table)) {
+        if (key !== 'max_workers') throw new ConfigError(
+          `unknown key \`${key}\` in [concurrency] (valid key: max_workers)`, file, `concurrency.${key}`,
+        );
+      }
+      concurrency = {
+        maxWorkers: table['max_workers'] !== undefined
+          ? requirePositiveInt(table['max_workers'], file, 'concurrency.max_workers')
+          : concurrency.maxWorkers,
+      };
+    }
     if (raw['review'] !== undefined) {
       const table = requireTable(raw['review'], file, 'review');
       for (const key of Object.keys(table)) {
-        if (!['enabled'].includes(key)) {
+        if (!['enabled', 'max_concurrent_children'].includes(key)) {
           throw new ConfigError(
-            `unknown key \`${key}\` in [review] (valid keys: enabled)`,
+            `unknown key \`${key}\` in [review] (valid keys: enabled, max_concurrent_children)`,
             file,
             `review.${key}`,
           );
@@ -1138,6 +1166,9 @@ export function loadConfig(
           table['enabled'] !== undefined
             ? requireBool(table['enabled'], file, 'review.enabled')
             : review.enabled,
+        maxConcurrentChildren: table['max_concurrent_children'] !== undefined
+          ? requirePositiveInt(table['max_concurrent_children'], file, 'review.max_concurrent_children')
+          : review.maxConcurrentChildren,
       };
     }
     if (raw['verify'] !== undefined) {
@@ -1174,6 +1205,13 @@ export function loadConfig(
     if (raw['decisions'] !== undefined) {
       decisions = readDecisionsConfig(raw['decisions'], file, decisions);
     }
+  }
+
+  if (review.enabled && concurrency.maxWorkers < 2) {
+    throw new ConfigError('Perkins requires concurrency.max_workers >= 2 for a lead and child', file, 'concurrency.max_workers');
+  }
+  if (review.maxConcurrentChildren > MAX_REVIEW_CHILDREN) {
+    throw new ConfigError(`review.max_concurrent_children must be <= ${MAX_REVIEW_CHILDREN} (bounded lens tool batch)`, file, 'review.max_concurrent_children');
   }
 
   for (const [label, dir] of [
@@ -1233,6 +1271,7 @@ export function loadConfig(
     lessons,
     silas,
     roll,
+    concurrency,
     review,
     verify,
     decisions,
