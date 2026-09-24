@@ -7,15 +7,13 @@ import { pickFreePort, startRealService, type RealServiceHandle } from './helper
 /**
  * Wake-on-alert e2e (owner ruling 2026-09-23): an action-required
  * notification must OPEN a Gru turn on the REAL service — no user message,
- * no ping. Gated on GRU_COMMAND_WAKE_E2E=1 because it boots dist/main.js
- * with the offline claude CLI double (run `npm run build` first).
+ * no ping. Always runs in `npm test` after the build, using the offline
+ * claude CLI double; no live model or paid API calls.
  *
  * The whole path is real: config load → ledger → event bus → awareness
  * wake policy → chat session spawn → turn frames on the wire. Only the
  * model binary is the suite's stream-json double.
  */
-
-const GATED = process.env['GRU_COMMAND_WAKE_E2E'] === '1';
 
 interface WireFrame {
   readonly type: string;
@@ -55,7 +53,7 @@ async function authedSocket(service: RealServiceHandle): Promise<{ socket: WebSo
   return { socket, frames };
 }
 
-describe.skipIf(!GATED)('wake-on-alert e2e (GRU_COMMAND_WAKE_E2E=1)', () => {
+describe('wake-on-alert real service (offline)', () => {
   let service: RealServiceHandle | null = null;
   afterAll(async () => {
     await service?.stop();

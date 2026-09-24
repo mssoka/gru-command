@@ -266,6 +266,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   /** Fatal native-writer uncertainty after failed compaction retirement.
    * Only process restart or a confirmed late resume may clear it. */
   let recoveryBlockedReason: string | null = null;
+  // A wake is accepted at the durable turn_start frame, not at the end of
+  // a potentially long-running prompt. Only the owning handle may accept it.
+  let acceptWakeTurn: { source: AgentHandle; accept: () => void } | null = null;
   const pendingNotices: Array<{ readonly text: string; readonly onPersist?: () => void }> = [];
   /** callId → tool name, for tool_end frames (the contract carries names). */
   const openCalls = new Map<string, string>();
@@ -439,6 +442,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       case 'turn_start':
         turnLive = true;
         emitLogged({ type: 'turn', state: 'start' });
+        if (acceptWakeTurn?.source === source) {
+          const { accept } = acceptWakeTurn;
+          acceptWakeTurn = null;
+          accept();
+        }
         broadcastContext();
         break;
       case 'turn_end':
@@ -707,14 +715,18 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
    * steering into a live conversation; settle hooks call back here. */
   function maybeWake(): void {
     if (disposed || !wakeRequested || wakeRunning || options.awareness === undefined) return;
+    if (recoveryBlockedReason !== null) {
+      wakeRequested = false;
+      options.awareness.noteWakeBlocked?.(recoveryBlockedReason);
+      return;
+    }
     if (
       turnLive ||
       frameLog.hasOpenTurn ||
       pendingDeliveries > 0 ||
       spawning !== null ||
       controlBarrier !== null ||
-      runtimeCompactionBarrier !== null ||
-      recoveryBlockedReason !== null
+      runtimeCompactionBarrier !== null
     ) {
       return;
     }
@@ -749,6 +761,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     // locals — the r3 backstop needs to know what this delivery opened).
     let midTurn = false;
     let ownedOpenTurn = false;
+    let acceptedWakeInjection: AwarenessInjection | null = null;
     return (async () => {
       try {
         // Re-enter every current barrier after every await. Provider-native
@@ -761,6 +774,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         }
         if (disposed) return;
         if (recoveryBlockedReason !== null) {
+          if (wake) {
+            options.awareness?.noteWakeBlocked?.(recoveryBlockedReason);
+            return;
+          }
           throw new Error('chat recovery is blocked; restart the service');
         }
         // A wake turn exists only to carry service context: with nothing to
@@ -829,6 +846,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             continue;
           }
           if (recoveryBlockedReason !== null) {
+            if (wake) {
+              options.awareness?.noteWakeBlocked?.(recoveryBlockedReason);
+              return;
+            }
             throw new Error('chat recovery is blocked; restart the service');
           }
           // A supervisor swap can replace the handle while ensureGru awaits.
@@ -877,14 +898,20 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             );
             ownedOpenTurn = true;
             turnLive = true; // optimistic: the turn_start event confirms
-            await gru.prompt(prompt, { owner: CHAT_OWNER });
+            if (wake && injection !== null) {
+              acceptWakeTurn = { source: gru, accept: () => {
+                acceptedWakeInjection = injection;
+                awarenessCommit(injection, 'wake');
+                options.awareness?.noteWakeOutcome?.(true, undefined, injection);
+              } };
+            }
+            try {
+              await gru.prompt(prompt, { owner: CHAT_OWNER });
+            } finally {
+              if (acceptWakeTurn?.source === gru) acceptWakeTurn = null;
+            }
             turnLive = false;
-            // Receipt only after the turn accepted the block: a failed
-            // delivery retries the same context on the next turn.
-            if (injection !== null) awarenessCommit(injection, wake ? 'wake' : 'chat');
-            // The policy-started turn opened — the wake-observability
-            // receipt the self-heal trackers count.
-            if (wake) options.awareness?.noteWakeOutcome?.(true, undefined, injection ?? undefined);
+            if (!wake && injection !== null) awarenessCommit(injection);
           }
         } catch (error) {
           const message = (error as Error).message;
@@ -894,7 +921,8 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             // An autonomous turn failing is an operational degradation, not
             // a user message failure — say so durably; the queued context
             // rides the next user message.
-            options.awareness?.noteWakeOutcome?.(false, message);
+            if (acceptedWakeInjection !== null) options.awareness?.noteWakeTurnFailure?.(message, acceptedWakeInjection);
+            else options.awareness?.noteWakeOutcome?.(false, message);
             emitLogged({
               type: 'notice',
               text:
@@ -922,7 +950,8 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         // only the turn THIS delivery opened, and report a bounded error
         // frame through whichever channel still works.
         log('error', 'chat delivery failed', { error: errorMessage(error) });
-        if (wake) options.awareness?.noteWakeOutcome?.(false, errorMessage(error));
+        if (acceptedWakeInjection !== null) options.awareness?.noteWakeTurnFailure?.(errorMessage(error), acceptedWakeInjection);
+        else if (wake) options.awareness?.noteWakeOutcome?.(false, errorMessage(error));
         if (ownedOpenTurn && turnLive) {
           try {
             settleOpenTurn();

@@ -517,6 +517,31 @@ describe('gru awareness — wake policy', () => {
     }
   });
 
+  it('escalates an undeliverable recovery-blocked wake and retains the machine ID for retry', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const center = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0, now: () => Date.now() });
+      let attempts = 0;
+      awareness.setWakeSink(() => { attempts += 1; awareness.noteWakeBlocked('native writer uncertain'); });
+      const alert = center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Needs a wake' });
+      expect(api.getNotification(`gru-wake-blocked:${alert.id}`)).toMatchObject({ routing: 'needs-owner', ackedAt: null });
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake-failed'] })).toHaveLength(1);
+      expect(JSON.parse(readFileSync(awareness.file, 'utf-8')) as { wake: { pending: string[] } }).toMatchObject({ wake: { pending: [alert.id] } });
+      vi.advanceTimersByTime(5_000);
+      expect(attempts).toBe(2);
+      expect(api.listNotifications({ routing: 'needs-owner' }).filter((row) => row.id === `gru-wake-blocked:${alert.id}`)).toHaveLength(1);
+      awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('persists a delayed owner follow-up for an unresolved delivered wake without re-waking the same ID', () => {
     vi.useFakeTimers();
     try {
@@ -745,7 +770,7 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       const morning = rig.awareness.prepare();
       expect(morning).not.toBeNull();
       expect(morning?.text).toContain('While you were away (since 2026-09-22T');
-      expect(morning?.text).toContain('- fires: 1 wake acted on');
+      expect(morning?.text).toContain('- fires: 1 wake delivered');
       expect(morning?.text).toContain('- actions:');
       expect(morning?.text).toContain('- merges: j-merge');
       expect(morning?.text).toContain('- staged PRs: j-staged');
@@ -786,7 +811,7 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       const next = new GruAwareness({ dir, ledger: api, bus: new EventBus(), now: () => Date.now() });
       const morning = next.prepare();
       expect(morning?.text).toContain('While you were away (since 2026-09-22T21:00:00.000Z)');
-      expect(morning?.text).toContain('- fires: 1 wake acted on');
+      expect(morning?.text).toContain('- fires: 1 wake delivered');
       expect(morning?.text).toContain('- actions: 1 board event');
       next.commit(morning!, 'chat');
       api.disposeMachineNotification(alert.id, 'Night alert fixed');

@@ -117,19 +117,22 @@ computed per-snapshot.
 - **FYI** — informational; derived automatically from board-worthy
   events (job blocked, agent errored, lens failed, round verdict) and
   posted directly by the supervisor (hang detected, restart engaged).
-- **Action-required** — needs a human decision; posted by the supervisor
-  on breaker trips. These also surface **in chat** as notice lines
-  (`⚠ Action required: …`) so the single Gru window carries them.
+- **Action-required** — machine attention for Gru. Eligible rows open a
+  rate-limited Gru wake turn; Gru diagnoses and dispositions them. They appear
+  in NEEDS GRU, not the owner bell. Breakers requiring owner re-arm and other
+  owner-only decisions use **needs-owner**, not action-required.
 
 **Ack ids — nothing shown is unproven.** Every notification carries a
 stable id (the ack contract). When a client displays one — a toast, the
 bell panel, a browser notification — it posts
 `POST /api/notifications/:id/shown {surface}` and the row records the
 receipt (`shown_at`, one per surface, idempotent). An **ack**
-(`POST /api/notifications/:id/ack`) is the human clearance: it clears the
-row (and, for a breaker row, re-arms supervision). The bell badge counts
-unacked needs-owner errors; the NEEDS GRU machine queue is tracked
-separately and never rings the bell; ack buttons live on every row.
+(`POST /api/notifications/:id/ack`) is the owner clearance for owner/FYI
+rows. The bell badge counts all unseen needs-owner rows, including info;
+the NEEDS GRU machine queue is tracked separately and never rings the bell.
+Only owner/FYI rows expose Ack or Mark seen controls; Gru dispositions
+machine rows through the notification disposition endpoint. A blocked wake
+creates a durable needs-owner stop asking for manual service recovery.
 
 **Surfaces:** in-app toasts (always — the floor), the browser
 Notification API (permission requested at pairing; toasts carry the load

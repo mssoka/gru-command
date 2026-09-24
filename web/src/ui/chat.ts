@@ -64,6 +64,7 @@ interface PendingResetView {
   readonly streamText: string;
   readonly streamOpen: boolean;
   readonly activeTool: HTMLElement | null;
+  readonly activeToolBand: ServiceBand | null;
   readonly serviceBand: ServiceBand | null;
   readonly unread: number;
 }
@@ -108,6 +109,7 @@ export class ChatView {
    * lazily on the first text delta, so tool-only turns leave no stub. */
   private streamOpen = false;
   private activeTool: HTMLElement | null = null;
+  private activeToolBand: ServiceBand | null = null;
   /** One collapsed band per run of consecutive service frames (tool lines
    * + product notices) — owner clean-chat clause 2026-09-23: the chat
    * reads as conversation, machinery one tap away. A conversation frame
@@ -319,6 +321,7 @@ export class ChatView {
       streamText: this.streamText,
       streamOpen: this.streamOpen,
       activeTool: this.activeTool,
+      activeToolBand: this.activeToolBand,
       serviceBand: this.serviceBand,
       unread: this.unread,
     };
@@ -331,6 +334,7 @@ export class ChatView {
     this.streamText = '';
     this.streamOpen = false;
     this.activeTool = null;
+    this.activeToolBand = null;
     this.serviceBand = null;
     this.unread = 0;
     this.cancelSettleScroll();
@@ -353,6 +357,7 @@ export class ChatView {
     this.streamText = prior.streamText;
     this.streamOpen = prior.streamOpen;
     this.activeTool = prior.activeTool;
+    this.activeToolBand = prior.activeToolBand;
     this.serviceBand = prior.serviceBand;
     this.unread = prior.unread;
     this.renderUnread();
@@ -708,6 +713,7 @@ export class ChatView {
     this.streamText = '';
     this.streamOpen = false;
     this.activeTool = null;
+    this.activeToolBand = null;
     this.serviceBand = null;
     this.cancelSettleScroll();
     this.stickToBottom = true;
@@ -789,12 +795,17 @@ export class ChatView {
       case 'tool': {
         if (frame.state === 'start') {
           this.activeTool?.remove();
+          if (this.activeToolBand !== null) {
+            this.activeToolBand.running = false;
+            this.renderServiceHead(this.activeToolBand);
+          }
           const line = el('div', 'tool-line tool-line--active', `⚙️ ${frame.name}`);
           line.dataset.toolName = frame.name;
           const band = this.appendServiceLine(line);
           band.running = true;
           this.renderServiceHead(band);
           this.activeTool = line;
+          this.activeToolBand = band;
         } else {
           // Only settle the line whose name matches; a stray end for an
           // unknown tool renders standalone instead of cross-labeling.
@@ -802,9 +813,10 @@ export class ChatView {
             this.activeTool.classList.remove('tool-line--active');
             this.activeTool.textContent = `⚙️ ${frame.name} · done`;
             this.activeTool = null;
-            if (this.serviceBand !== null) {
-              this.serviceBand.running = false;
-              this.renderServiceHead(this.serviceBand);
+            if (this.activeToolBand !== null) {
+              this.activeToolBand.running = false;
+              this.renderServiceHead(this.activeToolBand);
+              this.activeToolBand = null;
             }
           } else if (this.activeTool === null) {
             this.appendServiceLine(el('div', 'tool-line', `⚙️ ${frame.name} · done`));

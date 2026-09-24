@@ -90,10 +90,13 @@ export interface AwarenessInjection {
 export interface GruAwarenessPort {
   prepare(): AwarenessInjection | null;
   commit(injection: AwarenessInjection, source?: 'chat' | 'wake'): void;
-  /** Wake outcome receipt: only a successful turn with the delivered
-   * injection may claim its visible IDs. Failed wakes remain pending and
-   * record `gru.wake-failed` for operational diagnosis. */
+  /** Accepted turn_start claims visible IDs and arms unresolved attention;
+   * pre-acceptance failures remain pending for retry. */
   noteWakeOutcome?(ok: boolean, detail?: string, injection?: AwarenessInjection): void;
+  /** A turn which accepted its block but failed later is not a new wake. */
+  noteWakeTurnFailure?(detail: string, injection: AwarenessInjection): void;
+  /** Native writer recovery is unsafe: surface a durable owner stop and retry. */
+  noteWakeBlocked?(reason: string): void;
 }
 
 export type GruAwarenessLedger = Pick<
@@ -591,8 +594,8 @@ export class GruAwareness {
     }
   }
 
-  /** Wake receipt: `gru.wake` records only successful delivery. A failed
-   * attempt leaves IDs pending and appends a durable `gru.wake-failed`. */
+  /** Wake receipt at accepted turn_start: `gru.wake` records delivery, not
+   * action or resolution. A pre-acceptance failure retains pending IDs. */
   noteWakeOutcome(ok: boolean, detail?: string, injection?: AwarenessInjection): void {
     if (this.disposed) return;
     const active = this.activeWakeIds ?? [];
@@ -623,18 +626,63 @@ export class GruAwareness {
       return;
     }
     const reason = detail !== undefined && detail !== '' ? detail : 'no alert context delivered';
-    this.log('error', 'gru wake turn failed', { error: reason, notification_ids: active });
-    try {
-      this.ledger.appendCustomEvent({ kind: 'gru.wake-failed', payload: { error: reason, notification_ids: active } });
-    } catch (error) {
-      this.log('error', 'gru wake failure event failed', { error: String(error) });
-    }
+    this.recordWakeFailure(reason, active);
     this.persistWakeState();
     // A failed spawn/prompt must not burn the id. Bound retries so a broken
     // runtime cannot storm when the configured minimum interval is zero.
     if (this.pendingWakeIds.size > 0) {
       this.failedRetryAtMs = this.now() + 5_000;
       this.flushPendingWakes();
+    }
+  }
+
+  /** The block already reached Gru: retain its receipt and deadline even
+   * when the remainder of the turn fails. Never re-wake the same ID. */
+  noteWakeTurnFailure(detail: string, injection: AwarenessInjection): void {
+    if (this.disposed) return;
+    this.recordWakeFailure(detail, injection.notificationIds ?? []);
+  }
+
+  /** Unsafe recovery cannot open a Gru turn. Preserve the pending batch,
+   * record the failure and put an explicit needs-owner stop on the bell. */
+  noteWakeBlocked(reason: string): void {
+    if (this.disposed) return;
+    const active = this.activeWakeIds ?? [];
+    for (const id of active) {
+      const row = this.ledger.getNotification(id);
+      if (row?.routing !== 'action-required' || row.ackedAt !== null || row.resolvedAt !== null) continue;
+      const escalationId = `gru-wake-blocked:${id}`;
+      try {
+        const existing = this.ledger.getNotification(escalationId);
+        if (existing !== null && (existing.kind !== `gru.wake-blocked.${id}` || existing.routing !== 'needs-owner')) {
+          throw new Error(`Gru blocked-wake ID ${escalationId} is already assigned to another notification`);
+        }
+        if (existing === null) {
+          const posted = this.ledger.recordNotification({
+            id: escalationId,
+            kind: `gru.wake-blocked.${id}`,
+            routing: 'needs-owner',
+            severity: 'error',
+            title: `Gru wake blocked: ${row.title}`,
+            detail: `Notification ${id} could not reach Gru (${reason}). Restart the service to recover chat safely; the machine alert remains pending for retry.`,
+          });
+          try { this.onFollowUpPosted(posted); } catch (error) {
+            this.log('error', 'gru blocked-wake chat notice failed', { notification_id: id, error: String(error) });
+          }
+        }
+      } catch (error) {
+        this.log('error', 'gru blocked-wake owner escalation failed; retrying', { notification_id: id, error: String(error) });
+      }
+    }
+    this.noteWakeOutcome(false, `chat recovery blocked: ${reason}`);
+  }
+
+  private recordWakeFailure(reason: string, ids: readonly string[]): void {
+    this.log('error', 'gru wake turn failed', { error: reason, notification_ids: ids });
+    try {
+      this.ledger.appendCustomEvent({ kind: 'gru.wake-failed', payload: { error: reason, notification_ids: ids } });
+    } catch (error) {
+      this.log('error', 'gru wake failure event failed', { error: String(error) });
     }
   }
 
@@ -681,7 +729,7 @@ export class GruAwareness {
   }
 
   /** "While you were away" digest (owner ruling 2026-09-23): the first
-   * delivered block after a quiet gap summarises wakes (fires), actions,
+   * delivered block after a quiet gap summarises delivered wakes (fires), actions,
    * merges, and staged PRs from the ledger — the morning catch-up. Derived
    * from the ledger alone; null when the gap was short or nothing landed. */
   private morningDigest(): readonly string[] | null {
@@ -696,7 +744,7 @@ export class GruAwareness {
       if (count > 0) push(`- ${label}: ${count} ${noun}${count === 1 ? '' : 's'}`);
     };
     const wakes = this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: ['gru.wake'], limit: 100 }).length;
-    bounded('fires', wakes, 'wake acted on');
+    bounded('fires', wakes, 'wake delivered');
     const actions = this.ledger.listEventsAfter(this.lastOwnerSeq, {
       kinds: [...MORNING_ACTION_KINDS],
       limit: 100,

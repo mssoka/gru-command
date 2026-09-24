@@ -415,13 +415,20 @@ other turn (chat renders its machinery as a collapsed service band). A
 wake requested mid-turn becomes one trailing turn; a wake with nothing to
 inject neither spawns a session nor burns a model turn; a failed wake is a
 durable notice, never a message-delivery error. Notification IDs stay
-pending independently of the event cursor until the prompt accepts a block
-containing those IDs; spawn/prompt failures retry after at least five
+pending independently of the event cursor until a durable turn-start frame
+confirms the prompt accepted a block containing those IDs. This receipt
+arms the unresolved-attention deadline immediately, even if Gru's turn is
+still running or hung. A later turn failure is logged separately without
+re-waking an already delivered ID; pre-acceptance spawn/prompt failures
+retry after at least five
 seconds AND the configured wake interval. Long intervals use safe timer
 slices rather than Node's overflowing timeout. Only the IDs actually present in the bounded block count as woken; overflow
 travels in later, rate-limited turns. The backlog sink binds only after
 listen, chat and board route attachment, and the foreign-listener check:
 Gru's in-turn disposition API is available before any boot wake opens.
+If unsafe chat recovery prevents delivery, a `gru.wake-failed` receipt and
+an idempotent `needs-owner` stop ask for manual service recovery; the machine
+IDs remain pending for rate-limited retry.
 
 **Mandate — act (tier-2).** A wake is machine attention meant to be acted
 on in-turn: Gru diagnoses the incident and takes one substantive step per
@@ -462,15 +469,15 @@ owner stops.
 
 **Morning digest.** The first delivered block after `morning_digest_gap_ms`
 (default 8 h; 0 disables) carries a ledger-derived "while you were away"
-digest — fires (wakes acted on), actions, merges, staged PRs — so the
+digest — fires (wake turns delivered), actions, merges, staged PRs — so the
 chief catches up without the owner relaying anything. The persisted owner
 watermark is independent of the wake/event cursor: overnight wake turns
 never consume actions or fires from the next owner-directed digest.
 
-**Observability.** Every successful wake is logged, appended to the ledger as a
-`gru.wake` event (a failed turn adds `gru.wake-failed`), and counted by the
-board's wake tracker — the self-heal/CURE trackers can count wakes acted
-on straight from the record.
+**Observability.** Every delivered wake is logged, appended to the ledger as a
+`gru.wake` event (a failed attempt or later failed turn adds `gru.wake-failed`),
+and counted by the board's wake tracker. Delivery is not an action taken;
+actual resolutions and job events must be counted separately.
 
 **Silas mandate split** (same lane). Mechanical reactions move to Silas's
 ops driver — re-arm review rounds after clean aborts, pattern respins for

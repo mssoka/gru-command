@@ -198,6 +198,18 @@ describe('service band — consecutive service frames collapse', () => {
     expect(head?.textContent).not.toContain('· running');
   });
 
+  it('settles the tool-owning band when a reply split it from the current band', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(tool('start', 'long_task'), true);
+    const head = log().querySelector<HTMLElement>('.service-band__head');
+    expect(head?.textContent).toContain('· running');
+    view.addFrame(delta('Working on it.'), true);
+    view.addFrame(tool('end', 'long_task'), true);
+    expect(head?.textContent).not.toContain('· running');
+    expect(log().querySelector('.service-band .tool-line')?.textContent).toContain('· done');
+  });
+
   it('a notice-only run (no tools) still bands', () => {
     const view = new ChatView(() => true);
     view.reset();
