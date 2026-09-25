@@ -11,6 +11,7 @@ import {
   dedupeVerifiedFindings,
   parseFindingsSubmission,
   parseFindingsWithRecovery,
+  safeFixPath,
   verdictForFindings,
   type CanonicalReviewVerdict,
   type ChildFailureKind,
@@ -267,6 +268,7 @@ interface SubmissionValidationContext {
   readonly candidates: ReadonlyMap<string, ChildCandidate>;
   readonly prior: readonly VerifiedFinding[];
   readonly priorTargetSha: string | null;
+  readonly priorBaseSha: string | null;
   readonly expected: ReadonlySet<string>;
   readonly validCoverage: ReadonlySet<string>;
   readonly readChunks: ReadonlySet<string>;
@@ -415,8 +417,32 @@ function parseAuditEntry(
     return { index, audit: null };
   }
   const audit = entry as Record<string, unknown>;
-  if (Object.keys(audit).sort().join('\0') !== [...PRIOR_AUDIT_KEYS].sort().join('\0')) {
+  const expectedKeys = audit.fix_location === undefined ? PRIOR_AUDIT_KEYS : [...PRIOR_AUDIT_KEYS, 'fix_location'];
+  if (Object.keys(audit).sort().join('\0') !== [...expectedKeys].sort().join('\0')) {
     errors.push({ subject, rule: 'prior-audit-schema', message: `${subject} keys do not match the required schema` });
+  }
+  let fixLocation: FixAuditResult['fix_location'];
+  if (audit.fix_location !== undefined) {
+    const location = audit.fix_location;
+    if (typeof location !== 'object' || location === null || Array.isArray(location) ||
+        Object.keys(location).sort().join('\0') !== 'change\0path') {
+      errors.push({ subject, rule: 'prior-audit-fix-location', message: `${subject} fix_location requires exactly path and change` });
+    } else {
+      const value = location as Record<string, unknown>;
+      if (typeof value.path !== 'string' || !safeFixPath(value.path)) {
+        errors.push({ subject, rule: 'prior-audit-fix-location', message: `${subject} fix_location path must be a bounded safe relative file path` });
+      } else if (value.change !== 'added' && value.change !== 'removed') {
+        errors.push({ subject, rule: 'prior-audit-fix-location', message: `${subject} fix_location change must be added or removed` });
+      } else {
+        fixLocation = { path: value.path, change: value.change };
+      }
+    }
+    if (audit.status !== 'fixed') {
+      errors.push({ subject, rule: 'prior-audit-fix-location', message: `${subject} fix_location is supported only for fixed status` });
+    }
+    if (typeof audit.evidence !== 'string' || /[\r\n]/u.test(audit.evidence) || audit.evidence === 'N/A' || audit.evidence.startsWith('PATH ABSENT: ')) {
+      errors.push({ subject, rule: 'prior-audit-fix-location', message: `${subject} fix_location requires a single changed-line evidence payload` });
+    }
   }
   let priorIndex: number | null = null;
   if (
@@ -437,7 +463,7 @@ function parseAuditEntry(
   if (priorIndex === null || status === null || evidence === null || reason === null) {
     return { index, audit: null };
   }
-  return { index, audit: { prior_index: priorIndex, status, evidence, reason } };
+  return { index, audit: { prior_index: priorIndex, status, evidence, reason, ...(fixLocation === undefined ? {} : { fix_location: fixLocation }) } };
 }
 
 /** One bounded, line-addressable rejection listing every violation at once. */
@@ -505,10 +531,22 @@ interface ProofCache {
   readonly pathDiffs: Map<string, string>;
   readonly pathAbsent: Map<string, boolean>;
   readonly anywhere: Map<string, boolean>;
+  readonly changeStatus: Map<string, readonly DeltaPath[]>;
+  readonly changedLines: Map<string, ReadonlySet<string>>;
+  readonly canonicalPatches: Map<string, string>;
+  readonly sourceMatches: Map<string, readonly { readonly path: string; readonly lines: ReadonlySet<string> }[]>;
+}
+
+interface DeltaPath {
+  readonly oldPath: string | null;
+  readonly newPath: string | null;
 }
 
 function newProofCache(): ProofCache {
-  return { blobContains: new Map(), pathDiffs: new Map(), pathAbsent: new Map(), anywhere: new Map() };
+  return {
+    blobContains: new Map(), pathDiffs: new Map(), pathAbsent: new Map(), anywhere: new Map(),
+    changeStatus: new Map(), changedLines: new Map(), canonicalPatches: new Map(), sourceMatches: new Map(),
+  };
 }
 
 function frozenBlobContains(review: FrozenReview, path: string, evidence: string, cache?: ProofCache): boolean {
@@ -613,24 +651,302 @@ function fixedAuditEvidence(
   return diff.split('\n').some((line) => line.startsWith('-') && !line.startsWith('---') && line.slice(1) === evidence);
 }
 
+const MAX_INDIRECT_PROOF_BYTES = 8 * 1024 * 1024;
+// The MCP bridge serializes NativeAgentToolResult again inside an RPC frame.
+// Leave 64 KiB for transport metadata/IDs and protocol growth, not just the
+// inner JSON delivered directly by Pi's native-tool adapter.
+const MAX_PRIOR_DELTA_WIRE_BYTES = 1024 * 1024 - 64 * 1024;
+
+/** Read bounded Git bytes at two fixed commits, never from the checkout. A
+ * failed query must fail proof, not devolve into a weaker current-tree check. */
+function proofGitBytes(review: FrozenReview, args: readonly string[]): Buffer {
+  const raw = execFileSync('git', ['-C', review.manifest.repoPath, ...args], {
+    maxBuffer: MAX_INDIRECT_PROOF_BYTES, timeout: GIT_PROOF_TIMEOUT_MS,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (raw.byteLength > MAX_INDIRECT_PROOF_BYTES) throw new Error('frozen delta exceeds the proof byte bound');
+  return raw;
+}
+
+function proofGit(review: FrozenReview, args: readonly string[]): string {
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(proofGitBytes(review, args));
+}
+
+/** Git attributes can label a binary blob as text (or text as binary). The
+ * objects, not the diff driver's classification, decide whether proof exists. */
+function canonicalTextBlob(review: FrozenReview, sha: string, path: string): string | null {
+  const bytes = proofGitBytes(review, ['cat-file', 'blob', `${sha}:${path}`]);
+  if (bytes.some((byte) => byte === 0 || byte === 127 || (byte < 32 && byte !== 9 && byte !== 10 && byte !== 13))) return null;
+  try {
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** Rename detection runs BEFORE path selection. Filtering first reclassifies
+ * an unchanged renamed file as a wholly added file. */
+function deltaPaths(review: FrozenReview, priorSha: string, cache: ProofCache): readonly DeltaPath[] {
+  const cached = cache.changeStatus.get(priorSha);
+  if (cached !== undefined) return cached;
+  const fields = proofGit(review, [
+    'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--find-renames',
+    '--name-status', '-z', priorSha, review.manifest.targetSha, '--',
+  ]).split('\0');
+  if (fields.at(-1) !== '') throw new Error('frozen delta path metadata is incomplete');
+  fields.pop();
+  const paths: DeltaPath[] = [];
+  for (let i = 0; i < fields.length;) {
+    const status = fields[i++];
+    if (status === undefined) throw new Error('frozen delta path metadata is incomplete');
+    if (/^R[0-9]{1,3}$/u.test(status)) {
+      const oldPath = fields[i++];
+      const newPath = fields[i++];
+      if (!oldPath || !newPath) throw new Error('frozen rename metadata is incomplete');
+      paths.push({ oldPath, newPath });
+    } else if (status === 'A' || status === 'D' || status === 'M') {
+      const path = fields[i++];
+      if (!path) throw new Error('frozen delta path metadata is incomplete');
+      paths.push({ oldPath: status === 'A' ? null : path, newPath: status === 'D' ? null : path });
+    } else {
+      // Unknown types are never usable as indirect proof, but other files in
+      // the delta must not prevent a genuine changed caller being inspected.
+      const path = fields[i++];
+      if (!path) throw new Error('frozen delta path metadata is incomplete');
+    }
+  }
+  cache.changeStatus.set(priorSha, paths);
+  return paths;
+}
+
+function regularFrozenBlobId(review: FrozenReview, sha: string, path: string): string | null {
+  const entries = proofGit(review, ['ls-tree', '-z', sha, '--', `:(literal)${path}`]);
+  const match = /^(?:100644|100755) blob ([0-9a-f]{40})\t/u.exec(entries);
+  return match !== null && entries.slice(entries.indexOf('\t') + 1) === `${path}\0` ? match[1]! : null;
+}
+
+/** Do not mix another file's hunks into a renamed caller's path pair. */
+function isolatedDeltaPath(paths: readonly DeltaPath[], path: string, change?: 'added' | 'removed'): DeltaPath {
+  const matches = paths.filter((entry) => change === 'added' ? entry.newPath === path :
+    change === 'removed' ? entry.oldPath === path : entry.oldPath === path || entry.newPath === path);
+  if (matches.length !== 1) throw new Error(`fix_location ${path} has no unique changed path in the frozen prior-target delta`);
+  const entry = matches[0]!;
+  if (paths.some((other) => other !== entry && [entry.oldPath, entry.newPath].some((candidate) =>
+    candidate !== null && (other.oldPath === candidate || other.newPath === candidate)))) {
+    throw new Error(`fix_location ${path} overlaps another changed path in the frozen delta`);
+  }
+  return entry;
+}
+
+/** The same path-paired zero-context patch is supplied to the lead and checked
+ * at submission. Both blobs must be regular canonical UTF-8 text regardless
+ * of `.gitattributes`, diff drivers or textconv; --text then defeats -diff. */
+function canonicalPathPatch(review: FrozenReview, priorSha: string, entry: DeltaPath, cache: ProofCache): string | null {
+  const key = `${priorSha}\0${entry.oldPath ?? ''}\0${entry.newPath ?? ''}`;
+  const cached = cache.canonicalPatches.get(key);
+  if (cached !== undefined) return cached;
+  const oldBlob = entry.oldPath === null ? null : regularFrozenBlobId(review, priorSha, entry.oldPath);
+  const newBlob = entry.newPath === null ? null : regularFrozenBlobId(review, review.manifest.targetSha, entry.newPath);
+  if (entry.oldPath !== null && oldBlob === null) throw new Error(`frozen delta path ${entry.oldPath} is not a regular blob`);
+  if (entry.newPath !== null && newBlob === null) throw new Error(`frozen delta path ${entry.newPath} is not a regular blob`);
+  const oldText = entry.oldPath === null ? null : canonicalTextBlob(review, priorSha, entry.oldPath);
+  const newText = entry.newPath === null ? null : canonicalTextBlob(review, review.manifest.targetSha, entry.newPath);
+  if (entry.oldPath !== null && oldText === null) return null;
+  if (entry.newPath !== null && newText === null) return null;
+  const diffFlags = ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--text', '--unified=0'];
+  let patch: string;
+  if (entry.oldPath === null || entry.newPath === null) {
+    // A pathspec for a deleted file also selects a newly created directory's
+    // descendants. Build the one-sided patch from exactly the selected blob.
+    const text = (oldText ?? newText)!;
+    const lines = text === '' ? [] : text.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
+    const prefix = entry.oldPath === null ? '+' : '-';
+    const path = (entry.oldPath ?? entry.newPath)!;
+    patch = [`diff --git a/${path} b/${path}`,
+      `--- ${entry.oldPath === null ? '/dev/null' : `a/${path}`}`,
+      `+++ ${entry.newPath === null ? '/dev/null' : `b/${path}`}`,
+      `@@ -${entry.oldPath === null ? '0,0' : `1,${lines.length}`} +${entry.newPath === null ? '0,0' : `1,${lines.length}`} @@`,
+      ...lines.flatMap((line) => line.endsWith('\n') ? [prefix + line.slice(0, -1)] : [prefix + line, '\\ No newline at end of file']),
+    ].join('\n') + '\n';
+    if (Buffer.byteLength(patch, 'utf8') > MAX_INDIRECT_PROOF_BYTES) throw new Error('frozen one-sided patch exceeds the proof byte bound');
+  } else if (entry.oldPath !== entry.newPath) {
+    // A literal pathspec for oldPath also selects oldPath/descendants after a
+    // file-to-directory replacement. Diff the exact frozen blobs of this
+    // detected rename, never another file's hunks from the selected paths.
+    if (oldBlob === null || newBlob === null) throw new Error('frozen rename has no matching regular blob pair');
+    patch = proofGit(review, [...diffFlags, oldBlob, newBlob]);
+  } else {
+    const paths = [...new Set([entry.oldPath, entry.newPath].filter((path): path is string => path !== null))]
+      .map((path) => `:(literal)${path}`);
+    patch = proofGit(review, [...diffFlags, '--find-renames', priorSha, review.manifest.targetSha, '--', ...paths]);
+  }
+  cache.canonicalPatches.set(key, patch);
+  return patch;
+}
+
+/** Match plausible *whole-file* reuse of a changed source to this A blob.
+ * An incidental shared line in another changed file is not attribution. An
+ * identical blob, or two shared nonempty lines covering a majority of the
+ * smaller file, provides bounded evidence of a possible moved/edited caller.
+ * Binary and grossly disproportionate files cannot be canonical whole-file
+ * sources for this caller. Partial copies are outside this proof contract. */
+function changedSourcesForAddedPath(
+  review: FrozenReview, priorSha: string, entry: DeltaPath, cache: ProofCache,
+): readonly { readonly path: string; readonly lines: ReadonlySet<string> }[] {
+  const path = entry.newPath!;
+  const key = `${priorSha}\0${path}`;
+  const cached = cache.sourceMatches.get(key);
+  if (cached !== undefined) return cached;
+  const newBlob = regularFrozenBlobId(review, review.manifest.targetSha, path);
+  const newText = canonicalTextBlob(review, review.manifest.targetSha, path);
+  if (newBlob === null || newText === null) throw new Error(`fix_location ${path} has no canonical added caller blob`);
+  const targetBytes = Buffer.byteLength(newText, 'utf8');
+  const targetLines = new Set(newText.split(/\r?\n/u).filter((line) => line !== ''));
+  // A rename's old side is a frozen prior blob exactly like an M/D old
+  // side; excluding R entries would let a renamed file's unchanged prior
+  // line be re-quoted as newly authored by a sibling added caller.
+  const paths = deltaPaths(review, priorSha, cache).filter((other) => other.oldPath !== null &&
+    other.oldPath !== path && other.newPath !== path);
+  if (paths.length > 256) throw new Error(`fix_location ${path} exceeds the changed-source path bound`);
+  let inspectedBytes = 0;
+  const matches: { path: string; lines: ReadonlySet<string> }[] = [];
+  for (const candidate of paths) {
+    const sourcePath = candidate.oldPath!;
+    const oldBlob = regularFrozenBlobId(review, priorSha, sourcePath);
+    if (oldBlob === null) continue;
+    // Object size is metadata; never read a large unrelated source to see if
+    // it happens to contain a common string. Exact OID equality is decisive.
+    if (oldBlob === newBlob) {
+      matches.push({ path: sourcePath, lines: targetLines });
+      continue;
+    }
+    const sizeText = proofGit(review, ['cat-file', '-s', oldBlob]).trim();
+    const size = Number(sizeText);
+    if (!Number.isSafeInteger(size) || size < 0) throw new Error(`fix_location ${path} has invalid frozen source size`);
+    if (size > MAX_INDIRECT_PROOF_BYTES || size > targetBytes * 4 || targetBytes > size * 4) continue;
+    inspectedBytes += size;
+    if (inspectedBytes > MAX_INDIRECT_PROOF_BYTES) throw new Error(`fix_location ${path} exceeds the changed-source byte bound`);
+    const oldText = canonicalTextBlob(review, priorSha, sourcePath);
+    if (oldText === null) continue;
+    const oldLines = new Set(oldText.split(/\r?\n/u).filter((line) => line !== ''));
+    const shared = [...targetLines].filter((line) => oldLines.has(line)).length;
+    if (shared >= 2 && shared * 2 >= Math.min(targetLines.size, oldLines.size)) {
+      matches.push({ path: sourcePath, lines: oldLines });
+    }
+  }
+  cache.sourceMatches.set(key, matches);
+  return matches;
+}
+
+/** Null means located; otherwise return a specific, bounded rejection. */
+function priorCitedEvidence(
+  review: FrozenReview, finding: VerifiedFinding,
+  priorSha: string, priorBaseSha: string | null,
+): boolean {
+  const path = findingPath(finding);
+  if (path === null) return false;
+  const targetId = regularFrozenBlobId(review, priorSha, path);
+  if (targetId !== null && proofGit(review, ['cat-file', 'blob', targetId]).includes(finding.evidence)) return true;
+  if (priorBaseSha === null) return false; // Legacy blob citations work without a historical base.
+  const baseId = regularFrozenBlobId(review, priorBaseSha, path);
+  if (baseId === null) return false;
+  if (targetId === null) {
+    // Bind a deleted citation to its exact old blob, not a pathspec that
+    // also selects descendants installed at the same path.
+    const oldText = canonicalTextBlob(review, priorBaseSha, path);
+    return oldText !== null && oldText.includes(finding.evidence);
+  }
+  const patch = proofGit(review, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--text', '--unified=3', baseId, targetId]);
+  // Accepted citations can be multi-line, either with +/- prefixes or as
+  // blob text. Only inspect data inside a hunk of this exact blob pair: no
+  // headers or unrelated path can satisfy a historical citation.
+  let prefixed: string[] = [];
+  let payload: string[] = [];
+  let inHunk = false;
+  const matches = () => prefixed.join('\n').includes(finding.evidence) || payload.join('\n').includes(finding.evidence);
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('@@ ')) {
+      if (matches()) return true;
+      prefixed = [];
+      payload = [];
+      inHunk = true;
+    } else if (inHunk && /^[ +-]/u.test(line)) {
+      prefixed.push(line);
+      payload.push(line.slice(1));
+    }
+  }
+  return matches();
+}
+
+function indirectFixEvidence(
+  review: FrozenReview, finding: VerifiedFinding, audit: FixAuditResult,
+  priorSha: string | null, priorBaseSha: string | null, cache: ProofCache,
+): string | null {
+  const location = audit.fix_location!;
+  const citedPath = findingPath(finding);
+  if (citedPath === null || location.path === citedPath) return 'fix_location must name a changed file distinct from the original cited path';
+  if (priorSha === null) return 'fix_location requires a frozen prior target revision';
+  try {
+    if (!priorCitedEvidence(review, finding, priorSha, priorBaseSha)) {
+      return `fix_location ${location.path} prior accepted frozen file/hunk does not contain the original cited finding`;
+    }
+    const entry = isolatedDeltaPath(deltaPaths(review, priorSha, cache), location.path, location.change);
+    const sources = entry.oldPath === null && entry.newPath !== null ? changedSourcesForAddedPath(review, priorSha, entry, cache) : [];
+    if (sources.length > 1) return `fix_location ${location.path} has ambiguous changed source blobs`;
+    if (sources[0]?.lines.has(audit.evidence) === true) {
+      return `fix_location ${location.path} evidence is an unchanged line in changed source ${sources[0].path}`;
+    }
+    const patch = canonicalPathPatch(review, priorSha, entry, cache);
+    if (patch === null) return `fix_location ${location.path} has a binary caller blob, not canonical text proof`;
+    const key = `${priorSha}\0${entry.oldPath ?? ''}\0${entry.newPath ?? ''}\0${location.change}`;
+    let lines = cache.changedLines.get(key);
+    if (lines === undefined) {
+      const changed = new Set<string>();
+      let inHunk = false;
+      const patchLines = patch.split('\n');
+      for (let index = 0; index < patchLines.length; index += 1) {
+        const line = patchLines[index]!;
+        if (line.startsWith('diff --git ')) inHunk = false;
+        else if (/^@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@/u.test(line)) inHunk = true;
+        else if (inHunk && line.startsWith(location.change === 'added' ? '+' : '-')) {
+          const text = line.slice(1);
+          // Only strip a CR that terminated a CRLF *blob* line. Git's
+          // no-newline marker distinguishes an EOF bare CR from CRLF.
+          const bareCr = patchLines[index + 1] === '\\ No newline at end of file';
+          changed.add(text.endsWith('\r') && !bareCr ? text.slice(0, -1) : text);
+        }
+      }
+      lines = changed;
+      cache.changedLines.set(key, lines);
+    }
+    return lines.has(audit.evidence) ? null : `fix_location ${location.path} evidence is not an actual ${location.change} changed hunk line in the frozen prior-target delta`;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('fix_location ')) return error.message;
+    return `fix_location ${location.path} frozen delta is unavailable or exceeds bounds at the prior target revision`;
+  }
+}
+
 interface PriorReview {
   readonly findings: readonly VerifiedFinding[];
   readonly targetSha: string | null;
+  readonly baseSha: string | null;
 }
 
 function loadPriorReview(file: string | undefined): PriorReview {
-  if (file === undefined) return { findings: [], targetSha: null };
+  if (file === undefined) return { findings: [], targetSha: null, baseSha: null };
   const size = statSync(file).size;
   if (size > 8 * 1024 * 1024) throw new Error('prior consolidated review exceeds 8 MiB');
   const bytes = readFileSync(file);
   if (bytes.byteLength !== size || bytes.byteLength > 8 * 1024 * 1024) {
     throw new Error('prior consolidated review changed while bounded bytes were read');
   }
-  const parsed = JSON.parse(bytes.toString('utf8')) as { schemaVersion?: unknown; findings?: unknown; frozen?: { targetSha?: unknown } };
+  const parsed = JSON.parse(bytes.toString('utf8')) as { schemaVersion?: unknown; findings?: unknown; frozen?: { targetSha?: unknown; diffBaseSha?: unknown } };
   if (
     parsed.schemaVersion !== 2 ||
     !Array.isArray(parsed.findings) || parsed.findings.length > 10_000 ||
-    typeof parsed.frozen?.targetSha !== 'string' || !/^[0-9a-f]{40}$/u.test(parsed.frozen.targetSha)
+    typeof parsed.frozen?.targetSha !== 'string' || !/^[0-9a-f]{40}$/u.test(parsed.frozen.targetSha) ||
+    (parsed.frozen.diffBaseSha !== undefined &&
+      (typeof parsed.frozen.diffBaseSha !== 'string' || !/^[0-9a-f]{40}$/u.test(parsed.frozen.diffBaseSha)))
   ) {
     throw new Error('prior consolidated review has an invalid findings array');
   }
@@ -656,7 +972,8 @@ function loadPriorReview(file: string | undefined): PriorReview {
     ) throw new Error(`prior finding ${index} failed the durable schema`);
     return finding as VerifiedFinding;
   });
-  return { findings, targetSha: parsed.frozen.targetSha };
+  return { findings, targetSha: parsed.frozen.targetSha,
+    baseSha: typeof parsed.frozen.diffBaseSha === 'string' ? parsed.frozen.diffBaseSha : null };
 }
 
 function renderTemplateOnce(template: string, values: Readonly<Record<string, string>>): string {
@@ -1366,6 +1683,40 @@ export class PerkinsHybridReview {
       },
     };
 
+    const priorDeltaTool: NativeAgentTool | null = priorReview.targetSha === null ? null : {
+      name: 'perkins_read_prior_delta',
+      description: 'List changed paths between the prior frozen target and this frozen target with {}, or read one path-paired canonical text hunk with {"path":"relative/file"}. Read-only; binary callers cannot supply proof.',
+      inputSchema: {
+        type: 'object', additionalProperties: false,
+        properties: { path: { type: 'string', minLength: 1, maxLength: 500 } },
+      },
+      execute: async (raw, signal) => {
+        if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
+        const value = record(raw, 'perkins_read_prior_delta input');
+        exactKeys(value, value.path === undefined ? [] : ['path'], 'perkins_read_prior_delta input');
+        const priorTargetSha = priorReview.targetSha!;
+        const changes = deltaPaths(review, priorTargetSha, proofCache);
+        const selection = value.path;
+        let payload: string;
+        if (selection === undefined) {
+          payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, changes });
+        } else {
+          if (typeof selection !== 'string' || !safeFixPath(selection)) throw new Error('prior delta path must be a bounded safe relative file path');
+          const entry = isolatedDeltaPath(changes, selection);
+          const patch = canonicalPathPatch(review, priorTargetSha, entry, proofCache);
+          if (patch === null) throw new Error(`prior delta path ${selection} has a binary caller blob`);
+          payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, ...entry, diff: patch });
+        }
+        const details = { priorTargetSha, targetSha: review.manifest.targetSha };
+        const frame = JSON.stringify({ id: 'x'.repeat(256), ok: true, result: { text: payload, details } }) + '\n';
+        if (Buffer.byteLength(payload, 'utf8') > MAX_TRANSPORT_CHUNK_BYTES ||
+            Buffer.byteLength(frame, 'utf8') > MAX_PRIOR_DELTA_WIRE_BYTES) {
+          throw new Error('prior delta response exceeds the bounded serialized tool transport; select a smaller caller path');
+        }
+        return { text: payload, details };
+      },
+    };
+
     const validationContext: SubmissionValidationContext = {
       review,
       movementRef: input.movementRef,
@@ -1373,6 +1724,7 @@ export class PerkinsHybridReview {
       candidates,
       prior,
       priorTargetSha: priorReview.targetSha,
+      priorBaseSha: priorReview.baseSha,
       expected,
       validCoverage,
       readChunks,
@@ -1380,13 +1732,30 @@ export class PerkinsHybridReview {
       lenses,
     };
 
+    const priorAuditItemSchema = {
+      type: 'object', additionalProperties: false,
+      required: [...PRIOR_AUDIT_KEYS],
+      properties: {
+        prior_index: { type: 'integer', minimum: 0 },
+        status: { type: 'string', enum: ['fixed', 'still-present'] },
+        evidence: { type: 'string', minLength: 1, maxLength: 4_000 },
+        reason: { type: 'string', minLength: 1, maxLength: 1_000 },
+        fix_location: {
+          type: 'object', additionalProperties: false, required: ['path', 'change'],
+          properties: {
+            path: { type: 'string', minLength: 1, maxLength: 500 },
+            change: { type: 'string', enum: ['added', 'removed'] },
+          },
+        },
+      },
+    };
     const fullSubmissionSchema = {
       type: 'object', additionalProperties: false,
       required: ['canonical_verdict', 'candidate_decisions', 'prior_audit', 'report_markdown'],
       properties: {
         canonical_verdict: { type: 'string', enum: ['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'] },
         candidate_decisions: { type: 'array', maxItems: MAX_TOTAL_CANDIDATES, items: { type: 'object' } },
-        prior_audit: { type: 'array', maxItems: 10_000, items: { type: 'object' } },
+        prior_audit: { type: 'array', maxItems: 10_000, items: priorAuditItemSchema },
         report_markdown: { type: 'string', minLength: 1, maxLength: PERKINS_REPORT_MAX_BYTES },
       },
     };
@@ -1397,7 +1766,7 @@ export class PerkinsHybridReview {
         mode: { type: 'string', enum: ['delta'] },
         canonical_verdict: { type: 'string', enum: ['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'] },
         candidate_decisions: { type: 'array', maxItems: MAX_TOTAL_CANDIDATES, items: { type: 'object' } },
-        prior_audit: { type: 'array', maxItems: 10_000, items: { type: 'object' } },
+        prior_audit: { type: 'array', maxItems: 10_000, items: priorAuditItemSchema },
         report_markdown: { type: 'string', minLength: 1, maxLength: PERKINS_REPORT_MAX_BYTES },
       },
     };
@@ -1587,15 +1956,17 @@ export class PerkinsHybridReview {
       },
     };
 
+    const leadTools = [chunkTool, ...(priorDeltaTool === null ? [] : [priorDeltaTool]), runTool, artifactTool, recordTool, preflightTool, submitTool];
     const systemPrompt = [
       this.policy.portableContract.leadWorkflow,
       '',
       '--- PRODUCT-NATIVE TOOL CONTRACT ---',
       'Use perkins_read_chunk to read frozen diff chunks; use perkins_run_lenses to start and receive tracked lens children; use perkins_store_artifact only for optional lead notes; use perkins_record_decision to validate and record each candidate decision as you verify it; use perkins_preflight_submission to validate a candidate terminal submission (full or delta) without spending a terminal attempt; finish by calling perkins_submit_review.',
+      ...(priorReview.targetSha === null ? [] : ['On a re-review use perkins_read_prior_delta to list prior-target changes and read canonical caller hunks, including removed files.']),
       'A terminal submission is either a full payload or {"mode":"delta", ...} carrying only changed fields; recorded decisions and the last rejected submission are applied host-side, then the merged whole is validated with the same exhaustive rules. An accepted delta is indistinguishable from an accepted full submission of the same content.',
       'Lens children never inherit these tools. You, the lead, must independently inspect and decide every returned candidate. Do not write implementation files.',
     ].join('\n');
-    const initialPrompt = this.leadPrompt(review, lenses, prior);
+    const initialPrompt = this.leadPrompt(review, lenses, prior, priorReview.targetSha);
     let lead: AgentHandle | null = null;
     let unsubscribe = (): void => {};
     let turns = 0;
@@ -1605,7 +1976,7 @@ export class PerkinsHybridReview {
         reviewLead: {
           systemPrompt,
           tools: ['read', 'grep', 'find', 'ls'],
-          nativeTools: [chunkTool, runTool, artifactTool, recordTool, preflightTool, submitTool],
+          nativeTools: leadTools,
         },
       }), LEAD_SPAWN_TIMEOUT_MS, [input.signal, roundAbort.signal]);
       registerIsolatedHandle(lead, 'lead');
@@ -1629,7 +2000,7 @@ export class PerkinsHybridReview {
         preflightCalls: preflightAttempts,
         decisionRecords: recordAttempts,
         deltaSubmissions,
-        nativeTools: [chunkTool.name, runTool.name, artifactTool.name, recordTool.name, preflightTool.name, submitTool.name],
+        nativeTools: leadTools.map((tool) => tool.name),
       });
       return accepted;
     } finally {
@@ -1957,15 +2328,18 @@ export class PerkinsHybridReview {
         const finding = context.prior[audit.prior_index]!;
         const speculativeNa = finding.verification.disposition === 'unverifiable-speculative' && audit.evidence === 'N/A';
         const path = findingPath(finding);
-        const located = speculativeNa || (
-          path !== null && (
+        const indirectIssue = audit.fix_location === undefined ? null :
+          indirectFixEvidence(review, finding, audit, context.priorTargetSha, context.priorBaseSha, proofCache);
+        const located = speculativeNa || (indirectIssue === null && (
+          audit.fix_location !== undefined || (path !== null && (
             audit.status === 'still-present'
               ? frozenBlobContains(review, path, audit.evidence, proofCache)
               : fixedAuditEvidence(review, finding, audit.evidence, context.priorTargetSha, proofCache)
-          )
-        );
+          ))
+        ));
         if (!located) {
-          push(`prior audit ${audit.prior_index}`, 'prior-audit-evidence', `prior audit ${audit.prior_index} evidence is not locatable at the finding's cited frozen file/hunk`);
+          push(`prior audit ${audit.prior_index}`, 'prior-audit-evidence', indirectIssue ??
+            `prior audit ${audit.prior_index} evidence is not locatable at the finding's cited frozen file/hunk`);
           continue;
         }
         if (!locatedAudits.has(audit.prior_index)) locatedAudits.set(audit.prior_index, audit);
@@ -2108,6 +2482,10 @@ export class PerkinsHybridReview {
         if (!report.includes(audit.status) || !report.includes(auditPrefix)) {
           push(`prior audit ${audit.prior_index}`, 'report-prior-proof', `lead report omits prior audit proof: ${audit.prior_index}`);
         }
+        if (audit.fix_location !== undefined &&
+            (!report.includes(audit.fix_location.path) || !report.includes(context.prior[audit.prior_index]!.location))) {
+          push(`prior audit ${audit.prior_index}`, 'report-prior-proof', `lead report must identify both the original citation and fix_location ${audit.fix_location.path}`);
+        }
       }
     }
     if (errors.length > 0) return { ok: false, submission: parsed.submission, errors };
@@ -2131,13 +2509,14 @@ export class PerkinsHybridReview {
     };
   }
 
-  private leadPrompt(review: FrozenReview, lenses: readonly PerkinsLens[], prior: readonly VerifiedFinding[]): string {
+  private leadPrompt(review: FrozenReview, lenses: readonly PerkinsLens[], prior: readonly VerifiedFinding[], priorTargetSha: string | null): string {
     const coverage = review.chunks.flatMap((chunk) => lenses.map((lens) => ({ lens, chunk: chunk.id, files: chunk.files })));
     return [
       'Conduct the complete Perkins review as the lead. You own scheduling, investigation, candidate verification, prior-finding audit, synthesis and report authorship. The host owns safety and terminal proof validation.',
       '',
       `Frozen target SHA: ${review.manifest.targetSha}`,
       `Frozen diff base SHA: ${review.manifest.diffBaseSha}`,
+      ...(priorTargetSha === null ? [] : [`Frozen prior target SHA: ${priorTargetSha}`]),
       `Spec mode: ${review.manifest.specMode}`,
       '',
       '--- FROZEN SPECIFICATION / CONTEXT ---',
@@ -2156,6 +2535,8 @@ export class PerkinsHybridReview {
       'Record each decision with perkins_record_decision as you verify it: it validates the decision immediately with the same exhaustive rules and keeps clean decisions in the round record, so the final submission can carry only what is still missing.',
       'A rejected candidate still requires a concise reason. confirmed evidence must be one contiguous verbatim current-tree substring. N/A claims are speculative and cannot remain blockers.',
       'Pairing rules are enforced at cited locations: a rejected candidate needs contradictory evidence locatable at its cited file/hunk, confirmed candidate evidence must be locatable at its cited file/hunk, and your verification evidence must be locatable in the frozen review.',
+      ...(priorTargetSha === null ? [] : ['Call perkins_read_prior_delta with {} to list changed paths and {"path":"relative/caller.ts"} to read a selected frozen prior-target hunk; deleted callers are absent from the current tree but their removed lines remain available here. The tool is read-only, bounded, and rejects binary callers.']),
+      'For a fixed prior finding whose cited file remains unchanged, optionally give fix_location: {path: "relative/changed-caller.ts", change: "added" or "removed"} with evidence equal to ONE actual added or removed line in the prior-target-to-frozen-target delta. For CRLF blob lines omit only the CR terminator from evidence; retain other whitespace and never include an embedded CR or LF. The location must differ from the original citation; explain in reason why this caller change fixes that finding and name both paths in the report. A path alone, unchanged diff context, a rename with no changed hunk, or another revision is not proof. Old cited deletion/PATH ABSENT proofs remain valid without fix_location.',
       'Before the terminal submission, call perkins_preflight_submission with the exact candidate submission (full, or {"mode":"delta", ...} to amend the rejection record after a failed attempt). It spends no terminal attempt, accepts nothing, and returns every violation in one response; fix them all and preflight again until it reports no errors, then submit once.',
       'After a rejected terminal submission, resubmit a delta: {"mode":"delta", "candidate_decisions": [only the changed/added decisions], ...changed report fields}. The host applies it over the rejected submission and re-validates the merged whole with the same rules. A delta is still a real terminal attempt.',
       'Write a complete Markdown report containing `**Verdict: ...**` and every retained finding title, then call perkins_submit_review. Never claim completion from missing/failed runs.',
