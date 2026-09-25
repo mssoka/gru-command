@@ -1695,6 +1695,34 @@ describe('Perkins hybrid lead engine', () => {
     expect(h.fake.preflightResults[0]?.text).toContain('"ok":false');
   });
 
+  const renamedSourceSibling = (evidence: string) => {
+    const prior = 'const unchanged = true;\nconst selected = nativeRef;\n';
+    const h = indirectFixHarness({
+      afterPrior: (repo) => {
+        repo.git(['mv', 'src/caller.ts', 'src/renamed.ts']);
+        repo.commitFile('src/sibling.ts', `${prior}const novel = genuineChange;\n`);
+      },
+      audit: { evidence, fix_location: { path: 'src/sibling.ts', change: 'added' } },
+    });
+    const status = h.repo.git(['diff', '--no-ext-diff', '--no-textconv', '--find-renames', '--name-status', 'HEAD^', 'HEAD']);
+    expect(status).toMatch(/^R[0-9]+\tsrc\/caller\.ts\tsrc\/renamed\.ts$/mu);
+    expect(status).toMatch(/^A\tsrc\/sibling\.ts$/mu);
+    return h;
+  };
+
+  it('rejects an unchanged line reused from a renamed source in a separate added caller', async () => {
+    const h = renamedSourceSibling('const selected = nativeRef;');
+    await expect(h.run()).rejects.toThrow(/unchanged line in changed source src\/caller\.ts/u);
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":false');
+    expect(existsSync(join(h.frozen.directory, 'consolidated.json'))).toBe(false);
+  });
+
+  it('accepts a genuinely novel line in a caller beside a renamed source', async () => {
+    const h = renamedSourceSibling('const novel = genuineChange;');
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
+  });
+
   it('does not let an unrelated binary changed source poison a new caller', async () => {
     const h = indirectFixHarness({
       priorCallerBytes: Buffer.from([0, 0xc3, 0x28]),

@@ -802,8 +802,11 @@ function changedSourcesForAddedPath(
   if (newBlob === null || newText === null) throw new Error(`fix_location ${path} has no canonical added caller blob`);
   const targetBytes = Buffer.byteLength(newText, 'utf8');
   const targetLines = new Set(newText.split(/\r?\n/u).filter((line) => line !== ''));
+  // A rename's old side is a frozen prior blob exactly like an M/D old
+  // side; excluding R entries would let a renamed file's unchanged prior
+  // line be re-quoted as newly authored by a sibling added caller.
   const paths = deltaPaths(review, priorSha, cache).filter((other) => other.oldPath !== null &&
-    other.oldPath !== path && (other.newPath === null || other.newPath === other.oldPath));
+    other.oldPath !== path && other.newPath !== path);
   if (paths.length > 256) throw new Error(`fix_location ${path} exceeds the changed-source path bound`);
   let inspectedBytes = 0;
   const matches: { path: string; lines: ReadonlySet<string> }[] = [];
