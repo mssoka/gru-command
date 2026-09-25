@@ -105,6 +105,15 @@ describe('wake-on-alert real service (offline)', () => {
     db.close();
     const port = await pickFreePort();
     const foreign = createServer();
+    // Track squatter connections: the boot loop's /health probe can leave
+    // a lingering socket, and net.Server.close() never settles while one
+    // is open — destroy them before close or the test hangs (net.Server
+    // has no closeAllConnections; that is an http.Server method).
+    const squatterSockets = new Set<import('node:net').Socket>();
+    foreign.on('connection', (socket) => {
+      squatterSockets.add(socket);
+      socket.once('close', () => squatterSockets.delete(socket));
+    });
     await new Promise<void>((resolve, reject) => {
       foreign.once('error', reject);
       foreign.listen(port, '127.0.0.1', resolve);
@@ -119,6 +128,7 @@ describe('wake-on-alert real service (offline)', () => {
         expect(history.getNotification('seeded-refused-alert')).toMatchObject({ ackedAt: null, resolvedAt: null });
       } finally { reread.close(); }
     } finally {
+      for (const socket of squatterSockets) socket.destroy();
       await new Promise<void>((resolve) => foreign.close(() => resolve()));
       rmSync(home, { recursive: true, force: true });
       rmSync(workspace, { recursive: true, force: true });
