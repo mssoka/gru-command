@@ -1,11 +1,11 @@
 # Board — the live dashboard (E6)
 
-The board is the product's flagship window: repo-grouped job cards with
-state chips, review rounds with per-lens live chips, the agent rail
-(the standing crew), the notification center, and per-agent transcript
-views — all fed live from the ledger through the event bus. The browser
-is the only required window; the board is read-only by design (dispatch
-authorship UI lands with E8).
+The board is the product's flagship window: repo-grouped job rows with
+state chips, review rounds with per-lens live chips, the crew rail
+(gru, silas, minions, and lens children), the notification center, and
+per-agent transcript views — all fed live from the ledger through the
+event bus. The browser is the only required window; the board is
+read-only by design (dispatch authorship UI lands with E8).
 
 Data flow:
 
@@ -73,23 +73,24 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 
 ## The UI (`web/`)
 
-- **Cockpit (v6):** the estate is full-width. The sticky **command bar**
+- **Cockpit (v6.1):** the estate is full-width. The sticky **command bar**
   carries the brand + `ONE GRU · ONE WINDOW`, the monospace ticker
-  (`MODE` · `RADAR` · top review round), the Chat/Board lens toggle,
-  bell, theme and settings; below it the sticky **status chip rail**
-  relocates the v4 health row globally (DEPLOY → REVIEWS → SILAS →
-  ALERTS → VERIFY → CURE → TRACKERS) with the job/PR/lane KPI counts
-  folded into TRACKERS as `data-kpi` count groups. At ≥1100px it is
-  three panes — chat (~30%, collapsible, resizable) | board | agents
-  rail — with 4px drag splitters (sizes persist per breakpoint;
-  double-click resets). At 900–1099px the board + rail hold the page and
-  chat overlays via the Gru FAB (right drawer, dimmed board behind);
-  below 900px the rail stacks under the board and the FAB opens a bottom
-  sheet. The nav tabs stay as focus switches: `💬 Chat` opens/focuses
-  chat, `🗺️ Board` dismisses the overlay and marks the board.
+  (`MODE` · `RADAR` · top review round), the notification bell, theme and
+  settings — no lens toggle: chat is always docked on desktop and the FAB
+  owns mobile chat. Below it the sticky **status chip rail** relocates the
+  v4 health row globally (DEPLOY → REVIEWS → SILAS → ALERTS → VERIFY →
+  CURE → TRACKERS); the TRACKERS chip renders the KPI counts as labeled
+  fields (`HEISTS 17 · working 2 · in review 2 · …`, every number a
+  `data-kpi` span tied to the same `boardKpis` derivation the v4 strip
+  used). At ≥1100px it is three panes — chat (~30%, collapsible,
+  resizable) | board | crew rail — with 4px drag splitters (sizes persist
+  per breakpoint; double-click resets). At 900–1099px the board + rail
+  hold the page and chat overlays via the Gru FAB (right drawer, dimmed
+  board behind); below 900px the rail stacks under the board and the FAB
+  opens a bottom sheet.
 - **Dashboard:** **attention bands** — NEEDS YOU → IN FLIGHT → SETTLED →
   COLD, recency inside each band — rendered as full-width **dense rows**
-  (line 1: dot + title + status chip; line 2: repo + branch + lane/agent
+  (line 1: dot + title + status chip; line 2: repo + branch + heist/minion
   ages + PR link), with sticky band headers carrying counts and hairline
   dividers. Failing rows (blocked/error, aborted round, errored lenses
   without a verdict) are tinted with a left alert accent. NEEDS YOU is
@@ -99,7 +100,7 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   a row to disclose lane + rounds (v3 collapse, persisted per job).
   Round rows carry per-lens chips (`○ pending` gray · `◉ live` yellow ·
   `✓ done` green · `✕ error` red) behind a click.
-- **Agent rail:** AGENTS (n) / TRANSCRIPTS tabs above dense rows — a
+- **Crew rail:** CREW (n) / TRANSCRIPTS tabs above dense rows — a
   status dot + name + short hash, a `role · state` subline (with turn
   age and supervision marks), and a right-aligned state chip; error rows
   carry the alert accent; disposed rows collapse behind a dashed `+N
@@ -147,5 +148,5 @@ names anywhere, ever.
   against an in-test WS/HTTP server (auth, snapshot push, fatal, noise
   tolerance, stop).
 - E2E (`web/e2e/`): mock board render + transcript drawer; real-service
-  board (API-seeded jobs, live push, agent rail, real transcript open +
+  board (API-seeded jobs, live push, crew rail, real transcript open +
   search, 401 doors, phone board-first).

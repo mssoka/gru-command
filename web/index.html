@@ -7,7 +7,9 @@
   <meta name="description" content="One window into the whole operation — chat with the single Gru.">
 </head>
 <body>
-  <!-- Global command bar (v6): brand + ticker + Chat/Board lenses + bell. -->
+  <!-- Global command bar (v6.1): logo + tagline | ticker | bell + theme/settings.
+       No lens toggle — chat is always docked on desktop and the FAB owns
+       mobile chat; the board is always on the page. -->
   <header class="command-bar" id="command-bar">
     <div class="command-bar__brand">
       <span class="command-bar__logo" aria-hidden="true">🧠</span>
@@ -17,10 +19,6 @@
       </span>
     </div>
     <div class="command-bar__ticker" id="command-ticker" role="status" aria-live="polite"></div>
-    <nav class="command-bar__tabs" aria-label="Views">
-      <button id="tab-chat" class="command-bar__tab" type="button">💬 Chat</button>
-      <button id="tab-board" class="command-bar__tab" type="button">🗺️ Board</button>
-    </nav>
     <span class="conn-dot" id="conn-dot" title="socket: idle" role="status"></span>
     <button id="notification-bell" class="pp-btn pp-btn--secondary pp-btn--icon board-bell" title="Notifications" hidden data-unread="0" data-open="false">🔔<span class="board-bell__badge" id="notification-badge">0</span></button>
     <button id="theme-toggle" class="pp-btn pp-btn--secondary pp-btn--icon" title="Toggle theme">🌙</button>
@@ -155,15 +153,15 @@
       </section>
 
       <div id="splitter-rail" class="splitter" role="separator" aria-orientation="vertical"
-           aria-label="Resize agents rail" title="Drag to resize · double-click to reset" tabindex="0"></div>
+           aria-label="Resize crew rail" title="Drag to resize · double-click to reset" tabindex="0"></div>
 
-      <!-- Agents rail (v6): AGENTS / TRANSCRIPTS tabs, dense rows, dashed
+      <!-- Crew rail (v6): CREW / TRANSCRIPTS tabs, dense rows, dashed
            disposed overflow. -->
       <aside id="agents-rail" class="board-side agents-rail">
-        <div class="agents-rail__tabs" role="tablist" aria-label="Agents and transcripts">
+        <div class="agents-rail__tabs" role="tablist" aria-label="Crew and transcripts">
           <button id="rail-tab-agents" class="agents-rail__tab agents-rail__tab--active" type="button"
                   role="tab" aria-selected="true" aria-controls="board-agents" data-rail-tab="agents">
-            AGENTS (<span class="agents-rail__count" id="rail-agents-count">0</span>)
+            CREW (<span class="agents-rail__count" id="rail-agents-count">0</span>)
           </button>
           <button id="rail-tab-transcripts" class="agents-rail__tab" type="button"
                   role="tab" aria-selected="false" aria-controls="board-transcripts" data-rail-tab="transcripts">

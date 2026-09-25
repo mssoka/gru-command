@@ -338,8 +338,8 @@ describe('board v6 — dense job rows', () => {
     const meta = row.querySelector('.board-job__meta');
     expect(meta?.querySelector('.board-job__repo')?.textContent).toBe('📦 demo');
     expect(meta?.querySelector('.board-job__branch')?.textContent).toContain('gru/job-1');
-    expect(meta?.querySelector('.board-job__lane-age')?.textContent).toMatch(/lane \d+[smhd]/);
-    expect(meta?.querySelector('.board-job__agent-age')?.textContent).toMatch(/agent \d+[smhd]/);
+    expect(meta?.querySelector('.board-job__lane-age')?.textContent).toMatch(/^heist \d+[smhd]$/);
+    expect(meta?.querySelector('.board-job__agent-age')?.textContent).toMatch(/^minion \d+[smhd]$/);
     expect(meta?.querySelector<HTMLAnchorElement>('.board-job__pr')?.getAttribute('href')).toBe(
       'https://example.invalid/pr/7',
     );
@@ -518,7 +518,7 @@ describe('board v6 — bands', () => {
     // Sticky separators: a header per band, carrying the count.
     for (const band of bands) {
       expect(band.querySelector('.board-band__head')).not.toBeNull();
-      expect(band.querySelector('.board-band__count')?.textContent).toBe('1 job');
+      expect(band.querySelector('.board-band__count')?.textContent).toBe('1 heist');
     }
     expect(bands[0]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('needs-1');
     expect(bands[1]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('flight-1');
@@ -613,7 +613,7 @@ describe('board v6 — bands', () => {
 
     const settled = document.querySelector('.board-band--settled');
     expect(settled?.querySelectorAll('.board-job')).toHaveLength(10);
-    expect(settled?.querySelector('.board-band__count')?.textContent).toBe('12 jobs');
+    expect(settled?.querySelector('.board-band__count')?.textContent).toBe('12 heists');
     const more = settled?.querySelector<HTMLButtonElement>('.board-band__more');
     expect(more?.textContent).toBe('+2 older settled');
 

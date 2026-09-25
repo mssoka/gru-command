@@ -216,42 +216,6 @@ body {
 .command-ticker__segment--alert { color: var(--band-needs-you-ink); }
 .command-ticker__sep { color: var(--faint); }
 
-/* The Chat/Board segmented lens toggle. */
-.command-bar__tabs {
-  display: flex;
-  gap: 0;
-  border: var(--outline-thin);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-  flex: none;
-}
-
-.command-bar__tab {
-  font: inherit;
-  font-size: 12px;
-  font-weight: 800;
-  padding: 6px 12px;
-  border: 0;
-  background: var(--card);
-  color: var(--muted);
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.command-bar__tab + .command-bar__tab {
-  border-left: var(--outline-thin);
-}
-
-.command-bar__tab:hover {
-  background: var(--soft);
-  color: var(--ink);
-}
-
-.command-bar__tab--active {
-  background: var(--work);
-  color: var(--on-state);
-}
-
 .conn-dot {
   width: 12px;
   height: 12px;
@@ -288,10 +252,10 @@ body {
   top: var(--command-bar-h, 56px);
   z-index: 29;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   flex-wrap: wrap;
-  gap: 6px;
-  padding: 6px 12px;
+  gap: 8px;
+  padding: 8px 12px;
   background: var(--paper);
   border-bottom: 1.5px solid var(--line);
 }
@@ -312,26 +276,28 @@ body {
 .rail-chip {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 9px;
   flex: none;
-  padding: 4px 11px;
+  min-height: 48px;
+  padding: 8px 14px;
   border: var(--outline-thin);
   border-radius: 999px;
   background: var(--card);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
 
 .rail-chip__label {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 800;
   letter-spacing: 0.14em;
   color: var(--faint);
 }
 
 .rail-chip__value {
+  font-size: 14px;
   font-weight: 800;
   color: var(--ink);
 }
@@ -343,42 +309,55 @@ body {
 .rail-chip--muted { border-left: 5px solid var(--muted); }
 
 .rail-chip__flag {
-  font-size: 9px;
-  padding: 1px 8px;
+  font-size: 10px;
+  padding: 2px 8px;
 }
 
-/* Folded KPI count strips (TRACKERS): label + total, slash-separated
-   numbers in the mockup's telemetry style. */
+/* Folded KPI fields (TRACKERS): group label + total, then one labeled
+   field per count — every value carries its own visible label (v6.1). */
 .rail-kpi {
   display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
+  align-items: center;
+  gap: 8px;
 }
 
 .rail-kpi__label {
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 800;
   letter-spacing: 0.12em;
   color: var(--faint);
 }
 
 .rail-kpi__total {
-  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+  font-weight: 800;
   color: var(--ink);
+  font-variant-numeric: tabular-nums;
 }
 
-.rail-kpi__nums {
+.rail-kpi__field {
   display: inline-flex;
   align-items: baseline;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10px;
-  font-weight: 700;
+  gap: 3px;
+  padding-left: 6px;
+  border-left: 1.5px solid color-mix(in srgb, var(--line) 30%, transparent);
+}
+
+.rail-kpi__field-label {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
   color: var(--muted);
 }
 
-.rail-kpi__sep {
-  padding: 0 1px;
-  color: var(--faint);
+.rail-kpi__num {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
 }
 
 .rail-kpi__num--alert {
@@ -387,7 +366,20 @@ body {
 }
 
 .rail-chip--trackers {
-  gap: 6px;
+  gap: 8px;
+}
+
+/* Desktop: TRACKERS grows into the rail's remaining width and its
+   labeled fields flow there, instead of dead-ending in a pill wider than
+   the viewport. Below 900px the rail is a horizontal scroller and the
+   chip stays one nowrap pill like every other chip. */
+@media (min-width: 900px) {
+  .rail-chip--trackers {
+    flex: 1 1 560px;
+    min-width: 0;
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
 }
 
 .rail-chip--trackers .board-decisions,
@@ -2312,7 +2304,7 @@ body {
 }
 
 .toast--error {
-  background: var(--danger-soft, #ffe3d8);
+  background: var(--danger-soft);
 }
 
 .toast__text { flex: 1; min-width: 0; }
@@ -2344,11 +2336,11 @@ body {
   margin: 6px 0;
   padding: 8px 10px;
   border-radius: 10px;
-  border: 2px dashed var(--ink-soft, #7a6a5f);
-  background: var(--paper-soft, #fdf3e4);
+  border: 2px dashed var(--ink-soft);
+  background: var(--paper-soft);
   font-size: 13px;
   font-weight: 600;
-  color: var(--muted, #6b5e56);
+  color: var(--muted);
   overflow-wrap: anywhere;
 }
 
@@ -2359,8 +2351,9 @@ body {
   font-weight: 800;
   padding: 4px 10px;
   border-radius: 999px;
-  border: 2px solid var(--ink, #2b2320);
-  background: var(--accent-soft, #ffe9a8);
+  border: 2px solid var(--ink);
+  background: var(--accent-soft);
+  color: var(--ink);
   cursor: pointer;
 }
 
@@ -2408,8 +2401,8 @@ body {
   max-width: 100%;
   padding: 3px 8px;
   border-radius: 999px;
-  background: var(--card, #fff);
-  border: var(--outline-width, 1px) solid var(--border, #ccc);
+  background: var(--card);
+  border: var(--outline-width, 1px) solid var(--border);
   font-size: 12px;
   font-weight: 600;
   line-height: 1.4;
@@ -2437,7 +2430,7 @@ body {
 }
 
 .attach-chip__remove:hover {
-  color: var(--danger, #c0392b);
+  color: var(--danger);
 }
 
 .attach-chip--busy {
@@ -2464,8 +2457,8 @@ body {
   max-height: min(52vh, 380px);
   display: flex;
   flex-direction: column;
-  background: var(--card, #fff);
-  border: var(--outline-width, 1px) solid var(--border, #ccc);
+  background: var(--card);
+  border: var(--outline-width, 1px) solid var(--border);
   border-radius: 12px;
   box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
   z-index: 30;
@@ -2477,7 +2470,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
-  border-bottom: var(--outline-width, 1px) solid var(--border, #ccc);
+  border-bottom: var(--outline-width, 1px) solid var(--border);
 }
 
 .attach-picker__path {
@@ -2494,7 +2487,7 @@ body {
 
 .attach-picker__error {
   padding: 8px 12px;
-  color: var(--danger, #c0392b);
+  color: var(--danger);
   font-size: 12px;
   font-weight: 600;
 }
@@ -2508,12 +2501,12 @@ body {
 .attach-picker__empty,
 .attach-picker__truncated {
   padding: 10px 12px;
-  color: var(--muted, #888);
+  color: var(--muted);
   font-size: 13px;
 }
 
 .attach-picker__truncated {
-  border-top: 1px dashed var(--border, #ccc);
+  border-top: 1px dashed var(--border);
   font-weight: 600;
 }
 
@@ -2532,7 +2525,7 @@ body {
 }
 
 .attach-row:hover {
-  background: var(--soft, #f3f4f6);
+  background: var(--soft);
 }
 
 .attach-row:disabled {
@@ -2555,20 +2548,17 @@ body {
 }
 
 /* ------------------------------------------------------------------ */
-/* Phone chrome: compact two-row nav (≤560px)                          */
+/* Phone chrome (≤560px)                                               */
 /*                                                                     */
-/* Below ~560px the single-row header (logo + title + tabs + status +  */
-/* bell/theme/settings) does not fit: on a 390px phone it measured     */
-/* scrollWidth 519 on the board view with theme/settings clipped       */
-/* off-screen (natural width 581 unpaired / 643 paired; 519 is the     */
-/* flex-shrink floor). Phone-only treatment: tabs wrap onto their own  */
-/* full-width row, the title block tightens, spacing shrinks — the     */
-/* header's minimum width drops under the phone budget. flex-wrap      */
-/* lets the header grow rows instead of pushing sideways; it is        */
+/* The single-row header (logo + title + status + bell/theme/settings) */
+/* tightens on a phone: the decorative tagline and the wide-viewport   */
+/* ticker drop, the title block shrinks, spacing narrows — the header  */
+/* fits a 390px viewport with zero horizontal overflow. flex-wrap is   */
+/* insurance: the header grows rows instead of pushing sideways. It is */
 /* layout, not a CSS overflow guarantee — the e2e is the guarantee     */
 /* (scrollWidth <= clientWidth asserted on chat + board at 390px and   */
-/* 561px). Desktop (≥768px) is untouched; 561–768px still fits on one  */
-/* row (shrink floor ≈ 519px < 561px, e2e-pinned), so no rules there.  */
+/* 561px). Desktop (≥768px) is untouched; 561–768px keeps the full     */
+/* single row, e2e-pinned.                                             */
 /* ------------------------------------------------------------------ */
 @media (max-width: 560px) {
   .command-bar {
@@ -2596,14 +2586,5 @@ body {
      carries whole-system state on a phone. */
   .command-bar__ticker {
     display: none;
-  }
-
-  .command-bar__tabs {
-    order: 10;
-    flex: 1 1 100%;
-  }
-
-  .command-bar__tab {
-    flex: 1 1 0;
   }
 }

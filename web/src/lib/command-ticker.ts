@@ -1,20 +1,17 @@
 /**
  * Command-bar ticker (board UX v6): the inline status readout at the top
- * of the cockpit. Three pipe-separated, monospace segments — the active
- * lens/mode, the board socket's radar state, and the top review round on
- * the board. Pure so every combination is unit-testable without a DOM;
- * the view (`ui/command-bar.ts`) renders the segments into spans.
+ * of the cockpit. Three pipe-separated, monospace segments — the layout
+ * mode, the board socket's radar state, and the top review round on the
+ * board. Pure so every combination is unit-testable without a DOM; the
+ * view (`ui/command-bar.ts`) renders the segments into spans. There is
+ * no lens segment: v6.1 removed the Chat/Board toggle.
  */
 
 import type { BoardConnectionState } from './board-client.js';
 import type { BoardSnapshot } from './board-protocol.js';
 import type { ConsoleMode } from './console-layout.js';
 
-/** The two lenses the toggle switches between (same data, two windows). */
-export type ActiveView = 'chat' | 'board';
-
 export interface TickerInput {
-  readonly view: ActiveView;
   readonly layout: ConsoleMode;
   /** Board socket state; null before the board client exists (pairing). */
   readonly boardState: BoardConnectionState | null;
@@ -83,7 +80,7 @@ export function tickerSegments(input: TickerInput): readonly TickerSegment[] {
   const radar = radarLabel(input.boardState);
   const round = topReviewRound(input.snapshot);
   return [
-    { key: 'mode', label: `MODE: ${LAYOUT_LABELS[input.layout]} · ${input.view.toUpperCase()}`, tone: 'plain' },
+    { key: 'mode', label: `MODE: ${LAYOUT_LABELS[input.layout]}`, tone: 'plain' },
     { key: 'radar', label: `RADAR: ${radar.label}`, tone: radar.tone },
     { key: 'round', label: roundLabel(round), tone: round?.status === 'live' ? 'ok' : 'plain' },
   ];
