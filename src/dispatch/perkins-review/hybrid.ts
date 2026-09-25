@@ -713,10 +713,14 @@ function deltaPaths(review: FrozenReview, priorSha: string, cache: ProofCache): 
   return paths;
 }
 
-function regularFrozenBlob(review: FrozenReview, sha: string, path: string): boolean {
+function regularFrozenBlobId(review: FrozenReview, sha: string, path: string): string | null {
   const entries = proofGit(review, ['ls-tree', '-z', sha, '--', `:(literal)${path}`]);
-  return /^(?:100644|100755) blob [0-9a-f]{40}\t/u.test(entries) &&
-    entries.slice(entries.indexOf('\t') + 1) === `${path}\0`;
+  const match = /^(?:100644|100755) blob ([0-9a-f]{40})\t/u.exec(entries);
+  return match !== null && entries.slice(entries.indexOf('\t') + 1) === `${path}\0` ? match[1]! : null;
+}
+
+function regularFrozenBlob(review: FrozenReview, sha: string, path: string): boolean {
+  return regularFrozenBlobId(review, sha, path) !== null;
 }
 
 /** Do not mix another file's hunks into a renamed caller's path pair. */
@@ -739,17 +743,25 @@ function canonicalPathPatch(review: FrozenReview, priorSha: string, entry: Delta
   const key = `${priorSha}\0${entry.oldPath ?? ''}\0${entry.newPath ?? ''}`;
   const cached = cache.canonicalPatches.get(key);
   if (cached !== undefined) return cached;
-  for (const [sha, path] of [[priorSha, entry.oldPath], [review.manifest.targetSha, entry.newPath]] as const) {
-    if (path === null) continue;
-    if (!regularFrozenBlob(review, sha, path)) throw new Error(`frozen delta path ${path} is not a regular blob`);
-    if (canonicalTextBlob(review, sha, path) === null) return null;
+  const oldBlob = entry.oldPath === null ? null : regularFrozenBlobId(review, priorSha, entry.oldPath);
+  const newBlob = entry.newPath === null ? null : regularFrozenBlobId(review, review.manifest.targetSha, entry.newPath);
+  if (entry.oldPath !== null && oldBlob === null) throw new Error(`frozen delta path ${entry.oldPath} is not a regular blob`);
+  if (entry.newPath !== null && newBlob === null) throw new Error(`frozen delta path ${entry.newPath} is not a regular blob`);
+  if (entry.oldPath !== null && canonicalTextBlob(review, priorSha, entry.oldPath) === null) return null;
+  if (entry.newPath !== null && canonicalTextBlob(review, review.manifest.targetSha, entry.newPath) === null) return null;
+  const diffFlags = ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--text', '--unified=0'];
+  let patch: string;
+  if (entry.oldPath !== null && entry.newPath !== null && entry.oldPath !== entry.newPath) {
+    // A literal pathspec for oldPath also selects oldPath/descendants after a
+    // file-to-directory replacement. Diff the exact frozen blobs of this
+    // detected rename, never another file's hunks from the selected paths.
+    if (oldBlob === null || newBlob === null) throw new Error('frozen rename has no matching regular blob pair');
+    patch = proofGit(review, [...diffFlags, oldBlob, newBlob]);
+  } else {
+    const paths = [...new Set([entry.oldPath, entry.newPath].filter((path): path is string => path !== null))]
+      .map((path) => `:(literal)${path}`);
+    patch = proofGit(review, [...diffFlags, '--find-renames', priorSha, review.manifest.targetSha, '--', ...paths]);
   }
-  const paths = [...new Set([entry.oldPath, entry.newPath].filter((path): path is string => path !== null))]
-    .map((path) => `:(literal)${path}`);
-  const patch = proofGit(review, [
-    'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--text', '--find-renames', '--unified=0',
-    priorSha, review.manifest.targetSha, '--', ...paths,
-  ]);
   cache.canonicalPatches.set(key, patch);
   return patch;
 }

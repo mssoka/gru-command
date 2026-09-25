@@ -1468,6 +1468,41 @@ describe('Perkins hybrid lead engine', () => {
     expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
   });
 
+  const renamedCallerWithReplacedDirectory = (edited: boolean) => {
+    const stable = 'const unchanged = true;\nconst contextOne = 1;\nconst contextTwo = 2;\nconst contextThree = 3;\n';
+    const h = indirectFixHarness({
+      priorCallerContent: `${stable}const selected = nativeRef;\n`,
+      afterPrior: (repo) => {
+        repo.git(['mv', 'src/caller.ts', 'src/renamed.ts']);
+        if (edited) {
+          writeFileSync(join(repo.path, 'src/renamed.ts'), `${stable}const selected = nativeSetting;\n`);
+          repo.git(['add', 'src/renamed.ts']);
+        }
+        repo.commitFile('src/caller.ts/unrelated.ts', 'const selected = nativeSetting;\n');
+      },
+      audit: { fix_location: { path: 'src/renamed.ts', change: 'added' }, evidence: 'const selected = nativeSetting;' },
+    });
+    const status = h.repo.git(['diff', '--no-ext-diff', '--no-textconv', '--find-renames', '--name-status', 'HEAD^', 'HEAD']);
+    expect(status).toMatch(/^R[0-9]+\tsrc\/caller\.ts\tsrc\/renamed\.ts$/mu);
+    expect(status).toMatch(/^A\tsrc\/caller\.ts\/unrelated\.ts$/mu);
+    return h;
+  };
+
+  it('rejects an unrelated descendant hunk after an unchanged caller is renamed', async () => {
+    const h = renamedCallerWithReplacedDirectory(false);
+    await expect(h.run()).rejects.toThrow(/not an actual added changed hunk line|overlaps another changed path/u);
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":false');
+    expect(existsSync(join(h.frozen.directory, 'consolidated.json'))).toBe(false);
+  });
+
+  it('accepts only the caller hunk when an edited rename also replaces its old path with a directory', async () => {
+    const h = renamedCallerWithReplacedDirectory(true);
+    writeFileSync(join(h.repo.path, '.git', 'info', 'attributes'), 'src/renamed.ts -diff\nsrc/caller.ts/** diff\n');
+    expect(h.repo.git(['status', '--porcelain'])).toBe('');
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
+  });
+
   it('does not attribute a reused rename source path to the renamed caller', async () => {
     const h = indirectFixHarness({
       afterPrior: (repo) => {
