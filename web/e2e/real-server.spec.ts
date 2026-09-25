@@ -81,8 +81,8 @@ test.afterAll(async () => {
   rmSync(JEV_MODE_FILE, { force: true });
 });
 
-async function pair(page: Page): Promise<void> {
-  await page.goto('/');
+async function pair(page: Page, base = '/'): Promise<void> {
+  await page.goto(base);
   await expect(page.locator('#pairing-view')).toBeVisible();
   await page.locator('#pair-token').fill(REAL_TOKEN);
   await page.locator('#pair-submit').click();
@@ -396,9 +396,13 @@ test.describe('board (E6)', () => {
     const seededRow = board.notifications.find((n: { title: string }) => n.title.includes('e2e-ack-job blocked'));
     expect(seededRow.shownAt).not.toBeNull();
 
-    // The ack button clears the row through the human ack.
+    // The ack button clears the row through the human ack. Two render
+    // phases are both valid: the optimistic button flips to ✓, then the
+    // next snapshot push re-renders the acked row into the FEED band
+    // (title carries ✓, button gone). Assert on the row, not the button,
+    // or a fast push loses the race and the button vanishes mid-poll.
     await row.locator('.board-notification__ack').click();
-    await expect(row.locator('.board-notification__ack')).toHaveText('✓');
+    await expect(row).toContainText('✓');
     const after = await (await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers })).json();
     const ackedRow = after.notifications.find((n: { title: string }) => n.title.includes('e2e-ack-job blocked'));
     expect(ackedRow.ackedAt).not.toBeNull();
@@ -439,7 +443,9 @@ test.describe('board (E6)', () => {
     const board = await (await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers })).json();
     expect(board.notifications.find((item: { id: string }) => item.id === row.id).shownAt).not.toBeNull();
     await ownerRow.locator('.board-notification__ack').click();
-    await expect(ownerRow.locator('.board-notification__ack')).toHaveText('✓');
+    // Same two-phase ack render as the FYI round-trip: the row carries ✓
+    // whether the optimistic button or the push re-render landed first.
+    await expect(ownerRow).toContainText('✓');
   });
 
   test('unauthenticated board API is a locked door', async ({ page }) => {
@@ -453,8 +459,29 @@ test.describe('board (E6)', () => {
 });
 
 test.describe('themes', () => {
+  // Snapshot stability: the file's shared service carries a durable home,
+  // so a full-suite run leaves earlier tests' frames, service bands and
+  // board rows in the transcript — pixels the isolated baseline never
+  // saw. Theme rendering is what this test proves, so it boots its OWN
+  // hermetic instance (fresh home, free port) and pairs against it by
+  // explicit URL: identical pixels in isolated and full runs.
+  let themes: RealServiceHandle | null = null;
+  let themesPort = 0;
+  test.beforeAll(async () => {
+    themesPort = await pickFreePort();
+    themes = await startRealService({
+      port: themesPort,
+      token: REAL_TOKEN,
+      requireWebDist: false,
+    });
+  });
+  test.afterAll(async () => {
+    await themes?.stop();
+    themes = null;
+  });
+
   test('light default, dark toggle persists, both snapshotted', async ({ page }) => {
-    await pair(page);
+    await pair(page, `http://127.0.0.1:${themesPort}/`);
     await sendAndWaitReply(page, 'theme real check');
 
     await expect(page.locator('html')).not.toHaveClass(/dark/);

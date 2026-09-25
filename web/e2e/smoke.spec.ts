@@ -195,6 +195,13 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
+  // Failed controls are durable service machinery (r2 53): the notice
+  // bands — expand the band head to reveal it, never an ephemeral note.
+  const compactFailBand = page.locator('.service-band', {
+    has: page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
+  });
+  await expect(compactFailBand.locator('.service-band__head')).toBeVisible();
+  await compactFailBand.locator('.service-band__head').click();
   await expect(
     page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
   ).toBeVisible();

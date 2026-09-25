@@ -219,4 +219,30 @@ describe('service band — consecutive service frames collapse', () => {
     expect(head?.textContent).toContain('1 service event');
     expect(log().querySelectorAll('.service-band .notice-line')).toHaveLength(1);
   });
+
+  it('a failed new-chat control result lands in the band, not an ephemeral note', () => {
+    // r2 53: a failed reset is durable service machinery. After the view
+    // rollback the notice must band (survive across newer user messages),
+    // never vanish as a 6s ephemeral line.
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(turn('start'), true);
+    view.addFrame(delta('older conversation'), true);
+    view.addFrame(turn('end'), true);
+    view.showControlResult({
+      type: 'control_result',
+      action: 'new_chat',
+      request_id: 'control-x',
+      ok: false,
+      epoch: 1,
+      code: 'failed',
+      message: 'New chat did not complete before reconnect',
+    });
+    const band = log().querySelector('.service-band');
+    expect(band).not.toBeNull();
+    expect(band?.querySelector('.notice-line')?.textContent).toContain(
+      'New chat did not complete before reconnect',
+    );
+    expect(log().querySelectorAll('.notice-line--ephemeral')).toHaveLength(0);
+  });
 });

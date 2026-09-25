@@ -381,8 +381,14 @@ export class ChatView {
       const message =
         `${result.action === 'compact' ? 'compact context' : 'new chat'} failed: ` +
         (result.message ?? result.code ?? 'unknown error');
-      this.ephemeralNote(message);
+      // Failed context controls are durable service machinery, not
+      // ephemeral UI: the clean-chat clause bands them (r2 53) so the
+      // notice survives the restored conversation and later reloads of
+      // the same view stay readable. appendServiceLine never appends
+      // before intervening conversation (reset rollback covered above).
+      this.appendServiceLine(el('div', 'notice-line', `⚠️ ${message}`));
       this.announceContextOutcome(message);
+      this.followContent(true);
     } else if (result.action === 'compact') {
       this.ephemeralNote('context compacted');
       this.announceContextOutcome('Context compacted successfully');
