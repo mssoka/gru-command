@@ -76,7 +76,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 - **Cockpit (v6):** the estate is full-width. The sticky **command bar**
   carries the brand + `ONE GRU · ONE WINDOW`, the monospace ticker
   (`MODE` · `RADAR` · top review round), the Chat/Board lens toggle,
-  bell, theme and settings; below it the sticky **status chip rail**
+  bell, owner-chime speaker, theme and settings; below it the sticky
+  **status chip rail**
   relocates the v4 health row globally (DEPLOY → REVIEWS → SILAS →
   ALERTS → VERIFY → CURE → TRACKERS) with the job/PR/lane KPI counts
   folded into TRACKERS as `data-kpi` count groups. At ≥1100px it is
@@ -120,6 +121,12 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   an ack record); acking an action-required row clears it and re-arms an
   open breaker. Live arrivals toast (plus a browser notification when
   permission was granted).
+- **Owner chime (owner ruling 2026-09-23):** the ONE sound — a soft
+  two-note Web Audio chime on `needs-owner` arrivals only
+  (`action-required`/FYI stay silent by design). Audio arms on the first
+  user gesture; an unarmed arrival pulses the bell instead. The header
+  speaker toggles a persisted mute (badges still count), and chimes are
+  throttled to one per 30 s (a burst is one sound + the merged badge).
 - **Transcripts:** drawer with newest-first pages (`load older` by entry
   cursor), debounced server-side search with snippet matches that
   scroll+flash the entry, a wrap toggle (default `pre-wrap` — long lines

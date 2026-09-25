@@ -85,7 +85,9 @@ export interface NotificationView {
   readonly id: string;
   readonly ts: string;
   readonly kind: string;
-  readonly routing: 'fyi' | 'action-required';
+  /** 'needs-owner' (human attention) arrives with the routing split; the
+   * web side accepts it now so snapshots are never rejected in flight. */
+  readonly routing: 'fyi' | 'action-required' | 'needs-owner';
   readonly severity: 'info' | 'error';
   readonly title: string;
   readonly detail: string | null;
@@ -393,7 +395,9 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       typeof notification.ts === 'string' &&
       typeof notification.kind === 'string' &&
       (notification.severity === 'info' || notification.severity === 'error') &&
-      (notification.routing === 'fyi' || notification.routing === 'action-required') &&
+      (notification.routing === 'fyi' ||
+        notification.routing === 'action-required' ||
+        notification.routing === 'needs-owner') &&
       typeof notification.title === 'string' &&
       (notification.detail === null || typeof notification.detail === 'string') &&
       (notification.agentId === null || typeof notification.agentId === 'string') &&

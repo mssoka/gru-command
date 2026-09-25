@@ -6,6 +6,7 @@ import {
   lensChipTone,
   parseBoardServerFrame,
   type BoardSnapshot,
+  type NotificationView,
 } from './board-protocol.js';
 
 /** A minimal valid snapshot; tests mutate copies to break it. */
@@ -162,6 +163,30 @@ describe('board server-frame validator', () => {
     const junk = snapshot();
     (junk.repos[0]!.jobs[0] as unknown as { prState: unknown }).prState = 'draft';
     expect(isValidSnapshot(junk)).toBe(false);
+  });
+
+  it('accepts the needs-owner routing (the human-attention class) and still rejects unknowns', () => {
+    const row: NotificationView = {
+      id: 'n-owner',
+      ts: '2026-09-23T00:00:00.000Z',
+      kind: 'owner.request',
+      routing: 'needs-owner',
+      severity: 'info',
+      title: 'Needs the owner',
+      detail: null,
+      agentId: null,
+      shownAt: null,
+      ackedAt: null,
+      resolvedAt: null,
+      resolvedBy: null,
+    };
+    const valid = snapshot();
+    (valid.notifications as NotificationView[]).push(row);
+    expect(isValidSnapshot(valid)).toBe(true);
+
+    const unknown = snapshot();
+    (unknown.notifications as unknown[]).push({ ...row, id: 'n-unknown', routing: 'mystery' });
+    expect(isValidSnapshot(unknown)).toBe(false);
   });
 
   it('tone mapping covers every chip state with a design-token class', () => {
