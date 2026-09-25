@@ -81,8 +81,8 @@ test.afterAll(async () => {
   rmSync(JEV_MODE_FILE, { force: true });
 });
 
-async function pair(page: Page): Promise<void> {
-  await page.goto('/');
+async function pair(page: Page, base = '/'): Promise<void> {
+  await page.goto(base);
   await expect(page.locator('#pairing-view')).toBeVisible();
   await page.locator('#pair-token').fill(REAL_TOKEN);
   await page.locator('#pair-submit').click();
@@ -113,6 +113,7 @@ async function sendAndWaitReply(page: Page, text: string): Promise<void> {
   await page.locator('#chat-input').fill(text);
   await page.locator('#chat-send').click();
   await expect(page.locator('.msg--user', { hasText: text })).toBeVisible();
+  // Awareness may prepend service context; match the echo with the user's words.
   const reply = echoReplies(page, text).last();
   await expect(reply).toBeVisible();
   await expect(reply).not.toHaveClass(/msg--streaming/);
@@ -371,7 +372,7 @@ test.describe('board (E6)', () => {
     await expect(drawer).toBeHidden();
   });
 
-  test('notification ack round-trip (E7): a blocked job feeds the bell; ack clears it', async ({ page }) => {
+  test('notification round-trip (E7 + routing split): a blocked job lands in the feed, never the bell; ack clears it', async ({ page }) => {
     // Seed a blocked job through the real API — the FYI derivation posts a
     // durable notification row server-side.
     const headers = { authorization: `Bearer ${REAL_TOKEN}` };
@@ -383,8 +384,8 @@ test.describe('board (E6)', () => {
     await page.locator('#tab-board').click();
     const bell = page.locator('#notification-bell');
     await expect(bell).toBeVisible();
-    // The badge shows while an unseen error exists (CSS keys on data-unread).
-    await expect(bell).not.toHaveAttribute('data-unread', '0');
+    // Routing split: FYI (machine/feed) rows never ring the owner bell.
+    await expect(bell).toHaveAttribute('data-unread', '0');
     await bell.click();
     const panel = page.locator('#notification-panel');
     await expect(panel).toBeVisible();
@@ -395,20 +396,56 @@ test.describe('board (E6)', () => {
     const seededRow = board.notifications.find((n: { title: string }) => n.title.includes('e2e-ack-job blocked'));
     expect(seededRow.shownAt).not.toBeNull();
 
-    // The ack button clears the row through the human ack.
+    // The ack button clears the row through the human ack. Two render
+    // phases are both valid: the optimistic button flips to ✓, then the
+    // next snapshot push re-renders the acked row into the FEED band
+    // (title carries ✓, button gone). Assert on the row, not the button,
+    // or a fast push loses the race and the button vanishes mid-poll.
     await row.locator('.board-notification__ack').click();
-    await expect(row.locator('.board-notification__ack')).toHaveText('✓');
+    await expect(row).toContainText('✓');
     const after = await (await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers })).json();
     const ackedRow = after.notifications.find((n: { title: string }) => n.title.includes('e2e-ack-job blocked'));
     expect(ackedRow.ackedAt).not.toBeNull();
     await bell.click(); // close the panel
 
-    // A NEW notification arriving while paired earns the live toast.
+    // A NEW FYI row arriving while paired stays off the owner's shoulder:
+    // no toast (the FOR YOU band owns the live surface).
     const job2 = { id: 'e2e-ack-job-2', repo: 'e2e-repo', title: 'Toast probe job' };
     await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs`, { headers, data: job2 });
     await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs/e2e-ack-job-2/status`, { headers, data: { status: 'blocked' } });
-    const toast = page.locator('.toast', { hasText: 'e2e-ack-job-2 blocked' });
-    await expect(toast).toBeVisible();
+    await bell.click();
+    await expect(panel.locator('.board-notification', { hasText: 'e2e-ack-job-2 blocked' })).toBeVisible();
+    await expect(page.locator('.toast', { hasText: 'e2e-ack-job-2 blocked' })).toHaveCount(0);
+  });
+
+  test('Gru can escalate a machine stop to FOR YOU through the authenticated route', async ({ page }) => {
+    const headers = { authorization: `Bearer ${REAL_TOKEN}` };
+    await pair(page);
+    const bell = page.locator('#notification-bell');
+    const unreadBefore = Number(await bell.getAttribute('data-unread'));
+    const unauthorized = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/notifications/needs-owner`, {
+      data: { title: 'Owner decision probe', detail: 'Merge outside Gru authority' },
+    });
+    expect(unauthorized.status()).toBe(401);
+    const posted = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/notifications/needs-owner`, {
+      headers, data: { title: 'Owner decision probe', detail: 'Merge outside Gru authority' },
+    });
+    expect(posted.status()).toBe(201);
+    const row = await posted.json();
+    expect(row).toMatchObject({ routing: 'needs-owner', severity: 'error' });
+    await expect.poll(async () => Number(await bell.getAttribute('data-unread'))).toBe(unreadBefore + 1);
+    await expect(page.locator('.toast', { hasText: 'Owner decision probe' })).toHaveCount(1);
+    await expect(page.locator('#chat-log .service-band', { hasText: 'Owner decision probe' })).toHaveCount(1);
+    await bell.click();
+    const ownerRow = page.locator('.board-notification', { hasText: 'Owner decision probe' });
+    await expect(ownerRow).toBeVisible();
+    await expect(ownerRow.locator('.board-notification__ack')).toBeVisible();
+    const board = await (await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers })).json();
+    expect(board.notifications.find((item: { id: string }) => item.id === row.id).shownAt).not.toBeNull();
+    await ownerRow.locator('.board-notification__ack').click();
+    // Same two-phase ack render as the FYI round-trip: the row carries ✓
+    // whether the optimistic button or the push re-render landed first.
+    await expect(ownerRow).toContainText('✓');
   });
 
   test('unauthenticated board API is a locked door', async ({ page }) => {
@@ -422,8 +459,29 @@ test.describe('board (E6)', () => {
 });
 
 test.describe('themes', () => {
+  // Snapshot stability: the file's shared service carries a durable home,
+  // so a full-suite run leaves earlier tests' frames, service bands and
+  // board rows in the transcript — pixels the isolated baseline never
+  // saw. Theme rendering is what this test proves, so it boots its OWN
+  // hermetic instance (fresh home, free port) and pairs against it by
+  // explicit URL: identical pixels in isolated and full runs.
+  let themes: RealServiceHandle | null = null;
+  let themesPort = 0;
+  test.beforeAll(async () => {
+    themesPort = await pickFreePort();
+    themes = await startRealService({
+      port: themesPort,
+      token: REAL_TOKEN,
+      requireWebDist: false,
+    });
+  });
+  test.afterAll(async () => {
+    await themes?.stop();
+    themes = null;
+  });
+
   test('light default, dark toggle persists, both snapshotted', async ({ page }) => {
-    await pair(page);
+    await pair(page, `http://127.0.0.1:${themesPort}/`);
     await sendAndWaitReply(page, 'theme real check');
 
     await expect(page.locator('html')).not.toHaveClass(/dark/);

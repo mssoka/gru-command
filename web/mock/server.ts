@@ -343,7 +343,10 @@ function sampleSnapshot(): unknown {
     notifications: [
       { id: 'mock-n1', ts: new Date().toISOString(), kind: 'job.status', routing: 'fyi', severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
       { id: 'mock-n2', ts: new Date(Date.now() - 120_000).toISOString(), kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'Round r1 verdict', detail: 'approved', agentId: null, shownAt: new Date().toISOString(), ackedAt: new Date().toISOString(), resolvedAt: null, resolvedBy: null },
-      { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Needs-owner stops (ack re-arms supervision) ring the FOR YOU band.
+      { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Machine attention lives in the self-clearing NEEDS GRU queue.
+      { id: 'mock-n4', ts: new Date(Date.now() - 300_000).toISOString(), kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Review round demo-api-payment-fix-r1 is INCOMPLETE', detail: 'lead session aborted — the lane can be re-armed', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
     ],
     decisions: {
       enabled: true,
@@ -358,6 +361,8 @@ function sampleSnapshot(): unknown {
       generation: 1,
     },
     unackedActionRequired: 1,
+    unackedNeedsOwner: 1,
+    wakes: { count: 2, lastAt: new Date(Date.now() - 180_000).toISOString() },
     build: {
       buildRev: 'abc1234def5678abc1234def5678abc1234def56',
       buildCommittedAt: new Date(Date.now() - 5_400_000).toISOString(),

@@ -111,7 +111,9 @@ export interface ChatServerOptions {
   readonly pointer: GruSessionPointer;
   /** Spawn (or resume) the single Gru session. Injected: the chat layer
    * never touches a concrete adapter or the registry (runtime-agnostic). */
-  readonly spawnGru: (resumeFile: string | null) => Promise<AgentHandle>;
+  readonly spawnGru: (resumeFile: string | null, source?: 'chat' | 'wake') => Promise<AgentHandle>;
+  /** Supervisor owner-held breaker gate: machine turns never re-arm it. */
+  readonly canWakeGru?: () => boolean;
   /** Mint a native session without resume/transcript context. This is
    * mandatory: reusing spawnGru(null) could return the supervised old handle. */
   readonly spawnFreshGru: () => Promise<AgentHandle>;
@@ -266,6 +268,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   /** Fatal native-writer uncertainty after failed compaction retirement.
    * Only process restart or a confirmed late resume may clear it. */
   let recoveryBlockedReason: string | null = null;
+  // A wake is accepted at the durable turn_start frame, not at the end of
+  // a potentially long-running prompt. Only the owning handle may accept it.
+  let acceptWakeTurn: { source: AgentHandle; accept: () => void } | null = null;
   const pendingNotices: Array<{ readonly text: string; readonly onPersist?: () => void }> = [];
   /** callId → tool name, for tool_end frames (the contract carries names). */
   const openCalls = new Map<string, string>();
@@ -274,7 +279,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   // Gru session lifecycle
   // -----------------------------------------------------------------------
 
-  function ensureGru(): Promise<AgentHandle> {
+  function ensureGru(source: 'chat' | 'wake' = 'wake'): Promise<AgentHandle> {
+    if (source === 'wake' && options.canWakeGru?.() === false) {
+      return Promise.reject(new Error('owner-held Gru breaker is open; wake waits for authorized re-arm'));
+    }
     if (handle !== null) return Promise.resolve(handle);
     // Bounded retries: after a failure, a reconnect (or a fresh message)
     // inside the backoff window must NOT reach the spawner again. The gate
@@ -283,7 +291,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       return Promise.reject(new SpawnBackoffError(spawnGate.blockedFor()));
     }
     if (spawning === null) {
-      const attempt = spawnGru();
+      const attempt = spawnGru(source);
       // Assign the gate BEFORE any settlement callback can run: a
       // synchronous throw inside spawnGru (corrupt resume pointer) would
       // otherwise complete its cleanup before the assignment lands —
@@ -302,7 +310,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     return spawning;
   }
 
-  async function spawnGru(): Promise<AgentHandle> {
+  async function spawnGru(source: 'chat' | 'wake'): Promise<AgentHandle> {
     try {
       // Inside the try (r1 W4): a corrupt resume pointer must surface as
       // a spawn failure and CLEAR the spawn gate — not wedge it forever.
@@ -315,7 +323,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         resume: resumeFile !== null,
         replacing_unrecoverable_boundary: replacingUnrecoverableBoundary,
       });
-      const spawned = await options.spawnGru(resumeFile);
+      const spawned = await options.spawnGru(resumeFile, source);
       if (disposed) {
         // The server went down while the spawn was in flight — release the
         // session instead of wiring it into a dead server (r1 N9).
@@ -439,6 +447,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       case 'turn_start':
         turnLive = true;
         emitLogged({ type: 'turn', state: 'start' });
+        if (acceptWakeTurn?.source === source) {
+          const { accept } = acceptWakeTurn;
+          acceptWakeTurn = null;
+          accept();
+        }
         broadcastContext();
         break;
       case 'turn_end':
@@ -680,10 +693,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
   /** Awareness context for one prompt; fail-soft — a broken awareness layer
    * must never take message delivery down. */
-  function awarenessPrepare(): AwarenessInjection | null {
+  function awarenessPrepare(source: 'chat' | 'wake' = 'chat'): AwarenessInjection | null {
     if (options.awareness === undefined) return null;
     try {
-      return options.awareness.prepare();
+      return options.awareness.prepare(source);
     } catch (error) {
       log('error', 'gru awareness prepare failed — delivering without service context', {
         error: errorMessage(error),
@@ -692,9 +705,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     }
   }
 
-  function awarenessCommit(injection: AwarenessInjection): void {
+  function awarenessCommit(injection: AwarenessInjection, source: 'chat' | 'wake' = 'chat'): void {
     try {
-      options.awareness?.commit(injection);
+      options.awareness?.commit(injection, source);
     } catch (error) {
       log('error', 'gru awareness commit failed — context may re-inject', {
         error: errorMessage(error),
@@ -707,18 +720,23 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
    * steering into a live conversation; settle hooks call back here. */
   function maybeWake(): void {
     if (disposed || !wakeRequested || wakeRunning || options.awareness === undefined) return;
+    if (recoveryBlockedReason !== null || options.canWakeGru?.() === false) {
+      wakeRequested = false;
+      options.awareness.noteWakeBlocked?.(recoveryBlockedReason ?? 'owner-held Gru breaker is open; authorized re-arm required');
+      return;
+    }
     if (
       turnLive ||
       frameLog.hasOpenTurn ||
       pendingDeliveries > 0 ||
       spawning !== null ||
       controlBarrier !== null ||
-      runtimeCompactionBarrier !== null ||
-      recoveryBlockedReason !== null
+      runtimeCompactionBarrier !== null
     ) {
       return;
     }
     wakeRequested = false;
+    if (options.awareness.admitWake?.() === false) return;
     wakeRunning = true;
     void deliver(null, '', undefined, true).finally(() => {
       wakeRunning = false;
@@ -749,6 +767,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     // locals — the r3 backstop needs to know what this delivery opened).
     let midTurn = false;
     let ownedOpenTurn = false;
+    let acceptedWakeInjection: AwarenessInjection | null = null;
     return (async () => {
       try {
         // Re-enter every current barrier after every await. Provider-native
@@ -761,14 +780,24 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         }
         if (disposed) return;
         if (recoveryBlockedReason !== null) {
+          if (wake) {
+            options.awareness?.noteWakeBlocked?.(recoveryBlockedReason);
+            return;
+          }
           throw new Error('chat recovery is blocked; restart the service');
         }
         // A wake turn exists only to carry service context: with nothing to
         // inject, do not spawn a session or burn a model turn.
         let wakeInjection: AwarenessInjection | null = null;
         if (wake) {
-          wakeInjection = awarenessPrepare();
-          if (wakeInjection === null) return;
+          if (options.awareness?.admitWake?.() === false) return;
+          wakeInjection = awarenessPrepare('wake');
+          if (wakeInjection === null) {
+            // Claimed by the policy but nothing left to say (the row was
+            // closed in between): report it so the tracker sees the miss.
+            options.awareness?.noteWakeOutcome?.(false, 'no awareness context to inject');
+            return;
+          }
         }
         // Chip-path provenance (review r1): only workspace/uploads paths
         // ride the manifest — a handcrafted chip pointing elsewhere drops
@@ -807,13 +836,16 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         let gru: AgentHandle;
         for (;;) {
           try {
-            gru = await ensureGru();
+            gru = await ensureGru(wake ? 'wake' : 'chat');
           } catch (error) {
             // Ephemeral: a transient spawn failure must not replay forever.
             if (client !== null) {
               send(client, ephemeralError('Gru is temporarily unavailable; retry after reconnect.'));
             }
             log('error', 'Gru delivery spawn failed', { error: errorMessage(error) });
+            if (wake && options.canWakeGru?.() === false) {
+              options.awareness?.noteWakeBlocked?.('owner-held Gru breaker is open; authorized re-arm required');
+            } else if (wake) options.awareness?.noteWakeOutcome?.(false, errorMessage(error));
             return;
           }
           const barriers = activeDeliveryBarriers();
@@ -823,6 +855,10 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             continue;
           }
           if (recoveryBlockedReason !== null) {
+            if (wake) {
+              options.awareness?.noteWakeBlocked?.(recoveryBlockedReason);
+              return;
+            }
             throw new Error('chat recovery is blocked; restart the service');
           }
           // A supervisor swap can replace the handle while ensureGru awaits.
@@ -855,6 +891,11 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               { owner: CHAT_OWNER },
             );
           } else {
+            if (wake && options.canWakeGru?.() === false) {
+              options.awareness?.noteWakeBlocked?.('owner-held Gru breaker is open; authorized re-arm required');
+              return;
+            }
+            if (wake && options.awareness?.admitWake?.() === false) return;
             const injection = wake ? wakeInjection : awarenessPrepare();
             const baseText =
               injection === null
@@ -869,13 +910,23 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               allowed.length > 0 ? allowed : undefined,
               visionUnavailable,
             );
+            if (wake) options.awareness?.noteWakeAttempt?.();
             ownedOpenTurn = true;
             turnLive = true; // optimistic: the turn_start event confirms
-            await gru.prompt(prompt, { owner: CHAT_OWNER });
+            if (wake && injection !== null) {
+              acceptWakeTurn = { source: gru, accept: () => {
+                acceptedWakeInjection = injection;
+                awarenessCommit(injection, 'wake');
+                options.awareness?.noteWakeOutcome?.(true, undefined, injection);
+              } };
+            }
+            try {
+              await gru.prompt(prompt, { owner: CHAT_OWNER });
+            } finally {
+              if (acceptWakeTurn?.source === gru) acceptWakeTurn = null;
+            }
             turnLive = false;
-            // Receipt only after the turn accepted the block: a failed
-            // delivery retries the same context on the next turn.
-            if (injection !== null) awarenessCommit(injection);
+            if (!wake && injection !== null) awarenessCommit(injection);
           }
         } catch (error) {
           const message = (error as Error).message;
@@ -885,6 +936,8 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             // An autonomous turn failing is an operational degradation, not
             // a user message failure — say so durably; the queued context
             // rides the next user message.
+            if (acceptedWakeInjection !== null) options.awareness?.noteWakeTurnFailure?.(message, acceptedWakeInjection);
+            else options.awareness?.noteWakeOutcome?.(false, message);
             emitLogged({
               type: 'notice',
               text:
@@ -912,6 +965,8 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         // only the turn THIS delivery opened, and report a bounded error
         // frame through whichever channel still works.
         log('error', 'chat delivery failed', { error: errorMessage(error) });
+        if (acceptedWakeInjection !== null) options.awareness?.noteWakeTurnFailure?.(errorMessage(error), acceptedWakeInjection);
+        else if (wake) options.awareness?.noteWakeOutcome?.(false, errorMessage(error));
         if (ownedOpenTurn && turnLive) {
           try {
             settleOpenTurn();
@@ -1514,7 +1569,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         pendingDeliveries += 1;
         broadcastContext();
         try {
-          await ensureGru();
+          await ensureGru('chat');
         } finally {
           pendingDeliveries -= 1;
           broadcastContext();

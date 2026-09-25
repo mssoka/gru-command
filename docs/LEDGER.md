@@ -134,13 +134,16 @@ agents, lens binding/outcomes); see [BOARD.md](./BOARD.md).
 The `notifications` table is the durable notification log (SPEC ruling
 13): one row per notification, written once at event time. Columns:
 `id` (uuid — the ack contract), `ts`, `kind`, `routing`
-(`fyi` | `action-required`), `severity` (`info` | `error`), `title`,
-`detail`, `agent_id`, and the proven-ack pair: `shown_at`/`shown_by`
+(`fyi` | `action-required` | `needs-owner`), `severity` (`info` |
+`error`), `title`, `detail`, `agent_id`, and the proven-ack pair: `shown_at`/`shown_by`
 (display receipts, one per surface, idempotent) and `acked_at`/
 `acked_by` (the human clearance). Every mutation appends a
 `notification.created` / `notification.shown` / `notification.acked`
-event and publishes on the bus — the board pushes, the chat surfaces
-action-required items, and the breaker re-arm rides the ack. The
+event and publishes on the bus — the board pushes, machine-attention
+rows wake Gru, needs-owner rows surface in chat, and the breaker re-arm
+rides the ack. Legacy row routing is never promoted on boot or by age;
+`notification.resolved` with Gru's action detail closes machine work,
+while only an explicit `needs-owner` post creates a human decision stop. The
 board's notification center renders this table directly; nothing is
 derived per-snapshot.
 

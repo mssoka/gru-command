@@ -188,6 +188,45 @@ describe('board server — HTTP API', () => {
     expect(ok.body).toHaveProperty('decisions', expect.objectContaining({ status: 'disabled' }));
   });
 
+  it('machine disposition is authenticated, requires an action detail, and never resolves an owner stop', async () => {
+    const { api, port } = harness;
+    const machine = api.recordNotification({ id: 'machine-disposition', kind: 'test', routing: 'action-required', severity: 'error', title: 'Fix me' });
+    const owner = api.recordNotification({ id: 'owner-disposition', kind: 'test', routing: 'needs-owner', severity: 'info', title: 'Ask owner' });
+    const path = `/api/notifications/${machine.id}/disposition`;
+    expect((await postJson(port, path, null, { detail: 'Fixed' })).status).toBe(401);
+    expect((await postJson(port, path, 'wrong-token', { detail: 'Fixed' })).status).toBe(401);
+    expect((await postJson(port, path, 'board-test-token', {})).status).toBe(400);
+    expect((await postJson(port, path, 'board-test-token', { detail: '   ' })).status).toBe(400);
+    expect((await postJson(port, `/api/notifications/${owner.id}/disposition`, 'board-test-token', { detail: 'No' })).status).toBe(400);
+    expect(api.getNotification(machine.id)?.resolvedAt).toBeNull();
+    const resolved = await postJson(port, path, 'board-test-token', { detail: 'Opened repair lane' });
+    expect(resolved).toMatchObject({ status: 200, body: { resolvedBy: 'gru', ackedAt: null } });
+    expect(api.getNotification(machine.id)?.resolvedAt).not.toBeNull();
+    expect(api.getNotification(owner.id)?.resolvedAt).toBeNull();
+    expect((await postJson(port, path, 'board-test-token', { detail: 'duplicate' })).status).toBe(200);
+    expect(api.listEventsAfter(0, { kinds: ['notification.resolved'] }).filter((e) => (e.payload as { id?: string }).id === machine.id)).toMatchObject([
+      { payload: { id: machine.id, by: 'gru', detail: 'Opened repair lane' } },
+    ]);
+  });
+
+  it('validates authenticated Gru owner escalation and places it only in FOR YOU', async () => {
+    const { api, port } = harness;
+    const path = '/api/notifications/needs-owner';
+    for (const token of [null, 'wrong-token']) {
+      expect((await postJson(port, path, token, { title: 'Owner call', detail: 'Approve external merge' })).status).toBe(401);
+    }
+    for (const body of [{}, { title: '  ', detail: 'x' }, { title: 'x', detail: '\n' }, { title: 'x'.repeat(501), detail: 'y' }]) {
+      expect((await postJson(port, path, 'board-test-token', body)).status).toBe(400);
+    }
+    const before = api.countPendingActionRequired();
+    const created = await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge' });
+    expect(created).toMatchObject({ status: 201, body: { kind: 'gru.owner-escalation', routing: 'needs-owner', title: 'Owner call', ackedAt: null } });
+    expect(api.countPendingActionRequired()).toBe(before); // never loops into Gru's machine queue
+    const row = created.body as { id: string };
+    expect(api.getNotification(row.id)).toMatchObject({ detail: 'Approve external merge', shownAt: null });
+    expect((await getJson(port, '/api/board', 'board-test-token')).body).toMatchObject({ unackedNeedsOwner: expect.any(Number) });
+  });
+
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {
     expect((await getJson(harness.port, '/api/decisions/status', null)).status).toBe(401);
     expect((await postJson(harness.port, '/api/decisions/recheck', null, {})).status).toBe(401);
@@ -442,7 +481,7 @@ describe('board server — empty token config locks every door', () => {
     try {
       const row = notifications.post({
         kind: 'supervision.breaker',
-        routing: 'action-required',
+        routing: 'needs-owner',
         severity: 'error',
         title: 'Crash-loop breaker tripped: agent a1 stopped',
         detail: 'ack to re-arm',
@@ -463,7 +502,12 @@ describe('board server — empty token config locks every door', () => {
       // Missing surface is a 400.
       const bad = await postJson(port, `/api/notifications/${row.id}/shown`, 'ack-token', {});
       expect(bad.status).toBe(400);
-      // Ack fires the hook exactly once, idempotently.
+      const machine = notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Gru repair required' });
+      const illegal = await postJson(port, `/api/notifications/${machine.id}/ack`, 'ack-token', { by: 'web' });
+      expect(illegal.status).toBe(400);
+      expect(api.getNotification(machine.id)).toMatchObject({ ackedAt: null, resolvedAt: null });
+      expect(api.countPendingActionRequired()).toBeGreaterThan(0);
+      // Owner Ack fires the hook exactly once, idempotently.
       const ack1 = await postJson(port, `/api/notifications/${row.id}/ack`, 'ack-token', { by: 'web' });
       expect(ack1.status).toBe(200);
       expect((ack1.body as { ackedAt: string | null }).ackedAt).not.toBeNull();

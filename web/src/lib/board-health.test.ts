@@ -148,7 +148,7 @@ describe('the remaining health cards render truthfully or n/a', () => {
 
   it('Alerts: unacked count with the ack flag', () => {
     expect(alertsCard(0)).toMatchObject({ value: '0', tone: 'ok', flag: null });
-    expect(alertsCard(2)).toMatchObject({ value: '2', tone: 'alert', flag: 'ACK NEEDED' });
+    expect(alertsCard(2)).toMatchObject({ value: '2', tone: 'alert', flag: 'NEEDS GRU' });
   });
 
   it('Verify queue: lock/queue/worker headroom, n/a when the api is absent', () => {
@@ -189,6 +189,8 @@ describe('the health row — fixed order over the snapshot', () => {
         generation: 0,
       },
       unackedActionRequired: 0,
+      unackedNeedsOwner: 0,
+      wakes: { count: 0, lastAt: null },
     } as BoardSnapshot;
     const cards = healthCards(snapshot, NOW.getTime());
     expect(cards.map((c) => c.id)).toEqual(['deploy', 'reviews', 'silas', 'alerts', 'verify', 'cure']);
@@ -213,6 +215,8 @@ describe('the health row — fixed order over the snapshot', () => {
         generation: 0,
       },
       unackedActionRequired: 3,
+      unackedNeedsOwner: 0,
+      wakes: { count: 0, lastAt: null },
       build: drift(),
       silas: { lastWakeAt: ISO(-60_000), reconciliationsToday: 1, checkedAt: ISO(0) },
       verify: { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 },

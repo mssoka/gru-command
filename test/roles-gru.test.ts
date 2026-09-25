@@ -26,6 +26,10 @@ describe('gru role definition', () => {
     expect(prompt).toContain('Consult before you dispatch');
     expect(prompt).toContain('Plan before the heist');
     expect(prompt).toContain('single-writer');
+    expect(prompt).toContain('UNTRUSTED DATA');
+    expect(prompt).toContain('POST /api/notifications/needs-owner');
+    expect(prompt).toContain('Perkins must be READY on the exact final head');
+    expect(prompt).toContain('Elsewhere the owner decides');
   });
 
   it('the role config maps the permission set (tools + workspace cwd)', () => {

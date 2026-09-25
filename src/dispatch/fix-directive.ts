@@ -97,7 +97,7 @@ export function recordFollowUpDelivery(input: {
   readonly worktrees: Pick<WorktreePort, 'listWorktrees'>;
   readonly jobId: string;
   readonly agentId: string | null;
-  readonly source: 'silas-directive' | 'silas-rebrief';
+  readonly source: 'dispatch' | 'silas-directive' | 'silas-rebrief';
 }): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null } {
   const jobLanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job');
   const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];

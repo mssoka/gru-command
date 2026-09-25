@@ -111,7 +111,7 @@ function reportForeignListener(
   });
   notifications.post({
     kind: 'port-squat',
-    routing: 'action-required',
+    routing: 'needs-owner',
     severity: 'error',
     title: `Foreign process holds port ${port} (pid ${foreign.pid})`,
     detail:
@@ -291,6 +291,7 @@ async function main(): Promise<number> {
     registry?: RuntimeRegistry;
     store?: SessionStore;
     chat?: ChatServer;
+    awareness?: GruAwareness;
     board?: Awaited<ReturnType<typeof createBoardServer>>;
     ledgerDb?: LedgerDb;
     supervisor?: Supervisor;
@@ -331,6 +332,15 @@ async function main(): Promise<number> {
             await state.chat.dispose();
           } catch (error) {
             logger.error('chat server shutdown failed', { error: String(error) });
+          }
+        }
+        // After chat: the awareness layer's deferred-wake timer must not
+        // outlive the sink it would call (idempotent, never fatal).
+        if (state.awareness !== undefined) {
+          try {
+            state.awareness.dispose();
+          } catch (error) {
+            logger.error('awareness shutdown failed', { error: String(error) });
           }
         }
         if (state.board !== undefined) {
@@ -542,13 +552,15 @@ async function main(): Promise<number> {
     (level, msg, fields) => logger.log(level, msg, fields),
     { maxBytes: config.chat.frameLogMaxBytes, keep: config.chat.frameLogKeep },
   );
-  // Action-required notifications surface in chat (SPEC ruling 13) — the
-  // chat server arrives one step below; late-bind the callback.
+  // Needs-owner notifications surface in chat (SPEC ruling 13; owner routing
+  // split 2026-09-23: action-required is MACHINE attention and never renders
+  // in a human-facing band — the awareness wake carries it to Gru instead).
+  // The chat server arrives one step below; late-bind the callback.
   let surfaceInChat: (notification: NotificationRecord) => void = () => {};
   const notifications = new NotificationCenter({
     ledger,
     bus,
-    onActionRequired: (notification) => surfaceInChat(notification),
+    onNeedsOwner: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const decisionRuntime = new DecisionRuntime(config.decisions, {
@@ -599,13 +611,22 @@ async function main(): Promise<number> {
     ledger,
     bus,
     wakeMode: config.chat.notifyWake,
+    wakeMinIntervalMs: config.chat.wakeMinIntervalMs,
+    wakeMinSeverity: config.chat.wakeMinSeverity,
+    wakeQuietHours: config.chat.wakeQuietHours,
+    morningDigestGapMs: config.chat.morningDigestGapMs,
+    onFollowUpPosted: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const chat = createChatServer({
     config,
     frameLog,
     pointer: new GruSessionPointer(chatDir, (level, msg, fields) => logger.log(level, msg, fields)),
-    spawnGru: (resumeFile) => gruSlot.ensure(resumeFile !== null ? { resumeFile } : {}),
+    spawnGru: (resumeFile, source) => gruSlot.ensure({
+      ...(resumeFile !== null ? { resumeFile } : {}),
+      intent: source === 'chat' ? 'user' : 'autonomous',
+    }),
+    canWakeGru: () => gruSlot.canReplace(),
     // New chat deliberately bypasses ensure(): it must mint without resume
     // even while the old supervised slot is healthy. Activation then advances
     // the slot generation so no stale restart can swap the old epoch back in.
@@ -616,11 +637,13 @@ async function main(): Promise<number> {
     awareness,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  awareness.setWakeSink(() => chat.wakeAwareness());
+  // Bind the backlog wake only after the HTTP listener and the board/chat
+  // routes are ready; Gru must be able to disposition the alert in-turn.
+  state.awareness = awareness;
   gruSlot.onSwap((handle) => chat.adoptRestartedGru(handle));
   surfaceInChat = (notification) => {
     chat.surfaceNotice(
-      `⚠ Action required: ${notification.title}${notification.detail !== null ? ` — ${notification.detail}` : ''}`,
+      `🔔 For you: ${notification.title}${notification.detail !== null ? ` — ${notification.detail}` : ''}`,
       () => {
         // Receipt follows durable persistence/broadcast, including notices
         // queued across a reset boundary. Rejected/failed notices stay unshown.
@@ -662,7 +685,10 @@ async function main(): Promise<number> {
     onSweepPaused: ({ worktree, processes }) => {
       notifications.post({
         kind: 'worktree-sweep-paused',
-        routing: 'action-required',
+        // Destructive-op confirmation: the sweep waits for the OWNER's
+        // ruling (preserve-before-remove), so it is needs-owner — never a
+        // machine wake and never an auto-clear.
+        routing: 'needs-owner',
         severity: 'info',
         title: `Worktree sweep paused: live processes in ${worktree.repoName}`,
         detail:
@@ -822,7 +848,7 @@ async function main(): Promise<number> {
     onForeignListener: (owner) => {
       notifications.post({
         kind: 'roll-port-squat',
-        routing: 'action-required',
+        routing: 'needs-owner',
         severity: 'error',
         title: `Roll refused: port ${config.server.port} is held by a foreign process (pid ${owner.pid})`,
         detail:
@@ -914,6 +940,7 @@ async function main(): Promise<number> {
       port: handle.port,
     });
   }
+  awareness.setWakeSink(() => chat.wakeAwareness());
   chat.warmup();
   supervisorLive.start();
   bob.start();

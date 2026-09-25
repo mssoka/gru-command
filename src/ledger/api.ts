@@ -97,13 +97,22 @@ export interface EventRecord {
   readonly payload: unknown;
 }
 
-/** Notification routing (SPEC ruling 13): FYI → notification;
- * action-required → a queued item Gru surfaces in chat. */
-export const NOTIFICATION_ROUTINGS = ['fyi', 'action-required'] as const;
+/** Notification routing (SPEC ruling 13; owner routing split 2026-09-23):
+ * 'fyi' → the standing feed; 'action-required' → MACHINE attention — it
+ * wakes Gru (per the wake policy) and never rings the owner bell;
+ * 'needs-owner' → the ONLY human-facing class (FOR YOU band + bell +
+ * morning digest). */
+export const NOTIFICATION_ROUTINGS = ['fyi', 'action-required', 'needs-owner'] as const;
 export type NotificationRouting = (typeof NOTIFICATION_ROUTINGS)[number];
 
 export const NOTIFICATION_SEVERITIES = ['info', 'error'] as const;
 export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number];
+
+export function isOwnerHeldNotificationKind(kind: string): boolean {
+  return kind.startsWith('decisions.degraded.') ||
+    kind.startsWith('supervision.provider-wall.') ||
+    ['supervision.breaker', 'port-squat', 'roll-port-squat', 'worktree-sweep-paused'].includes(kind);
+}
 
 export function isNotificationRouting(value: string): value is NotificationRouting {
   return (NOTIFICATION_ROUTINGS as readonly string[]).includes(value);
@@ -357,6 +366,20 @@ export class LedgerApi {
   latestEventSeq(): number {
     const row = this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get() as Row;
     return Number(row.seq);
+  }
+
+  /** How many durable events of one kind exist (the board's wake tracker). */
+  countEvents(kind: string): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM events WHERE kind = ?').get(kind) as Row;
+    return Number(row.n);
+  }
+
+  /** Newest durable event of one kind (the board's wake tracker stamp). */
+  latestEventOfKind(kind: string): EventRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM events WHERE kind = ? ORDER BY seq DESC LIMIT 1')
+      .get(kind) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
   }
 
   /** Latest durable event for one review round/kind (restart reconciliation). */
@@ -1162,22 +1185,41 @@ export class LedgerApi {
     return row === undefined ? null : this.notificationFromRow(row);
   }
 
-  listNotifications(opts: { limit?: number; unackedOnly?: boolean } = {}): readonly NotificationRecord[] {
+  listNotifications(opts: { limit?: number; offset?: number; unackedOnly?: boolean; routing?: NotificationRouting } = {}): readonly NotificationRecord[] {
     const limit = opts.limit ?? 50;
-    const sql = opts.unackedOnly
-      ? 'SELECT * FROM notifications WHERE acked_at IS NULL AND resolved_at IS NULL ORDER BY ts DESC, id LIMIT ?'
-      : 'SELECT * FROM notifications ORDER BY ts DESC, id LIMIT ?';
-    return (this.db.prepare(sql).all(limit) as Row[]).map((row) => this.notificationFromRow(row));
+    const offset = opts.offset ?? 0;
+    if (!Number.isSafeInteger(limit) || limit <= 0 || !Number.isSafeInteger(offset) || offset < 0) {
+      throw new Error('notification page limit must be positive and offset must be non-negative');
+    }
+    const clauses = [
+      ...(opts.unackedOnly ? ['acked_at IS NULL', 'resolved_at IS NULL'] : []),
+      ...(opts.routing !== undefined ? ['routing = ?'] : []),
+    ];
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '';
+    return (this.db.prepare(`SELECT * FROM notifications${where} ORDER BY ts DESC, id LIMIT ? OFFSET ?`)
+      .all(...(opts.routing !== undefined ? [opts.routing] : []), limit, offset) as Row[])
+      .map((row) => this.notificationFromRow(row));
   }
 
-  /** Count action-required notifications still awaiting a human ack (a
-   * system-resolved incident no longer needs human action). Read straight
-   * from the TABLE — not the bounded feed window — so the board's badge
-   * stays true even when old rows have scrolled past the feed's limit. */
+  /** Count action-required notifications still awaiting a machine
+   * disposition — the NEEDS GRU queue (self-clearing; the human bell is
+   * not rung by these). Read straight from the TABLE — not the bounded
+   * feed window — so the tracker stays true. */
   countPendingActionRequired(): number {
     const row = this.db
       .prepare(
         "SELECT COUNT(*) AS n FROM notifications WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL",
+      )
+      .get() as Row;
+    return Number(row.n);
+  }
+
+  /** Count needs-owner notifications still awaiting a human ack — the FOR
+   * YOU queue (the only class that rings the bell). */
+  countPendingNeedsOwner(): number {
+    const row = this.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM notifications WHERE routing = 'needs-owner' AND acked_at IS NULL AND resolved_at IS NULL",
       )
       .get() as Row;
     return Number(row.n);
@@ -1242,6 +1284,19 @@ export class LedgerApi {
     });
   }
 
+  /** Resolve one exact incident ID without acknowledging it for the owner. */
+  resolveNotificationById(id: string, by: string): NotificationRecord | null {
+    if (by.trim() === '') throw new Error('resolution by must be non-empty');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null || current.resolvedAt !== null) return current;
+      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
+        .run(nowIso(), by, id);
+      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by } });
+      return this.getNotification(id);
+    });
+  }
+
   /**
    * Record a display receipt (the shown:true doctrine): idempotent per
    * surface — a repeated receipt for the same surface is a no-op that
@@ -1271,12 +1326,33 @@ export class LedgerApi {
     });
   }
 
-  /** Human ack — the action-required clearance. Idempotent. */
+  /** Explicit machine disposition, distinct from the owner's Ack.
+   * A successful wake prompt by itself never calls this method. */
+  disposeMachineNotification(id: string, detail: string): NotificationRecord | null {
+    if (detail.trim() === '') throw new Error('machine disposition detail must be non-empty');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null) return null;
+      if (current.routing !== 'action-required') {
+        throw new Error('only action-required notifications accept a Gru disposition; owner stops require owner acknowledgement');
+      }
+      if (current.resolvedAt !== null || current.ackedAt !== null) return current;
+      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
+        .run(nowIso(), 'gru', id);
+      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'gru', detail } });
+      return this.getNotification(id) as NotificationRecord;
+    });
+  }
+
+  /** Human ack for owner/FYI only. Machine alerts require a disposition. */
   ackNotification(id: string, by: string): NotificationRecord | null {
     if (by === '') throw new Error('acked-by must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
+      if (current.routing === 'action-required') {
+        throw new Error('action-required notifications require a Gru disposition; Ack cannot clear machine attention');
+      }
       if (current.ackedAt !== null) return current;
       this.db
         .prepare('UPDATE notifications SET acked_at = ?, acked_by = ? WHERE id = ?')

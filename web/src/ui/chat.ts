@@ -64,7 +64,18 @@ interface PendingResetView {
   readonly streamText: string;
   readonly streamOpen: boolean;
   readonly activeTool: HTMLElement | null;
+  readonly activeToolBand: ServiceBand | null;
+  readonly serviceBand: ServiceBand | null;
   readonly unread: number;
+}
+
+/** One collapsed run of service-context frames (tool lines + notices). */
+interface ServiceBand {
+  readonly root: HTMLElement;
+  readonly head: HTMLButtonElement;
+  readonly detail: HTMLElement;
+  /** A tool inside this band is still running (head shows "· running"). */
+  running: boolean;
 }
 
 export class ChatView {
@@ -98,6 +109,12 @@ export class ChatView {
    * lazily on the first text delta, so tool-only turns leave no stub. */
   private streamOpen = false;
   private activeTool: HTMLElement | null = null;
+  private activeToolBand: ServiceBand | null = null;
+  /** One collapsed band per run of consecutive service frames (tool lines
+   * + product notices) — owner clean-chat clause 2026-09-23: the chat
+   * reads as conversation, machinery one tap away. A conversation frame
+   * (user message, reply delta, error) closes the run. */
+  private serviceBand: ServiceBand | null = null;
   private unread = 0;
   /** Auto-follow engages while the reader is near the log's bottom; a
    * user scroll away disengages until they return or jump-to-latest. */
@@ -304,6 +321,8 @@ export class ChatView {
       streamText: this.streamText,
       streamOpen: this.streamOpen,
       activeTool: this.activeTool,
+      activeToolBand: this.activeToolBand,
+      serviceBand: this.serviceBand,
       unread: this.unread,
     };
     // Confirmation accepted: immediately show the fresh pending view. The
@@ -315,6 +334,8 @@ export class ChatView {
     this.streamText = '';
     this.streamOpen = false;
     this.activeTool = null;
+    this.activeToolBand = null;
+    this.serviceBand = null;
     this.unread = 0;
     this.cancelSettleScroll();
     this.stickToBottom = true;
@@ -336,6 +357,8 @@ export class ChatView {
     this.streamText = prior.streamText;
     this.streamOpen = prior.streamOpen;
     this.activeTool = prior.activeTool;
+    this.activeToolBand = prior.activeToolBand;
+    this.serviceBand = prior.serviceBand;
     this.unread = prior.unread;
     this.renderUnread();
     this.pendingResetView = null;
@@ -358,8 +381,14 @@ export class ChatView {
       const message =
         `${result.action === 'compact' ? 'compact context' : 'new chat'} failed: ` +
         (result.message ?? result.code ?? 'unknown error');
-      this.ephemeralNote(message);
+      // Failed context controls are durable service machinery, not
+      // ephemeral UI: the clean-chat clause bands them (r2 53) so the
+      // notice survives the restored conversation and later reloads of
+      // the same view stay readable. appendServiceLine never appends
+      // before intervening conversation (reset rollback covered above).
+      this.appendServiceLine(el('div', 'notice-line', `⚠️ ${message}`));
       this.announceContextOutcome(message);
+      this.followContent(true);
     } else if (result.action === 'compact') {
       this.ephemeralNote('context compacted');
       this.announceContextOutcome('Context compacted successfully');
@@ -690,6 +719,8 @@ export class ChatView {
     this.streamText = '';
     this.streamOpen = false;
     this.activeTool = null;
+    this.activeToolBand = null;
+    this.serviceBand = null;
     this.cancelSettleScroll();
     this.stickToBottom = true;
     this.jumpButton.hidden = true;
@@ -699,6 +730,8 @@ export class ChatView {
   /** User message status changes: queued → sent → acked. `live` is false
    * for replayed frames: the viewport settle coalesces those. */
   upsertMessage(message: ChatMessage, live = true): void {
+    // A user message is conversation: it ends any open service run.
+    this.closeServiceBand();
     let bubble = this.bubbles.get(message.client_msg_id);
     const fresh = bubble === undefined;
     if (bubble === undefined) {
@@ -754,6 +787,7 @@ export class ChatView {
         // Perkins r1/r2 blocker). Order is load-bearing. The bubble's DOM
         // is created lazily on the first text delta too: a tool-only turn
         // never leaves an empty stub.
+        this.closeServiceBand();
         if (!this.streamOpen) this.openStream();
         this.streamText += frame.text;
         if (frame.text !== '') {
@@ -767,10 +801,23 @@ export class ChatView {
       case 'tool': {
         if (frame.state === 'start') {
           this.activeTool?.remove();
+          if (this.activeToolBand !== null) {
+            this.activeToolBand.running = false;
+            if (this.activeToolBand.detail.childElementCount === 0) {
+              this.activeToolBand.root.remove();
+              if (this.serviceBand === this.activeToolBand) this.serviceBand = null;
+            } else {
+              this.renderServiceHead(this.activeToolBand);
+            }
+            this.activeToolBand = null;
+          }
           const line = el('div', 'tool-line tool-line--active', `⚙️ ${frame.name}`);
           line.dataset.toolName = frame.name;
-          this.log.append(line);
+          const band = this.appendServiceLine(line);
+          band.running = true;
+          this.renderServiceHead(band);
           this.activeTool = line;
+          this.activeToolBand = band;
         } else {
           // Only settle the line whose name matches; a stray end for an
           // unknown tool renders standalone instead of cross-labeling.
@@ -778,8 +825,13 @@ export class ChatView {
             this.activeTool.classList.remove('tool-line--active');
             this.activeTool.textContent = `⚙️ ${frame.name} · done`;
             this.activeTool = null;
+            if (this.activeToolBand !== null) {
+              this.activeToolBand.running = false;
+              this.renderServiceHead(this.activeToolBand);
+              this.activeToolBand = null;
+            }
           } else if (this.activeTool === null) {
-            this.log.append(el('div', 'tool-line', `⚙️ ${frame.name} · done`));
+            this.appendServiceLine(el('div', 'tool-line', `⚙️ ${frame.name} · done`));
           }
         }
         this.followContent(live);
@@ -797,21 +849,67 @@ export class ChatView {
         break;
       }
       case 'error': {
+        this.closeServiceBand();
         const line = el('div', 'tool-line', `⚠️ ${frame.message}`);
         this.log.append(line);
         this.followContent(live);
         break;
       }
       case 'notice': {
-        // E7: product notices (action-required escalations) surface in
-        // the chat stream — visually distinct from Gru's own bubbles.
-        const line = el('div', 'notice-line', frame.text);
-        this.log.append(line);
+        // E7: product notices (wake failures, supervisor restarts, control
+        // outcomes) are service machinery — they join the collapsed
+        // service band so the conversation stays readable.
+        this.appendServiceLine(el('div', 'notice-line', frame.text));
         if (live) this.bumpUnread();
         this.followContent(live);
         break;
       }
     }
+  }
+
+  /** Append a service-context line to the open band (opening one if the
+   * previous frame was conversation); returns the band for head updates. */
+  private appendServiceLine(node: HTMLElement): ServiceBand {
+    // Reset rollback can restore an older band with a newer user bubble
+    // after it. Never append a notice before that intervening conversation.
+    const band = this.serviceBand?.root === this.log.lastElementChild
+      ? this.serviceBand : this.openServiceBand();
+    band.detail.append(node);
+    this.renderServiceHead(band);
+    return band;
+  }
+
+  private openServiceBand(): ServiceBand {
+    const root = el('div', 'service-band');
+    const head = el('button', 'service-band__head');
+    head.type = 'button';
+    head.setAttribute('aria-expanded', 'false');
+    const detail = el('div', 'service-band__detail');
+    detail.hidden = true;
+    const band: ServiceBand = { root, head, detail, running: false };
+    head.addEventListener('click', () => {
+      detail.hidden = !detail.hidden;
+      head.setAttribute('aria-expanded', String(!detail.hidden));
+      this.renderServiceHead(band);
+    });
+    root.append(head, detail);
+    this.log.append(root);
+    this.serviceBand = band;
+    return band;
+  }
+
+  private renderServiceHead(band: ServiceBand): void {
+    const count = band.detail.childElementCount;
+    const suffix = band.running ? ' · running' : '';
+    band.head.textContent = `⚙️ ${count} service event${count === 1 ? '' : 's'}${suffix} — ${
+      band.detail.hidden ? 'expand' : 'collapse'
+    }`;
+  }
+
+  /** A conversation frame arrived; the next service frame starts a fresh
+   * band (consecutive runs only). */
+  private closeServiceBand(): void {
+    this.serviceBand = null;
   }
 
   /** Open the LOGICAL stream for a turn (or for the first bare delta of a

@@ -427,7 +427,9 @@ export class DecisionRuntime implements DecisionService {
     this.signalStatus();
     this.notificationEffect('degraded notification', () => this.options.notifications?.postIncident({
       kind: `decisions.degraded.${reason}`,
-      routing: 'action-required',
+      // Owner-only remediation (provider credentials/quota), so this is
+      // human-facing: FOR YOU + bell, never a machine wake.
+      routing: 'needs-owner',
       severity: 'error',
       title: 'Jev degraded — deterministic fallback active',
       detail: `${reason}. Run the local credentials command if needed, then use Recheck; Gru Command remains usable.`,

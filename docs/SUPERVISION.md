@@ -83,8 +83,8 @@ fatal errors climb.
 
 **Crash-loop breaker.** ≥ `max_restarts` (default 3) restarts within a
 rolling `restart_window_ms` (default 10 min) trips the breaker: the agent
-is **stopped** (no further restarts), an **action-required** notification
-escalates, and the board marks the agent (`⛔ stopped` on the rail + the
+is **stopped** (no further restarts), a **needs-owner** notification
+escalates (re-arm is the human's ack), and the board marks the agent (`⛔ stopped` on the rail + the
 notification). Acking that notification **re-arms** supervision: the ring
 clears, a fresh window opens, one restart attempt resumes the agent. A
 service restart also resets breaker state (in-memory by design) — the ack
@@ -117,23 +117,29 @@ computed per-snapshot.
 - **FYI** — informational; derived automatically from board-worthy
   events (job blocked, agent errored, lens failed, round verdict) and
   posted directly by the supervisor (hang detected, restart engaged).
-- **Action-required** — needs a human decision; posted by the supervisor
-  on breaker trips. These also surface **in chat** as notice lines
-  (`⚠ Action required: …`) so the single Gru window carries them.
+- **Action-required** — machine attention for Gru. Eligible rows open a
+  rate-limited Gru wake turn; Gru diagnoses and dispositions them. They appear
+  in NEEDS GRU, not the owner bell. Breakers requiring owner re-arm and other
+  owner-only decisions use **needs-owner**, not action-required.
 
 **Ack ids — nothing shown is unproven.** Every notification carries a
 stable id (the ack contract). When a client displays one — a toast, the
 bell panel, a browser notification — it posts
 `POST /api/notifications/:id/shown {surface}` and the row records the
 receipt (`shown_at`, one per surface, idempotent). An **ack**
-(`POST /api/notifications/:id/ack`) is the human clearance: it clears the
-row (and, for a breaker row, re-arms supervision). The bell badge counts
-unacked errors; ack buttons live on every row.
+(`POST /api/notifications/:id/ack`) is the owner clearance for owner/FYI
+rows. The bell badge counts all unseen needs-owner rows, including info;
+the NEEDS GRU machine queue is tracked separately and never rings the bell.
+Only owner/FYI rows expose Ack or Mark seen controls; Gru dispositions
+machine rows through the notification disposition endpoint. Existing routing
+never changes by age or at boot. Gru may post an explicit needs-owner decision
+through the authenticated endpoint; a blocked wake creates a durable
+needs-owner stop asking for manual service recovery.
 
 **Surfaces:** in-app toasts (always — the floor), the browser
 Notification API (permission requested at pairing; toasts carry the load
 when denied), the board bell panel, and chat notices for
-action-required items.
+needs-owner items.
 
 The log is append-only by design (the record of what was escalated and
 when). Retention/pruning of very old notification rows is a known
@@ -185,7 +191,7 @@ owns un-hanging the turn itself; `timeoutMs` is caller-side relief.
 
 `test/supervisor.test.ts` drives a controllable runtime: a killed stub
 agent climbs the ladder and is restored (resumed from its session file);
-three fast failures trip the breaker exactly once with an action-required
+three fast failures trip the breaker exactly once with a needs-owner
 notification; an ack re-arms; in-band errors never restart. The same
 suite pins the hung-turn follow-ups: a live open tool never trips the
 watchdog, heartbeats keep a quiet run alive, an interrupted turn is
