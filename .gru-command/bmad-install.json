@@ -130,6 +130,7 @@
     ]
   },
   "official_manifest_sha256": "bfb19c23abe00abc8b2883d97c3890cabc0802ba900f8f327be278d85ab0abda",
-  "source_payload_sha256": "6aa518c2b6aa28fb1b2cfd07294003e172d3048a3cb1e41b31ed4652de25ce34",
-  "compatibility_patches": []
+  "source_payload_sha256": "9465f44e276f60f5862cff19b9a2bb90342fca03f0a551d094ea9f3f5b5e8f83",
+  "compatibility_patches": [],
+  "source_payload_format": "without-derived-caches-v1"
 }
