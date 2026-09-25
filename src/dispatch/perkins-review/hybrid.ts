@@ -268,6 +268,7 @@ interface SubmissionValidationContext {
   readonly candidates: ReadonlyMap<string, ChildCandidate>;
   readonly prior: readonly VerifiedFinding[];
   readonly priorTargetSha: string | null;
+  readonly priorBaseSha: string | null;
   readonly expected: ReadonlySet<string>;
   readonly validCoverage: ReadonlySet<string>;
   readonly readChunks: ReadonlySet<string>;
@@ -533,6 +534,7 @@ interface ProofCache {
   readonly changeStatus: Map<string, readonly DeltaPath[]>;
   readonly changedLines: Map<string, ReadonlySet<string>>;
   readonly canonicalPatches: Map<string, string>;
+  readonly sourceMatches: Map<string, readonly { readonly path: string; readonly lines: ReadonlySet<string> }[]>;
 }
 
 interface DeltaPath {
@@ -543,7 +545,7 @@ interface DeltaPath {
 function newProofCache(): ProofCache {
   return {
     blobContains: new Map(), pathDiffs: new Map(), pathAbsent: new Map(), anywhere: new Map(),
-    changeStatus: new Map(), changedLines: new Map(), canonicalPatches: new Map(),
+    changeStatus: new Map(), changedLines: new Map(), canonicalPatches: new Map(), sourceMatches: new Map(),
   };
 }
 
@@ -650,6 +652,10 @@ function fixedAuditEvidence(
 }
 
 const MAX_INDIRECT_PROOF_BYTES = 8 * 1024 * 1024;
+// The MCP bridge serializes NativeAgentToolResult again inside an RPC frame.
+// Leave 64 KiB for transport metadata/IDs and protocol growth, not just the
+// inner JSON delivered directly by Pi's native-tool adapter.
+const MAX_PRIOR_DELTA_WIRE_BYTES = 1024 * 1024 - 64 * 1024;
 
 /** Read bounded Git bytes at two fixed commits, never from the checkout. A
  * failed query must fail proof, not devolve into a weaker current-tree check. */
@@ -663,7 +669,7 @@ function proofGitBytes(review: FrozenReview, args: readonly string[]): Buffer {
 }
 
 function proofGit(review: FrozenReview, args: readonly string[]): string {
-  return new TextDecoder('utf-8', { fatal: true }).decode(proofGitBytes(review, args));
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(proofGitBytes(review, args));
 }
 
 /** Git attributes can label a binary blob as text (or text as binary). The
@@ -672,7 +678,7 @@ function canonicalTextBlob(review: FrozenReview, sha: string, path: string): str
   const bytes = proofGitBytes(review, ['cat-file', 'blob', `${sha}:${path}`]);
   if (bytes.some((byte) => byte === 0 || byte === 127 || (byte < 32 && byte !== 9 && byte !== 10 && byte !== 13))) return null;
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     return null;
   }
@@ -719,10 +725,6 @@ function regularFrozenBlobId(review: FrozenReview, sha: string, path: string): s
   return match !== null && entries.slice(entries.indexOf('\t') + 1) === `${path}\0` ? match[1]! : null;
 }
 
-function regularFrozenBlob(review: FrozenReview, sha: string, path: string): boolean {
-  return regularFrozenBlobId(review, sha, path) !== null;
-}
-
 /** Do not mix another file's hunks into a renamed caller's path pair. */
 function isolatedDeltaPath(paths: readonly DeltaPath[], path: string, change?: 'added' | 'removed'): DeltaPath {
   const matches = paths.filter((entry) => change === 'added' ? entry.newPath === path :
@@ -747,11 +749,27 @@ function canonicalPathPatch(review: FrozenReview, priorSha: string, entry: Delta
   const newBlob = entry.newPath === null ? null : regularFrozenBlobId(review, review.manifest.targetSha, entry.newPath);
   if (entry.oldPath !== null && oldBlob === null) throw new Error(`frozen delta path ${entry.oldPath} is not a regular blob`);
   if (entry.newPath !== null && newBlob === null) throw new Error(`frozen delta path ${entry.newPath} is not a regular blob`);
-  if (entry.oldPath !== null && canonicalTextBlob(review, priorSha, entry.oldPath) === null) return null;
-  if (entry.newPath !== null && canonicalTextBlob(review, review.manifest.targetSha, entry.newPath) === null) return null;
+  const oldText = entry.oldPath === null ? null : canonicalTextBlob(review, priorSha, entry.oldPath);
+  const newText = entry.newPath === null ? null : canonicalTextBlob(review, review.manifest.targetSha, entry.newPath);
+  if (entry.oldPath !== null && oldText === null) return null;
+  if (entry.newPath !== null && newText === null) return null;
   const diffFlags = ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--text', '--unified=0'];
   let patch: string;
-  if (entry.oldPath !== null && entry.newPath !== null && entry.oldPath !== entry.newPath) {
+  if (entry.oldPath === null || entry.newPath === null) {
+    // A pathspec for a deleted file also selects a newly created directory's
+    // descendants. Build the one-sided patch from exactly the selected blob.
+    const text = (oldText ?? newText)!;
+    const lines = text === '' ? [] : text.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
+    const prefix = entry.oldPath === null ? '+' : '-';
+    const path = (entry.oldPath ?? entry.newPath)!;
+    patch = [`diff --git a/${path} b/${path}`,
+      `--- ${entry.oldPath === null ? '/dev/null' : `a/${path}`}`,
+      `+++ ${entry.newPath === null ? '/dev/null' : `b/${path}`}`,
+      `@@ -${entry.oldPath === null ? '0,0' : `1,${lines.length}`} +${entry.newPath === null ? '0,0' : `1,${lines.length}`} @@`,
+      ...lines.flatMap((line) => line.endsWith('\n') ? [prefix + line.slice(0, -1)] : [prefix + line, '\\ No newline at end of file']),
+    ].join('\n') + '\n';
+    if (Buffer.byteLength(patch, 'utf8') > MAX_INDIRECT_PROOF_BYTES) throw new Error('frozen one-sided patch exceeds the proof byte bound');
+  } else if (entry.oldPath !== entry.newPath) {
     // A literal pathspec for oldPath also selects oldPath/descendants after a
     // file-to-directory replacement. Diff the exact frozen blobs of this
     // detected rename, never another file's hunks from the selected paths.
@@ -766,21 +784,115 @@ function canonicalPathPatch(review: FrozenReview, priorSha: string, entry: Delta
   return patch;
 }
 
+/** Match plausible *whole-file* reuse of a changed source to this A blob.
+ * An incidental shared line in another changed file is not attribution. An
+ * identical blob, or two shared nonempty lines covering a majority of the
+ * smaller file, provides bounded evidence of a possible moved/edited caller.
+ * Binary and grossly disproportionate files cannot be canonical whole-file
+ * sources for this caller. Partial copies are outside this proof contract. */
+function changedSourcesForAddedPath(
+  review: FrozenReview, priorSha: string, entry: DeltaPath, cache: ProofCache,
+): readonly { readonly path: string; readonly lines: ReadonlySet<string> }[] {
+  const path = entry.newPath!;
+  const key = `${priorSha}\0${path}`;
+  const cached = cache.sourceMatches.get(key);
+  if (cached !== undefined) return cached;
+  const newBlob = regularFrozenBlobId(review, review.manifest.targetSha, path);
+  const newText = canonicalTextBlob(review, review.manifest.targetSha, path);
+  if (newBlob === null || newText === null) throw new Error(`fix_location ${path} has no canonical added caller blob`);
+  const targetBytes = Buffer.byteLength(newText, 'utf8');
+  const targetLines = new Set(newText.split(/\r?\n/u).filter((line) => line !== ''));
+  const paths = deltaPaths(review, priorSha, cache).filter((other) => other.oldPath !== null &&
+    other.oldPath !== path && (other.newPath === null || other.newPath === other.oldPath));
+  if (paths.length > 256) throw new Error(`fix_location ${path} exceeds the changed-source path bound`);
+  let inspectedBytes = 0;
+  const matches: { path: string; lines: ReadonlySet<string> }[] = [];
+  for (const candidate of paths) {
+    const sourcePath = candidate.oldPath!;
+    const oldBlob = regularFrozenBlobId(review, priorSha, sourcePath);
+    if (oldBlob === null) continue;
+    // Object size is metadata; never read a large unrelated source to see if
+    // it happens to contain a common string. Exact OID equality is decisive.
+    if (oldBlob === newBlob) {
+      matches.push({ path: sourcePath, lines: targetLines });
+      continue;
+    }
+    const sizeText = proofGit(review, ['cat-file', '-s', oldBlob]).trim();
+    const size = Number(sizeText);
+    if (!Number.isSafeInteger(size) || size < 0) throw new Error(`fix_location ${path} has invalid frozen source size`);
+    if (size > MAX_INDIRECT_PROOF_BYTES || size > targetBytes * 4 || targetBytes > size * 4) continue;
+    inspectedBytes += size;
+    if (inspectedBytes > MAX_INDIRECT_PROOF_BYTES) throw new Error(`fix_location ${path} exceeds the changed-source byte bound`);
+    const oldText = canonicalTextBlob(review, priorSha, sourcePath);
+    if (oldText === null) continue;
+    const oldLines = new Set(oldText.split(/\r?\n/u).filter((line) => line !== ''));
+    const shared = [...targetLines].filter((line) => oldLines.has(line)).length;
+    if (shared >= 2 && shared * 2 >= Math.min(targetLines.size, oldLines.size)) {
+      matches.push({ path: sourcePath, lines: oldLines });
+    }
+  }
+  cache.sourceMatches.set(key, matches);
+  return matches;
+}
+
 /** Null means located; otherwise return a specific, bounded rejection. */
+function priorCitedEvidence(
+  review: FrozenReview, finding: VerifiedFinding,
+  priorSha: string, priorBaseSha: string | null,
+): boolean {
+  const path = findingPath(finding);
+  if (path === null) return false;
+  const targetId = regularFrozenBlobId(review, priorSha, path);
+  if (targetId !== null && proofGit(review, ['cat-file', 'blob', targetId]).includes(finding.evidence)) return true;
+  if (priorBaseSha === null) return false; // Legacy blob citations work without a historical base.
+  const baseId = regularFrozenBlobId(review, priorBaseSha, path);
+  if (baseId === null) return false;
+  if (targetId === null) {
+    // Bind a deleted citation to its exact old blob, not a pathspec that
+    // also selects descendants installed at the same path.
+    const oldText = canonicalTextBlob(review, priorBaseSha, path);
+    return oldText !== null && oldText.includes(finding.evidence);
+  }
+  const patch = proofGit(review, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--text', '--unified=3', baseId, targetId]);
+  // Accepted citations can be multi-line, either with +/- prefixes or as
+  // blob text. Only inspect data inside a hunk of this exact blob pair: no
+  // headers or unrelated path can satisfy a historical citation.
+  let prefixed: string[] = [];
+  let payload: string[] = [];
+  let inHunk = false;
+  const matches = () => prefixed.join('\n').includes(finding.evidence) || payload.join('\n').includes(finding.evidence);
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('@@ ')) {
+      if (matches()) return true;
+      prefixed = [];
+      payload = [];
+      inHunk = true;
+    } else if (inHunk && /^[ +-]/u.test(line)) {
+      prefixed.push(line);
+      payload.push(line.slice(1));
+    }
+  }
+  return matches();
+}
+
 function indirectFixEvidence(
   review: FrozenReview, finding: VerifiedFinding, audit: FixAuditResult,
-  priorSha: string | null, cache: ProofCache,
+  priorSha: string | null, priorBaseSha: string | null, cache: ProofCache,
 ): string | null {
   const location = audit.fix_location!;
   const citedPath = findingPath(finding);
   if (citedPath === null || location.path === citedPath) return 'fix_location must name a changed file distinct from the original cited path';
   if (priorSha === null) return 'fix_location requires a frozen prior target revision';
   try {
-    if (!regularFrozenBlob(review, priorSha, citedPath) ||
-        !proofGit(review, ['show', `${priorSha}:${citedPath}`]).includes(finding.evidence)) {
-      return `fix_location ${location.path} prior target revision does not contain the original cited finding`;
+    if (!priorCitedEvidence(review, finding, priorSha, priorBaseSha)) {
+      return `fix_location ${location.path} prior accepted frozen file/hunk does not contain the original cited finding`;
     }
     const entry = isolatedDeltaPath(deltaPaths(review, priorSha, cache), location.path, location.change);
+    const sources = entry.oldPath === null && entry.newPath !== null ? changedSourcesForAddedPath(review, priorSha, entry, cache) : [];
+    if (sources.length > 1) return `fix_location ${location.path} has ambiguous changed source blobs`;
+    if (sources[0]?.lines.has(audit.evidence) === true) {
+      return `fix_location ${location.path} evidence is an unchanged line in changed source ${sources[0].path}`;
+    }
     const patch = canonicalPathPatch(review, priorSha, entry, cache);
     if (patch === null) return `fix_location ${location.path} has a binary caller blob, not canonical text proof`;
     const key = `${priorSha}\0${entry.oldPath ?? ''}\0${entry.newPath ?? ''}\0${location.change}`;
@@ -788,15 +900,17 @@ function indirectFixEvidence(
     if (lines === undefined) {
       const changed = new Set<string>();
       let inHunk = false;
-      for (const line of patch.split('\n')) {
+      const patchLines = patch.split('\n');
+      for (let index = 0; index < patchLines.length; index += 1) {
+        const line = patchLines[index]!;
         if (line.startsWith('diff --git ')) inHunk = false;
         else if (/^@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@/u.test(line)) inHunk = true;
         else if (inHunk && line.startsWith(location.change === 'added' ? '+' : '-')) {
           const text = line.slice(1);
-          // A CR immediately before the diff's LF terminates a CRLF blob
-          // line. Keep all other whitespace intact; audit evidence remains
-          // a single line with no embedded CR or LF.
-          changed.add(text.endsWith('\r') ? text.slice(0, -1) : text);
+          // Only strip a CR that terminated a CRLF *blob* line. Git's
+          // no-newline marker distinguishes an EOF bare CR from CRLF.
+          const bareCr = patchLines[index + 1] === '\\ No newline at end of file';
+          changed.add(text.endsWith('\r') && !bareCr ? text.slice(0, -1) : text);
         }
       }
       lines = changed;
@@ -812,21 +926,24 @@ function indirectFixEvidence(
 interface PriorReview {
   readonly findings: readonly VerifiedFinding[];
   readonly targetSha: string | null;
+  readonly baseSha: string | null;
 }
 
 function loadPriorReview(file: string | undefined): PriorReview {
-  if (file === undefined) return { findings: [], targetSha: null };
+  if (file === undefined) return { findings: [], targetSha: null, baseSha: null };
   const size = statSync(file).size;
   if (size > 8 * 1024 * 1024) throw new Error('prior consolidated review exceeds 8 MiB');
   const bytes = readFileSync(file);
   if (bytes.byteLength !== size || bytes.byteLength > 8 * 1024 * 1024) {
     throw new Error('prior consolidated review changed while bounded bytes were read');
   }
-  const parsed = JSON.parse(bytes.toString('utf8')) as { schemaVersion?: unknown; findings?: unknown; frozen?: { targetSha?: unknown } };
+  const parsed = JSON.parse(bytes.toString('utf8')) as { schemaVersion?: unknown; findings?: unknown; frozen?: { targetSha?: unknown; diffBaseSha?: unknown } };
   if (
     parsed.schemaVersion !== 2 ||
     !Array.isArray(parsed.findings) || parsed.findings.length > 10_000 ||
-    typeof parsed.frozen?.targetSha !== 'string' || !/^[0-9a-f]{40}$/u.test(parsed.frozen.targetSha)
+    typeof parsed.frozen?.targetSha !== 'string' || !/^[0-9a-f]{40}$/u.test(parsed.frozen.targetSha) ||
+    (parsed.frozen.diffBaseSha !== undefined &&
+      (typeof parsed.frozen.diffBaseSha !== 'string' || !/^[0-9a-f]{40}$/u.test(parsed.frozen.diffBaseSha)))
   ) {
     throw new Error('prior consolidated review has an invalid findings array');
   }
@@ -852,7 +969,8 @@ function loadPriorReview(file: string | undefined): PriorReview {
     ) throw new Error(`prior finding ${index} failed the durable schema`);
     return finding as VerifiedFinding;
   });
-  return { findings, targetSha: parsed.frozen.targetSha };
+  return { findings, targetSha: parsed.frozen.targetSha,
+    baseSha: typeof parsed.frozen.diffBaseSha === 'string' ? parsed.frozen.diffBaseSha : null };
 }
 
 function renderTemplateOnce(template: string, values: Readonly<Record<string, string>>): string {
@@ -1586,10 +1704,13 @@ export class PerkinsHybridReview {
           if (patch === null) throw new Error(`prior delta path ${selection} has a binary caller blob`);
           payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, ...entry, diff: patch });
         }
-        if (Buffer.byteLength(payload, 'utf8') > MAX_TRANSPORT_CHUNK_BYTES) {
-          throw new Error('prior delta response exceeds the bounded tool transport; select a smaller caller path');
+        const details = { priorTargetSha, targetSha: review.manifest.targetSha };
+        const frame = JSON.stringify({ id: 'x'.repeat(256), ok: true, result: { text: payload, details } }) + '\n';
+        if (Buffer.byteLength(payload, 'utf8') > MAX_TRANSPORT_CHUNK_BYTES ||
+            Buffer.byteLength(frame, 'utf8') > MAX_PRIOR_DELTA_WIRE_BYTES) {
+          throw new Error('prior delta response exceeds the bounded serialized tool transport; select a smaller caller path');
         }
-        return { text: payload, details: { priorTargetSha, targetSha: review.manifest.targetSha } };
+        return { text: payload, details };
       },
     };
 
@@ -1600,6 +1721,7 @@ export class PerkinsHybridReview {
       candidates,
       prior,
       priorTargetSha: priorReview.targetSha,
+      priorBaseSha: priorReview.baseSha,
       expected,
       validCoverage,
       readChunks,
@@ -2204,7 +2326,7 @@ export class PerkinsHybridReview {
         const speculativeNa = finding.verification.disposition === 'unverifiable-speculative' && audit.evidence === 'N/A';
         const path = findingPath(finding);
         const indirectIssue = audit.fix_location === undefined ? null :
-          indirectFixEvidence(review, finding, audit, context.priorTargetSha, proofCache);
+          indirectFixEvidence(review, finding, audit, context.priorTargetSha, context.priorBaseSha, proofCache);
         const located = speculativeNa || (indirectIssue === null && (
           audit.fix_location !== undefined || (path !== null && (
             audit.status === 'still-present'

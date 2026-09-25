@@ -139,6 +139,7 @@ export interface LeadBrainOptions {
   readonly beforeSubmit?: () => void;
   readonly onLeadStart?: () => void;
   readonly onPriorDelta?: (list: unknown, selected: unknown, prompt: string) => void | Promise<void>;
+  readonly priorDeltaPath?: string;
   readonly transformReport?: (report: string) => string;
   /** Validate the exact submission through the preflight channel first. */
   readonly preflight?: HybridPreflightOptions;
@@ -239,7 +240,7 @@ export function fakeHybridSpawner(
     if (options.onPriorDelta !== undefined) {
       if (priorDeltaTool === undefined) throw new Error('rereview lead needs perkins_read_prior_delta');
       const list = JSON.parse((await priorDeltaTool.execute({})).text) as unknown;
-      const selected = JSON.parse((await priorDeltaTool.execute({ path: 'src/caller.ts' })).text) as unknown;
+      const selected = JSON.parse((await priorDeltaTool.execute({ path: options.priorDeltaPath ?? 'src/caller.ts' })).text) as unknown;
       await options.onPriorDelta(list, selected, prompt);
     }
 

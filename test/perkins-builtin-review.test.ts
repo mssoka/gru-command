@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -37,6 +37,11 @@ import {
 } from '../src/dispatch/perkins-review/types.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeHybridSpawner, type HybridSubmission, type LeadBrainOptions } from './helpers/perkins-hybrid-double.js';
+import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
+import { PiRuntime } from '../src/runtime/pi-adapter.js';
+import { SessionStore } from '../src/sessions/store.js';
+import { configPathFor, loadConfig } from '../src/config.js';
+import type { NativeAgentTool } from '../src/runtime/types.js';
 
 const repos: FixtureRepo[] = [];
 const temporaryDirectories: string[] = [];
@@ -174,6 +179,10 @@ function hybridHarness(brain: LeadBrainOptions, options?: { noSpec?: boolean; sp
 function indirectFixHarness(options: {
   readonly audit?: Record<string, unknown> | (() => Record<string, unknown>);
   readonly priorCallerContent?: string;
+  readonly priorHelperContent?: string;
+  readonly priorHistoricalHunk?: boolean;
+  readonly priorExtraSource?: string;
+  readonly priorCallerBytes?: Buffer;
   readonly priorFinding?: Partial<ReviewFinding>;
   readonly priorDisposition?: 'confirmed' | 'unverifiable-speculative';
   readonly priorSha?: string;
@@ -183,20 +192,31 @@ function indirectFixHarness(options: {
   readonly preflight?: LeadBrainOptions['preflight'];
   readonly transformReport?: LeadBrainOptions['transformReport'];
   readonly onPriorDelta?: LeadBrainOptions['onPriorDelta'];
+  readonly priorDeltaPath?: LeadBrainOptions['priorDeltaPath'];
 } = {}) {
   const repo = makeFixtureRepo('indirect-audit');
   repos.push(repo);
   const base = repo.head();
   repo.git(['checkout', '-b', 'feature/review']);
-  repo.commitFile('src/helper.ts', 'export function helper(ref: string): string { return ref.slice(ref.indexOf("/") + 1); }\n');
-  const priorTarget = repo.commitFile('src/caller.ts', options.priorCallerContent ?? 'const unchanged = true;\nconst selected = nativeRef;\n');
+  repo.commitFile('src/helper.ts', options.priorHelperContent ?? 'export function helper(ref: string): string { return ref.slice(ref.indexOf("/") + 1); }\n');
+  const priorDiffBase = options.priorHistoricalHunk === true ? repo.head() : base;
+  if (options.priorHistoricalHunk === true) repo.commitFile('src/helper.ts', 'export function helper(ref: string): string { return nativeRef; }\n');
+  if (options.priorExtraSource !== undefined) repo.commitFile('src/secondary.ts', options.priorExtraSource);
+  let priorTarget = repo.commitFile('src/caller.ts', options.priorCallerContent ?? 'const unchanged = true;\nconst selected = nativeRef;\n');
+  if (options.priorCallerBytes !== undefined) {
+    writeFileSync(join(repo.path, 'src/caller.ts'), options.priorCallerBytes);
+    repo.git(['add', 'src/caller.ts']);
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'prior raw caller']);
+    priorTarget = repo.head();
+  }
   options.afterPrior?.(repo);
   if (options.afterPrior === undefined) repo.commitFile('src/caller.ts', 'const unchanged = true;\nconst selected = nativeSetting;\n');
   const root = temp('perkins-indirect-');
   const priorFile = join(root, 'prior.json');
   writeFileSync(priorFile, JSON.stringify({
     schemaVersion: 2,
-    frozen: { targetSha: options.useBaseAsPrior === true ? base : options.priorSha ?? priorTarget },
+    frozen: { targetSha: options.useBaseAsPrior === true ? base : options.priorSha ?? priorTarget,
+      ...(options.priorHistoricalHunk === true ? { diffBaseSha: priorDiffBase } : {}) },
     findings: [{
       ...finding('security', 'warning', {
         title: 'Native settings token reaches the prefix stripper', location: 'src/helper.ts:1',
@@ -216,6 +236,7 @@ function indirectFixHarness(options: {
     ...(options.submitPayload === undefined ? {} : { submitPayload: options.submitPayload }),
     ...(options.transformReport === undefined ? {} : { transformReport: options.transformReport }),
     ...(options.onPriorDelta === undefined ? {} : { onPriorDelta: options.onPriorDelta }),
+    ...(options.priorDeltaPath === undefined ? {} : { priorDeltaPath: options.priorDeltaPath }),
     priorAudit: () => {
       const override = typeof options.audit === 'function' ? options.audit() : options.audit;
       const audit = {
@@ -1340,6 +1361,51 @@ describe('Perkins hybrid lead engine', () => {
     await rejectIndirect({ evidence: 'N/A', fix_location: undefined }, /cited frozen file|locatable/u);
   });
 
+  const malformedLocations: ReadonlyArray<{ readonly label: string; readonly location: unknown;
+    readonly auditPatch?: Readonly<Record<string, unknown>>; readonly rule: RegExp }> = [
+    { label: 'missing path', location: { change: 'added' }, rule: /prior-audit-fix-location/u },
+    { label: 'extra key', location: { path: 'src/caller.ts', change: 'added', extra: true }, rule: /prior-audit-fix-location/u },
+    { label: 'null', location: null, rule: /prior-audit-fix-location/u },
+    { label: 'array', location: [], rule: /prior-audit-fix-location/u },
+    { label: 'invalid change', location: { path: 'src/caller.ts', change: 'moved' }, rule: /prior-audit-fix-location/u },
+    { label: 'newline path', location: { path: 'src/caller.ts\n', change: 'added' }, rule: /prior-audit-fix-location/u },
+    { label: 'newline evidence', location: { path: 'src/caller.ts', change: 'added' },
+      auditPatch: { evidence: 'const selected = nativeSetting;\n' }, rule: /prior-audit-fix-location/u },
+    { label: 'extra audit key', location: { path: 'src/caller.ts', change: 'added' },
+      auditPatch: { unexpected: true }, rule: /prior-audit-schema/u },
+  ];
+  const checkMalformedLocation = async (mode: 'full' | 'delta', caseIndex: number): Promise<void> => {
+    const { location, auditPatch, rule } = malformedLocations[caseIndex]!;
+    const malformed = (audit: HybridSubmission['prior_audit'][number]) => ({ ...audit, fix_location: location, ...auditPatch });
+    const h = indirectFixHarness(mode === 'full' ? { audit: { fix_location: location, ...auditPatch } } : {
+      submitPayload: (attempt, submission) => attempt === 1
+        ? { ...submission, prior_audit: [] }
+        : { mode: 'delta', prior_audit: submission.prior_audit.map(malformed) },
+      preflight: { beforeAttempt: 2, calls: 1, payload: (submission) => ({ mode: 'delta',
+        prior_audit: submission.prior_audit.map(malformed) }) },
+    });
+    await expect(h.run()).rejects.toThrow(rule);
+    expect(h.fake.preflightResults[0]?.text).toMatch(rule);
+    expect(h.fake.toolErrors.some(({ tool, error }) => tool === 'perkins_submit_review' && rule.test(error))).toBe(true);
+    expect(existsSync(join(h.frozen.directory, 'consolidated.json'))).toBe(false);
+  };
+  it('rejects native full malformed fix_location: missing path', () => checkMalformedLocation('full', 0));
+  it('rejects native full malformed fix_location: extra key', () => checkMalformedLocation('full', 1));
+  it('rejects native full malformed fix_location: null', () => checkMalformedLocation('full', 2));
+  it('rejects native full malformed fix_location: array', () => checkMalformedLocation('full', 3));
+  it('rejects native full malformed fix_location: invalid change', () => checkMalformedLocation('full', 4));
+  it('rejects native full malformed fix_location: newline path', () => checkMalformedLocation('full', 5));
+  it('rejects native full malformed fix_location: newline evidence', () => checkMalformedLocation('full', 6));
+  it('rejects native full malformed fix_location: extra audit key', () => checkMalformedLocation('full', 7));
+  it('rejects native delta malformed fix_location: missing path', () => checkMalformedLocation('delta', 0));
+  it('rejects native delta malformed fix_location: extra key', () => checkMalformedLocation('delta', 1));
+  it('rejects native delta malformed fix_location: null', () => checkMalformedLocation('delta', 2));
+  it('rejects native delta malformed fix_location: array', () => checkMalformedLocation('delta', 3));
+  it('rejects native delta malformed fix_location: invalid change', () => checkMalformedLocation('delta', 4));
+  it('rejects native delta malformed fix_location: newline path', () => checkMalformedLocation('delta', 5));
+  it('rejects native delta malformed fix_location: newline evidence', () => checkMalformedLocation('delta', 6));
+  it('rejects native delta malformed fix_location: extra audit key', () => checkMalformedLocation('delta', 7));
+
   it('rejects an omitted prior audit in a full submission and preflight', async () => {
     const h = indirectFixHarness({
       submitPayload: (_attempt, submission) => ({ ...submission, prior_audit: [] }),
@@ -1389,7 +1455,7 @@ describe('Perkins hybrid lead engine', () => {
     const missing = indirectFixHarness({ priorSha: 'f'.repeat(40) });
     await expect(missing.run()).rejects.toThrow(/prior target revision/u);
     const wrongCommit = indirectFixHarness({ useBaseAsPrior: true });
-    await expect(wrongCommit.run()).rejects.toThrow(/prior target revision does not contain the original cited finding/u);
+    await expect(wrongCommit.run()).rejects.toThrow(/prior accepted frozen file\/hunk does not contain the original cited finding/u);
   });
 
   it('revalidates an indirect proof in a delta over a rejected full submission', async () => {
@@ -1420,6 +1486,49 @@ describe('Perkins hybrid lead engine', () => {
     });
     expect((await removed.run()).canonicalVerdict).toBe('READY TO MERGE');
     expect(removed.fake.preflightResults[0]?.text).toContain('"ok":true');
+  });
+
+  it('does not strip a final bare CR as though it terminated a CRLF line', async () => {
+    const h = indirectFixHarness({
+      afterPrior: (repo) => { repo.commitFile('src/caller.ts', 'const selected = nativeSetting;\r'); },
+    });
+    await expect(h.run()).rejects.toThrow(/not an actual added changed hunk line/u);
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":false');
+    expect(existsSync(join(h.frozen.directory, 'consolidated.json'))).toBe(false);
+  });
+
+  it('preserves a BOM in the accepted prior cited blob and its unchanged citation', async () => {
+    const cited = '\uFEFFexport function helper(ref: string): string { return ref.slice(ref.indexOf("/") + 1); }';
+    const h = indirectFixHarness({ priorHelperContent: cited + '\n', priorFinding: { evidence: cited } });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
+  });
+
+  it('locates a prefixed original citation in its actual accepted prior base-target hunk', async () => {
+    const h = indirectFixHarness({ priorHistoricalHunk: true,
+      priorFinding: { evidence: '-export function helper(ref: string): string { return ref.slice(ref.indexOf("/") + 1); }' } });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
+    const prior = JSON.parse(readFileSync(h.priorFile, 'utf8')) as { frozen: { targetSha: string; diffBaseSha: string } };
+    expect(prior.frozen.diffBaseSha).not.toBe(prior.frozen.targetSha);
+  });
+
+  it('locates a multiline accepted prior quote only in the exact prefixed historical hunk', async () => {
+    const h = indirectFixHarness({
+      priorHistoricalHunk: true,
+      priorHelperContent: 'export function helper(ref: string): string {\n  return ref.slice(ref.indexOf("/") + 1);\n}\n',
+      priorFinding: { evidence: '-  return ref.slice(ref.indexOf("/") + 1);\n-}' },
+    });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
+  });
+
+  it('rejects a missing prior base when the original citation exists only in its hunk', async () => {
+    const h = indirectFixHarness({ priorHistoricalHunk: true });
+    const prior = JSON.parse(readFileSync(h.priorFile, 'utf8')) as { frozen: { diffBaseSha?: string } };
+    delete prior.frozen.diffBaseSha;
+    writeFileSync(h.priorFile, JSON.stringify(prior));
+    await expect(h.run()).rejects.toThrow(/prior accepted frozen file\/hunk/u);
   });
 
   it('rejects a CR in an audit evidence payload even for a CRLF caller', async () => {
@@ -1503,15 +1612,111 @@ describe('Perkins hybrid lead engine', () => {
     expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
   });
 
-  it('does not attribute a reused rename source path to the renamed caller', async () => {
+  it('rejects a real unchanged caller line copied from a rewritten source classified M+A', async () => {
     const h = indirectFixHarness({
       afterPrior: (repo) => {
         repo.git(['mv', 'src/caller.ts', 'src/renamed.ts']);
         repo.commitFile('src/caller.ts', 'const selected = nativeSetting;\n');
       },
-      audit: { fix_location: { path: 'src/renamed.ts', change: 'added' } },
+      audit: { fix_location: { path: 'src/renamed.ts', change: 'added' }, evidence: 'const selected = nativeRef;' },
     });
-    await expect(h.run()).rejects.toThrow(/overlaps another changed path|not an actual added changed hunk line/u);
+    const status = h.repo.git(['diff', '--no-ext-diff', '--no-textconv', '--find-renames', '--name-status', 'HEAD^', 'HEAD']);
+    expect(status).toMatch(/^M\tsrc\/caller\.ts$/mu);
+    expect(status).toMatch(/^A\tsrc\/renamed\.ts$/mu);
+    await expect(h.run()).rejects.toThrow(/unchanged.*source|ambiguous.*source/u);
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":false');
+    expect(existsSync(join(h.frozen.directory, 'consolidated.json'))).toBe(false);
+  });
+
+  it('accepts a genuinely new caller with tool-derived added evidence', async () => {
+    let selectedEvidence: string | undefined;
+    const h = indirectFixHarness({
+      afterPrior: (repo) => { repo.commitFile('src/new-caller.ts', 'const selected = nativeSetting;\n'); },
+      audit: () => ({ fix_location: { path: 'src/new-caller.ts', change: 'added' }, evidence: selectedEvidence ?? 'UNAVAILABLE' }),
+      priorDeltaPath: 'src/new-caller.ts',
+      onPriorDelta: (list, selected) => {
+        expect((list as { changes: Array<{ oldPath: string | null; newPath: string | null }> }).changes)
+          .toContainEqual({ oldPath: null, newPath: 'src/new-caller.ts' });
+        const patch = (selected as { diff: string }).diff;
+        selectedEvidence = patch.split('\n').find((line) => line.startsWith('+const selected = '))?.slice(1);
+        expect(selectedEvidence).toBe('const selected = nativeSetting;');
+      },
+    });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
+  });
+
+  it('accepts a novel line in an edited copy of a rewritten caller', async () => {
+    const h = indirectFixHarness({
+      afterPrior: (repo) => {
+        repo.commitFile('src/copied.ts', 'const unchanged = true;\nconst selected = nativeRef;\nconst selected = nativeSetting;\n');
+        repo.commitFile('src/caller.ts', 'const selected = differentSetting;\n');
+      },
+      audit: { fix_location: { path: 'src/copied.ts', change: 'added' } },
+    });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
+  });
+
+  it('reads only the deleted regular caller, not invalid descendants of its replacement directory', async () => {
+    let selectedEvidence: string | undefined;
+    const h = indirectFixHarness({
+      afterPrior: (repo) => {
+        repo.git(['rm', 'src/caller.ts']);
+        mkdirSync(join(repo.path, 'src/caller.ts'), { recursive: true });
+        writeFileSync(join(repo.path, 'src/caller.ts', 'invalid.ts'), Buffer.from([0xc3, 0x28]));
+        repo.git(['add', 'src/caller.ts/invalid.ts']);
+        repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'replace caller with directory']);
+      },
+      audit: () => ({ evidence: selectedEvidence ?? 'UNAVAILABLE', fix_location: { path: 'src/caller.ts', change: 'removed' } }),
+      onPriorDelta: (_list, selected) => {
+        const patch = (selected as { diff: string }).diff;
+        expect(patch).not.toContain('invalid.ts');
+        selectedEvidence = patch.split('\n').find((line) => line.startsWith('-const selected = '))?.slice(1);
+        expect(selectedEvidence).toBe('const selected = nativeRef;');
+      },
+    });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":true');
+  });
+
+  it('fails closed on two matching changed sources without reclassifying an added path', async () => {
+    const prior = 'const unchanged = true;\nconst selected = nativeRef;\n';
+    const h = indirectFixHarness({
+      priorExtraSource: prior,
+      afterPrior: (repo) => {
+        repo.commitFile('src/secondary.ts', 'const selected = anotherSetting;\n');
+        repo.commitFile('src/caller.ts', 'const selected = nativeSetting;\n');
+        repo.commitFile('src/ambiguous.ts', prior);
+      },
+      audit: { evidence: 'const selected = nativeRef;', fix_location: { path: 'src/ambiguous.ts', change: 'added' } },
+    });
+    await expect(h.run()).rejects.toThrow(/ambiguous changed source blobs/u);
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":false');
+  });
+
+  it('does not let an unrelated binary changed source poison a new caller', async () => {
+    const h = indirectFixHarness({
+      priorCallerBytes: Buffer.from([0, 0xc3, 0x28]),
+      afterPrior: (repo) => {
+        repo.commitFile('src/caller.ts', 'const unrelated = true;\n');
+        repo.commitFile('src/fresh.ts', 'const selected = nativeSetting;\n');
+      },
+      audit: { fix_location: { path: 'src/fresh.ts', change: 'added' } },
+    });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
+  });
+
+  it('does not read an unrelated oversized changed source to attribute a small new caller', async () => {
+    const h = indirectFixHarness({
+      priorCallerContent: `const selected = nativeRef;\n${'x'.repeat(8 * 1024 * 1024 + 1)}\n`,
+      afterPrior: (repo) => {
+        repo.commitFile('src/caller.ts', 'const unrelated = true;\n');
+        repo.commitFile('src/fresh.ts', 'const selected = nativeSetting;\n');
+      },
+      audit: { fix_location: { path: 'src/fresh.ts', change: 'added' } },
+    });
+    expect((await h.run()).canonicalVerdict).toBe('READY TO MERGE');
   });
 
   it('accepts removed-line evidence in a deleted caller and rejects binary proof', async () => {
@@ -1525,6 +1730,31 @@ describe('Perkins hybrid lead engine', () => {
     });
     await expect(binary.run()).rejects.toThrow(/binary|text|changed.*line/u);
   });
+
+  const rejectPriorBinary = async (priorCallerBytes: Buffer): Promise<void> => {
+    const options = {
+      priorCallerBytes,
+      afterPrior: (repo: FixtureRepo) => {
+        repo.commitFile('.gitattributes', 'src/caller.ts diff text\n');
+        repo.git(['rm', 'src/caller.ts']);
+        repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'delete raw caller']);
+      },
+      audit: { evidence: 'const selected = nativeRef;', fix_location: { path: 'src/caller.ts', change: 'removed' } },
+    } as const;
+    const h = indirectFixHarness(options);
+    await expect(h.run()).rejects.toThrow(/binary caller|canonical text/u);
+    expect(h.fake.preflightResults[0]?.text).toContain('"ok":false');
+    expect(h.fake.toolErrors.some(({ tool, error }) => tool === 'perkins_submit_review' && /binary caller/u.test(error))).toBe(true);
+    expect(existsSync(join(h.frozen.directory, 'consolidated.json'))).toBe(false);
+
+    const reader = indirectFixHarness({ ...options, onPriorDelta: () => { throw new Error('binary caller was exposed to lead'); } });
+    await expect(reader.run()).rejects.toThrow(/binary caller/u);
+    expect(reader.fake.preflightResults).toHaveLength(0);
+  };
+  it('rejects a NUL prior-only caller in preflight, terminal and lead reader', () =>
+    rejectPriorBinary(Buffer.concat([Buffer.from('const selected = nativeRef;\n'), Buffer.from([0])])));
+  it('rejects an invalid UTF-8 prior-only caller in preflight, terminal and lead reader', () =>
+    rejectPriorBinary(Buffer.concat([Buffer.from('const selected = nativeRef;\n'), Buffer.from([0xc3, 0x28])])));
 
   it('gives the isolated rereview lead frozen prior-target deleted-caller hunks on demand', async () => {
     let observed = false;
@@ -1553,6 +1783,98 @@ describe('Perkins hybrid lead engine', () => {
     expect(observed).toBe(true);
     expect(h.fake.leadCalls[0]?.options.reviewLead?.nativeTools.some((tool) => tool.name === 'perkins_read_prior_delta')).toBe(true);
     expect(h.fake.childCalls.every((call) => call.options.isolatedReview?.nativeTools?.every((tool) => tool.name !== 'perkins_read_prior_delta') ?? true)).toBe(true);
+  });
+
+  it('caps the serialized prior-delta envelope consistently for native Pi and the real MCP adapter', async () => {
+    const makeLargeDeletion = (backslashes: number) => indirectFixHarness({
+      priorCallerContent: `const escaped = "${'\\'.repeat(backslashes)}";\nconst selected = nativeRef;\n`,
+      afterPrior: (repo) => {
+        repo.git(['rm', 'src/caller.ts']);
+        repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'delete caller']);
+      },
+      audit: { evidence: 'const selected = nativeRef;', fix_location: { path: 'src/caller.ts', change: 'removed' } },
+    });
+    const mcpCall = async (tool: NativeAgentTool): Promise<{ readonly result?: { readonly content: Array<{ readonly text: string }> }; readonly error?: { readonly message: string } }> => {
+      const bridge = await ReviewMcpBridge.start([tool]);
+      try {
+        const child = spawn(process.execPath, [join(import.meta.dirname, '..', 'src/runtime/review-mcp-server.mjs')], {
+          env: { ...process.env, GRU_REVIEW_BRIDGE_SOCKET: bridge.socketPath }, stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.setEncoding('utf8');
+        child.stderr.setEncoding('utf8');
+        child.stdout.on('data', (part: string) => { stdout += part; });
+        child.stderr.on('data', (part: string) => { stderr += part; });
+        child.stdin.end(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name: 'perkins_read_prior_delta', arguments: { path: 'src/caller.ts' } } })}\n`);
+        const exit = await new Promise<number | null>((resolve, reject) => {
+          child.once('error', reject);
+          child.once('close', resolve);
+        });
+        expect(exit, stderr).toBe(0);
+        return JSON.parse(stdout.trim()) as { result?: { content: Array<{ text: string }> }; error?: { message: string } };
+      } finally {
+        await bridge.close();
+      }
+    };
+    const small = makeLargeDeletion(100_000);
+    expect((await small.run()).canonicalVerdict).toBe('READY TO MERGE');
+    const smallTool = small.fake.leadCalls[0]!.options.reviewLead!.nativeTools.find((tool) => tool.name === 'perkins_read_prior_delta')!;
+    const piResult = await smallTool.execute({ path: 'src/caller.ts' });
+    expect(JSON.parse(piResult.text)).toMatchObject({ oldPath: 'src/caller.ts', newPath: null });
+    // Exercise the real Pi adapter's native-tool invocation with an offline
+    // intercepted streaming model response; no provider request is sent.
+    const home = temp('perkins-r4-pi-home-');
+    const workspace = temp('perkins-r4-pi-workspace-');
+    writeFileSync(configPathFor(home), `workspace_root = ${JSON.stringify(workspace)}\n`);
+    const config = loadConfig({ GRU_COMMAND_HOME: home });
+    const runtime = new PiRuntime({ config, store: new SessionStore(config.dataDir), agentDir: temp('perkins-r4-pi-agent-') });
+    const originalFetch = globalThis.fetch;
+    const previousKey = process.env['DEEPSEEK_API_KEY'];
+    process.env['DEEPSEEK_API_KEY'] = 'offline-prior-delta-fixture-key';
+    let calls = 0;
+    let toolResponseObserved = false;
+    try {
+      globalThis.fetch = (async (request: string | URL | Request, init?: RequestInit) => {
+        if (!String(request).includes('api.deepseek.com')) return originalFetch(request, init);
+        calls += 1;
+        const body = typeof init?.body === 'string' ? init.body : '';
+        if (calls === 2) toolResponseObserved = body.includes('const selected = nativeRef;') && body.includes('const escaped =');
+        const chunk = (data: unknown) => `data: ${JSON.stringify(data)}\n\n`;
+        const stream = calls === 1 ? [
+          chunk({ id: 'call-1', object: 'chat.completion.chunk', created: 0, model: 'deepseek-v4-flash', choices: [{ index: 0,
+            delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'call-prior', type: 'function',
+              function: { name: 'perkins_read_prior_delta', arguments: '{"path":"src/caller.ts"}' } }] }, finish_reason: null }] }),
+          chunk({ id: 'call-1', object: 'chat.completion.chunk', created: 0, model: 'deepseek-v4-flash',
+            choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+        ] : [chunk({ id: 'call-2', object: 'chat.completion.chunk', created: 0, model: 'deepseek-v4-flash',
+          choices: [{ index: 0, delta: { role: 'assistant', content: 'done' }, finish_reason: 'stop' }] })];
+        return new Response([...stream, 'data: [DONE]\n\n'].join(''), {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        });
+      }) as typeof fetch;
+      const handle = await runtime.spawn('perkins', { cwd: workspace, model: 'deepseek/deepseek-v4-flash',
+        reviewLead: { systemPrompt: 'Read the frozen prior delta.', tools: ['read'], nativeTools: [smallTool] } });
+      try { await handle.prompt('Read the prior caller and say done'); }
+      finally { await handle.dispose(); }
+      expect(calls).toBe(2);
+      expect(toolResponseObserved).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousKey === undefined) delete process.env['DEEPSEEK_API_KEY'];
+      else process.env['DEEPSEEK_API_KEY'] = previousKey;
+      await runtime.dispose();
+    }
+    const throughMcp = await mcpCall(smallTool);
+    expect(throughMcp.error).toBeUndefined();
+    expect(throughMcp.result?.content[0]?.text).toBe(piResult.text);
+
+    const large = makeLargeDeletion(270_000);
+    expect((await large.run()).canonicalVerdict).toBe('READY TO MERGE');
+    const largeTool = large.fake.leadCalls[0]!.options.reviewLead!.nativeTools.find((tool) => tool.name === 'perkins_read_prior_delta')!;
+    await expect(largeTool.execute({ path: 'src/caller.ts' })).rejects.toThrow(/bounded serialized tool transport/u);
+    expect((await mcpCall(largeTool)).error?.message).toMatch(/bounded serialized tool transport/u);
   });
 
   it('accepts canonical text caller hunks even when Git attributes suppress diffs', async () => {
