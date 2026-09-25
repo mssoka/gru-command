@@ -672,7 +672,7 @@ export class WaveRunner {
       ? await preflight({ repoPath })
       : { ok: true, failures: [] };
     if (!result.ok) return this.beginFallbackGate(input, result.failures, repoPath);
-    const begun = await this.beginPerkinsRound(input);
+    const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel });
     return { route: 'perkins', round: begun.round, run: begun.run };
   }
 
@@ -686,14 +686,16 @@ export class WaveRunner {
     force?: boolean;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     this.enforceBranchIdleForRequest(input);
+    let reviewModel: ReviewPreflightResult['reviewModel'];
     if (this.opts.reviewPreflight !== undefined) {
       const repoPath = this.resolveReviewRequestRepo(input);
       if (repoPath !== null) {
         const result = await this.opts.reviewPreflight({ repoPath });
         if (!result.ok) throw new FallbackGateRequiredError(result.failures);
+        reviewModel = result.reviewModel;
       }
     }
-    return this.beginPerkinsRound(input);
+    return this.beginPerkinsRound({ ...input, reviewModel });
   }
 
   private resolveReviewRequestRepo(input: { jobId: string }): string | null {
@@ -777,6 +779,7 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    reviewModel?: ReviewPreflightResult['reviewModel'];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     const controller = new AbortController();
@@ -1021,6 +1024,7 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    reviewModel?: ReviewPreflightResult['reviewModel'];
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
     const policy = (this.opts.reviewPolicyLoader ?? loadPerkinsPolicy)();
@@ -1179,6 +1183,7 @@ export class WaveRunner {
         frozenReview,
         policy,
         runController.signal,
+        input.reviewModel,
       ),
       runController,
     );
@@ -1264,9 +1269,10 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     policy: PerkinsPolicy,
     signal: AbortSignal,
+    reviewModel?: ReviewPreflightResult['reviewModel'],
   ): Promise<WaveOutcome> {
     try {
-      return await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal);
+      return await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel);
     } finally {
       await this.sweepReviewWorktree(reviewLaneId);
     }
@@ -1281,9 +1287,16 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     policy: PerkinsPolicy,
     signal: AbortSignal,
+    reviewModel?: ReviewPreflightResult['reviewModel'],
   ): Promise<WaveOutcome> {
     const workflow = new PerkinsHybridReview({
-      spawner: this.opts.spawner,
+      // This closure belongs to one round. A concurrent preflight cannot
+      // replace the proof used by its lead or lens children.
+      spawner: (role, options) => this.opts.spawner(role, {
+        ...options,
+        ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
+          ? { reviewModel } : {}),
+      }),
       policy,
       onAgent: ({ phase, lens, chunk, attempt, handle }) => {
         this.opts.ledger.registerAgent({

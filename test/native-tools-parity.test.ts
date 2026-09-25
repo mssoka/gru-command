@@ -72,7 +72,7 @@ async function harnesses(): Promise<Harnesses> {
   const modelRuntime = await makeStubModelRuntime(script);
   const pi = new PiRuntime({ config, store, agentDir, modelRuntime });
   process.env['CLAUDE_DOUBLE_LOG'] = join(home, 'double-log.jsonl');
-  const claude = new ClaudeCodeRuntime({ config, store, binary: DOUBLE });
+  const claude = new ClaudeCodeRuntime({ config, store, binary: DOUBLE, reviewSettingsFile: join(home, 'absent-review-settings.json') });
   return { pi, claude, workspace };
 }
 

@@ -1,3 +1,4 @@
+import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -805,6 +806,158 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     );
   });
 
+  it('preflight and spawn share a single bounded live-catalog refresh for concurrent misses', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
+    let calls = 0;
+    let visible = false;
+    const fx = await fixture([], ['text'], {
+      modelCatalogRefresh: async (_runtime, request) => {
+        calls += 1;
+        expect(request).toEqual({ provider: 'gru-stub', timeoutMs: 10_000 });
+        await gate;
+        visible = true;
+        return { attempted: true, detail: 'completed' };
+      },
+    });
+    const original = fx.modelRuntime.getModel.bind(fx.modelRuntime);
+    let misses = 0;
+    let allMissed!: () => void;
+    const missGate = new Promise<void>((resolveGate) => { allMissed = resolveGate; });
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+      if (visible) return original(provider, id);
+      misses += 1;
+      if (misses === 3) allMissed();
+      return undefined;
+    });
+    const a = fx.runtime.checkReviewModel('perkins');
+    const b = fx.runtime.checkReviewModel('perkins');
+    const spawned = fx.runtime.spawn('perkins');
+    await missGate;
+    await vi.waitFor(() => expect(calls).toBe(1));
+    release();
+    const handle = await spawned;
+    await expect(Promise.all([a, b])).resolves.toEqual([undefined, undefined]);
+    expect(calls).toBe(1);
+    await handle.dispose();
+  });
+
+  it('shares cold catalog initialization across probes and retries a rejected initialization', async () => {
+    const fx = await fixture();
+    let release!: () => void;
+    const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
+    const create = vi.spyOn(ModelRuntime, 'create');
+    let attempts = 0;
+    create.mockImplementation(async () => {
+      attempts += 1;
+      await gate;
+      if (attempts === 1) throw new Error('cold catalog unavailable');
+      return fx.modelRuntime;
+    });
+    const runtime = new PiRuntime({ config: fx.config, store: fx.store, agentDir: fx.agentDir });
+    try {
+      const a = runtime.checkReviewModel('perkins');
+      const b = runtime.checkReviewModel('perkins');
+      const spawn = runtime.spawn('perkins');
+      await vi.waitFor(() => expect(attempts).toBe(1));
+      release();
+      await expect(Promise.allSettled([a, b, spawn])).resolves.toEqual([
+        expect.objectContaining({ status: 'rejected' }),
+        expect.objectContaining({ status: 'rejected' }),
+        expect.objectContaining({ status: 'rejected' }),
+      ]);
+      await expect(runtime.checkReviewModel('perkins')).resolves.toBeUndefined();
+      const handle = await runtime.spawn('perkins');
+      await handle.dispose();
+      expect(create).toHaveBeenCalledTimes(2);
+    } finally {
+      create.mockRestore();
+      await runtime.dispose();
+    }
+  });
+
+  it('does not share a provider-scoped refresh with another provider while preflight and spawn overlap', async () => {
+    let releaseA!: () => void;
+    const aGate = new Promise<void>((resolveGate) => { releaseA = resolveGate; });
+    const refreshed = new Set<string>();
+    const calls: string[] = [];
+    const fx = await fixture([], ['text'], {
+      configExtra: '[models.roles]\nperkins = "gru-stub/live-A"\ngru = "other/live-B"\n',
+      modelCatalogRefresh: async (_runtime, request) => {
+        calls.push(request.provider);
+        if (request.provider === 'gru-stub') await aGate;
+        refreshed.add(request.provider);
+        return { attempted: true, detail: 'completed' };
+      },
+    });
+    const originalProvider = fx.modelRuntime.getProvider('gru-stub')!;
+    const originalModel = fx.modelRuntime.getModel('gru-stub', 'stub-model')!;
+    fx.modelRuntime.registerNativeProvider({
+      ...originalProvider, id: 'other',
+      getModels: () => [{ ...originalModel, provider: 'other', id: 'live-B' }],
+    });
+    await fx.modelRuntime.refresh({ allowNetwork: false, providers: ['other'] });
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) =>
+      refreshed.has(provider) ? { ...originalModel, provider, id } : undefined);
+    const a = fx.runtime.checkReviewModel('perkins');
+    await vi.waitFor(() => expect(calls).toEqual(['gru-stub']));
+    const b = fx.runtime.checkReviewModel('gru');
+    const anotherB = fx.runtime.spawn('gru');
+    await new Promise<void>((resolveGate) => setImmediate(resolveGate));
+    expect(calls).toEqual(['gru-stub']);
+    releaseA();
+    await expect(a).resolves.toBeUndefined();
+    await expect(b).resolves.toBeUndefined();
+    const handle = await anotherB;
+    await handle.dispose();
+    expect(calls).toEqual(['gru-stub', 'other']);
+  });
+
+  it('preflight fails on real miss, offline mode and refresh failure, never substitutes a model', async () => {
+    for (const [policy, detail] of [
+      ['', 'failed (network unavailable)'],
+      ['[runtimes.pi]\nmodel_refresh = false\n', 'skipped ([runtimes.pi] model_refresh = false)'],
+    ]) {
+      const fx = await fixture([], ['text'], {
+        configExtra: `${policy}\n[models.roles]\nperkins = "gru-stub/no-such-id"\n`,
+        modelCatalogRefresh: async () => ({ attempted: true, detail: 'failed (network unavailable)' }),
+      });
+      await expect(fx.runtime.checkReviewModel('perkins')).rejects.toThrow(detail);
+      await expect(fx.runtime.spawn('perkins')).rejects.toThrow(detail);
+    }
+  });
+
+  it('registry preflight selects the perkins role model and the same cached adapter used by spawn', async () => {
+    const fx = await fixture([], ['text'], { configExtra: '[models.roles]\nperkins = "gru-stub/custom/group-model"\n' });
+    const original = fx.modelRuntime.getModel.bind(fx.modelRuntime);
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+      if (provider === 'gru-stub' && id === 'custom/group-model') {
+        return { ...original('gru-stub', 'stub-model')!, id };
+      }
+      return original(provider, id);
+    });
+    const registry = new RuntimeRegistry({
+      config: fx.config, store: fx.store,
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    });
+    await expect(registry.checkReviewModel('perkins')).resolves.toBeUndefined();
+    const handle = await registry.spawn('perkins');
+    await handle.dispose();
+    expect(registry.runtimeIdFor('perkins')).toBe('pi');
+    await expect(registry.checkReviewModel('gru')).resolves.toBeUndefined();
+  });
+
+  it('preflight checks the resolved model provider auth, including settings defaults', async () => {
+    const fx = await fixture([], ['text'], { configExtra: '[models.roles]\nperkins = "default"\n' });
+    writeFileSync(join(fx.agentDir, 'settings.json'), JSON.stringify({ defaultProvider: 'gru-stub', defaultModel: 'stub-model' }));
+    await expect(fx.runtime.checkReviewModel('perkins')).resolves.toBeUndefined();
+    const auth = vi.spyOn(fx.modelRuntime, 'checkAuth').mockResolvedValue(undefined);
+    await expect(fx.runtime.checkReviewModel('perkins')).rejects.toThrow('not authenticated: gru-stub');
+    expect(auth).toHaveBeenCalledWith('gru-stub');
+    auth.mockRestore();
+    await expect(fx.runtime.spawn('perkins', { model: 'default' }).then(async (handle) => handle.dispose())).resolves.toBeUndefined();
+  });
+
   it('resolves a live-catalog model through ONE bounded refresh (deepseek-flash shape)', async () => {
     // Reproduces the owner report: the offline catalog misses the model
     // (`getModel` returns undefined) while the live catalog has it. The
@@ -940,6 +1093,24 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     } finally {
       await handle.dispose();
     }
+  });
+
+  it('preflight rejects the pi default when neither config nor settings select a model', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-pi-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
+    const agentDir = mkdtempSync(join(tmpdir(), 'gru-command-agentdir-'));
+    cleanupDirs.push(home, workspace, agentDir);
+    writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n`, 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const runtime = new PiRuntime({
+      config,
+      store: new SessionStore(config.dataDir),
+      agentDir,
+      modelRuntime: await makeIsolatedModelRuntime(),
+    });
+    await expect(runtime.checkReviewModel('perkins')).rejects.toThrow(
+      /no selected pi default model; configure a settings default or \[models\] default for review/,
+    );
   });
 
   it('the sentinel path fails LOUD when nothing is configured (no silent fallback)', async () => {
