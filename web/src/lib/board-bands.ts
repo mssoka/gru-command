@@ -3,7 +3,9 @@
  * TO DO NEXT, not what happened last. Bands, in order:
  *
  *   1 NEEDS YOU  — unacked action-required, blocked/error, PR conflicting,
- *                  aborted review, failed lenses in the newest round
+ *                  aborted review, failed lenses in the newest round —
+ *                  review-history causes apply only to work that is
+ *                  still open (concluded merged/done never revives)
  *   2 IN FLIGHT  — dispatched, fresh working, in-review
  *   3 SETTLED    — delivered, merged today
  *   4 COLD       — stalled working (30 min, Silas's default threshold),
@@ -74,8 +76,15 @@ export function needsYouReasons(job: JobView, unacked: number): readonly string[
   if (unacked > 0) reasons.push('action-required');
   if (job.status === 'blocked' || job.status === 'error') reasons.push(job.status);
   if (derivedPrState(job) === 'conflicting') reasons.push('PR conflicting');
+  // Stale review decoration must not revive resolved merged/done work
+  // (owner ruling 2026-09-26): an aborted newest round or failed lenses
+  // are actionable only while the job is still open — on a concluded
+  // job they are ledger history. The current-state causes above still
+  // promote ANY status (unacked action-required, blocked/error,
+  // conflicting PR), so a genuinely separate owner obligation survives.
+  const concluded = job.status === 'merged' || job.status === 'done';
   const round = job.rounds.at(-1) ?? null;
-  if (round !== null) {
+  if (round !== null && !concluded) {
     if (round.status === 'aborted') reasons.push('round aborted');
     else if (round.status !== 'verdict-posted' && round.lenses.some((lens) => lens.state === 'error')) {
       reasons.push('lens failed');
