@@ -206,14 +206,16 @@ function lensVerdictFromNote(note: string | null): string | null {
   return null;
 }
 
-/** Lens children mint `lens:chunk` labels; a retry appends `#attempt`
- * (`blind:001#2`). The round tracker reads the lens prefix back off both
- * shapes so attempts count together. */
+/** Whole-PR review specialists mint bare `lens` labels; a retry appends
+ * `#attempt` (`blind#2`). Legacy chunk-era `lens:chunk` labels are still
+ * parsed so historical agent rows keep resolving. */
 function lensFromAgentLabel(label: string | null): string | null {
-  if (label === null) return null;
-  const cut = label.indexOf(':');
-  if (cut <= 0) return null;
-  return label.slice(0, cut);
+  if (label === null || label === '') return null;
+  const withoutAttempt = label.split('#', 1)[0]!;
+  if (withoutAttempt === '') return null;
+  const cut = withoutAttempt.indexOf(':');
+  if (cut > 0) return withoutAttempt.slice(0, cut);
+  return withoutAttempt.includes('/') || withoutAttempt === 'lead' ? null : withoutAttempt;
 }
 
 export interface BoardEngineOptions {

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +17,7 @@ import { BoardEngine } from '../src/board/engine.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
-import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import type { AgentCapabilities, AgentHandle, AgentState, PromptOptions, RuntimeEvent, SpawnOptions } from '../src/runtime/types.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
@@ -106,7 +107,7 @@ function makeDispatchHarness(opts: {
   const handles: FakeHandle[] = [];
   const reviewSessions = join(dataDir, 'review-sessions');
   mkdirSync(reviewSessions, { recursive: true });
-  const hybrid = fakeHybridSpawner(reviewSessions, { childAnswer: () => '[]' });
+  const hybrid = fakeWholeSpawner(reviewSessions, { childAnswer: () => '[]' });
   let n = 0;
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
@@ -135,7 +136,7 @@ function makeDispatchHarness(opts: {
     return handle;
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
-  const poster = { post: vi.fn(async (input: { readonly targetSha: string }) => ({ headSha: input.targetSha, baseSha: 'e2e-delivered-base' })) };
+  const poster = { post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({ reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'e2e-delivered-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') })) };
   const wave = new WaveRunner({
     ledger,
     worktrees,

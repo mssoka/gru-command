@@ -1,9 +1,9 @@
-import type { PerkinsLens } from './policy.js';
+import type { PerkinsFindingSource, PerkinsLens } from './policy.js';
 
 export type FindingSeverity = 'blocker' | 'warning' | 'note';
 
 export interface ReviewFinding {
-  readonly source: PerkinsLens;
+  readonly source: PerkinsFindingSource;
   readonly severity: FindingSeverity;
   readonly category: string;
   readonly title: string;
@@ -13,41 +13,38 @@ export interface ReviewFinding {
   readonly recommended_fix: string;
 }
 
-export type VerificationDisposition = 'confirmed' | 'rejected' | 'unverifiable-speculative';
-
-export interface VerificationResult {
-  readonly candidate: number;
-  readonly disposition: VerificationDisposition;
-  readonly evidence: string;
-  readonly reason: string;
-}
-
-export interface FixAuditResult {
+/** A lead's disposition of one prior-round finding: substantive reviewer
+ * judgment with a bounded note — deliberately free of the retired
+ * removed-line/distinct-file/PATH-ABSENT proof shapes. `refresh` optionally
+ * carries a truthful current citation/severity for a still-present prior
+ * whose code moved without resolving it. */
+export interface PriorDisposition {
   readonly prior_index: number;
   readonly status: 'fixed' | 'still-present';
-  readonly evidence: string;
-  readonly reason: string;
-  readonly fix_location?: {
-    readonly path: string;
-    readonly change: 'added' | 'removed';
+  readonly note: string;
+  readonly refresh?: {
+    readonly location?: string;
+    readonly evidence?: string;
+    readonly severity?: 'blocker' | 'warning' | 'note';
   };
 }
 
+/** A verified finding in a round's durable consolidated record. Legacy
+ * schemaVersion-2 records may still carry a `chunks: string[]` field; it is
+ * read tolerantly and never written by new rounds. */
 export interface VerifiedFinding extends ReviewFinding {
   readonly verification: {
-    readonly disposition: Exclude<VerificationDisposition, 'rejected'>;
+    readonly disposition: 'confirmed' | 'unverifiable-speculative';
     readonly evidence: string;
     readonly reason: string;
   };
-  readonly chunks: readonly string[];
-  readonly sources: readonly PerkinsLens[];
+  readonly sources: readonly PerkinsFindingSource[];
   readonly roundOrigin: number;
 }
 
 export interface LensEnvelope {
   readonly schemaVersion: 1;
   readonly lens: PerkinsLens;
-  readonly chunk: string;
   readonly attempt: 1 | 2;
   readonly status: 'valid' | 'invalid' | 'failed';
   readonly outputSha256: string | null;
@@ -73,25 +70,17 @@ export type LensOutputRecovery =
  * a host/runtime failure before any valid output existed ('error'). */
 export type ChildFailureKind = 'timeout' | 'output' | 'error';
 
-export interface RecoveredFindings {
-  readonly findings: readonly ReviewFinding[];
-  /** Present only when strict recovery was required and applied. */
-  readonly recovery?: LensOutputRecovery;
-}
-
-export interface ReviewCompleteness {
-  readonly complete: boolean;
-  readonly requiredLensRuns: number;
-  readonly validLensRuns: number;
-  readonly failedRuns: readonly { readonly lens: PerkinsLens; readonly chunk: string; readonly reason: string }[];
-  readonly verificationComplete: boolean;
-}
-
 export type CanonicalReviewVerdict =
   | 'READY TO MERGE'
   | 'NEEDS CHANGES'
   | 'MAJOR REWORK NEEDED'
   | 'INCOMPLETE';
+
+export interface RecoveredFindings {
+  readonly findings: readonly ReviewFinding[];
+  /** Present only when strict recovery was required and applied. */
+  readonly recovery?: LensOutputRecovery;
+}
 
 const FINDING_KEYS = [
   'source',
@@ -114,8 +103,6 @@ const SUBMITTED_FINDING_KEYS = [
   'detail',
   'recommended_fix',
 ] as const;
-const VERIFICATION_KEYS = ['candidate', 'disposition', 'evidence', 'reason'] as const;
-const FIX_AUDIT_KEYS = ['prior_index', 'status', 'evidence', 'reason'] as const;
 
 /** Literal Git path only; no pathspecs, escape components or control bytes. */
 export function safeFixPath(path: string): boolean {
@@ -267,8 +254,8 @@ function findingsCandidates(text: string): readonly FindingsCandidate[] {
 }
 
 /**
- * Strict tolerant recovery for a NON-tool (text-path) lens child: try the
- * bare array first, then whitespace/fence/preamble/prose recovery, and
+ * Strict tolerant recovery for a NON-tool (text-path) specialist child: try
+ * the bare array first, then whitespace/fence/preamble/prose recovery, and
  * validate every candidate with the exact strict schema. Recovery only
  * locates the JSON array — a recovered array whose findings fail validation
  * is still invalid. The primary pi path never uses this: native calls are
@@ -332,20 +319,6 @@ function validateFindingEntries(
       recommended_fix: fix,
     };
   });
-  const gates = findings.filter((finding) => finding.category === 'coverage-gate');
-  if (expectedLens === 'tests') {
-    if (gates.length !== 1) throw new Error('tests lens output must contain exactly one coverage-gate finding');
-    const gate = gates[0]!;
-    const status = /^Coverage gate: (PASS|CONCERNS|FAIL)$/u.exec(gate.title)?.[1];
-    const expectedSeverity: Readonly<Record<string, FindingSeverity>> = {
-      PASS: 'note', CONCERNS: 'warning', FAIL: 'blocker',
-    };
-    if (status === undefined || gate.severity !== expectedSeverity[status]) {
-      throw new Error('tests coverage-gate must use title "Coverage gate: PASS|CONCERNS|FAIL" and matching note|warning|blocker severity');
-    }
-  } else if (gates.length > 0) {
-    throw new Error('coverage-gate findings are owned only by the tests lens');
-  }
   return findings;
 }
 
@@ -364,61 +337,6 @@ export function parseFindingsSubmission(input: unknown, expectedLens: PerkinsLen
   return validateFindingEntries(value.findings, expectedLens, false);
 }
 
-export function parseFixAuditResults(text: string, findingCount: number): readonly FixAuditResult[] {
-  const results = parseArray(text, 'fix-audit output').map((entry, index) => {
-    const result = object(entry, `fix audit ${index}`);
-    exactKeys(result, result.fix_location === undefined ? FIX_AUDIT_KEYS : [...FIX_AUDIT_KEYS, 'fix_location'], `fix audit ${index}`);
-    if (result.fix_location !== undefined) {
-      const location = object(result.fix_location, `fix audit ${index} fix_location`);
-      exactKeys(location, ['path', 'change'], `fix audit ${index} fix_location`);
-      if (result.status !== 'fixed') throw new Error(`fix audit ${index} fix_location requires fixed status`);
-      if (typeof location.path !== 'string' || !safeFixPath(location.path)) throw new Error(`fix audit ${index} fix_location path must be a bounded relative file path`);
-      if (location.change !== 'added' && location.change !== 'removed') throw new Error(`fix audit ${index} fix_location change must be added or removed`);
-      if (typeof result.evidence !== 'string' || /[\r\n]/u.test(result.evidence) || result.evidence === 'N/A' || result.evidence.startsWith('PATH ABSENT: ')) {
-        throw new Error(`fix audit ${index} fix_location requires one changed-line evidence payload`);
-      }
-    }
-    if (!Number.isSafeInteger(result.prior_index) || Number(result.prior_index) < 0 || Number(result.prior_index) >= findingCount) {
-      throw new Error(`fix audit ${index} prior_index is invalid`);
-    }
-    if (typeof result.status !== 'string' || !['fixed', 'still-present'].includes(result.status)) throw new Error(`fix audit ${index} status is invalid`);
-    return {
-      prior_index: Number(result.prior_index),
-      status: result.status as FixAuditResult['status'],
-      evidence: boundedString(result.evidence, `fix audit ${index} evidence`, 4_000),
-      reason: boundedString(result.reason, `fix audit ${index} reason`, 1_000),
-      ...(result.fix_location !== undefined ? { fix_location: result.fix_location as NonNullable<FixAuditResult['fix_location']> } : {}),
-    };
-  });
-  if (results.length !== findingCount || new Set(results.map((result) => result.prior_index)).size !== findingCount) {
-    throw new Error('fix-audit output must contain every prior finding exactly once');
-  }
-  return [...results].sort((left, right) => left.prior_index - right.prior_index);
-}
-
-export function parseVerificationResults(text: string, candidateCount: number): readonly VerificationResult[] {
-  const results = parseArray(text, 'verification output').map((entry, index) => {
-    const result = object(entry, `verification ${index}`);
-    exactKeys(result, VERIFICATION_KEYS, `verification ${index}`);
-    if (!Number.isSafeInteger(result.candidate) || Number(result.candidate) < 0 || Number(result.candidate) >= candidateCount) {
-      throw new Error(`verification ${index} candidate index is invalid`);
-    }
-    if (typeof result.disposition !== 'string' || !['confirmed', 'rejected', 'unverifiable-speculative'].includes(result.disposition)) {
-      throw new Error(`verification ${index} disposition is invalid`);
-    }
-    return {
-      candidate: Number(result.candidate),
-      disposition: result.disposition as VerificationDisposition,
-      evidence: boundedString(result.evidence, `verification ${index} evidence`, 4_000),
-      reason: boundedString(result.reason, `verification ${index} reason`, 1_000),
-    };
-  });
-  if (results.length !== candidateCount || new Set(results.map((result) => result.candidate)).size !== candidateCount) {
-    throw new Error('verification output must contain every candidate exactly once');
-  }
-  return [...results].sort((left, right) => left.candidate - right.candidate);
-}
-
 function normalize(value: string): string {
   return value.toLowerCase().replace(/\s+/g, ' ').trim();
 }
@@ -433,10 +351,14 @@ export function dedupeVerifiedFindings(findings: readonly VerifiedFinding[]): re
       byKey.set(key, finding);
       continue;
     }
-    const preferred = severityRank[finding.severity] > severityRank[prior.severity] ? finding : prior;
+    // Within one round the higher severity wins; across rounds the FRESHER
+    // judgment wins — a current downgrade must not lose to a stale
+    // carried-up severity the reviewer explicitly moved away from.
+    const preferred = prior.roundOrigin === finding.roundOrigin
+      ? (severityRank[finding.severity] > severityRank[prior.severity] ? finding : prior)
+      : (finding.roundOrigin > prior.roundOrigin ? finding : prior);
     byKey.set(key, {
       ...preferred,
-      chunks: [...new Set([...prior.chunks, ...finding.chunks])].sort(),
       sources: [...new Set([...prior.sources, ...finding.sources])].sort(),
       roundOrigin: Math.min(prior.roundOrigin, finding.roundOrigin),
     });
@@ -445,15 +367,4 @@ export function dedupeVerifiedFindings(findings: readonly VerifiedFinding[]): re
     const severity = severityRank[right.severity] - severityRank[left.severity];
     return severity !== 0 ? severity : `${left.location}\0${left.title}`.localeCompare(`${right.location}\0${right.title}`);
   });
-}
-
-export function verdictForFindings(
-  findings: readonly VerifiedFinding[],
-  completeness: ReviewCompleteness,
-): CanonicalReviewVerdict {
-  if (!completeness.complete || !completeness.verificationComplete) return 'INCOMPLETE';
-  const blockers = findings.filter((finding) => finding.severity === 'blocker').length;
-  if (blockers === 0) return 'READY TO MERGE';
-  if (blockers <= 3) return 'NEEDS CHANGES';
-  return 'MAJOR REWORK NEEDED';
 }

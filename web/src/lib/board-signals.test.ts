@@ -88,7 +88,22 @@ describe('roundSummary', () => {
         ],
       }),
     );
-    expect(summary).toEqual({ done: 1, total: 3, blockers: 2, failures: 1 });
+    expect(summary).toEqual({ done: 1, used: 1, unused: 0, total: 3, blockers: 2, failures: 1 });
+  });
+
+  it('counts whole-PR used lenses separately from done-as-not-used lenses', () => {
+    const summary = roundSummary(
+      round({
+        blockers: 1,
+        lenses: [
+          { lens: 'security', state: 'done', agentId: null, note: 'blocker — found', verdict: 'blocker' },
+          { lens: 'tests', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+          { lens: 'edge', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+          { lens: 'blind', state: 'error', agentId: null, note: 'specialist attempts failed', verdict: null },
+        ],
+      }),
+    );
+    expect(summary).toEqual({ done: 3, used: 1, unused: 2, total: 4, blockers: 1, failures: 1 });
   });
 });
 
