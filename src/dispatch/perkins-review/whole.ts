@@ -4,7 +4,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool } from '../../runtime/types.js';
-import { assertFrozenPromptBounds, writeReviewArtifact, type FrozenReview } from './artifacts.js';
+import { assertFrozenPromptBounds, refMovedSinceFreeze, writeReviewArtifact, type FrozenReview } from './artifacts.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
 import {
@@ -212,6 +212,11 @@ function sanitizeError(error: unknown): string {
 }
 
 function headMovedSinceFreeze(review: FrozenReview, movementRef: string): boolean {
+  // The frozen inputs — target ref, base drift, HEAD, and the pristine
+  // detached checkout — must ALL still be exactly what was frozen; unknown
+  // movement can never authorize the now-different head.
+  if (refMovedSinceFreeze(review)) return true;
+  if (movementRef === review.manifest.targetSha || movementRef === review.manifest.targetRef) return false;
   try {
     return execFileSync(
       'git', ['-C', review.manifest.repoPath, 'rev-parse', '--verify', `${movementRef}^{commit}`],
@@ -884,6 +889,7 @@ export class PerkinsWholeReview {
             runSpecialist(run.lens, run.attempt, run.previous, signal));
         } catch (error) {
           restoreAttempts(scheduled);
+          specialistsStarted -= scheduled.length;
           throw error;
         }
         if (accepted !== null) {
