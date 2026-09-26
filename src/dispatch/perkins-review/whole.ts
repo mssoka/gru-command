@@ -596,8 +596,15 @@ async function boundedSpawn(
   }
 }
 
-async function pool<T, U>(items: readonly T[], concurrency: number, run: (item: T) => Promise<U>): Promise<U[]> {
-  const results = new Array<U>(items.length);
+interface PoolOutcome<U> {
+  /** Settled results in input order; undefined where a run rejected. */
+  readonly results: ReadonlyArray<U | undefined>;
+  /** First rejection reason, or null when every run settled to a value. */
+  readonly error: unknown | null;
+}
+
+async function pool<T, U>(items: readonly T[], concurrency: number, run: (item: T) => Promise<U>): Promise<PoolOutcome<U>> {
+  const results = new Array<U | undefined>(items.length).fill(undefined);
   let cursor = 0;
   const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
     for (;;) {
@@ -608,8 +615,9 @@ async function pool<T, U>(items: readonly T[], concurrency: number, run: (item: 
   });
   const settled = await Promise.allSettled(workers);
   const failed = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
-  if (failed !== undefined) throw failed.reason;
-  return results;
+  // Settled work is never discarded: the caller receives every result that
+  // completed plus the first error, and decides accounting itself (T13).
+  return { results, error: failed !== undefined ? failed.reason : null };
 }
 
 /** One whole-PR Perkins review: a lead that owns the complete change, with
@@ -676,6 +684,8 @@ export class PerkinsWholeReview {
     ): Promise<SpecialistResult> => {
       this.onProgress({ lens, state: 'running' });
       let handle: AgentHandle | null = null;
+      let settled: SpecialistResult | null = null;
+      let disposeArtifactError: unknown | null = null;
       let raw: string | null = null;
       /** Set only when the child's own output failed recovery/validation or
        * construction-time evidence pairing: host errors stay 'error'. */
@@ -816,7 +826,7 @@ export class PerkinsWholeReview {
         };
         writeReviewArtifact(review, `children/${resultId}.json`, result);
         this.onProgress({ lens, state: 'done', note: `${reviewFindings.length} finding(s)` });
-        return result;
+        settled = result;
       } catch (error) {
         const message = sanitizeError(error);
         // A tool-capable child that finished its turn without submitting still
@@ -863,14 +873,37 @@ export class PerkinsWholeReview {
           }
         }
         this.onProgress({ lens, state: 'error', note: `${failureKind}: ${message}` });
-        return {
+        settled = {
           resultId: `failed-${lens}-a${attempt}`,
           agentId: handle?.id ?? 'spawn-failed', lens, attempt,
           status, findings: [], failureKind, error: message,
         };
       } finally {
-        await handle?.dispose();
+        // Cleanup is best-effort by design (T13): a rejected dispose must
+        // never discard the settled result above it. The cleanup failure
+        // is recorded distinctly as a durable artifact — the child's work
+        // stands, and the leak is visible to operators. A secondary
+        // artifact-write failure is rethrown AFTER the finally (never
+        // inside it) so it cannot erase the settled result either.
+        if (handle !== null) {
+          try {
+            await handle.dispose();
+          } catch (disposeError) {
+            try {
+              writeReviewArtifact(review, `specialists/${lens}.attempt-${attempt}-${runToken}.dispose-error.json`, {
+                error: sanitizeError(disposeError),
+                agentId: handle.id,
+              });
+            } catch (artifactError) {
+              if (!(artifactError instanceof Error && 'code' in artifactError && (artifactError as { code?: string }).code === 'EEXIST')) {
+                disposeArtifactError = artifactError;
+              }
+            }
+          }
+        }
       }
+      if (disposeArtifactError !== null) throw disposeArtifactError;
+      return settled as SpecialistResult;
     };
 
     // Tool protocols may deliver multiple calls concurrently. Serialize the
@@ -937,15 +970,38 @@ export class PerkinsWholeReview {
         }
         for (const run of scheduled) attempts.set(run.lens, run.attempt);
         specialistsStarted += scheduled.length;
-        let childResults: readonly SpecialistResult[];
-        try {
-          childResults = await pool(scheduled, SPECIALIST_CONCURRENCY, (run) =>
-            runSpecialist(run.lens, run.attempt, run.previous, signal));
-        } catch (error) {
-          restoreAttempts(scheduled);
-          specialistsStarted -= scheduled.length;
-          throw error;
+        const batch = await pool(scheduled, SPECIALIST_CONCURRENCY, (run) =>
+          runSpecialist(run.lens, run.attempt, run.previous, signal));
+        // Every settled child is REAL work (T13): commit its result before
+        // any error handling, so executed runs are never restored to
+        // "not used" or hidden from the durable record.
+        const committed = batch.results.filter((result): result is SpecialistResult => result !== undefined);
+        const commitSettled = (): void => {
+          for (const result of committed) {
+            results.set(result.resultId, result);
+            if (result.status !== 'valid') {
+              const failures = failureLog.get(result.lens) ?? [];
+              failureLog.set(result.lens, [...failures, {
+                attempt: result.attempt,
+                status: result.status,
+                failureKind: result.failureKind ?? 'error',
+                error: result.error ?? 'no host-recorded reason',
+              }]);
+            }
+          }
+        };
+        if (batch.error !== null) {
+          commitSettled();
+          // Only lenses that produced NO result never ran: restore their
+          // attempt budget and started count. Lenses that ran keep their
+          // accounted state — their evidence already stands.
+          const ran = new Set(committed.map((result) => result.lens));
+          const neverRan = scheduled.filter((run) => !ran.has(run.lens));
+          restoreAttempts(neverRan);
+          specialistsStarted -= neverRan.length;
+          throw batch.error;
         }
+        const childResults: readonly SpecialistResult[] = committed;
         const payload = JSON.stringify({ results: childResults });
         const commitResults = (): void => {
           // Real executed children are committed to the durable run record

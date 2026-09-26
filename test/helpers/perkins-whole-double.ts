@@ -33,6 +33,7 @@ export interface WholeSpawnCall {
   readonly sessionFile: string;
   prompt?: string;
   disposed?: boolean;
+  disposeRejected?: boolean;
 }
 
 export interface WholeFindingView {
@@ -101,6 +102,9 @@ export interface WholeLeadOptions {
   readonly neverSubmit?: boolean;
   /** Lenses whose first child answer is malformed (retried once by default). */
   readonly badRuns?: readonly string[];
+  /** Simulate a session whose dispose() rejects (cleanup failure): the
+   * settled run result must survive it (T13). */
+  readonly disposeRejects?: (call: WholeSpawnCall) => boolean;
   readonly storeArtifact?: { readonly name: string; readonly content: string };
   readonly duplicateArtifact?: boolean;
   readonly duplicateRun?: string;
@@ -435,7 +439,13 @@ export function fakeWholeSpawner(
       async followUp() {},
       subscribe(_listener: RuntimeEventListener) { return () => {}; },
       health() { return { state: 'idle', lastActivity: null, sessionFile: file }; },
-      async dispose() { call.disposed = true; },
+      async dispose() {
+        if (options.disposeRejects?.(call) === true) {
+          call.disposeRejected = true;
+          throw new Error('simulated session dispose failure');
+        }
+        call.disposed = true;
+      },
     };
     return handle;
   };

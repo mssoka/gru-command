@@ -20,7 +20,7 @@ import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/per
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
-import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSubmission } from './helpers/perkins-whole-double.js';
+import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall, type WholeSubmission } from './helpers/perkins-whole-double.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
 
 const repos: FixtureRepo[] = [];
@@ -1139,6 +1139,114 @@ describe('whole-PR engine: independent-review repairs', () => {
     // A file replaced by a directory is ambiguous: refuse, never silently
     // return descendant hunks.
     await expect(tool.execute({ path: 'src/replaced.txt' })).rejects.toThrow(/ambiguous/);
+  });
+});
+
+describe('whole-PR engine: six-blocker specialist-cleanup repairs (T13)', () => {
+  const childOnly = (call: WholeSpawnCall): boolean => call.options.reviewLead === undefined;
+  const securityOnly = (call: WholeSpawnCall): boolean =>
+    call.options.reviewLead === undefined && (call.prompt ?? '').includes('"source": "security"');
+
+  it('keeps a settled valid result when its dispose rejects, recording the cleanup failure distinctly', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      specialists: ['security'],
+      disposeRejects: childOnly,
+    });
+    const result = await h.run();
+    const run = result.specialistRuns.find((entry) => entry.lens === 'security');
+    expect(run?.status).toBe('valid');
+    expect(h.childCalls.every((call) => call.disposeRejected === true)).toBe(true);
+    const disposeErrors = readdirSync(join(result.artifactDirectory, 'specialists'))
+      .filter((name) => name.endsWith('.dispose-error.json'));
+    expect(disposeErrors).toHaveLength(1);
+    const recorded = JSON.parse(readFileSync(join(result.artifactDirectory, 'specialists', disposeErrors[0]!), 'utf8')) as { error?: string; agentId?: string };
+    expect(recorded.error).toContain('simulated session dispose failure');
+    expect(recorded.agentId).toBe(h.childCalls[0]?.agentId);
+    // The run's real work stands: clean completion, no "not used" erasure.
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+  });
+
+  it('records a failed child alongside its cleanup error without faking success', async () => {
+    const h = wholeHarness({
+      childAnswer: () => 'not json',
+      specialists: ['tests'],
+      disposeRejects: childOnly,
+    });
+    const result = await h.run();
+    const runs = result.specialistRuns.filter((entry) => entry.lens === 'tests');
+    expect(runs.length).toBe(2);
+    expect(runs.every((entry) => entry.status === 'invalid')).toBe(true);
+    expect(result.findings).toHaveLength(0);
+    const specialists = readdirSync(join(result.artifactDirectory, 'specialists'));
+    expect(specialists.filter((name) => name.endsWith('.dispose-error.json'))).toHaveLength(runs.length);
+    for (const name of specialists.filter((entry) => entry.startsWith('tests.') && entry.endsWith('.envelope.json'))) {
+      const envelope = JSON.parse(readFileSync(join(result.artifactDirectory, 'specialists', name), 'utf8')) as { status?: string; failureKind?: string };
+      expect(envelope.status).toBe('invalid');
+      expect(envelope.failureKind).toBe('output');
+    }
+    // Both failed attempts are honest evidence, never restored as unused.
+    const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns?: number };
+    expect(receipt.specialistRuns).toBe(runs.length);
+  });
+
+  it('commits successful siblings when another sibling dispose rejects', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "security"')
+        ? JSON.stringify([groundedFinding('security', 'blocker')])
+        : '[]'),
+      specialists: ['security', 'codebase', 'edge'],
+      disposeRejects: securityOnly,
+    });
+    const result = await h.run();
+    const statuses = Object.fromEntries(result.specialistRuns.map((run) => [run.lens, run.status]));
+    expect(statuses).toEqual({ security: 'valid', codebase: 'valid', edge: 'valid' });
+    const disposeErrors = readdirSync(join(result.artifactDirectory, 'specialists'))
+      .filter((name) => name.startsWith('security.') && name.endsWith('.dispose-error.json'));
+    expect(disposeErrors).toHaveLength(1);
+    // The security blocker survives its cleanup failure: the verdict counts it.
+    expect(result.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(result.findings.some((finding) => finding.source === 'security' && finding.severity === 'blocker')).toBe(true);
+  });
+
+  it('seals a terminal submission only after a gated sibling batch with a dispose rejection commits', async () => {
+    let releaseChild: (() => void) | null = null;
+    const childGate = new Promise<void>((resolve) => { releaseChild = resolve; });
+    const h = wholeHarness({
+      childAnswer: async (_prompt, call) => {
+        if (call.options.reviewLead === undefined) await childGate;
+        return '[]';
+      },
+      neverSubmit: true,
+      specialists: [],
+      disposeRejects: childOnly,
+    });
+    const runPromise = h.run().then(() => undefined, () => undefined);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    const leadTools = h.leadCalls[0]!.options.reviewLead!.nativeTools;
+    const runTool = leadTools.find((tool) => tool.name === 'perkins_run_specialists') as NativeAgentTool;
+    const submitTool = leadTools.find((tool) => tool.name === 'perkins_submit_review') as NativeAgentTool;
+    const targetSha = h.frozen.manifest.targetSha;
+    const baseSha = h.frozen.manifest.diffBaseSha;
+    const batch = runTool.execute({ runs: [{ lens: 'blind' }] }).then(() => 'batch', (error: Error) => `batch-error:${error.message}`);
+    const submission = submitTool.execute({
+      verdict: 'READY TO MERGE',
+      findings: [],
+      prior_dispositions: [],
+      report_markdown: `# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\nFrozen target: ${targetSha}\nFrozen base: ${baseSha}\n`,
+    }).then(() => 'submitted', (error: Error) => `submit-error:${error.message}`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    let settled = false;
+    await Promise.race([Promise.all([batch, submission]).then(() => { settled = true; }), new Promise((resolve) => setTimeout(resolve, 200))]);
+    expect(settled).toBe(false);
+    releaseChild!();
+    const [batchOutcome, submitOutcome] = await Promise.all([batch, submission]);
+    expect(batchOutcome).toBe('batch');
+    expect(submitOutcome).toBe('submitted');
+    await runPromise;
+    const specialists = readdirSync(join(h.frozen.directory, 'specialists'));
+    expect(specialists.some((name) => name.startsWith('blind.') && name.endsWith('.envelope.json'))).toBe(true);
+    expect(specialists.filter((name) => name.startsWith('blind.') && name.endsWith('.dispose-error.json'))).toHaveLength(1);
   });
 });
 

@@ -232,6 +232,58 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     input.repoPath = join(dirname(absent.log), 'repo');
     await expect(absent.poster.reconcile!(input)).resolves.toBeNull();
   });
+  it('requires a provider commit binding on GitHub creation and reconciliation (T5)', async () => {
+    const head = '1'.repeat(40);
+    const base = '2'.repeat(40);
+    const make = (createdLine: string, reviews: unknown): { poster: GhPrPoster; log: string } => {
+      const root = mkdtempSync(join(tmpdir(), 'perkins-gh-t5-'));
+      const log = join(root, 'calls.jsonl');
+      const binary = join(root, 'gh-double.mjs');
+      const repoPath = join(root, 'repo');
+      execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
+      execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
+      writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  process.stdout.write(${JSON.stringify(createdLine)});\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(JSON.stringify(reviews))});\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+      chmodSync(binary, 0o755);
+      return { poster: new GhPrPoster(binary), log };
+    };
+    const input = {
+      prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test',
+      body: 'review body\n', targetSha: head, baseSha: base,
+    } as { prUrl: string; host: string; repoPath: string; body: string; targetSha: string; baseSha: string };
+    const goodBody = JSON.stringify({ id: 7, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body: 'review body\n' });
+    // Creation: a provider response without a usable commit_id is refused
+    // — missing, null and empty each fail loud, mismatched is bound-refused.
+    for (const [label, created] of [
+      ['missing', JSON.stringify({ id: 7, user: { login: 'gru-bot' }, state: 'COMMENTED', body: 'review body\n' })],
+      ['null', JSON.stringify({ id: 7, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: null, body: 'review body\n' })],
+      ['empty', JSON.stringify({ id: 7, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: '', body: 'review body\n' })],
+    ] as const) {
+      const refused = make(created, []);
+      input.repoPath = join(dirname(refused.log), 'repo');
+      await expect(refused.poster.post(input), label).rejects.toThrow(/missing the GitHub commit binding/);
+    }
+    const mismatched = make(JSON.stringify({ id: 7, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: 'review body\n' }), []);
+    input.repoPath = join(dirname(mismatched.log), 'repo');
+    await expect(mismatched.poster.post(input)).rejects.toThrow(/bound to commit/);
+    const valid = make(goodBody, []);
+    input.repoPath = join(dirname(valid.log), 'repo');
+    await expect(valid.poster.post(input)).resolves.toMatchObject({ reviewId: '7', commitId: head, headSha: head });
+    // Reconciliation: a body-matching review with no usable commit binding
+    // is NOT a match — honestly unresolved, never a bound receipt.
+    const unboundList = make(goodBody, [
+      { id: 8, user: { login: 'gru-bot' }, state: 'COMMENTED', body: 'review body\n' },
+      { id: 9, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: null, body: 'review body\n' },
+      { id: 10, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: '', body: 'review body\n' },
+    ]);
+    input.repoPath = join(dirname(unboundList.log), 'repo');
+    await expect(unboundList.poster.reconcile!(input)).resolves.toBeNull();
+    const boundList = make(goodBody, [
+      { id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: head, body: 'unrelated' },
+      { id: 11, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body: 'review body\n' },
+    ]);
+    input.repoPath = join(dirname(boundList.log), 'repo');
+    await expect(boundList.poster.reconcile!(input)).resolves.toMatchObject({ reviewId: '11', commitId: head, headSha: head });
+  });
 });
 
 describe('review publication redaction', () => {
@@ -1285,6 +1337,291 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(postedBody).toContain('- Failed specialist attempts: tests ×2');
     expect(postedBody).toContain('- Lenses not used this round:');
     expect(postedBody).toContain('authenticated COMMENT review on the reviewed commit');
+  });
+
+  it('reconciles an ambiguous post through the PRODUCTION adapter: same provider selection, single POST (T1)', async () => {
+    const repo = makeFixtureRepo('perkins-adapter-reconcile');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/adapter-reconcile']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-adapt-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-adapt-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-adapt-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-adapt-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/adapter-reconcile', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-adapt' });
+    const job = ledger.addJob({ id: 'job-adapt', repo: 'fixture', title: 'adapter reconcile', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/39');
+    attachOrigin(repo, 'feature/adapter-reconcile', root);
+    // The poster's origin check compares the PR URL against the review
+    // worktree's origin remote: present the fixture as the github repo.
+    repo.git(['remote', 'set-url', 'origin', 'https://github.com/acme/fixture.git']);
+    // The gh double records what a provider-accepted-then-timed-out POST
+    // looks like: the POST body is stored as a created review (provider
+    // committed), the CLI exits 1, and the later /reviews list carries it.
+    const ghRoot = mkdtempSync(join(tmpdir(), 'perkins-gh-adapt-'));
+    dirs.push(ghRoot);
+    const ghLog = join(ghRoot, 'calls.jsonl');
+    const ghStore = join(ghRoot, 'created.json');
+    const binary = join(ghRoot, 'gh-double.mjs');
+    const repoPath = join(ghRoot, 'repo');
+    execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://github.com/acme/fixture.git']);
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(ghLog)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  writeFileSync(${JSON.stringify(ghStore)}, JSON.stringify({ id: 9100, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n  process.exit(1);\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify(existsSync(${JSON.stringify(ghStore)}) ? [JSON.parse(readFileSync(${JSON.stringify(ghStore)}, 'utf8'))] : []));\n} else {\n  process.stdout.write(${JSON.stringify(`${target}\t${'2'.repeat(40)}\n`)});\n}\n`, 'utf8');
+    chmodSync(binary, 0o755);
+    // PRODUCTION adapter with the real GitHub poster; the GitLeg provider
+    // fails loud if the adapter ever selects it for a github.com URL.
+    const gitlabWrong = new GitLabMrPoster({
+      token: 'x',
+      fetchImpl: async () => { throw new Error('gitlab poster selected for a github.com URL'); },
+    });
+    const adapter = new AutoVerdictPoster(new GhPrPoster(binary), gitlabWrong);
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: adapter,
+      reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/adapter-reconcile'),
+    });
+    // Explicit commit pin: the freeze needs no origin fetch (the github-form
+    // origin below exists for the poster's repo-identity check).
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: target }));
+    // One POST attempt, one reconciliation lookup — never a second POST.
+    const ghCalls = readFileSync(ghLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[] });
+    expect(ghCalls.filter((call) => call.argv.includes('POST'))).toHaveLength(1);
+    expect(ghCalls.filter((call) => call.argv.some((entry) => entry.includes('/reviews?')))).toHaveLength(1);
+    expect(outcome.posted).toBe(true);
+    expect(outcome.verdict).toBe('changes-requested');
+    expect(outcome.round.status).toBe('verdict-posted');
+    const posted = ledger.latestRoundEvent(outcome.round.id, 'round.posted')?.payload as {
+      reconciled?: boolean; receipt?: { reviewId?: string; headSha?: string; commitId?: string };
+    };
+    expect(posted.reconciled).toBe(true);
+    expect(posted.receipt?.reviewId).toBe('9100');
+    expect(posted.receipt?.headSha).toBe(target);
+    expect(posted.receipt?.commitId).toBe(target);
+    expect(escalations).toEqual([]);
+  });
+
+  it('recovers a REAL writer round.posted event after a crash between publication and verdict (T2)', async () => {
+    // The verdict write is lost exactly as a process crash loses it: the
+    // round.posted event (real recordDelivery output) is durable, the
+    // verdict never lands. No field is invented by the test.
+    class CrashBeforeVerdictLedger extends LedgerApi {
+      private crashed = false;
+      override setRoundVerdict(id: string, verdict: string): ReturnType<LedgerApi['setRoundVerdict']> {
+        if (!this.crashed) {
+          this.crashed = true;
+          // The write is lost exactly as a process crash loses it: no
+          // throw (that would terminalize the round), the event log keeps
+          // the durable round.posted fact, the verdict simply never lands.
+          return this.getRound(id) as ReturnType<LedgerApi['setRoundVerdict']>;
+        }
+        return super.setRoundVerdict(id, verdict);
+      }
+    }
+    const repo = makeFixtureRepo('perkins-crash-recovery');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/crash-recovery']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-crash-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-crash-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-crash-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-crash-db-')));
+    dbs.push(db);
+    const ledger = new CrashBeforeVerdictLedger(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/crash-recovery', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-crash' });
+    const job = ledger.addJob({ id: 'job-crash', repo: 'fixture', title: 'crash recovery', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/40');
+    attachOrigin(repo, 'feature/crash-recovery', root);
+    const poster = receiptPoster();
+    const first = new WaveRunner({
+      ledger: ledger as unknown as LedgerApi, worktrees: port, spawner: makeSpawner(sessions, []),
+      poster, reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/crash-recovery'),
+    });
+    const outcome = asWave(await first.runRound({ jobId: job.id }));
+    // Publication happened and its event is the REAL writer output —
+    // including the nested headSha recovery requires (the reviewed gap).
+    expect(outcome.posted).toBe(true);
+    const round = ledger.getRound(outcome.round.id);
+    expect(round?.status).toBe('live');
+    expect(round?.verdict).toBeNull();
+    const postedEvent = ledger.latestRoundEvent(outcome.round.id, 'round.posted')?.payload as {
+      publicationFile?: string; publicationSha256?: string;
+      receipt?: { reviewId?: string; headSha?: string; bodySha256?: string };
+    };
+    expect(postedEvent.receipt?.headSha).toBe(target);
+    expect(postedEvent.receipt?.bodySha256).toBe(postedEvent.publicationSha256);
+    // Recovery consumes the ACTUAL persisted event and completes the round.
+    const secondPoster = { post: vi.fn() } as unknown as VerdictPoster;
+    // A REAL crash dies before runOwnedReview's finally sweeps the review
+    // worktree; the sweep above only ran because the simulated crash let
+    // the flow continue. Present the crash-time lane state (unswept) to
+    // recovery through the same port interface.
+    const crashTimePort: WorktreePort = {
+      createJobWorktree: (input) => port.createJobWorktree(input),
+      createReviewWorktree: (input) => port.createReviewWorktree(input),
+      getWorktree: (id) => port.getWorktree(id),
+      listWorktrees: (listOpts) => port.listWorktrees(listOpts).map((lane) =>
+        lane.roundId === outcome.round.id && lane.status === 'swept' ? { ...lane, status: 'active' } : lane),
+      release: (input) => port.release(input),
+    };
+    const second = new WaveRunner({
+      ledger: ledger as unknown as LedgerApi, worktrees: crashTimePort,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      poster: secondPoster, reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/crash-recovery'),
+    });
+    expect(await second.recoverInterruptedRounds()).toBe(1);
+    const recovered = ledger.getRound(outcome.round.id);
+    expect(recovered?.status).toBe('verdict-posted');
+    expect(recovered?.verdict).toBe('changes-requested');
+    const recoveredEvent = ledger.latestRoundEvent(outcome.round.id, 'round.post-recovered')?.payload as { receipt?: { reviewId?: string } };
+    expect(recoveredEvent?.receipt?.reviewId).toBe('9001');
+    expect(secondPoster.post).not.toHaveBeenCalled();
+  });
+
+  it('refuses recovery promotion without the preserved publication artifact and digest (T3)', async () => {
+    const target = '1'.repeat(40);
+    const makeEvent = (overrides: Record<string, unknown>): Record<string, unknown> => ({
+      verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', url: 'https://example.invalid/pr/1',
+      targetSha: target, baseSha: '2'.repeat(40),
+      receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: target, headSha: target, bodySha256: '0'.repeat(64) },
+      ...overrides,
+    });
+    const cases: ReadonlyArray<[string, (file: string, sha: string) => Record<string, unknown>, (artifactDir: string) => void]> = [
+      ['publicationFile missing', (file, sha) => makeEvent({ publicationSha256: sha, receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: target, headSha: target, bodySha256: sha } }), () => {}],
+      ['publicationFile null', (_file, sha) => makeEvent({ publicationFile: null, publicationSha256: sha, receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: target, headSha: target, bodySha256: sha } }), () => {}],
+      ['publicationFile malformed', (_file, sha) => makeEvent({ publicationFile: 42, publicationSha256: sha, receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: target, headSha: target, bodySha256: sha } }), () => {}],
+      ['publication file deleted', (file, sha) => makeEvent({ publicationFile: file, publicationSha256: sha, receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: target, headSha: target, bodySha256: sha } }), (dir) => { rmSync(join(dir, 'perkins-report.publication.md'), { force: true }); }],
+      ['publication digest changed', (file, sha) => makeEvent({ publicationFile: file, publicationSha256: sha, receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: target, headSha: target, bodySha256: sha } }), (dir) => { writeFileSync(join(dir, 'perkins-report.publication.md'), '# tampered\n', 'utf8'); }],
+    ];
+    for (const [label, payloadFor, mutate] of cases) {
+      const root = mkdtempSync(join(tmpdir(), 'perkins-t3-port-'));
+      const artifacts = mkdtempSync(join(tmpdir(), 'perkins-t3-artifacts-'));
+      dirs.push(root, artifacts);
+      const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-t3-db-')));
+      dbs.push(db);
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      const repo = makeFixtureRepo(`perkins-t3-${label.replace(/\W+/gu, '-')}`);
+      repos.push(repo);
+      repo.git(['checkout', '-b', `feature/t3-${label.replace(/\W+/gu, '-')}`]);
+      const commit = repo.commitFile('src/main.ts', 'export const three = 3;\n');
+      const port = new GitReviewPort(root, `feature/t3-${label.replace(/\W+/gu, '-')}`, commit);
+      await port.createJobWorktree({ repoPath: repo.path, jobId: `job-t3-${label.replace(/\W+/gu, '-')}` });
+      const job = ledger.addJob({ id: `job-t3-${label.replace(/\W+/gu, '-')}`, repo: 'fixture', title: 't3', baseBranch: 'main', briefing: 'review' });
+      ledger.setJobStatus(job.id, 'working');
+      settleLane(ledger, job.id);
+      const round = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: commit });
+      await port.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: commit, jobId: job.id });
+      ledger.setRoundStatus(round.id, 'live');
+      const roundDir = join(artifacts, round.id);
+      mkdirSync(roundDir, { recursive: true });
+      const publicationFile = join(roundDir, 'perkins-report.publication.md');
+      writeFileSync(publicationFile, '# Perkins Code Review\n\n**Verdict: NEEDS CHANGES**\n', 'utf8');
+      const sha = createHash('sha256').update('# Perkins Code Review\n\n**Verdict: NEEDS CHANGES**\n', 'utf8').digest('hex');
+      mutate(roundDir);
+      ledger.appendCustomEvent({ kind: 'round.posted', jobId: job.id, roundId: round.id, payload: payloadFor(publicationFile, sha) });
+      const escalations: string[] = [];
+      const wave = new WaveRunner({
+        ledger, worktrees: port, spawner: vi.fn() as unknown as never, poster: { post: vi.fn() },
+        reviewArtifactRoot: artifacts,
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      expect(await wave.recoverInterruptedRounds(), label).toBe(1);
+      expect(ledger.getRound(round.id), label).toMatchObject({ status: 'aborted', verdict: null });
+      expect(escalations.some((line) => line.includes('without a provider-bound receipt')), label).toBe(true);
+      expect(ledger.latestRoundEvent(round.id, 'round.post-recovered'), label).toBeNull();
+    }
+  });
+
+  it('does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)', async () => {
+    const prepare = async (name: string, branch: string) => {
+      const repo = makeFixtureRepo(name);
+      repos.push(repo);
+      repo.git(['checkout', '-b', branch]);
+      const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+      const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+      const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+      const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+      dirs.push(root, artifacts, sessions);
+      const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+      dbs.push(db);
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      const port = new GitReviewPort(root, branch, target);
+      await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
+      const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+      ledger.setJobStatus(job.id, 'working');
+      settleLane(ledger, job.id);
+      ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
+      attachOrigin(repo, branch, root);
+      return { repo, ledger, port, artifacts, sessions, target, job, root };
+    };
+    // (a) The movement ref advances while the reconciliation lookup is
+    // outstanding: the receipt is preserved, never recorded as delivery.
+    const moved = await prepare('perkins-t4-moved', 'feature/t4-moved');
+    const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      // The frozen BASE drifts while the lookup is outstanding — the
+      // stale-source guard refMovedSinceFreeze must refuse the recording.
+      const newMain = moved.repo.git(['commit-tree', 'main^{tree}', '-m', 'base moves during lookup']).trim();
+      moved.repo.git(['branch', '-f', 'main', newMain]);
+      return {
+        reviewId: '9200', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      };
+    });
+    const escalations: string[] = [];
+    const movedWave = new WaveRunner({
+      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, []),
+      poster: { post, reconcile }, reviewArtifactRoot: moved.artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/t4-moved'),
+    });
+    const movedOutcome = asWave(await movedWave.runRound({ jobId: moved.job.id }));
+    expect(movedOutcome.posted).toBe(false);
+    expect(movedOutcome.verdict).toBeNull();
+    expect(movedOutcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(escalations.some((line) => line.includes('reconciled a provider review but did NOT record it'))).toBe(true);
+    const unrecorded = JSON.parse(readFileSync(join(moved.artifacts, movedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
+    expect(unrecorded.recorded).toBe(false);
+    expect(unrecorded.reason).toContain('moved while the reconciliation lookup was outstanding');
+    expect(unrecorded.receipt?.reviewId).toBe('9200');
+    expect(moved.ledger.latestRoundEvent(movedOutcome.round.id, 'round.posted')).toBeNull();
+    // (b) The run's abort signal fires while the lookup is outstanding.
+    const aborted = await prepare('perkins-t4-aborted', 'feature/t4-aborted');
+    const abortPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
+    const abortReconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      for (const controller of (abortedWave as unknown as { activeControllers: Set<AbortController> }).activeControllers) controller.abort();
+      return {
+        reviewId: '9201', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      };
+    });
+    const abortEscalations: string[] = [];
+    const abortedWave = new WaveRunner({
+      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, []),
+      poster: { post: abortPost, reconcile: abortReconcile }, reviewArtifactRoot: aborted.artifacts,
+      escalate: (title, detail) => abortEscalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/t4-aborted'),
+    });
+    const abortedOutcome = asWave(await abortedWave.runRound({ jobId: aborted.job.id }));
+    expect(abortedOutcome.posted).toBe(false);
+    expect(abortedOutcome.verdict).toBeNull();
+    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { reason?: string };
+    expect(unrecordedAbort.reason).toContain('aborted while the reconciliation lookup was outstanding');
+    expect(aborted.ledger.latestRoundEvent(abortedOutcome.round.id, 'round.posted')).toBeNull();
   });
 });
 

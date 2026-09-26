@@ -257,7 +257,13 @@ export class GhPrPoster implements VerdictPoster {
     const reviewId = created.id !== undefined ? String(created.id) : '';
     const actor = typeof created.user?.login === 'string' ? created.user.login : '';
     const event = typeof created.state === 'string' ? created.state : '';
-    const commitId = typeof created.commit_id === 'string' ? created.commit_id : null;
+    // A GitHub pull-request review MUST name the commit it is bound to: a
+    // response without a usable commit_id is not a SHA-bound receipt, no
+    // matter what else it carries (T5).
+    if (typeof created.commit_id !== 'string' || created.commit_id.trim() === '') {
+      throw new Error('provider receipt is missing the GitHub commit binding (commit_id) — delivery not recorded');
+    }
+    const commitId = created.commit_id;
     const echoedBody = typeof created.body === 'string' ? created.body : null;
     if (echoedBody === null || receiptDigest(echoedBody) !== receiptDigest(input.body)) {
       throw new Error('provider receipt body does not match the published body — delivery not recorded');
@@ -293,6 +299,10 @@ export class GhPrPoster implements VerdictPoster {
       typeof review.body === 'string' && receiptDigest(review.body) === receiptDigest(input.body));
     if (matches.length === 0) return null;
     const found = matches[matches.length - 1]!;
+    // The filter already demands commit equality; keep the construction
+    // honest too — a review without a usable string commit_id is never
+    // turned into a bound receipt (T5).
+    if (typeof found.commit_id !== 'string' || found.commit_id.trim() === '') return null;
     return verifyPostedReceipt(
       {
         reviewId: found.id !== undefined ? String(found.id) : '',
@@ -576,14 +586,29 @@ export class AutoVerdictPoster implements VerdictPoster {
   ) {}
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
+    return this.select(input).post(input);
+  }
+
+  /** Reconciliation reaches the SAME host-selected provider as posting —
+   * an ambiguous post must be reconciled by the backend that created it,
+   * never by a hand-picked alternate. */
+  async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
+    const poster = this.select(input);
+    if (typeof poster.reconcile !== 'function') {
+      throw new Error(`the selected ${new URL(input.prUrl.trim()).host} poster does not support reconciliation — delivery stays honestly unresolved`);
+    }
+    return poster.reconcile(input);
+  }
+
+  private select(input: VerdictPosterInput): VerdictPoster {
     let host = '';
     try {
       host = new URL(input.prUrl.trim()).host;
     } catch {
       throw new Error(`cannot parse pull request URL: ${input.prUrl}`);
     }
-    if (isGitHubRemote(host)) return this.github.post(input);
-    if (isGitLabRemote(host)) return this.gitlab.post(input);
+    if (isGitHubRemote(host)) return this.github;
+    if (isGitLabRemote(host)) return this.gitlab;
     throw new Error(
       `unsupported code host for verdict delivery: ${host} — the review gate supports GitHub (gh) and GitLab (GITLAB_TOKEN) remotes`,
     );
@@ -841,11 +866,19 @@ export class WaveRunner {
         let bound = receipt !== undefined &&
           typeof receipt.reviewId === 'string' && receipt.reviewId.trim() !== '' &&
           receipt.headSha === round.targetRef &&
-          typeof receipt.bodySha256 === 'string' && receipt.bodySha256 === publicationSha256;
-        if (bound && typeof publication === 'string') {
-          // Verify the durable artifact still carries the digested bytes.
+          typeof receipt.bodySha256 === 'string' &&
+          typeof publicationSha256 === 'string' && publicationSha256 !== '' &&
+          receipt.bodySha256 === publicationSha256 &&
+          typeof publication === 'string' && publication.trim() !== '';
+        // The preserved publication artifact is REQUIRED evidence, not an
+        // optional extra: promotion verifies the file still exists and
+        // carries exactly the digested bytes (T3). A missing/null/
+        // malformed path, a missing/unreadable file or a changed digest
+        // keeps the round honestly interrupted — never a promoted verdict
+        // on unverified publication bytes.
+        if (bound) {
           try {
-            const body = readFileSync(publication, 'utf8');
+            const body = readFileSync(publication as string, 'utf8');
             bound = createHash('sha256').update(body).digest('hex') === publicationSha256;
           } catch {
             bound = false;
@@ -1726,7 +1759,7 @@ export class WaveRunner {
             publicationFile, publicationSha256,
             receipt: {
               reviewId: delivered.reviewId, actor: delivered.actor, event: delivered.event,
-              commitId: delivered.commitId, bodySha256: delivered.bodySha256,
+              commitId: delivered.commitId, headSha: delivered.headSha, bodySha256: delivered.bodySha256,
             },
             reconciled,
           },
@@ -1786,10 +1819,39 @@ export class WaveRunner {
               ? null
               : verifyPostedReceipt(found, { targetSha: review.targetSha, bodySha256: publicationSha256 });
             if (reconciledDelivery !== null) {
-              recordDelivery(reconciledDelivery, publicationFile, publicationSha256, true);
-              this.log('info', 'Perkins report delivery reconciled against provider evidence', {
-                round: round.id, reviewId: reconciledDelivery.reviewId,
-              });
+              // The SAME stale-head/cancellation safeguards as a normal
+              // POST apply AFTER the lookup, before anything is recorded
+              // (T4): a receipt discovered while the ref moved (or the
+              // operation aborted) is preserved as evidence but never
+              // recorded as delivery — the changed head was not reviewed.
+              if (signal.aborted || refMovedSinceFreeze(frozenReview)) {
+                const reason = signal.aborted
+                  ? 'review operation aborted while the reconciliation lookup was outstanding'
+                  : 'source head/base moved while the reconciliation lookup was outstanding';
+                try {
+                  writeReviewArtifact(frozenReview, 'perkins-report.reconciled-unrecorded.json', {
+                    recorded: false, reconciled: true, reason,
+                    receipt: {
+                      reviewId: reconciledDelivery.reviewId, actor: reconciledDelivery.actor,
+                      event: reconciledDelivery.event, commitId: reconciledDelivery.commitId,
+                      headSha: reconciledDelivery.headSha, baseSha: reconciledDelivery.baseSha,
+                      bodySha256: reconciledDelivery.bodySha256,
+                    },
+                  });
+                } catch (artifactError) {
+                  if (!(artifactError instanceof Error && 'code' in artifactError && (artifactError as { code?: string }).code === 'EEXIST')) throw artifactError;
+                }
+                this.opts.escalate?.(
+                  `Perkins report for round ${round.id} reconciled a provider review but did NOT record it`,
+                  `${reason}; the remote comment is preserved as unrecorded evidence and the round stays honestly unposted — the changed head was not reviewed`,
+                );
+                reconciledDelivery = null;
+              } else {
+                recordDelivery(reconciledDelivery, publicationFile, publicationSha256, true);
+                this.log('info', 'Perkins report delivery reconciled against provider evidence', {
+                  round: round.id, reviewId: reconciledDelivery.reviewId,
+                });
+              }
             }
           } catch (reconcileError) {
             this.log('error', 'Perkins report delivery reconciliation failed', { round: round.id, error: String(reconcileError) });
