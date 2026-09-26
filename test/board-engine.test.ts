@@ -397,6 +397,43 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(roundView?.lenses.find((chip) => chip.lens === 'edge')?.verdict).toBe('clean');
   });
 
+  it('counts whole-PR bare-lens specialist attempts (blind, blind#2) alongside legacy lens:chunk labels', () => {
+    const { api, engine } = fresh();
+    const job = api.addJob({ id: 'whole-job', repo: 'demo-repo', title: 'Whole' });
+    api.setJobStatus(job.id, 'working');
+    api.registerWorktree({
+      id: job.id,
+      kind: 'job',
+      repoPath: '/repos/demo-repo',
+      repoName: 'demo-repo',
+      path: '/worktrees/demo-repo/job-whole-job',
+      branch: 'gru/whole-job',
+      sha: 'def456base',
+      jobId: job.id,
+    });
+    const round = api.addRound({ jobId: job.id, targetRef: 'def456base' });
+    // Whole-PR specialists mint bare lens labels; retries append #attempt.
+    api.registerAgent({ id: 'sp-blind-1', role: 'perkins', label: 'blind', roundId: round.id, jobId: job.id });
+    api.registerAgent({ id: 'sp-blind-2', role: 'perkins', label: 'blind#2', roundId: round.id, jobId: job.id });
+    api.registerAgent({ id: 'sp-security-1', role: 'perkins', label: 'security', roundId: round.id, jobId: job.id });
+    api.setAgentState('sp-blind-2', 'streaming');
+    api.setLensOutcome(round.id, 'blind', 'done', 'clean — lead retained no finding sourced from this specialist');
+    api.setLensOutcome(round.id, 'security', 'done', 'not used — lead-owned whole-PR review');
+    const view = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((entry) => entry.id === job.id);
+    const roundView = view?.rounds[0];
+    expect(roundView?.lensAttempts).toEqual([
+      { lens: 'blind', attempts: 2 },
+      { lens: 'security', attempts: 1 },
+    ]);
+    // The 'lead' agent label is not a lens and never becomes an attempt.
+    api.registerAgent({ id: 'lead-1', role: 'perkins', label: 'lead', roundId: round.id, jobId: job.id });
+    const after = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((entry) => entry.id === job.id)?.rounds[0];
+    expect(after?.lensAttempts).toEqual([
+      { lens: 'blind', attempts: 2 },
+      { lens: 'security', attempts: 1 },
+    ]);
+  });
+
   it('counts unacked action-required rows from the whole table, not the feed window', () => {
     const { api, engine } = fresh();
     api.recordNotification({ id: 'n-action', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Ack me' });

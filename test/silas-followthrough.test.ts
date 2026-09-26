@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -206,7 +207,7 @@ async function bootFollowThrough(input: {
     ledger,
     worktrees,
     spawner,
-    poster: { async post(input) { return { headSha: input.targetSha, baseSha: 'stub-base' }; } },
+    poster: { async post(input: { readonly targetSha: string; readonly body: string }) { return { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'stub-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') }; } },
     reviewArtifactRoot: join(dir, 'reviews'),
     prHeadProbe: originHeadProbe(),
   });

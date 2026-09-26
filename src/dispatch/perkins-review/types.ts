@@ -15,11 +15,18 @@ export interface ReviewFinding {
 
 /** A lead's disposition of one prior-round finding: substantive reviewer
  * judgment with a bounded note — deliberately free of the retired
- * removed-line/distinct-file/PATH-ABSENT proof shapes. */
+ * removed-line/distinct-file/PATH-ABSENT proof shapes. `refresh` optionally
+ * carries a truthful current citation/severity for a still-present prior
+ * whose code moved without resolving it. */
 export interface PriorDisposition {
   readonly prior_index: number;
   readonly status: 'fixed' | 'still-present';
   readonly note: string;
+  readonly refresh?: {
+    readonly location?: string;
+    readonly evidence?: string;
+    readonly severity?: 'blocker' | 'warning' | 'note';
+  };
 }
 
 /** A verified finding in a round's durable consolidated record. Legacy
@@ -344,7 +351,12 @@ export function dedupeVerifiedFindings(findings: readonly VerifiedFinding[]): re
       byKey.set(key, finding);
       continue;
     }
-    const preferred = severityRank[finding.severity] > severityRank[prior.severity] ? finding : prior;
+    // Within one round the higher severity wins; across rounds the FRESHER
+    // judgment wins — a current downgrade must not lose to a stale
+    // carried-up severity the reviewer explicitly moved away from.
+    const preferred = prior.roundOrigin === finding.roundOrigin
+      ? (severityRank[finding.severity] > severityRank[prior.severity] ? finding : prior)
+      : (finding.roundOrigin > prior.roundOrigin ? finding : prior);
     byKey.set(key, {
       ...preferred,
       sources: [...new Set([...prior.sources, ...finding.sources])].sort(),

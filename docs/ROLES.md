@@ -11,7 +11,7 @@ fail-loud at boot); this page is the map.
 | Gru | `roles/gru.md` | workspace root | chat only | judgment: consult, plan-before-heist, dispatch, verify |
 | Silas | `roles/silas.md` | workspace root | ledger/ops | operations: briefings are contracts, lanes, sweeps, close-outs; hosted as the `silas-ops` slot with follow-through + recurrence duties (`docs/FLOW.md`) |
 | minion | `roles/minion.md` | **spawn-provided** (the job worktree) | code | one briefing per lane, verified work, honest commits |
-| Perkins | `roles/perkins.md` | **spawn-provided** (frozen detached review tree) | review artifacts only | one hybrid lead delegates, verifies, audits, reconciles, and reports through narrow host tools |
+| Perkins | `roles/perkins.md` | **spawn-provided** (frozen detached review tree) | review artifacts only | one whole-PR lead reviews the complete change, may run tracked whole-change specialists, verifies, revisits priors, and reports through narrow host tools |
 | Bob | `roles/bob.md` | workspace root | memory files | periodic consolidation with provenance |
 
 ## Cwd policy (SPEC ruling 17)
@@ -25,9 +25,11 @@ fail-loud at boot); this page is the map.
   review tree; blind specialists are rooted outside it. Review sessions
   disable all project/global skills, context files, extensions, prompts,
   settings, plugins, and unrelated MCP servers. The sole MCP exception is a
-  fresh, per-session bridge for the Claude lead's product-native tools;
-  specialists never receive it. Discovery never falls back to the workspace
-  or agent home. A `spawn_provided` role without a cwd fails loud.
+  fresh, per-session bridge exposing exactly each session's declared
+  product-native tools: the lead's orchestration set and every native-tool
+  child's `perkins_submit_findings` (children never see the lead's tools,
+  and no session sees another's bridge). Discovery never falls back to the
+  workspace or agent home. A `spawn_provided` role without a cwd fails loud.
 
 ## Permissions
 

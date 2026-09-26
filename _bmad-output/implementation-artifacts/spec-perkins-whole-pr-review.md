@@ -186,3 +186,12 @@ legacy v2 prior loading, board label parsing.
 - 2026-09-26: initial spec from dispatch briefing.
 - 2026-09-26: delivered on PR #77 (head 91fd204f, CI 36216219411 success);
   review layers staged for external runs.
+- 2026-09-27: factual correction (owner, j-110): the "existing independent
+  GitHub App identity" phrase in the original brief was Gru's unsupported
+  assumption, not a deployment fact. No independent App exists or may be
+  created; the deployed transport is an authenticated gh COMMENT under the
+  PR author's account. Repairs record actual provider event/actor/receipt
+  and never claim a formal GitHub APPROVED/CHANGES_REQUESTED event. The
+  frozen intent block is retained verbatim as history. See
+  spec-perkins-whole-pr-review-repair.md and the independent review
+  (owner-independent-pr77-cb13682-20260926, B1) for the corrected contract.

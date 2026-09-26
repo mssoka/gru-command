@@ -1,5 +1,6 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -17,6 +18,7 @@ import {
 import { loadPerkinsPolicy, PERKINS_LENSES, PERKINS_POLICY_SHA256 } from '../src/dispatch/perkins-review/policy.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/perkins-review/whole.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
+import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSubmission } from './helpers/perkins-whole-double.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
@@ -154,6 +156,7 @@ describe('bundled Perkins policy (whole-PR contract)', () => {
 describe('whole-PR freeze (no chunk partitioning)', () => {
   it('freezes a formerly oversized multi-directory diff as ONE whole review with no chunk artifacts', () => {
     const repo = makeFixtureRepo('whole-oversize');
+    repos.push(repo);
     const base = repo.head();
     repo.git(['checkout', '-b', 'feature/oversize']);
     // Two directories, each over the retired 3000-line threshold.
@@ -182,6 +185,7 @@ describe('whole-PR freeze (no chunk partitioning)', () => {
 
   it('fails closed on UTF-8 byte bounds for frozen diff and spec', () => {
     const repo = makeFixtureRepo('whole-bounds');
+    repos.push(repo);
     const base = repo.head();
     repo.git(['checkout', '-b', 'feature/bounds']);
     repo.commitFile('src/huge.txt', `${'x'.repeat(FROZEN_DIFF_MAX_BYTES + 1)}\n`);
@@ -191,6 +195,8 @@ describe('whole-PR freeze (no chunk partitioning)', () => {
       baseRef: base, targetRef: repo.head(), movementRef: 'feature/bounds', spec: 'too big',
     })).toThrow(/frozen diff exceeds/);
     const specRepo = makeFixtureRepo('whole-spec-bounds');
+    repos.push(repo);
+    repos.push(specRepo);
     const specBase = specRepo.head();
     specRepo.git(['checkout', '-b', 'feature/spec']);
     specRepo.commitFile('src/tiny.ts', 'export const one = 1;\n');
@@ -204,6 +210,7 @@ describe('whole-PR freeze (no chunk partitioning)', () => {
 
   it('rejects writeReviewArtifact traversal and unsafe round ids, and refuses a symlinked frozen tree', () => {
     const repo = makeFixtureRepo('whole-guards');
+    repos.push(repo);
     const base = repo.head();
     repo.git(['checkout', '-b', 'feature/guards']);
     const target = repo.commitFile('src/main.ts', 'export const guarded = true;\n');
@@ -217,6 +224,7 @@ describe('whole-PR freeze (no chunk partitioning)', () => {
     expect(() => reviewArtifactDirectory(root, '../outside')).toThrow(/safe artifact path component/);
 
     const symlinkRepo = makeFixtureRepo('whole-symlink');
+    repos.push(repo);
     const symlinkBase = symlinkRepo.head();
     symlinkRepo.git(['checkout', '-b', 'feature/symlink']);
     symlinkSync('/etc/hosts', join(symlinkRepo.path, 'link'));
@@ -230,6 +238,7 @@ describe('whole-PR freeze (no chunk partitioning)', () => {
 
   it('rejects freezeReviewInputs ingress conflicts (spec+noSpec, neither) and an empty diff', () => {
     const repo = makeFixtureRepo('whole-ingress');
+    repos.push(repo);
     const base = repo.head();
     repo.git(['checkout', '-b', 'feature/ingress']);
     const target = repo.commitFile('src/main.ts', 'export const ingress = true;\n');
@@ -254,6 +263,7 @@ describe('whole-PR freeze (no chunk partitioning)', () => {
 describe('review base resolution', () => {
   it('resolves explicit base, origin/HEAD, main fallback, and fails closed with no base', () => {
     const repo = makeFixtureRepo('whole-base');
+    repos.push(repo);
     expect(resolveReviewBaseRef(repo.path, 'main')).toBe('main');
     expect(resolveReviewBaseRef(repo.path, 'refs/heads/main')).toBe('refs/heads/main');
     expect(resolveReviewBaseRef(repo.path, null)).toBe('main');
@@ -261,6 +271,7 @@ describe('review base resolution', () => {
     // Fail closed when no conventional default exists: a repo whose only
     // branch is neither main nor master and which has no origin/HEAD.
     const lone = makeFixtureRepo('whole-base-lone');
+    repos.push(lone);
     lone.git(['checkout', '-q', '-b', 'only-branch']);
     lone.git(['branch', '-D', 'main']);
     expect(() => resolveReviewBaseRef(lone.path, null)).toThrow(/requires job.baseBranch/);
@@ -391,22 +402,32 @@ describe('Perkins whole-PR lead engine', () => {
     expect(consolidated.findings).toHaveLength(0);
   });
 
-  it('accepts a same-file additive fix that the removed-line proof shape used to reject', async () => {
+  it('accepts a same-file additive fix that the removed-line proof shape used to reject, with a truthful guard note', async () => {
+    const guardedHelper = 'export function helper(ref: string): string {\n  if (!ref.includes("/")) throw new Error("malformed ref");\n  return ref.slice(ref.indexOf("/") + 1);\n}\n';
     const h = priorHarness({
-      audit: { prior_index: 0, status: 'fixed', note: 'src/helper.ts now validates the ref before slicing; the vulnerable line is gone from the file.' },
+      audit: {
+        prior_index: 0,
+        status: 'fixed',
+        note: 'src/helper.ts now rejects refs without a separator before slicing, so the unvalidated prefix strip is unreachable.',
+      },
       afterPrior: (repo) => {
-        repo.commitFile('src/helper.ts', 'export function helper(ref: string): string {\n  if (!ref.includes("/")) throw new Error("malformed ref");\n  return ref.slice(ref.indexOf("/") + 1);\n}\n');
+        repo.commitFile('src/helper.ts', guardedHelper);
       },
     });
     const result = await h.run();
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
     expect(result.priorDispositions[0]?.status).toBe('fixed');
+    // The fixture keeps the old line behind a guard: the honest note names
+    // the GUARD (the actual change), not a false removal claim.
+    expect(readFileSync(join(h.repo.path, 'src/helper.ts'), 'utf8')).toContain('return ref.slice(ref.indexOf("/") + 1);');
+    expect(readFileSync(join(h.repo.path, 'src/helper.ts'), 'utf8')).toContain('throw new Error("malformed ref")');
+    expect(result.priorDispositions[0]?.note).toContain('unreachable');
   });
 
   it('still-present priors carry their original round marker and are not double-counted', async () => {
     const h = priorHarness({
       audit: { prior_index: 0, status: 'still-present', note: 'The helper still strips without validation.' },
-      leadFinding: groundedFinding('security', 'warning', {
+      leadFinding: groundedFinding('lead', 'warning', {
         title: 'Native settings token reaches the prefix stripper',
         location: 'src/helper.ts:1',
         evidence: 'return ref.slice(ref.indexOf("/") + 1);',
@@ -587,14 +608,18 @@ describe('Perkins whole-PR lead engine', () => {
     expect(result.specialistRuns.every((run) => run.status === 'invalid')).toBe(true);
   });
 
-  it('refuses duplicate lenses inside one run call', async () => {
+  it('refuses duplicate lenses inside one run call and the lead proceeds with one real run', async () => {
     const h = wholeHarness({
-      ...ALL_CLEAN,
+      childAnswer: () => '[]',
       specialists: ['blind', 'edge'],
       duplicateRun: 'blind',
     });
-    await expect(h.run()).rejects.toThrow(/cannot duplicate a lens/);
-    expect(h.childCalls).toHaveLength(0);
+    const result = await h.run();
+    expect(h.toolErrors.some((entry) =>
+      entry.tool === 'perkins_run_specialists' && /cannot duplicate a lens/.test(entry.error),
+    )).toBe(true);
+    expect(result.specialistRuns.map((run) => run.lens).sort()).toEqual(['blind', 'edge']);
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
   });
 
   it('refuses a specialist rerun of a lens that already has a valid result', async () => {
@@ -756,7 +781,7 @@ interface PriorHarness {
 /** A re-review harness: a prior round cited src/helper.ts, then the caller
  * changed (cross-file) or the helper itself changed (same-file). */
 function priorHarness(options: {
-  readonly audit?: { prior_index: number; status: 'fixed' | 'still-present'; note: string };
+  readonly audit?: { prior_index: number; status: 'fixed' | 'still-present'; note: string; refresh?: { location?: string; evidence?: string; severity?: 'blocker' | 'warning' | 'note' } };
   readonly afterPrior?: (repo: FixtureRepo) => void;
   readonly legacyPrior?: boolean;
   readonly leadFinding?: ReturnType<typeof groundedFinding>;
@@ -829,6 +854,450 @@ function priorHarness(options: {
     }),
   };
 }
+
+describe('whole-PR engine: independent-review repairs', () => {
+  it('an over-bound specialist batch commits its real runs and never hides them as unused (B7)', async () => {
+    // 200 schema-valid findings per lens, each quoting a real ~3.8 KiB
+    // substring of the (padded) frozen file: one lens fits the transport,
+    // two in one batch exceed the wire frame.
+    const bulk = (lens: string): string => JSON.stringify(
+      Array.from({ length: 200 }, (_unused, index) => ({
+        source: lens, severity: 'note', category: 'bulk', title: `${lens} bulk finding ${index}`,
+        location: 'src/main.ts:2', evidence: `  return 43; /*${'x'.repeat(3_800)}`,
+        detail: 'Bulk finding to exceed the response bound.', recommended_fix: 'None needed.',
+      })),
+    );
+    const h = wholeHarness({
+      childAnswer: (prompt) => {
+        const lens = /"source": "(security|codebase)"/u.exec(prompt)?.[1];
+        return lens === undefined ? '[]' : bulk(lens);
+      },
+      specialists: ['security', 'codebase'],
+    }, {
+      beforeFreeze: (repo) => {
+        repo.git(['checkout', 'feature/review']);
+        repo.commitFile('src/main.ts', `export function answer(): number {\n  return 43; /*${'x'.repeat(3_950)}*/\n}\n`);
+      },
+    });
+    const result = await h.run();
+    // Both specialists really ran and produced valid envelopes...
+    const validRuns = result.specialistRuns.filter((run) => run.status === 'valid');
+    expect(validRuns.map((run) => run.lens).sort()).toEqual(['codebase', 'security']);
+    const envelopeFiles = readdirSync(join(result.artifactDirectory, 'specialists')).filter((name) => name.endsWith('.envelope.json'));
+    expect(envelopeFiles).toHaveLength(2);
+    // ...but their oversized batch could not be delivered: the honest
+    // transport error is reported, the runs are NOT "not used".
+    expect(h.toolErrors.some((entry) =>
+      entry.tool === 'perkins_run_specialists' &&
+      /exceeds the bounded (serialized )?tool response.*recorded but their findings were not delivered/.test(entry.error),
+    )).toBe(true);
+    // The lead still completes its own whole-change review honestly.
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
+    expect(receipt.specialistRuns).toBe(2);
+  }, 120_000);
+
+  it('refusals that a child would satisfy are checked before any spawn (B7)', async () => {
+    const h = wholeHarness({
+      childAnswer: () => 'not json',
+      neverSubmit: true,
+      specialists: ['tests'],
+      probeExhausted: 'tests',
+    });
+    await h.run().catch(() => undefined); // the lead never submits in this scenario
+    // Both tests attempts failed; the further run is refused BEFORE
+    // spawning — a refusal must never strand a started child.
+    expect(h.childCalls).toHaveLength(2);
+    expect(h.toolErrors.some((entry) =>
+      entry.tool === 'perkins_run_specialists' && /specialist tests exhausted its attempts/.test(entry.error),
+    )).toBe(true);
+  });
+
+  it('a terminal submission is serialized behind an in-flight specialist batch and seals the complete run record (B8)', async () => {
+    let releaseChild: (() => void) | null = null;
+    const childGate = new Promise<void>((resolve) => { releaseChild = resolve; });
+    const h = wholeHarness({
+      childAnswer: async (prompt) => {
+        if (prompt.includes('"source": "blind"')) await childGate;
+        return '[]';
+      },
+      neverSubmit: true,
+      specialists: [],
+    });
+    const runPromise = h.run().then(() => undefined, () => undefined);
+    // Wait for the lead session to spawn, then race submit against the
+    // still-running blind specialist through the very tool instances the
+    // engine handed the lead.
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    const leadTools = h.leadCalls[0]!.options.reviewLead!.nativeTools;
+    const runTool = leadTools.find((tool) => tool.name === 'perkins_run_specialists') as NativeAgentTool;
+    const submitTool = leadTools.find((tool) => tool.name === 'perkins_submit_review') as NativeAgentTool;
+    const targetSha = h.frozen.manifest.targetSha;
+    const baseSha = h.frozen.manifest.diffBaseSha;
+    const batch = runTool.execute({ runs: [{ lens: 'blind' }] }).then(() => 'batch', (error: Error) => `batch-error:${error.message}`);
+    const submission = submitTool.execute({
+      verdict: 'READY TO MERGE',
+      findings: [],
+      prior_dispositions: [],
+      report_markdown: `# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\nFrozen target: ${targetSha}\nFrozen base: ${baseSha}\n`,
+    }).then(() => 'submitted', (error: Error) => `submit-error:${error.message}`);
+    // While the specialist is gated, neither call may complete.
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    let settled = false;
+    await Promise.race([Promise.all([batch, submission]).then(() => { settled = true; }), new Promise((resolve) => setTimeout(resolve, 200))]);
+    expect(settled).toBe(false);
+    releaseChild!();
+    const [batchOutcome, submitOutcome] = await Promise.all([batch, submission]);
+    expect(batchOutcome).toBe('batch');
+    expect(submitOutcome).toBe('submitted');
+    await runPromise;
+    // The accepted review sealed AFTER the batch committed: the blind run
+    // is in the durable record, not discarded.
+    const envelopes = readdirSync(join(h.frozen.directory, 'specialists')).filter((name) => name.startsWith('blind.'));
+    expect(envelopes.length).toBeGreaterThan(0);
+  });
+
+  it('rejects a lead finding attributed to a lens that never ran (N1)', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      leadFinding: groundedFinding('security', 'warning'),
+      submitRetries: 0,
+    });
+    const rejection = await h.run().then(() => { throw new Error('expected rejection'); }, (error: Error) => error.message);
+    expect(rejection).toContain('names a lens with no valid specialist result');
+  });
+
+  it('accepts a provenance-clean lead finding and rejects an unknown source', async () => {
+    const clean = wholeHarness({
+      ...ALL_CLEAN,
+      leadFinding: groundedFinding('lead', 'warning'),
+    });
+    const cleanResult = await clean.run();
+    expect(cleanResult.findings[0]?.source).toBe('lead');
+
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      leadFinding: groundedFinding('mystery' as never, 'warning'),
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(/finding-source/);
+  });
+
+  it('allows a still-present prior to refresh its citation and severity while keeping its origin (N2)', async () => {
+    const h = priorHarness({
+      audit: {
+        prior_index: 0,
+        status: 'still-present',
+        note: 'The helper moved but still strips without validation.',
+        refresh: { location: 'src/helper.ts:2', severity: 'note' },
+      },
+    });
+    const result = await h.run();
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.location).toBe('src/helper.ts:2');
+    expect(result.findings[0]?.severity).toBe('note');
+    expect(result.findings[0]?.roundOrigin).toBe(1);
+  });
+
+  it('strips legacy v2 chunk fields from newly written v3 records (N9)', async () => {
+    const h = priorHarness({
+      audit: { prior_index: 0, status: 'still-present', note: 'still present' },
+      legacyPrior: true,
+    });
+    const result = await h.run();
+    const consolidated = readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8');
+    expect(consolidated).not.toContain('"chunks"');
+    // The legacy prior file itself stays untouched.
+    expect(readFileSync(h.priorFile, 'utf8')).toContain('"chunks"');
+  });
+
+  it('rejects a report that reads issue-free beside retained findings (B10 coherence)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "security"')
+        ? JSON.stringify([groundedFinding('security', 'blocker')])
+        : '[]'),
+      submitRetries: 0,
+      transformReport: (report) => report
+        .replace(/### blocker — security grounded defect\nSource: security · Location: src\/main\.ts:1\nThe exact changed function demonstrates the defect\.\nFix: Correct the function and retain a regression test\.\n/, '')
+        .replace(/\[\d+\] still-present: .+/g, ''),
+    });
+    await expect(h.run()).rejects.toThrow(/report-coherence/);
+  });
+
+  it('bounds the report by exact UTF-8 bytes including multibyte overflow (C123)', async () => {
+    // Near-limit pass: pad a valid report to exactly ten bytes under the cap.
+    const fit = wholeHarness({
+      ...ALL_CLEAN,
+      transformReport: (report) => {
+        const budget = 128 * 1024 - 10 - Buffer.byteLength(report, 'utf8');
+        return `${report}${'y'.repeat(Math.max(budget, 0))}`;
+      },
+    });
+    await expect(fit.run()).resolves.toMatchObject({ canonicalVerdict: 'READY TO MERGE' });
+    // Overflow: multibyte stars push the byte count past the cap even though
+    // the character count stays far below it.
+    const overflow = wholeHarness({
+      ...ALL_CLEAN,
+      submitRetries: 0,
+      transformReport: (report) => {
+        const budget = 128 * 1024 - 10 - Buffer.byteLength(report, 'utf8');
+        return `${report}${'y'.repeat(Math.max(budget, 0))}${'★'.repeat(16)}`;
+      },
+    });
+    await expect(overflow.run()).rejects.toThrow(/report_markdown exceeds 131072 UTF-8 bytes/);
+  });
+
+  it('marks a native-tool child that never calls the tool invalid even with finding-shaped text (C079)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('Your lens id is "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'note')])
+        : '[]'),
+      childNativeTools: 'text-only',
+      specialists: ['edge'],
+    });
+    const result = await h.run();
+    const edgeRuns = result.specialistRuns.filter((run) => run.lens === 'edge');
+    expect(edgeRuns.every((run) => run.status === 'invalid')).toBe(true);
+    expect(result.findings).toHaveLength(0);
+    const envelopeFiles = readdirSync(join(result.artifactDirectory, 'specialists'))
+      .filter((name) => name.startsWith('edge.') && name.endsWith('.envelope.json'));
+    for (const name of envelopeFiles) {
+      const envelope = JSON.parse(readFileSync(join(result.artifactDirectory, 'specialists', name), 'utf8')) as { status: string; error?: string };
+      expect(envelope.status).toBe('invalid');
+      expect(envelope.error).toMatch(/did not submit findings via perkins_submit_findings/);
+    }
+  });
+
+  it('prior-revision listing is truthful for added and deleted files (N3/E1)', async () => {
+    const h = priorHarness({
+      audit: { prior_index: 0, status: 'fixed', note: 'caller changed' },
+      onPriorRevision: () => {},
+      afterPrior: (repo) => {
+        repo.commitFile('src/caller.ts', 'const unchanged = true;\nconst selected = nativeSetting;\n');
+        repo.commitFile('src/brand-new.ts', 'export const fresh = true;\n');
+      },
+    });
+    await h.run();
+    // Drive the reader directly for the truthful listing shape.
+    const tool = h.leadCalls[0]!.options.reviewLead!.nativeTools
+      .find((entry) => entry.name === 'perkins_read_prior_revision') as NativeAgentTool;
+    const listing = JSON.parse((await tool.execute({})).text) as { changes: Array<{ status: string; oldPath: string | null; newPath: string | null }> };
+    const caller = listing.changes.find((change) => change.newPath === 'src/caller.ts' || change.oldPath === 'src/caller.ts');
+    expect(caller?.status).toBe('M');
+    expect(caller?.oldPath).toBe('src/caller.ts');
+    expect(caller?.newPath).toBe('src/caller.ts');
+    // An added file (present only at the current target) has NO old path.
+    const added = listing.changes.find((change) => change.newPath !== null && change.oldPath === null);
+    expect(added).toBeDefined();
+    expect(added!.status).toBe('A');
+  });
+
+  it('prior-revision path reads defeat -diff attributes and refuse ambiguous selections (N3/H7/H8)', async () => {
+    const repo = makeFixtureRepo('whole-reader-attrs');
+    repos.push(repo);
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/reader']);
+    repo.commitFile('src/old-caller.ts', 'export const oldSetting = nativeRef;\n');
+    const priorTarget = repo.head();
+    // The current target hides the old file's diff text via -diff and
+    // replaces a deleted file with a directory of the same name.
+    repo.commitFile('src/old-caller.ts', 'export const oldSetting = nativeSetting;\n');
+    repo.commitFile('.gitattributes', 'src/old-caller.ts -diff\n');
+    // A file deleted and replaced by a directory of the same name.
+    repo.commitFile('src/replaced.txt', 'original single file\n');
+    repo.git(['rm', '-q', 'src/replaced.txt']);
+    repo.commitFile('src/replaced.txt/child.txt', 'inside the replacement directory\n');
+    const root = temp('perkins-reader-');
+    const priorFile = join(root, 'prior.json');
+    writeFileSync(priorFile, JSON.stringify({
+      schemaVersion: 3,
+      architecture: 'perkins-whole-pr',
+      canonicalVerdict: 'NEEDS CHANGES', complete: true, headMoved: false,
+      findings: [],
+      frozen: { targetSha: priorTarget, diffBaseSha: base },
+    }));
+    const frozen = freezeReviewInputs({
+      roundId: 'reader-round', repoPath: repo.path, artifactRoot: root,
+      baseRef: base, targetRef: repo.head(), movementRef: 'feature/reader', spec: 'reader',
+    });
+    const fake = fakeWholeSpawner(temp('perkins-reader-sessions-'), {
+      childAnswer: () => '[]',
+      specialists: [],
+      onPriorRevision: () => {},
+    });
+    const engine = new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+    await engine.run({
+      roundId: 'reader-round', roundNumber: 2, frozenReview: frozen,
+      movementRef: 'feature/reader', noSpec: false, priorConsolidatedFile: priorFile,
+    });
+    const tool = fake.leadCalls[0]!.options.reviewLead!.nativeTools
+      .find((entry) => entry.name === 'perkins_read_prior_revision') as NativeAgentTool;
+    // -diff attributes must not suppress the earlier text.
+    const readable = JSON.parse((await tool.execute({ path: 'src/old-caller.ts' })).text) as { diff: string };
+    expect(readable.diff).toContain('-export const oldSetting = nativeRef;');
+    expect(readable.diff).toContain('+export const oldSetting = nativeSetting;');
+    // A file replaced by a directory is ambiguous: refuse, never silently
+    // return descendant hunks.
+    await expect(tool.execute({ path: 'src/replaced.txt' })).rejects.toThrow(/ambiguous/);
+  });
+});
+
+describe('packaged product and terminal-frame coverage (N6)', () => {
+  it('packs, extracts, verifies, and MCP-smokes the rebuilt source-free product under an empty home', async () => {
+    const productRoot = join(import.meta.dirname, '..');
+    const packRoot = temp('perkins-pack-source-');
+    const tarRoot = temp('perkins-pack-tar-');
+    const extractRoot = temp('perkins-pack-extract-');
+    const emptyHome = temp('perkins-source-free-home-');
+    mkdirSync(join(emptyHome, '.pi', 'agent', 'skills'), { recursive: true });
+    for (const entry of [
+      'package.json', 'package-lock.json', 'tsconfig.json', 'README.md', 'LICENSE', 'install.sh',
+      'src', 'resources', 'roles', 'tools', 'install',
+    ]) cpSync(join(productRoot, entry), join(packRoot, entry), { recursive: true });
+    // web's tsc typechecks its e2e specs, which import the shared real-service
+    // helper from the parent tree — the pack staging needs it for build:web.
+    mkdirSync(join(packRoot, 'test', 'helpers'), { recursive: true });
+    for (const entry of ['real-service.mjs', 'real-service.d.mts']) {
+      cpSync(join(productRoot, 'test', 'helpers', entry), join(packRoot, 'test', 'helpers', entry));
+    }
+    mkdirSync(join(packRoot, 'web'), { recursive: true });
+    for (const entry of [
+      'package.json', 'tsconfig.json', 'vite.config.ts', 'vitest.config.ts', 'playwright.config.ts',
+      'index.html', 'src', 'mock', 'e2e',
+    ]) {
+      cpSync(join(productRoot, 'web', entry), join(packRoot, 'web', entry), { recursive: true });
+    }
+    symlinkSync(join(productRoot, 'node_modules'), join(packRoot, 'node_modules'), 'dir');
+    mkdirSync(join(packRoot, 'dist'), { recursive: true });
+    mkdirSync(join(packRoot, 'web', 'dist'), { recursive: true });
+    writeFileSync(join(packRoot, 'dist', 'stale-before-prepack.txt'), 'must be cleaned', 'utf8');
+    writeFileSync(join(packRoot, 'web', 'dist', 'stale-before-prepack.txt'), 'must be cleaned', 'utf8');
+
+    const packOutput = execFileSync('npm', ['pack', '--json', '--pack-destination', tarRoot], {
+      cwd: packRoot,
+      encoding: 'utf8',
+      timeout: 300_000,
+      maxBuffer: 32 * 1024 * 1024,
+      env: { ...process.env, HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
+    });
+    const jsonStart = packOutput.lastIndexOf('\n[\n  {');
+    const packed = JSON.parse(packOutput.slice(jsonStart === -1 ? packOutput.indexOf('[') : jsonStart + 1)) as
+      Array<{ filename: string; files: Array<{ path: string }> }>;
+    const packedFiles = packed[0]?.files.map((entry) => entry.path).sort() ?? [];
+    expect(packedFiles).toEqual(expect.arrayContaining([
+      'dist/dispatch/perkins-review/policy.js',
+      'dist/dispatch/perkins-review/whole.js',
+      'dist/runtime/review-mcp-bridge.js',
+      'dist/runtime/review-mcp-server.mjs',
+      'resources/perkins-code-review/policy.json',
+      'tools/verify-perkins-resource.mjs',
+      'install.sh',
+      'install/launchd/com.gru-command.service.plist.template',
+      'install/systemd/gru-command.service.template',
+      'roles/perkins.md',
+      'web/dist/index.html',
+    ]));
+    const excludedMarker = ['j', 'ev'].join('');
+    expect(packedFiles.some((file) =>
+      file.startsWith('src/') || file.startsWith('_bmad/') || file.toLowerCase().includes(excludedMarker),
+    )).toBe(false);
+    expect(packedFiles).not.toContain('dist/stale-before-prepack.txt');
+    expect(packedFiles).not.toContain('web/dist/stale-before-prepack.txt');
+
+    execFileSync('tar', ['-xzf', join(tarRoot, packed[0]!.filename), '-C', extractRoot]);
+    const stage = join(extractRoot, 'package');
+    expect(existsSync(join(stage, 'src'))).toBe(false);
+    expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
+    })).not.toThrow();
+
+    const smokeFile = join(stage, 'source-free-smoke.mjs');
+    writeFileSync(smokeFile, `
+      import { readFileSync, realpathSync } from 'node:fs';
+      import { spawn } from 'node:child_process';
+      import { loadPerkinsPolicy } from './dist/dispatch/perkins-review/policy.js';
+      import { ReviewMcpBridge } from './dist/runtime/review-mcp-bridge.js';
+      const bridge = await ReviewMcpBridge.start([{
+        name: 'perkins_probe', description: 'staged probe', inputSchema: { type: 'object' },
+        execute: async () => ({ text: 'stage-ok' }),
+      }]);
+      const config = JSON.parse(readFileSync(bridge.configFile, 'utf8'));
+      const server = config.mcpServers.gru_perkins;
+      if (realpathSync(server.args[0]) !== realpathSync('./dist/runtime/review-mcp-server.mjs')) {
+        throw new Error('MCP server escaped the staged product');
+      }
+      const child = spawn(server.command, server.args, {
+        env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', ...server.env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let buffered = '';
+      const waiters = new Map();
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        buffered += chunk;
+        for (;;) {
+          const newline = buffered.indexOf('\\n');
+          if (newline === -1) break;
+          const line = buffered.slice(0, newline);
+          buffered = buffered.slice(newline + 1);
+          if (line.trim() === '') continue;
+          const message = JSON.parse(line);
+          if (message.id !== undefined && waiters.has(message.id)) {
+            waiters.get(message.id)(message);
+            waiters.delete(message.id);
+          }
+        }
+      });
+      const call = (id, method, params) => {
+        const response = new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('staged MCP timeout: ' + method)), 5000);
+          waiters.set(id, (message) => { clearTimeout(timer); resolve(message); });
+        });
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\\n');
+        return response;
+      };
+      try {
+        const initialized = await call(1, 'initialize', { protocolVersion: '2099-arbitrary', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
+        const listed = await call(2, 'tools/list', {});
+        const called = await call(3, 'tools/call', { name: 'perkins_probe', arguments: {} });
+        process.stdout.write(JSON.stringify({
+          identity: loadPerkinsPolicy().identity,
+          protocolVersion: initialized.result.protocolVersion,
+          listed: JSON.stringify(listed).includes('perkins_probe'),
+          called: JSON.stringify(called).includes('stage-ok'),
+        }));
+      } finally {
+        child.kill('SIGTERM');
+        await bridge.close();
+      }
+    `, 'utf8');
+    const smoke = JSON.parse(execFileSync(process.execPath, [smokeFile], {
+      cwd: stage,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
+    })) as { identity: string; protocolVersion: string; listed: boolean; called: boolean };
+    expect(smoke).toEqual({
+      identity: 'perkins-code-review', protocolVersion: '2024-11-05', listed: true, called: true,
+    });
+  }, 360_000);
+
+  it('finalAssistantText rejects a failed Claude terminal frame and non-assistant JSON (C116)', () => {
+    const root = temp('perkins-terminal-frame-');
+    const failed = join(root, 'failed.jsonl');
+    writeFileSync(failed, [
+      `${JSON.stringify({ role: 'assistant', text: 'partial answer', stopReason: 'stop' })}`,
+      `${JSON.stringify({ type: 'result', is_error: true, result: 'exceeds max tokens' })}`,
+      '',
+    ].join('\n'), 'utf8');
+    expect(() => finalAssistantText(failed)).toThrow(/did not complete successfully/);
+
+    const nonAssistant = join(root, 'non-assistant.jsonl');
+    writeFileSync(nonAssistant, `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'run' } })}\n`, 'utf8');
+    expect(() => finalAssistantText(nonAssistant)).toThrow(/no assistant JSON output/);
+  });
+});
 
 describe('review MCP bridge smoke (declared lead tools)', () => {
   it('exposes exactly the declared whole-PR lead tools over a scoped bridge', async () => {

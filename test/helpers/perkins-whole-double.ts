@@ -50,6 +50,7 @@ export interface WholePriorDisposition {
   readonly prior_index: number;
   readonly status: 'fixed' | 'still-present';
   readonly note: string;
+  readonly refresh?: { readonly location?: string; readonly evidence?: string; readonly severity?: 'blocker' | 'warning' | 'note' };
 }
 
 /** The exact payload the scripted lead sends to preflight/submit. */
@@ -242,8 +243,16 @@ export function fakeWholeSpawner(
           }
         }
       } catch (error) {
+        // A refused batch (duplicate lens, exhausted attempts, transport
+        // bound) is recorded; the lead continues with what it has.
         toolErrors.push({ tool: 'perkins_run_specialists', error: String(error) });
-        throw error;
+        for (const lens of runs) {
+          if (!retried.has(lens)) {
+            retried.add(lens);
+            worklist.push(lens);
+          }
+        }
+        continue;
       }
     }
 
@@ -258,16 +267,35 @@ export function fakeWholeSpawner(
 
     if (options.neverSubmit === true) return 'lead gave up without submitting';
 
+    const effectiveDispositions: readonly WholePriorDisposition[] = options.priorDisposition?.(prior) ??
+      prior.map((entry, index) => {
+        const finding = entry as { title: string };
+        return {
+          prior_index: index,
+          status: 'still-present' as const,
+          note: `prior remains: ${finding.title}`,
+        };
+      });
+    const priorDispositions = effectiveDispositions;
+
     const retained: WholeFindingView[] = [...(options.findings?.(findings) ?? findings)];
     if (options.leadFinding !== undefined) retained.push(options.leadFinding);
     // Policy verdict guidance counts confirmed blockers — a still-present
-    // prior blocker is still a blocker of this change.
-    for (const disposition of (options.priorDisposition?.(prior) ?? [])) {
+    // prior blocker is still a blocker of this change (the SAME effective
+    // dispositions the submission carries feed the verdict).
+    for (const disposition of effectiveDispositions) {
       if (disposition.status !== 'still-present') continue;
       const carried = prior[disposition.prior_index] as { severity: string; title: string; location: string };
+      // The scripted lead cites the CURRENT location/severity when the
+      // disposition refreshes one, so its finding merges with the carried
+      // prior instead of duplicating it.
       retained.push({
-        source: 'lead', severity: carried.severity as WholeFindingView['severity'], category: 'carried',
-        title: carried.title, location: carried.location, evidence: 'carried from prior round',
+        source: 'lead',
+        severity: (disposition.refresh?.severity ?? carried.severity) as WholeFindingView['severity'],
+        category: 'carried',
+        title: carried.title,
+        location: disposition.refresh?.location ?? carried.location,
+        evidence: disposition.refresh?.evidence ?? 'carried from prior round',
         detail: 'Still present from the prior round.', recommended_fix: 'Resolve the prior finding.',
       });
     }
@@ -283,16 +311,6 @@ export function fakeWholeSpawner(
     const verdict = options.verdictOverride ?? brainVerdict(finalFindings);
     const targetSha = /^Frozen target SHA: (.+)$/m.exec(prompt)?.[1] ?? 'missing-target';
     const baseSha = /^Frozen diff base SHA: (.+)$/m.exec(prompt)?.[1] ?? 'missing-base';
-
-    const priorDispositions = options.priorDisposition?.(prior) ??
-      prior.map((entry, index) => {
-        const finding = entry as { title: string };
-        return {
-          prior_index: index,
-          status: 'still-present' as const,
-          note: `prior remains: ${finding.title}`,
-        };
-      });
 
     // The whole-PR report is coherent prose: identity anchors, verdict line,
     // and per-finding source references — deliberately NOT a verbatim

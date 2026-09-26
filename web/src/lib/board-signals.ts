@@ -9,6 +9,10 @@ import type { BoardSnapshot, JobView, RoundView } from './board-protocol.js';
 
 export interface RoundSummary {
   readonly done: number;
+  /** Lenses that actually ran (done minus "not used"). */
+  readonly used: number;
+  /** Lenses done as "not used" this round. */
+  readonly unused: number;
   readonly total: number;
   readonly blockers: number;
   readonly failures: number;
@@ -22,8 +26,15 @@ export interface JobSignal {
 
 /** Done lenses / total, blocker verdicts, errored lenses for one round. */
 export function roundSummary(round: RoundView): RoundSummary {
+  // Whole-PR rounds: a lens the lead never used is done as "not used", not
+  // as coverage. `used` counts lenses that actually ran; `unused` is shown
+  // separately so a lead-only round never reads as 7/7 specialist coverage.
+  const done = round.lenses.filter((lens) => lens.state === 'done');
+  const unused = done.filter((lens) => lens.note !== null && lens.note.startsWith('not used')).length;
   return {
-    done: round.lenses.filter((lens) => lens.state === 'done').length,
+    done: done.length,
+    used: done.length - unused,
+    unused,
     total: round.lenses.length,
     blockers: round.blockers,
     failures: round.lenses.filter((lens) => lens.state === 'error').length,

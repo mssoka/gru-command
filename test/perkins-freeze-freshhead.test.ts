@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -255,9 +256,10 @@ describe('freeze-time integration on PR rounds', () => {
     settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/13');
     const poster = {
-      post: vi.fn(async (_input: { readonly targetSha: string }) => ({
-        headSha: _input.targetSha,
-        baseSha: 'stub-base',
+      post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+        headSha: input.targetSha, baseSha: 'stub-base',
+        bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
       })),
     };
     const wave = new WaveRunner({
@@ -347,9 +349,10 @@ describe('freeze-time integration on PR rounds', () => {
       worktrees: port,
       spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
       poster: {
-        post: vi.fn(async (input: { readonly targetSha: string }) => ({
-          headSha: input.targetSha,
-          baseSha: 'stub-base',
+        post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({
+          reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+          headSha: input.targetSha, baseSha: 'stub-base',
+          bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
         })),
       },
       reviewArtifactRoot: artifacts,
@@ -387,9 +390,10 @@ describe('freeze-time integration on PR rounds', () => {
     settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/16');
     const poster = {
-      post: vi.fn(async (input: { readonly targetSha: string }) => ({
-        headSha: input.targetSha,
-        baseSha: 'stub-base',
+      post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({
+        reviewId: '9003', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+        headSha: input.targetSha, baseSha: 'stub-base',
+        bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
       })),
     };
     const wave = new WaveRunner({

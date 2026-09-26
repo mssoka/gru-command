@@ -218,16 +218,23 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       evidence: string; detail: string; recommended_fix: string; source: string;
     }> = [];
     const harvest = (prompt: string): void => {
+      // A resumed prompt replays earlier tool results; only NEW blocks count.
       for (const markerText of prompt.split('[TOOL_RESULT perkins_run_specialists]').slice(1)) {
         const payload = markerText.split(/\n\[TOOL_RESULT /)[0]!.trim();
         try {
           const parsed = JSON.parse(payload) as { results: Array<{ findings: Array<Record<string, unknown>> }> };
           for (const result of parsed.results) {
-            for (const finding of result.findings) harvested.push(finding as never);
+            for (const finding of result.findings) {
+              const key = `${finding['title']}\0${finding['location']}`;
+              if (harvestedIds.has(key)) continue;
+              harvestedIds.add(key);
+              harvested.push(finding as never);
+            }
           }
         } catch { /* non-JSON tool text */ }
       }
     };
+    const harvestedIds = new Set<string>();
     const fx = await fixture((prompt) => {
       if (prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)')) {
         leadTurns += 1;

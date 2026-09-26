@@ -30,17 +30,31 @@ const LEAD_SPAWN_TIMEOUT_MS = 60 * 1_000;
 /** Wall-clock bound on the whole lead run (one prompt = many turns). */
 const LEAD_TOTAL_TIMEOUT_MS = 4 * 60 * 60 * 1_000;
 const MAX_LEAD_TURNS = 80;
-/** Specialists per tool call and per round: the whole-change catalog fits in
- * one call; the round bound keeps a confused lead from spawning forever. */
-const MAX_TOOL_RUNS = 8;
+/** Specialists per tool call, aligned with the Claude MCP bridge's
+ * 15-minute tool-execution bound: one call runs at most one concurrency-4
+ * wave (each child bounded by a 10-minute turn budget), so a full call
+ * stays inside the transport. The lead issues multiple calls for more. */
+const MAX_TOOL_RUNS = 4;
 const MAX_SPECIALISTS_PER_ROUND = 16;
 const MAX_TOTAL_FINDINGS = 500;
 const MAX_TERMINAL_ATTEMPTS = 2;
 const MAX_LEAD_ARTIFACTS = 20;
 const MAX_LEAD_ARTIFACT_BYTES = 100 * 1024;
-/** Response bound for one native-tool response. The MCP transport caps one
- * tool response at 1 MiB; this keeps the serialized payload inside it. */
+/** Response bound for one native-tool response, measured on the FULL wire
+ * frame the Claude MCP bridge serializes (result text re-serialized inside
+ * a JSON-RPC frame whose server rejects >1 MiB), leaving margin for ids and
+ * protocol growth. Pi's in-process path has the same ceiling by symmetry. */
 const MAX_TOOL_RESPONSE_BYTES = 900 * 1024;
+const MAX_WIRE_FRAME_BYTES = 1024 * 1024 - 64 * 1024;
+
+/** Assert a tool response fits the serialized MCP wire frame the server
+ * will actually accept (inner payload AND its frame). */
+function assertToolResponseFits(text: string, details: Readonly<Record<string, unknown>>, what: string): void {
+  const frame = JSON.stringify({ id: 'x'.repeat(256), ok: true, result: { text, details } });
+  if (Buffer.byteLength(frame, 'utf8') > MAX_WIRE_FRAME_BYTES) {
+    throw new Error(`${what} exceeds the bounded serialized tool response; select a smaller scope`);
+  }
+}
 /** Response bound for the aggregated submission-validation rejection. */
 const MAX_VALIDATION_MESSAGE_BYTES = 256 * 1024;
 export const PERKINS_REPORT_MAX_BYTES = 128 * 1024;
@@ -187,6 +201,9 @@ interface SubmissionValidationContext {
   readonly movementRef: string;
   readonly prior: readonly VerifiedFinding[];
   readonly priorTargetSha: string | null;
+  /** Lenses with a committed VALID specialist result; a lead finding may
+   * never be attributed to a lens that did not actually run. */
+  readonly validLenses: ReadonlySet<PerkinsLens>;
 }
 
 interface SubmissionValidationSuccess {
@@ -305,26 +322,58 @@ function findingPath(finding: Pick<ReviewFinding, 'location'>): string | null {
 
 const GIT_PROOF_TIMEOUT_MS = 30_000;
 
-function frozenBlobContains(review: FrozenReview, path: string, evidence: string): boolean {
+/** Frozen-blob reads memoized per review: many findings can cite one path,
+ * and each read is a subprocess. The SHAs are immutable, so the cache is
+ * safe for the whole round. */
+const blobCache = new WeakMap<FrozenReview, Map<string, string | null>>();
+
+function frozenBlob(review: FrozenReview, path: string): string | null {
+  let cache = blobCache.get(review);
+  if (cache === undefined) {
+    cache = new Map();
+    blobCache.set(review, cache);
+  }
+  const cached = cache.get(path);
+  if (cached !== undefined) return cached;
+  let blob: string | null;
   try {
-    const blob = execFileSync('git', ['-C', review.manifest.repoPath, 'show', `${review.manifest.targetSha}:${path}`], {
+    blob = execFileSync('git', ['-C', review.manifest.repoPath, 'show', `${review.manifest.targetSha}:${path}`], {
       encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
     });
-    return blob.includes(evidence);
   } catch {
-    return false;
+    blob = null;
   }
+  cache.set(path, blob);
+  return blob;
 }
 
+function frozenBlobContains(review: FrozenReview, path: string, evidence: string): boolean {
+  const blob = frozenBlob(review, path);
+  return blob !== null && blob.includes(evidence);
+}
+
+/** Frozen path diffs memoized per review (same immutability argument). */
+const pathDiffCache = new WeakMap<FrozenReview, Map<string, string>>();
+
 function frozenPathDiff(review: FrozenReview, path: string): string {
+  let cache = pathDiffCache.get(review);
+  if (cache === undefined) {
+    cache = new Map();
+    pathDiffCache.set(review, cache);
+  }
+  const cached = cache.get(path);
+  if (cached !== undefined) return cached;
+  let diff = '';
   try {
-    return execFileSync('git', [
+    diff = execFileSync('git', [
       '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--unified=3',
       review.manifest.diffBaseSha, review.manifest.targetSha, '--', `:(literal)${path}`,
     ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
   } catch {
-    return '';
+    diff = '';
   }
+  cache.set(path, diff);
+  return diff;
 }
 
 /** Child grounding: a finding that cites a real file must quote that file
@@ -881,6 +930,11 @@ export class PerkinsWholeReview {
           }
           return { ...run, attempt: (priorAttempt + 1) as 1 | 2, previous: failureLog.get(run.lens)?.at(-1) };
         });
+        // Capacity is checked BEFORE any child starts: a bound the host
+        // could have known up front must never strand started children.
+        if (specialistsStarted + scheduled.length > MAX_SPECIALISTS_PER_ROUND) {
+          throw new Error(`review exceeds ${MAX_SPECIALISTS_PER_ROUND} specialist runs; finish with what has run`);
+        }
         for (const run of scheduled) attempts.set(run.lens, run.attempt);
         specialistsStarted += scheduled.length;
         let childResults: readonly SpecialistResult[];
@@ -892,38 +946,41 @@ export class PerkinsWholeReview {
           specialistsStarted -= scheduled.length;
           throw error;
         }
+        const payload = JSON.stringify({ results: childResults });
+        const commitResults = (): void => {
+          // Real executed children are committed to the durable run record
+          // and the lens state, whatever happens to the response: their
+          // work must never silently become "not used".
+          for (const result of childResults) {
+            results.set(result.resultId, result);
+            if (result.status !== 'valid') {
+              const failures = failureLog.get(result.lens) ?? [];
+              failureLog.set(result.lens, [...failures, {
+                attempt: result.attempt,
+                status: result.status,
+                failureKind: result.failureKind ?? 'error',
+                error: result.error ?? 'no host-recorded reason',
+              }]);
+            }
+          }
+        };
         if (accepted !== null) {
-          restoreAttempts(scheduled);
+          commitResults();
           throw new Error('review already has an accepted terminal submission');
         }
-        const payload = JSON.stringify({ results: childResults });
         try {
           if (Buffer.byteLength(payload, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {
             throw new Error('specialist result batch exceeds the bounded tool response');
           }
-          if (specialistsStarted > MAX_SPECIALISTS_PER_ROUND) {
-            throw new Error(`review exceeds ${MAX_SPECIALISTS_PER_ROUND} specialist runs`);
-          }
+          assertToolResponseFits(payload, { resultCount: childResults.length }, 'specialist result batch');
         } catch (error) {
-          // Host-side bounds are not child-quality failures: restore the
-          // attempt counters so the lenses stay retryable.
-          restoreAttempts(scheduled);
-          throw error;
+          // The children really ran: their envelopes/artifacts/run records
+          // stay committed (never restored or hidden) — only the response
+          // failed, so the lead learns the transport fact honestly.
+          commitResults();
+          throw new Error(`${(error instanceof Error ? error.message : String(error))}; the completed runs are recorded but their findings were not delivered to you`);
         }
-        // Commit ownership only after the exact response bytes have passed
-        // every host-side bound.
-        for (const result of childResults) {
-          results.set(result.resultId, result);
-          if (result.status !== 'valid') {
-            const failures = failureLog.get(result.lens) ?? [];
-            failureLog.set(result.lens, [...failures, {
-              attempt: result.attempt,
-              status: result.status,
-              failureKind: result.failureKind ?? 'error',
-              error: result.error ?? 'no host-recorded reason',
-            }]);
-          }
-        }
+        commitResults();
         return {
           text: payload,
           details: { resultCount: childResults.length, findingCount: childResults.reduce((sum, result) => sum + result.findings.length, 0) },
@@ -957,7 +1014,7 @@ export class PerkinsWholeReview {
 
     const priorRevisionTool: NativeAgentTool | null = priorReview.targetSha === null ? null : {
       name: 'perkins_read_prior_revision',
-      description: 'Inspect the frozen delta between the prior round target and this round target: with {} list changed paths, or with {"path":"relative/file"} read one bounded path diff. Read-only investigative material for revisiting prior findings.',
+      description: 'Inspect the frozen delta between the prior round target and this round target: with {} list changed paths, or with {"path":"relative/file"} read one bounded exact-file diff. Read-only investigative material for revisiting prior findings.',
       inputSchema: {
         type: 'object', additionalProperties: false,
         properties: { path: { type: 'string', minLength: 1, maxLength: 500 } },
@@ -973,14 +1030,28 @@ export class PerkinsWholeReview {
             '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--find-renames',
             '--name-status', '-z', priorTargetSha, review.manifest.targetSha, '--',
           ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+          // Truthful per-status parsing: an added file has NO old path and a
+          // deleted file has NO new path — a re-reviewer must not be shown a
+          // prior version of a file that did not exist.
           const fields = listing.split('\0').filter(Boolean);
           const changes: { status: string; oldPath: string | null; newPath: string | null }[] = [];
           for (let i = 0; i < fields.length;) {
             const status = fields[i++]!;
             if (/^R[0-9]{1,3}$/u.test(status)) {
-              changes.push({ status: 'R', oldPath: fields[i++] ?? null, newPath: fields[i++] ?? null });
+              const oldPath = fields[i++];
+              const newPath = fields[i++];
+              if (oldPath !== undefined && newPath !== undefined) changes.push({ status: 'R', oldPath, newPath });
+            } else if (status === 'A' || status === 'D' || status === 'M') {
+              const path = fields[i++];
+              if (path !== undefined) {
+                changes.push({
+                  status,
+                  oldPath: status === 'A' ? null : path,
+                  newPath: status === 'D' ? null : path,
+                });
+              }
             } else {
-              changes.push({ status, oldPath: fields[i++] ?? null, newPath: status === 'D' ? null : fields[i - 1] ?? null });
+              i += 1; // unknown types are skipped without mislabeling others
             }
           }
           payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, changes });
@@ -988,15 +1059,26 @@ export class PerkinsWholeReview {
           if (typeof value.path !== 'string' || !safeFixPath(value.path)) {
             throw new Error('prior revision path must be a bounded safe relative file path');
           }
+          // Exact-file selection: --text defeats `-diff` attribute binary
+          // marking and --no-textconv defeats textconv drivers, so the
+          // earlier text of a deleted caller stays readable; the result is
+          // then verified to contain EXACTLY the requested file (a literal
+          // pathspec also selects a directory that replaced the file).
           const diff = execFileSync('git', [
-            '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--unified=3',
-            priorTargetSha, review.manifest.targetSha, '--', `:(literal)${value.path}`,
+            '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--no-textconv', '--text',
+            '--unified=3', priorTargetSha, review.manifest.targetSha, '--', `:(literal)${value.path}`,
           ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+          const selected = [...diff.matchAll(/^diff --git a\/(.*) b\/(.*)$/gmu)];
+          if (selected.length > 1 || (selected.length === 1 &&
+              selected[0]![1] !== value.path && selected[0]![2] !== value.path)) {
+            throw new Error(`prior revision path ${value.path} is ambiguous (a directory may have replaced it); select an exact file`);
+          }
           payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, path: value.path, diff });
         }
         if (Buffer.byteLength(payload, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {
           throw new Error('prior revision response exceeds the bounded tool response; select a smaller path');
         }
+        assertToolResponseFits(payload, { priorTargetSha, targetSha: review.manifest.targetSha }, 'prior revision response');
         return { text: payload, details: { priorTargetSha, targetSha: review.manifest.targetSha } };
       },
     };
@@ -1012,11 +1094,21 @@ export class PerkinsWholeReview {
       },
     };
 
+    // The valid-lens set is read live at each validation: submission must
+    // see every specialist run committed so far (the tools are serialized,
+    // so no run can commit mid-validation).
     const validationContext: SubmissionValidationContext = {
       review,
       movementRef: input.movementRef,
       prior,
       priorTargetSha: priorReview.targetSha,
+      get validLenses() {
+        const valid = new Set<PerkinsLens>();
+        for (const result of results.values()) {
+          if (result.status === 'valid') valid.add(result.lens);
+        }
+        return valid;
+      },
     };
 
     const preflightTool: NativeAgentTool = {
@@ -1027,16 +1119,38 @@ export class PerkinsWholeReview {
         if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
         if (accepted !== null) throw new Error('review already has an accepted terminal submission');
         preflightAttempts += 1;
-        const validation = this.validateSubmission(validationContext, raw);
+        const validation = this.validateSubmission(
+          validationContext, raw, headMovedSinceFreeze(review, input.movementRef));
         const issues = validation.ok ? [] : validation.issues;
-        writeReviewArtifact(review, `lead/preflight-attempt-${preflightAttempts}.json`, {
+        const artifact = `lead/preflight-attempt-${preflightAttempts}.json`;
+        writeReviewArtifact(review, artifact, {
           schemaVersion: 1,
           ok: validation.ok,
           errorCount: issues.length,
           errors: issues,
         });
+        // The response is wire-bounded: every issue stays durable in the
+        // artifact above; the response carries as many as fit plus an
+        // explicit omitted count and pointer — never silent truncation.
+        const included: SubmissionValidationIssue[] = [];
+        for (const issue of issues) {
+          const candidate = JSON.stringify({
+            preflight: true, ok: validation.ok, errorCount: issues.length,
+            errors: [...included, issue],
+            omittedErrorCount: issues.length - included.length - 1,
+            fullList: artifact,
+          });
+          if (Buffer.byteLength(JSON.stringify({ id: 'x'.repeat(256), ok: true, result: { text: candidate } }), 'utf8') > MAX_WIRE_FRAME_BYTES) break;
+          included.push(issue);
+        }
         return {
-          text: JSON.stringify({ preflight: true, ok: validation.ok, errorCount: issues.length, errors: issues }),
+          text: JSON.stringify({
+            preflight: true, ok: validation.ok, errorCount: issues.length,
+            errors: included,
+            ...(included.length < issues.length
+              ? { omittedErrorCount: issues.length - included.length, fullList: artifact }
+              : {}),
+          }),
           details: { preflight: true, ok: validation.ok, errorCount: issues.length, preflightAttempt: preflightAttempts },
         };
       },
@@ -1046,14 +1160,22 @@ export class PerkinsWholeReview {
       name: 'perkins_submit_review',
       description: 'Submit the lead-authored terminal review: your verdict, your final verified findings, one disposition per prior finding, and the coherent Markdown report. The host validates schema, prior-finding accounting, and identity anchors — substantive truth is yours. A rejected submission lists every violation in one response.',
       inputSchema: submissionSchema,
-      execute: async (raw, signal) => {
+      // Serialized with specialist scheduling: a terminal submission can
+      // never seal while children are still in flight or discard their
+      // finished results — it executes only after every started batch has
+      // committed its run record.
+      execute: (raw, signal) => serializeRunTool(async () => {
         if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
         terminalAttempts += 1;
         if (terminalAttempts > MAX_TERMINAL_ATTEMPTS) throw new Error('terminal submission attempts exhausted');
         const attempt = terminalAttempts;
         try {
           if (accepted !== null) throw new Error('review already has an accepted terminal submission');
-          const validation = this.validateSubmission(validationContext, raw);
+          // ONE head-move observation decides both validation and the
+          // sealed artifact, so a result can never internally disagree with
+          // itself (READY with headMoved:true).
+          const headMovedAtSubmit = headMovedSinceFreeze(review, input.movementRef);
+          const validation = this.validateSubmission(validationContext, raw, headMovedAtSubmit);
           if (!validation.ok) {
             writeReviewArtifact(review, `lead/submission-attempt-${attempt}.error.json`, {
               error: rejectionMessage(validation.issues),
@@ -1064,7 +1186,7 @@ export class PerkinsWholeReview {
           const submission = validation.submission;
           writeReviewArtifact(review, `lead/submission-attempt-${attempt}.json`, submission);
           const reportFile = writeReviewArtifact(review, 'perkins-report.md', submission.report_markdown.endsWith('\n') ? submission.report_markdown : `${submission.report_markdown}\n`);
-          const headMoved = headMovedSinceFreeze(review, input.movementRef);
+          const headMoved = headMovedAtSubmit;
           // The reviewer owns the verdict; the host owns assembly of the
           // durable record from the accepted submission.
           const leadFindings: VerifiedFinding[] = submission.findings.map((finding) => ({
@@ -1079,10 +1201,30 @@ export class PerkinsWholeReview {
           }));
           // Still-present prior findings carry their original round marker so
           // a fresh rediscovery merges INTO the original, never replaces it.
+          // An optional refresh updates the CURRENT citation/severity for
+          // moved code without touching the origin; legacy v2 chunk fields
+          // are stripped — v3 records never carry them.
           const carried: VerifiedFinding[] = [];
           for (const disposition of submission.prior_dispositions) {
             if (disposition.status !== 'still-present') continue;
-            carried.push(prior[disposition.prior_index]!);
+            const original = prior[disposition.prior_index]!;
+            const { chunks: _legacyChunks, ...clean } = original as VerifiedFinding & { chunks?: unknown };
+            const refresh = disposition.refresh;
+            carried.push({
+              ...clean,
+              ...(refresh?.location !== undefined ? { location: refresh.location } : {}),
+              ...(refresh?.severity !== undefined ? { severity: refresh.severity } : {}),
+              ...(refresh?.evidence !== undefined
+                ? {
+                    evidence: refresh.evidence,
+                    verification: {
+                      disposition: clean.verification.disposition,
+                      evidence: refresh.evidence,
+                      reason: disposition.note,
+                    },
+                  }
+                : {}),
+            });
           }
           const findings = dedupeVerifiedFindings([...carried, ...leadFindings]);
           const specialistRuns = [...results.values()].map((result) => ({
@@ -1118,7 +1260,7 @@ export class PerkinsWholeReview {
           }
           throw error;
         }
-      },
+      }),
     };
 
     const leadTools = [
@@ -1189,6 +1331,7 @@ export class PerkinsWholeReview {
   private validateSubmission(
     context: SubmissionValidationContext,
     raw: unknown,
+    headMovedObserved: boolean,
   ): SubmissionValidation {
     const issues: SubmissionValidationIssue[] = [];
     const push = (subject: string, rule: string, message: string): void => {
@@ -1228,6 +1371,8 @@ export class PerkinsWholeReview {
         }
         if (typeof candidate.source !== 'string' || !sources.has(candidate.source)) {
           push(subject, 'finding-source', `${subject} source must be a lens or "lead"`);
+        } else if (candidate.source !== 'lead' && !context.validLenses.has(candidate.source as PerkinsLens)) {
+          push(subject, 'finding-source', `${subject} source "${candidate.source}" names a lens with no valid specialist result; source it as "lead" or run that specialist`);
         }
         if (typeof candidate.severity !== 'string' || !['blocker', 'warning', 'note'].includes(candidate.severity)) {
           push(subject, 'finding-severity', `${subject} severity is invalid`);
@@ -1264,7 +1409,10 @@ export class PerkinsWholeReview {
           return;
         }
         const candidate = entry as Record<string, unknown>;
-        if (Object.keys(candidate).sort().join('\0') !== ['note', 'prior_index', 'status'].sort().join('\0')) {
+        const expectedKeys = candidate.refresh === undefined
+          ? ['note', 'prior_index', 'status']
+          : ['note', 'prior_index', 'refresh', 'status'];
+        if (Object.keys(candidate).sort().join('\0') !== [...expectedKeys].sort().join('\0')) {
           push(subject, 'prior-schema', `${subject} keys do not match the required schema`);
         }
         if (!Number.isSafeInteger(candidate.prior_index) || Number(candidate.prior_index) < 0 || Number(candidate.prior_index) >= context.prior.length) {
@@ -1275,9 +1423,54 @@ export class PerkinsWholeReview {
           push(subject, 'prior-status', `${subject} status is invalid`);
           return;
         }
+        // Optional refresh: a truthful current citation for a still-present
+        // prior (the code moved, the finding did not). Bounded like the
+        // finding schema; judgment stays with the reviewer.
+        let refresh: PriorDisposition['refresh'];
+        if (candidate.refresh !== undefined) {
+          if (typeof candidate.refresh !== 'object' || candidate.refresh === null || Array.isArray(candidate.refresh)) {
+            push(subject, 'prior-refresh', `${subject} refresh must be an object`);
+            return;
+          }
+          const rawRefresh = candidate.refresh as Record<string, unknown>;
+          if (Object.keys(rawRefresh).length === 0 ||
+              Object.keys(rawRefresh).some((key) => !['location', 'evidence', 'severity'].includes(key))) {
+            push(subject, 'prior-refresh', `${subject} refresh allows only location, evidence and severity`);
+            return;
+          }
+          const location = rawRefresh.location === undefined
+            ? null
+            : collectBoundedString(rawRefresh.location, `${subject} refresh location`, 500, subject, 'prior-refresh', issues);
+          const evidence = rawRefresh.evidence === undefined
+            ? null
+            : collectBoundedString(rawRefresh.evidence, `${subject} refresh evidence`, 4_000, subject, 'prior-refresh', issues);
+          let severity: VerifiedFinding['severity'] | null = null;
+          if (rawRefresh.severity !== undefined) {
+            if (typeof rawRefresh.severity !== 'string' || !['blocker', 'warning', 'note'].includes(rawRefresh.severity)) {
+              push(subject, 'prior-refresh', `${subject} refresh severity is invalid`);
+              severity = null;
+            } else {
+              severity = rawRefresh.severity as VerifiedFinding['severity'];
+            }
+          }
+          if (location === null && evidence === null && severity === null) {
+            push(subject, 'prior-refresh', `${subject} refresh carries no usable field`);
+            return;
+          }
+          refresh = {
+            ...(location !== null ? { location } : {}),
+            ...(evidence !== null ? { evidence } : {}),
+            ...(severity !== null ? { severity } : {}),
+          };
+        }
         const note = collectBoundedString(candidate.note, `${subject} note`, 1_000, subject, 'prior-note', issues);
         if (note === null) return;
-        const disposition = { prior_index: Number(candidate.prior_index), status: candidate.status as PriorDisposition['status'], note };
+        const disposition = {
+          prior_index: Number(candidate.prior_index),
+          status: candidate.status as PriorDisposition['status'],
+          note,
+          ...(refresh === undefined ? {} : { refresh }),
+        };
         collectedDispositions.push(disposition);
         const list = byIndex.get(disposition.prior_index) ?? [];
         list.push(disposition);
@@ -1298,11 +1491,25 @@ export class PerkinsWholeReview {
       if (!report.includes(context.review.manifest.targetSha) || !report.includes(context.review.manifest.diffBaseSha)) {
         push('report', 'report-identity', 'report omits the frozen target/base identity');
       }
+      // Coherence, not transcription: when findings are retained, the prose
+      // must acknowledge at least one of them — a report that reads as
+      // issue-free beside retained blockers disagrees with its own record.
+      const retainedTitles = [
+        ...(findings ?? []).map((finding) => finding.title),
+        ...(dispositions ?? [])
+          .filter((disposition) => disposition.status === 'still-present')
+          .map((disposition) => context.prior[disposition.prior_index]?.title ?? ''),
+      ].filter((title) => title !== '');
+      if (retainedTitles.length > 0 && !retainedTitles.some((title) => report.includes(title))) {
+        push('report', 'report-coherence', `report mentions none of the ${retainedTitles.length} retained finding(s) while the submission retains them; the prose must agree with the structured outcome`);
+      }
     }
     // A moved source ref never retargets this frozen review, and it can never
     // authorize the now-different head: only a fail-closed INCOMPLETE
-    // submission can be accepted against a moved ref.
-    const headMoved = headMovedSinceFreeze(context.review, context.movementRef);
+    // submission can be accepted against a moved ref. The observation is
+    // supplied by the caller (one per submission) so validation and the
+    // sealed artifact can never disagree.
+    const headMoved = headMovedObserved;
     if (headMoved && verdict !== null && verdict !== 'INCOMPLETE') {
       push('submission', 'head-moved', `the source ref moved after target ${context.review.manifest.targetSha} was frozen; only an INCOMPLETE submission can be accepted`);
     }
@@ -1336,7 +1543,7 @@ export class PerkinsWholeReview {
       JSON.stringify(prior.map((finding, prior_index) => ({ prior_index, ...finding })), null, 2),
       '',
       'Investigate the frozen tree with your confined read tools (the review worktree you are rooted in IS the frozen snapshot). Decide yourself whether perkins_run_specialists helps; each specialist sees the whole change.',
-      'For the terminal submission call perkins_submit_review with: your verdict, your final verified findings (source may be a lens or "lead"), one prior_dispositions entry per prior_index above (fixed or still-present, each with a short grounded note), and the coherent report containing `**Verdict: ...**` and both frozen SHAs.',
+      'For the terminal submission call perkins_submit_review with: your verdict, your final verified findings (source may be "lead" or a lens that actually ran), one prior_dispositions entry per prior_index above (fixed or still-present, each with a short grounded note; for a still-present finding whose code moved, optionally refresh {location, evidence, severity} to the truthful current citation), and the coherent report containing `**Verdict: ...**` and both frozen SHAs.',
       'Prefer fewer grounded findings; [] findings is honest. Never claim completion from work you could not do — submit INCOMPLETE instead, and remember INCOMPLETE never approves.',
     ].join('\n');
   }

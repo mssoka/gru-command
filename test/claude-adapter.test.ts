@@ -1140,7 +1140,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(build!.argv[build!.argv.indexOf('--tools') + 1]).toBe('Read,Bash,Edit,Write,Grep,Glob,LS');
     // The role prompt is the perkins/minion definition's own:
     expect(review!.argv[review!.argv.indexOf('--append-system-prompt') + 1]).toContain(
-      'Hybrid Code Review Lead',
+      'Whole-PR Review Lead',
     );
     expect(build!.argv[build!.argv.indexOf('--append-system-prompt') + 1]).toContain(
       'worker agent',

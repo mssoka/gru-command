@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -135,7 +136,7 @@ function makeDispatchHarness(opts: {
     return handle;
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
-  const poster = { post: vi.fn(async (input: { readonly targetSha: string }) => ({ headSha: input.targetSha, baseSha: 'e2e-delivered-base' })) };
+  const poster = { post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({ reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'e2e-delivered-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') })) };
   const wave = new WaveRunner({
     ledger,
     worktrees,
