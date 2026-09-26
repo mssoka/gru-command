@@ -228,8 +228,9 @@ bare-label truth.
   evidence: serial rerun green.
 - 2026-09-27 (recovery verification — REAL finding, patched): the
   prior session's new receipt doubles hardcoded the owner's personal
-  GitHub login (`actor: 'mssoka'` ×19) in shipped tests, failing the
-  always-on hygiene gate (SPEC ruling 8). Replaced with the generic
+  GitHub login (19 occurrences, actor fields of the new poster doubles)
+  in shipped tests, failing the always-on hygiene gate (SPEC ruling 8).
+  Replaced with the generic
   service actor `gru-bot` (the existing GitLab-double convention);
   evidence: `bash scripts/hygiene-grep.sh` → clean; affected suites
   rerun green.
@@ -251,6 +252,11 @@ bare-label truth.
 - 2026-09-27: recovery continuation (prior session disposed mid-run at
   13:16Z with WIP byte-preserved); status in-review; repair-diff review
   prompts staged; full verification rerun.
+- 2026-09-27 (CI-caught, patched): the first repair commit's own triage
+  log quoted the personal login literally inside the now-tracked spec —
+  hygiene-grep could not see it pre-commit (the file was gitignored until
+  force-add), CI could. Reworded without the literal; hygiene clean on
+  the full tracked set.
 - 2026-09-27: status done. Committed 8bd33098e3c516ae65b883c1b2ca8a0a2e
   50b094 (code) — the two recovery-session findings (persona pins,
   personal actor in doubles) patched in the same commit; serial backend
