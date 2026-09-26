@@ -2,7 +2,7 @@
 title: 'Whole-PR Perkins review: independent PR77 review repairs'
 type: 'bugfix'
 created: '2026-09-27'
-status: 'in-review'
+status: 'done'
 route: 'dispatch'
 baseline_commit: 'cb136827c53f820c1b6150db4b3a34bf4f1bb32c'
 approved_via: 'dispatch briefing (owner unblock directive); independent review owner-independent-pr77-cb13682-20260926 (NEEDS CHANGES)'
@@ -251,3 +251,11 @@ bare-label truth.
 - 2026-09-27: recovery continuation (prior session disposed mid-run at
   13:16Z with WIP byte-preserved); status in-review; repair-diff review
   prompts staged; full verification rerun.
+- 2026-09-27: status done. Committed 8bd33098e3c516ae65b883c1b2ca8a0a2e
+  50b094 (code) — the two recovery-session findings (persona pins,
+  personal actor in doubles) patched in the same commit; serial backend
+  1226/1226 green (exit 1 solely from vitest worker-RPC onTaskUpdate
+  timeouts, zero test failures), web 287/287 exit 0, lint/typecheck/
+  build exit 0; exact-head CI on PR #77 is the authoritative gate.
+  Independent out-of-runner recheck (incl. B1 re-evaluation) follows via
+  Gru per the owner re-brief; lane hands off blocked-awaiting-recheck.
