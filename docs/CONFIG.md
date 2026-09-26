@@ -284,13 +284,31 @@ enabled = true
 [verify]
 # Verification scheduler: lanes request their project's verify command
 # through POST /api/verify; the scheduler owns ONE global test budget
-# across lanes. Requests beyond max_concurrent queue FIFO, a queued
-# request past lock_wait_timeout_ms fails loud, a holder whose pid is
-# dead is released, and every run is recorded for review evidence.
+# across lanes/repos. It governs only verification commands submitted
+# through that API — it does not set AI-agent/reviewer counts and does
+# not govern arbitrary commands run directly outside it. Requests
+# beyond max_concurrent queue FIFO, a queued request past
+# lock_wait_timeout_ms fails loud, a holder whose pid is dead is
+# released, and every run is recorded for review evidence.
+# Maximum simultaneous verification commands; 1 serializes runs and
+# later requests queue FIFO. Not a per-command test-worker count.
 max_concurrent = 1
-# Total test workers across runs; 0 = auto (CPU cores - 2).
+# Total test-runner worker allowance across admitted runs, NOT AI
+# agents/reviewers. 0 = auto: max(1, OS-available CPU parallelism - 2).
+# The allowance is split across the effective concurrency (max_concurrent
+# clamped so the budget is never exceeded; each run gets its share,
+# minimum 1). Enforcement passes supported runner worker settings to
+# each run (vitest pool env vars + GRU_VERIFY_*); it is not an OS CPU
+# quota and reserves no cores.
 worker_budget = 0
+# Deadline for a queued request waiting for a slot, in milliseconds;
+# 900000 = 15 minutes. Expiry fails that queued request loud without
+# starting it; the current holder is not terminated.
 lock_wait_timeout_ms = 900000
+# Execution deadline after a run starts (queue wait excluded), in
+# milliseconds; 1800000 = 30 minutes. On expiry the scheduler SIGTERMs
+# the run's process group, then SIGKILLs after the 5-second grace if
+# needed, and records the run as timed out / non-success.
 run_timeout_ms = 1800000
 
 ```
