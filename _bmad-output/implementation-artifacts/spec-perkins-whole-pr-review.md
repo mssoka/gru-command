@@ -2,7 +2,7 @@
 title: 'Whole-PR Perkins review'
 type: 'feature'
 created: '2026-09-26'
-status: 'in-review'
+status: 'done'
 route: 'dispatch'
 baseline_commit: '128412db65f25183854b5d3b54768f51aa8bd862'
 approved_via: 'dispatch briefing (owner pre-approved design; no open questions)'
@@ -150,7 +150,7 @@ Key decisions (all inside the approved scope):
 5. `perkins.ts` WaveRunner integration + lens outcomes.
 6. Board label parsing + `docs/ROLES.md`.
 7. Tests: new double + engine suite; adapt wave/freeze/compat suites.
-8. Full `npm test`; commit; PR.
+8. [x] Full `npm test` (components each exit 0; backend run serially for a load-stable green); commit; PR #77 with exact-head CI green.
 
 ## Test Plan
 
@@ -168,6 +168,21 @@ legacy v2 prior loading, board label parsing.
 - Old suites encode chunk behavior; replacement must keep every
   posting/receipt safety test intact.
 
+## Review Triage Log
+
+- Step-04 review layers (blind-hunter, edge-case-hunter, verification-gap):
+  this dispatch runtime has no subagent-spawn capability, so per the
+  workflow fallback each layer's standalone prompt (diff/claims/instruction
+  inlined) is staged under `_bmad-output/implementation-artifacts/
+  review-layer-*-prompt.md` for the human to run in separate sessions. No
+  findings have been triaged yet; the implementer's own full-diff audit
+  found and fixed two issues (submission-time head-move gate strength,
+  failed-batch specialist accounting). Independent review of PR #77 by the
+  deployed Perkins gate remains mandatory per the briefing — never
+  self-approval, never self-merge.
+
 ## Spec Change Log
 
 - 2026-09-26: initial spec from dispatch briefing.
+- 2026-09-26: delivered on PR #77 (head 91fd204f, CI 36216219411 success);
+  review layers staged for external runs.
