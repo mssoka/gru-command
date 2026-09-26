@@ -197,6 +197,24 @@ sibling/submit-race regressions via the real batch/pool/terminal paths.
   exact-head CI. Authoritative independent gate: Gru's fresh
   out-of-runner whole-PR recheck.
 
+- 2026-09-27 (CI-caught, fixed): T4's reconcile double used a raw
+  `git commit-tree` without a committer identity — local machines
+  carry a global git user, CI runners do not, so reconciliation
+  errored there and the specific guard never ran. Diagnosed with a
+  temporary CI diagnostic commit (escalations + artifact state),
+  fixed by passing `-c user.name/-c user.email` exactly as the
+  fixture's own commitFile does; diagnostic commits remain in branch
+  history. Two earlier CI failures of the same test were this single
+  cause (deterministic), not flake.
+- 2026-09-27 (delivery): code commit f486672 + T4 identity fix
+  d3e1094; exact-head CI 36264081215 SUCCESS (Full suite Node 22,
+  3m2s) — the authoritative parallel gate including the web suite.
+  Local: serial backend 1235/1235 (exit 1 only from vitest RPC
+  unhandled errors, zero test failures), serial web 287/287 exit 0,
+  lint/typecheck/build/hygiene exit 0. Lane holds BLOCKED awaiting
+  Gru's fresh independent out-of-runner whole-PR recheck; T6-T12,
+  T14-T15 remain open findings for it.
+
 ## Spec Change Log
 
 - 2026-09-27: initial six-blocker repair spec from independent review
