@@ -1592,6 +1592,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(movedOutcome.posted).toBe(false);
     expect(movedOutcome.verdict).toBeNull();
     expect(movedOutcome.canonicalVerdict).toBe('INCOMPLETE');
+    console.log('T4 DIAG', JSON.stringify({ escalations, artifactExists: existsSync(join(moved.artifacts, movedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json')), targetRef: moved.ledger.getRound(movedOutcome.round.id)?.targetRef, baseRef: moved.ledger.getRound(movedOutcome.round.id)?.baseRef }));
     expect(escalations.some((line) => line.includes('reconciled a provider review but did NOT record it'))).toBe(true);
     const unrecorded = JSON.parse(readFileSync(join(moved.artifacts, movedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
     expect(unrecorded.recorded).toBe(false);
