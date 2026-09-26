@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PERKINS_POLICY_ID = 'perkins-code-review';
 export const PERKINS_CANONICAL_SOURCE_SHA256 = 'f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7';
-export const PERKINS_POLICY_SHA256 = '325f751720cc46c21093b108ca77fb5627198d2a9cdd145a8a94db24d6c239a9';
+export const PERKINS_POLICY_SHA256 = '5622da6b100dff79cda29147cb7a3ecd8dd5e0e4905b8bcfb4dcd22f58dfb6a9';
 
 export const PERKINS_LENSES = [
   'blind',
@@ -17,6 +17,11 @@ export const PERKINS_LENSES = [
   'tests',
 ] as const;
 export type PerkinsLens = (typeof PERKINS_LENSES)[number];
+
+/** Authoring sources of a whole-PR review finding: any specialist lens, or
+ * the lead's own investigation. */
+export const PERKINS_FINDING_SOURCES = [...PERKINS_LENSES, 'lead'] as const;
+export type PerkinsFindingSource = (typeof PERKINS_FINDING_SOURCES)[number];
 
 export interface PerkinsPolicy {
   readonly identity: string;
@@ -38,12 +43,11 @@ export interface PerkinsPolicy {
     };
     readonly leadWorkflow: string;
     readonly lenses: Readonly<Record<PerkinsLens, string>>;
-    readonly verificationPrompt: string;
-    readonly reReviewPrompt: string;
     readonly rules: {
       readonly fullLenses: readonly PerkinsLens[];
       readonly noSpecLenses: readonly PerkinsLens[];
-      readonly chunkLineThreshold: number;
+      /** Per-specialist attempt bound: a resource limit on one lens's
+       * retries, never a required-coverage gate. */
       readonly maxLensAttempts: number;
       readonly verdicts: Readonly<Record<string, string>>;
       readonly dedupeKey: string;
@@ -100,11 +104,14 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
     policy.identity !== PERKINS_POLICY_ID ||
     policy.version !== 1 ||
     policy.provenance?.sourceSha256 !== PERKINS_CANONICAL_SOURCE_SHA256 ||
-    policy.portableContract?.rules?.chunkLineThreshold !== 3000 ||
     policy.portableContract?.rules?.maxLensAttempts !== 2 ||
     policy.portableContract?.rules?.incompleteNeverApproves !== true
   ) {
     throw new Error(`bundled ${PERKINS_POLICY_ID} resource failed its identity/provenance/rules contract`);
+  }
+  const rules = policy.portableContract.rules;
+  if ('chunkLineThreshold' in rules) {
+    throw new Error(`bundled ${PERKINS_POLICY_ID} carries the retired chunk-threshold rule`);
   }
   for (const lens of PERKINS_LENSES) {
     if (typeof policy.portableContract.lenses[lens] !== 'string' || policy.portableContract.lenses[lens].trim() === '') {
@@ -112,7 +119,7 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
     }
   }
   if (typeof policy.portableContract.leadWorkflow !== 'string' || !policy.portableContract.leadWorkflow.includes('perkins_submit_review')) {
-    throw new Error(`bundled ${PERKINS_POLICY_ID} resource is missing the hybrid lead workflow`);
+    throw new Error(`bundled ${PERKINS_POLICY_ID} resource is missing the whole-PR lead workflow`);
   }
   const outputContracts = policy.portableContract.outputContracts;
   for (const key of ['text', 'blindText', 'nativeTool', 'blindNativeTool'] as const) {
@@ -130,14 +137,14 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
       throw new Error(`bundled ${PERKINS_POLICY_ID} ${key} is missing the output-contract placeholder`);
     }
   }
-  // The blind child has no tools: the chunk-file inventory and the
+  // The blind child has no tools: the whole-change file inventory and the
   // locatable-evidence discipline are the only grounding that keeps its
   // citations verifiable, so the policy cannot silently drop either.
-  if (!policy.portableContract.blindPrompt.includes('{{CHUNK_FILES}}')) {
-    throw new Error(`bundled ${PERKINS_POLICY_ID} blindPrompt is missing the chunk-file inventory placeholder`);
+  if (!policy.portableContract.blindPrompt.includes('{{CHANGED_FILES}}')) {
+    throw new Error(`bundled ${PERKINS_POLICY_ID} blindPrompt is missing the whole-change file inventory placeholder`);
   }
   for (const key of ['blindText', 'blindNativeTool'] as const) {
-    if (!outputContracts[key].includes('FILES IN THIS CHUNK') || !outputContracts[key].includes('recited verbatim')) {
+    if (!outputContracts[key].includes('FILES IN THIS CHANGE') || !outputContracts[key].includes('recited verbatim')) {
       throw new Error(`bundled ${PERKINS_POLICY_ID} ${key} is missing the locatable-evidence discipline`);
     }
   }

@@ -4,20 +4,20 @@ import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
-import { PerkinsHybridReview } from '../src/dispatch/perkins-review/hybrid.js';
+import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { ClaudeCodeRuntime } from '../src/runtime/claude-adapter.js';
 import { PiRuntime } from '../src/runtime/pi-adapter.js';
 import type { NativeAgentTool, SpawnOptions } from '../src/runtime/types.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
-import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { makeStubModelRuntime, StubScript } from './helpers/stub-model.js';
 
 /**
  * Native-tools runtime parity (SPEC ruling 4, owner ruling 2026-09-22):
  * above the adapter layer gru-command behaves identically regardless of
- * harness. This file runs the REAL Perkins hybrid engine through its
+ * harness. This file runs the REAL Perkins whole-PR engine through its
  * offline double to capture the exact review policies it declares, then
  * replays every DISTINCT captured policy through BOTH real adapters
  * (pi: in-process custom tools; claude-code: the session-scoped MCP
@@ -148,11 +148,12 @@ interface CapturedPolicy {
 }
 
 /**
- * One REAL hybrid run through the offline double captures the policy the
- * engine declares for its lead and every lens child. Returns the distinct
- * shapes only — the adapters must agree on each shape, not on session count.
+ * One REAL whole-PR run through the offline double captures the policy the
+ * engine declares for its lead and every specialist child. Returns the
+ * distinct shapes only — the adapters must agree on each shape, not on
+ * session count.
  */
-async function capturedHybridPolicies(): Promise<CapturedPolicy[]> {
+async function capturedWholePolicies(): Promise<CapturedPolicy[]> {
   const repo = makeFixtureRepo('parity-native-tools');
   repos.push(repo);
   const base = repo.head();
@@ -170,8 +171,8 @@ async function capturedHybridPolicies(): Promise<CapturedPolicy[]> {
     movementRef: 'feature/review',
     spec: 'Acceptance: answer returns 43.',
   });
-  const fake = fakeHybridSpawner(sessionsRoot, { childAnswer: () => '[]' });
-  const engine = new PerkinsHybridReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+  const fake = fakeWholeSpawner(sessionsRoot, { childAnswer: () => '[]' });
+  const engine = new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
   const result = await engine.run({
     roundId: 'parity-round',
     roundNumber: 1,
@@ -207,9 +208,9 @@ async function capturedHybridPolicies(): Promise<CapturedPolicy[]> {
   return [...policies.values()];
 }
 
-describe('native-tools harness parity (hybrid double → both real adapters)', () => {
-  it('every policy the hybrid engine declares maps to identical tool semantics on pi and claude', async () => {
-    const policies = await capturedHybridPolicies();
+describe('native-tools harness parity (whole double → both real adapters)', () => {
+  it('every policy the whole-PR engine declares maps to identical tool semantics on pi and claude', async () => {
+    const policies = await capturedWholePolicies();
     expect(policies.length).toBeGreaterThanOrEqual(3); // lead + blind + lens children
     const h = await harnesses();
     try {
@@ -223,14 +224,12 @@ describe('native-tools harness parity (hybrid double → both real adapters)', (
         expect(sorted(pi.nativeTools), `${label}: pi native tools`).toEqual(sorted(nativeTools));
         expect(sorted(claude.nativeTools), `${label}: claude native tools`).toEqual(sorted(nativeTools));
       }
-      // The lead declares its six orchestration tools (record-decision
-      // joined the five after #48's parity harness landed).
+      // The lead declares its whole-PR orchestration tools (a re-review
+      // adds perkins_read_prior_revision through its own seam).
       const lead = policies.find((policy) => policy.label === 'lead')!;
       expect(sorted(lead.nativeTools)).toEqual(sorted([
-        'perkins_read_chunk',
-        'perkins_run_lenses',
+        'perkins_run_specialists',
         'perkins_store_artifact',
-        'perkins_record_decision',
         'perkins_preflight_submission',
         'perkins_submit_review',
       ]));

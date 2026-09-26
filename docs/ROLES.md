@@ -21,26 +21,27 @@ fail-loud at boot); this page is the map.
 - Minions host at the **project root they serve** and discover that
   project's own `.agents/skills` and `_bmad` through the fresh worktree
   bootstrap manifest (`.gru-command/worktree.toml`).
-- Perkins leads and non-blind lens children are rooted in the frozen detached
-  review tree; blind children are rooted outside it. Review sessions disable
-  all project/global skills, context files, extensions, prompts, settings,
-  plugins, and unrelated MCP servers. The sole MCP exception is a fresh,
-  per-session bridge for the Claude lead's six product-native tools; children
-  never receive it. Discovery never falls back to the workspace or agent home. A `spawn_provided` role without a cwd fails loud.
+- Perkins leads and non-blind specialists are rooted in the frozen detached
+  review tree; blind specialists are rooted outside it. Review sessions
+  disable all project/global skills, context files, extensions, prompts,
+  settings, plugins, and unrelated MCP servers. The sole MCP exception is a
+  fresh, per-session bridge for the Claude lead's product-native tools;
+  specialists never receive it. Discovery never falls back to the workspace
+  or agent home. A `spawn_provided` role without a cwd fails loud.
 
 ## Permissions
 
-Tool sets narrow with responsibility. The Perkins lead gets only frozen
-chunk read, tracked child delegation, bounded note storage, decision
-recording, submission
-preflight, terminal submit, and confined tree reads. Non-blind children get
-confined read/grep/find/list;
-blind gets no tools. Seven required lens types run for every frozen chunk (six
-only for explicit no-spec); each malformed lens/chunk attempt may be retried
-within the policy limit as a new tracked child. No reviewer gets bash, edit,
-write, general tasks, or nested delegation. Minions get the full editing set;
-Gru/Silas/Bob carry operational tool sets. Runtime adapters enforce the same
-policy natively.
+Tool sets narrow with responsibility. The Perkins lead gets whole-change
+specialist delegation, a bounded prior-revision reader, bounded note
+storage, submission preflight, terminal submit, and confined tree reads;
+the complete frozen diff and the exact reviewed snapshot are its review
+unit. Non-blind specialists get confined read/grep/find/list; blind gets no
+tools. Specialists are optional and each reviews the WHOLE change (six
+available only for explicit no-spec); each failed specialist attempt may
+be retried within the policy limit as a new tracked child. No reviewer
+gets bash, edit, write, general tasks, or nested delegation. Minions get
+the full editing set; Gru/Silas/Bob carry operational tool sets. Runtime
+adapters enforce the same policy natively.
 
 ## Skills
 

@@ -12,7 +12,7 @@ import { loadConfig, DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
-import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { NotificationCenter } from '../src/notifications/center.js';
@@ -87,7 +87,7 @@ async function boot(opts: {
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const reviewSessions = join(dir, 'review-sessions');
   mkdirSync(reviewSessions, { recursive: true });
-  const hybrid = fakeHybridSpawner(reviewSessions, { childAnswer: () => '[]' });
+  const hybrid = fakeWholeSpawner(reviewSessions, { childAnswer: () => '[]' });
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
     if (role === 'perkins') return hybrid.spawner(role, options);

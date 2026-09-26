@@ -16,7 +16,7 @@ import { BoardEngine } from '../src/board/engine.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
-import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import type { AgentCapabilities, AgentHandle, AgentState, PromptOptions, RuntimeEvent, SpawnOptions } from '../src/runtime/types.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
@@ -106,7 +106,7 @@ function makeDispatchHarness(opts: {
   const handles: FakeHandle[] = [];
   const reviewSessions = join(dataDir, 'review-sessions');
   mkdirSync(reviewSessions, { recursive: true });
-  const hybrid = fakeHybridSpawner(reviewSessions, { childAnswer: () => '[]' });
+  const hybrid = fakeWholeSpawner(reviewSessions, { childAnswer: () => '[]' });
   let n = 0;
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });

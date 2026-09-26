@@ -9,7 +9,7 @@ import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubResponder, type StubTurn } from './helpers/stub-model.js';
-import { PerkinsHybridReview } from '../src/dispatch/perkins-review/hybrid.js';
+import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
@@ -211,49 +211,46 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
-  it('runs a hybrid Perkins lead through the production registry and real Pi adapter', async () => {
+  it('runs a whole-PR Perkins lead through the production registry and real Pi adapter', async () => {
     let leadTurns = 0;
-    const confirmed = new Map<string, { candidate_ref: string }>();
+    const harvested: Array<{
+      severity: string; category: string; title: string; location: string;
+      evidence: string; detail: string; recommended_fix: string; source: string;
+    }> = [];
     const harvest = (prompt: string): void => {
-      for (const markerText of prompt.split('[TOOL_RESULT perkins_run_lenses]').slice(1)) {
+      for (const markerText of prompt.split('[TOOL_RESULT perkins_run_specialists]').slice(1)) {
         const payload = markerText.split(/\n\[TOOL_RESULT /)[0]!.trim();
         try {
-          const parsed = JSON.parse(payload) as { results: Array<{ findings: Array<{ ref: string }> }> };
+          const parsed = JSON.parse(payload) as { results: Array<{ findings: Array<Record<string, unknown>> }> };
           for (const result of parsed.results) {
-            for (const candidate of result.findings) confirmed.set(candidate.ref, { candidate_ref: candidate.ref });
+            for (const finding of result.findings) harvested.push(finding as never);
           }
         } catch { /* non-JSON tool text */ }
       }
     };
     const fx = await fixture((prompt) => {
-      if (prompt.includes('REQUIRED CHILD COVERAGE')) {
+      if (prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)')) {
         leadTurns += 1;
         harvest(prompt);
         if (leadTurns === 1) {
           return {
             deltas: [],
-            toolCall: { id: 'lead-read-1', name: 'perkins_read_chunk', args: { chunk: '001' } },
+            toolCall: {
+              id: 'lead-run-1', name: 'perkins_run_specialists',
+              args: { runs: ['blind', 'edge', 'acceptance', 'security'].map((lens) => ({ lens })) },
+            },
           };
         }
         if (leadTurns === 2) {
           return {
             deltas: [],
             toolCall: {
-              id: 'lead-run-1', name: 'perkins_run_lenses',
-              args: { runs: ['blind', 'edge', 'acceptance', 'security'].map((lens) => ({ lens, chunk: '001' })) },
+              id: 'lead-run-2', name: 'perkins_run_specialists',
+              args: { runs: ['architecture', 'codebase', 'tests'].map((lens) => ({ lens })) },
             },
           };
         }
-        if (leadTurns === 3) {
-          return {
-            deltas: [],
-            toolCall: {
-              id: 'lead-run-2', name: 'perkins_run_lenses',
-              args: { runs: ['architecture', 'codebase', 'tests'].map((lens) => ({ lens, chunk: '001' })) },
-            },
-          };
-        }
-        if (leadTurns >= 5) return { deltas: ['hybrid lead complete'] };
+        if (leadTurns >= 4) return { deltas: ['whole-PR lead complete'] };
         const targetSha = /^Frozen target SHA: (.+)$/m.exec(prompt)?.[1] ?? '';
         const baseSha = /^Frozen diff base SHA: (.+)$/m.exec(prompt)?.[1] ?? '';
         return {
@@ -261,23 +258,17 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
           toolCall: {
             id: 'lead-submit', name: 'perkins_submit_review',
             args: {
-              canonical_verdict: 'READY TO MERGE',
-              candidate_decisions: [...confirmed.values()].map((candidate) => ({
-                ...candidate,
-                disposition: 'confirmed',
-                evidence: 'export function answer(): number {',
-                reason: 'lead verified against the frozen tree',
-              })),
-              prior_audit: [],
+              verdict: 'READY TO MERGE',
+              findings: harvested,
+              prior_dispositions: [],
               report_markdown: [
                 '# Perkins Code Review',
                 '',
                 '**Verdict: READY TO MERGE**',
                 `Target: ${targetSha}`,
                 `Base: ${baseSha}`,
-                'Coverage: blind edge acceptance security architecture codebase tests',
+                'Specialists: blind edge acceptance security architecture codebase tests',
                 'warning Verified adapter finding src/main.ts:2',
-                '  return 43;',
                 'Retain verification coverage for this path.',
               ].join('\n'),
             },
@@ -296,10 +287,10 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
           }]
         : lens === 'tests'
           ? [{
-              severity: 'warning', category: 'coverage-gate', title: 'Coverage gate: CONCERNS',
-              location: 'N/A', evidence: 'N/A',
-              detail: 'Changed behavior has no executed live-credential smoke proof.',
-              recommended_fix: 'Run the opt-in live-credential smoke test before release.',
+              severity: 'warning', category: 'coverage', title: 'Changed behavior lacks test tracing',
+              location: 'src/main.ts:2', evidence: '  return 43;',
+              detail: 'The changed return value has no direct assertion.',
+              recommended_fix: 'Add an assertion for the changed return value.',
             }]
           : [];
       return {
@@ -327,7 +318,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         store: fx.store,
         pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
       });
-      const engine = new PerkinsHybridReview({
+      const engine = new PerkinsWholeReview({
         spawner: async (role, options) => {
           const handle = await registry!.spawn(role, options);
           owned.push(handle);
@@ -340,10 +331,10 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         movementRef: 'feature/review', noSpec: false,
       });
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
-      expect(result.completeness).toMatchObject({ requiredLensRuns: 7, validLensRuns: 7 });
-      expect(leadTurns).toBe(4);
-      expect(fx.script.calls.filter((call) => !call.prompt.includes('REQUIRED CHILD COVERAGE'))).toHaveLength(7);
-      expect(result.findings).toHaveLength(1);
+      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(7);
+      expect(leadTurns).toBe(3);
+      expect(fx.script.calls.filter((call) => !call.prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)'))).toHaveLength(7);
+      expect(result.findings).toHaveLength(2);
       expect(owned).toHaveLength(8);
       expect(new Set(owned.map((handle) => handle.id)).size).toBe(8);
       expect(new Set(owned.map((handle) => handle.sessionFile)).size).toBe(8);

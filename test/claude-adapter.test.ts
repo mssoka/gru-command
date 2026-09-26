@@ -22,7 +22,7 @@ import {
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import type { AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
-import { PerkinsHybridReview } from '../src/dispatch/perkins-review/hybrid.js';
+import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
@@ -1208,8 +1208,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         'mcp__gru_perkins__perkins_submit_findings',
       ]);
       for (const leadTool of [
-        'perkins_read_chunk', 'perkins_run_lenses', 'perkins_store_artifact',
-        'perkins_record_decision', 'perkins_preflight_submission', 'perkins_submit_review',
+        'perkins_run_specialists', 'perkins_store_artifact',
+        'perkins_preflight_submission', 'perkins_submit_review',
       ]) {
         expect(allowed.join(',')).not.toContain(leadTool);
       }
@@ -1326,42 +1326,42 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('runs a hybrid Perkins lead through the real Claude adapter and scoped MCP bridge', async () => {
+  it('runs a whole-PR Perkins lead through the real Claude adapter and scoped MCP bridge', async () => {
     const fx = fixture();
-    const repo = makeFixtureRepo('claude-perkins-hybrid');
+    const repo = makeFixtureRepo('claude-perkins-whole');
     const base = repo.head();
     repo.git(['checkout', '-b', 'feature/review']);
     const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
     process.env['CLAUDE_DOUBLE_WORKFLOW_CANDIDATE'] = '1';
     try {
       const frozen = freezeReviewInputs({
-        roundId: 'claude-hybrid-round', repoPath: repo.path, artifactRoot: join(fx.home, 'review-artifacts'),
+        roundId: 'claude-whole-round', repoPath: repo.path, artifactRoot: join(fx.home, 'review-artifacts'),
         baseRef: base, targetRef: target, movementRef: 'feature/review', spec: 'Acceptance: answer returns 43.',
       });
-      const engine = new PerkinsHybridReview({
+      const engine = new PerkinsWholeReview({
         spawner: (role, options) => fx.runtime.spawn(role, options),
         policy: loadPerkinsPolicy(),
       });
       const result = await engine.run({
-        roundId: 'claude-hybrid-round', roundNumber: 1, frozenReview: frozen,
+        roundId: 'claude-whole-round', roundNumber: 1, frozenReview: frozen,
         movementRef: 'feature/review', noSpec: false,
       });
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
-      expect(result.completeness).toMatchObject({ requiredLensRuns: 7, validLensRuns: 7 });
+      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(7);
       const invocations = doubleInvocations(fx);
       expect(invocations).toHaveLength(8);
-      const lead = invocations.find((record) => record.prompt.includes('REQUIRED CHILD COVERAGE'));
+      const lead = invocations.find((record) => record.prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)'));
       expect(lead).toBeDefined();
       const configFile = lead!.argv[lead!.argv.indexOf('--mcp-config') + 1];
       expect(configFile).toContain('mcp-config.json');
       const allowed = lead!.argv[lead!.argv.indexOf('--allowedTools') + 1] ?? '';
-      expect(allowed).toContain('mcp__gru_perkins__perkins_run_lenses');
+      expect(allowed).toContain('mcp__gru_perkins__perkins_run_specialists');
       expect(allowed).toContain('mcp__gru_perkins__perkins_submit_review');
       expect(allowed).toMatch(/Read\(\/.+\/\*\*\)/);
       expect(lead!.argv[lead!.argv.indexOf('--setting-sources') + 1]).toBe('');
       const bridgeDirectory = dirname(configFile ?? '');
       await vi.waitFor(() => expect(existsSync(bridgeDirectory)).toBe(false));
-      expect(result.findings).toHaveLength(1);
+      expect(result.findings).toHaveLength(2);
       expect(result.findings[0]?.verification).toMatchObject({ disposition: 'confirmed' });
     } finally {
       await fx.runtime.dispose();

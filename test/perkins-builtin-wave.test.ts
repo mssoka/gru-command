@@ -42,7 +42,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
-import { fakeHybridSpawner, type LeadBrainOptions } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 
 class DeferredReviewPort implements WorktreePort {
@@ -93,8 +93,8 @@ function sourceFor(prompt: string): string {
 }
 
 /**
- * Hybrid wave spawner: one scripted lead driving the REAL native tools,
- * plus children answering by lens. Security malforms once, then reports
+ * Whole-PR wave spawner: one scripted lead driving the REAL native tools,
+ * plus specialists answering by lens. Security malforms once, then reports
  * the canonical verified blocker — mirroring the pre-hybrid contract.
  */
 function makeSpawner(
@@ -104,7 +104,7 @@ function makeSpawner(
   answerOverride?: (prompt: string) => string | undefined,
 ): AgentSpawner {
   let securityAttempts = 0;
-  const brain: LeadBrainOptions = {
+  const brain: WholeLeadOptions = {
     onLeadStart: () => {
       order.push('model:lead');
       onLeadStart?.();
@@ -123,7 +123,7 @@ function makeSpawner(
           : '[]');
     },
   };
-  return fakeHybridSpawner(root, brain).spawner;
+  return fakeWholeSpawner(root, brain).spawner;
 }
 
 const repos: FixtureRepo[] = [];
@@ -558,22 +558,22 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(port.getWorktree(second.round.id)?.status).toBe('swept');
   });
 
-  it('aborts immediately with an action-required escalation when required coverage is exhausted', async () => {
-    const repo = makeFixtureRepo('perkins-coverage-exhausted');
+  it('records an honest lens error when every specialist attempt fails, while the lead-owned review still completes', async () => {
+    const repo = makeFixtureRepo('perkins-specialist-failed');
     repos.push(repo);
-    repo.git(['checkout', '-b', 'feature/coverage-exhausted']);
+    repo.git(['checkout', '-b', 'feature/specialist-failed']);
     const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
-    const root = mkdtempSync(join(tmpdir(), 'perkins-cov-port-'));
-    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-cov-artifacts-'));
-    const sessions = mkdtempSync(join(tmpdir(), 'perkins-cov-sessions-'));
+    const root = mkdtempSync(join(tmpdir(), 'perkins-fail-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-fail-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-fail-sessions-'));
     dirs.push(sessions);
-    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-cov-db-')));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-fail-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/coverage-exhausted', target);
-    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-coverage-exhausted' });
+    const port = new GitReviewPort(root, 'feature/specialist-failed', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-specialist-failed' });
     const job = ledger.addJob({
-      id: 'job-coverage-exhausted', repo: 'fixture', title: 'coverage exhausted', baseBranch: 'main', briefing: 'review',
+      id: 'job-specialist-failed', repo: 'fixture', title: 'specialist failed', baseBranch: 'main', briefing: 'review',
     });
     ledger.setJobStatus(job.id, 'working');
     settleLane(ledger, job.id);
@@ -581,37 +581,42 @@ describe('WaveRunner built-in Perkins production path', () => {
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: makeSpawner(sessions, [], undefined, (prompt) => sourceFor(prompt) === 'security' ? 'malformed' : undefined),
+      // Only security and tests specialists run; the tests specialist
+      // malforms both attempts while the lead's own review completes.
+      spawner: fakeWholeSpawner(sessions, {
+        childAnswer: (prompt) => (sourceFor(prompt) === 'tests' ? 'malformed' : sourceFor(prompt) === 'security'
+          ? JSON.stringify([{
+              source: 'security', severity: 'blocker', category: 'auth', title: 'Verified security defect',
+              location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line demonstrates the security defect.',
+              recommended_fix: 'Correct the implementation and add a regression test.',
+            }])
+          : '[]'),
+        specialists: ['security', 'tests'],
+      }).spawner,
       reviewArtifactRoot: artifacts,
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
-    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
-    expect(outcome.round.status).toBe('aborted');
-    // The abort consumes the failureKind record: the durable event carries
-    // every attempt's class and error, not only a status name.
-    const payload = ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload as Record<string, unknown>;
-    expect(payload['reason']).toBe('coverage_exhausted');
-    expect(payload['error']).toContain('coverage exhausted');
-    expect(payload['exhausted']).toEqual([expect.objectContaining({ lens: 'security', chunk: '001' })]);
-    const attempts = (payload['exhausted'] as Array<{
-      attempts: Array<{ attempt: number; failureKind: string; error: string }>;
-    }>)[0]!.attempts;
-    expect(attempts.map((entry) => [entry.attempt, entry.failureKind])).toEqual([[1, 'output'], [2, 'output']]);
-    expect(attempts.every((entry) => entry.error.length > 0)).toBe(true);
-    // The escalation is action-required, names the round and lens/chunk, and
-    // spells out each attempt's failureKind and error.
-    expect(escalations.some((line) =>
-      line.includes('Action required') && line.includes(`review round ${outcome.round.id}`) && line.includes('security/001'),
-    )).toBe(true);
-    expect(escalations.some((line) =>
-      line.includes('attempt 1 invalid (output):') && line.includes('attempt 2 invalid (output):'),
-    )).toBe(true);
-    expect(existsSync(join(artifacts, outcome.round.id, 'coverage-exhausted.json'))).toBe(true);
+    // The failed specialist is an execution fact, never a missing reviewer:
+    // the round still reaches the lead's honest conclusive verdict.
+    expect(outcome.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(outcome.round.status).toBe('verdict-posted');
+    const testsChip = outcome.round.lenses.find((chip) => chip.lens === 'tests');
+    expect(testsChip?.state).toBe('error');
+    expect(testsChip?.note).toContain('specialist attempts failed');
+    const securityChip = outcome.round.lenses.find((chip) => chip.lens === 'security');
+    expect(securityChip?.state).toBe('done');
+    expect(securityChip?.note).toContain('blocker');
+    for (const lens of ['blind', 'edge', 'acceptance', 'architecture', 'codebase']) {
+      const unusedChip = outcome.round.lenses.find((chip) => chip.lens === lens);
+      expect(unusedChip?.state, lens).toBe('done');
+      expect(unusedChip?.note, lens).toContain('not used');
+    }
+    expect(escalations).toEqual([]);
     expect(port.getWorktree(outcome.round.id)?.status).toBe('swept');
-    rmSync(root, { recursive: true, force: true });
-    rmSync(artifacts, { recursive: true, force: true });
-    rmSync(sessions, { recursive: true, force: true });
+    for (const directory of [root, artifacts, sessions]) {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('audits the last complete predecessor across an incomplete middle round', async () => {
@@ -642,10 +647,12 @@ describe('WaveRunner built-in Perkins production path', () => {
     const second = asWave(await new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: makeSpawner(secondSessions, [], undefined, (prompt) => {
-        if (sourceFor(prompt) === 'security') return 'malformed';
-        return '[]';
-      }),
+      // The middle round's lead stops without submitting: an honest
+      // INCOMPLETE that leaves no complete consolidated record behind.
+      spawner: fakeWholeSpawner(secondSessions, {
+        childAnswer: () => '[]',
+        neverSubmit: true,
+      }).spawner,
       reviewArtifactRoot: artifacts,
     }).runRound({ jobId: job.id }));
     expect(second.canonicalVerdict).toBe('INCOMPLETE');
@@ -657,11 +664,11 @@ describe('WaveRunner built-in Perkins production path', () => {
       ledger,
       worktrees: port,
       spawner: (() => {
-        const fake = fakeHybridSpawner(thirdSessions, {
+        const fake = fakeWholeSpawner(thirdSessions, {
           childAnswer: () => '[]',
-          priorAudit: () => {
+          priorDisposition: () => {
             thirdAuditSeen = true;
-            return [{ prior_index: 0, status: 'still-present', evidence: '  return 43;', reason: 'defect remains' }];
+            return [{ prior_index: 0, status: 'still-present', note: 'defect remains: src/main.ts:2 still returns 43' }];
           },
         });
         return fake.spawner;
@@ -783,7 +790,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       .listAgents()
       .filter((agent) => agent.roundId === outcome.round.id)
       .map((agent) => agent.label);
-    const securityLabels = roundLabels.filter((label) => label?.startsWith('security:'));
+    const securityLabels = roundLabels.filter((label) => label?.startsWith('security'));
     expect(securityLabels).toHaveLength(2);
     expect(securityLabels.some((label) => label?.endsWith('#2'))).toBe(true);
     expect(new Set(roundLabels).size).toBe(roundLabels.length);
@@ -1688,10 +1695,10 @@ describe('fallback review timeout constant is exported and positive (V4 pin)', (
 
 describe('lens agent labels are unique across retries', () => {
   it('mints the classic label on attempt 1 and the attempt-suffixed label on retry', () => {
-    expect(lensAgentLabel('blind', '001', 1)).toBe('blind:001');
-    expect(lensAgentLabel('blind', '001', 2)).toBe('blind:001#2');
+    expect(lensAgentLabel('blind', 1)).toBe('blind');
+    expect(lensAgentLabel('blind', 2)).toBe('blind#2');
     // A retry never collides with its first attempt.
-    expect(lensAgentLabel('blind', '001', 2)).not.toBe(lensAgentLabel('blind', '001', 1));
-    expect(lensAgentLabel('edge', 'a-01', 2)).toBe('edge:a-01#2');
+    expect(lensAgentLabel('blind', 2)).not.toBe(lensAgentLabel('blind', 1));
+    expect(lensAgentLabel('edge', 2)).toBe('edge#2');
   });
 });

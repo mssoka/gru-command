@@ -16,7 +16,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
-import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 
 /**
  * Hotfix pins: a Perkins round that reviews a PR branch freezes the LIVE
@@ -263,7 +263,7 @@ describe('freeze-time integration on PR rounds', () => {
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: fakeHybridSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
       poster,
       reviewArtifactRoot: artifacts,
       prHeadProbe: fixedProbe('feature/lane', tip),
@@ -345,7 +345,7 @@ describe('freeze-time integration on PR rounds', () => {
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: fakeHybridSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
       poster: {
         post: vi.fn(async (input: { readonly targetSha: string }) => ({
           headSha: input.targetSha,
@@ -395,7 +395,7 @@ describe('freeze-time integration on PR rounds', () => {
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: fakeHybridSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
       poster,
       reviewArtifactRoot: artifacts,
       // The PR reports its real head branch; `gru/job-rebase` is never fetched.
@@ -437,7 +437,7 @@ describe('freeze-time integration on PR rounds', () => {
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: fakeHybridSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
       reviewArtifactRoot: artifacts,
       prHeadProbe: probe,
     });

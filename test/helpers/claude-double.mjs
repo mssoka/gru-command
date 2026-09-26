@@ -423,61 +423,50 @@ async function run() {
     return;
   }
 
-  if (prompt.includes('REQUIRED CHILD COVERAGE')) {
+  if (prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)')) {
     const configFile = flagValue('--mcp-config');
     if (configFile === undefined) {
-      process.stderr.write('hybrid lead prompt without --mcp-config\n');
+      process.stderr.write('whole-PR lead prompt without --mcp-config\n');
       process.exit(2);
     }
     const session = await mcpSession(configFile);
     try {
       const listed = await session.call('tools/list', {});
       const names = listed.result.tools.map((tool) => tool.name).sort().join(',');
-      const chunk = await session.call('tools/call', {
-        name: 'perkins_read_chunk',
-        arguments: { chunk: '001' },
-      });
-      if (!mcpToolText(chunk).includes('diff --git')) throw new Error('invalid frozen chunk read');
       const run = (lenses) =>
         session.call('tools/call', {
-          name: 'perkins_run_lenses',
-          arguments: { runs: lenses.map((lens) => ({ lens, chunk: '001' })) },
+          name: 'perkins_run_specialists',
+          arguments: { runs: lenses.map((lens) => ({ lens })) },
         });
       const first = await run(['blind', 'edge', 'acceptance', 'security']);
       const second = await run(['architecture', 'codebase', 'tests']);
-      const refs = [];
+      const findings = [];
       for (const response of [first, second]) {
         const payload = JSON.parse(mcpToolText(response));
         for (const result of payload.results) {
           if (result.status !== 'valid') continue;
-          for (const finding of result.findings) refs.push(finding.ref);
+          for (const finding of result.findings) findings.push(finding);
         }
       }
       const submission = await session.call('tools/call', {
         name: 'perkins_submit_review',
         arguments: {
-          canonical_verdict: 'READY TO MERGE',
-          candidate_decisions: refs.map((ref) => ({
-            candidate_ref: ref,
-            disposition: 'confirmed',
-            evidence: 'export function answer(): number {',
-            reason: 'lead verified against the frozen tree over MCP',
-          })),
-          prior_audit: [],
+          verdict: 'READY TO MERGE',
+          findings,
+          prior_dispositions: [],
           report_markdown: [
             '# Perkins Code Review',
             '',
             '**Verdict: READY TO MERGE**',
             `Target: ${/^Frozen target SHA: (.+)$/m.exec(prompt)?.[1] ?? ''}`,
             `Base: ${/^Frozen diff base SHA: (.+)$/m.exec(prompt)?.[1] ?? ''}`,
-            'Coverage: blind edge acceptance security architecture codebase tests',
+            'Specialists: blind edge acceptance security architecture codebase tests',
             'warning Verified adapter finding src/main.ts:2',
-            '  return 43;',
             'Retain verification coverage for this path.',
           ].join('\n'),
         },
       });
-      const final = `hybrid lead complete; tools=${names}; submit=${mcpToolText(submission)}`;
+      const final = `whole-PR lead complete; tools=${names}; submit=${mcpToolText(submission)}`;
       await emitTextTurn(final);
       out(resultFrame(final, false));
     } finally {
@@ -509,7 +498,7 @@ async function run() {
       const findings = lens === 'security'
         ? [{ severity: 'warning', category: 'coverage', title: 'Verified adapter finding', location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line is independently reviewable.', recommended_fix: 'Retain verification coverage for this path.' }]
         : lens === 'tests'
-          ? [{ severity: 'warning', category: 'coverage-gate', title: 'Coverage gate: CONCERNS', location: 'N/A', evidence: 'N/A', detail: 'Changed behavior has no executed live-credential smoke proof.', recommended_fix: 'Run the opt-in live-credential smoke test before release.' }]
+          ? [{ severity: 'warning', category: 'coverage', title: 'Changed behavior lacks test tracing', location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed return value has no direct assertion.', recommended_fix: 'Add an assertion for the changed return value.' }]
           : [];
       const session = await mcpSession(configFile);
       try {
@@ -532,7 +521,7 @@ async function run() {
     if (prompt.includes('"source": "security"')) {
       answer = '[{"source":"security","severity":"warning","category":"coverage","title":"Verified adapter finding","location":"src/main.ts:2","evidence":"  return 43;","detail":"The changed line is independently reviewable.","recommended_fix":"Retain verification coverage for this path."}]';
     } else if (prompt.includes('"source": "tests"')) {
-      answer = '[{"source":"tests","severity":"warning","category":"coverage-gate","title":"Coverage gate: CONCERNS","location":"N/A","evidence":"N/A","detail":"Changed behavior has no executed live-credential smoke proof.","recommended_fix":"Run the opt-in live-credential smoke test before release."}]';
+      answer = '[{"source":"tests","severity":"warning","category":"coverage","title":"Changed behavior lacks test tracing","location":"src/main.ts:2","evidence":"  return 43;","detail":"The changed return value has no direct assertion.","recommended_fix":"Add an assertion for the changed return value."}]';
     }
     await emitTextTurn(answer);
     out(resultFrame(answer, false));

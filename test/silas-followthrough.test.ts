@@ -12,7 +12,7 @@ import { loadConfig } from '../src/config.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
-import { fakeHybridSpawner, type LeadBrainOptions } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { SilasDriver } from '../src/dispatch/silas-driver.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { NotificationCenter } from '../src/notifications/center.js';
@@ -125,9 +125,9 @@ interface FollowThroughHarness {
 /** Boot the production follow-through wiring with the silas session faked. */
 async function bootFollowThrough(input: {
   fixtureName: string;
-  childAnswer: LeadBrainOptions['childAnswer'];
+  childAnswer: WholeLeadOptions['childAnswer'];
   onLeadStart?: () => void;
-  priorAudit?: LeadBrainOptions['priorAudit'];
+  priorDisposition?: WholeLeadOptions['priorDisposition'];
 }): Promise<FollowThroughHarness> {
   const repo = makeFixtureRepo(input.fixtureName);
   cleanupRepos.push(repo);
@@ -150,10 +150,10 @@ async function bootFollowThrough(input: {
   const minionPrompts: string[] = [];
   const reviewSessions = join(dir, 'review-sessions');
   mkdirSync(reviewSessions, { recursive: true });
-  const hybrid = fakeHybridSpawner(reviewSessions, {
+  const hybrid = fakeWholeSpawner(reviewSessions, {
     childAnswer: input.childAnswer,
     ...(input.onLeadStart !== undefined ? { onLeadStart: input.onLeadStart } : {}),
-    ...(input.priorAudit !== undefined ? { priorAudit: input.priorAudit } : {}),
+    ...(input.priorDisposition !== undefined ? { priorDisposition: input.priorDisposition } : {}),
   });
   let minionTurns = 0;
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
@@ -357,13 +357,13 @@ describe('silas follow-through (no human input)', () => {
           },
         ]);
       },
-      // The fix diff removes the flagged line, so the prior finding audits fixed.
-      priorAudit: (prior) =>
+      // The fix diff removes the flagged line, so the prior finding is
+      // revisited as fixed by reviewer judgment.
+      priorDisposition: (prior) =>
         prior.map((_entry, index) => ({
           prior_index: index,
           status: 'fixed' as const,
-          evidence: '  return 42;',
-          reason: 'the fix turn removed the placeholder return',
+          note: 'the fix turn removed the placeholder return from src/main.ts',
         })),
     });
     try {

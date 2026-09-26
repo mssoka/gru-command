@@ -14,8 +14,8 @@ import {
   type BranchIdlePhase,
 } from './branch-idle.js';
 import type { AgentSpawner } from './service.js';
-import type { CanonicalReviewVerdict, LensEnvelope, VerifiedFinding } from './perkins-review/types.js';
-import { CoverageExhaustedError, PerkinsHybridReview, type PerkinsHybridResult } from './perkins-review/hybrid.js';
+import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
+import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
 import {
   freezeReviewInputs,
@@ -53,13 +53,12 @@ import {
 
 export const FALLBACK_REVIEW_TIMEOUT_MS = 15 * 60 * 1_000;
 
-/** The agent-rail label for one Perkins lens child. First attempts mint
- * the classic `${lens}:${chunk}`; a RETRY suffixes the wave's attempt
- * counter (`blind:001#2`) so two attempts on one chunk can never collide
- * into duplicate agent rows and transcript labels. */
-export function lensAgentLabel(lens: string, chunk: string, attempt: number): string {
-  const base = `${lens}:${chunk}`;
-  return attempt > 1 ? `${base}#${attempt}` : base;
+/** The agent-rail label for one Perkins specialist child. First attempts
+ * mint the plain lens name; a RETRY suffixes the attempt counter
+ * (`blind#2`) so two attempts on one lens can never collide into duplicate
+ * agent rows and transcript labels. */
+export function lensAgentLabel(lens: string, attempt: number): string {
+  return attempt > 1 ? `${lens}#${attempt}` : lens;
 }
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -1115,7 +1114,6 @@ export class WaveRunner {
         baseRef,
         targetRef: targetSha,
         movementRef,
-        chunkLineThreshold: policy.portableContract.rules.chunkLineThreshold,
         ...(input.noSpec === true ? { noSpec: true } : { spec }),
         ...(input.force === true
           ? { branchIdle: { forced: true as const, targetBranch: idle.targetBranch, blockers: idle.blockers } }
@@ -1169,7 +1167,7 @@ export class WaveRunner {
       round: round.id,
       lenses: canonicalLenses.length,
       targetRef: targetSha,
-      workflow: 'perkins-hybrid',
+      workflow: 'perkins-whole-pr',
     });
     const runController = new AbortController();
     const run = this.track(
@@ -1289,32 +1287,32 @@ export class WaveRunner {
     signal: AbortSignal,
     reviewModel?: ReviewPreflightResult['reviewModel'],
   ): Promise<WaveOutcome> {
-    const workflow = new PerkinsHybridReview({
+    const workflow = new PerkinsWholeReview({
       // This closure belongs to one round. A concurrent preflight cannot
-      // replace the proof used by its lead or lens children.
+      // replace the proof used by its lead or specialist children.
       spawner: (role, options) => this.opts.spawner(role, {
         ...options,
         ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
           ? { reviewModel } : {}),
       }),
       policy,
-      onAgent: ({ phase, lens, chunk, attempt, handle }) => {
+      onAgent: ({ phase, lens, attempt, handle }) => {
         this.opts.ledger.registerAgent({
           id: handle.id,
           role: 'perkins',
           label:
-            phase === 'lens' && lens !== undefined
-              ? lensAgentLabel(lens, chunk ?? '', attempt ?? 1)
+            phase === 'specialist' && lens !== undefined
+              ? lensAgentLabel(lens, attempt ?? 1)
               : 'lead',
           sessionFile: handle.sessionFile,
           roundId: round.id,
           jobId: job.id,
         });
-        if (phase === 'lens' && lens !== undefined) this.opts.ledger.markLensLive(round.id, lens);
+        if (phase === 'specialist' && lens !== undefined) this.opts.ledger.markLensLive(round.id, lens);
       },
     });
 
-    let review: PerkinsHybridResult;
+    let review: PerkinsWholeResult;
     try {
       const priorConsolidatedFile = this.opts.ledger
         .listRounds(job.id)
@@ -1338,7 +1336,7 @@ export class WaveRunner {
         ...(priorConsolidatedFile !== undefined ? { priorConsolidatedFile } : {}),
       });
     } catch (error) {
-      const detail = `Perkins hybrid workflow failed: ${String(error).replace(/[\r\n]+/gu, ' ').slice(0, 500)}`;
+      const detail = `Perkins whole-PR workflow failed: ${String(error).replace(/[\r\n]+/gu, ' ').slice(0, 500)}`;
       this.abortRound(this.opts.ledger.getRound(round.id) ?? round, detail.slice(0, 500));
       const errorArtifact = join(frozenReview.directory, 'workflow-error.json');
       if (!existsSync(errorArtifact)) {
@@ -1355,39 +1353,13 @@ export class WaveRunner {
       if (!existsSync(primaryReport)) {
         writeFileSync(primaryReport, incompleteContents, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
       }
-      if (error instanceof CoverageExhaustedError) {
-        // Host-detected dead coverage: the hybrid engine already aborted the
-        // round before the lead could spend a terminal submission. Escalate
-        // action-required with the round, lens/chunk, and each attempt's
-        // failureKind and error, and record the same exhaustive reasons.
-        this.opts.ledger.appendCustomEvent({
-          kind: 'round.perkins-incomplete',
-          jobId: job.id,
-          roundId: round.id,
-          payload: {
-            reason: 'coverage_exhausted',
-            error: detail.slice(0, 500),
-            exhausted: error.exhausted.map((entry) => ({
-              lens: entry.lens,
-              chunk: entry.chunk,
-              attempts: entry.attempts,
-            })),
-            reportFile,
-          },
-        });
-        this.opts.escalate?.(
-          `Action required: review round ${round.id} cannot complete — coverage exhausted for ${error.exhausted.map((entry) => `${entry.lens}/${entry.chunk}`).join(', ')}`,
-          `${error.message}. The host aborted the round immediately; no terminal submission was consumed. Restore the lens output path, then rerun a complete review against a newly frozen target.`,
-        );
-      } else {
-        this.opts.ledger.appendCustomEvent({
-          kind: 'round.perkins-incomplete',
-          jobId: job.id,
-          roundId: round.id,
-          payload: { reason: signal.aborted ? 'cancelled' : 'workflow_error', error: detail.slice(0, 500), reportFile },
-        });
-        this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail);
-      }
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.perkins-incomplete',
+        jobId: job.id,
+        roundId: round.id,
+        payload: { reason: signal.aborted ? 'cancelled' : 'workflow_error', error: detail.slice(0, 500), reportFile },
+      });
+      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail);
       return {
         round: this.opts.ledger.getRound(round.id) as RoundRecord,
         results: lenses.map(() => ({ state: 'error' as const, note: detail })),
@@ -1514,7 +1486,7 @@ export class WaveRunner {
           artifactDirectory: review.artifactDirectory,
           reportFile,
           headMoved,
-          complete: review.completeness.complete && !headMoved,
+          complete: canonical !== 'INCOMPLETE' && !headMoved,
         },
       });
       this.opts.ledger.setRoundVerdict(round.id, recordedVerdict);
@@ -1613,21 +1585,24 @@ export class WaveRunner {
   private recordLensResults(
     round: RoundRecord,
     lenses: readonly PerkinsLens[],
-    review: PerkinsHybridResult,
+    review: PerkinsWholeResult,
   ): ReviewLensResult[] {
     const results: ReviewLensResult[] = [];
     for (const lens of lenses) {
-      const finalByChunk = new Map<string, LensEnvelope>();
-      for (const envelope of review.lensEnvelopes) {
-        if (envelope.lens !== lens) continue;
-        const prior = finalByChunk.get(envelope.chunk);
-        if (prior === undefined || envelope.attempt > prior.attempt) finalByChunk.set(envelope.chunk, envelope);
+      const runs = review.specialistRuns.filter((run) => run.lens === lens);
+      if (runs.length === 0) {
+        // Whole-PR review: the lead owns the review; a lens it never used is
+        // a truthful 'not used', never missing required coverage.
+        const note = 'not used — lead-owned whole-PR review';
+        this.opts.ledger.setLensOutcome(round.id, lens, 'done', note);
+        results.push({ state: 'done', verdict: 'clean', evidence: note });
+        continue;
       }
-      const failed = [...finalByChunk.values()].filter((entry) => entry.status !== 'valid');
-      if (failed.length > 0 || finalByChunk.size === 0 || !review.completeness.verificationComplete) {
-        const note = failed.length > 0
-          ? `incomplete chunks: ${failed.map((entry) => entry.chunk).join(', ')}`
-          : 'independent verification did not complete';
+      const failed = runs.filter((run) => run.status !== 'valid');
+      if (failed.length === runs.length) {
+        // Every attempt on this lens failed: honest execution error, named
+        // per attempt. The lead's own review still stands apart from it.
+        const note = `specialist attempts failed: ${failed.map((run) => `a${run.attempt} ${run.failureKind ?? 'error'}: ${(run.error ?? 'no host-recorded reason').slice(0, 200)}`).join('; ')}`;
         this.opts.ledger.setLensOutcome(round.id, lens, 'error', note);
         results.push({ state: 'error', note });
         continue;
@@ -1635,7 +1610,7 @@ export class WaveRunner {
       const findings = review.findings.filter((finding) => finding.sources.includes(lens));
       const verdict: 'blocker' | 'warning' | 'note' | 'clean' = this.lensVerdict(findings);
       const evidence = findings.length === 0
-        ? 'lead verification retained no finding for this lens'
+        ? 'lead retained no finding sourced from this specialist'
         : findings.slice(0, 10).map((finding) =>
             `${finding.severity}: ${finding.title} @ ${finding.location} — ${finding.evidence.slice(0, 240)}`,
           ).join('\n');
@@ -1660,18 +1635,22 @@ export class WaveRunner {
       const bytes = readFileSync(file);
       if (bytes.byteLength !== info.size) return false;
       const parsed = JSON.parse(bytes.toString('utf8')) as {
+        schemaVersion?: unknown;
         architecture?: unknown;
         canonicalVerdict?: unknown;
         completeness?: { complete?: unknown; verificationComplete?: unknown };
+        complete?: unknown;
         frozen?: { targetSha?: unknown };
         headMoved?: unknown;
         findings?: unknown;
       };
-      return parsed.architecture === 'perkins-hybrid' &&
+      const complete = parsed.schemaVersion === 3
+        ? parsed.complete === true
+        : parsed.completeness?.complete === true && parsed.completeness.verificationComplete === true;
+      return (parsed.architecture === 'perkins-hybrid' || parsed.architecture === 'perkins-whole-pr') &&
         parsed.frozen?.targetSha === expectedTargetSha &&
         parsed.canonicalVerdict !== 'INCOMPLETE' &&
-        parsed.completeness?.complete === true &&
-        parsed.completeness.verificationComplete === true &&
+        complete &&
         parsed.headMoved === false &&
         Array.isArray(parsed.findings);
     } catch {
