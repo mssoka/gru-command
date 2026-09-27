@@ -5,11 +5,11 @@
  *
  * The surface stack:
  *   - the status chip rail (v4 health row relocated; `board-rail.ts`)
- *     under the command bar carries whole-system state incl. the folded
- *     jobs/PRs/lane counts and the Jev/unacked trackers;
- *   - attention-bucketed job rows (NEEDS YOU / IN FLIGHT / SETTLED /
+ *     under the command bar carries whole-system state incl. the labeled
+ *     heist/PR/minion counts and the Jev/unacked trackers;
+ *   - attention-bucketed job rows (NEEDS GRU / IN FLIGHT / SETTLED /
  *     COLD) with sticky headers and counts;
- *   - the agents/transcripts rail (tabs, dense rows, disposed overflow);
+ *   - the crew rail (CREW/TRANSCRIPTS tabs, dense rows, disposed overflow);
  *   - the notification center (bell + panel).
  *
  * v3 semantics survive the redesign: rows collapse to their summary face
@@ -39,8 +39,23 @@ import {
   type BandId,
 } from '../lib/board-bands.js';
 import { railChips, type RailChip } from '../lib/board-rail.js';
+import { BOARD_WORDS, heistCount } from '../lib/board-vocabulary.js';
 import { formatAge } from '../lib/board-time.js';
-import { jobSignal, pluralCount, roundSummary, unackedByJob } from '../lib/board-signals.js';
+import { jobSignal, pluralCount, roundSummary, unackedByJob, type RoundSummary } from '../lib/board-signals.js';
+
+/** Truthful lens progress for whole-PR rounds: show what actually ran —
+ * including lenses that ran and failed — and name unused lenses instead of
+ * counting them as coverage (R9). */
+function lensProgressLabel(summary: RoundSummary): string {
+  const parts = [`${summary.ran}/${summary.total} lenses ran`];
+  if (summary.failures > 0) parts.push(`${summary.failures} failed`);
+  if (summary.unused > 0) parts.push(`${summary.unused} not used`);
+  if (parts.length === 1) {
+    // Clean full-usage round keeps the compact historical label.
+    return `${summary.done}/${summary.total} lenses`;
+  }
+  return parts.join(' · ');
+}
 import type { BoardClient } from '../lib/board-client.js';
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
@@ -75,6 +90,7 @@ export class BoardView {
   private readonly notificationPanel: HTMLElement;
   private readonly decisionsChip: HTMLElement;
   private readonly unackedChip: HTMLElement;
+  private readonly wakesChip: HTMLElement;
   private readonly onOpenTranscript: (request: TranscriptOpenRequest) => void;
   /** v3: collapsed-by-default job rows. The expanded set loads once from
    * the injected storage (null = session-only) and persists on every
@@ -99,9 +115,9 @@ export class BoardView {
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
-  /** Error notification ids the user has already seen (panel opened with
-   * them present) — the badge counts only UNSEEN errors. */
-  private readonly seenErrorIds = new Set<string>();
+  /** Owner notification ids seen in the panel; every pending owner stop,
+   * including informational destructive-op asks, earns a bell badge. */
+  private readonly seenOwnerIds = new Set<string>();
   /** E7: display receipts already sent (id → surfaces sent). */
   private readonly sentShown = new Map<string, Set<string>>();
   /** E7: notification ids previously seen (new arrivals toast). */
@@ -125,6 +141,7 @@ export class BoardView {
     this.notificationPanel = mustGet('notification-panel');
     this.decisionsChip = mustGet('board-decisions');
     this.unackedChip = mustGet('board-unacked');
+    this.wakesChip = mustGet('board-wakes');
     this.onOpenTranscript = onOpenTranscript;
     this.boardClient = boardClient;
     this.collapseStorage = collapseStorage;
@@ -136,7 +153,9 @@ export class BoardView {
         // Opening the panel proves display of every current row: mark
         // seen (badge) AND send one receipt per surface (shown:true).
         for (const notification of this.snapshot?.notifications ?? []) {
-          if (notification.severity === 'error') this.seenErrorIds.add(notification.id);
+          if (notification.routing === 'needs-owner') {
+            this.seenOwnerIds.add(notification.id);
+          }
           this.sendShown(notification, 'web-panel');
         }
         this.updateBadge(this.snapshot?.notifications ?? []);
@@ -197,7 +216,8 @@ export class BoardView {
   }
 
   /** TRACKERS: the folded KPI count strips plus the Jev + unacked chips the
-   * v4 tracker strip carried (their ids/behavior survive the move). */
+   * v4 tracker strip carried (their ids/behavior survive the move). v6.1:
+   * every count renders as a labeled field — no bare slash counters. */
   private trackersChipNode(chip: RailChip): HTMLElement {
     const node = el('span', `rail-chip rail-chip--trackers rail-chip--${chip.tone}`);
     node.dataset.chip = 'trackers';
@@ -206,34 +226,35 @@ export class BoardView {
     for (const group of chip.kpis ?? []) {
       const groupNode = el('span', 'rail-kpi');
       groupNode.title = group.title;
-      const label = el('span', 'rail-kpi__label', group.label);
+      const label = el('b', 'rail-kpi__label', group.label);
       if (group.total !== undefined) {
-        const total = el('b', 'rail-kpi__total', String(group.total.value));
+        const total = el('span', 'rail-kpi__total', String(group.total.value));
         total.dataset.kpi = group.total.kpi;
         total.title = group.total.title;
         label.append(document.createTextNode(' '), total);
       }
       groupNode.append(label);
-      const nums = el('span', 'rail-kpi__nums');
-      group.values.forEach((value, index) => {
-        if (index > 0) nums.append(el('span', 'rail-kpi__sep', '/'));
+      for (const value of group.values) {
+        const field = el('span', 'rail-kpi__field');
+        const fieldLabel = el('span', 'rail-kpi__field-label', value.label);
+        fieldLabel.title = value.title;
         const number = el('span', 'rail-kpi__num', String(value.value));
         number.dataset.kpi = value.kpi;
         number.title = value.title;
         if (value.kpi === 'prs.conflicting' && value.value > 0) {
           number.classList.add('rail-kpi__num--alert');
         }
-        nums.append(number);
-      });
-      groupNode.append(nums);
+        field.append(fieldLabel, number);
+        groupNode.append(field);
+      }
       node.append(groupNode);
     }
-    node.append(this.decisionsChip, this.unackedChip);
+    node.append(this.decisionsChip, this.unackedChip, this.wakesChip);
     return node;
   }
 
   // ------------------------------------------------------------------
-  // Trackers: decisions chip + unacked action-required badge
+  // Trackers: decisions chip + NEEDS GRU queue + wake count
   // ------------------------------------------------------------------
 
   private renderTrackers(snapshot: BoardSnapshot): void {
@@ -247,10 +268,22 @@ export class BoardView {
         : decisions.reason === null
           ? `Decision routing: ${decisions.status}.`
           : `Decision routing: ${decisions.status} (${decisions.reason}).`;
-    const unacked = snapshot.unackedActionRequired;
-    this.unackedChip.hidden = unacked === 0;
-    this.unackedChip.textContent = `🔔 ${unacked} action-required`;
-    this.unackedChip.title = `${unacked} action-required notification${unacked === 1 ? '' : 's'} awaiting an ack`;
+    // NEEDS GRU is the machine queue: action-required rows awaiting a
+    // machine disposition. It never rings the owner bell — the FOR YOU
+    // band (bell + toasts) is the only human-facing surface.
+    const needsGru = snapshot.unackedActionRequired;
+    this.unackedChip.hidden = needsGru === 0;
+    this.unackedChip.textContent = `🛠 ${needsGru} needs Gru`;
+    this.unackedChip.title = `${needsGru} machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the machine queue clears itself; the owner bell is not rung.`;
+    // Wake tracker: every autonomous wake is a durable `gru.wake` event;
+    // the count/last fire stamp makes the wake path visible on the board.
+    const wakes = snapshot.wakes;
+    this.wakesChip.hidden = wakes.count === 0;
+    this.wakesChip.textContent = `⚡ ${wakes.count} wake${wakes.count === 1 ? '' : 's'}`;
+    this.wakesChip.title =
+      wakes.count === 0
+        ? 'No autonomous Gru wakes yet.'
+        : `${wakes.count} autonomous Gru wake turn${wakes.count === 1 ? '' : 's'} opened; last ${wakes.lastAt !== null ? formatTs(wakes.lastAt) : '—'}.`;
   }
 
   // ------------------------------------------------------------------
@@ -293,10 +326,10 @@ export class BoardView {
   // Attention-bucketed dense job rows
   // ------------------------------------------------------------------
 
-  /** Banded job rows: NEEDS YOU / IN FLIGHT / SETTLED / COLD, recency
+  /** Banded job rows: NEEDS GRU / IN FLIGHT / SETTLED / COLD, recency
    * within each band. Every band is a full-width row list; band headers
    * are sticky separators with counts, so the operator never loses the
-   * band they are reading. NEEDS YOU is always on screen (its clear
+   * band they are reading. NEEDS GRU is always on screen (its clear
    * state is information); SETTLED is a rolling window over its
    * recency-sorted tail (v4.1). */
   private renderJobs(snapshot: BoardSnapshot): void {
@@ -308,7 +341,7 @@ export class BoardView {
         el(
           'div',
           'board-empty__hint',
-          'Jobs land here once work is dispatched — the ledger is the record, this board is the window.',
+          'Heists land here once work is dispatched — the ledger is the record, this board is the window.',
         ),
       );
       this.mount.append(empty);
@@ -324,7 +357,7 @@ export class BoardView {
       const head = el('h2', 'board-band__head');
       head.append(
         el('span', 'board-band__label', BAND_LABELS[band]),
-        el('span', 'board-band__count lbl', `${jobs.length} job${jobs.length === 1 ? '' : 's'}`),
+        el('span', 'board-band__count lbl', heistCount(jobs.length)),
       );
       section.append(head);
       if (band === 'needs-you' && jobs.length === 0) {
@@ -354,13 +387,13 @@ export class BoardView {
     this.firstJobsRender = false;
   }
 
-  /** An empty NEEDS YOU band is good news, not absence: a calm green
+  /** An empty NEEDS GRU band is good news, not absence: a calm green
    * satisfied state (never hidden, never a false alarm). */
   private clearNeedsYou(): HTMLElement {
     const node = el('div', 'board-band__clear');
     node.append(
       el('span', 'board-band__clear-mark', '✓'),
-      el('div', 'board-band__clear-text', 'nothing needs you'),
+      el('div', 'board-band__clear-text', 'nothing needs Gru'),
       el('div', 'lbl board-band__clear-hint', 'the crew is on it'),
     );
     return node;
@@ -397,7 +430,7 @@ export class BoardView {
     toggle.append(dot, chevron, name);
     if (stale) {
       const flag = el('span', 'pp-chip pp-chip--alert board-job__stale', 'stalled');
-      flag.title = 'working with no agent frames past the stall window';
+      flag.title = 'working with no minion frames past the stall window';
       toggle.append(flag);
     }
     const signal = jobSignal(job, unackedActionRequired);
@@ -414,8 +447,8 @@ export class BoardView {
     meta.append(el('span', 'board-job__repo', `📦 ${job.repo}`));
     if (job.lane !== null) {
       meta.append(el('span', 'board-job__branch', `🌿 ${job.lane.branch ?? 'detached'}`));
-      meta.append(this.ageNode('board-job__age board-job__lane-age', job.lane.createdAt, 'lane ', ''));
-      meta.append(this.ageNode('board-job__age board-job__agent-age', job.lastAgentActivity, 'agent ', ''));
+      meta.append(this.ageNode('board-job__age board-job__lane-age', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''));
+      meta.append(this.ageNode('board-job__age board-job__agent-age', job.lastAgentActivity, `${BOARD_WORDS.minion} `, ''));
     } else if (job.baseBranch !== null) {
       meta.append(el('span', 'board-job__branch', `⌂ ${job.baseBranch}`));
     }
@@ -472,8 +505,8 @@ export class BoardView {
       lane.append(
         el('span', 'pp-chip board-lane__branch', `🌿 ${job.lane.branch ?? 'detached'}`),
         el('span', 'board-lane__base lbl', `⌂ ${job.lane.sha.slice(0, 8)}`),
-        this.ageNode('board-lane__age lbl', job.lane.createdAt, 'lane ', ''),
-        this.ageNode('board-lane__activity lbl', job.lastAgentActivity, 'agent ', ''),
+        this.ageNode('board-lane__age lbl', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''),
+        this.ageNode('board-lane__activity lbl', job.lastAgentActivity, `${BOARD_WORDS.minion} `, ''),
       );
       if (job.lane.status !== 'active') {
         lane.append(el('span', 'pp-chip pp-chip--park board-lane__status', job.lane.status));
@@ -509,7 +542,7 @@ export class BoardView {
     if (round.verdict !== null) {
       toggle.append(el('span', 'lbl board-round__verdict', `· ${round.verdict}`));
     }
-    toggle.append(el('span', 'lbl board-round__lens-progress', `${summary.done}/${summary.total} lenses`));
+    toggle.append(el('span', 'lbl board-round__lens-progress', lensProgressLabel(summary)));
     if (summary.blockers > 0 && !quiescent) {
       toggle.append(
         el('span', 'pp-chip pp-chip--alert board-round__blockers', `⛔ ${pluralCount(summary.blockers, 'blocker')}`),
@@ -574,7 +607,7 @@ export class BoardView {
   }
 
   // ------------------------------------------------------------------
-  // Agent rail (dense rows, tabs, disposed overflow)
+  // Crew rail (dense rows, tabs, disposed overflow)
   // ------------------------------------------------------------------
 
   private renderAgents(agents: readonly AgentView[]): void {
@@ -585,7 +618,7 @@ export class BoardView {
     const disposed = agents.filter((agent) => agent.state === 'disposed');
     this.agentsCount.textContent = String(live.length);
     if (agents.length === 0) {
-      rail.append(el('div', 'lbl', 'no agents yet'));
+      rail.append(el('div', 'lbl', 'no crew yet'));
       return;
     }
     // Liveness-first order arrives from the server; disposed rows collapse
@@ -684,46 +717,77 @@ export class BoardView {
       list.append(el('div', 'lbl', 'nothing needs attention'));
       return;
     }
-    for (const item of notifications) {
-      const row = el('div', `board-notification board-notification--${item.severity}`);
-      const icon = item.routing === 'action-required' ? '🔔' : item.severity === 'error' ? '🚨' : 'ℹ️';
-      row.append(
-        el(
-          'div',
-          'board-notification__title',
-          `${icon} ${item.title}${item.resolvedAt !== null ? ' · resolved' : item.ackedAt !== null ? ' ✓' : ''}`,
-        ),
-        el(
-          'div',
-          'board-notification__meta lbl',
-          `${formatTs(item.ts)} · ${item.routing}${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
-        ),
-      );
-      // Ack button: action-required rows clear through a human ack
-      // (acking also re-arms a tripped breaker server-side). A resolved
-      // incident no longer needs human action — no ack control, no badge,
-      // no toast — but the durable row stays visible for the record.
-      if (item.ackedAt === null && item.resolvedAt === null) {
-        const ack = document.createElement('button');
-        ack.type = 'button';
-        ack.className = 'board-notification__ack';
-        ack.textContent = item.routing === 'action-required' ? 'Ack' : 'Mark seen';
-        ack.addEventListener('click', () => {
-          void this.boardClient
-            ?.ackNotification(item.id)
-            .then(() => {
-              this.seenErrorIds.add(item.id);
-              ack.textContent = '✓';
-              ack.disabled = true;
-            })
-            .catch(() => {
-              /* the row re-renders on the next snapshot push */
-            });
-        });
-        row.append(ack);
-      }
-      list.append(row);
+    // Routing split (owner ruling 2026-09-23): FOR YOU is the only
+    // human-facing band; NEEDS GRU is the self-clearing machine queue
+    // (Gru dispositions, the owner bell stays quiet); everything else is
+    // the standing feed.
+    // A pre-disposition release could Ack machine rows. Those legacy rows
+    // are closed receipts, not active NEEDS GRU work, even if unresolved.
+    const unresolved = (item: NotificationView): boolean => item.resolvedAt === null && item.ackedAt === null;
+    const forYou = notifications.filter((item) => item.routing === 'needs-owner' && unresolved(item));
+    const needsGru = notifications.filter((item) => item.routing === 'action-required' && unresolved(item));
+    const feed = notifications.filter(
+      (item) => item.routing === 'fyi' || !unresolved(item),
+    );
+    this.renderNotificationSection(list, 'FOR YOU', forYou, 'nothing needs you');
+    this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'machine queue is clear');
+    if (feed.length > 0) this.renderNotificationSection(list, 'FEED', feed, null);
+  }
+
+  private renderNotificationSection(
+    list: HTMLElement,
+    label: string,
+    rows: readonly NotificationView[],
+    empty: string | null,
+  ): void {
+    const section = el('section', 'board-notification-section');
+    section.append(el('div', 'board-notification-section__head lbl', label));
+    if (rows.length === 0) {
+      if (empty !== null) section.append(el('div', 'board-notification-section__empty lbl', empty));
+    } else {
+      for (const item of rows) section.append(this.notificationRow(item));
     }
+    list.append(section);
+  }
+
+  private notificationRow(item: NotificationView): HTMLElement {
+    const row = el('div', `board-notification board-notification--${item.severity}`);
+    const icon = item.routing === 'needs-owner' ? '🔔' : item.routing === 'action-required' ? '🛠' : item.severity === 'error' ? '🚨' : 'ℹ️';
+    row.append(
+      el(
+        'div',
+        'board-notification__title',
+        `${icon} ${item.title}${item.resolvedAt !== null ? ' · resolved' : item.ackedAt !== null ? ' ✓' : ''}`,
+      ),
+      el(
+        'div',
+        'board-notification__meta lbl',
+        `${formatTs(item.ts)} · ${item.routing}${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
+      ),
+    );
+    // Only an owner stop or FYI row has a human Ack/Mark seen control.
+    // Gru records a machine disposition through the authenticated API
+    // after acting; a human click must not silently clear NEEDS GRU.
+    if (item.routing !== 'action-required' && item.ackedAt === null && item.resolvedAt === null) {
+      const ack = document.createElement('button');
+      ack.type = 'button';
+      ack.className = 'board-notification__ack';
+      ack.textContent = item.routing === 'fyi' ? 'Mark seen' : 'Ack';
+      ack.addEventListener('click', () => {
+        void this.boardClient
+          ?.ackNotification(item.id)
+          .then(() => {
+            this.seenOwnerIds.add(item.id);
+            ack.textContent = '✓';
+            ack.disabled = true;
+          })
+          .catch(() => {
+            /* the row re-renders on the next snapshot push */
+          });
+      });
+      row.append(ack);
+    }
+    return row;
   }
 
   /**
@@ -738,6 +802,9 @@ export class BoardView {
     for (const notification of notifications) {
       if (this.knownNotificationIds.has(notification.id)) continue;
       this.knownNotificationIds.add(notification.id);
+      // Only needs-owner rings the shoulder; machine/fyi rows live in the
+      // panel bands and reach Gru through the wake path instead.
+      if (notification.routing !== 'needs-owner') continue;
       if (firstRender || notification.resolvedAt !== null) continue; // history/resolved — no toast spam
       this.onToast?.(notification);
       this.sendShown(notification, 'web-toast');
@@ -762,12 +829,17 @@ export class BoardView {
     });
   }
 
-  /** Badge = unacked error-severity items not yet seen here (panel-open
-   * marks seen; an ack from ANY device clears it via ackedAt). The number
-   * is rendered — a literal "0" badge read as a false alert. */
-  private updateBadge(notifications: readonly { id: string; severity: string; ackedAt: string | null; resolvedAt: string | null }[]): void {
+  /** Badge = unacked needs-owner items not yet seen here, at ANY severity
+   * (panel-open marks seen; an ack from ANY device clears it via ackedAt).
+   * Machine (action-required) and FYI rows never count — they are not the
+   * owner's shoulder. */
+  private updateBadge(notifications: readonly { id: string; routing: string; severity: string; ackedAt: string | null; resolvedAt: string | null }[]): void {
     const unseen = notifications.filter(
-      (n) => n.severity === 'error' && n.ackedAt === null && n.resolvedAt === null && !this.seenErrorIds.has(n.id),
+      (n) =>
+        n.routing === 'needs-owner' &&
+        n.ackedAt === null &&
+        n.resolvedAt === null &&
+        !this.seenOwnerIds.has(n.id),
     ).length;
     this.notificationBell.dataset.unread = String(unseen);
     this.notificationBadge.textContent = String(unseen);

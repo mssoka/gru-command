@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +17,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
-import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 
 /**
  * Hotfix pins: a Perkins round that reviews a PR branch freezes the LIVE
@@ -255,15 +256,16 @@ describe('freeze-time integration on PR rounds', () => {
     settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/13');
     const poster = {
-      post: vi.fn(async (_input: { readonly targetSha: string }) => ({
-        headSha: _input.targetSha,
-        baseSha: 'stub-base',
+      post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+        headSha: input.targetSha, baseSha: 'stub-base',
+        bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
       })),
     };
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: fakeHybridSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
       poster,
       reviewArtifactRoot: artifacts,
       prHeadProbe: fixedProbe('feature/lane', tip),
@@ -345,11 +347,12 @@ describe('freeze-time integration on PR rounds', () => {
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: fakeHybridSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
       poster: {
-        post: vi.fn(async (input: { readonly targetSha: string }) => ({
-          headSha: input.targetSha,
-          baseSha: 'stub-base',
+        post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({
+          reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+          headSha: input.targetSha, baseSha: 'stub-base',
+          bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
         })),
       },
       reviewArtifactRoot: artifacts,
@@ -387,15 +390,16 @@ describe('freeze-time integration on PR rounds', () => {
     settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/16');
     const poster = {
-      post: vi.fn(async (input: { readonly targetSha: string }) => ({
-        headSha: input.targetSha,
-        baseSha: 'stub-base',
+      post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({
+        reviewId: '9003', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+        headSha: input.targetSha, baseSha: 'stub-base',
+        bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
       })),
     };
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: fakeHybridSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
       poster,
       reviewArtifactRoot: artifacts,
       // The PR reports its real head branch; `gru/job-rebase` is never fetched.
@@ -437,7 +441,7 @@ describe('freeze-time integration on PR rounds', () => {
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: fakeHybridSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
       reviewArtifactRoot: artifacts,
       prHeadProbe: probe,
     });

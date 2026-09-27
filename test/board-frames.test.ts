@@ -81,6 +81,8 @@ const SNAPSHOT_VALID = {
     generation: 0,
   },
   unackedActionRequired: 0,
+  unackedNeedsOwner: 0,
+  wakes: { count: 0, lastAt: null },
 };
 
 const SERVER_CORPUS: readonly unknown[] = [

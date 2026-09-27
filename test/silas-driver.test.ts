@@ -320,6 +320,33 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
+  it('re-arms only a proven same-head service-restart abort once, not cancelled or unexplained aborts', async () => {
+    const h = makeLedger();
+    try {
+      const digestOf = () => computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      addJobWithDelivery(h.ledger, 'clean', { prUrl: 'https://git.example.invalid/pull/clean' });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'clean', payload: { sha: 'sha-clean' } });
+      const round = h.ledger.addRound({ jobId: 'clean', targetRef: 'sha-clean' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setJobStatus('clean', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'clean', payload: { route: 'perkins', round_id: round.id } });
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean', roundId: round.id, payload: { reason: 'cancelled' } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean', roundId: round.id, payload: { reason: 'service_restart' } });
+      expect((await digestOf()).prWithoutReview).toMatchObject([
+        { jobId: 'clean', cleanAbort: { roundId: round.id, ruleId: 'clean-abort-service-restart' } },
+      ]);
+      h.ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'clean', payload: {
+        route: 'perkins', rule_id: 'clean-abort-service-restart', source_round_id: round.id,
+      } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+    } finally { h.cleanup(); }
+  });
+
   it('re-review fires only for a moved head: the reviewed head and a missing head stay quiet', async () => {
     const h = makeLedger();
     try {
@@ -590,6 +617,21 @@ describe('silas skills and wake prompt', () => {
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);
   });
 
+  it('assembles shipped skills with one scoped merge authority and exact clean-abort rule', () => {
+    const prompt = buildWakePrompt({ digest: { computedAt: '2026-09-24T00:00:00Z', trigger: 'sweep',
+      deliveredWithoutPr: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
+        priorRounds: 1, cleanAbort: { roundId: 'clean-r1', ruleId: 'clean-abort-service-restart' } }],
+      verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [] },
+      trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
+    expect(prompt).toContain('You NEVER merge a pull request');
+    expect(prompt).toContain('Gru may merge gru-command only');
+    expect(prompt).toContain('fallback PASS is not that clearance');
+    expect(prompt).toContain('owner holds merges elsewhere');
+    expect(prompt).toContain('clean-abort-service-restart');
+    expect(prompt).toContain('source_round_id');
+    expect(prompt).not.toContain('human holds the merge);');
+  });
+
   it('the wake prompt carries skills, ops surface, digest, and the no-cap ladder', () => {
     const skills: SkillModule[] = [{ name: 'ops-dispatch', body: 'SKILL BODY MARKER' }];
     const prompt = buildWakePrompt({
@@ -737,6 +779,24 @@ describe('silas driver wakes', () => {
     } finally {
       h.cleanup();
     }
+  });
+
+  it('a recorded clean-abort event wakes Silas with the bounded same-head rule', async () => {
+    const h = makeDriver();
+    try {
+      h.driver.start();
+      addJobWithDelivery(h.ledger, 'abort-wake', { prUrl: 'https://example.invalid/1' });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'abort-wake', payload: { sha: 'same-head' } });
+      const round = h.ledger.addRound({ jobId: 'abort-wake', targetRef: 'same-head' });
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      h.ledger.setJobStatus('abort-wake', 'in-review');
+      const event = h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', roundId: round.id,
+        jobId: 'abort-wake', payload: { reason: 'service_restart' } });
+      h.bus.publish(event);
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      expect(h.prompts[0]?.text).toContain('clean-abort-service-restart');
+      expect(h.prompts[0]?.text).toContain('"roundId": "abort-wake-r1"');
+    } finally { h.cleanup(); }
   });
 
   it('a sweep with an empty digest does not wake; an event trigger always does', async () => {
