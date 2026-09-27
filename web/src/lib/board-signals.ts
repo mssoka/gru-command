@@ -9,6 +9,14 @@ import type { BoardSnapshot, JobView, RoundView } from './board-protocol.js';
 
 export interface RoundSummary {
   readonly done: number;
+  /** Lenses that actually ran (done minus "not used"). */
+  readonly used: number;
+  /** Lenses done as "not used" this round. */
+  readonly unused: number;
+  /** Lenses that RAN a specialist attempt, including ones that then failed:
+   * used + lenses in error state with recorded attempts (R9/N8). An error
+   * lens with no attempts (interrupted before spawn) did not run. */
+  readonly ran: number;
   readonly total: number;
   readonly blockers: number;
   readonly failures: number;
@@ -22,8 +30,24 @@ export interface JobSignal {
 
 /** Done lenses / total, blocker verdicts, errored lenses for one round. */
 export function roundSummary(round: RoundView): RoundSummary {
+  // Whole-PR rounds: a lens the lead never used is done as "not used", not
+  // as coverage. `used` counts lenses that actually ran; `unused` is shown
+  // separately so a lead-only round never reads as 7/7 specialist coverage.
+  // `ran` additionally counts lenses that RAN AND FAILED (R9): a specialist
+  // that executed and errored is real work and must not vanish from the
+  // "lenses ran" count — only error lenses WITHOUT any recorded attempt
+  // (interrupted before spawn) stay excluded.
+  const done = round.lenses.filter((lens) => lens.state === 'done');
+  const unused = done.filter((lens) => lens.note !== null && lens.note.startsWith('not used')).length;
+  const attemptsByLens = new Map(round.lensAttempts.map((entry) => [entry.lens, entry.attempts] as const));
+  const failedRan = round.lenses.filter(
+    (lens) => lens.state === 'error' && (attemptsByLens.get(lens.lens) ?? 0) > 0,
+  ).length;
   return {
-    done: round.lenses.filter((lens) => lens.state === 'done').length,
+    done: done.length,
+    used: done.length - unused,
+    unused,
+    ran: done.length - unused + failedRan,
     total: round.lenses.length,
     blockers: round.blockers,
     failures: round.lenses.filter((lens) => lens.state === 'error').length,
@@ -110,8 +134,11 @@ export function jobSignal(job: JobView, unackedActionRequired: number): JobSigna
     }
     if (!concluded) {
       if (round.status === 'live') {
-        parts.push(`◉ round ${round.seq} · live · ${summary.done}/${summary.total}`);
-        details.push(`round ${round.seq} live — ${summary.done}/${summary.total} lenses done`);
+        // Settled progress: an errored lens will not run again, so it
+        // counts toward the terminal progress, never as outstanding work.
+        const settled = summary.done + summary.failures;
+        parts.push(`◉ round ${round.seq} · live · ${settled}/${summary.total}`);
+        details.push(`round ${round.seq} live — ${settled}/${summary.total} lenses settled`);
       } else if (round.status === 'pending') {
         parts.push(`○ round ${round.seq} pending`);
         details.push(`round ${round.seq} pending`);
