@@ -91,12 +91,12 @@ export function redactReviewForPublication(body: string): string {
  * with the stricter isGitHubRemote/isGitLabRemote checks. */
 export type PublicationProviderKind = 'github' | 'gitlab' | 'unknown';
 
-function publicationProviderKindFor(prUrl: string | null): PublicationProviderKind {
+export function publicationProviderKindFor(prUrl: string | null): PublicationProviderKind {
   if (prUrl === null) return 'unknown';
   try {
     const url = new URL(prUrl.trim());
     if (isGitHubRemote(url.host) || /^\/[^/]+\/[^/]+\/pull\/\d+\/?$/u.test(url.pathname)) return 'github';
-    if (isGitLabRemote(url.host) || /\/~-\/merge_requests\/\d+\/?$/u.test(url.pathname)) return 'gitlab';
+    if (isGitLabRemote(url.host) || /\/-\/merge_requests\/\d+\/?$/u.test(url.pathname)) return 'gitlab';
   } catch {
     // An unparsable URL never gets a provider-specific publication claim.
   }
@@ -311,6 +311,12 @@ export function parsePostedEventPayload(payload: unknown): PostedEventPayload | 
   const receiptValue = value['receipt'];
   if (verdict !== 'approved' && verdict !== 'changes-requested') return null;
   if (typeof canonicalVerdict !== 'string') return null;
+  // The ledger verdict and the recorded canonical verdict must agree — a
+  // posted event claiming approval beside a NEEDS CHANGES review is not a
+  // coherent writer product.
+  if (verdict === 'approved' ? canonicalVerdict !== 'READY TO MERGE' : !['NEEDS CHANGES', 'MAJOR REWORK NEEDED'].includes(canonicalVerdict)) {
+    return null;
+  }
   if (!nonEmptyString(url) || !nonEmptyString(host) || !nonEmptyString(targetSha) || !nonEmptyString(baseSha)) return null;
   if (!nonEmptyString(publicationFile) || !nonEmptyString(publicationSha256)) return null;
   if (typeof reconciled !== 'boolean') return null;
@@ -376,7 +382,9 @@ export function verifyPostedReceipt(
 /** GitHub poster using a commit-bound pull-request review, not an unbound
  * comment. The API's commit_id makes a head race rejectable server-side. */
 export class GhPrPoster implements VerdictPoster {
-  private authenticatedLogin: string | null = null;
+  /** Login per host: one poster instance may serve several GitHub hosts,
+   * each authenticating a different account. */
+  private readonly authenticatedLogins = new Map<string, string>();
 
   constructor(private readonly binary = 'gh') {}
 
@@ -384,7 +392,8 @@ export class GhPrPoster implements VerdictPoster {
    * identity a receipt's actor may match (R5). Resolved once per poster
    * instance; no account is hard-coded and no new credential path exists. */
   private resolveAuthenticatedLogin(host: string): string {
-    if (this.authenticatedLogin !== null) return this.authenticatedLogin;
+    const cached = this.authenticatedLogins.get(host);
+    if (cached !== undefined) return cached;
     const who = spawnSync(
       this.binary,
       ['api', '--hostname', host, 'user', '--jq', '.login'],
@@ -395,7 +404,7 @@ export class GhPrPoster implements VerdictPoster {
     }
     const login = (who.stdout ?? '').trim();
     if (login === '') throw new Error(`gh authenticated account on ${host} is unknown — delivery not recorded`);
-    this.authenticatedLogin = login;
+    this.authenticatedLogins.set(host, login);
     return login;
   }
 
@@ -594,7 +603,9 @@ export class GitLabMrPoster implements VerdictPoster {
   private readonly tokenResolver: () => string | undefined;
   private readonly fetchImpl: (input: string, init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
   private readonly gitBinary: string;
-  private authenticatedUser: string | null = null;
+  /** Username per host: one poster instance may serve several GitLab
+   * hosts, each with its own token and account. */
+  private readonly authenticatedUsers = new Map<string, string>();
 
   constructor(options: GitLabMrPosterOptions = {}) {
     this.token = options.token;
@@ -607,7 +618,8 @@ export class GitLabMrPoster implements VerdictPoster {
    * author whose notes this service may claim (R5). Resolved once per
    * poster instance through the SAME token, no new credential path. */
   private async resolveAuthenticatedUser(host: string, headers: { readonly 'PRIVATE-TOKEN': string; readonly 'CONTENT-TYPE': string }): Promise<string> {
-    if (this.authenticatedUser !== null) return this.authenticatedUser;
+    const cached = this.authenticatedUsers.get(host);
+    if (cached !== undefined) return cached;
     let response: Awaited<ReturnType<typeof this.fetchImpl>>;
     try {
       response = await this.fetchImpl(`https://${host}/api/v4/user`, { headers, signal: AbortSignal.timeout(15_000) });
@@ -625,12 +637,16 @@ export class GitLabMrPoster implements VerdictPoster {
     }
     const username = typeof user.username === 'string' ? user.username.trim() : '';
     if (username === '') throw new Error('GitLab token authenticates no named account — delivery stays unresolved');
-    this.authenticatedUser = username;
+    this.authenticatedUsers.set(host, username);
     return username;
   }
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
     const { mrUrl, headers } = await this.gitLabIdentity(input);
+    // Resolve the token's account BEFORE creating anything (V1/R5): the
+    // note's echoed author must match it, and an unnamed account refuses
+    // delivery before a note exists.
+    const author = await this.resolveAuthenticatedUser(input.host, headers);
     let noteResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
     try {
       noteResponse = await this.fetchImpl(`${mrUrl}/notes`, {
@@ -658,6 +674,9 @@ export class GitLabMrPoster implements VerdictPoster {
     const echoedBody = typeof created.body === 'string' ? created.body : null;
     if (echoedBody === null || receiptDigest(echoedBody) !== receiptDigest(input.body)) {
       throw new Error('provider receipt body does not match the published body — delivery not recorded');
+    }
+    if (actor.toLowerCase() !== author.toLowerCase()) {
+      throw new Error(`provider receipt actor ${actor === '' ? '(none)' : actor} is not the authenticated posting account ${author} — delivery not recorded`);
     }
     const confirmed = await this.confirmHead(mrUrl, headers, input.targetSha);
     // GitLab notes are not commit-bound server-side; the post-delivery head
@@ -1083,16 +1102,28 @@ export class WaveRunner {
     }
     if (event.receipt.actor.split('').some((character) => character.charCodeAt(0) < 32)) return 'receipt actor is malformed';
     if (!/^[0-9a-f]{64}$/u.test(event.receipt.bodySha256)) return 'receipt body digest is malformed';
-    // The enacted provider event is whitelisted with its commit binding: a
-    // GitHub COMMENT review MUST be commit-bound to the frozen target; a
-    // GitLab note MUST NOT claim a server-side commit binding it cannot
-    // have. Any other event string is not a known enacted publication.
-    if (event.receipt.event === 'COMMENTED') {
+    // The enacted provider event is bound to the job's actual PR form: a
+    // GitHub pull-request URL must carry a COMMENTED review commit-bound to
+    // the frozen target; a GitLab merge-request URL must carry a note with
+    // NO server-side commit binding. Any other pairing — a GitLab note on a
+    // GitHub PR, an unknown event — is not a promotable publication.
+    const providerKind = publicationProviderKindFor(job.prUrl);
+    if (providerKind === 'github') {
+      if (event.receipt.event !== 'COMMENTED') return `receipt event "${event.receipt.event}" is not the GitHub COMMENT review this pull request requires`;
       if (event.receipt.commitId !== round.targetRef) return 'COMMENTED receipt is not commit-bound to the frozen target';
-    } else if (event.receipt.event === 'note') {
+    } else if (providerKind === 'gitlab') {
+      if (event.receipt.event !== 'note') return `receipt event "${event.receipt.event}" is not the GitLab merge-request note this merge request requires`;
       if (event.receipt.commitId !== null) return 'note receipt must not claim a commit binding GitLab does not record';
     } else {
-      return `receipt event "${event.receipt.event}" is not a known enacted provider event`;
+      // Unknown provider form: fall back to the per-event discipline so an
+      // odd-but-consistent record is not rejected for its host alone.
+      if (event.receipt.event === 'COMMENTED') {
+        if (event.receipt.commitId !== round.targetRef) return 'COMMENTED receipt is not commit-bound to the frozen target';
+      } else if (event.receipt.event === 'note') {
+        if (event.receipt.commitId !== null) return 'note receipt must not claim a commit binding GitLab does not record';
+      } else {
+        return `receipt event "${event.receipt.event}" is not a known enacted provider event`;
+      }
     }
     const canonical = join(reviewArtifactDirectory(this.artifactRoot(), round.id), 'perkins-report.publication.md');
     if (resolve(event.publicationFile) !== resolve(canonical)) {
@@ -2056,7 +2087,27 @@ export class WaveRunner {
           });
           throw overflow;
         }
-        return { prUrl, publicationBody: redactReviewForPublication(publicationBody) };
+        const redactedBody = redactReviewForPublication(publicationBody);
+        // Redaction can EXPAND the body (fixed placeholders replace short
+        // matches), so the provider bound is enforced on the FINAL bytes
+        // that will actually be posted.
+        if (Buffer.byteLength(redactedBody, 'utf8') > PUBLICATION_BODY_MAX_BYTES) {
+          writeReviewArtifact(frozenReview, 'perkins-report.publication-overflow.json', {
+            schemaVersion: 1,
+            reason: 'redaction expanded the assembled publication body past the provider review-body limit',
+            provider: providerKind,
+            retainedFindings: review.findings.map((finding) => ({
+              severity: finding.severity, title: finding.title, location: finding.location, source: finding.source,
+            })),
+            reportFile,
+            specialistRuns: review.specialistRuns,
+          });
+          throw new Error(
+            `redacted publication body (${Buffer.byteLength(redactedBody, 'utf8')} bytes) exceeds the provider review-body limit (${PUBLICATION_BODY_MAX_BYTES} bytes); ` +
+            'complete retained-finding evidence is preserved locally — refusing to publish a partial disclosure',
+          );
+        }
+        return { prUrl, publicationBody: redactedBody };
       };
       const recordDelivery = (delivered: PostedReviewReceipt, publicationFile: string, publicationSha256: string, reconciled: boolean): void => {
         // The payload IS the shared PostedEventPayload contract: recovery

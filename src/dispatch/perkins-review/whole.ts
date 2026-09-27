@@ -1021,6 +1021,14 @@ export class PerkinsWholeReview {
           }
         };
         if (batch.error !== null) {
+          // The lead receives NO response for this batch either: every
+          // committed valid run's findings were not delivered (R17), and
+          // the durable record must say so.
+          for (const result of committed) {
+            if (result.findingsDelivered !== false) {
+              results.set(result.resultId, { ...result, findingsDelivered: false });
+            }
+          }
           commitSettled();
           // Only lenses that produced NO result never ran: restore their
           // attempt budget and started count. Lenses that ran keep their
@@ -1651,7 +1659,9 @@ export class PerkinsWholeReview {
           .map((disposition) => context.prior[disposition.prior_index]?.title ?? ''),
       ].filter((title) => title !== '');
       if (retainedTitles.length > 0) {
-        const normalizedReport = report.replace(/\s+/gu, ' ');
+        // Hidden HTML comments are not visible prose: titles buried there
+        // do not account for a finding the reader can see (E6).
+        const normalizedReport = report.replace(/<!--[\s\S]*?-->/gu, '').replace(/\s+/gu, ' ');
         const uniqueRetained = [...new Set(retainedTitles)];
         const missing = uniqueRetained.filter((title) => !normalizedReport.includes(title.replace(/\s+/gu, ' ')));
         if (missing.length > 0) {

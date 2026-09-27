@@ -54,7 +54,7 @@ const PINS: Record<string, number> = {
   'logger.test.ts': 3,
   'native-tools-parity.test.ts': 2,
   'notifications.test.ts': 15,
-  'perkins-builtin-wave.test.ts': 73,
+  'perkins-builtin-wave.test.ts': 78,
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
   'perkins-freeze-freshhead.test.ts': 13,
   'perkins-lead-schema-compat.test.ts': 6,
