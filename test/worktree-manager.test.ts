@@ -369,6 +369,37 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
     // No half-created lane: nothing registered, no review debris.
     expect(h.manager.getWorktree('job-review-down-r1')).toBeNull();
   });
+
+  it('a review ref naming origin/HEAD resolves through the fetched default branch', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-review-head');
+    ledgerJob(h, 'job-review-head', repo);
+    h.ledger.addRound({ jobId: 'job-review-head', targetRef: 'HEAD' });
+    const tip = advanceOrigin(origin, 'main', 'src/head-ref.ts', 'export const headRef = 1;\n');
+
+    const review = await h.manager.createReviewWorktree({
+      repoPath: repo.path,
+      roundId: 'job-review-head-r1',
+      ref: 'refs/remotes/origin/HEAD',
+    });
+    expect(review.sha).toBe(tip);
+    expect(review.baseSource).toBe('origin');
+    expect(repo.git(['rev-parse', 'HEAD'], review.path)).toBe(tip);
+  });
+
+  it('release re-resolves the FETCHED origin head — follow-on work starts from the fetched tip', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-release-fresh');
+    ledgerJob(h, 'job-release-fresh', repo);
+    await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-release-fresh' });
+    const tip = advanceOrigin(origin, 'main', 'src/after-lane.ts', 'export const afterLane = 1;\n');
+
+    const result = await h.manager.release({ worktreeId: 'job-release-fresh' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') {
+      expect(result.freshHead).toBe(tip);
+    }
+  });
 });
 
 describe('worktree manager: sweep (ruling 18c)', () => {

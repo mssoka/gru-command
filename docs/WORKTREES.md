@@ -84,7 +84,8 @@ every pause is answerable by construction (job id or round id).
 ## 5. Concurrency (18e)
 
 Same-repo creation is sequential (git index/refs contention); every
-creation resolves the CURRENT head — never a held sha.
+creation resolves the FETCHED origin default-branch head (5a) — never a
+held sha.
 
 ## 5a. Base provenance (owner incident 2026-09-23)
 
@@ -95,10 +96,12 @@ hardcoded `main`). The registry row records the base SOURCE: `origin`
 for a fetched base, `local-head-fallback` when the fetch failed and the
 lane branched from the host clone's local HEAD instead. The fallback is
 never silent: the row carries it, the `worktree.created` event carries
-it, and an `worktree-base-fallback` FYI notification names the stale
+it, and a `worktree-base-fallback` FYI notification names the stale
 risk. Review lanes apply the same fetch discipline to `origin/<branch>`
 refs; an unfetchable origin ref refuses outright — a stale review is a
-wrong review, not an offline one.
+wrong review, not an offline one. Lane release re-resolves through the
+same contract, so follow-on work starts from the fetched head too; a
+fetch failure there degrades identically (logged warning, local HEAD).
 
 ## Endpoints
 

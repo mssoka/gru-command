@@ -193,7 +193,9 @@ export interface WorktreeRecord {
   readonly sha: string;
   /** How `sha` was resolved — 'origin' (fetched origin tip) or
    * 'local-head-fallback' (degraded path; the lane may be stale).
-   * NULL only for rows written before the provenance migration. */
+   * NULL for rows written before the provenance migration and for
+   * review rows pinned to an exact commit (their sha IS their
+   * provenance). */
   readonly baseSource: WorktreeBaseSource | null;
   readonly jobId: string | null;
   readonly roundId: string | null;
