@@ -44,6 +44,9 @@ class StubOscillator {
   readonly frequency = new StubParam();
   startAt: number | null = null;
   stopAt: number | null = null;
+  /** R4 shape: this node's FIRST stop() call throws (after start()) —
+   * exactly the in-progress-note stranded-outside-cleanup bug. */
+  failFirstStop = false;
 
   connect(destination: unknown): unknown {
     return destination;
@@ -54,6 +57,10 @@ class StubOscillator {
   }
 
   stop(when?: number): void {
+    if (this.failFirstStop) {
+      this.failFirstStop = false; // one refusal, then stop() works
+      throw new Error('stop refused after start');
+    }
     this.stopAt = when ?? 0;
   }
 }
@@ -91,6 +98,8 @@ class StubAudioContext {
    * the Nth node ever created (0-based) — e.g. 1 = the second note of
    * the first chime — after earlier notes already started. */
   failOnNthOscillator: number | null = null;
+  /** R4 shape: the Nth oscillator's first stop() throws after start(). */
+  failStopOnNthOscillator: number | null = null;
   private oscillatorsCreated = 0;
   private gateResolve: (() => void) | null = null;
 
@@ -99,8 +108,11 @@ class StubAudioContext {
     if (this.failOnNthOscillator !== null && this.oscillatorsCreated === this.failOnNthOscillator) {
       throw new Error(`audio node ${this.failOnNthOscillator} allocation failed`);
     }
-    this.oscillatorsCreated += 1;
     const oscillator = new StubOscillator();
+    if (this.failStopOnNthOscillator !== null && this.oscillatorsCreated === this.failStopOnNthOscillator) {
+      oscillator.failFirstStop = true;
+    }
+    this.oscillatorsCreated += 1;
     this.oscillators.push(oscillator);
     return oscillator;
   }
@@ -619,6 +631,60 @@ describe('owner chime — live board wiring', () => {
       ]),
     );
     expect(h.context.oscillators).toHaveLength(2);
+  });
+
+  it('a stop() that throws AFTER start() cancels the in-progress note too: nothing stays live, nudge/receipts isolated, retry is one full chime', () => {
+    mountDom();
+    const context = new StubAudioContext();
+    context.failStopOnNthOscillator = 1; // the SECOND note: start() lands, stop() refuses
+    const chime = new OwnerChime({
+      storage: memoryStorage(),
+      indicator: document.getElementById('sound-toggle') as HTMLButtonElement,
+      bell: document.getElementById('notification-bell') as HTMLButtonElement,
+      createContext: () => context,
+    });
+    expect(chime.arm()).toBe(true); // playable — the failure is mid-NOTE
+    const outcomes: string[] = [];
+    const shown: Array<{ id: string; surface: string }> = [];
+    const client = {
+      markNotificationShown: (id: string, surface: string) => {
+        shown.push({ id, surface });
+        return Promise.resolve(true);
+      },
+    } as unknown as BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(client);
+    view.setToastHandler((notification) => {
+      outcomes.push(chime.notify(notification));
+    });
+
+    view.render(boardSnapshot([])); // history baseline
+
+    // Before R4, the in-progress second note never entered the cleanup
+    // list: it stayed connected with no stop recorded while notify()
+    // returned 'nudge' and left the throttle unconsumed.
+    expect(() => view.render(boardSnapshot([arrival('owner-1', 'needs-owner')]))).not.toThrow();
+    expect(outcomes).toEqual(['nudge']);
+    expect(shown.map((entry) => entry.id)).toEqual(['owner-1']); // receipt landed (R2 intact)
+    expect(
+      document.getElementById('notification-bell')?.classList.contains(OWNER_CHIME_NUDGE_CLASS),
+    ).toBe(true);
+    expect(context.oscillators).toHaveLength(2); // both notes were created…
+    // …and NO oscillator remains live: every one is stopped-at-0,
+    // including the one whose own stop() had just thrown.
+    expect(context.oscillators.every((note) => note.stopAt === 0)).toBe(true);
+    expect(context.gains.every((gain) => gain.disconnected)).toBe(true); // no tail stays wired
+
+    // Retry inside the same 30s window (throttle never consumed): ONE
+    // full two-note chime, both notes ringing their scheduled decay.
+    expect(() => view.render(boardSnapshot([arrival('owner-2', 'needs-owner')]))).not.toThrow();
+    expect(outcomes).toEqual(['nudge', 'chime']);
+    expect(shown.map((entry) => entry.id)).toEqual(['owner-1', 'owner-2']);
+    expect(context.oscillators).toHaveLength(4);
+    const retryNotes = context.oscillators.slice(2);
+    expect(retryNotes.every((note) => note.startAt !== null)).toBe(true);
+    expect(retryNotes.every((note) => note.stopAt !== 0 && note.stopAt !== null)).toBe(true);
+    expect(context.gains.slice(2).every((gain) => !gain.disconnected)).toBe(true);
   });
 
   it('a SECOND-NOTE scheduling failure is atomic through the board wiring: no partial chime rings, nudge and receipts stay intact, an immediate retry is one full chime', () => {

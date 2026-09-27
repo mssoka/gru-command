@@ -44,6 +44,14 @@ export interface ChimeNotification {
 }
 /** Two soft notes: A5 → D6 (a rising perfect fourth). */
 export const OWNER_CHIME_NOTES_HZ = [880, 1174.66] as const;
+
+/** A note under construction: registered for cancellation the moment its
+ * oscillator exists — before any later scheduling call can throw — with
+ * its gain attached as soon as that exists too. */
+interface ScheduledNote {
+  readonly oscillator: ChimeOscillatorNode;
+  gain: ChimeGainNode | null;
+}
 /** ~-18 dBFS peak — a deliberately low, subtle envelope. */
 export const OWNER_CHIME_PEAK = 10 ** (-18 / 20);
 /** Bell nudge class for the unarmed visual fallback. */
@@ -315,23 +323,27 @@ export class OwnerChime {
     if (context === null) return; // only reachable when armed
     const start = context.currentTime + 0.01;
     const [first, second] = OWNER_CHIME_NOTES_HZ;
-    const scheduled: Array<{ readonly oscillator: ChimeOscillatorNode; readonly gain: ChimeGainNode }> = [];
+    // Every note registers itself HERE the moment its oscillator exists —
+    // before any later operation (createGain, connect, start, stop) can
+    // throw — so a failure mid-note cancels the in-progress note together
+    // with every prior one. Registering only after playNote() returns
+    // would strand a started-but-unreturned note outside the cleanup.
+    const scheduled: ScheduledNote[] = [];
     try {
-      scheduled.push(this.playNote(context, first, start));
-      scheduled.push(this.playNote(context, second, start + NOTE_GAP_S));
+      this.playNote(context, first, start, scheduled);
+      this.playNote(context, second, start + NOTE_GAP_S, scheduled);
     } catch (error) {
       for (const note of scheduled) this.cancelNote(note);
       throw error;
     }
   }
 
-  private playNote(
-    context: ChimeAudioContext,
-    frequency: number,
-    at: number,
-  ): { readonly oscillator: ChimeOscillatorNode; readonly gain: ChimeGainNode } {
-    const oscillator = context.createOscillator();
+  private playNote(context: ChimeAudioContext, frequency: number, at: number, scheduled: ScheduledNote[]): void {
+    const oscillator = context.createOscillator(); // a throw here strands nothing
+    const note: ScheduledNote = { oscillator, gain: null };
+    scheduled.push(note); // in-progress from the very next line on
     const gain = context.createGain();
+    note.gain = gain;
     oscillator.type = 'sine';
     oscillator.frequency.setValueAtTime(frequency, at);
     gain.gain.setValueAtTime(0, at);
@@ -341,18 +353,18 @@ export class OwnerChime {
     gain.connect(context.destination);
     oscillator.start(at);
     oscillator.stop(at + DECAY_S + TAIL_S);
-    return { oscillator, gain };
   }
 
   /** Best-effort cancellation of a partially scheduled note. Never
    * throws: stop() on a never-started oscillator (or a hostile node) is
    * already a failed graph — there is nothing audible left to protect. */
-  private cancelNote(note: { readonly oscillator: ChimeOscillatorNode; readonly gain: ChimeGainNode }): void {
+  private cancelNote(note: ScheduledNote): void {
     try {
       note.oscillator.stop(0); // before/at now: the note never rings on
     } catch {
       /* never started — nothing scheduled to silence */
     }
+    if (note.gain === null) return; // failed before its gain existed
     try {
       note.gain.disconnect(); // detach any tail already flowing
     } catch {
