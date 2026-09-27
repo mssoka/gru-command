@@ -340,6 +340,68 @@ describe('notification center — durable log + receipts + acks', () => {
     expect(api.listEventsAfter(0, { kinds: ['notification.triaged'] })).toHaveLength(0);
   });
 
+  it('honors the owner routing when an unacked legacy machine row dedupes a new owner-held stop (gh-97)', () => {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const needsOwner: NotificationRecord[] = [];
+    const center = new NotificationCenter({
+      ledger: api,
+      bus,
+      onNeedsOwner: (notification) => needsOwner.push(notification),
+    });
+    // Pre-routing-split ledger state: an UNRESOLVED machine-routed provider
+    // wall of exactly the kind a new owner-held stop would dedupe against.
+    const kind = 'supervision.provider-wall.minion-1.authentication_wall';
+    api.recordNotification({
+      id: 'legacy-provider-wall',
+      kind,
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Legacy machine wall',
+      agentId: 'minion-1',
+    });
+    const ownerStop = center.postIncident({
+      kind,
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Agent minion-1 stopped: authentication wall',
+      agentId: 'minion-1',
+      dedupe: 'unacked',
+    });
+    // The returned row honors the requested owner routing: a FRESH row that
+    // rings the bell (the needs-owner hook fires) and is owner-Ack-able.
+    expect(ownerStop.id).not.toBe('legacy-provider-wall');
+    expect(ownerStop).toMatchObject({ routing: 'needs-owner', ackedAt: null, resolvedAt: null });
+    expect(needsOwner.map((row) => row.id)).toEqual([ownerStop.id]);
+    // The legacy machine row stays for Gru: unmigrated, unacked, unresolved,
+    // and still refusing a human Ack — the exact strand gh-97 fixes.
+    expect(api.getNotification('legacy-provider-wall')).toMatchObject({
+      routing: 'action-required',
+      ackedAt: null,
+      resolvedAt: null,
+    });
+    expect(() => api.ackNotification('legacy-provider-wall', 'operator')).toThrow(
+      'action-required notifications require a Gru disposition',
+    );
+    expect(api.countPendingActionRequired()).toBe(1);
+    // Deterministic dedupe around the split state: while the fresh owner row
+    // is unacked it dedupes same-routing posts; once acked, the only unacked
+    // row is the legacy machine one, so a NEW trip again honors the request
+    // instead of returning the un-Ack-able legacy row.
+    const repeated = center.postIncident({
+      kind, routing: 'needs-owner', severity: 'error', title: 'repeat', agentId: 'minion-1', dedupe: 'unacked',
+    });
+    expect(repeated.id).toBe(ownerStop.id);
+    expect(center.ack(ownerStop.id, 'operator')).toMatchObject({ ackedBy: 'operator' });
+    const nextTrip = center.postIncident({
+      kind, routing: 'needs-owner', severity: 'error', title: 'next trip', agentId: 'minion-1', dedupe: 'unacked',
+    });
+    expect(nextTrip.id).not.toBe('legacy-provider-wall');
+    expect(nextTrip.id).not.toBe(ownerStop.id);
+    expect(nextTrip.routing).toBe('needs-owner');
+  });
+
   it('does not duplicate an acknowledged but unresolved active incident', () => {
     const incidents = boot();
     const first = incidents.center.postIncident({

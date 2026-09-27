@@ -681,6 +681,47 @@ describe('supervisor — decision-backed failure guidance', () => {
     await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
     h.dispose();
   });
+
+  it('a legacy machine-routed provider-wall row never strands a new owner stop: fresh Ack-able row, ack re-arms the ladder (gh-97)', async () => {
+    const h = boot({ decide: vi.fn(async () => { throw new Error('decision service down'); }) } as unknown as DecisionService);
+    const handle = new FakeHandle('minion', 'minion-legacy-wall', null);
+    h.registry.adopt(handle);
+    // Pre-routing-split ledger state: an unresolved MACHINE-routed wall of
+    // exactly the kind this stop will dedupe against.
+    const wallKind = `supervision.provider-wall.${handle.id}.authentication_wall`;
+    h.api.recordNotification({
+      id: 'legacy-provider-wall',
+      kind: wallKind,
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Legacy machine wall',
+      agentId: handle.id,
+    });
+    const spawns = h.registry.spawnCalls.length;
+    handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
+    // The stop honors its owner routing against the legacy machine row: a
+    // FRESH needs-owner row exists and the legacy row stays machine-held.
+    const rows = h.api.listNotifications({ limit: 50 }).filter((row) => row.kind === wallKind);
+    expect(rows).toHaveLength(2);
+    const ownerStop = rows.find((row) => row.routing === 'needs-owner');
+    expect(ownerStop).toMatchObject({ ackedAt: null, resolvedAt: null });
+    expect(rows.find((row) => row.id === 'legacy-provider-wall')).toMatchObject({
+      routing: 'action-required',
+      ackedAt: null,
+      resolvedAt: null,
+    });
+    // The real owner ACK entry chain works on the fresh row (the same calls
+    // the board ack endpoint makes) and re-arms the restart ladder.
+    expect(() => h.center.ack(ownerStop!.id, 'test-human')).not.toThrow();
+    h.supervisor.onNotificationAcked(ownerStop!.id);
+    // Synchronous read: the ack closed the breaker before the async rung
+    // replaces the disposed agent slot.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ breakerOpen: false });
+    await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
+    h.dispose();
+  });
   it('grants the decision-authorized act-band restart: unattended respawn without any human ack', async () => {
     const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) => {
       const fallback = deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled');

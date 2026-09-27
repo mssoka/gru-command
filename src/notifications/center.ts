@@ -155,6 +155,16 @@ export class NotificationCenter {
       input.dedupe === 'all' ? 'any' : input.dedupe,
     );
     if (existing !== null) {
+      // A routing mismatch must not strand an owner-held stop (gh-97): an
+      // UNACKED machine row is not owner-Ack-able (ledger.ackNotification
+      // throws for action-required), so honoring the requested owner routing
+      // means a FRESH row — it rings the bell and re-arms the breaker through
+      // the ack chain. The legacy row stays machine-held for Gru triage:
+      // never migrated, auto-acked, resolved, or grandfathered into FOR YOU.
+      // Same-routing hits and previously ACKED rows still reuse the old ID.
+      if (input.routing === 'needs-owner' && existing.routing !== 'needs-owner' && existing.ackedAt === null) {
+        return this.post(input);
+      }
       // Do not grandfather an old machine row into FOR YOU merely because
       // a newer post of the same kind is owner-held. Gru triages the old ID.
       return existing;
