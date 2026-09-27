@@ -1,8 +1,8 @@
-import { createPrivateKey, createSign } from 'node:crypto';
+import { createHash, createPrivateKey, createSign } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { PrIdentity, VerdictPoster } from './perkins.js';
-import { AutoVerdictPoster, GhPrPoster } from './perkins.js';
+import type { PostedReviewReceipt, PrIdentity, VerdictPoster, VerdictPosterInput } from './perkins.js';
+import { AutoVerdictPoster, GhPrPoster, verifyPostedReceipt } from './perkins.js';
 import { repoRemote } from './review-path.js';
 
 /**
@@ -301,6 +301,11 @@ function base64urlJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value), 'utf-8').toString('base64url');
 }
 
+/** Same body digest the provider receipts bind to (sha256, UTF-8). */
+function receiptDigest(body: string): string {
+  return createHash('sha256').update(body, 'utf8').digest('hex');
+}
+
 /** Mint the App JWT GitHub requires: RS256, iss = app id, ≤ 10 minutes. */
 function mintAppJwt(appId: number, privateKeyPem: string, nowMs: number): string {
   const iat = Math.floor(nowMs / 1_000) - 60;
@@ -382,16 +387,20 @@ interface ProviderReview {
  * during this round: author login+type, event state, frozen head,
  * byte-identical body, and a submission time inside the round's window —
  * an older round's identical bytes are never credited as this delivery. */
-function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number): boolean {
-  const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
-  return review.user?.login === botLogin &&
+function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
+  const base = review.user?.login === botLogin &&
     review.user?.type === 'Bot' &&
     review.state === 'COMMENTED' &&
     review.commit_id === targetSha &&
     review.body === body &&
-    typeof review.id === 'number' &&
-    Number.isFinite(submittedAt) &&
-    submittedAt >= notBeforeMs;
+    typeof review.id === 'number';
+  if (!base) return false;
+  // With a recency bound (the ambiguous-POST path), only submissions from
+  // this round's window count; null (the idempotent recovery seam) matches
+  // any identical publication.
+  if (notBeforeMs === null) return true;
+  const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
+  return Number.isFinite(submittedAt) && submittedAt >= notBeforeMs;
 }
 
 /** GitHub error bodies/markers that mean rate limiting, not permission. */
@@ -427,14 +436,86 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     this.maxReconciliationPages = options.maxReconciliationPages ?? 3;
   }
 
-  async post(input: {
-    readonly prUrl: string;
-    readonly host: string;
-    readonly repoPath: string;
-    readonly body: string;
-    readonly targetSha: string;
+  async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
+    const { grant, botLogin, owner, repo, prNumber, headSha, baseSha } = await this.prepare(input);
+    const postStartMs = this.now();
+    let review: unknown;
+    try {
+      review = (await this.callApi('POST review delivery', `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
+        method: 'POST',
+        headers: this.bearerHeaders(grant.token),
+        body: JSON.stringify({ body: input.body, event: 'COMMENT', commit_id: input.targetSha }),
+        signal: AbortSignal.timeout(this.postTimeoutMs),
+      })).body;
+    } catch (error) {
+      // Only a 4xx is the provider's definitive refusal — no review exists;
+      // the rejection surfaces directly (a rate-limit refusal says so by
+      // name). Anything else (a 3xx that slipped past redirect refusal,
+      // network loss after send, an unreadable response, 5xx) leaves the
+      // outcome genuinely unknown: bounded reconciliation only — a proved
+      // match credits the delivery, anything else stays an explicit
+      // failure. Never a second POST.
+      if (error instanceof PerkinsAppHttpError && error.status >= 400 && error.status < 500) {
+        if ((error.status === 403 || error.status === 429) && providerIndicatesRateLimit(error)) {
+          throw new PerkinsAppError(
+            `review POST refused with HTTP ${error.status} — GitHub rate limiting (${error.providerMessage}); the provider created no review; wait for the window to reset before the next round — no retry was attempted`,
+          );
+        }
+        throw error;
+      }
+      return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, baseSha, error, postStartMs);
+    }
+    try {
+      return verifyPostedReceipt(
+        this.receiptFromReview(review, botLogin, input.targetSha, headSha, baseSha, input.body),
+        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+      );
+    } catch (error) {
+      if (error instanceof PerkinsAppError) {
+        // A 2xx whose receipt cannot be proved (foreign author, enacted
+        // event, wrong commit, mismatched or unreadable body) leaves the
+        // delivery identity ambiguous — the same bounded reconciliation
+        // decides it, never a blind retry.
+        return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, baseSha, error, postStartMs);
+      }
+      throw error;
+    }
+  }
+
+  /** Idempotent recovery lookup (the VerdictPoster seam): find an
+   * already-published App review for this exact head whose body digest
+   * matches — read-only, never creates anything. `null` is returned ONLY
+   * when the bounded walk provably covered the whole review list; an
+   * exhausted window without that proof is an UNRESOLVED error, never
+   * proof of absence. */
+  async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
+    const { grant, botLogin, owner, repo, prNumber, baseSha } = await this.prepare(input);
+    const { matched, provablyAbsent } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, null);
+    if (matched !== null) {
+      return verifyPostedReceipt(
+        this.receiptFromReview(matched, botLogin, input.targetSha, input.targetSha, baseSha, input.body),
+        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+      );
+    }
+    if (provablyAbsent) return null;
+    throw new PerkinsAppError(
+      `review reconciliation exceeded its ${this.maxReconciliationPages}-page lookup bound without exhausting the review list; delivery stays unresolved — verify manually before any retry, never assume absence`,
+    );
+  }
+
+  /** The shared pre-delivery chain (both post and reconcile are held to
+   * the same standard): host binding, URL/origin validation, bundle load,
+   * owner installation mapping, least-scope token mint, App identity
+   * proof, and the live PR head check. */
+  private async prepare(input: VerdictPosterInput): Promise<{
+    readonly grant: TokenGrant;
+    readonly botLogin: string;
+    readonly owner: string;
+    readonly repo: string;
+    readonly prNumber: string;
+    readonly headSha: string;
     readonly baseSha: string;
-  }): Promise<PrIdentity> {
+  }> {
     if (input.host !== 'github.com') {
       throw new PerkinsAppError(
         `Perkins App publication is configured, but host "${input.host}" is not github.com — the App's credentials are bound to api.github.com and are never used for other hosts; github.com is the only GitHub host supported while the bundle is installed. Remove the App bundle to restore the legacy publisher for this host, or escalate an explicit publisher decision`,
@@ -478,44 +559,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     const grant = await this.mintInstallationToken(jwt, installationId, owner, repo, nowMs);
     const botLogin = await this.verifyAppIdentity(jwt, config.appId);
     const { headSha, baseSha } = await this.verifyPullRequest(grant, owner, repo, prNumber, input.targetSha);
-
-    const postStartMs = this.now();
-    let review: unknown;
-    try {
-      review = (await this.callApi('POST review delivery', `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
-        method: 'POST',
-        headers: this.bearerHeaders(grant.token),
-        body: JSON.stringify({ body: input.body, event: 'COMMENT', commit_id: input.targetSha }),
-        signal: AbortSignal.timeout(this.postTimeoutMs),
-      })).body;
-    } catch (error) {
-      // Only a 4xx is the provider's definitive refusal — no review exists;
-      // the rejection surfaces directly (a rate-limit refusal says so by
-      // name). Anything else (a 3xx that slipped past redirect refusal,
-      // network loss after send, an unreadable response, 5xx) leaves the
-      // outcome genuinely unknown: bounded reconciliation only — a proved
-      // match credits the delivery, anything else stays an explicit
-      // failure. Never a second POST.
-      if (error instanceof PerkinsAppHttpError && error.status >= 400 && error.status < 500) {
-        if ((error.status === 403 || error.status === 429) && providerIndicatesRateLimit(error)) {
-          throw new PerkinsAppError(
-            `review POST refused with HTTP ${error.status} — GitHub rate limiting (${error.providerMessage}); the provider created no review; wait for the window to reset before the next round — no retry was attempted`,
-          );
-        }
-        throw error;
-      }
-      const reconciled = await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, baseSha, error, postStartMs);
-      return reconciled;
-    }
-    try {
-      this.verifyReviewAuthor(review, botLogin, input.targetSha);
-    } catch (error) {
-      // A 2xx whose receipt cannot be proved (foreign author, wrong commit,
-      // an unreadable body) leaves the delivery identity ambiguous — the
-      // same bounded reconciliation decides it, never a blind retry.
-      return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, baseSha, error, postStartMs);
-    }
-    return { headSha, baseSha };
+    return { grant, botLogin, owner, repo, prNumber, headSha, baseSha };
   }
 
   private bearerHeaders(token: string): Record<string, string> {
@@ -672,8 +716,21 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     return { headSha, baseSha };
   }
 
-  private verifyReviewAuthor(review: unknown, botLogin: string, targetSha: string): void {
-    const parsed = review as { id?: unknown; user?: { login?: unknown; type?: unknown }; commit_id?: unknown } | null;
+  /** Parse the provider's review object into a PostedReviewReceipt,
+   * proving on the way: the author is the verified App bot (a Bot), the
+   * enacted event is COMMENTED, the provider bound the review to the
+   * reviewed commit, and the echoed body is byte-identical to what this
+   * delivery published. Any failure throws — the delivery identity stays
+   * unproven. */
+  private receiptFromReview(
+    review: unknown,
+    botLogin: string,
+    targetSha: string,
+    headSha: string,
+    baseSha: string,
+    publishedBody: string,
+  ): PostedReviewReceipt {
+    const parsed = review as { id?: unknown; user?: { login?: unknown; type?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown } | null;
     const reviewId = typeof parsed?.id === 'number' ? String(parsed.id) : 'unknown';
     const loginText = typeof parsed?.user?.login === 'string' ? parsed.user.login : '<absent>';
     const typeText = typeof parsed?.user?.type === 'string' ? parsed.user.type : '<absent>';
@@ -682,11 +739,31 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         `review publication identity mismatch: provider review ${reviewId} is authored by ${sanitize(loginText)} (${sanitize(typeText)}), expected the verified App bot ${botLogin} — delivery identity is unproven`,
       );
     }
+    if (parsed?.state !== 'COMMENTED') {
+      throw new PerkinsAppError(
+        `review publication state mismatch: provider review ${reviewId} enacted ${parsed?.state === undefined || parsed?.state === null ? '(none)' : sanitize(String(parsed?.state))} instead of COMMENTED — delivery identity is unproven`,
+      );
+    }
     if (parsed?.commit_id !== targetSha) {
       throw new PerkinsAppError(
         `review publication receipt mismatch: provider review ${reviewId} committed to ${sanitize(String(parsed?.commit_id))}, expected ${targetSha}`,
       );
     }
+    const echoedBody = typeof parsed?.body === 'string' ? parsed.body : null;
+    if (echoedBody === null || receiptDigest(echoedBody) !== receiptDigest(publishedBody)) {
+      throw new PerkinsAppError(
+        `review publication body mismatch: provider review ${reviewId} echoed a body whose digest does not match the published body — delivery identity is unproven`,
+      );
+    }
+    return {
+      reviewId,
+      actor: botLogin,
+      event: 'COMMENTED',
+      commitId: parsed?.commit_id ?? null,
+      headSha,
+      baseSha,
+      bodySha256: receiptDigest(echoedBody),
+    };
   }
 
   /** Parse the last page number out of a GitHub Link header, if present. */
@@ -698,15 +775,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     return page === null ? null : Number(page[1]);
   }
 
-  /** Bounded ambiguous-POST reconciliation: consult a bounded window of the
-   * provider's review list for OUR bot's byte-identical COMMENT review on
-   * the exact frozen head, submitted at or after this round's POST. GitHub
-   * lists reviews oldest-first and the review being reconciled is the
-   * newest, so once the Link header reveals the last page the window jumps
-   * there and then walks backward (without a Link header the walk stays
-   * sequential). A proved match is the delivery receipt; an exhausted
-   * lookup, a failing or malformed lookup, or a foreign author with the
-   * same bytes is NEVER absence — the delivery stays explicitly unproven. */
+  /** Bounded ambiguous-POST reconciliation (the delivery path): a bounded
+   * walk of the provider's review list for OUR bot's byte-identical
+   * COMMENT review on the exact frozen head, submitted in this round's
+   * window. A proved match is the delivery receipt; a fully-covered list
+   * with no match PROVES the POST did not land; anything less stays an
+   * explicit unproven failure. Never a second POST. */
   private async reconcileAmbiguousPost(
     grant: TokenGrant,
     owner: string,
@@ -718,7 +792,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     baseSha: string,
     cause: unknown,
     postStartMs: number,
-  ): Promise<PrIdentity> {
+  ): Promise<PostedReviewReceipt> {
     const causeText = cause instanceof Error ? sanitize(cause.message) : 'network error';
     const unproven = (what: string): PerkinsAppError => new PerkinsAppError(
       `review POST outcome is ambiguous (${causeText}) and ${what} — delivery stays unproven; the review was NOT re-posted. Resolve the pull request manually before retrying (expected author ${botLogin} on head ${targetSha}; the round's publication body is in the review artifact report).`,
@@ -726,53 +800,88 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // Skew margin only: the review this round may have created was submitted
     // after the POST began; anything older is another round's bytes.
     const notBeforeMs = postStartMs - 60_000;
+    let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean };
+    try {
+      walked = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, targetSha, body, notBeforeMs);
+    } catch (lookupError) {
+      throw unproven(
+        `the bounded proof lookup itself failed (${lookupError instanceof Error ? sanitize(lookupError.message) : 'lookup error'})`,
+      );
+    }
+    if (walked.matched !== null) {
+      return verifyPostedReceipt(
+        this.receiptFromReview(walked.matched, botLogin, targetSha, targetSha, baseSha, body),
+        { targetSha, bodySha256: receiptDigest(body) },
+      );
+    }
+    if (walked.provablyAbsent) {
+      throw new PerkinsAppError(
+        `review POST outcome is ambiguous (${causeText}) but the bounded lookup covered the whole review list and proved no matching App review from this round exists — the POST did not land; the review was NOT re-posted. A retry on a NEW frozen head is safe.`,
+      );
+    }
+    throw unproven('no provider-proved matching App review was found in the bounded lookup');
+  }
+
+  /** Shared bounded review-list walk. GitHub lists reviews oldest-first
+   * and the review being reconciled is the newest, so once the Link
+   * header reveals the last page the window jumps there and then walks
+   * backward (without a Link header the walk stays sequential).
+   * `notBeforeMs` bounds credit to this round's submissions when given;
+   * null matches any identical publication (the idempotent recovery
+   * seam). `provablyAbsent` is true ONLY when the walk provably covered
+   * the ENTIRE review list; lookup failures and malformed bodies throw —
+   * they are never absence. */
+  private async lookupMatchingReview(
+    grant: TokenGrant,
+    owner: string,
+    repo: string,
+    prNumber: string,
+    botLogin: string,
+    targetSha: string,
+    body: string,
+    notBeforeMs: number | null,
+  ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean }> {
     const visited = new Set<number>();
     let lastPage: number | null = null;
     let page = 1;
+    let sequentialEnd = false;
     for (let fetched = 0; fetched < this.maxReconciliationPages; fetched += 1) {
       visited.add(page);
-      let list: unknown;
       let linkHeader: string | null = null;
-      try {
-        const result = await this.callApi(
-          'review reconciliation',
-          `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`,
-          { headers: this.bearerHeaders(grant.token), signal: AbortSignal.timeout(this.probeTimeoutMs) },
-        );
-        list = result.body;
-        linkHeader = result.header('link');
-      } catch (lookupError) {
-        // A failing lookup is NEVER absence — the ambiguity stands, stated
-        // explicitly so nobody concludes "nothing was delivered" and
-        // re-posts.
-        throw unproven(
-          `the bounded proof lookup itself failed (${lookupError instanceof Error ? sanitize(lookupError.message) : 'lookup error'})`,
-        );
-      }
+      const result = await this.callApi(
+        'review reconciliation',
+        `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`,
+        { headers: this.bearerHeaders(grant.token), signal: AbortSignal.timeout(this.probeTimeoutMs) },
+      );
+      const list = result.body;
+      linkHeader = result.header('link');
       if (lastPage === null) lastPage = this.parseLastPage(linkHeader);
       if (!Array.isArray(list)) {
         // Never report "searched and not found" when no usable list was read.
-        throw unproven('the bounded proof lookup returned a malformed list body');
+        throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
       const reviews = list as readonly ProviderReview[];
       const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, notBeforeMs));
       if (match !== undefined) {
-        return { headSha: targetSha, baseSha };
+        return { matched: match, provablyAbsent: false };
       }
-      if (reviews.length === 0) break;
       let next: number;
       if (lastPage !== null) {
         // Jump to the newest page first, then walk backward through it.
         next = page < lastPage ? lastPage : page - 1;
       } else {
         // No Link header: the classic short-page end-of-list heuristic.
-        if (reviews.length < 100) break;
+        if (reviews.length < 100) {
+          sequentialEnd = true;
+          break;
+        }
         next = page + 1;
       }
       if (next < 1 || visited.has(next)) break;
       page = next;
     }
-    throw unproven('no provider-proved matching App review was found in the bounded lookup');
+    const provablyAbsent = lastPage !== null ? visited.size >= lastPage : sequentialEnd;
+    return { matched: null, provablyAbsent };
   }
 }
 

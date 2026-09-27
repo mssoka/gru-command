@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { createVerify, generateKeyPairSync } from 'node:crypto';
+import { createHash, createVerify, generateKeyPairSync } from 'node:crypto';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -386,12 +386,15 @@ describe('startup poster selection (the seam main wires)', () => {
       const stub: VerdictPoster = {
         post: async (input) => {
           routed.push(input.prUrl);
-          return { headSha: input.targetSha, baseSha: input.baseSha };
+          return { headSha: input.targetSha, baseSha: input.baseSha, reviewId: 'github-stub', actor: 'github-stub', event: 'COMMENTED', commitId: null, bodySha256: 'github-stub' };
         },
       };
       const auto = createStartupVerdictPoster({ instanceDir: emptyHome }, { githubPosterOverride: stub });
       await expect(auto.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-        .resolves.toEqual({ headSha: HEAD, baseSha: BASE });
+        .resolves.toEqual({
+          headSha: HEAD, baseSha: BASE, reviewId: 'github-stub', actor: 'github-stub',
+          event: 'COMMENTED', commitId: null, bodySha256: 'github-stub',
+        });
       expect(routed).toEqual([PR_INPUT.prUrl]);
     } finally {
       rmSync(emptyHome, { recursive: true, force: true });
@@ -409,14 +412,14 @@ describe('startup poster selection (the seam main wires)', () => {
     expect(legs.github).toBeInstanceOf(PerkinsAppPrPoster);
     // The wired composite delivers a github.com round through the App.
     await expect(auto.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .resolves.toEqual({ headSha: HEAD, baseSha: BASE });
+      .resolves.toEqual(RECEIPT);
     expect(api.calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
     // The router still hands GitLab URLs to the GitLab leg, never the App.
     const gitlabCalls: string[] = [];
     const router = new AutoVerdictPoster(legs.github, {
       post: async (input) => {
         gitlabCalls.push(input.prUrl);
-        return { headSha: input.targetSha, baseSha: input.baseSha };
+        return { headSha: input.targetSha, baseSha: input.baseSha, reviewId: 'gitlab-stub', actor: 'gitlab-stub', event: 'note', commitId: null, bodySha256: 'gitlab-stub' };
       },
     });
     await router.post({
@@ -506,7 +509,7 @@ describe('App publication happy path', () => {
     const fixture = bundleFixture();
     const { poster, calls } = posterWith(fixture);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .resolves.toEqual({ headSha: HEAD, baseSha: BASE });
+      .resolves.toEqual(RECEIPT);
 
     // Sequence: mint token -> prove App identity -> prove PR head -> POST review.
     expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
@@ -784,7 +787,7 @@ describe('post-publication identity proof', () => {
     expect(error).toBeInstanceOf(PerkinsAppError);
     expect(error?.message ?? '').toMatch(/identity mismatch/u);
     expect(error?.message ?? '').toMatch(/provider review 1/u);
-    expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+    expect(error?.message ?? '').toMatch(/NOT re-posted/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
@@ -796,7 +799,7 @@ describe('post-publication identity proof', () => {
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .resolves.toEqual({ headSha: HEAD, baseSha: BASE });
+      .resolves.toEqual(RECEIPT);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
@@ -809,7 +812,7 @@ describe('post-publication identity proof', () => {
     ]);
     const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
     expect(error?.message ?? '').toMatch(/receipt mismatch/u);
-    expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+    expect(error?.message ?? '').toMatch(/NOT re-posted/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 });
@@ -827,6 +830,18 @@ const MATCHING_REVIEW = {
   submitted_at: new Date(NOW + 60_000).toISOString(),
 };
 
+const BODY_SHA = createHash('sha256').update('review body\n', 'utf8').digest('hex');
+/** The PostedReviewReceipt a successful delivery of PR_INPUT resolves to. */
+const RECEIPT = {
+  headSha: HEAD,
+  baseSha: BASE,
+  reviewId: '987654',
+  actor: 'perkins-review[bot]',
+  event: 'COMMENTED',
+  commitId: HEAD,
+  bodySha256: BODY_SHA,
+} as const;
+
 describe('bounded ambiguous-POST reconciliation', () => {
   it('credits a provider-proved matching App review without a second POST', async () => {
     const fixture = bundleFixture();
@@ -835,7 +850,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .resolves.toEqual({ headSha: HEAD, baseSha: BASE });
+      .resolves.toEqual(RECEIPT);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(1);
   });
@@ -848,7 +863,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [foreignAuthor] }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .rejects.toThrow(/delivery stays unproven/u);
+      .rejects.toThrow(/NOT re-posted/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
@@ -859,7 +874,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [] }) },
     ]);
     await expect(emptyList.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .rejects.toThrow(/delivery stays unproven/u);
+      .rejects.toThrow(/did not land/u);
     expect(emptyList.calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
 
     const lookupError = posterWith(fixture, [
@@ -878,7 +893,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .resolves.toEqual({ headSha: HEAD, baseSha: BASE });
+      .resolves.toEqual(RECEIPT);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
@@ -899,7 +914,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .resolves.toEqual({ headSha: HEAD, baseSha: BASE });
+      .resolves.toEqual(RECEIPT);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(2);
   });
@@ -977,7 +992,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .resolves.toEqual({ headSha: HEAD, baseSha: BASE });
+      .resolves.toEqual(RECEIPT);
     const pages = calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?')).map((call) => /[?&]page=(\d+)/u.exec(call.url)?.[1]);
     expect(pages).toEqual(['1', '3']);
   });
@@ -1007,7 +1022,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       },
     ], { maxReconciliationPages: 3 });
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .resolves.toEqual({ headSha: HEAD, baseSha: BASE });
+      .resolves.toEqual(RECEIPT);
     const pages = calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?')).map((call) => /[?&]page=(\d+)/u.exec(call.url)?.[1]);
     expect(pages).toEqual(['1', '3', '2']);
   });
@@ -1031,7 +1046,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [stale] }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .rejects.toThrow(/delivery stays unproven/u);
+      .rejects.toThrow(/NOT re-posted/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
@@ -1043,7 +1058,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
     ]);
     const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
     expect(error?.message ?? '').toMatch(/<absent>/u);
-    expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+    expect(error?.message ?? '').toMatch(/NOT re-posted/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
@@ -1054,7 +1069,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [] }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .rejects.toThrow(/delivery stays unproven/u);
+      .rejects.toThrow(/NOT re-posted/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
     for (const call of calls) {
       expect(call.url.startsWith('https://api.github.com/')).toBe(true);
@@ -1069,14 +1084,14 @@ describe('bounded ambiguous-POST reconciliation', () => {
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
     ]);
     await expect(credited.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .resolves.toEqual({ headSha: HEAD, baseSha: BASE });
+      .resolves.toEqual(RECEIPT);
 
     const unproven = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => ({ status: 200, rawText: '<html>gateway replaced the response</html>' }) },
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [] }) },
     ]);
     await expect(unproven.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .rejects.toThrow(/delivery stays unproven/u);
+      .rejects.toThrow(/NOT re-posted/u);
     expect(unproven.calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
@@ -1105,6 +1120,124 @@ describe('bounded ambiguous-POST reconciliation', () => {
     // A definitive refusal: still no reconciliation lookup, no retry.
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(0);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Provider receipt discipline (PostedReviewReceipt contract)
+// ---------------------------------------------------------------------------
+
+describe('provider receipt discipline', () => {
+  it('rejects a 2xx whose enacted state is not COMMENTED, through bounded reconciliation', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/reviews$/,
+        handler: async () => ({ status: 200, body: { id: 5, user: { login: 'perkins-review[bot]', type: 'Bot' }, state: 'APPROVED', commit_id: HEAD, body: 'review body\n' } }),
+      },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [] }) },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toMatch(/state mismatch/u);
+    expect(error?.message ?? '').toMatch(/NOT re-posted/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('rejects a 2xx whose echoed body digest differs, through bounded reconciliation', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/reviews$/,
+        handler: async () => ({ status: 200, body: { id: 6, user: { login: 'perkins-review[bot]', type: 'Bot' }, state: 'COMMENTED', commit_id: HEAD, body: 'tampered body\n' } }),
+      },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [] }) },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toMatch(/body mismatch/u);
+    // The empty review list proves the POST did not land; either way the
+    // review was never re-posted.
+    expect(error?.message ?? '').toMatch(/NOT re-posted/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idempotent recovery reconciliation (the VerdictPoster.reconcile seam)
+// ---------------------------------------------------------------------------
+
+describe('idempotent recovery reconciliation', () => {
+  it('returns the provider-proved receipt for an existing matching App review, without any POST', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+    ]);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .resolves.toEqual(RECEIPT);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+  });
+
+  it('returns null only when the bounded walk provably covered the whole review list', async () => {
+    const fixture = bundleFixture();
+    const foreignPage = Array.from({ length: 100 }, (_, index) => ({
+      id: 6000 + index,
+      user: { login: 'other-user', type: 'User' },
+      commit_id: HEAD,
+      state: 'COMMENTED',
+      body: 'review body\n',
+    }));
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => {
+          const page = Number(/[?&]page=(\d+)/u.exec(call.url)?.[1] ?? '1');
+          const links = [`<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${Math.min(page + 1, 3)}>; rel="next"`];
+          if (page > 1) links.push(`<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${page - 1}>; rel="prev"`);
+          links.push('<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=3>; rel="last"');
+          return { status: 200, body: foreignPage, headers: { link: links.join(', ') } };
+        },
+      },
+    ]);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .resolves.toBeNull();
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(3);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+  });
+
+  it('throws unresolved when the bounded window cannot cover the review list', async () => {
+    const fixture = bundleFixture();
+    const foreignPage = Array.from({ length: 100 }, (_, index) => ({
+      id: 7000 + index,
+      user: { login: 'other-user', type: 'User' },
+      commit_id: HEAD,
+      state: 'COMMENTED',
+      body: 'review body\n',
+    }));
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => {
+          const page = Number(/[?&]page=(\d+)/u.exec(call.url)?.[1] ?? '1');
+          const links = [`<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${Math.min(page + 1, 5)}>; rel="next"`];
+          if (page > 1) links.push(`<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${page - 1}>; rel="prev"`);
+          links.push('<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=5>; rel="last"');
+          return { status: 200, body: foreignPage, headers: { link: links.join(', ') } };
+        },
+      },
+    ]);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/delivery stays unresolved/u);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(3);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+  });
+
+  it('refuses non-github.com hosts in reconcile exactly like post', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture);
+    await expect(poster.reconcile?.({
+      ...PR_INPUT, repoPath: repoPathOf(fixture),
+      prUrl: 'https://ghe.corp.example/acme/widget/pull/7', host: 'ghe.corp.example',
+    })).rejects.toThrow(/not github\.com/u);
+    expect(calls).toHaveLength(0);
   });
 });
 
