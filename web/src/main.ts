@@ -17,7 +17,7 @@ import { clearBanner, showBanner } from './ui/banner.js';
 import { ChatView, renderConnectionDot } from './ui/chat.js';
 import { BoardView } from './ui/board.js';
 import { CommandBar, renderChatOnline } from './ui/command-bar.js';
-import { ConsoleShell, CONSOLE_QUERY, type ChatPaneHandle } from './ui/console.js';
+import { ConsoleShell, type ChatPaneHandle } from './ui/console.js';
 import { RailTabs } from './ui/rail-tabs.js';
 import { SplitterController } from './ui/splitters.js';
 import { ToastStack } from './ui/toast.js';
@@ -141,7 +141,7 @@ const splitterController = new SplitterController({
   storage,
 });
 
-// The agents rail's AGENTS / TRANSCRIPTS tabs (v6).
+// The agents rail's CREW / TRANSCRIPTS tabs (v6).
 new RailTabs(mustGet('agents-rail'));
 
 /** Keep the ticker's layout segment and the splitter bounds in step with
@@ -160,10 +160,10 @@ window.addEventListener('resize', syncCockpit);
 // At/above 1100px the estate is the cockpit — chat | board | agents-rail
 // with drag splitters — and the FAB toggles the chat pane; below it the
 // board carries the page and the FAB opens the chat overlay (SPEC ruling
-// 11's dashboard-first stance, extended to laptop widths).
+// 11's dashboard-first stance, extended to laptop widths). The command
+// bar carries no lens toggle (v6.1): the chat pane is always docked on
+// desktop, the board is always on the page, and the FAB owns mobile chat.
 // ---------------------------------------------------------------------
-
-const consoleQuery = window.matchMedia(CONSOLE_QUERY);
 
 /** The shell drives the chat through this handle; the view is created at
  * pair time, so before that every call is a no-op. */
@@ -174,7 +174,9 @@ const chatPaneHandle: ChatPaneHandle = {
   setPaneCollapsed: (collapsed) => chatView?.setPaneCollapsed(collapsed),
 };
 
-const consoleShell = new ConsoleShell({
+// The shell owns the FAB/rail/collapse gestures itself; main only
+// constructs it (the chat view is handed over through the handle above).
+new ConsoleShell({
   root: mustGet('console'),
   fab: mustGet<HTMLButtonElement>('gru-fab'),
   rail: mustGet<HTMLButtonElement>('chat-rail'),
@@ -191,37 +193,6 @@ function showPairing(): void {
   mustGet('board-view').hidden = true;
   mustGet('gru-fab').hidden = true;
 }
-
-type ViewId = 'chat' | 'board';
-
-function setActiveTab(id: ViewId): void {
-  mustGet('tab-chat').classList.toggle('command-bar__tab--active', id === 'chat');
-  mustGet('tab-board').classList.toggle('command-bar__tab--active', id === 'board');
-  commandBar.setView(id);
-}
-
-/** Nav Chat: console focuses the pane; below it the sheet opens. */
-function focusChat(): void {
-  setActiveTab('chat');
-  if (consoleQuery.matches) {
-    consoleShell.setCollapsed(false);
-    chatView?.focusComposer();
-  } else {
-    chatView?.openSheet();
-  }
-}
-
-/** Nav Board: the board is always on the page; this dismisses the
- * overlay when one is open and marks the board tab. */
-function focusBoard(): void {
-  setActiveTab('board');
-  chatView?.closeSheet();
-}
-
-mustGet<HTMLButtonElement>('tab-chat').addEventListener('click', () => focusChat());
-mustGet<HTMLButtonElement>('tab-board').addEventListener('click', () => focusBoard());
-// Board-first below the console breakpoint; chat-first on the console.
-setActiveTab(consoleQuery.matches ? 'chat' : 'board');
 
 function onConnection(state: ConnectionState): void {
   renderConnectionDot(state);
