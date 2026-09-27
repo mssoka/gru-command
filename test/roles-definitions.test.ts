@@ -56,6 +56,9 @@ describe('role definitions (E8)', () => {
       'bmad-review',
       'never a silent downgrade',
     ]) expect(silas).toContain(clause);
+    expect(silas).toContain('never\nmerge');
+    expect(silas).toContain('service-restart clean abort');
+    expect(silas).toContain('owner-held');
   });
 
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {

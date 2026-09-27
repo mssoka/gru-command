@@ -216,7 +216,10 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     const events = h.ledger.listEvents({ limit: 100 });
     expect(events.some((e) => e.kind === 'job.handoff')).toBe(true);
     expect(events.some((e) => e.kind === 'job.minion-spawned')).toBe(true);
-    expect(events.some((e) => e.kind === 'job.delivered')).toBe(true);
+    const delivered = events.find((e) => e.kind === 'job.delivered');
+    expect(delivered?.payload).toMatchObject({ agentId: outcome.agentId, source: 'dispatch',
+      sha: execFileSync('git', ['rev-parse', outcome.worktree.branch!], { cwd: outcome.worktree.path, encoding: 'utf8' }).trim(),
+    });
     const agentRow = h.ledger.getAgent(outcome.agentId);
     expect(agentRow?.jobId).toBe('widget-polish');
     expect(agentRow?.role).toBe('minion');

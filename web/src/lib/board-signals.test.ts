@@ -72,6 +72,8 @@ function snapshot(overrides: Partial<BoardSnapshot> = {}): BoardSnapshot {
       generation: 0,
     },
     unackedActionRequired: 0,
+    unackedNeedsOwner: 0,
+    wakes: { count: 0, lastAt: null },
     ...overrides,
   };
 }
@@ -187,9 +189,9 @@ describe('jobSignal', () => {
 
   it('leads with unacked action-required and keeps the live round visible', () => {
     const signal = jobSignal(job({ rounds: [round({ seq: 2, status: 'live' })] }), 1);
-    expect(signal?.label).toBe('🔔 1 action-required · ◉ round 2 · live · 0/0');
+    expect(signal?.label).toBe('🛠 1 needs Gru · ◉ round 2 · live · 0/0');
     expect(signal?.tone).toBe('alert');
-    expect(signal?.title).toContain('1 notification awaiting ack');
+    expect(signal?.title).toContain('1 machine-attention notification awaiting Gru disposition');
   });
 });
 
@@ -203,9 +205,9 @@ describe('jobSignal — v5 stale review pills on concluded cards', () => {
     expect(jobSignal(job({ status: 'in-review', rounds: [round({ seq: 2, status: 'live' })] }), 0)?.label).toContain('live');
   });
 
-  it('keeps attention pills that explain why a concluded card needs you', () => {
+  it('keeps attention pills that explain why a concluded card needs Gru', () => {
     const unacked = jobSignal(job({ status: 'merged' }), 2);
-    expect(unacked?.label).toBe('🔔 2 action-required');
+    expect(unacked?.label).toBe('🛠 2 needs Gru');
     const aborted = jobSignal(job({ status: 'done', rounds: [round({ seq: 3, status: 'aborted' })] }), 0);
     expect(aborted?.label).toBe('⛔ round 3 aborted');
     const failed = jobSignal(

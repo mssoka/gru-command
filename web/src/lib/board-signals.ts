@@ -80,8 +80,8 @@ export function jobSignal(job: JobView, unackedActionRequired: number): JobSigna
   let attention = false;
 
   if (unackedActionRequired > 0) {
-    parts.push(`🔔 ${unackedActionRequired} action-required`);
-    details.push(`${pluralCount(unackedActionRequired, 'notification')} awaiting ack`);
+    parts.push(`🛠 ${unackedActionRequired} needs Gru`);
+    details.push(`${pluralCount(unackedActionRequired, 'machine-attention notification')} awaiting Gru disposition`);
     attention = true;
   }
 

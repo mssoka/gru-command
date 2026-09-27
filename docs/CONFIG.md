@@ -201,15 +201,24 @@ keep = 5
 # gru.frames.jsonl rotation; reconnect replay spans retained shards.
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
-# Gru awareness wake policy. "never" (default) injects action-required
-# escalations and a compact ledger digest into the NEXT Gru turn passively
-# — no model turn runs by itself, so it adds no turn cost. Wake modes
-# start a Gru turn when a notification lands: "action-required" only for
-# action-required notifications; "all" for every notification (FYI
-# included). Each wake is a full model turn (provider tokens + latency),
-# so it costs whenever the lane is noisy. Wakes never acknowledge
-# anything: the human still holds every ack.
-notify_wake = "never"
+# Gru awareness wake policy. Wakes OPEN a Gru turn so a critical alert
+# is acted on without the user pinging. "action-required" (default) wakes
+# for machine-attention rows; "all" also for FYI/needs-owner; "never"
+# injects context passively before the next turn only (no autonomous
+# turn). Each wake is a full model turn (provider tokens + latency).
+notify_wake = "action-required"
+# Minimum interval between autonomous wakes; candidates inside the
+# window coalesce into ONE trailing wake. 0 disables the cap.
+wake_min_interval_ms = 300000
+# Severity floor for a wake: "info" wakes for every routed row,
+# "error" only for error-severity rows.
+wake_min_severity = "info"
+# Local-time quiet window ("HH:MM-HH:MM", may wrap midnight); wakes
+# inside it defer to the window end. Empty string = off.
+wake_quiet_hours = ""
+# First delivered block after this much quiet time carries a "while you
+# were away" digest (wakes, actions, merges, staged PRs). 0 disables it.
+morning_digest_gap_ms = 28800000
 
 [worktrees]
 # Job/review worktree roots follow data_dir by default; uncomment only to relocate.
