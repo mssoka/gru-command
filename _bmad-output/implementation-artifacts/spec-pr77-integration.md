@@ -147,8 +147,18 @@ Investigation (2026-09-27, this lane):
    owner-merged main (every cited file byte-identical to 6249e98, untouched
    by PR77); ZERO target the integration delta. No loopback; 3 grouped
    defer rows appended. Review did NOT broaden into the findings backlog.
-7. [ ] **Re-resolve main, push, CI** — pending.
-8. [ ] **BLOCKED hold + delivery** — pending.
+7. [x] **Re-resolve main, push, CI** — origin/main re-resolved (still
+   6249e98, no advance) before push; normal fast-forward push
+   234b1e9..5da0224 (no force). The earlier 2540538→234b1e9 remote movement
+   was the CHIEF publishing this lane's merge commit on the owner's direct
+   "fix it now" instruction (receipts preserved in the delivery dir;
+   verified byte-identical). CI run 36314189462 on final head 5da0224:
+   completed/SUCCESS; PR OPEN, MERGEABLE, mergeState CLEAN, base 6249e98.
+8. [x] **BLOCKED hold + delivery** — `POST /api/jobs/perkins-whole-pr-review/status
+   {"status":"blocked"}` → 200; independent /api/board read-back confirms
+   `blocked` (updatedAt 2026-09-27T11:00:57.944Z). Delivery receipt + layer
+   receipts + verification logs preserved under
+   `~/.gru-command/briefings/pr77-integration-after-pr71-owner-merge-20260927-delivery/`.
 
 ## Acceptance Criteria
 
