@@ -57,7 +57,7 @@ Investigation (2026-09-27, this lane, HEAD=cea37b5, origin/main=df9fe01):
 - [x] Scheduler full verification via `POST /api/verify {job_id:"owner-chime", scope:"full"}` at a safe checkpoint (media run finished) -- required project verification through shared scheduler.
 - [x] Genuinely independent bounded BMAD delta review of `origin/main..HEAD` -- separate process/author from source; receipts recorded; findings triaged honestly (capability gaps reported, not faked).
 - [x] Normal safe push (re-verify remote hasn't advanced) + fresh exact-final-head GitHub CI green -- publication.
-- [x] Receipts under `/Users/moses/.gru-command/briefings/pr70-after68-owner-merge-20260927/delivery/` -- refs, resolution inventory, tests/exits, review identities/SHA binding, CI evidence, limitations.
+- [x] Receipts under the job briefing's delivery directory -- refs, resolution inventory, tests/exits, review identities/SHA binding, CI evidence, limitations.
 - [x] Persist job `owner-chime` = DELIVERED via status API + independent read-back -- stop source writes; Silas takes the ONE native whole-PR Perkins arm after idle.
 
 **Acceptance Criteria:**
