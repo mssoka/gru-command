@@ -51,7 +51,7 @@ context:
 - `web/src/lib/board-signals.ts`, `web/src/ui/board.ts` -- roundSummary/lensProgressLabel/jobSignal progress truth
 - `test/perkins-whole-review.test.ts`, `test/perkins-builtin-wave.test.ts`, `web/src/lib/board-signals.test.ts`, `web/src/ui/board.test.ts` -- suite homes; `test/helpers/perkins-whole-double.ts` fake lead/children
 - `src/main.ts:691-712` -- production poster wiring + startup recovery await (no change expected; verify no crash path)
-- Evidence: `/Users/moses/.gru-command/reviews/owner-independent-pr77-2bdbec1-20260926/` (review.md, triage/*, posting-receipt.json)
+- Evidence: the owner-review directory `owner-independent-pr77-2bdbec1-20260926/` recorded beside this lane's briefings (review.md, triage/*, posting-receipt.json)
 
 ## Tasks & Acceptance
 
