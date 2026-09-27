@@ -2,7 +2,7 @@
 title: 'PR68 bounded integration after owner merged PR71/PR77'
 type: 'integration'
 created: '2026-09-27'
-status: 'in-progress'
+status: 'done'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: '05f897220ba21f7b13b0737f92a9802cea46cd5a'
@@ -93,9 +93,10 @@ Investigation (2026-09-27, this lane):
    (command bar, chip rail, board bands, crew rail) via agent-browser.
 8. [x] **Independent BMAD review of the integration delta** — fresh
    layers, receipts under the delivery dir.
-9. [ ] **Push + exact-head CI + DELIVERED** — normal push, CI green on
-   pushed head, delivery receipt + status API delivered + /api/board
-   read-back; then return for branch-idle native Perkins gate.
+9. [x] **Push + exact-head CI + DELIVERED** — normal push, CI green on
+   pushed head (run 36331035751 SUCCESS at f2eabe9), delivery receipt +
+   status API delivered + /api/board read-back done; branch idle for the
+   native Perkins whole-PR gate (owner/Gru arms it).
 
 ## Acceptance Criteria
 
