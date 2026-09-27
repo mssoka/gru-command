@@ -533,41 +533,53 @@ export class WorktreeManager {
     repoPath: string,
     ref: string,
   ): { sha: string; baseSource: WorktreeBaseSource | null } {
-    const symbolic = spawnGit(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', ref]);
-    let fullName = symbolic.status === 0 ? symbolic.stdout.trim() : '';
     const prefix = 'refs/remotes/origin/';
-    if (fullName === '') {
-      // Not locally known — but the SPELLING may name an EXACT origin
-      // branch (origin/<branch> or refs/remotes/origin/<branch>): treat it
-      // as one and fetch (Perkins blocker: a remote-only branch must be
-      // FETCHED, not rejected as an unknown revision; a branch the remote
-      // does not have fails the fetch and refuses here). Origin-prefixed
-      // REVISION EXPRESSIONS (origin/main~1) deliberately do NOT take this
-      // path — they fall through and resolve as the named revision
-      // (Perkins R4: fetching a literal branch named "main~1" is wrong).
-      if (isExactOriginBranchSpelling(ref)) {
-        fullName = ref.startsWith('refs/remotes/origin/')
-          ? ref
-          : `refs/remotes/origin/${ref.slice('origin/'.length)}`;
-      }
-    }
-    if (fullName.startsWith(prefix) && fullName.length > prefix.length) {
-      const suffix = fullName.slice(prefix.length);
-      const branch = suffix === 'HEAD' ? this.resolveDefaultBranch(repoPath).branch : suffix;
+    const strip = /^(?:refs\/)?remotes\/origin\/|^origin\//u;
+    /** The fetch discipline one origin-branch spelling always gets. */
+    const fetchedOriginBranch = (branch: string | null, namedAs: string): {
+      sha: string;
+      baseSource: WorktreeBaseSource | null;
+    } => {
       if (branch === null) {
         throw new Error(
-          `review ref ${ref} names origin/HEAD but the origin default branch is unresolvable — ` +
+          `review ref ${namedAs} names origin/HEAD but the origin default branch is unresolvable — ` +
             'refusing to check out a possibly stale origin tip',
         );
       }
       const fetched = this.fetchOriginTip(repoPath, branch);
       if (!fetched.ok) {
         throw new Error(
-          `review ref ${ref} names origin/${branch} but fetching it fresh failed: ${fetched.detail} — ` +
+          `review ref ${namedAs} names origin/${branch} but fetching it fresh failed: ${fetched.detail} — ` +
             'refusing to check out a possibly stale origin tip; verify the remote and retry',
         );
       }
       return { sha: fetched.sha, baseSource: 'origin' };
+    };
+    // (1) An EXACT origin-branch spelling classifies FIRST (Perkins R5):
+    // git's ambiguous DWIM lets a local refs/heads/origin/topic or
+    // refs/tags/origin/topic SHADOW refs/remotes/origin/topic — the
+    // spelling would resolve to LOCAL bytes posing as the remote and pin
+    // them without a fetch. The spelling means the REMOTE branch: fetch
+    // it fresh, fail closed (origin/HEAD resolves through the default
+    // branch; origin-prefixed revision expressions like origin/main~1
+    // are NOT exact spellings and never take this path — Perkins R4).
+    if (isExactOriginBranchSpelling(ref)) {
+      const stripped = ref.replace(strip, '');
+      const branch = stripped === 'HEAD' ? this.resolveDefaultBranch(repoPath).branch : stripped;
+      return fetchedOriginBranch(branch, ref);
+    }
+    // (2) Everything else resolves locally — DWIM symbolic lookup first
+    // (a local branch, tag, or another remote's tracking ref), else the
+    // exact pin (SHAs, tags, revision expressions). Exact origin
+    // spellings never reach here; should a pathological spelling still
+    // DWIM-resolve onto an origin tracking ref, it gets the same fetch
+    // discipline — never a possibly-stale local pin.
+    const symbolic = spawnGit(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', ref]);
+    const fullName = symbolic.status === 0 ? symbolic.stdout.trim() : '';
+    if (fullName.startsWith(prefix) && fullName.length > prefix.length) {
+      const suffix = fullName.slice(prefix.length);
+      const branch = suffix === 'HEAD' ? this.resolveDefaultBranch(repoPath).branch : suffix;
+      return fetchedOriginBranch(branch, ref);
     }
     return { sha: runGit(repoPath, ['rev-parse', '--verify', `${ref}^{commit}`]), baseSource: null };
   }

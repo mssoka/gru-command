@@ -21,26 +21,48 @@ export function resolveReviewTargetReal(
   repoPath: string,
   ref: string,
 ): { readonly sha: string; readonly baseSource: WorktreeBaseSource | null } {
+  // (1) An EXACT origin-branch spelling classifies FIRST (Perkins R5): a
+  // local branch or tag named origin/topic would otherwise DWIM-shadow
+  // the remote ref and pin local bytes. Fetch fresh, fail closed;
+  // origin/HEAD resolves through the live default branch; origin-prefixed
+  // revision expressions (origin/main~1) are NOT exact spellings and pin.
+  if (isExactOriginBranchSpelling(ref)) {
+    const stripped = ref.replace(/^(?:refs\/)?remotes\/origin\/|^origin\//u, '');
+    let branch = stripped;
+    if (stripped === 'HEAD') {
+      const head = spawnSync('git', ['-C', repoPath, 'ls-remote', '--symref', 'origin', 'HEAD'], { encoding: 'utf-8' });
+      const match = head.status === 0 ? /^ref:\s+refs\/heads\/([^\s]+)\s+HEAD$/mu.exec(head.stdout) : null;
+      if (match === null || match[1] === undefined || match[1] === '') {
+        throw new Error(`review ref ${ref} names origin/HEAD but the default branch is unresolvable — refusing to freeze a possibly stale tip`);
+      }
+      branch = match[1];
+    }
+    const fetched = spawnSync(
+      'git',
+      ['-C', repoPath, 'fetch', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
+      { encoding: 'utf-8' },
+    );
+    if (fetched.status !== 0) {
+      throw new Error(
+        `review ref ${ref} names origin/${branch} but fetching it fresh failed: ${(fetched.stderr ?? '').trim()} — ` +
+          'refusing to freeze a possibly stale tip',
+      );
+    }
+    const sha = execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`], {
+      encoding: 'utf-8',
+    }).trim();
+    return { sha, baseSource: 'origin' };
+  }
+  // (2) Everything else: local DWIM, then the exact pin.
   const sym = spawnSync('git', ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref], {
     encoding: 'utf-8',
   });
-  let fullName = sym.status === 0 ? sym.stdout.trim() : '';
+  const fullName = sym.status === 0 ? sym.stdout.trim() : '';
   const prefix = 'refs/remotes/origin/';
-  if (fullName === '') {
-    // Not locally known, but an EXACT origin-branch spelling is fetched
-    // (a branch the remote does not have fails the fetch and refuses);
-    // origin-prefixed revision expressions (origin/main~1) fall through
-    // and resolve as the named revision (Perkins R4).
-    if (isExactOriginBranchSpelling(ref)) {
-      fullName = ref.startsWith(prefix)
-        ? ref
-        : prefix + ref.slice('origin/'.length);
-    }
-  }
   if (fullName.startsWith(prefix) && fullName.length > prefix.length) {
-    const suffix = fullName.slice(prefix.length);
-    let branch = suffix;
-    if (suffix === 'HEAD') {
+    const stripped = fullName.slice(prefix.length);
+    let branch = stripped;
+    if (stripped === 'HEAD') {
       const head = spawnSync('git', ['-C', repoPath, 'ls-remote', '--symref', 'origin', 'HEAD'], { encoding: 'utf-8' });
       const match = head.status === 0 ? /^ref:\s+refs\/heads\/([^\s]+)\s+HEAD$/mu.exec(head.stdout) : null;
       if (match === null || match[1] === undefined || match[1] === '') {

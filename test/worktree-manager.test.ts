@@ -488,6 +488,64 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
     expect(h.baseFallbacks[0]?.defaultBranch).toBe('main');
     expect(h.baseFallbacks[0]?.detail).toMatch(/missing-origin|fetch/iu);
   });
+
+  it('a LOCAL BRANCH named origin/topic cannot shadow the remote — the fetched tip is frozen (Perkins R5)', async () => {
+    const h = harness();
+    const { repo } = originBacked(h, 'fixture-branch-shadow');
+    const remoteTip = repo.head();
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main:refs/heads/topic']);
+    const shadow = repo.commitFile('src/shadow-branch.ts', 'export const shadowBranch = 1;\n');
+    expect(shadow).not.toBe(remoteTip);
+    // No local tracking ref: the shadow wins DWIM cleanly — the exact
+    // exploitable shape (a tracking ref would make the lookup ambiguous).
+    repo.git(['update-ref', '-d', 'refs/remotes/origin/topic']);
+    repo.git(['branch', 'origin/topic', shadow]);
+    expect(repo.git(['rev-parse', '--symbolic-full-name', '--verify', 'origin/topic'])).toBe(
+      'refs/heads/origin/topic',
+    );
+    ledgerJob(h, 'job-branch-shadow', repo);
+    h.ledger.addRound({ jobId: 'job-branch-shadow', targetRef: 'HEAD' });
+
+    const review = await h.manager.createReviewWorktree({
+      repoPath: repo.path,
+      roundId: 'job-branch-shadow-r1',
+      ref: 'origin/topic',
+    });
+    // The FETCHED remote tip freezes — never the shadowing local bytes.
+    expect(review.sha).toBe(remoteTip);
+    expect(review.sha).not.toBe(shadow);
+    expect(review.baseSource).toBe('origin');
+    expect(repo.git(['rev-parse', 'HEAD'], review.path)).toBe(remoteTip);
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/topic'])).toBe(remoteTip);
+  });
+
+  it('a TAG named origin/topic cannot shadow the remote — the fetched tip is frozen (Perkins R5)', async () => {
+    const h = harness();
+    const { repo } = originBacked(h, 'fixture-tag-shadow');
+    const remoteTip = repo.head();
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main:refs/heads/topic']);
+    const shadow = repo.commitFile('src/shadow-tag.ts', 'export const shadowTag = 1;\n');
+    expect(shadow).not.toBe(remoteTip);
+    // Tags beat branches in DWIM order and no tracking ref competes:
+    // the shadow wins cleanly.
+    repo.git(['update-ref', '-d', 'refs/remotes/origin/topic']);
+    repo.git(['tag', 'origin/topic', shadow]);
+    expect(repo.git(['rev-parse', '--symbolic-full-name', '--verify', 'origin/topic'])).toBe(
+      'refs/tags/origin/topic',
+    );
+    ledgerJob(h, 'job-tag-shadow', repo);
+    h.ledger.addRound({ jobId: 'job-tag-shadow', targetRef: 'HEAD' });
+
+    const review = await h.manager.createReviewWorktree({
+      repoPath: repo.path,
+      roundId: 'job-tag-shadow-r1',
+      ref: 'origin/topic',
+    });
+    expect(review.sha).toBe(remoteTip);
+    expect(review.sha).not.toBe(shadow);
+    expect(review.baseSource).toBe('origin');
+    expect(repo.git(['rev-parse', 'HEAD'], review.path)).toBe(remoteTip);
+  });
 });
 
 describe('worktree manager: sweep (ruling 18c)', () => {
