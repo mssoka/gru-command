@@ -40,6 +40,13 @@ async function sendAndWaitReply(page: Page, text: string): Promise<void> {
 test('pair, send, streamed reply with tool line', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'build me a rocket');
+  // Clean-chat clause: the tool line sits in a collapsed service band —
+  // one tap reveals the machinery.
+  const toolBand = page.locator('.service-band', {
+    has: page.locator('.tool-line', { hasText: 'mock-echo' }),
+  });
+  await expect(toolBand).toHaveCount(1);
+  await toolBand.locator('.service-band__head').click();
   await expect(page.locator('.tool-line', { hasText: 'mock-echo' })).toBeVisible();
 });
 
@@ -178,6 +185,7 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
   await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(1);
+  // Ephemeral UI note (not a frame): stays directly visible, never banded.
   await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
 
   const compactFailure = await page.request.post('http://localhost:8788/__compact-fail', {
@@ -187,6 +195,13 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
+  // Failed controls are durable service machinery (r2 53): the notice
+  // bands — expand the band head to reveal it, never an ephemeral note.
+  const compactFailBand = page.locator('.service-band', {
+    has: page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
+  });
+  await expect(compactFailBand.locator('.service-band__head')).toBeVisible();
+  await compactFailBand.locator('.service-band__head').click();
   await expect(
     page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
   ).toBeVisible();
@@ -223,10 +238,14 @@ test('failed New chat restores history and delivers a word typed in the pending 
   await expect(page.locator('#chat-view')).toBeVisible();
   await expect(page.locator('.msg--user', { hasText: 'word typed during failed reset' })).toHaveCount(1);
 
-  // The failed reset surfaces on reconnect: the notice lands and history is
-  // restored EXACTLY once. (The transient empty view between reload and the
-  // inferred failure is not deterministically observable — this lane asserts
-  // the end state, not a racing intermediate frame.)
+  // The failed reset surfaces on reconnect; reveal the service notice and
+  // assert that the restored history is present exactly once.
+  await page
+    .locator('.service-band', {
+      has: page.locator('.notice-line', { hasText: 'New chat did not complete before reconnect' }),
+    })
+    .locator('.service-band__head')
+    .click();
   await expect(
     page.locator('.notice-line', { hasText: 'New chat did not complete before reconnect' }),
   ).toBeVisible();
@@ -443,7 +462,7 @@ test.describe('board (E6, mock feed)', () => {
     await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
     // v4 bands lead the board; rows group under sticky band separators.
-    await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS YOU');
+    await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS GRU');
     await expect(
       page.locator('.board-band--needs-you .board-job', { hasText: 'Merge main into the retry branch' }),
     ).toBeVisible();
@@ -456,10 +475,12 @@ test.describe('board (E6, mock feed)', () => {
     // Line 1 carries the status dot + chip; line 2 the repo/branch/ages.
     await expect(job.locator('.board-job__dot')).toBeVisible();
     await expect(job.locator('.board-job__branch')).toContainText('gru/demo-api-payment-fix');
-    // The one compact signal carries the live round + the unacked notice.
+    // The one compact signal carries this job's live round; the mock's
+    // unbound machine notification stays in the global NEEDS GRU tracker.
     const signal = job.locator('.board-job__signal');
     await expect(signal).toContainText('live');
-    await expect(signal).toContainText('action-required');
+    await expect(signal).toContainText('1 blocker');
+    await expect(page.locator('#board-unacked')).toContainText('needs Gru');
 
     // Expand the row, then the round row: all 7 lens chips appear.
     await job.locator('.board-job__toggle').click();
@@ -516,7 +537,7 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('.rail-chip[data-chip="cure"] .rail-chip__value')).toHaveText('n/a');
 
     // Bands in priority order, headers sticky separators with counts.
-    await expect(page.locator('.board-band__label')).toHaveText(['NEEDS YOU', 'IN FLIGHT', 'SETTLED', 'COLD']);
+    await expect(page.locator('.board-band__label')).toHaveText(['NEEDS GRU', 'IN FLIGHT', 'SETTLED', 'COLD']);
     const bandSticky = await page
       .locator('.board-band--in-flight .board-band__head')
       .evaluate((node) => getComputedStyle(node).position);

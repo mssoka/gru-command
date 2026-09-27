@@ -61,13 +61,14 @@ for a lane is the lane's to tear down — not a stranger's.
    match (a sibling lane `job-a-2` is never confused with `job-a`) OR
    the process's actual **cwd** (lsof on macOS, procfs on Linux; other
    platforms argv-only, declared).
-4. **Pause and ask** — any other live process pauses the sweep
-   (action-required escalation) and touches nothing. `confirm_kill`
-   answers the RECORDED ask: it kills exactly the acknowledged pids
-   (never a fresh enumeration — later arrivals were never acknowledged),
-   with a SIGTERM grace before SIGKILL. Survivors re-pause; newcomers get
-   their own ask; `confirm_kill` without a recorded pause is not honored.
-   Silent kills do not exist for processes the orchestrator did not spawn.
+4. **Pause and ask** — any other live process pauses the sweep (needs-owner
+   escalation — a destructive step is the owner's ruling) and touches
+   nothing. `confirm_kill` answers the RECORDED ask: it kills exactly
+   the acknowledged pids (never a fresh enumeration — later arrivals
+   were never acknowledged), with a SIGTERM grace before SIGKILL.
+   Survivors re-pause; newcomers get their own ask; `confirm_kill`
+   without a recorded pause is not honored. Silent kills do not exist
+   for processes the orchestrator did not spawn.
 5. **Remove** the worktree; **containment-verified** branch delete (a
    branch dies only when provably contained in an existing ref;
    otherwise retained and noted).
