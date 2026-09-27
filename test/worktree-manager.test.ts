@@ -441,6 +441,53 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
     expect(h.baseFallbacks[0]?.defaultBranch).toBeNull();
     expect(h.baseFallbacks[0]?.detail).not.toContain('gru/feature-x');
   });
+
+  it('a SUCCESSFUL probe without a HEAD symref is authoritative — the stale cached default is never fetched or labeled origin (Perkins R5)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-nosymref'); // bare HEAD=main, cached origin/HEAD -> main
+    const local = repo.head();
+    // The cached branch stays FETCHABLE on the remote but is not the default.
+    const wrongTip = advanceOrigin(origin, 'main', 'src/wrong-default.ts', 'export const wrongDefault = 1;\n');
+    expect(wrongTip).not.toBe(local);
+    // The remote's HEAD names NO branch at all: the live probe succeeds
+    // (exit 0) and carries no symref line.
+    execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/never-created'], { stdio: 'ignore' });
+    const probe = execFileSync('git', ['-C', repo.path, 'ls-remote', '--symref', 'origin', 'HEAD'], {
+      encoding: 'utf-8',
+    });
+    expect(probe).not.toMatch(/^ref:/mu); // authoritative absence, proven at setup
+    expect(repo.git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])).toBe('origin/main'); // cache still names main
+    ledgerJob(h, 'job-nosymref', repo);
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-nosymref' });
+    // The cached branch is NOT selected and NOT labeled origin: the lane
+    // takes the DECLARED local-head fallback with null defaultBranch.
+    expect(row.sha).toBe(local);
+    expect(row.sha).not.toBe(wrongTip);
+    expect(row.baseSource).toBe('local-head-fallback');
+    expect(h.baseFallbacks).toHaveLength(1);
+    expect(h.baseFallbacks[0]?.defaultBranch).toBeNull();
+    expect(h.baseFallbacks[0]?.detail).toMatch(/names no branch|no branch symref/u);
+    // main was never fetched for the base: the stale tracking ref stands.
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/main'])).not.toBe(wrongTip);
+  });
+
+  it('an UNREACHABLE origin still consults the cached origin/HEAD as its declared offline guess (retained)', async () => {
+    const h = harness();
+    const { repo } = originBacked(h, 'fixture-offline-cache'); // cached origin/HEAD -> main
+    const local = repo.head();
+    repo.git(['remote', 'set-url', 'origin', join(repo.path, '..', 'missing-origin.git')]);
+    ledgerJob(h, 'job-offline-cache', repo);
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-offline-cache' });
+    expect(row.sha).toBe(local);
+    expect(row.baseSource).toBe('local-head-fallback');
+    // The cache WAS consulted offline: the FYI names the cached branch as
+    // the fetch guess that failed — the declared, never-silent degrade.
+    expect(h.baseFallbacks).toHaveLength(1);
+    expect(h.baseFallbacks[0]?.defaultBranch).toBe('main');
+    expect(h.baseFallbacks[0]?.detail).toMatch(/missing-origin|fetch/iu);
+  });
 });
 
 describe('worktree manager: sweep (ruling 18c)', () => {

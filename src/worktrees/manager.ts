@@ -357,10 +357,12 @@ export class WorktreeManager {
     const defaultBranch = resolved.branch;
     const localHead = (): string => runGit(repoPath, ['rev-parse', 'HEAD']);
     if (defaultBranch === null) {
-      const detail =
-        `origin default branch is unresolvable — live probe: ${
-          resolved.liveDetail ?? 'named no branch'
-        }, no cached origin/HEAD`;
+      const detail = resolved.authoritativeAbsence
+        ? `origin default branch is unresolvable — the reachable remote's HEAD names no branch ` +
+          `(${resolved.liveDetail ?? 'no symref'}); cached origin/HEAD deliberately not trusted`
+        : `origin default branch is unresolvable — live probe: ${
+            resolved.liveDetail ?? 'named no branch'
+          }, no cached origin/HEAD`;
       this.log('warn', 'base resolution degraded to the local checkout', { repo: repoPath, detail });
       return { sha: localHead(), baseSource: 'local-head-fallback', defaultBranch: null, fallbackDetail: detail };
     }
@@ -389,7 +391,17 @@ export class WorktreeManager {
    * proves what the remote calls default TODAY. */
   private liveDefaultBranch(
     repoPath: string,
-  ): { readonly branch: string | null; readonly detail: string | null } {
+  ): {
+    readonly branch: string | null;
+    readonly detail: string | null;
+    /** True when the probe SUCCEEDED and authoritatively found no default
+     * (exit 0, no symref line): the reachable remote names no branch, so
+     * no cached value may speak for it (Perkins R5 — consulting the
+     * cache here selected a demoted-but-fetchable branch and recorded it
+     * as 'origin'). False when the probe failed/unreachable — the cache
+     * remains the declared offline guess. */
+    readonly authoritativeAbsence: boolean;
+  } {
     const live = spawnGit(repoPath, ['ls-remote', '--symref', 'origin', 'HEAD'], {
       timeoutMs: this.fetchTimeoutMs,
       noPrompt: true,
@@ -397,13 +409,18 @@ export class WorktreeManager {
     if (live.status === 0) {
       const match = /^ref:\s+refs\/heads\/([^\s]+)\s+HEAD$/mu.exec(live.stdout);
       if (match !== null && match[1] !== undefined && match[1] !== '') {
-        return { branch: match[1], detail: null };
+        return { branch: match[1], detail: null, authoritativeAbsence: false };
       }
-      // Exit 0 but no symref line: the remote names no default HEAD.
-      return { branch: null, detail: 'remote HEAD carries no branch symref' };
+      // Exit 0 but no symref line: the reachable remote names no default
+      // HEAD — an AUTHORITATIVE absence, never a cache consultation.
+      return { branch: null, detail: 'remote HEAD carries no branch symref', authoritativeAbsence: true };
     }
     const detail = live.stderr.trim() || live.error || live.stdout.trim();
-    return { branch: null, detail: (detail === '' ? `ls-remote exited ${String(live.status)}` : detail).slice(0, 500) };
+    return {
+      branch: null,
+      detail: (detail === '' ? `ls-remote exited ${String(live.status)}` : detail).slice(0, 500),
+      authoritativeAbsence: false,
+    };
   }
 
   /**
@@ -417,18 +434,31 @@ export class WorktreeManager {
    * blocker). Null = nothing names a default; the caller declares the
    * degraded fallback.
    */
-  private resolveDefaultBranch(repoPath: string): { readonly branch: string | null; readonly liveDetail: string | null } {
+  private resolveDefaultBranch(repoPath: string): {
+    readonly branch: string | null;
+    readonly liveDetail: string | null;
+    readonly authoritativeAbsence: boolean;
+  } {
     const live = this.liveDefaultBranch(repoPath);
-    if (live.branch !== null) return { branch: live.branch, liveDetail: null };
+    if (live.branch !== null) return { branch: live.branch, liveDetail: null, authoritativeAbsence: false };
+    // A SUCCESSFUL probe that names no branch is authoritative (Perkins
+    // R5): the reachable remote has no default HEAD, so the cached
+    // origin/HEAD must NOT speak for it — a stale cache naming a
+    // demoted-but-fetchable branch would base the lane on a non-default
+    // and record it as 'origin'. The cache is a fallback ONLY when the
+    // probe failed (offline), where the fetch still validates the guess.
+    if (live.authoritativeAbsence) {
+      return { branch: null, liveDetail: live.detail, authoritativeAbsence: true };
+    }
     const cached = spawnGit(repoPath, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
     if (cached.status === 0) {
       const name = cached.stdout.trim();
       const prefix = 'origin/';
       if (name.startsWith(prefix) && name.length > prefix.length) {
-        return { branch: name.slice(prefix.length), liveDetail: live.detail };
+        return { branch: name.slice(prefix.length), liveDetail: live.detail, authoritativeAbsence: false };
       }
     }
-    return { branch: null, liveDetail: live.detail };
+    return { branch: null, liveDetail: live.detail, authoritativeAbsence: live.authoritativeAbsence };
   }
 
   /** `git fetch origin <branch>` with an explicit refspec so the
