@@ -552,6 +552,39 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
     expect(h.baseFallbacks[0]?.detail).toMatch(/redacted|invalid\.example/u);
   });
 
+  it('a review ref naming origin/HEAD REFUSES an UNVERIFIED cache-guessed default (the r6 B1 review arm, pinned)', async () => {
+    const h = harness();
+    const { repo } = originBacked(h, 'fixture-review-head-unverified'); // cached origin/HEAD -> main
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf-8' }).trim();
+    const shimDir = mkdtempSync(join(tmpdir(), 'gru-wt-lsremote-shim2-'));
+    const shim = join(shimDir, 'git');
+    writeFileSync(
+      shim,
+      '#!/bin/sh\n' +
+        'if [ "$1" = \'ls-remote\' ]; then echo \'ls-remote unreachable (simulated)\' >&2; exit 1; fi\n' +
+        'exec ' + JSON.stringify(realGit) + ' "$@"\n',
+      'utf-8',
+    );
+    chmodSync(shim, 0o755);
+    const priorPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${priorPath ?? ''}`;
+    try {
+      ledgerJob(h, 'job-review-head-unverified', repo);
+      h.ledger.addRound({ jobId: 'job-review-head-unverified', targetRef: 'HEAD' });
+      await expect(
+        h.manager.createReviewWorktree({
+          repoPath: repo.path,
+          roundId: 'job-review-head-unverified-r1',
+          ref: 'origin/HEAD',
+        }),
+      ).rejects.toThrowError(/origin\/HEAD.*could not be verified live|possibly non-default/u);
+      expect(h.manager.getWorktree('job-review-head-unverified-r1')).toBeNull();
+    } finally {
+      process.env.PATH = priorPath;
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+  });
+
   it('a review ref naming origin/HEAD REFUSES when the default is unresolvable (the refusal arm, pinned)', async () => {
     const h = harness();
     const repo = h.make('fixture-review-head-down');
