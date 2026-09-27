@@ -12,9 +12,11 @@
  *    (deterministic oscillator envelope, no audio assets, ~0.6s,
  *    peak ~-18 dBFS).
  *  - AUTOPLAY — browsers block audio before a user gesture: the chime
- *    arms on the first interaction anywhere. An unarmed arrival falls
- *    back to a harder bell-badge pulse (no console spam). A browser with
- *    no Web Audio stack gets an honest disabled speaker, not a dead one.
+ *    arms on the first interaction anywhere. Until playback is actually
+ *    possible (a suspended context, a rejected or thrown resume), an
+ *    arrival falls back to a harder bell-badge pulse (no console spam)
+ *    and later gestures retry the resume. A browser with no Web Audio
+ *    stack gets an honest disabled speaker, not a dead one.
  *  - MUTE — the header speaker indicator enables/mutes; the choice is
  *    persisted in localStorage and never hides the badge.
  *  - THROTTLE — at most one chime per 30s (monotonic clock — wall-clock
@@ -76,6 +78,9 @@ export interface ChimeGainNode {
 }
 
 export interface ChimeAudioContext {
+  /** Playback truth: 'running' means sound can leave the speakers now;
+   * 'suspended' (autoplay holdout, failed resume) means it cannot. */
+  readonly state: string;
   readonly currentTime: number;
   readonly destination: unknown;
   createOscillator(): ChimeOscillatorNode;
@@ -131,7 +136,11 @@ export class OwnerChime {
   }
 
   get armed(): boolean {
-    return this.context !== null;
+    // Playable, not merely constructed: a context that sits suspended
+    // (autoplay holdout, rejected or thrown resume) cannot sound, so it
+    // must not count as armed — arrivals keep the visual nudge and
+    // gestures keep retrying resume until playback is actually possible.
+    return this.context !== null && this.context.state === 'running';
   }
 
   get muted(): boolean {
@@ -143,35 +152,48 @@ export class OwnerChime {
   }
 
   /** Arm the audio graph. Idempotent; must run inside a user gesture the
-   * first time (browser autoplay policy). Returns false when Web Audio is
-   * unavailable — callers get the visual fallback, never an exception.
-   * A `null` factory result marks the stack permanently absent; a thrown
-   * construction stays retryable on a later gesture. */
+   * first time (browser autoplay policy). Returns true only when audio
+   * is PLAYABLE now — a context whose resume() rejected or threw stays
+   * un-armed and is retried on a later gesture; callers get the visual
+   * fallback, never an exception. A `null` factory result marks the
+   * stack permanently absent; a thrown construction stays retryable. */
   arm(): boolean {
-    if (this.context !== null) return true;
-    if (this.audioUnavailable) return false;
-    let context: ChimeAudioContext | null;
-    try {
-      context = this.createContext();
-    } catch {
-      return false; // transient (e.g. resource limit) — retry later
+    if (this.context === null) {
+      if (this.audioUnavailable) return false;
+      let context: ChimeAudioContext | null;
+      try {
+        context = this.createContext();
+      } catch {
+        return false; // transient (e.g. resource limit) — retry later
+      }
+      if (context === null) {
+        this.audioUnavailable = true; // no audio stack in this browser
+        this.syncIndicator();
+        return false;
+      }
+      this.context = context;
     }
-    if (context === null) {
-      this.audioUnavailable = true; // no audio stack in this browser
-      this.syncIndicator();
-      return false;
-    }
-    this.context = context;
-    try {
-      void context.resume().catch(() => {
-        /* still suspended: the graph schedules anyway and plays once the
-           page earns audio playback — never spam the console */
-      });
-    } catch {
-      /* resume() itself threw — the graph remains best-effort */
+    if (this.context.state !== 'running') {
+      // Suspended (autoplay holdout or a failed earlier resume): ask
+      // again — callers re-arm on later gestures, and the arrival path
+      // keeps the visual nudge until this actually lands.
+      try {
+        void this.context
+          .resume()
+          .then(() => {
+            this.syncIndicator(); // state flipped to 'running'
+          })
+          .catch(() => {
+            /* still suspended: arrivals nudge and the next gesture
+               retries — never spam the console */
+          });
+      } catch {
+        /* resume() itself threw synchronously — retryable on a later
+           gesture; claiming armed here would silently swallow arrivals */
+      }
     }
     this.syncIndicator();
-    return true;
+    return this.armed;
   }
 
   /** Persist the mute choice BEFORE flipping in-memory state, so a
@@ -203,9 +225,10 @@ export class OwnerChime {
     return 'chime';
   }
 
-  /** First interaction anywhere arms the graph — once. A failed arm
-   * keeps the listeners: a transient construction failure retries on the
-   * next gesture (a permanently absent stack short-circuits in arm()). */
+  /** First interaction anywhere arms the graph — once PLAYABLE. A
+   * context that exists but stays suspended keeps the listeners: a
+   * rejected/thrown resume is retried on the next gesture (a permanently
+   * absent stack short-circuits in arm()). */
   private armOnFirstGesture(target: Document): void {
     const gesture = (event: Event): void => {
       // The indicator's own click distinguishes “enable” from “mute”;

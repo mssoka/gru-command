@@ -67,10 +67,18 @@ class StubGain {
 
 class StubAudioContext {
   currentTime = 100;
+  /** Playback truth the chime reads — starts 'suspended' like a real
+   * browser before the gesture; a successful resume flips it to
+   * 'running' (synchronously in the stub, microtask in a browser). */
+  state: 'running' | 'suspended' = 'suspended';
   readonly destination: unknown = {};
   readonly oscillators: StubOscillator[] = [];
   readonly gains: StubGain[] = [];
   resumeCalls = 0;
+  /** 'ok' resolves; 'reject' rejects; 'throw' throws synchronously;
+   * 'gate' parks until releaseResume() flips state and resolves. */
+  resumeMode: 'ok' | 'reject' | 'throw' | 'gate' = 'ok';
+  private gateResolve: (() => void) | null = null;
 
   createOscillator(): ChimeOscillatorNode {
     const oscillator = new StubOscillator();
@@ -86,7 +94,27 @@ class StubAudioContext {
 
   resume(): Promise<void> {
     this.resumeCalls += 1;
+    if (this.resumeMode === 'throw') throw new Error('resume refused');
+    if (this.resumeMode === 'reject') return Promise.reject(new Error('still suspended'));
+    if (this.resumeMode === 'gate') {
+      return new Promise<void>((resolve) => {
+        this.gateResolve = resolve;
+      });
+    }
+    this.state = 'running';
     return Promise.resolve();
+  }
+
+  /** The autoplay holdout lifts: resume starts succeeding. */
+  resumeSucceeds(): void {
+    this.resumeMode = 'ok';
+  }
+
+  /** Release a parked 'gate' resume and flip to running. */
+  releaseResume(): void {
+    this.state = 'running';
+    this.gateResolve?.();
+    this.gateResolve = null;
   }
 }
 
@@ -196,6 +224,80 @@ describe('owner chime — arming (autoplay policy)', () => {
     expect(h.chime.muted).toBe(false);
     expect(h.storage.getItem(OWNER_CHIME_MUTE_KEY)).toBeNull();
     expect(h.indicator.textContent).toBe('🔈');
+  });
+
+  it('a REJECTED resume never claims armed: arrivals nudge, the throttle is not consumed, and a later gesture retries', () => {
+    mountDom();
+    const context = new StubAudioContext();
+    context.resumeMode = 'reject';
+    const chime = new OwnerChime({
+      storage: memoryStorage(),
+      indicator: document.getElementById('sound-toggle') as HTMLButtonElement,
+      bell: document.getElementById('notification-bell') as HTMLButtonElement,
+      createContext: () => context,
+    });
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    expect(chime.armed).toBe(false); // context exists but cannot play
+    expect(context.resumeCalls).toBe(1);
+
+    // Arrivals must NOT be swallowed as silent 'chime' + consumed throttle.
+    expect(chime.notify(fresh('needs-owner'))).toBe('nudge');
+    expect(context.oscillators).toHaveLength(0);
+    expect(chime.notify(fresh('needs-owner'))).toBe('nudge'); // nothing consumed
+
+    // The next gesture retries resume; once it lands, sound is real.
+    context.resumeSucceeds();
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    expect(chime.armed).toBe(true);
+    expect(context.resumeCalls).toBe(2);
+    expect(chime.notify(fresh('needs-owner'))).toBe('chime');
+    expect(context.oscillators).toHaveLength(2); // the ONE two-note chime
+  });
+
+  it('a resume() that THROWS synchronously is retried, never swallowed as armed', () => {
+    mountDom();
+    const context = new StubAudioContext();
+    context.resumeMode = 'throw';
+    const chime = new OwnerChime({
+      storage: memoryStorage(),
+      indicator: document.getElementById('sound-toggle') as HTMLButtonElement,
+      bell: document.getElementById('notification-bell') as HTMLButtonElement,
+      createContext: () => context,
+    });
+    expect(() => document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }))).not.toThrow();
+    expect(chime.armed).toBe(false);
+    expect(chime.notify(fresh('needs-owner'))).toBe('nudge');
+    expect(context.oscillators).toHaveLength(0);
+
+    context.resumeSucceeds(); // the synchronous refusal lifts
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    expect(chime.armed).toBe(true);
+    expect(chime.notify(fresh('needs-owner'))).toBe('chime');
+    expect(context.oscillators).toHaveLength(2);
+  });
+
+  it('a SUSPENDED context keeps the visual nudge until resume actually lands', async () => {
+    vi.useFakeTimers();
+    mountDom();
+    const context = new StubAudioContext();
+    context.resumeMode = 'gate'; // parks until releaseResume()
+    const chime = new OwnerChime({
+      storage: memoryStorage(),
+      indicator: document.getElementById('sound-toggle') as HTMLButtonElement,
+      bell: document.getElementById('notification-bell') as HTMLButtonElement,
+      createContext: () => context,
+    });
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    expect(chime.armed).toBe(false); // resume in flight, still suspended
+    expect(chime.notify(fresh('needs-owner'))).toBe('nudge');
+    expect(document.getElementById('notification-bell')?.classList.contains(OWNER_CHIME_NUDGE_CLASS)).toBe(true);
+    expect(context.oscillators).toHaveLength(0);
+
+    context.releaseResume(); // the promise resolves, state -> running
+    await Promise.resolve(); // let the .then(syncIndicator) microtask run
+    expect(chime.armed).toBe(true);
+    expect(chime.notify(fresh('needs-owner'))).toBe('chime');
+    expect(context.oscillators).toHaveLength(2);
   });
 
   it('degrades to the visual fallback when Web Audio is unavailable', () => {
