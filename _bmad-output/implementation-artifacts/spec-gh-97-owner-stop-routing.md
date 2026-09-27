@@ -4,7 +4,7 @@ type: 'bugfix'
 created: '2026-09-27'
 status: 'done'
 route: 'oneshot'
-review_loop_iteration: 1
+review_loop_iteration: 2
 context:
   - '{project-root}/AGENTS.md'
 ---
@@ -61,3 +61,13 @@ context:
 - Perkins R1 finding (equal-ms tie → legacy row wins dedupe → duplicate owner rows): verified REAL by a deterministic red reproduction (frozen clock + all-zeros legacy id — lexicographically first among UUIDs — repeat stop minted a second owner row `d89f0906… ≠ 8fc3bcd4…`). Fixed as prescribed (reuse-then-insert); regression `reuses the open owner row on a same-millisecond tie instead of duplicating the bell (Perkins R1)` asserts: repeat returns the SAME owner id, exactly 2 rows of the kind, exactly ONE onNeedsOwner bell ring, legacy row untouched (action-required/unacked/unresolved).
 
 - Loopback 1 files: `src/ledger/api.ts` (+`findNotificationByKindAndRouting`), `src/notifications/center.ts` (reuse-before-insert on the machine-hit branch), `test/notifications.test.ts` (+1 fixed-clock tie regression; 17→18), `test/suite-shape.test.ts` (17→18).
+
+## Spec Change Log (loopback 2 — Perkins R2 on PR #129)
+
+- Finding: the R1 routing-scoped lookup excluded ACKed rows unconditionally, but the decisions.degraded.* producer posts with `dedupe: 'active'` (ack = "human saw it", the row stays the ONE active incident until recovery resolves it). On a legacy-first same-millisecond tie, the kind lookup selected the legacy machine row, the scoped lookup missed the ACKED-but-unresolved owner row, and the repeated active post inserted a duplicate owner row + second bell.
+- Amendment: `findNotificationByKindAndRouting` is now MODE-AWARE with the same semantics as `findNotificationByKind` — 'unacked' (acked owner row is spent → new trip mints a new owner row), 'active' (unresolved owner row reused even if acked, until resolved), 'any'. `postIncident` passes the producer's own dedupe mode through. Known-bad state avoided: duplicate owner bell on active dedupe after ack.
+- KEEP: R1 tie regression unchanged and green; unacked-dedupe next-trip-after-ack semantics unchanged and green (gh-97 test); the pinned acked-machine-row reuse under 'active' (legacy-0) unchanged; fresh-install behavior unchanged.
+
+## Review Triage Log (loopback 2)
+
+- Perkins R2 finding: verified REAL by deterministic red reproduction (frozen clock + all-zeros legacy machine row + `decisions.degraded.credential_missing`; ack the unresolved owner row; repeated 'active' post minted `480bf1c4… ≠ a75efa93…`). Fixed as prescribed; regression `active dedupe reuses an ACKed unresolved owner row on a tie instead of ringing the bell again (Perkins R2)` asserts same owner id, exactly 2 rows, ONE bell ring, legacy machine row untouched.

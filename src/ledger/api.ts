@@ -1255,17 +1255,29 @@ export class LedgerApi {
   }
 
   /**
-   * Routing-scoped open-incident lookup (Perkins R1, gh-97): the plain
+   * Routing-scoped open-incident lookup (Perkins R1/R2, gh-97): the plain
    * kind lookup ties-break by id (ts DESC, id ASC), so a legacy
    * machine-routed row can keep winning the dedupe over a same-millisecond
-   * owner row. Callers that must honor a specific routing ask THIS query:
-   * the newest UNACKED, UNRESOLVED row of the exact kind AND routing —
-   * never a stale acked/resolved row, never the other routing class.
+   * owner row. Callers that must honor a specific routing ask THIS query,
+   * with the SAME mode semantics as findNotificationByKind: 'unacked' →
+   * newest UNACKED+UNRESOLVED row of the exact kind AND routing (an acked
+   * owner row is spent — a new trip may mint a new one); 'active' → newest
+   * UNRESOLVED row even if ACKed (an ack records that a human saw the
+   * incident; the row stays the one active incident until resolved, per
+   * the decisions.degraded producer contract); 'any' → newest row of any
+   * state. Never the other routing class.
    */
-  findNotificationByKindAndRouting(kind: string, routing: NotificationRouting): NotificationRecord | null {
-    const row = this.db
-      .prepare('SELECT * FROM notifications WHERE kind = ? AND routing = ? AND acked_at IS NULL AND resolved_at IS NULL ORDER BY ts DESC, id LIMIT 1')
-      .get(kind, routing) as Row | undefined;
+  findNotificationByKindAndRouting(
+    kind: string,
+    routing: NotificationRouting,
+    mode: 'any' | 'unacked' | 'active' = 'unacked',
+  ): NotificationRecord | null {
+    const sql = mode === 'unacked'
+      ? 'SELECT * FROM notifications WHERE kind = ? AND routing = ? AND acked_at IS NULL AND resolved_at IS NULL ORDER BY ts DESC, id LIMIT 1'
+      : mode === 'active'
+        ? 'SELECT * FROM notifications WHERE kind = ? AND routing = ? AND resolved_at IS NULL ORDER BY ts DESC, id LIMIT 1'
+        : 'SELECT * FROM notifications WHERE kind = ? AND routing = ? ORDER BY ts DESC, id LIMIT 1';
+    const row = this.db.prepare(sql).get(kind, routing) as Row | undefined;
     return row === undefined ? null : this.notificationFromRow(row);
   }
 

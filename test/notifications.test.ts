@@ -454,6 +454,59 @@ describe('notification center — durable log + receipts + acks', () => {
     }
   });
 
+  it('active dedupe reuses an ACKed unresolved owner row on a tie instead of ringing the bell again (Perkins R2)', () => {
+    // The decisions.degraded.* producer posts with dedupe 'active': an
+    // acknowledgement records that a human SAW the incident — the row stays
+    // the ONE active incident until recovery resolves it. Frozen clock +
+    // all-zeros legacy id: the tie always selects the legacy machine row,
+    // so the reuse must come from the routing-scoped lookup, which must be
+    // mode-aware enough to see the ACKED-but-unresolved owner row.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-27T12:00:00.000Z'));
+    try {
+      const db = new LedgerDb(tmpDir());
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const needsOwner: NotificationRecord[] = [];
+      const center = new NotificationCenter({
+        ledger: api,
+        bus,
+        onNeedsOwner: (notification) => needsOwner.push(notification),
+      });
+      const kind = 'decisions.degraded.credential_missing';
+      api.recordNotification({
+        id: '00000000-0000-0000-0000-000000000000',
+        kind,
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Legacy machine degradation',
+      });
+      const first = center.postIncident({
+        kind, routing: 'needs-owner', severity: 'error', title: 'Jev degraded', dedupe: 'active',
+      });
+      expect(first.routing).toBe('needs-owner');
+      expect(center.ack(first.id, 'operator')).toMatchObject({ ackedBy: 'operator', resolvedAt: null });
+      // SAME millisecond, legacy-first tie: the kind lookup selects the
+      // legacy machine row; the repeated ACTIVE post must reuse the ACKED
+      // unresolved owner incident — same id, still exactly one bell ring.
+      const repeated = center.postIncident({
+        kind, routing: 'needs-owner', severity: 'error', title: 'Jev degraded again', dedupe: 'active',
+      });
+      expect(repeated.id).toBe(first.id);
+      const rows = api.listNotifications({ limit: 50 }).filter((row) => row.kind === kind);
+      expect(rows).toHaveLength(2);
+      expect(needsOwner.map((row) => row.id)).toEqual([first.id]);
+      // The historical machine row is preserved untouched for Gru triage.
+      expect(api.getNotification('00000000-0000-0000-0000-000000000000')).toMatchObject({
+        routing: 'action-required',
+        ackedAt: null,
+        resolvedAt: null,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not duplicate an acknowledged but unresolved active incident', () => {
     const incidents = boot();
     const first = incidents.center.postIncident({
