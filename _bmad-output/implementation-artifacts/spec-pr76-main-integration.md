@@ -51,7 +51,7 @@ Investigation (2026-09-27, this lane):
 - [x] Scheduler full verification via `POST /api/verify {job_id:"verify-config-comments", scope:"full"}` -- required project verification through shared scheduler.
 - [ ] Bounded BMAD delta review (lane-local bmad-review) of the integration delta (diff `origin/main..HEAD`) -- independent pre-push review gate.
 - [ ] Normal safe push (re-verify remote hasn't advanced) + fresh exact-final-head GitHub CI green -- publication.
-- [ ] Receipts under `/Users/moses/.gru-command/briefings/pr76-post77-conflict-and-native-review-20260927-delivery/` -- record refs, resolution inventory, tests/exits, delta review, exact CI, limitations.
+- [ ] Receipts under `~/.gru-command/briefings/pr76-post77-conflict-and-native-review-20260927-delivery/` -- record refs, resolution inventory, tests/exits, delta review, exact CI, limitations.
 - [ ] Persist job `verify-config-comments` = DELIVERED via status API + independent read-back -- stop source writes; hand native Perkins arm to Gru/Silas.
 
 **Acceptance Criteria:**
@@ -90,7 +90,7 @@ CHECKPOINT 1 authority: owner-approved briefing `pr76-post77-conflict-and-native
 
 ## Review Triage Log
 
-2026-09-27 delta review (3 layers, launched simultaneously 13:49:15Z, all exit 0; full outputs preserved at /Users/moses/.gru-command/briefings/pr76-post77-conflict-and-native-review-20260927-delivery/layers/). Scoping proof: story delta vs origin/main = exactly 4 feature files; every file cited by every finding is byte-identical to main 4845b1a (verified `git diff --quiet` per file; config-reference.ts [chat] region L340-390 diff-identical, only hunk vs main is [verify] L464+). No finding cites this story's changed surface. Per briefing ("No whole-PR #71/#77 findings harvest or repair pass"), claims in main-verbatim code are not deep-verified here; they route to defer as pre-existing (maybe-false, severity-if-true recorded) — the owner's parallel follow-up issues job owns them.
+2026-09-27 delta review (3 layers, launched simultaneously 13:49:15Z, all exit 0; full outputs preserved at ~/.gru-command/briefings/pr76-post77-conflict-and-native-review-20260927-delivery/layers/). Scoping proof: story delta vs origin/main = exactly 4 feature files; every file cited by every finding is byte-identical to main 4845b1a (verified `git diff --quiet` per file; config-reference.ts [chat] region L340-390 diff-identical, only hunk vs main is [verify] L464+). No finding cites this story's changed surface. Per briefing ("No whole-PR #71/#77 findings harvest or repair pass"), claims in main-verbatim code are not deep-verified here; they route to defer as pre-existing (maybe-false, severity-if-true recorded) — the owner's parallel follow-up issues job owns them.
 
 - B1/E1 whole.ts findingsDelivered:false stamp clobbered by commitSettled (batch.error path) — maybe-false; would be high (undelivered recorded as delivered); identical at main; what settles: trace at main. DEFER.
 - B2 perkins.ts round.posted writer emits payloads its strict reader rejects (baseSha '' path) — maybe-false; would be high (verified delivery escalated unbound/interrupted on restart); identical at main. DEFER.
