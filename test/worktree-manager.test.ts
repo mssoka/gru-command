@@ -472,6 +472,99 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
     expect(repo.git(['rev-parse', 'refs/remotes/origin/main'])).not.toBe(wrongTip);
   });
 
+  it('a FAILED live probe with a FETCHABLE cached default is declared fallback — never mislabeled origin (Perkins r6 B1)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-unverified-default'); // bare HEAD=main, cached origin/HEAD -> main
+    const local = repo.head();
+    // The remote renames its default to trunk; main stays FETCHABLE.
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main:refs/heads/trunk']);
+    execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/trunk'], { stdio: 'ignore' });
+    const wrongTip = advanceOrigin(origin, 'main', 'src/demoted.ts', 'export const demoted = 1;\n');
+    expect(wrongTip).not.toBe(local);
+    expect(repo.git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])).toBe('origin/main'); // stale cache
+    // Simulate the transient probe failure: every ls-remote fails, all
+    // other git calls pass through to the real binary.
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf-8' }).trim();
+    const shimDir = mkdtempSync(join(tmpdir(), 'gru-wt-lsremote-shim-'));
+    const shim = join(shimDir, 'git');
+    writeFileSync(
+      shim,
+      '#!/bin/sh\n' +
+        'if [ "$1" = \'ls-remote\' ]; then echo \'ls-remote unreachable (simulated)\' >&2; exit 1; fi\n' +
+        'exec ' + JSON.stringify(realGit) + ' "$@"\n',
+      'utf-8',
+    );
+    chmodSync(shim, 0o755);
+    const priorPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${priorPath ?? ''}`;
+    let row: Awaited<ReturnType<WorktreeManager['createJobWorktree']>>;
+    try {
+      ledgerJob(h, 'job-unverified', repo);
+      row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-unverified' });
+    } finally {
+      process.env.PATH = priorPath;
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+    // A successful fetch of the demoted cached branch proves EXISTENCE,
+    // not defaultness: the lane takes the DECLARED fallback, visibly.
+    expect(row.sha).toBe(local);
+    expect(row.sha).not.toBe(wrongTip);
+    expect(row.baseSource).toBe('local-head-fallback');
+    expect(h.baseFallbacks).toHaveLength(1);
+    expect(h.baseFallbacks[0]?.defaultBranch).toBe('main');
+    expect(h.baseFallbacks[0]?.detail).toMatch(/UNVERIFIED/u);
+    expect(h.baseFallbacks[0]?.detail).toMatch(/proves the branch exists/u);
+  });
+
+  it('an UNTOUCHED lane based ahead of the host releases with its branch DELETED (Perkins r6 W1)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-release-ahead');
+    const staleHost = repo.head();
+    // Origin advances BEFORE lane creation: the lane bases on the fetched
+    // tip, which the host checkout does not contain.
+    const fetchedTip = advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    expect(fetchedTip).not.toBe(staleHost);
+    ledgerJob(h, 'job-release-ahead', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-release-ahead' });
+    expect(row.sha).toBe(fetchedTip); // the lane really is ahead of the host
+
+    const result = await h.manager.release({ worktreeId: 'job-release-ahead' });
+    expect(result.status).toBe('swept');
+    // The untouched branch is contained in its REGISTERED base — no
+    // leftover debris blocking job-id reuse.
+    expect(() => repo.git(['rev-parse', '--verify', '--quiet', 'refs/heads/gru/job-release-ahead'])).toThrow();
+  });
+
+  it('a credential-bearing fetch failure is REDACTED in the fallback FYI (Perkins r6 W3)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-redact-fallback');
+    repo.git(['remote', 'add', 'origin', 'https://user:hunter2@invalid.example/repo.git']);
+    ledgerJob(h, 'job-redact', repo);
+    const local = repo.head();
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-redact' });
+    expect(row.baseSource).toBe('local-head-fallback');
+    expect(row.sha).toBe(local);
+    expect(h.baseFallbacks).toHaveLength(1);
+    // Raw git stderr (carrying the credential-bearing URL) is redacted
+    // before it reaches logs or the persisted notification.
+    expect(h.baseFallbacks[0]?.detail).not.toContain('hunter2');
+    expect(h.baseFallbacks[0]?.detail).toMatch(/redacted|invalid\.example/u);
+  });
+
+  it('a review ref naming origin/HEAD REFUSES when the default is unresolvable (the refusal arm, pinned)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-review-head-down');
+    repo.git(['remote', 'add', 'origin', join(repo.path, '..', 'no-such-origin.git')]);
+    ledgerJob(h, 'job-review-head-down', repo);
+    h.ledger.addRound({ jobId: 'job-review-head-down', targetRef: 'HEAD' });
+
+    await expect(
+      h.manager.createReviewWorktree({ repoPath: repo.path, roundId: 'job-review-head-down-r1', ref: 'origin/HEAD' }),
+    ).rejects.toThrowError(/origin\/HEAD.*unresolvable|refusing to check out/u);
+    expect(h.manager.getWorktree('job-review-head-down-r1')).toBeNull();
+  });
+
   it('an UNREACHABLE origin still consults the cached origin/HEAD as its declared offline guess (retained)', async () => {
     const h = harness();
     const { repo } = originBacked(h, 'fixture-offline-cache'); // cached origin/HEAD -> main

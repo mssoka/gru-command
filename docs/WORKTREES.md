@@ -97,10 +97,14 @@ fetchable would otherwise keep basing lanes on the demoted branch); when
 the remote is unreachable, the cached `origin/HEAD` is used as a
 declared guess the fetch must validate — and the repo's checked-out
 branch is never consulted, because a host clone sitting on a lane
-branch must not name the default. The registry row records the base
+branch must not name the default. A default resolved from the cache
+(probe unreachable) is NEVER recorded `origin` even when its fetch
+succeeds — the lane takes the declared local-HEAD fallback with its
+FYI, because a fetch proves the branch exists, not that it is the
+default. The registry row records the base
 SOURCE: `origin`
-for a fetched base, `local-head-fallback` when the fetch failed and the
-lane branched from the host clone's local HEAD instead. The fallback is
+for a fetched live-verified base, `local-head-fallback` when the lane
+branched from the host clone's local HEAD instead. The fallback is
 never silent: the row carries it, the `worktree.created` event carries
 it, and a `worktree-base-fallback` FYI notification names the stale
 risk. Review lanes apply the same fetch discipline to `origin/<branch>`

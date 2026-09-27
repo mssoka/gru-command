@@ -834,6 +834,109 @@ describe('freeze-time integration on PR rounds', () => {
     expect(manifest.targetSha).toBe(ancestor);
   });
 
+  it('a SHORT origin/topic spelling COLLIDING with a real remote branch follows PR verification — the local tag never bypasses it (Perkins r6 B2)', async () => {
+    const repo = makeFixtureRepo('freeze-collide-pr');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/lane']);
+    const laneFirst = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const laneTip = repo.commitFile('src/lane2.ts', 'export const lane2 = true;\n');
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    // The remote REALLY HAS a branch named topic (the collision), and the
+    // local tag origin/topic points at UNRELATED bytes. The tracking ref
+    // is absent so the tag wins DWIM cleanly — the exploitable shape
+    // (a tracking ref would make the lookup ambiguous and safe).
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main:refs/heads/topic']);
+    repo.git(['update-ref', '-d', 'refs/remotes/origin/topic']);
+    repo.git(['tag', 'origin/topic', laneFirst]);
+    expect(repo.git(['rev-parse', 'origin/topic'])).toBe(laneFirst);
+    expect(repo.git(['rev-parse', '--symbolic-full-name', '--verify', 'origin/topic'])).toBe(
+      'refs/tags/origin/topic',
+    );
+
+    const root = tempDir('gru-freeze-collide-port-');
+    const artifacts = tempDir('gru-freeze-collide-artifacts-');
+    const sessions = tempDir('gru-freeze-collide-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-collide' });
+    const job = ledger.addJob({
+      id: 'job-collide', repo: 'fixture', title: 'short origin spelling colliding with a remote branch', baseBranch: 'main',
+      briefing: 'Acceptance: lane returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/24');
+    const probe = vi.fn(fixedProbe('feature/lane', laneTip));
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: probe,
+    });
+
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'origin/topic' }));
+    // The colliding SHORT spelling means the REMOTE branch: PR-head
+    // verification ran (probe called) and the VERIFIED PR head froze —
+    // the local tag never substituted its unrelated bytes.
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(outcome.round.targetRef).toBe(laneTip);
+    expect(outcome.round.targetRef).not.toBe(laneFirst);
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
+    ) as { readonly targetSha: string };
+    expect(manifest.targetSha).toBe(laneTip);
+  });
+
+  it('a FULLY QUALIFIED refs/tags/origin/topic pin is preserved even when the remote branch collides (Perkins r6 B2)', async () => {
+    const repo = makeFixtureRepo('freeze-collide-qualified');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/lane']);
+    const laneFirst = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const laneTip = repo.commitFile('src/lane2.ts', 'export const lane2 = true;\n');
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main:refs/heads/topic']);
+    repo.git(['tag', 'origin/topic', laneFirst]);
+
+    const root = tempDir('gru-freeze-collideq-port-');
+    const artifacts = tempDir('gru-freeze-collideq-artifacts-');
+    const sessions = tempDir('gru-freeze-collideq-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-collide-qualified' });
+    const job = ledger.addJob({
+      id: 'job-collide-qualified', repo: 'fixture', title: 'fully qualified tag pin beside a colliding remote branch', baseBranch: 'main',
+      briefing: 'Acceptance: lane returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/25');
+    const probe = vi.fn(async () => {
+      throw new Error('a fully qualified tag pin must not probe the host');
+    }) as unknown as PrHeadProbe;
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: probe,
+    });
+
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'refs/tags/origin/topic' }));
+    expect(probe).not.toHaveBeenCalled();
+    // The caller was explicit about the tag: those exact bytes freeze,
+    // collision or not.
+    expect(outcome.round.targetRef).toBe(laneFirst);
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
+    ) as { readonly targetSha: string };
+    expect(manifest.targetSha).toBe(laneFirst);
+  });
+
   it('an explicit TAG pin origin/v1 on a linked PR stays frozen — never silently replaced by the live PR head (Perkins R5)', async () => {
     const repo = makeFixtureRepo('freeze-tag-pin-pr');
     repos.push(repo);

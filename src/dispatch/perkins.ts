@@ -2163,6 +2163,19 @@ export class WaveRunner {
     return name === '' ? null : name;
   }
 
+  /** True when origin currently advertises a branch by that name — the
+   * SHORT-spelling collision bit (Perkins r6 B2). Read-only, bounded; a
+   * failed probe reports a collision (the remote route — PR-head
+   * verification or the manager's fetch — is the safe arm either way). */
+  private originHasBranch(repoPath: string, branch: string): boolean {
+    const result = spawnSync('git', ['-C', repoPath, 'ls-remote', '--refs', 'origin', `refs/heads/${branch}`], {
+      encoding: 'utf-8',
+      timeout: 30_000,
+    });
+    if (result.status !== 0) return true;
+    return (result.stdout ?? '').trim() !== '';
+  }
+
   private async resolveFreezeTarget(input: {
     job: { readonly id: string; readonly prUrl: string | null };
     jobWorktree: { readonly path: string; readonly repoPath: string };
@@ -2188,18 +2201,29 @@ export class WaveRunner {
     const namesOriginRef = isExactOriginBranchSpelling(input.candidateRef);
     // A locally RESOLVED origin-prefixed ref that is neither a branch nor
     // an origin tracking ref — a tag like refs/tags/origin/v1 — is an
-    // INTENTIONAL pin (Perkins R5): the caller named exactly those bytes.
-    // A tracking-ref resolution is NOT a pin (that is the stale-local
+    // INTENTIONAL pin when the caller was FULLY QUALIFIED (refs/tags/…)
+    // or when the remote has NO branch by that name (Perkins R5/r6 B2):
+    // a SHORT spelling (origin/topic) whose name COLLIDES with a real
+    // remote branch means the REMOTE branch — pinning the local tag
+    // there would bypass PR-head verification and freeze unrelated
+    // bytes. A tracking-ref resolution is NOT a pin (the stale-local
     // shape the fetch exists to defeat), and only an UNRESOLVED origin
-    // spelling follows the live remote branch. (Ambiguous lookups return
-    // no name and stay on the remote route — the fetch is the safe arm.)
+    // spelling follows the live remote branch. (Ambiguous lookups and
+    // collision-probe failures both stay on the remote route — the
+    // fetch/PR verification is the safe arm.)
     const resolvedName = namesOriginRef
       ? this.resolvedLocalRefName(input.jobWorktree.repoPath, input.candidateRef)
       : null;
-    const resolvedOriginPin =
+    const resolvedNonBranchRef =
       resolvedName !== null &&
       !resolvedName.startsWith('refs/remotes/origin/') &&
       !resolvedName.startsWith('refs/heads/');
+    const fullyQualifiedPin = input.candidateRef.startsWith('refs/');
+    const shortSpellingCollides =
+      namesOriginRef &&
+      !fullyQualifiedPin &&
+      this.originHasBranch(input.jobWorktree.repoPath, input.candidateRef.replace(ORIGIN_REF_SPELLING, ''));
+    const resolvedOriginPin = resolvedNonBranchRef && !shortSpellingCollides;
     const explicitPin =
       input.explicitTarget && candidateBranch === null && (!namesOriginRef || resolvedOriginPin);
     if (input.job.prUrl === null || explicitPin) {
