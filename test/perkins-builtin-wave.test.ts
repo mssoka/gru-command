@@ -1,6 +1,6 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -9,6 +9,7 @@ import {
   GhPrPoster,
   GitLabMrPoster,
   WaveRunner,
+  hostDisclosureAppendix,
   redactReviewForPublication,
   type FallbackGateOutcome,
   type VerdictPoster,
@@ -46,6 +47,7 @@ import { lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeWholeSpawner, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
+import { PersistedReviewPort } from './helpers/persisted-review-port.js';
 
 class DeferredReviewPort implements WorktreePort {
   constructor(
@@ -148,7 +150,7 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     const head = '1'.repeat(40);
     const base = '2'.repeat(40);
     const review = { id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body: 'review body\n' };
-    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  process.stdout.write(JSON.stringify({ id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: 'other' }, ${JSON.stringify(review)}]));\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  process.stdout.write(JSON.stringify({ id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: 'other' }, ${JSON.stringify(review)}]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
     chmodSync(binary, 0o755);
     const poster = new GhPrPoster(binary);
     // (a) The PR's recorded base (GitHub pins it at open/link time) trails
@@ -165,9 +167,11 @@ describe('GitHub SHA-bound Perkins delivery', () => {
       bodySha256: createHash('sha256').update('review body\n', 'utf8').digest('hex'),
     });
     const calls = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[]; input: string });
-    expect(calls).toHaveLength(2);
+    // identity probe, commit-bound POST, authenticated-account probe (R5).
+    expect(calls).toHaveLength(3);
     expect(calls[0]?.argv).toEqual(['api', '--hostname', 'git.example.test', 'repos/acme/widget/pulls/42', '--jq', '[.head.sha,.base.sha] | @tsv']);
     expect(calls[1]?.argv).toEqual(['api', '--hostname', 'git.example.test', '--method', 'POST', 'repos/acme/widget/pulls/42/reviews', '--input', '-']);
+    expect(calls[2]?.argv).toEqual(['api', '--hostname', 'git.example.test', 'user', '--jq', '.login']);
     expect(JSON.parse(calls[1]!.input)).toEqual({ body: 'review body\n', event: 'COMMENT', commit_id: head });
     // (b) A moved head is real movement and still fails closed — before any
     // review is posted.
@@ -199,7 +203,7 @@ describe('GitHub SHA-bound Perkins delivery', () => {
       execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
       const head = '1'.repeat(40);
       const base = '2'.repeat(40);
-      writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  const behavior = ${JSON.stringify(postBehavior)};\n  if (behavior === 'empty') process.exit(0);\n  if (behavior === 'timeout') process.exit(1);\n  if (behavior === 'wrong-commit') { process.stdout.write(JSON.stringify({ id: 7, user: { login: 'x' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: body.body })); process.exit(0); }\n  process.stdout.write(JSON.stringify({ id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(JSON.stringify(reviews))});\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+      writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  const behavior = ${JSON.stringify(postBehavior)};\n  if (behavior === 'empty') process.exit(0);\n  if (behavior === 'timeout') process.exit(1);\n  if (behavior === 'wrong-commit') { process.stdout.write(JSON.stringify({ id: 7, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: body.body })); process.exit(0); }\n  process.stdout.write(JSON.stringify({ id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(JSON.stringify(reviews))});\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
       chmodSync(binary, 0o755);
       return { poster: new GhPrPoster(binary), log };
     };
@@ -242,7 +246,7 @@ describe('GitHub SHA-bound Perkins delivery', () => {
       const repoPath = join(root, 'repo');
       execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
       execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
-      writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  process.stdout.write(${JSON.stringify(createdLine)});\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(JSON.stringify(reviews))});\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+      writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  process.stdout.write(${JSON.stringify(createdLine)});\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(JSON.stringify(reviews))});\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
       chmodSync(binary, 0o755);
       return { poster: new GhPrPoster(binary), log };
     };
@@ -633,6 +637,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const job2 = ledger2.addJob({ id: 'job-post-recovery-bound', repo: 'fixture', title: 'bound recovery', baseBranch: 'main', briefing: 'review' });
     ledger2.setJobStatus(job2.id, 'working');
     ledger2.setJobStatus(job2.id, 'in-review');
+    ledger2.setJobPr(job2.id, 'https://example.invalid/pr/1');
     const round2 = ledger2.addRound({ jobId: job2.id, lenses: ['blind'], targetRef: target2 });
     await port2.createReviewWorktree({ repoPath: repo2.path, roundId: round2.id, ref: target2, jobId: job2.id });
     ledger2.setRoundStatus(round2.id, 'live');
@@ -645,9 +650,9 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger2.appendCustomEvent({
       kind: 'round.posted', jobId: job2.id, roundId: round2.id,
       payload: {
-        verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', url: 'https://example.invalid/pr/1',
-        targetSha: target2, baseSha: 'b'.repeat(40), publicationFile, publicationSha256,
-        receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: target2, headSha: target2, bodySha256: publicationSha256 },
+        verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', url: 'https://example.invalid/pr/1', host: 'example.invalid',
+        targetSha: target2, baseSha: 'b'.repeat(40), publicationFile, publicationSha256, reconciled: false,
+        receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: target2, headSha: target2, baseSha: 'b'.repeat(40), bodySha256: publicationSha256 },
       },
     });
     const poster2 = { post: vi.fn() };
@@ -1309,16 +1314,23 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // Security reports the canonical blocker; the tests specialist fails
     // both attempts; several lenses stay unused.
     const poster = receiptPoster();
+    let securityAttempts = 0;
     const wave = new WaveRunner({
       ledger, worktrees: port,
       spawner: fakeWholeSpawner(sessions, {
         childAnswer: (prompt) => {
           const source = /"source": "(security|tests)"/u.exec(prompt)?.[1];
-          if (source === 'security') return JSON.stringify([{
-            source: 'security', severity: 'blocker', category: 'auth', title: 'Verified security defect',
-            location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line demonstrates the security defect.',
-            recommended_fix: 'Correct the implementation and add a regression test.',
-          }]);
+          if (source === 'security') {
+            // Malformed once, then the canonical verified blocker: the done
+            // lens note must retain the earlier failed attempt (T12).
+            securityAttempts += 1;
+            if (securityAttempts === 1) return 'malformed first attempt';
+            return JSON.stringify([{
+              source: 'security', severity: 'blocker', category: 'auth', title: 'Verified security defect',
+              location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line demonstrates the security defect.',
+              recommended_fix: 'Correct the implementation and add a regression test.',
+            }]);
+          }
           if (source === 'tests') return 'malformed output';
           return '[]';
         },
@@ -1334,9 +1346,22 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(postedBody).toContain('## Execution and findings (host-recorded facts)');
     expect(postedBody).toContain('- Retained findings: 1 (1 blocker)');
     expect(postedBody).toContain('Verified security defect');
-    expect(postedBody).toContain('- Failed specialist attempts: tests ×2');
+    expect(postedBody).toContain('- Failed specialist attempts: security ×1, tests ×2');
     expect(postedBody).toContain('- Lenses not used this round:');
     expect(postedBody).toContain('authenticated COMMENT review on the reviewed commit');
+    // R16: the persisted round.posted receipt pins the actual actor/event —
+    // removing them from the ledger writer would fail this test.
+    const postedEvent = ledger.latestRoundEvent(outcome.round.id, 'round.posted')?.payload as {
+      receipt?: { actor?: string; event?: string; reviewId?: string };
+    };
+    expect(postedEvent.receipt?.actor).toBe('gru-bot');
+    expect(postedEvent.receipt?.event).toBe('COMMENTED');
+    expect(postedEvent.receipt?.reviewId).toBe('9001');
+    // T12: a lens that failed once then succeeded keeps its earlier failure
+    // visible in the persisted lens note (security malformed once).
+    const securityChip = ledger.getRound(outcome.round.id)?.lenses.find((chip) => chip.lens === 'security');
+    expect(securityChip?.state).toBe('done');
+    expect(securityChip?.note).toContain('earlier failed attempts: a1 output');
   });
 
   it('reconciles an ambiguous post through the PRODUCTION adapter: same provider selection, single POST (T1)', async () => {
@@ -1372,7 +1397,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const repoPath = join(ghRoot, 'repo');
     execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
     execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://github.com/acme/fixture.git']);
-    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(ghLog)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  writeFileSync(${JSON.stringify(ghStore)}, JSON.stringify({ id: 9100, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n  process.exit(1);\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify(existsSync(${JSON.stringify(ghStore)}) ? [JSON.parse(readFileSync(${JSON.stringify(ghStore)}, 'utf8'))] : []));\n} else {\n  process.stdout.write(${JSON.stringify(`${target}\t${'2'.repeat(40)}\n`)});\n}\n`, 'utf8');
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(ghLog)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  writeFileSync(${JSON.stringify(ghStore)}, JSON.stringify({ id: 9100, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n  process.exit(1);\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify(existsSync(${JSON.stringify(ghStore)}) ? [JSON.parse(readFileSync(${JSON.stringify(ghStore)}, 'utf8'))] : []));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${target}\t${'2'.repeat(40)}\n`)});\n}\n`, 'utf8');
     chmodSync(binary, 0o755);
     // PRODUCTION adapter with the real GitHub poster; the GitLeg provider
     // fails loud if the adapter ever selects it for a github.com URL.
@@ -2449,4 +2474,685 @@ describe('lens agent labels are unique across retries', () => {
     expect(lensAgentLabel('blind', 2)).not.toBe(lensAgentLabel('blind', 1));
     expect(lensAgentLabel('edge', 2)).toBe('edge#2');
   });
+});
+
+describe('repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R6/R13)', () => {
+  const head = '1'.repeat(40);
+  const base = '2'.repeat(40);
+  const body = 'review body\n';
+
+  /** gh double with an authenticated-user probe, identity probe, a
+   * configurable POST response and per-page review lists. */
+  function makeDouble(options: {
+    readonly login?: string;
+    readonly created?: unknown;
+    readonly reviewPages?: readonly unknown[];
+  }): { poster: GhPrPoster; log: string; repoPath: string } {
+    const root = mkdtempSync(join(tmpdir(), 'perkins-gh-p3-'));
+    dirs.push(root);
+    const log = join(root, 'calls.jsonl');
+    const binary = join(root, 'gh-double.mjs');
+    const repoPath = join(root, 'repo');
+    execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const parsed = JSON.parse(input);\n  const created = ${JSON.stringify(options.created === undefined ? 'null' : JSON.stringify(options.created))};\n  const receipt = created === 'null' ? null : JSON.parse(created);\n  const out = receipt ?? { id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: parsed.commit_id, body: parsed.body };\n  process.stdout.write(JSON.stringify(out));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  const page = Number(/[?&]page=(\\d+)/u.exec(argv.find((entry) => entry.includes('/reviews?')) ?? '')?.[1] ?? '1');\n  const pages = ${JSON.stringify(JSON.stringify(options.reviewPages ?? []))};\n  process.stdout.write(JSON.stringify(JSON.parse(pages)[page - 1] ?? []));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write(${JSON.stringify(options.login ?? 'gru-bot')});\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+    chmodSync(binary, 0o755);
+    return { poster: new GhPrPoster(binary), log, repoPath };
+  }
+  const input = (repoPath: string) => ({
+    prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
+    body, targetSha: head, baseSha: base,
+  });
+
+  it('refuses a null provider review id instead of stringifying it (R13)', async () => {
+    const { poster, repoPath } = makeDouble({ created: { id: null, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body } });
+    await expect(poster.post(input(repoPath))).rejects.toThrow(/missing a review id/);
+  });
+
+  it('refuses a POST response whose enacted state is not COMMENTED (R6)', async () => {
+    const { poster, repoPath } = makeDouble({ created: { id: 9002, user: { login: 'gru-bot' }, state: 'APPROVED', commit_id: head, body } });
+    await expect(poster.post(input(repoPath))).rejects.toThrow(/APPROVED.*instead of COMMENTED|enacted/);
+  });
+
+  it('refuses a receipt authored by another account than the authenticated poster (R5)', async () => {
+    const { poster, repoPath } = makeDouble({ created: { id: 9003, user: { login: 'someone-else' }, state: 'COMMENTED', commit_id: head, body } });
+    await expect(poster.post(input(repoPath))).rejects.toThrow(/not the authenticated posting account/);
+  });
+
+  it('does not reconcile a copied review from another author even on the right commit (R5)', async () => {
+    const { poster, repoPath } = makeDouble({
+      reviewPages: [[{ id: 8000, user: { login: 'someone-else' }, state: 'COMMENTED', commit_id: head, body }]],
+    });
+    await expect(poster.reconcile!(input(repoPath))).resolves.toBeNull();
+  });
+
+  it('finds a correctly bound authored match beyond page one (R4)', async () => {
+    const filler = Array.from({ length: 100 }, (_unused, index) => ({
+      id: 7000 + index, user: { login: 'someone-else' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: `filler ${index}`,
+    }));
+    const { poster, repoPath } = makeDouble({
+      reviewPages: [
+        filler,
+        [{ id: 9100, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body }],
+      ],
+    });
+    await expect(poster.reconcile!(input(repoPath))).resolves.toMatchObject({ reviewId: '9100', actor: 'gru-bot', event: 'COMMENTED', commitId: head });
+    const calls = readFileSync(join(dirname(repoPath), 'calls.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[]; stdout?: string });
+    console.log('P3PAGE calls:', JSON.stringify(calls.map((call) => call.argv.filter((entry) => entry.includes('/reviews?') || entry.includes('user')))));
+    expect(calls.filter((call) => call.argv.some((entry) => entry.includes('/reviews?')))).toHaveLength(2);
+  });
+
+  it('treats an exhausted pagination bound as unresolved, not proof of absence (R4)', async () => {
+    const filler = Array.from({ length: 100 }, (_unused, index) => ({
+      id: 7000 + index, user: { login: 'someone-else' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: `filler ${index}`,
+    }));
+    const { poster, repoPath } = makeDouble({ reviewPages: [filler, filler, filler, filler, filler, filler, filler, filler, filler, filler, filler] });
+    await expect(poster.reconcile!(input(repoPath))).rejects.toThrow(/exceeded.*pages.*unresolved|unresolved/);
+  });
+
+  it('skips PENDING drafts: only an authored COMMENTED publication reconciles (R6/R5)', async () => {
+    const { poster, repoPath } = makeDouble({
+      reviewPages: [[{ id: 8001, user: { login: 'gru-bot' }, state: 'PENDING', commit_id: head, body }]],
+    });
+    await expect(poster.reconcile!(input(repoPath))).resolves.toBeNull();
+  });
+});
+
+describe('repair pass 3: GitLab note reconciliation fails closed (R3/T7)', () => {
+  const head = 'a'.repeat(40);
+  const base = 'b'.repeat(40);
+  const mrUrl = 'https://gitlab.example.test/acme/widget/-/merge_requests/7';
+  const body = 'review body\n';
+
+  function gitlabDouble(options: {
+    readonly user?: string;
+    readonly notePages?: readonly unknown[];
+    readonly mrStatus?: number;
+  }): { poster: GitLabMrPoster; repoPath: string } {
+    const root = mkdtempSync(join(tmpdir(), 'perkins-gl-p3-'));
+    dirs.push(root);
+    const repoPath = join(root, 'repo');
+    execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://gitlab.example.test/acme/widget.git']);
+    const mr = () => ({ status: options.mrStatus ?? 200, body: JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) });
+    const fetchImpl = async (url: string): Promise<{ ok: boolean; status: number; text(): Promise<string> }> => {
+      if (url.endsWith('/user')) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ username: options.user ?? 'gru-bot' }) };
+      }
+      if (url.includes('/notes?')) {
+        const page = Number(/[?&]page=(\d+)/u.exec(url)?.[1] ?? '1');
+        const pages = options.notePages ?? [];
+        return { ok: true, status: 200, text: async () => JSON.stringify(pages[page - 1] ?? []) };
+      }
+      const response = mr();
+      return { ok: response.status < 300, status: response.status, text: async () => response.body };
+    };
+    return { poster: new GitLabMrPoster({ token: 'glpat-token', fetchImpl: fetchImpl as never }), repoPath };
+  }
+  const input = (repoPath: string) => ({
+    prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body, targetSha: head, baseSha: base,
+  });
+
+  it('throws unresolved on ANY body-matching authored note: the creation head cannot be proved (R3)', async () => {
+    const { poster, repoPath } = gitlabDouble({
+      notePages: [[{ id: 55, body, author: { username: 'gru-bot' } }]],
+    });
+    await expect(poster.reconcile!(input(repoPath))).rejects.toThrow(/cannot prove|fail closed|unresolved/);
+  });
+
+  it('fails closed even when the matching note sits beyond page one (R3/R4)', async () => {
+    const filler = Array.from({ length: 100 }, (_unused, index) => ({
+      id: 6000 + index, body: `unrelated note ${index}`, author: { username: 'someone-else' },
+    }));
+    const { poster, repoPath } = gitlabDouble({
+      notePages: [filler, [{ id: 56, body, author: { username: 'gru-bot' } }]],
+    });
+    await expect(poster.reconcile!(input(repoPath))).rejects.toThrow(/cannot prove|fail closed|unresolved/);
+  });
+
+  it('returns null only when exhaustive pagination finds no authored body match (R4)', async () => {
+    const filler = Array.from({ length: 100 }, (_unused, index) => ({
+      id: 6000 + index, body: `unrelated note ${index}`, author: { username: 'someone-else' },
+    }));
+    const { poster, repoPath } = gitlabDouble({ notePages: [filler, []] });
+    await expect(poster.reconcile!(input(repoPath))).resolves.toBeNull();
+  });
+
+  it('treats an exhausted pagination bound as unresolved, never as absence (R4)', async () => {
+    const filler = Array.from({ length: 100 }, (_unused, index) => ({
+      id: 6000 + index, body: `unrelated note ${index}`, author: { username: 'someone-else' },
+    }));
+    const { poster, repoPath } = gitlabDouble({ notePages: [filler, filler, filler, filler, filler, filler, filler, filler, filler, filler, filler] });
+    await expect(poster.reconcile!(input(repoPath))).rejects.toThrow(/exceeded.*pages|unresolved/);
+  });
+});
+
+describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
+
+  async function recoveryFixture(name: string, shared?: {
+    ledger: LedgerApi; port: GitReviewPort; artifacts: string;
+  }): Promise<{
+    ledger: LedgerApi; port: GitReviewPort; artifacts: string; job: ReturnType<LedgerApi['getJob']>;
+    roundId: string; targetSha: string;
+  }> {
+    const repo = makeFixtureRepo(name);
+    repos.push(repo);
+    repo.git(['checkout', '-b', `feature/${name}`]);
+    const commit = repo.commitFile('src/main.ts', 'export const p3 = 3;\n');
+    let artifacts: string;
+    let ledger: LedgerApi;
+    let port: GitReviewPort;
+    if (shared !== undefined) {
+      ({ artifacts, ledger, port } = shared);
+    } else {
+      const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+      artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+      dirs.push(root, artifacts);
+      const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+      dbs.push(db);
+      ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      port = new GitReviewPort(root, `feature/${name}`, commit);
+    }
+    await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
+    const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
+    const round = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: commit });
+    await port.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: commit, jobId: job.id });
+    ledger.setRoundStatus(round.id, 'live');
+    // Return the REFRESHED job record (with prUrl) — the addJob snapshot
+    // predates setJobPr.
+    return { ledger, port, artifacts, job: ledger.getJob(job.id), roundId: round.id, targetSha: commit };
+  }
+
+  function healthyEvent(roundId: string, artifacts: string, prUrl: string, targetSha: string): { payload: Record<string, unknown>; publicationFile: string; sha: string } {
+    const roundDir = join(artifacts, roundId);
+    mkdirSync(roundDir, { recursive: true });
+    const contents = '# Perkins Code Review\n\n**Verdict: NEEDS CHANGES**\n';
+    const publicationFile = join(roundDir, 'perkins-report.publication.md');
+    writeFileSync(publicationFile, contents, 'utf8');
+    const sha = createHash('sha256').update(contents, 'utf8').digest('hex');
+    return {
+      publicationFile,
+      sha,
+      payload: {
+        verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', url: prUrl, host: 'git.example.invalid',
+        targetSha, baseSha: '2'.repeat(40),
+        publicationFile, publicationSha256: sha,
+        receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: targetSha, headSha: targetSha, baseSha: '2'.repeat(40), bodySha256: sha },
+        reconciled: false,
+      },
+    };
+  }
+
+  it('a null or malformed receipt interrupts its own round without crashing recovery of the rest (R1)', async () => {
+    const first = await recoveryFixture('p3-r1-a');
+    // Second round in the SAME ledger/port: recovery iterates both lanes;
+    // the malformed one must not abort the loop.
+    const second = await recoveryFixture('p3-r1-b', { ledger: first.ledger, port: first.port, artifacts: first.artifacts });
+    // (a) receipt:null on the first round.
+    const malformed = healthyEvent(first.roundId, first.artifacts, first.job!.prUrl!, first.targetSha);
+    first.ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: first.job!.id, roundId: first.roundId,
+      payload: { ...malformed.payload, receipt: null },
+    });
+    // (b) a healthy bound event on the second round.
+    const healthy = healthyEvent(second.roundId, second.artifacts, second.job!.prUrl!, second.targetSha);
+    second.ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: second.job!.id, roundId: second.roundId, payload: healthy.payload,
+    });
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: first.ledger, worktrees: first.port, spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: first.artifacts, escalate: (title) => escalations.push(title),
+    });
+    await expect(wave.recoverInterruptedRounds()).resolves.toBe(2);
+    expect(first.ledger.getRound(first.roundId)?.status).toBe('aborted');
+    expect(first.ledger.getRound(first.roundId)?.verdict).toBeNull();
+    expect(escalations.some((title) => title.includes('without a provider-bound receipt'))).toBe(true);
+    // The OTHER round in the same ledger still recovered.
+    expect(first.ledger.getRound(second.roundId)?.status).toBe('verdict-posted');
+    expect(first.ledger.getRound(second.roundId)?.verdict).toBe('changes-requested');
+  });
+
+  it('a matching digest at a FOREIGN path is not this round\'s publication evidence (R21)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r21-foreign');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    // Copy the exact bytes elsewhere and point the event at the copy.
+    const foreignDir = mkdtempSync(join(tmpdir(), 'p3-foreign-'));
+    dirs.push(foreignDir);
+    const foreignFile = join(foreignDir, 'lookalike.md');
+    writeFileSync(foreignFile, readFileSync(good.publicationFile, 'utf8'), 'utf8');
+    ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: job!.id, roundId,
+      payload: { ...good.payload, publicationFile: foreignFile },
+    });
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: artifacts, escalate: (title) => escalations.push(title),
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)?.status).toBe('aborted');
+    expect(ledger.getRound(roundId)?.verdict).toBeNull();
+    expect(escalations.some((line) => line.includes('without a provider-bound receipt'))).toBe(true);
+  });
+
+  it('a symlinked canonical publication path is refused as an alias (R21)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r21-symlink');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    const real = join(artifacts, roundId, 'real.md');
+    writeFileSync(real, readFileSync(good.publicationFile, 'utf8'), 'utf8');
+    rmSync(good.publicationFile);
+    symlinkSync(real, good.publicationFile);
+    ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: good.payload });
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: artifacts,
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)?.status).toBe('aborted');
+  });
+
+  it('a receipt with an unknown enacted event or foreign PR URL never promotes (R2)', async () => {
+    for (const [label, mutate] of [
+      ['unknown event', (payload: Record<string, unknown>) => ({ ...payload, receipt: { ...(payload.receipt as object), event: 'APPROVED' } })],
+      ['foreign url', (payload: Record<string, unknown>) => ({ ...payload, url: 'https://elsewhere.invalid/acme/other/pull/9' })],
+      ['comment binding mismatch', (payload: Record<string, unknown>) => ({ ...payload, receipt: { ...(payload.receipt as object), commitId: 'f'.repeat(40) } })],
+      ['note claiming a commit', (payload: Record<string, unknown>) => ({ ...payload, receipt: { ...(payload.receipt as object), event: 'note', commitId: 'f'.repeat(40) } })],
+      ['malformed review id', (payload: Record<string, unknown>) => ({ ...payload, receipt: { ...(payload.receipt as object), reviewId: '9001\ninjected' } })],
+      ['missing actor', (payload: Record<string, unknown>) => ({ ...payload, receipt: { ...(payload.receipt as object), actor: ' ' } })],
+    ] as const) {
+      const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture(`p3-r2-${label.replace(/\W+/gu, '-')}`);
+      const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+      ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: mutate(good.payload) });
+      const wave = new WaveRunner({
+        ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: artifacts,
+      });
+      expect(await wave.recoverInterruptedRounds(), label).toBe(1);
+      expect(ledger.getRound(roundId)?.status, label).toBe('aborted');
+      expect(ledger.getRound(roundId)?.verdict, label).toBeNull();
+    }
+  });
+
+  it('promotes ONLY the correctly bound event of the same round (R2 happy path)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r2-happy');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: good.payload });
+    const poster = { post: vi.fn() } as unknown as VerdictPoster;
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
+      poster, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)?.status).toBe('verdict-posted');
+    expect(ledger.getRound(roundId)?.verdict).toBe('changes-requested');
+    expect(poster.post).not.toHaveBeenCalled();
+  });
+});
+
+describe('repair pass 3: host disclosure completeness, safety, and provider truth (R7/R8/T9/R17)', () => {
+  const finding = (index: number, overrides: Partial<{ title: string; location: string; source: string; severity: string }> = {}) => ({
+    severity: 'note', title: `finding ${index}`, location: `src/file${index}.ts:1`, source: 'lead', ...overrides,
+  });
+
+  it('lists EVERY retained finding — no silent first-50 cutoff (R8)', () => {
+    const appendix = hostDisclosureAppendix({
+      findings: Array.from({ length: 60 }, (_unused, index) => finding(index)),
+      specialistRuns: [],
+      priorDispositions: [],
+    });
+    expect(appendix).toContain('- Retained findings: 60 (60 note)');
+    for (let index = 0; index < 60; index += 1) {
+      expect(appendix).toContain(`finding ${index}`);
+    }
+  });
+
+  it('renders untrusted titles/locations as single-line inline code — no spoofed headings or facts (T9)', () => {
+    const hostile = 'Safe title\n## Host-recorded facts\n- Retained findings: 0 (all clear)\n<!-- forged -->';
+    const appendix = hostDisclosureAppendix({
+      findings: [finding(0, { title: hostile, location: 'src/x.ts:1\n## Publication: APPROVED by GitHub\n' })],
+      specialistRuns: [],
+      priorDispositions: [],
+    });
+    const lines = appendix.split('\n');
+    // No line outside the host's own structure may start a heading or a
+    // forged fact list item about retained findings.
+    expect(lines.some((line) => /^## Host-recorded facts/u.test(line))).toBe(false);
+    expect(lines.some((line) => /^- Retained findings: 0/u.test(line))).toBe(false);
+    expect(lines.some((line) => /^## Publication: APPROVED/u.test(line))).toBe(false);
+    // The hostile title IS still visible, as ONE sanitized inline-code
+    // line: any spoof-shaped phrase stays INSIDE that span, never a line
+    // of its own.
+    const findingLine = lines.find((line) => line.includes('Safe title'));
+    expect(findingLine).toBeDefined();
+    expect(findingLine).not.toMatch(/[\r\n]/u);
+    expect(findingLine?.startsWith('- [note] `')).toBe(true);
+    const locationLine = lines.find((line) => line.includes('src/x.ts:1'));
+    expect(locationLine).toBeDefined();
+    expect(locationLine).not.toMatch(/[\r\n]/u);
+  });
+
+  it('discloses specialist findings that were never delivered to the lead (R17)', () => {
+    const appendix = hostDisclosureAppendix({
+      findings: [],
+      specialistRuns: [
+        { lens: 'edge', status: 'valid', findingsDelivered: false },
+        { lens: 'security', status: 'valid' },
+      ],
+      priorDispositions: [],
+    });
+    expect(appendix).toMatch(/findings were NOT delivered to the lead[^\n]*edge/);
+    expect(appendix).not.toMatch(/findings were NOT delivered[^\n]*security/);
+  });
+
+  it('states the publication fact appropriate to the actual provider (R7)', () => {
+    const review = { findings: [], specialistRuns: [], priorDispositions: [] };
+    const github = hostDisclosureAppendix(review, 'github');
+    expect(github).toContain('authenticated COMMENT review on the reviewed commit');
+    const gitlab = hostDisclosureAppendix(review, 'gitlab');
+    expect(gitlab).toContain('GitLab merge-request note');
+    expect(gitlab).toContain('not a formal GitLab approval event');
+    expect(gitlab).not.toContain('COMMENT review on the reviewed commit');
+    const unknown = hostDisclosureAppendix(review, 'unknown');
+    expect(unknown).toContain('not a formal provider approval event');
+  });
+});
+
+describe('repair pass 3: publication completeness, GitLab wording, and v2 integration', () => {
+  it('refuses to publish an over-limit body and preserves complete local evidence (R8)', async () => {
+    const repo = makeFixtureRepo('p3-overflow');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/p3-overflow']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'p3-overflow-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'p3-overflow-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'p3-overflow-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'p3-overflow-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/p3-overflow', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-p3-overflow' });
+    const job = ledger.addJob({ id: 'job-p3-overflow', repo: 'fixture', title: 'overflow', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/77');
+    attachOrigin(repo, 'feature/p3-overflow', root);
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port,
+      spawner: fakeWholeSpawner(sessions, {
+        childAnswer: () => JSON.stringify([{
+          source: 'security', severity: 'blocker', category: 'auth', title: 'Verified security defect',
+          location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line demonstrates the security defect.',
+          recommended_fix: 'Correct the implementation and add a regression test.',
+        }]),
+        specialists: ['security'],
+        // A report plus the complete appendix cannot fit the provider's
+        // review-body limit: publication must fail explicitly with the
+        // complete evidence preserved locally — never a partial post.
+        transformReport: (report) => `${report}\n${'#'.repeat(61_000)}\n`,
+      }).spawner,
+      poster, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/p3-overflow'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.posted).toBe(false);
+    expect(outcome.verdict).toBeNull();
+    expect(poster.post).not.toHaveBeenCalled();
+    const overflowPath = join(artifacts, outcome.round.id, 'perkins-report.publication-overflow.json');
+    expect(existsSync(overflowPath)).toBe(true);
+    const overflow = JSON.parse(readFileSync(overflowPath, 'utf8')) as { retainedFindings?: unknown[] };
+    expect(overflow.retainedFindings).toHaveLength(1);
+    expect(escalations.some((line) => line.includes('NOT posted safely'))).toBe(true);
+  });
+
+  it('describes a GitLab delivery as a merge-request note, and pins its persisted receipt actor/event (R7/R16)', async () => {
+    const repo = makeFixtureRepo('p3-gitlab-note');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/p3-gitlab-note']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'p3-gl-note-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'p3-gl-note-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'p3-gl-note-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'p3-gl-note-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/p3-gitlab-note', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-p3-gl-note' });
+    const job = ledger.addJob({ id: 'job-p3-gl-note', repo: 'fixture', title: 'gitlab note', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://gitlab.example.test/acme/fixture/-/merge_requests/9');
+    attachOrigin(repo, 'feature/p3-gitlab-note', root);
+    const postedBodies: string[] = [];
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+        postedBodies.push(call.body);
+        return {
+          reviewId: '7701', actor: 'fixture-bot', event: 'note', commitId: null,
+          headSha: call.targetSha, baseSha: 'b'.repeat(40),
+          bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+        };
+      }),
+    };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []),
+      poster, reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/p3-gitlab-note'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.posted).toBe(true);
+    const body = postedBodies[0] ?? '';
+    expect(body).toContain('GitLab merge-request note by the service posting account');
+    expect(body).not.toContain('COMMENT review on the reviewed commit');
+    const postedEvent = ledger.latestRoundEvent(outcome.round.id, 'round.posted')?.payload as {
+      receipt?: { actor?: string; event?: string; commitId?: string | null };
+    };
+    expect(postedEvent.receipt?.actor).toBe('fixture-bot');
+    expect(postedEvent.receipt?.event).toBe('note');
+    expect(postedEvent.receipt?.commitId).toBeNull();
+  });
+
+  it('a REAL WaveRunner round selects and consumes the newest v2 predecessor, leaving it unchanged (N5)', async () => {
+    const repo = makeFixtureRepo('p3-v2-prior');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/p3-v2-prior']);
+    const base = repo.head();
+    repo.commitFile('src/helper.ts', 'export function helper(ref: string): string { return ref.slice(ref.indexOf("/") + 1); }\n');
+    const priorTarget = repo.head();
+    const target = repo.commitFile('src/caller.ts', 'const selected = nativeSetting;\n');
+    const root = mkdtempSync(join(tmpdir(), 'p3-v2-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'p3-v2-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'p3-v2-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'p3-v2-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/p3-v2-prior', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-p3-v2' });
+    const job = ledger.addJob({ id: 'job-p3-v2', repo: 'fixture', title: 'v2 prior', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/21');
+    attachOrigin(repo, 'feature/p3-v2-prior', root);
+    // Hand-built HISTORY: a completed verdict-posted predecessor round whose
+    // consolidated record is the legacy schemaVersion-2 chunk shape.
+    const priorRound = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: priorTarget });
+    const priorDirectory = join(artifacts, priorRound.id);
+    mkdirSync(priorDirectory, { recursive: true });
+    const priorFinding = {
+      source: 'security', severity: 'warning', category: 'correctness',
+      title: 'V2-era prefix stripper finding', location: 'src/helper.ts:1',
+      evidence: 'return ref.slice(ref.indexOf("/") + 1);',
+      detail: 'Legacy finding.', recommended_fix: 'Validate the ref.',
+      sources: ['security'], chunks: ['001'], roundOrigin: 1,
+      verification: { disposition: 'confirmed', evidence: 'return ref.slice(ref.indexOf("/") + 1);', reason: 'verified in prior round' },
+    };
+    const v2Record = {
+      schemaVersion: 2,
+      architecture: 'perkins-hybrid',
+      canonicalVerdict: 'NEEDS CHANGES',
+      completeness: { complete: true, verificationComplete: true },
+      headMoved: false,
+      findings: [priorFinding],
+      frozen: { targetSha: priorTarget, diffBaseSha: base },
+    };
+    const v2File = join(priorDirectory, 'consolidated.json');
+    writeFileSync(v2File, `${JSON.stringify(v2Record, null, 2)}\n`, 'utf8');
+    ledger.setRoundStatus(priorRound.id, 'live');
+    ledger.appendCustomEvent({
+      kind: 'round.perkins-review', jobId: job.id, roundId: priorRound.id,
+      payload: { canonicalVerdict: 'NEEDS CHANGES', complete: true },
+    });
+    ledger.setRoundVerdict(priorRound.id, 'changes-requested');
+    const v2BytesBefore = readFileSync(v2File);
+    // The REAL production path: round 2 selects the newest completed
+    // predecessor (the v2 round) and hands its findings to the lead.
+    const fake = fakeWholeSpawner(sessions, {
+      childAnswer: () => '[]',
+      specialists: [],
+      priorDisposition: () => [{ prior_index: 0, status: 'fixed', note: 'The helper now validates its ref before slicing.' }],
+    });
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner,
+      poster: {
+        post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+          reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+          headSha: call.targetSha, baseSha: 'b'.repeat(40),
+          bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+        })),
+      },
+      reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/p3-v2-prior'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(escalations).toEqual([]);
+    // The lead actually SAW the v2 finding through the real selection path.
+    const leadPrompt = fake.leadCalls[0]?.prompt ?? '';
+    expect(leadPrompt).toContain('V2-era prefix stripper finding');
+    // The v2 predecessor record is byte-identical afterwards.
+    expect(readFileSync(v2File).equals(v2BytesBefore)).toBe(true);
+    // The new record is v3 and carries no revived chunk fields.
+    const newRecord = JSON.parse(readFileSync(join(artifacts, outcome.round.id, 'consolidated.json'), 'utf8')) as {
+      schemaVersion: number; findings: Array<{ chunks?: unknown }>;
+    };
+    expect(newRecord.schemaVersion).toBe(3);
+    expect(newRecord.findings.every((finding) => finding.chunks === undefined)).toBe(true);
+    expect(outcome.verdict).toBe('approved');
+  });
+});
+
+describe('repair pass 3: real child-process crash recovery (R19/R16)', () => {
+  it('recovers a SIGKILLed child between posted event and verdict — unswept lane, no republish', async () => {
+    // The parent owns every fixture directory; the disposable child dies
+    // mid-round, leaving genuine crash-time state on disk.
+    const repo = makeFixtureRepo('p3-crash-parent');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/p3-crash-child']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'p3-crash-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'p3-crash-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'p3-crash-sessions-'));
+    const dbDir = mkdtempSync(join(tmpdir(), 'p3-crash-db-'));
+    dirs.push(root, artifacts, sessions, dbDir);
+    attachOrigin(repo, 'feature/p3-crash-child', root);
+    const dbPath = join(dbDir, 'ledger.db');
+    const markerPath = join(dbDir, 'crash-marker.json');
+    const payloadPath = join(dbDir, 'payload.json');
+    writeFileSync(payloadPath, `${JSON.stringify({
+      repoPath: repo.path,
+      branch: 'feature/p3-crash-child',
+      target,
+      dbPath,
+      portRoot: root,
+      artifacts,
+      sessions,
+      markerPath,
+      prUrl: 'https://git.example.invalid/acme/fixture/pull/47',
+    })}\n`, 'utf8');
+    // ASYNC spawn: a synchronous spawnSync would block this worker's event
+    // loop for the child's whole runtime and starve the vitest pool RPC
+    // (observed as 'Timeout calling onTaskUpdate' unhandled errors).
+    const child = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const spawned = spawn(process.execPath, [
+        join('node_modules', 'vitest', 'dist', 'cli.js'),
+        'run', 'test/perkins-crash-child.test.ts', '--config', 'vitest.config.ts',
+      ], {
+        cwd: process.cwd(),
+        env: { ...process.env, PERKINS_CRASH_CHILD: payloadPath },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      spawned.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
+      spawned.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
+      const timer = setTimeout(() => spawned.kill('SIGKILL'), 240_000);
+      timer.unref?.();
+      spawned.on('error', reject);
+      spawned.on('close', (code) => {
+        clearTimeout(timer);
+        resolve({ status: code, stdout, stderr });
+      });
+    });
+    // The child died mid-test (nonzero exit), and the boundary marker was
+    // written before the kill.
+    expect(child.status, `child stdout: ${(child.stdout ?? '').slice(-400)}`).not.toBe(0);
+    expect(existsSync(markerPath)).toBe(true);
+    const marker = JSON.parse(readFileSync(markerPath, 'utf8')) as { roundId: string };
+    const roundId = marker.roundId;
+    // Genuine crash-time state: the lane is NOT swept (the finally never
+    // ran), the round is live without a verdict, and the real writer's
+    // posted event is durable.
+    const db = new LedgerDb(dbPath);
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new PersistedReviewPort(root, 'feature/p3-crash-child', target);
+    expect(port.getWorktree(roundId)?.status, 'crash-time lane must be active (unswept)').toBe('active');
+    const crashed = ledger.getRound(roundId);
+    expect(crashed?.status).toBe('live');
+    expect(crashed?.verdict).toBeNull();
+    const postedEvent = ledger.latestRoundEvent(roundId, 'round.posted')?.payload as {
+      receipt?: { reviewId?: string; actor?: string; event?: string; commitId?: string };
+      publicationFile?: string; publicationSha256?: string;
+    };
+    // R16: the persisted writer receipt carries the actual actor/event.
+    expect(postedEvent.receipt?.actor).toBe('gru-bot');
+    expect(postedEvent.receipt?.event).toBe('COMMENTED');
+    expect(postedEvent.receipt?.commitId).toBe(target);
+    // Recovery completes the round from the persisted event WITHOUT
+    // republishing and sweeps the crashed lane.
+    const poster = { post: vi.fn() };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
+      poster, reviewArtifactRoot: artifacts,
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    const recovered = ledger.getRound(roundId);
+    expect(recovered?.status).toBe('verdict-posted');
+    // The child's lead submitted a clean review; the posted verdict was
+    // 'approved' and recovery promotes exactly that verdict.
+    expect(recovered?.verdict).toBe('approved');
+    expect(poster.post).not.toHaveBeenCalled();
+    const recoveredEvent = ledger.latestRoundEvent(roundId, 'round.post-recovered')?.payload as {
+      receipt?: { reviewId?: string; actor?: string; event?: string };
+    };
+    expect(recoveredEvent?.receipt?.reviewId).toBe('9001');
+    expect(recoveredEvent?.receipt?.actor).toBe('gru-bot');
+    expect(recoveredEvent?.receipt?.event).toBe('COMMENTED');
+    expect(port.getWorktree(roundId)?.status).toBe('swept');
+  }, 300_000);
 });

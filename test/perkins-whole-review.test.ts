@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   assertFrozenPromptBounds,
@@ -402,8 +403,11 @@ describe('Perkins whole-PR lead engine', () => {
     expect(consolidated.findings).toHaveLength(0);
   });
 
-  it('accepts a same-file additive fix that the removed-line proof shape used to reject, with a truthful guard note', async () => {
-    const guardedHelper = 'export function helper(ref: string): string {\n  if (!ref.includes("/")) throw new Error("malformed ref");\n  return ref.slice(ref.indexOf("/") + 1);\n}\n';
+  it('accepts a same-file additive fix guarded by a helper that is INVOKED, not merely read (N10/R20)', async () => {
+    // The fixture body is valid TypeScript without annotations so the test
+    // can import and EXECUTE the actual guard (the .ts extension is
+    // irrelevant to the frozen diff; the behavior is what the note claims).
+    const guardedHelper = 'export function helper(ref) {\n  if (!ref.includes("/")) throw new Error("malformed ref");\n  return ref.slice(ref.indexOf("/") + 1);\n}\n';
     const h = priorHarness({
       audit: {
         prior_index: 0,
@@ -422,6 +426,14 @@ describe('Perkins whole-PR lead engine', () => {
     expect(readFileSync(join(h.repo.path, 'src/helper.ts'), 'utf8')).toContain('return ref.slice(ref.indexOf("/") + 1);');
     expect(readFileSync(join(h.repo.path, 'src/helper.ts'), 'utf8')).toContain('throw new Error("malformed ref")');
     expect(result.priorDispositions[0]?.note).toContain('unreachable');
+    // R20: the guard is invoked with malformed and valid input — reading
+    // its text or the note proves nothing about behavior.
+    const moduleRoot = temp('perkins-guard-invoke-');
+    const moduleFile = join(moduleRoot, 'guarded-helper.mjs');
+    writeFileSync(moduleFile, guardedHelper, 'utf8');
+    const { helper } = await import(pathToFileURL(moduleFile).href);
+    expect(() => helper('noslash')).toThrow(/malformed ref/);
+    expect(helper('prefix/value')).toBe('value');
   });
 
   it('still-present priors carry their original round marker and are not double-counted', async () => {
@@ -1445,3 +1457,231 @@ describe('review MCP bridge smoke (declared lead tools)', () => {
 });
 
 
+
+describe('whole-PR engine: repair pass 3', () => {
+  it('keeps a settled valid result when recording its dispose failure ALSO fails, disclosing the recording gap (R10)', async () => {
+    let frozenDir = '';
+    let edgeDisposes = 0;
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'blocker')])
+        : '[]'),
+      specialists: ['edge'],
+      disposeRejects: (call) => {
+        if (call.options.reviewLead === undefined && call.options.isolatedReview !== undefined && edgeDisposes === 0) {
+          edgeDisposes += 1;
+          // The dispose rejects AND the specialists artifact store becomes
+          // unwritable, so writing the dispose-error artifact fails too.
+          chmodSync(join(frozenDir, 'specialists'), 0o500);
+          return true;
+        }
+        return false;
+      },
+      beforeSubmit: () => {
+        try { chmodSync(join(frozenDir, 'specialists'), 0o700); } catch { /* already writable */ }
+      },
+    });
+    frozenDir = h.frozen.directory;
+    const result = await h.run();
+    // The settled edge finding survived: its blocker forces NEEDS CHANGES.
+    expect(result.canonicalVerdict).toBe('NEEDS CHANGES');
+    const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+      specialistRuns: Array<{ lens: string; status: string; cleanupRecordingError?: string }>;
+    };
+    const edgeRuns = consolidated.specialistRuns.filter((run) => run.lens === 'edge' && run.status === 'valid');
+    expect(edgeRuns.length).toBe(1);
+    // The un-recordable cleanup failure is still disclosed durably.
+    expect(typeof consolidated.specialistRuns.find((run) => run.lens === 'edge')?.cleanupRecordingError).toBe('string');
+  });
+
+  it('durably marks over-bound specialist batches as findings never delivered to the lead (R17)', async () => {
+    const bulk = (lens: string): string => JSON.stringify(
+      Array.from({ length: 200 }, (_unused, index) => ({
+        source: lens, severity: 'note', category: 'bulk', title: `${lens} bulk finding ${index}`,
+        location: 'src/main.ts:2', evidence: `  return 43; /*${'x'.repeat(3_800)}`,
+        detail: 'Bulk finding to exceed the response bound.', recommended_fix: 'None needed.',
+      })),
+    );
+    const h = wholeHarness({
+      childAnswer: (prompt) => {
+        const lens = /"source": "(security|codebase)"/u.exec(prompt)?.[1];
+        return lens === undefined ? '[]' : bulk(lens);
+      },
+      specialists: ['security', 'codebase'],
+    }, {
+      beforeFreeze: (repo) => {
+        repo.git(['checkout', 'feature/review']);
+        repo.commitFile('src/main.ts', `export function answer(): number {\n  return 43; /*${'x'.repeat(3_950)}*/\n}\n`);
+      },
+    });
+    const result = await h.run();
+    const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+      specialistRuns: Array<{ lens: string; status: string; findingsDelivered?: boolean }>;
+    };
+    const valid = consolidated.specialistRuns.filter((run) => run.status === 'valid');
+    expect(valid.map((run) => run.lens).sort()).toEqual(['codebase', 'security']);
+    expect(valid.every((run) => run.findingsDelivered === false)).toBe(true);
+  }, 120_000);
+
+  it('refuses to credit a valid-but-empty lens for a lead-invented finding (R12)', async () => {
+    const h = wholeHarness({
+      childAnswer: () => '[]',
+      specialists: ['edge'],
+      leadFinding: groundedFinding('edge', 'blocker'),
+    });
+    await expect(h.run()).rejects.toThrow(/finding-source/);
+  });
+
+  it('rejects a clean-claiming report that names only one of several retained findings (T11)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "codebase"')
+        ? JSON.stringify([
+          groundedFinding('codebase', 'warning', { title: 'first retained problem' }),
+          groundedFinding('codebase', 'warning', { title: 'second retained problem' }),
+        ])
+        : '[]'),
+      specialists: ['codebase'],
+      transformReport: (report) => report
+        // Drop the SECOND finding's whole section (header + its 3 lines)...
+        .replace(/### warning \u2014 second retained problem\n(?:[^\n]*\n){0,3}/u, '')
+        .replace(/- #\d+ [^\n]*second retained problem[^\n]*\n?/gu, '')
+        // ...then assert cleanliness beside the still-retained finding.
+        .concat('\nIn summary, no issues remain in this change; the report above is complete.\n'),
+    });
+    await expect(h.run()).rejects.toThrow(/report-coherence/);
+  });
+
+  it('accepts nuanced prose that still accounts for every retained finding (T11)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "codebase"')
+        ? JSON.stringify([
+          groundedFinding('codebase', 'warning', { title: 'first retained problem' }),
+          groundedFinding('codebase', 'warning', { title: 'second retained problem' }),
+        ])
+        : '[]'),
+      specialists: ['codebase'],
+      transformReport: (report) => report
+        .concat('\nNote: the blind and edge lenses reported no issues of their own; both retained findings above were verified by the lead and stand.\n'),
+    });
+    const result = await h.run();
+    // Warnings do not force changes; the point is the report's honesty.
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.findings).toHaveLength(2);
+  });
+
+  it('handles Git-quoted prior paths and refuses nonexistent or directory-masquerading selections (R11)', async () => {
+    const repo = makeFixtureRepo('whole-reader-quoted');
+    repos.push(repo);
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/quoted']);
+    repo.commitFile('src/plain.ts', 'export const before = 1;\n');
+    const priorTarget = repo.head();
+    repo.commitFile('src/plain.ts', 'export const after = 2;\n');
+    // A file whose name forces Git header quoting stays as an exact read,
+    // and another quoted name is replaced by a directory.
+    repo.commitFile('src/we"ird.ts', 'export const quoted = true;\n');
+    repo.commitFile('src/re"placed.ts', 'export const original = true;\n');
+    repo.git(['rm', '-q', 'src/re"placed.ts']);
+    repo.commitFile('src/re"placed.ts/child.ts', 'export const descendant = true;\n');
+    const root = temp('perkins-quoted-');
+    const priorFile = join(root, 'prior.json');
+    writeFileSync(priorFile, JSON.stringify({
+      schemaVersion: 3,
+      architecture: 'perkins-whole-pr',
+      canonicalVerdict: 'NEEDS CHANGES', complete: true, headMoved: false,
+      findings: [],
+      frozen: { targetSha: priorTarget, diffBaseSha: base },
+    }));
+    const frozen = freezeReviewInputs({
+      roundId: 'quoted-round', repoPath: repo.path, artifactRoot: root,
+      baseRef: base, targetRef: repo.head(), movementRef: 'feature/quoted', spec: 'quoted reader',
+    });
+    const fake = fakeWholeSpawner(temp('perkins-quoted-sessions-'), {
+      childAnswer: () => '[]',
+      specialists: [],
+      onPriorRevision: () => {},
+    });
+    const engine = new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+    await engine.run({
+      roundId: 'quoted-round', roundNumber: 2, frozenReview: frozen,
+      movementRef: 'feature/quoted', noSpec: false, priorConsolidatedFile: priorFile,
+    });
+    const tool = fake.leadCalls[0]!.options.reviewLead!.nativeTools
+      .find((entry) => entry.name === 'perkins_read_prior_revision') as NativeAgentTool;
+    // An ordinary exact-file read still works.
+    const plain = JSON.parse((await tool.execute({ path: 'src/plain.ts' })).text) as { diff: string };
+    expect(plain.diff).toContain('-export const before = 1;');
+    expect(plain.diff).toContain('+export const after = 2;');
+    // A Git-quoted name is read exactly (no header-regex bypass).
+    const quoted = JSON.parse((await tool.execute({ path: 'src/we"ird.ts' })).text) as { diff: string };
+    expect(quoted.diff).toContain('+export const quoted = true;');
+    // ...and ANOTHER quoted name replaced by a directory is refused as
+    // ambiguous — the descendant hunks are not "one exact file".
+    await expect(tool.execute({ path: 'src/re"placed.ts' })).rejects.toThrow(/ambiguous/);
+    // A path that is a file in NEITHER revision is not a valid selection.
+    await expect(tool.execute({ path: 'src/never-existed.ts' })).rejects.toThrow(/not a file in either revision/);
+  });
+
+  it('lists a deleted prior file truthfully as {status:"D"} with newPath null (T15)', async () => {
+    const repo = makeFixtureRepo('whole-reader-deleted');
+    repos.push(repo);
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/deleted']);
+    repo.commitFile('src/gone.ts', 'export const gone = true;\n');
+    const priorTarget = repo.head();
+    repo.git(['rm', '-q', 'src/gone.ts']);
+    repo.commitFile('src/kept.ts', 'export const kept = true;\n');
+    const root = temp('perkins-deleted-');
+    const priorFile = join(root, 'prior.json');
+    writeFileSync(priorFile, JSON.stringify({
+      schemaVersion: 3,
+      architecture: 'perkins-whole-pr',
+      canonicalVerdict: 'NEEDS CHANGES', complete: true, headMoved: false,
+      findings: [],
+      frozen: { targetSha: priorTarget, diffBaseSha: base },
+    }));
+    const frozen = freezeReviewInputs({
+      roundId: 'deleted-round', repoPath: repo.path, artifactRoot: root,
+      baseRef: base, targetRef: repo.head(), movementRef: 'feature/deleted', spec: 'deleted reader',
+    });
+    const fake = fakeWholeSpawner(temp('perkins-deleted-sessions-'), {
+      childAnswer: () => '[]',
+      specialists: [],
+      onPriorRevision: () => {},
+    });
+    const engine = new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+    await engine.run({
+      roundId: 'deleted-round', roundNumber: 2, frozenReview: frozen,
+      movementRef: 'feature/deleted', noSpec: false, priorConsolidatedFile: priorFile,
+    });
+    const tool = fake.leadCalls[0]!.options.reviewLead!.nativeTools
+      .find((entry) => entry.name === 'perkins_read_prior_revision') as NativeAgentTool;
+    const listing = JSON.parse((await tool.execute({})).text) as { changes: Array<{ status: string; oldPath: string | null; newPath: string | null }> };
+    const deleted = listing.changes.find((change) => change.oldPath === 'src/gone.ts');
+    expect(deleted).toEqual({ status: 'D', oldPath: 'src/gone.ts', newPath: null });
+  });
+
+  it('delivers the LAST-file sentinel of a >3000-line multi-file diff to BOTH the lead and specialist prompts (R18)', async () => {
+    const sentinel = 'P3-SENTINEL-LAST-FILE-4902';
+    const h = wholeHarness({
+      childAnswer: () => '[]',
+      specialists: ['edge'],
+    }, {
+      beforeFreeze: (repo) => {
+        repo.git(['checkout', 'feature/review']);
+        for (const directory of ['src/deep', 'web/deep']) {
+          const lines = Array.from({ length: 1_600 }, (_unused, index) => `export const value${index} = ${index};`);
+          repo.commitFile(`${directory}/big-a.ts`, `${lines.join('\n')}\n`);
+        }
+        repo.commitFile('src/deep/big-b.ts', `${Array.from({ length: 20 }, (_unused, index) => `export const tail${index} = ${index};`).join('\n')}\nexport const ${sentinel} = true;\n`);
+      },
+    });
+    await h.run();
+    const leadPrompt = h.leadCalls[0]?.prompt ?? '';
+    expect(leadPrompt).toContain('--- COMPLETE FROZEN DIFF (the whole change under review) ---');
+    expect(leadPrompt).toContain(sentinel);
+    const childPrompts = h.childCalls.map((call) => call.prompt ?? '');
+    expect(childPrompts.length).toBeGreaterThanOrEqual(1);
+    expect(childPrompts.every((prompt) => prompt.includes(sentinel))).toBe(true);
+  }, 120_000);
+});

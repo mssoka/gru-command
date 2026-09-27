@@ -42,13 +42,18 @@ import { railChips, type RailChip } from '../lib/board-rail.js';
 import { formatAge } from '../lib/board-time.js';
 import { jobSignal, pluralCount, roundSummary, unackedByJob, type RoundSummary } from '../lib/board-signals.js';
 
-/** Truthful lens progress for whole-PR rounds: show what actually ran, and
- * name unused lenses instead of counting them as coverage. */
+/** Truthful lens progress for whole-PR rounds: show what actually ran —
+ * including lenses that ran and failed — and name unused lenses instead of
+ * counting them as coverage (R9). */
 function lensProgressLabel(summary: RoundSummary): string {
-  if (summary.unused > 0) {
-    return `${summary.used}/${summary.total} lenses ran · ${summary.unused} not used`;
+  const parts = [`${summary.ran}/${summary.total} lenses ran`];
+  if (summary.failures > 0) parts.push(`${summary.failures} failed`);
+  if (summary.unused > 0) parts.push(`${summary.unused} not used`);
+  if (parts.length === 1) {
+    // Clean full-usage round keeps the compact historical label.
+    return `${summary.done}/${summary.total} lenses`;
   }
-  return `${summary.done}/${summary.total} lenses`;
+  return parts.join(' · ');
 }
 import type { BoardClient } from '../lib/board-client.js';
 import type { StorageLike } from '../theme.js';

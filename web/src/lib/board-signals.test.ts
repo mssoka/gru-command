@@ -88,13 +88,14 @@ describe('roundSummary', () => {
         ],
       }),
     );
-    expect(summary).toEqual({ done: 1, used: 1, unused: 0, total: 3, blockers: 2, failures: 1 });
+    expect(summary).toEqual({ done: 1, used: 1, unused: 0, ran: 1, total: 3, blockers: 2, failures: 1 });
   });
 
   it('counts whole-PR used lenses separately from done-as-not-used lenses', () => {
     const summary = roundSummary(
       round({
         blockers: 1,
+        lensAttempts: [{ lens: 'blind', attempts: 2 }],
         lenses: [
           { lens: 'security', state: 'done', agentId: null, note: 'blocker — found', verdict: 'blocker' },
           { lens: 'tests', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
@@ -103,7 +104,37 @@ describe('roundSummary', () => {
         ],
       }),
     );
-    expect(summary).toEqual({ done: 3, used: 1, unused: 2, total: 4, blockers: 1, failures: 1 });
+    expect(summary).toEqual({ done: 3, used: 1, unused: 2, ran: 2, total: 4, blockers: 1, failures: 1 });
+  });
+
+  it('counts lenses that RAN AND FAILED inside `ran` — an error lens is real work, not "not ran" (R9/N8)', () => {
+    const summary = roundSummary(
+      round({
+        lensAttempts: [{ lens: 'security', attempts: 1 }, { lens: 'edge', attempts: 2 }],
+        lenses: [
+          { lens: 'security', state: 'done', agentId: null, note: 'blocker — found; earlier failed attempt recorded', verdict: 'blocker' },
+          { lens: 'edge', state: 'error', agentId: null, note: 'specialist attempts failed: a1 timeout; a2 timeout', verdict: null },
+          { lens: 'tests', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+          { lens: 'blind', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+        ],
+      }),
+    );
+    // security ran (valid) and edge ran (failed): 2 lenses actually ran.
+    expect(summary.ran).toBe(2);
+    expect(summary.used).toBe(1);
+    expect(summary.unused).toBe(2);
+    expect(summary.failures).toBe(1);
+    // An error lens with NO attempts (e.g. interrupted before spawn) did
+    // not run and must not inflate `ran`.
+    const interrupted = roundSummary(
+      round({
+        lenses: [
+          { lens: 'blind', state: 'error', agentId: null, note: 'review interrupted by service restart', verdict: null },
+          { lens: 'security', state: 'done', agentId: null, note: 'blocker — found', verdict: 'blocker' },
+        ],
+      }),
+    );
+    expect(interrupted.ran).toBe(1);
   });
 });
 
@@ -161,7 +192,7 @@ describe('jobSignal', () => {
     expect(signal).toEqual({
       label: '◉ round 2 · live · 1/3',
       tone: 'work',
-      title: 'round 2 live — 1/3 lenses done',
+      title: 'round 2 live — 1/3 lenses settled',
     });
   });
 
@@ -181,7 +212,9 @@ describe('jobSignal', () => {
       }),
       0,
     );
-    expect(signal?.label).toBe('⛔ 2 blockers · ✕ 1 lens failure · ◉ round 3 · live · 1/2');
+    // An errored lens is settled (it will not run again); settled counts
+    // done + failed, so the pill cannot read 1/2 beside a failed lens.
+    expect(signal?.label).toBe('⛔ 2 blockers · ✕ 1 lens failure · ◉ round 3 · live · 2/2');
     expect(signal?.tone).toBe('alert');
     expect(signal?.title).toContain('round 3: 2 blockers');
   });

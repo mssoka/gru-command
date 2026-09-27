@@ -462,6 +462,7 @@ async function run() {
             `Base: ${/^Frozen diff base SHA: (.+)$/m.exec(prompt)?.[1] ?? ''}`,
             'Specialists: blind edge acceptance security architecture codebase tests',
             'warning Verified adapter finding src/main.ts:2',
+            'warning Changed behavior lacks test tracing src/main.ts:2 — add an assertion for the changed return value.',
             'Retain verification coverage for this path.',
           ].join('\n'),
         },

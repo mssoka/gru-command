@@ -150,6 +150,14 @@ export interface SpecialistRun {
   readonly status: 'valid' | 'invalid' | 'failed';
   readonly failureKind?: ChildFailureKind;
   readonly error?: string;
+  /** False when the run completed validly but its findings never reached
+   * the lead (over-bound tool response): 'ran' must never read as
+   * 'delivered' (R17). Absent = delivered. */
+  readonly findingsDelivered?: boolean;
+  /** Set when the run settled but its cleanup failure could not be
+   * recorded durably — the settled work stands, the recording gap is
+   * disclosed (R10). */
+  readonly cleanupRecordingError?: string;
 }
 
 export interface PerkinsWholeResult {
@@ -204,6 +212,11 @@ interface SubmissionValidationContext {
   /** Lenses with a committed VALID specialist result; a lead finding may
    * never be attributed to a lens that did not actually run. */
   readonly validLenses: ReadonlySet<PerkinsLens>;
+  /** Per lens, the exact titles of the findings its valid runs actually
+   * DELIVERED to the lead (R12): crediting a lens requires the specialist
+   * to have reported that finding — a valid-but-empty (or undelivered)
+   * result cannot originate a lead-invented finding. */
+  readonly deliveredLensFindingTitles: ReadonlyMap<PerkinsLens, ReadonlySet<string>>;
 }
 
 interface SubmissionValidationSuccess {
@@ -882,9 +895,11 @@ export class PerkinsWholeReview {
         // Cleanup is best-effort by design (T13): a rejected dispose must
         // never discard the settled result above it. The cleanup failure
         // is recorded distinctly as a durable artifact — the child's work
-        // stands, and the leak is visible to operators. A secondary
-        // artifact-write failure is rethrown AFTER the finally (never
-        // inside it) so it cannot erase the settled result either.
+        // stands, and the leak is visible to operators. When recording the
+        // failure ALSO fails (R10), one alternate artifact name is tried;
+        // if that fails too the fact travels in-memory on the settled run
+        // record — it is NEVER rethrown after settlement, so the pool can
+        // neither drop the result nor refund the executed attempt.
         if (handle !== null) {
           try {
             await handle.dispose();
@@ -896,13 +911,28 @@ export class PerkinsWholeReview {
               });
             } catch (artifactError) {
               if (!(artifactError instanceof Error && 'code' in artifactError && (artifactError as { code?: string }).code === 'EEXIST')) {
-                disposeArtifactError = artifactError;
+                try {
+                  writeReviewArtifact(review, `specialists/${lens}.attempt-${attempt}-${runToken}.dispose-error-${randomUUID().slice(0, 8)}.json`, {
+                    error: sanitizeError(disposeError),
+                    recordingError: sanitizeError(artifactError),
+                    agentId: handle.id,
+                  });
+                } catch (alternateError) {
+                  if (!(alternateError instanceof Error && 'code' in alternateError && (alternateError as { code?: string }).code === 'EEXIST')) {
+                    disposeArtifactError = alternateError;
+                  }
+                }
               }
             }
           }
         }
       }
-      if (disposeArtifactError !== null) throw disposeArtifactError;
+      if (disposeArtifactError !== null && settled !== null) {
+        settled = {
+          ...settled,
+          cleanupRecordingError: `could not record the dispose failure durably: ${sanitizeError(disposeArtifactError)}`,
+        };
+      }
       return settled as SpecialistResult;
     };
 
@@ -1002,13 +1032,18 @@ export class PerkinsWholeReview {
           throw batch.error;
         }
         const childResults: readonly SpecialistResult[] = committed;
+        /** Runs of THIS batch whose findings never reached the lead (R17):
+         * commitResults stamps them undelivered even on the error path. */
+        const undeliveredRuns = new Set<string>();
         const payload = JSON.stringify({ results: childResults });
         const commitResults = (): void => {
           // Real executed children are committed to the durable run record
           // and the lens state, whatever happens to the response: their
           // work must never silently become "not used".
           for (const result of childResults) {
-            results.set(result.resultId, result);
+            results.set(result.resultId, undeliveredRuns.has(result.resultId)
+              ? { ...result, findingsDelivered: false }
+              : result);
             if (result.status !== 'valid') {
               const failures = failureLog.get(result.lens) ?? [];
               failureLog.set(result.lens, [...failures, {
@@ -1032,7 +1067,11 @@ export class PerkinsWholeReview {
         } catch (error) {
           // The children really ran: their envelopes/artifacts/run records
           // stay committed (never restored or hidden) — only the response
-          // failed, so the lead learns the transport fact honestly.
+          // failed, so the lead learns the transport fact honestly. The
+          // run records carry findingsDelivered:false so the durable
+          // consolidated record, the ledger note and the published
+          // appendix can never present these findings as received (R17).
+          for (const result of childResults) undeliveredRuns.add(result.resultId);
           commitResults();
           throw new Error(`${(error instanceof Error ? error.message : String(error))}; the completed runs are recorded but their findings were not delivered to you`);
         }
@@ -1115,20 +1154,46 @@ export class PerkinsWholeReview {
           if (typeof value.path !== 'string' || !safeFixPath(value.path)) {
             throw new Error('prior revision path must be a bounded safe relative file path');
           }
-          // Exact-file selection: --text defeats `-diff` attribute binary
-          // marking and --no-textconv defeats textconv drivers, so the
-          // earlier text of a deleted caller stays readable; the result is
-          // then verified to contain EXACTLY the requested file (a literal
-          // pathspec also selects a directory that replaced the file).
+          // Exact-file selection (R11/T10): --text defeats `-diff`
+          // attribute binary marking and --no-textconv defeats textconv
+          // drivers, so the earlier text of a deleted caller stays
+          // readable. EXACTNESS is decided by machine-readable
+          // `diff --name-only -z` under the SAME literal pathspec (raw
+          // NUL-separated paths — Git quoting can never hide a match):
+          // exactly one selected path, identical to the request. A literal
+          // pathspec that selected a directory's descendants, a
+          // masquerading replacement, or a path that is a file in neither
+          // revision is refused — zero matches no longer bypass the check.
+          const selectedPaths = execFileSync('git', [
+            '-C', review.manifest.repoPath, 'diff', '--name-only', '-z', '--no-ext-diff', '--no-color',
+            priorTargetSha, review.manifest.targetSha, '--', `:(literal)${value.path}`,
+          ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] })
+            .split('\0')
+            .filter((entry) => entry !== '');
+          const blobIn = (revision: string): boolean => {
+            try {
+              return execFileSync('git', [
+                '-C', review.manifest.repoPath, 'cat-file', '-t', `${revision}:${value.path}`,
+              ], { encoding: 'utf8', timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'blob';
+            } catch {
+              return false;
+            }
+          };
+          if (selectedPaths.length === 1 && selectedPaths[0] === value.path) {
+            // exact file — fall through and read its diff
+          } else if (selectedPaths.length === 0) {
+            // Unchanged between the revisions is a valid empty read — but
+            // only for a path that IS a file in one of the two trees.
+            if (!blobIn(priorTargetSha) && !blobIn(review.manifest.targetSha)) {
+              throw new Error(`prior revision path ${value.path} is not a file in either revision; select an exact file that exists`);
+            }
+          } else {
+            throw new Error(`prior revision path ${value.path} is ambiguous (${selectedPaths.length} paths selected — a directory may have replaced it); select an exact file`);
+          }
           const diff = execFileSync('git', [
             '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--no-textconv', '--text',
             '--unified=3', priorTargetSha, review.manifest.targetSha, '--', `:(literal)${value.path}`,
           ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
-          const selected = [...diff.matchAll(/^diff --git a\/(.*) b\/(.*)$/gmu)];
-          if (selected.length > 1 || (selected.length === 1 &&
-              selected[0]![1] !== value.path && selected[0]![2] !== value.path)) {
-            throw new Error(`prior revision path ${value.path} is ambiguous (a directory may have replaced it); select an exact file`);
-          }
           payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, path: value.path, diff });
         }
         if (Buffer.byteLength(payload, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {
@@ -1164,6 +1229,16 @@ export class PerkinsWholeReview {
           if (result.status === 'valid') valid.add(result.lens);
         }
         return valid;
+      },
+      get deliveredLensFindingTitles() {
+        const byLens = new Map<PerkinsLens, ReadonlySet<string>>();
+        for (const result of results.values()) {
+          if (result.status !== 'valid' || result.findingsDelivered === false) continue;
+          const titles = byLens.get(result.lens) ?? new Set<string>();
+          for (const finding of result.findings) (titles as Set<string>).add(finding.title.trim());
+          byLens.set(result.lens, titles);
+        }
+        return byLens;
       },
     };
 
@@ -1287,6 +1362,8 @@ export class PerkinsWholeReview {
             lens: result.lens, attempt: result.attempt, status: result.status,
             ...(result.failureKind !== undefined ? { failureKind: result.failureKind } : {}),
             ...(result.error !== undefined ? { error: result.error } : {}),
+            ...(result.findingsDelivered === false ? { findingsDelivered: false } : {}),
+            ...(result.cleanupRecordingError !== undefined ? { cleanupRecordingError: result.cleanupRecordingError } : {}),
           }));
           writeReviewArtifact(review, 'consolidated.json', {
             schemaVersion: 3,
@@ -1439,6 +1516,19 @@ export class PerkinsWholeReview {
         const evidence = collectBoundedString(candidate.evidence, `${subject} evidence`, 4_000, subject, 'finding-evidence', issues);
         const detail = collectBoundedString(candidate.detail, `${subject} detail`, 320, subject, 'finding-detail', issues);
         const fix = collectBoundedString(candidate.recommended_fix, `${subject} recommended_fix`, 320, subject, 'finding-fix', issues);
+        // Provenance (R12): crediting a lens requires that specialist to
+        // have actually DELIVERED a finding with this exact title — a
+        // valid-but-empty or undelivered run cannot originate a
+        // lead-invented finding; the lead's own judgments source "lead".
+        if (
+          title !== null && typeof candidate.source === 'string' && candidate.source !== 'lead' &&
+          sources.has(candidate.source) && context.validLenses.has(candidate.source as PerkinsLens)
+        ) {
+          const deliveredTitles = context.deliveredLensFindingTitles.get(candidate.source as PerkinsLens);
+          if (deliveredTitles === undefined || !deliveredTitles.has(title.trim())) {
+            push(subject, 'finding-source', `${subject} source "${candidate.source}" did not report a finding titled "${title.trim().slice(0, 120)}"; keep the specialist's exact title to credit it, or attribute your own judgment to "lead"`);
+          }
+        }
         if (
           category === null || title === null || location === null || evidence === null || detail === null || fix === null ||
           typeof candidate.source !== 'string' || !sources.has(candidate.source) ||
@@ -1547,17 +1637,32 @@ export class PerkinsWholeReview {
       if (!report.includes(context.review.manifest.targetSha) || !report.includes(context.review.manifest.diffBaseSha)) {
         push('report', 'report-identity', 'report omits the frozen target/base identity');
       }
-      // Coherence, not transcription: when findings are retained, the prose
-      // must acknowledge at least one of them — a report that reads as
-      // issue-free beside retained blockers disagrees with its own record.
+      // Coherence, not transcription (T11): when findings are retained, the
+      // prose must account for EVERY one of them — a report that reads as
+      // issue-free (or names only a token finding) beside retained findings
+      // disagrees with its own record. Whitespace-normalized matching keeps
+      // quoted and wrapped titles working; nuanced scoping ("the blind lens
+      // found no issues of its own") stays legitimate because the titles
+      // themselves are still present.
       const retainedTitles = [
         ...(findings ?? []).map((finding) => finding.title),
         ...(dispositions ?? [])
           .filter((disposition) => disposition.status === 'still-present')
           .map((disposition) => context.prior[disposition.prior_index]?.title ?? ''),
       ].filter((title) => title !== '');
-      if (retainedTitles.length > 0 && !retainedTitles.some((title) => report.includes(title))) {
-        push('report', 'report-coherence', `report mentions none of the ${retainedTitles.length} retained finding(s) while the submission retains them; the prose must agree with the structured outcome`);
+      if (retainedTitles.length > 0) {
+        const normalizedReport = report.replace(/\s+/gu, ' ');
+        const uniqueRetained = [...new Set(retainedTitles)];
+        const missing = uniqueRetained.filter((title) => !normalizedReport.includes(title.replace(/\s+/gu, ' ')));
+        if (missing.length > 0) {
+          const shown = missing.slice(0, 5).map((title) => `"${title.replace(/\s+/gu, ' ').slice(0, 120)}"`);
+          push(
+            'report',
+            'report-coherence',
+            `the report prose does not account for ${missing.length} of ${uniqueRetained.length} retained finding(s) — missing ${shown.join(', ')}${missing.length > 5 ? ` (+${missing.length - 5} more)` : ''}; ` +
+              'a coherent report references every retained finding (quote or restate its title, including still-present priors), or honestly resolves it in the dispositions',
+          );
+        }
       }
     }
     // A moved source ref never retargets this frozen review, and it can never

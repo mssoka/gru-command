@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
@@ -85,17 +85,56 @@ export function redactReviewForPublication(body: string): string {
   return patterns.reduce((text, pattern) => text.replace(pattern, redaction), body);
 }
 
+/** Publication kinds the appendix can describe truthfully. The wording
+ * follows the PR/MR URL FORM (pull/N vs merge_requests/N), which is the
+ * provider family the posting adapter enacts; credential routing stays
+ * with the stricter isGitHubRemote/isGitLabRemote checks. */
+export type PublicationProviderKind = 'github' | 'gitlab' | 'unknown';
+
+function publicationProviderKindFor(prUrl: string | null): PublicationProviderKind {
+  if (prUrl === null) return 'unknown';
+  try {
+    const url = new URL(prUrl.trim());
+    if (isGitHubRemote(url.host) || /^\/[^/]+\/[^/]+\/pull\/\d+\/?$/u.test(url.pathname)) return 'github';
+    if (isGitLabRemote(url.host) || /\/~-\/merge_requests\/\d+\/?$/u.test(url.pathname)) return 'gitlab';
+  } catch {
+    // An unparsable URL never gets a provider-specific publication claim.
+  }
+  return 'unknown';
+}
+
+/** Render one untrusted string as ONE sanitized inline-code span (T9):
+ * newlines/control characters are collapsed (an embedded heading or list
+ * item can never start a line), backticks are neutralized so the span
+ * cannot be escaped, and overlong values are visibly truncated. */
+function renderUntrustedInline(value: string, maxChars = 240): string {
+  const single = value
+    .split('')
+    .map((character) => (character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127 ? ' ' : character))
+    .join('')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .replace(/`+/gu, "'");
+  if (single === '') return '(unspecified)';
+  return single.length > maxChars ? `${single.slice(0, maxChars)}…[truncated]` : single;
+}
+
 /** Compact host-owned factual appendix for the published body: retained
  * findings and execution facts (specialists ran/failed/not-used, prior
  * dispositions) assembled deterministically from the structured result, so
  * PR readers receive the real outcome regardless of the lead's prose. No
  * model transcription is involved; substantive judgment stays with the
- * reviewer. */
-export function hostDisclosureAppendix(review: {
-  readonly findings: ReadonlyArray<{ readonly severity: string; readonly title: string; readonly location: string; readonly source: string }>;
-  readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string }>;
-  readonly priorDispositions: ReadonlyArray<{ readonly status: string }>;
-}): string {
+ * reviewer. EVERY retained finding is listed (R8): there is no silent
+ * first-50 cutoff — a body that cannot fit fails publication explicitly
+ * before it is posted. */
+export function hostDisclosureAppendix(
+  review: {
+    readonly findings: ReadonlyArray<{ readonly severity: string; readonly title: string; readonly location: string; readonly source: string }>;
+    readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string; readonly findingsDelivered?: boolean; readonly cleanupRecordingError?: string }>;
+    readonly priorDispositions: ReadonlyArray<{ readonly status: string }>;
+  },
+  provider: PublicationProviderKind = 'github',
+): string {
   const counts = new Map<string, number>();
   for (const finding of review.findings) counts.set(finding.severity, (counts.get(finding.severity) ?? 0) + 1);
   const severityLine = ['blocker', 'warning', 'note']
@@ -104,22 +143,31 @@ export function hostDisclosureAppendix(review: {
     .join(', ');
   const findingsLines = review.findings.length === 0
     ? ['- none retained']
-    : review.findings.slice(0, 50).map((finding) =>
-        `- [${finding.severity}] ${finding.title} — ${finding.location} (source: ${finding.source})`);
-  const byLens = new Map<string, { valid: number; failed: number }>();
+    : review.findings.map((finding) =>
+        `- [${finding.severity}] \`${renderUntrustedInline(finding.title)}\` — \`${renderUntrustedInline(finding.location)}\` (source: ${renderUntrustedInline(finding.source, 40)})`);
+  const byLens = new Map<string, { valid: number; failed: number; undelivered: boolean; cleanupGap: boolean }>();
   for (const run of review.specialistRuns) {
-    const entry = byLens.get(run.lens) ?? { valid: 0, failed: 0 };
+    const entry = byLens.get(run.lens) ?? { valid: 0, failed: 0, undelivered: false, cleanupGap: false };
     if (run.status === 'valid') entry.valid += 1;
     else entry.failed += 1;
+    if (run.findingsDelivered === false) entry.undelivered = true;
+    if (run.cleanupRecordingError !== undefined) entry.cleanupGap = true;
     byLens.set(run.lens, entry);
   }
   const ran = [...byLens.entries()].sort(([left], [right]) => left.localeCompare(right));
   const failed = ran.filter(([, entry]) => entry.failed > 0);
+  const undelivered = ran.filter(([, entry]) => entry.undelivered);
+  const cleanupGaps = ran.filter(([, entry]) => entry.cleanupGap);
   const notUsed = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests']
     .filter((lens) => !byLens.has(lens));
   const prior = review.priorDispositions;
   const priorFixed = prior.filter((disposition) => disposition.status === 'fixed').length;
   const priorStill = prior.length - priorFixed;
+  const publicationLine = provider === 'github'
+    ? 'Publication: authenticated COMMENT review on the reviewed commit by the service posting account; the substantive verdict is the independent review judgment recorded in this report, not a formal GitHub APPROVED/CHANGES_REQUESTED event.'
+    : provider === 'gitlab'
+      ? 'Publication: GitLab merge-request note by the service posting account — GitLab notes are not server-side commit-bound, so delivery is verified against the frozen head at post time; the substantive verdict is the independent review judgment recorded in this report, not a formal GitLab approval event.'
+      : 'Publication: provider publication by the service posting account; the substantive verdict is the independent review judgment recorded in this report, not a formal provider approval event.';
   return [
     '---',
     '',
@@ -129,10 +177,36 @@ export function hostDisclosureAppendix(review: {
     ...findingsLines,
     `- Specialists run: ${ran.length === 0 ? 'none (lead-owned whole-change review)' : ran.map(([lens, entry]) => `${lens}${entry.failed > 0 ? ` (attempts: ${entry.valid} valid, ${entry.failed} failed)` : ''}`).join(', ')}`,
     ...(failed.length > 0 ? [`- Failed specialist attempts: ${failed.map(([lens, entry]) => `${lens} ×${entry.failed}`).join(', ')} — the lead judged the change on its own whole-change verification`] : []),
+    ...(undelivered.length > 0 ? [`- Specialist findings were NOT delivered to the lead: ${undelivered.map(([lens]) => lens).join(', ')} — those runs completed but the transport response failed, so the lead judged without their findings`] : []),
+    ...(cleanupGaps.length > 0 ? [`- Specialist cleanup failures that could not be recorded durably: ${cleanupGaps.map(([lens]) => lens).join(', ')}`] : []),
     ...(notUsed.length > 0 ? [`- Lenses not used this round: ${notUsed.join(', ')}`]: []),
     ...(prior.length > 0 ? [`- Prior findings revisited: ${prior.length} (${priorFixed} fixed, ${priorStill} still present)`] : []),
-    '- Publication: authenticated COMMENT review on the reviewed commit by the service posting account; the substantive verdict is the independent review judgment recorded in this report, not a formal GitHub APPROVED/CHANGES_REQUESTED event.',
+    publicationLine,
   ].join('\n');
+}
+
+/** Conservative provider review-body bound (GitHub's is 65,536 characters;
+ * the margin absorbs transport growth). A body over this bound is NEVER
+ * silently trimmed: publication fails explicitly with complete local
+ * evidence instead (R8). */
+export const PUBLICATION_BODY_MAX_BYTES = 60_000;
+
+/** Assemble the exact publication body (report + host appendix) and refuse
+ * one that cannot carry the complete disclosure: the caller preserves the
+ * complete retained-finding evidence locally and fails loudly. */
+export function publicationBodyFor(
+  reportText: string,
+  review: Parameters<typeof hostDisclosureAppendix>[0],
+  provider: PublicationProviderKind,
+): string {
+  const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider)}\n`;
+  if (Buffer.byteLength(body, 'utf8') > PUBLICATION_BODY_MAX_BYTES) {
+    throw new Error(
+      `publication body (${Buffer.byteLength(body, 'utf8')} bytes) exceeds the provider review-body limit (${PUBLICATION_BODY_MAX_BYTES} bytes); ` +
+      'complete retained-finding evidence is preserved locally — refusing to publish a partial disclosure',
+    );
+  }
+  return body;
 }
 
 type ReviewLensResult =
@@ -189,8 +263,84 @@ export interface VerdictPoster {
   reconcile?(input: VerdictPosterInput): Promise<PostedReviewReceipt | null>;
 }
 
+/** Bounded pagination for ambiguous-delivery lookups (R4): both providers
+ * page past the first hundred; an exhausted bound is an UNRESOLVED error,
+ * never proof of absence or permission for a second POST. */
+const MAX_RECONCILE_PAGES = 10;
+
 function receiptDigest(body: string): string {
   return createHash('sha256').update(body, 'utf8').digest('hex');
+}
+
+/** The exact `round.posted` payload the production writer appends (see
+ * recordDelivery). ONE shared shape for writer and restart-recovery reader
+ * (R2/R21): the reader can never be more permissive than the writer. */
+export interface PostedEventPayload {
+  readonly verdict: RoundVerdict;
+  readonly canonicalVerdict: CanonicalReviewVerdict;
+  readonly url: string;
+  readonly host: string;
+  readonly targetSha: string;
+  readonly baseSha: string;
+  readonly publicationFile: string;
+  readonly publicationSha256: string;
+  readonly receipt: PostedReviewReceipt;
+  readonly reconciled: boolean;
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+/** Strict, THROW-FREE parse of a `round.posted` payload (R1): a null
+ * receipt, mistyped fields or a non-object all return null so one corrupt
+ * row can never crash startup recovery; the round simply stays
+ * interrupted. */
+export function parsePostedEventPayload(payload: unknown): PostedEventPayload | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
+  const value = payload as Record<string, unknown>;
+  const verdict = value['verdict'];
+  const canonicalVerdict = value['canonicalVerdict'];
+  const url = value['url'];
+  const host = value['host'];
+  const targetSha = value['targetSha'];
+  const baseSha = value['baseSha'];
+  const publicationFile = value['publicationFile'];
+  const publicationSha256 = value['publicationSha256'];
+  const reconciled = value['reconciled'];
+  const receiptValue = value['receipt'];
+  if (verdict !== 'approved' && verdict !== 'changes-requested') return null;
+  if (typeof canonicalVerdict !== 'string') return null;
+  if (!nonEmptyString(url) || !nonEmptyString(host) || !nonEmptyString(targetSha) || !nonEmptyString(baseSha)) return null;
+  if (!nonEmptyString(publicationFile) || !nonEmptyString(publicationSha256)) return null;
+  if (typeof reconciled !== 'boolean') return null;
+  if (typeof receiptValue !== 'object' || receiptValue === null || Array.isArray(receiptValue)) return null;
+  const receipt = receiptValue as Record<string, unknown>;
+  if (
+    !nonEmptyString(receipt['reviewId']) || (receipt['reviewId'] as string).length > 200 ||
+    !nonEmptyString(receipt['actor']) || (receipt['actor'] as string).length > 200 ||
+    !nonEmptyString(receipt['event']) || (receipt['event'] as string).length > 64 ||
+    !nonEmptyString(receipt['headSha']) || !nonEmptyString(receipt['baseSha']) ||
+    !nonEmptyString(receipt['bodySha256'])
+  ) return null;
+  const commitId = receipt['commitId'];
+  if (commitId !== null && !nonEmptyString(commitId)) return null;
+  return {
+    verdict,
+    canonicalVerdict: canonicalVerdict as CanonicalReviewVerdict,
+    url,
+    host,
+    targetSha,
+    baseSha,
+    publicationFile,
+    publicationSha256,
+    reconciled,
+    receipt: {
+      reviewId: receipt['reviewId'], actor: receipt['actor'], event: receipt['event'],
+      commitId: commitId as string | null, headSha: receipt['headSha'], baseSha: receipt['baseSha'],
+      bodySha256: receipt['bodySha256'],
+    },
+  };
 }
 
 /** Host-side binding of a provider receipt before anything is recorded as
@@ -226,7 +376,37 @@ export function verifyPostedReceipt(
 /** GitHub poster using a commit-bound pull-request review, not an unbound
  * comment. The API's commit_id makes a head race rejectable server-side. */
 export class GhPrPoster implements VerdictPoster {
+  private authenticatedLogin: string | null = null;
+
   constructor(private readonly binary = 'gh') {}
+
+  /** The account gh actually authenticates as on this host — the ONLY
+   * identity a receipt's actor may match (R5). Resolved once per poster
+   * instance; no account is hard-coded and no new credential path exists. */
+  private resolveAuthenticatedLogin(host: string): string {
+    if (this.authenticatedLogin !== null) return this.authenticatedLogin;
+    const who = spawnSync(
+      this.binary,
+      ['api', '--hostname', host, 'user', '--jq', '.login'],
+      { encoding: 'utf8', timeout: 15_000 },
+    );
+    if (who.error !== undefined || who.status !== 0) {
+      throw new Error(`cannot resolve the authenticated gh account on ${host} (${String(who.error ?? who.stderr).trim().slice(0, 200)}) — delivery not recorded`);
+    }
+    const login = (who.stdout ?? '').trim();
+    if (login === '') throw new Error(`gh authenticated account on ${host} is unknown — delivery not recorded`);
+    this.authenticatedLogin = login;
+    return login;
+  }
+
+  /** Provider review ids are integers (or provider-quoted strings); a null
+   * or otherwise unusable id must never be stringified into a receipt
+   * (R13). */
+  private static reviewIdOf(id: unknown): string {
+    if (typeof id === 'number' && Number.isSafeInteger(id)) return String(id);
+    if (typeof id === 'string' && id.trim() !== '') return id;
+    return '';
+  }
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
     const { apiPath, observedHead, observedBase } = this.githubPrIdentity(input);
@@ -254,9 +434,20 @@ export class GhPrPoster implements VerdictPoster {
     } catch {
       throw new Error('gh api review delivery returned no parsable review receipt — delivery not recorded');
     }
-    const reviewId = created.id !== undefined ? String(created.id) : '';
+    const reviewId = GhPrPoster.reviewIdOf(created.id);
     const actor = typeof created.user?.login === 'string' ? created.user.login : '';
     const event = typeof created.state === 'string' ? created.state : '';
+    // The provider must have enacted the requested COMMENT review — a
+    // response carrying any other state is not the delivery we asked for
+    // (R6), and the receipt's author must be the authenticated posting
+    // account, never somebody else's review (R5).
+    if (event !== 'COMMENTED') {
+      throw new Error(`provider enacted review state ${event === '' ? '(none)' : event} instead of COMMENTED — delivery not recorded`);
+    }
+    const authenticatedLogin = this.resolveAuthenticatedLogin(input.host);
+    if (actor.toLowerCase() !== authenticatedLogin.toLowerCase()) {
+      throw new Error(`provider receipt actor ${actor === '' ? '(none)' : actor} is not the authenticated posting account ${authenticatedLogin} — delivery not recorded`);
+    }
     // A GitHub pull-request review MUST name the commit it is bound to: a
     // response without a usable commit_id is not a SHA-bound receipt, no
     // matter what else it carries (T5).
@@ -275,28 +466,45 @@ export class GhPrPoster implements VerdictPoster {
   }
 
   /** Ambiguous-post reconciliation: find an existing provider review bound
-   * to the frozen head whose body is byte-identical to ours. Read-only. */
+   * to the frozen head whose body is byte-identical to ours, authored by
+   * the authenticated account in the enacted COMMENTED state. Read-only,
+   * paged past the first hundred under an explicit bound — an exhausted
+   * bound is UNRESOLVED, never proof of absence or permission to repost
+   * (R4). */
   async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
     const { apiPath, observedHead, observedBase } = this.githubPrIdentity(input);
-    const listed = spawnSync(
-      this.binary,
-      ['api', '--hostname', input.host, `${apiPath}/reviews?per_page=100`],
-      { encoding: 'utf8', timeout: 30_000 },
-    );
-    if (listed.error !== undefined || listed.status !== 0) {
-      throw new Error(`gh api review reconciliation query failed (${(listed.stderr ?? String(listed.error ?? '')).trim().slice(0, 300)})`);
-    }
-    let reviews: ReadonlyArray<{ id?: unknown; user?: { login?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown }>;
-    try {
-      const parsed = JSON.parse((listed.stdout ?? '').trim()) as unknown;
-      if (!Array.isArray(parsed)) throw new Error('not an array');
-      reviews = parsed as typeof reviews;
-    } catch {
-      throw new Error('gh api review reconciliation response was not a review list');
+    const authenticatedLogin = this.resolveAuthenticatedLogin(input.host);
+    const reviews: Array<{ id?: unknown; user?: { login?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown }> = [];
+    for (let page = 1; page <= MAX_RECONCILE_PAGES; page += 1) {
+      const listed = spawnSync(
+        this.binary,
+        ['api', '--hostname', input.host, `${apiPath}/reviews?per_page=100&page=${page}`],
+        { encoding: 'utf8', timeout: 30_000 },
+      );
+      if (listed.error !== undefined || listed.status !== 0) {
+        throw new Error(`gh api review reconciliation query failed (${(listed.stderr ?? String(listed.error ?? '')).trim().slice(0, 300)})`);
+      }
+      let pageReviews: ReadonlyArray<{ id?: unknown; user?: { login?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown }>;
+      try {
+        const parsed = JSON.parse((listed.stdout ?? '').trim()) as unknown;
+        if (!Array.isArray(parsed)) throw new Error('not an array');
+        pageReviews = parsed as typeof pageReviews;
+      } catch {
+        throw new Error('gh api review reconciliation response was not a review list');
+      }
+      reviews.push(...pageReviews);
+      if (pageReviews.length < 100) break;
+      if (page === MAX_RECONCILE_PAGES) {
+        throw new Error(
+          `GitHub review reconciliation exceeded the ${MAX_RECONCILE_PAGES}-page lookup bound without exhausting the review list; delivery stays unresolved — verify manually before any retry, never assume absence`,
+        );
+      }
     }
     const matches = reviews.filter((review) =>
       review.commit_id === input.targetSha &&
-      typeof review.body === 'string' && receiptDigest(review.body) === receiptDigest(input.body));
+      typeof review.body === 'string' && receiptDigest(review.body) === receiptDigest(input.body) &&
+      typeof review.user?.login === 'string' && review.user.login.toLowerCase() === authenticatedLogin.toLowerCase() &&
+      review.state === 'COMMENTED');
     if (matches.length === 0) return null;
     const found = matches[matches.length - 1]!;
     // The filter already demands commit equality; keep the construction
@@ -305,7 +513,7 @@ export class GhPrPoster implements VerdictPoster {
     if (typeof found.commit_id !== 'string' || found.commit_id.trim() === '') return null;
     return verifyPostedReceipt(
       {
-        reviewId: found.id !== undefined ? String(found.id) : '',
+        reviewId: GhPrPoster.reviewIdOf(found.id),
         actor: typeof found.user?.login === 'string' ? found.user.login : '',
         event: typeof found.state === 'string' ? found.state : '',
         commitId: typeof found.commit_id === 'string' ? found.commit_id : null,
@@ -386,12 +594,39 @@ export class GitLabMrPoster implements VerdictPoster {
   private readonly tokenResolver: () => string | undefined;
   private readonly fetchImpl: (input: string, init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
   private readonly gitBinary: string;
+  private authenticatedUser: string | null = null;
 
   constructor(options: GitLabMrPosterOptions = {}) {
     this.token = options.token;
     this.tokenResolver = options.tokenResolver ?? (() => process.env['GITLAB_TOKEN'] ?? process.env['GL_TOKEN']);
     this.fetchImpl = options.fetchImpl ?? (fetch as never);
     this.gitBinary = options.gitBinary ?? 'git';
+  }
+
+  /** The account the PRIVATE-TOKEN authenticates as on this host — the only
+   * author whose notes this service may claim (R5). Resolved once per
+   * poster instance through the SAME token, no new credential path. */
+  private async resolveAuthenticatedUser(host: string, headers: { readonly 'PRIVATE-TOKEN': string; readonly 'CONTENT-TYPE': string }): Promise<string> {
+    if (this.authenticatedUser !== null) return this.authenticatedUser;
+    let response: Awaited<ReturnType<typeof this.fetchImpl>>;
+    try {
+      response = await this.fetchImpl(`https://${host}/api/v4/user`, { headers, signal: AbortSignal.timeout(15_000) });
+    } catch (error) {
+      throw new Error(`GitLab authenticated-account probe failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!response.ok) {
+      throw new Error(`GitLab authenticated-account probe exited HTTP ${response.status} — delivery stays unresolved`);
+    }
+    let user: { username?: unknown };
+    try {
+      user = JSON.parse((await response.text()).slice(0, 1024 * 1024)) as typeof user;
+    } catch {
+      throw new Error('GitLab authenticated-account response was not valid JSON');
+    }
+    const username = typeof user.username === 'string' ? user.username.trim() : '';
+    if (username === '') throw new Error('GitLab token authenticates no named account — delivery stays unresolved');
+    this.authenticatedUser = username;
+    return username;
   }
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
@@ -438,45 +673,53 @@ export class GitLabMrPoster implements VerdictPoster {
     );
   }
 
-  /** Ambiguous-post reconciliation: find an existing note byte-identical to
-   * ours on the same head. Read-only. */
+  /** Ambiguous-post reconciliation FAILS CLOSED (R3/T7): GitLab notes
+   * carry no server-side commit binding, so a body-matching note — even by
+   * the authenticated author, even on the MR's current head — proves
+   * neither the head it was created on nor the attempt that created it.
+   * A historical match can therefore NEVER become a delivered receipt;
+   * only exhaustive pagination with zero authored matches is an honest
+   * `null` (nothing was posted). No new correlation protocol exists. */
   async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
     const { mrUrl, headers } = await this.gitLabIdentity(input);
-    let listResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
-    try {
-      listResponse = await this.fetchImpl(`${mrUrl}/notes?per_page=100`, {
-        headers,
-        signal: AbortSignal.timeout(15_000),
-      });
-    } catch (error) {
-      throw new Error(`GitLab note reconciliation query failed: ${error instanceof Error ? error.message : String(error)}`);
+    const author = await this.resolveAuthenticatedUser(input.host, headers);
+    const matches: ReadonlyArray<{ body?: unknown }> = [];
+    for (let page = 1; page <= MAX_RECONCILE_PAGES; page += 1) {
+      let listResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
+      try {
+        listResponse = await this.fetchImpl(`${mrUrl}/notes?per_page=100&page=${page}`, {
+          headers,
+          signal: AbortSignal.timeout(15_000),
+        });
+      } catch (error) {
+        throw new Error(`GitLab note reconciliation query failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (!listResponse.ok) {
+        throw new Error(`GitLab note reconciliation exited HTTP ${listResponse.status} — cannot verify delivery`);
+      }
+      let notes: ReadonlyArray<{ id?: unknown; body?: unknown; author?: { username?: unknown } }>;
+      try {
+        const parsed = JSON.parse((await listResponse.text()).slice(0, 8 * 1024 * 1024)) as unknown;
+        if (!Array.isArray(parsed)) throw new Error('not an array');
+        notes = parsed as typeof notes;
+      } catch {
+        throw new Error('GitLab note reconciliation response was not a note list');
+      }
+      const pageMatches = notes.filter((note) =>
+        typeof note.body === 'string' && receiptDigest(note.body) === receiptDigest(input.body) &&
+        typeof note.author?.username === 'string' && note.author.username.trim().toLowerCase() === author.toLowerCase());
+      (matches as Array<{ body?: unknown }>).push(...pageMatches);
+      if (notes.length < 100) break;
+      if (page === MAX_RECONCILE_PAGES) {
+        throw new Error(
+          `GitLab note reconciliation exceeded the ${MAX_RECONCILE_PAGES}-page lookup bound without exhausting the note list; delivery stays unresolved — verify manually before any retry, never assume absence`,
+        );
+      }
     }
-    if (!listResponse.ok) {
-      throw new Error(`GitLab note reconciliation exited HTTP ${listResponse.status} — cannot verify delivery`);
-    }
-    let notes: ReadonlyArray<{ id?: unknown; body?: unknown; author?: { username?: unknown } }>;
-    try {
-      const parsed = JSON.parse((await listResponse.text()).slice(0, 8 * 1024 * 1024)) as unknown;
-      if (!Array.isArray(parsed)) throw new Error('not an array');
-      notes = parsed as typeof notes;
-    } catch {
-      throw new Error('GitLab note reconciliation response was not a note list');
-    }
-    const matches = notes.filter((note) => typeof note.body === 'string' && receiptDigest(note.body) === receiptDigest(input.body));
     if (matches.length === 0) return null;
-    const found = matches[matches.length - 1]!;
-    const confirmed = await this.confirmHead(mrUrl, headers, input.targetSha);
-    return verifyPostedReceipt(
-      {
-        reviewId: found.id !== undefined ? String(found.id) : '',
-        actor: typeof found.author?.username === 'string' ? found.author.username : '',
-        event: 'note',
-        commitId: null,
-        headSha: confirmed.headSha,
-        baseSha: confirmed.baseSha,
-        bodySha256: receiptDigest(input.body),
-      },
-      { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+    throw new Error(
+      `GitLab reconciliation found a body-matching note by ${author}, but GitLab notes carry no server-side commit binding — ` +
+      'the note\'s creation head and creating attempt cannot be proved, so this historical match is NOT delivery evidence (fail closed); the round stays honestly unposted',
     );
   }
 
@@ -819,6 +1062,45 @@ export class WaveRunner {
     }
   }
 
+  /** Binding check for a parsed `round.posted` event against the
+   * AUTHORITATIVE frozen facts (R2/R21): the round's frozen target, the
+   * job's actual pull request, a known enacted provider event with its
+   * commit-binding discipline, and the round's OWN canonical publication
+   * path — never a self-declared foreign path or an alias. Returns null
+   * when correctly bound, or a human-readable problem otherwise. */
+  private postedEventBindingProblem(
+    event: PostedEventPayload,
+    round: RoundRecord,
+  ): string | null {
+    if (event.receipt.headSha !== round.targetRef) return 'receipt head does not match the round\'s frozen target';
+    if (event.targetSha !== round.targetRef) return 'posted target does not match the round\'s frozen target';
+    const job = this.opts.ledger.getJob(round.jobId);
+    if (job === null || job.prUrl === null || event.url !== job.prUrl) {
+      return 'posted event URL does not match the job\'s recorded pull request';
+    }
+    if (!/^[A-Za-z0-9._:-]{1,200}$/u.test(event.receipt.reviewId)) {
+      return 'receipt review id is malformed';
+    }
+    if (event.receipt.actor.split('').some((character) => character.charCodeAt(0) < 32)) return 'receipt actor is malformed';
+    if (!/^[0-9a-f]{64}$/u.test(event.receipt.bodySha256)) return 'receipt body digest is malformed';
+    // The enacted provider event is whitelisted with its commit binding: a
+    // GitHub COMMENT review MUST be commit-bound to the frozen target; a
+    // GitLab note MUST NOT claim a server-side commit binding it cannot
+    // have. Any other event string is not a known enacted publication.
+    if (event.receipt.event === 'COMMENTED') {
+      if (event.receipt.commitId !== round.targetRef) return 'COMMENTED receipt is not commit-bound to the frozen target';
+    } else if (event.receipt.event === 'note') {
+      if (event.receipt.commitId !== null) return 'note receipt must not claim a commit binding GitLab does not record';
+    } else {
+      return `receipt event "${event.receipt.event}" is not a known enacted provider event`;
+    }
+    const canonical = join(reviewArtifactDirectory(this.artifactRoot(), round.id), 'perkins-report.publication.md');
+    if (resolve(event.publicationFile) !== resolve(canonical)) {
+      return 'publication path is not this round\'s canonical publication artifact';
+    }
+    return null;
+  }
+
   /** Mark crash-interrupted proof INCOMPLETE and release every owned lane. */
   async recoverInterruptedRounds(): Promise<number> {
     let recovered = 0;
@@ -830,6 +1112,7 @@ export class WaveRunner {
     );
     for (const lane of lanes) {
       if (lane.kind !== 'review' || lane.status === 'swept' || lane.roundId === null) continue;
+      try {
       const round = this.opts.ledger.getRound(lane.roundId);
       if (round === null) {
         await this.sweepReviewWorktree(lane.id);
@@ -847,44 +1130,41 @@ export class WaveRunner {
         ? (payload as { verdict?: unknown }).verdict
         : undefined;
       // A delivered verdict is only recoverable when the posted event
-      // carries a provider-bound receipt that still matches the round's
-      // frozen target and the preserved publication artifact. A bare or
-      // unbound local event — forged or written by an older build — is NOT
-      // promoted to a delivered approval; it terminalizes honestly as an
+      // parses through the SAME shared contract the writer emits and the
+      // receipt is correctly bound to this round, this job's actual pull
+      // request, a known enacted provider event, and the round's OWN
+      // canonical publication artifact (R1/R2/R21). A bare, malformed or
+      // unbound local event — forged, corrupted, or written by an older
+      // build — is NOT promoted; it terminalizes honestly as an
       // interrupted round instead. Completed historical rounds are never
-      // rewritten.
+      // rewritten, and one malformed round never aborts the recovery of
+      // the rest.
       if (postedVerdict === 'approved' || postedVerdict === 'changes-requested') {
-        const receipt = typeof payload === 'object' && payload !== null
-          ? (payload as { receipt?: { reviewId?: unknown; headSha?: unknown; bodySha256?: unknown } }).receipt
-          : undefined;
-        const publication = typeof payload === 'object' && payload !== null
-          ? (payload as { publicationFile?: unknown; publicationSha256?: unknown }).publicationFile
-          : undefined;
-        const publicationSha256 = typeof payload === 'object' && payload !== null
-          ? (payload as { publicationSha256?: unknown }).publicationSha256
-          : undefined;
-        let bound = receipt !== undefined &&
-          typeof receipt.reviewId === 'string' && receipt.reviewId.trim() !== '' &&
-          receipt.headSha === round.targetRef &&
-          typeof receipt.bodySha256 === 'string' &&
-          typeof publicationSha256 === 'string' && publicationSha256 !== '' &&
-          receipt.bodySha256 === publicationSha256 &&
-          typeof publication === 'string' && publication.trim() !== '';
+        const event = parsePostedEventPayload(payload);
+        const bindingProblem = event === null
+          ? 'the round.posted payload is malformed (receipt, publication or identity fields missing or mistyped)'
+          : this.postedEventBindingProblem(event, round);
         // The preserved publication artifact is REQUIRED evidence, not an
-        // optional extra: promotion verifies the file still exists and
-        // carries exactly the digested bytes (T3). A missing/null/
-        // malformed path, a missing/unreadable file or a changed digest
-        // keeps the round honestly interrupted — never a promoted verdict
-        // on unverified publication bytes.
-        if (bound) {
+        // optional extra: promotion verifies the round's OWN canonical
+        // publication file still exists as a regular non-symlink file and
+        // carries exactly the digested bytes (T3/R21).
+        let bound = false;
+        if (event !== null && bindingProblem === null) {
+          bound = true;
           try {
-            const body = readFileSync(publication as string, 'utf8');
-            bound = createHash('sha256').update(body).digest('hex') === publicationSha256;
+            const canonical = join(reviewArtifactDirectory(this.artifactRoot(), round.id), 'perkins-report.publication.md');
+            const info = lstatSync(canonical);
+            if (!info.isFile() || info.isSymbolicLink()) {
+              bound = false;
+            } else {
+              const digest = createHash('sha256').update(readFileSync(canonical, 'utf8')).digest('hex');
+              bound = digest === event.publicationSha256 && digest === event.receipt.bodySha256;
+            }
           } catch {
             bound = false;
           }
         }
-        if (bound) {
+        if (bound && event !== null) {
           this.opts.ledger.setRoundVerdict(round.id, postedVerdict);
           this.opts.ledger.appendCustomEvent({
             kind: 'round.post-recovered',
@@ -893,7 +1173,10 @@ export class WaveRunner {
             payload: {
               verdict: postedVerdict,
               postedEventSeq: posted?.seq ?? null,
-              receipt: { reviewId: receipt!.reviewId, headSha: receipt!.headSha, bodySha256: receipt!.bodySha256 },
+              receipt: {
+                reviewId: event.receipt.reviewId, actor: event.receipt.actor, event: event.receipt.event,
+                headSha: event.receipt.headSha, bodySha256: event.receipt.bodySha256,
+              },
             },
           });
           await this.sweepReviewWorktree(lane.id);
@@ -902,7 +1185,7 @@ export class WaveRunner {
         }
         this.opts.escalate?.(
           `Review round ${round.id} carries a posted verdict without a provider-bound receipt`,
-          'restart recovery cannot verify the delivery of an unbound round.posted event; the round terminalizes as interrupted rather than promoting an unverifiable approval',
+          `restart recovery cannot verify the delivery of an unbound round.posted event (${bindingProblem ?? 'the preserved publication artifact did not match the posted digest'}); the round terminalizes as interrupted rather than promoting an unverifiable approval`,
         );
       }
       const note = 'review interrupted by service restart; required lens/verification proof is incomplete';
@@ -917,6 +1200,20 @@ export class WaveRunner {
       this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE after service restart`, note);
       await this.sweepReviewWorktree(lane.id);
       recovered += 1;
+      } catch (error) {
+        // One unexpectedly failing row must never abort startup recovery of
+        // the remaining rounds (R1): the failure is escalated loudly and
+        // the round is left untouched for inspection and the next restart.
+        this.log('error', 'startup recovery failed for one review round', {
+          lane: lane.id,
+          round: lane.roundId,
+          error: String(error),
+        });
+        this.opts.escalate?.(
+          `Review round ${String(lane.roundId)} could not be processed during startup recovery`,
+          `${String(error)} — the round is left as recorded for inspection; other rounds continue to recover`,
+        );
+      }
     }
 
     for (const job of this.opts.ledger.listJobs()) {
@@ -1732,23 +2029,42 @@ export class WaveRunner {
     let deliveryFailureKind: 'report_not_posted' | 'no_pr_link' = 'report_not_posted';
     if (canonical !== 'INCOMPLETE' && job.prUrl !== null && this.opts.poster !== undefined) {
       const poster = this.opts.poster;
+      const providerKind = publicationProviderKindFor(job.prUrl);
       const deliveryInput = () => {
         const prUrl = new URL(job.prUrl!);
         // The publication carries the lead-authored report PLUS a compact
         // host-owned factual appendix assembled from the structured result:
-        // retained findings and real execution facts (ran/failed/not-used)
-        // reach PR readers deterministically, with no model transcription.
-        const privateBody = `${readFileSync(reportFile, 'utf8').trimEnd()}\n\n${hostDisclosureAppendix(review)}\n`;
-        const publicationBody = redactReviewForPublication(privateBody);
-        return { prUrl, publicationBody };
+        // EVERY retained finding and the real execution facts
+        // (ran/failed/not-used/nondelivered) reach PR readers
+        // deterministically, with no model transcription. A body that
+        // cannot carry the COMPLETE disclosure is refused before posting —
+        // the full evidence is preserved locally instead (R8).
+        let publicationBody: string;
+        try {
+          publicationBody = publicationBodyFor(readFileSync(reportFile, 'utf8'), review, providerKind);
+        } catch (overflow) {
+          if (!(overflow instanceof Error) || !overflow.message.includes('exceeds the provider review-body limit')) throw overflow;
+          writeReviewArtifact(frozenReview, 'perkins-report.publication-overflow.json', {
+            schemaVersion: 1,
+            reason: overflow.message,
+            provider: providerKind,
+            retainedFindings: review.findings.map((finding) => ({
+              severity: finding.severity, title: finding.title, location: finding.location, source: finding.source,
+            })),
+            reportFile,
+            specialistRuns: review.specialistRuns,
+          });
+          throw overflow;
+        }
+        return { prUrl, publicationBody: redactReviewForPublication(publicationBody) };
       };
       const recordDelivery = (delivered: PostedReviewReceipt, publicationFile: string, publicationSha256: string, reconciled: boolean): void => {
-        this.opts.ledger.appendCustomEvent({
-          kind: 'round.posted',
-          jobId: job.id,
-          roundId: round.id,
-          payload: {
-            verdict, canonicalVerdict: canonical, url: job.prUrl, host: new URL(job.prUrl!).host,
+        // The payload IS the shared PostedEventPayload contract: recovery
+        // parses this exact shape through parsePostedEventPayload, so the
+        // writer and reader can never drift apart (R2/R21).
+        if (verdict === null) throw new Error('internal: delivery recorded without a conclusive verdict');
+        const postedPayload: PostedEventPayload = {
+            verdict, canonicalVerdict: canonical, url: job.prUrl!, host: new URL(job.prUrl!).host,
             // The delivery record carries the identity and receipt the
             // poster PROVED: the provider review id, the actual actor and
             // event (an authenticated COMMENT — never a formal
@@ -1759,10 +2075,15 @@ export class WaveRunner {
             publicationFile, publicationSha256,
             receipt: {
               reviewId: delivered.reviewId, actor: delivered.actor, event: delivered.event,
-              commitId: delivered.commitId, headSha: delivered.headSha, bodySha256: delivered.bodySha256,
+              commitId: delivered.commitId, headSha: delivered.headSha, baseSha: delivered.baseSha, bodySha256: delivered.bodySha256,
             },
             reconciled,
-          },
+        };
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.posted',
+          jobId: job.id,
+          roundId: round.id,
+          payload: postedPayload,
         });
         posted = true;
       };
@@ -2042,8 +2363,20 @@ export class WaveRunner {
         : findings.slice(0, 10).map((finding) =>
             `${finding.severity}: ${finding.title} @ ${finding.location} — ${finding.evidence.slice(0, 240)}`,
           ).join('\n');
-      this.opts.ledger.setLensOutcome(round.id, lens, 'done', `${verdict} — ${evidence}`);
-      results.push({ state: 'done', verdict, evidence });
+      // Truthful accounting on the done chip (T12/R17): an earlier FAILED
+      // attempt stays visible after a later success, and valid runs whose
+      // findings never reached the lead say so — 'ran' must never read as
+      // 'delivered and considered'.
+      const history: string[] = [];
+      if (failed.length > 0) {
+        history.push(`earlier failed attempts: ${failed.map((run) => `a${run.attempt} ${run.failureKind ?? 'error'}`).join(', ')}`);
+      }
+      if (runs.some((run) => run.status === 'valid' && run.findingsDelivered === false)) {
+        history.push('specialist findings for this lens were NOT delivered to the lead (transport overflow); the lead judged without them');
+      }
+      const note = `${verdict} — ${evidence}${history.length > 0 ? ` · ${history.join(' · ')}` : ''}`;
+      this.opts.ledger.setLensOutcome(round.id, lens, 'done', note);
+      results.push({ state: 'done', verdict, evidence: note });
     }
     return results;
   }

@@ -493,6 +493,67 @@ describe('board v6 — dense job rows', () => {
   });
 });
 
+describe('board round progress labels (R9/T14/N8)', () => {
+  beforeEach(mountBoardDom);
+
+  it('renders the truthful lenses-ran label counting failed-and-ran lenses, with the failure history on the chip', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({
+      jobs: [baseJob({
+        status: 'in-review',
+        rounds: [baseRound({
+          status: 'live',
+          lensAttempts: [{ lens: 'blind', attempts: 2 }, { lens: 'security', attempts: 1 }, { lens: 'edge', attempts: 2 }],
+          lenses: [
+            { lens: 'blind', state: 'done', agentId: null, note: 'blocker — unsafe retry; earlier failed attempt: a1 timeout', verdict: 'blocker' },
+            { lens: 'security', state: 'done', agentId: null, note: 'clean — nothing found', verdict: 'clean' },
+            { lens: 'edge', state: 'error', agentId: null, note: 'specialist attempts failed: a1 timeout: x; a2 timeout: y', verdict: null },
+            { lens: 'tests', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+          ],
+        })],
+      })],
+    }));
+    const row = document.querySelector<HTMLElement>('.board-job');
+    if (row === null) throw new Error('row missing');
+    // Reveal the round body to render the round header row.
+    row.querySelector<HTMLElement>('.board-job__meta')?.click();
+    const label = row.querySelector<HTMLElement>('.board-round__lens-progress');
+    if (label === null) throw new Error('lens progress label missing');
+    // blind + security + edge actually ran (edge failed): 3 ran, 1 failed,
+    // 1 not used — the label must mean what it counts.
+    expect(label.textContent).toBe('3/4 lenses ran · 1 failed · 1 not used');
+    // Reveal the per-lens chips: the failure history stays visible on the
+    // errored chip after the later success of its siblings (T12).
+    row.querySelector<HTMLButtonElement>('.board-round__toggle')?.click();
+    const edgeChip = [...row.querySelectorAll<HTMLElement>('.board-lens')].find((chip) => chip.textContent?.includes('edge'));
+    expect(edgeChip?.title).toContain('specialist attempts failed');
+    const blindChip = [...row.querySelectorAll<HTMLElement>('.board-lens')].find((chip) => chip.textContent?.includes('blind'));
+    expect(blindChip?.title).toContain('earlier failed attempt');
+  });
+
+  it('keeps the clean full-usage label unchanged (7/7 lenses)', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({
+      jobs: [baseJob({
+        status: 'in-review',
+        rounds: [baseRound({
+          status: 'live',
+          lensAttempts: [],
+          lenses: [
+            { lens: 'blind', state: 'done', agentId: null, note: 'blocker — x', verdict: 'blocker' },
+            { lens: 'security', state: 'done', agentId: null, note: 'clean', verdict: 'clean' },
+          ],
+        })],
+      })],
+    }));
+    const row = document.querySelector<HTMLElement>('.board-job');
+    if (row === null) throw new Error('row missing');
+    row.querySelector<HTMLElement>('.board-job__meta')?.click();
+    const label = row.querySelector<HTMLElement>('.board-round__lens-progress');
+    expect(label?.textContent).toBe('2/2 lenses');
+  });
+});
+
 describe('board v6 — bands', () => {
   beforeEach(mountBoardDom);
 
