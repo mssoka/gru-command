@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { WorktreeBaseSource } from '../../src/ledger/api.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../../src/dispatch/worktree-port.js';
+import { isExactOriginBranchSpelling } from '../../src/worktrees/manager.js';
 
 /**
  * Git-backed review port double: the job lane IS the fixture repo (one
@@ -26,12 +27,14 @@ export function resolveReviewTargetReal(
   let fullName = sym.status === 0 ? sym.stdout.trim() : '';
   const prefix = 'refs/remotes/origin/';
   if (fullName === '') {
-    // Not locally known, but the SPELLING names an origin branch: fetch it
-    // (a branch the remote does not have fails the fetch and refuses).
-    if (ref.startsWith(prefix) && ref.length > prefix.length) {
-      fullName = ref;
-    } else if (ref.startsWith('origin/') && ref.length > 'origin/'.length) {
-      fullName = prefix + ref.slice('origin/'.length);
+    // Not locally known, but an EXACT origin-branch spelling is fetched
+    // (a branch the remote does not have fails the fetch and refuses);
+    // origin-prefixed revision expressions (origin/main~1) fall through
+    // and resolve as the named revision (Perkins R4).
+    if (isExactOriginBranchSpelling(ref)) {
+      fullName = ref.startsWith(prefix)
+        ? ref
+        : prefix + ref.slice('origin/'.length);
     }
   }
   if (fullName.startsWith(prefix) && fullName.length > prefix.length) {

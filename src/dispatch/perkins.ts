@@ -17,6 +17,7 @@ import {
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
 import type { ResidentReviewRound } from '../runtime/registry.js';
+import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
@@ -2157,15 +2158,19 @@ export class WaveRunner {
     const candidateBranch = input.job.prUrl === null
       ? null
       : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
-    // An origin ref NEVER classifies as an explicit pin (Perkins R3): a
-    // remote-only origin/topic is invisible to prBranchCandidate (nothing
-    // local resolves), but it still names a REMOTE BRANCH, and the manager
-    // fetches that spelling — letting it through as a "pin" would bypass
-    // PR-head verification and freeze unrelated bytes for a linked PR.
+    // An EXACT origin branch spelling is NEVER an explicit pin (Perkins
+    // R3/R5): a remote-only origin/topic is invisible to prBranchCandidate
+    // (nothing local resolves), but it still names a REMOTE BRANCH, and
+    // the manager fetches that spelling — letting it through as a "pin"
+    // would bypass PR-head verification and freeze unrelated bytes for a
+    // linked PR. Origin-prefixed REVISION EXPRESSIONS (origin/main~1) are
+    // the opposite case (Perkins R4): they ARE pins — a real branch name
+    // cannot carry their operators — and must resolve to the NAMED
+    // ancestor, never the live PR tip nor a literal branch named "main~1".
     // True explicit pins — SHAs, tags, revision expressions like HEAD~1 —
     // stay pins even for a PR round; everything else on a PR-linked job
     // resolves from the PR's live head branch.
-    const namesOriginRef = ORIGIN_REF_SPELLING.test(input.candidateRef);
+    const namesOriginRef = isExactOriginBranchSpelling(input.candidateRef);
     const explicitPin = input.explicitTarget && candidateBranch === null && !namesOriginRef;
     if (input.job.prUrl === null || explicitPin) {
       // Origin refs (any spelling the manager routes to a fetch) resolve

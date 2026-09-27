@@ -741,6 +741,99 @@ describe('freeze-time integration on PR rounds', () => {
     expect(manifest.targetRef).toBe('origin/feature/lane');
   });
 
+  it('an origin-prefixed REVISION PIN (origin/feature/lane~1) on a linked PR freezes the named ancestor, never the live PR tip (Perkins R4)', async () => {
+    const repo = makeFixtureRepo('freeze-pin-expr-pr');
+    repos.push(repo);
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    repo.git(['checkout', '-b', 'feature/lane']);
+    const laneFirst = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const laneTip = repo.commitFile('src/lane2.ts', 'export const lane2 = true;\n');
+    const origin = attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    const ancestor = repo.git(['rev-parse', 'origin/feature/lane~1']);
+    expect(ancestor).toBe(laneFirst);
+    expect(ancestor).not.toBe(laneTip); // the ancestor is NOT the PR head
+
+    const root = tempDir('gru-freeze-expr-pr-port-');
+    const artifacts = tempDir('gru-freeze-expr-pr-artifacts-');
+    const sessions = tempDir('gru-freeze-expr-pr-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pin-expr-pr' });
+    const job = ledger.addJob({
+      id: 'job-pin-expr-pr', repo: 'fixture', title: 'origin-prefixed revision pin on a linked PR', baseBranch: 'main',
+      briefing: 'Acceptance: lane returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/22');
+    const probe = vi.fn(async () => {
+      throw new Error('a revision pin must not probe the host');
+    }) as unknown as PrHeadProbe;
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: probe,
+    });
+
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'origin/feature/lane~1' }));
+    expect(probe).not.toHaveBeenCalled();
+    // The NAMED ANCESTOR is the frozen target — not the live PR tip.
+    expect(outcome.round.targetRef).toBe(ancestor);
+    expect(outcome.round.targetRef).not.toBe(laneTip);
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
+    ) as { readonly targetSha: string; readonly targetRef: string };
+    expect(manifest.targetSha).toBe(ancestor);
+    expect(manifest.targetRef).toBe('origin/feature/lane~1');
+  });
+
+  it('an origin-prefixed REVISION PIN (origin/feature/lane~1) on a non-PR round resolves the named ancestor — no literal branch fetch (Perkins R4)', async () => {
+    const repo = makeFixtureRepo('freeze-pin-expr-nopr');
+    repos.push(repo);
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+    repo.git(['checkout', '-b', 'feature/lane']);
+    const laneFirst = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const laneTip = repo.commitFile('src/lane2.ts', 'export const lane2 = true;\n');
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    const ancestor = repo.git(['rev-parse', 'origin/feature/lane~1']);
+    expect(ancestor).toBe(laneFirst);
+    expect(ancestor).not.toBe(laneTip);
+
+    const root = tempDir('gru-freeze-expr-nopr-port-');
+    const artifacts = tempDir('gru-freeze-expr-nopr-artifacts-');
+    const sessions = tempDir('gru-freeze-expr-nopr-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pin-expr-nopr' });
+    const job = ledger.addJob({
+      id: 'job-pin-expr-nopr', repo: 'fixture', title: 'origin-prefixed revision pin, non-PR', baseBranch: 'main',
+      briefing: 'Acceptance: lane returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+    });
+
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'origin/feature/lane~1' }));
+    // The named ancestor freezes — the pre-fix code FETCHED a literal
+    // branch named "feature/lane~1" and refused.
+    expect(outcome.round.targetRef).toBe(ancestor);
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
+    ) as { readonly targetSha: string };
+    expect(manifest.targetSha).toBe(ancestor);
+  });
+
   it('aborts before any round when the resolved PR head ref fetches nothing', async () => {
     const repo = makeFixtureRepo('freeze-unfetchable');
     repos.push(repo);

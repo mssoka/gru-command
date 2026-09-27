@@ -297,6 +297,23 @@ interface ResolvedBase {
   readonly fallbackDetail: string | null;
 }
 
+/** True when a ref's SPELLING names an EXACT origin remote branch — the
+ * origin prefix stripped, the remainder is a syntactically plausible
+ * branch name. Origin-prefixed REVISION EXPRESSIONS (origin/main~1,
+ * origin/main^, origin/main@{u}) are NOT branch spellings: a real branch
+ * name cannot contain their operators, and routing one to the fetch would
+ * fetch a literal branch named "main~1" instead of resolving the named
+ * ancestor. Such spellings keep pin semantics (resolved exactly as
+ * named, refusing loudly when unresolvable). */
+export function isExactOriginBranchSpelling(ref: string): boolean {
+  const stripped = ref.replace(/^(?:refs\/)?remotes\/origin\/|^origin\//u, '');
+  if (stripped === '' || stripped === ref) return false; // no origin prefix
+  // Revision-expression operators and git's forbidden ref-name sequences.
+  // A misclassification here can only land on a loud refusal (a fetch of a
+  // name the remote rejects), never on wrong bytes.
+  return !/[~^:@\s]|\.\./u.test(stripped) && !stripped.startsWith('-');
+}
+
 export class WorktreeManager {
   private readonly opts: WorktreeManagerOptions;
   private readonly log: Log;
@@ -490,15 +507,18 @@ export class WorktreeManager {
     let fullName = symbolic.status === 0 ? symbolic.stdout.trim() : '';
     const prefix = 'refs/remotes/origin/';
     if (fullName === '') {
-      // Not locally known — but the SPELLING names an origin branch
-      // (origin/<branch> or refs/remotes/origin/<branch>): treat it as
-      // one and fetch (Perkins blocker: a remote-only branch must be
-      // FETCHED, not rejected as an unknown revision; a branch the
-      // remote does not have fails the fetch and refuses here).
-      if (ref.startsWith(prefix) && ref.length > prefix.length) {
-        fullName = ref;
-      } else if (ref.startsWith('origin/') && ref.length > 'origin/'.length) {
-        fullName = prefix + ref.slice('origin/'.length);
+      // Not locally known — but the SPELLING may name an EXACT origin
+      // branch (origin/<branch> or refs/remotes/origin/<branch>): treat it
+      // as one and fetch (Perkins blocker: a remote-only branch must be
+      // FETCHED, not rejected as an unknown revision; a branch the remote
+      // does not have fails the fetch and refuses here). Origin-prefixed
+      // REVISION EXPRESSIONS (origin/main~1) deliberately do NOT take this
+      // path — they fall through and resolve as the named revision
+      // (Perkins R4: fetching a literal branch named "main~1" is wrong).
+      if (isExactOriginBranchSpelling(ref)) {
+        fullName = ref.startsWith('refs/remotes/origin/')
+          ? ref
+          : `refs/remotes/origin/${ref.slice('origin/'.length)}`;
       }
     }
     if (fullName.startsWith(prefix) && fullName.length > prefix.length) {
