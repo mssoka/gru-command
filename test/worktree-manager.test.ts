@@ -598,6 +598,54 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
     expect(h.manager.getWorktree('job-review-head-down-r1')).toBeNull();
   });
 
+  it('a force-pushed remote orphans the lane base — the branch is RETAINED and the old tip stays reachable (Perkins R7)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-forcepush');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-forcepush', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-forcepush' });
+    const laneTip = row.sha; // the fetched origin tip the lane branched from
+    // The remote FORCE-PUSHES main to rewritten history after creation:
+    // the lane's base tip no longer survives anywhere on the remote.
+    const clone = mkdtempSync(join(tmpdir(), 'gru-wt-forcepush-clone-'));
+    try {
+      execFileSync('git', ['clone', '--quiet', '--branch', 'main', origin, clone], { stdio: 'ignore' });
+      execFileSync(
+        'git',
+        ['-C', clone, ...GIT_IDENTITY, 'commit', '--allow-empty', '--amend', '-m', 'force-pushed history'],
+        { stdio: 'ignore' },
+      );
+      execFileSync('git', ['-C', clone, 'push', '--quiet', '--force', 'origin', 'HEAD:refs/heads/main'], {
+        stdio: 'ignore',
+      });
+    } finally {
+      rmSync(clone, { recursive: true, force: true });
+    }
+    // Proven at setup: the rewritten remote main does NOT contain the tip.
+    const rewrittenTip = execFileSync('git', ['-C', origin, 'rev-parse', 'refs/heads/main'], {
+      encoding: 'utf-8',
+    }).trim();
+    expect(rewrittenTip).not.toBe(laneTip);
+
+    const result = await h.manager.release({ worktreeId: 'job-forcepush' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') {
+      // Containment could not be proven in a CURRENT ref: the branch is
+      // RETAINED and the release reports why — the lane's only copy of
+      // the orphaned tip survives (the release fetch already overwrote
+      // the tracking ref, so the branch is all that is left).
+      expect(result.branch).toBe('retained');
+    }
+    expect(repo.git(['rev-parse', 'refs/heads/gru/job-forcepush'])).toBe(laneTip);
+    const retainedEvent = h.ledger
+      .listEvents({ limit: 100 })
+      .find((event) => event.kind === 'worktree.branch-retained');
+    expect(retainedEvent?.payload).toMatchObject({ branch: 'gru/job-forcepush' });
+    expect(String((retainedEvent?.payload as Record<string, unknown>)?.reason ?? '')).toMatch(
+      /current ref|force-pushed/u,
+    );
+  });
+
   it('an UNREACHABLE origin still consults the cached origin/HEAD as its declared offline guess (retained)', async () => {
     const h = harness();
     const { repo } = originBacked(h, 'fixture-offline-cache'); // cached origin/HEAD -> main

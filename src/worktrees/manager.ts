@@ -1233,14 +1233,20 @@ export class WorktreeManager {
     let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
     let freshHead = '';
     try {
+      // Release re-resolves the FRESH head FIRST (ruling 18e; Perkins r7):
+      // the fetch makes the CURRENT remote state known BEFORE the branch
+      // decision, so containment is judged against surviving refs that
+      // exist now — a remote that force-pushed the lane's base away can
+      // no longer be masked by a stale tracking ref. (A freshHead failure
+      // here skips the disposition — fail-safe: the branch is retained.)
+      freshHead = this.freshHead(row.repoPath);
       // Containment-verified branch delete — job lanes only; a branch
-      // is deleted only when its commits are provably contained in an
-      // existing ref; otherwise it is RETAINED and noted.
+      // is deleted only when its tip is provably contained in a ref that
+      // survives the release; otherwise it is RETAINED, noted, and the
+      // reason reported.
       if (row.kind === 'job' && row.branch !== null) {
         branchOutcome = this.deleteBranchContained(row, baseBranch);
       }
-      // Release re-resolves the FRESH head (ruling 18e).
-      freshHead = this.freshHead(row.repoPath);
     } catch (error) {
       this.log('error', 'sweep tail failed after removal — row still flips swept', {
         id: row.id,
@@ -1420,29 +1426,56 @@ export class WorktreeManager {
       runGit(row.repoPath, ['branch', '-D', branch]);
       return 'deleted';
     }
-    // The lane's REGISTERED base is a provable home too (Perkins r6 W1):
-    // a lane created at a fetched-ahead origin tip has commits the stale
-    // host checkout lacks, so the base-branch check alone would retain
-    // an UNTOUCHED lane's branch — leftover debris that blocks job-id
-    // reuse. Contained in the registered base = the lane never added
-    // commits beyond it; its commits live on in origin's default branch.
-    const containedInRegisteredBase = spawnGit(row.repoPath, [
-      'merge-base',
-      '--is-ancestor',
-      branch,
-      row.sha,
-    ]);
-    if (containedInRegisteredBase.status === 0) {
-      runGit(row.repoPath, ['branch', '-D', branch]);
-      return 'deleted';
+    // The lane's tip must survive in a CURRENT REF — never a bare
+    // recorded sha (Perkins r6 W1 → r7): containment in row.sha only
+    // proves the lane was UNTOUCHED; after a remote force-push the old
+    // tip has no surviving ref anywhere, and deleting the lane's only
+    // branch would orphan it (the release's own fetch then overwrites
+    // the tracking ref, losing the tip for good). Prove containment in
+    // a ref that exists NOW — on the release path the fresh remote
+    // state is fetched FIRST, so a retained remote tip shows up as
+    // origin/<default> containment and the common case still deletes.
+    // Any current ref counts (another branch, a tracking ref, a tag);
+    // the lane's own branch is excluded — it cannot witness itself.
+    const branchTip = spawnGit(row.repoPath, ['rev-parse', `refs/heads/${branch}^{commit}`]);
+    if (branchTip.status === 0 && branchTip.stdout.trim() !== '') {
+      const surviving = spawnGit(row.repoPath, [
+        'for-each-ref',
+        `--contains=${branchTip.stdout.trim()}`,
+        '--format=%(refname)',
+        'refs/heads',
+        'refs/remotes',
+        'refs/tags',
+      ]);
+      if (surviving.status === 0) {
+        const otherRefs = surviving.stdout
+          .split('\n')
+          .map((name) => name.trim())
+          .filter((name) => name !== '' && name !== `refs/heads/${branch}`);
+        if (otherRefs.length > 0) {
+          runGit(row.repoPath, ['branch', '-D', branch]);
+          return 'deleted';
+        }
+      }
     }
     this.opts.ledger.appendCustomEvent({
       kind: 'worktree.branch-retained',
       jobId: row.jobId,
-      payload: { id: row.id, branch, reason: `commits not contained in ${base}` },
+      payload: {
+        id: row.id,
+        branch,
+        reason:
+          'tip not contained in any current ref (remote force-pushed?); retained to preserve the commits',
+      },
     });
-    this.opts.ledger.noteWorktree(row.id, `branch ${branch} retained: not contained in ${base}`);
-    this.log('warn', 'worktree branch retained (uncontained commits)', { id: row.id, branch, base });
+    this.opts.ledger.noteWorktree(
+      row.id,
+      `branch ${branch} retained: tip not contained in any current ref`,
+    );
+    this.log('warn', 'worktree branch retained (no surviving ref for the tip)', {
+      id: row.id,
+      branch,
+    });
     return 'retained';
   }
 }
