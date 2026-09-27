@@ -35,7 +35,8 @@ record.
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
 | `POST /api/agents/state` | `{id, state}` |
 | `POST /api/notifications/:id/shown` | `{surface}` — display receipt (idempotent per surface; the shown:true doctrine) |
-| `POST /api/notifications/:id/ack` | `{by?}` — human ack; clears the row and re-arms an open breaker |
+| `POST /api/notifications/:id/ack` | `{by?}` — owner/FYI ack; refuses machine rows (400), and owner ack re-arms an open breaker |
+| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
 | `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
@@ -87,13 +88,14 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   below 900px the rail stacks under the board and the FAB opens a bottom
   sheet. The nav tabs stay as focus switches: `💬 Chat` opens/focuses
   chat, `🗺️ Board` dismisses the overlay and marks the board.
-- **Dashboard:** **attention bands** — NEEDS YOU → IN FLIGHT → SETTLED →
+- **Dashboard:** **attention bands** — NEEDS GRU → IN FLIGHT → SETTLED →
   COLD, recency inside each band — rendered as full-width **dense rows**
   (line 1: dot + title + status chip; line 2: repo + branch + lane/agent
   ages + PR link), with sticky band headers carrying counts and hairline
   dividers. Failing rows (blocked/error, aborted round, errored lenses
-  without a verdict) are tinted with a left alert accent. NEEDS YOU is
-  always visible (empty = calm “nothing needs you”); SETTLED is a rolling
+  without a verdict) are tinted with a left alert accent. NEEDS GRU is
+  always visible (empty = calm “nothing needs Gru”); FOR YOU belongs only
+  to the owner notification band. SETTLED is a rolling
   window (latest 10 + `+K older settled`, session-expanded; concluded
   jobs render their last round quiescent — no stale blocker pills). Click
   a row to disclose lane + rounds (v3 collapse, persisted per job).
@@ -111,15 +113,22 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `silas.review-triggered`, `silas.directive-sent`, `silas.rebrief`,
   `silas.escalated`, `silas.wake`) — visible in the event stream like
   every other transition.
-- **Notification center (E7):** the bell panel renders the durable
-  notification log — FYI rows (blocked jobs, errored agents/lenses,
-  verdicts, supervisor events) and action-required rows (crash-loop
-  breaker trips) with ack buttons. The badge counts unacked error-severity
-  rows not yet viewed here (an ack from any device clears it); every
-  displayed row earns a shown receipt per surface (nothing "shown" without
-  an ack record); acking an action-required row clears it and re-arms an
-  open breaker. Live arrivals toast (plus a browser notification when
-  permission was granted).
+- **Notification center (E7; routing split 2026-09-23):** the bell panel
+  renders the durable notification log in three bands — FOR YOU
+  (all pending needs-owner rows, even older than the bounded latest feed:
+  owner-only decisions and stops whose ack re-arms supervision), NEEDS GRU
+  (all pending machine rows, including those older than the recent feed;
+  it wakes Gru once and refuses human Ack), and FEED (FYI rows). A machine
+  alert left unresolved 30 minutes after delivery opens a separate
+  owner-only follow-up in FOR YOU; Gru's later disposition resolves it. The badge and live
+  toasts serve needs-owner only; every displayed row earns a shown receipt
+  per surface (a display receipt is not an acknowledgement); acking an
+  owner row clears it where an ack has meaning (a breaker row re-arms
+  supervision). Informational owner stops earn the same unread badge as
+  errors. The
+  wake tracker chip counts durable Gru wakes (`gru.wake` events). Live
+  needs-owner arrivals toast (plus a browser notification when permission
+  was granted).
 - **Transcripts:** drawer with newest-first pages (`load older` by entry
   cursor), debounced server-side search with snippet matches that
   scroll+flash the entry, a wrap toggle (default `pre-wrap` — long lines

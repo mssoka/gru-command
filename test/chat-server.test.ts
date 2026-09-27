@@ -2408,8 +2408,17 @@ describe('chat context controls and durable new-chat boundaries', () => {
     }
   });
 
-  it('does not resume the committed session when timed-out compaction disposal fails', async () => {
-    const h = await makeHarness({ controlTimeoutMs: 25, replaceDisposedOnResume: true });
+  it('reports a recovery-blocked wake instead of leaving the active batch stranded', async () => {
+    const blocked: string[] = [];
+    const h = await makeHarness({
+      controlTimeoutMs: 25,
+      replaceDisposedOnResume: true,
+      awareness: {
+        prepare: () => ({ text: '[gru awareness · service context — not a user message]', coveredThroughSeq: 1 }),
+        commit: () => {},
+        noteWakeBlocked: (reason) => { blocked.push(reason); },
+      },
+    });
     try {
       const client = await authedClient(h.port, TOKEN, undefined, true);
       client.send('establish disposal failure', 'dispose-failure-establish');
@@ -2426,6 +2435,10 @@ describe('chat context controls and durable new-chat boundaries', () => {
       ).toMatchObject({ ok: false, code: 'failed' });
       expect(h.spawnCalls).toHaveLength(spawnsBefore);
       expect(await client.closed).toBe(1011);
+      h.chat.wakeAwareness();
+      await pollUntil(() => blocked.length === 1, 'recovery-blocked wake failure');
+      expect(blocked[0]).toContain('restart the service');
+      expect(h.spawnCalls).toHaveLength(spawnsBefore);
     } finally {
       await h.close();
     }
@@ -3316,10 +3329,12 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
   it('wakeAwareness starts a turn from the injected block plus the wake instruction', async () => {
     const injection = sampleInjection();
     const commits: AwarenessInjection[] = [];
+    const outcomes: { ok: boolean; detail?: string }[] = [];
     const harness = await makeHarness({
       awareness: {
         prepare: () => injection,
         commit: (value) => commits.push(value),
+        noteWakeOutcome: (ok, detail) => outcomes.push({ ok, ...(detail !== undefined ? { detail } : {}) }),
       },
     });
     try {
@@ -3333,6 +3348,59 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
       expect(
         harness.frameLog.history.some((frame) => frame.type === 'turn' && frame.state === 'start'),
       ).toBe(true);
+      expect(outcomes).toEqual([{ ok: true }]);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('receipts a wake at turn start while its tool is still running and records a later turn failure separately', async () => {
+    let rejectTurn!: (error: Error) => void;
+    const hold = new Promise<void>((_resolve, reject) => { rejectTurn = reject; });
+    const injection = { ...sampleInjection(), notificationIds: ['machine-id'] };
+    const events: string[] = [];
+    const harness = await makeHarness({
+      awareness: {
+        prepare: () => injection,
+        commit: () => { events.push('committed'); },
+        noteWakeOutcome: (ok) => { events.push(ok ? 'delivered' : 'retry'); },
+        noteWakeTurnFailure: (detail, delivered) => { events.push(`failed: ${detail}: ${delivered.notificationIds?.[0]}`); },
+      },
+    });
+    harness.handle.nextHold = hold;
+    try {
+      harness.chat.wakeAwareness();
+      await pollUntil(() => events.includes('delivered'), 'wake receipt while turn held');
+      expect(events).toEqual(['committed', 'delivered']);
+      expect(harness.frameLog.hasOpenTurn).toBe(true);
+      rejectTurn(new Error('tool stopped'));
+      await pollUntil(() => events.length === 3, 'late wake failure');
+      expect(events).toEqual(['committed', 'delivered', 'failed: tool stopped: machine-id']);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('reports an automatic spawn failure so the awareness policy can retry the same notification', async () => {
+    const injection = { ...sampleInjection(), notificationIds: ['machine-id'] };
+    const outcomes: { ok: boolean; ids?: readonly string[] }[] = [];
+    const harness = await makeHarness({
+      failFirstSpawn: new Error('provider unavailable'),
+      awareness: {
+        prepare: () => injection,
+        commit: () => {},
+        noteWakeOutcome: (ok, _detail, delivered) => outcomes.push({ ok, ...(delivered?.notificationIds !== undefined ? { ids: delivered.notificationIds } : {}) }),
+      },
+    });
+    try {
+      harness.chat.wakeAwareness();
+      await pollUntil(() => outcomes.length === 1, 'failed automatic spawn reported');
+      expect(outcomes).toEqual([{ ok: false }]);
+      expect(harness.handle.calls).toHaveLength(0);
+      harness.chat.wakeAwareness();
+      await pollUntil(() => outcomes.length === 2, 'automatic spawn retry');
+      expect(outcomes[1]).toEqual({ ok: true, ids: ['machine-id'] });
+      expect(harness.handle.calls[0]?.text).toContain('machine attention');
     } finally {
       await harness.close();
     }
@@ -3368,6 +3436,38 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
     } finally {
       await harness.close();
     }
+  });
+
+  it('rechecks wake admission after a held user turn before opening the trailing turn', async () => {
+    let releaseTurn!: () => void;
+    const held = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    let allowed = true;
+    const outcomes: boolean[] = [];
+    const harness = await makeHarness({ awareness: {
+      admitWake: () => allowed,
+      prepare: () => sampleInjection(),
+      commit: () => {},
+      noteWakeOutcome: (ok) => outcomes.push(ok),
+    } });
+    harness.handle.nextHold = held;
+    try {
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('busy before quiet hours', 'm1');
+      await pollUntil(() => harness.handle.calls.length === 1, 'held user turn');
+      harness.chat.wakeAwareness();
+      allowed = false; // time entered quiet hours while wake was queued
+      releaseTurn();
+      await done;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(harness.handle.calls).toHaveLength(1);
+      expect(outcomes).toEqual([]);
+      allowed = true; // awareness timer opens the next eligible window
+      harness.chat.wakeAwareness();
+      await pollUntil(() => harness.handle.calls.length === 2, 'admitted trailing wake');
+      expect(outcomes).toEqual([true]);
+      await client.close();
+    } finally { await harness.close(); }
   });
 
   it('a wake with nothing to inject neither spawns a session nor burns a turn', async () => {

@@ -82,9 +82,17 @@ keep = 5
 [chat]
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
-# Wake policy for Gru awareness: "never" (default; passive context only),
-# "action-required", or "all" (each wake is a full model turn).
-notify_wake = "never"
+# Wake policy for Gru awareness: "action-required" (default; machine
+# attention OPENS a Gru turn), "all", or "never" (passive context only).
+notify_wake = "action-required"
+# Minimum interval between autonomous wakes (ms); 0 disables the cap.
+wake_min_interval_ms = 300000
+# Severity floor for a wake: "info" or "error".
+wake_min_severity = "info"
+# Local-time quiet window ("HH:MM-HH:MM", may wrap midnight); "" = off.
+wake_quiet_hours = ""
+# First block after this quiet gap carries the "while you were away" digest.
+morning_digest_gap_ms = 28800000
 
 [worktrees]
 # root = "~/.gru-command/worktrees" # omitted so it follows data_dir

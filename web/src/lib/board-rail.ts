@@ -80,7 +80,7 @@ function trackersChip(snapshot: BoardSnapshot, kpis: ReturnType<typeof boardKpis
     id: 'trackers',
     label: 'TRACKERS',
     value: '',
-    detail: `${snapshot.unackedActionRequired} action-required · Jev ${decisions.status}`,
+    detail: `${snapshot.unackedActionRequired} needs Gru · Jev ${decisions.status}`,
     tone,
     flag: null,
     titleAttr: `Jobs, PRs, and lanes across the board · Jev decision routing: ${decisions.status}`,

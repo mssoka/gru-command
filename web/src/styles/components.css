@@ -1016,6 +1016,46 @@ body {
   animation: conn-pulse 1s ease-in-out infinite;
 }
 
+/* Service band (owner clean-chat clause 2026-09-23): one collapsed run of
+   tool lines + product notices; the chat reads as conversation, machinery
+   one tap away. */
+.service-band {
+  display: grid;
+  gap: 4px;
+  align-self: stretch;
+}
+
+.service-band__head {
+  all: unset;
+  cursor: pointer;
+  align-self: flex-start;
+  font-size: 11px;
+  font-weight: 800;
+  color: var(--muted);
+  opacity: 0.85;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+
+.service-band__head:hover,
+.service-band__head:focus-visible {
+  opacity: 1;
+  background: var(--park);
+}
+
+.service-band__detail {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+  margin-left: 6px;
+  padding-left: 8px;
+  border-left: 2px dashed var(--line);
+}
+
+.service-band__detail[hidden] {
+  display: none;
+}
+
 .chat-context {
   display: flex;
   align-items: center;
@@ -1774,7 +1814,8 @@ body {
 /* Tracker chips (inside the rail's TRACKERS chip) */
 
 .board-decisions,
-.board-unacked {
+.board-unacked,
+.board-wakes {
   font-size: 10px;
   padding: 3px 10px;
 }
@@ -2092,6 +2133,21 @@ body {
   gap: 8px;
   max-height: 320px;
   overflow-y: auto;
+}
+
+.board-notification-section {
+  display: grid;
+  gap: 6px;
+}
+
+.board-notification-section__head {
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  opacity: 0.75;
+}
+
+.board-notification-section__empty {
+  opacity: 0.6;
 }
 
 .board-notification {

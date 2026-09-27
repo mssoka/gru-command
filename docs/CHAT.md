@@ -43,7 +43,7 @@ never logged or replayed.
 | `delta` | `text`, `seq` | streamed reply chunk |
 | `tool` | `name`, `state: start\|end`, `seq` | live tool activity |
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |
-| `notice` | `text`, `seq` | product notice surfaced in chat (E7, SPEC ruling 13): action-required notifications ("⚠ Action required: …") and supervisor restart notices. Logged + replayed; never fatal, never a turn |
+| `notice` | `text`, `seq` | product notice surfaced in chat (E7, SPEC ruling 13; routing split 2026-09-23): needs-owner items ("🔔 For you: …") and supervisor restart notices. Logged + replayed; never fatal, never a turn |
 | `error` | `message`, `fatal?`, `seq?` | see the error classes below |
 | `context` | `epoch`, `replay_floor_seq`, `state: idle\|busy\|compacting\|resetting`, `usage`, `compact_supported`, `session_active`, `writer` | fresh server-owned snapshot after auth and on every control/writer/runtime-state transition. `usage` is provider-owned or `null`, never a frontend estimate |
 | `control_result` | `action`, `request_id`, `ok`, `epoch`, `code?`, `message?` | terminal result for exactly one request; failures distinguish `busy`, `unsupported`, `read_only`, `no_session`, and runtime/persistence `failed` |
@@ -303,17 +303,39 @@ relaying it. Two mechanisms share one boundary:
   `<data_dir>/chat/awareness.json` advances only after the prompt was
   accepted, so a failed delivery retries the same context. Acked and
   resolved notifications never inject — the human keeps every ack.
-- **Wake policy** (`[chat] notify_wake`, CONFIG.md): `never` (default)
-  is passive only; `action-required` starts a Gru turn when an
-  action-required notification lands; `all` does so for every
-  notification (FYI included). A wake with nothing to inject does not
-  spawn a session or burn a turn, and a wake requested mid-turn becomes
-  one trailing turn after the conversation goes idle — it is never
-  steered into a live user turn. Each wake is a full model turn.
+- **Wake policy** (`[chat] notify_wake`, CONFIG.md; owner ruling
+  2026-09-23): `action-required` (default) starts a Gru turn when a
+  machine-attention notification lands, so a critical alert is acted on
+  without the user pinging; `all` also wakes for FYI/needs-owner rows;
+  `never` is passive-only. `wake_min_severity` floors the wake,
+  `wake_min_interval_ms` (default 5 min) bounds autonomous turns while
+  candidates inside the window coalesce into ONE trailing wake,
+  `wake_quiet_hours` defers wakes to the next real local-time window end
+  (including DST changes); admission is rechecked after any queued user
+  turn. Per-id dedupe is reconciled from durable ledger receipts on boot
+  so a torn awareness sidecar write cannot redeliver a received wake. Unacked
+  machine rows at boot are seeded as Gru's backlog. A wake with nothing to
+  inject does not spawn a session or burn a turn, and a wake requested
+  mid-turn becomes one trailing turn after the conversation goes idle — it
+  is never steered into a live user turn. Each wake is a full model turn.
+- **Morning digest** (`[chat] morning_digest_gap_ms`, default 8 h; 0
+  disables): the first delivered block after a quiet gap adds a bounded
+  "while you were away" digest — fires (wakes delivered), actions with
+  disposition details, merges, staged PRs — derived from the ledger with
+  a separate owner cursor, so autonomous turns cannot consume it. Capped
+  counts are shown as lower bounds (e.g. `100+`).
 
-The client-facing `notice` frame (action-required items, supervisor
-restart notices) is unchanged and independent: it stays the human's
-durable banner, while the awareness block is session context.
+The client-facing `notice` frame is now the needs-owner channel only:
+action-required rows never render in a human-facing band or ring the owner
+bell — they wake Gru and live in the board's NEEDS GRU machine queue,
+while needs-owner rows ("🔔 For you: …") stay the human's durable banner.
+
+**Clean-chat rendering** (owner clause 2026-09-23): consecutive
+service-context frames (tool lines + product notices) render as ONE
+collapsed band — "⚙️ N service events — expand" — while conversation
+frames (user messages, reply deltas, errors) stay visible and close the
+run. The session/turn mechanism is unchanged: single stream, single pen,
+and the ledger remains the durable log.
 
 ## Limits and notes
 

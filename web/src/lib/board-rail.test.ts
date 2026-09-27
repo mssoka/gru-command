@@ -51,6 +51,8 @@ function snapshot(jobs: readonly JobView[], agents: readonly AgentView[] = []): 
       generation: 1,
     },
     unackedActionRequired: 0,
+    unackedNeedsOwner: 0,
+    wakes: { count: 0, lastAt: null },
     build: null,
     silas: null,
     verify: null,
@@ -153,7 +155,7 @@ describe('board rail — chips (v6)', () => {
     const snap = snapshot([job('i1', 'in-review', { prUrl: 'https://x/2', prState: 'conflicting' })]);
     const trackers = railChips({ ...snap, unackedActionRequired: 2 }, NOW).find((chip) => chip.id === 'trackers');
     expect(trackers?.tone).toBe('alert');
-    expect(trackers?.detail).toContain('2 action-required');
+    expect(trackers?.detail).toContain('2 needs Gru');
   });
 
   it('carries the health cards verbatim: unwired feeds stay an honest n/a', () => {
