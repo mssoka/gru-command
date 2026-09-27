@@ -2148,6 +2148,21 @@ export class WaveRunner {
    * the request aborts before a round row, a review worktree, or any lens
    * exists. Non-PR rounds and explicit commit pins keep the local
    * resolution. */
+  /** The full ref name a candidate resolves to LOCALLY (shared ref store),
+   * or null when nothing resolves (an unresolved spelling or an ambiguous
+   * lookup — both stay on the remote route, where the fetch is the safe
+   * arm). Used to distinguish an intentional local pin such as
+   * refs/tags/origin/v1 from an unresolved origin/<branch> spelling
+   * (Perkins R5). */
+  private resolvedLocalRefName(repoPath: string, ref: string): string | null {
+    const result = spawnSync('git', ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref], {
+      encoding: 'utf-8',
+      timeout: 30_000,
+    });
+    const name = result.status === 0 ? (result.stdout ?? '').trim() : '';
+    return name === '' ? null : name;
+  }
+
   private async resolveFreezeTarget(input: {
     job: { readonly id: string; readonly prUrl: string | null };
     jobWorktree: { readonly path: string; readonly repoPath: string };
@@ -2171,21 +2186,35 @@ export class WaveRunner {
     // stay pins even for a PR round; everything else on a PR-linked job
     // resolves from the PR's live head branch.
     const namesOriginRef = isExactOriginBranchSpelling(input.candidateRef);
-    const explicitPin = input.explicitTarget && candidateBranch === null && !namesOriginRef;
+    // A locally RESOLVED origin-prefixed ref that is neither a branch nor
+    // an origin tracking ref — a tag like refs/tags/origin/v1 — is an
+    // INTENTIONAL pin (Perkins R5): the caller named exactly those bytes.
+    // A tracking-ref resolution is NOT a pin (that is the stale-local
+    // shape the fetch exists to defeat), and only an UNRESOLVED origin
+    // spelling follows the live remote branch. (Ambiguous lookups return
+    // no name and stay on the remote route — the fetch is the safe arm.)
+    const resolvedName = namesOriginRef
+      ? this.resolvedLocalRefName(input.jobWorktree.repoPath, input.candidateRef)
+      : null;
+    const resolvedOriginPin =
+      resolvedName !== null &&
+      !resolvedName.startsWith('refs/remotes/origin/') &&
+      !resolvedName.startsWith('refs/heads/');
+    const explicitPin =
+      input.explicitTarget && candidateBranch === null && (!namesOriginRef || resolvedOriginPin);
     if (input.job.prUrl === null || explicitPin) {
-      // Origin refs (any spelling the manager routes to a fetch) resolve
-      // through its fetch-before-freeze discipline (Perkins R3 lineage):
-      // FETCHED fresh — never the stale local tracking sha — and an
-      // unfetchable one refuses BEFORE any round row, review lane, or
-      // freeze exists. Tracking refs live in the SHARED ref store, so
-      // resolving from the host repo is equivalent to the lane.
-      //
-      // Everything else resolves from the ACTIVE JOB LANE (Perkins R3):
-      // worktree-relative refs — HEAD, HEAD~1 — are PER-WORKTREE and
-      // must never resolve against the host checkout, which can sit
-      // behind a lane based on a fetched origin tip; branches, tags,
-      // and shas are shared and resolve identically from the lane.
-      if (namesOriginRef) {
+      // UNRESOLVED origin-branch spellings resolve through the manager's
+      // fetch-before-freeze discipline (Perkins R3 lineage): FETCHED
+      // fresh — never the stale local tracking sha — and an unfetchable
+      // one refuses BEFORE any round row, review lane, or freeze exists.
+      // Tracking refs live in the SHARED ref store, so resolving from
+      // the host repo is equivalent to the lane. Locally resolved pins —
+      // tags, shas, revision expressions, lane branches — resolve from
+      // the ACTIVE JOB LANE (Perkins R3): worktree-relative refs like
+      // HEAD are PER-WORKTREE and must never resolve against the host
+      // checkout; branches, tags, and shas are shared and resolve
+      // identically from the lane.
+      if (namesOriginRef && !resolvedOriginPin) {
         const resolved = await this.opts.worktrees.resolveReviewTarget({
           repoPath: input.jobWorktree.repoPath,
           ref: input.candidateRef,

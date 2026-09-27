@@ -834,6 +834,100 @@ describe('freeze-time integration on PR rounds', () => {
     expect(manifest.targetSha).toBe(ancestor);
   });
 
+  it('an explicit TAG pin origin/v1 on a linked PR stays frozen — never silently replaced by the live PR head (Perkins R5)', async () => {
+    const repo = makeFixtureRepo('freeze-tag-pin-pr');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/lane']);
+    const laneFirst = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const laneTip = repo.commitFile('src/lane2.ts', 'export const lane2 = true;\n');
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    // The explicit pin is a local TAG named origin/v1 at the lane's FIRST
+    // commit — a different commit than the live PR head.
+    repo.git(['tag', 'origin/v1', laneFirst]);
+    const tagSha = repo.git(['rev-parse', 'origin/v1']);
+    expect(repo.git(['rev-parse', '--symbolic-full-name', '--verify', 'origin/v1'])).toBe(
+      'refs/tags/origin/v1',
+    );
+    expect(tagSha).not.toBe(laneTip); // the tag and the PR head differ
+
+    const root = tempDir('gru-freeze-tagpin-port-');
+    const artifacts = tempDir('gru-freeze-tagpin-artifacts-');
+    const sessions = tempDir('gru-freeze-tagpin-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-tag-pin-pr' });
+    const job = ledger.addJob({
+      id: 'job-tag-pin-pr', repo: 'fixture', title: 'explicit tag pin on a linked PR', baseBranch: 'main',
+      briefing: 'Acceptance: lane returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/23');
+    const probe = vi.fn(async () => {
+      throw new Error('an explicit tag pin must not probe the host');
+    }) as unknown as PrHeadProbe;
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: probe,
+    });
+
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'origin/v1' }));
+    expect(probe).not.toHaveBeenCalled();
+    // The TAG SHA stays frozen — never the substituted live PR head.
+    expect(outcome.round.targetRef).toBe(tagSha);
+    expect(outcome.round.targetRef).not.toBe(laneTip);
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
+    ) as { readonly targetSha: string; readonly targetRef: string };
+    expect(manifest.targetSha).toBe(tagSha);
+    expect(manifest.targetRef).toBe('origin/v1');
+  });
+
+  it('an explicit TAG pin origin/v1 on a non-PR round freezes the tag — consistent routing', async () => {
+    const repo = makeFixtureRepo('freeze-tag-pin-nopr');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/lane']);
+    const laneFirst = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const laneTip = repo.commitFile('src/lane2.ts', 'export const lane2 = true;\n');
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    repo.git(['tag', 'origin/v1', laneFirst]);
+    const tagSha = repo.git(['rev-parse', 'origin/v1']);
+    expect(tagSha).not.toBe(laneTip);
+
+    const root = tempDir('gru-freeze-tagpin-nopr-port-');
+    const artifacts = tempDir('gru-freeze-tagpin-nopr-artifacts-');
+    const sessions = tempDir('gru-freeze-tagpin-nopr-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-tag-pin-nopr' });
+    const job = ledger.addJob({
+      id: 'job-tag-pin-nopr', repo: 'fixture', title: 'explicit tag pin, non-PR', baseBranch: 'main',
+      briefing: 'Acceptance: lane returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+    });
+
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'origin/v1' }));
+    expect(outcome.round.targetRef).toBe(tagSha);
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
+    ) as { readonly targetSha: string };
+    expect(manifest.targetSha).toBe(tagSha);
+  });
+
   it('aborts before any round when the resolved PR head ref fetches nothing', async () => {
     const repo = makeFixtureRepo('freeze-unfetchable');
     repos.push(repo);
