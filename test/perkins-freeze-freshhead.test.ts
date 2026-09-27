@@ -748,7 +748,7 @@ describe('freeze-time integration on PR rounds', () => {
     repo.git(['checkout', '-b', 'feature/lane']);
     const laneFirst = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
     const laneTip = repo.commitFile('src/lane2.ts', 'export const lane2 = true;\n');
-    const origin = attachBareOrigin(repo);
+    attachBareOrigin(repo);
     repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
     repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
     const ancestor = repo.git(['rev-parse', 'origin/feature/lane~1']);
