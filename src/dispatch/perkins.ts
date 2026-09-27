@@ -2155,19 +2155,31 @@ export class WaveRunner {
     // from the job id.
     const explicitPin = input.explicitTarget && candidateBranch === null;
     if (input.job.prUrl === null || explicitPin) {
-      // Non-PR targets resolve through the manager's fetch-before-freeze
-      // discipline (Perkins blocker): a candidate naming an origin
-      // tracking ref is FETCHED fresh — never the stale local tracking
-      // sha — and an unfetchable one refuses BEFORE any round row, review
-      // lane, or freeze exists. Explicit commit pins (shas, tags,
-      // revision expressions) and local lane branches pin exactly as
-      // before; the ref semantics live in the manager, one discipline.
-      const resolved = await this.opts.worktrees.resolveReviewTarget({
-        repoPath: input.jobWorktree.repoPath,
-        ref: input.candidateRef,
-      });
+      // Origin refs (any spelling the manager routes to a fetch) resolve
+      // through its fetch-before-freeze discipline (Perkins R3 lineage):
+      // FETCHED fresh — never the stale local tracking sha — and an
+      // unfetchable one refuses BEFORE any round row, review lane, or
+      // freeze exists. Tracking refs live in the SHARED ref store, so
+      // resolving from the host repo is equivalent to the lane.
+      //
+      // Everything else resolves from the ACTIVE JOB LANE (Perkins R3):
+      // worktree-relative refs — HEAD, HEAD~1 — are PER-WORKTREE and
+      // must never resolve against the host checkout, which can sit
+      // behind a lane based on a fetched origin tip; branches, tags,
+      // and shas are shared and resolve identically from the lane.
+      const originRefSpelling = /^(?:(?:refs\/)?remotes\/origin\/|origin\/)/u;
+      if (originRefSpelling.test(input.candidateRef)) {
+        const resolved = await this.opts.worktrees.resolveReviewTarget({
+          repoPath: input.jobWorktree.repoPath,
+          ref: input.candidateRef,
+        });
+        return {
+          targetSha: resolved.sha,
+          movementRef: input.candidateRef,
+        };
+      }
       return {
-        targetSha: resolved.sha,
+        targetSha: resolveGitCommit(input.jobWorktree.path, input.candidateRef),
         movementRef: input.candidateRef,
       };
     }

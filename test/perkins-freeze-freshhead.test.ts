@@ -18,6 +18,52 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
+import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
+
+/** Wraps GitReviewPort so the JOB LANE lives at a real linked worktree
+ * (path ≠ the host checkout) — the divergence shape the stock double
+ * cannot model, and exactly how production lanes differ from the host
+ * clone the resolver is handed (Perkins R3: worktree-relative refs must
+ * resolve against the LANE, never the host). */
+class LaneWorktreePort implements WorktreePort {
+  private jobLane: WorktreeLane | null = null;
+
+  constructor(
+    private readonly delegate: GitReviewPort,
+    private readonly lanePath: string,
+  ) {}
+
+  private withLanePath(lane: WorktreeLane): WorktreeLane {
+    return this.jobLane !== null && lane.id === this.jobLane.id ? this.jobLane : lane;
+  }
+
+  async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
+    const lane = await this.delegate.createJobWorktree(input);
+    this.jobLane = { ...lane, path: this.lanePath };
+    return this.jobLane;
+  }
+
+  async resolveReviewTarget(input: { repoPath: string; ref: string }) {
+    return this.delegate.resolveReviewTarget(input);
+  }
+
+  async createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }) {
+    return this.delegate.createReviewWorktree(input);
+  }
+
+  getWorktree(id: string): WorktreeLane | null {
+    const lane = this.delegate.getWorktree(id);
+    return lane === null ? null : this.withLanePath(lane);
+  }
+
+  listWorktrees(options: { jobId?: string } = {}): readonly WorktreeLane[] {
+    return this.delegate.listWorktrees(options).map((lane) => this.withLanePath(lane));
+  }
+
+  async release(input: { worktreeId: string }): Promise<WorktreeSweepResult> {
+    return this.delegate.release(input);
+  }
+}
 
 /**
  * Hotfix pins: a Perkins round that reviews a PR branch freezes the LIVE
@@ -586,6 +632,57 @@ describe('freeze-time integration on PR rounds', () => {
     expect((failure as Error).message).toMatch(/refusing to freeze a possibly stale tip/);
     expect(ledger.listRounds(job.id)).toHaveLength(0);
     expect(ledger.getJob(job.id)?.status).toBe('working');
+  });
+
+  it('an explicit HEAD target freezes the LANE commit when host and lane HEADs diverged (Perkins R3)', async () => {
+    const repo = makeFixtureRepo('freeze-head-lane');
+    repos.push(repo);
+    // Lane work happens on its own branch; the host checkout stays on
+    // main — host HEAD and lane HEAD genuinely diverge.
+    repo.git(['checkout', '--quiet', '-b', 'feature/lane']);
+    const laneCommit = repo.commitFile('src/lane-ahead.ts', 'export const laneAhead = true;\n');
+    repo.git(['checkout', '--quiet', 'main']);
+    const hostHead = repo.git(['rev-parse', 'HEAD']);
+    expect(laneCommit).not.toBe(hostHead); // the divergence is real
+    const lanePath = tempDir('gru-freeze-head-lanepath-');
+    cleanupDirs.push(lanePath);
+    repo.git(['worktree', 'add', '--quiet', lanePath, 'feature/lane']);
+    expect(repo.git(['rev-parse', 'HEAD'], lanePath)).toBe(laneCommit);
+
+    const root = tempDir('gru-freeze-head-port-');
+    const artifacts = tempDir('gru-freeze-head-artifacts-');
+    const sessions = tempDir('gru-freeze-head-sessions-');
+    const ledger = makeLedger();
+    const port = new LaneWorktreePort(new GitReviewPort(root, 'feature/lane', laneCommit), lanePath);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-head-lane' });
+    const job = ledger.addJob({
+      id: 'job-head-lane', repo: 'fixture', title: 'explicit head on a diverged lane', baseBranch: 'main',
+      briefing: 'Acceptance: laneAhead returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    const probe = vi.fn(async () => {
+      throw new Error('the host probe must not run without a linked PR');
+    }) as unknown as PrHeadProbe;
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: probe,
+    });
+
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'HEAD' }));
+    expect(probe).not.toHaveBeenCalled();
+    // HEAD is WORKTREE-RELATIVE: the frozen target is the LANE commit,
+    // never the host checkout's (behind) HEAD.
+    expect(outcome.round.targetRef).toBe(laneCommit);
+    expect(outcome.round.targetRef).not.toBe(hostHead);
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
+    ) as { readonly targetSha: string; readonly targetRef: string };
+    expect(manifest.targetSha).toBe(laneCommit);
+    expect(manifest.targetRef).toBe('HEAD');
   });
 
   it('aborts before any round when the resolved PR head ref fetches nothing', async () => {
