@@ -12,7 +12,8 @@
  *    (deterministic oscillator envelope, no audio assets, ~0.6s,
  *    peak ~-18 dBFS).
  *  - AUTOPLAY — browsers block audio before a user gesture: the chime
- *    arms on the first interaction anywhere. Until playback is actually
+ *    arms on the first interaction anywhere (pointer, key, or click —
+ *    click-only activation paths count). Until playback is actually
  *    possible (a suspended context, a rejected or thrown resume), an
  *    arrival falls back to a harder bell-badge pulse (no console spam)
  *    and later gestures retry the resume. A browser with no Web Audio
@@ -236,24 +237,29 @@ export class OwnerChime {
     return 'chime';
   }
 
-  /** First interaction anywhere arms the graph — once PLAYABLE. A
-   * context that exists but stays suspended keeps the listeners: a
-   * rejected/thrown resume is retried on the next gesture (a permanently
-   * absent stack short-circuits in arm()). */
+  /** First interaction anywhere arms the graph — once PLAYABLE. Pointer,
+   * key, AND click activation count: some real activation paths (AT/switch
+   * access, programmatic activation) produce only a click with no
+   * pointerdown/keydown, and those must arm too. A context that exists
+   * but stays suspended keeps the listeners: a rejected/thrown resume is
+   * retried on the next gesture (a permanently absent stack short-
+   * circuits in arm()). The indicator is excluded on every event type —
+   * its own handler owns the enable-vs-mute cycle, and a pre-arm here
+   * would double-toggle it into mute on the very first click. */
   private armOnFirstGesture(target: Document): void {
     const gesture = (event: Event): void => {
-      // The indicator's own click distinguishes “enable” from “mute”;
-      // let it run its course instead of pre-arming here.
       if (event.target instanceof Node && this.indicator.contains(event.target)) return;
       if (this.armed || this.audioUnavailable) {
         target.removeEventListener('pointerdown', gesture, true);
         target.removeEventListener('keydown', gesture, true);
+        target.removeEventListener('click', gesture, true);
         return;
       }
       this.arm();
     };
     target.addEventListener('pointerdown', gesture, true);
     target.addEventListener('keydown', gesture, true);
+    target.addEventListener('click', gesture, true);
   }
 
   /** Speaker cycle: muted → on, off (unarmed) → on, on → muted. With no

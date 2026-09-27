@@ -335,6 +335,34 @@ describe('owner chime — arming (autoplay policy)', () => {
     expect(muted.indicator.disabled).toBe(true);
   });
 
+  it('a click-only activation on another control arms the chime — and the speaker never double-toggles', () => {
+    const h = harness();
+    expect(h.chime.armed).toBe(false);
+
+    // Click-ONLY activation (AT/switch access, programmatic activation on
+    // another control): a click event with no pointerdown/keydown. Before
+    // the fix this armed nothing, and the next needs-owner arrival nudged
+    // instead of sounding.
+    const theme = document.createElement('button');
+    theme.id = 'theme-toggle';
+    document.body.append(theme);
+    theme.click();
+    expect(h.chime.armed).toBe(true);
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('chime');
+    expect(h.context.oscillators).toHaveLength(2);
+
+    // The guard: the speaker's own click-only activation (jsdom fires no
+    // pointerdown) must stay enable-first — an unguarded document click
+    // listener would pre-arm and make the FIRST speaker click mute.
+    const second = harness();
+    expect(second.chime.armed).toBe(false);
+    second.indicator.click();
+    expect(second.chime.armed).toBe(true);
+    expect(second.chime.muted).toBe(false); // enable, never a double-toggle
+    second.indicator.click();
+    expect(second.chime.muted).toBe(true); // the second click mutes, as designed
+  });
+
   it('a transient arm failure retries on the next gesture', () => {
     mountDom();
     const context = new StubAudioContext();
