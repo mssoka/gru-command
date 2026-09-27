@@ -110,6 +110,7 @@ function mountDom(): void {
     <div id="chip-rail" hidden>
       <span id="board-decisions"></span>
       <span id="board-unacked" hidden></span>
+      <span id="board-wakes" hidden></span>
     </div>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
@@ -334,6 +335,8 @@ describe('owner chime — live board wiring', () => {
         generation: 0,
       },
       unackedActionRequired: 0,
+      unackedNeedsOwner: 0,
+      wakes: { count: 0, lastAt: null },
       build: null,
       silas: null,
       verify: null,
