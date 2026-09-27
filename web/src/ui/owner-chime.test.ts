@@ -361,6 +361,34 @@ describe('owner chime — arming (autoplay policy)', () => {
     expect(muted.indicator.disabled).toBe(true);
   });
 
+  it('a NON-ACTIVATING keydown aimed at the focused speaker arms the chime', () => {
+    const h = harness();
+    expect(h.chime.armed).toBe(false);
+    // The focused speaker receiving ArrowRight: before the fix the guard
+    // skipped the speaker for every event type, so this first keyboard
+    // interaction armed nothing and a needs-owner arrival merely nudged.
+    h.indicator.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    expect(h.chime.armed).toBe(true);
+    expect(h.chime.muted).toBe(false); // arming never touched the mute cycle
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('chime'); // sounds, no nudge
+    expect(h.context.oscillators).toHaveLength(2);
+  });
+
+  it('an ACTIVATION key on the speaker enables without double-toggling into mute', () => {
+    const h = harness();
+    // Space on the focused speaker: the keydown must NOT pre-arm…
+    h.indicator.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
+    expect(h.chime.armed).toBe(false);
+    // …so the native activation click it triggers reads enable-first.
+    h.indicator.click();
+    expect(h.chime.armed).toBe(true);
+    expect(h.chime.muted).toBe(false); // enable, never a double-toggle
+    // The next activation (Enter) toggles mute, as the cycle promises.
+    h.indicator.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    h.indicator.click();
+    expect(h.chime.muted).toBe(true);
+  });
+
   it('a click-only activation on another control arms the chime — and the speaker never double-toggles', () => {
     const h = harness();
     expect(h.chime.armed).toBe(false);

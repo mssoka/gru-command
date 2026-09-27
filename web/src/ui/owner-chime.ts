@@ -256,9 +256,27 @@ export class OwnerChime {
    * circuits in arm()). The indicator is excluded on every event type —
    * its own handler owns the enable-vs-mute cycle, and a pre-arm here
    * would double-toggle it into mute on the very first click. */
+  /** First interaction anywhere arms the graph — once PLAYABLE. Pointer,
+   * key, AND click activation count (click-only paths arm too). The
+   * speaker's own surface is special-cased by event type: pointer/click
+   * never pre-arm (its handler owns the enable-vs-mute cycle — a pre-arm
+   * would double-toggle the very first activation into mute), and an
+   * ACTIVATION keydown (Enter/Space) is skipped for the same reason — the
+   * native click it triggers must still read “not armed before”. But a
+   * NON-ACTIVATING keydown aimed at the focused speaker (ArrowRight,
+   * Tab-away…) is a genuine first keyboard interaction: the first-keydown
+   * rule applies and the graph arms. A context that exists but stays
+   * suspended keeps the listeners: a rejected/thrown resume is retried on
+   * the next gesture (a permanently absent stack short-circuits in
+   * arm()). */
   private armOnFirstGesture(target: Document): void {
     const gesture = (event: Event): void => {
-      if (event.target instanceof Node && this.indicator.contains(event.target)) return;
+      const atSpeaker = event.target instanceof Node && this.indicator.contains(event.target);
+      if (atSpeaker) {
+        if (event.type !== 'keydown' || isSpeakerActivationKey(event)) return;
+        this.arm(); // first keyboard interaction on the speaker — arms
+        return;
+      }
       if (this.armed || this.audioUnavailable) {
         target.removeEventListener('pointerdown', gesture, true);
         target.removeEventListener('keydown', gesture, true);
@@ -381,6 +399,16 @@ export class OwnerChime {
       this.nudgeTimer = null;
     }, NUDGE_MS);
   }
+}
+
+/** Keys whose keydown on the speaker precedes a native activation click:
+ * arming on the keydown would make that click read “already armed” and
+ * toggle mute on the user's very first speaker activation. */
+function isSpeakerActivationKey(event: Event): boolean {
+  return (
+    event instanceof KeyboardEvent &&
+    (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar')
+  );
 }
 
 /** Real Web Audio constructor, when the browser exposes one. `null`
