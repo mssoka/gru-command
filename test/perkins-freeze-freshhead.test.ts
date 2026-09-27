@@ -516,7 +516,7 @@ describe('freeze-time integration on PR rounds', () => {
     // fetched — the local repo cannot resolve it at all.
     const clone = mkdtempSync(join(tmpdir(), 'gru-freeze-remote-only-'));
     cleanupDirs.push(clone);
-    execFileSync('git', ['clone', '--quiet', origin, clone], { stdio: 'ignore' });
+    execFileSync('git', ['clone', '--quiet', '--branch', 'main', origin, clone], { stdio: 'ignore' });
     execFileSync('git', ['-C', clone, 'checkout', '--quiet', '-b', 'topic'], { stdio: 'ignore' });
     writeFileSync(join(clone, 'src/remote-only.ts'), 'export const remoteOnly = 1;\n', 'utf-8');
     const identity = ['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid'];
