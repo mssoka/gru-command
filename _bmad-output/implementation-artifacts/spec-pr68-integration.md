@@ -91,7 +91,7 @@ Investigation (2026-09-27, this lane):
 6. [x] **Full gate via scheduler** — one `POST /api/verify` scope `full`.
 7. [x] **Captures** — light+dark × desktop+mobile of the changed views
    (command bar, chip rail, board bands, crew rail) via agent-browser.
-8. [ ] **Independent BMAD review of the integration delta** — fresh
+8. [x] **Independent BMAD review of the integration delta** — fresh
    layers, receipts under the delivery dir.
 9. [ ] **Push + exact-head CI + DELIVERED** — normal push, CI green on
    pushed head, delivery receipt + status API delivered + /api/board
@@ -172,3 +172,35 @@ decisions the contracts cannot settle.
 **Manual checks (if no CLI):**
 - Four breakpoint captures (light/dark × desktop/mobile) show the changed
   views per rulings 1–5; goldens diff shows only expected UI deltas.
+
+## Review Triage Log
+
+Three fresh independent layers (blind-hunter, edge-case-hunter,
+verification-gap) on the integration delta — headless, no session, tools
+read/grep/bash, receipts under
+`~/.gru-command/briefings/parallel-pending-heists-20260927/pr68-delivery/layers/`.
+All seven findings were in-delta; none pre-existed on main. All fixed in
+commit 22903ed (web unit 314/314 after; mock e2e green incl. the new
+assertions).
+
+| # | finding (layer) | verdict | disposition |
+|---|---|---|---|
+| 1 | MINIONS group label counts all agents (midTurn/disposed unfiltered) | medium, confirmed | fixed: group labeled CREW (the owner's umbrella word), minion-only field labeled "minions"; tests pin labels + mixed-role semantics (blind r1, edge r1) |
+| 2 | singular-heist tooltip pluralization at count 1 | low, confirmed | fixed via heistCount + minion pluralization (blind r2, edge r2) |
+| 3 | removed toggle had no absence assertion | medium, confirmed | fixed: e2e count-0 pins for #tab-chat/#tab-board/.command-bar__tabs (vgap r1) |
+| 4 | labeled KPI rendering adjacency unasserted | medium, confirmed | fixed: BoardView DOM test — every [data-kpi] number has its visible label sibling; groups HEISTS/PRS/CREW (vgap r2) |
+| 5 | CREW tab text pinned only in a unit fixture | low, confirmed | fixed: e2e pins #rail-tab-agents normalized text + tablist aria-label (vgap r3) |
+| 6 | theme tests checked token presence, not usage, on changed surfaces | medium, confirmed | fixed: theme-surfaces guards selector rule blocks against literal colors; mutation-checked (flags hex AND named colors) (vgap r4) |
+| 7 | quiet-state vocabulary unpinned (empty board, stale tooltip, empty crew) | low, confirmed | fixed: BoardView assertions for all three strings (vgap r5) |
+
+E2e flake record (not a finding against the delta): after the fixes,
+full-suite reruns rotate failures across chat-reply/screenshot tests
+(mock themes golden, context controls, reconnect, socket drop, mobile
+sheet, mock controls). Proof of nondeterminism/pre-existence: identical
+tree alternates pass/fail on solo reruns (3x: pass/fail/fail on one
+test); the failing surfaces (web/src/ui/chat.ts, web/mock/server.ts)
+are byte-identical to origin/main; the first full run on the merge tree
+was 44/44 green; host carries the owner's 900-frame render (load ~5.4,
+81%-CPU python). Recorded, not waved off; CI (no e2e in CI) is the
+authoritative gate per pr77 precedent.
+
