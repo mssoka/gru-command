@@ -40,6 +40,13 @@ async function sendAndWaitReply(page: Page, text: string): Promise<void> {
 test('pair, send, streamed reply with tool line', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'build me a rocket');
+  // Clean-chat clause: the tool line sits in a collapsed service band —
+  // one tap reveals the machinery.
+  const toolBand = page.locator('.service-band', {
+    has: page.locator('.tool-line', { hasText: 'mock-echo' }),
+  });
+  await expect(toolBand).toHaveCount(1);
+  await toolBand.locator('.service-band__head').click();
   await expect(page.locator('.tool-line', { hasText: 'mock-echo' })).toBeVisible();
 });
 
@@ -178,6 +185,7 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
   await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(1);
+  // Ephemeral UI note (not a frame): stays directly visible, never banded.
   await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
 
   const compactFailure = await page.request.post('http://localhost:8788/__compact-fail', {
@@ -187,6 +195,13 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
+  // Failed controls are durable service machinery (r2 53): the notice
+  // bands — expand the band head to reveal it, never an ephemeral note.
+  const compactFailBand = page.locator('.service-band', {
+    has: page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
+  });
+  await expect(compactFailBand.locator('.service-band__head')).toBeVisible();
+  await compactFailBand.locator('.service-band__head').click();
   await expect(
     page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
   ).toBeVisible();
@@ -223,10 +238,14 @@ test('failed New chat restores history and delivers a word typed in the pending 
   await expect(page.locator('#chat-view')).toBeVisible();
   await expect(page.locator('.msg--user', { hasText: 'word typed during failed reset' })).toHaveCount(1);
 
-  // The failed reset surfaces on reconnect: the notice lands and history is
-  // restored EXACTLY once. (The transient empty view between reload and the
-  // inferred failure is not deterministically observable — this lane asserts
-  // the end state, not a racing intermediate frame.)
+  // The failed reset surfaces on reconnect; reveal the service notice and
+  // assert that the restored history is present exactly once.
+  await page
+    .locator('.service-band', {
+      has: page.locator('.notice-line', { hasText: 'New chat did not complete before reconnect' }),
+    })
+    .locator('.service-band__head')
+    .click();
   await expect(
     page.locator('.notice-line', { hasText: 'New chat did not complete before reconnect' }),
   ).toBeVisible();
@@ -440,10 +459,15 @@ test('socket drop shows a degraded banner that clears on recovery', async ({ pag
 test.describe('board (E6, mock feed)', () => {
   test('dense rows collapse by default; expanding reveals the round lens chips', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
+    // v6.1 ruling 1: the Chat/Board segmented toggle is GONE — chat is
+    // always docked on desktop, the FAB owns mobile. Absence is pinned,
+    // not implied (a restored toggle must fail here).
+    await expect(page.locator('#tab-chat')).toHaveCount(0);
+    await expect(page.locator('#tab-board')).toHaveCount(0);
+    await expect(page.locator('.command-bar__tabs')).toHaveCount(0);
     // v4 bands lead the board; rows group under sticky band separators.
-    await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS YOU');
+    await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS GRU');
     await expect(
       page.locator('.board-band--needs-you .board-job', { hasText: 'Merge main into the retry branch' }),
     ).toBeVisible();
@@ -456,10 +480,12 @@ test.describe('board (E6, mock feed)', () => {
     // Line 1 carries the status dot + chip; line 2 the repo/branch/ages.
     await expect(job.locator('.board-job__dot')).toBeVisible();
     await expect(job.locator('.board-job__branch')).toContainText('gru/demo-api-payment-fix');
-    // The one compact signal carries the live round + the unacked notice.
+    // The one compact signal carries this job's live round; the mock's
+    // unbound machine notification stays in the global NEEDS GRU tracker.
     const signal = job.locator('.board-job__signal');
     await expect(signal).toContainText('live');
-    await expect(signal).toContainText('action-required');
+    await expect(signal).toContainText('1 blocker');
+    await expect(page.locator('#board-unacked')).toContainText('needs Gru');
 
     // Expand the row, then the round row: all 7 lens chips appear.
     await job.locator('.board-job__toggle').click();
@@ -480,7 +506,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('v6: the chip rail carries the v4 health row + folded KPI counts, bands stay ordered', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
 
     // The global rail replaces the old KPI strip + health row: seven chips.
@@ -516,12 +541,12 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('.rail-chip[data-chip="cure"] .rail-chip__value')).toHaveText('n/a');
 
     // Bands in priority order, headers sticky separators with counts.
-    await expect(page.locator('.board-band__label')).toHaveText(['NEEDS YOU', 'IN FLIGHT', 'SETTLED', 'COLD']);
+    await expect(page.locator('.board-band__label')).toHaveText(['NEEDS GRU', 'IN FLIGHT', 'SETTLED', 'COLD']);
     const bandSticky = await page
       .locator('.board-band--in-flight .board-band__head')
       .evaluate((node) => getComputedStyle(node).position);
     expect(bandSticky).toBe('sticky');
-    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('12 jobs');
+    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('12 heists');
     // The stalled working lane sank to COLD carrying the stale flag.
     const stalled = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
     await expect(stalled).toBeVisible();
@@ -530,7 +555,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('row disclosure persists per job across a reload (v3)', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     const job = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
     await expect(job).toHaveAttribute('data-expanded', 'false');
 
@@ -548,21 +572,18 @@ test.describe('board (E6, mock feed)', () => {
 
     // Reload: the expanded job comes back expanded (per-job localStorage).
     await page.reload();
-    await page.locator('#tab-board').click();
     await expect(job).toHaveAttribute('data-expanded', 'true');
 
     // Collapse it again; the next reload comes back collapsed.
     await job.locator('.board-job__toggle').click();
     await expect(job).toHaveAttribute('data-expanded', 'false');
     await page.reload();
-    await page.locator('#tab-board').click();
     await expect(job).toHaveAttribute('data-expanded', 'false');
     await expect(job.locator('.board-job__body')).toHaveCount(0);
   });
 
   test('trackers: lane strip, round progress, decisions + unacked, disposed collapse', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
 
     // The lane strip lives in the expanded detail (v2 surface, v3 default).
@@ -572,8 +593,8 @@ test.describe('board (E6, mock feed)', () => {
     await expect(lane).toBeVisible();
     await expect(lane.locator('.board-lane__branch')).toContainText('gru/demo-api-payment-fix');
     await expect(lane.locator('.board-lane__base')).toContainText('abc1234');
-    await expect(lane.locator('.board-lane__age')).toContainText('lane');
-    await expect(lane.locator('.board-lane__activity')).toContainText('agent');
+    await expect(lane.locator('.board-lane__age')).toContainText('heist');
+    await expect(lane.locator('.board-lane__activity')).toContainText('minion');
 
     // Round header: lens count, blockers, elapsed; chips behind the row.
     const round = card.locator('.board-round__toggle');
@@ -588,8 +609,15 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('#board-decisions')).toContainText('Jev: READY');
     await expect(page.locator('#board-unacked')).toBeVisible();
 
-    // Disposed rows collapse by default behind the toggle on the AGENTS tab.
+    // Disposed rows collapse by default behind the toggle on the CREW tab.
     const rail = page.locator('#board-agents');
+    // v6.1 ruling 2: the rail tab renders CREW (n) — pinned against the
+    // real DOM, not a test fixture (vgap r3). The button's markup carries
+    // source whitespace, so assert on the normalized text.
+    await expect
+      .poll(async () => (await page.locator('#rail-tab-agents').textContent())?.trim() ?? '')
+      .toMatch(/^CREW \(\d+\)$/);
+    await expect(page.locator('.agents-rail__tabs')).toHaveAttribute('aria-label', 'Crew and transcripts');
     await expect(rail.locator('.board-agent--disposed')).toHaveCount(0);
     const toggle = rail.locator('.board-agent-toggle');
     await expect(toggle).toContainText('1 disposed');
@@ -601,7 +629,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('trackers render in dark theme and on a narrow phone viewport', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     const card = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
     await card.locator('.board-job__toggle').click();
     await expect(card.locator('.board-lane')).toBeVisible();
@@ -623,7 +650,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('transcript drawer: mock transcript lists, opens, searches', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     // Transcripts live behind the rail's TRANSCRIPTS tab (v6).
     await page.locator('#rail-tab-transcripts').click();
     const row = page.locator('#board-transcripts .board-agent', { hasText: 'gru' }).first();
@@ -676,7 +702,6 @@ test.describe('cockpit layout (v6)', () => {
 
     // Reload: the user's widths come back (poll through the 180ms grid tween).
     await page.reload();
-    await page.locator('#tab-board').click();
     await expect
       .poll(async () => Math.abs((await page.locator('#chat-main-mount').boundingBox())!.width - widened.width))
       .toBeLessThanOrEqual(2);
@@ -820,7 +845,7 @@ test.describe('phone chrome', () => {
     expect(box!.x + box!.width, `${selector} right edge on screen`).toBeLessThanOrEqual(vw);
   }
 
-  const CHROME_CONTROLS = ['#tab-chat', '#tab-board', '#theme-toggle', '#settings-toggle', '#sound-toggle'];
+  const CHROME_CONTROLS = ['#theme-toggle', '#settings-toggle', '#sound-toggle'];
 
   /** Top-anchored overlays must clear the nav, whatever its wrapped
    * height: kills any mutation of --phone-nav-clearance to less than the

@@ -1,5 +1,7 @@
 import { spawnSync } from 'node:child_process';
+import type { ClaudeReviewSnapshot } from '../runtime/claude-review-settings.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
+export { buildClaudeCodeAuthArgs } from '../runtime/claude-model.js';
 
 /**
  * Review-path selection (user amendment 2026-09-20, bmad-review fallback
@@ -32,6 +34,8 @@ export interface ReviewCapabilityFailure {
 export interface ReviewPreflightResult {
   readonly ok: boolean;
   readonly failures: readonly ReviewCapabilityFailure[];
+  /** In-memory request-owned proof, never included in fallback findings. */
+  readonly reviewModel?: ClaudeReviewSnapshot;
 }
 
 const LEG_REMEDIATION: Readonly<Record<ReviewCapabilityLeg, string>> = {
@@ -65,6 +69,20 @@ export async function runReviewPreflight(checks: Readonly<Record<ReviewCapabilit
     }
   }
   return { ok: failures.length === 0, failures };
+}
+
+/** Production model leg composition: a successful native adapter probe hands
+ * its request-owned proof to the same review wave that was just checked. */
+export async function runRuntimeReviewPreflight(
+  prepareReviewModel: () => Promise<ClaudeReviewSnapshot | undefined>,
+  otherChecks: Readonly<Omit<Record<ReviewCapabilityLeg, ReviewLegCheck>, 'model-provider'>>,
+): Promise<ReviewPreflightResult> {
+  let reviewModel: ClaudeReviewSnapshot | undefined;
+  const result = await runReviewPreflight({
+    ...otherChecks,
+    'model-provider': async () => { reviewModel = await prepareReviewModel(); },
+  });
+  return { ...result, ...(result.ok && reviewModel !== undefined ? { reviewModel } : {}) };
 }
 
 export interface RepoRemote {
@@ -161,40 +179,6 @@ export async function probeGitLabRemote(
   }
   if (!response.ok) {
     throw new Error(`GitLab token cannot read ${remote.owner}/${remote.repo} on ${remote.host} (HTTP ${response.status})`);
-  }
-}
-
-/** Leg 2 probe seam. pi-ai's ModelRuntime satisfies this structurally. */
-export interface ModelProviderProbe {
-  /** "provider/model" or "default". */
-  modelRef: string;
-  getModel(provider: string, id: string): unknown;
-  checkAuth(provider: string): Promise<{ type: string } | undefined>;
-  availableProviders(): readonly string[];
-}
-
-/** Cheap model-provider probe: the configured review model must resolve
- * and its provider must hold configured credentials (api key or OAuth).
- * No network generation call is made. */
-export async function probeModelProvider(probe: ModelProviderProbe): Promise<void> {
-  const ref = probe.modelRef.trim();
-  if (ref === '' || ref === 'default') {
-    const providers = probe.availableProviders();
-    for (const provider of providers) {
-      if (await probe.checkAuth(provider)) return;
-    }
-    throw new Error('no configured/authed model provider is available for the default review model');
-  }
-  const separator = ref.indexOf('/');
-  const provider = separator === -1 ? ref : ref.slice(0, separator);
-  const modelId = separator === -1 ? '' : ref.slice(separator + 1);
-  if (provider === '' || modelId === '') throw new Error(`review model reference is invalid: ${ref}`);
-  if (probe.getModel(provider, modelId) === undefined) {
-    throw new Error(`review model does not resolve: ${ref}`);
-  }
-  const auth = await probe.checkAuth(provider);
-  if (auth === undefined) {
-    throw new Error(`review model provider is not authenticated: ${provider} (model ${ref})`);
   }
 }
 
@@ -332,13 +316,4 @@ export function skillInstalled(skillPath: string): boolean {
   } catch {
     return false;
   }
-}
-
-/** Build the argv tokens for a claude-code auth probe. The --model flag and
- * its value MUST be separate argv tokens — the combined single-token form
- * (e.g. '--model claude-sonnet-4') is rejected by the CLI. */
-export function buildClaudeCodeAuthArgs(modelRef: string): string[] {
-  const resolved = modelRef.trim();
-  const modelArgs = resolved === '' || resolved === 'default' ? [] : ['--model', resolved];
-  return ['-p', 'reply with exactly: ok', '--max-turns', '1', '--no-session-persistence', ...modelArgs];
 }

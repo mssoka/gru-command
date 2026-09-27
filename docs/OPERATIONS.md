@@ -99,9 +99,9 @@ restart ladder with resume — the conversation survives, and the
 interrupted prompt is re-delivered or the lane is escalated as
 recoverable). Sleep/wake gaps grant a fresh silence window instead of
 restarting. ≥ 3 restarts inside 10 minutes trips the **crash-loop
-breaker**: the agent is stopped, an action-required notification
-escalates (chat notice + board bell), and **acking that notification
-re-arms** supervision. A service restart also clears an open breaker —
+breaker**: the agent is stopped, a needs-owner notification escalates
+(FOR YOU band + owner bell + chat notice), and **acking that notification
+re-arms** supervision — re-arm is the human's step. A service restart also clears an open breaker —
 the ack record is durable, the breaker state is not.
 
 Knobs (`[supervision]` in `config.toml`): `turn_silence_ms` (default 15

@@ -731,7 +731,7 @@ describe('runtime startup, degradation and generation safety', () => {
     }
     const incidents = ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === 'decisions.degraded.credential_missing');
     expect(incidents).toHaveLength(1);
-    expect(incidents[0]).toMatchObject({ routing: 'action-required', severity: 'error' });
+    expect(incidents[0]).toMatchObject({ routing: 'needs-owner', severity: 'error' });
     db.close();
   });
 
@@ -761,7 +761,7 @@ describe('runtime startup, degradation and generation safety', () => {
     expect(incidents).toEqual(expect.arrayContaining([
       expect.objectContaining({
         kind: 'decisions.degraded.credential_missing',
-        routing: 'action-required',
+        routing: 'needs-owner',
         ackedAt: null,
         resolvedAt: expect.any(String),
         resolvedBy: 'decisions-runtime',

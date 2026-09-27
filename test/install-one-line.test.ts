@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -36,7 +36,9 @@ function run(
   try {
     const stdout = execFileSync('bash', [script, ...args], {
       encoding: 'utf-8',
-      env: { ...process.env, ...env },
+      // Each simulated installation owns its config home even when the test
+      // runner supplies an XDG_CONFIG_HOME outside the fixture's HOME.
+      env: { ...process.env, ...env, ...(env.HOME ? { XDG_CONFIG_HOME: join(env.HOME, '.config') } : {}) },
       timeout: 120_000,
     });
     lastStderr = '';
@@ -320,6 +322,7 @@ function ptyUpdaterLauncher(home: string, target: string, instance: string, seam
       '#!/usr/bin/env bash',
       'set -euo pipefail',
       `export HOME=${shellQuote(home)}`,
+      `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
       `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
       `export GRU_MANAGER_LOG=${shellQuote(seam.managerLog)}`,
       `export GRU_COMMAND_LAUNCHCTL=${shellQuote(seam.manager)}`,
@@ -430,6 +433,7 @@ describe('install.sh setup mode (one-line path)', () => {
         '#!/usr/bin/env bash',
         'set -euo pipefail',
         `export HOME=${shellQuote(home)}`,
+        `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
         `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
         `export GRU_COMMAND_ORIGIN=${shellQuote(`file://${fixture}`)}`,
         `export GRU_COMMAND_TARGET=${shellQuote(join(home, 'gru-command'))}`,
@@ -646,6 +650,83 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(readFileSync(unit, 'utf-8')).toContain(`${target}/dist/main.js`);
   });
 
+  it.skipIf(process.platform !== 'linux')('systemd unit retains stable Node/npm PATH after a version-manager session expires', () => {
+    const { fixture, home } = buildFixtureRepo();
+    // Direct --service requires an already-built service entrypoint.
+    mkdirSync(join(fixture, 'dist'), { recursive: true });
+    writeFileSync(join(fixture, 'dist', 'main.js'), '// fixture service\n');
+    const sessionBin = join(home, 'ephemeral version manager', 'bin');
+    mkdirSync(sessionBin, { recursive: true });
+    symlinkSync(process.execPath, join(sessionBin, 'node'));
+    const stableBin = dirname(realpathSync(process.execPath));
+    expect(existsSync(join(stableBin, 'npm'))).toBe(true);
+    const seam = serviceManagerSeam(home);
+    const result = run(join(fixture, 'install.sh'), ['--service'], {
+      HOME: home,
+      GRU_COMMAND_HOME: join(home, '.gru-command'),
+      PATH: `${sessionBin}:/usr/local/bin:/usr/bin:/bin`,
+      ...seam.env,
+    });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const unit = readFileSync(seam.unit, 'utf-8');
+    const servicePath = unit.match(/^Environment="PATH=([^"]+)"$/m)?.[1];
+    expect(servicePath).toBeDefined();
+    expect(servicePath!.split(':')[0]).toBe(stableBin);
+    rmSync(sessionBin, { recursive: true, force: true });
+    const npm = spawnSync('sh', ['-c', 'command -v npm && npm --version'], {
+      env: { PATH: servicePath! }, encoding: 'utf-8',
+    });
+    expect(npm.status, `${npm.stdout}\n${npm.stderr}`).toBe(0);
+    expect(realpathSync(npm.stdout.split('\n')[0]!)).toBe(realpathSync(join(stableBin, 'npm')));
+  });
+
+  it.skipIf(process.platform !== 'linux')('systemd PATH escapes quotes, backslashes and percent specifiers without losing the stable bin', () => {
+    const home = tempDir('gru-command-path-escape-');
+    const odd = join(home, 'quoted"back\\slash%bin');
+    const supplied = `${process.env.PATH ?? '/usr/bin:/bin'}:${odd}`;
+    const result = run(join(repoRoot, 'install.sh'), ['--print'], { HOME: home, PATH: supplied });
+    expect(result.status, result.stderr).toBe(0);
+    const encoded = supplied.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('%', '%%');
+    expect(result.stdout).toContain(`Environment="PATH=${dirname(realpathSync(process.execPath))}:${encoded}:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"`);
+    expect(result.stdout).not.toContain('{{PATH}}');
+  });
+
+  it.skipIf(process.platform !== 'linux')('newline PATH fails before writing a unit or calling the service manager', () => {
+    const { fixture, home } = buildFixtureRepo();
+    mkdirSync(join(fixture, 'dist'), { recursive: true });
+    writeFileSync(join(fixture, 'dist', 'main.js'), '// fixture service\n');
+    const seam = serviceManagerSeam(home);
+    const env = { HOME: home, GRU_COMMAND_HOME: join(home, '.gru-command'), ...seam.env };
+    const rendered = run(join(fixture, 'install.sh'), ['--print'], env);
+    expect(rendered.status, rendered.stderr).toBe(0);
+    mkdirSync(dirname(seam.unit), { recursive: true });
+    writeFileSync(seam.unit, rendered.stdout);
+    const result = run(join(fixture, 'install.sh'), ['--service'], {
+      ...env,
+      PATH: `${process.env.PATH ?? '/usr/bin:/bin'}\nmalformed`,
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('PATH contains a newline');
+    expect(readFileSync(seam.unit, 'utf-8')).toBe(rendered.stdout);
+    expect(existsSync(`${seam.unit}.r`)).toBe(false);
+    expect(existsSync(seam.managerLog)).toBe(false);
+  });
+
+  it.skipIf(process.platform !== 'linux')('fixture HOME contains service units even with a foreign XDG config home', () => {
+    const home = tempDir('gru-command-sandbox-home-');
+    const outside = tempDir('gru-command-foreign-xdg-');
+    const outsideUnit = join(outside, 'systemd', 'user', 'gru-command.service');
+    mkdirSync(dirname(outsideUnit), { recursive: true });
+    writeFileSync(outsideUnit, 'unrelated-user-unit\n');
+    const result = run(join(repoRoot, 'install.sh'), ['--uninstall'], {
+      HOME: home,
+      XDG_CONFIG_HOME: outside,
+    });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('not installed');
+    expect(readFileSync(outsideUnit, 'utf-8')).toBe('unrelated-user-unit\n');
+  });
+
   it('--no-interact + absent unit: the updater REGISTERS the service (unit written + manager called)', () => {
     const { home, target, instance, seam } = stageConfiguredAbsentUnit();
     const result = run(join(target, 'install.sh'), ['--no-interact'], {
@@ -718,6 +799,7 @@ describe('install.sh setup mode (one-line path)', () => {
         '#!/usr/bin/env bash',
         'set -euo pipefail',
         `export HOME=${shellQuote(home)}`,
+        `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
         `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
         `export GRU_MANAGER_LOG=${shellQuote(seam.managerLog)}`,
         `export GRU_COMMAND_LAUNCHCTL=${shellQuote(seam.manager)}`,
@@ -761,6 +843,7 @@ describe('install.sh setup mode (one-line path)', () => {
         '#!/usr/bin/env bash',
         'set -euo pipefail',
         `export HOME=${shellQuote(home)}`,
+        `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
         `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
         `export GRU_MANAGER_LOG=${shellQuote(seam.managerLog)}`,
         `export GRU_COMMAND_LAUNCHCTL=${shellQuote(seam.manager)}`,
@@ -779,6 +862,7 @@ describe('install.sh setup mode (one-line path)', () => {
       env: {
         ...process.env,
         HOME: home,
+        XDG_CONFIG_HOME: join(home, '.config'),
         GRU_COMMAND_HOME: instance,
       },
     });

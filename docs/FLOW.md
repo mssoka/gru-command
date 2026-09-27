@@ -172,7 +172,8 @@ fallback session is a full-capability minion by design — it must load the
 ambient BMAD skill — and is instructed never to gate, approve, merge, or
 modify implementation code; every gate decision is the host's. The fallback
 never records a Perkins verdict and never moves merge authority: only an
-exact-head Perkins READY can authorize a merge, and merge stays user-held
+exact-head Perkins READY can authorize a merge; Gru merges this repository
+only after that gate, while the owner holds merges elsewhere
 everywhere. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (install BMAD via
 onboarding / restore Perkins) are escalated and recorded on the job as
@@ -253,8 +254,9 @@ the ordered, preserve-first sweep (ruling 18c):
    platforms are argv-only, declared). Every pid a pause or confirmed
    kill is grounded on lands in the ledger's worktree-process records —
    the ask always names exactly what was live.
-4. **Pause and ask** — any other live process pauses the sweep, records
-   an action-required escalation, and touches nothing. `confirm_kill` is
+4. **Pause and ask** — any other live process pauses the sweep, records a
+   needs-owner escalation (destructive steps require the owner's ruling),
+   and touches nothing. `confirm_kill` is
    the human's answer to the RECORDED ask: it kills exactly the pids the
    pause put on the record (never a fresh enumeration — pids that
    appeared since were never acknowledged), with a SIGTERM grace before
@@ -263,11 +265,11 @@ the ordered, preserve-first sweep (ruling 18c):
    `confirm_kill` without a recorded pause is not honored — the ask
    always comes first. Silent kills do not exist for processes the
    orchestrator did not spawn.
-4. **Remove** the worktree; **containment-verified** branch delete (a
+5. **Remove** the worktree; **containment-verified** branch delete (a
    branch is deleted only when its commits are provably contained in an
    existing ref — otherwise it is retained and noted, never
    force-deleted).
-5. **Re-resolve the fresh head** at release: follow-on work always
+6. **Re-resolve the fresh head** at release: follow-on work always
    starts from the current head, never a held sha.
 
 ## The worktree subsystem (ruling 18)
@@ -321,10 +323,12 @@ the judgment; the dispatch surface is the mechanical hand.
 - **The digest** handed to every wake carries the actionable states,
   computed from the ledger: delivered jobs with no PR registered; PRs
   whose follow-up delivery proves the lane head moved past the newest
-  round's reviewed target (first review AND re-review after a fix round;
-  an unchanged head warrants no round; and a review already REQUESTED for
+  round's reviewed target (first review AND re-review after a fix round);
+  or a proven `service_restart` abort on the unchanged delivered head,
+  once per source round under `clean-abort-service-restart`. Other aborts
+  and unchanged heads warrant no round. A review already REQUESTED for
   the current state retires the row — including the bmad-review fallback
-  route, which creates no round and owns its own fix loop); NEEDS CHANGES
+  route, which creates no round and owns its own fix loop. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
   plus recent minion errors for context.
@@ -345,7 +349,7 @@ the judgment; the dispatch surface is the mechanical hand.
   the rung and Silas executes it through `/api/silas/*`: `directive_at`
   (default 2) → fix directive to the implementing minion; `rebrief_at`
   (default 3) → re-brief a FRESH minion on the same lane; `escalate_at`
-  (default 4) → action-required notification surfaced to the Gru chat.
+  (default 4) → action-required notification that wakes Gru to rule.
   Escalation always beats an endless loop. Every rung lands as
   `silas.directive-sent`, `silas.rebrief`, or `silas.escalated`.
 - **Restart safety.** A re-brief REQUEST is durable BEFORE any worker
@@ -371,6 +375,120 @@ the judgment; the dispatch surface is the mechanical hand.
   wakes; the `/api/silas/*` surface answers 503. Model and thinking come
   from config (`[models.roles] silas` / `[thinking.roles] silas`), never
   hardcoded.
+
+## Wake-on-alert (owner ruling 2026-09-23)
+
+Before this ruling the awareness pipe delivered service context into Gru
+TURNS but never opened one. With `notify_wake = "never"` and nothing of
+Gru running between user messages, an action-required alert sat unacked
+until the owner pinged — proven by the 2026-09-23 morning observation.
+Wake-on-alert closes that hole: a critical notification OPENS a Gru turn
+by itself, and the turn is expected to ACT.
+
+**Wake policy** (`[chat]`, see CONFIG.md). `wake-policy.ts` decides; the
+awareness layer batches, persists, and calls the chat wake sink.
+
+- **Routing gate** — `notify_wake = "action-required"` (default) wakes for
+  machine-attention rows; `"all"` also wakes for FYI/needs-owner; `"never"`
+  stays passive-only (context rides the next human turn).
+- **Severity gate** — `wake_min_severity = "info" | "error"` floors a wake
+  without changing routing.
+- **Rate limit + coalescing** — `wake_min_interval_ms` (default 5 min)
+  bounds autonomous turns; candidates inside the window coalesce into ONE
+  trailing wake carrying the whole batch.
+- **Quiet hours** — `wake_quiet_hours = "HH:MM-HH:MM"` (local time, may wrap
+  midnight; default off) defers wakes to the next real local window end,
+  including DST transitions. Admission is checked again after a queued
+  user turn and immediately before a wake starts; no turn opens in-window.
+- **Dedupe** — one wake per open notification id, persisted (`awareness.json`);
+  open receipts are never evicted after an arbitrary number of other wakes.
+  Closed IDs are pruned. A failed attempt consumes the configured interval
+  (including across restarts) but never claims the notification ID.
+- **Backlog migration** — existing routing is immutable: even legacy rows
+  with owner-like kinds remain machine attention if recorded as
+  `action-required`. Open machine rows seed bounded wake turns; an owner
+  decision is a new explicit `needs-owner` post, never an automatic rewrite.
+  All mode includes FYI/owner context too.
+
+**Mechanics.** A wake calls the chat server's `wakeAwareness()`: when the
+lane is idle it opens one ordinary turn whose prompt is the awareness
+block plus the wake instruction, clearly marked `[gru awareness · service
+context — not a user message]`. The single stream and single pen are
+unchanged — the wake rides the same session and the same frame log as any
+other turn (chat renders its machinery as a collapsed service band). A
+wake requested mid-turn becomes one trailing turn; a wake with nothing to
+inject neither spawns a session nor burns a model turn; a failed wake is a
+durable notice, never a message-delivery error. Notification IDs stay
+pending independently of the event cursor until a durable turn-start frame
+confirms the prompt accepted a block containing those IDs. This receipt
+survives sidecar-write failure because boot reconciles delivered IDs from
+ledger `gru.wake` events. A later turn failure is logged separately without
+re-waking an already delivered ID; pre-acceptance spawn/prompt failures
+retry after at least five
+seconds AND the configured wake interval. Long intervals use safe timer
+slices rather than Node's overflowing timeout. Only the IDs actually present in the bounded block count as woken; overflow
+travels in later, rate-limited turns. The backlog sink binds only after
+listen, chat and board route attachment, and the foreign-listener check:
+Gru's in-turn disposition API is available before any boot wake opens.
+If unsafe chat recovery prevents delivery, a `gru.wake-failed` receipt and
+an idempotent `needs-owner` stop ask for manual service recovery; the machine
+IDs remain pending for rate-limited retry.
+
+**Mandate — act (tier-2).** A wake is machine attention meant to be acted
+on in-turn: Gru diagnoses the incident and takes one substantive step per
+incident (a fix lane, a re-arm, a disposition) within budget, staging the
+rest; novel failures and judgment calls stay with Gru. Gru holds merge
+authority for this repository; the owner retains it elsewhere. The owner
+is reached only through `needs-owner` — and sparingly; an empty FOR YOU
+band is the healthy state.
+
+**Routing split** (same ruling). Routing is the attention channel; `never`
+disables autonomous wakes but still carries pending owner stops in Gru's
+next user-directed context block:
+
+| routing | meaning | surface |
+|---|---|---|
+| `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue; wakes Gru; never rings the owner bell |
+| `needs-owner` | owner-only decisions (merges outside this repo, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
+| `fyi` | standing feed | board feed only |
+
+**Unresolved follow-up.** A successful prompt is delivery, not resolution.
+Open machine and owner stops remain eligible for bounded context in later
+user turns even after the ledger event cursor advances; both routing classes
+receive space when each has pending rows. No age-based owner escalation is
+made: only Gru's explicit, justified `POST /api/notifications/needs-owner`
+creates an owner stop. A machine disposition closes the original incident.
+
+**Machine disposition.** A successful prompt is delivery, not resolution.
+After acting on an `action-required` row Gru calls the authenticated
+`POST /api/notifications/{id}/disposition` with a nonempty JSON `detail`
+(the action taken or why no safe action was possible). The ledger records
+`notification.resolved` by `gru` with the action detail; the endpoint refuses `needs-owner` and
+FYI rows. The authenticated `/ack` API itself refuses machine rows, not
+just the web UI. Both open machine alerts and owner stops remain in their
+board bands regardless of newer feed traffic. Only the owner Ack clears
+owner stops.
+
+**Morning digest.** The first delivered block after `morning_digest_gap_ms`
+(default 8 h; 0 disables) carries a ledger-derived "while you were away"
+digest — fires (wake turns delivered), actions, merges, staged PRs — so the
+chief catches up without the owner relaying anything. The persisted owner
+watermark is independent of the wake/event cursor: overnight wake turns
+never consume actions or fires from the next owner-directed digest.
+
+**Observability.** Every delivered wake is logged, appended to the ledger as a
+`gru.wake` event (a failed attempt or later failed turn adds `gru.wake-failed`),
+and counted by the board's wake tracker. Delivery is not an action taken;
+actual resolutions and job events must be counted separately.
+
+**Silas mandate split** (same lane). Mechanical reactions move to Silas's
+ops driver — re-arm review rounds after clean aborts, pattern respins for
+known failure classes, sweep acks under recorded rules. Gru keeps the
+judgments: rulings, merges, and novel failures. One standing rule from the
+2026-09-23 freeze: never auto-arm a review round on a branch while a
+rebase/force-push lane is active on the same target (the round races the
+push and dies obsolete); arm after the lane delivery settles. Service
+restarts remain manual until self-roll-34 lands.
 
 ## Bob (periodic memory)
 

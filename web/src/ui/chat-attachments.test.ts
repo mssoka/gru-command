@@ -279,6 +279,11 @@ describe('chat context control rendering', () => {
         node.textContent?.includes('typed into pending view'),
       ),
     ).toHaveLength(1);
+    view.addFrame({ type: 'notice', text: 'after rejected reset', seq: 12 }, true);
+    const children = [...document.getElementById('chat-log')!.children];
+    expect(children.at(-1)?.textContent).toContain('after rejected reset');
+    expect(children.findIndex((node) => node.textContent?.includes('typed into pending view')))
+      .toBeLessThan(children.findIndex((node) => node.textContent?.includes('after rejected reset')));
   });
 });
 
