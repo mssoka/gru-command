@@ -4,7 +4,7 @@ type: 'bugfix'
 created: '2026-09-27'
 status: 'done'
 route: 'oneshot'
-review_loop_iteration: 0
+review_loop_iteration: 1
 context:
   - '{project-root}/AGENTS.md'
 ---
@@ -49,3 +49,15 @@ context:
 - "regression does not pin breakerNotificationId" — `false` as a defect: the supervisor binds exactly the postIncident return; if it returned the legacy row, no needs-owner row would exist (length assertion) and the owner ack would throw (asserted), so the chain cannot pass on a legacy-bound breaker.
 - "no decisions.degraded.* fresh-row variant" — `low`, deferred to deferred-work.md: mechanism is kind-agnostic and covered via the provider-wall kind; adjacent coverage, not a bug.
 - "suite-shape counts hand-updated" — `false`: the suite-shape pin validates each file's static count and passed against the actual combined tree (17 notifications / 44 supervisor, confirmed by the vitest tallies).
+
+## Spec Change Log (loopback 1 — Perkins R1 on PR #129)
+
+- Finding: equal-millisecond ties in `findNotificationByKind` (`ORDER BY ts DESC, id ASC`, src/ledger/api.ts) let the legacy machine row keep WINNING the dedupe after a fresh owner row exists; each repeated owner stop then inserted ANOTHER owner row (duplicate bell). The original test's `legacy-provider-wall` id always sorts after a UUID (hex digits < 'l') and did not control the clock, so the tie path was untested.
+- Amendment: on an unacked machine-row hit, `postIncident` now reuses an ELIGIBLE unacked same-kind `needs-owner` row before inserting — via a new routing-scoped ledger lookup `findNotificationByKindAndRouting` (unacked + unresolved, newest first). Known-bad state avoided: duplicate owner notifications on same-ms ties; acked/resolved owner rows are NOT eligible, so a genuinely new trip still mints a new owner row (next-trip semantics preserved).
+- KEEP: the round-1 acceptance set (fresh Ack-able row on machine hit; legacy row preserved; acked-row reuse under `dedupe:'active'`; same-routing dedupe; fresh-install behavior) all still green unchanged — the amendment only collapses the duplicate-insert window.
+
+## Review Triage Log (loopback 1)
+
+- Perkins R1 finding (equal-ms tie → legacy row wins dedupe → duplicate owner rows): verified REAL by a deterministic red reproduction (frozen clock + all-zeros legacy id — lexicographically first among UUIDs — repeat stop minted a second owner row `d89f0906… ≠ 8fc3bcd4…`). Fixed as prescribed (reuse-then-insert); regression `reuses the open owner row on a same-millisecond tie instead of duplicating the bell (Perkins R1)` asserts: repeat returns the SAME owner id, exactly 2 rows of the kind, exactly ONE onNeedsOwner bell ring, legacy row untouched (action-required/unacked/unresolved).
+
+- Loopback 1 files: `src/ledger/api.ts` (+`findNotificationByKindAndRouting`), `src/notifications/center.ts` (reuse-before-insert on the machine-hit branch), `test/notifications.test.ts` (+1 fixed-clock tie regression; 17→18), `test/suite-shape.test.ts` (17→18).

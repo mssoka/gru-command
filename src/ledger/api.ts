@@ -1255,6 +1255,21 @@ export class LedgerApi {
   }
 
   /**
+   * Routing-scoped open-incident lookup (Perkins R1, gh-97): the plain
+   * kind lookup ties-break by id (ts DESC, id ASC), so a legacy
+   * machine-routed row can keep winning the dedupe over a same-millisecond
+   * owner row. Callers that must honor a specific routing ask THIS query:
+   * the newest UNACKED, UNRESOLVED row of the exact kind AND routing —
+   * never a stale acked/resolved row, never the other routing class.
+   */
+  findNotificationByKindAndRouting(kind: string, routing: NotificationRouting): NotificationRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM notifications WHERE kind = ? AND routing = ? AND acked_at IS NULL AND resolved_at IS NULL ORDER BY ts DESC, id LIMIT 1')
+      .get(kind, routing) as Row | undefined;
+    return row === undefined ? null : this.notificationFromRow(row);
+  }
+
+  /**
    * Resolve product incidents without forging a human acknowledgement.
    * Every changed row emits an event so connected status/notification
    * surfaces refresh immediately.

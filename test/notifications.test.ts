@@ -402,6 +402,58 @@ describe('notification center — durable log + receipts + acks', () => {
     expect(nextTrip.routing).toBe('needs-owner');
   });
 
+  it('reuses the open owner row on a same-millisecond tie instead of duplicating the bell (Perkins R1)', () => {
+    // Fixed clock: every row this test writes shares one millisecond, so
+    // findNotificationByKind's ORDER BY ts DESC, id ASC tie-break always
+    // selects the lexicographically-first id — the all-zeros LEGACY row,
+    // never the minted UUID (hex digits are never all-zero).
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-27T12:00:00.000Z'));
+    try {
+      const db = new LedgerDb(tmpDir());
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const needsOwner: NotificationRecord[] = [];
+      const center = new NotificationCenter({
+        ledger: api,
+        bus,
+        onNeedsOwner: (notification) => needsOwner.push(notification),
+      });
+      const kind = 'supervision.provider-wall.minion-tie.authentication_wall';
+      api.recordNotification({
+        id: '00000000-0000-0000-0000-000000000000',
+        kind,
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Legacy machine wall',
+        agentId: 'minion-tie',
+      });
+      const first = center.postIncident({
+        kind, routing: 'needs-owner', severity: 'error', title: 'stop one', agentId: 'minion-tie', dedupe: 'unacked',
+      });
+      expect(first.routing).toBe('needs-owner');
+      expect(first.id).not.toBe('00000000-0000-0000-0000-000000000000');
+      // SAME millisecond: the tie keeps selecting the legacy machine row,
+      // so the repeat must REUSE the open owner incident — one owner row,
+      // one bell ring — never a duplicate insert.
+      const repeated = center.postIncident({
+        kind, routing: 'needs-owner', severity: 'error', title: 'stop two', agentId: 'minion-tie', dedupe: 'unacked',
+      });
+      expect(repeated.id).toBe(first.id);
+      const rows = api.listNotifications({ limit: 50 }).filter((row) => row.kind === kind);
+      expect(rows).toHaveLength(2);
+      expect(needsOwner.map((row) => row.id)).toEqual([first.id]);
+      // The historical machine row is preserved untouched for Gru triage.
+      expect(api.getNotification('00000000-0000-0000-0000-000000000000')).toMatchObject({
+        routing: 'action-required',
+        ackedAt: null,
+        resolvedAt: null,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not duplicate an acknowledged but unresolved active incident', () => {
     const incidents = boot();
     const first = incidents.center.postIncident({
