@@ -400,6 +400,47 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
       expect(result.freshHead).toBe(tip);
     }
   });
+
+  it('a remote default RENAME wins over the stale cached origin/HEAD (Perkins blocker)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-default-rename'); // origin HEAD=main, cached origin/HEAD -> main
+    // The remote grows trunk FROM main, advances it, and renames its
+    // default to trunk — while old main stays fetchable at its old tip.
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main:refs/heads/trunk']);
+    const staleMainTip = repo.git(['rev-parse', 'refs/remotes/origin/main']);
+    const tip = advanceOrigin(origin, 'trunk', 'src/renamed-default.ts', 'export const renamedDefault = 1;\n');
+    execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/trunk'], { stdio: 'ignore' });
+    // The host clone's cache still names the DEMOTED branch (stale).
+    expect(repo.git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])).toBe('origin/main');
+    expect(tip).not.toBe(staleMainTip);
+    ledgerJob(h, 'job-renamed-default', repo);
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-renamed-default' });
+    // The lane bases on the LIVE default (trunk), never the cached main.
+    expect(row.sha).toBe(tip);
+    expect(row.sha).not.toBe(staleMainTip);
+    expect(row.baseSource).toBe('origin');
+    expect(repo.git(['rev-parse', 'HEAD'], row.path)).toBe(tip);
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/trunk'])).toBe(tip);
+    expect(h.baseFallbacks).toEqual([]);
+  });
+
+  it('a checked-out FEATURE branch is never taken for the default (no cached origin/HEAD, origin unreachable)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-feature-checkout');
+    repo.git(['checkout', '--quiet', '-b', 'gru/feature-x']);
+    repo.git(['remote', 'add', 'origin', join(repo.path, '..', 'no-such-origin.git')]);
+    ledgerJob(h, 'job-feature-offline', repo);
+    const local = repo.head();
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-feature-offline' });
+    expect(row.sha).toBe(local);
+    expect(row.baseSource).toBe('local-head-fallback');
+    // The degrade is declared WITHOUT presenting the feature branch as a default.
+    expect(h.baseFallbacks).toHaveLength(1);
+    expect(h.baseFallbacks[0]?.defaultBranch).toBeNull();
+    expect(h.baseFallbacks[0]?.detail).not.toContain('gru/feature-x');
+  });
 });
 
 describe('worktree manager: sweep (ruling 18c)', () => {

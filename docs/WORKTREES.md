@@ -90,9 +90,15 @@ held sha.
 ## 5a. Base provenance (owner incident 2026-09-23)
 
 A lane's base is the `git fetch origin <default-branch>` tip of the
-remote's default branch (resolved per-repo: `origin/HEAD`, else the
-remote's live HEAD symref, else the repo's checked-out branch — never a
-hardcoded `main`). The registry row records the base SOURCE: `origin`
+remote's default branch. The default is what the remote's LIVE HEAD
+symref says (`ls-remote --symref`) — the authority, never a stale cached
+`origin/HEAD` (a remote that renames main→trunk while main stays
+fetchable would otherwise keep basing lanes on the demoted branch); when
+the remote is unreachable, the cached `origin/HEAD` is used as a
+declared guess the fetch must validate — and the repo's checked-out
+branch is never consulted, because a host clone sitting on a lane
+branch must not name the default. The registry row records the base
+SOURCE: `origin`
 for a fetched base, `local-head-fallback` when the fetch failed and the
 lane branched from the host clone's local HEAD instead. The fallback is
 never silent: the row carries it, the `worktree.created` event carries

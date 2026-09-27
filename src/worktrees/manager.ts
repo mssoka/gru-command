@@ -336,10 +336,14 @@ export class WorktreeManager {
    * surfaced by an FYI) — staleness is visible, never silent.
    */
   private resolveBase(repoPath: string): ResolvedBase {
-    const defaultBranch = this.resolveDefaultBranch(repoPath);
+    const resolved = this.resolveDefaultBranch(repoPath);
+    const defaultBranch = resolved.branch;
     const localHead = (): string => runGit(repoPath, ['rev-parse', 'HEAD']);
     if (defaultBranch === null) {
-      const detail = 'origin default branch is unresolvable (no origin/HEAD, no reachable origin)';
+      const detail =
+        `origin default branch is unresolvable — live probe: ${
+          resolved.liveDetail ?? 'named no branch'
+        }, no cached origin/HEAD`;
       this.log('warn', 'base resolution degraded to the local checkout', { repo: repoPath, detail });
       return { sha: localHead(), baseSource: 'local-head-fallback', defaultBranch: null, fallbackDetail: detail };
     }
@@ -360,34 +364,54 @@ export class WorktreeManager {
     };
   }
 
-  /**
-   * The origin default branch, resolved PER-REPO — never a hardcoded
-   * 'main': (1) the cached remote HEAD (`refs/remotes/origin/HEAD`), else
-   * (2) the remote's live HEAD symref, else (3) the repo's own checked-out
-   * branch. Null = nothing local or remote names a default branch; the
-   * caller declares the degraded fallback.
-   */
-  private resolveDefaultBranch(repoPath: string): string | null {
-    const cached = spawnGit(repoPath, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
-    if (cached.status === 0) {
-      const name = cached.stdout.trim();
-      const prefix = 'origin/';
-      if (name.startsWith(prefix) && name.length > prefix.length) return name.slice(prefix.length);
-    }
+  /** The remote's own HEAD symref, asked live — the AUTHORITY for the
+   * default branch. The cached `refs/remotes/origin/HEAD` can name a
+   * branch the remote has since demoted (Perkins blocker: default
+   * renamed main→trunk while main stayed fetchable — lanes branched
+   * from the stale main recorded as 'origin'); only the live answer
+   * proves what the remote calls default TODAY. */
+  private liveDefaultBranch(
+    repoPath: string,
+  ): { readonly branch: string | null; readonly detail: string | null } {
     const live = spawnGit(repoPath, ['ls-remote', '--symref', 'origin', 'HEAD'], {
       timeoutMs: this.fetchTimeoutMs,
       noPrompt: true,
     });
     if (live.status === 0) {
       const match = /^ref:\s+refs\/heads\/([^\s]+)\s+HEAD$/mu.exec(live.stdout);
-      if (match !== null && match[1] !== undefined && match[1] !== '') return match[1];
+      if (match !== null && match[1] !== undefined && match[1] !== '') {
+        return { branch: match[1], detail: null };
+      }
+      // Exit 0 but no symref line: the remote names no default HEAD.
+      return { branch: null, detail: 'remote HEAD carries no branch symref' };
     }
-    const local = spawnGit(repoPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
-    if (local.status === 0) {
-      const branch = local.stdout.trim();
-      if (branch !== '') return branch;
+    const detail = live.stderr.trim() || live.error || live.stdout.trim();
+    return { branch: null, detail: (detail === '' ? `ls-remote exited ${String(live.status)}` : detail).slice(0, 500) };
+  }
+
+  /**
+   * The origin default branch, resolved PER-REPO — never a hardcoded
+   * 'main': (1) the remote's LIVE HEAD symref (the authority — a cached
+   * value can go stale exactly when the remote renames its default),
+   * else (2) offline, the cached remote HEAD (`refs/remotes/origin/HEAD`)
+   * as a declared guess that the fetch must still validate. The repo's
+   * checked-out branch is deliberately NOT consulted — a host clone on
+   * a lane branch must never be taken to name the default (Perkins
+   * blocker). Null = nothing names a default; the caller declares the
+   * degraded fallback.
+   */
+  private resolveDefaultBranch(repoPath: string): { readonly branch: string | null; readonly liveDetail: string | null } {
+    const live = this.liveDefaultBranch(repoPath);
+    if (live.branch !== null) return { branch: live.branch, liveDetail: null };
+    const cached = spawnGit(repoPath, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+    if (cached.status === 0) {
+      const name = cached.stdout.trim();
+      const prefix = 'origin/';
+      if (name.startsWith(prefix) && name.length > prefix.length) {
+        return { branch: name.slice(prefix.length), liveDetail: live.detail };
+      }
     }
-    return null;
+    return { branch: null, liveDetail: live.detail };
   }
 
   /** `git fetch origin <branch>` with an explicit refspec so the
@@ -468,7 +492,8 @@ export class WorktreeManager {
       const prefix = 'refs/remotes/origin/';
       if (fullName.startsWith(prefix) && fullName.length > prefix.length) {
         const suffix = fullName.slice(prefix.length);
-        const branch = suffix === 'HEAD' ? this.resolveDefaultBranch(repoPath) : suffix;
+        const branch =
+          suffix === 'HEAD' ? this.resolveDefaultBranch(repoPath).branch : suffix;
         if (branch === null) {
           throw new Error(
             `review ref ${ref} names origin/HEAD but the origin default branch is unresolvable — ` +
