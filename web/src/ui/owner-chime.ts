@@ -76,6 +76,8 @@ export interface ChimeOscillatorNode {
 export interface ChimeGainNode {
   readonly gain: ChimeAudioParam;
   connect(destination: unknown): unknown;
+  /** Cancellation seam: detaches any already-flowing tail. */
+  disconnect(): void;
 }
 
 export interface ChimeAudioContext {
@@ -302,16 +304,32 @@ export class OwnerChime {
 
   /** The soft two-note pattern: sine oscillators, short attack, long
    * exponential decay, one low peak per note. */
+  /** The soft two-note pattern: sine oscillators, short attack, long
+   * exponential decay, one low peak per note. SCHEDULING IS ATOMIC — if
+   * any note fails to schedule, every note this attempt already created
+   * is cancelled (stopped + detached) before the failure propagates, so
+   * a partial chime can never ring: the caller's fallback is the visual
+   * nudge, and an unconsumed throttle never buys repeated half-chimes. */
   private play(): void {
     const context = this.context;
     if (context === null) return; // only reachable when armed
     const start = context.currentTime + 0.01;
     const [first, second] = OWNER_CHIME_NOTES_HZ;
-    this.playNote(context, first, start);
-    this.playNote(context, second, start + NOTE_GAP_S);
+    const scheduled: Array<{ readonly oscillator: ChimeOscillatorNode; readonly gain: ChimeGainNode }> = [];
+    try {
+      scheduled.push(this.playNote(context, first, start));
+      scheduled.push(this.playNote(context, second, start + NOTE_GAP_S));
+    } catch (error) {
+      for (const note of scheduled) this.cancelNote(note);
+      throw error;
+    }
   }
 
-  private playNote(context: ChimeAudioContext, frequency: number, at: number): void {
+  private playNote(
+    context: ChimeAudioContext,
+    frequency: number,
+    at: number,
+  ): { readonly oscillator: ChimeOscillatorNode; readonly gain: ChimeGainNode } {
     const oscillator = context.createOscillator();
     const gain = context.createGain();
     oscillator.type = 'sine';
@@ -323,6 +341,23 @@ export class OwnerChime {
     gain.connect(context.destination);
     oscillator.start(at);
     oscillator.stop(at + DECAY_S + TAIL_S);
+    return { oscillator, gain };
+  }
+
+  /** Best-effort cancellation of a partially scheduled note. Never
+   * throws: stop() on a never-started oscillator (or a hostile node) is
+   * already a failed graph — there is nothing audible left to protect. */
+  private cancelNote(note: { readonly oscillator: ChimeOscillatorNode; readonly gain: ChimeGainNode }): void {
+    try {
+      note.oscillator.stop(0); // before/at now: the note never rings on
+    } catch {
+      /* never started — nothing scheduled to silence */
+    }
+    try {
+      note.gain.disconnect(); // detach any tail already flowing
+    } catch {
+      /* already detached */
+    }
   }
 
   /** Unarmed fallback: a bounded, stronger bell-badge pulse. */

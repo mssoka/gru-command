@@ -60,9 +60,14 @@ class StubOscillator {
 
 class StubGain {
   readonly gain = new StubParam();
+  disconnected = false;
 
   connect(destination: unknown): unknown {
     return destination;
+  }
+
+  disconnect(): void {
+    this.disconnected = true;
   }
 }
 
@@ -82,10 +87,19 @@ class StubAudioContext {
   /** Scheduling failure: createOscillator throws although the context
    * reports 'running' — the dead/hostile-node regression shape. */
   throwOnCreateOscillator = false;
+  /** Partial-scheduling failure (R3): createOscillator throws only on
+   * the Nth node ever created (0-based) — e.g. 1 = the second note of
+   * the first chime — after earlier notes already started. */
+  failOnNthOscillator: number | null = null;
+  private oscillatorsCreated = 0;
   private gateResolve: (() => void) | null = null;
 
   createOscillator(): ChimeOscillatorNode {
     if (this.throwOnCreateOscillator) throw new Error('audio node allocation failed');
+    if (this.failOnNthOscillator !== null && this.oscillatorsCreated === this.failOnNthOscillator) {
+      throw new Error(`audio node ${this.failOnNthOscillator} allocation failed`);
+    }
+    this.oscillatorsCreated += 1;
     const oscillator = new StubOscillator();
     this.oscillators.push(oscillator);
     return oscillator;
@@ -605,6 +619,59 @@ describe('owner chime — live board wiring', () => {
       ]),
     );
     expect(h.context.oscillators).toHaveLength(2);
+  });
+
+  it('a SECOND-NOTE scheduling failure is atomic through the board wiring: no partial chime rings, nudge and receipts stay intact, an immediate retry is one full chime', () => {
+    mountDom();
+    const context = new StubAudioContext();
+    context.failOnNthOscillator = 1; // the second note of the first chime throws
+    const chime = new OwnerChime({
+      storage: memoryStorage(),
+      indicator: document.getElementById('sound-toggle') as HTMLButtonElement,
+      bell: document.getElementById('notification-bell') as HTMLButtonElement,
+      createContext: () => context,
+    });
+    expect(chime.arm()).toBe(true); // playable — the failure is mid-SCHEDULING
+    const outcomes: string[] = [];
+    const shown: Array<{ id: string; surface: string }> = [];
+    const client = {
+      markNotificationShown: (id: string, surface: string) => {
+        shown.push({ id, surface });
+        return Promise.resolve(true);
+      },
+    } as unknown as BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(client);
+    view.setToastHandler((notification) => {
+      outcomes.push(chime.notify(notification));
+    });
+
+    view.render(boardSnapshot([])); // history baseline
+
+    // Before R3, note 1 stayed scheduled-and-audible while the throw
+    // bypassed the throttle — repeated attempts rang partial chimes.
+    expect(() => view.render(boardSnapshot([arrival('owner-1', 'needs-owner')]))).not.toThrow();
+    expect(outcomes).toEqual(['nudge']);
+    expect(shown.map((entry) => entry.id)).toEqual(['owner-1']); // receipt landed (R2 intact)
+    expect(
+      document.getElementById('notification-bell')?.classList.contains(OWNER_CHIME_NUDGE_CLASS),
+    ).toBe(true); // visual fallback carried the arrival
+    expect(context.oscillators).toHaveLength(1); // note 1 was created…
+    expect(context.oscillators[0]?.stopAt).toBe(0); // …and cancelled before ringing
+    expect(context.gains[0]?.disconnected).toBe(true); // its tail is detached
+
+    // IMMEDIATE retry inside the same 30s window: one FULL two-note
+    // chime — no duplicate, no overlap with a partial.
+    context.failOnNthOscillator = null;
+    expect(() => view.render(boardSnapshot([arrival('owner-2', 'needs-owner')]))).not.toThrow();
+    expect(outcomes).toEqual(['nudge', 'chime']);
+    expect(shown.map((entry) => entry.id)).toEqual(['owner-1', 'owner-2']);
+    expect(context.oscillators).toHaveLength(3); // cancelled note + the two fresh ones
+    const retryNotes = context.oscillators.slice(1);
+    expect(retryNotes[0]?.startAt).toBeCloseTo(100.01, 6); // the rising pair,
+    expect(retryNotes[1]?.startAt).toBeCloseTo(100.19, 6); // gap preserved
+    expect(retryNotes.every((note) => note.stopAt !== 0 && note.stopAt !== null)).toBe(true);
+    expect(context.gains.slice(1).every((gain) => !gain.disconnected)).toBe(true);
   });
 
   it('a throwing audio node stays contained through the live board wiring: visual nudge, unconsumed throttle, receipts and remaining notifications still flow', () => {
