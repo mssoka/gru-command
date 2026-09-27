@@ -685,6 +685,62 @@ describe('freeze-time integration on PR rounds', () => {
     expect(manifest.targetRef).toBe('HEAD');
   });
 
+  it('a remote-only origin/topic on a linked PR NEVER bypasses PR-head verification — the PR head is frozen (Perkins R3)', async () => {
+    const repo = makeFixtureRepo('freeze-remoteonly-pr');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/lane']);
+    const laneSha = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const origin = attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    // A remote-only topic branch at a DIFFERENT commit than the PR head —
+    // pushed from an isolated clone, never fetched into the fixture.
+    const clone = mkdtempSync(join(tmpdir(), 'gru-freeze-decoy-'));
+    cleanupDirs.push(clone);
+    execFileSync('git', ['clone', '--quiet', '--branch', 'feature/lane', origin, clone], { stdio: 'ignore' });
+    execFileSync('git', ['-C', clone, 'checkout', '--quiet', '-b', 'topic'], { stdio: 'ignore' });
+    writeFileSync(join(clone, 'src/decoy.ts'), 'export const decoy = true;\n', 'utf-8');
+    const identity = ['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid'];
+    execFileSync('git', ['-C', clone, 'add', 'src/decoy.ts'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', clone, ...identity, 'commit', '-m', 'decoy topic tip'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', clone, 'push', '--quiet', 'origin', 'HEAD:refs/heads/topic'], { stdio: 'ignore' });
+    const decoy = execFileSync('git', ['-C', clone, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    expect(decoy).not.toBe(laneSha); // the refetch would freeze UNRELATED bytes
+    expect(() => repo.git(['show-ref', '--verify', 'refs/remotes/origin/topic'])).toThrow(); // remote-only
+
+    const root = tempDir('gru-freeze-decoy-port-');
+    const artifacts = tempDir('gru-freeze-decoy-artifacts-');
+    const sessions = tempDir('gru-freeze-decoy-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', laneSha);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-decoy-topic' });
+    const job = ledger.addJob({
+      id: 'job-decoy-topic', repo: 'fixture', title: 'remote-only origin ref on a linked PR', baseBranch: 'main',
+      briefing: 'Acceptance: lane returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/21');
+    const probe = vi.fn(fixedProbe('feature/lane', laneSha));
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: probe,
+    });
+
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'origin/topic' }));
+    // The live PR head was verified and frozen — the decoy topic tip never.
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(outcome.round.targetRef).toBe(laneSha);
+    expect(outcome.round.targetRef).not.toBe(decoy);
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
+    ) as { readonly targetSha: string; readonly targetRef: string };
+    expect(manifest.targetSha).toBe(laneSha);
+    expect(manifest.targetRef).toBe('origin/feature/lane');
+  });
+
   it('aborts before any round when the resolved PR head ref fetches nothing', async () => {
     const repo = makeFixtureRepo('freeze-unfetchable');
     repos.push(repo);

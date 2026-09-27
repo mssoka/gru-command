@@ -271,6 +271,14 @@ export interface VerdictPoster {
  * never proof of absence or permission for a second POST. */
 const MAX_RECONCILE_PAGES = 10;
 
+/** A ref whose SPELLING names an origin remote branch (origin/<branch>,
+ * refs/remotes/origin/<branch>, remotes/origin/<branch>). Such a ref is
+ * NEVER an explicit pin (Perkins R3): even when nothing local resolves
+ * it — a remote-only branch — the manager fetches that spelling, and a
+ * linked-PR review must verify the live PR head instead of freezing
+ * whatever the ref fetches to. */
+const ORIGIN_REF_SPELLING = /^(?:(?:refs\/)?remotes\/origin\/|origin\/)/u;
+
 function receiptDigest(body: string): string {
   return createHash('sha256').update(body, 'utf8').digest('hex');
 }
@@ -2149,11 +2157,16 @@ export class WaveRunner {
     const candidateBranch = input.job.prUrl === null
       ? null
       : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
-    // An explicit commit pin (a SHA, a tag, a revision expression) stays a
-    // pin even for a PR round. Everything else on a PR-linked job resolves
-    // from the PR's live head branch — never from a lane name synthesized
-    // from the job id.
-    const explicitPin = input.explicitTarget && candidateBranch === null;
+    // An origin ref NEVER classifies as an explicit pin (Perkins R3): a
+    // remote-only origin/topic is invisible to prBranchCandidate (nothing
+    // local resolves), but it still names a REMOTE BRANCH, and the manager
+    // fetches that spelling — letting it through as a "pin" would bypass
+    // PR-head verification and freeze unrelated bytes for a linked PR.
+    // True explicit pins — SHAs, tags, revision expressions like HEAD~1 —
+    // stay pins even for a PR round; everything else on a PR-linked job
+    // resolves from the PR's live head branch.
+    const namesOriginRef = ORIGIN_REF_SPELLING.test(input.candidateRef);
+    const explicitPin = input.explicitTarget && candidateBranch === null && !namesOriginRef;
     if (input.job.prUrl === null || explicitPin) {
       // Origin refs (any spelling the manager routes to a fetch) resolve
       // through its fetch-before-freeze discipline (Perkins R3 lineage):
@@ -2167,8 +2180,7 @@ export class WaveRunner {
       // must never resolve against the host checkout, which can sit
       // behind a lane based on a fetched origin tip; branches, tags,
       // and shas are shared and resolve identically from the lane.
-      const originRefSpelling = /^(?:(?:refs\/)?remotes\/origin\/|origin\/)/u;
-      if (originRefSpelling.test(input.candidateRef)) {
+      if (namesOriginRef) {
         const resolved = await this.opts.worktrees.resolveReviewTarget({
           repoPath: input.jobWorktree.repoPath,
           ref: input.candidateRef,
@@ -2187,7 +2199,11 @@ export class WaveRunner {
       const fresh = await resolveFreshPrHead({
         repoPath: input.jobWorktree.repoPath,
         prUrl: input.job.prUrl,
-        branchRef: candidateBranch ?? '',
+        // A remote-only origin ref carries its branch name in the spelling
+        // — recover the hint prBranchCandidate could not see locally.
+        branchRef:
+          candidateBranch ??
+          (namesOriginRef ? input.candidateRef.replace(ORIGIN_REF_SPELLING, '') : ''),
         ...(this.opts.prHeadProbe !== undefined ? { probe: this.opts.prHeadProbe } : {}),
       });
       this.log('info', 'freeze target refreshed from the live PR head', {
