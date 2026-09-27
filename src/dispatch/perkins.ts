@@ -2155,8 +2155,19 @@ export class WaveRunner {
     // from the job id.
     const explicitPin = input.explicitTarget && candidateBranch === null;
     if (input.job.prUrl === null || explicitPin) {
+      // Non-PR targets resolve through the manager's fetch-before-freeze
+      // discipline (Perkins blocker): a candidate naming an origin
+      // tracking ref is FETCHED fresh — never the stale local tracking
+      // sha — and an unfetchable one refuses BEFORE any round row, review
+      // lane, or freeze exists. Explicit commit pins (shas, tags,
+      // revision expressions) and local lane branches pin exactly as
+      // before; the ref semantics live in the manager, one discipline.
+      const resolved = await this.opts.worktrees.resolveReviewTarget({
+        repoPath: input.jobWorktree.repoPath,
+        ref: input.candidateRef,
+      });
       return {
-        targetSha: resolveGitCommit(input.jobWorktree.path, input.candidateRef),
+        targetSha: resolved.sha,
         movementRef: input.candidateRef,
       };
     }

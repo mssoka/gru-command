@@ -487,30 +487,53 @@ export class WorktreeManager {
     ref: string,
   ): { sha: string; baseSource: WorktreeBaseSource | null } {
     const symbolic = spawnGit(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', ref]);
-    if (symbolic.status === 0) {
-      const fullName = symbolic.stdout.trim();
-      const prefix = 'refs/remotes/origin/';
-      if (fullName.startsWith(prefix) && fullName.length > prefix.length) {
-        const suffix = fullName.slice(prefix.length);
-        const branch =
-          suffix === 'HEAD' ? this.resolveDefaultBranch(repoPath).branch : suffix;
-        if (branch === null) {
-          throw new Error(
-            `review ref ${ref} names origin/HEAD but the origin default branch is unresolvable — ` +
-              'refusing to check out a possibly stale origin tip',
-          );
-        }
-        const fetched = this.fetchOriginTip(repoPath, branch);
-        if (!fetched.ok) {
-          throw new Error(
-            `review ref ${ref} names origin/${branch} but fetching it fresh failed: ${fetched.detail} — ` +
-              'refusing to check out a possibly stale origin tip; verify the remote and retry',
-          );
-        }
-        return { sha: fetched.sha, baseSource: 'origin' };
+    let fullName = symbolic.status === 0 ? symbolic.stdout.trim() : '';
+    const prefix = 'refs/remotes/origin/';
+    if (fullName === '') {
+      // Not locally known — but the SPELLING names an origin branch
+      // (origin/<branch> or refs/remotes/origin/<branch>): treat it as
+      // one and fetch (Perkins blocker: a remote-only branch must be
+      // FETCHED, not rejected as an unknown revision; a branch the
+      // remote does not have fails the fetch and refuses here).
+      if (ref.startsWith(prefix) && ref.length > prefix.length) {
+        fullName = ref;
+      } else if (ref.startsWith('origin/') && ref.length > 'origin/'.length) {
+        fullName = prefix + ref.slice('origin/'.length);
       }
     }
+    if (fullName.startsWith(prefix) && fullName.length > prefix.length) {
+      const suffix = fullName.slice(prefix.length);
+      const branch = suffix === 'HEAD' ? this.resolveDefaultBranch(repoPath).branch : suffix;
+      if (branch === null) {
+        throw new Error(
+          `review ref ${ref} names origin/HEAD but the origin default branch is unresolvable — ` +
+            'refusing to check out a possibly stale origin tip',
+        );
+      }
+      const fetched = this.fetchOriginTip(repoPath, branch);
+      if (!fetched.ok) {
+        throw new Error(
+          `review ref ${ref} names origin/${branch} but fetching it fresh failed: ${fetched.detail} — ` +
+            'refusing to check out a possibly stale origin tip; verify the remote and retry',
+        );
+      }
+      return { sha: fetched.sha, baseSource: 'origin' };
+    }
     return { sha: runGit(repoPath, ['rev-parse', '--verify', `${ref}^{commit}`]), baseSource: null };
+  }
+
+  /** Resolve a review target exactly as `createReviewWorktree` does —
+   * same resolver, no worktree: origin tracking refs are FETCHED fresh
+   * (refusing when unfetchable), everything else pins exactly. The
+   * Perkins freeze path resolves its non-PR targets here so the frozen
+   * round identity and the checked-out bytes share ONE fetch-aware
+   * resolution (Perkins blocker: pre-resolving locally froze stale
+   * bytes the manager could never fetch). */
+  async resolveReviewTarget(input: {
+    repoPath: string;
+    ref: string;
+  }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null }> {
+    return this.withRepoLock(input.repoPath, async () => this.resolveReviewRef(input.repoPath, input.ref));
   }
 
   private assertRepo(repoPath: string): { repoPath: string; repoName: string } {

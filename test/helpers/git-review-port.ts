@@ -1,6 +1,7 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import type { WorktreeBaseSource } from '../../src/ledger/api.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../../src/dispatch/worktree-port.js';
 
 /**
@@ -8,9 +9,73 @@ import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../../src/
  * branch), review lanes are real detached worktrees. Shared by the Perkins
  * wave suites so freeze/ref identity is exercised against real git.
  */
+
+/** Production-faithful review-target resolution for git-backed doubles —
+ * the manager's discipline, verbatim: a ref naming an origin tracking ref
+ * is FETCHED fresh (refusing when the fetch fails — never a stale local
+ * resolution), origin/HEAD resolves through the live default-branch
+ * symref, and everything else (commit pins, tags, local branches) pins
+ * exactly. */
+export function resolveReviewTargetReal(
+  repoPath: string,
+  ref: string,
+): { readonly sha: string; readonly baseSource: WorktreeBaseSource | null } {
+  const sym = spawnSync('git', ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref], {
+    encoding: 'utf-8',
+  });
+  let fullName = sym.status === 0 ? sym.stdout.trim() : '';
+  const prefix = 'refs/remotes/origin/';
+  if (fullName === '') {
+    // Not locally known, but the SPELLING names an origin branch: fetch it
+    // (a branch the remote does not have fails the fetch and refuses).
+    if (ref.startsWith(prefix) && ref.length > prefix.length) {
+      fullName = ref;
+    } else if (ref.startsWith('origin/') && ref.length > 'origin/'.length) {
+      fullName = prefix + ref.slice('origin/'.length);
+    }
+  }
+  if (fullName.startsWith(prefix) && fullName.length > prefix.length) {
+    const suffix = fullName.slice(prefix.length);
+    let branch = suffix;
+    if (suffix === 'HEAD') {
+      const head = spawnSync('git', ['-C', repoPath, 'ls-remote', '--symref', 'origin', 'HEAD'], { encoding: 'utf-8' });
+      const match = head.status === 0 ? /^ref:\s+refs\/heads\/([^\s]+)\s+HEAD$/mu.exec(head.stdout) : null;
+      if (match === null || match[1] === undefined || match[1] === '') {
+        throw new Error(`review ref ${ref} names origin/HEAD but the default branch is unresolvable — refusing to freeze a possibly stale tip`);
+      }
+      branch = match[1];
+    }
+    const fetched = spawnSync(
+      'git',
+      ['-C', repoPath, 'fetch', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
+      { encoding: 'utf-8' },
+    );
+    if (fetched.status !== 0) {
+      throw new Error(
+        `review ref ${ref} names origin/${branch} but fetching it fresh failed: ${(fetched.stderr ?? '').trim()} — ` +
+          'refusing to freeze a possibly stale tip',
+      );
+    }
+    const sha = execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`], {
+      encoding: 'utf-8',
+    }).trim();
+    return { sha, baseSource: 'origin' };
+  }
+  const sha = execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', `${ref}^{commit}`], {
+    encoding: 'utf-8',
+  }).trim();
+  return { sha, baseSource: null };
+}
 export class GitReviewPort implements WorktreePort {
   private readonly lanes = new Map<string, WorktreeLane>();
   constructor(private readonly root: string, private readonly branch: string, private readonly sha: string) {}
+
+  async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
+    readonly sha: string;
+    readonly baseSource: WorktreeBaseSource | null;
+  }> {
+    return resolveReviewTargetReal(input.repoPath, input.ref);
+  }
 
   async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
     const lane: WorktreeLane = {

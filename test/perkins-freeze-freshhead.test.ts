@@ -456,6 +456,138 @@ describe('freeze-time integration on PR rounds', () => {
     expect(manifest.targetRef).toBe('feature/lane');
   });
 
+  it('a non-PR origin/topic target FREEZES the fetched tip, never the stale local tracking ref (Perkins blocker)', async () => {
+    const repo = makeFixtureRepo('freeze-nopr-moving');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/lane']);
+    repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const origin = attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane:refs/heads/topic']);
+    // origin/topic advances from an isolated clone — the local tracking
+    // ref is left behind (the remote-ahead round shape).
+    const tip = advanceOriginBranch(origin, 'topic', 'src/moved.ts', 'export const moved = true;\n');
+    const stale = repo.git(['rev-parse', 'refs/remotes/origin/topic']);
+    expect(tip).not.toBe(stale);
+    const root = tempDir('gru-freeze-nopr-move-port-');
+    const artifacts = tempDir('gru-freeze-nopr-move-artifacts-');
+    const sessions = tempDir('gru-freeze-nopr-move-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', stale);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-nopr-moving' });
+    const job = ledger.addJob({
+      id: 'job-nopr-moving', repo: 'fixture', title: 'moving origin target', baseBranch: 'main',
+      briefing: 'Acceptance: moved returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    const probe = vi.fn(async () => {
+      throw new Error('the host probe must not run without a linked PR');
+    }) as unknown as PrHeadProbe;
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: probe,
+    });
+
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'origin/topic' }));
+    expect(probe).not.toHaveBeenCalled();
+    // The round, the manifest, and the bytes under review are ALL the
+    // FETCHED tip — one fetch-aware resolution, never the stale ref.
+    expect(outcome.round.targetRef).toBe(tip);
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
+    ) as { readonly targetSha: string; readonly targetRef: string };
+    expect(manifest.targetSha).toBe(tip);
+    // The fetch went through the port: the tracking ref now names the tip.
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/topic'])).toBe(tip);
+  });
+
+  it('a non-PR origin/topic that was NEVER tracked locally still freezes the remote tip', async () => {
+    const repo = makeFixtureRepo('freeze-nopr-untracked');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/lane']);
+    repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const origin = attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    // topic exists ONLY on the remote: pushed from an isolated clone, never
+    // fetched — the local repo cannot resolve it at all.
+    const clone = mkdtempSync(join(tmpdir(), 'gru-freeze-remote-only-'));
+    cleanupDirs.push(clone);
+    execFileSync('git', ['clone', '--quiet', origin, clone], { stdio: 'ignore' });
+    execFileSync('git', ['-C', clone, 'checkout', '--quiet', '-b', 'topic'], { stdio: 'ignore' });
+    writeFileSync(join(clone, 'src/remote-only.ts'), 'export const remoteOnly = 1;\n', 'utf-8');
+    const identity = ['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid'];
+    execFileSync('git', ['-C', clone, 'add', 'src/remote-only.ts'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', clone, ...identity, 'commit', '-m', 'remote-only topic tip'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', clone, 'push', '--quiet', 'origin', 'HEAD:refs/heads/topic'], { stdio: 'ignore' });
+    const tip = execFileSync('git', ['-C', clone, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    expect(() => repo.git(['show-ref', '--verify', 'refs/remotes/origin/topic'])).toThrow();
+    const root = tempDir('gru-freeze-nopr-untracked-port-');
+    const artifacts = tempDir('gru-freeze-nopr-untracked-artifacts-');
+    const sessions = tempDir('gru-freeze-nopr-untracked-sessions-');
+    const ledger = makeLedger();
+    const laneSha = repo.git(['rev-parse', 'HEAD']);
+    const port = new GitReviewPort(root, 'feature/lane', laneSha);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-nopr-untracked' });
+    const job = ledger.addJob({
+      id: 'job-nopr-untracked', repo: 'fixture', title: 'remote-only target', baseBranch: 'main',
+      briefing: 'Acceptance: remoteOnly returns 1.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+    });
+
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'origin/topic' }));
+    expect(outcome.round.targetRef).toBe(tip);
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
+    ) as { readonly targetSha: string };
+    expect(manifest.targetSha).toBe(tip);
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/topic'])).toBe(tip);
+  });
+
+  it('a non-PR origin/topic whose fetch fails REFUSES before any round exists', async () => {
+    const repo = makeFixtureRepo('freeze-nopr-refuse');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/lane']);
+    const laneSha = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane:refs/heads/topic']);
+    repo.git(['remote', 'set-url', 'origin', join(repo.path, '..', 'missing-origin.git')]);
+    const root = tempDir('gru-freeze-nopr-refuse-port-');
+    const artifacts = tempDir('gru-freeze-nopr-refuse-artifacts-');
+    const sessions = tempDir('gru-freeze-nopr-refuse-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', laneSha);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-nopr-refuse' });
+    const job = ledger.addJob({
+      id: 'job-nopr-refuse', repo: 'fixture', title: 'unfetchable target', baseBranch: 'main',
+      briefing: 'Acceptance: lane returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+    });
+
+    const failure = await captureFailure(() => wave.runRound({ jobId: job.id, targetRef: 'origin/topic' }));
+    expect((failure as Error).message).toMatch(/refusing to freeze a possibly stale tip/);
+    expect(ledger.listRounds(job.id)).toHaveLength(0);
+    expect(ledger.getJob(job.id)?.status).toBe('working');
+  });
+
   it('aborts before any round when the resolved PR head ref fetches nothing', async () => {
     const repo = makeFixtureRepo('freeze-unfetchable');
     repos.push(repo);
