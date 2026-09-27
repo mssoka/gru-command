@@ -47,7 +47,9 @@ The instance dir also carries state that is NOT config and has no keys
 here: `sessions/`, `chat/`, `logs/`, `ledger/`, `worktrees/` and
 `worktree-preserves/` (job lanes and swept-out deliverables —
 [WORKTREES.md](./WORKTREES.md)), and `uploads/` (the attach-flow home,
-created at boot — SPEC ruling 19).
+created at boot — SPEC ruling 19). The Perkins App credential bundle under
+`perkins/` is also instance state — see
+[PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md).
 
 ## Load & validation behavior
 

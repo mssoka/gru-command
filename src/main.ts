@@ -19,8 +19,8 @@ import { TranscriptService } from './transcripts/service.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
-import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
-import { createGithubVerdictPoster } from './dispatch/perkins-github-app.js';
+import { WaveRunner } from './dispatch/perkins.js';
+import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver } from './dispatch/silas-driver.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
@@ -689,7 +689,7 @@ async function main(): Promise<number> {
     ledger,
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
-    poster: new AutoVerdictPoster(createGithubVerdictPoster(config.instanceDir)),
+    poster: createStartupVerdictPoster(config),
     reviewArtifactRoot: join(config.dataDir, 'reviews'),
     reviewPreflight: (input) => reviewPreflightCheck(config, registry, input.repoPath),
     fallbackGate: {
