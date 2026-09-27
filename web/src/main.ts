@@ -370,7 +370,7 @@ function startBoard(token: string): void {
   boardView.bindClient(boardClient);
   boardView.setToastHandler((notification) => {
     surfaceNotification(notification);
-    ownerChime.notify(notification.routing);
+    ownerChime.notify(notification);
   });
   // Rebound on EVERY startBoard: a re-pair mints a fresh client, and a
   // stale view holding the old client would 401-and-bounce valid sessions.

@@ -4,18 +4,22 @@
  *
  * The ONE sound in Gru Command. Keyed on the notifications routing field:
  * `needs-owner` rings the owner bell; `action-required` (machine queue)
- * and FYI rows are silent by design — machine noise stays machine noise.
+ * and FYI rows are silent by design — machine noise stays machine noise,
+ * and rows another device already acked or resolved are history, never
+ * fresh audio.
  *
  *  - SOUND — a soft two-note chime synthesized with Web Audio
  *    (deterministic oscillator envelope, no audio assets, ~0.6s,
  *    peak ~-18 dBFS).
  *  - AUTOPLAY — browsers block audio before a user gesture: the chime
  *    arms on the first interaction anywhere. An unarmed arrival falls
- *    back to a harder bell-badge pulse (no console spam).
+ *    back to a harder bell-badge pulse (no console spam). A browser with
+ *    no Web Audio stack gets an honest disabled speaker, not a dead one.
  *  - MUTE — the header speaker indicator enables/mutes; the choice is
  *    persisted in localStorage and never hides the badge.
- *  - THROTTLE — at most one chime per 30s; a burst is one sound plus the
- *    merged badge.
+ *  - THROTTLE — at most one chime per 30s (monotonic clock — wall-clock
+ *    skew cannot double-ring or silence it); a burst is one sound plus
+ *    the merged badge.
  */
 
 import type { StorageLike } from '../theme.js';
@@ -26,6 +30,15 @@ export const OWNER_CHIME_MUTE_KEY = 'gru-owner-chime-muted';
 export const OWNER_CHIME_THROTTLE_MS = 30_000;
 /** The only routing that ever sounds. */
 export const OWNER_CHIME_ROUTING = 'needs-owner';
+
+/** The arrival shape the chime decides on. Handled rows (`ackedAt`/
+ * `resolvedAt`) never sound — the owner already answered them, on this
+ * device or another; they are history, not fresh audio. */
+export interface ChimeNotification {
+  readonly routing: string;
+  readonly ackedAt: string | null;
+  readonly resolvedAt: string | null;
+}
 /** Two soft notes: A5 → D6 (a rising perfect fourth). */
 export const OWNER_CHIME_NOTES_HZ = [880, 1174.66] as const;
 /** ~-18 dBFS peak — a deliberately low, subtle envelope. */
@@ -90,10 +103,17 @@ export class OwnerChime {
   private readonly indicator: HTMLButtonElement;
   private readonly bell: HTMLElement;
   private readonly createContext: () => ChimeAudioContext | null;
+  /** Monotonic by default (performance.now): a wall-clock jump must
+   * neither double-ring inside the 30s window nor silence it until the
+   * clock re-passes the last chime. */
   private readonly now: () => number;
   private readonly throttleMs: number;
   private context: ChimeAudioContext | null = null;
   private mutedState: boolean;
+  /** Set when the browser exposes no audio stack at all — permanent,
+   * surfaced on the speaker instead of promising a click that can never
+   * succeed. A construction THROW is transient and stays retryable. */
+  private audioUnavailable = false;
   private lastChimeAt: number | null = null;
   private nudgeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -102,7 +122,7 @@ export class OwnerChime {
     this.indicator = options.indicator;
     this.bell = options.bell;
     this.createContext = options.createContext ?? browserAudioContext;
-    this.now = options.now ?? (() => Date.now());
+    this.now = options.now ?? (() => (typeof performance !== 'undefined' ? performance.now() : Date.now()));
     this.throttleMs = options.throttleMs ?? OWNER_CHIME_THROTTLE_MS;
     this.mutedState = this.storage.getItem(OWNER_CHIME_MUTE_KEY) === 'true';
     this.indicator.addEventListener('click', () => this.onIndicatorClick());
@@ -118,18 +138,29 @@ export class OwnerChime {
     return this.mutedState;
   }
 
+  get unavailable(): boolean {
+    return this.audioUnavailable;
+  }
+
   /** Arm the audio graph. Idempotent; must run inside a user gesture the
    * first time (browser autoplay policy). Returns false when Web Audio is
-   * unavailable — callers get the visual fallback, never an exception. */
+   * unavailable — callers get the visual fallback, never an exception.
+   * A `null` factory result marks the stack permanently absent; a thrown
+   * construction stays retryable on a later gesture. */
   arm(): boolean {
     if (this.context !== null) return true;
+    if (this.audioUnavailable) return false;
     let context: ChimeAudioContext | null;
     try {
       context = this.createContext();
     } catch {
-      return false; // a hostile/absent audio stack: silent + no spam
+      return false; // transient (e.g. resource limit) — retry later
     }
-    if (context === null) return false;
+    if (context === null) {
+      this.audioUnavailable = true; // no audio stack in this browser
+      this.syncIndicator();
+      return false;
+    }
     this.context = context;
     try {
       void context.resume().catch(() => {
@@ -143,19 +174,23 @@ export class OwnerChime {
     return true;
   }
 
-  /** Persist the mute choice. Muted = silent until unmuted; the badge
-   * and panel are untouched by design. */
+  /** Persist the mute choice BEFORE flipping in-memory state, so a
+   * throwing storage (quota exhausted, access revoked) fails loudly out
+   * of the click without leaving the UI muted-but-unpersisted — the same
+   * fail-loud contract the theme toggle follows. */
   setMuted(muted: boolean): void {
     if (this.mutedState === muted) return;
-    this.mutedState = muted;
     if (muted) this.storage.setItem(OWNER_CHIME_MUTE_KEY, 'true');
     else this.storage.removeItem(OWNER_CHIME_MUTE_KEY);
+    this.mutedState = muted;
     this.syncIndicator();
   }
 
-  /** The single entry point for arrivals: sound only for `needs-owner`. */
-  notify(routing: string): ChimeOutcome {
-    if (routing !== OWNER_CHIME_ROUTING) return 'ignored';
+  /** The single entry point for arrivals: sound only for `needs-owner`
+   * rows nobody has handled yet. */
+  notify(notification: ChimeNotification): ChimeOutcome {
+    if (notification.routing !== OWNER_CHIME_ROUTING) return 'ignored';
+    if (notification.ackedAt !== null || notification.resolvedAt !== null) return 'ignored';
     if (this.mutedState) return 'muted';
     if (!this.armed) {
       this.nudge();
@@ -168,24 +203,36 @@ export class OwnerChime {
     return 'chime';
   }
 
-  /** First interaction anywhere arms the graph — once. */
+  /** First interaction anywhere arms the graph — once. A failed arm
+   * keeps the listeners: a transient construction failure retries on the
+   * next gesture (a permanently absent stack short-circuits in arm()). */
   private armOnFirstGesture(target: Document): void {
     const gesture = (event: Event): void => {
       // The indicator's own click distinguishes “enable” from “mute”;
       // let it run its course instead of pre-arming here.
       if (event.target instanceof Node && this.indicator.contains(event.target)) return;
-      target.removeEventListener('pointerdown', gesture, true);
-      target.removeEventListener('keydown', gesture, true);
+      if (this.armed || this.audioUnavailable) {
+        target.removeEventListener('pointerdown', gesture, true);
+        target.removeEventListener('keydown', gesture, true);
+        return;
+      }
       this.arm();
     };
     target.addEventListener('pointerdown', gesture, true);
     target.addEventListener('keydown', gesture, true);
   }
 
-  /** Speaker cycle: muted → on, off (unarmed) → on, on → muted. */
+  /** Speaker cycle: muted → on, off (unarmed) → on, on → muted. With no
+   * audio stack at all the speaker says so once and disables itself —
+   * never a dead control that keeps promising “enables on first click”. */
   private onIndicatorClick(): void {
     const wasArmed = this.armed;
     this.arm(); // the click is itself the gesture
+    if (this.audioUnavailable && !wasArmed) {
+      this.indicator.disabled = true;
+      this.syncIndicator();
+      return;
+    }
     if (this.mutedState) {
       this.setMuted(false);
     } else if (wasArmed) {
@@ -199,13 +246,16 @@ export class OwnerChime {
     const armed = this.armed;
     this.indicator.dataset.muted = String(muted);
     this.indicator.dataset.armed = String(armed);
+    this.indicator.dataset.unavailable = String(this.audioUnavailable);
     this.indicator.textContent = muted ? '🔇' : '🔈';
     this.indicator.setAttribute('aria-pressed', String(muted));
-    const title = muted
-      ? 'Owner chime muted — click to unmute'
-      : armed
-        ? 'Owner chime on — click to mute'
-        : 'Owner chime enables on your first click';
+    const title = this.audioUnavailable
+      ? 'Owner chime unavailable — this browser has no Web Audio'
+      : muted
+        ? 'Owner chime muted — click to unmute'
+        : armed
+          ? 'Owner chime on — click to mute'
+          : 'Owner chime enables on your first click';
     this.indicator.title = title;
     this.indicator.setAttribute('aria-label', title);
   }
@@ -246,7 +296,9 @@ export class OwnerChime {
   }
 }
 
-/** Real Web Audio constructor, when the browser exposes one. */
+/** Real Web Audio constructor, when the browser exposes one. `null`
+ * means the stack is absent (permanent); a construction throw propagates
+ * to arm()'s transient-failure branch. */
 function browserAudioContext(): ChimeAudioContext | null {
   if (typeof window === 'undefined') return null;
   const scope = window as unknown as {
@@ -255,9 +307,5 @@ function browserAudioContext(): ChimeAudioContext | null {
   };
   const ctor = scope.AudioContext ?? scope.webkitAudioContext;
   if (ctor === undefined) return null;
-  try {
-    return new ctor();
-  } catch {
-    return null;
-  }
+  return new ctor();
 }

@@ -14,6 +14,7 @@ import {
   OwnerChime,
   type ChimeAudioContext,
   type ChimeGainNode,
+  type ChimeNotification,
   type ChimeOscillatorNode,
 } from './owner-chime.js';
 
@@ -155,6 +156,11 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
+/** A fresh, unhandled notification for the chime seam. */
+function fresh(routing: string): ChimeNotification {
+  return { routing, ackedAt: null, resolvedAt: null };
+}
+
 describe('owner chime — arming (autoplay policy)', () => {
   it('arms on the first interaction anywhere, exactly once', () => {
     const h = harness();
@@ -200,13 +206,63 @@ describe('owner chime — arming (autoplay policy)', () => {
     try {
       const h = harness({ omitFactory: true });
       expect(h.chime.arm()).toBe(false);
-      expect(h.chime.notify('needs-owner')).toBe('nudge');
+      expect(h.chime.notify(fresh('needs-owner'))).toBe('nudge');
       expect(h.bell.classList.contains(OWNER_CHIME_NUDGE_CLASS)).toBe(true);
     } finally {
       if (saved.audio !== undefined) scope.AudioContext = saved.audio;
       if (saved.webkit !== undefined) scope.webkitAudioContext = saved.webkit;
     }
   });
+  it('the speaker says so and disables itself when Web Audio is absent', () => {
+    const h = harness({ createContext: () => null });
+    h.indicator.click(); // the enabling click
+    expect(h.chime.unavailable).toBe(true);
+    expect(h.indicator.disabled).toBe(true);
+    expect(h.indicator.title).toContain('unavailable');
+    expect(h.indicator.getAttribute('aria-label')).toBe(h.indicator.title);
+    // A muted-past user with no audio stack gets the same honest control.
+    const storage = memoryStorage();
+    storage.setItem(OWNER_CHIME_MUTE_KEY, 'true');
+    const muted = harness({ storage, createContext: () => null });
+    muted.indicator.click();
+    expect(muted.indicator.disabled).toBe(true);
+  });
+
+  it('a transient arm failure retries on the next gesture', () => {
+    mountDom();
+    const context = new StubAudioContext();
+    let fail = true;
+    const chime = new OwnerChime({
+      storage: memoryStorage(),
+      indicator: document.getElementById('sound-toggle') as HTMLButtonElement,
+      bell: document.getElementById('notification-bell') as HTMLButtonElement,
+      createContext: () => {
+        if (fail) throw new Error('resource limit');
+        return context;
+      },
+    });
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    expect(chime.armed).toBe(false); // the throw was transient, not fatal
+    expect(chime.unavailable).toBe(false);
+    fail = false;
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    expect(chime.armed).toBe(true); // retried and armed
+  });
+
+  it('index.html keeps #sound-toggle in the command bar beside the bell', async () => {
+    // The chime constructs with mustGet('sound-toggle') at startup — a
+    // vanished or renamed button kills the whole app. Pinned in CI here.
+    // (vitest's web root is the workspace dir, so index.html is cwd-relative.)
+    const { readFileSync } = await import('node:fs');
+    const html = readFileSync('index.html', 'utf8');
+    const speaker = html.indexOf('id="sound-toggle"');
+    const bell = html.indexOf('id="notification-bell"');
+    const bar = html.indexOf('class="command-bar"');
+    expect(bar).toBeGreaterThanOrEqual(0);
+    expect(speaker).toBeGreaterThan(bar);
+    expect(bell).toBeGreaterThan(speaker);
+  });
+
 });
 
 describe('owner chime — routing gate', () => {
@@ -214,7 +270,7 @@ describe('owner chime — routing gate', () => {
     const h = harness();
     h.chime.arm();
 
-    expect(h.chime.notify('needs-owner')).toBe('chime');
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('chime');
     expect(h.context.oscillators).toHaveLength(2);
     expect(h.context.oscillators.every((oscillator) => oscillator.type === 'sine')).toBe(true);
     expect(h.context.oscillators.map((oscillator) => oscillator.frequency.writes[0]?.value)).toEqual([
@@ -235,9 +291,9 @@ describe('owner chime — routing gate', () => {
   it('never sounds for action-required, fyi, or unknown routings', () => {
     const h = harness();
     h.chime.arm();
-    expect(h.chime.notify('action-required')).toBe('ignored');
-    expect(h.chime.notify('fyi')).toBe('ignored');
-    expect(h.chime.notify('nope')).toBe('ignored');
+    expect(h.chime.notify(fresh('action-required'))).toBe('ignored');
+    expect(h.chime.notify(fresh('fyi'))).toBe('ignored');
+    expect(h.chime.notify(fresh('nope'))).toBe('ignored');
     expect(h.context.oscillators).toHaveLength(0);
     expect(h.bell.classList.contains(OWNER_CHIME_NUDGE_CLASS)).toBe(false);
   });
@@ -245,16 +301,47 @@ describe('owner chime — routing gate', () => {
   it('pulses the bell instead when a needs-owner lands unarmed', () => {
     vi.useFakeTimers();
     const h = harness();
-    expect(h.chime.notify('needs-owner')).toBe('nudge');
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('nudge');
     expect(h.bell.classList.contains(OWNER_CHIME_NUDGE_CLASS)).toBe(true);
     expect(h.context.oscillators).toHaveLength(0);
 
     vi.advanceTimersByTime(3_000);
     expect(h.bell.classList.contains(OWNER_CHIME_NUDGE_CLASS)).toBe(false);
   });
+
+  it('never sounds for a row another device already acked or resolved', () => {
+    const h = harness();
+    h.chime.arm();
+    const handled: ChimeNotification[] = [
+      { routing: 'needs-owner', ackedAt: new Date(0).toISOString(), resolvedAt: null },
+      { routing: 'needs-owner', ackedAt: null, resolvedAt: new Date(0).toISOString() },
+    ];
+    for (const row of handled) {
+      expect(h.chime.notify(row)).toBe('ignored');
+    }
+    expect(h.context.oscillators).toHaveLength(0);
+    expect(h.bell.classList.contains(OWNER_CHIME_NUDGE_CLASS)).toBe(false);
+  });
+
 });
 
 describe('owner chime — mute', () => {
+  it('a storage failure on mute never leaves the UI diverged from storage', () => {
+    const storage = memoryStorage();
+    const boom = {
+      ...storage,
+      setItem: () => {
+        throw new Error('quota');
+      },
+    } as typeof storage;
+    const h = harness({ storage: boom });
+    h.chime.arm();
+    expect(() => h.chime.setMuted(true)).toThrow('quota'); // fail loud
+    expect(h.chime.muted).toBe(false); // …but nothing half-applied
+    expect(storage.getItem(OWNER_CHIME_MUTE_KEY)).toBeNull();
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('chime'); // still truthful
+  });
+
   it('persists the mute choice and silences needs-owner across instances', () => {
     const storage = memoryStorage();
     const first = harness({ storage });
@@ -265,36 +352,50 @@ describe('owner chime — mute', () => {
     const second = harness({ storage });
     expect(second.chime.muted).toBe(true);
     second.chime.arm();
-    expect(second.chime.notify('needs-owner')).toBe('muted');
+    expect(second.chime.notify(fresh('needs-owner'))).toBe('muted');
     expect(second.context.oscillators).toHaveLength(0);
 
     // Unmute restores the chime.
     second.chime.setMuted(false);
-    expect(second.chime.notify('needs-owner')).toBe('chime');
+    expect(second.chime.notify(fresh('needs-owner'))).toBe('chime');
     expect(second.context.oscillators).toHaveLength(2);
   });
 
   it('stays visually quiet while muted: no chime and no nudge', () => {
     const h = harness();
     h.chime.setMuted(true);
-    expect(h.chime.notify('needs-owner')).toBe('muted');
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('muted');
     expect(h.bell.classList.contains(OWNER_CHIME_NUDGE_CLASS)).toBe(false);
     expect(h.context.oscillators).toHaveLength(0);
   });
 });
 
 describe('owner chime — throttle', () => {
+  it('the throttle reads a monotonic clock — wall-clock skew cannot double-ring', () => {
+    // The wall clock leaps a minute per call; the monotonic clock advances
+    // a second. A Date.now()-backed throttle would ring on the second
+    // arrival (>=30s "elapsed"); performance.now() holds the window.
+    const mono = { at: 0 };
+    vi.spyOn(performance, 'now').mockImplementation(() => (mono.at += 1_000));
+    vi.spyOn(Date, 'now').mockImplementation(() => 1_700_000_000_000 + mono.at * 60_000);
+    const h = harness(); // no injected `now` — the production default
+    h.chime.arm();
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('chime');
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('throttled');
+    expect(h.context.oscillators).toHaveLength(2); // still ONE two-note chime
+  });
+
   it('honors one chime per 30s across a burst', () => {
     let now = 1_000_000;
     const h = harness({ now: () => now });
     h.chime.arm();
 
-    expect(h.chime.notify('needs-owner')).toBe('chime');
-    expect(h.chime.notify('needs-owner')).toBe('throttled');
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('chime');
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('throttled');
     now += OWNER_CHIME_THROTTLE_MS - 1;
-    expect(h.chime.notify('needs-owner')).toBe('throttled');
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('throttled');
     now += 1;
-    expect(h.chime.notify('needs-owner')).toBe('chime');
+    expect(h.chime.notify(fresh('needs-owner'))).toBe('chime');
     expect(h.context.oscillators).toHaveLength(4); // two chimes × two notes
   });
 });
@@ -349,7 +450,7 @@ describe('owner chime — live board wiring', () => {
     h.chime.arm();
     const view = new BoardView(() => {});
     view.setToastHandler((notification) => {
-      h.chime.notify(notification.routing);
+      h.chime.notify(notification);
     });
 
     view.render(boardSnapshot([])); // history baseline: nothing to ring
@@ -376,7 +477,7 @@ describe('owner chime — live board wiring', () => {
     h.chime.arm();
     const view = new BoardView(() => {});
     view.setToastHandler((notification) => {
-      h.chime.notify(notification.routing);
+      h.chime.notify(notification);
     });
 
     view.render(boardSnapshot([]));

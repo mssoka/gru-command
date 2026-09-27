@@ -2105,6 +2105,13 @@ body {
   filter: grayscale(1);
 }
 
+/* No Web Audio stack in this browser: the speaker disables itself with
+   an honest tooltip instead of promising a click that can never work. */
+.board-sound[data-unavailable='true'] {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
 /* Unarmed fallback: a needs-owner arrival pulses the bell harder (the
    chime could not play yet). Bounded — the class is removed by the
    chime service; reduced-motion tames it globally. */
