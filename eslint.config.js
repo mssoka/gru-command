@@ -7,6 +7,10 @@ export default tseslint.config(
       'dist/**',
       'node_modules/**',
       'coverage/**',
+      // Worktree bootstrap copies installed BMAD skills into these directories;
+      // they are external generated framework code, not repository source.
+      '.agents/skills/**',
+      '.claude/skills/**',
       'web/dist/**',
       'web/playwright-report/**',
       'web/test-results/**',

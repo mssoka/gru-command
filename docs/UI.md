@@ -56,7 +56,7 @@ key `gru-theme`).
 | `--perkins` | `#c9b8ff` | `#b7a3ff` | Perkins rounds |
 | `--accent` | `#22304a` | `#ffd54a` | primary buttons |
 | `--on-state` | `#22304a` | `#1a2236` | text ON saturated state colors |
-| `--band-needs-you` / `-ink` | `#f2868f` / `#b03e4a` | `#ff8f9c` / `#ff9fae` | NEEDS YOU accent (edge/pill · readable ink) |
+| `--band-needs-you` / `-ink` | `#f2868f` / `#b03e4a` | `#ff8f9c` / `#ff9fae` | NEEDS GRU accent (edge/pill · readable ink) |
 | `--band-in-flight` / `--band-settled` / `--band-cold` | work / done / park | work / done / park | IN FLIGHT / SETTLED / COLD band accents |
 
 Shape language: 2.5–3px ink outlines (`--outline*`), 14–22px radii,
@@ -283,7 +283,7 @@ sight).
 
 ### Attention bands (v4 → v6: dense rows)
 
-Jobs bucket NEEDS YOU → IN FLIGHT → SETTLED → COLD (recency inside each
+Jobs bucket NEEDS GRU → IN FLIGHT → SETTLED → COLD (recency inside each
 band; see [BOARD.md](./BOARD.md)). v6 renders every band as a full-width
 **dense row list**, not a card grid: line 1 = status dot + title +
 status chip (right-aligned, with the compact signal/stale chips inline);
@@ -292,8 +292,8 @@ in monospace. Band headers are **sticky separators with counts**;
 dividers are hairlines (zebra-free); failing rows (blocked/error status,
 aborted newest round, unresolved lens errors) are tinted with a left
 alert accent. Clicking anywhere on a row expands the v3 detail inline —
-a row is never a card until it is expanded. NEEDS YOU is always visible
-(an empty band shows a calm “nothing needs you” state); SETTLED is a
+a row is never a card until it is expanded. NEEDS GRU is always visible
+(an empty band shows a calm “nothing needs Gru” state); SETTLED is a
 rolling window — the latest 10 rows, then `+K older settled`
 (session-expanded), and a concluded job's round history renders
 quiescent (no blocker/failure pills; a “review history on the ledger”

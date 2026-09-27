@@ -10,6 +10,7 @@ import { flipJobToWorking, rebriefFreshMinion, recordFollowUpDelivery, routeFixD
 import { finalizeRebriefRequest } from './rebrief-recovery.js';
 import type { LessonsReferencePort } from '../lessons/types.js';
 import { BranchBusyError } from './branch-idle.js';
+import { deliveredTargetSha } from './silas-driver.js';
 import type { WorktreePort } from './worktree-port.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -209,6 +210,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const by = byField(body);
       const force = optBoolField(body, 'force');
+      const ruleId = optStrField(body, 'rule_id');
+      const sourceRoundId = optStrField(body, 'source_round_id');
+      if ((ruleId === undefined) !== (sourceRoundId === undefined) ||
+          (ruleId !== undefined && (by !== 'silas' || ruleId !== 'clean-abort-service-restart'))) {
+        throw new Error('rule_id/source_round_id must be paired and only silas may use clean-abort-service-restart');
+      }
       const input = {
         jobId: strField(body, 'job_id'),
         ...(optStrField(body, 'target_ref') !== undefined ? { targetRef: optStrField(body, 'target_ref') } : {}),
@@ -216,6 +223,26 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(optBoolField(body, 'no_spec') !== undefined ? { noSpec: optBoolField(body, 'no_spec') } : {}),
         ...(force !== undefined ? { force } : {}),
       };
+      if (sourceRoundId !== undefined) {
+        if (force === true) throw new Error('mechanical clean-abort re-arm cannot force past the branch-idle guard');
+        const round = options.ledger.getRound(sourceRoundId);
+        const proof = options.ledger.latestRoundEvent(sourceRoundId, 'round.perkins-incomplete');
+        const reason = typeof proof?.payload === 'object' && proof.payload !== null
+          ? (proof.payload as { reason?: unknown }).reason : null;
+        const newestRound = options.ledger.listRounds(input.jobId).at(-1);
+        const delivered = options.ledger.latestJobEvent(input.jobId, 'job.delivered');
+        const sha = delivered === null ? null : deliveredTargetSha(delivered);
+        if (round?.jobId !== input.jobId || round.status !== 'aborted' ||
+            newestRound?.id !== sourceRoundId || sha === null || sha !== round.targetRef ||
+            (reason !== 'service_restart' && reason !== 'service_restart_missing_review_lane')) {
+          throw new Error('source round is not the latest clean service-restart abort on the unchanged delivered head');
+        }
+        const latest = options.ledger.latestJobEvent(input.jobId, 'silas.review-triggered');
+        if (latest !== null && typeof latest.payload === 'object' && latest.payload !== null &&
+            (latest.payload as { source_round_id?: unknown }).source_round_id === sourceRoundId) {
+          throw new Error(`clean-abort round ${sourceRoundId} was already re-armed`);
+        }
+      }
       let outcome: Awaited<ReturnType<WaveRunner['requestReview']>>;
       try {
         outcome = await options.wave.requestReview(input);
@@ -231,6 +258,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
               payload: {
                 target_branch: error.targetBranch,
                 phase: error.phase,
+                ...(ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
                 blockers: refusal.blockers,
                 hint: refusal.hint,
               },
@@ -247,6 +275,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           jobId: input.jobId,
           payload: {
             route: outcome.route,
+            ...(ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
             ...(outcome.route === 'perkins' ? { round_id: outcome.round.id } : {}),
           },
         });
@@ -257,6 +286,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         track(outcome.run);
         json(res, 202, {
           route: outcome.route,
+          ...(ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
           clear_to_merge: outcome.clearToMerge,
           skill_installed: outcome.skillInstalled,
           failed_legs: outcome.failedLegs.map((leg) => ({ leg: leg.leg, detail: leg.detail, remediation: leg.remediation })),
@@ -268,6 +298,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       json(res, 202, {
         route: 'perkins',
         round_id: outcome.round.id,
+        ...(ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
         status: outcome.round.status,
         lenses: outcome.round.lenses.map((chip) => chip.lens),
       });

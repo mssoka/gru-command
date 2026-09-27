@@ -3,6 +3,7 @@ import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
 import { PiRuntime } from './pi-adapter.js';
 import { ClaudeCodeRuntime } from './claude-adapter.js';
+import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
 import type { AgentHandle, AgentRuntime, RuntimeEvent, SpawnOptions } from './types.js';
 
@@ -34,6 +35,7 @@ type PiRuntimeOptionsModelRuntime = ConstructorParameters<typeof PiRuntime>[0]['
 export interface ClaudeKnobs {
   readonly binary?: string;
   readonly killGraceMs?: number;
+  readonly reviewSettingsFile?: string;
 }
 
 export interface RuntimeRegistryOptions {
@@ -70,6 +72,7 @@ export type AgentEventListener = (envelope: AgentEventEnvelope) => void;
  */
 export class RuntimeRegistry {
   private readonly adapters = new Map<RuntimeId, AgentRuntime>();
+  private readonly nativeAdapters = new Map<RuntimeId, PiRuntime | ClaudeCodeRuntime>();
   private readonly handles = new Set<AgentHandle>();
   private readonly agentListeners = new Set<AgentEventListener>();
   private readonly opts: RuntimeRegistryOptions;
@@ -120,6 +123,20 @@ export class RuntimeRegistry {
     }
   }
 
+  /** A request-owned review model proof; no adapter stores it by role. */
+  async prepareReviewModel(role: Role): Promise<ClaudeReviewSnapshot | undefined> {
+    const id = this.runtimeIdFor(role);
+    this.runtimeFor(id);
+    const native = this.nativeAdapters.get(id)!;
+    if (native instanceof ClaudeCodeRuntime) return native.prepareReviewModel(role);
+    await native.checkReviewModel(role);
+    return undefined;
+  }
+
+  async checkReviewModel(role: Role): Promise<void> {
+    await this.prepareReviewModel(role);
+  }
+
   /** The fallback-wrapped adapter for a runtime id (created on first use). */
   runtimeFor(id: RuntimeId): AgentRuntime {
     if (!(RUNTIME_IDS as readonly string[]).includes(id)) {
@@ -128,33 +145,28 @@ export class RuntimeRegistry {
     let adapter = this.adapters.get(id);
     if (adapter === undefined) {
       if (id === 'pi') {
-        adapter = withFallbacks(
-          new PiRuntime({
-            config: this.opts.config,
-            store: this.opts.store,
-            ...(this.opts.pi?.agentDir !== undefined ? { agentDir: this.opts.pi.agentDir } : {}),
-            ...(this.opts.pi?.modelRuntime !== undefined
-              ? { modelRuntime: this.opts.pi.modelRuntime }
-              : {}),
-            ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
-          }),
-        );
+        const native = new PiRuntime({
+          config: this.opts.config,
+          store: this.opts.store,
+          ...(this.opts.pi?.agentDir !== undefined ? { agentDir: this.opts.pi.agentDir } : {}),
+          ...(this.opts.pi?.modelRuntime !== undefined ? { modelRuntime: this.opts.pi.modelRuntime } : {}),
+          ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
+        });
+        this.nativeAdapters.set(id, native);
+        adapter = withFallbacks(native);
       } else {
         // E3: the claude-code adapter hosts sessions on the headless CLI;
         // steer-unable, so the interface fallback wrapper serializes it.
-        adapter = withFallbacks(
-          new ClaudeCodeRuntime({
-            config: this.opts.config,
-            store: this.opts.store,
-            ...(this.opts.claude?.binary !== undefined
-              ? { binary: this.opts.claude.binary }
-              : {}),
-            ...(this.opts.claude?.killGraceMs !== undefined
-              ? { killGraceMs: this.opts.claude.killGraceMs }
-              : {}),
-            ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
-          }),
-        );
+        const native = new ClaudeCodeRuntime({
+          config: this.opts.config,
+          store: this.opts.store,
+          ...(this.opts.claude?.binary !== undefined ? { binary: this.opts.claude.binary } : {}),
+          ...(this.opts.claude?.killGraceMs !== undefined ? { killGraceMs: this.opts.claude.killGraceMs } : {}),
+          ...(this.opts.claude?.reviewSettingsFile !== undefined ? { reviewSettingsFile: this.opts.claude.reviewSettingsFile } : {}),
+          ...(this.opts.log !== undefined ? { log: this.opts.log } : {}),
+        });
+        this.nativeAdapters.set(id, native);
+        adapter = withFallbacks(native);
       }
       this.adapters.set(id, adapter);
     }
@@ -162,6 +174,9 @@ export class RuntimeRegistry {
   }
 
   async spawn(role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
+    if (options.reviewModel !== undefined && this.runtimeIdFor(role) !== 'claude-code') {
+      throw new Error('Claude review model snapshot cannot be used with a different runtime');
+    }
     const adapter = this.runtimeFor(this.runtimeIdFor(role));
     // SPEC ruling 16: resolve the model & thinking policy from config
     // (most specific wins) with spawn options overriding, "default"
@@ -183,6 +198,7 @@ export class RuntimeRegistry {
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),
+      ...(options.reviewModel !== undefined ? { reviewModel: options.reviewModel } : {}),
       model: policy.model,
       thinkingLevel,
     });

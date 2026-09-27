@@ -125,7 +125,7 @@ describe('board bands — deterministic bucketing', () => {
     expect(isStalledWorking(job({ status: 'parked', lastAgentActivity: ISO(-10 * 3_600_000) }), { now: NOW })).toBe(false);
   });
 
-  it('cascade promoter: a conflicting PR jumps ANY status to NEEDS YOU', () => {
+  it('cascade promoter: a conflicting PR jumps ANY status to NEEDS GRU', () => {
     for (const status of ['working', 'in-review', 'parked', 'done', 'delivered']) {
       const conflicting = job({ status, prState: 'conflicting', prUrl: 'https://example.invalid/pr/1' });
       expect(bandForJob(conflicting, { now: NOW }), status).toBe('needs-you');
@@ -143,7 +143,7 @@ describe('board bands — deterministic bucketing', () => {
     // A verdict-posted round's failed lens is history — it never re-alarms.
     const historical = round({ status: 'verdict-posted', lenses: [{ lens: 'blind', state: 'error', agentId: null, note: null, verdict: null }] });
     expect(bandForJob(job({ status: 'in-review', rounds: [historical] }), { now: NOW })).toBe('in-flight');
-    // Blocker verdicts are review work (the lead owns them), not a NEEDS YOU band entry.
+    // Blocker verdicts are review work (the lead owns them), not a NEEDS GRU band entry.
     const blockers = round({ blockers: 2, lenses: [{ lens: 'blind', state: 'done', agentId: null, note: 'blocker — x', verdict: 'blocker' }] });
     expect(bandForJob(job({ status: 'in-review', rounds: [blockers] }), { now: NOW })).toBe('in-flight');
     // Only the NEWEST round drives attention (older failures are history):
@@ -168,7 +168,7 @@ describe('board bands — deterministic bucketing', () => {
     ).toBe('cold');
   });
 
-  it('orders bands NEEDS YOU → IN FLIGHT → SETTLED → COLD and omits empty bands', () => {
+  it('orders bands NEEDS GRU → IN FLIGHT → SETTLED → COLD and omits empty bands', () => {
     const jobs = [
       job({ id: 'cold-1', status: 'parked' }),
       job({ id: 'settled-1', status: 'delivered' }),
@@ -177,7 +177,7 @@ describe('board bands — deterministic bucketing', () => {
     ];
     const bands = bucketJobs(jobs, { now: NOW });
     expect(bands.map((group) => group.band)).toEqual(['needs-you', 'in-flight', 'settled', 'cold']);
-    expect(BAND_LABELS['needs-you']).toBe('NEEDS YOU');
+    expect(BAND_LABELS['needs-you']).toBe('NEEDS GRU');
     expect(bucketJobs([], { now: NOW })).toEqual([]);
     expect(bucketJobs([job({ id: 'only-parked', status: 'parked' })], { now: NOW }).map((g) => g.band)).toEqual(['cold']);
   });

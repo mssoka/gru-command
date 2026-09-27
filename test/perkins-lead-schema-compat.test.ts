@@ -1,17 +1,19 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createConnection } from 'node:net';
 import { readStoredCredential } from '@earendil-works/pi-coding-agent';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
-import { PerkinsHybridReview } from '../src/dispatch/perkins-review/hybrid.js';
+import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { PiRuntime } from '../src/runtime/pi-adapter.js';
+import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import type { NativeAgentTool, SpawnOptions } from '../src/runtime/types.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
-import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 
 /**
  * Leader tool-schema provider compatibility (deepseek 400 regression).
@@ -31,10 +33,8 @@ import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
  */
 
 const LEAD_TOOL_NAMES = [
-  'perkins_read_chunk',
-  'perkins_run_lenses',
+  'perkins_run_specialists',
   'perkins_store_artifact',
-  'perkins_record_decision',
   'perkins_preflight_submission',
   'perkins_submit_review',
 ] as const;
@@ -56,8 +56,8 @@ afterAll(() => {
   for (const dir of cleanupDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-/** Capture the exact policies the REAL hybrid engine declares for its lead
- * and lens children by running it through its offline spawner double. */
+/** Capture the exact policies the REAL whole-PR engine declares for its
+ * lead and specialist children by running it through its offline double. */
 async function capturedPolicies(): Promise<{ readonly lead: LeadPolicy; readonly child: ChildPolicy }> {
   const repo = makeFixtureRepo('schema-compat');
   repos.push(repo);
@@ -75,8 +75,8 @@ async function capturedPolicies(): Promise<{ readonly lead: LeadPolicy; readonly
     movementRef: 'feature/review',
     spec: 'Acceptance: answer returns 43.',
   });
-  const fake = fakeHybridSpawner(sessionsRoot, { childAnswer: () => '[]' });
-  const engine = new PerkinsHybridReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+  const fake = fakeWholeSpawner(sessionsRoot, { childAnswer: () => '[]' });
+  const engine = new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
   const result = await engine.run({
     roundId: 'schema-compat-round',
     roundNumber: 1,
@@ -94,6 +94,15 @@ async function capturedPolicies(): Promise<{ readonly lead: LeadPolicy; readonly
 }
 
 /** Root-type guarantee every OpenAI-compatible provider validates first. */
+function expectSubmissionSchema(schema: Record<string, unknown>): void {
+  expect(schema['required']).toEqual(['verdict', 'findings', 'prior_dispositions', 'report_markdown']);
+  const properties = schema['properties'] as Record<string, Record<string, unknown>>;
+  expect(properties['verdict']).toMatchObject({ type: 'string', enum: ['READY TO MERGE', 'NEEDS CHANGES', 'MAJOR REWORK NEEDED', 'INCOMPLETE'] });
+  expect(properties['findings']).toMatchObject({ type: 'array' });
+  expect(properties['prior_dispositions']).toMatchObject({ type: 'array' });
+  expect(properties['report_markdown']).toMatchObject({ type: 'string' });
+}
+
 function expectObjectRoot(toolName: string, schema: unknown): Record<string, unknown> {
   expect(typeof schema, `${toolName}: schema present`).toBe('object');
   expect(schema, `${toolName}: schema not null`).not.toBeNull();
@@ -231,13 +240,36 @@ describe('declared native tool schemas are provider-compatible', () => {
     for (const tool of [...lead.nativeTools, ...(child.nativeTools ?? [])]) {
       expectObjectRoot(tool.name, tool.inputSchema);
     }
-    // The submission-shaped tools share one declaration: root stays a typed
-    // object while both payload shapes stay declared beneath it.
+    // The submission-shaped tools share one typed-object declaration.
     for (const name of ['perkins_preflight_submission', 'perkins_submit_review']) {
       const tool = lead.nativeTools.find((entry) => entry.name === name)!;
       const root = expectObjectRoot(tool.name, tool.inputSchema);
-      expect(Array.isArray(root['oneOf']), `${name}: both payload shapes retained`).toBe(true);
+      expectSubmissionSchema(root);
     }
+  });
+
+  it('serializes the same nested proof schema through the Claude MCP bridge', async () => {
+    const bridge = await ReviewMcpBridge.start(lead.nativeTools);
+    try {
+      const tools = await new Promise<Array<{ name: string; inputSchema: unknown }>>((resolve, reject) => {
+        const socket = createConnection(bridge.socketPath);
+        let body = '';
+        socket.setEncoding('utf8');
+        socket.once('connect', () => socket.end(`${JSON.stringify({ id: 'proof-schema', name: '__list__', input: {} })}\n`));
+        socket.on('data', (data: string) => { body += data; });
+        socket.once('error', reject);
+        socket.once('end', () => {
+          try { resolve((JSON.parse(body) as { result: Array<{ name: string; inputSchema: unknown }> }).result); }
+          catch (error) { reject(error); }
+        });
+      });
+      for (const name of ['perkins_preflight_submission', 'perkins_submit_review']) {
+        const declared = lead.nativeTools.find((tool) => tool.name === name)!;
+        const bridged = tools.find((tool) => tool.name === name)!;
+        expect(bridged.inputSchema).toEqual(declared.inputSchema);
+        expectSubmissionSchema(expectObjectRoot(name, bridged.inputSchema));
+      }
+    } finally { await bridge.close(); }
   });
 
   it('the exact lead wire payload carries an object root for every declared function', async () => {
@@ -249,7 +281,7 @@ describe('declared native tool schemas are provider-compatible', () => {
     for (const entry of perkins) {
       const root = expectObjectRoot(entry.name, entry.parameters);
       if (entry.name === 'perkins_preflight_submission' || entry.name === 'perkins_submit_review') {
-        expect(Array.isArray(root['oneOf']), `${entry.name}: both payload shapes retained on the wire`).toBe(true);
+        expectSubmissionSchema(root);
       }
     }
   });

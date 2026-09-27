@@ -509,10 +509,32 @@ function observedBmadSkills(repoPath: string, tools: readonly string[]): Runtime
   );
 }
 
-function hashOwnedPayload(repoPath: string, runtimeSkills: RuntimeSkillMap): string {
+function validatedSkillPath(repoPath: string, tool: string, skill: string): string {
+  if (tool !== 'pi' && tool !== 'claude-code') throw new Error(`unsafe BMAD runtime tool: ${tool}`);
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(skill) || skill === '.' || skill === '..') {
+    throw new Error(`unsafe BMAD recorded skill name: ${skill}`);
+  }
+  const root = runtimeSkillsRoot(repoPath, tool);
+  const path = join(root, skill);
+  assertNoSymlinkComponents(repoPath, relative(repoPath, path));
+  const realRepo = realpathSync(repoPath);
+  const realRoot = realpathSync(root);
+  const realSkill = realpathSync(path);
+  if (!insideOrEqual(realRepo, realRoot) || !insideOrEqual(realRoot, realSkill) ||
+      !lstatSync(path).isDirectory()) {
+    throw new Error(`unsafe BMAD recorded skill path: ${path}`);
+  }
+  return path;
+}
+
+function hashOwnedPayload(repoPath: string, runtimeSkills: RuntimeSkillMap, includeDerived = false): string {
   const hash = createHash('sha256');
   const visit = (path: string): void => {
     const relativePath = relative(repoPath, path);
+    // The renderer and Python bytecode caches are derived output, not the
+    // pinned executable/configuration source. Never include or copy them.
+    if (!includeDerived && (relativePath === '_bmad/render' ||
+        (relativePath.startsWith('_bmad/') && relativePath.split('/').includes('__pycache__')))) return;
     const info = lstatSync(path);
     if (info.isSymbolicLink()) throw new Error(`BMAD owned payload contains symlink: ${path}`);
     if (info.isDirectory()) {
@@ -529,7 +551,7 @@ function hashOwnedPayload(repoPath: string, runtimeSkills: RuntimeSkillMap): str
   visit(join(repoPath, '_bmad'));
   for (const tool of Object.keys(runtimeSkills).sort()) {
     for (const skill of [...(runtimeSkills[tool] ?? [])].sort()) {
-      visit(join(runtimeSkillsRoot(repoPath, tool), skill));
+      visit(validatedSkillPath(repoPath, tool, skill));
     }
   }
   return hash.digest('hex');
@@ -572,7 +594,9 @@ function updateLocalExclude(
 const BOOTSTRAP_SOURCE = `#!/usr/bin/env node
 ${BOOTSTRAP_MARKER}
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import process from 'node:process';
+import console from 'node:console';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, relative, resolve, isAbsolute } from 'node:path';
 const childEnv = { ...process.env };
@@ -584,13 +608,18 @@ const common = (dir) => realpathSync(execFileSync('git', ['-C', dir, 'rev-parse'
 if (common(root) !== common(source)) throw new Error('BMAD bootstrap source belongs to a different Git repository');
 if (root === source) process.exit(0);
 const inside = (base, child) => { const rel = relative(base, child); return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel)); };
+// lstat sees dangling symlinks that existsSync follows and misses.
+const lstatIfPresent = (path) => {
+  try { return lstatSync(path); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+};
 const assertSafeDestination = (to) => {
   const target = resolve(to);
   if (!inside(root, target)) throw new Error('BMAD bootstrap destination escapes worktree: ' + to);
   let current = root;
   for (const part of relative(root, target).split('/').filter(Boolean)) {
     current = join(current, part);
-    if (existsSync(current) && lstatSync(current).isSymbolicLink()) {
+    if (lstatIfPresent(current)?.isSymbolicLink()) {
       throw new Error('BMAD bootstrap refuses destination symlink: ' + current);
     }
   }
@@ -598,6 +627,11 @@ const assertSafeDestination = (to) => {
 const copyTree = (from, to) => {
   const unresolved = resolve(from);
   if (!inside(source, unresolved)) throw new Error('BMAD bootstrap source escapes the selected repo: ' + from);
+  // Only these lexical derived-cache paths are excluded. All other entries
+  // still pass through the source symlink and realpath confinement checks.
+  const rel = relative(source, unresolved);
+  if (rel === '_bmad/render' ||
+      (rel.startsWith('_bmad/') && rel.split('/').includes('__pycache__'))) return;
   const unresolvedInfo = lstatSync(unresolved);
   if (unresolvedInfo.isSymbolicLink()) throw new Error('BMAD bootstrap refuses source symlink: ' + from);
   const src = realpathSync(unresolved);
@@ -605,28 +639,63 @@ const copyTree = (from, to) => {
   const info = lstatSync(src);
   assertSafeDestination(to);
   if (info.isDirectory()) {
-    mkdirSync(to, { recursive: true });
+    const dest = lstatIfPresent(to);
+    if (dest && !dest.isDirectory()) throw new Error('BMAD bootstrap destination collision: ' + to);
+    if (!dest) mkdirSync(to, { recursive: true, mode: 0o700 });
+    // Never alter a directory already present in the lane: it may contain
+    // private, unrelated files. New directories stay private until complete.
     for (const name of readdirSync(src)) copyTree(join(src, name), join(to, name));
+    if (!dest) chmodSync(to, info.mode & 0o777);
     return;
   }
   if (!info.isFile()) throw new Error('BMAD bootstrap supports only files/directories: ' + from);
-  if (existsSync(to)) {
-    const dest = lstatSync(to);
+  const dest = lstatIfPresent(to);
+  if (dest) {
     if (!dest.isFile() || dest.isSymbolicLink()) throw new Error('BMAD bootstrap destination collision: ' + to);
     if (!readFileSync(src).equals(readFileSync(to))) throw new Error('BMAD bootstrap destination differs from source: ' + to);
     return;
   }
-  mkdirSync(dirname(to), { recursive: true });
+  mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
   cpSync(src, to, { errorOnExist: true, force: false });
 };
 const record = JSON.parse(readFileSync(join(root, '.gru-command', 'bmad-install.json'), 'utf-8'));
 const sourceManifest = readFileSync(join(source, '_bmad', '_config', 'manifest.yaml'));
 const sourceHash = createHash('sha256').update(sourceManifest).digest('hex');
 if (sourceHash !== record.official_manifest_sha256) throw new Error('BMAD bootstrap source manifest changed since onboarding');
+if (record.source_payload_format !== undefined && record.source_payload_format !== 'without-derived-caches-v1') {
+  throw new Error('BMAD bootstrap record has unsupported source payload format');
+}
+// Validate ALL recorded bindings before hashing any owned payload. A record
+// cannot use a relative skill name or symlinked ancestor to read outside it.
+const skillPaths = [];
+for (const tool of Object.keys(record.runtime_skills ?? {}).sort()) {
+  if (tool !== 'pi' && tool !== 'claude-code') throw new Error('BMAD bootstrap record has unsafe runtime tool: ' + tool);
+  const dir = tool === 'claude-code' ? '.claude' : '.agents';
+  const names = record.runtime_skills[tool];
+  if (!Array.isArray(names)) throw new Error('BMAD bootstrap record has invalid skills for ' + tool);
+  const skillsRoot = join(source, dir, 'skills');
+  for (const name of [...names].sort()) {
+    if (typeof name !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) || name === '..') {
+      throw new Error('BMAD bootstrap record has unsafe skill name for ' + tool);
+    }
+    const path = join(skillsRoot, name);
+    for (const part of [join(source, dir), skillsRoot, path]) {
+      if (lstatSync(part).isSymbolicLink()) throw new Error('BMAD bootstrap refuses source skill symlink: ' + part);
+    }
+    if (!inside(realpathSync(skillsRoot), realpathSync(path)) || !lstatSync(path).isDirectory()) {
+      throw new Error('BMAD bootstrap record has unsafe skill path: ' + path);
+    }
+    skillPaths.push(path);
+  }
+}
 const hashPayload = () => {
   const hash = createHash('sha256');
   const visit = (path) => {
     const relativePath = relative(source, path);
+    // Old records still verify against the full payload until explicitly refreshed.
+    if (record.source_payload_format === 'without-derived-caches-v1' &&
+        (relativePath === '_bmad/render' ||
+          (relativePath.startsWith('_bmad/') && relativePath.split('/').includes('__pycache__')))) return;
     const info = lstatSync(path);
     if (info.isSymbolicLink()) throw new Error('BMAD owned payload contains symlink: ' + path);
     if (info.isDirectory()) {
@@ -639,10 +708,7 @@ const hashPayload = () => {
     } else throw new Error('BMAD owned payload contains unsupported entry: ' + path);
   };
   visit(join(source, '_bmad'));
-  for (const tool of Object.keys(record.runtime_skills ?? {}).sort()) {
-    const dir = tool === 'claude-code' ? '.claude' : '.agents';
-    for (const skillName of [...record.runtime_skills[tool]].sort()) visit(join(source, dir, 'skills', skillName));
-  }
+  for (const path of skillPaths) visit(path);
   return hash.digest('hex');
 };
 if (hashPayload() !== record.source_payload_sha256) throw new Error('BMAD bootstrap source payload changed since onboarding');
@@ -683,7 +749,9 @@ function updateWorktreeBootstrap(repoPath: string, env: NodeJS.ProcessEnv): void
   }
   const next = managedBlock(original, BLOCK_START, BLOCK_END, [
     '[[setup]]',
-    'command = "node .gru-command/bmad-bootstrap.mjs"',
+    '# Fresh clones have no git-local BMAD source. Only onboarded repositories',
+    '# run the generated copier; a configured but invalid source still fails loud.',
+    'command = "if git config --local --get gru-command.bmad-source >/dev/null 2>&1; then node .gru-command/bmad-bootstrap.mjs; fi"',
   ]);
   const bootstrapPath = join(repoPath, BOOTSTRAP_PATH);
   if (existsSync(bootstrapPath) && !readFileSync(bootstrapPath, 'utf-8').includes(BOOTSTRAP_MARKER)) {
@@ -724,6 +792,7 @@ function writeRecord(
     runtime_skills: runtimeSkills,
     official_manifest_sha256: createHash('sha256').update(manifestText).digest('hex'),
     source_payload_sha256: hashOwnedPayload(repoPath, runtimeSkills),
+    source_payload_format: 'without-derived-caches-v1',
     compatibility_patches: fresh ? ['qualify-bmm-gds-short-config-tokens-v1'] : [],
   };
   atomicWrite(path, `${JSON.stringify(record, null, 2)}\n`);
@@ -829,6 +898,7 @@ export function onboardBmadRepo(
     const existing = manifestFor(repoPath);
     let installed: InstalledBmad;
     let fresh = false;
+    let verifiedLegacyRecord: Record<string, unknown> | undefined;
     if (action === 'install') {
       if (existing !== null) {
         throw new Error('BMAD already exists; choose reuse to preserve it (automatic overwrite/upgrade is disabled)');
@@ -843,19 +913,31 @@ export function onboardBmadRepo(
       let recordedSkills: RuntimeSkillMap | undefined;
       const priorRecord = join(repoPath, RECORD_PATH);
       if (existsSync(priorRecord)) {
-        const raw = (JSON.parse(readFileSync(priorRecord, 'utf-8')) as {
-          runtime_skills?: unknown;
-        }).runtime_skills;
+        const prior = JSON.parse(readFileSync(priorRecord, 'utf-8')) as Record<string, unknown>;
+        if (typeof prior.source_payload_sha256 !== 'string') {
+          throw new Error(`existing BMAD record lacks a source payload fingerprint: ${priorRecord}`);
+        }
+        const raw = prior.runtime_skills;
         if (raw !== undefined && raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
           const parsed: Record<string, string[]> = {};
           for (const [tool, names] of Object.entries(raw)) {
-            if (!Array.isArray(names) || names.some((name) => typeof name !== 'string')) {
+            if ((tool !== 'pi' && tool !== 'claude-code') || !Array.isArray(names) ||
+                names.some((name) => typeof name !== 'string')) {
               throw new Error(`existing BMAD record has invalid runtime_skills: ${priorRecord}`);
             }
+            for (const name of names as string[]) validatedSkillPath(repoPath, tool, name);
             parsed[tool] = [...names] as string[];
           }
           recordedSkills = parsed;
         }
+        if (prior.source_payload_format !== undefined && prior.source_payload_format !== 'without-derived-caches-v1') {
+          throw new Error('existing BMAD record has unsupported source payload format');
+        }
+        if (!recordedSkills ||
+            hashOwnedPayload(repoPath, recordedSkills, prior.source_payload_format === undefined) !== prior.source_payload_sha256) {
+          throw new Error('BMAD source payload changed since onboarding; reuse cannot refresh an unverified fingerprint (including legacy render caches). Review source and re-onboard deliberately');
+        }
+        if (prior.source_payload_format === undefined) verifiedLegacyRecord = prior;
       }
       const runtimeSkills = recordedSkills ?? observedBmadSkills(repoPath, existing.summary.tools);
       installed = { ...existing, runtimeSkills };
@@ -882,6 +964,16 @@ export function onboardBmadRepo(
       updateWorktreeBootstrap(repoPath, env);
     }
     const existingRecordPath = join(repoPath, RECORD_PATH);
+    // Explicit reuse can upgrade an unchanged legacy fingerprint; a changed
+    // legacy hash (even cache-only) cannot prove that executable bytes stayed
+    // the same, so it was refused above rather than silently re-pinned.
+    if (verifiedLegacyRecord) {
+      atomicWrite(existingRecordPath, `${JSON.stringify({
+        ...verifiedLegacyRecord,
+        source_payload_sha256: hashOwnedPayload(repoPath, installed.runtimeSkills),
+        source_payload_format: 'without-derived-caches-v1',
+      }, null, 2)}\n`);
+    }
     const recordPath = !fresh && existsSync(existingRecordPath)
       ? existingRecordPath
       : writeRecord(
