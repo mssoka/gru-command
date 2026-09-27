@@ -216,7 +216,7 @@ describe('Perkins App bundle config parsing', () => {
         '# literal data, not shell',
         'app_id=4366368',
         'key_path="/opt/keys/perkins key.pem"',
-        "installation_id_mssoka=164552969",
+        "installation_id_widget-shop=111222333",
         'installation_id_solarity-services=999888777',
         '  installation_id_MixedCase=42  ',
         '',
@@ -225,7 +225,7 @@ describe('Perkins App bundle config parsing', () => {
     );
     expect(config.appId).toBe(4366368);
     expect(config.keyPath).toBe('/opt/keys/perkins key.pem');
-    expect(config.installationIds.get('mssoka')).toBe('164552969');
+    expect(config.installationIds.get('widget-shop')).toBe('111222333');
     // Hyphenated organization owner survives as a distinct mapping.
     expect(config.installationIds.get('solarity-services')).toBe('999888777');
     // Owner lookup is case-insensitive: MixedCase maps lowercased.
@@ -778,7 +778,7 @@ describe('fail-closed credential and identity checks', () => {
 describe('post-publication identity proof', () => {
   it('routes an unprovable receipt through bounded reconciliation — foreign author with no proved match stays unproven', async () => {
     const fixture = bundleFixture();
-    const foreign = { id: 1, user: { login: 'mssoka', type: 'User' }, commit_id: HEAD, state: 'COMMENTED', body: 'review body\n' };
+    const foreign = { id: 1, user: { login: 'some-user', type: 'User' }, commit_id: HEAD, state: 'COMMENTED', body: 'review body\n' };
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => ({ status: 200, body: foreign }) },
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [foreign] }) },
@@ -793,7 +793,7 @@ describe('post-publication identity proof', () => {
 
   it('credits a 2xx unprovable receipt only when the bounded lookup proves our bot published the bytes', async () => {
     const fixture = bundleFixture();
-    const foreign = { id: 1, user: { login: 'mssoka', type: 'User' }, commit_id: HEAD, state: 'COMMENTED', body: 'review body\n' };
+    const foreign = { id: 1, user: { login: 'some-user', type: 'User' }, commit_id: HEAD, state: 'COMMENTED', body: 'review body\n' };
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => ({ status: 200, body: foreign }) },
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
@@ -857,7 +857,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
 
   it('never credits a foreign author with the same bytes on the same head', async () => {
     const fixture = bundleFixture();
-    const foreignAuthor = { ...MATCHING_REVIEW, user: { login: 'mssoka', type: 'User' } };
+    const foreignAuthor = { ...MATCHING_REVIEW, user: { login: 'some-user', type: 'User' } };
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [foreignAuthor] }) },
@@ -901,7 +901,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
     const fixture = bundleFixture();
     const foreignPage = Array.from({ length: 100 }, (_, index) => ({
       id: 1000 + index,
-      user: { login: 'mssoka', type: 'User' },
+      user: { login: 'some-user', type: 'User' },
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',

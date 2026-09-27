@@ -27,7 +27,7 @@ sourced as a shell script, so `$HOME` in a value stays the literal string:
 ```
 app_id=4366368
 key_path="/absolute/path/to/app-key.pem"
-installation_id_mssoka=164552969
+installation_id_widget-shop=111222333
 installation_id_solarity-services=999888777
 ```
 
