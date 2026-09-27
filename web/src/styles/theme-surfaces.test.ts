@@ -25,6 +25,20 @@ const THEMED_SURFACES = [
   'danger',
 ] as const;
 
+/** Changed surfaces (v6.1 audit) whose own rule blocks must stay themed:
+ * every color-carrying declaration references a token (var(--…)), never a
+ * literal hex/rgb — a literal passes the token checks above but renders one
+ * theme forever (vgap r4: presence of tokens is not usage of tokens). */
+const THEMED_SELECTORS = [
+  '.toast--error',
+  '.board-notification--error',
+  '.board-notification__ack',
+  '.attach-chip',
+  '.attach-chip__remove',
+] as const;
+
+const COLOR_DECL = /\b(background|background-color|color|border|border-color|fill|stroke)\s*:\s*([^;]+);/g;
+
 function themeBlock(selector: string): string {
   const match = new RegExp(`${selector.replace('.', '\\.')}\\s*\\{([\\s\\S]*?)\\}`).exec(TOKENS_CSS);
   if (match === null) throw new Error(`no ${selector} block in tokens.css`);
@@ -58,6 +72,28 @@ describe('dark-mode surface tokens (v6.1)', () => {
       expect(light, `--${token} light`).toBeDefined();
       expect(darkValue, `--${token} dark`).toBeDefined();
       expect(darkValue, `--${token} flips`).not.toBe(light);
+    }
+  });
+
+  it('uses the tokens on the changed surfaces — no literal colors in their blocks (vgap r4)', () => {
+    for (const selector of THEMED_SELECTORS) {
+      const match = new RegExp(`${selector.replace('.', '\\.')}` + String.raw`\s*\{([\s\S]*?)\}`).exec(COMPONENTS_CSS);
+      expect(match, `${selector} rule block exists`).not.toBeNull();
+      const block = match?.[1] ?? '';
+      const decls = [...block.matchAll(COLOR_DECL)];
+      expect(decls.length, `${selector} carries color declarations`).toBeGreaterThan(0);
+      for (const decl of decls) {
+        const value = decl[2]?.trim() ?? '';
+        expect(
+          value.includes('var(') ||
+            value === 'transparent' ||
+            value === 'inherit' ||
+            value === 'currentColor' ||
+            value === 'none' ||
+            value === '0',
+          `${selector} ${decl[1]}: ${value}`,
+        ).toBe(true);
+      }
     }
   });
 });

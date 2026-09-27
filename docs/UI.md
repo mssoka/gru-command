@@ -263,8 +263,9 @@ health row globally: DEPLOY → REVIEWS → SILAS → ALERTS → VERIFY → CURE
 TRACKERS, each with one accent edge and its own flags (e.g. REVIEWS
 carries `12 FAILED`). The TRACKERS chip folds the v4 KPI counts in as
 labeled fields (`HEISTS 17 working 2 in review 2 merged 0 done 0 parked 1`,
-`PRS 1 open 1 conflicting 0 merged today 0`, `MINIONS 1 live 1 mid-turn 1
-disposed 1`; every number is a `data-kpi` span tied to the same
+`PRS 1 open 1 conflicting 0 merged today 0`, `CREW 1 minions 1 mid-turn 1
+disposed 1` — the crew group counts the whole crew: gru, silas, minions,
+lens children; every number is a `data-kpi` span tied to the same
 `boardKpis` derivation the v4 strip used) plus the Jev decisions chip and
 the unacked action-required badge. No bare slash counters survive: every
 value carries its label beside it.

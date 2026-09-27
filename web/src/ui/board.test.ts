@@ -344,6 +344,25 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     // A conflict is the loudest PR state: the number carries the alert ink.
     const conflicting = [...document.querySelectorAll<HTMLElement>('[data-kpi="prs.conflicting"]')][0];
     expect(conflicting?.classList.contains('rail-kpi__num--alert')).toBe(true);
+
+    // v6.1 ruling 5: every rendered number carries its visible label —
+    // adjacency in the DOM, not a tooltip promise.
+    const fields = [...document.querySelectorAll<HTMLElement>('.rail-kpi__field')];
+    expect(fields.length).toBeGreaterThan(0);
+    for (const field of fields) {
+      const label = field.querySelector<HTMLElement>('.rail-kpi__field-label');
+      const num = field.querySelector<HTMLElement>('[data-kpi]');
+      expect(label?.textContent, `${num?.dataset.kpi} label text`).toBeTruthy();
+      expect(num, `${label?.textContent} number`).not.toBeNull();
+      expect(label?.nextElementSibling).toBe(num);
+    }
+    const groupLabels = [...document.querySelectorAll<HTMLElement>('.rail-kpi__label')].map(
+      (node) => node.textContent ?? '',
+    );
+    expect(groupLabels.some((text) => text.startsWith('HEISTS'))).toBe(true);
+    expect(groupLabels.some((text) => text.startsWith('PRS'))).toBe(true);
+    expect(groupLabels.some((text) => text.startsWith('CREW'))).toBe(true);
+    expect(groupLabels.some((text) => text.includes('MINIONS'))).toBe(false);
   });
 
   it('keeps the Jev decisions chip and unacked badge inside the TRACKERS chip', () => {
@@ -695,6 +714,11 @@ describe('board v6 — bands', () => {
     const stalled = bands[2]?.querySelector<HTMLElement>('.board-job');
     expect(stalled?.getAttribute('data-job-id')).toBe('stalled-job');
     expect(stalled?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+    // v6.1 vocabulary rides the flag's tooltip too: the worker word is
+    // minion, never agent (owner ruling 3).
+    expect(stalled?.querySelector<HTMLElement>('.board-job__stale')?.title).toBe(
+      'working with no minion frames past the stall window',
+    );
   });
 
   it('attributes unacked action-required notifications through agent bindings', () => {
@@ -772,6 +796,21 @@ describe('board v6 — bands', () => {
     expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS GRU');
     expect(needsYou?.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs Gru');
     expect(needsYou?.querySelector('.board-band__clear-mark')?.textContent).toBe('✓');
+  });
+
+  it('v6.1 vocabulary pins the quiet states: empty board and empty crew (vgap r5)', () => {
+    const view = new BoardView(() => {});
+    // No repos, no jobs: the board's empty hint speaks heists.
+    view.render(snapshot({ repos: [] }));
+    expect(document.querySelector('.board-empty__title')?.textContent).toBe('The board is quiet');
+    expect(document.querySelector('.board-empty__hint')?.textContent).toBe(
+      'Heists land here once work is dispatched — the ledger is the record, this board is the window.',
+    );
+
+    // Jobs on the board but nobody aboard: the crew rail says crew, not agents.
+    view.render(snapshot({ jobs: [baseJob({ id: 'solo', status: 'working' })], agents: [] }));
+    expect(document.querySelector('#board-agents')?.textContent).toContain('no crew yet');
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('0');
   });
 });
 

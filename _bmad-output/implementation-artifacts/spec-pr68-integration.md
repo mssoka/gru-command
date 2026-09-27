@@ -73,23 +73,23 @@ Investigation (2026-09-27, this lane):
 
 ## Tasks
 
-1. [ ] **Backup + merge** — non-overwriting `backup/pr68-pre-integration-05f8972`
+1. [x] **Backup + merge** — non-overwriting `backup/pr68-pre-integration-05f8972`
    ref; `git merge origin/main` (normal, no rebase/force).
-2. [ ] **Resolve text conflicts** — board.ts header comment (union: labeled
+2. [x] **Resolve text conflicts** — board.ts header comment (union: labeled
    heist counts + NEEDS GRU band), docs/BOARD.md (v6.1 vocabulary ∩ #71
    routing semantics).
-3. [ ] **Semantic pass on auto-merges** — every v6.1 ruling survives onto
+3. [x] **Semantic pass on auto-merges** — every v6.1 ruling survives onto
    main's evolved board.ts (heistCount band counts beside NEEDS GRU label,
    heist/minion meta, CREW rail, labeled tracker fields, dark surfaces);
    main's FOR YOU section/wakes chip/service band survive intact; smoke +
    real-server e2e text updated for both (NEEDS GRU × heists).
-4. [ ] **Regenerate 4 goldens** via `npm run e2e` on the merged tree;
+4. [x] **Regenerate 4 goldens** via `npm run e2e` on the merged tree;
    verify diffs show exactly toggle-removal + service-band, both themes.
-5. [ ] **Focused suites** — web unit (board*, board-vocabulary,
+5. [x] **Focused suites** — web unit (board*, board-vocabulary,
    theme-surfaces, rail-tabs, command-ticker, palette-contrast, chat-service-band),
    board bands/signals/protocol, suite-shape.
-6. [ ] **Full gate via scheduler** — one `POST /api/verify` scope `full`.
-7. [ ] **Captures** — light+dark × desktop+mobile of the changed views
+6. [x] **Full gate via scheduler** — one `POST /api/verify` scope `full`.
+7. [x] **Captures** — light+dark × desktop+mobile of the changed views
    (command bar, chip rail, board bands, crew rail) via agent-browser.
 8. [ ] **Independent BMAD review of the integration delta** — fresh
    layers, receipts under the delivery dir.
@@ -125,6 +125,33 @@ Investigation (2026-09-27, this lane):
 - Existing unrelated findings become explicit follow-up notes, never
   bundled fixes.
 - Bundle grep: no user-facing " JOBS<"/"LANE "/"AGENTS (" strings.
+- Merge commit `39f68e4796aaf6c39316f9fcd728868d8e41949a` (parents 05f8972
+  + 4845b1a), tree clean; backup ref `backup/pr68-pre-integration-05f8972`.
+- Delta vs main is EXACTLY docs/ + web/ + lane spec (26 files) — zero
+  backend changes (git-proven), so backend gate outcomes equal main's.
+- lint/typecheck/build/build:web exit 0 (build includes perkins verifier).
+- Web unit: 311/311 pass with `--no-file-parallelism`; under default
+  parallel pool 3 liveness/timing tests failed on this loaded host
+  (900-frame render active) and pass serially — same class pr77 recorded.
+- suite-shape 2/2. E2e 44/44 incl. 4 regenerated goldens; goldens
+  pixel-verified via vision reads (no toggle; TRACKERS labeled groups
+  HEISTS/PRS/MINIONS; NEEDS GRU/IN FLIGHT/SETTLED + heist counts;
+  CREW (5); dark surfaces complete — user bubble #182033 navy, cream
+  hits were text ink; mobile: board → crew rail stacked, chat hidden
+  until FAB, 0 toggle tabs, 11 labeled tracker fields, wakes chip).
+- Scheduled full gate run `85695afd-8d92-4c30-8e7b-e24c764f0488` at
+  39f68e4 (tracked-clean, 14 workers, 1068s): FAILED exit 1 — 22 files /
+  55 tests; cause triage: 44 explicit timeouts + 4 "service never
+  listened" + fetch/spawn failures; 2 bmad-onboarding assertion
+  failures are the SAME tests/messages as historical CI run 35937797053
+  (pre-merge, different machine class). Backend code byte-identical to
+  main (delta = web/docs only) → failures are main-under-host-load, not
+  merge-introduced. Failure preserved verbatim in delivery dir; per
+  pr77 precedent the authoritative exact-head gate is GitHub CI on the
+  pushed head (isolated runner).
+- Row meta renders uppercase via existing CSS text-transform (all row
+  meta — repo/branch too); source strings are lowercase heist/minion —
+  words correct, case follows pre-existing v6 style.
 
 ## Open Questions
 

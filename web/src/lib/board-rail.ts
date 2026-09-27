@@ -15,7 +15,7 @@
 import { healthCards, type HealthTone } from './board-health.js';
 import { boardKpis } from './board-kpi.js';
 import type { BoardSnapshot } from './board-protocol.js';
-import { BOARD_WORDS } from './board-vocabulary.js';
+import { BOARD_WORDS, heistCount } from './board-vocabulary.js';
 
 export interface RailKpi {
   /** The v4 KPI key (e.g. `jobs.working`). */
@@ -91,7 +91,7 @@ function trackersChip(snapshot: BoardSnapshot, kpis: ReturnType<typeof boardKpis
     kpis: [
       {
         label: BOARD_WORDS.heists.toUpperCase(),
-        total: kpi('jobs.total', kpis.jobs.total, 'total', `${kpis.jobs.total} heists on the board`),
+        total: kpi('jobs.total', kpis.jobs.total, 'total', `${heistCount(kpis.jobs.total)} on the board`),
         values: [
           kpi('jobs.working', kpis.jobs.working, 'working', `${kpis.jobs.working} working`),
           kpi('jobs.inReview', kpis.jobs.inReview, 'in review', `${kpis.jobs.inReview} in review`),
@@ -111,13 +111,13 @@ function trackersChip(snapshot: BoardSnapshot, kpis: ReturnType<typeof boardKpis
         title: 'open / conflicting / merged today',
       },
       {
-        label: 'MINIONS',
+        label: BOARD_WORDS.crew.toUpperCase(),
         values: [
-          kpi('lanes.liveMinions', kpis.lanes.liveMinions, 'live', `${kpis.lanes.liveMinions} live minions`),
+          kpi('lanes.liveMinions', kpis.lanes.liveMinions, 'minions', `${kpis.lanes.liveMinions} live minion${kpis.lanes.liveMinions === 1 ? '' : 's'}`),
           kpi('lanes.midTurn', kpis.lanes.midTurn, 'mid-turn', `${kpis.lanes.midTurn} mid-turn`),
           kpi('lanes.disposed', kpis.lanes.disposed, 'disposed', `${kpis.lanes.disposed} disposed`),
         ],
-        title: 'live minions / mid-turn / disposed',
+        title: 'live minions / crew mid-turn / crew disposed',
       },
     ],
   };

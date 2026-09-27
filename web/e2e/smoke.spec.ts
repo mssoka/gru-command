@@ -460,6 +460,12 @@ test.describe('board (E6, mock feed)', () => {
   test('dense rows collapse by default; expanding reveals the round lens chips', async ({ page }) => {
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
+    // v6.1 ruling 1: the Chat/Board segmented toggle is GONE — chat is
+    // always docked on desktop, the FAB owns mobile. Absence is pinned,
+    // not implied (a restored toggle must fail here).
+    await expect(page.locator('#tab-chat')).toHaveCount(0);
+    await expect(page.locator('#tab-board')).toHaveCount(0);
+    await expect(page.locator('.command-bar__tabs')).toHaveCount(0);
     // v4 bands lead the board; rows group under sticky band separators.
     await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS GRU');
     await expect(
@@ -605,6 +611,13 @@ test.describe('board (E6, mock feed)', () => {
 
     // Disposed rows collapse by default behind the toggle on the CREW tab.
     const rail = page.locator('#board-agents');
+    // v6.1 ruling 2: the rail tab renders CREW (n) — pinned against the
+    // real DOM, not a test fixture (vgap r3). The button's markup carries
+    // source whitespace, so assert on the normalized text.
+    await expect
+      .poll(async () => (await page.locator('#rail-tab-agents').textContent())?.trim() ?? '')
+      .toMatch(/^CREW \(\d+\)$/);
+    await expect(page.locator('.agents-rail__tabs')).toHaveAttribute('aria-label', 'Crew and transcripts');
     await expect(rail.locator('.board-agent--disposed')).toHaveCount(0);
     const toggle = rail.locator('.board-agent-toggle');
     await expect(toggle).toContainText('1 disposed');
