@@ -220,8 +220,19 @@ export class OwnerChime {
     }
     const at = this.now();
     if (this.lastChimeAt !== null && at - this.lastChimeAt < this.throttleMs) return 'throttled';
-    this.lastChimeAt = at;
-    this.play();
+    try {
+      this.play();
+    } catch {
+      // A Web Audio scheduling failure (a dead or hostile node throwing in
+      // create/connect/start) is CONTAINED at this seam: it must not
+      // escape into the board pipeline, where it would abort the shown
+      // receipt, the remaining snapshot notifications, and the render
+      // that follows. The arrival still earns its visual nudge, and the
+      // throttle window stays unconsumed — a failed chime is not a chime.
+      this.nudge();
+      return 'nudge';
+    }
+    this.lastChimeAt = at; // consumed only by a successfully scheduled chime
     return 'chime';
   }
 

@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { StorageLike } from '../theme.js';
 import { memoryStorage } from '../lib/chat-storage.js';
+import type { BoardClient } from '../lib/board-client.js';
 import type { BoardSnapshot, NotificationView } from '../lib/board-protocol.js';
 import { BoardView } from './board.js';
 import {
@@ -78,9 +79,13 @@ class StubAudioContext {
   /** 'ok' resolves; 'reject' rejects; 'throw' throws synchronously;
    * 'gate' parks until releaseResume() flips state and resolves. */
   resumeMode: 'ok' | 'reject' | 'throw' | 'gate' = 'ok';
+  /** Scheduling failure: createOscillator throws although the context
+   * reports 'running' — the dead/hostile-node regression shape. */
+  throwOnCreateOscillator = false;
   private gateResolve: (() => void) | null = null;
 
   createOscillator(): ChimeOscillatorNode {
+    if (this.throwOnCreateOscillator) throw new Error('audio node allocation failed');
     const oscillator = new StubOscillator();
     this.oscillators.push(oscillator);
     return oscillator;
@@ -572,6 +577,60 @@ describe('owner chime — live board wiring', () => {
       ]),
     );
     expect(h.context.oscillators).toHaveLength(2);
+  });
+
+  it('a throwing audio node stays contained through the live board wiring: visual nudge, unconsumed throttle, receipts and remaining notifications still flow', () => {
+    mountDom();
+    const context = new StubAudioContext();
+    context.state = 'running'; // playable: passes the armed gate…
+    context.throwOnCreateOscillator = true; // …but scheduling explodes
+    const chime = new OwnerChime({
+      storage: memoryStorage(),
+      indicator: document.getElementById('sound-toggle') as HTMLButtonElement,
+      bell: document.getElementById('notification-bell') as HTMLButtonElement,
+      createContext: () => context,
+    });
+    expect(chime.arm()).toBe(true); // playable — the throws below are SCHEDULING failures
+    const outcomes: string[] = [];
+    const shown: Array<{ id: string; surface: string }> = [];
+    const client = {
+      markNotificationShown: (id: string, surface: string) => {
+        shown.push({ id, surface });
+        return Promise.resolve(true);
+      },
+    } as unknown as BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(client);
+    view.setToastHandler((notification) => {
+      outcomes.push(chime.notify(notification));
+    });
+
+    view.render(boardSnapshot([])); // history baseline
+    // Before the containment, this render THREW out of the toast handler,
+    // aborting the loop: owner-1 kept no shown receipt and owner-2 was
+    // never surfaced at all.
+    expect(() =>
+      view.render(
+        boardSnapshot([arrival('owner-1', 'needs-owner'), arrival('owner-2', 'needs-owner')]),
+      ),
+    ).not.toThrow();
+    expect(outcomes).toEqual(['nudge', 'nudge']); // failure ≠ chime, ≠ throttled
+    expect(shown.map((entry) => entry.id).sort()).toEqual(['owner-1', 'owner-2']);
+    expect(shown.every((entry) => entry.surface === 'web-toast')).toBe(true);
+    expect(
+      document.getElementById('notification-bell')?.classList.contains(OWNER_CHIME_NUDGE_CLASS),
+    ).toBe(true); // the visual fallback carried the arrival
+
+    // The failure is not a consumed chime: once nodes schedule again the
+    // very next arrival rings — the window was never spent.
+    context.throwOnCreateOscillator = false;
+    view.render(boardSnapshot([arrival('owner-3', 'needs-owner')]));
+    expect(outcomes).toEqual(['nudge', 'nudge', 'chime']);
+    expect(context.oscillators).toHaveLength(2); // the ONE two-note chime
+
+    // A re-render of the same rows is not a new arrival.
+    view.render(boardSnapshot([arrival('owner-3', 'needs-owner')]));
+    expect(outcomes).toEqual(['nudge', 'nudge', 'chime']);
   });
 
   it('a live action-required arrival never rings', () => {
