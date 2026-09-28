@@ -6,7 +6,7 @@
     "go ahead."
   ],
   "interpretation": "Repeated confirmation of one undertaking, not two dispatches. Approves implementing the consulted provider-recovery plan, the explicit eligible-wait definition, and bounded same-route real-generation fallback.",
-  "plan": "/Users/moses/.gru-command/briefings/provider-recovery-sensor-intake-20260928/plan-v3.md",
+  "plan": "<intake-briefing-dir>/plan-v3.md",
   "planSha256": "051194c8067abf7fcda6a805dafca84bd18c80aeea6897b5450132c074d1490e",
   "policy": {
     "automaticRecovery": "new explicitly eligible temporary-provider waits only",
