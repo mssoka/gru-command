@@ -312,6 +312,13 @@ export class PiRuntime implements AgentRuntime {
     }
   }
 
+  /** The shared offline model runtime (the same instance spawns resolve
+   * through): read-only consumers — the provider-recovery probe — reuse
+   * it instead of building a second catalog/auth snapshot. */
+  runtimeHandle(): Promise<ModelRuntime> {
+    return this.runtime();
+  }
+
   /**
    * One bounded catalog refresh per unknown-model failure (concurrent
    * failures share the in-flight attempt). Healthy resolutions never call
@@ -797,6 +804,8 @@ export class PiAgentHandle implements AgentHandle {
       isCompacting: boolean;
       readonly sessionId: string;
       readonly sessionFile: string | undefined;
+      /** The session's resolved model (provider identity for error events). */
+      readonly model?: { readonly id: string; readonly provider: string } | undefined;
     },
     sessionFile: string,
     capabilities: AgentCapabilities,
@@ -1174,7 +1183,14 @@ export class PiAgentHandle implements AgentHandle {
         // 'disposed' state with 'error'.
         if (!this.disposed) {
           this.setState('error', String(error));
-          this.emit({ type: 'error', error: String(error), fatal: false });
+          this.emit({
+            type: 'error',
+            error: String(error),
+            fatal: false,
+            ...(this.session.model !== undefined
+              ? { provider: this.session.model.provider, model: this.session.model.id }
+              : {}),
+          });
         }
         throw error;
       })
@@ -1349,7 +1365,21 @@ export class PiAgentHandle implements AgentHandle {
         const msg = e['message'] as Record<string, unknown> | undefined;
         if (msg !== undefined && msg['role'] === 'assistant' && msg['stopReason'] === 'error') {
           const detail = String(msg['errorMessage'] ?? 'model error');
-          this.emit({ type: 'error', error: detail, fatal: false });
+          this.emit({
+            type: 'error',
+            error: detail,
+            fatal: false,
+            ...(typeof msg['provider'] === 'string'
+              ? { provider: msg['provider'] }
+              : this.session.model !== undefined
+                ? { provider: this.session.model.provider }
+                : {}),
+            ...(typeof msg['model'] === 'string'
+              ? { model: msg['model'] }
+              : this.session.model !== undefined
+                ? { model: this.session.model.id }
+                : {}),
+          });
           this.setState('error', detail);
         }
         return;

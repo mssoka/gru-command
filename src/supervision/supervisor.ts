@@ -188,6 +188,7 @@ interface SupervisedAgent {
     reason: string;
     allowRestart: boolean;
     runtimeError: boolean;
+    source: ProviderErrorSource | null;
     handle: AgentHandle | null;
     activityGeneration: number;
     openTurn: boolean;
@@ -209,6 +210,33 @@ interface InterruptedTurn {
    * fresh-mint restart may retire the record's current id, but the job /
    * branch / phase context lives under this one. */
   readonly originAgentId: string;
+}
+
+/** Structured provider identity from a runtime error, when the runtime
+ * carried one (the provider-recovery sensor's evidence input; never
+ * guessed from prose). */
+export interface ProviderErrorSource {
+  readonly provider: string | null;
+  readonly model: string | null;
+  readonly error: string;
+}
+
+/** The provider-recovery observation sink (the sensor's recorder): the
+ * supervisor reports every wall stop with its structured evidence; the
+ * sink alone decides eligibility (owner control is preserved for
+ * auth/billing/ambiguous/unsupported). */
+export interface ProviderWallSink {
+  onProviderWall(input: {
+    readonly agentId: string;
+    readonly role: Role;
+    readonly slotId: string | null;
+    readonly jobId: string | null;
+    readonly sessionFile: string | null;
+    readonly failureClass: string;
+    readonly source: ProviderErrorSource | null;
+    readonly incidentId: string | null;
+    readonly continuation: { readonly promptText: string | null; readonly promptOwner: string | null; readonly hadOpenTurn: boolean } | null;
+  }): void;
 }
 
 /** A declared supervision slot — a stable identity that outlives handles
@@ -249,6 +277,10 @@ export interface SupervisorOptions {
    * restart-versus-escalate guidance. Counters, ceilings, stop/cancel state,
    * and re-arm remain deterministic here regardless of this service. */
   readonly decisions?: DecisionService;
+  /** Optional provider-recovery observation sink: wall stops are reported
+   * with their structured evidence; the sink alone decides wait
+   * eligibility. Absent = pure observer (no sensor). */
+  readonly providerWalls?: ProviderWallSink;
   readonly log?: Log;
   /** Test seam: tick interval override (default: min(silence/4, 5 s)). */
   readonly tickMs?: number;
@@ -265,6 +297,7 @@ export class Supervisor {
   private readonly ledger: LedgerApi;
   private readonly notifications: NotificationCenter;
   private readonly decisions: DecisionService | null;
+  private readonly providerWalls: ProviderWallSink | null;
   private readonly log: Log;
   private readonly now: () => number;
   private readonly wallNow: () => number;
@@ -283,6 +316,7 @@ export class Supervisor {
     this.ledger = opts.ledger;
     this.notifications = opts.notifications;
     this.decisions = opts.decisions ?? null;
+    this.providerWalls = opts.providerWalls ?? null;
     this.log = opts.log ?? (() => {});
     this.now = opts.now ?? Date.now;
     this.wallNow = opts.wallNow ?? Date.now;
@@ -659,12 +693,20 @@ export class Supervisor {
               agent_id: agent.agentId,
               error: event.error,
             });
-            void this.evaluateRecovery(agent, `fatal error: ${event.error}`, true, true);
+            void this.evaluateRecovery(agent, `fatal error: ${event.error}`, true, true, {
+              provider: event.provider ?? null,
+              model: event.model ?? null,
+              error: event.error,
+            });
           } else {
             // Preserve the adapter contract: in-band failures never restart.
             // They still enter provider-wall classification so known auth or
             // quota failures produce durable stop/re-arm guidance.
-            void this.evaluateRecovery(agent, `runtime error: ${event.error}`, false, true);
+            void this.evaluateRecovery(agent, `runtime error: ${event.error}`, false, true, {
+              provider: event.provider ?? null,
+              model: event.model ?? null,
+              error: event.error,
+            });
           }
           break;
         default:
@@ -1149,6 +1191,7 @@ export class Supervisor {
     reason: string,
     allowRestart = true,
     runtimeError = false,
+    source: ProviderErrorSource | null = null,
   ): Promise<void> {
     // Perkins review attempts are owned by the bounded review workflow. A
     // supervisor resume would drop that attempt's cwd/isolation contract and
@@ -1162,7 +1205,7 @@ export class Supervisor {
     const deterministicWall = deterministicClass === 'authentication_wall' || deterministicClass === 'quota_wall';
     if (this.decisions === null) {
       if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
-        this.stopForGuidance(agent, deterministicClass);
+        this.stopForGuidance(agent, deterministicClass, source);
       } else if (allowRestart) {
         await this.restartRung(agent, reason);
       }
@@ -1176,6 +1219,7 @@ export class Supervisor {
         reason,
         allowRestart,
         runtimeError,
+        source,
         handle: agent.handle,
         activityGeneration: agent.activityGeneration,
         openTurn: agent.openTurn,
@@ -1238,7 +1282,7 @@ export class Supervisor {
       if (classifiedWall) {
         // A wall already evident in the runtime error stops unconditionally:
         // model advice never burns rungs on it.
-        this.stopForGuidance(agent, failureClass);
+        this.stopForGuidance(agent, failureClass, source);
         return;
       }
       if (restartAuthorized) {
@@ -1259,6 +1303,7 @@ export class Supervisor {
       this.stopForGuidance(
         agent,
         restartAdvised ? 'restart_confirmation_required' : failureClass,
+        source,
       );
     } catch (error) {
       this.log('error', 'recovery classification failed; using deterministic restart guards', {
@@ -1273,7 +1318,7 @@ export class Supervisor {
         (runtimeError || agent.openTurn === expectedOpenTurn) &&
         !agent.breakerOpen
       ) {
-        if (deterministicWall) this.stopForGuidance(agent, deterministicClass);
+        if (deterministicWall) this.stopForGuidance(agent, deterministicClass, source);
         else if (allowRestart) await this.restartRung(agent, reason);
       }
     } finally {
@@ -1292,14 +1337,17 @@ export class Supervisor {
         agent.activityGeneration === queued.activityGeneration &&
         queuedTurnStillMatches
       ) {
-        void this.evaluateRecovery(agent, queued.reason, queued.allowRestart, queued.runtimeError);
+        void this.evaluateRecovery(agent, queued.reason, queued.allowRestart, queued.runtimeError, queued.source);
       }
     }
   }
 
   /** Known futile retry walls stop once and require the existing human ack
-   * re-arm path; they never burn the restart ring blindly. */
-  private stopForGuidance(agent: SupervisedAgent, failureClass: string): void {
+   * re-arm path; they never burn the restart ring blindly. Wall stops are
+   * ALSO reported to the provider-recovery sink (when wired): the sink
+   * alone decides whether the stop is an eligible temporary provider wait
+   * — the supervisor's stop semantics are identical either way. */
+  private stopForGuidance(agent: SupervisedAgent, failureClass: string, source: ProviderErrorSource | null = null): void {
     if (agent.breakerOpen) return;
     agent.breakerOpen = true;
     agent.state = 'stopped';
@@ -1330,6 +1378,34 @@ export class Supervisor {
       dedupe: 'unacked',
     });
     agent.breakerNotificationId = notification.id;
+    if (this.providerWalls !== null) {
+      try {
+        const ledgerAgent = this.ledger.getAgent(agent.agentId);
+        this.providerWalls.onProviderWall({
+          agentId: agent.agentId,
+          role: agent.role,
+          slotId: agent.slot?.id ?? null,
+          jobId: ledgerAgent?.jobId ?? null,
+          sessionFile: agent.sessionFile,
+          failureClass,
+          source,
+          incidentId: notification.id,
+          continuation: captured === null
+            ? null
+            : {
+                promptText: captured.pending?.text ?? null,
+                promptOwner: captured.pending?.owner ?? null,
+                hadOpenTurn: captured.hadOpenTurn,
+              },
+        });
+      } catch (error) {
+        // The sink is an observer: its faults never change the stop.
+        this.log('error', 'provider-wall sink failed', {
+          agent_id: agent.agentId,
+          error: String(error),
+        });
+      }
+    }
     if (handle !== null) {
       void this.registry.disposeHandle(handle).catch((error: unknown) => {
         this.log('warn', 'dispose after provider-wall escalation failed', {
@@ -1734,6 +1810,50 @@ export class Supervisor {
       void this.restartRung(agent, 'breaker re-armed');
       return;
     }
+  }
+
+  /**
+   * Guarded OWNED re-arm for a provider-recovered agent (the provider-recovery
+   * sensor's dedicated eligible-state transition — NOT notification-ACK
+   * automation): re-arms the open breaker of the exact agent a durable
+   * provider wait names, only while that wait is still open and the agent's
+   * breaker is genuinely the provider stop. Everything else keeps requiring
+   * the human ack path. Returns whether the re-arm happened.
+   */
+  ownedProviderReArm(agentId: string, waitId: string): boolean {
+    if (this.disposed || !this.cfg.enabled) return false;
+    const agent = this.agents.get(agentId);
+    if (agent === undefined || !agent.breakerOpen || agent.handle !== null) return false;
+    // The durable wait must still be open for THIS agent: the ledger, not
+    // memory, is the record (restart-safe).
+    let open = false;
+    try {
+      const wait = this.ledger.openProviderWaitForAgent(agentId);
+      open = wait !== null && wait.id === waitId;
+    } catch (error) {
+      this.log('error', 'owned re-arm could not verify the durable wait', {
+        agent_id: agentId,
+        error: String(error),
+      });
+      return false;
+    }
+    if (!open) return false;
+    agent.breakerOpen = false;
+    agent.breakerNotificationId = null;
+    agent.restartRing = [];
+    agent.consecutiveFailures = 0;
+    agent.state = 'watching';
+    this.log('info', 'breaker re-armed by owned provider recovery', {
+      agent_id: agentId,
+      wait_id: waitId,
+    });
+    this.ledger.appendCustomEvent({
+      kind: 'supervision.rearmed',
+      agentId,
+      payload: { by: 'provider-recovery', wait_id: waitId },
+    });
+    void this.restartRung(agent, 'provider recovery re-arm');
+    return true;
   }
 
   // ------------------------------------------------------------------

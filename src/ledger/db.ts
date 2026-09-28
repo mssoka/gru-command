@@ -310,4 +310,64 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_pending_rebriefs_job ON pending_rebriefs(job_id);
     `,
   },
+  {
+    // Provider-recovery sensor (owner-approved 2026-09-28): durable
+    // provider-wait state, per-route probe cadence/budget, and the
+    // restart-safe pending recovery delivery marker. Explicit waits only —
+    // never inferred from generic blocked status or backlog membership.
+    id: 9,
+    name: 'provider-recovery-waits',
+    sql: `
+      CREATE TABLE provider_waits (
+        id                      TEXT PRIMARY KEY,
+        route_key               TEXT NOT NULL,
+        provider                TEXT NOT NULL,
+        model                   TEXT NOT NULL,
+        credential_fingerprint  TEXT NOT NULL,
+        waiter_kind             TEXT NOT NULL CHECK (waiter_kind IN ('job-minion','silas-slot')),
+        job_id                  TEXT REFERENCES jobs(id),
+        agent_id                TEXT,
+        slot_id                 TEXT,
+        session_file            TEXT,
+        continuation            TEXT,
+        incident_id             TEXT NOT NULL,
+        incident_generation     INTEGER NOT NULL,
+        status                  TEXT NOT NULL CHECK (status IN ('waiting','recovered-pending','claimed','cancelled','superseded')),
+        reason_class            TEXT NOT NULL,
+        created_at              TEXT NOT NULL,
+        updated_at              TEXT NOT NULL
+      );
+      CREATE INDEX idx_provider_waits_route ON provider_waits(route_key, status);
+      CREATE INDEX idx_provider_waits_job ON provider_waits(job_id);
+      CREATE INDEX idx_provider_waits_agent ON provider_waits(agent_id);
+
+      CREATE TABLE provider_routes (
+        route_key                  TEXT PRIMARY KEY,
+        provider                   TEXT NOT NULL,
+        model                      TEXT NOT NULL,
+        credential_fingerprint     TEXT NOT NULL,
+        credential_generation      INTEGER NOT NULL,
+        window_start               TEXT NOT NULL,
+        attempts_in_window         INTEGER NOT NULL,
+        next_check_at              TEXT NOT NULL,
+        last_attempt_at            TEXT,
+        last_result                TEXT,
+        consecutive_probe_failures INTEGER NOT NULL,
+        false_recovery_count       INTEGER NOT NULL,
+        suspended_until            TEXT,
+        updated_at                 TEXT NOT NULL
+      );
+
+      CREATE TABLE pending_provider_recovery (
+        id                   TEXT PRIMARY KEY,
+        route_key            TEXT NOT NULL,
+        incident_generation  INTEGER NOT NULL,
+        evidence             TEXT NOT NULL,
+        created_at           TEXT NOT NULL,
+        updated_at           TEXT NOT NULL,
+        UNIQUE (route_key, incident_generation)
+      );
+      CREATE INDEX idx_pending_provider_recovery_route ON pending_provider_recovery(route_key);
+    `,
+  },
 ];

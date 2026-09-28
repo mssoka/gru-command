@@ -133,6 +133,24 @@ escalate_at = 4                   # …before escalation to the chief (always be
 [concurrency]
 max_workers = 4                 # service-wide resident workers, including idle sessions (<= 128)
 
+[provider_recovery]               # provider-recovery sensor — owner activation is manual
+# Watches EXPLICIT temporary provider waits on supported routes (v1: the
+# zai-coding-cn GLM coding route): shared bounded probes per exact
+# provider/model/credential binding (tiny no-history/no-tools generation,
+# at most 64 output tokens, no hidden retries), then one guarded Silas
+# continuation per recovered wait — no owner ACK for eligible waits.
+# Auth/billing/ambiguous failures and unsupported providers stay
+# owner-controlled; routine polling never rings the owner bell.
+enabled = false                   # true arms the sensor (owner decision)
+tick_interval_ms = 30000          # how often waiting routes are re-examined
+cadence_min_ms = 300000           # approved floor: shared checks at least 5 min apart
+max_attempts_per_hour = 12        # approved cap: at most 12 probes/hour/route
+probe_backoff_base_ms = 60000     # failed-probe backoff base (doubles per failure)
+probe_backoff_max_ms = 1800000    # failed-probe backoff cap (30 min)
+false_recovery_escalate_at = 3    # recovered-then-re-hit continuations before escalation
+suspension_ms = 21600000          # route probe suspension after escalation (6 h)
+retry_after_max_ms = 3600000      # cap honored for trustworthy Retry-After hints
+
 [review]
 max_concurrent_children = 2     # lens children within the pool (<= 32, review-gated)
 # Review gate policy (user amendment 2026-09-20). Optional; enabled by default.

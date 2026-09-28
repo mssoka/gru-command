@@ -184,7 +184,17 @@ export type RuntimeEvent =
       readonly reason: 'single-writer' | 'steer-unable';
       readonly owner: string;
     }
-  | { readonly type: 'error'; readonly error: string; readonly fatal: boolean };
+  | {
+      /** A runtime/turn failure. `fatal` marks process-level failures;
+      * in-band provider errors carry the provider/model identity so
+      * provider-aware consumers (the recovery sensor) can bind a route
+      * without guessing from prose. */
+      readonly type: 'error';
+      readonly error: string;
+      readonly fatal: boolean;
+      readonly provider?: string;
+      readonly model?: string;
+    };
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;
 

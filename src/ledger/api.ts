@@ -203,6 +203,91 @@ export function isPendingRebriefKind(value: string): value is PendingRebriefKind
   return (PENDING_REBRIEF_KINDS as readonly string[]).includes(value);
 }
 
+// ------------------------------------------------------------------
+// Provider-recovery waits (owner-approved 2026-09-28): EXPLICIT durable
+// provider-wait state. A row exists only after a supported provider-aware
+// classifier established a temporary recoverable limit from real runtime
+// rejection evidence — never from generic blocked status, prose, or
+// backlog membership. Route rows carry the shared probe cadence/budget;
+// the pending-recovery marker is the restart-safe delivery handoff.
+// ------------------------------------------------------------------
+
+export const PROVIDER_WAIT_STATUSES = ['waiting', 'recovered-pending', 'claimed', 'cancelled', 'superseded'] as const;
+export type ProviderWaitStatus = (typeof PROVIDER_WAIT_STATUSES)[number];
+
+export const PROVIDER_WAITER_KINDS = ['job-minion', 'silas-slot'] as const;
+export type ProviderWaiterKind = (typeof PROVIDER_WAITER_KINDS)[number];
+
+export function isProviderWaitStatus(value: string): value is ProviderWaitStatus {
+  return (PROVIDER_WAIT_STATUSES as readonly string[]).includes(value);
+}
+
+export function isProviderWaiterKind(value: string): value is ProviderWaiterKind {
+  return (PROVIDER_WAITER_KINDS as readonly string[]).includes(value);
+}
+
+/** The saved continuation reference: what to re-deliver when the provider
+ * returns (the interrupted turn's prompt/owner snapshot; no secrets). */
+export interface ProviderWaitContinuation {
+  readonly promptText: string | null;
+  readonly promptOwner: string | null;
+  readonly hadOpenTurn: boolean;
+}
+
+export interface ProviderWaitRecord {
+  readonly id: string;
+  /** Canonical provider/model + credential binding key (sensor-defined). */
+  readonly routeKey: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly credentialFingerprint: string;
+  readonly waiterKind: ProviderWaiterKind;
+  readonly jobId: string | null;
+  readonly agentId: string | null;
+  readonly slotId: string | null;
+  readonly sessionFile: string | null;
+  readonly continuation: ProviderWaitContinuation | null;
+  readonly incidentId: string;
+  readonly incidentGeneration: number;
+  readonly status: ProviderWaitStatus;
+  readonly reasonClass: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/** Shared per-route probe state: cadence, rolling budget, backoff,
+ * credential generation, false-recovery accounting. Durable so a restart
+ * never re-baselines away an outstanding wait or its budget. */
+export interface ProviderRouteRecord {
+  readonly routeKey: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly credentialFingerprint: string;
+  readonly credentialGeneration: number;
+  readonly windowStart: string;
+  readonly attemptsInWindow: number;
+  readonly nextCheckAt: string;
+  readonly lastAttemptAt: string | null;
+  readonly lastResult: string | null;
+  readonly consecutiveProbeFailures: number;
+  readonly falseRecoveryCount: number;
+  readonly suspendedUntil: string | null;
+  readonly updatedAt: string;
+}
+
+/** The restart-safe recovery delivery marker: written when valid producer
+ * evidence clears a route, consumed when every eligible waiter has been
+ * claimed or retired. UNIQUE per route+incident generation — duplicate
+ * recovery observations can never double-deliver. */
+export interface PendingProviderRecoveryRecord {
+  readonly id: string;
+  readonly routeKey: string;
+  readonly incidentGeneration: number;
+  /** Non-secret JSON digest of the producer evidence that cleared the route. */
+  readonly evidence: string;
+  readonly createdAt: string;
+}
+
 export interface PendingRebriefRecord {
   readonly id: string;
   readonly jobId: string;
@@ -1134,6 +1219,276 @@ export class LedgerApi {
   }
 
   // ------------------------------------------------------------------
+  // Provider-recovery waits (see the type block above)
+  // ------------------------------------------------------------------
+
+  /** Persist one EXPLICIT provider wait. The caller (the sensor's
+   * recorder) has already established eligibility from structured
+   * evidence; the ledger just records. Idempotent per incident: the same
+   * incident id updates its row instead of stacking a duplicate. */
+  recordProviderWait(input: {
+    id: string;
+    routeKey: string;
+    provider: string;
+    model: string;
+    credentialFingerprint: string;
+    waiterKind: ProviderWaiterKind;
+    jobId: string | null;
+    agentId: string | null;
+    slotId: string | null;
+    sessionFile: string | null;
+    continuation: ProviderWaitContinuation | null;
+    incidentId: string;
+    incidentGeneration: number;
+    reasonClass: string;
+  }): ProviderWaitRecord {
+    if (input.id === '' || input.routeKey === '' || input.incidentId === '') {
+      throw new Error('provider wait id, route key, and incident id must be non-empty');
+    }
+    return this.transaction(() => {
+      const ts = nowIso();
+      const existing = this.db.prepare('SELECT id FROM provider_waits WHERE incident_id = ?').get(input.incidentId) as Row | undefined;
+      if (existing !== undefined) {
+        this.db
+          .prepare(
+            `UPDATE provider_waits SET status = 'waiting', session_file = ?, continuation = ?, updated_at = ? WHERE id = ?`,
+          )
+          .run(input.sessionFile, JSON.stringify(input.continuation ?? {}), ts, str(existing.id));
+        return this.getProviderWait(str(existing.id)) as ProviderWaitRecord;
+      }
+      this.db
+        .prepare(
+          `INSERT INTO provider_waits
+             (id, route_key, provider, model, credential_fingerprint, waiter_kind, job_id, agent_id, slot_id,
+              session_file, continuation, incident_id, incident_generation, status, reason_class, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.routeKey,
+          input.provider,
+          input.model,
+          input.credentialFingerprint,
+          input.waiterKind,
+          input.jobId,
+          input.agentId,
+          input.slotId,
+          input.sessionFile,
+          JSON.stringify(input.continuation ?? {}),
+          input.incidentId,
+          input.incidentGeneration,
+          input.reasonClass,
+          ts,
+          ts,
+        );
+      this.appendEvent({
+        kind: 'provider.wait-established',
+        jobId: input.jobId,
+        agentId: input.agentId,
+        payload: {
+          id: input.id,
+          route: input.routeKey,
+          waiter: input.waiterKind,
+          reason: input.reasonClass,
+          credential_generation: input.incidentGeneration,
+        },
+      });
+      return this.getProviderWait(input.id) as ProviderWaitRecord;
+    });
+  }
+
+  getProviderWait(id: string): ProviderWaitRecord | null {
+    const row = this.db.prepare('SELECT * FROM provider_waits WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : this.providerWaitFromRow(row);
+  }
+
+  /** The open (waiting/recovered-pending) provider wait for one agent, or
+   * null — the supervisor's guarded owned re-arm verifies with this. */
+  openProviderWaitForAgent(agentId: string): ProviderWaitRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM provider_waits WHERE agent_id = ? AND status IN ('waiting','recovered-pending')
+         ORDER BY created_at DESC, id LIMIT 1`,
+      )
+      .get(agentId) as Row | undefined;
+    return row === undefined ? null : this.providerWaitFromRow(row);
+  }
+
+  listProviderWaits(opts: { status?: ProviderWaitStatus; routeKey?: string } = {}): readonly ProviderWaitRecord[] {
+    const clauses: string[] = [];
+    const params: string[] = [];
+    if (opts.status !== undefined) {
+      clauses.push('status = ?');
+      params.push(opts.status);
+    }
+    if (opts.routeKey !== undefined) {
+      clauses.push('route_key = ?');
+      params.push(opts.routeKey);
+    }
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db
+      .prepare(`SELECT * FROM provider_waits${where} ORDER BY created_at, id`)
+      .all(...params) as Row[];
+    return rows.map((row) => this.providerWaitFromRow(row));
+  }
+
+  /** Update a wait's status (guarded state machine: a terminal row never
+   * returns to waiting; only the sensor's re-queue path may move
+   * recovered-pending → waiting, and only while its claim never admitted). */
+  setProviderWaitStatus(
+    id: string,
+    status: ProviderWaitStatus,
+    payload?: Record<string, unknown>,
+  ): ProviderWaitRecord {
+    if (!isProviderWaitStatus(status)) throw new Error(`unknown provider wait status "${status}"`);
+    return this.transaction(() => {
+      const current = this.getProviderWait(id);
+      if (current === null) throw new RecordNotFound(`provider wait "${id}" not found`);
+      if (current.status === status) return current;
+      const terminal = current.status === 'cancelled' || current.status === 'superseded' || current.status === 'claimed';
+      if (terminal) {
+        throw new Error(
+          `provider wait "${id}" is ${current.status} (terminal) — cannot become ${status}`,
+        );
+      }
+      if (status === 'waiting' && current.status !== 'recovered-pending') {
+        throw new Error(
+          `provider wait "${id}" can re-enter waiting only from recovered-pending (is ${current.status})`,
+        );
+      }
+      this.db
+        .prepare('UPDATE provider_waits SET status = ?, updated_at = ? WHERE id = ?')
+        .run(status, nowIso(), id);
+      this.appendEvent({
+        kind: 'provider.wait-status',
+        jobId: current.jobId,
+        agentId: current.agentId,
+        payload: { id, from: current.status, to: status, ...(payload ?? {}) },
+      });
+      return this.getProviderWait(id) as ProviderWaitRecord;
+    });
+  }
+
+  /** Upsert the shared per-route probe state. The sensor owns every field
+   * transition; the ledger records it atomically with its event. */
+  upsertProviderRoute(
+    input: ProviderRouteRecord,
+    event?: { kind: string; payload?: Record<string, unknown> },
+  ): ProviderRouteRecord {
+    return this.transaction(() => {
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `INSERT INTO provider_routes
+             (route_key, provider, model, credential_fingerprint, credential_generation, window_start,
+              attempts_in_window, next_check_at, last_attempt_at, last_result, consecutive_probe_failures,
+              false_recovery_count, suspended_until, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(route_key) DO UPDATE SET
+             provider = excluded.provider,
+             model = excluded.model,
+             credential_fingerprint = excluded.credential_fingerprint,
+             credential_generation = excluded.credential_generation,
+             window_start = excluded.window_start,
+             attempts_in_window = excluded.attempts_in_window,
+             next_check_at = excluded.next_check_at,
+             last_attempt_at = excluded.last_attempt_at,
+             last_result = excluded.last_result,
+             consecutive_probe_failures = excluded.consecutive_probe_failures,
+             false_recovery_count = excluded.false_recovery_count,
+             suspended_until = excluded.suspended_until,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          input.routeKey,
+          input.provider,
+          input.model,
+          input.credentialFingerprint,
+          input.credentialGeneration,
+          input.windowStart,
+          input.attemptsInWindow,
+          input.nextCheckAt,
+          input.lastAttemptAt,
+          input.lastResult,
+          input.consecutiveProbeFailures,
+          input.falseRecoveryCount,
+          input.suspendedUntil,
+          ts,
+        );
+      if (event !== undefined) {
+        this.appendEvent({ kind: event.kind, payload: event.payload ?? {} });
+      }
+      return this.getProviderRoute(input.routeKey) as ProviderRouteRecord;
+    });
+  }
+
+  getProviderRoute(routeKey: string): ProviderRouteRecord | null {
+    const row = this.db.prepare('SELECT * FROM provider_routes WHERE route_key = ?').get(routeKey) as Row | undefined;
+    return row === undefined ? null : this.providerRouteFromRow(row);
+  }
+
+  listProviderRoutes(): readonly ProviderRouteRecord[] {
+    const rows = this.db.prepare('SELECT * FROM provider_routes ORDER BY route_key').all() as Row[];
+    return rows.map((row) => this.providerRouteFromRow(row));
+  }
+
+  /** Insert the deduplicated recovery marker + `provider.restored` event in
+   * one transaction. Returns null when this incident generation already
+   * recovered (duplicate observation is a no-op, never a double delivery). */
+  recordProviderRecovery(input: {
+    id: string;
+    routeKey: string;
+    incidentGeneration: number;
+    evidence: Record<string, unknown>;
+    waiterJobIds: readonly string[];
+  }): PendingProviderRecoveryRecord | null {
+    return this.transaction(() => {
+      const existing = this.db
+        .prepare('SELECT id FROM pending_provider_recovery WHERE route_key = ? AND incident_generation = ?')
+        .get(input.routeKey, input.incidentGeneration) as Row | undefined;
+      if (existing !== undefined) return null;
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `INSERT INTO pending_provider_recovery (id, route_key, incident_generation, evidence, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(input.id, input.routeKey, input.incidentGeneration, JSON.stringify(input.evidence), ts, ts);
+      this.appendEvent({
+        kind: 'provider.restored',
+        payload: {
+          route: input.routeKey,
+          credential_generation: input.incidentGeneration,
+          evidence: input.evidence,
+          waiter_jobs: [...input.waiterJobIds],
+        },
+      });
+      return this.getPendingProviderRecovery(input.routeKey, input.incidentGeneration);
+    });
+  }
+
+  getPendingProviderRecovery(routeKey: string, incidentGeneration: number): PendingProviderRecoveryRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM pending_provider_recovery WHERE route_key = ? AND incident_generation = ?')
+      .get(routeKey, incidentGeneration) as Row | undefined;
+    return row === undefined ? null : this.pendingProviderRecoveryFromRow(row);
+  }
+
+  listPendingProviderRecoveries(): readonly PendingProviderRecoveryRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM pending_provider_recovery ORDER BY created_at, route_key')
+      .all() as Row[];
+    return rows.map((row) => this.pendingProviderRecoveryFromRow(row));
+  }
+
+  /** Clear the delivery marker once every eligible waiter settled. */
+  clearPendingProviderRecovery(id: string): void {
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM pending_provider_recovery WHERE id = ?').run(id);
+    });
+  }
+
+  // ------------------------------------------------------------------
   // Notifications (EPICS E7 story 2) — the durable notification log.
   // Every mutation is atomic with its event row and bus-published so all
   // surfaces (board push, chat notices, toasts) converge on one record.
@@ -1442,6 +1797,79 @@ export class LedgerApi {
       sessionFile: nstr(row.session_file),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
+    };
+  }
+
+  private providerWaitFromRow(row: Row): ProviderWaitRecord {
+    const status = str(row.status);
+    if (!isProviderWaitStatus(status)) {
+      throw new Error(`provider_waits row has unknown status "${status}"`);
+    }
+    const waiterKind = str(row.waiter_kind);
+    if (!isProviderWaiterKind(waiterKind)) {
+      throw new Error(`provider_waits row has unknown waiter kind "${waiterKind}"`);
+    }
+    let continuation: ProviderWaitContinuation | null = null;
+    const raw = nstr(row.continuation);
+    if (raw !== null && raw !== '') {
+      try {
+        const parsed = JSON.parse(raw) as Partial<ProviderWaitContinuation>;
+        continuation = {
+          promptText: typeof parsed.promptText === 'string' ? parsed.promptText : null,
+          promptOwner: typeof parsed.promptOwner === 'string' ? parsed.promptOwner : null,
+          hadOpenTurn: parsed.hadOpenTurn === true,
+        };
+      } catch (error) {
+        throw new Error(`provider_waits row ${str(row.id)} continuation is not valid JSON: ${String(error)}`);
+      }
+    }
+    return {
+      id: str(row.id),
+      routeKey: str(row.route_key),
+      provider: str(row.provider),
+      model: str(row.model),
+      credentialFingerprint: str(row.credential_fingerprint),
+      waiterKind,
+      jobId: nstr(row.job_id),
+      agentId: nstr(row.agent_id),
+      slotId: nstr(row.slot_id),
+      sessionFile: nstr(row.session_file),
+      continuation,
+      incidentId: str(row.incident_id),
+      incidentGeneration: Number(row.incident_generation),
+      status,
+      reasonClass: str(row.reason_class),
+      createdAt: str(row.created_at),
+      updatedAt: str(row.updated_at),
+    };
+  }
+
+  private providerRouteFromRow(row: Row): ProviderRouteRecord {
+    return {
+      routeKey: str(row.route_key),
+      provider: str(row.provider),
+      model: str(row.model),
+      credentialFingerprint: str(row.credential_fingerprint),
+      credentialGeneration: Number(row.credential_generation),
+      lastResult: nstr(row.last_result),
+      suspendedUntil: nstr(row.suspended_until),
+      windowStart: str(row.window_start),
+      attemptsInWindow: Number(row.attempts_in_window),
+      nextCheckAt: str(row.next_check_at),
+      lastAttemptAt: nstr(row.last_attempt_at),
+      consecutiveProbeFailures: Number(row.consecutive_probe_failures),
+      falseRecoveryCount: Number(row.false_recovery_count),
+      updatedAt: str(row.updated_at),
+    };
+  }
+
+  private pendingProviderRecoveryFromRow(row: Row): PendingProviderRecoveryRecord {
+    return {
+      id: str(row.id),
+      routeKey: str(row.route_key),
+      incidentGeneration: Number(row.incident_generation),
+      evidence: str(row.evidence),
+      createdAt: str(row.created_at),
     };
   }
 

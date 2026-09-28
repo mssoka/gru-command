@@ -22,6 +22,9 @@ import { createWorktreeServer } from './worktrees/server.js';
 import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver } from './dispatch/silas-driver.js';
+import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
+import { ModelRuntimeProbe } from './provider-recovery/probe.js';
+import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
@@ -299,6 +302,7 @@ async function main(): Promise<number> {
     bob?: BobScheduler;
     dream?: DreamScheduler;
     silas?: SilasDriver;
+    providerRecovery?: ProviderRecoverySensor;
     wave?: WaveRunner;
     verify?: ReturnType<typeof createVerificationServer>;
     deployDrift?: DeployDriftTracker;
@@ -383,6 +387,13 @@ async function main(): Promise<number> {
             state.silas.stop();
           } catch (error) {
             logger.error('silas driver stop failed', { error: String(error) });
+          }
+        }
+        if (state.providerRecovery !== undefined) {
+          try {
+            state.providerRecovery.stop();
+          } catch (error) {
+            logger.error('provider-recovery sensor stop failed', { error: String(error) });
           }
         }
         if (state.wave !== undefined) {
@@ -589,12 +600,70 @@ async function main(): Promise<number> {
     decisionRuntime,
     () => decisionRuntime.status().status === 'ready',
   );
+  // Provider-recovery sensor (owner-approved 2026-09-28): constructed
+  // BEFORE the supervisor so its recorder can observe wall stops, with
+  // late-bound wake (SilasDriver lands below) and guarded re-arm ports.
+  // Disabled by config = fully inert (no waits, no probes, no wakes).
+  const silasWakePort: {
+    trigger: (input: { kind: 'provider.restored'; routeKey: string }) => Promise<void>;
+  } = {
+    trigger: async (input) => {
+      const driver = state.silas;
+      if (driver === undefined) {
+        logger.log('warn', 'provider-restored wake dropped — silas driver not yet started (the sweep retries)', {
+          route: input.routeKey,
+        });
+        return;
+      }
+      await driver.trigger({ kind: 'provider.restored' });
+    },
+  };
+  const slotReArmPort = {
+    ownedProviderReArm: (agentId: string, waitId: string): boolean =>
+      supervisorLive.ownedProviderReArm(agentId, waitId),
+  };
+  const providerRecoverySensor = new ProviderRecoverySensor({
+    config: config.providerRecovery,
+    ledger,
+    probe: new ModelRuntimeProbe({ runtime: () => registry.piModelRuntime() }),
+    notifications,
+    wake: silasWakePort,
+    slotReArm: slotReArmPort,
+    silasHosted: () => config.silas.enabled,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  state.providerRecovery = providerRecoverySensor;
   const supervisorLive = new Supervisor({
     config: config.supervision,
     registry,
     ledger,
     notifications,
     decisions: decisionRuntime,
+    providerWalls: {
+      // The sensor's recorder: observed wall stops in, explicit eligible
+      // waits out — every other class stays owner-controlled. Fire-and-
+      // forget: the sink must never slow the stop path.
+      onProviderWall: (observation) => {
+        void establishProviderWait(providerRecoverySensor, {
+          agentId: observation.agentId,
+          role: observation.role,
+          slotId: observation.slotId,
+          jobId: observation.jobId,
+          sessionFile: observation.sessionFile,
+          failureClass: observation.failureClass,
+          provider: observation.source?.provider ?? null,
+          model: observation.source?.model ?? null,
+          errorMessage: observation.source?.error ?? '',
+          incidentId: observation.incidentId,
+          continuation: observation.continuation,
+        }).catch((error: unknown) => {
+          logger.log('error', 'provider wait establishment failed', {
+            agent_id: observation.agentId,
+            error: String(error),
+          });
+        });
+      },
+    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   supervisor = supervisorLive;
@@ -851,7 +920,28 @@ async function main(): Promise<number> {
     wave,
     ledger,
     ...(config.silas.enabled && silasSlot !== null
-      ? { silasOps: { registry, worktrees: worktreeManager, notifications } }
+      ? {
+          silasOps: {
+            registry,
+            worktrees: worktreeManager,
+            notifications,
+            slotReArm: slotReArmPort,
+            providerRecovery: {
+              claim: (waitId: string, by: string) =>
+                claimProviderRecoveryContinuation(
+                  {
+                    registry,
+                    ledger,
+                    worktrees: worktreeManager,
+                    slotReArm: slotReArmPort,
+                    log: (level, msg, fields) => logger.log(level, msg, fields),
+                  },
+                  waitId,
+                  by,
+                ),
+            },
+          },
+        }
       : {}),
     ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
@@ -1032,6 +1122,19 @@ async function main(): Promise<number> {
     });
     state.silas = silas;
     silas.start();
+  }
+  // The provider-recovery sensor runs in the service, independent of
+  // Silas's model availability: its timer starts after listen (same
+  // pattern as the drivers) and its boot reconciliation re-wakes any
+  // recovery whose delivery was lost across a restart — never silently
+  // re-baselined away.
+  if (config.providerRecovery.enabled) {
+    providerRecoverySensor.start();
+    void providerRecoverySensor.reconcileAtBoot().catch((error: unknown) => {
+      logger.error('provider-recovery boot reconciliation failed', { error: String(error) });
+    });
+  } else {
+    logger.info('provider-recovery sensor disabled — owner activation stays manual', {});
   }
 
   logger.info('listening', { host: handle.host, port: handle.port });
