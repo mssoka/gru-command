@@ -7,6 +7,8 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { Supervisor, type SupervisorRegistry } from '../src/supervision/supervisor.js';
+import { buildHealthPayload } from '../src/server.js';
+import type { GruCommandConfig } from '../src/config.js';
 import type { Role } from '../src/config.js';
 import type {
   AgentCapabilities,
@@ -241,6 +243,51 @@ class SeamHarness {
     return new Promise((resolve) => setTimeout(resolve, 30));
   }
 }
+
+describe('attention surface wiring (acceptance 9)', () => {
+  it('the token-gated /health payload carries the concise waiting view', () => {
+    const config = {
+      workspaceRoot: '/w',
+      dataDir: '/d',
+    } as unknown as GruCommandConfig;
+    const identity = { installId: 'i', createdAt: '2026-01-01T00:00:00Z' } as never;
+    const payload = buildHealthPayload(
+      config,
+      identity,
+      process.hrtime.bigint(),
+      'req-1',
+      null,
+      null,
+      null,
+      null,
+      [
+        {
+          route: 'zai-coding-cn/glm-5.3@fp',
+          provider: 'zai-coding-cn',
+          model: 'glm-5.3',
+          waiters: 2,
+          nextCheckAt: '2026-09-28T10:05:00Z',
+          lastResult: 'still-limited',
+          lastAttemptAt: '2026-09-28T10:00:00Z',
+        },
+      ],
+    );
+    expect(payload.providerRecovery).toEqual([
+      {
+        route: 'zai-coding-cn/glm-5.3@fp',
+        provider: 'zai-coding-cn',
+        model: 'glm-5.3',
+        waiters: 2,
+        nextCheckAt: '2026-09-28T10:05:00Z',
+        lastResult: 'still-limited',
+        lastAttemptAt: '2026-09-28T10:00:00Z',
+      },
+    ]);
+    // Default (sensor not wired) keeps the pre-feature shape: null.
+    const bare = buildHealthPayload(config, identity, process.hrtime.bigint(), 'req-2');
+    expect(bare.providerRecovery).toBeNull();
+  });
+});
 
 describe('supervisor ⇄ sensor seam', () => {
   it('a structured GLM quota wall stop becomes an explicit provider wait', async () => {

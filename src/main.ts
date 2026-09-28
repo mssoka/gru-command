@@ -1024,6 +1024,7 @@ async function main(): Promise<number> {
       staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)),
       supervisionStatus: () => supervisorLive.status(),
       decisionsStatus: () => decisionRuntime.status(),
+      providerRecoveryView: () => providerRecoverySensor.waitingView(),
       buildInfo: () => buildInfo,
       requestHook: (req, res, path) =>
         lessonsServer.requestHook(req, res, path) ||
