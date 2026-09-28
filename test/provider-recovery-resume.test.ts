@@ -13,7 +13,13 @@ import {
   claimProviderRecoveryContinuation,
   type RecoveryClaimDeps,
 } from '../src/provider-recovery/resume.js';
-import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+import type {
+  AgentCapabilities,
+  AgentHandle,
+  AgentHealth,
+  RuntimeEventListener,
+  SpawnOptions,
+} from '../src/runtime/types.js';
 import type { Role } from '../src/config.js';
 
 /**
@@ -56,7 +62,7 @@ class FakeHandle implements AgentHandle {
   readonly capabilities = FAKE_CAPABILITIES;
   promptCount = 0;
   disposed = false;
-  private readonly listeners = new Set<(event: { type: string }) => void>();
+  private readonly listeners = new Set<RuntimeEventListener>();
 
   constructor(role: Role, id: string, sessionFile: string | null) {
     this.role = role;
@@ -70,18 +76,18 @@ class FakeHandle implements AgentHandle {
   async prompt(): Promise<void> {
     this.promptCount += 1;
     // Realistic admission: the turn STARTS when the prompt is delivered.
-    for (const listener of this.listeners) listener({ type: 'turn_start' });
+    this.turnStart();
   }
   async steer(): Promise<void> {}
   async followUp(): Promise<void> {}
-  subscribe(listener: (event: { type: string }) => void): () => void {
+  subscribe(listener: RuntimeEventListener): () => void {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
     };
   }
-  health(): { state: 'idle' } {
-    return { state: 'idle' };
+  health(): AgentHealth {
+    return { state: 'idle', lastActivity: new Date().toISOString(), sessionFile: this.sessionFile };
   }
   async dispose(): Promise<void> {
     this.disposed = true;

@@ -19,11 +19,7 @@ import type {
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
-import {
-  establishProviderWait,
-  ProviderRecoverySensor,
-  type ProviderWallObservation,
-} from '../src/provider-recovery/sensor.js';
+import { establishProviderWait, ProviderRecoverySensor } from '../src/provider-recovery/sensor.js';
 import type { ProviderProbePort, ProbeOutcome, ProbeRoute } from '../src/provider-recovery/probe.js';
 import { DEFAULT_PROVIDER_RECOVERY_CONFIG } from '../src/config.js';
 
@@ -148,7 +144,9 @@ class SeamHarness {
   readonly notifications: NotificationCenter;
   readonly registry = new FakeRegistry();
   readonly probe = new SensorProbe();
-  readonly observations: ProviderWallObservation[] = [];
+  readonly observations: Parameters<
+    NonNullable<import('../src/supervision/supervisor.js').ProviderWallSink>['onProviderWall']
+  >[0][] = [];
   readonly wakes: { kind: string; routeKey: string }[] = [];
   supervisor: Supervisor;
   sensor: ProviderRecoverySensor;
@@ -170,7 +168,6 @@ class SeamHarness {
           this.wakes.push({ ...input });
         },
       },
-      slotReArm: null,
       silasHosted: () => true,
     });
     const sensor = this.sensor;

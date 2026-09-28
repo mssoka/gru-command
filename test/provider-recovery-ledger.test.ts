@@ -152,9 +152,11 @@ describe('provider routes (durable cadence/budget)', () => {
       suspendedUntil: null,
       updatedAt: now,
     });
+    const current = ledger.getProviderRoute('r');
+    if (current === null) throw new Error('route r missing before update');
     ledger.upsertProviderRoute(
       {
-        ...(ledger.getProviderRoute('r') as never),
+        ...current,
         attemptsInWindow: 1,
         lastResult: 'still-limited',
       },
