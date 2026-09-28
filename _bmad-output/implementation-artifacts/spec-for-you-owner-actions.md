@@ -128,7 +128,7 @@ here as the standing Checkpoint-1 approval.
 - [x] `web/src/ui/board.ts` + `web/src/ui/board.test.ts` — FOR YOU band: ack rows with consequence copy (quota-ack scope note), PR rows with OPEN PR, count, calm empty state, expander, focus preservation, no toast/chime, bell/NEEDS GRU unchanged.
 - [x] `web/mock/server.ts` — fixture rows incl. a ready PR and negative samples for visual proof.
 - [x] `docs/BOARD.md`, `docs/UI.md` — honest action semantics + readiness rule + limitations (GitHub-native review states beyond `mergeable_state` are not separately projected; Perkins READY is represented by the head-bound approved round).
-- [ ] Delivery artifacts under the approved briefings delivery folder.
+- [x] Delivery artifacts under the approved briefings delivery folder (`delivery/delivery-record.md`, `delivery/verification-snapshot.md`).
 
 **Acceptance Criteria:**
 - Given a snapshot with mixed routing and ack states, when the board renders, then FOR YOU contains exactly the unacked unresolved needs-owner rows plus ready PRs, in stable order, with count; NEEDS GRU and FEED bands unchanged.
