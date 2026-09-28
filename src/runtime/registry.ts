@@ -67,6 +67,12 @@ export interface AgentEventEnvelope {
 
 export type AgentEventListener = (envelope: AgentEventEnvelope) => void;
 
+/** Core roles that never consume resident-worker capacity: the resident
+ * budget bounds worker sessions only (docs/FLOW.md §4d). One declared set,
+ * beside the budget it feeds — a role added here is exempt by name, never
+ * by an inline list scattered at the enforcement site. */
+const RESIDENT_EXEMPT_ROLES: ReadonlySet<Role> = new Set(['gru', 'silas', 'bob']);
+
 /** A round owns two permits atomically (lead + first child). Optional child
  * permits are taken only when spare capacity exists and no older request is
  * waiting; a tool batch releases them after its last child settles. */
@@ -193,7 +199,7 @@ export class RuntimeRegistry {
   }
 
   async spawn(role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
-    const release = role === 'gru' || role === 'silas' || role === 'bob'
+    const release = RESIDENT_EXEMPT_ROLES.has(role)
       ? null : await this.residents.acquire(1, options.signal);
     try {
       return await this.spawnReserved(role, options, release);
@@ -269,9 +275,15 @@ export class RuntimeRegistry {
         closed = true;
         closePromise = (async () => {
           await Promise.allSettled([...pending]);
-          await Promise.all([...live].map((handle) => handle.dispose()));
+          // Permits release before any disposal error propagates: a failed
+          // dispose must not leak the round's slots for the service lifetime.
+          const disposes = await Promise.allSettled([...live].map((handle) => handle.dispose()));
           for (const extra of extras.splice(0)) extra();
           releasePair();
+          const failed = disposes.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+          if (failed.length > 0) {
+            throw new AggregateError(failed.map((result) => result.reason), 'review reservation disposal failed');
+          }
         })();
         return closePromise;
       },

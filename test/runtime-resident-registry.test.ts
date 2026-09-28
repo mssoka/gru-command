@@ -231,4 +231,61 @@ describe('registry resident boundary across adapters', () => {
       await admitted.dispose(); await resumed.dispose();
     } finally { h.cleanup(); }
   });
+
+  it('never charges Gru, Silas or Bob to the resident pool, even at full saturation', async () => {
+    const h = harness(2);
+    try {
+      const busyA = await h.registry.spawn('minion');
+      const busyB = await h.registry.spawn('minion');
+      await busyA.prompt('turn'); await busyB.prompt('turn');
+      h.controllers.get(busyA.id)!.active = true;
+      h.controllers.get(busyB.id)!.active = true;
+      expect(h.registry.residents.occupied).toBe(2);
+      expect(h.registry.residents.queued).toBe(0);
+      // Core sessions resolve immediately at saturation: no permit charge,
+      // no queue wait, and no idle worker is reclaimed to make room.
+      const gru = await h.registry.spawn('gru');
+      const silas = await h.registry.spawn('silas');
+      const bob = await h.registry.spawn('bob');
+      expect(h.registry.residents.occupied).toBe(2);
+      expect(h.registry.residents.queued).toBe(0);
+      expect(h.registry.getHandle(busyA.id)).toBe(busyA);
+      expect(h.registry.getHandle(busyB.id)).toBe(busyB);
+      // A queued minion still waits behind the saturated pool — the
+      // exemption covers core roles only.
+      const queued = h.registry.spawn('minion');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(h.registry.residents.queued).toBe(1);
+      h.controllers.get(busyA.id)!.active = false;
+      h.registry.residents.changed();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const admitted = await queued;
+      expect(h.registry.getHandle(busyA.id)).toBeNull();
+      await Promise.all([gru.dispose(), silas.dispose(), bob.dispose(), admitted.dispose(), busyB.dispose()]);
+    } finally { h.cleanup(); }
+  });
+
+  it('releases the paired permits even when a round handle disposal fails at close', async () => {
+    const h = harness(2);
+    try {
+      const round = await h.registry.reserveReviewRound();
+      const lead = await round.spawn({ reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } });
+      await round.spawn({ isolatedReview: { systemPrompt: 'lens', tools: [] } });
+      expect(h.registry.residents.occupied).toBe(2);
+      // The lead's adapter refuses disposal; the round's paired permits must
+      // still release — the failed handle keeps only what it truly holds.
+      Object.defineProperty(lead, 'dispose', {
+        value: () => Promise.reject(new Error('lead disposal failed')),
+        configurable: true,
+      });
+      await expect(round.close()).rejects.toThrow(/review reservation disposal failed/);
+      // The pair is free again: a queued single worker is admitted at once.
+      const admitted = h.registry.spawn('minion');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(h.registry.residents.queued).toBe(0);
+      const handle = await Promise.race([admitted, new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('pair permit was not released')), 2_000))]);
+      await handle.dispose();
+    } finally { h.cleanup(); }
+  });
 });

@@ -21,7 +21,8 @@ afterEach(() => {
 
 const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
 
-describe('four-busy-minion saturation and complete whole-PR Perkins coverage', () => {  it('keeps busy work and durable lanes intact, admits the lead+child ahead of new arrivals, and runs every lens within four slots', async () => {
+describe('four-busy-minion saturation and complete whole-PR Perkins coverage', () => {
+  it('keeps busy work and durable lanes intact, admits the lead+child ahead of new arrivals, and runs every lens within four slots', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'resident-saturation-'));
     dirs.push(dir);
     const sessions = join(dir, 'sessions');
