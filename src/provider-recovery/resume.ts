@@ -132,7 +132,7 @@ async function claimJobMinion(
         agent.jobId === wait.jobId &&
         agent.role === 'minion' &&
         agent.id !== wait.agentId &&
-        agent.createdAt > wait.createdAt &&
+        agent.createdAt >= wait.createdAt &&
         deps.registry.getHandle(agent.id) !== null,
     );
   if (replacement !== undefined) {

@@ -346,7 +346,7 @@ export const MIGRATIONS: readonly Migration[] = [
         provider                   TEXT NOT NULL,
         model                      TEXT NOT NULL,
         credential_fingerprint     TEXT NOT NULL,
-        credential_generation      INTEGER NOT NULL,
+        incident_seq               INTEGER NOT NULL,
         window_start               TEXT NOT NULL,
         attempts_in_window         INTEGER NOT NULL,
         next_check_at              TEXT NOT NULL,

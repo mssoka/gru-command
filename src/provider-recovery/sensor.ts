@@ -294,7 +294,7 @@ export class ProviderRecoverySensor {
         provider: first.provider,
         model: first.model,
         credentialFingerprint: first.credentialFingerprint,
-        credentialGeneration: first.incidentGeneration,
+        incidentSeq: first.incidentGeneration,
         windowStart: nowIso,
         attemptsInWindow: 0,
         nextCheckAt: nowIso,
@@ -353,7 +353,7 @@ export class ProviderRecoverySensor {
               agent.jobId === wait.jobId &&
               agent.role === 'minion' &&
               agent.id !== wait.agentId &&
-              agent.createdAt > wait.createdAt,
+              agent.createdAt >= wait.createdAt,
           );
         if (newer !== undefined) return 'supersede';
       }
@@ -444,7 +444,11 @@ export class ProviderRecoverySensor {
     return Math.max(this.cfg.cadenceMinMs, Math.min(retryAfterMs, this.cfg.retryAfterMaxMs));
   }
 
-  /** Persist the deduplicated recovery, mark waiters, wake Silas once. */
+  /** Persist the deduplicated recovery, mark waiters, wake Silas once.
+   * The marker keys on the newest incident sequence among the waiters the
+   * evidence covered — each NEW incident (renewed quota included) gets its
+   * own delivery; a duplicate observation of the same sequence never
+   * double-delivers. */
   private async recoverRoute(
     route: ProviderRouteRecord,
     eligible: readonly ProviderWaitRecord[],
@@ -452,28 +456,31 @@ export class ProviderRecoverySensor {
     nowMs: number,
   ): Promise<void> {
     const nowIso = new Date(nowMs).toISOString();
+    const recoveredSeq = eligible.reduce((max, wait) => Math.max(max, wait.incidentGeneration), 0);
     this.ledger.upsertProviderRoute(
       { ...route, lastResult: 'recovered', nextCheckAt: new Date(nowMs + this.cfg.cadenceMinMs).toISOString(), updatedAt: nowIso },
       {
         kind: 'provider.probe-result',
-        payload: { route: route.routeKey, result: 'recovered', evidence },
+        payload: { route: route.routeKey, result: 'recovered', incident_seq: recoveredSeq, evidence },
       },
     );
     const recorded = this.ledger.recordProviderRecovery({
       id: randomUUID(),
       routeKey: route.routeKey,
-      incidentGeneration: route.credentialGeneration,
+      incidentGeneration: recoveredSeq,
       evidence,
       waiterJobIds: eligible.map((wait) => wait.jobId).filter((jobId): jobId is string => jobId !== null),
     });
     if (recorded === null) {
-      // Duplicate observation of the same incident generation: the
-      // delivery marker already exists — never a second event or wake.
+      // Duplicate observation of the same incident sequence: the delivery
+      // marker already exists — never a second event or wake.
       return;
     }
     for (const wait of eligible) {
+      if (wait.incidentGeneration > recoveredSeq) continue; // newer incident: not covered by this evidence
       this.ledger.setProviderWaitStatus(wait.id, 'recovered-pending', {
         route: route.routeKey,
+        incident_seq: wait.incidentGeneration,
         evidence_completed_at: nowIso,
       });
     }
@@ -550,14 +557,19 @@ export class ProviderRecoverySensor {
     const routeKey = providerRouteKey(evidence.provider, evidence.model, fingerprint);
     let route = this.ledger.getProviderRoute(routeKey);
     const nowIso = new Date(this.now()).toISOString();
-    let generation = 1;
+    // Sink replays of the SAME incident are idempotent: the existing row
+    // updates (never a second wait or seq bump).
+    const replayed = this.ledger
+      .listProviderWaits()
+      .find((wait) => wait.incidentId === (observation.incidentId ?? `provider-wall.${observation.agentId}`));
+    let generation = replayed?.incidentGeneration ?? 1;
     if (route === null) {
       route = {
         routeKey,
         provider: evidence.provider,
         model: evidence.model,
         credentialFingerprint: fingerprint,
-        credentialGeneration: 1,
+        incidentSeq: replayed?.incidentGeneration ?? 1,
         windowStart: nowIso,
         attemptsInWindow: 0,
         nextCheckAt: nowIso,
@@ -569,19 +581,28 @@ export class ProviderRecoverySensor {
         updatedAt: nowIso,
       };
       this.ledger.upsertProviderRoute(route);
-    } else {
-      generation = route.credentialGeneration;
+    } else if (replayed === undefined) {
+      // A NEW incident on this route: the sequence advances so the next
+      // recovery delivers exactly once for this incident.
+      generation = route.incidentSeq + 1;
+      route = this.ledger.upsertProviderRoute({ ...route, incidentSeq: generation, updatedAt: nowIso });
     }
-    // Renewed quota after a recovered-pending continuation: the prior wait
-    // is superseded by this new incident and the false-recovery ladder
-    // climbs (bounded: escalation suspends the route rather than looping).
-    const prior = observation.agentId !== null
-      ? this.ledger.listProviderWaits({ status: 'recovered-pending' }).find(
-          (wait) => wait.agentId === observation.agentId && wait.routeKey === routeKey,
-        )
+    // Renewed quota after a recovered continuation: a prior claimed or
+    // still-pending wait for the same agent+route means the recovery was
+    // false (the continuation re-hit the wall) — supersede the prior, climb
+    // the bounded false-recovery ladder (escalation suspends the route
+    // rather than looping).
+    const prior = observation.agentId !== null && replayed === undefined
+      ? [
+          ...this.ledger.listProviderWaits({ status: 'recovered-pending' }),
+          ...this.ledger.listProviderWaits({ status: 'claimed' }),
+        ].find((wait) => wait.agentId === observation.agentId && wait.routeKey === routeKey)
       : undefined;
     if (prior !== undefined) {
-      this.ledger.setProviderWaitStatus(prior.id, 'superseded', { why: 'renewed-quota' });
+      if (prior.status === 'recovered-pending') {
+        this.ledger.setProviderWaitStatus(prior.id, 'superseded', { why: 'renewed-quota' });
+      }
+      // (a claimed prior stays claimed — history; only the ladder moves)
       const count = route.falseRecoveryCount + 1;
       this.ledger.upsertProviderRoute({ ...route, falseRecoveryCount: count, updatedAt: nowIso });
       route = { ...route, falseRecoveryCount: count };

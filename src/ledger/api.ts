@@ -256,14 +256,16 @@ export interface ProviderWaitRecord {
 }
 
 /** Shared per-route probe state: cadence, rolling budget, backoff,
- * credential generation, false-recovery accounting. Durable so a restart
- * never re-baselines away an outstanding wait or its budget. */
+ * incident sequence, false-recovery accounting. Durable so a restart
+ * never re-baselines away an outstanding wait or its budget. The
+ * incident sequence advances on every NEW provider-wall incident on the
+ * route (renewed quota included) so each recovery delivers exactly once. */
 export interface ProviderRouteRecord {
   readonly routeKey: string;
   readonly provider: string;
   readonly model: string;
   readonly credentialFingerprint: string;
-  readonly credentialGeneration: number;
+  readonly incidentSeq: number;
   readonly windowStart: string;
   readonly attemptsInWindow: number;
   readonly nextCheckAt: string;
@@ -1290,7 +1292,7 @@ export class LedgerApi {
           route: input.routeKey,
           waiter: input.waiterKind,
           reason: input.reasonClass,
-          credential_generation: input.incidentGeneration,
+          incident_generation: input.incidentGeneration,
         },
       });
       return this.getProviderWait(input.id) as ProviderWaitRecord;
@@ -1356,6 +1358,11 @@ export class LedgerApi {
           `provider wait "${id}" can re-enter waiting only from recovered-pending (is ${current.status})`,
         );
       }
+      if (status === 'claimed' && current.status !== 'recovered-pending') {
+        throw new Error(
+          `provider wait "${id}" can be claimed only from recovered-pending (is ${current.status})`,
+        );
+      }
       this.db
         .prepare('UPDATE provider_waits SET status = ?, updated_at = ? WHERE id = ?')
         .run(status, nowIso(), id);
@@ -1380,7 +1387,7 @@ export class LedgerApi {
       this.db
         .prepare(
           `INSERT INTO provider_routes
-             (route_key, provider, model, credential_fingerprint, credential_generation, window_start,
+             (route_key, provider, model, credential_fingerprint, incident_seq, window_start,
               attempts_in_window, next_check_at, last_attempt_at, last_result, consecutive_probe_failures,
               false_recovery_count, suspended_until, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1388,7 +1395,7 @@ export class LedgerApi {
              provider = excluded.provider,
              model = excluded.model,
              credential_fingerprint = excluded.credential_fingerprint,
-             credential_generation = excluded.credential_generation,
+             incident_seq = excluded.incident_seq,
              window_start = excluded.window_start,
              attempts_in_window = excluded.attempts_in_window,
              next_check_at = excluded.next_check_at,
@@ -1404,7 +1411,7 @@ export class LedgerApi {
           input.provider,
           input.model,
           input.credentialFingerprint,
-          input.credentialGeneration,
+          input.incidentSeq,
           input.windowStart,
           input.attemptsInWindow,
           input.nextCheckAt,
@@ -1458,7 +1465,7 @@ export class LedgerApi {
         kind: 'provider.restored',
         payload: {
           route: input.routeKey,
-          credential_generation: input.incidentGeneration,
+          incident_generation: input.incidentGeneration,
           evidence: input.evidence,
           waiter_jobs: [...input.waiterJobIds],
         },
@@ -1850,7 +1857,7 @@ export class LedgerApi {
       provider: str(row.provider),
       model: str(row.model),
       credentialFingerprint: str(row.credential_fingerprint),
-      credentialGeneration: Number(row.credential_generation),
+      incidentSeq: Number(row.incident_seq),
       lastResult: nstr(row.last_result),
       suspendedUntil: nstr(row.suspended_until),
       windowStart: str(row.window_start),
