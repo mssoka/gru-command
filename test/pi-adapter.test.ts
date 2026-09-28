@@ -1470,11 +1470,11 @@ describe('RuntimeRegistry', () => {
   it('resolves claude-code to a fallback-wrapped adapter and still rejects unknown ids', () => {
     const store = new SessionStore(mkdtempSync(join(tmpdir(), 'gru-command-reg-')));
     cleanupDirs.push(store.dataDir);
-    // Minimal config stand-in: the registry only reads runtimes for this
-    // path; constructing the claude-code adapter must not touch disk or
-    // probe the binary (that happens lazily at spawn).
+    // Minimal config stand-in: the registry reads runtimes and the resident
+    // concurrency limit for this path; constructing the claude-code adapter
+    // must not touch disk or probe the binary (that happens lazily at spawn).
     const registry = new RuntimeRegistry({
-      config: { runtimes: { default: 'pi', roles: {} } } as never,
+      config: { runtimes: { default: 'pi', roles: {} }, concurrency: { maxWorkers: 4 } } as never,
       store,
     });
     // Pre-E3 this threw "no adapter implementation yet" (red → green flip):

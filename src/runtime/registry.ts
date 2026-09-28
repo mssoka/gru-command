@@ -355,11 +355,21 @@ export class RuntimeRegistry {
             if (disposingNow || released) return Promise.reject(new Error('worker is being disposed'));
             pending += 1;
             budget.changed();
-            return Promise.resolve().then(() => method.apply(target, args)).finally(() => {
+            // Invoke SYNCHRONOUSLY: adapter wrappers (e.g. the claude
+            // fallback queue) emit their `queued` events inside the call,
+            // and callers observe them immediately after it returns.
+            try {
+              const operation = method.apply(target, args);
+              return Promise.resolve(operation).finally(() => {
+                pending -= 1;
+                if (property !== 'compact') completedPrompt = true;
+                budget.changed();
+              });
+            } catch (error) {
               pending -= 1;
-              if (property !== 'compact') completedPrompt = true;
               budget.changed();
-            });
+              return Promise.reject(error);
+            }
           };
         }
         const value: unknown = Reflect.get(target, property);
