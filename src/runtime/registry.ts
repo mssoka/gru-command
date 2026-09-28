@@ -333,6 +333,9 @@ export class RuntimeRegistry {
       release?.();
     };
     const budget = this.residents;
+    // One wrapper per tracked method, memoized: handle.prompt ===
+    // handle.prompt holds, and no per-access allocation.
+    const wrappers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
     const resident: AgentHandle = new Proxy(handle, {
       get(target, property) {
         if (property === 'dispose') return (): Promise<void> => {
@@ -349,9 +352,14 @@ export class RuntimeRegistry {
           return disposing;
         };
         if (['prompt', 'steer', 'followUp', 'compact'].includes(String(property))) {
+          if (wrappers.has(String(property))) return wrappers.get(String(property));
           const method = Reflect.get(target, property) as ((...args: unknown[]) => Promise<unknown>) | undefined;
-          if (method === undefined) return undefined;
-          return (...args: unknown[]) => {
+          if (method === undefined) {
+            throw new Error(
+              `resident handle was asked for "${String(property)}" but its runtime adapter does not implement it`,
+            );
+          }
+          const wrapper = (...args: unknown[]) => {
             if (disposingNow || released) return Promise.reject(new Error('worker is being disposed'));
             pending += 1;
             budget.changed();
@@ -362,7 +370,11 @@ export class RuntimeRegistry {
               const operation = method.apply(target, args);
               return Promise.resolve(operation).finally(() => {
                 pending -= 1;
-                if (property !== 'compact') completedPrompt = true;
+                // Only a real prompt delivers the briefing: steer/followUp
+                // alone must never mark an un-briefed session reclaim-
+                // eligible (docs/FLOW.md §4d "as-yet-undelivered first
+                // prompt").
+                if (property === 'prompt') completedPrompt = true;
                 budget.changed();
               });
             } catch (error) {
@@ -371,6 +383,8 @@ export class RuntimeRegistry {
               return Promise.reject(error);
             }
           };
+          wrappers.set(String(property), wrapper);
+          return wrapper;
         }
         const value: unknown = Reflect.get(target, property);
         return typeof value === 'function' ? value.bind(target) : value;

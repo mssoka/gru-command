@@ -23,7 +23,10 @@ import {
 
 export type { CanonicalReviewVerdict } from './types.js';
 
-const SPECIALIST_CONCURRENCY = 4;
+/** Standalone/unconfigured engine default (tests and direct use). Production
+ * always passes the configured `[review] max_concurrent_children` ceiling from
+ * config.ts — this constant never overrides it. */
+const STANDALONE_SPECIALIST_CONCURRENCY = 4;
 const CHILD_SPAWN_TIMEOUT_MS = 60 * 1_000;
 const CHILD_TURN_TIMEOUT_MS = 10 * 60 * 1_000;
 const LEAD_SPAWN_TIMEOUT_MS = 60 * 1_000;
@@ -121,6 +124,11 @@ export interface ReviewProgress {
 export interface PerkinsWholeReviewOptions {
   readonly spawner: AgentSpawner;
   readonly policy: PerkinsPolicy;
+  /** Optional admitted round: holds a lead and first child together. */
+  readonly beginChildren?: () => { readonly concurrency: number; finish(): void };
+  /** Effective specialist ceiling for this round; bounded by the host's
+   * per-call input bound below. */
+  readonly maxConcurrentChildren?: number;
   readonly onProgress?: (progress: ReviewProgress) => void;
   readonly onAgent?: (input: {
     readonly phase: 'lead' | 'specialist';
@@ -639,12 +647,16 @@ async function pool<T, U>(items: readonly T[], concurrency: number, run: (item: 
 export class PerkinsWholeReview {
   private readonly spawner: AgentSpawner;
   private readonly policy: PerkinsPolicy;
+  private readonly beginChildren: NonNullable<PerkinsWholeReviewOptions['beginChildren']>;
+  private readonly maxConcurrentChildren: number;
   private readonly onProgress: (progress: ReviewProgress) => void;
   private readonly onAgent: NonNullable<PerkinsWholeReviewOptions['onAgent']>;
 
   constructor(options: PerkinsWholeReviewOptions) {
     this.spawner = options.spawner;
     this.policy = options.policy;
+    this.maxConcurrentChildren = options.maxConcurrentChildren ?? STANDALONE_SPECIALIST_CONCURRENCY;
+    this.beginChildren = options.beginChildren ?? (() => ({ concurrency: this.maxConcurrentChildren, finish: () => {} }));
     this.onProgress = options.onProgress ?? (() => {});
     this.onAgent = options.onAgent ?? (() => {});
   }
@@ -952,12 +964,12 @@ export class PerkinsWholeReview {
 
     const runTool: NativeAgentTool = {
       name: 'perkins_run_specialists',
-      description: `Start and await 1-${MAX_TOOL_RUNS} host-tracked specialist children. Each run names one lens and reviews the WHOLE change in isolation. The host enforces isolation, attempt bounds, concurrency, output validation, durability and ownership. Specialists are optional: use the lenses that help this change.`,
+      description: `Start and await 1-${Math.max(MAX_TOOL_RUNS, this.maxConcurrentChildren)} host-tracked specialist children. Each run names one lens and reviews the WHOLE change in isolation. The host enforces isolation, attempt bounds, concurrency, output validation, durability and ownership. Specialists are optional: use the lenses that help this change.`,
       inputSchema: {
         type: 'object', additionalProperties: false, required: ['runs'],
         properties: {
           runs: {
-            type: 'array', minItems: 1, maxItems: MAX_TOOL_RUNS,
+            type: 'array', minItems: 1, maxItems: Math.max(MAX_TOOL_RUNS, this.maxConcurrentChildren),
             items: {
               type: 'object', additionalProperties: false, required: ['lens'],
               properties: {
@@ -972,8 +984,9 @@ export class PerkinsWholeReview {
         if (accepted !== null) throw new Error('review already has an accepted terminal submission');
         const value = record(raw, 'perkins_run_specialists input');
         exactKeys(value, ['runs'], 'perkins_run_specialists input');
-        if (!Array.isArray(value.runs) || value.runs.length < 1 || value.runs.length > MAX_TOOL_RUNS) {
-          throw new Error(`runs must contain 1-${MAX_TOOL_RUNS} entries`);
+        const maxToolRuns = Math.max(MAX_TOOL_RUNS, this.maxConcurrentChildren);
+        if (!Array.isArray(value.runs) || value.runs.length < 1 || value.runs.length > maxToolRuns) {
+          throw new Error(`runs must contain 1-${maxToolRuns} entries`);
         }
         const requested = value.runs.map((entry, index) => {
           const run = record(entry, `run ${index}`);
@@ -1000,12 +1013,29 @@ export class PerkinsWholeReview {
         }
         for (const run of scheduled) attempts.set(run.lens, run.attempt);
         specialistsStarted += scheduled.length;
-        const batch = await pool(scheduled, SPECIALIST_CONCURRENCY, (run) =>
-          runSpecialist(run.lens, run.attempt, run.previous, signal));
+        const batch = this.beginChildren();
+        // One tool call = ONE admitted wave: every run in a call must be
+        // able to start together, keeping the call's wall clock inside the
+        // Claude MCP bridge's 15-minute tool bound no matter how small the
+        // admitted wave is (each child carries a 10-minute turn budget).
+        // The lead splits larger batches across multiple calls.
+        if (scheduled.length > batch.concurrency) {
+          batch.finish();
+          throw new Error(
+            `perkins_run_specialists: ${scheduled.length} runs exceed this round's admitted wave of ${batch.concurrency}; split them across multiple calls`,
+          );
+        }
+        let poolOutcome: PoolOutcome<SpecialistResult | undefined>;
+        try {
+          poolOutcome = await pool(scheduled, batch.concurrency, (run) =>
+            runSpecialist(run.lens, run.attempt, run.previous, signal));
+        } finally {
+          batch.finish();
+        }
         // Every settled child is REAL work (T13): commit its result before
         // any error handling, so executed runs are never restored to
         // "not used" or hidden from the durable record.
-        const committed = batch.results.filter((result): result is SpecialistResult => result !== undefined);
+        const committed = poolOutcome.results.filter((result): result is SpecialistResult => result !== undefined);
         const commitSettled = (): void => {
           for (const result of committed) {
             results.set(result.resultId, result);
@@ -1020,7 +1050,7 @@ export class PerkinsWholeReview {
             }
           }
         };
-        if (batch.error !== null) {
+        if (poolOutcome.error !== null) {
           // The lead receives NO response for this batch either: every
           // committed valid run's findings were not delivered (R17), and
           // the durable record must say so.
@@ -1037,7 +1067,7 @@ export class PerkinsWholeReview {
           const neverRan = scheduled.filter((run) => !ran.has(run.lens));
           restoreAttempts(neverRan);
           specialistsStarted -= neverRan.length;
-          throw batch.error;
+          throw poolOutcome.error;
         }
         const childResults: readonly SpecialistResult[] = committed;
         /** Runs of THIS batch whose findings never reached the lead (R17):

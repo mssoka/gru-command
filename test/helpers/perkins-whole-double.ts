@@ -221,8 +221,12 @@ export function fakeWholeSpawner(
     const worklist = [...(options.specialists !== undefined ? [...options.specialists] : [...catalog])];
     const retried = new Set<string>();
     let first = true;
+    // The host bounds one tool call to one admitted wave; the lead reads the
+    // refusal and re-batches smaller (a real lead does the same from the
+    // error text).
+    let waveLimit = 4;
     while (worklist.length > 0) {
-      const batch = worklist.splice(0, 4);
+      const batch = worklist.splice(0, waveLimit);
       let runs: readonly string[];
       if (first && options.badRuns !== undefined) {
         runs = options.badRuns;
@@ -250,6 +254,15 @@ export function fakeWholeSpawner(
         // A refused batch (duplicate lens, exhausted attempts, transport
         // bound) is recorded; the lead continues with what it has.
         toolErrors.push({ tool: 'perkins_run_specialists', error: String(error) });
+        const waveRefusal = /admitted wave of (\d+)/u.exec(String(error));
+        if (waveRefusal !== null) {
+          // Not a lens failure: re-batch the SAME runs at the admitted wave
+          // size without burning their retry budget.
+          waveLimit = Math.max(1, Number(waveRefusal[1]));
+          worklist.unshift(...runs);
+          for (const lens of runs) retried.delete(lens);
+          continue;
+        }
         for (const lens of runs) {
           if (!retried.has(lens)) {
             retried.add(lens);

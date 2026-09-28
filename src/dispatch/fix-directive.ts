@@ -53,8 +53,15 @@ export async function routeFixDirectiveToMinion(
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
-      await racedPrompt(handle, directive, input.signal, owner);
-      return { delivered: true, minionId: minion.id };
+      try {
+        await racedPrompt(handle, directive, input.signal, owner);
+        return { delivered: true, minionId: minion.id };
+      } catch (error) {
+        // A resident-budget reclaim may be disposing this handle under us:
+        // fall through to the resume/re-brief path instead of dropping the
+        // directive with an opaque failure.
+        if (!/worker is being disposed/u.test(String(error))) throw error;
+      }
     }
   }
   const lane = input.worktrees

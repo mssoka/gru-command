@@ -2036,6 +2036,7 @@ export class WaveRunner {
     reviewModel?: ReviewPreflightResult['reviewModel'],
   ): Promise<WaveOutcome> {
     let reservation: ResidentReviewRound | undefined;
+    let settledOutcome: WaveOutcome | null = null;
     try {
       reservation = this.opts.reserveReviewRound === undefined
         ? undefined : await this.opts.reserveReviewRound(signal);
@@ -2050,7 +2051,9 @@ export class WaveRunner {
           payload: { reason: 'lead and child resident slots admitted' },
         });
       }
-      return await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, reservation);
+      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, reservation);
+      settledOutcome = outcome;
+      return outcome;
     } catch (error) {
       if (this.opts.ledger.getRound(round.id)?.status === 'pending') {
         this.abortRound(this.opts.ledger.getRound(round.id) ?? round, `review admission cancelled: ${String(error)}`);
@@ -2061,8 +2064,19 @@ export class WaveRunner {
       }
       throw error;
     } finally {
+      // A settled review outcome outranks a close-time disposal failure:
+      // the verdict/record is the durable truth; the failed disposal is
+      // escalated loudly without masking the returned result.
       try {
         await reservation?.close();
+      } catch (closeError) {
+        this.log('error', 'review reservation disposal failed', { round: round.id, error: String(closeError) });
+        if (settledOutcome !== null) {
+          this.opts.escalate?.(
+            `Review round ${round.id} disposal failed after completion`,
+            `The settled review outcome was preserved, but releasing its resident handles failed: ${String(closeError)}`,
+          );
+        }
       } finally {
         await this.sweepReviewWorktree(reviewLaneId);
       }
@@ -2085,6 +2099,9 @@ export class WaveRunner {
     // preflight cannot replace the proof used by its lead or specialist
     // children, and a reserved round routes through its own admission.
     const spawnWithOptions: AgentSpawner = (role, options) => {
+      if (reservation !== undefined && role !== 'perkins') {
+        throw new Error(`review reservation spawns perkins sessions only, got role "${role}"`);
+      }
       const resolved = {
         ...options,
         ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)

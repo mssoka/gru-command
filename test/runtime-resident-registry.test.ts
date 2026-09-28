@@ -265,6 +265,28 @@ describe('registry resident boundary across adapters', () => {
     } finally { h.cleanup(); }
   });
 
+  it('names the round misuse errors: duplicate lead, over-parallel child, overlapping batch', async () => {
+    const h = harness(4);
+    try {
+      const round = await h.registry.reserveReviewRound();
+      const leadOpts = { reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } };
+      await round.spawn(leadOpts);
+      await expect(round.spawn(leadOpts)).rejects.toThrow(/review reservation already has a lead/);
+      // First child takes the pair's child slot; with no extras admitted, a
+      // second concurrent child exceeds admitted parallelism.
+      const first = await round.spawn({ isolatedReview: { systemPrompt: 'lens', tools: [] } });
+      await expect(round.spawn({ isolatedReview: { systemPrompt: 'lens 2', tools: [] } }))
+        .rejects.toThrow(/review child exceeded admitted parallelism/);
+      // A new batch requires the previous child to have settled.
+      await expect(() => round.beginChildren(2)).toThrow(/review child batch overlaps an active batch/);
+      await first.dispose();
+      const batch = round.beginChildren(2);
+      expect(() => round.beginChildren(2)).toThrow(/review child batch overlaps an active batch/);
+      batch.finish();
+      await round.close();
+    } finally { h.cleanup(); }
+  });
+
   it('releases the paired permits even when a round handle disposal fails at close', async () => {
     const h = harness(2);
     try {

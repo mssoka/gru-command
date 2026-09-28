@@ -359,6 +359,88 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(ledger.listRounds(job.id)).toHaveLength(0); // fallback unavailable: no phantom approval
     await resumed.shutdown();
   });
+  it('holds a reserved round pending while admission waits, admits to live, and cancels cleanly', async () => {
+    const repo = makeFixtureRepo('perkins-residency-lifecycle');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/review']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-residency-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-residency-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-residency-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/review', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-residency' });
+    const job = ledger.addJob({
+      id: 'job-residency', repo: 'fixture', title: 'residency', baseBranch: 'main', briefing: 'review this',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    attachOrigin(repo, 'feature/review', root);
+    const spawner = vi.fn() as unknown as AgentSpawner;
+    const deferred: Array<{
+      resolve: (round: import('../src/runtime/registry.js').ResidentReviewRound) => void;
+      reject: (error: Error) => void;
+    }> = [];
+    const reserveReviewRound = (signal: AbortSignal) => new Promise<import('../src/runtime/registry.js').ResidentReviewRound>((resolve, reject) => {
+      deferred.push({ resolve, reject });
+      signal.addEventListener('abort', () => reject(new Error('resident admission cancelled')), { once: true });
+    });
+    const probeRound: import('../src/runtime/registry.js').ResidentReviewRound = {
+      spawn: async () => { throw new Error('admission-probe: spawn refused'); },
+      beginChildren: () => ({ concurrency: 1, finish: () => {} }),
+      close: async () => {},
+    };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner, reviewArtifactRoot: artifacts,
+      reserveReviewRound,
+    });
+
+    // Admitted path: the round freezes pending, waits for two resident
+    // slots, then flips live on admission — never before.
+    const admitted = wave.beginRound({ jobId: job.id });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const [queued] = ledger.listRounds(job.id);
+    expect(queued?.status).toBe('pending'); // NOT live while admission waits
+    expect(ledger.latestRoundEvent(queued!.id, 'round.residency-queued')?.roundId).toBe(queued!.id);
+    deferred[0]!.resolve(probeRound);
+    const outcome = await admitted;
+    expect(outcome.round.id).toBe(queued!.id);
+    expect(ledger.latestRoundEvent(queued!.id, 'round.residency-admitted')).not.toBeNull();
+    expect(ledger.latestRoundEvent(queued!.id, 'round.residency-cancelled')).toBeNull();
+    expect(ledger.getRound(queued!.id)?.status).not.toBe('pending'); // admitted to live, then terminalized by the probe refusal
+    await wave.shutdown();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+
+    // Cancelled path: a queued admission aborted by shutdown records the
+    // cancellation and aborts the still-pending round.
+    const db2 = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-residency-db2-')));
+    dbs.push(db2);
+    const ledger2 = new LedgerApi(db2.handle, { bus: new EventBus() });
+    const port2 = new GitReviewPort(mkdtempSync(join(tmpdir(), 'perkins-residency-port2-')), 'feature/review', target);
+    await port2.createJobWorktree({ repoPath: repo.path, jobId: 'job-residency-2' });
+    const job2 = ledger2.addJob({
+      id: 'job-residency-2', repo: 'fixture', title: 'residency cancel', baseBranch: 'main', briefing: 'review this',
+    });
+    ledger2.setJobStatus(job2.id, 'working');
+    settleLane(ledger2, job2.id);
+    deferred.length = 0;
+    const wave2 = new WaveRunner({
+      ledger: ledger2, worktrees: port2, spawner, reviewArtifactRoot: artifacts,
+      reserveReviewRound,
+    });
+    const pending = wave2.beginRound({ jobId: job2.id });
+    pending.catch(() => {}); // observed below via the ledger; avoid unhandled noise
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const [waiting] = ledger2.listRounds(job2.id);
+    expect(waiting?.status).toBe('pending');
+    await wave2.shutdown(); // aborts the active controller → admission rejects
+    await pending.catch(() => {});
+    expect(ledger2.getRound(waiting!.id)?.status).toBe('aborted');
+    expect(ledger2.latestRoundEvent(waiting!.id, 'round.residency-cancelled')).not.toBeNull();
+    expect(spawner).not.toHaveBeenCalled();
+  });
   it('fails closed on bundled-policy setup errors before a round or reviewer spawn', async () => {
     const repo = makeFixtureRepo('perkins-policy-setup-error');
     repos.push(repo);
