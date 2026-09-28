@@ -457,6 +457,34 @@ test('socket drop shows a degraded banner that clears on recovery', async ({ pag
 });
 
 test.describe('board (E6, mock feed)', () => {
+  test('FOR YOU owner band renders the pending owner obligations above the job bands', async ({ page }) => {
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const band = page.locator('#board-owner');
+    await expect(band).toBeVisible();
+    await expect(band.locator('.board-band__label')).toHaveText('FOR YOU');
+    // The mock owes two owner actions: one unacked needs-owner stop and
+    // one evidence-bound ready PR — the count is owed actions, not rows.
+    await expect(band.locator('.board-band__count')).toHaveText('2 pending');
+    // The owner stop carries its Ack control and the honest scope copy.
+    const stop = band.locator('.board-owner__row', { hasText: 'Crash-loop breaker tripped' });
+    await expect(stop).toBeVisible();
+    await expect(stop.locator('.board-owner__ack')).toHaveText('Ack');
+    await expect(stop).toContainText('does NOT clear code/test/review holds');
+    // The ready PR row: exact-head reason + OPEN PR as an external link
+    // (never an in-app merge button).
+    const pr = band.locator('.board-owner__row--pr', { hasText: 'Fix the payment retry loop' });
+    await expect(pr).toBeVisible();
+    await expect(pr).toContainText('ready for you');
+    await expect(pr).toContainText('CI green');
+    const open = pr.locator('.board-owner__open');
+    await expect(open).toHaveText('OPEN PR ↗');
+    await expect(open).toHaveAttribute('href', 'https://example.invalid/pr/41');
+    await expect(open).toHaveAttribute('target', '_blank');
+    // Machine attention stays OUT of the owner band (NEEDS GRU owns it).
+    await expect(band).not.toContainText('Review round demo-api-payment-fix-r1 is INCOMPLETE');
+  });
+
   test('dense rows collapse by default; expanding reveals the round lens chips', async ({ page }) => {
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
@@ -466,8 +494,10 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('#tab-chat')).toHaveCount(0);
     await expect(page.locator('#tab-board')).toHaveCount(0);
     await expect(page.locator('.command-bar__tabs')).toHaveCount(0);
-    // v4 bands lead the board; rows group under sticky band separators.
-    await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS GRU');
+    // FOR YOU (owner approval 2026-09-28) leads the board — the permanent
+    // owner-action band — then the v4 job bands; rows group under sticky
+    // band separators.
+    await expect(page.locator('.board-band__label').first()).toHaveText('FOR YOU');
     await expect(
       page.locator('.board-band--needs-you .board-job', { hasText: 'Merge main into the retry branch' }),
     ).toBeVisible();
@@ -540,8 +570,16 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('.rail-chip[data-chip="verify"]')).toContainText('lock free');
     await expect(page.locator('.rail-chip[data-chip="cure"] .rail-chip__value')).toHaveText('n/a');
 
-    // Bands in priority order, headers sticky separators with counts.
-    await expect(page.locator('.board-band__label')).toHaveText(['NEEDS GRU', 'IN FLIGHT', 'SETTLED', 'COLD']);
+    // Bands in priority order, headers sticky separators with counts: the
+    // permanent FOR YOU owner band first (owner approval 2026-09-28), then
+    // the unchanged v4 job-band order.
+    await expect(page.locator('.board-band__label')).toHaveText([
+      'FOR YOU',
+      'NEEDS GRU',
+      'IN FLIGHT',
+      'SETTLED',
+      'COLD',
+    ]);
     const bandSticky = await page
       .locator('.board-band--in-flight .board-band__head')
       .evaluate((node) => getComputedStyle(node).position);

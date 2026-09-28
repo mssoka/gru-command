@@ -531,6 +531,7 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
         branch: `gru/${id}`,
         sha,
         merged: false,
+        pr_open: true,
         mergeable_state: 'clean',
         pr_number: 7,
         pr_url: PR_URL,
@@ -561,7 +562,11 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
         branch: 'gru/job-moved',
         sha: 'ffff0000aaaa1111bbbb2222cccc3333dddd4444',
         merged: false,
-        mergeable_state: 'clean',
+        pr_open: true,
+        // The FIXED poll writes null here: GitHub had not computed
+        // mergeability for the new head, and the old head's 'clean' no
+        // longer certifies it.
+        mergeable_state: null,
         pr_number: 7,
         pr_url: PR_URL,
         merge_commit_sha: null,
@@ -595,6 +600,7 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
         branch: 'gru/job-merged',
         sha: SHA,
         merged: true,
+        pr_open: false,
         mergeable_state: 'clean',
         pr_number: 7,
         pr_url: PR_URL,
@@ -602,6 +608,61 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
         ci: { sha: SHA, status: 'green', signature: '', failures: [], checks: ['ci'] },
       },
     });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('FOR YOU r1: drops the row when the PR closes WITHOUT merging (close-after-ready transition)', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-closed');
+    // The PR is closed on GitHub but never merged: only the explicitly-open
+    // gate settles it now — the row must not survive on stale readiness.
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'job-closed',
+      payload: {
+        repo: 'example/demo',
+        branch: 'gru/job-closed',
+        sha: SHA,
+        merged: false,
+        pr_open: false,
+        mergeable_state: 'clean',
+        pr_number: 7,
+        pr_url: PR_URL,
+        merge_commit_sha: null,
+        ci: { sha: SHA, status: 'green', signature: '', failures: [], checks: ['ci'] },
+      },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('FOR YOU r1: a legacy branch-state event without pr_open fails closed until the poll re-observes', () => {
+    const { api, engine } = fresh();
+    // Exactly stageReadyJob but with the pre-r1 payload (no pr_open key) —
+    // an event written before this change parses to prOpen null and must
+    // not qualify; the next poll tick rewrites the cursor with the status.
+    const job = api.addJob({ id: 'job-legacy', repo: 'demo', title: 'Heist job-legacy' });
+    api.setJobPr('job-legacy', PR_URL);
+    api.setJobStatus('job-legacy', 'working');
+    api.setJobStatus('job-legacy', 'in-review');
+    const round = api.addRound({ jobId: 'job-legacy', targetRef: SHA });
+    api.setRoundStatus(round.id, 'live');
+    api.setRoundVerdict(round.id, 'approved');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'job-legacy',
+      payload: {
+        repo: 'example/demo',
+        branch: 'gru/job-legacy',
+        sha: SHA,
+        merged: false,
+        mergeable_state: 'clean',
+        pr_number: 7,
+        pr_url: PR_URL,
+        merge_commit_sha: null,
+        ci: { sha: SHA, status: 'green', signature: '', failures: [], checks: ['ci'] },
+      },
+    });
+    void job;
     expect(engine.snapshot().ownerPrs).toEqual([]);
   });
 

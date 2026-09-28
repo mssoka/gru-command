@@ -1126,6 +1126,36 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('owner-ack:focus-me');
   });
 
+  it('FOR YOU r1 parity: a PR-only obligation shows on BOTH the board band and the bell — never a contradiction', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [], ownerPrs: [ownerPr('job-only-pr')] }));
+    // Board band: 1 pending, OPEN PR row.
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    expect(band.querySelector('.board-owner__open')?.textContent).toContain('OPEN PR');
+    // Bell panel: the SAME authoritative projection — the FOR YOU section
+    // carries the PR row instead of claiming "nothing needs you".
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const panel = document.getElementById('notification-list')!;
+    expect(panel.textContent).not.toContain('nothing needs attention');
+    expect(panel.textContent).not.toContain('nothing needs you');
+    const heads = [...panel.querySelectorAll('.board-notification-section__head')].map((node) => node.textContent);
+    expect(heads[0]).toBe('FOR YOU');
+    expect(panel.querySelector('.board-owner__row--pr')?.textContent).toContain('Heist job-only-pr');
+    expect(panel.querySelector('.board-owner__open')).not.toBeNull();
+    // Alert semantics preserved: the badge counts unseen needs-owner
+    // NOTIFICATIONS only — a ready PR never rings the bell.
+    expect(document.getElementById('notification-badge')?.textContent).toBe('0');
+  });
+
+  it('FOR YOU r1 parity: an empty projection shows the honest empty state on BOTH surfaces', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [notification('fyi-1', { routing: 'fyi' })] }));
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('0 pending');
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    expect(document.getElementById('notification-list')!.textContent).toContain('nothing needs you');
+  });
+
   it('a visible band sends one web-board shown receipt per notification; a hidden band sends none', async () => {
     const client = stubClient();
     const stop = notification('show-me', { routing: 'needs-owner' });

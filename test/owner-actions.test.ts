@@ -49,6 +49,7 @@ function branchState(overrides: Partial<NormalizedBranchState> = {}): Normalized
   return {
     sha: SHA,
     merged: false,
+    prOpen: true,
     mergeableState: 'clean',
     ci: greenCi(SHA),
     prNumber: 7,
@@ -94,7 +95,9 @@ describe('owner-action projection — fail-closed readiness gate', () => {
     ['prUrl is not https', job({ prUrl: 'http://insecure.example/pr' }), evidence()],
     ['no branch-state evidence at all', job(), null],
     ['evidence describes a different PR', job(), evidence({ prUrl: 'https://github.com/example/demo/pull/9' })],
-    ['PR already merged', job(), evidence({ merged: true })],
+    ['PR already merged', job(), evidence({ merged: true, prOpen: false })],
+    ['PR closed without merging', job(), evidence({ prOpen: false })],
+    ['PR open/closed status never observed (legacy event)', job(), evidence({ prOpen: null })],
     ['head sha missing', job(), evidence({ sha: null })],
     ['mergeable dirty (conflicts)', job(), evidence({ mergeableState: 'dirty' })],
     ['mergeable blocked (required gate)', job(), evidence({ mergeableState: 'blocked' })],

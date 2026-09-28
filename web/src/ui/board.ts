@@ -194,7 +194,7 @@ export class BoardView {
     this.renderRail(snapshot);
     this.renderJobs(snapshot);
     this.renderAgents(snapshot.agents);
-    this.renderNotifications(snapshot.notifications);
+    this.renderNotifications(snapshot);
     this.surfaceNewNotifications(previous, snapshot.notifications);
   }
 
@@ -877,15 +877,12 @@ export class BoardView {
   // Notification center
   // ------------------------------------------------------------------
 
-  private renderNotifications(notifications: readonly NotificationView[]): void {
+  private renderNotifications(snapshot: BoardSnapshot): void {
+    const notifications = snapshot.notifications;
     const list = mustGet('notification-list');
     list.replaceChildren();
     this.updateBadge(notifications);
     this.notificationBell.hidden = false;
-    if (notifications.length === 0) {
-      list.append(el('div', 'lbl', 'nothing needs attention'));
-      return;
-    }
     // Routing split (owner ruling 2026-09-23): FOR YOU is the only
     // human-facing band; NEEDS GRU is the self-clearing machine queue
     // (Gru dispositions, the owner bell stays quiet); everything else is
@@ -893,12 +890,30 @@ export class BoardView {
     // A pre-disposition release could Ack machine rows. Those legacy rows
     // are closed receipts, not active NEEDS GRU work, even if unresolved.
     const unresolved = (item: NotificationView): boolean => item.resolvedAt === null && item.ackedAt === null;
-    const forYou = notifications.filter((item) => item.routing === 'needs-owner' && unresolved(item));
     const needsGru = notifications.filter((item) => item.routing === 'action-required' && unresolved(item));
     const feed = notifications.filter(
       (item) => item.routing === 'fyi' || !unresolved(item),
     );
-    this.renderNotificationSection(list, 'FOR YOU', forYou, 'nothing needs you');
+    if (notifications.length === 0 && (snapshot.ownerPrs ?? []).length === 0) {
+      list.append(el('div', 'lbl', 'nothing needs attention'));
+      return;
+    }
+    // FOR YOU parity (FOR YOU r1): the bell renders the SAME authoritative
+    // owner projection the board band renders — pending acks AND ready PRs
+    // — so the two surfaces can never disagree about what the owner owes.
+    // Alert/history behavior is untouched: the badge and toasts still ride
+    // needs-owner notifications only, and acked/resolved rows stay in FEED.
+    const ownerRowsForBell = ownerRows(snapshot);
+    const forYou = el('section', 'board-notification-section');
+    forYou.append(el('div', 'board-notification-section__head lbl', 'FOR YOU'));
+    if (ownerRowsForBell.length === 0) {
+      forYou.append(el('div', 'board-notification-section__empty lbl', 'nothing needs you'));
+    } else {
+      for (const row of ownerRowsForBell) {
+        forYou.append(row.kind === 'ack' ? this.notificationRow(row.notification) : this.ownerPrRow(row));
+      }
+    }
+    list.append(forYou);
     this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'machine queue is clear');
     if (feed.length > 0) this.renderNotificationSection(list, 'FEED', feed, null);
   }

@@ -164,7 +164,47 @@ here as the standing Checkpoint-1 approval.
 
 ## Spec Change Log
 
+- 2026-09-28 (r1 follow-through, chief-directed): four round-1 review
+  blockers fixed in one bounded pass on the same lane. (1) PR open/closed
+  status (`prOpen`/`pr_open`) now flows GhPull → NormalizedBranchState →
+  dedupe comparison → branch-state payload/parser, and the readiness gate
+  requires an explicitly OPEN pull (closed-without-merge and legacy
+  no-status events fail closed; the poll rewrites the cursor on its next
+  tick because prOpen now participates in sameBranchState). (2) A moved
+  head no longer inherits the old head's mergeability: nextBranchState
+  invalidates the carried value on head change (the same-head async-
+  unknown retry keeps its pinned behavior); unknown-at-new-head yields
+  null and the board fails closed until 'clean' is observed for the new
+  head. (3) The two e2e board-order assertions now expect FOR YOU first
+  (five bands), and a mock-backed FOR YOU e2e test pins the owner stop +
+  ready-PR row content. (4) The bell renders the SAME authoritative owner
+  projection as the board band (pending acks AND ready PRs) so a PR-only
+  obligation can never read "nothing needs you"; badge/toast alert
+  semantics and FEED history are unchanged. Verification HOLD per the
+  brief: no tests/builds/browser/verify were run after the GitHub Full
+  Suite failure at 1f41a1b (run 36434424797) — preserved, not rerun.
+
 ## Review Triage Log
+
+- readiness (r1): closed-unmerged PR stayed eligible for OPEN PR —
+  verified real (only `merged` settled; GhPull.state was dropped at
+  normalization). Fixed: prOpen carried/compared/projected; explicitly-
+  open gate + close-after-ready and legacy-event fixtures. high → patched.
+- readiness (r1): new head inherited the old head's clean mergeability —
+  verified real (nextBranchState carried prev mergeableState on 'unknown'
+  regardless of sha). Fixed: head-change invalidation, fail-closed null
+  at the new head; same-head carry pinned unchanged; poll-to-board
+  fixture added. high → patched.
+- verification (r1): e2e board-order assertions contradicted the new band
+  (NEEDS GRU first / exactly four bands). Verified real at
+  smoke.spec.ts:470,544. Fixed: both orders now FOR YOU + four job bands;
+  mock-backed FOR YOU e2e source added. high → patched.
+- owner-projection (r1): bell contradicted the board on a PR-only
+  obligation ("nothing needs you" vs 1 pending). Verified real (bell
+  filtered needs-owner notifications only). Fixed: bell FOR YOU renders
+  the authoritative ownerRows projection (acks + PRs); alert/history
+  behavior preserved; PR-only and empty-projection parity tests added.
+  high → patched.
 
 <!-- Step-04 halt record (2026-09-28): this dispatch host exposes no
      subagent runtime, so the three review layers (blind-hunter,

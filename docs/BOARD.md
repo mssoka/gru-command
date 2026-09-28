@@ -107,10 +107,14 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   link click is never a merge; readiness is projected SERVER-side
   (`ownerPrs` on the snapshot) from the conjunction of durable exact-head
   facts: `in-review` job + recorded PR, a `github.branch-state`
-  observation whose `pr_url` matches the recorded PR with
-  `merged:false` + `mergeable_state:clean`, CI observed **green at that
-  exact sha**, and the job's NEWEST review round `verdict-posted` /
-  `approved` with its frozen `targetRef` equal to that sha. Anything
+  observation whose `pr_url` matches the recorded PR with the pull
+  explicitly OPEN (`pr_open:true` — a closed-without-merge pull is never
+  an open obligation), `merged:false`, `mergeable_state:clean` observed
+  for THAT head (a moved head invalidates the old mergeability — the
+  poll fails closed until GitHub answers for the new head), CI observed
+  **green at that exact sha**, and the job's NEWEST review round
+  `verdict-posted` / `approved` with its frozen `targetRef` equal to that
+  sha. Anything
   missing, stale, moved, dirty, blocked, pending/failed, or
   changes-requested renders no row (fail closed — no heuristic).
   Known limitation (deliberate): GitHub-native review approvals beyond
@@ -147,9 +151,11 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   owner-only decisions and stops whose ack re-arms supervision), NEEDS GRU
   (all pending machine rows, including those older than the recent feed;
   it wakes Gru once and refuses human Ack), and FEED (FYI rows). The bell
-  is the alert/history surface: it shares the SAME authoritative rows as
-  the board's permanent FOR YOU band (no second state machine); opening
-  it never completes an obligation. A machine
+  is the alert/history surface: it shares the SAME authoritative owner
+  projection as the board's permanent FOR YOU band — pending acks AND
+  ready PRs, so the two surfaces never disagree about what the owner
+  owes (the badge and toasts still count needs-owner notifications
+  only); opening it never completes an obligation. A machine
   alert left unresolved 30 minutes after delivery opens a separate
   owner-only follow-up in FOR YOU; Gru's later disposition resolves it. The badge and live
   toasts serve needs-owner only; every displayed row earns a shown receipt

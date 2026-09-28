@@ -10,9 +10,11 @@
  *   - a `github.branch-state` observation exists for the job whose
  *     `pr_url` is EXACTLY the recorded PR (no ambiguity about which pull
  *     the evidence describes);
- *   - that observation says the PR is NOT merged and mergeable_state is
+ *   - that observation says the PR is explicitly OPEN (`pr_open` true),
+ *     NOT merged, and mergeable_state is
  *     `clean` (not dirty/blocked/unknown/unstable — conflicts and
- *     required-gate blocks fail closed);
+ *     required-gate blocks fail closed; a closed-without-merge pull is
+ *     not an open obligation no matter what older evidence said);
  *   - CI was observed GREEN at exactly the branch-state sha (a carried
  *     forward conclusion for a moved head never qualifies);
  *   - the job's NEWEST review round is `verdict-posted` with verdict
@@ -113,6 +115,7 @@ export function ownerReadyPr(job: OwnerPrJob, evidence: BranchEvidence | null): 
   const { state, checkedAt } = evidence;
   if (state.prUrl === null || state.prUrl !== prUrl) return null; // evidence describes another PR
   if (state.merged) return null; // settled: only confirmed state clears
+  if (state.prOpen !== true) return null; // closed (unmerged) or status never observed — only an explicitly OPEN pull may be OPEN-PR'd (fail closed)
   const sha = state.sha;
   if (sha === null || sha === '') return null;
   if (state.mergeableState !== 'clean') return null; // dirty/blocked/unknown/unstable
