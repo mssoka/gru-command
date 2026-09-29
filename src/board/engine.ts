@@ -12,7 +12,6 @@ import {
   LedgerApi,
   type AgentRecord,
   type JobRecord,
-  type NotificationRecord,
   type RoundRecord,
 } from '../ledger/api.js';
 import type { JobStatus } from '../ledger/states.js';
@@ -108,7 +107,7 @@ export interface NotificationView {
   readonly id: string;
   readonly ts: string;
   readonly kind: string;
-  readonly routing: 'fyi' | 'action-required';
+  readonly routing: 'fyi' | 'action-required' | 'needs-owner';
   readonly severity: 'info' | 'error';
   readonly title: string;
   readonly detail: string | null;
@@ -142,11 +141,17 @@ export interface BoardSnapshot {
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionRuntimeStatus;
-  /** LIVE action-required rows still awaiting a human ack: rows bound to
-   * a terminal (merged/done) job are closed receipts — the bell keeps
-   * them, this count (and the needs-you banding) does not. Counted from
-   * the table, not the 30-row feed window, so the badge stays true. */
+  /** NEEDS GRU: machine-attention rows still awaiting a disposition
+   * (self-clearing machine queue; never rings the owner bell). Counted
+   * LIVE: rows bound to a terminal (merged/done) job are closed receipts —
+   * the record keeps them, this count (and the banding) does not. Read
+   * from the table, not the 30-row feed window, so the tracker is true. */
   readonly unackedActionRequired: number;
+  /** FOR YOU: needs-owner rows still awaiting a human ack — the only
+   * class that rings the bell. */
+  readonly unackedNeedsOwner: number;
+  /** Autonomous Gru turns recorded as durable `gru.wake` events. */
+  readonly wakes: { readonly count: number; readonly lastAt: string | null };
   /** Running build vs origin/main (null when the tracker is unwired). */
   readonly build: DeployDriftView | null;
   /** Silas ops health, derived from the ledger event stream. */
@@ -207,14 +212,16 @@ function lensVerdictFromNote(note: string | null): string | null {
   return null;
 }
 
-/** Lens children mint `lens:chunk` labels; a retry appends `#attempt`
- * (`blind:001#2`). The round tracker reads the lens prefix back off both
- * shapes so attempts count together. */
+/** Whole-PR review specialists mint bare `lens` labels; a retry appends
+ * `#attempt` (`blind#2`). Legacy chunk-era `lens:chunk` labels are still
+ * parsed so historical agent rows keep resolving. */
 function lensFromAgentLabel(label: string | null): string | null {
-  if (label === null) return null;
-  const cut = label.indexOf(':');
-  if (cut <= 0) return null;
-  return label.slice(0, cut);
+  if (label === null || label === '') return null;
+  const withoutAttempt = label.split('#', 1)[0]!;
+  if (withoutAttempt === '') return null;
+  const cut = withoutAttempt.indexOf(':');
+  if (cut > 0) return withoutAttempt.slice(0, cut);
+  return withoutAttempt.includes('/') || withoutAttempt === 'lead' ? null : withoutAttempt;
 }
 
 export interface BoardEngineOptions {
@@ -429,6 +436,11 @@ export class BoardEngine {
       notifications: this.notifications(),
       decisions: this.decisionsStatus(),
       unackedActionRequired: this.ledger.countLivePendingActionRequired(),
+      unackedNeedsOwner: this.ledger.countPendingNeedsOwner(),
+      wakes: {
+        count: this.ledger.countEvents('gru.wake'),
+        lastAt: this.ledger.latestEventOfKind('gru.wake')?.ts ?? null,
+      },
       build: this.buildDrift(),
       silas: this.silasView(),
       verify: this.verifyQueue(),
@@ -541,9 +553,20 @@ export class BoardEngine {
    * them), action-required rows carry acks; nothing is computed here.
    */
   notifications(limit = 30): readonly NotificationView[] {
-    return this.ledger
-      .listNotifications({ limit })
-      .map((row: NotificationRecord) => ({
+    // The recent feed is bounded, but neither pending attention queue is.
+    // Old machine incidents remain visible until Gru dispositions them;
+    // owner stops remain in FOR YOU until the owner's Ack.
+    const byId = new Map(this.ledger.listNotifications({ limit }).map((row) => [row.id, row]));
+    for (const routing of ['needs-owner', 'action-required'] as const) {
+      for (let offset = 0;; offset += 50) {
+        const page = this.ledger.listNotifications({ unackedOnly: true, routing, limit: 50, offset });
+        for (const row of page) byId.set(row.id, row);
+        if (page.length < 50) break;
+      }
+    }
+    return [...byId.values()]
+      .sort((a, b) => b.ts.localeCompare(a.ts) || a.id.localeCompare(b.id))
+      .map((row) => ({
         id: row.id,
         ts: row.ts,
         kind: row.kind,

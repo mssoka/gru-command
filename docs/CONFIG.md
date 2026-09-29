@@ -201,15 +201,24 @@ keep = 5
 # gru.frames.jsonl rotation; reconnect replay spans retained shards.
 frame_log_max_bytes = 8388608
 frame_log_keep = 3
-# Gru awareness wake policy. "never" (default) injects action-required
-# escalations and a compact ledger digest into the NEXT Gru turn passively
-# — no model turn runs by itself, so it adds no turn cost. Wake modes
-# start a Gru turn when a notification lands: "action-required" only for
-# action-required notifications; "all" for every notification (FYI
-# included). Each wake is a full model turn (provider tokens + latency),
-# so it costs whenever the lane is noisy. Wakes never acknowledge
-# anything: the human still holds every ack.
-notify_wake = "never"
+# Gru awareness wake policy. Wakes OPEN a Gru turn so a critical alert
+# is acted on without the user pinging. "action-required" (default) wakes
+# for machine-attention rows; "all" also for FYI/needs-owner; "never"
+# injects context passively before the next turn only (no autonomous
+# turn). Each wake is a full model turn (provider tokens + latency).
+notify_wake = "action-required"
+# Minimum interval between autonomous wakes; candidates inside the
+# window coalesce into ONE trailing wake. 0 disables the cap.
+wake_min_interval_ms = 300000
+# Severity floor for a wake: "info" wakes for every routed row,
+# "error" only for error-severity rows.
+wake_min_severity = "info"
+# Local-time quiet window ("HH:MM-HH:MM", may wrap midnight); wakes
+# inside it defer to the window end. Empty string = off.
+wake_quiet_hours = ""
+# First delivered block after this much quiet time carries a "while you
+# were away" digest (wakes, actions, merges, staged PRs). 0 disables it.
+morning_digest_gap_ms = 28800000
 
 [worktrees]
 # Job/review worktree roots follow data_dir by default; uncomment only to relocate.
@@ -284,13 +293,31 @@ enabled = true
 [verify]
 # Verification scheduler: lanes request their project's verify command
 # through POST /api/verify; the scheduler owns ONE global test budget
-# across lanes. Requests beyond max_concurrent queue FIFO, a queued
-# request past lock_wait_timeout_ms fails loud, a holder whose pid is
-# dead is released, and every run is recorded for review evidence.
+# across lanes/repos. It governs only verification commands submitted
+# through that API — it does not set AI-agent/reviewer counts and does
+# not govern arbitrary commands run directly outside it. Requests
+# beyond max_concurrent queue FIFO, a queued request past
+# lock_wait_timeout_ms fails loud, a holder whose pid is dead is
+# released, and every run is recorded for review evidence.
+# Maximum simultaneous verification commands; 1 serializes runs and
+# later requests queue FIFO. Not a per-command test-worker count.
 max_concurrent = 1
-# Total test workers across runs; 0 = auto (CPU cores - 2).
+# Total test-runner worker allowance across admitted runs, NOT AI
+# agents/reviewers. 0 = auto: max(1, OS-available CPU parallelism - 2).
+# The allowance is split across the effective concurrency (max_concurrent
+# clamped so the budget is never exceeded; each run gets its share,
+# minimum 1). Enforcement passes supported runner worker settings to
+# each run (vitest pool env vars + GRU_VERIFY_*); it is not an OS CPU
+# quota and reserves no cores.
 worker_budget = 0
+# Deadline for a queued request waiting for a slot, in milliseconds;
+# 900000 = 15 minutes. Expiry fails that queued request loud without
+# starting it; the current holder is not terminated.
 lock_wait_timeout_ms = 900000
+# Execution deadline after a run starts (queue wait excluded), in
+# milliseconds; 1800000 = 30 minutes. On expiry the scheduler SIGTERMs
+# the run's process group, then SIGKILLs after the 5-second grace if
+# needed, and records the run as timed out / non-success.
 run_timeout_ms = 1800000
 
 ```

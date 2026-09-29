@@ -383,9 +383,15 @@ function sampleSnapshot(): unknown {
     notifications: [
       { id: 'mock-n1', ts: new Date().toISOString(), kind: 'job.status', routing: 'fyi', severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
       { id: 'mock-n2', ts: new Date(Date.now() - 120_000).toISOString(), kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'Round r1 verdict', detail: 'approved', agentId: null, shownAt: new Date().toISOString(), ackedAt: new Date().toISOString(), resolvedAt: null, resolvedBy: null },
-      { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
-      { id: 'mock-n4', ts: new Date(Date.now() - 900_000).toISOString(), kind: 'supervision.provider-wall.demo-api-quota-walled.quota_wall', routing: 'action-required', severity: 'error', title: 'Agent mock-minion-quota stopped: quota wall', detail: 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.', agentId: 'mock-minion-quota', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
-      { id: 'mock-n5', ts: new Date(Date.now() - 2_400_000).toISOString(), kind: 'supervision.provider-wall.demo-api-merged-leftover.quota_wall', routing: 'action-required', severity: 'error', title: 'Agent mock-minion-merged stopped: quota wall', detail: 'Leftover escalation — the lane merged anyway. Closed receipt: kept for the record, never live queue.', agentId: 'mock-minion-merged', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Needs-owner stops (ack re-arms supervision) ring the FOR YOU band / bell.
+      { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Provider-wall stops are owner-held too: resolve the provider, then ack to re-arm.
+      { id: 'mock-n4', ts: new Date(Date.now() - 900_000).toISOString(), kind: 'supervision.provider-wall.demo-api-quota-walled.quota_wall', routing: 'needs-owner', severity: 'error', title: 'Agent mock-minion-quota stopped: quota wall', detail: 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.', agentId: 'mock-minion-quota', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Machine attention lives in the self-clearing NEEDS GRU queue — a live global row keeps the tracker legible.
+      { id: 'mock-n5', ts: new Date(Date.now() - 300_000).toISOString(), kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Review round demo-api-payment-fix-r1 is INCOMPLETE', detail: 'lead session aborted — the lane can be re-armed', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Section truth: a leftover MACHINE row bound to the merged lane is a
+      // closed receipt — the record keeps it, the live count does not.
+      { id: 'mock-n6', ts: new Date(Date.now() - 2_400_000).toISOString(), kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Leftover machine escalation on the merged lane', detail: 'The lane merged anyway. Closed receipt: kept for the record, never live queue.', agentId: 'mock-minion-merged', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
     ],
     decisions: {
       enabled: true,
@@ -399,10 +405,14 @@ function sampleSnapshot(): unknown {
       incarnation: 'mock-incarnation',
       generation: 1,
     },
-    // LIVE unacked action-required rows only: n3 (payment-fix, in-review)
-    // + n4 (quota-walled, working). The merged lane's n5 is a closed
-    // receipt — the bell keeps it; this count (and NEEDS YOU) does not.
-    unackedActionRequired: 2,
+    // LIVE machine rows only: the global review escalation (n5) counts;
+    // the merged lane's leftover n6 is a closed receipt — the record keeps
+    // it, this count (and NEEDS GRU) does not.
+    unackedActionRequired: 1,
+    // Owner stops ring the bell (FOR YOU): the crash-loop stop and the
+    // provider-wall stop await the owner's ack.
+    unackedNeedsOwner: 2,
+    wakes: { count: 2, lastAt: new Date(Date.now() - 180_000).toISOString() },
     build: {
       buildRev: 'abc1234def5678abc1234def5678abc1234def56',
       buildCommittedAt: new Date(Date.now() - 5_400_000).toISOString(),

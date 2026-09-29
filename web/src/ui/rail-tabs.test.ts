@@ -6,7 +6,7 @@ import { RailTabs } from './rail-tabs.js';
 function mount(): HTMLElement {
   document.body.innerHTML = `
     <aside id="agents-rail">
-      <button data-rail-tab="agents" class="agents-rail__tab agents-rail__tab--active" aria-selected="true">AGENTS <span id="rail-agents-count">0</span></button>
+      <button data-rail-tab="agents" class="agents-rail__tab agents-rail__tab--active" aria-selected="true">CREW <span id="rail-agents-count">0</span></button>
       <button data-rail-tab="transcripts" class="agents-rail__tab" aria-selected="false">TRANSCRIPTS</button>
       <div data-rail-panel="agents"></div>
       <div data-rail-panel="transcripts" hidden></div>

@@ -51,6 +51,8 @@ function snapshot(jobs: readonly JobView[], agents: readonly AgentView[] = []): 
       generation: 1,
     },
     unackedActionRequired: 0,
+    unackedNeedsOwner: 0,
+    wakes: { count: 0, lastAt: null },
     build: null,
     silas: null,
     verify: null,
@@ -92,18 +94,52 @@ describe('board rail — chips (v6)', () => {
     ]);
   });
 
-  it('folds three KPI groups (jobs/PRs/lanes) into the trackers chip', () => {
+  it('folds three KPI groups (heists/PRs/crew) into the trackers chip', () => {
     const chips = railChips(snapshot([job('w1', 'working')]), NOW);
     const trackers = chips.find((chip) => chip.id === 'trackers');
-    expect(trackers?.kpis?.map((group) => group.label)).toEqual(['JOBS', 'PRS', 'LANES']);
+    expect(trackers?.kpis?.map((group) => group.label)).toEqual(['HEISTS', 'PRS', 'CREW']);
     expect(trackers?.kpis?.map((group) => group.title)).toEqual([
       'working / in-review / merged / done / parked',
       'open / conflicting / merged today',
-      'live minions / mid-turn / disposed',
+      'live minions / crew mid-turn / crew disposed',
+    ]);
+    // CREW, not MINIONS: midTurn/disposed count every agent (gru, silas,
+    // lens children too) — the label must not promise minions only.
+    const crewGroup = trackers?.kpis?.[2];
+    expect(crewGroup?.values.map((value) => value.kpi)).toEqual([
+      'lanes.liveMinions',
+      'lanes.midTurn',
+      'lanes.disposed',
     ]);
     // The health chips carry no folded counts (their flags are the health
     // card's own sub-badge — e.g. REVIEWS carries "12 FAILED").
     expect(chips.filter((chip) => chip.id !== 'trackers').every((chip) => chip.kpis === undefined)).toBe(true);
+  });
+
+  it('labels every folded count beside its number (v6.1 ruling 5)', () => {
+    const chips = railChips(snapshot([job('w1', 'working')]), NOW);
+    const trackers = chips.find((chip) => chip.id === 'trackers');
+    for (const group of trackers?.kpis ?? []) {
+      for (const value of group.values) {
+        expect(value.label, value.kpi).not.toBe('');
+      }
+    }
+    const labels = (trackers?.kpis ?? []).flatMap((group) => group.values.map((value) => value.label));
+    expect(labels).toEqual([
+      'working',
+      'in review',
+      'merged',
+      'done',
+      'parked',
+      'open',
+      'conflicting',
+      'merged today',
+      'minions',
+      'mid-turn',
+      'disposed',
+    ]);
+    // No bare slash counters survive — the operator reads the label order.
+    expect(trackers?.kpis?.every((group) => group.values.every((value) => value.label !== undefined))).toBe(true);
   });
 
   it('every folded count equals the v4 KPI derivation (same snapshot)', () => {
@@ -149,11 +185,31 @@ describe('board rail — chips (v6)', () => {
     expect(values.get('lanes.disposed')).toBe(1);
   });
 
+  it('renders truthful counts in words: singular heist, crew-wide mid-turn (blind r1/r2)', () => {
+    const one = railChips(snapshot([job('w1', 'working')]), NOW);
+    const oneTrackers = one.find((chip) => chip.id === 'trackers');
+    expect(oneTrackers?.kpis?.[0]?.total?.title).toBe('1 heist on the board');
+    const two = railChips(snapshot([job('w1', 'working'), job('w2', 'working')]), NOW);
+    expect(two.find((chip) => chip.id === 'trackers')?.kpis?.[0]?.total?.title).toBe('2 heists on the board');
+
+    // The CREW group counts the whole crew: a streaming lens child rides
+    // mid-turn and the live-minion field pluralizes with its count.
+    const mixed = railChips(
+      snapshot([job('w1', 'working')], [agent('lens', 'streaming', 'perkins'), agent('m1', 'idle')]),
+      NOW,
+    );
+    const crew = mixed.find((chip) => chip.id === 'trackers')?.kpis?.[2];
+    expect(crew?.label).toBe('CREW');
+    expect(crew?.values[1]?.value).toBe(1);
+    expect(crew?.values[0]?.value).toBe(1);
+    expect(crew?.values[0]?.title).toBe('1 live minion');
+  });
+
   it('marks the loud states: an unacked tracker chip flags the count', () => {
     const snap = snapshot([job('i1', 'in-review', { prUrl: 'https://x/2', prState: 'conflicting' })]);
     const trackers = railChips({ ...snap, unackedActionRequired: 2 }, NOW).find((chip) => chip.id === 'trackers');
     expect(trackers?.tone).toBe('alert');
-    expect(trackers?.detail).toContain('2 action-required');
+    expect(trackers?.detail).toContain('2 needs Gru');
   });
 
   it('carries the health cards verbatim: unwired feeds stay an honest n/a', () => {

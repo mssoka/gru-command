@@ -11,6 +11,10 @@ close-out: a ledger-visible end state a stranger can audit.
   `silas.directive-sent`, `silas.rebrief`, `silas.escalated`, plus the
   `silas.wake` rows for your turns). Never edit or imply history — append
   only.
+- Mechanical reactions are recorded too (mandate split 2026-09-23): a
+  re-arm, a pattern respin, or a rule-based sweep ack lands as the event
+  it is (the review request, the round, the sweep) with the rule that
+  fired it — the chief's trackers count them.
 - Before you act on a lane, re-read its recent events. A stale digest is a
   hypothesis; the ledger is the fact.
 

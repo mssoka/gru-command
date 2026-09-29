@@ -398,12 +398,51 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(roundView?.lenses.find((chip) => chip.lens === 'edge')?.verdict).toBe('clean');
   });
 
+  it('counts whole-PR bare-lens specialist attempts (blind, blind#2) alongside legacy lens:chunk labels', () => {
+    const { api, engine } = fresh();
+    const job = api.addJob({ id: 'whole-job', repo: 'demo-repo', title: 'Whole' });
+    api.setJobStatus(job.id, 'working');
+    api.registerWorktree({
+      id: job.id,
+      kind: 'job',
+      repoPath: '/repos/demo-repo',
+      repoName: 'demo-repo',
+      path: '/worktrees/demo-repo/job-whole-job',
+      branch: 'gru/whole-job',
+      sha: 'def456base',
+      jobId: job.id,
+    });
+    const round = api.addRound({ jobId: job.id, targetRef: 'def456base' });
+    // Whole-PR specialists mint bare lens labels; retries append #attempt.
+    api.registerAgent({ id: 'sp-blind-1', role: 'perkins', label: 'blind', roundId: round.id, jobId: job.id });
+    api.registerAgent({ id: 'sp-blind-2', role: 'perkins', label: 'blind#2', roundId: round.id, jobId: job.id });
+    api.registerAgent({ id: 'sp-security-1', role: 'perkins', label: 'security', roundId: round.id, jobId: job.id });
+    api.setAgentState('sp-blind-2', 'streaming');
+    api.setLensOutcome(round.id, 'blind', 'done', 'clean — lead retained no finding sourced from this specialist');
+    api.setLensOutcome(round.id, 'security', 'done', 'not used — lead-owned whole-PR review');
+    const view = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((entry) => entry.id === job.id);
+    const roundView = view?.rounds[0];
+    expect(roundView?.lensAttempts).toEqual([
+      { lens: 'blind', attempts: 2 },
+      { lens: 'security', attempts: 1 },
+    ]);
+    // The 'lead' agent label is not a lens and never becomes an attempt.
+    api.registerAgent({ id: 'lead-1', role: 'perkins', label: 'lead', roundId: round.id, jobId: job.id });
+    const after = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((entry) => entry.id === job.id)?.rounds[0];
+    expect(after?.lensAttempts).toEqual([
+      { lens: 'blind', attempts: 2 },
+      { lens: 'security', attempts: 1 },
+    ]);
+  });
+
   it('counts unacked action-required rows from the whole table, not the feed window', () => {
     const { api, engine } = fresh();
     api.recordNotification({ id: 'n-action', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Ack me' });
     api.recordNotification({ id: 'n-fyi', kind: 'test.notice', routing: 'fyi', severity: 'info', title: 'FYI' });
     expect(engine.snapshot().unackedActionRequired).toBe(1);
-    api.ackNotification('n-action', 'web');
+    expect(() => api.ackNotification('n-action', 'web')).toThrow(/require a Gru disposition/);
+    expect(engine.snapshot().unackedActionRequired).toBe(1);
+    api.disposeMachineNotification('n-action', 'Fixed the cause');
     expect(engine.snapshot().unackedActionRequired).toBe(0);
     const resolved = api.recordNotification({ id: 'n-resolved', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Resolved' });
     expect(engine.snapshot().unackedActionRequired).toBe(1);
@@ -422,7 +461,7 @@ describe('board engine — liveness-first rail and job trackers', () => {
     api.registerAgent({ id: 'live-minion', role: 'minion', jobId: live.id });
     api.recordNotification({
       id: 'n-live',
-      kind: 'supervision.provider-wall.live-job.quota_wall',
+      kind: 'test.live.notice',
       routing: 'action-required',
       severity: 'error',
       title: 'Agent live-minion stopped: quota wall',
@@ -434,7 +473,7 @@ describe('board engine — liveness-first rail and job trackers', () => {
     api.registerAgent({ id: 'merged-minion', role: 'minion', jobId: merged.id });
     api.recordNotification({
       id: 'n-merged',
-      kind: 'supervision.provider-wall.merged-job.quota_wall',
+      kind: 'test.merged.notice',
       routing: 'action-required',
       severity: 'error',
       title: 'Leftover escalation on a merged lane',
@@ -462,7 +501,7 @@ describe('board engine — liveness-first rail and job trackers', () => {
     api.setJobStatus(done.id, 'done');
     expect(engine.snapshot().unackedActionRequired).toBe(2);
 
-    // Nothing was acked or resolved — the bell keeps the receipts.
+    // Nothing was acked or resolved — the record keeps the receipts.
     for (const id of ['n-merged', 'n-done']) {
       const row = api.getNotification(id);
       expect(row?.ackedAt).toBeNull();
@@ -474,5 +513,51 @@ describe('board engine — liveness-first rail and job trackers', () => {
     api.setJobStatus(live.id, 'in-review');
     api.setJobStatus(live.id, 'merged');
     expect(engine.snapshot().unackedActionRequired).toBe(1); // the unbound global row
+  });
+
+  it('counts needs-owner rows separately (the FOR YOU band never borrows the machine queue)', () => {
+    const { api, engine } = fresh();
+    api.recordNotification({ id: 'n-machine', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Machine' });
+    api.recordNotification({ id: 'n-owner', kind: 'test.notice', routing: 'needs-owner', severity: 'error', title: 'Owner' });
+    let snapshot = engine.snapshot();
+    expect(snapshot.unackedActionRequired).toBe(1);
+    expect(snapshot.unackedNeedsOwner).toBe(1);
+    api.ackNotification('n-owner', 'web');
+    snapshot = engine.snapshot();
+    expect(snapshot.unackedActionRequired).toBe(1);
+    expect(snapshot.unackedNeedsOwner).toBe(0);
+  });
+
+  it('keeps pending owner-only stops visible despite thirty newer machine/FYI rows', () => {
+    const { api, engine } = fresh();
+    const owner = api.recordNotification({ id: 'owner-stop', kind: 'supervision.breaker', routing: 'needs-owner', severity: 'info', title: 'Owner-only re-arm' });
+    for (let i = 0; i < 35; i += 1) {
+      api.recordNotification({ id: `noise-${i}`, kind: 'noise', routing: i % 2 ? 'fyi' : 'action-required', severity: 'info', title: `Noise ${i}` });
+    }
+    const snap = engine.snapshot();
+    expect(snap.unackedNeedsOwner).toBe(1);
+    expect(snap.notifications.find((row) => row.id === owner.id)).toMatchObject({ routing: 'needs-owner', ackedAt: null });
+  });
+
+  it('keeps pending machine incidents visible beyond the recent feed while closed rows stay bounded', () => {
+    const { api, engine } = fresh();
+    api.recordNotification({ id: 'old-machine', kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Still needs Gru' });
+    for (let i = 0; i < 35; i += 1) {
+      api.recordNotification({ id: `feed-${i}`, kind: 'noise', routing: 'fyi', severity: 'info', title: `Noise ${i}` });
+    }
+    expect(engine.snapshot().notifications.find((row) => row.id === 'old-machine')).toMatchObject({ routing: 'action-required', resolvedAt: null });
+    api.disposeMachineNotification('old-machine', 'Remediated');
+    expect(engine.snapshot().notifications.some((row) => row.id === 'old-machine')).toBe(false);
+  });
+
+  it('tracks autonomous wakes from the durable gru.wake events', () => {
+    const { api, engine } = fresh();
+    expect(engine.snapshot().wakes).toEqual({ count: 0, lastAt: null });
+    api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+    const first = engine.snapshot().wakes;
+    expect(first.count).toBe(1);
+    expect(first.lastAt).not.toBeNull();
+    api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n2'], count: 1 } });
+    expect(engine.snapshot().wakes.count).toBe(2);
   });
 });

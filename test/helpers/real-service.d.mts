@@ -48,6 +48,8 @@ export declare function startRealService(options?: {
   decisionKey?: string;
   /** Offline child preload, e.g. the Jev fetch double. */
   nodeImport?: string;
+  /** Write [chat] notify_wake with this mode (wake-on-alert e2e). */
+  notifyWake?: 'never' | 'action-required' | 'all';
   /** Additional non-secret test controls for the child process. */
   extraEnv?: NodeJS.ProcessEnv;
 }): Promise<RealServiceHandle>;

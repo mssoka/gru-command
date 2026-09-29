@@ -124,6 +124,7 @@ export async function startRealService({
   decisionsEnabled = false,
   decisionKey,
   nodeImport,
+  notifyWake,
   extraEnv = {},
 } = {}) {
   // Port-squat prevention: ephemeral or an explicit high-range override —
@@ -167,6 +168,11 @@ export async function startRealService({
       // exercise the conservative decline through the real service.
       `default = "${model}"`,
       ...(decisionsEnabled ? ['[decisions.jev]', 'enabled = true'] : []),
+      // Wake-on-alert tests need the policy ON (the default in production,
+      // explicit here so the hermetic config pins the behavior).
+      ...(notifyWake !== undefined
+        ? ['[chat]', `notify_wake = ${JSON.stringify(notifyWake)}`, 'wake_min_interval_ms = 0']
+        : []),
       '',
     ].join('\n'),
     'utf-8',

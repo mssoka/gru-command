@@ -202,6 +202,8 @@ export interface PrWithoutReviewRow {
   readonly repo: string;
   readonly prUrl: string;
   readonly priorRounds: number;
+  /** Only these service-restart aborts are known-safe mechanical re-arms. */
+  readonly cleanAbort?: { readonly roundId: string; readonly ruleId: 'clean-abort-service-restart' };
 }
 
 export interface VerdictAwaitingDirectiveRow {
@@ -371,6 +373,19 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     const reviewRequest = latestReviewRequest(input.ledger, job.id);
     const reviewAlreadyRequested =
       reviewRequest !== null && (delivered === null || reviewRequest.seq > delivered.seq);
+    const abortProof = newestRound?.status === 'aborted'
+      ? input.ledger.latestRoundEvent(newestRound.id, 'round.perkins-incomplete') : null;
+    const abortReason = abortProof !== null && abortProof.roundId === newestRound?.id && typeof abortProof.payload === 'object' && abortProof.payload !== null
+      ? (abortProof.payload as { reason?: unknown }).reason : null;
+    const cleanAbort = newestRound !== null && delivered !== null &&
+      newestRound.status === 'aborted' &&
+      (abortReason === 'service_restart' || abortReason === 'service_restart_missing_review_lane') &&
+      deliveredTargetSha(delivered) !== null && deliveredTargetSha(delivered) === newestRound.targetRef &&
+      !(reviewRequest !== null && reviewRequest.kind === 'silas.review-triggered' &&
+        reviewRequest.seq > (abortProof?.seq ?? 0) &&
+        typeof reviewRequest.payload === 'object' && reviewRequest.payload !== null &&
+        (reviewRequest.payload as { source_round_id?: unknown; rule_id?: unknown }).source_round_id === newestRound.id &&
+        (reviewRequest.payload as { rule_id?: unknown }).rule_id === 'clean-abort-service-restart');
 
     // (1) Delivered, no PR yet.
     if (delivered !== null && job.prUrl === null && rounds.length === 0) {
@@ -394,7 +409,10 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // `delivered` (settled before the PR landed) and `in-review` (the
     // register-PR hop lands there). Blocked/parked/terminal lanes do not.
     const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
-    if (job.prUrl !== null && reviewPending && newestRound === null && !reviewAlreadyRequested) {
+    if (job.prUrl !== null && reviewPending && cleanAbort && newestRound !== null) {
+      digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
+        priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
+    } else if (job.prUrl !== null && reviewPending && newestRound === null && !reviewAlreadyRequested) {
       digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl, priorRounds: 0 });
     } else if (
       job.prUrl !== null &&
@@ -549,7 +567,7 @@ export interface SilasSlot {
   ensure(options?: SpawnOptions): Promise<AgentHandle>;
 }
 
-export type SilasTriggerKind = 'job.delivered' | 'job.minion-error' | 'round.verdict' | 'sweep';
+export type SilasTriggerKind = 'job.delivered' | 'job.minion-error' | 'round.verdict' | 'round.perkins-incomplete' | 'sweep';
 
 export interface SilasTrigger {
   readonly kind: SilasTriggerKind;
@@ -581,7 +599,7 @@ export interface SilasDriverOptions {
   readonly now?: () => number;
 }
 
-const SILAS_WAKE_EVENTS: readonly string[] = ['job.delivered', 'job.minion-error', 'round.verdict'];
+const SILAS_WAKE_EVENTS: readonly string[] = ['job.delivered', 'job.minion-error', 'round.verdict', 'round.perkins-incomplete'];
 
 export class SilasDriver {
   private readonly opts: SilasDriverOptions;
@@ -789,8 +807,10 @@ export function buildWakePrompt(input: {
     'You are the operations layer. The digest below lists every lane awaiting',
     'ops follow-through, computed from the ledger moments ago. Work inside',
     'your authority: dispatch, track, close. Never write product code; never',
-    'merge (Perkins owns verdict authority; the human holds the merge);',
-    'preserve before remove; escalate to the chief with pointers, not prose.',
+    'merge. Perkins owns verdict authority. Gru may merge gru-command only',
+    'after the required Perkins gate; fallback PASS is not that clearance.',
+    'The owner holds merges elsewhere and the fallback gate. Preserve before',
+    'remove; escalate novel failures to the chief with pointers, not prose.',
     'Never act on the Gru chat session itself.',
     '',
     '## Ops surface',
