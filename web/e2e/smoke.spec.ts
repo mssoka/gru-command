@@ -674,6 +674,14 @@ test.describe('board (E6, mock feed)', () => {
     await expect(row).toHaveAttribute('title', /Fix the payment retry loop.*mock-minion/u);
     for (const theme of ['light', 'dark'] as const) {
       if (theme === 'dark') await page.locator('#theme-toggle').click();
+      // Label integrity (P13): each pass positively asserts its ACTUAL html
+      // theme before any capture named for it — the same pattern the
+      // trackers theme test uses. Light is checked, never assumed.
+      if (theme === 'dark') {
+        await expect(page.locator('html')).toHaveClass(/dark/);
+      } else {
+        await expect(page.locator('html')).not.toHaveClass(/dark/);
+      }
       for (const [viewport, width, height] of [['desktop', 1280, 900], ['phone', 390, 844]] as const) {
         await page.setViewportSize({ width, height });
         if (viewport === 'phone') await row.scrollIntoViewIfNeeded();
