@@ -845,7 +845,7 @@ test.describe('phone chrome', () => {
     expect(box!.x + box!.width, `${selector} right edge on screen`).toBeLessThanOrEqual(vw);
   }
 
-  const CHROME_CONTROLS = ['#theme-toggle', '#settings-toggle'];
+  const CHROME_CONTROLS = ['#theme-toggle', '#settings-toggle', '#sound-toggle'];
 
   /** Top-anchored overlays must clear the nav, whatever its wrapped
    * height: kills any mutation of --phone-nav-clearance to less than the

@@ -76,7 +76,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 
 - **Cockpit (v6.1):** the estate is full-width. The sticky **command bar**
   carries the brand + `ONE GRU · ONE WINDOW`, the monospace ticker
-  (`MODE` · `RADAR` · top review round), the notification bell, theme and
+  (`MODE` · `RADAR` · top review round), the notification bell, the
+  owner-chime speaker, theme and
   settings — no lens toggle: chat is always docked on desktop and the FAB
   owns mobile chat. Below it the sticky **status chip rail** relocates the
   v4 health row globally (DEPLOY → REVIEWS → SILAS → ALERTS → VERIFY →
@@ -130,6 +131,14 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   wake tracker chip counts durable Gru wakes (`gru.wake` events). Live
   needs-owner arrivals toast (plus a browser notification when permission
   was granted).
+- **Owner chime (owner ruling 2026-09-23):** the ONE sound — a soft
+  two-note Web Audio chime on NEW unresolved `needs-owner` arrivals
+  only (`action-required`/NEEDS GRU/FYI stay silent by design — machine
+  queue, machine noise). Audio arms on the first user gesture; an
+  unarmed arrival pulses the bell badge instead (visual fallback). The
+  header speaker toggles a persisted mute, separate from the bell's
+  panel navigation (badges still count), and chimes are throttled to
+  one per 30 s (a burst is one sound + the merged badge).
 - **Transcripts:** drawer with newest-first pages (`load older` by entry
   cursor), debounced server-side search with snippet matches that
   scroll+flash the entry, a wrap toggle (default `pre-wrap` — long lines
