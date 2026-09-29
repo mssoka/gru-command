@@ -903,3 +903,30 @@ describe('self-roll table', () => {
     }
   });
 });
+
+describe('resident config bounds completions (phase 2)', () => {
+  it('rejects unsafe integers with their own actionable message', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-config-unsafe-'));
+    const file = join(home, 'config.toml');
+    // 2^53 parses as a valid TOML float but is not a JS safe integer, so
+    // the schema (not the TOML parser) must reject it.
+    writeFileSync(file, '[concurrency]\nmax_workers = 9007199254740992.0\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/exceeds the maximum safe integer/);
+  });
+
+  it('caps resident workers at the documented sanity ceiling', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-config-cap-'));
+    const file = join(home, 'config.toml');
+    writeFileSync(file, '[concurrency]\nmax_workers = 500\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/max_workers must be <= 128/);
+  });
+
+  it('gates the children ceiling on review enablement, symmetric with the >= 2 rule', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-config-children-'));
+    const file = join(home, 'config.toml');
+    writeFileSync(file, '[review]\nenabled = false\nmax_concurrent_children = 64\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).not.toThrow();
+    writeFileSync(file, '[review]\nenabled = true\nmax_concurrent_children = 64\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/max_concurrent_children must be <= 32/);
+  });
+});

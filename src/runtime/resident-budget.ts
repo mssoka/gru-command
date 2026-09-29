@@ -16,10 +16,32 @@ export class ResidentBudget {
   private nextIdleOrder = 0;
   private reclaiming = false;
   private stopped = false;
+  /** Drain epoch: one admission decision at the head of the queue. Each
+   * eligible idle worker is attempted at most once per epoch; a FAILED
+   * disposal is recorded (and never re-attempted this epoch, so our own
+   * failure-driven changed() callback cannot spin). A SUCCESSFUL partial
+   * reclaim is progress, not exhaustion — the head waiter stays queued and
+   * retains the freed capacity for its own admission. */
+  private epoch = 0;
+  private epochHead: unknown = null;
+  private readonly epochTried = new Set<AgentHandle>();
+  private reclaimFailures = 0;
+
+  /** Durable, deduplicated reclaim-failure observations (one per handle
+   * per drain epoch, by construction). The registry relays these; the
+   * budget owns no ledger. */
+  onReclaimFailure?: (observation: {
+    readonly agentId: string;
+    readonly generation: number;
+    readonly attempt: number;
+    readonly error: string;
+  }) => void;
 
   constructor(readonly capacity: number) {
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('resident worker capacity must be a positive safe integer');
   }
+
+  get reclaimFailureCount(): number { return this.reclaimFailures; }
 
   get occupied(): number { return this.used; }
   get queued(): number { return this.waiting.length; }
@@ -87,6 +109,14 @@ export class ResidentBudget {
     const head = this.waiting[0];
     if (head === undefined) return;
     if (head.signal?.aborted) { head.onAbort(); return; }
+    // A new waiter at the head starts a new drain epoch: every eligible
+    // idle worker is reconsidered exactly once for it, regardless of how
+    // the previous waiter left the queue.
+    if (head !== this.epochHead) {
+      this.epochHead = head;
+      this.epoch += 1;
+      this.epochTried.clear();
+    }
     if (this.available >= head.count) {
       this.waiting.shift();
       head.signal?.removeEventListener('abort', head.onAbort);
@@ -96,22 +126,48 @@ export class ResidentBudget {
       return;
     }
     if (this.reclaiming) return;
-    // Only reclaim idle minions, never review coordinators or children.
+    // Only reclaim idle minions, never review coordinators or children. A
+    // candidate that already failed THIS drain epoch is not reattempted —
+    // our own failure-driven changed() callback must not spin the queue.
     const candidate = [...this.idle].filter(([handle, record]) =>
-      handle.role === 'minion' && record.at !== null,
+      handle.role === 'minion' && record.at !== null && !this.epochTried.has(handle),
     ).sort((a, b) => (a[1].at ?? 0) - (b[1].at ?? 0) || a[1].order - b[1].order)[0]?.[0];
-    if (candidate === undefined) return;
-    this.reclaiming = true;
-    this.idle.delete(candidate);
-    // The supported handle disposal path releases its own permit. A failed
-    // disposal cannot release capacity, and must not spin on the same handle.
-    void candidate.dispose().catch((error: unknown) => {
+    if (candidate === undefined) {
+      // Nothing eligible to attempt: the steady state of a full house with
+      // no warm eligible worker — the waiter stays QUEUED and a future
+      // release/changed() re-drains. Only a genuine epoch exhaustion (every
+      // eligible idle worker was tried and every disposal FAILED) is
+      // surfaced loud to the head waiter; a successful reclaim that freed
+      // too little capacity keeps the waiter queued (demand-driven
+      // reservation), never rejects it.
+      if (this.epochTried.size === 0) return;
+      // Epoch exhausted: every attempted disposal failed. Surface the real
+      // decision to the head waiter — capacity stays truthful, nothing is
+      // force-released.
       const index = this.waiting.indexOf(head);
       if (index >= 0) {
         this.waiting.splice(index, 1);
         head.signal?.removeEventListener('abort', head.onAbort);
-        head.reject(new Error(`resident idle disposal failed: ${String(error)}`));
+        head.reject(new Error(
+          `resident reclaim exhausted: ${this.epochTried.size} eligible idle worker(s) failed disposal this epoch; ` +
+          'free a worker or raise [concurrency] max_workers',
+        ));
       }
+      return;
+    }
+    this.reclaiming = true;
+    this.idle.delete(candidate);
+    // The supported handle disposal path releases its own permit. A failed
+    // disposal cannot release capacity; it keeps its permit and the drain
+    // continues fairly with the next genuinely different candidate. Only
+    // failures are recorded for the epoch's exhaustion decision.
+    void candidate.dispose().catch((error: unknown) => {
+      this.reclaimFailures += 1;
+      this.epochTried.add(candidate);
+      this.onReclaimFailure?.({
+        agentId: candidate.id, generation: this.epoch, attempt: this.epochTried.size,
+        error: String(error),
+      });
     }).finally(() => {
       this.reclaiming = false;
       this.drain();

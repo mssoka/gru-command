@@ -302,8 +302,13 @@ export interface ConcurrencyConfig {
 
 export const DEFAULT_CONCURRENCY_CONFIG: ConcurrencyConfig = { maxWorkers: 4 };
 export const DEFAULT_REVIEW_CHILDREN = 2;
-/** Explicit finite tool-batch bound; higher settings are rejected at load time. */
+/** Explicit finite tool-batch bound; higher settings are rejected at load time
+ * (review-gated, like the max_workers >= 2 requirement: both bounds govern
+ * the review path only). */
 export const MAX_REVIEW_CHILDREN = 32;
+/** Documented finite sanity ceiling for resident workers: a typo must fail
+ * load with an actionable bound, not silently oversubscribe the host. */
+export const MAX_RESIDENT_WORKERS = 128;
 
 /** Review gate policy (Perkins primary; bmad-review fallback gate per the
  * 2026-09-20 amendment, fork-3). */
@@ -584,9 +589,18 @@ function requireBool(value: unknown, file: string, field: string): boolean {
 }
 
 function requirePositiveInt(value: unknown, file: string, field: string): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
     throw new ConfigError(
       `${field} must be a positive integer, got: ${String(value)}`,
+      file,
+      field,
+    );
+  }
+  // Integers beyond the safe range are representable but lose exactness;
+  // they are rejected with their own actionable message.
+  if (!Number.isSafeInteger(value)) {
+    throw new ConfigError(
+      `${field} exceeds the maximum safe integer (2^53 - 1); use a bounded value, got: ${String(value)}`,
       file,
       field,
     );
@@ -1207,10 +1221,13 @@ export function loadConfig(
     }
   }
 
+  if (concurrency.maxWorkers > MAX_RESIDENT_WORKERS) {
+    throw new ConfigError(`concurrency.max_workers must be <= ${MAX_RESIDENT_WORKERS} (documented resident sanity ceiling)`, file, 'concurrency.max_workers');
+  }
   if (review.enabled && concurrency.maxWorkers < 2) {
     throw new ConfigError('Perkins requires concurrency.max_workers >= 2 for a lead and child', file, 'concurrency.max_workers');
   }
-  if (review.maxConcurrentChildren > MAX_REVIEW_CHILDREN) {
+  if (review.enabled && review.maxConcurrentChildren > MAX_REVIEW_CHILDREN) {
     throw new ConfigError(`review.max_concurrent_children must be <= ${MAX_REVIEW_CHILDREN} (bounded lens tool batch)`, file, 'review.max_concurrent_children');
   }
 

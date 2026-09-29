@@ -390,6 +390,10 @@ describe('WaveRunner built-in Perkins production path', () => {
       spawn: async () => { throw new Error('admission-probe: spawn refused'); },
       beginChildren: () => ({ concurrency: 1, finish: () => {} }),
       close: async () => {},
+      // Inert on this double: the admission probe never opens a round body,
+      // so it holds no cleanup debt and has nothing to reconcile.
+      reconcileCleanup: () => {},
+      cleanupDebt: () => [],
     };
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner, reviewArtifactRoot: artifacts,
@@ -1000,7 +1004,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     for (const directory of [root, artifacts, firstSessions, secondSessions, thirdSessions]) {
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }, 180_000);
 
   it('withholds a built-in verdict when PR delivery rejects or is absent', async () => {
     for (const mode of ['rejecting', 'absent'] as const) {
@@ -3442,4 +3446,229 @@ describe('repair pass 3: real child-process crash recovery (R19/R16)', () => {
     expect(recoveredEvent?.receipt?.event).toBe('COMMENTED');
     expect(port.getWorktree(roundId)?.status).toBe('swept');
   }, 300_000);
+});
+describe('durable handoff admission: perkins route, re-busy re-queue, crash/terminal reconciliation', () => {
+  const HANDOFF_CAPS = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
+  const failingPreflight = async () => ({ ok: false as const, failures: [preflightFailure('review-policy', 'disabled')] });
+
+  async function handoffFixture(name: string, jobId: string) {
+    const repo = makeFixtureRepo(name);
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/review']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 45;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), `handoff-${name}-port-`));
+    dirs.push(root);
+    const artifacts = mkdtempSync(join(tmpdir(), `handoff-${name}-art-`));
+    dirs.push(artifacts);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), `handoff-${name}-db-`)));
+    dbs.push(db);
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    const port = new GitReviewPort(root, 'feature/review', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId });
+    const job = ledger.addJob({ id: jobId, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review this' });
+    ledger.setJobStatus(jobId, 'working');
+    return { repo, target, root, artifacts, db, bus, ledger, port, job };
+  }
+
+  async function tickUntil(predicate: () => boolean, limit = 100): Promise<void> {
+    for (let index = 0; index < limit && !predicate(); index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
+
+  it('admits a queued handoff to a real perkins round on the default route', async () => {
+    const f = await handoffFixture('handoff-perkins-route', 'job-handoff-pr');
+    const sessionFile = join(f.root, 'lead-stub.jsonl');
+    const stubHandle: AgentHandle = {
+      role: 'perkins', id: 'lead-stub-1', sessionFile, capabilities: HANDOFF_CAPS,
+      reviewIsolation: true,
+      health: () => ({ state: 'idle', lastActivity: null, sessionFile }),
+      prompt: async () => { throw new Error('probe: lead refused'); },
+      steer: async () => {}, followUp: async () => {},
+      subscribe: () => () => {}, dispose: async () => {},
+    };
+    const spawner = vi.fn(async () => stubHandle) as unknown as AgentSpawner;
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner, reviewArtifactRoot: f.artifacts, bus: f.bus });
+    const accepted = await wave.requestReview({ jobId: 'job-handoff-pr', handoff: true });
+    expect(accepted.route).toBe('queued');
+    expect(f.ledger.listRounds('job-handoff-pr')).toHaveLength(0); // nothing frozen while busy
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-pr', payload: { sha: f.target } });
+    await tickUntil(() => f.ledger.latestJobEvent('job-handoff-pr', 'job.review-handoff-started') !== null);
+    const started = f.ledger.latestJobEvent('job-handoff-pr', 'job.review-handoff-started');
+    expect(started?.payload).toMatchObject({ route: 'perkins' });
+    const roundId = (started?.payload as { roundId?: string }).roundId;
+    expect(f.ledger.listRounds('job-handoff-pr').some((round) => round.id === roundId)).toBe(true);
+    await wave.shutdown();
+  }, 120_000);
+
+  it('re-queues a replay that meets its own lane busy again, then admits on the next delivery', async () => {
+    const f = await handoffFixture('handoff-rebusy', 'job-handoff-rebusy');
+    const first = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
+    const accepted = await first.requestReview({ jobId: 'job-handoff-rebusy', handoff: true });
+    expect(accepted.route).toBe('queued');
+    await first.shutdown(); // listener detached; the queued event persists
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-rebusy', payload: { sha: f.target } });
+    f.ledger.setJobStatus('job-handoff-rebusy', 'delivered'); // the turn settled
+    f.ledger.setJobStatus('job-handoff-rebusy', 'working'); // fresh attempt re-opens the lane: the delivery no longer settles it
+    const escalate = vi.fn();
+    const bus2 = new EventBus();
+    const ledger2 = new LedgerApi(f.db.handle, { bus: bus2 });
+    const second = new WaveRunner({ ledger: ledger2, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: bus2, reviewPreflight: failingPreflight, escalate });
+    second.resumeQueuedHandoffs();
+    await tickUntil(() => ledger2.latestJobEvent('job-handoff-rebusy', 'job.review-handoff-requeued') !== null);
+    expect(ledger2.latestJobEvent('job-handoff-rebusy', 'job.review-handoff-failed')).toBeNull(); // intent preserved, not terminalized
+    expect(ledger2.listRounds('job-handoff-rebusy')).toHaveLength(0);
+    ledger2.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-rebusy', payload: { sha: f.target } });
+    await tickUntil(() => ledger2.latestJobEvent('job-handoff-rebusy', 'job.review-handoff-failed') !== null);
+    const failed = ledger2.latestJobEvent('job-handoff-rebusy', 'job.review-handoff-failed');
+    expect(String((failed?.payload as { error?: string }).error)).toContain('not configured'); // the re-armed replay ran to its terminal fallback outcome
+    expect(ledger2.latestJobEvent('job-handoff-rebusy', 'job.review-handoff-requeued')).not.toBeNull();
+    await second.shutdown();
+  }, 120_000);
+
+  it('fails closed on a claimed handoff with no terminal marker (crash window) instead of blind replay', async () => {
+    const f = await handoffFixture('handoff-crash-claim', 'job-handoff-claim');
+    const queued = f.ledger.appendCustomEvent({
+      kind: 'job.review-handoff-queued', jobId: 'job-handoff-claim',
+      payload: { input: { jobId: 'job-handoff-claim' } },
+    });
+    f.ledger.appendCustomEvent({ kind: 'job.review-handoff-claimed', jobId: 'job-handoff-claim', payload: { requestSeq: queued.seq } });
+    const spawner = vi.fn() as unknown as AgentSpawner;
+    const escalate = vi.fn();
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner, bus: f.bus, escalate });
+    wave.resumeQueuedHandoffs();
+    await tickUntil(() => f.ledger.latestJobEvent('job-handoff-claim', 'job.review-handoff-failed') !== null);
+    const failed = f.ledger.latestJobEvent('job-handoff-claim', 'job.review-handoff-failed');
+    expect(String((failed?.payload as { error?: string }).error)).toContain('claimed but never terminalized');
+    expect(escalate).toHaveBeenCalled();
+    expect(f.ledger.listRounds('job-handoff-claim')).toHaveLength(0);
+    expect(spawner).not.toHaveBeenCalled();
+    await wave.shutdown();
+  }, 120_000);
+
+  it('reconsiders pending handoffs on the deterministic pass alone — no second API call, no follow-through feature', async () => {
+    const f = await handoffFixture('handoff-sweep-reconcile', 'job-handoff-sweep');
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
+    const accepted = await wave.requestReview({ jobId: 'job-handoff-sweep', handoff: true });
+    expect(accepted.route).toBe('queued');
+    expect(f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-requeued')).toBeNull();
+    // The lane goes idle WITHOUT a delivery and WITHOUT any second request:
+    // the authorized status leaves the busy set, so only the deterministic-
+    // pass reconciler (exactly what main wires into the Silas seam) may
+    // reconsider it.
+    f.ledger.setJobStatus('job-handoff-sweep', 'in-review');
+    wave.reconcilePendingHandoffs(); // the wired callback target — no API call, no timer, no follow-through lane
+    await tickUntil(() => f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-failed') !== null
+      || f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-started') !== null);
+    expect(f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-skipped')).toBeNull();
+    const terminal = f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-failed')
+      ?? f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-started');
+    expect(terminal).not.toBeNull();
+    await wave.shutdown();
+  }, 120_000);
+
+  it('HOLDS a handoff on a post-intake status flip and rearms only via a genuinely new validated request', async () => {
+    const f = await handoffFixture('handoff-held-rearm', 'job-handoff-held');
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
+    const first = await wave.requestReview({ jobId: 'job-handoff-held', handoff: true });
+    expect(first.route).toBe('queued');
+    f.ledger.setJobStatus('job-handoff-held', 'blocked'); // post-intake owner/quality hold
+    wave.reconcilePendingHandoffs();
+    await tickUntil(() => f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-held') !== null);
+    expect(f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-held')?.payload).toMatchObject({ reason: 'job-status-blocked' });
+    // Sweep/ACK/status-flip alone must NOT rearm: back to working + sweep.
+    f.ledger.setJobStatus('job-handoff-held', 'working');
+    wave.reconcilePendingHandoffs();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-started')).toBeNull();
+    expect(f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-failed')).toBeNull(); // still held, still visible
+    // A NEW validated review request rearms the held intent.
+    const again = await wave.requestReview({ jobId: 'job-handoff-held', handoff: true });
+    expect(again.route).toBe('queued');
+    // The lane settles into an authorized-but-idle status: the rearmed
+    // intent may now reach its terminal outcome on the next pass.
+    f.ledger.setJobStatus('job-handoff-held', 'in-review');
+    wave.reconcilePendingHandoffs();
+    await tickUntil(() => f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-failed') !== null
+      || f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-started') !== null);
+    const terminal = f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-failed')
+      ?? f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-started');
+    expect(terminal).not.toBeNull();
+    await wave.shutdown();
+  }, 120_000);
+
+  it('boot: a matching REQUEUED after CLAIM is proven no-admission (re-armable); an unmatched CLAIM stays ambiguous fail-closed', async () => {
+    const f = await handoffFixture('handoff-boot-disambig', 'job-handoff-boot');
+    const queued = f.ledger.appendCustomEvent({
+      kind: 'job.review-handoff-queued', jobId: 'job-handoff-boot',
+      payload: { input: { jobId: 'job-handoff-boot' } },
+    });
+    // Matching identity: requeued for the SAME request, newer than the claim.
+    f.ledger.appendCustomEvent({ kind: 'job.review-handoff-claimed', jobId: 'job-handoff-boot', payload: { requestSeq: queued.seq } });
+    f.ledger.appendCustomEvent({ kind: 'job.review-handoff-requeued', jobId: 'job-handoff-boot', payload: { requestSeq: queued.seq } });
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-boot', payload: { sha: f.target } });
+    const escalate = vi.fn();
+    const waveA = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight, escalate });
+    waveA.resumeQueuedHandoffs();
+    await tickUntil(() => f.ledger.latestJobEvent('job-handoff-boot', 'job.review-handoff-failed') !== null
+      || f.ledger.latestJobEvent('job-handoff-boot', 'job.review-handoff-started') !== null);
+    // Proven no-admission re-armed — NOT the ambiguous-claim failure.
+    expect(String((f.ledger.latestJobEvent('job-handoff-boot', 'job.review-handoff-failed')?.payload as { error?: string })?.error)).not.toContain('claimed but never terminalized');
+    await waveA.shutdown();
+    // Ambiguous: claim with NO later same-request outcome.
+    const f2 = await handoffFixture('handoff-boot-ambiguous', 'job-handoff-amb');
+    const q2 = f2.ledger.appendCustomEvent({
+      kind: 'job.review-handoff-queued', jobId: 'job-handoff-amb',
+      payload: { input: { jobId: 'job-handoff-amb' } },
+    });
+    f2.ledger.appendCustomEvent({ kind: 'job.review-handoff-claimed', jobId: 'job-handoff-amb', payload: { requestSeq: q2.seq } });
+    const escalate2 = vi.fn();
+    const waveB = new WaveRunner({ ledger: f2.ledger, worktrees: f2.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f2.bus, reviewPreflight: failingPreflight, escalate: escalate2 });
+    waveB.resumeQueuedHandoffs();
+    await tickUntil(() => f2.ledger.latestJobEvent('job-handoff-amb', 'job.review-handoff-failed') !== null);
+    expect(String((f2.ledger.latestJobEvent('job-handoff-amb', 'job.review-handoff-failed')?.payload as { error?: string })?.error)).toContain('claimed but never terminalized');
+    expect(escalate2).toHaveBeenCalled();
+    await waveB.shutdown();
+  }, 120_000);
+
+  it('reconciles an un-armed handoff on the next genuine observation when the lane went idle without delivery', async () => {
+    const f = await handoffFixture('handoff-idle-reconcile', 'job-handoff-idle');
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
+    const accepted = await wave.requestReview({ jobId: 'job-handoff-idle', handoff: true });
+    expect(accepted.route).toBe('queued'); // busy lane, durable 202 receipt
+    // The turn ends WITHOUT a delivery event (abort/failure): the lane goes
+    // idle and a later genuine observation must ARM the review — no skip.
+    f.ledger.setJobStatus('job-handoff-idle', 'in-review');
+    const second = await wave.requestReview({ jobId: 'job-handoff-idle' });
+    expect(second.route).toBe('queued'); // the receipt stays truthful while admission reconciles
+    await tickUntil(() => f.ledger.latestJobEvent('job-handoff-idle', 'job.review-handoff-failed') !== null
+      || f.ledger.latestJobEvent('job-handoff-idle', 'job.review-handoff-started') !== null);
+    expect(f.ledger.latestJobEvent('job-handoff-idle', 'job.review-handoff-skipped')).toBeNull(); // never abandoned
+    const terminal = f.ledger.latestJobEvent('job-handoff-idle', 'job.review-handoff-failed')
+      ?? f.ledger.latestJobEvent('job-handoff-idle', 'job.review-handoff-started');
+    expect(terminal).not.toBeNull(); // armed on current fences (preflight-failing fixture ends in the known terminal fallback outcome)
+    await wave.shutdown();
+  }, 120_000);
+
+  it('skips replay for a terminal job truthfully, without failure or escalation', async () => {
+    const f = await handoffFixture('handoff-terminal', 'job-handoff-terminal');
+    f.ledger.setJobStatus('job-handoff-terminal', 'in-review');
+    f.ledger.setJobStatus('job-handoff-terminal', 'merged');
+    f.ledger.appendCustomEvent({
+      kind: 'job.review-handoff-queued', jobId: 'job-handoff-terminal',
+      payload: { input: { jobId: 'job-handoff-terminal' } },
+    });
+    const spawner = vi.fn() as unknown as AgentSpawner;
+    const escalate = vi.fn();
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner, bus: f.bus, escalate });
+    wave.resumeQueuedHandoffs();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const skipped = f.ledger.latestJobEvent('job-handoff-terminal', 'job.review-handoff-skipped');
+    expect(skipped?.payload).toMatchObject({ reason: 'terminal-job', status: 'merged' });
+    expect(f.ledger.latestJobEvent('job-handoff-terminal', 'job.review-handoff-failed')).toBeNull();
+    expect(escalate).not.toHaveBeenCalled();
+    expect(spawner).not.toHaveBeenCalled();
+    await wave.shutdown();
+  }, 120_000);
 });

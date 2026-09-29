@@ -17,7 +17,8 @@ import {
   type FrozenReview,
 } from '../src/dispatch/perkins-review/artifacts.js';
 import { loadPerkinsPolicy, PERKINS_LENSES, PERKINS_POLICY_SHA256 } from '../src/dispatch/perkins-review/policy.js';
-import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/perkins-review/whole.js';
+import { DEFAULT_REVIEW_CHILDREN } from '../src/config.js';
+import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult } from '../src/dispatch/perkins-review/whole.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -1683,5 +1684,75 @@ describe('whole-PR engine: repair pass 3', () => {
     const childPrompts = h.childCalls.map((call) => call.prompt ?? '');
     expect(childPrompts.length).toBeGreaterThanOrEqual(1);
     expect(childPrompts.every((prompt) => prompt.includes(sentinel))).toBe(true);
+  }, 120_000);
+});
+
+describe('standalone default parity (phase 3)', () => {
+  it('pins the standalone engine default vs the production-configured default as a deliberate, documented pair', () => {
+    expect(STANDALONE_SPECIALIST_CONCURRENCY).toBe(4); // unconfigured/direct-use engine default
+    expect(DEFAULT_REVIEW_CHILDREN).toBe(2); // production config default (config.ts)
+  });
+});
+
+describe('wave refusals never consume lens or round budget (H1)', () => {
+  function waveHarness(brain: WholeLeadOptions, wave: number) {
+    const fixture = makeReviewRepo('perkins-wave-refusal');
+    repos.push(fixture.repo);
+    const base = fixture.repo.git(['rev-parse', 'main']);
+    const target = fixture.repo.head();
+    const root = temp('perkins-wave-refusal-');
+    const frozen = freezeReviewInputs({
+      roundId: 'wave-refusal-round', repoPath: fixture.repo.path, artifactRoot: root,
+      baseRef: base, targetRef: target, movementRef: 'feature/review', spec: 'return 43',
+    });
+    const fake = fakeWholeSpawner(temp('perkins-wave-sessions-'), brain);
+    const engine = new PerkinsWholeReview({
+      spawner: fake.spawner,
+      policy: loadPerkinsPolicy(),
+      maxConcurrentChildren: wave,
+      beginChildren: () => ({ concurrency: wave, finish: () => {} }),
+    });
+    return { fake, engine, frozen };
+  }
+
+  it('a refused batch keeps its full attempt budget: re-batched invalid run still gets its policy retry', async () => {
+    // The double's first call is the oversized badRuns batch (4 lenses at
+    // admitted wave 1 -> refused and RESTORED), then each lens re-batches
+    // one at a time; security's first REAL answer is invalid and must still
+    // receive its second policy attempt. Under the old bug the refusal had
+    // already burned attempt 1, so the invalid real run (attempt 2) left
+    // security exhausted with zero valid coverage.
+    const h = waveHarness({
+      childAnswer: (prompt) => {
+        if (!prompt.includes('"source": "security"')) return '[]';
+        if (prompt.includes('RETRY CORRECTION')) return '[]';
+        // First real attempt: evidence cannot be located at the cited spot.
+        return JSON.stringify([groundedFinding('security', 'warning', { evidence: 'not anywhere in the frozen tree' })]);
+      },
+      badRuns: ['blind', 'edge', 'security', 'architecture'],
+    }, 1);
+    const result = await h.engine.run({
+      roundId: 'wave-refusal-round', roundNumber: 1, frozenReview: h.frozen,
+      movementRef: 'feature/review', noSpec: false,
+    });
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.fake.childCalls).toHaveLength(8); // 7 lenses + security's invalid attempt
+    const valid = result.specialistRuns.filter((run) => run.status === 'valid');
+    expect(valid).toHaveLength(7); // every required lens still ran
+    const securityValid = valid.find((run) => run.lens === 'security');
+    expect(securityValid?.attempt).toBe(2); // retry survived the refusal
+  }, 120_000);
+
+  it('repeated refusals from a stubborn lead exhaust nothing: every lens still runs', async () => {
+    const h = waveHarness({ childAnswer: () => '[]', stubbornBatches: 3 }, 1);
+    const result = await h.engine.run({
+      roundId: 'wave-refusal-round', roundNumber: 1, frozenReview: h.frozen,
+      movementRef: 'feature/review', noSpec: false,
+    });
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.specialistRuns).toHaveLength(7);
+    expect(h.fake.childCalls).toHaveLength(7);
+    const refusals = h.fake.toolErrors.filter((entry) => entry.error.includes('admitted wave'));
+    expect(refusals.length).toBeGreaterThanOrEqual(3); // the stubborn re-issues happened
   }, 120_000);
 });

@@ -84,6 +84,10 @@ describe('four-busy-minion saturation and complete whole-PR Perkins coverage', (
         const listeners = new Set<RuntimeEventListener>();
         return {
           ...scripted,
+          // Terminal health truth after the wrapper's owned disposal (the
+          // real adapters report 'disposed'); the round's pair release is
+          // proof-gated on this — fulfillment alone is not cessation.
+          health: () => ({ state: disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: scripted.sessionFile }),
           subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
           dispose: async () => {
             if (disposed) return;
@@ -199,6 +203,10 @@ describe('four-busy-minion saturation and complete whole-PR Perkins coverage', (
         const listeners = new Set<RuntimeEventListener>();
         return {
           ...scripted,
+          // Terminal health truth after the wrapper's owned disposal (the
+          // real adapters report 'disposed'); the round's pair release is
+          // proof-gated on this — fulfillment alone is not cessation.
+          health: () => ({ state: disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: scripted.sessionFile }),
           subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
           dispose: async () => {
             if (disposed) return;

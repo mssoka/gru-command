@@ -14,7 +14,7 @@ import type { SessionStore } from '../src/sessions/store.js';
 
 const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
 
-function harness(capacity: number, shouldFail?: (role: Role) => boolean) {
+function harness(capacity: number, shouldFail?: (role: Role) => boolean, closeSettleMs?: number) {
   const dir = mkdtempSync(join(tmpdir(), 'gru-resident-'));
   const config = { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: capacity } };
   let next = 0;
@@ -41,6 +41,7 @@ function harness(capacity: number, shouldFail?: (role: Role) => boolean) {
         health: () => ({ state: activity.disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: `${dir}/${agentId}.jsonl` }),
         subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
         prompt: async () => {}, steer: async () => {}, followUp: async () => {},
+        hasLiveProcess: () => false, isCompacting: () => false,
         dispose: async () => {
           if (activity.disposed) return;
           activity.disposed = true;
@@ -56,7 +57,11 @@ function harness(capacity: number, shouldFail?: (role: Role) => boolean) {
     override runtimeIdFor(role: Role): RuntimeId { return role === 'perkins' ? 'claude-code' : 'pi'; }
     override runtimeFor(id: RuntimeId): AgentRuntime { return id === 'pi' ? pi : claude; }
   }
-  const registry = new TestRegistry({ config, store: {} as SessionStore, canReclaim: (id) => controllers.get(id)?.active === false });
+  const registry = new TestRegistry({
+    config, store: {} as SessionStore,
+    canReclaim: (id) => controllers.get(id)?.active === false,
+    ...(closeSettleMs === undefined ? {} : { closeSettleMs }),
+  });
   return { registry, controllers, events, config, dir, made, get peak() { return peak; }, get live() { return live; }, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
@@ -287,6 +292,46 @@ describe('registry resident boundary across adapters', () => {
     } finally { h.cleanup(); }
   });
 
+  it('holds the pair for an unproven live handle at close, then releases exactly once on proven cessation', async () => {
+    const h = harness(4);
+    try {
+      const round = await h.registry.reserveReviewRound();
+      const lead = await round.spawn({ reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } });
+      await round.spawn({ isolatedReview: { systemPrompt: 'lens', tools: [] } });
+      expect(h.registry.residents.occupied).toBe(2 + 0); // pair only (capacity 4)
+      // The lead's dispose REJECTS while its health is still live: the pair
+      // is NOT released — the live handle owns its backing count.
+      h.events.get(lead.id)!({ type: 'state', state: 'idle' });
+      Object.defineProperty(lead, 'dispose', { value: () => Promise.reject(new Error('lead disposal failed')), configurable: true });
+      await expect(round.close()).rejects.toThrow(/owned capacity not proven ceased \(worker-1\); retained as cleanup debt/);
+      expect(round.cleanupDebt()).toContain(lead.id);
+      expect(h.registry.residents.occupied).toBe(2); // debt counted, cap intact
+      // A queued implementer can never be admitted above the cap by the debt.
+      const leadActivity = h.controllers.get(lead.id)!;
+      h.controllers.clear();
+      // Proven cessation (terminal health truth) reconciles and releases ONCE.
+      leadActivity.disposed = true;
+      h.events.get(lead.id)!({ type: 'state', state: 'disposed' });
+      round.reconcileCleanup();
+      expect(round.cleanupDebt()).toHaveLength(0);
+      expect(h.registry.residents.occupied).toBe(0);
+      round.reconcileCleanup(); // idempotent: no double release
+      expect(h.registry.residents.occupied).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
+  it('never-settling disposal hits the whole-close deadline and holds capacity as owned debt', async () => {
+    const h = harness(2, undefined, 60);
+    try {
+      const round = await h.registry.reserveReviewRound();
+      const lead = await round.spawn({ reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } });
+      Object.defineProperty(lead, 'dispose', { value: () => new Promise<void>(() => {}), configurable: true });
+      await expect(round.close()).rejects.toThrow(/close settle window exceeded: capacity retained as owned cleanup debt/);
+      expect(h.registry.residents.occupied).toBe(2);
+      expect(round.cleanupDebt()).toContain(lead.id);
+    } finally { h.cleanup(); }
+  });
+
   it('releases the paired permits even when a round handle disposal fails at close', async () => {
     const h = harness(2);
     try {
@@ -300,6 +345,10 @@ describe('registry resident boundary across adapters', () => {
         value: () => Promise.reject(new Error('lead disposal failed')),
         configurable: true,
       });
+      // The adapter refused the dispose CALL, but the child's terminal exit
+      // was already observed (health truth): the pair must release, and the
+      // close still reports the disposal failure.
+      h.controllers.get(lead.id)!.disposed = true;
       await expect(round.close()).rejects.toThrow(/review reservation disposal failed/);
       // The pair is free again: a queued single worker is admitted at once.
       const admitted = h.registry.spawn('minion');
@@ -308,6 +357,260 @@ describe('registry resident boundary across adapters', () => {
       const handle = await Promise.race([admitted, new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error('pair permit was not released')), 2_000))]);
       await handle.dispose();
+    } finally { h.cleanup(); }
+  });
+
+  it('reclaims a truthful-probe handle on demand and exposes read-only residency snapshot facts', async () => {
+    const h = harness(2);
+    try {
+      const first = await h.registry.spawn('minion');
+      await first.prompt('previous turn');
+      const second = await h.registry.spawn('minion');
+      await second.prompt('previous turn');
+      const snapshot = h.registry.residencySnapshot();
+      expect(snapshot).toMatchObject({ capacity: 2, occupied: 2, queued: 0, reclaimFailures: 0 });
+      expect(snapshot.handles.map((entry) => entry.agentId).sort()).toEqual([first.id, second.id].sort());
+      // The snapshot is facts only: no admission record, no fan-out flag.
+      expect(Object.keys(snapshot).sort()).toEqual(['capacity', 'handles', 'occupied', 'queued', 'reclaimFailures']);
+      // Truthful probes (hasLiveProcess/isCompacting present and false) keep
+      // the handle reclaimable; absent probes are ineligible by contract.
+      h.controllers.get(first.id)!.active = false;
+      const queued = h.registry.spawn('minion');
+      await tick();
+      expect(h.registry.getHandle(first.id)).toBeNull(); // reclaimed with truthful evidence
+      const admitted = await queued;
+      await admitted.dispose();
+      await second.dispose();
+    } finally { h.cleanup(); }
+  });
+
+  it('close settles late spawn success within the bound and releases exactly once', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resident-close-late-'));
+    const config = { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 4 }, };
+    const slow: AgentRuntime = {
+      id: 'pi', capabilities: caps, health: () => ({ state: 'ok' }), dispose: async () => {},
+      spawn: async (role: Role): Promise<AgentHandle> => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5)); // late but inside the settle window
+        return {
+          id: 'late-child', role, sessionFile: `${dir}/late.jsonl`, capabilities: caps,
+          health: () => ({ state: 'idle', lastActivity: null, sessionFile: `${dir}/late.jsonl` }),
+          prompt: async () => {}, steer: async () => {}, followUp: async () => {},
+          hasLiveProcess: () => false, isCompacting: () => false,
+          subscribe: () => () => {}, dispose: async () => {},
+        };
+      },
+    };
+    class SlowRegistry extends RuntimeRegistry {
+      override runtimeIdFor(): RuntimeId { return 'pi'; }
+      override runtimeFor(): AgentRuntime { return slow; }
+    }
+    const registry = new SlowRegistry({ config, store: {} as SessionStore, closeSettleMs: 250 });
+    try {
+      const round = await registry.reserveReviewRound();
+      const spawnPromise = round.spawn({ isolatedReview: { systemPrompt: 'lens', tools: [] } });
+      void spawnPromise; // settles after close begins, within the window
+      await round.close(); // no throw: late spawn settled inside the bound
+      expect(registry.residents.occupied).toBe(0);
+      await registry.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('close settle expiry fails CLOSED: capacity retained as cleanup debt, never released while a spawn may live', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resident-close-expiry-'));
+    const config = { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 2 }, };
+    const never: AgentRuntime = {
+      id: 'pi', capabilities: caps, health: () => ({ state: 'ok' }), dispose: async () => {},
+      spawn: (): Promise<AgentHandle> => new Promise<AgentHandle>(() => {}), // never settles
+    };
+    class NeverRegistry extends RuntimeRegistry {
+      override runtimeIdFor(): RuntimeId { return 'pi'; }
+      override runtimeFor(): AgentRuntime { return never; }
+    }
+    const registry = new NeverRegistry({ config, store: {} as SessionStore, closeSettleMs: 10 });
+    try {
+      const round = await registry.reserveReviewRound();
+      void round.spawn({ isolatedReview: { systemPrompt: 'lens', tools: [] } }).catch(() => {});
+      await expect(round.close()).rejects.toThrow(/close settle window exceeded: capacity retained/);
+      expect(registry.residents.occupied).toBe(2); // permits NOT released — truthful cleanup debt
+      const again = round.close(); // repeated close is memoized: same failure, no double effect
+      await expect(again).rejects.toThrow(/close settle window exceeded/);
+      expect(registry.residents.occupied).toBe(2);
+      await registry.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('treats missing, undefined-returning, throwing and alive probes as unknown (ineligible); only explicit false reclaims', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resident-probe-variants-'));
+    const config = { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 1 } };
+    const caps2 = caps;
+    const made: Array<{ id: string; probe: () => boolean | undefined; disposed: boolean }> = [];
+    const listeners = new Map<string, (event: RuntimeEvent) => void>();
+    const adapter: AgentRuntime = {
+      id: 'pi', capabilities: caps2, health: () => ({ state: 'ok' }), dispose: async () => {},
+      spawn: async (role: Role): Promise<AgentHandle> => {
+        const id = `variant-${made.length + 1}`;
+        made.push({ id, probe: () => undefined, disposed: false });
+        const entry = made.at(-1)!;
+        return {
+          id, role, sessionFile: null, capabilities: caps2,
+          health: () => ({ state: entry.disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
+          prompt: async () => {}, steer: async () => {}, followUp: async () => {},
+          // Deliberately malformed probe return (models "cannot tell"): the
+          // runtime contract declares boolean, the reclaim contract must
+          // treat anything but literal false as unknown.
+          hasLiveProcess: () => entry.probe() as boolean,
+          isCompacting: () => false,
+          subscribe: (listener) => { listeners.set(id, listener); return () => { listeners.delete(id); }; },
+          dispose: async () => { entry.disposed = true; listeners.get(id)?.({ type: 'state', state: 'disposed' }); },
+        };
+      },
+    };
+    class VariantRegistry extends RuntimeRegistry {
+      override runtimeIdFor(): RuntimeId { return 'pi'; }
+      override runtimeFor(): AgentRuntime { return adapter; }
+    }
+    const registry = new VariantRegistry({ config, store: {} as SessionStore, canReclaim: () => true });
+    try {
+      const missing = await registry.spawn('minion');
+      await missing.prompt('turn');
+      // A competing request is what forces the drain to consider reclaiming;
+      // while probes are unknown/alive the slot must be kept.
+      const queued = registry.spawn('minion');
+      await tick();
+      expect(registry.residents.queued).toBe(1);
+      // Variant matrix on the SAME logical slot: undefined / throwing / alive all block reclaim.
+      for (const variant of [() => undefined, () => { throw new Error('probe blew up'); }, () => true]) {
+        made[0]!.probe = variant;
+        registry.residents.changed();
+        await tick();
+        expect(registry.getHandle(missing.id)).toBe(missing); // never reclaimed on unknown/alive
+        expect(registry.residents.queued).toBe(1);
+      }
+      made[0]!.probe = () => false; // explicit false = proof
+      registry.residents.changed();
+      await tick();
+      expect(registry.getHandle(missing.id)).toBeNull(); // reclaimed only now
+      const admitted = await queued;
+      await admitted.dispose();
+      void made; void listeners;
+      await registry.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('OPEN-round child disposal never releases the pair; another implementer cannot borrow it', async () => {
+    const h = harness(2);
+    try {
+      const round = await h.registry.reserveReviewRound();
+      const lead = await round.spawn({ reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } });
+      const first = await round.spawn({ isolatedReview: { systemPrompt: 'lens', tools: [] } });
+      expect(h.registry.residents.occupied).toBe(2);
+      await first.dispose(); // child settles during an OPEN round
+      await tick();
+      expect(h.registry.residents.occupied).toBe(2); // pair STILL reserved for the live lead
+      const queued = h.registry.spawn('minion');
+      await tick();
+      expect(h.registry.residents.queued).toBe(1);  // the pair cannot be borrowed
+      await lead.dispose();
+      await round.close();
+      const admitted = await queued;
+      await admitted.dispose();
+      expect(h.registry.residents.occupied).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
+  it('a pending pair spawn stays counted through the close deadline; settling one member cannot release another', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resident-pending-counted-'));
+    const config = { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 2 } };
+    const late = { release: null as (() => void) | null };
+    const slow: AgentRuntime = {
+      id: 'pi', capabilities: caps, health: () => ({ state: 'ok' }), dispose: async () => {},
+      spawn: () => new Promise<AgentHandle>((resolve) => {
+        late.release = () => resolve({
+          id: 'late-pair', role: 'perkins', sessionFile: null, capabilities: caps,
+          hasLiveProcess: () => false, isCompacting: () => false,
+          health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }),
+          prompt: async () => {}, steer: async () => {}, followUp: async () => {},
+          subscribe: () => () => {}, dispose: async () => {},
+        });
+      }),
+    };
+    class SlowRegistry extends RuntimeRegistry {
+      override runtimeIdFor(): RuntimeId { return 'pi'; }
+      override runtimeFor(): AgentRuntime { return slow; }
+    }
+    const registry = new SlowRegistry({ config, store: {} as SessionStore, closeSettleMs: 40 });
+    try {
+      const round = await registry.reserveReviewRound();
+      void round.spawn({ reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } }).catch(() => {});
+      await tick();
+      await expect(round.close()).rejects.toThrow(/close settle window exceeded/);
+      expect(registry.residents.occupied).toBe(2); // pending pair spawn stays counted
+      late.release?.(); // LATE success AFTER deadline: owned cleanup, counted until proven
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      round.reconcileCleanup();
+      expect(registry.residents.occupied).toBe(0); // proven ceased (explicit-false probes) releases ONCE
+      round.reconcileCleanup();
+      expect(registry.residents.occupied).toBe(0);
+      await registry.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a fulfilled dispose with unknown probes does NOT release; real later cessation releases once', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resident-fulfilled-unknown-'));
+    const config = { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 2 } };
+    const state = { live: 'unknown' as 'unknown' | 'false', disposed: false };
+    const handle: AgentHandle = {
+      id: 'opaque', role: 'perkins', sessionFile: null, capabilities: caps,
+      // Deliberately malformed probe return (models "cannot tell"): not
+      // literal false, so it must never be read as proven cessation.
+      hasLiveProcess: () => (state.live === 'false' ? false : undefined) as boolean,
+      isCompacting: () => false,
+      health: () => ({ state: state.disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
+      prompt: async () => {}, steer: async () => {}, followUp: async () => {},
+      // Fulfills WITHOUT terminal health or explicit-false probes: the debt
+      // path, not a positive release.
+      subscribe: () => () => {}, dispose: async () => {},
+    };
+    class OneRegistry extends RuntimeRegistry {
+      override runtimeIdFor(): RuntimeId { return 'pi'; }
+      override runtimeFor(): AgentRuntime { return { id: 'pi', capabilities: caps, health: () => ({ state: 'ok' }), dispose: async () => {}, spawn: async () => handle }; }
+    }
+    const registry = new OneRegistry({ config, store: {} as SessionStore, closeSettleMs: 250 });
+    try {
+      const round = await registry.reserveReviewRound();
+      await round.spawn({ reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } });
+      await expect(round.close()).rejects.toThrow(/not proven ceased/); // dispose fulfilled, probes UNKNOWN -> debt, reported
+      expect(registry.residents.occupied).toBe(2); // unknown evidence retains capacity
+      state.disposed = true; // real later cessation: terminal health truth
+      round.reconcileCleanup();
+      expect(registry.residents.occupied).toBe(0); // health-truth proof releases ONCE
+      await registry.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('multiple pair members and consumed extras all participate; the queued implementer never exceeds the cap', async () => {
+    const h = harness(4);
+    try {
+      const implementer = await h.registry.spawn('minion');
+      await implementer.prompt('previous turn');
+      h.controllers.get(implementer.id)!.active = true; // genuinely busy: not reclaimable
+      const round = await h.registry.reserveReviewRound();
+      const lead = await round.spawn({ reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } });
+      const batch = round.beginChildren(2);
+      const first = await round.spawn({ isolatedReview: { systemPrompt: 'lens 1', tools: [] } });
+      const extra = await round.spawn({ isolatedReview: { systemPrompt: 'lens 2', tools: [] } });
+      expect(batch.concurrency).toBe(2);
+      expect(h.peak).toBeLessThanOrEqual(4);
+      const queued = h.registry.spawn('minion');
+      await tick();
+      expect(h.registry.residents.queued).toBe(1); // at cap: 4/4 with implementer+lead+pair child+extra
+      await Promise.all([extra.dispose(), first.dispose(), lead.dispose()]);
+      batch.finish();
+      await round.close();
+      const admitted = await queued;
+      await admitted.dispose();
+      await implementer.dispose();
+      expect(h.registry.residents.occupied).toBe(0);
     } finally { h.cleanup(); }
   });
 });

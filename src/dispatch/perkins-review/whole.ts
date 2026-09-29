@@ -26,7 +26,7 @@ export type { CanonicalReviewVerdict } from './types.js';
 /** Standalone/unconfigured engine default (tests and direct use). Production
  * always passes the configured `[review] max_concurrent_children` ceiling from
  * config.ts — this constant never overrides it. */
-const STANDALONE_SPECIALIST_CONCURRENCY = 4;
+export const STANDALONE_SPECIALIST_CONCURRENCY = 4;
 const CHILD_SPAWN_TIMEOUT_MS = 60 * 1_000;
 const CHILD_TURN_TIMEOUT_MS = 10 * 60 * 1_000;
 const LEAD_SPAWN_TIMEOUT_MS = 60 * 1_000;
@@ -964,7 +964,7 @@ export class PerkinsWholeReview {
 
     const runTool: NativeAgentTool = {
       name: 'perkins_run_specialists',
-      description: `Start and await 1-${Math.max(MAX_TOOL_RUNS, this.maxConcurrentChildren)} host-tracked specialist children. Each run names one lens and reviews the WHOLE change in isolation. The host enforces isolation, attempt bounds, concurrency, output validation, durability and ownership. Specialists are optional: use the lenses that help this change.`,
+      description: `Start and await 1-${Math.max(MAX_TOOL_RUNS, this.maxConcurrentChildren)} host-tracked specialist children. Each run names one lens and reviews the WHOLE change in isolation. One call starts all its runs together: the host admits at most this round's resident wave per call (a smaller wave is refused with a split-the-batch error, never a lens failure) and the round is bounded to ${MAX_SPECIALISTS_PER_ROUND} total runs. The host enforces isolation, attempt bounds, concurrency, output validation, durability and ownership. Specialists are optional: use the lenses that help this change.`,
       inputSchema: {
         type: 'object', additionalProperties: false, required: ['runs'],
         properties: {
@@ -1013,17 +1013,24 @@ export class PerkinsWholeReview {
         }
         for (const run of scheduled) attempts.set(run.lens, run.attempt);
         specialistsStarted += scheduled.length;
-        const batch = this.beginChildren();
-        // One tool call = ONE admitted wave: every run in a call must be
-        // able to start together, keeping the call's wall clock inside the
-        // Claude MCP bridge's 15-minute tool bound no matter how small the
-        // admitted wave is (each child carries a 10-minute turn budget).
-        // The lead splits larger batches across multiple calls.
-        if (scheduled.length > batch.concurrency) {
-          batch.finish();
-          throw new Error(
-            `perkins_run_specialists: ${scheduled.length} runs exceed this round's admitted wave of ${batch.concurrency}; split them across multiple calls`,
-          );
+        // Refusals happen BEFORE any child starts, so neither an admission
+        // race (prior wave still settling) nor a wave-size refusal may
+        // consume lens attempts or the round's specialist budget — only
+        // real starts do. The lead still sees a named error and retries
+        // within its existing safeguards (no unlimited retries added).
+        let batch: { concurrency: number; finish(): void };
+        try {
+          batch = this.beginChildren();
+          if (scheduled.length > batch.concurrency) {
+            batch.finish();
+            throw new Error(
+              `perkins_run_specialists: ${scheduled.length} runs exceed this round's admitted wave of ${batch.concurrency}; split them across multiple calls`,
+            );
+          }
+        } catch (error) {
+          restoreAttempts(scheduled);
+          specialistsStarted -= scheduled.length;
+          throw error;
         }
         let poolOutcome: PoolOutcome<SpecialistResult | undefined>;
         try {

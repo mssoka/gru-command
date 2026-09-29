@@ -290,6 +290,7 @@ drain_timeout_ms = 900000
 # a review lead and one child can be admitted together; at capacity new
 # work queues FIFO and only genuinely idle workers are reclaimed
 # (sessions, lanes and untracked work are preserved for resume).
+# Positive integer <= 128 (documented sanity ceiling).
 max_workers = 4
 
 [review]
@@ -302,7 +303,8 @@ max_workers = 4
 # directives; 0 blockers = clear to merge; merge stays user-held).
 enabled = true
 # Simultaneous lens children inside the global resident pool (not extra slots).
-# Positive integer <= 32; effective concurrency also depends on spare global slots.
+# Positive integer <= 32 (review-gated bound); effective concurrency also
+# depends on spare global slots.
 max_concurrent_children = 2
 
 [verify]

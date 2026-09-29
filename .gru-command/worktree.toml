@@ -11,3 +11,10 @@ command = "npm ci"
 
 [verify]
 full = "npm test"
+typecheck = "npm run typecheck"
+
+# Declared focused verification scopes (phase 4; invoked only via the
+# authenticated /api/verify scheduler at unchanged budgets/thresholds —
+# plain vitest invocations, no worker/timeout flags, never the npm chain).
+residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-resident-registry.test.ts test/fix-directive.test.ts test/silas-deterministic-seam.test.ts"
+handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"

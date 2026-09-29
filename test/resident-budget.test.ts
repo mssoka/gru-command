@@ -60,18 +60,51 @@ describe('service-wide resident permits', () => {
     await expect(budget.acquire(3)).rejects.toThrow(/cannot fit/);
   });
 
-  it('does not free a permit when disposal fails; the waiting caller gets an actionable error', async () => {
+  it('exhausts a drain epoch fairly: failed candidates keep their permits, the next candidate admits, and observations are deduplicated', async () => {
+    const budget = new ResidentBudget(2);
+    const occupied = await Promise.all([budget.acquire(), budget.acquire()]);
+    const failure = new Error('adapter refused disposal');
+    const observations: Array<{ agentId: string; generation: number; attempt: number; error: string }> = [];
+    budget.onReclaimFailure = (observation) => { observations.push(observation); };
+    const stuck = { ...fakeMinion('stuck', () => {}), dispose: async () => { throw failure; } };
+    const healthy = fakeMinion('healthy', () => { occupied[1]!(); });
+    budget.watch(stuck, () => true, 1);
+    budget.watch(healthy, () => true, 2);
+    const release = await budget.acquire(); // oldest fails -> next candidate reclaims -> admitted
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({ agentId: 'stuck', error: 'Error: adapter refused disposal' });
+    expect(budget.occupied).toBe(2); // stuck kept its permit; healthy's slot was reused
+    release();
+    occupied[0]!();
+    expect(budget.reclaimFailureCount).toBe(1);
+  });
+
+  it('exhaustion surfaces a real decision: every eligible candidate failed this epoch', async () => {
     const budget = new ResidentBudget(1);
     const held = await budget.acquire();
-    const worker = fakeMinion('stuck', () => {});
     const failure = new Error('adapter refused disposal');
-    const broken = { ...worker, dispose: async () => { throw failure; } };
+    const broken = { ...fakeMinion('stuck', () => {}), dispose: async () => { throw failure; } };
     budget.watch(broken, () => true);
-    await expect(budget.acquire()).rejects.toThrow(/resident idle disposal failed: Error: adapter refused disposal/);
-    expect(budget.occupied).toBe(1);
+    await expect(budget.acquire()).rejects.toThrow(/resident reclaim exhausted: 1 eligible idle worker/);
+    expect(budget.occupied).toBe(1); // nothing force-released
     held();
     const next = await budget.acquire();
     next();
+  });
+
+  it('a failed candidate is not reattempted within the epoch even when its own failure re-triggers drain', async () => {
+    const budget = new ResidentBudget(1);
+    const held = await budget.acquire();
+    const failure = new Error('boom');
+    let attempts = 0;
+    const flaky = {
+      ...fakeMinion('flaky', () => {}),
+      dispose: async () => { attempts += 1; budget.changed(); throw failure; },
+    };
+    budget.watch(flaky, () => true);
+    await expect(budget.acquire()).rejects.toThrow(/resident reclaim exhausted/);
+    expect(attempts).toBe(1); // no spin: the epoch tried it exactly once
+    held();
   });
 
   it('two competing rounds and later worker arrivals progress in FIFO order', async () => {

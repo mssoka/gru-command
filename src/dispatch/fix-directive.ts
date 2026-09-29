@@ -1,6 +1,7 @@
 import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { requireSpawnCwd } from '../roles.js';
 import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
@@ -50,6 +51,7 @@ export async function routeFixDirectiveToMinion(
   const minions = input.ledger
     .listAgents()
     .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+  let evictedSessionFile: string | null = null;
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
@@ -57,10 +59,12 @@ export async function routeFixDirectiveToMinion(
         await racedPrompt(handle, directive, input.signal, owner);
         return { delivered: true, minionId: minion.id };
       } catch (error) {
-        // A resident-budget reclaim may be disposing this handle under us:
-        // fall through to the resume/re-brief path instead of dropping the
-        // directive with an opaque failure.
-        if (!/worker is being disposed/u.test(String(error))) throw error;
+        // A resident-budget reclaim may be disposing this handle under us
+        // (typed handshake): fall through to the resume/re-brief path —
+        // remembering THIS handle's logical session — instead of dropping
+        // the directive with an opaque failure.
+        if (!(error instanceof WorkerDisposalInProgressError)) throw error;
+        evictedSessionFile = handle.sessionFile;
       }
     }
   }
@@ -70,8 +74,13 @@ export async function routeFixDirectiveToMinion(
   if (lane === undefined) {
     return { delivered: false, note: 'no implementing minion session and no job lane' };
   }
-  const previous = [...minions].reverse().find((minion) => minion.sessionFile !== null);
-  const resumeFile = previous?.sessionFile ?? null;
+  // Prefer the CURRENT failing logical session; only when the evicted
+  // handle exposed none fall back to the newest session-bearing record —
+  // never an arbitrary older disposed minion's session.
+  const fallback = evictedSessionFile === null
+    ? ([...minions].reverse().find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
+    : null;
+  const resumeFile = evictedSessionFile ?? fallback;
   let handle: AgentHandle;
   let prompt = directive;
   try {
@@ -82,7 +91,7 @@ export async function routeFixDirectiveToMinion(
   } catch (error) {
     if (resumeFile === null || input.signal.aborted) throw error;
     const job = input.ledger.getJob(input.jobId);
-    if (job?.briefing === null || job === null) {
+    if (job == null || job.briefing == null) {
       throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
     }
     handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal });
