@@ -290,6 +290,38 @@ describe('config-generate CLI', () => {
     expect(loaded.worktrees.root).toBe(join(root, 'lanes'));
   });
 
+  it('round trip preserves an active [concurrency] backoff section (never silently dropped)', () => {
+    const root = tempDir('gru-command-config-concurrency-');
+    const instance = join(root, 'instance');
+    mkdirSync(instance, { recursive: true });
+    const prior = [
+      '[concurrency]',
+      'backoff_base_ms = 250',
+      'backoff_max_ms = 5000',
+      'max_auto_retries = 2',
+      '[concurrency.providers."provider-x"]',
+      'rate_limit_patterns = ["pacing code \\\\d+"]',
+    ].join('\n');
+    writeFileSync(join(instance, 'config.toml'), `${prior}\n`);
+
+    const forced = run(instance, ['--force']);
+    expect(forced.status, `${forced.stdout}\n${forced.stderr}`).toBe(0);
+    const raw = parse(readFileSync(join(instance, 'config.toml'), 'utf-8')) as Record<string, unknown>;
+    expect(raw.concurrency).toMatchObject({
+      backoff_base_ms: 250,
+      backoff_max_ms: 5000,
+      max_auto_retries: 2,
+    });
+    const loaded = loadConfig({ GRU_COMMAND_HOME: instance }, root);
+    expect(loaded.concurrency).toEqual({
+      enabled: true,
+      backoffBaseMs: 250,
+      backoffMaxMs: 5_000,
+      maxAutoRetries: 2,
+      providers: { 'provider-x': { rateLimitPatterns: ['pacing code \\d+'] } },
+    });
+  });
+
   it('data_dir is emitted ~-anchored for home-under instances (restore-on-new-machine portability)', () => {
     // Regression guard (Perkins R1 blocker 1): a machine-specific absolute
     // data_dir redirects all state to the OLD machine when the config is
