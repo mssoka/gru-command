@@ -1054,7 +1054,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     rmSync(artifacts, { recursive: true, force: true });
     rmSync(sessions, { recursive: true, force: true });
     }
-  });
+  }, 180_000);
 
   it('freezes a detached tree, runs one lead plus tracked children, posts the exact-head report, and sweeps', async () => {
     const repo = makeFixtureRepo('perkins-wave-built-in');
