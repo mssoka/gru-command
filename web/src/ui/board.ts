@@ -402,7 +402,9 @@ export class BoardView {
     row.dataset.status = job.status;
     // Defect truth (2026-09-29): a supervision-stopped worker is waiting
     // on a human re-arm — the row says so instead of a bare "working".
-    const waiting = workerStop !== null;
+    // The swap is scoped to working lanes (where the status lies); other
+    // statuses keep their true chip, and the agent rail carries the ⛔.
+    const waiting = workerStop !== null && job.status === 'working';
     if (waiting) row.dataset.workerState = 'waiting';
     if (jobFailing(job)) row.classList.add('board-job--alert');
     // v5: a job that was not on screen slides in (8px); a snapshot push

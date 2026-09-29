@@ -289,6 +289,21 @@ rolling window — the latest 10 rows, then `+K older settled`
 quiescent (no blocker/failure pills; a “review history on the ledger”
 pointer).
 
+Two section-truth rules keep the bands honest (2026-09-29):
+
+- **Closed receipts stay closed.** A terminal job (merged/done) never
+  re-enters NEEDS YOU, whatever is left over — leftover unacked
+  escalation rows keep living in the notification bell (the owner can
+  still ack them), but they no longer promote the lane, alert its row,
+  or count into the unacked tracker chip (the service counts live rows
+  only). A merged lane renders in SETTLED/COLD as a receipt.
+- **Stopped lanes wait with their reason.** A working lane whose worker
+  is supervision-stopped (breaker open) shows an explicit
+  `waiting · <reason>` status chip (e.g. `waiting · quota wall`) instead
+  of a bare `working` — the supervisor records why it stopped, and the
+  board relays it. Such a lane is never flagged `stalled` and never
+  sinks to COLD: COLD stays for genuinely-silent lanes.
+
 ## Views
 
 - **Pairing** — token field + QR (encodes `{url, token}` JSON payload

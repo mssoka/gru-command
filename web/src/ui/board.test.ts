@@ -906,6 +906,25 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expect(unacked?.textContent).toContain('1 action-required');
   });
 
+  it('the waiting truth is scoped to working lanes: an in-review lane with a live round keeps its true chip', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'reviewing', status: 'in-review' })],
+        agents: [
+          agent('minion-reviewing', {
+            role: 'minion',
+            jobId: 'reviewing',
+            supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' },
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-worker-state')).toBeNull();
+    expect(row?.querySelector('.board-job__status')?.textContent).toBe('in-review');
+  });
+
   it('without a stop the same silent lane still demotes to COLD with the stalled flag (COLD stays honest)', () => {
     const view = new BoardView(() => {});
     view.render(
