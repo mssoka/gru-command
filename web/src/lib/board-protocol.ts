@@ -272,6 +272,15 @@ export function parseBoardServerFrame(raw: unknown): BoardServerFrame | null {
   return null;
 }
 
+/** True when the value carries at least one visible character: zero-width
+ * and format controls (Unicode Cf), controls (Cc), and combining marks
+ * (M) do not count — mirror of the ledger's authored-name rule, so a
+ * server that somehow persisted an invisible-only name is rejected here
+ * instead of rendering an empty card. */
+function hasVisibleCharacters(value: string): boolean {
+  return value.replace(/[\p{Cf}\p{Cc}\p{M}\s]/gu, '') !== '';
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
@@ -484,7 +493,8 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
           isRecord(job) &&
           typeof job.id === 'string' &&
           typeof job.title === 'string' &&
-          (job.displayName === undefined || job.displayName === null || (typeof job.displayName === 'string' && job.displayName.trim() !== '')) &&
+          (job.displayName === undefined || job.displayName === null ||
+            (typeof job.displayName === 'string' && job.displayName.trim() !== '' && hasVisibleCharacters(job.displayName))) &&
           typeof job.status === 'string' &&
           (job.prState === null || job.prState === undefined || isPrState(job.prState)) &&
           (job.lane === null || isLane(job.lane)) &&

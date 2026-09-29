@@ -257,6 +257,11 @@ describe('dispatch server (E8)', () => {
       expect(field<string>(res.json, 'job_id')).toBe('http-job');
       expect(field<string>(res.json, 'branch')).toBe('gru/http-job');
       expect(field<string>(res.json, 'status')).toBe('working');
+      // The authored name persists, and the job.created event carries it
+      // (G10) so the event stream stays a complete record of authorship.
+      expect(h.ledger.getJob('http-job')?.displayName).toBe('Wake Alerts');
+      const created = h.ledger.latestJobEvent('http-job', 'job.created');
+      expect(created?.payload).toMatchObject({ repo: expect.any(String), display_name: 'Wake Alerts' });
       // Ruling 17: the minion spawn carried the worktree as cwd.
       expect(h.spawns[0]?.options.cwd).toBe(field<string>(res.json, 'worktree'));
       expect(h.ledger.getJob('http-job')).toMatchObject({ briefing: 'do the thing via http', title: 'http dispatched', displayName: 'Wake Alerts' });
@@ -412,13 +417,23 @@ describe('dispatch server (E8)', () => {
       const bad = await call(h.port, 'POST', '/api/dispatch', { job_id: 'x' }, TOKEN);
       expect(bad.status).toBe(400);
       expect(field<string>(bad.json, 'error')).toBe('bad_request');
-      for (const display_name of ['', '  ', 42, null]) {
-        const invalid = await call(h.port, 'POST', '/api/dispatch', {
-          job_id: 'invalid-name', repo_path: '/fixture', title: 'T', briefing: 'B', display_name,
+      // Optional-field idiom (G2 ruling 2026-09-29): absent, null, blank,
+      // or mistyped display_name means "no authored name" — accepted, and
+      // the job carries no display name. A too-long name is a hard 400.
+      let seq = 0;
+      for (const display_name of [undefined, null, '', '  ', 42]) {
+        const accepted = await call(h.port, 'POST', '/api/dispatch', {
+          job_id: `unnamed-${(seq += 1)}`, repo_path: '/fixture', title: 'T', briefing: 'B',
+          ...(display_name !== undefined ? { display_name } : {}),
         }, TOKEN);
-        expect(invalid.status).toBe(400);
+        expect(accepted.status).toBe(202);
+        expect(h.ledger.getJob(`unnamed-${seq}`)?.displayName).toBeNull();
       }
-      expect(h.ledger.getJob('invalid-name')).toBeNull();
+      const oversized = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'name-too-long', repo_path: '/fixture', title: 'T', briefing: 'B', display_name: 'x'.repeat(101),
+      }, TOKEN);
+      expect(oversized.status).toBe(400);
+      expect(h.ledger.getJob('name-too-long')).toBeNull();
     } finally {
       await h.close();
     }

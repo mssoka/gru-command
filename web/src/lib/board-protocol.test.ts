@@ -93,6 +93,14 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(board)).toBe(false);
     job.displayName = 123;
     expect(isValidSnapshot(board)).toBe(false);
+    // Invisible-only names would render an empty card (G3): format and
+    // combining characters alone are as bad as blank.
+    job.displayName = '\u200b\u200d';
+    expect(isValidSnapshot(board)).toBe(false);
+    job.displayName = '\u0301\u0301';
+    expect(isValidSnapshot(board)).toBe(false);
+    job.displayName = '🧑\u200d🚀 launch';
+    expect(isValidSnapshot(board)).toBe(true);
   });
 
   it('rejects malformed frames (wrong shapes, missing fields, non-objects)', () => {

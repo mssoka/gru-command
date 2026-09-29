@@ -39,6 +39,18 @@ export const DEFAULT_LENSES = [
   'tests',
 ] as const;
 
+/** Upper bound for an authored job display name (Gru ruling G2,
+ * 2026-09-29): a short card label, bounded at every write boundary —
+ * four times the 24-grapheme rail bound the board renders. */
+export const JOB_DISPLAY_NAME_MAX_LENGTH = 100;
+
+/** True when the value carries at least one visible character: zero-width
+ * and format controls (Unicode Cf), controls (Cc), and combining marks
+ * (M) do not count — a name made only of them renders an empty card. */
+export function hasVisibleCharacters(value: string): boolean {
+  return value.replace(/[\p{Cf}\p{Cc}\p{M}\s]/gu, '') !== '';
+}
+
 export interface JobRecord {
   readonly id: string;
   readonly repo: string;
@@ -466,6 +478,17 @@ export class LedgerApi {
     if (input.displayName !== undefined && input.displayName !== null && input.displayName.trim() === '') {
       throw new Error('job display name must be a non-empty string');
     }
+    const displayName = input.displayName?.trim() ?? null;
+    if (displayName !== null) {
+      // A name made only of invisible characters (ZWSP/ZWJ, bidi and
+      // format controls, combining marks) would render an empty card.
+      if (!hasVisibleCharacters(displayName)) {
+        throw new Error('job display name must contain visible characters');
+      }
+      if (displayName.length > JOB_DISPLAY_NAME_MAX_LENGTH) {
+        throw new Error(`job display name exceeds ${JOB_DISPLAY_NAME_MAX_LENGTH} characters`);
+      }
+    }
     return this.transaction(() => {
       if (this.getJob(input.id) !== null) {
         throw new Error(`job "${input.id}" already exists`);
@@ -476,8 +499,8 @@ export class LedgerApi {
           `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, display_name, created_at, updated_at)
            VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?)`,
         )
-        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, input.displayName?.trim() ?? null, ts, ts);
-      this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title } });
+        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, displayName, ts, ts);
+      this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title, display_name: displayName } });
       return this.getJob(input.id) as JobRecord;
     });
   }

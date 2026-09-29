@@ -53,6 +53,33 @@ describe('ledger api — the record of state', () => {
     reopenedDb.close();
   });
 
+  it('authored names are bounded and must be visible: cap, invisible-only, emoji ok (G2/G3)', () => {
+    expect(() => api.addJob({ id: 'name-over-cap', repo: 'fixture', title: 'T', displayName: 'x'.repeat(101) }))
+      .toThrow(/exceeds 100 characters/u);
+    // Zero-width and format-only names would render an empty card.
+    expect(() => api.addJob({ id: 'name-invisible-zwsp', repo: 'fixture', title: 'T', displayName: '\u200b\u200b' }))
+      .toThrow(/visible characters/u);
+    expect(() => api.addJob({ id: 'name-invisible-zwj', repo: 'fixture', title: 'T', displayName: '\u200d\u200d\u200d' }))
+      .toThrow(/visible characters/u);
+    expect(() => api.addJob({ id: 'name-invisible-bidi', repo: 'fixture', title: 'T', displayName: '\u200e\u202e\u2066' }))
+      .toThrow(/visible characters/u);
+    expect(() => api.addJob({ id: 'name-invisible-marks', repo: 'fixture', title: 'T', displayName: '\u0301\u0301' }))
+      .toThrow(/visible characters/u);
+    const named = api.addJob({ id: 'name-emoji-ok', repo: 'fixture', title: 'T', displayName: '🧑\u200d🚀 launch' });
+    expect(named.displayName).toBe('🧑\u200d🚀 launch');
+    const atCap = api.addJob({ id: 'name-at-cap', repo: 'fixture', title: 'T', displayName: 'y'.repeat(100) });
+    expect(atCap.displayName).toHaveLength(100);
+  });
+
+  it('job.created payload carries the authored name; legacy jobs record null (G10)', () => {
+    api.addJob({ id: 'created-named', repo: 'fixture', title: 'Full title', displayName: 'short name' });
+    api.addJob({ id: 'created-legacy', repo: 'fixture', title: 'Full title' });
+    const named = api.latestJobEvent('created-named', 'job.created');
+    const legacy = api.latestJobEvent('created-legacy', 'job.created');
+    expect(named?.payload).toMatchObject({ repo: 'fixture', title: 'Full title', display_name: 'short name' });
+    expect(legacy?.payload).toMatchObject({ repo: 'fixture', title: 'Full title', display_name: null });
+  });
+
   it('duplicate job ids and empty fields are rejected', () => {
     expect(() => api.addJob({ id: 'fix-login-flow', repo: 'x', title: 'dup' })).toThrow(/already exists/u);
     expect(() => api.addJob({ id: '', repo: 'x', title: 'empty id' })).toThrow(/non-empty/u);
