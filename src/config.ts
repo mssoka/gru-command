@@ -271,6 +271,55 @@ export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   escalateAt: 4,
 };
 
+/** Provider pacing policy (owner heist 2026-09-29): automatic admission
+ * control for minion and Perkins review turns plus bounded rate-limit
+ * backoff, replacing per-429 owner ACKs.
+ *
+ * Provider-agnostic by ruling: no provider name, model, or limit appears in
+ * code. Limits come from this config section alone; the shipped default is
+ * ENABLED but UNLIMITED (behavior-preserving) until the owner sets values.
+ * `[pacing.providers."<id>"]` entries add per-provider rate-limit error
+ * signatures (error-text regex bodies, case-insensitive), keyed by provider
+ * id string for organization — matching itself is by error signature only,
+ * never by a runtime or CLI brand. */
+export interface PacingProviderOverride {
+  /** Extra case-insensitive regex bodies classified as this provider's
+   * rate-limit class (e.g. provider-specific pacing codes). Matched against
+   * the runtime error text alongside the generic 429-family signatures. */
+  readonly rateLimitPatterns: readonly string[];
+}
+
+export interface PacingConfig {
+  /** Master switch; false disables both gates and auto-backoff (pure
+   * pre-pacing behavior). The limits below still parse while disabled. */
+  readonly enabled: boolean;
+  /** Max concurrent minion turns (dispatch briefings and directive
+   * deliveries); further spawns/deliveries queue FIFO. 0 = unlimited. */
+  readonly maxConcurrentMinions: number;
+  /** Max concurrent Perkins review turns (lead + lens children combined);
+   * fan-out throttles to fit instead of failing. 0 = unlimited. */
+  readonly maxConcurrentReviewTurns: number;
+  /** Backoff base between auto-retries; doubles per retry (with jitter). */
+  readonly backoffBaseMs: number;
+  /** Upper bound on any single auto-retry delay. */
+  readonly backoffMaxMs: number;
+  /** Automatic retries per rate-limit incident before the supervisor stop
+   * + owner-ACK ladder fires. 0 = no automatic retry (ladder immediately). */
+  readonly maxAutoRetries: number;
+  /** Per-provider rate-limit signature overrides, keyed by provider id. */
+  readonly providers: Readonly<Record<string, PacingProviderOverride>>;
+}
+
+export const DEFAULT_PACING_CONFIG: PacingConfig = {
+  enabled: true,
+  maxConcurrentMinions: 0,
+  maxConcurrentReviewTurns: 0,
+  backoffBaseMs: 1_000,
+  backoffMaxMs: 60_000,
+  maxAutoRetries: 5,
+  providers: {},
+};
+
 /** Verification scheduler policy (contention fix 2026-09-22): lanes request
  * verification runs through the service (POST /api/verify); the scheduler owns
  * the machine's GLOBAL test budget so co-tenant lanes cannot oversubscribe it.
@@ -361,6 +410,7 @@ export interface GruCommandConfig {
   readonly roll: RollConfig;
   readonly review: ReviewConfig;
   readonly verify: VerifyConfig;
+  readonly pacing: PacingConfig;
   readonly decisions: DecisionsConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
@@ -484,6 +534,7 @@ const TOP_LEVEL_KEYS = [
   'roll',
   'review',
   'verify',
+  'pacing',
   'decisions',
 ] as const;
 
@@ -725,6 +776,7 @@ export function loadConfig(
   let roll: RollConfig = DEFAULT_ROLL_CONFIG;
   let review: ReviewConfig = { enabled: true };
   let verify: VerifyConfig = DEFAULT_VERIFY_CONFIG;
+  let pacing: PacingConfig = DEFAULT_PACING_CONFIG;
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
   let sourceFile: string | null = null;
 
@@ -1171,6 +1223,9 @@ export function loadConfig(
             : verify.runTimeoutMs,
       };
     }
+    if (raw['pacing'] !== undefined) {
+      pacing = readPacingConfig(raw['pacing'], file, pacing);
+    }
     if (raw['decisions'] !== undefined) {
       decisions = readDecisionsConfig(raw['decisions'], file, decisions);
     }
@@ -1235,9 +1290,134 @@ export function loadConfig(
     roll,
     review,
     verify,
+    pacing,
     decisions,
     sourceFile,
     instanceDir,
+  };
+}
+
+const PACING_KEYS = [
+  'enabled',
+  'max_concurrent_minions',
+  'max_concurrent_review_turns',
+  'backoff_base_ms',
+  'backoff_max_ms',
+  'max_auto_retries',
+  'providers',
+] as const;
+
+/** Parse one [pacing] table. Fail loud on unknown keys, wrong types,
+ * non-compiling patterns, and an inverted backoff ladder — a pacing
+ * misconfiguration must never silently disable or distort the gates. */
+function readPacingConfig(
+  value: unknown,
+  file: string,
+  defaults: PacingConfig,
+): PacingConfig {
+  const table = requireTable(value, file, 'pacing');
+  for (const key of Object.keys(table)) {
+    if (!(PACING_KEYS as readonly string[]).includes(key)) {
+      throw new ConfigError(
+        `unknown key \`${key}\` in [pacing] (valid keys: ${PACING_KEYS.join(', ')})`,
+        file,
+        `pacing.${key}`,
+      );
+    }
+  }
+  const backoffBaseMs =
+    table['backoff_base_ms'] !== undefined
+      ? requirePositiveInt(table['backoff_base_ms'], file, 'pacing.backoff_base_ms')
+      : defaults.backoffBaseMs;
+  const backoffMaxMs =
+    table['backoff_max_ms'] !== undefined
+      ? requirePositiveInt(table['backoff_max_ms'], file, 'pacing.backoff_max_ms')
+      : defaults.backoffMaxMs;
+  if (backoffBaseMs > backoffMaxMs) {
+    throw new ConfigError(
+      `pacing.backoff_base_ms (${backoffBaseMs}) must not exceed pacing.backoff_max_ms (${backoffMaxMs})`,
+      file,
+      'pacing.backoff_base_ms',
+    );
+  }
+  let providers = defaults.providers;
+  if (table['providers'] !== undefined) {
+    const providersTable = requireTable(table['providers'], file, 'pacing.providers');
+    const parsed: Record<string, PacingProviderOverride> = {};
+    for (const [providerId, entry] of Object.entries(providersTable)) {
+      if (providerId.trim() === '') {
+        throw new ConfigError(
+          'pacing.providers keys must be non-empty provider ids',
+          file,
+          'pacing.providers',
+        );
+      }
+      const entryTable = requireTable(entry, file, `pacing.providers."${providerId}"`);
+      for (const key of Object.keys(entryTable)) {
+        if (key !== 'rate_limit_patterns') {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [pacing.providers."${providerId}"] (valid keys: rate_limit_patterns)`,
+            file,
+            `pacing.providers."${providerId}".${key}`,
+          );
+        }
+      }
+      const rawPatterns = entryTable['rate_limit_patterns'];
+      if (rawPatterns === undefined) {
+        throw new ConfigError(
+          `[pacing.providers."${providerId}"] must set rate_limit_patterns`,
+          file,
+          `pacing.providers."${providerId}"`,
+        );
+      }
+      if (!Array.isArray(rawPatterns)) {
+        throw new ConfigError(
+          `pacing.providers."${providerId}".rate_limit_patterns must be an array of strings`,
+          file,
+          `pacing.providers."${providerId}".rate_limit_patterns`,
+        );
+      }
+      const patterns = rawPatterns.map((pattern, index) => {
+        const text = requireString(
+          pattern,
+          file,
+          `pacing.providers."${providerId}".rate_limit_patterns[${index}]`,
+        );
+        try {
+          new RegExp(text, 'i');
+        } catch (error) {
+          throw new ConfigError(
+            `pacing.providers."${providerId}".rate_limit_patterns[${index}] is not a valid regex: ${(error as Error).message}`,
+            file,
+            `pacing.providers."${providerId}".rate_limit_patterns[${index}]`,
+          );
+        }
+        return text;
+      });
+      parsed[providerId] = { rateLimitPatterns: patterns };
+    }
+    providers = parsed;
+  }
+  return {
+    enabled:
+      table['enabled'] !== undefined
+        ? requireBool(table['enabled'], file, 'pacing.enabled')
+        : defaults.enabled,
+    maxConcurrentMinions:
+      table['max_concurrent_minions'] !== undefined
+        ? requireNonNegativeInt(table['max_concurrent_minions'], file, 'pacing.max_concurrent_minions')
+        : defaults.maxConcurrentMinions,
+    maxConcurrentReviewTurns:
+      table['max_concurrent_review_turns'] !== undefined
+        ? requireNonNegativeInt(table['max_concurrent_review_turns'], file, 'pacing.max_concurrent_review_turns')
+        : defaults.maxConcurrentReviewTurns,
+    backoffBaseMs,
+    backoffMaxMs,
+    maxAutoRetries:
+      table['max_auto_retries'] !== undefined
+        ? requireNonNegativeInt(table['max_auto_retries'], file, 'pacing.max_auto_retries')
+        : defaults.maxAutoRetries,
+    providers,
   };
 }
 
