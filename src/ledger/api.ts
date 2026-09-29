@@ -1007,21 +1007,24 @@ export class LedgerApi {
     return rows.map((row) => this.agentFromRow(row));
   }
 
-  /** The implementing minions of one job: role-minion rows MINUS
-   * review-only sessions (Gru ruling 2026-09-29 on the phase8 finding).
-   * A session is review-only when existing data says so — the review-worker
-   * role (Perkins lead, lens specialists, fallback reviewer), review-round
-   * membership (`round_id`), or a bound lens chip — and a review-only
-   * session must never win a latest-minion pick (re-brief resume, Silas
-   * digest, fix-directive routing). Query-side exclusion only: no schema
-   * change, and the lens subquery rides idx_lens_agent. */
+  /** The implementing minions of one job, newest spawn first: role-minion
+   * rows MINUS review-only sessions (Gru ruling 2026-09-29 on the phase8
+   * finding). A session is review-only when existing data says so — the
+   * review-worker role (Perkins lead, lens specialists, fallback reviewer),
+   * review-round membership (`round_id`), or a bound lens chip — and a
+   * review-only session must never win a latest-minion pick (re-brief
+   * resume, Silas digest, fix-directive routing). Recency is spawn order
+   * (`created_at`): observer state writes refresh `updated_at` on older
+   * rows, so a revisited old implementer must not outrank the newest.
+   * Query-side exclusion only: no schema change, and the lens subquery
+   * rides idx_lens_agent. */
   listImplementerMinions(jobId: string): readonly AgentRecord[] {
     const rows = this.db
       .prepare(
         `SELECT * FROM agents
          WHERE job_id = ? AND role = 'minion' AND round_id IS NULL
            AND NOT EXISTS (SELECT 1 FROM lens_states WHERE lens_states.agent_id = agents.id)
-         ORDER BY updated_at DESC, id`,
+         ORDER BY created_at DESC, id`,
       )
       .all(jobId) as Row[];
     return rows.map((row) => this.agentFromRow(row));
