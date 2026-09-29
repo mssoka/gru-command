@@ -1951,4 +1951,32 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     await vi.waitFor(() => expect(handle.promptCalls).toHaveLength(1));
     h.dispose();
   });
+
+  it('never auto-retries an isolated (workflow-owned) review attempt', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('perkins', 'isolated-review-429', null, true);
+    // A capturable turn exists: without the isolation guard this failure
+    // would schedule an automatic retry and re-deliver the prompt in place.
+    handle.pendingTurnSnapshot = { text: 'review the diff', owner: 'perkins-whole:lead' };
+    h.registry.adopt(handle);
+    h.api.registerAgent({ id: handle.id, role: 'perkins' });
+    hang(handle);
+    emitFailure(handle, '429 too many requests');
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    // The workflow-owned abort contract is unchanged: no retry scheduled,
+    // no prompt re-delivered, and the durable abort bookkeeping lands.
+    expect(sleeper.delays).toEqual([]);
+    expect(handle.promptCalls).toHaveLength(0);
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind.startsWith('pacing.'))).toBe(false);
+    expect(h.api.listEvents({ limit: 100 }).some((event) =>
+      event.kind === 'supervision.review-attempt-aborted' && event.agentId === handle.id,
+    )).toBe(true);
+    expect(h.api.getAgent(handle.id)?.state).toBe('error');
+    h.dispose();
+  });
 });

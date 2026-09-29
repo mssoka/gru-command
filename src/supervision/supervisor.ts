@@ -1158,6 +1158,11 @@ export class Supervisor {
   private absorbRateLimitFailure(agent: SupervisedAgent, errorText: string): boolean {
     const policy = this.rateLimitBackoff;
     if (policy === null) return false;
+    // Workflow-owned review attempts keep their existing contract: the
+    // enclosing Perkins workflow owns session-isolation and retry
+    // accounting, so an in-place automatic retry here would race it. Fall
+    // through to the ladder, which aborts the attempt for the workflow.
+    if (agent.handle?.reviewIsolation === true) return false;
     if (!isRateLimitErrorText(errorText, policy.patterns)) return false;
     const incident = agent.rateLimitRetry;
     if (incident !== null) {
