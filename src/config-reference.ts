@@ -62,6 +62,7 @@ export const CONFIG_SECTION_HEADERS: readonly string[] = [
   '[runtimes.claude-code]',
   '[runtimes.claude-code.roles]',
   '[supervision]',
+  '[concurrency]',
   '[logging]',
   '[chat]',
   '[worktrees]',
@@ -346,6 +347,53 @@ export function renderReferenceConfig(
     `# Compact an IDLE session proactively once context usage reaches this`,
     `# percent (1-100); pi's own threshold compaction stays as the backstop.`,
     `proactive_compact_percent = ${supervision.proactiveCompactPercent}`,
+  );
+  // Provider pacing (owner heist 2026-09-29, scope-trimmed): the [concurrency]
+  // section ships as a commented example — the section being present is the
+  // feature switch, so activating it by default would change behavior. A
+  // user-set section is preserved ACTIVE on regeneration, never dropped.
+  const concurrency = preserved?.concurrency;
+  if (concurrency?.enabled === true) {
+    lines.push(
+      '',
+      '[concurrency]',
+      '# Bounded automatic retry for the provider rate-limit error class',
+      '# (HTTP 429 and plain-language throttling). Every automatic retry is',
+      '# recorded as a pacing.auto-retry ledger event; non-rate-limit failures',
+      '# and an exhausted budget still stop to the supervisor ladder + owner',
+      '# ACK. Remove this section to disable (current behavior).',
+      `backoff_base_ms = ${concurrency.backoffBaseMs}`,
+      `backoff_max_ms = ${concurrency.backoffMaxMs}`,
+      `max_auto_retries = ${concurrency.maxAutoRetries}`,
+    );
+    for (const [providerId, override] of Object.entries(concurrency.providers)) {
+      lines.push(
+        '',
+        `[concurrency.providers.${tomlString(providerId)}]`,
+        '# Extra provider-specific rate-limit signatures (regex bodies matched',
+        '# against error text only — never a brand baked into code).',
+        `rate_limit_patterns = [${override.rateLimitPatterns.map((pattern) => tomlString(pattern)).join(', ')}]`,
+      );
+    }
+  } else {
+    lines.push(
+      '',
+      '# [concurrency]',
+      '# Provider pacing: bounded automatic retry for the rate-limit error',
+      '# class (HTTP 429, "rate limit", "too many requests", throttling).',
+      '# Each automatic retry is recorded as a pacing.auto-retry ledger event;',
+      '# non-rate-limit failures and an exhausted budget still stop to the',
+      '# supervisor ladder + owner ACK. Absent section = disabled (current',
+      '# behavior). Suggested starting point: 1s, capped at 60s, 5 retries.',
+      '# backoff_base_ms = 1000',
+      '# backoff_max_ms = 60000',
+      '# max_auto_retries = 5',
+      '# Optional per-provider extra signatures live alongside the section.',
+      '# [concurrency.providers."<provider-id>"]',
+      '# rate_limit_patterns = ["pacing code \\\\d+"]',
+    );
+  }
+  lines.push(
     '',
     '[logging]',
     '# service.log size-based rotation.',

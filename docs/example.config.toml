@@ -78,6 +78,19 @@ restart_backoff_ms = 2000
 # percent (1-100); pi's own threshold compaction stays as the backstop.
 proactive_compact_percent = 70
 
+# [concurrency]                     # provider pacing — automatic rate-limit retry (optional)
+# Bounded automatic retry for the provider rate-limit error class (HTTP 429,
+# "rate limit"/"too many requests"/throttling). Every automatic retry is
+# recorded as a pacing.auto-retry ledger event; non-rate-limit failures and an
+# exhausted budget still stop to the supervisor ladder + owner ACK. Absent
+# section = disabled (current behavior). Provider-agnostic: signatures match
+# error text, never a provider brand baked into code.
+# backoff_base_ms = 1000
+# backoff_max_ms = 60000
+# max_auto_retries = 5
+# [concurrency.providers."<provider-id>"]  # extra provider-specific signatures
+# rate_limit_patterns = ["pacing code \\d+"]
+
 [logging]
 max_bytes = 10485760
 keep = 5
