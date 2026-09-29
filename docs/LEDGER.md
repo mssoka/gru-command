@@ -92,7 +92,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 
 | Kind | Payload (essentials) |
 |---|---|
-| `job.created` | repo, title |
+| `job.created` | repo, title, display_name |
 | `job.status` / `job.note` / `job.pr` / `job.target` | from→to / note / url / ref |
 | `round.created` / `round.status` / `round.verdict` / `round.target` | seq, lenses / from→to / verdict / ref |
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
@@ -180,3 +180,16 @@ observation — the failed
 worker keeps its permit; `resident.open-control-unknown` records (once
 per affected handle) that supervision lacked openControl evidence, which
 makes the handle non-reclaimable rather than presumed idle.
+### E9: short heist names (migration 9)
+
+`jobs.display_name` is the optional short name the crew rail shows on
+minion cards (nullable: legacy rows read as NULL and fall back to a
+display-only, grapheme-bounded shortening of the title). `addJob` trims
+an authored value, rejects blank or visible-character-free names, and
+caps it at `JOB_DISPLAY_NAME_MAX_LENGTH` (100 characters); the dispatch
+API accepts the same value as `display_name`, maps a missing, blank or
+mistyped field to "no authored name" rather than an error, answers a
+too-long name with 400, and `job.created` payloads carry the stored
+value. Reads: `JobView.displayName` on `GET /api/board`; the full title
+and the full agent id stay on the job and in each row's tooltip, so
+nothing is lost when a name is shortened for display.

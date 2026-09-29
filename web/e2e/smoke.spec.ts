@@ -667,8 +667,17 @@ test.describe('board (E6, mock feed)', () => {
 
   test('minion heist names fit the crew rail on desktop and phone in light and dark', async ({ page }, testInfo) => {
     await pair(page);
-    await page.locator('#tab-board').click();
-    const row = page.locator('#board-agents .board-agent[data-role="minion"]');
+    // v6.1 ruling 1: no Chat/Board toggle exists to click — the board is
+    // docked beside chat on desktop and is the default view on phones.
+    await expect(page.locator('#board-view')).toBeVisible();
+    // G5: the authored short name renders as-is (lowercased) with its own
+    // four-character suffix; the title-fallback row below stays the legacy
+    // path. Two minion rows now exist, so scope each by its displayed name.
+    const authored = page.locator('#board-agents .board-agent[data-role="minion"]', { hasText: 'api docs pass' });
+    await expect(authored.locator('.board-agent__name')).toHaveText('api docs pass');
+    await expect(authored.locator('.board-agent__hash')).toHaveText('docs');
+    await expect(authored).toHaveAttribute('title', /Docs pass on the public endpoints.*mock-minion-docs/u);
+    const row = page.locator('#board-agents .board-agent[data-role="minion"]', { hasText: 'fix the payment retry' });
     await expect(row.locator('.board-agent__name')).toHaveText('fix the payment retry');
     await expect(row.locator('.board-agent__hash')).toHaveText('nion');
     await expect(row).toHaveAttribute('title', /Fix the payment retry loop.*mock-minion/u);
