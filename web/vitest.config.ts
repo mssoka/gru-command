@@ -5,7 +5,7 @@ import { defineConfig } from 'vitest/config';
 // budget (cores - 2), while dispatched lanes and housekeeping burst
 // outside it on the same host. Clamp the effective pool so the web suite
 // keeps headroom; tests, assertions, and timeouts are untouched.
-const SUITE_WORKER_CAP = 6;
+const SUITE_WORKER_CAP = 3;
 const pinnedPools = [process.env.VITEST_MAX_THREADS, process.env.VITEST_MAX_FORKS]
   .map((value) => (value === undefined ? Number.NaN : Number.parseInt(value, 10)))
   .filter((value) => Number.isFinite(value));

@@ -12,7 +12,7 @@ import { defineConfig } from 'vitest/config';
 // stay exactly as authored. The scheduler's pin (if present) still acts
 // as the upper bound; the config module executes before resolveConfig
 // applies the environment, so clamping here composes with it.
-const SUITE_WORKER_CAP = 6;
+const SUITE_WORKER_CAP = 3;
 const pinnedPools = [process.env.VITEST_MAX_THREADS, process.env.VITEST_MAX_FORKS]
   .map((value) => (value === undefined ? Number.NaN : Number.parseInt(value, 10)))
   .filter((value) => Number.isFinite(value));
