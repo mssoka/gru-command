@@ -155,6 +155,30 @@ export class NotificationCenter {
       input.dedupe === 'all' ? 'any' : input.dedupe,
     );
     if (existing !== null) {
+      // A routing mismatch must not strand an owner-held stop (gh-97): an
+      // UNACKED machine row is not owner-Ack-able (ledger.ackNotification
+      // throws for action-required), so honoring the requested owner routing
+      // means an owner-held row. The legacy row stays machine-held for Gru
+      // triage: never migrated, auto-acked, resolved, or grandfathered into
+      // FOR YOU. Same-routing hits and previously ACKED rows still reuse the
+      // old ID.
+      if (input.routing === 'needs-owner' && existing.routing !== 'needs-owner' && existing.ackedAt === null) {
+        // Perkins R1/R2: the kind lookup tie-breaks by id (ts DESC, id
+        // ASC), so a same-millisecond legacy row can keep WINNING this
+        // dedupe after the owner row exists. Reuse the open owner incident
+        // before inserting — one owner row, one bell ring per incident —
+        // with the producer's OWN dedupe mode: 'unacked' reuse requires an
+        // unacked owner row (an ack spends the row, so a NEW trip mints a
+        // NEW owner row), 'active' reuse keeps the one unresolved owner
+        // row even if acked until something resolves it.
+        const openOwnerRow = this.ledger.findNotificationByKindAndRouting(
+          input.kind,
+          'needs-owner',
+          input.dedupe === 'all' ? 'any' : input.dedupe,
+        );
+        if (openOwnerRow !== null) return openOwnerRow;
+        return this.post(input);
+      }
       // Do not grandfather an old machine row into FOR YOU merely because
       // a newer post of the same kind is owner-held. Gru triages the old ID.
       return existing;
