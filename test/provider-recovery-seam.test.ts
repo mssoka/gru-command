@@ -182,6 +182,7 @@ class SeamHarness {
         restartWindowMs: 600_000,
         maxRestarts: 3,
         restartBackoffMs: 1_000,
+        proactiveCompactPercent: 70,
       },
       registry: this.registry,
       ledger: this.ledger,

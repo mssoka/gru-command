@@ -59,7 +59,7 @@ const PINS: Record<string, number> = {
   'perkins-freeze-freshhead.test.ts': 13,
   'perkins-lead-schema-compat.test.ts': 6,
   'perkins-whole-review.test.ts': 67,
-  'pi-adapter.test.ts': 63,
+  'pi-adapter.test.ts': 65,
   'provider-recovery-admission.test.ts': 4,
   'provider-recovery-classify.test.ts': 25,
   'provider-recovery-composition.test.ts': 9,
