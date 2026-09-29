@@ -83,7 +83,7 @@ const PINS: Record<string, number> = {
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
   'suite-shape.test.ts': 2,
-  'supervisor.test.ts': 43,
+  'supervisor.test.ts': 49,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 13,
   'uploads-dir.test.ts': 3,

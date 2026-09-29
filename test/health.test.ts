@@ -161,6 +161,7 @@ describe('GET /health', () => {
           turnSilenceMs: 900_000,
           restartWindowMs: 600_000,
           maxRestarts: 3,
+          proactiveCompactPercent: 70,
           agents: [
             {
               agentId: 'gru-main',
@@ -173,6 +174,9 @@ describe('GET /health', () => {
               openToolCalls: 0,
               lastEventAt: '2026-09-18T00:00:00.000Z',
               lastFileBytes: 1024,
+              contextPercent: null,
+              compactionDegraded: false,
+              compactionDeferred: false,
             },
           ],
         }),
@@ -185,6 +189,7 @@ describe('GET /health', () => {
       const supervision = body['supervision'] as Record<string, unknown>;
       expect(supervision['enabled']).toBe(true);
       expect(supervision['turnSilenceMs']).toBe(900_000);
+      expect(supervision['proactiveCompactPercent']).toBe(70);
       const agents = supervision['agents'] as Array<Record<string, unknown>>;
       expect(agents[0]).toMatchObject({ agentId: 'gru-main', state: 'watching', restarts: 1 });
     } finally {
