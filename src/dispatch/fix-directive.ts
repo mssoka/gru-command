@@ -26,7 +26,7 @@ export interface DirectiveRegistry {
 
 export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
-  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent' | 'getJob'>;
+  readonly ledger: Pick<LedgerApi, 'listImplementerMinions' | 'registerAgent' | 'getJob'>;
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
@@ -49,8 +49,7 @@ export async function routeFixDirectiveToMinion(
     input.lessons?.referencesFor(input.directive) ?? [],
   );
   const minions = input.ledger
-    .listAgents()
-    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+    .listImplementerMinions(input.jobId);
   let evictedSessionFile: string | null = null;
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
@@ -221,8 +220,7 @@ export async function rebriefFreshMinion(
   },
 ): Promise<{ minionId: string; lanePath: string; prompt: string; sessionFile: string | null }> {
   const jobMinions = input.ledger
-    .listAgents()
-    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+    .listImplementerMinions(input.jobId);
   for (const minion of jobMinions) {
     const handle = input.registry.getHandle(minion.id);
     if (handle === null) continue;

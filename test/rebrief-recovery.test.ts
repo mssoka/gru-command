@@ -264,6 +264,60 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.ledger.listPendingRebriefs()).toHaveLength(0);
   });
 
+  it('never resumes a review-only session, however new its row is (Gru ruling 2026-09-29)', async () => {
+    const h = makeHarness();
+    const jobId = 'reviewer-safe-job';
+    const sessions = join(h.dir, 'sessions');
+    mkdirSync(sessions, { recursive: true });
+    const implementerFile = join(sessions, 'implementer.jsonl');
+    const reviewerFile = join(sessions, 'review-only.jsonl');
+    writeFileSync(implementerFile, '{"type":"turn"}\n');
+    writeFileSync(reviewerFile, '{"type":"turn"}\n');
+    await seedPendingRebrief({ h, jobId });
+    // The implementer registered first; the review-only rows registered
+    // after it are the NEWEST minion-looking rows of the job — exactly the
+    // shape that made the old latest-minion fallback resume a reviewer.
+    h.ledger.registerAgent({ id: 'impl-worker', role: 'minion', jobId, sessionFile: implementerFile });
+    const round = h.ledger.addRound({ jobId, lenses: ['blind'] });
+    h.ledger.registerAgent({ id: 'zz-fallback-reviewer', role: 'perkins', jobId, sessionFile: reviewerFile });
+    h.ledger.registerAgent({ id: 'zz-round-reviewer', role: 'minion', roundId: round.id, jobId, sessionFile: reviewerFile });
+    h.ledger.registerAgent({ id: 'zz-lens-reviewer', role: 'minion', jobId, sessionFile: reviewerFile });
+    h.ledger.bindLens(round.id, 'blind', 'zz-lens-reviewer');
+    // Deterministic recency: every reviewer row strictly newer than the
+    // implementer row, regardless of clock granularity.
+    const bump = h.db.handle.prepare('UPDATE agents SET updated_at = ? WHERE id = ?');
+    bump.run('2026-09-29T12:00:02.000Z', 'zz-lens-reviewer');
+    bump.run('2026-09-29T12:00:03.000Z', 'zz-round-reviewer');
+    bump.run('2026-09-29T12:00:04.000Z', 'zz-fallback-reviewer');
+    bump.run('2026-09-29T12:00:01.000Z', 'impl-worker');
+
+    const report = await reconcilePendingRebriefs(
+      { registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    await report.settled;
+    expect(h.registry.workers[0]?.options.resumeFile).toBe(implementerFile);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')?.payload).toMatchObject({ path: 'resumed' });
+  });
+
+  it('a job whose only minion-side rows are review-only gets a FRESH worker, never a resumed reviewer', async () => {
+    const h = makeHarness();
+    const jobId = 'only-reviewers-job';
+    const sessions = join(h.dir, 'sessions');
+    mkdirSync(sessions, { recursive: true });
+    const reviewerFile = join(sessions, 'review-only.jsonl');
+    writeFileSync(reviewerFile, '{"type":"turn"}\n');
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.registerAgent({ id: 'zz-fallback-reviewer', role: 'perkins', jobId, sessionFile: reviewerFile });
+    const report = await reconcilePendingRebriefs(
+      { registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    await report.settled;
+    expect(h.registry.workers[0]?.options.resumeFile).toBeUndefined();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')?.payload).toMatchObject({ path: 'redispatched' });
+  });
+
   it('double-boot does not double-dispatch: in-flight claims and consumed markers are idempotent', async () => {
     const h = makeHarness();
     const jobId = 'double-boot-job';

@@ -188,6 +188,31 @@ describe('ledger api — the record of state', () => {
     expect(() => api.setAgentState('ghost', 'idle')).toThrow(/not found/u);
   });
 
+  it('listImplementerMinions: newest-first role-minion rows, review-only sessions excluded (G1)', () => {
+    api.addJob({ id: 'unrelated', repo: 'fixture', title: 'other heist' });
+    api.registerAgent({ id: 'crew', role: 'gru' });
+    api.registerAgent({ id: 'impl', role: 'minion', jobId: 'fix-login-flow', sessionFile: '/impl.jsonl' });
+    api.registerAgent({ id: 'other-job', role: 'minion', jobId: 'unrelated', sessionFile: '/other.jsonl' });
+    const round = api.addRound({ jobId: 'fix-login-flow', lenses: ['blind'] });
+    api.registerAgent({ id: 'lead', role: 'perkins', jobId: 'fix-login-flow', roundId: round.id, sessionFile: '/lead.jsonl' });
+    api.registerAgent({ id: 'round-bound', role: 'minion', jobId: 'fix-login-flow', roundId: round.id, sessionFile: '/round.jsonl' });
+    api.registerAgent({ id: 'lens-bound', role: 'minion', jobId: 'fix-login-flow', sessionFile: '/lens.jsonl' });
+    api.bindLens(round.id, 'blind', 'lens-bound');
+    api.registerAgent({ id: 'unlinked', role: 'minion', sessionFile: '/unlinked.jsonl' });
+    const bump = db.handle.prepare('UPDATE agents SET updated_at = ? WHERE id = ?');
+    bump.run('2026-09-29T12:00:01.000Z', 'impl');
+    bump.run('2026-09-29T12:00:02.000Z', 'round-bound');
+    bump.run('2026-09-29T12:00:03.000Z', 'lens-bound');
+    // 'agent-one' trails from an earlier suite section sharing this db.
+    const implementers = api.listImplementerMinions('fix-login-flow').map((agent) => agent.id);
+    expect(implementers[0]).toBe('impl');
+    for (const reviewer of ['lead', 'round-bound', 'lens-bound']) {
+      expect(implementers).not.toContain(reviewer);
+    }
+    expect(api.listImplementerMinions('unrelated').map((agent) => agent.id)).toEqual(['other-job']);
+    expect(api.listImplementerMinions('no-such-job')).toEqual([]);
+  });
+
   it('lens binding + outcome transitions; unknown rounds/lenses fail loud', () => {
     api.registerAgent({ id: 'lens-blind', role: 'perkins', roundId: 'fix-login-flow-r1' });
     let round = api.bindLens('fix-login-flow-r1', 'blind', 'lens-blind');

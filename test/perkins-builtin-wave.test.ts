@@ -2463,7 +2463,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       const outcome = await h.wave.runRound({ jobId: h.job.id });
       if (!('route' in outcome)) throw new Error('expected fallback route');
       expect(h.prompts).toHaveLength(1);
-      expect(h.ledger.getAgent('prod-minion-1')).toMatchObject({ role: 'minion', jobId: h.job.id, state: 'spawning' });
+      expect(h.ledger.getAgent('prod-minion-1')).toMatchObject({ role: 'perkins', label: 'fallback-review', jobId: h.job.id, state: 'spawning' });
       expect(h.prompts[0]).toContain(h.skillPath);
       expect(h.prompts[0]).toContain('WORKING DIFF');
       expect(h.spawnCwds[0]).toBe(h.repo.path);

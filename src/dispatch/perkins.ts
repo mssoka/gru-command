@@ -1925,9 +1925,14 @@ export class WaveRunner {
   private async defaultFallbackReview(input: FallbackReviewRunInput): Promise<readonly FallbackFinding[]> {
     const handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
     try {
+      // The ledger role is the review-worker role on purpose (Gru ruling
+      // 2026-09-29): this session runs ONE review pass and is forbidden
+      // from implementation edits, so it must never win an implementer
+      // pick (re-brief resume, Silas digest, fix-directive routing).
       this.opts.ledger.registerAgent({
         id: handle.id,
-        role: 'minion',
+        role: 'perkins',
+        label: 'fallback-review',
         sessionFile: handle.sessionFile,
         jobId: input.jobId,
       });

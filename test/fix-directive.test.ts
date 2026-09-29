@@ -99,6 +99,61 @@ describe('fresh fix worker association', () => {
       db.close();
     }
   });
+
+  it('never routes a directive into a review-only session, however new (Gru ruling 2026-09-29)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-reviewer-safe-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'reviewer-safe', repo: 'fixture', title: 't', briefing: 'b' });
+      // An implementer with NO live handle, and a NEWEST review-only row
+      // (round-bound minion) whose handle IS live — the old newest-first
+      // live-handle loop prompted the reviewer; routing must spawn fresh
+      // instead.
+      ledger.registerAgent({ id: 'impl-minion', role: 'minion', jobId: 'reviewer-safe', sessionFile: '/fixture/impl.jsonl' });
+      const round = ledger.addRound({ jobId: 'reviewer-safe', lenses: ['blind'] });
+      ledger.registerAgent({ id: 'rev-reviewer', role: 'minion', roundId: round.id, jobId: 'reviewer-safe', sessionFile: '/fixture/rev.jsonl' });
+      const bump = db.handle.prepare('UPDATE agents SET updated_at = ? WHERE id = ?');
+      bump.run('2026-09-29T12:00:01.000Z', 'impl-minion');
+      bump.run('2026-09-29T12:00:02.000Z', 'rev-reviewer');
+      const prompted: string[] = [];
+      let spawned = 0;
+      const reviewerHandle = {
+        id: 'rev-reviewer', role: 'minion', sessionFile: '/fixture/rev.jsonl',
+        async prompt() { prompted.push('rev-reviewer'); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: '/fixture/rev.jsonl' }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const freshHandle = {
+        id: 'fresh-worker', role: 'minion', sessionFile: '/fixture/fresh.jsonl',
+        async prompt() { prompted.push('fresh-worker'); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: '/fixture/fresh.jsonl' }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const outcome = await routeFixDirectiveToMinion({
+        jobId: 'reviewer-safe', directive: 'repair the flake', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: (id: string) => (id === 'rev-reviewer' ? reviewerHandle : null),
+          spawn: async () => { spawned += 1; return freshHandle; },
+          disposeHandle: async () => {},
+        },
+      });
+      expect(prompted).toEqual(['fresh-worker']);
+      expect(spawned).toBe(1);
+      expect(outcome.delivered).toBe(true);
+      expect(outcome.minionId).toBe('fresh-worker');
+    } finally {
+      db.close();
+    }
+  });
 });
 
 describe('recordFollowUpDelivery (the loop-closing signal)', () => {

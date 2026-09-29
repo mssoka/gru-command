@@ -149,6 +149,8 @@ describe('re-review freshness predicate', () => {
 interface Harness {
   ledger: LedgerApi & DigestLedger;
   bus: EventBus;
+  /** Raw handle for deterministic test-seam row timestamps. */
+  db: LedgerDb;
   cleanup(): void;
 }
 
@@ -163,6 +165,7 @@ function makeLedger(): Harness {
   return {
     ledger,
     bus,
+    db,
     cleanup() {
       db.close();
     },
@@ -269,6 +272,33 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
+  it('the delivered-without-PR pick never lands on a review-only session (Gru ruling 2026-09-29)', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-reviewer-safe', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-reviewer-safe', 'working');
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-reviewer-safe', payload: { agentId: 'a1' } });
+      h.ledger.registerAgent({ id: 'min-impl', role: 'minion', jobId: 'job-reviewer-safe', sessionFile: '/sessions/min-impl.jsonl' });
+      // The fallback review worker registers as the review-worker role and
+      // is NEWEST — it must never win the digest's minion-session pick.
+      h.ledger.registerAgent({ id: 'rev-fallback', role: 'perkins', jobId: 'job-reviewer-safe', sessionFile: '/sessions/rev-fallback.jsonl' });
+      const bump = h.db.handle.prepare('UPDATE agents SET created_at = ?, updated_at = ? WHERE id = ?');
+      bump.run('2026-09-29T12:00:01.000Z', '2026-09-29T12:00:01.000Z', 'min-impl');
+      bump.run('2026-09-29T12:00:02.000Z', '2026-09-29T12:00:02.000Z', 'rev-fallback');
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        worktrees: { listWorktrees: () => [] },
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.deliveredWithoutPr).toHaveLength(1);
+      expect(digest.deliveredWithoutPr[0]?.minionSessionFile).toBe('/sessions/min-impl.jsonl');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('flags a stalled working lane past the threshold, with the minion idle age', async () => {
     const h = makeLedger();
     try {
@@ -287,6 +317,33 @@ describe('silas digest (the four actionable states)', () => {
       expect(digest.stalledWorking).toHaveLength(1);
       expect(digest.stalledWorking[0]?.jobId).toBe('job-slow');
       expect(digest.stalledWorking[0]?.minionId).toBe('min-slow');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the stalled-lane pick never lands on a review-only session (Gru ruling 2026-09-29)', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-stall-safe', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-stall-safe', 'working');
+      h.ledger.registerAgent({ id: 'min-stalled', role: 'minion', jobId: 'job-stall-safe' });
+      h.ledger.setAgentState('min-stalled', 'idle');
+      const round = h.ledger.addRound({ jobId: 'job-stall-safe', lenses: ['blind'] });
+      h.ledger.registerAgent({ id: 'rev-fresh', role: 'minion', roundId: round.id, jobId: 'job-stall-safe' });
+      const bump = h.db.handle.prepare('UPDATE agents SET created_at = ?, updated_at = ? WHERE id = ?');
+      bump.run('2026-09-29T12:00:01.000Z', '2026-09-29T12:00:01.000Z', 'min-stalled');
+      bump.run('2026-09-29T12:00:02.000Z', '2026-09-29T12:00:02.000Z', 'rev-fresh');
+      const now = Date.now();
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => now + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000,
+      });
+      expect(digest.stalledWorking).toHaveLength(1);
+      expect(digest.stalledWorking[0]?.minionId).toBe('min-stalled');
     } finally {
       h.cleanup();
     }
