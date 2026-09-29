@@ -57,3 +57,24 @@ slot + dispatch + supervisor mechanisms only.
 Context-window usage telemetry (`getContextUsage` in runtime types,
 chat/server.ts surfaces) is NOT provider quota readiness. Never wire it into
 the sensor.
+
+## Final implementation map — r1 blockers + owner multi-provider overlay (2026-09-29)
+
+The audit above is the pre-implementation map; the shipped surface after the
+r1 Perkins rework and the owner-approved multi-provider extension is:
+
+| Area | Path | Content |
+| --- | --- | --- |
+| Classifier | `src/provider-recovery/classify.ts` | Typed-evidence-only classification; owner statuses (401/402/403) beat quota-flavored body codes; supported providers: `zai-coding-cn` (generation fallback, activation-gated), `openai-codex` + `anthropic-claude-native` (metadata-only). |
+| Metadata adapters | `src/provider-recovery/metadata.ts` | Codex `wham/usage` + Claude `oauth/usage` read-only adapters; strict schema validators; 401/403/402 → owner-controlled; 429/transport → read failure; optional model windows = unknown, never unlimited; ZERO generation; single bounded GET with credential-claim request binding (`ChatGPT-Account-Id`). |
+| Metadata composition | `src/provider-recovery/composition.ts` | Nonmutating codex snapshot via `readStoredCredential` (no refresh, ms-expiry verified from pi-ai source); claude snapshot from the observed keychain item (`claudeAiOauth`, pro/max only) behind an injected command port; `BoundMetadataReader` fences provider + credential-generation fingerprint; safe-category logging only. |
+| Probe (GLM) | `src/provider-recovery/probe.ts` | Exact endpoint + credential binding verified at probe time; `maxTokens 64`, `maxRetries 0`, `maxRetryDelayMs 0`, finite timeout + AbortSignal; completed-producer evidence gate. |
+| Sensor | `src/provider-recovery/sensor.ts` | Explicit typed establishment; eligibility with durable establishment-status vs churn; ≥300 s floor on every outcome; reserve-and-charge before I/O (crash → spent-unknown); post-I/O reload/revalidation; atomic shared recovery batch; single durable delivery path (`provider.restored`); lineage-based renewal ladder; deterministic in-service timer. |
+| Resume/claim | `src/provider-recovery/resume.ts` | Atomic claim-before-spawn; full recheck set; one continuation; admission recorded separately; silas-slot guarded re-arm with tolerant concurrent settle. |
+| Admission ports | `src/provider-recovery/admission-observations.ts` | Typed admission/progress observations + all-binding fan-out gate. SOURCE-ONLY consumer: the cap-owned runtime emitter is NOT grounded on this branch (returned as the precise interface; no cap files touched). |
+| Ledger | `src/ledger/db.ts` migration 9 (unshipped, edited in place), `src/ledger/api.ts` | `provider_waits` (+endpoint/job-status-at-establishment/lineage/batch), `provider_routes`, `pending_provider_recovery`, `provider_probe_reservations`; atomic batch + CAS claim APIs. |
+| Supervisor seam | `src/supervision/supervisor.ts` | `ownsProviderWall` (machine ownership BEFORE any owner stop) + `linkProviderWaitIncident`; typed evidence threading; guarded `ownedProviderReArm`; stop/ack semantics otherwise unchanged. |
+| Notification seam | `src/notifications/center.ts`, `src/ledger/api.ts` | `supervision.provider-wall.*` no longer force-held: the supervisor's explicit routing governs (action-required = machine-owned; needs-owner = conservative fallback). Other owner-held kinds unchanged. |
+| Runtime seam | `src/runtime/{types,pi-adapter}.ts` | `typed` provenance on error events — sdk-error (numeric status + headers) or provider-message (strict machine-composed line) only. |
+| Wiring | `src/main.ts` | Sensor before supervisor (late-bound wake/re-arm); `ownsProviderWall`/`linkProviderWaitIncident` wired; claude context observes env + settings-file overrides (no brand assertion); metadata readers composed from read-only installed source interfaces. |
+| Config/docs | `src/config.ts`, `src/config-reference.ts`, `docs/CONFIG.md`, `docs/example.config.toml` | `[provider_recovery]` incl. `probe_timeout_ms` and `glm_generation_fallback` (default OFF = fail closed, zero I/O); approval floors enforced at parse time. |

@@ -36,3 +36,30 @@ Final gates (not self-served by this worker):
 - fresh independent BMAD final-diff review
 - required native Perkins review
 - owner merge/deploy/activation (manual, owner-controlled)
+
+## Multi-provider overlay + r1 rework additions (2026-09-29)
+
+| Scenario | Deterministic coverage |
+| --- | --- |
+| Codex metadata: strict schema accept/reject, exhausted vs available (reset hint), no fallback to generation, one GET, account-claim header binding | `provider-recovery-metadata.test.ts`, `provider-recovery-composition.test.ts` |
+| Claude metadata: strict schema, required-window exhaustion, optional model windows never "unlimited", owner statuses preserve the hold | same |
+| Codex/Claude snapshots: fake auth.json / fake keychain port only; API-key/expiry/override/wrong-kind/wrong-account rejections BEFORE I/O; fingerprint-fenced readers; rotation fails closed | `provider-recovery-composition.test.ts` |
+| Machine ownership BEFORE any owner stop (zero needs-owner chimes for eligible waits; conservative needs-owner for auth/unsupported/failure) | `provider-recovery-seam.test.ts` |
+| GLM fallback activation guard: default OFF performs ZERO provider I/O while a wait remains durable | `provider-recovery-sensor.test.ts` |
+| ≤300 s floor on every outcome class; pre-I/O charge with crash settle (no refund/duplicate); post-I/O revalidation (rotation/holds applied); atomic batch binding all matching waiters; single delivery path; CAS claim before spawn | `provider-recovery-sensor.test.ts`, `provider-recovery-resume.test.ts`, `provider-recovery-ledger.test.ts` |
+| Interrupted-turn churn (blocked/delivered after establishment) stays eligible; pre-existing/generic blocks hold with zero I/O | `provider-recovery-sensor.test.ts` |
+| Typed provenance: SDK errors (status/headers) and provider terminal messages only; arbitrary exceptions anonymous | `pi-adapter.test.ts` (pure parsers) |
+| Fan-out gate: all claim/actor/session-turn/route/generation bindings enforced | `provider-recovery-admission.test.ts` |
+| Historical owner stops never resolved by the machine lifecycle; machine-owned incidents resolve with their wait | `provider-recovery-sensor.test.ts` |
+
+Verified on the lane at head `3692718` (local, isolated pure suites):
+`lint` green; both tsconfigs green; `build` green (incl. Perkins resource
+verifier); 21 adjacent test files / 459 tests green (nine provider-recovery
+suites = 198, plus supervisor, awareness, notifications, ledger-api,
+ledger-db, silas-driver, pi-adapter, fix-directive, rebrief-recovery, health,
+config, config-generate, suite-shape).
+
+Remaining gates (not self-served): exact-head CI (running on `3692718`),
+`/api/verify` full scope after a media-safe Silas checkpoint, fresh
+independent BMAD final-diff review, required native Perkins review, owner
+merge/deploy/activation.

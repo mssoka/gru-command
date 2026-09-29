@@ -81,3 +81,26 @@ A deterministic fake-clock test drives the full loop — approved step hits a st
 ## Open Questions
 
 - None blocking implementation; the approved policy answered the probe-fallback decision. Genuinely new owner choices discovered mid-implementation escalate per the briefing.
+
+---
+
+## Owner decision — multi-provider scope extension (2026-09-28, journal j-267)
+
+The owner approved using the successfully tested NON-generation quota
+metadata interfaces for OpenAI/Codex (`GET
+https://chatgpt.com/backend-api/wham/usage` via the existing Pi OAuth
+credential) and native Claude Code (claude.ai OAuth via the selected macOS
+keychain item, `GET https://api.anthropic.com/api/oauth/usage`), retaining
+the bounded same-route generation probe for GLM (activation-gated, default
+OFF). Supersedes ONLY the original GLM-first restriction; all
+eligible-wait, incident-fencing, budget, owner-stop, review, verification
+and activation boundaries remain. Full text:
+`briefings/provider-recovery-sensor-approved-20260928/multi-provider-approved-overlay.md`.
+
+### Implementation status (2026-09-29)
+
+All r1 Perkins blockers and the multi-provider overlay are implemented on
+this branch; see `code-map.md` (final map) and `gate-matrix.md` (coverage +
+remaining gates). Metadata paths are zero-generation; GLM generation runs
+only when `glm_generation_fallback` is explicitly enabled. Activation stays
+owner-manual; no live provider probing was performed.
