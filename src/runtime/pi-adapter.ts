@@ -104,6 +104,12 @@ function nativeReviewTools(definitions: readonly NativeAgentTool[]): ToolDefinit
 
 const COMPACTION_END_RECONCILE_MS = 5_000;
 
+/** Explicit and automatic compactions are bounded: a summarization model
+ * call that never settles must not wedge the session or climb the
+ * supervision restart ladder. 5 minutes stays well below the 15-minute
+ * default turn-silence watchdog (dispatch briefing 2026-09-29). */
+export const COMPACTION_DEADLINE_MS = 300_000;
+
 /** pi adapter capabilities, hoisted so the runtime probe can report them
  * without constructing the adapter (E3 story 3). */
 export const PI_CAPABILITIES: AgentCapabilities = {
@@ -127,6 +133,9 @@ export interface PiRuntimeOptions {
   readonly modelRuntime?: ModelRuntime;
   /** Test seam: override the long-tool heartbeat cadence. */
   readonly toolHeartbeatMs?: number;
+  /** Test seam: override the compaction deadline (0 disables the bound;
+   * production uses COMPACTION_DEADLINE_MS). */
+  readonly compactionDeadlineMs?: number;
   /** Tests inject a bounded "catalog became live" refresh. Production
    * defaults to one ModelRuntime.refresh({ allowNetwork: true }) bounded by
    * [runtimes.pi] model_refresh_timeout_ms. */
@@ -261,6 +270,7 @@ export class PiRuntime implements AgentRuntime {
   /** Long-tool heartbeat cadence override; derived from the supervision
    * window at spawn when unset (construction must not touch config). */
   private readonly toolHeartbeatMs: number | null;
+  private readonly compactionDeadlineMs: number | null;
   private readonly modelCatalogRefresh: ModelCatalogRefresher | undefined;
   private readonly handles = new Set<PiAgentHandle>();
   /** Normalized session paths currently hosted by this process (B4). */
@@ -280,6 +290,7 @@ export class PiRuntime implements AgentRuntime {
     this.log = opts.log ?? (() => {});
     this.modelRuntime = opts.modelRuntime;
     this.toolHeartbeatMs = opts.toolHeartbeatMs ?? null;
+    this.compactionDeadlineMs = opts.compactionDeadlineMs ?? null;
     this.modelCatalogRefresh = opts.modelCatalogRefresh;
   }
 
@@ -657,6 +668,7 @@ export class PiRuntime implements AgentRuntime {
           this.activeFiles.delete(sessionFile);
         },
         this.heartbeatMs(),
+        this.compactionDeadlineMs ?? COMPACTION_DEADLINE_MS,
       );
       this.handles.add(handle);
       this.down = undefined;
@@ -745,6 +757,8 @@ export class PiAgentHandle implements AgentHandle {
   private nativeCompactionOpen = false;
   private compactionEndDeadline = 0;
   private compactionEndTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Bounds a compaction summary model call (explicit or pi-auto). */
+  private compactionDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
   private explicitCompactionTerminal: {
     readonly resolve: (event: Extract<RuntimeEvent, { type: 'compaction_end' }>) => void;
     settled: boolean;
@@ -760,6 +774,9 @@ export class PiAgentHandle implements AgentHandle {
       subscribe(listener: (event: unknown) => void): () => void;
       dispose(): void;
       compact(customInstructions?: string): Promise<unknown>;
+      /** Present on the SDK session; used to cancel a compaction whose
+       * summary call outlived its deadline. */
+      abort?(): Promise<void>;
       getContextUsage(): {
         readonly tokens: number | null;
         readonly contextWindow: number;
@@ -779,6 +796,7 @@ export class PiAgentHandle implements AgentHandle {
     private readonly log: Log,
     private readonly onDispose: () => void = () => {},
     toolHeartbeatMs = 60_000,
+    private readonly compactionDeadlineMs = COMPACTION_DEADLINE_MS,
   ) {
     this.role = role;
     this.id = session.sessionId;
@@ -942,12 +960,36 @@ export class PiAgentHandle implements AgentHandle {
     this.compacting = true;
     let failed = false;
     let failure: unknown;
+    let deadlineHit = false;
     try {
-      await this.session.compact();
+      if (this.compactionDeadlineMs > 0) {
+        // Bound the summary model call: a hanging provider stream must not
+        // wedge the single-operation lane forever. The deadline never
+        // disposes the session — the gate degrades it instead.
+        await Promise.race([
+          this.session.compact(),
+          new Promise<never>((_resolve, reject) => {
+            this.compactionDeadlineTimer = setTimeout(() => {
+              this.compactionDeadlineTimer = null;
+              deadlineHit = true;
+              reject(
+                new Error(
+                  `native compaction exceeded the ${this.compactionDeadlineMs}ms deadline`,
+                ),
+              );
+            }, this.compactionDeadlineMs);
+            this.compactionDeadlineTimer.unref?.();
+          }),
+        ]);
+      } else {
+        await this.session.compact();
+      }
     } catch (error) {
       failed = true;
       failure = error;
     } finally {
+      this.clearCompactionDeadline();
+      if (deadlineHit) this.abortNativeCompaction('deadline');
       this.compacting = false;
       if (!this.disposed) {
         if (failed || this.pendingCompactionEnd === null) {
@@ -989,6 +1031,7 @@ export class PiAgentHandle implements AgentHandle {
     if (this.disposed) return;
     this.disposed = true;
     this.toolHeartbeat.dispose();
+    this.clearCompactionDeadline();
     if (this.compactionEndTimer !== null) clearTimeout(this.compactionEndTimer);
     this.compactionEndTimer = null;
     const abortCompaction =
@@ -1161,6 +1204,63 @@ export class PiAgentHandle implements AgentHandle {
     this.publishCompactionEnd(terminal as Extract<RuntimeEvent, { type: 'compaction_end' }>);
   }
 
+  private clearCompactionDeadline(): void {
+    if (this.compactionDeadlineTimer !== null) clearTimeout(this.compactionDeadlineTimer);
+    this.compactionDeadlineTimer = null;
+  }
+
+  /** Bound pi's own (threshold/overflow) compaction, which has no caller to
+   * own a timeout: a silent summary call must not keep supervision reading
+   * an open control until the restart watchdog fires. */
+  private armNativeCompactionDeadline(): void {
+    if (this.compactionDeadlineMs <= 0 || this.disposed) return;
+    this.clearCompactionDeadline();
+    this.compactionDeadlineTimer = setTimeout(() => {
+      this.compactionDeadlineTimer = null;
+      this.onNativeCompactionDeadline();
+    }, this.compactionDeadlineMs);
+    this.compactionDeadlineTimer.unref?.();
+  }
+
+  private onNativeCompactionDeadline(): void {
+    if (this.disposed || this.compacting || !this.nativeCompactionOpen) return;
+    const error = `native compaction exceeded the ${this.compactionDeadlineMs}ms deadline`;
+    this.log('warn', 'native compaction exceeded its deadline — aborting and degrading, no restart', {
+      role: this.role,
+      session: this.id,
+      deadline_ms: this.compactionDeadlineMs,
+    });
+    this.abortNativeCompaction('deadline');
+    this.nativeCompactionOpen = false;
+    this.pendingCompactionEnd = null;
+    this.compactionEndDeadline = 0;
+    this.publishCompactionEnd({ type: 'compaction_end', success: false, error });
+  }
+
+  /** Ask the SDK to cancel an in-flight compaction. Fire-and-forget: a
+   * wedged provider transport must never keep the deadline from settling. */
+  private abortNativeCompaction(reason: string): void {
+    const abort = this.session.abort;
+    if (typeof abort !== 'function') return;
+    try {
+      void Promise.resolve(abort.call(this.session)).catch((error: unknown) => {
+        this.log('warn', 'native compaction abort failed', {
+          role: this.role,
+          session: this.id,
+          reason,
+          error: String(error),
+        });
+      });
+    } catch (error) {
+      this.log('warn', 'native compaction abort threw', {
+        role: this.role,
+        session: this.id,
+        reason,
+        error: String(error),
+      });
+    }
+  }
+
   private publishCompactionEnd(
     terminal: Extract<RuntimeEvent, { type: 'compaction_end' }>,
   ): void {
@@ -1214,8 +1314,12 @@ export class PiAgentHandle implements AgentHandle {
         if (this.nativeCompactionOpen) return;
         this.nativeCompactionOpen = true;
         this.emit({ type: 'compaction_start' });
+        // The explicit compact() race owns its own deadline; arm here only
+        // for pi-initiated (threshold/overflow) compactions.
+        if (!this.compacting) this.armNativeCompactionDeadline();
         return;
       case 'compaction_end': {
+        this.clearCompactionDeadline();
         if (
           !this.nativeCompactionOpen &&
           !this.compacting &&
