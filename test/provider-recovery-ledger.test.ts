@@ -29,7 +29,10 @@ function waitInput(overrides: Partial<Parameters<LedgerApi['recordProviderWait']
     routeKey: 'zai-coding-cn/glm-5.3@fp1',
     provider: 'zai-coding-cn',
     model: 'glm-5.3',
+    endpoint: 'https://open.bigmodel.cn/api/coding/paas/v4',
     credentialFingerprint: 'fp1',
+    jobStatusAtEstablishment: null as string | null,
+    lineageKey: null as string | null,
     waiterKind: 'job-minion' as const,
     jobId: null,
     agentId: 'agent-1',
@@ -113,6 +116,7 @@ describe('provider routes (durable cadence/budget)', () => {
       routeKey: 'zai-coding-cn/glm-5.3@fp1',
       provider: 'zai-coding-cn',
       model: 'glm-5.3',
+      endpoint: 'https://open.bigmodel.cn/api/coding/paas/v4',
       credentialFingerprint: 'fp1',
       incidentSeq: 1,
       windowStart: now,
@@ -140,6 +144,7 @@ describe('provider routes (durable cadence/budget)', () => {
       routeKey: 'r',
       provider: 'zai-coding-cn',
       model: 'glm-5.3',
+      endpoint: 'https://open.bigmodel.cn/api/coding/paas/v4',
       credentialFingerprint: 'fp1',
       incidentSeq: 1,
       windowStart: now,
@@ -167,62 +172,125 @@ describe('provider routes (durable cadence/budget)', () => {
   });
 });
 
-describe('pending provider recovery (deduplicated delivery marker)', () => {
-  it('records once per route+incident generation and returns null on duplicates', () => {
+describe('pending provider recovery (atomic batch handoff, r1 #7/#8)', () => {
+  it('one transaction records the marker, flips EVERY bound waiter, and appends ONE provider.restored event', () => {
     const ledger = makeLedger();
-    const first = ledger.recordProviderRecovery({
-      id: 'p1',
-      routeKey: 'r',
-      incidentGeneration: 1,
+    ledger.recordProviderWait(waitInput());
+    ledger.recordProviderWait(waitInput({ id: 'w2', incidentId: 'incident-2', agentId: 'agent-2' }));
+    const batch = ledger.commitProviderRecoveryBatch({
+      id: 'recovery-r-1',
+      routeKey: 'zai-coding-cn/glm-5.3@fp1',
+      incidentGenerations: [1],
       evidence: { stopReason: 'stop', totalTokens: 4 },
-      waiterJobIds: [],
+      waiters: [
+        { id: 'w1', jobId: null },
+        { id: 'w2', jobId: null },
+      ],
     });
-    expect(first).not.toBeNull();
-    const duplicate = ledger.recordProviderRecovery({
-      id: 'p2',
-      routeKey: 'r',
-      incidentGeneration: 1,
-      evidence: { stopReason: 'stop', totalTokens: 5 },
-      waiterJobIds: [],
+    expect(batch).not.toBeNull();
+    const flipped = ledger.listProviderWaits({ status: 'recovered-pending' });
+    expect(flipped).toHaveLength(2);
+    expect(flipped.every((wait) => wait.recoveryBatchId === 'recovery-r-1')).toBe(true);
+    const restored = ledger.listEvents({ limit: 10 }).filter((event) => event.kind === 'provider.restored');
+    expect(restored).toHaveLength(1);
+    expect(restored[0]?.payload).toMatchObject({
+      batch_id: 'recovery-r-1',
+      route: 'zai-coding-cn/glm-5.3@fp1',
+      incident_generations: [1],
+      waiters: ['w1', 'w2'],
     });
-    expect(duplicate).toBeNull();
-    expect(ledger.listPendingProviderRecoveries()).toHaveLength(1);
-    // A NEW incident generation is a new delivery.
-    const second = ledger.recordProviderRecovery({
-      id: 'p3',
-      routeKey: 'r',
-      incidentGeneration: 2,
-      evidence: { stopReason: 'stop' },
-      waiterJobIds: [],
-    });
-    expect(second).not.toBeNull();
-    expect(ledger.listPendingProviderRecoveries()).toHaveLength(2);
   });
 
-  it('the provider.restored event lands once with its evidence and waiters', () => {
+  it('a duplicate batch id is a no-op — no second marker, event, or flip', () => {
     const ledger = makeLedger();
-    ledger.recordProviderRecovery({
+    ledger.recordProviderWait(waitInput());
+    const input = {
+      id: 'recovery-r-1',
+      routeKey: 'zai-coding-cn/glm-5.3@fp1',
+      incidentGenerations: [1],
+      evidence: { stopReason: 'stop' },
+      waiters: [{ id: 'w1', jobId: null as string | null }],
+    };
+    expect(ledger.commitProviderRecoveryBatch(input)).not.toBeNull();
+    // Replay of the SAME batch (crash between commit and delivery reconciliation).
+    expect(ledger.commitProviderRecoveryBatch(input)).toBeNull();
+    expect(ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    expect(ledger.listEvents({ limit: 10 }).filter((event) => event.kind === 'provider.restored')).toHaveLength(1);
+  });
+
+  it('the provider.restored event carries the batch evidence and waiter ids', () => {
+    const ledger = makeLedger();
+    ledger.commitProviderRecoveryBatch({
       id: 'p1',
       routeKey: 'r',
-      incidentGeneration: 1,
+      incidentGenerations: [1],
       evidence: { stopReason: 'stop' },
-      waiterJobIds: ['job-1'],
+      waiters: [{ id: 'w1', jobId: 'job-1' }],
     });
-    const restored = ledger.listEvents({ limit: 5 }).find((e) => e.kind === 'provider.restored');
+    const restored = ledger.listEvents({ limit: 5 }).find((event) => event.kind === 'provider.restored');
     expect(restored?.payload).toMatchObject({
+      batch_id: 'p1',
       route: 'r',
-      incident_generation: 1,
-      waiter_jobs: ['job-1'],
+      incident_generations: [1],
+      waiters: ['w1'],
     });
+    expect(restored?.jobId).toBe('job-1');
   });
 
   it('clearing a marker deletes only that marker', () => {
     const ledger = makeLedger();
-    ledger.recordProviderRecovery({ id: 'p1', routeKey: 'r1', incidentGeneration: 1, evidence: {}, waiterJobIds: [] });
-    ledger.recordProviderRecovery({ id: 'p2', routeKey: 'r2', incidentGeneration: 1, evidence: {}, waiterJobIds: [] });
+    ledger.commitProviderRecoveryBatch({ id: 'p1', routeKey: 'r1', incidentGenerations: [1], evidence: {}, waiters: [] });
+    ledger.commitProviderRecoveryBatch({ id: 'p2', routeKey: 'r2', incidentGenerations: [1], evidence: {}, waiters: [] });
     ledger.clearPendingProviderRecovery('p1');
     const remaining = ledger.listPendingProviderRecoveries();
     expect(remaining).toHaveLength(1);
     expect(remaining[0]?.routeKey).toBe('r2');
+  });
+
+  it('getPendingProviderRecoveryById resolves the batch a wait is stamped with', () => {
+    const ledger = makeLedger();
+    ledger.recordProviderWait(waitInput());
+    ledger.commitProviderRecoveryBatch({
+      id: 'recovery-b1',
+      routeKey: 'zai-coding-cn/glm-5.3@fp1',
+      incidentGenerations: [1],
+      evidence: {},
+      waiters: [{ id: 'w1', jobId: null }],
+    });
+    const wait = ledger.getProviderWait('w1');
+    expect(wait?.recoveryBatchId).toBe('recovery-b1');
+    expect(ledger.getPendingProviderRecoveryById('recovery-b1')?.id).toBe('recovery-b1');
+    expect(ledger.getPendingProviderRecoveryById('missing')).toBeNull();
+  });
+});
+
+describe('pre-I/O probe reservations (r1 #5 — charged before the network)', () => {
+  it('reserves once, blocks an overlapping reservation, and releases cleanly', () => {
+    const ledger = makeLedger();
+    const now = '2026-09-28T10:00:00.000Z';
+    const expiresAt = '2026-09-28T10:01:30.000Z';
+    expect(ledger.reserveProviderProbe({ routeKey: 'r', reservedAt: now, expiresAt })).toBeNull();
+    const blocked = ledger.reserveProviderProbe({ routeKey: 'r', reservedAt: now, expiresAt });
+    expect(blocked?.outcome).toBe('reserved');
+    expect(blocked?.expiresAt).toBe(expiresAt);
+    ledger.releaseProviderProbeReservation('r');
+    expect(ledger.getProviderProbeReservation('r')).toBeNull();
+    expect(ledger.reserveProviderProbe({ routeKey: 'r', reservedAt: now, expiresAt })).toBeNull();
+  });
+
+  it('an interrupted reservation settles spent-unknown without refunding or duplicating', () => {
+    const ledger = makeLedger();
+    ledger.reserveProviderProbe({
+      routeKey: 'r',
+      reservedAt: '2026-09-28T10:00:00.000Z',
+      expiresAt: '2026-09-28T10:01:30.000Z',
+    });
+    ledger.markProviderProbeSpentUnknown('r');
+    const reservation = ledger.getProviderProbeReservation('r');
+    expect(reservation?.outcome).toBe('spent-unknown');
+    // Still reserved: no concurrent duplicate check until the settle releases it.
+    expect(ledger.reserveProviderProbe({ routeKey: 'r', reservedAt: '2026-09-28T10:02:00.000Z', expiresAt: '2026-09-28T10:03:30.000Z' })).not.toBeNull();
+    ledger.releaseProviderProbeReservation('r');
+    expect(ledger.getProviderProbeReservation('r')).toBeNull();
   });
 });

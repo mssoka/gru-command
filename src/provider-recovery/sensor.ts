@@ -10,9 +10,9 @@ import type {
 import type { ProviderRecoveryConfig } from '../config.js';
 import {
   classifyProviderRejection,
-  extractProviderRejectionEvidence,
   providerSupportsSensor,
   type ProviderRejectionEvidence,
+  type TypedProviderResponse,
 } from './classify.js';
 import type { ProbeRoute, ProviderProbePort } from './probe.js';
 
@@ -71,10 +71,20 @@ export interface SlotReArmPort {
   ownedProviderReArm(agentId: string, waitId: string): boolean;
 }
 
+/** A non-generation metadata reader mapped onto the probe vocabulary
+ * (Codex/Claude adapters; zero generation). */
+export interface MetadataReaderPort {
+  read(route: ProbeRoute): Promise<import('./probe.js').ProbeOutcome>;
+}
+
 export interface ProviderRecoverySensorOptions {
   readonly config: ProviderRecoveryConfig;
   readonly ledger: LedgerApi;
+  /** GLM bounded generation fallback probe (config-gated; the overlay
+   * keeps it DISABLED in production). */
   readonly probe: ProviderProbePort;
+  /** Non-generation metadata readers keyed by provider id. */
+  readonly metadataReaders?: Readonly<Record<string, MetadataReaderPort>>;
   readonly notifications: SensorNotifications;
   readonly wake: RecoveryWakePort;
   readonly slotReArm?: SlotReArmPort;
@@ -98,8 +108,11 @@ export interface ProviderWallObservation {
   /** Structured provider identity when the runtime error carried one. */
   readonly provider: string | null;
   readonly model: string | null;
-  /** The raw runtime error line (machine-composed by the transport). */
+  /** The raw runtime error line (diagnostics; provider-message origin only). */
   readonly errorMessage: string;
+  /** TYPED provider-response provenance (r1 #13) — required to establish a
+   * wait: arbitrary turn exceptions carry none and stay owner-controlled. */
+  readonly typed: TypedProviderResponse | null;
   /** The supervision incident id (the provider-wall notification). */
   readonly incidentId: string | null;
   /** The captured interrupted turn, when one existed. */
@@ -131,17 +144,31 @@ export async function establishProviderWait(
     });
     return null;
   }
+  if (observation.typed === null) {
+    // r1 #13: no TYPED provider-response provenance (arbitrary turn
+    // exception, lost SDK shape) — never an eligible wait.
+    sensor.debugLog('provider wall without typed provider-response provenance — owner control preserved', {
+      agent_id: observation.agentId,
+    });
+    return null;
+  }
   if (observation.failureClass !== 'quota_wall') {
     // The supervisor's own class already says auth/unknown/etc. — never a
     // wait. (quota_wall is necessary but NOT sufficient: the explicit
     // classifier below still decides.)
     return null;
   }
-  const evidence: ProviderRejectionEvidence = extractProviderRejectionEvidence({
+  // Typed provenance is authoritative (r1 #13). The composed-line parser
+  // only refines a provider-message origin whose typed block lacked the
+  // body code; it can never manufacture evidence on its own.
+  const evidence: ProviderRejectionEvidence = {
     provider: observation.provider,
     model: observation.model,
     errorMessage: observation.errorMessage,
-  });
+    ...(observation.typed.status !== undefined ? { status: observation.typed.status } : {}),
+    ...(observation.typed.bodyCode !== undefined ? { bodyCode: observation.typed.bodyCode } : {}),
+    ...(observation.typed.retryAfterMs !== undefined ? { retryAfterMs: observation.typed.retryAfterMs } : {}),
+  };
   const limitClass = classifyProviderRejection(evidence);
   if (limitClass.kind !== 'temporary-recoverable') {
     sensor.debugLog('provider wall classified owner-controlled — no wait', {
@@ -159,15 +186,17 @@ export async function establishProviderWait(
     });
     return null;
   }
-  const fingerprint = await sensor.probe.credentialFingerprint(evidence.provider);
-  if (fingerprint === null) {
-    sensor.debugLog('credential could not be resolved for the route binding — no wait', {
+  // Single route-truth source: the shared runtime catalog + auth snapshot
+  // resolves BOTH the exact endpoint and the credential fingerprint (r1 #3).
+  const resolved = await sensor.probeFor(evidence.provider).resolveRoute(evidence.provider, evidence.model);
+  if (resolved === null) {
+    sensor.debugLog('route/credential could not be resolved for the binding — no wait', {
       agent_id: observation.agentId,
       provider: evidence.provider,
     });
     return null;
   }
-  return sensor.recordWait(observation, evidence, fingerprint);
+  return sensor.recordWait(observation, evidence, resolved.endpoint, resolved.credentialFingerprint);
 }
 
 /** Rolling budget window (1 h, per the approval's 12/hour pin). */
@@ -178,6 +207,7 @@ export class ProviderRecoverySensor {
   private readonly cfg: ProviderRecoveryConfig;
   private readonly ledger: LedgerApi;
   readonly probe: ProviderProbePort;
+  private readonly metadataReaders: Readonly<Record<string, MetadataReaderPort>>;
   private readonly notifications: SensorNotifications;
   private readonly wake: RecoveryWakePort;
   private readonly slotReArm: SlotReArmPort | null;
@@ -195,6 +225,7 @@ export class ProviderRecoverySensor {
     this.cfg = opts.config;
     this.ledger = opts.ledger;
     this.probe = opts.probe;
+    this.metadataReaders = opts.metadataReaders ?? {};
     this.notifications = opts.notifications;
     this.wake = opts.wake;
     this.slotReArm = opts.slotReArm ?? null;
@@ -207,6 +238,35 @@ export class ProviderRecoverySensor {
 
   debugLog(msg: string, fields: Record<string, unknown>): void {
     this.log('info', msg, fields);
+  }
+
+  /** The readiness port for a provider: a non-generation metadata reader
+   * when one exists (Codex/Claude), else the GLM generation fallback ONLY
+   * while config enables it (overlay: disabled in production). Returns null
+   * (fail closed, no checks) when neither applies. */
+  probeFor(provider: string): ProviderProbePort {
+    const metadata = this.metadataReaders[provider];
+    if (metadata !== undefined) {
+      return {
+        probe: (route) => metadata.read(route),
+        resolveRoute: (p, m) => this.probe.resolveRoute(p, m),
+      };
+    }
+    if (provider === 'zai-coding-cn' && this.cfg.glmGenerationFallback) {
+      return this.probe;
+    }
+    // Fail-closed stub: a supported provider whose only readiness path is
+    // the disabled GLM fallback resolves routes (wait establishment stays
+    // possible) but every check reports a closed probe — never generation.
+    return {
+      probe: () =>
+        Promise.resolve({
+          kind: 'probe-failed',
+          reason: 'no readiness path for this provider (GLM generation fallback disabled)',
+          retryAfterMs: null,
+        }),
+      resolveRoute: (p, m) => this.probe.resolveRoute(p, m),
+    };
   }
 
   /** Start the deterministic service timer (never an OS daemon). */
@@ -271,6 +331,8 @@ export class ProviderRecoverySensor {
       } else if (disposition === 'supersede') {
         this.ledger.setProviderWaitStatus(wait.id, 'superseded', { why: 'replaced' });
       }
+      // 'hold': kept, but not probed — ambiguous state never retires the
+      // provider blocker and never spends a check on an unactionable wait.
     }
     // No eligible waiters on this route: stop polling it (demand-gated —
     // the reference's ungated default probe is deliberately not copied).
@@ -293,6 +355,7 @@ export class ProviderRecoverySensor {
         routeKey,
         provider: first.provider,
         model: first.model,
+        endpoint: first.endpoint,
         credentialFingerprint: first.credentialFingerprint,
         incidentSeq: first.incidentGeneration,
         windowStart: nowIso,
@@ -333,18 +396,20 @@ export class ProviderRecoverySensor {
     }
   }
 
-  /** Eligibility per waiter, re-checked every tick and before any claim:
-   * only still-approved unfinished work whose next action can advance. */
+  /** Eligibility per waiter — TYPED distinction (r1 #1 phase3): the wait
+   * itself is the durable record that THIS provider blocker stopped an
+   * authorized unfinished continuation. Inputs are incident currency,
+   * establishment-time evidence, replacement actors and explicit holds —
+   * NEVER job.minion-error text, backlog membership, or `working` as
+   * permission. Expected interrupted-turn churn (blocked/delivered/
+   * in-review AFTER establishment) keeps the continuation ELIGIBLE;
+   * pre-existing/generic blocks (those states AT establishment), active
+   * review gates, stale incidents and suspensions HOLD with zero I/O. */
   private validateWaiter(wait: ProviderWaitRecord): 'eligible' | 'cancel' | 'supersede' | 'hold' {
     if (wait.waiterKind === 'job-minion') {
       const job = wait.jobId !== null ? this.ledger.getJob(wait.jobId) : null;
       if (job === null || job.status === 'merged' || job.status === 'done') return 'cancel';
-      // Owner/ops holds (blocked/parked) and other owner decisions on the
-      // lane invalidate automatic recovery: the wall is no longer the
-      // operative blocker.
-      if (job.status === 'blocked' || job.status === 'parked') return 'cancel';
-      // An already-live replacement minion (newer than this wait) owns the
-      // lane — the wait is superseded, never double-resumed.
+      if (job.status === 'parked') return 'cancel'; // explicit manual hold
       if (wait.jobId !== null) {
         const newer = this.ledger
           .listAgents()
@@ -357,14 +422,45 @@ export class ProviderRecoverySensor {
           );
         if (newer !== undefined) return 'supersede';
       }
-      // A delivered lane means the turn settled without this wait's
-      // continuation: the work is not waiting on the provider.
-      if (job.status === 'delivered' || job.status === 'in-review') return 'supersede';
+      // Incident currency (rotation/staleness fencing).
+      const route = this.ledger.getProviderRoute(wait.routeKey);
+      if (
+        route === null ||
+        route.credentialFingerprint !== wait.credentialFingerprint ||
+        route.endpoint !== wait.endpoint
+      ) {
+        return 'hold'; // binding changed or is being re-established — zero I/O
+      }
+      if (route.suspendedUntil !== null && Date.parse(route.suspendedUntil) > this.now()) return 'hold';
+      // Quality gate: an ACTIVE review round owns the lane (never cleared by
+      // provider recovery). Delivered/in-review WITHOUT an active round is
+      // expected churn (the round already settled or never opened).
+      if (job.status === 'in-review' && this.hasActiveReviewRound(wait.jobId)) return 'hold';
+      // Generic/unknown block: the job was ALREADY blocked/delivered/in-review
+      // when the provider stop was classified — the interrupted-turn churn
+      // explanation does not apply; hold with zero I/O until ruled otherwise.
+      const atEstablishment = wait.jobStatusAtEstablishment;
+      if (
+        atEstablishment === 'blocked' ||
+        atEstablishment === 'delivered' ||
+        atEstablishment === 'in-review'
+      ) {
+        return 'hold';
+      }
+      // Otherwise: current approved continuation — eligible through the
+      // expected post-establishment status churn.
       return 'eligible';
     }
-    // silas-slot: eligible while silas is hosted; disabling silas retires
-    // the wait (owner decision).
     return this.silasHosted() ? 'eligible' : 'cancel';
+  }
+
+  private hasActiveReviewRound(jobId: string | null): boolean {
+    if (jobId === null) return false;
+    try {
+      return this.ledger.listRounds(jobId).some((round) => round.status === 'pending' || round.status === 'live');
+    } catch {
+      return false; // no rounds readable = no active gate
+    }
   }
 
   /** The shared non-overlapping check for one route. */
@@ -379,18 +475,86 @@ export class ProviderRecoverySensor {
     const probeRoute: ProbeRoute = {
       provider: route.provider,
       model: route.model,
-      baseUrl: '',
+      endpoint: route.endpoint,
       credentialFingerprint: route.credentialFingerprint,
     };
-    const outcome = await this.probe.probe(probeRoute);
+    // r1 #5: reserve + CHARGE before the network I/O, in one transaction.
+    // A crash after this point leaves the reservation (spent-unknown at
+    // reconcile) — the budget and cadence were already advanced.
+    const reservationExpiryMs = this.cfg.probeTimeoutMs + this.cfg.tickIntervalMs * 2 + 5_000;
+    const blockedBy = this.ledger.reserveProviderProbe({
+      routeKey,
+      reservedAt: nowIso,
+      expiresAt: new Date(nowMs + reservationExpiryMs).toISOString(),
+    });
+    if (blockedBy !== null) {
+      if (Date.parse(blockedBy.expiresAt) <= nowMs) {
+        // Interrupted mid-flight (crash): settle spent-unknown; the
+        // previously-advanced cadence governs the next attempt.
+        this.ledger.markProviderProbeSpentUnknown(routeKey);
+        this.ledger.releaseProviderProbeReservation(routeKey);
+        this.ledger.upsertProviderRoute(
+          {
+            ...route,
+            lastResult: 'probe-unknown-crash',
+            lastAttemptAt: nowIso,
+            updatedAt: nowIso,
+          },
+          { kind: 'provider.probe-result', payload: { route: routeKey, result: 'probe-unknown-crash' } },
+        );
+      }
+      return;
+    }
+    // The charge itself: budget + cadence advance BEFORE the I/O. Every
+    // outcome class floors at the 300 s approval minimum (r1 #4).
+    const provisionalDelay = this.cfg.cadenceMinMs;
     const base = {
       ...route,
       attemptsInWindow: attempts,
       lastAttemptAt: nowIso,
       consecutiveProbeFailures: 0,
+      nextCheckAt: new Date(nowMs + provisionalDelay).toISOString(),
     };
+    this.ledger.upsertProviderRoute(
+      {
+        ...base,
+        updatedAt: nowIso,
+      },
+    );
+    let outcome: Awaited<ReturnType<ProviderProbePort['probe']>>;
+    try {
+      outcome = await this.probeFor(route.provider).probe(probeRoute);
+    } finally {
+      this.ledger.releaseProviderProbeReservation(routeKey);
+    }
     if (outcome.kind === 'completed') {
-      await this.recoverRoute(route, eligible, outcome.evidence as unknown as Record<string, unknown>, nowMs);
+      // r1 #6: the check was ASYNC — reload and revalidate everything the
+      // recovery is about to bind: fresh waiters (holds/completions/
+      // replacements that landed mid-probe), incident currency, and the
+      // route/credential binding (rotation = route change, fail closed).
+      const revalidated = this.revalidateAfterCheck(route);
+      if (revalidated === null) {
+        // The route binding changed mid-check: never clobber the (new)
+        // binding — mark the FRESH route row and recover nothing.
+        const freshRoute = this.ledger.getProviderRoute(routeKey);
+        if (freshRoute !== null) {
+          this.ledger.upsertProviderRoute(
+            { ...freshRoute, lastResult: 'route-changed-mid-check', updatedAt: nowIso },
+            { kind: 'provider.probe-result', payload: { route: routeKey, result: 'route-changed-mid-check' } },
+          );
+        }
+        return;
+      }
+      if (revalidated.length === 0) {
+        // Valid evidence but every waiter settled mid-check: nothing to
+        // deliver — record the outcome on the route, commit nothing.
+        this.ledger.upsertProviderRoute(
+          { ...base, lastResult: 'recovered-no-eligible-waiters', updatedAt: nowIso },
+          { kind: 'provider.probe-result', payload: { route: routeKey, result: 'recovered-no-eligible-waiters' } },
+        );
+        return;
+      }
+      await this.recoverRoute(route, revalidated, outcome.evidence as unknown as Record<string, unknown>, nowMs);
       return;
     }
     if (outcome.kind === 'still-limited') {
@@ -414,9 +578,11 @@ export class ProviderRecoverySensor {
     // backoff bounded, never a recovery. Credential rotation invalidates
     // the waits (route change) instead of probing against a new binding.
     const failures = route.consecutiveProbeFailures + 1;
-    const backoff = Math.min(
-      this.cfg.probeBackoffBaseMs * 2 ** (failures - 1),
-      this.cfg.probeBackoffMaxMs,
+    // r1 #4: backoff LENGTHENS beyond the cadence floor; it can never go
+    // below it — 300 s minimum spacing on every outcome class.
+    const backoff = Math.max(
+      this.cfg.cadenceMinMs,
+      Math.min(this.cfg.probeBackoffBaseMs * 2 ** (failures - 1), this.cfg.probeBackoffMaxMs),
     );
     this.ledger.upsertProviderRoute(
       {
@@ -432,7 +598,13 @@ export class ProviderRecoverySensor {
     );
     if (outcome.reason.includes('credential rotated')) {
       for (const wait of eligible) {
-        this.ledger.setProviderWaitStatus(wait.id, 'superseded', { why: 'credential-rotated' });
+        // The check was ASYNC: only a row still waiting is superseded — an
+        // owner/completion transition that landed mid-check already settled
+        // it and must not be re-transitioned (terminal guards).
+        const current = this.ledger.getProviderWait(wait.id);
+        if (current !== null && current.status === 'waiting') {
+          this.ledger.setProviderWaitStatus(wait.id, 'superseded', { why: 'credential-rotated' });
+        }
       }
     }
   }
@@ -444,11 +616,39 @@ export class ProviderRecoverySensor {
     return Math.max(this.cfg.cadenceMinMs, Math.min(retryAfterMs, this.cfg.retryAfterMaxMs));
   }
 
-  /** Persist the deduplicated recovery, mark waiters, wake Silas once.
-   * The marker keys on the newest incident sequence among the waiters the
-   * evidence covered — each NEW incident (renewed quota included) gets its
-   * own delivery; a duplicate observation of the same sequence never
-   * double-delivers. */
+  /** r1 #6: reload + revalidate AFTER the async check. Returns the
+   * still-eligible waiters bound to the SAME route/credential binding, or
+   * null when the route itself changed (rotation mid-check). Fresh
+   * dispositions are APPLIED here (a hold/cancel/supersede that landed
+   * mid-check settles now, never at some later tick). */
+  private revalidateAfterCheck(route: ProviderRouteRecord): readonly ProviderWaitRecord[] | null {
+    const freshRoute = this.ledger.getProviderRoute(route.routeKey);
+    if (
+      freshRoute === null ||
+      freshRoute.credentialFingerprint !== route.credentialFingerprint ||
+      freshRoute.endpoint !== route.endpoint
+    ) {
+      return null;
+    }
+    const fresh = this.ledger.listProviderWaits({ status: 'waiting', routeKey: route.routeKey });
+    const eligible: ProviderWaitRecord[] = [];
+    for (const wait of fresh) {
+      const disposition = this.validateWaiter(wait);
+      if (disposition === 'eligible') eligible.push(wait);
+      else if (disposition === 'cancel') {
+        this.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'waiter-invalid-during-check' });
+      } else if (disposition === 'supersede') {
+        this.ledger.setProviderWaitStatus(wait.id, 'superseded', { why: 'replaced-during-check' });
+      }
+    }
+    return eligible;
+  }
+
+  /** Persist the ATOMIC recovery batch (r1 #7/#8): the marker, the single
+   * `provider.restored` event (the ONE durable Silas delivery path — the
+   * event bus wake rides the existing SilasDriver one-slot coalescing; no
+   * second explicit trigger), and EVERY matching waiter's flip commit in
+   * one ledger transaction. Duplicate batch = no-op. */
   private async recoverRoute(
     route: ProviderRouteRecord,
     eligible: readonly ProviderWaitRecord[],
@@ -456,57 +656,35 @@ export class ProviderRecoverySensor {
     nowMs: number,
   ): Promise<void> {
     const nowIso = new Date(nowMs).toISOString();
-    const recoveredSeq = eligible.reduce((max, wait) => Math.max(max, wait.incidentGeneration), 0);
     this.ledger.upsertProviderRoute(
       { ...route, lastResult: 'recovered', nextCheckAt: new Date(nowMs + this.cfg.cadenceMinMs).toISOString(), updatedAt: nowIso },
       {
         kind: 'provider.probe-result',
-        payload: { route: route.routeKey, result: 'recovered', incident_seq: recoveredSeq, evidence },
+        payload: { route: route.routeKey, result: 'recovered', evidence },
       },
     );
-    const recorded = this.ledger.recordProviderRecovery({
-      id: randomUUID(),
+    const batchId = `recovery-${route.routeKey}-${nowMs}`;
+    const generations = [...new Set(eligible.map((wait) => wait.incidentGeneration))];
+    const recorded = this.ledger.commitProviderRecoveryBatch({
+      id: batchId,
       routeKey: route.routeKey,
-      incidentGeneration: recoveredSeq,
+      incidentGenerations: generations,
       evidence,
-      waiterJobIds: eligible.map((wait) => wait.jobId).filter((jobId): jobId is string => jobId !== null),
+      waiters: eligible.map((wait) => ({ id: wait.id, jobId: wait.jobId })),
     });
-    if (recorded === null) {
-      // Duplicate observation of the same incident sequence: the delivery
-      // marker already exists — never a second event or wake.
-      return;
-    }
-    for (const wait of eligible) {
-      if (wait.incidentGeneration > recoveredSeq) continue; // newer incident: not covered by this evidence
-      this.ledger.setProviderWaitStatus(wait.id, 'recovered-pending', {
-        route: route.routeKey,
-        incident_seq: wait.incidentGeneration,
-        evidence_completed_at: nowIso,
-      });
-    }
+    if (recorded === null) return; // duplicate observation — never a second delivery
     this.notifications.resolveIncidents(`provider.waiting.${route.routeKey}`, 'provider-recovery-sensor');
     // The Silas logical slot re-arms deterministically through the guarded
-    // owned transition — the sensor never depends on the stopped COO to
-    // accept the wake (though the wake still informs it when it can turn).
+    // owned transition — never depending on the stopped COO.
     for (const wait of eligible) {
       if (wait.waiterKind === 'silas-slot' && wait.agentId !== null && this.slotReArm !== null) {
-        const rearmed = this.slotReArm.ownedProviderReArm(wait.agentId, wait.id);
-        this.log('info', 'silas slot provider re-arm attempted', {
-          route: route.routeKey,
-          agent_id: wait.agentId,
-          rearmed,
-        });
+        this.slotReArm.ownedProviderReArm(wait.agentId, wait.id);
       }
     }
-    this.log('info', 'provider recovery recorded — waking silas once', {
+    this.log('info', 'provider recovery batch committed — one durable event delivery', {
       route: route.routeKey,
+      batch: batchId,
       waiters: eligible.length,
-    });
-    await this.wake.trigger({ kind: 'provider.restored', routeKey: route.routeKey }).catch((error: unknown) => {
-      this.log('error', 'provider-restored wake could not be delivered — the digest sweep retries', {
-        route: route.routeKey,
-        error: String(error),
-      });
     });
   }
 
@@ -536,9 +714,9 @@ export class ProviderRecoverySensor {
         this.ledger.clearPendingProviderRecovery(pending.id);
         continue;
       }
-      // The delivery may have been lost across the restart boundary: wake
-      // once per boot for it (the wake coalescer still guarantees at most
-      // one in-flight wake).
+      // The durable `provider.restored` event predates the restart; the ONE
+      // delivery path is re-armed here — a single wake per open batch per
+      // boot (request identity = the batch marker; the coalescer dedupes).
       await this.wake.trigger({ kind: 'provider.restored', routeKey: pending.routeKey }).catch(() => {});
       rewoken += 1;
     }
@@ -552,6 +730,7 @@ export class ProviderRecoverySensor {
   recordWait(
     observation: ProviderWallObservation,
     evidence: ProviderRejectionEvidence,
+    endpoint: string,
     fingerprint: string,
   ): ProviderWaitRecord {
     const routeKey = providerRouteKey(evidence.provider, evidence.model, fingerprint);
@@ -568,6 +747,7 @@ export class ProviderRecoverySensor {
         routeKey,
         provider: evidence.provider,
         model: evidence.model,
+        endpoint,
         credentialFingerprint: fingerprint,
         incidentSeq: replayed?.incidentGeneration ?? 1,
         windowStart: nowIso,
@@ -592,11 +772,17 @@ export class ProviderRecoverySensor {
     // false (the continuation re-hit the wall) — supersede the prior, climb
     // the bounded false-recovery ladder (escalation suspends the route
     // rather than looping).
-    const prior = observation.agentId !== null && replayed === undefined
+    const lineage =
+      observation.jobId !== null
+        ? `job:${observation.jobId}`
+        : observation.slotId !== null
+          ? `slot:${observation.slotId}`
+          : null;
+    const prior = lineage !== null && replayed === undefined
       ? [
           ...this.ledger.listProviderWaits({ status: 'recovered-pending' }),
           ...this.ledger.listProviderWaits({ status: 'claimed' }),
-        ].find((wait) => wait.agentId === observation.agentId && wait.routeKey === routeKey)
+        ].find((wait) => wait.lineageKey === lineage && wait.routeKey === routeKey)
       : undefined;
     if (prior !== undefined) {
       if (prior.status === 'recovered-pending') {
@@ -610,12 +796,21 @@ export class ProviderRecoverySensor {
         this.escalateFalseRecovery(route, observation);
       }
     }
+    const jobAtStop = observation.jobId !== null ? this.ledger.getJob(observation.jobId) : null;
     const wait = this.ledger.recordProviderWait({
       id: randomUUID(),
       routeKey,
       provider: evidence.provider,
       model: evidence.model,
+      endpoint,
       credentialFingerprint: fingerprint,
+      jobStatusAtEstablishment: jobAtStop?.status ?? null,
+      lineageKey:
+        observation.jobId !== null
+          ? `job:${observation.jobId}`
+          : observation.slotId !== null
+            ? `slot:${observation.slotId}`
+            : null,
       waiterKind: observation.role === 'silas' ? 'silas-slot' : 'job-minion',
       jobId: observation.jobId,
       agentId: observation.agentId,

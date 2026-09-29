@@ -128,14 +128,15 @@ class FakeRegistry implements SupervisorRegistry {
 
 class SensorProbe implements ProviderProbePort {
   fingerprint = 'fp00000000000001';
+  endpoint = 'https://open.bigmodel.cn/api/coding/paas/v4';
   outcome: ProbeOutcome = { kind: 'still-limited', status: 429, retryAfterMs: null, detail: 'limited' };
   readonly calls: ProbeRoute[] = [];
   probe(route: ProbeRoute): Promise<ProbeOutcome> {
     this.calls.push(route);
     return Promise.resolve(this.outcome);
   }
-  credentialFingerprint(): Promise<string | null> {
-    return Promise.resolve(this.fingerprint);
+  resolveRoute(): Promise<{ endpoint: string; credentialFingerprint: string } | null> {
+    return Promise.resolve({ endpoint: this.endpoint, credentialFingerprint: this.fingerprint });
   }
 }
 
@@ -146,6 +147,9 @@ class SeamHarness {
   readonly probe = new SensorProbe();
   readonly observations: Parameters<
     NonNullable<import('../src/supervision/supervisor.js').ProviderWallSink>['onProviderWall']
+  >[0][] = [];
+  readonly ownershipChecks: Parameters<
+    NonNullable<NonNullable<import('../src/supervision/supervisor.js').ProviderWallSink>['ownsProviderWall']>
   >[0][] = [];
   readonly wakes: { kind: string; routeKey: string }[] = [];
   supervisor: Supervisor;
@@ -183,6 +187,30 @@ class SeamHarness {
       ledger: this.ledger,
       notifications: this.notifications,
       providerWalls: {
+        // Mirrors the production wiring: machine-ownership decided BEFORE
+        // any owner stop; the persisted wait is the only `true` answer.
+        ownsProviderWall: async (input) => {
+          this.ownershipChecks.push(input);
+          const wait = await establishProviderWait(sensor, {
+            agentId: input.agentId,
+            role: input.role,
+            slotId: input.slotId,
+            jobId: input.jobId,
+            sessionFile: input.sessionFile,
+            failureClass: input.failureClass,
+            provider: input.source?.provider ?? null,
+            model: input.source?.model ?? null,
+            errorMessage: input.source?.error ?? '',
+            typed: input.source?.typed ?? null,
+            incidentId: null,
+            continuation: input.continuation,
+          }).catch(() => null);
+          return wait !== null;
+        },
+        linkProviderWaitIncident: ({ agentId, incidentId }) => {
+          const wait = this.ledger.openProviderWaitForAgent(agentId);
+          if (wait !== null) this.ledger.setProviderWaitIncident(wait.id, incidentId);
+        },
         onProviderWall: (observation) => {
           this.observations.push(observation);
           void establishProviderWait(sensor, {
@@ -195,6 +223,7 @@ class SeamHarness {
             provider: observation.source?.provider ?? null,
             model: observation.source?.model ?? null,
             errorMessage: observation.source?.error ?? '',
+            typed: observation.source?.typed ?? null,
             incidentId: observation.incidentId,
             continuation: observation.continuation,
           }).catch(() => {});
@@ -232,6 +261,32 @@ class SeamHarness {
       fatal: false,
       provider: 'zai-coding-cn',
       model: 'glm-5.3',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
+    });
+    return handle;
+  }
+
+  /** A live minion whose error is an OWNER-controlled auth wall. */
+  async runMinionIntoAuthWall(jobId: string): Promise<FakeHandle> {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-seam-session-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'minion.jsonl');
+    writeFileSync(sessionFile, '{}\n');
+    this.ledger.addJob({ id: jobId, repo: 'https://github.com/example/repo', title: 'job' });
+    this.ledger.setJobStatus(jobId, 'working');
+    const handle = new FakeHandle('minion', `agent-${jobId}`, sessionFile);
+    this.registry.handles.set(handle.id, handle);
+    this.registry.emit({ agentId: handle.id, role: 'minion', sessionFile, phase: 'spawned' });
+    this.registry.wireTap(handle, 'minion');
+    this.ledger.registerAgent({ id: handle.id, role: 'minion', jobId, sessionFile });
+    handle.emit({ type: 'turn_start' });
+    handle.emit({
+      type: 'error',
+      error: '401: {"error":{"code":"1002","message":"invalid api key"}}',
+      fatal: false,
+      provider: 'zai-coding-cn',
+      model: 'glm-5.3',
+      typed: { origin: 'provider-message', status: 401, bodyCode: '1002' },
     });
     return handle;
   }
@@ -287,50 +342,69 @@ describe('attention surface wiring (acceptance 9)', () => {
 });
 
 describe('supervisor ⇄ sensor seam', () => {
-  it('a structured GLM quota wall stop becomes an explicit provider wait', async () => {
+  it('a structured GLM quota wall stop becomes an explicit provider wait — machine-owned BEFORE any owner stop', async () => {
     const h = new SeamHarness();
     const handle = await h.runMinionIntoQuotaWall('job-seam-1');
     await h.settle();
-    // The supervisor stopped the agent (breaker open, incident posted).
+    // The supervisor stopped the agent. Machine ownership was decided
+    // BEFORE the notice: MACHINE attention (action-required), and ZERO
+    // needs-owner chimes for a newly eligible wait (r1 #2, phase3).
     const incident = h.ledger
       .listNotifications({ unackedOnly: true })
       .find((n) => n.kind.startsWith('supervision.provider-wall.'));
     expect(incident).toBeDefined();
-    expect(incident?.routing).toBe('needs-owner');
-    // The sink observed the wall with its structured evidence...
-    expect(h.observations).toHaveLength(1);
-    expect(h.observations[0]?.source).toMatchObject({ provider: 'zai-coding-cn', model: 'glm-5.3' });
-    expect(h.observations[0]?.continuation?.promptText).toBe('the interrupted briefing turn');
-    // ...and the sensor persisted an eligible wait.
+    expect(incident?.routing).toBe('action-required');
+    expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toHaveLength(0);
+    // The ownership decision observed the structured evidence...
+    expect(h.ownershipChecks).toHaveLength(1);
+    expect(h.ownershipChecks[0]?.source).toMatchObject({ provider: 'zai-coding-cn', model: 'glm-5.3' });
+    expect(h.ownershipChecks[0]?.continuation?.promptText).toBe('the interrupted briefing turn');
+    // ...and the persisted wait IS that decision: eligible, bound, linked.
     const waits = h.ledger.listProviderWaits({ status: 'waiting' });
     expect(waits).toHaveLength(1);
     expect(waits[0]?.agentId).toBe(handle.id);
     expect(waits[0]?.continuation?.promptOwner).toBe('minion-brief');
+    expect(waits[0]?.incidentId).toBe(incident?.id);
     // The stop itself is unchanged: the handle is disposed.
     expect(handle.disposed).toBe(true);
   });
 
-  it('an auth wall stops the agent but never becomes a wait', async () => {
+  it('an auth wall keeps the conservative owner stop and never becomes a wait', async () => {
     const h = new SeamHarness();
-    const dir = mkdtempSync(join(tmpdir(), 'pr-seam-auth-'));
+    await h.runMinionIntoAuthWall('job-auth');
+    await h.settle();
+    expect(h.observations).toHaveLength(1);
+    expect(h.observations[0]?.failureClass).toBe('authentication_wall');
+    expect(h.ledger.listProviderWaits()).toHaveLength(0);
+    // Owner control preserved: the conservative needs-owner stop still posts.
+    expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toHaveLength(1);
+  });
+
+  it('an unsupported provider wall keeps the conservative owner stop (no machine notice, no wait)', async () => {
+    const h = new SeamHarness();
+    const dir = mkdtempSync(join(tmpdir(), 'pr-seam-unsup-'));
     cleanupDirs.push(dir);
-    const handle = new FakeHandle('minion', 'agent-auth', join(dir, 's.jsonl'));
+    const handle = new FakeHandle('minion', 'agent-unsup', join(dir, 's.jsonl'));
     mkdirSync(dirname(handle.sessionFile as string), { recursive: true });
     writeFileSync(handle.sessionFile as string, '{}\n');
     h.registry.handles.set(handle.id, handle);
     h.registry.emit({ agentId: handle.id, role: 'minion', sessionFile: handle.sessionFile, phase: 'spawned' });
     h.registry.wireTap(handle, 'minion');
+    h.ledger.addJob({ id: 'job-unsup', repo: 'https://github.com/example/repo', title: 'job' });
+    h.ledger.setJobStatus('job-unsup', 'working');
+    h.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-unsup', sessionFile: handle.sessionFile });
     handle.emit({
       type: 'error',
-      error: '401: {"error":{"code":"1002","message":"invalid api key"}}',
+      error: '429: {"error":{"code":"9999"}}',
       fatal: false,
-      provider: 'zai-coding-cn',
-      model: 'glm-5.3',
+      provider: 'some-other-provider',
+      model: 'model-x',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '9999' },
     });
     await h.settle();
-    expect(h.observations).toHaveLength(1);
-    expect(h.observations[0]?.failureClass).toBe('authentication_wall');
     expect(h.ledger.listProviderWaits()).toHaveLength(0);
+    expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toHaveLength(1);
+    expect(h.ledger.listNotifications({ routing: 'action-required' })).toHaveLength(0);
   });
 
   it('the guarded owned re-arm clears exactly the provider-stopped breaker', async () => {
@@ -348,14 +422,15 @@ describe('supervisor ⇄ sensor seam', () => {
     expect(h.supervisor.ownedProviderReArm(handle.id, 'not-a-wait')).toBe(false);
   });
 
-  it('an ack re-arm still works independently of the sensor path', async () => {
+  it('an ack re-arm still works independently of the sensor path (owner-held auth stop)', async () => {
     const h = new SeamHarness();
-    await h.runMinionIntoQuotaWall('job-seam-3');
+    await h.runMinionIntoAuthWall('job-seam-3');
     await h.settle();
     const incident = h.ledger
       .listNotifications({ unackedOnly: true })
       .find((n) => n.kind.startsWith('supervision.provider-wall.'));
     expect(incident).toBeDefined();
+    expect(incident?.routing).toBe('needs-owner');
     // The owner's ack (returned by ackNotification) re-arms as before.
     const acked = h.notifications.ack(incident!.id, 'owner');
     expect(acked?.ackedAt).not.toBeNull();

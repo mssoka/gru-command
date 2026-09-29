@@ -39,12 +39,22 @@ export const PROBE_TIMEOUT_MS = 30_000;
 /** The fixed probe prompt. Constant on purpose: no context, no history. */
 export const PROBE_PROMPT = 'Reply with exactly: ok';
 
-/** The route identity one probe proves. credentialFingerprint is a
- * truncated sha256 of the resolved credential — never the credential. */
+/** The route identity one probe proves. `endpoint` is the EXACT catalog
+ * baseUrl of the provider/model at wait establishment — verified again at
+ * probe time (r1 #3: route rotation or catalog drift fails closed).
+ * credentialFingerprint is a truncated sha256 of the resolved credential —
+ * never the credential. */
 export interface ProbeRoute {
   readonly provider: string;
   readonly model: string;
-  readonly baseUrl: string;
+  readonly endpoint: string;
+  readonly credentialFingerprint: string;
+}
+
+/** The resolved route identity (single source of route/generation truth:
+ * the SHARED offline ModelRuntime catalog + auth snapshot spawns use). */
+export interface ResolvedRoute {
+  readonly endpoint: string;
   readonly credentialFingerprint: string;
 }
 
@@ -60,8 +70,16 @@ export interface ProducerEvidence {
   readonly completedAt: string;
 }
 
+/** Non-secret digest of a completed NON-generation metadata read:
+ * adapter-named fields (usage windows, account claim, store, credential
+ * generation) — never secrets, never raw credential material. */
+export interface MetadataEvidence {
+  readonly adapter: string;
+  readonly [field: string]: unknown;
+}
+
 export type ProbeOutcome =
-  | { readonly kind: 'completed'; readonly evidence: ProducerEvidence }
+  | { readonly kind: 'completed'; readonly evidence: ProducerEvidence | MetadataEvidence }
   | {
       readonly kind: 'still-limited';
       readonly status?: number;
@@ -75,9 +93,11 @@ export type ProbeOutcome =
  * ModelRuntime probe; tests inject a deterministic fake. */
 export interface ProviderProbePort {
   probe(route: ProbeRoute): Promise<ProbeOutcome>;
-  /** The current credential fingerprint for a provider (non-secret
-   * binding); null when no credential resolves. */
-  credentialFingerprint(provider: string): Promise<string | null>;
+  /** Resolve the exact endpoint + credential fingerprint for a
+   * provider/model through the SAME runtime catalog/auth spawns use — the
+   * one route-truth source; null when either does not resolve (fail
+   * closed, no wait). */
+  resolveRoute(provider: string, model: string): Promise<ResolvedRoute | null>;
 }
 
 /**
@@ -142,12 +162,18 @@ export class ModelRuntimeProbe implements ProviderProbePort {
     this.now = opts.now ?? (() => new Date());
   }
 
-  async credentialFingerprint(provider: string): Promise<string | null> {
+  async resolveRoute(provider: string, model: string): Promise<ResolvedRoute | null> {
     try {
       const runtime = await this.runtime();
+      const resolved = runtime.getModel(provider, model);
+      if (resolved === undefined) return null;
       const auth = await runtime.getAuth(provider);
       const current = auth?.auth.apiKey;
-      return current === undefined ? null : credentialFingerprintOf(current);
+      if (current === undefined) return null;
+      return {
+        endpoint: resolved.baseUrl,
+        credentialFingerprint: credentialFingerprintOf(current),
+      };
     } catch {
       return null;
     }
@@ -162,6 +188,16 @@ export class ModelRuntimeProbe implements ProviderProbePort {
         return {
           kind: 'probe-failed',
           reason: `model ${route.provider}/${route.model} not in the registered catalog`,
+          retryAfterMs: null,
+        };
+      }
+      // EXACT endpoint binding (r1 #3): the catalog-resolved baseUrl must
+      // still be the endpoint the wait was established under — a rotated
+      // endpoint is a route change and fails closed.
+      if (resolved.baseUrl !== route.endpoint) {
+        return {
+          kind: 'probe-failed',
+          reason: `endpoint rotated since the wait was established (${route.endpoint} → ${resolved.baseUrl})`,
           retryAfterMs: null,
         };
       }

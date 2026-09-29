@@ -168,19 +168,15 @@ class ClaimHarness {
       mkdirSync(dirname(sessionFile), { recursive: true });
       writeFileSync(sessionFile, '{}\n');
     }
-    this.ledger.recordProviderRecovery({
-      id: 'p1',
-      routeKey: 'zai-coding-cn/glm-5.3@fp1',
-      incidentGeneration: 1,
-      evidence: { stopReason: 'stop' },
-      waiterJobIds: [jobId],
-    });
-    const wait = this.ledger.recordProviderWait({
+    this.ledger.recordProviderWait({
       id: 'wait-1',
       routeKey: 'zai-coding-cn/glm-5.3@fp1',
       provider: 'zai-coding-cn',
       model: 'glm-5.3',
+      endpoint: 'https://open.bigmodel.cn/api/coding/paas/v4',
       credentialFingerprint: 'fp1',
+      jobStatusAtEstablishment: 'working',
+      lineageKey: `job:${jobId}`,
       waiterKind: 'job-minion',
       jobId,
       agentId: `agent-${jobId}`,
@@ -191,8 +187,17 @@ class ClaimHarness {
       incidentGeneration: 1,
       reasonClass: 'temporary-recoverable:429',
     });
-    this.ledger.setProviderWaitStatus(wait.id, 'recovered-pending');
-    return wait.id;
+    // The atomic recovery batch (r1 #7/#8): marker + one provider.restored
+    // event + the waiter flip commit in ONE transaction. The claim guard
+    // verifies batch membership by the stamped batch id.
+    this.ledger.commitProviderRecoveryBatch({
+      id: 'p1',
+      routeKey: 'zai-coding-cn/glm-5.3@fp1',
+      incidentGenerations: [1],
+      evidence: { stopReason: 'stop' },
+      waiters: [{ id: 'wait-1', jobId }],
+    });
+    return 'wait-1';
   }
 }
 
@@ -314,19 +319,15 @@ describe('guarded claim — every recheck fails visible', () => {
 
 describe('guarded claim — silas logical slot', () => {
   async function recoveredSilasWait(h: ClaimHarness): Promise<string> {
-    h.ledger.recordProviderRecovery({
-      id: 'p-silas',
-      routeKey: 'zai-coding-cn/glm-5.3@fp1',
-      incidentGeneration: 1,
-      evidence: { stopReason: 'stop' },
-      waiterJobIds: [],
-    });
-    const wait = h.ledger.recordProviderWait({
+    h.ledger.recordProviderWait({
       id: 'wait-silas',
       routeKey: 'zai-coding-cn/glm-5.3@fp1',
       provider: 'zai-coding-cn',
       model: 'glm-5.3',
+      endpoint: 'https://open.bigmodel.cn/api/coding/paas/v4',
       credentialFingerprint: 'fp1',
+      jobStatusAtEstablishment: null,
+      lineageKey: 'slot:silas-ops',
       waiterKind: 'silas-slot',
       jobId: null,
       agentId: 'agent-silas',
@@ -337,8 +338,14 @@ describe('guarded claim — silas logical slot', () => {
       incidentGeneration: 1,
       reasonClass: 'temporary-recoverable:429',
     });
-    h.ledger.setProviderWaitStatus(wait.id, 'recovered-pending');
-    return wait.id;
+    h.ledger.commitProviderRecoveryBatch({
+      id: 'p-silas',
+      routeKey: 'zai-coding-cn/glm-5.3@fp1',
+      incidentGenerations: [1],
+      evidence: { stopReason: 'stop' },
+      waiters: [{ id: 'wait-silas', jobId: null }],
+    });
+    return 'wait-silas';
   }
 
   it('re-arms the SAME logical slot through the guarded owned path', async () => {

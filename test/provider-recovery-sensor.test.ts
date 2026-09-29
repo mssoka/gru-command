@@ -52,6 +52,10 @@ class Harness {
     const full: ProviderRecoveryConfig = {
       ...DEFAULT_PROVIDER_RECOVERY_CONFIG,
       enabled: true,
+      // The GLM generation fallback is an explicit ACTIVATION guard
+      // (default OFF = zero generation, fail closed). Activated-path tests
+      // opt in; the guard's default-off behavior has its own test.
+      glmGenerationFallback: true,
       ...config,
     };
     this.sensor = new ProviderRecoverySensor({
@@ -114,6 +118,7 @@ class Harness {
       failureClass: 'quota_wall',
       provider: 'zai-coding-cn',
       model: 'glm-5.3',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
       errorMessage: '429: {"error":{"code":"1302","message":"usage window limit"}}',
       incidentId: 'supervision.provider-wall.agent-minion-1.quota_wall',
       continuation: { promptText: 'continue the work', promptOwner: 'minion-brief', hadOpenTurn: true },
@@ -131,9 +136,14 @@ class FakeProbe implements ProviderProbePort {
   fingerprint = 'fp00000000000001';
   outcomes: ProbeOutcome[] = [];
   readonly calls: ProbeRoute[] = [];
+  /** Test hook: observe when a check actually reaches the transport. */
+  onProbeStart?: () => void;
+  /** Test hook: override the live route resolution (rotation mid-check). */
+  resolveRouteImpl?: (provider: string, model: string) => Promise<{ endpoint: string; credentialFingerprint: string } | null>;
 
   probe(route: ProbeRoute): Promise<ProbeOutcome> {
     this.calls.push(route);
+    this.onProbeStart?.();
     const outcome = this.outcomes.shift();
     if (outcome === undefined) {
       return Promise.resolve({
@@ -146,8 +156,11 @@ class FakeProbe implements ProviderProbePort {
     return Promise.resolve(outcome);
   }
 
-  credentialFingerprint(): Promise<string | null> {
-    return Promise.resolve(this.fingerprint);
+  endpoint = 'https://open.bigmodel.cn/api/coding/paas/v4';
+
+  resolveRoute(provider: string, model: string): Promise<{ endpoint: string; credentialFingerprint: string } | null> {
+    if (this.resolveRouteImpl !== undefined) return this.resolveRouteImpl(provider, model);
+    return Promise.resolve({ endpoint: this.endpoint, credentialFingerprint: this.fingerprint });
   }
 
   queueCompleted(): void {
@@ -164,6 +177,16 @@ class FakeProbe implements ProviderProbePort {
         completedAt: '2026-09-28T10:05:00Z',
       },
     });
+  }
+
+  /** A check that never settles until RELEASED (crash simulation). */
+  queueDeferred(): { resolve: (outcome: ProbeOutcome) => void } {
+    let releaseFn!: (outcome: ProbeOutcome) => void;
+    const promise = new Promise<ProbeOutcome>((resolve) => {
+      releaseFn = resolve;
+    });
+    this.outcomes.push(promise as unknown as ProbeOutcome);
+    return { resolve: (outcome) => releaseFn(outcome) };
   }
 }
 
@@ -191,9 +214,22 @@ describe('wait establishment (acceptance 1) — explicit evidence only', () => {
   it('auth walls, billing walls, and ambiguous failures never become waits', async () => {
     const h = new Harness();
     h.makeJob('job-1');
-    expect(await h.establishMinionWait({ failureClass: 'authentication_wall', errorMessage: '401: unauthorized' })).toBeNull();
-    expect(await h.establishMinionWait({ errorMessage: '402: {"error":{"code":"1113","message":"Insufficient Balance"}}' })).toBeNull();
-    expect(await h.establishMinionWait({ errorMessage: 'something exploded' })).toBeNull();
+    expect(
+      await h.establishMinionWait({
+        failureClass: 'authentication_wall',
+        errorMessage: '401: unauthorized',
+        typed: { origin: 'provider-message', status: 401 },
+      }),
+    ).toBeNull();
+    expect(
+      await h.establishMinionWait({
+        errorMessage: '402: {"error":{"code":"1113","message":"Insufficient Balance"}}',
+        typed: { origin: 'provider-message', status: 402, bodyCode: '1113' },
+      }),
+    ).toBeNull();
+    expect(
+      await h.establishMinionWait({ errorMessage: 'something exploded', typed: { origin: 'provider-message' } }),
+    ).toBeNull();
     expect(await h.establishMinionWait({ provider: null, model: null })).toBeNull();
     expect(h.ledger.listProviderWaits()).toHaveLength(0);
   });
@@ -224,6 +260,21 @@ describe('wait establishment (acceptance 1) — explicit evidence only', () => {
     expect(h.ledger.listProviderWaits()).toHaveLength(0);
   });
 
+  it('the GLM generation fallback is an activation guard: default OFF performs ZERO provider I/O', async () => {
+    const h = new Harness({ glmGenerationFallback: false });
+    h.makeJob('job-guard');
+    // Establishment is independent of the readiness path — the wait is
+    // durable and explicit either way...
+    const wait = await h.establishMinionWait({ jobId: 'job-guard' });
+    expect(wait).not.toBeNull();
+    // ...but the check fails CLOSED without a readiness path: no probe I/O.
+    await h.sensor.tick();
+    expect(h.probe.calls).toHaveLength(0);
+    const route = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
+    expect(route?.lastResult).toBe('probe-failed');
+    expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1);
+  });
+
   it('the silas logical slot can establish a wait (COO provider-stopped)', async () => {
     const h = new Harness();
     const wait = await establishProviderWait(h.sensor, {
@@ -235,6 +286,7 @@ describe('wait establishment (acceptance 1) — explicit evidence only', () => {
       failureClass: 'quota_wall',
       provider: 'zai-coding-cn',
       model: 'glm-5.3',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
       errorMessage: '429: {"error":{"code":"1302"}}',
       incidentId: 'supervision.provider-wall.agent-silas.quota_wall',
       continuation: { promptText: 'run the sweep', promptOwner: 'silas-driver', hadOpenTurn: true },
@@ -318,14 +370,21 @@ describe('shared cadence + budget (acceptance 3)', () => {
     await h.sensor.tick();
     const route1 = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
     expect(route1?.lastResult).toBe('probe-failed');
-    expect(Date.parse(route1?.nextCheckAt ?? '')).toBe(h.now + 60_000);
+    // r1 #4: the 60 s base backoff is BELOW the 300 s approval floor — the
+    // floor wins on every outcome class (no 60 s path).
+    expect(Date.parse(route1?.nextCheckAt ?? '')).toBe(h.now + 300_000);
     expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1);
-    // Backoff doubles per consecutive failure, capped.
-    h.advance(60_000);
-    h.probe.outcomes.push({ kind: 'probe-failed', reason: 'timeout', retryAfterMs: null });
-    await h.sensor.tick();
-    const route2 = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
-    expect(Date.parse(route2?.nextCheckAt ?? '')).toBe(h.now + 120_000);
+    // The base doubles per consecutive failure (60 → 120 → 240 → 480 s):
+    // still floored at 300 s until it passes the floor.
+    let lastDelay = 300_000;
+    for (const expected of [300_000, 300_000, 480_000]) {
+      h.advance(lastDelay);
+      h.probe.outcomes.push({ kind: 'probe-failed', reason: 'timeout', retryAfterMs: null });
+      await h.sensor.tick();
+      const route = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
+      expect(Date.parse(route?.nextCheckAt ?? '')).toBe(h.now + expected);
+      lastDelay = expected;
+    }
   });
 
   it('credential rotation during a probe supersedes the waits (route change)', async () => {
@@ -344,10 +403,11 @@ describe('shared cadence + budget (acceptance 3)', () => {
     await h.establishMinionWait();
     await h.sensor.tick();
     expect(h.probe.calls).toHaveLength(1);
-    // The job completes: no waiters remain, no further probes run.
-    h.ledger.setJobStatus('job-1', 'delivered');
+    // The job completes (done): no eligible waiters remain, no more probes.
+    h.ledger.setJobStatus('job-1', 'done');
     h.advance(300_000);
     await h.sensor.tick();
+    expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(1);
     h.advance(300_000);
     await h.sensor.tick();
     expect(h.probe.calls).toHaveLength(1);
@@ -357,15 +417,23 @@ describe('shared cadence + budget (acceptance 3)', () => {
 });
 
 describe('eligibility invalidation (acceptance 2)', () => {
-  it('owner hold (parked) and blocked cancel the wait at the next tick', async () => {
+  it('parked (owner hold) cancels; a provider-settled BLOCKED job stays eligible through the churn', async () => {
     for (const status of ['parked', 'blocked'] as const) {
       const h = new Harness();
       h.makeJob('job-1');
       await h.establishMinionWait();
-      h.ledger.setJobStatus('job-1', status === 'parked' ? 'parked' : 'blocked');
+      h.ledger.setJobStatus('job-1', status);
       await h.sensor.tick();
-      expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(1);
-      expect(h.probe.calls).toHaveLength(0);
+      if (status === 'parked') {
+        expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(1);
+        expect(h.probe.calls).toHaveLength(0);
+      } else {
+        // r1 #1: a dispatch-settled BLOCKED job after a provider stop is
+        // expected interrupted-turn churn — still checked, never cancelled.
+        expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(0);
+        expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1);
+        expect(h.probe.calls).toHaveLength(1);
+      }
     }
   });
 
@@ -402,6 +470,7 @@ describe('eligibility invalidation (acceptance 2)', () => {
       provider: 'zai-coding-cn',
       model: 'glm-5.3',
       errorMessage: '429: {"error":{"code":"1302"}}',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
       incidentId: 'i-silas',
       continuation: null,
     });
@@ -419,7 +488,7 @@ describe('eligibility invalidation (acceptance 2)', () => {
     // ledger (the timer state, wait rows, and budget all reload from it).
     const restartedClock = { ms: h.now + 60_000 };
     const sensor2 = new ProviderRecoverySensor({
-      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true },
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, glmGenerationFallback: true },
       ledger: h.ledger,
       probe: h.probe,
       notifications: h.notifications,
@@ -451,7 +520,10 @@ describe('recovery + delivery (acceptance 5/6)', () => {
     const restored = h.ledger.listEvents({ limit: 10 }).filter((e) => e.kind === 'provider.restored');
     expect(restored).toHaveLength(1);
     expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
-    expect(h.wakes).toEqual([{ kind: 'provider.restored', routeKey: `zai-coding-cn/glm-5.3@${h.probe.fingerprint}` }]);
+    // r1 #9: ONE delivery path — the durable `provider.restored` event
+    // rides the ledger bus into the SilasDriver; the sensor never triggers
+    // a second explicit wake.
+    expect(h.wakes).toHaveLength(0);
     // The fyi waiting notice resolves (no stale attention row).
     const waiting = h.ledger.findNotificationByKind(
       `provider.waiting.zai-coding-cn/glm-5.3@${h.probe.fingerprint}`,
@@ -495,6 +567,7 @@ describe('recovery + delivery (acceptance 5/6)', () => {
       provider: 'zai-coding-cn',
       model: 'glm-5.3',
       errorMessage: '429: {"error":{"code":"1302"}}',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
       incidentId: 'i-silas',
       continuation: null,
     });
@@ -502,7 +575,9 @@ describe('recovery + delivery (acceptance 5/6)', () => {
     await h.sensor.tick();
     expect(h.reArms).toHaveLength(1);
     expect(h.reArms[0]?.agentId).toBe('agent-silas');
-    expect(h.wakes).toHaveLength(1);
+    // The durable event is the single delivery path (no explicit wake).
+    expect(h.wakes).toHaveLength(0);
+    expect(h.ledger.listEvents({ limit: 10 }).some((e) => e.kind === 'provider.restored')).toBe(true);
   });
 
   it('boot reconciliation re-wakes an un-delivered recovery (lost wake)', async () => {
@@ -511,8 +586,7 @@ describe('recovery + delivery (acceptance 5/6)', () => {
     await h.establishMinionWait();
     h.probe.queueCompleted();
     await h.sensor.tick();
-    expect(h.wakes).toHaveLength(1);
-    h.wakes.length = 0;
+    expect(h.wakes).toHaveLength(0); // delivery rides the durable event
     const result = await h.sensor.reconcileAtBoot();
     expect(result.rewoken).toBe(1);
     expect(h.wakes).toHaveLength(1);
@@ -605,5 +679,257 @@ describe('sensor lifecycle', () => {
       lastResult: 'still-limited',
     });
     expect(typeof view[0]?.nextCheckAt).toBe('string');
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// PHASE2 test sources (ruling item 1): 300s floor on ALL outcomes, pre-I/O
+// reservation crash/no-refund/idempotency, post-I/O revalidation, atomic
+// batch binding, no-eligible-waiter zero I/O, typed-only establishment.
+// WRITTEN SOURCE ONLY under the phase ruling — execution deferred.
+// ---------------------------------------------------------------------------
+
+describe('phase2 — 300 second floor on ALL outcome classes (r1 #4)', () => {
+  it('probe-failed backoff floors at cadenceMinMs (no 60s path)', async () => {
+    const h = new Harness();
+    h.makeJob('job-f1');
+    await h.establishMinionWait({ jobId: 'job-f1' });
+    h.probe.outcomes.push({ kind: 'probe-failed', reason: 'fetch failed', retryAfterMs: null });
+    await h.sensor.tick();
+    const route = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
+    expect(Date.parse(route?.nextCheckAt ?? '')).toBe(h.now + 300_000);
+  });
+
+  it('still-limited WITHOUT Retry-After waits the full cadence', async () => {
+    const h = new Harness();
+    h.makeJob('job-f2');
+    await h.establishMinionWait({ jobId: 'job-f2' });
+    await h.sensor.tick();
+    const route = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
+    expect(Date.parse(route?.nextCheckAt ?? '')).toBe(h.now + 300_000);
+  });
+});
+
+describe('phase2 — pre-I/O reservation (r1 #5)', () => {
+  it('the attempt is CHARGED before the I/O: crash mid-probe never refunds or duplicates', async () => {
+    const h = new Harness();
+    h.makeJob('job-r1');
+    await h.establishMinionWait({ jobId: 'job-r1' });
+    // A probe that never settles until released: the reservation stays open.
+    const gate = h.probe.queueDeferred();
+    const inFlight = h.sensor.tick();
+    await new Promise((resolve) => setTimeout(resolve, 0)); // charge + probe started
+    const route = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
+    expect(route?.attemptsInWindow).toBe(1); // charged BEFORE the I/O
+    expect(Date.parse(route?.nextCheckAt ?? '')).toBe(h.now + 300_000); // cadence advanced pre-I/O
+    // A second tick while the (unexpired) reservation is open: no new I/O.
+    h.advance(299_999);
+    await h.sensor.tick();
+    expect(h.probe.calls).toHaveLength(1);
+    // Release the hung check so the sensor settles deterministically.
+    gate.resolve({ kind: 'probe-failed', reason: 'crash-sim released', retryAfterMs: null });
+    await inFlight;
+  });
+
+  it('an EXPIRED reservation settles spent-unknown: budget stays charged, next check honors the advanced cadence', async () => {
+    const h = new Harness();
+    h.makeJob('job-r2');
+    await h.establishMinionWait({ jobId: 'job-r2' });
+    const gate = h.probe.queueDeferred();
+    const inFlight = h.sensor.tick();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Simulate the crash + a later boot past the reservation expiry (the
+    // reservation expires at ~95 s; 10 min later is still inside the
+    // one-hour budget window, so the charge must survive): a FRESH sensor
+    // over the same ledger settles the reservation as spent-unknown; the
+    // charge is never refunded and the next check honors the advanced
+    // cadence.
+    h.advance(600_000);
+    const restarted = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, glmGenerationFallback: true },
+      ledger: h.ledger,
+      probe: h.probe,
+      notifications: h.notifications,
+      wake: h.wakePort(),
+      slotReArm: h.reArmPort(),
+      silasHosted: () => true,
+      now: () => h.now,
+    });
+    await restarted.tick();
+    const route = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
+    expect(route?.lastResult).toBe('probe-unknown-crash');
+    expect(route?.attemptsInWindow).toBeGreaterThanOrEqual(1); // never refunded
+    gate.resolve({ kind: 'probe-failed', reason: 'crash-sim released', retryAfterMs: null });
+    await inFlight;
+  });
+});
+
+describe('phase2 — post-I/O revalidation (r1 #6)', () => {
+  it('a credential rotation landing mid-check fails closed: no recovery, route flagged', async () => {
+    const h = new Harness();
+    h.makeJob('job-v1');
+    await h.establishMinionWait({ jobId: 'job-v1' });
+    h.probe.queueCompleted();
+    // The binding rotates WHILE the check is in flight (the durable route
+    // row is re-bound before the completed outcome lands).
+    h.probe.onProbeStart = () => {
+      const current = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
+      if (current !== null) {
+        h.ledger.upsertProviderRoute({
+          ...current,
+          credentialFingerprint: 'fp00000000000002',
+          updatedAt: new Date(h.now).toISOString(),
+        });
+      }
+    };
+    await h.sensor.tick();
+    expect(h.ledger.listProviderWaits({ status: 'recovered-pending' })).toHaveLength(0);
+    expect(h.ledger.listEvents({ limit: 20 }).some((e) => e.kind === 'provider.restored')).toBe(false);
+    const route = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
+    expect(route?.lastResult).toBe('route-changed-mid-check');
+    // The rotation is NOT clobbered by the stale pre-check binding.
+    expect(route?.credentialFingerprint).toBe('fp00000000000002');
+  });
+
+  it('an owner park landing mid-check keeps the wait un-recovered (revalidated post-I/O)', async () => {
+    const h = new Harness();
+    h.makeJob('job-v2');
+    await h.establishMinionWait({ jobId: 'job-v2' });
+    h.probe.queueCompleted();
+    h.probe.onProbeStart = () => h.ledger.setJobStatus('job-v2', 'parked');
+    await h.sensor.tick();
+    expect(h.ledger.listProviderWaits({ status: 'recovered-pending' })).toHaveLength(0);
+    expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(1);
+  });
+});
+
+describe('phase2 — atomic recovery batch binds ALL matching waiters (r1 #7/#8)', () => {
+  it('two same-route incidents recover together: every waiter carries the SAME batch id and is claimable', async () => {
+    const h = new Harness();
+    h.makeJob('job-b1');
+    h.makeJob('job-b2');
+    await h.establishMinionWait({ jobId: 'job-b1', incidentId: 'incident-b1' });
+    await h.establishMinionWait({
+      agentId: 'agent-minion-2',
+      jobId: 'job-b2',
+      incidentId: 'incident-b2',
+      sessionFile: '/tmp/minion-b2.jsonl',
+    });
+    h.probe.queueCompleted();
+    await h.sensor.tick();
+    const recovered = h.ledger.listProviderWaits({ status: 'recovered-pending' });
+    expect(recovered).toHaveLength(2);
+    const batches = new Set(recovered.map((wait) => wait.recoveryBatchId));
+    expect(batches.size).toBe(1);
+    const restored = h.ledger.listEvents({ limit: 10 }).filter((e) => e.kind === 'provider.restored');
+    expect(restored).toHaveLength(1);
+    expect((restored[0]?.payload as { waiters?: string[] }).waiters).toHaveLength(2);
+  });
+
+  it('ONE delivery path: no explicit second wake — the durable event is the wake', async () => {
+    const h = new Harness();
+    h.makeJob('job-b3');
+    await h.establishMinionWait({ jobId: 'job-b3' });
+    h.probe.queueCompleted();
+    await h.sensor.tick();
+    expect(h.wakes).toHaveLength(0); // bus event rides SilasDriver; no double trigger
+    expect(h.ledger.listEvents({ limit: 10 }).some((e) => e.kind === 'provider.restored')).toBe(true);
+  });
+});
+
+describe('phase2 — provider blocker vs generic state churn (r1 #1)', () => {
+  it('a provider-settled BLOCKED job remains eligible through the churn (checked, never cancelled)', async () => {
+    const h = new Harness();
+    h.makeJob('job-h1');
+    await h.establishMinionWait({ jobId: 'job-h1' });
+    h.ledger.setJobStatus('job-h1', 'blocked');
+    h.ledger.appendCustomEvent({
+      kind: 'job.minion-error',
+      jobId: 'job-h1',
+      payload: { error: 'runtime error: 429: ...' },
+    });
+    await h.sensor.tick();
+    expect(h.probe.calls).toHaveLength(1); // eligible: the provider blocker owns this stop
+    expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1);
+    expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(0);
+  });
+
+  it('a job ALREADY blocked at establishment stays held with zero I/O (generic block)', async () => {
+    const h = new Harness();
+    h.makeJob('job-hb');
+    h.ledger.setJobStatus('job-hb', 'blocked');
+    await h.establishMinionWait({ jobId: 'job-hb' });
+    await h.sensor.tick();
+    expect(h.probe.calls).toHaveLength(0);
+    expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1);
+    expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(0);
+  });
+
+  it('an unchanged-head late DELIVERY stays eligible and is not superseded', async () => {
+    const h = new Harness();
+    h.makeJob('job-h2');
+    await h.establishMinionWait({ jobId: 'job-h2' });
+    h.ledger.setJobStatus('job-h2', 'delivered');
+    await h.sensor.tick();
+    expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1);
+    expect(h.ledger.listProviderWaits({ status: 'superseded' })).toHaveLength(0);
+    expect(h.probe.calls).toHaveLength(1);
+  });
+
+  it('a job ALREADY delivered at establishment stays held with zero I/O', async () => {
+    const h = new Harness();
+    h.makeJob('job-hd');
+    h.ledger.setJobStatus('job-hd', 'delivered');
+    await h.establishMinionWait({ jobId: 'job-hd' });
+    await h.sensor.tick();
+    expect(h.probe.calls).toHaveLength(0);
+    expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1);
+  });
+
+  it('parked (explicit manual hold) still retires the wait; done/merged still cancel', async () => {
+    const h = new Harness();
+    h.makeJob('job-h3');
+    await h.establishMinionWait({ jobId: 'job-h3' });
+    h.ledger.setJobStatus('job-h3', 'parked');
+    await h.sensor.tick();
+    expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(1);
+  });
+});
+
+describe('phase2 — machine-owned incidents resolve with their wait lifecycle (r1 #2)', () => {
+  it('a linked machine-owned (action-required) incident resolves when its wait settles — never an ACK', async () => {
+    const h = new Harness();
+    h.makeJob('job-i1');
+    const wait = await h.establishMinionWait({ jobId: 'job-i1', incidentId: null });
+    h.ledger.recordNotification({
+      id: 'incident-i1',
+      kind: 'supervision.provider-wall.agent-minion-1.quota_wall',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'stopped',
+    });
+    h.ledger.setProviderWaitIncident(wait!.id, 'incident-i1');
+    h.ledger.setProviderWaitStatus(wait!.id, 'cancelled', { why: 'test-settle' });
+    const incident = h.ledger.getNotification('incident-i1');
+    expect(incident?.resolvedAt).not.toBeNull();
+    expect(incident?.ackedAt).toBeNull(); // lifecycle resolution, never an owner ACK
+  });
+
+  it('an owner-held (needs-owner) stop linked to a wait is NEVER resolved by the machine lifecycle', async () => {
+    const h = new Harness();
+    h.makeJob('job-i2');
+    const wait = await h.establishMinionWait({ jobId: 'job-i2', incidentId: null });
+    h.ledger.recordNotification({
+      id: 'incident-historic',
+      kind: 'supervision.provider-wall.agent-minion-1.quota_wall',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'historic owner stop',
+    });
+    h.ledger.setProviderWaitIncident(wait!.id, 'incident-historic');
+    h.ledger.setProviderWaitStatus(wait!.id, 'cancelled', { why: 'test-settle' });
+    const incident = h.ledger.getNotification('incident-historic');
+    expect(incident?.resolvedAt).toBeNull(); // owner control preserved
   });
 });

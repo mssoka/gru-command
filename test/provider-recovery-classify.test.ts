@@ -23,7 +23,7 @@ import type { AssistantMessage } from '@earendil-works/pi-ai';
 const ROUTE: ProbeRoute = {
   provider: 'zai-coding-cn',
   model: 'glm-5.3',
-  baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
+  endpoint: 'https://open.bigmodel.cn/api/coding/paas/v4',
   credentialFingerprint: 'abc123',
 };
 
@@ -247,5 +247,68 @@ describe('probe envelope bounds (owner-approved pins)', () => {
     expect(fingerprint).toHaveLength(16);
     expect(fingerprint).toMatch(/^[0-9a-f]{16}$/);
     expect(fingerprint).not.toContain('secret');
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// PHASE2 sources (ruling item 1): contradictory owner-status precedence
+// (r1 #11) and typed-only establishment semantics (r1 #13). NOT executed.
+// ---------------------------------------------------------------------------
+
+describe('phase2 — contradictory owner statuses beat temporary body codes (r1 #11)', () => {
+  it('403 with a 1302 body code stays owner-controlled (permission)', () => {
+    const outcome = classifyProviderRejection({
+      provider: 'zai-coding-cn',
+      model: 'glm-5.3',
+      status: 403,
+      bodyCode: '1302',
+      errorMessage: '403: {"error":{"code":"1302"}}',
+    });
+    expect(outcome).toEqual({ kind: 'owner-controlled', reason: 'permission' });
+  });
+
+  it('402 with a 1308 body code stays owner-controlled (billing)', () => {
+    const outcome = classifyProviderRejection({
+      provider: 'zai-coding-cn',
+      model: 'glm-5.3',
+      status: 402,
+      bodyCode: '1308',
+      errorMessage: '402: {"error":{"code":"1308"}}',
+    });
+    expect(outcome).toEqual({ kind: 'owner-controlled', reason: 'billing' });
+  });
+
+  it('401 with quota-flavored prose stays owner-controlled (authentication)', () => {
+    expect(
+      classifyProviderRejection({
+        provider: 'zai-coding-cn',
+        model: 'glm-5.3',
+        status: 401,
+        bodyCode: '1302',
+        errorMessage: '401: quota-ish',
+      }),
+    ).toEqual({ kind: 'owner-controlled', reason: 'authentication' });
+  });
+
+  it('a clean 429/1302 WITHOUT a contradictory status is still temporary-recoverable', () => {
+    expect(
+      classifyProviderRejection({
+        provider: 'zai-coding-cn',
+        model: 'glm-5.3',
+        status: 429,
+        bodyCode: '1302',
+        errorMessage: '429: {"error":{"code":"1302"}}',
+      }).kind,
+    ).toBe('temporary-recoverable');
+  });
+});
+
+describe('phase2 — multi-provider scope (overlay)', () => {
+  it('codex and native-claude rejections are in sensor scope; ordinary anthropic/openai are not', () => {
+    expect(providerSupportsSensor('openai-codex')).toBe(true);
+    expect(providerSupportsSensor('anthropic-claude-native')).toBe(true);
+    expect(providerSupportsSensor('anthropic')).toBe(false);
+    expect(providerSupportsSensor('openai')).toBe(false);
   });
 });

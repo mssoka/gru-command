@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
@@ -24,6 +24,11 @@ import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver } from './dispatch/silas-driver.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
+import {
+  composeMetadataReaders,
+  type NativeCommandPort,
+  type NativeContextPort,
+} from './provider-recovery/composition.js';
 import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
@@ -156,6 +161,24 @@ import { BOARD_WS_PATH } from './board/frames.js';
 import { GruSessionPointer } from './chat/session-state.js';
 import { createStaticRoot, defaultStaticRoot } from './static.js';
 import { SERVICE_NAME, VERSION } from './version.js';
+
+/** Non-secret override flags from the Claude settings file (presence
+ * booleans only; values never read into memory beyond the check). A
+ * missing/unreadable file counts as NO override — the env overrides and
+ * the keychain item itself remain the binding proofs. */
+function claudeSettingsOverridesPresent(): boolean {
+  try {
+    const raw = readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8');
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof parsed['apiKeyHelper'] === 'string' && parsed['apiKeyHelper'] !== '') return true;
+    const env = parsed['env'];
+    if (typeof env !== 'object' || env === null) return false;
+    const keys = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN'];
+    return keys.some((key) => (env as Record<string, unknown>)[key] !== undefined);
+  } catch {
+    return false;
+  }
+}
 
 async function main(): Promise<number> {
   const bootHr = process.hrtime.bigint();
@@ -622,10 +645,77 @@ async function main(): Promise<number> {
     ownedProviderReArm: (agentId: string, waitId: string): boolean =>
       supervisorLive.ownedProviderReArm(agentId, waitId),
   };
+  // Non-generation metadata readers (owner-approved overlay), composed
+  // from read-only installed source interfaces: codex rides a nonmutating
+  // one-off auth.json read (readStoredCredential — no store run, no
+  // refresh); claude composes against the typed native snapshot port whose
+  // platform proof is the keychain item itself (never a hardcoded brand
+  // flag). ZERO generation on these paths, and their failures never fall
+  // back to generation.
   const providerRecoverySensor = new ProviderRecoverySensor({
     config: config.providerRecovery,
     ledger,
     probe: new ModelRuntimeProbe({ runtime: () => registry.piModelRuntime() }),
+    metadataReaders: composeMetadataReaders({
+      config: config.providerRecovery,
+      codexAuthPath: undefined, // readStoredCredential resolves the installed auth.json itself
+      fetch: {
+        get: async ({ url, authorization, accept, timeoutMs, extraHeaders }) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          timer.unref?.();
+          try {
+            const response = await fetch(url, {
+              headers: { authorization, accept, ...(extraHeaders ?? {}) },
+              signal: controller.signal,
+              redirect: 'manual',
+            });
+            return { status: response.status, body: await response.text() };
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+      },
+      claude: {
+        // Traced native protocol: one bounded `security find-generic-password`
+        // against the ACTUAL selected store/account. Never invoked while the
+        // sensor is disabled; activation runs it under a ruled checkpoint.
+        // Output stays in-process — never logged.
+        command: {
+          findGenericPassword: async ({ service, account }) => {
+            const { execFile } = await import('node:child_process');
+            return await new Promise((resolve) => {
+              execFile(
+                'security',
+                ['find-generic-password', '-s', service, '-a', account, '-w'],
+                { timeout: 10_000 },
+                (error, stdout) => {
+                  if (error !== null) resolve(null);
+                  else resolve({ exitCode: 0, stdout: String(stdout) });
+                },
+              );
+            });
+          },
+        } satisfies NativeCommandPort as NativeCommandPort,
+        // OBSERVED context only (phase3 ruling: never assert a selected
+        // platform): env overrides plus non-secret flags from the Claude
+        // settings file. Presence booleans only — values never logged.
+        context: (): NativeContextPort => ({
+          overridesPresent:
+            process.env['ANTHROPIC_API_KEY'] !== undefined ||
+            process.env['ANTHROPIC_AUTH_TOKEN'] !== undefined ||
+            process.env['ANTHROPIC_BASE_URL'] !== undefined ||
+            process.env['CLAUDE_CODE_OAUTH_TOKEN'] !== undefined ||
+            process.env['CLAUDE_CODE_USE_BEDROCK'] !== undefined ||
+            process.env['CLAUDE_CODE_USE_VERTEX'] !== undefined ||
+            process.env['CLAUDE_CODE_USE_FOUNDRY'] !== undefined ||
+            process.env['CLAUDE_CONFIG_DIR'] !== undefined ||
+            claudeSettingsOverridesPresent(),
+        }),
+        account: () => process.env['USER'] ?? '',
+      },
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    }),
     notifications,
     wake: silasWakePort,
     slotReArm: slotReArmPort,
@@ -640,9 +730,40 @@ async function main(): Promise<number> {
     notifications,
     decisions: decisionRuntime,
     providerWalls: {
-      // The sensor's recorder: observed wall stops in, explicit eligible
-      // waits out — every other class stays owner-controlled. Fire-and-
-      // forget: the sink must never slow the stop path.
+      // Machine-vs-owner classification BEFORE any owner stop (phase3 r1
+      // #2): the sink persists an eligible machine-owned wait FIRST and
+      // answers true; false/throw keeps the conservative needs-owner stop.
+      ownsProviderWall: async (input) => {
+        const wait = await establishProviderWait(providerRecoverySensor, {
+          agentId: input.agentId,
+          role: input.role,
+          slotId: input.slotId,
+          jobId: input.jobId,
+          sessionFile: input.sessionFile,
+          failureClass: input.failureClass,
+          provider: input.source?.provider ?? null,
+          model: input.source?.model ?? null,
+          errorMessage: input.source?.error ?? '',
+          typed: input.source?.typed ?? null,
+          incidentId: null,
+          continuation: input.continuation,
+        }).catch((error: unknown) => {
+          logger.log('error', 'provider wait establishment failed (conservative owner stop kept)', {
+            agent_id: input.agentId,
+            error: String(error),
+          });
+          return null;
+        });
+        return wait !== null;
+      },
+      // Link the machine-owned action-required notice onto the persisted
+      // wait: the incident resolves with the wait's own terminal lifecycle.
+      linkProviderWaitIncident: ({ agentId, incidentId }) => {
+        const wait = ledger.openProviderWaitForAgent(agentId);
+        if (wait !== null) ledger.setProviderWaitIncident(wait.id, incidentId);
+      },
+      // The observation report for NON-machine-owned stops (incidentId
+      // null): the sink re-classifies; ineligible classes stay owner-held.
       onProviderWall: (observation) => {
         void establishProviderWait(providerRecoverySensor, {
           agentId: observation.agentId,
@@ -654,6 +775,7 @@ async function main(): Promise<number> {
           provider: observation.source?.provider ?? null,
           model: observation.source?.model ?? null,
           errorMessage: observation.source?.error ?? '',
+          typed: observation.source?.typed ?? null,
           incidentId: observation.incidentId,
           continuation: observation.continuation,
         }).catch((error: unknown) => {

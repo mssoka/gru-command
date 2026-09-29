@@ -150,6 +150,8 @@ probe_backoff_max_ms = 1800000    # failed-probe backoff cap (30 min)
 false_recovery_escalate_at = 3    # recovered-then-re-hit continuations before escalation
 suspension_ms = 21600000          # route probe suspension after escalation (6 h)
 retry_after_max_ms = 3600000      # cap honored for trustworthy Retry-After hints
+probe_timeout_ms = 30000          # finite timeout for one probe I/O / reservation expiry
+glm_generation_fallback = false   # GLM bounded generation fallback; overlay: disabled in production
 
 [review]
 max_concurrent_children = 2     # lens children within the pool (<= 32, review-gated)

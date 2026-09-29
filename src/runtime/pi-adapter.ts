@@ -23,6 +23,7 @@ import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths
 // consumers of the pi adapter's surface keep working.
 export { normalizeSessionPath, SessionAlreadyActiveError };
 import { capabilitiesForModelInput } from './types.js';
+import { extractProviderRejectionEvidence } from '../provider-recovery/classify.js';
 import type {
   AgentCapabilities,
   AgentHandle,
@@ -109,6 +110,62 @@ const COMPACTION_END_RECONCILE_MS = 5_000;
  * supervision restart ladder. 5 minutes stays well below the 15-minute
  * default turn-silence watchdog (dispatch briefing 2026-09-29). */
 export const COMPACTION_DEADLINE_MS = 300_000;
+
+/** Typed provenance from an SDK provider error object ONLY (numeric status
+ * on the error, retry-after from its Headers). Anything else → null.
+ * Exported for the deterministic adapter-provenance tests. */
+export function typedFromSdkError(error: unknown): { origin: 'sdk-error'; status?: number; bodyCode?: string; retryAfterMs?: number } | null {
+  if (typeof error !== 'object' || error === null) return null;
+  const candidate = error as { status?: unknown; statusCode?: unknown; headers?: unknown };
+  const status =
+    typeof candidate.status === 'number' ? candidate.status :
+    typeof candidate.statusCode === 'number' ? candidate.statusCode :
+    undefined;
+  if (status === undefined) return null;
+  let bodyCode: string | undefined;
+  try {
+    const body = (error as { error?: unknown }).error;
+    if (typeof body === 'object' && body !== null) {
+      const code = (body as { error?: { code?: unknown } }).error?.code ?? (body as { code?: unknown }).code;
+      if (typeof code === 'string' && code !== '') bodyCode = code;
+      else if (typeof code === 'number' && Number.isInteger(code)) bodyCode = String(code);
+    }
+  } catch {
+    bodyCode = undefined;
+  }
+  let retryAfterMs: number | undefined;
+  try {
+    const headers = candidate.headers;
+    if (headers !== undefined && typeof headers === 'object' && typeof (headers as { get?: unknown }).get === 'function') {
+      const get = (headers as { get(name: string): string | null }).get.bind(headers);
+      const ms = get('retry-after-ms');
+      const seconds = get('retry-after');
+      const parsed = ms !== null ? Number.parseFloat(ms) : seconds !== null ? Number.parseFloat(seconds) * 1000 : Number.NaN;
+      if (Number.isFinite(parsed) && parsed >= 0) retryAfterMs = parsed;
+    }
+  } catch {
+    retryAfterMs = undefined;
+  }
+  return { origin: 'sdk-error', status, ...(bodyCode !== undefined ? { bodyCode } : {}), ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) };
+}
+
+/** Typed provenance from a provider TERMINAL message line only (the strict
+ * machine-composed "<status>: <json-body>" transport shape). Arbitrary turn
+ * exceptions and prose yield null — never provider evidence. Exported for
+ * the deterministic adapter-provenance tests. */
+export function typedFromProviderMessageLine(
+  detail: string,
+  provider: string,
+  model: string,
+): { origin: 'provider-message'; status?: number; bodyCode?: string } | null {
+  const parsed = extractProviderRejectionEvidence({ provider, model, errorMessage: detail });
+  if (parsed.status === undefined && parsed.bodyCode === undefined) return null;
+  return {
+    origin: 'provider-message',
+    ...(parsed.status !== undefined ? { status: parsed.status } : {}),
+    ...(parsed.bodyCode !== undefined ? { bodyCode: parsed.bodyCode } : {}),
+  };
+}
 
 /** pi adapter capabilities, hoisted so the runtime probe can report them
  * without constructing the adapter (E3 story 3). */
@@ -1183,13 +1240,19 @@ export class PiAgentHandle implements AgentHandle {
         // 'disposed' state with 'error'.
         if (!this.disposed) {
           this.setState('error', String(error));
+          // Typed provenance (r1 #13): ONLY a real SDK provider error
+          // (numeric status) carries provider identity + typed fields.
+          // Arbitrary exceptions stay anonymous — the sensor can never
+          // mistake them for provider rejections.
+          const typed = typedFromSdkError(error);
           this.emit({
             type: 'error',
             error: String(error),
             fatal: false,
-            ...(this.session.model !== undefined
+            ...(typed !== null && this.session.model !== undefined
               ? { provider: this.session.model.provider, model: this.session.model.id }
               : {}),
+            ...(typed !== null ? { typed } : {}),
           });
         }
         throw error;
@@ -1365,6 +1428,14 @@ export class PiAgentHandle implements AgentHandle {
         const msg = e['message'] as Record<string, unknown> | undefined;
         if (msg !== undefined && msg['role'] === 'assistant' && msg['stopReason'] === 'error') {
           const detail = String(msg['errorMessage'] ?? 'model error');
+          // The provider terminal message IS the typed origin: its
+          // machine-composed line was built by the transport from the real
+          // response (pi-ai formatProviderError). Strict parse only.
+          const typed = typedFromProviderMessageLine(
+            detail,
+            typeof msg['provider'] === 'string' ? msg['provider'] : this.session.model?.provider ?? '',
+            typeof msg['model'] === 'string' ? msg['model'] : this.session.model?.id ?? '',
+          );
           this.emit({
             type: 'error',
             error: detail,
@@ -1379,6 +1450,7 @@ export class PiAgentHandle implements AgentHandle {
               : this.session.model !== undefined
                 ? { model: this.session.model.id }
                 : {}),
+            ...(typed !== null ? { typed } : {}),
           });
           this.setState('error', detail);
         }

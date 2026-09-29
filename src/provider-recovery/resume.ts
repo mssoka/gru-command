@@ -82,8 +82,13 @@ function claimSilasSlot(
   const rearmed = deps.slotReArm.ownedProviderReArm(wait.agentId, wait.id);
   if (!rearmed) {
     // The slot is no longer in the recorded provider-stop state (owner
-    // re-armed it, or it was replaced): retain nothing — the live slot
-    // owns the lane now.
+    // re-armed it, or another claimant already settled this wait): settle
+    // only when this wait is not ALREADY terminal — otherwise the loser of
+    // a concurrent claim must not throw, it just reports the settled state.
+    const current = deps.ledger.getProviderWait(wait.id);
+    if (current !== null && (current.status === 'claimed' || current.status === 'superseded' || current.status === 'cancelled')) {
+      return { outcome: 'skipped', waitId: wait.id, why: 'slot no longer provider-stopped (wait already settled)' };
+    }
     deps.ledger.setProviderWaitStatus(wait.id, 'superseded', { why: 'slot no longer provider-stopped', by });
     return { outcome: 'skipped', waitId: wait.id, why: 'slot no longer provider-stopped' };
   }
@@ -114,8 +119,13 @@ async function claimJobMinion(
     deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: `job ${job.status} (owner/ops hold)`, by });
     return { outcome: 'skipped', waitId: wait.id, why: `job ${job.status} (owner/ops hold)` };
   }
-  // Guard 2 — the incident is still current for this waiter.
-  const pending = deps.ledger.getPendingProviderRecovery(wait.routeKey, wait.incidentGeneration);
+  // Guard 2 — this waiter is a member of a still-open recovery BATCH
+  // (r1 #7: shared recoveries bind every matching waiter; membership is by
+  // the batch id stamped on the wait, not per-generation marker equality).
+  const pending =
+    wait.recoveryBatchId !== null
+      ? deps.ledger.getPendingProviderRecoveryById(wait.recoveryBatchId)
+      : deps.ledger.getPendingProviderRecovery(wait.routeKey, wait.incidentGeneration);
   if (pending === null) {
     deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'recovery evidence no longer current', by });
     return { outcome: 'skipped', waitId: wait.id, why: 'recovery evidence no longer current' };
@@ -159,6 +169,16 @@ async function claimJobMinion(
     continuationPrompt !== null && continuationPrompt.trim() !== ''
       ? `Provider ${wait.provider} recovered. The interrupted turn's prompt is re-delivered below.`
       : `Provider ${wait.provider} recovered. The interrupted turn's prompt could not be recovered — continue the briefing.`;
+  // r1 #10 (phase3 item 5): ATOMIC claim-BEFORE-spawn. Compare-and-set
+  // recovered-pending → claimed; concurrent claimants and replays lose
+  // here, before any prompt or spawn side effect can duplicate.
+  const claimed = deps.ledger.claimProviderWaitAtomic(wait.id, {
+    by,
+    path: resumeFile !== null ? 'resumed' : 'redispatched',
+  });
+  if (!claimed) {
+    return { outcome: 'skipped', waitId: wait.id, why: 'recovery already claimed (concurrent claimant or replay)' };
+  }
   deps.ledger.appendCustomEvent({
     kind: 'provider.recovery-claimed',
     jobId: wait.jobId,
@@ -166,37 +186,51 @@ async function claimJobMinion(
     payload: { wait_id: wait.id, waiter: 'job-minion', by, path: resumeFile !== null ? 'resumed' : 'redispatched' },
   });
   const admitted = { recorded: false };
-  const result = await rebriefFreshMinion({
-    registry: deps.registry,
-    ledger: deps.ledger,
-    worktrees: deps.worktrees,
-    jobId: wait.jobId as string,
-    note,
-    briefing: continuationPrompt ?? job.briefing,
-    ...(resumeFile !== null ? { resumeFile } : {}),
-    onSpawned: (worker) => {
-      // Record ACTUAL admission (the turn really starting) separately from
-      // this claim/delivery — a delivered event alone is not proof.
-      const handle = deps.registry.getHandle(worker.id);
-      if (handle === null) return;
-      handle.subscribe((event) => {
-        if (event.type === 'turn_start' && !admitted.recorded) {
-          admitted.recorded = true;
-          deps.ledger.appendCustomEvent({
-            kind: 'provider.continuation-admitted',
-            jobId: wait.jobId,
-            agentId: worker.id,
-            payload: { wait_id: wait.id, by },
-          });
-        }
-      });
-    },
-  });
-  deps.ledger.setProviderWaitStatus(wait.id, 'claimed', {
-    why: 'continuation started',
-    by,
-    minion: result.minionId,
-  });
+  let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
+  try {
+    result = await rebriefFreshMinion({
+      registry: deps.registry,
+      ledger: deps.ledger,
+      worktrees: deps.worktrees,
+      jobId: wait.jobId as string,
+      note,
+      briefing: continuationPrompt ?? job.briefing,
+      ...(resumeFile !== null ? { resumeFile } : {}),
+      onSpawned: (worker) => {
+        // Record ACTUAL admission (the turn really starting) separately from
+        // this claim/delivery — a delivered event alone is not proof.
+        const handle = deps.registry.getHandle(worker.id);
+        if (handle === null) return;
+        handle.subscribe((event) => {
+          if (event.type === 'turn_start' && !admitted.recorded) {
+            admitted.recorded = true;
+            deps.ledger.appendCustomEvent({
+              kind: 'provider.continuation-admitted',
+              jobId: wait.jobId,
+              agentId: worker.id,
+              payload: { wait_id: wait.id, by },
+            });
+          }
+        });
+      },
+    });
+  } catch (error) {
+    // The claim won but the spawn/continuation failed DETERMINISTICALLY.
+    // Never blind-retry (crash/ambiguous delivery must be reconciled, not
+    // replayed): keep the claim as the durable record and surface it.
+    deps.ledger.appendCustomEvent({
+      kind: 'provider.continuation-failed',
+      jobId: wait.jobId,
+      agentId: wait.agentId,
+      payload: { wait_id: wait.id, by, error: String(error).slice(0, 300) },
+    });
+    deps.log?.('error', 'provider recovery continuation failed after atomic claim — stranded claim recorded, no replay', {
+      wait_id: wait.id,
+      job: wait.jobId,
+      error: String(error),
+    });
+    return { outcome: 'skipped', waitId: wait.id, why: 'continuation spawn failed after atomic claim (recorded; no automatic replay)' };
+  }
   deps.log?.('info', 'provider recovery continuation started', {
     wait_id: wait.id,
     job: wait.jobId,

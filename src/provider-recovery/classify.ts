@@ -24,6 +24,18 @@
  * backlog membership. Unknown or partial evidence fails toward the owner.
  */
 
+/** Typed provider-response provenance (r1 #13): structured evidence the
+ * ADAPTER extracted from a real provider-response object — an SDK provider
+ * error (status/headers) or a provider terminal message (stopReason
+ * 'error' whose machine-composed line the transport built). Arbitrary turn
+ * exceptions carry NO typed provenance and can never establish a wait. */
+export interface TypedProviderResponse {
+  readonly origin: 'sdk-error' | 'provider-message';
+  readonly status?: number;
+  readonly bodyCode?: string;
+  readonly retryAfterMs?: number;
+}
+
 /** Structured evidence extracted from a runtime provider rejection. */
 export interface ProviderRejectionEvidence {
   /** Provider id as the runtime reported it (e.g. "zai-coding-cn"). */
@@ -57,15 +69,16 @@ export type ProviderLimitClass =
     };
 
 /**
- * Classify structured provider rejection evidence. Pure and deterministic.
+ * Classify typed provider rejection evidence. Pure and deterministic.
  *
- * Precedence: a known GLM temporary-quota body code wins over the HTTP
- * status (the Z.AI API wraps quota-limit rejections; the body code is the
- * precise signal). Then 429 → temporary; 401/403/402 → owner; GLM billing
- * code → owner; a provider without a wait-capable rejection → owner
- * (unsupported); everything else → owner (ambiguous). Missing
- * provider/model identity is ambiguous: a wait cannot bind a route without
- * it.
+ * Precedence (r1 #11): a contradictory OWNER-CONTROLLED HTTP status
+ * (401/402/403) wins over any temporary body code — a provider that says
+ * unauthorized/payment-required/forbidden with quota-flavored prose is an
+ * owner condition, never an eligible temporary wait. Then typed temporary
+ * signals (GLM 1302/1308 body code; 429 usage limit) are
+ * temporary-recoverable; GLM billing code, ambiguous or unsupported
+ * evidence stay owner-controlled. Missing provider/model identity is
+ * ambiguous: a wait cannot bind a route without it.
  */
 export function classifyProviderRejection(
   evidence: ProviderRejectionEvidence,
@@ -73,16 +86,7 @@ export function classifyProviderRejection(
   if (evidence.provider === '' || evidence.model === '') {
     return { kind: 'owner-controlled', reason: 'ambiguous' };
   }
-  const bodyCode = evidence.bodyCode;
-  if (bodyCode !== undefined && GLM_TEMPORARY_QUOTA_CODES.has(bodyCode)) {
-    return { kind: 'temporary-recoverable', retryAfterMs: evidence.retryAfterMs ?? null };
-  }
-  if (bodyCode !== undefined && GLM_BILLING_CODES.has(bodyCode)) {
-    return { kind: 'owner-controlled', reason: 'billing' };
-  }
   switch (evidence.status) {
-    case 429:
-      return { kind: 'temporary-recoverable', retryAfterMs: evidence.retryAfterMs ?? null };
     case 401:
       return { kind: 'owner-controlled', reason: 'authentication' };
     case 403:
@@ -90,17 +94,35 @@ export function classifyProviderRejection(
     case 402:
       return { kind: 'owner-controlled', reason: 'billing' };
     default:
-      return { kind: 'owner-controlled', reason: 'ambiguous' };
+      break;
   }
+  const bodyCode = evidence.bodyCode;
+  if (bodyCode !== undefined && GLM_BILLING_CODES.has(bodyCode)) {
+    return { kind: 'owner-controlled', reason: 'billing' };
+  }
+  if (bodyCode !== undefined && GLM_TEMPORARY_QUOTA_CODES.has(bodyCode)) {
+    return { kind: 'temporary-recoverable', retryAfterMs: evidence.retryAfterMs ?? null };
+  }
+  if (evidence.status === 429) {
+    return { kind: 'temporary-recoverable', retryAfterMs: evidence.retryAfterMs ?? null };
+  }
+  return { kind: 'owner-controlled', reason: 'ambiguous' };
 }
 
 /**
- * Providers whose rejections this sensor version understands. v1 is the
- * actual installed China coding route (owner pin); other providers get
- * verified adapters later — until then their walls stay owner-controlled
- * even when the status looks like 429.
+ * Providers whose rejections this sensor version understands. The
+ * owner-approved overlay extends recovery to openai-codex and the native
+ * claude.ai Pro route VIA NON-GENERATION METADATA READS — their
+ * subscription/usage-window walls become eligible waits while their
+ * readiness evidence comes from the metadata adapters (never generation).
+ * Every other provider stays owner-controlled until a verified adapter
+ * exists.
  */
-export const SENSOR_SUPPORTED_PROVIDERS: ReadonlySet<string> = new Set(['zai-coding-cn']);
+export const SENSOR_SUPPORTED_PROVIDERS: ReadonlySet<string> = new Set([
+  'zai-coding-cn',
+  'openai-codex',
+  'anthropic-claude-native',
+]);
 
 /** Is this provider's evidence eligible for automatic recovery at all? */
 export function providerSupportsSensor(provider: string): boolean {

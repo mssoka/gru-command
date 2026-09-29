@@ -188,12 +188,22 @@ export type RuntimeEvent =
       /** A runtime/turn failure. `fatal` marks process-level failures;
       * in-band provider errors carry the provider/model identity so
       * provider-aware consumers (the recovery sensor) can bind a route
-      * without guessing from prose. */
+      * without guessing from prose. `typed` carries structured
+      * provider-response provenance (r1 #13): present ONLY for real
+      * provider responses (SDK error with status/headers, or a provider
+      * terminal message) — arbitrary turn exceptions carry none, so they
+      * can never be misread as provider rejections. */
       readonly type: 'error';
       readonly error: string;
       readonly fatal: boolean;
       readonly provider?: string;
       readonly model?: string;
+      readonly typed?: {
+        readonly origin: 'sdk-error' | 'provider-message';
+        readonly status?: number;
+        readonly bodyCode?: string;
+        readonly retryAfterMs?: number;
+      };
     };
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;

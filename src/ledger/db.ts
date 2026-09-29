@@ -323,6 +323,7 @@ export const MIGRATIONS: readonly Migration[] = [
         route_key               TEXT NOT NULL,
         provider                TEXT NOT NULL,
         model                   TEXT NOT NULL,
+        endpoint                TEXT NOT NULL,
         credential_fingerprint  TEXT NOT NULL,
         waiter_kind             TEXT NOT NULL CHECK (waiter_kind IN ('job-minion','silas-slot')),
         job_id                  TEXT REFERENCES jobs(id),
@@ -330,6 +331,9 @@ export const MIGRATIONS: readonly Migration[] = [
         slot_id                 TEXT,
         session_file            TEXT,
         continuation            TEXT,
+        job_status_at_establishment TEXT,
+        lineage_key             TEXT,
+        recovery_batch_id       TEXT,
         incident_id             TEXT NOT NULL,
         incident_generation     INTEGER NOT NULL,
         status                  TEXT NOT NULL CHECK (status IN ('waiting','recovered-pending','claimed','cancelled','superseded')),
@@ -345,6 +349,7 @@ export const MIGRATIONS: readonly Migration[] = [
         route_key                  TEXT PRIMARY KEY,
         provider                   TEXT NOT NULL,
         model                      TEXT NOT NULL,
+        endpoint                   TEXT NOT NULL,
         credential_fingerprint     TEXT NOT NULL,
         incident_seq               INTEGER NOT NULL,
         window_start               TEXT NOT NULL,
@@ -368,6 +373,18 @@ export const MIGRATIONS: readonly Migration[] = [
         UNIQUE (route_key, incident_generation)
       );
       CREATE INDEX idx_pending_provider_recovery_route ON pending_provider_recovery(route_key);
+
+      -- Durable PRE-I/O probe reservation (r1 #5): a row exists while a
+      -- check is in flight or was interrupted mid-flight; its presence
+      -- means the attempt was CHARGED (budget + cadence advanced BEFORE
+      -- the network I/O), so a crash can never refund it or issue an
+      -- immediate duplicate.
+      CREATE TABLE provider_probe_reservations (
+        route_key    TEXT PRIMARY KEY,
+        reserved_at  TEXT NOT NULL,
+        expires_at   TEXT NOT NULL,
+        outcome      TEXT NOT NULL CHECK (outcome IN ('reserved','spent-unknown'))
+      );
     `,
   },
 ];

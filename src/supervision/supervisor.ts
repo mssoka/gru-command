@@ -188,7 +188,7 @@ interface SupervisedAgent {
     reason: string;
     allowRestart: boolean;
     runtimeError: boolean;
-    source: ProviderErrorSource | null;
+    source: ProviderErrorSource | null;  // carries .typed (r1 #13)
     handle: AgentHandle | null;
     activityGeneration: number;
     openTurn: boolean;
@@ -219,6 +219,14 @@ export interface ProviderErrorSource {
   readonly provider: string | null;
   readonly model: string | null;
   readonly error: string;
+  /** Typed provider-response provenance (r1 #13) — absent for arbitrary
+   * turn exceptions; the sensor requires it to establish a wait. */
+  readonly typed: {
+    readonly origin: 'sdk-error' | 'provider-message';
+    readonly status?: number;
+    readonly bodyCode?: string;
+    readonly retryAfterMs?: number;
+  } | null;
 }
 
 /** The provider-recovery observation sink (the sensor's recorder): the
@@ -226,6 +234,22 @@ export interface ProviderErrorSource {
  * sink alone decides eligibility (owner control is preserved for
  * auth/billing/ambiguous/unsupported). */
 export interface ProviderWallSink {
+  /** Machine-ownership classification BEFORE any owner stop is created
+   * (phase3 r1 #2): true only when the sink has ALREADY durably persisted
+   * an eligible machine-owned provider wait for this stop. false/absent/
+   * throwing keeps the conservative human-controlled needs-owner stop. */
+  ownsProviderWall?(input: {
+    readonly agentId: string;
+    readonly role: Role;
+    readonly slotId: string | null;
+    readonly jobId: string | null;
+    readonly sessionFile: string | null;
+    readonly failureClass: string;
+    readonly source: ProviderErrorSource | null;
+    readonly continuation: { readonly promptText: string | null; readonly promptOwner: string | null; readonly hadOpenTurn: boolean } | null;
+  }): Promise<boolean>;
+  /** Link the machine-owned stop notice onto the persisted wait (lifecycle). */
+  linkProviderWaitIncident?(waitLink: { readonly agentId: string; readonly incidentId: string }): void;
   onProviderWall(input: {
     readonly agentId: string;
     readonly role: Role;
@@ -697,6 +721,7 @@ export class Supervisor {
               provider: event.provider ?? null,
               model: event.model ?? null,
               error: event.error,
+              typed: event.typed ?? null,
             });
           } else {
             // Preserve the adapter contract: in-band failures never restart.
@@ -706,6 +731,7 @@ export class Supervisor {
               provider: event.provider ?? null,
               model: event.model ?? null,
               error: event.error,
+              typed: event.typed ?? null,
             });
           }
           break;
@@ -1352,8 +1378,6 @@ export class Supervisor {
     agent.breakerOpen = true;
     agent.state = 'stopped';
     const handle = agent.handle;
-    // Snapshot the open turn before the stop disposes it: the ack re-arm
-    // resumes it, or the lane is documented rather than silently dead.
     const captured = this.captureInterruptedTurn(handle, agent);
     if (captured !== null) agent.pendingRecovery = captured;
     agent.openTurn = false;
@@ -1365,46 +1389,63 @@ export class Supervisor {
       agentId: agent.agentId,
       payload: { class: failureClass, restarts: agent.restartRing.length },
     });
-    const notification = this.notifications.postIncident({
-      kind: `supervision.provider-wall.${agent.agentId}.${failureClass}`,
-      // Re-arm is an ACK with side effects (supervisor.onNotificationAcked),
-      // so this stop must stay human-facing: FOR YOU + bell. The machine
-      // queue never self-arms a walled provider condition.
-      routing: 'needs-owner',
-      severity: 'error',
-      title: `Agent ${agent.agentId} stopped: ${failureClass.replaceAll('_', ' ')}`,
-      detail: 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.',
+    const ledgerAgent = this.ledger.getAgent(agent.agentId);
+    const observation = {
       agentId: agent.agentId,
-      dedupe: 'unacked',
-    });
-    agent.breakerNotificationId = notification.id;
-    if (this.providerWalls !== null) {
-      try {
-        const ledgerAgent = this.ledger.getAgent(agent.agentId);
-        this.providerWalls.onProviderWall({
-          agentId: agent.agentId,
-          role: agent.role,
-          slotId: agent.slot?.id ?? null,
-          jobId: ledgerAgent?.jobId ?? null,
-          sessionFile: agent.sessionFile,
-          failureClass,
-          source,
-          incidentId: notification.id,
-          continuation: captured === null
-            ? null
-            : {
-                promptText: captured.pending?.text ?? null,
-                promptOwner: captured.pending?.owner ?? null,
-                hadOpenTurn: captured.hadOpenTurn,
-              },
-        });
-      } catch (error) {
-        // The sink is an observer: its faults never change the stop.
-        this.log('error', 'provider-wall sink failed', {
-          agent_id: agent.agentId,
-          error: String(error),
-        });
+      role: agent.role,
+      slotId: agent.slot?.id ?? null,
+      jobId: ledgerAgent?.jobId ?? null,
+      sessionFile: agent.sessionFile,
+      failureClass,
+      source,
+      continuation: captured === null
+        ? null
+        : {
+            promptText: captured.pending?.text ?? null,
+            promptOwner: captured.pending?.owner ?? null,
+            hadOpenTurn: captured.hadOpenTurn,
+          },
+    } as const;
+    // r1 #2 (phase3): decide MACHINE ownership BEFORE creating any owner
+    // stop. The sink persists the eligible wait first; only a FAILED or
+    // ineligible classification falls back to the conservative needs-owner
+    // stop. Machine-owned stops post MACHINE attention (action-required),
+    // never a needs-owner chime.
+    const postStopNotice = (routing: 'needs-owner' | 'action-required') => {
+      const notification = this.notifications.postIncident({
+        kind: `supervision.provider-wall.${agent.agentId}.${failureClass}`,
+        routing,
+        severity: 'error',
+        title: `Agent ${agent.agentId} stopped: ${failureClass.replaceAll('_', ' ')}`,
+        detail:
+          routing === 'needs-owner'
+            ? 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.'
+            : 'Machine-owned temporary provider limit: the recovery sensor owns this stop (no owner ACK required).',
+        agentId: agent.agentId,
+        dedupe: 'unacked',
+      });
+      agent.breakerNotificationId = notification.id;
+      if (routing === 'action-required') {
+        this.providerWalls?.linkProviderWaitIncident?.({ agentId: agent.agentId, incidentId: notification.id });
       }
+      return notification;
+    };
+    const sink = this.providerWalls;
+    if (sink?.ownsProviderWall !== undefined) {
+      void sink
+        .ownsProviderWall({ ...observation })
+        .then((machineOwned) => {
+          postStopNotice(machineOwned ? 'action-required' : 'needs-owner');
+          this.onProviderWallObserved(observation, machineOwned);
+        })
+        .catch(() => {
+          // Classification failure: conservative human-controlled stop.
+          postStopNotice('needs-owner');
+          this.onProviderWallObserved(observation, false);
+        });
+    } else {
+      postStopNotice('needs-owner');
+      this.onProviderWallObserved(observation, false);
     }
     if (handle !== null) {
       void this.registry.disposeHandle(handle).catch((error: unknown) => {
@@ -1413,6 +1454,32 @@ export class Supervisor {
           error: String(error),
         });
       });
+    }
+  }
+
+  /** The observation report to the sensor sink (fire-and-forget observer). */
+  private onProviderWallObserved(
+    observation: {
+      readonly agentId: string;
+      readonly role: Role;
+      readonly slotId: string | null;
+      readonly jobId: string | null;
+      readonly sessionFile: string | null;
+      readonly failureClass: string;
+      readonly source: ProviderErrorSource | null;
+      readonly continuation: { readonly promptText: string | null; readonly promptOwner: string | null; readonly hadOpenTurn: boolean } | null;
+    },
+    machineOwned: boolean,
+  ): void {
+    if (this.providerWalls === null) return;
+    try {
+      if (machineOwned) return; // wait already persisted by ownsProviderWall
+      this.providerWalls.onProviderWall({
+        ...observation,
+        incidentId: null,
+      });
+    } catch (error) {
+      this.log('error', 'provider-wall sink failed', { agent_id: observation.agentId, error: String(error) });
     }
   }
 

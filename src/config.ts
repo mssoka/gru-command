@@ -302,6 +302,14 @@ export interface ProviderRecoveryConfig {
   /** Upper bound honored for a trustworthy provider Retry-After hint
    * (longer hints clamp to the cadence policy, never extend past this). */
   readonly retryAfterMaxMs: number;
+  /** Bounded finite timeout for one probe I/O (generation or metadata
+   * read); also bounds the pre-I/O reservation expiry. */
+  readonly probeTimeoutMs: number;
+  /** GLM bounded generation fallback (≤64 output tokens, no history/tools,
+   * no hidden retries). The owner overlay keeps it DISABLED in production:
+   * false (the default) means GLM waits never run a generation probe —
+   * checks fail closed until a documented readiness endpoint exists. */
+  readonly glmGenerationFallback: boolean;
 }
 
 export const DEFAULT_PROVIDER_RECOVERY_CONFIG: ProviderRecoveryConfig = {
@@ -314,6 +322,8 @@ export const DEFAULT_PROVIDER_RECOVERY_CONFIG: ProviderRecoveryConfig = {
   falseRecoveryEscalateAt: 3,
   suspensionMs: 21_600_000,
   retryAfterMaxMs: 3_600_000,
+  probeTimeoutMs: 30_000,
+  glmGenerationFallback: false,
 };
 
 /** Hard floors from the owner approval — config may tighten, never
@@ -1198,6 +1208,8 @@ export function loadConfig(
         'false_recovery_escalate_at',
         'suspension_ms',
         'retry_after_max_ms',
+        'probe_timeout_ms',
+        'glm_generation_fallback',
       ];
       for (const key of Object.keys(table)) {
         if (!VALID.includes(key)) {
@@ -1240,6 +1252,11 @@ export function loadConfig(
         falseRecoveryEscalateAt: table['false_recovery_escalate_at'] !== undefined ? requirePositiveInt(table['false_recovery_escalate_at'], file, 'provider_recovery.false_recovery_escalate_at') : providerRecovery.falseRecoveryEscalateAt,
         suspensionMs: table['suspension_ms'] !== undefined ? requirePositiveInt(table['suspension_ms'], file, 'provider_recovery.suspension_ms') : providerRecovery.suspensionMs,
         retryAfterMaxMs: table['retry_after_max_ms'] !== undefined ? requirePositiveInt(table['retry_after_max_ms'], file, 'provider_recovery.retry_after_max_ms') : providerRecovery.retryAfterMaxMs,
+        probeTimeoutMs: table['probe_timeout_ms'] !== undefined ? requirePositiveInt(table['probe_timeout_ms'], file, 'provider_recovery.probe_timeout_ms') : providerRecovery.probeTimeoutMs,
+        glmGenerationFallback:
+          table['glm_generation_fallback'] !== undefined
+            ? requireBool(table['glm_generation_fallback'], file, 'provider_recovery.glm_generation_fallback')
+            : providerRecovery.glmGenerationFallback,
       };
     }
     if (raw['roll'] !== undefined) {

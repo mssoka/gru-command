@@ -302,6 +302,13 @@ probe_backoff_max_ms = 1800000
 false_recovery_escalate_at = 3
 suspension_ms = 21600000
 retry_after_max_ms = 3600000
+# Finite timeout for one probe I/O (generation or metadata read); also
+# bounds the durable pre-I/O reservation expiry.
+probe_timeout_ms = 30000
+# GLM bounded generation fallback (<=64 output tokens, no history/tools,
+# no hidden retries). The owner overlay keeps it DISABLED in production:
+# false means GLM checks fail closed (no readiness endpoint exists yet).
+glm_generation_fallback = false
 
 [roll]
 # Graceful self-roll drain policy: how long the service waits for
