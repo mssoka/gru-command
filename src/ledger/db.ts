@@ -325,13 +325,25 @@ export const MIGRATIONS: readonly Migration[] = [
     // claim, no live schema action).
     //
     // Identity: (job_id, logical_step, incident_key) — stable across
-    // duplicate observations; distinct incidents coexist. `generation` is
-    // the job's blocked-generation at creation: only a NEW distinct
-    // incident advances it; duplicates never invalidate live work.
+    // duplicate observations; distinct incidents coexist. The partial
+    // unique index enforces ONE ACTIVE incarnation per tuple (settled/
+    // closed rows are history; a recurrence mints `id#n`); the table-level
+    // UNIQUE of the first draft would have rejected every recurrence.
+    // `generation` is the job's blocked-generation at creation: only a
+    // NEW distinct incident advances it; duplicates never invalidate live
+    // work. `plan_revision` bumps ONLY when a duplicate observation
+    // changes the plan (next action / authority / wake condition) — the
+    // fence that retires claims derived from the older plan.
     // Discriminated unions persist as JSON in TEXT columns, validated in
     // src/ledger/obligations.ts (types are the authority, never prose).
+    // `claim_log` keeps the full identity of every prior claim (never a
+    // bare counter): expiry alone transfers nothing — the reconciliation
+    // path records positive disposition proof there. `receipt_correlation`
+    // binds an armed receipt expectation to the delegated phase's actual
+    // identity, so a later unrelated event of the same kind cannot
+    // satisfy an older expectation.
     id: 9,
-    name: 'job-obligations',
+    name: 'job-obligations-and-directive-requests',
     sql: `
       CREATE TABLE job_obligations (
         id               TEXT PRIMARY KEY,
@@ -349,19 +361,42 @@ export const MIGRATIONS: readonly Migration[] = [
         due_at           TEXT,
         receipt_kind     TEXT,
         deadline_at      TEXT,
+        receipt_correlation TEXT,
         recorded_receipts TEXT NOT NULL DEFAULT '[]',
         observations     INTEGER NOT NULL DEFAULT 1,
+        plan_revision    INTEGER NOT NULL DEFAULT 0,
         first_origin_seq INTEGER NOT NULL,
         last_origin_seq  INTEGER NOT NULL,
         superseded_by    TEXT,
         claim            TEXT,
-        claim_history    INTEGER NOT NULL DEFAULT 0,
+        claim_log        TEXT NOT NULL DEFAULT '[]',
         created_at       TEXT NOT NULL,
-        updated_at       TEXT NOT NULL,
-        UNIQUE (job_id, logical_step, incident_key)
+        updated_at       TEXT NOT NULL
       );
+      CREATE UNIQUE INDEX idx_job_obligations_active_tuple
+        ON job_obligations(job_id, logical_step, incident_key)
+        WHERE state IN ('open', 'waiting', 'suspended');
       CREATE INDEX idx_job_obligations_job ON job_obligations(job_id);
       CREATE INDEX idx_job_obligations_state ON job_obligations(state);
+
+      CREATE TABLE pending_directives (
+        request_id    TEXT PRIMARY KEY,
+        job_id        TEXT NOT NULL REFERENCES jobs(id),
+        payload       TEXT NOT NULL,
+        payload_hash  TEXT NOT NULL,
+        state         TEXT NOT NULL,
+        baseline_seq  INTEGER NOT NULL,
+        claim         TEXT,
+        admission_seq INTEGER,
+        admission_minion TEXT,
+        delivery_seq  INTEGER,
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        fail_reason   TEXT,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+      );
+      CREATE INDEX idx_pending_directives_job ON pending_directives(job_id);
+      CREATE INDEX idx_pending_directives_state ON pending_directives(state);
     `,
   },
 ];

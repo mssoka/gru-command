@@ -49,6 +49,7 @@ export const KNOWN_BLOCKER_CATEGORIES = [
   'verification-failure',
   'review-verdict',
   'lane-unavailable',
+  'phase-completion',
 ] as const;
 export type KnownBlockerCategory = (typeof KNOWN_BLOCKER_CATEGORIES)[number];
 
@@ -90,24 +91,61 @@ export type ObligationWakeCondition =
   | { readonly kind: 'receipt'; readonly receiptKind: string }
   | { readonly kind: 'sweep' };
 
+/** Validate/canonicalize an ISO timestamp at the write/read boundary
+ * (ruling D): elapsed-time reasoning never trusts lexicographic strings
+ * that were never checked to parse. Returns the canonical form. */
+export function canonicalIsoTimestamp(value: string, what: string): string {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) throw new Error(`${what} must be a parseable ISO timestamp, got "${value}"`);
+  return new Date(parsed).toISOString();
+}
+
 /** Typed authority binding an obligation's continuation to a concrete
  * accepted operation or ruling VERSION. `rulingRef` is a stable ruling
  * identifier (e.g. a ledger-anchored ruling id), never a filesystem path
- * and never prose. Absent authority = attention only, always. */
+ * and never prose. Absent authority = attention only, always. Current
+ * validity is a LEDGER question, not a string question: the api's
+ * `verifyObligationAuthority` checks the referenced fact durably exists
+ * and applies to this obligation (ruling E) — an unverifiable reference
+ * is a visible NON-EXECUTABLE decision, never a grant. */
 export type ObligationAuthority =
   | { readonly source: 'accepted-operation'; readonly operationId: string; readonly version: string }
   | { readonly source: 'chief-ruling'; readonly rulingRef: string; readonly version: string }
   | { readonly source: 'owner-ruling'; readonly rulingRef: string; readonly version: string };
 
 /** How an obligation ends. Receipts NEVER settle; only an explicit,
- * validated settlement call does. `job-terminal`/`superseded`/`cancelled`
- * close (history preserved); the evidence kinds settle. */
+ * validated settlement call does. Evidence kinds name the exact ledger
+ * event kind they cite — the api validates the event EXISTS, belongs to
+ * the obligation's job, and carries that kind, so no fabricated sequence
+ * or wrong-job/gate event can settle debt (ruling A).
+ * `job-terminal`/`superseded`/`cancelled` close (history preserved); the
+ * evidence kinds settle. */
 export type ObligationSettlement =
-  | { readonly kind: 'executed-action'; readonly action: string; readonly evidenceEventSeq: number }
-  | { readonly kind: 'accepted-evidence'; readonly gate: string; readonly evidenceEventSeq: number }
+  | {
+      readonly kind: 'executed-action'
+      readonly action: string
+      readonly evidenceEventSeq: number
+      readonly evidenceEventKind: string
+    }
+  | {
+      readonly kind: 'accepted-evidence'
+      readonly gate: string
+      readonly evidenceEventSeq: number
+      readonly evidenceEventKind: string
+    }
   | { readonly kind: 'superseded'; readonly byObligationId: string | null; readonly reason: string }
   | { readonly kind: 'cancelled'; readonly reason: string }
   | { readonly kind: 'job-terminal'; readonly jobStatus: 'done' | 'merged' };
+
+/** The delegated phase's identity an armed receipt expectation may pin
+ * itself to. Present ⇒ a receipt event whose payload lacks the matching
+ * correlation is recorded as evidence but NEVER satisfies the
+ * expectation — a later unrelated event of the same kind cannot answer
+ * an older phase's debt (ruling A). */
+export interface ReceiptCorrelation {
+  readonly requestId?: string;
+  readonly minionId?: string;
+}
 
 // ------------------------------------------------------------------
 // Firing rules (closed registry — issue #117 provenance)
@@ -120,6 +158,7 @@ export const FIRING_RULE_IDS = [
   'verification-failure-gru-decision',
   'review-verdict-gru-decision',
   'lane-unavailable-gru-decision',
+  'phase-completion-gru-decision',
   'unknown-triage-gru',
 ] as const;
 export type FiringRuleId = (typeof FIRING_RULE_IDS)[number];
@@ -166,6 +205,15 @@ export const FIRING_RULES: readonly FiringRule[] = [
     id: 'lane-unavailable-gru-decision',
     category: { kind: 'known', category: 'lane-unavailable' },
     nextAction: { kind: 'gru-decision', decision: 'lane unavailability requires a recovery ruling' },
+    wakeCondition: { kind: 'sweep' },
+  },
+  {
+    // Same-head/terminal hand-back (incident 131/132/133): a bounded
+    // silas-directive/rebrief phase settled while the lane stayed blocked
+    // — the next Gru ruling is owed durably, no owner prompting needed.
+    id: 'phase-completion-gru-decision',
+    category: { kind: 'known', category: 'phase-completion' },
+    nextAction: { kind: 'gru-decision', decision: 'bounded phase completed on a still-blocked lane — rule on the follow-through' },
     wakeCondition: { kind: 'sweep' },
   },
   {
@@ -216,6 +264,10 @@ export interface BlockerContext {
   readonly dueAt?: string | null;
   readonly receiptKind?: string | null;
   readonly deadlineAt?: string | null;
+  /** Pin a receipt expectation to the delegated phase's actual identity
+   * (request/minion) — without the match, a same-kind event is evidence
+   * but never satisfaction (ruling A). */
+  readonly receiptCorrelation?: ReceiptCorrelation;
   readonly firingRule?: FiringRuleId;
 }
 
@@ -233,6 +285,7 @@ export interface ResolvedObligation {
   readonly dueAt: string | null;
   readonly receiptKind: string | null;
   readonly deadlineAt: string | null;
+  readonly receiptCorrelation: ReceiptCorrelation | null;
 }
 
 /** Validate + resolve a blocker context against the registry. Throws
@@ -249,6 +302,14 @@ export function resolveObligation(context: BlockerContext, jobId: string): Resol
           throw new Error(`unknown firing rule "${context.firingRule}" — the registry is closed`);
         })())
       : defaultFiringRule(context.category);
+  // Rule/category compatibility (ruling E): a caller may pick a rule by
+  // id for provenance, never mislabel the category it fired on.
+  if (categoryKey(rule.category) !== categoryKey(context.category)) {
+    throw new Error(
+      `firing rule "${rule.id}" is registered for category "${categoryKey(rule.category)}", ` +
+        `not the observed "${categoryKey(context.category)}" — fix the category or drop the explicit rule`,
+    );
+  }
   const nextAction = context.nextAction ?? rule.nextAction;
   if (nextAction.kind === 'silas-mechanical') {
     if (!(SILAS_MECHANICAL_ACTIONS as readonly string[]).includes(nextAction.action)) {
@@ -275,6 +336,7 @@ export function resolveObligation(context: BlockerContext, jobId: string): Resol
     dueAt: context.dueAt ?? null,
     receiptKind: context.receiptKind ?? null,
     deadlineAt: context.deadlineAt ?? null,
+    receiptCorrelation: context.receiptCorrelation ?? null,
   };
 }
 
@@ -359,14 +421,31 @@ export function selectDueObligations(
 // ------------------------------------------------------------------
 
 /** A durable hold on an obligation's next action. Lease expiry alone
- * NEVER permits a replacement writer — reconciling actual live
- * actor/session/owned-child evidence before any re-claim is the phase-3
- * contract; this primitive only records the fence and its history. */
+ * NEVER permits a replacement writer — the reconciliation path must
+ * record a positive disposition of the old claim (with proof) before a
+ * new holder may take over (ruling D). An attention-only lease
+ * coordinates WHO is minding the decision; it never grants execution —
+ * only typed authority on the obligation itself can do that. */
 export interface ObligationClaim {
   readonly requestId: string;
   readonly holder: string;
   readonly generation: number;
-  readonly expiresAt: string;
+  readonly expiresAt: string | null;
+}
+
+/** The full identity of a prior claim and how it left: persisted per
+ * replacement/release — never reduced to an integer counter. `proof` is
+ * the reconciliation evidence that justified the handover;
+ * `supersededByRequest` names the taker. */
+export interface ClaimLogEntry {
+  readonly requestId: string;
+  readonly holder: string;
+  readonly generation: number;
+  readonly expiresAt: string | null;
+  readonly disposition: 'released' | 'superseded-expired-reconciled' | 'plan-revision' | 'terminal-close';
+  readonly at: string;
+  readonly proof: string | null;
+  readonly supersededByRequest: string | null;
 }
 
 // ------------------------------------------------------------------
@@ -466,12 +545,14 @@ export function parseSettlement(raw: string): ObligationSettlement {
         kind,
         action: reqStr(record, 'action', 'executed-action settlement'),
         evidenceEventSeq: reqSeq(record, 'evidenceEventSeq', 'executed-action settlement'),
+        evidenceEventKind: reqStr(record, 'evidenceEventKind', 'executed-action settlement'),
       };
     case 'accepted-evidence':
       return {
         kind,
         gate: reqStr(record, 'gate', 'accepted-evidence settlement'),
         evidenceEventSeq: reqSeq(record, 'evidenceEventSeq', 'accepted-evidence settlement'),
+        evidenceEventKind: reqStr(record, 'evidenceEventKind', 'accepted-evidence settlement'),
       };
     case 'superseded':
       return { kind, byObligationId: optStr(record, 'byObligationId'), reason: reqStr(record, 'reason', 'superseded settlement') };
@@ -496,12 +577,50 @@ export function parseClaim(raw: string | null): ObligationClaim | null {
   if (typeof generation !== 'number' || !Number.isSafeInteger(generation)) {
     throw new Error('obligation claim generation must be a safe integer');
   }
+  const expiresAt = optStr(record, 'expiresAt');
+  if (expiresAt !== null) canonicalIsoTimestamp(expiresAt, 'obligation claim expiresAt');
   return {
     requestId: reqStr(record, 'requestId', 'obligation claim'),
     holder: reqStr(record, 'holder', 'obligation claim'),
     generation,
-    expiresAt: reqStr(record, 'expiresAt', 'obligation claim'),
+    expiresAt,
   };
+}
+
+const CLAIM_LOG_DISPOSITIONS = [
+  'released',
+  'superseded-expired-reconciled',
+  'plan-revision',
+  'terminal-close',
+] as const;
+export type ClaimLogDisposition = (typeof CLAIM_LOG_DISPOSITIONS)[number];
+
+export function parseClaimLog(raw: string): readonly ClaimLogEntry[] {
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) throw new Error('obligation claim log must be a JSON array');
+  return parsed.map((entry) => {
+    const record = asRecord(entry, 'claim log entry');
+    const generation = record['generation'];
+    if (typeof generation !== 'number' || !Number.isSafeInteger(generation)) {
+      throw new Error('claim log entry generation must be a safe integer');
+    }
+    const disposition = reqStr(record, 'disposition', 'claim log entry');
+    if (!(CLAIM_LOG_DISPOSITIONS as readonly string[]).includes(disposition)) {
+      throw new Error(`claim log entry disposition "${disposition}" is unknown`);
+    }
+    const expiresAt = optStr(record, 'expiresAt');
+    if (expiresAt !== null) canonicalIsoTimestamp(expiresAt, 'claim log entry expiresAt');
+    return {
+      requestId: reqStr(record, 'requestId', 'claim log entry'),
+      holder: reqStr(record, 'holder', 'claim log entry'),
+      generation,
+      expiresAt,
+      disposition: disposition as ClaimLogDisposition,
+      at: canonicalIsoTimestamp(reqStr(record, 'at', 'claim log entry'), 'claim log entry at'),
+      proof: optStr(record, 'proof'),
+      supersededByRequest: optStr(record, 'supersededByRequest'),
+    };
+  });
 }
 
 export function parseReceipts(raw: string): readonly RecordedReceipt[] {
@@ -520,4 +639,18 @@ export function parseReceipts(raw: string): readonly RecordedReceipt[] {
       applied: record['applied'] === true,
     };
   });
+}
+
+export function parseReceiptCorrelation(raw: string | null): ReceiptCorrelation | null {
+  if (raw === null || raw === '') return null;
+  const record = asRecord(JSON.parse(raw), 'obligation receipt correlation');
+  const requestId = optStr(record, 'requestId');
+  const minionId = optStr(record, 'minionId');
+  if (requestId === null && minionId === null) {
+    throw new Error('obligation receipt correlation must name at least a requestId or minionId');
+  }
+  return {
+    ...(requestId !== null ? { requestId } : {}),
+    ...(minionId !== null ? { minionId } : {}),
+  };
 }

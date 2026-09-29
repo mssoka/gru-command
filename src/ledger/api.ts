@@ -20,26 +20,42 @@ import {
   type RoundVerdict,
 } from './states.js';
 import {
+  canonicalIsoTimestamp,
   categoryKey,
+  defaultFiringRule,
+  isObligationLogicalStep,
+  obligationId,
   parseAuthority,
   parseCategory,
   parseClaim,
+  parseClaimLog,
   parseNextAction,
+  parseReceiptCorrelation,
   parseReceipts,
   parseSettlement,
   parseWakeCondition,
   resolveObligation,
   type BlockerContext,
+  type ClaimLogEntry,
+  type ClaimLogDisposition,
   type ObligationAuthority,
   type ObligationCategory,
   type ObligationClaim,
   type ObligationNextAction,
   type ObligationSettlement,
   type ObligationWakeCondition,
+  type ReceiptCorrelation,
   type RecordedReceipt,
+  type ResolvedObligation,
 } from './obligations.js';
+import {
+  isDirectiveState,
+  type DirectiveRequestRecord,
+  type DirectiveState,
+} from './directives.js';
 
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
+export type { DirectiveRequestRecord, DirectiveState } from './directives.js';
 
 type Row = Record<string, unknown>;
 
@@ -193,6 +209,25 @@ export class ClaimHeldError extends Error {
   }
 }
 
+/** A directive request id was reused with a DIFFERENT canonical payload —
+ * a conflict, never a silent replacement of the accepted request. */
+export class DirectiveConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DirectiveConflictError';
+  }
+}
+
+/** A caller without an idempotency identity repeated a directive while
+ * another request for the job is live. Fail closed — the caller must
+ * identify its retries, not duplicate the turn. */
+export class AmbiguousDirectiveError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AmbiguousDirectiveError';
+  }
+}
+
 /** One durable follow-through obligation (current state; full history is
  * the events table). See src/ledger/obligations.ts for the vocabulary. */
 export interface ObligationRecord {
@@ -215,11 +250,18 @@ export interface ObligationRecord {
   readonly deadlineAt: string | null;
   readonly recordedReceipts: readonly RecordedReceipt[];
   readonly observations: number;
+  /** Bumped ONLY when a duplicate observation changed the plan (next
+   * action / authority / wake condition): the revision that fences claims
+   * derived from the older plan (ruling C). */
+  readonly planRevision: number;
   readonly firstOriginSeq: number;
   readonly lastOriginSeq: number;
   readonly supersededBy: string | null;
   readonly claim: ObligationClaim | null;
-  readonly claimHistory: number;
+  /** Full identity of every prior claim and how it left — never a bare
+   * counter (ruling D). */
+  readonly claimLog: readonly ClaimLogEntry[];
+  readonly receiptCorrelation: ReceiptCorrelation | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -439,6 +481,14 @@ export class LedgerApi {
   latestEventSeq(): number {
     const row = this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get() as Row;
     return Number(row.seq);
+  }
+
+  /** One event by seq, or null — the receipt/settlement evidence check
+   * (ruling A: no fabricated sequence may settle debt). */
+  getEvent(seq: number): EventRecord | null {
+    if (!Number.isSafeInteger(seq) || seq < 0) return null;
+    const row = this.db.prepare('SELECT * FROM events WHERE seq = ?').get(seq) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
   }
 
   /** How many durable events of one kind exist (the board's wake tracker). */
@@ -1570,7 +1620,12 @@ export class LedgerApi {
     return row === undefined ? null : this.obligationFromRow(row);
   }
 
-  listObligations(opts: { jobId?: string; state?: ObligationState } = {}): readonly ObligationRecord[] {
+  listObligations(
+    opts: { jobId?: string; state?: ObligationState; limit?: number; cursor?: number } = {},
+  ): readonly ObligationRecord[] {
+    // Bounded by default and hard-capped (ruling E): a reconcile/adoption
+    // pass never scans unbounded, and a cursor pages past the cap.
+    const limit = Math.min(Math.max(1, opts.limit ?? 200), 1000);
     const where: string[] = [];
     const params: unknown[] = [];
     if (opts.jobId !== undefined) {
@@ -1581,22 +1636,127 @@ export class LedgerApi {
       where.push('state = ?');
       params.push(opts.state);
     }
-    const sql = `SELECT * FROM job_obligations${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY rowid`;
-    return (this.db.prepare(sql).all(...(params as never[])) as Row[]).map((row) => this.obligationFromRow(row));
+    if (opts.cursor !== undefined) {
+      where.push('rowid > ?');
+      params.push(opts.cursor);
+    }
+    const sql = `SELECT rowid AS _rowid, * FROM job_obligations${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY rowid LIMIT ?`;
+    return (this.db.prepare(sql).all(...(params as never[]), limit) as Row[]).map((row) =>
+      this.obligationFromRow(row),
+    );
+  }
+
+  /** One obligation's rowid cursor (pagination anchor). */
+  obligationRowid(id: string): number | null {
+    const row = this.db.prepare('SELECT rowid AS _rowid FROM job_obligations WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : Number(row._rowid);
+  }
+
+  /** Queue-facing listing (ruling E): one malformed row must stay VISIBLE
+   * as a triage problem without poisoning the whole pass. `readable`
+   * carries parsed rows; `malformed` carries the raw id plus the parse
+   * error — never silently dropped, never fatal to the rest. */
+  listObligationsDetailed(
+    opts: { jobId?: string; state?: ObligationState; limit?: number; cursor?: number } = {},
+  ): { readable: readonly ObligationRecord[]; malformed: readonly { id: string; error: string }[] } {
+    const limit = Math.min(Math.max(1, opts.limit ?? 200), 1000);
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (opts.jobId !== undefined) {
+      where.push('job_id = ?');
+      params.push(opts.jobId);
+    }
+    if (opts.state !== undefined) {
+      where.push('state = ?');
+      params.push(opts.state);
+    }
+    if (opts.cursor !== undefined) {
+      where.push('rowid > ?');
+      params.push(opts.cursor);
+    }
+    const sql = `SELECT rowid AS _rowid, * FROM job_obligations${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY rowid LIMIT ?`;
+    const rows = this.db.prepare(sql).all(...(params as never[]), limit) as Row[];
+    const readable: ObligationRecord[] = [];
+    const malformed: { id: string; error: string }[] = [];
+    for (const row of rows) {
+      try {
+        readable.push(this.obligationFromRow(row));
+      } catch (error) {
+        const rawId = typeof row['id'] === 'string' ? row['id'] : `rowid:${String(row['_rowid'])}`;
+        malformed.push({ id: rawId, error: String(error) });
+      }
+    }
+    return { readable, malformed };
+  }
+
+  /** Is this obligation's authority CURRENTLY VALID against durable
+   * facts (ruling E)? An unverifiable reference is a visible
+   * NON-EXECUTABLE decision, never a grant. Attribution limits
+   * (issue #99, unchanged): a shared bearer token means caller-supplied
+   * `by`/source text never proves owner/Gru identity — validity is
+   * checked against ledger facts only.
+   *
+   * - No authority ⇒ non-executable (attention-only).
+   * - `accepted-operation` ⇒ the named directive request must exist,
+   *   belong to this job and generation, and be actually admitted or
+   *   settled — accepted, not merely typed.
+   * - `chief-ruling`/`owner-ruling` ⇒ a `ruling.recorded` event with the
+   *   exact ref and version must exist on this job; prose or a path is
+   *   never proof. */
+  verifyObligationAuthority(obligationId: string): { executable: boolean; reason: string } {
+    const row = this.getObligation(obligationId);
+    if (row === null) throw new RecordNotFound(`obligation "${obligationId}" not found`);
+    const authority = row.authority;
+    if (authority === null) {
+      return { executable: false, reason: 'no typed authority — attention-only' };
+    }
+    if (authority.source === 'accepted-operation') {
+      const directive = this.getDirective(authority.operationId);
+      if (directive === null) {
+        return { executable: false, reason: `accepted operation "${authority.operationId}" has no durable directive request` };
+      }
+      if (directive.jobId !== row.jobId) {
+        return { executable: false, reason: `accepted operation "${authority.operationId}" belongs to job ${directive.jobId}, not ${row.jobId}` };
+      }
+      if (directive.state !== 'admitted' && directive.state !== 'settled') {
+        return { executable: false, reason: `accepted operation "${authority.operationId}" is ${directive.state} — accepted admission required` };
+      }
+      return { executable: true, reason: `operation ${authority.operationId} v${authority.version} is durably admitted` };
+    }
+    const event = this.latestJobEvent(row.jobId, 'ruling.recorded');
+    if (event === null) {
+      return { executable: false, reason: `no durably recorded ruling event answers "${authority.rulingRef}" — attention decision required` };
+    }
+    const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
+    if (payload['ref'] !== authority.rulingRef || payload['version'] !== authority.version) {
+      return {
+        executable: false,
+        reason: `the recorded ruling event does not carry ref "${authority.rulingRef}" v"${authority.version}" — attention decision required`,
+      };
+    }
+    return { executable: true, reason: `ruling ${authority.rulingRef} v${authority.version} is durably recorded` };
   }
 
   /** Take a request/generation-fenced claim on an obligation's next
-   * action. Records the fence; NEVER authorizes executing work by itself,
-   * and lease expiry alone never licenses a replacement holder. */
+   * action. Records the fence; NEVER authorizes executing work by itself
+   * (a silas-mechanical obligation must already carry typed authority —
+   * a claim cannot mint it). Lease expiry alone never licenses a
+   * replacement holder: superseding an EXPIRED claim requires positive
+   * reconciliation proof, recorded with the full prior identity in the
+   * claim log (ruling D). */
   claimObligation(input: {
     obligationId: string;
     requestId: string;
     holder: string;
     expiresAt: string;
     expectedGeneration: number;
+    /** Positive disposition proof for superseding an EXPIRED claim —
+     * e.g. the ledger/actor facts checked. Ignored when no claim exists. */
+    supersedeProof?: string;
   }): ObligationRecord {
     if (input.requestId.trim() === '') throw new Error('claim requires a non-empty requestId');
     if (input.holder.trim() === '') throw new Error('claim requires a non-empty holder');
+    const expiresAt = canonicalIsoTimestamp(input.expiresAt, 'claim expiresAt');
     return this.transaction(() => {
       const row = this.getObligation(input.obligationId);
       if (row === null) throw new RecordNotFound(`obligation "${input.obligationId}" not found`);
@@ -1609,38 +1769,70 @@ export class LedgerApi {
             `the obligation is at ${row.generation} — re-derive from current durable state before acting`,
         );
       }
-      const now = nowIso();
-      if (row.claim !== null && row.claim.requestId !== input.requestId && row.claim.expiresAt > now) {
-        throw new ClaimHeldError(
-          `obligation "${row.id}" is held by request ${row.claim.requestId} (${row.claim.holder}) until ${row.claim.expiresAt}`,
+      if (row.nextAction.kind === 'silas-mechanical' && row.authority === null) {
+        throw new Error(
+          `obligation "${row.id}" names mechanical action "${row.nextAction.action}" without typed authority — ` +
+            'a claim is a coordination fence, never a grant; the obligation is attention-only until authority exists',
         );
       }
-      const replaced = row.claim !== null && row.claim.requestId !== input.requestId;
-      this.db
-        .prepare(
-          'UPDATE job_obligations SET claim = ?, claim_history = claim_history + ?, updated_at = ? WHERE id = ?',
-        )
-        .run(
-          JSON.stringify({
-            requestId: input.requestId,
-            holder: input.holder,
-            generation: row.generation,
-            expiresAt: input.expiresAt,
-          }),
-          replaced ? 1 : 0,
-          now,
-          row.id,
+      const now = nowIso();
+      if (row.claim !== null && row.claim.requestId !== input.requestId) {
+        const expired = row.claim.expiresAt !== null && row.claim.expiresAt <= now;
+        if (!expired) {
+          throw new ClaimHeldError(
+            `obligation "${row.id}" is held by request ${row.claim.requestId} (${row.claim.holder}) until ${row.claim.expiresAt}`,
+          );
+        }
+        if (input.supersedeProof === undefined || input.supersedeProof.trim() === '') {
+          throw new ClaimHeldError(
+            `obligation "${row.id}" claim by ${row.claim.requestId} expired at ${row.claim.expiresAt}, but expiry alone ` +
+              'transfers nothing — the reconciliation path must positively dispose of the old claim first ' +
+              '(supply supersedeProof with the checked evidence)',
+          );
+        }
+      }
+      if (row.claim !== null && row.claim.requestId === input.requestId && row.claim.holder !== input.holder) {
+        throw new ClaimHeldError(
+          `request ${input.requestId} holds "${row.id}" as ${row.claim.holder} — the same request id cannot change holder`,
         );
+      }
+      const replacing = row.claim !== null && row.claim.requestId !== input.requestId;
+      const claim: ObligationClaim = { requestId: input.requestId, holder: input.holder, generation: row.generation, expiresAt };
+      const log = replacing
+        ? [
+            ...row.claimLog,
+            {
+              requestId: row.claim!.requestId,
+              holder: row.claim!.holder,
+              generation: row.claim!.generation,
+              expiresAt: row.claim!.expiresAt,
+              disposition: 'superseded-expired-reconciled' as ClaimLogDisposition,
+              at: now,
+              proof: input.supersedeProof ?? null,
+              supersededByRequest: input.requestId,
+            },
+          ]
+        : row.claimLog;
+      this.db
+        .prepare('UPDATE job_obligations SET claim = ?, claim_log = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(claim), JSON.stringify(log), now, row.id);
       this.appendEvent({
         kind: 'job.obligation-claimed',
         jobId: row.jobId,
-        payload: { id: row.id, requestId: input.requestId, holder: input.holder, expiresAt: input.expiresAt, replacedExpired: replaced },
+        payload: {
+          id: row.id,
+          requestId: input.requestId,
+          holder: input.holder,
+          expiresAt,
+          ...(replacing ? { supersededExpired: row.claim!.requestId, proof: input.supersedeProof } : {}),
+        },
       });
       return this.getObligation(row.id) as ObligationRecord;
     });
   }
 
-  /** Release a claim; only the owning request may release it. */
+  /** Release a claim; only the owning request may release it, and the
+   * full identity of the released claim lands in the claim log. */
   releaseClaim(input: { obligationId: string; requestId: string }): ObligationRecord {
     return this.transaction(() => {
       const row = this.getObligation(input.obligationId);
@@ -1649,9 +1841,22 @@ export class LedgerApi {
       if (row.claim.requestId !== input.requestId) {
         throw new ClaimHeldError(`obligation "${row.id}" is held by request ${row.claim.requestId}, not ${input.requestId}`);
       }
+      const log: readonly ClaimLogEntry[] = [
+        ...row.claimLog,
+        {
+          requestId: row.claim.requestId,
+          holder: row.claim.holder,
+          generation: row.claim.generation,
+          expiresAt: row.claim.expiresAt,
+          disposition: 'released',
+          at: nowIso(),
+          proof: null,
+          supersededByRequest: null,
+        },
+      ];
       this.db
-        .prepare('UPDATE job_obligations SET claim = NULL, updated_at = ? WHERE id = ?')
-        .run(nowIso(), row.id);
+        .prepare('UPDATE job_obligations SET claim = NULL, claim_log = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(log), nowIso(), row.id);
       this.appendEvent({
         kind: 'job.obligation-claim-released',
         jobId: row.jobId,
@@ -1662,10 +1867,16 @@ export class LedgerApi {
   }
 
   /** Record receipt evidence for an obligation. IDEMPOTENT per
-   * (kind, eventSeq). A receipt postdating the obligation's watermark may
-   * hand a waiting obligation back to open (the decision returns); a
-   * receipt NEVER settles — accepted gates require an explicit, validated
-   * settlement. A stale (older) receipt is kept as evidence only. */
+   * (kind, eventSeq). The receipt must cite an ACTUAL ledger event:
+   * it must exist, carry exactly that kind, and belong to the
+   * obligation's job — a fabricated sequence or a wrong-job event is
+   * refused, never settled on (ruling A). When the obligation armed a
+   * correlation, an event that does not carry the delegated phase's
+   * identity is recorded as unapplied evidence: a later unrelated event
+   * of the same kind cannot satisfy an older expectation. A receipt
+   * postdating the obligation's watermark may hand a waiting obligation
+   * back to open (the decision returns); a receipt NEVER settles —
+   * accepted gates require an explicit, validated settlement. */
   recordObligationReceipt(input: {
     obligationId: string;
     kind: string;
@@ -1682,7 +1893,38 @@ export class LedgerApi {
         (receipt) => receipt.kind === input.kind && receipt.eventSeq === input.eventSeq,
       );
       if (duplicate) return row; // already recorded — replay is a no-op
-      const applied = input.eventSeq > row.lastOriginSeq;
+      // Evidence grounding (ruling A): the cited event must really exist,
+      // be of the claimed kind, and belong to this obligation's job.
+      const event = this.getEvent(input.eventSeq);
+      if (event === null) {
+        throw new Error(
+          `receipt for "${row.id}" cites event seq ${input.eventSeq} which does not exist — ` +
+            'a receipt without a real correlated event is refused',
+        );
+      }
+      if (event.kind !== input.kind) {
+        throw new Error(
+          `receipt for "${row.id}" claims kind "${input.kind}" but event ${input.eventSeq} is "${event.kind}"`,
+        );
+      }
+      if (event.jobId !== row.jobId) {
+        throw new Error(
+          `receipt for "${row.id}" cites event ${input.eventSeq} of job ${String(event.jobId)} — a wrong-job event cannot answer this obligation's debt`,
+        );
+      }
+      // Correlation (ruling A): when the expectation was armed with the
+      // delegated phase's identity, the event must carry it. A mismatch is
+      // recorded as unapplied evidence — visible, never satisfying.
+      const correlation = row.receiptCorrelation;
+      let correlated = true;
+      if (correlation !== null) {
+        const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
+        if (correlation.requestId !== undefined && payload['request_id'] !== correlation.requestId) correlated = false;
+        if (correlation.minionId !== undefined && payload['agentId'] !== correlation.minionId && payload['minion_id'] !== correlation.minionId) {
+          correlated = false;
+        }
+      }
+      const applied = correlated && input.eventSeq > row.lastOriginSeq;
       const receipts: RecordedReceipt[] = [
         ...row.recordedReceipts,
         { kind: input.kind, eventSeq: input.eventSeq, at: input.at ?? nowIso(), applied },
@@ -1701,17 +1943,29 @@ export class LedgerApi {
       this.appendEvent({
         kind: 'job.obligation-receipt',
         jobId: row.jobId,
-        payload: { id: row.id, receipt_kind: input.kind, event_seq: input.eventSeq, applied, from: row.state, to: state },
+        payload: {
+          id: row.id,
+          receipt_kind: input.kind,
+          event_seq: input.eventSeq,
+          applied,
+          ...(correlated ? {} : { correlation: 'mismatch — recorded as evidence only' }),
+          from: row.state,
+          to: state,
+        },
       });
       return this.getObligation(row.id) as ObligationRecord;
     });
   }
 
   /** Settle or close an obligation with a validated, discriminated
-   * settlement. Evidence kinds settle; supersession/cancellation/
-   * job-terminal close. History is preserved (the row and its events
-   * stay); settled/closed are terminal — a recurring incident is a NEW
-   * obligation. */
+   * settlement. Evidence kinds cite a REAL ledger event (it must exist,
+   * belong to this obligation's job, and carry the exact cited kind —
+   * no fabricated sequence or wrong-job/gate event settles debt,
+   * ruling A); administrative closes (superseded/cancelled/job-terminal)
+   * are durable truth from the job machine itself and clear any claim
+   * rather than being vetoed by it. History is preserved (the row and
+   * its events stay); settled/closed are terminal — a recurring incident
+   * is a NEW obligation. */
   settleObligation(input: {
     obligationId: string;
     settlement: ObligationSettlement;
@@ -1725,11 +1979,34 @@ export class LedgerApi {
           ? 'settled'
           : 'closed';
       assertObligationTransition(row.state, target);
+      if (
+        input.settlement.kind === 'executed-action' ||
+        input.settlement.kind === 'accepted-evidence'
+      ) {
+        // Evidence grounding (ruling A): the cited event must exist, sit
+        // on this obligation's job, and carry the exact cited kind. Mere
+        // typed JSON is not proof; the ledger fact is.
+        const event = this.getEvent(input.settlement.evidenceEventSeq);
+        if (event === null) {
+          throw new Error(
+            `settlement for "${row.id}" cites evidence event seq ${input.settlement.evidenceEventSeq} which does not exist — refused`,
+          );
+        }
+        if (event.jobId !== row.jobId) {
+          throw new Error(
+            `settlement for "${row.id}" cites evidence event ${input.settlement.evidenceEventSeq} of job ${String(event.jobId)} — refused`,
+          );
+        }
+        if (event.kind !== input.settlement.evidenceEventKind) {
+          throw new Error(
+            `settlement for "${row.id}" cites kind "${input.settlement.evidenceEventKind}" but event ${input.settlement.evidenceEventSeq} is "${event.kind}" — refused`,
+          );
+        }
+      }
       // Evidence settlements are claim-fenced (the owning request proves
-      // its continuation). Administrative closes (superseded/cancelled/
-      // job-terminal) are durable truth from the job machine itself — they
-      // clear any claim rather than being vetoed by it, and the cleared
-      // claim stays in claim_history/events for the record.
+      // its continuation). Administrative closes clear the claim and log
+      // its identity — the durable truth outranks the fence, and the
+      // history records who lost it.
       if (
         row.claim !== null &&
         row.claim.requestId !== input.requestId &&
@@ -1739,11 +2016,29 @@ export class LedgerApi {
           `obligation "${row.id}" is held by request ${row.claim.requestId} — settle through the owning request or release it first`,
         );
       }
+      const administrative = target === 'closed';
+      const supersededBy = input.settlement.kind === 'superseded' ? input.settlement.byObligationId : null;
+      const log: readonly ClaimLogEntry[] =
+        row.claim === null
+          ? row.claimLog
+          : [
+              ...row.claimLog,
+              {
+                requestId: row.claim.requestId,
+                holder: row.claim.holder,
+                generation: row.claim.generation,
+                expiresAt: row.claim.expiresAt,
+                disposition: administrative ? 'terminal-close' : 'released',
+                at: nowIso(),
+                proof: `settlement: ${input.settlement.kind}`,
+                supersededByRequest: null,
+              },
+            ];
       this.db
         .prepare(
-          'UPDATE job_obligations SET state = ?, settlement = ?, claim = NULL, updated_at = ? WHERE id = ?',
+          'UPDATE job_obligations SET state = ?, settlement = ?, superseded_by = COALESCE(?, superseded_by), claim = NULL, claim_log = ?, updated_at = ? WHERE id = ?',
         )
-        .run(target, JSON.stringify(input.settlement), nowIso(), row.id);
+        .run(target, JSON.stringify(input.settlement), supersededBy, JSON.stringify(log), nowIso(), row.id);
       this.appendEvent({
         kind: 'job.obligation-settled',
         jobId: row.jobId,
@@ -1755,17 +2050,22 @@ export class LedgerApi {
 
   /** Arm a receipt expectation: the obligation's next action is delegated
    * to a phase that owes a typed receipt (e.g. job.delivered) by a
-   * deadline. Pure state — arming does NOT spawn, notify or execute
-   * anything; the phase-3 delegation hook calls this when it actually
-   * hands work over, so "waiting" is always backed by durable intent. */
+   * deadline. `correlation` pins the expectation to the delegated
+   * phase's actual identity (request/minion) — without a match, a
+   * same-kind event is evidence but never satisfaction (ruling A).
+   * Pure state — arming does NOT spawn, notify or execute anything; the
+   * delegation hook calls this when it actually hands work over, so
+   * "waiting" is always backed by durable intent. */
   armReceiptExpectation(input: {
     obligationId: string;
     receiptKind: string;
     deadlineAt: string;
+    correlation?: ReceiptCorrelation;
     requestId?: string;
     reason?: string;
   }): ObligationRecord {
     if (input.receiptKind.trim() === '') throw new Error('arming requires a non-empty receiptKind');
+    const deadlineAt = canonicalIsoTimestamp(input.deadlineAt, 'arming deadlineAt');
     return this.transaction(() => {
       const row = this.getObligation(input.obligationId);
       if (row === null) throw new RecordNotFound(`obligation "${input.obligationId}" not found`);
@@ -1777,9 +2077,15 @@ export class LedgerApi {
       }
       this.db
         .prepare(
-          `UPDATE job_obligations SET state = 'waiting', receipt_kind = ?, deadline_at = ?, updated_at = ? WHERE id = ?`,
+          `UPDATE job_obligations SET state = 'waiting', receipt_kind = ?, deadline_at = ?, receipt_correlation = ?, updated_at = ? WHERE id = ?`,
         )
-        .run(input.receiptKind, input.deadlineAt, nowIso(), row.id);
+        .run(
+          input.receiptKind,
+          deadlineAt,
+          input.correlation === undefined ? null : JSON.stringify(input.correlation),
+          nowIso(),
+          row.id,
+        );
       this.appendEvent({
         kind: 'job.obligation-state',
         jobId: row.jobId,
@@ -1788,7 +2094,8 @@ export class LedgerApi {
           from: row.state,
           to: 'waiting',
           receipt_kind: input.receiptKind,
-          deadline_at: input.deadlineAt,
+          deadline_at: deadlineAt,
+          ...(input.correlation !== undefined ? { correlation: input.correlation } : {}),
           ...(input.reason !== undefined ? { reason: input.reason } : {}),
         },
       });
@@ -1833,159 +2140,215 @@ export class LedgerApi {
     });
   }
 
-  /** Close obligations whose continuations were fenced off by newer
+  /** Reclassify obligations whose continuations were fenced off by newer
    * durable truth (head moved, completion, cancellation, revised ruling,
-   * owner hold). Acts ONLY on applicable rows (open/waiting, at or before
-   * the watermark); terminal rows and their history are untouched. */
+   * owner hold). The old EXECUTION authority dies; the still-owed debt
+   * does NOT: each reclassified row closes as `superseded` linked to a
+   * genuine successor created ATOMICALLY in the same transaction — fresh
+   * generation, attention-routed Gru re-derivation, no carried authority
+   * or claim (ruling B: a new owner hold must not erase verification/
+   * review obligations; only an explicit applicable cancellation or
+   * terminal disposition ends the debt). Acts ONLY on applicable rows
+   * (open/waiting, at or before the watermark); terminal rows and
+   * history are untouched. */
   invalidateStaleContinuations(input: {
     jobId: string;
     newerThanSeq: number;
     reason: string;
-  }): readonly ObligationRecord[] {
+  }): { readonly superseded: readonly ObligationRecord[]; readonly successors: readonly ObligationRecord[] } {
     return this.transaction(() => {
       if (this.getJob(input.jobId) === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
-      const applicable = this.listObligations({ jobId: input.jobId }).filter(
+      const applicable = this.listObligations({ jobId: input.jobId, limit: 1000 }).filter(
         (row) => (row.state === 'open' || row.state === 'waiting') && row.lastOriginSeq <= input.newerThanSeq,
       );
-      const settled: ObligationRecord[] = [];
+      const superseded: ObligationRecord[] = [];
+      const successors: ObligationRecord[] = [];
       for (const row of applicable) {
-        settled.push(
-          this.settleObligation({
-            obligationId: row.id,
-            settlement: { kind: 'superseded', byObligationId: null, reason: input.reason },
-          }),
-        );
+        // The successor is the same incident's debt re-derived under the
+        // newer truth: attention-only (no carried authority), fresh
+        // generation, unclaimed. The old row closes LINKED to it — the
+        // debt visibly continues, it did not vanish.
+        const logicalStep = isObligationLogicalStep(row.logicalStep) ? row.logicalStep : 'operation';
+        const successorId = this.nextIncarnationId(obligationId(row.jobId, logicalStep, row.incidentKey));
+        this.settleObligation({
+          obligationId: row.id,
+          settlement: { kind: 'superseded', byObligationId: successorId, reason: input.reason },
+        });
+        const generation = this.currentJobGeneration(input.jobId) + 1;
+        const successorPlan: ObligationNextAction = {
+          kind: 'gru-decision',
+          decision: `re-derive the next action after durable truth changed: ${input.reason}`,
+        };
+        const now = nowIso();
+        this.db
+          .prepare(
+            `INSERT INTO job_obligations
+               (id, job_id, logical_step, incident_key, generation, category, next_action, wake_condition,
+                authority, firing_rule, state, recorded_receipts, observations, first_origin_seq, last_origin_seq,
+                created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'open', '[]', 1, ?, ?, ?, ?)`,
+          )
+          .run(
+            successorId,
+            row.jobId,
+            logicalStep,
+            row.incidentKey,
+            generation,
+            JSON.stringify(row.category),
+            JSON.stringify(successorPlan),
+            JSON.stringify(defaultFiringRule(row.category).wakeCondition),
+            defaultFiringRule(row.category).id,
+            input.newerThanSeq,
+            input.newerThanSeq,
+            now,
+            now,
+          );
+        this.appendEvent({
+          kind: 'job.obligation-recorded',
+          jobId: row.jobId,
+          payload: {
+            id: successorId,
+            generation,
+            category: categoryKey(row.category),
+            next_action: successorPlan,
+            firing_rule: defaultFiringRule(row.category).id,
+            authority: null,
+            reclassified_of: row.id,
+            reason: input.reason,
+          },
+        });
+        superseded.push(this.getObligation(row.id) as ObligationRecord);
+        successors.push(this.getObligation(successorId) as ObligationRecord);
       }
-      return settled;
+      return { superseded, successors };
     });
   }
 
-  // -- obligation internals (all inside a transaction) ----------------
-
-  /** Apply one typed blocked observation: create a new incident (new
-   * generation) or coalesce a duplicate (no generation advance, stable
-   * identity, latest plan wins). A terminal row for the same incident is
-   * history: the recurrence mints a new incarnation id (#n suffix). */
+  /** Apply one typed blocked observation. The lookup is the tuple's
+   * ACTIVE incarnation — never just the base id, which may be settled
+   * history while a live `#2` incarnation exists (ruling C). Semantics:
+   * - live incarnation ⇒ coalesce: stable identity and generation; a
+   *   strictly newer observation applies its plan, and a CHANGED plan
+   *   bumps `plan_revision` and fences claims derived from the older
+   *   plan; a stale replay (seq at/below the row's watermark) changes
+   *   nothing — it never regresses the watermark or overwrites a newer
+   *   plan.
+   * - all incarnations terminal ⇒ a recurrence mints the next free
+   *   incarnation id at a fresh generation — but only when the
+   *   observation postdates the tuple's newest watermark; an older
+   *   replay is evidence and must NOT reopen settled history.
+   * - fresh tuple ⇒ the first incarnation opens.
+   * The partial unique index enforces one active incarnation per tuple
+   * transactionally (a race fails loud instead of minting duplicates). */
   private applyBlockedObservation(jobId: string, context: BlockerContext): ObligationRecord {
     const resolved = resolveObligation(context, jobId);
-    const existing = this.getObligation(resolved.id);
     const now = nowIso();
-    if (existing === null) {
-      const id = this.nextIncarnationId(resolved.id);
-      const generation = this.currentJobGeneration(jobId) + 1;
-      this.db
-        .prepare(
-          `INSERT INTO job_obligations
-             (id, job_id, logical_step, incident_key, generation, category, next_action, wake_condition,
-              authority, firing_rule, state, due_at, receipt_kind, deadline_at, recorded_receipts,
-              observations, first_origin_seq, last_origin_seq, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, '[]', 1, ?, ?, ?, ?)`,
-        )
-        .run(
-          id,
-          jobId,
-          resolved.logicalStep,
-          resolved.incidentKey,
-          generation,
-          JSON.stringify(resolved.category),
-          JSON.stringify(resolved.nextAction),
-          JSON.stringify(resolved.wakeCondition),
-          resolved.authority === null ? null : JSON.stringify(resolved.authority),
-          resolved.firingRule,
-          resolved.dueAt,
-          resolved.receiptKind,
-          resolved.deadlineAt,
-          context.observedAtSeq,
-          context.observedAtSeq,
-          now,
-          now,
-        );
+    const active = this.activeIncarnation(jobId, resolved.logicalStep, resolved.incidentKey);
+    if (active !== null) {
+      return this.coalesceObservation(active, resolved, context, now);
+    }
+    const newestWatermark = this.newestIncarnationWatermark(jobId, resolved.logicalStep, resolved.incidentKey);
+    if (newestWatermark !== null && context.observedAtSeq <= newestWatermark) {
       this.appendEvent({
-        kind: 'job.obligation-recorded',
+        kind: 'job.obligation-stale-observation',
         jobId,
         payload: {
-          id,
-          generation,
-          category: categoryKey(resolved.category),
-          next_action: resolved.nextAction,
-          firing_rule: resolved.firingRule,
-          authority: resolved.authority,
+          incident_key: resolved.incidentKey,
+          logical_step: resolved.logicalStep,
+          observed_at_seq: context.observedAtSeq,
+          newest_watermark: newestWatermark,
+          note: 'observation predates the tuple history — evidence only, no reopen',
         },
       });
-      return this.getObligation(id) as ObligationRecord;
+      return this.latestIncarnation(jobId, resolved.logicalStep, resolved.incidentKey) as ObligationRecord;
     }
-    if (existing.state === 'settled' || existing.state === 'closed') {
-      // Same incident recurring after settlement: history stays, a new
-      // incarnation opens at a fresh generation.
-      const id = this.nextIncarnationId(existing.id);
-      const generation = this.currentJobGeneration(jobId) + 1;
-      this.db
-        .prepare(
-          `INSERT INTO job_obligations
-             (id, job_id, logical_step, incident_key, generation, category, next_action, wake_condition,
-              authority, firing_rule, state, due_at, receipt_kind, deadline_at, recorded_receipts,
-              observations, first_origin_seq, last_origin_seq, superseded_by, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, '[]', 1, ?, ?, NULL, ?, ?)`,
-        )
-        .run(
-          id,
-          jobId,
-          resolved.logicalStep,
-          resolved.incidentKey,
-          generation,
-          JSON.stringify(resolved.category),
-          JSON.stringify(resolved.nextAction),
-          JSON.stringify(resolved.wakeCondition),
-          resolved.authority === null ? null : JSON.stringify(resolved.authority),
-          resolved.firingRule,
-          resolved.dueAt,
-          resolved.receiptKind,
-          resolved.deadlineAt,
-          context.observedAtSeq,
-          context.observedAtSeq,
-          now,
-          now,
-        );
-      this.db
-        .prepare('UPDATE job_obligations SET superseded_by = ?, updated_at = ? WHERE id = ?')
-        .run(id, now, existing.id);
+    const id = this.nextIncarnationId(obligationId(jobId, resolved.logicalStep, resolved.incidentKey));
+    const generation = this.currentJobGeneration(jobId) + 1;
+    this.insertObligationRow({ id, jobId, resolved, generation, observedAtSeq: context.observedAtSeq, now });
+    this.appendEvent({
+      kind: 'job.obligation-recorded',
+      jobId,
+      payload: {
+        id,
+        generation,
+        category: categoryKey(resolved.category),
+        next_action: resolved.nextAction,
+        firing_rule: resolved.firingRule,
+        authority: resolved.authority,
+      },
+    });
+    return this.getObligation(id) as ObligationRecord;
+  }
+
+  /** Coalesce a duplicate observation of the LIVE incarnation. */
+  private coalesceObservation(
+    existing: ObligationRecord,
+    resolved: ResolvedObligation,
+    context: BlockerContext,
+    now: string,
+  ): ObligationRecord {
+    if (context.observedAtSeq <= existing.lastOriginSeq) {
       this.appendEvent({
-        kind: 'job.obligation-recorded',
-        jobId,
+        kind: 'job.obligation-stale-observation',
+        jobId: existing.jobId,
         payload: {
-          id,
-          generation,
-          category: categoryKey(resolved.category),
-          next_action: resolved.nextAction,
-          firing_rule: resolved.firingRule,
-          authority: resolved.authority,
-          recurrence_of: existing.id,
+          id: existing.id,
+          observed_at_seq: context.observedAtSeq,
+          newest_watermark: existing.lastOriginSeq,
+          note: 'stale replay — evidence only, plan and watermark untouched',
         },
       });
-      return this.getObligation(id) as ObligationRecord;
+      return existing;
     }
-    // Duplicate observation of a live incident: coalesce. Identity,
-    // generation and history stay; the latest plan and watermark win.
-    const changed: string[] = [];
-    const nextPlanChanged =
+    const planChanged =
+      categoryKey(existing.category) !== categoryKey(resolved.category) ||
       JSON.stringify(existing.nextAction) !== JSON.stringify(resolved.nextAction) ||
       JSON.stringify(existing.wakeCondition) !== JSON.stringify(resolved.wakeCondition) ||
-      JSON.stringify(existing.authority) !== JSON.stringify(resolved.authority);
-    if (nextPlanChanged) changed.push('plan');
+      JSON.stringify(existing.authority) !== JSON.stringify(resolved.authority) ||
+      existing.firingRule !== resolved.firingRule;
+    const changed: string[] = [];
+    if (planChanged) changed.push('plan');
     if (existing.dueAt !== resolved.dueAt || existing.deadlineAt !== resolved.deadlineAt) changed.push('bounds');
+    // A changed plan is a NEW authority revision (ruling C): claims taken
+    // under the old plan are fenced and their full identity moves to the
+    // claim log, so an old continuation cannot ride new wording.
+    let claim: ObligationClaim | null = existing.claim;
+    let claimLog: readonly ClaimLogEntry[] = existing.claimLog;
+    let planRevision = existing.planRevision;
+    if (planChanged) {
+      planRevision += 1;
+      if (existing.claim !== null) {
+        claimLog = [
+          ...claimLog,
+          {
+            requestId: existing.claim.requestId,
+            holder: existing.claim.holder,
+            generation: existing.claim.generation,
+            expiresAt: existing.claim.expiresAt,
+            disposition: 'plan-revision' as ClaimLogDisposition,
+            at: now,
+            proof: `plan revision ${planRevision}`,
+            supersededByRequest: null,
+          },
+        ];
+        claim = null;
+      }
+    }
     this.db
       .prepare(
         `UPDATE job_obligations
            SET observations = observations + 1,
-               last_origin_seq = MAX(last_origin_seq, ?),
-               next_action = ?, wake_condition = ?, authority = ?, firing_rule = ?,
+               last_origin_seq = ?,
+               category = ?, next_action = ?, wake_condition = ?, authority = ?, firing_rule = ?,
                due_at = COALESCE(?, due_at), receipt_kind = COALESCE(?, receipt_kind),
                deadline_at = COALESCE(?, deadline_at),
+               plan_revision = ?, claim = ?, claim_log = ?,
                updated_at = ?
          WHERE id = ?`,
       )
       .run(
         context.observedAtSeq,
+        JSON.stringify(resolved.category),
         JSON.stringify(resolved.nextAction),
         JSON.stringify(resolved.wakeCondition),
         resolved.authority === null ? null : JSON.stringify(resolved.authority),
@@ -1993,20 +2356,103 @@ export class LedgerApi {
         resolved.dueAt,
         resolved.receiptKind,
         resolved.deadlineAt,
+        planRevision,
+        claim === null ? null : JSON.stringify(claim),
+        JSON.stringify(claimLog),
         now,
         existing.id,
       );
     this.appendEvent({
       kind: 'job.obligation-updated',
-      jobId,
+      jobId: existing.jobId,
       payload: {
         id: existing.id,
         observations: existing.observations + 1,
-        last_origin_seq: Math.max(existing.lastOriginSeq, context.observedAtSeq),
+        last_origin_seq: context.observedAtSeq,
         changed,
+        ...(planChanged ? { plan_revision: planRevision, claim_fenced: existing.claim !== null } : {}),
       },
     });
     return this.getObligation(existing.id) as ObligationRecord;
+  }
+
+  /** Insert one fresh obligation incarnation (first or recurrence). */
+  private insertObligationRow(input: {
+    id: string;
+    jobId: string;
+    resolved: ResolvedObligation;
+    generation: number;
+    observedAtSeq: number;
+    now: string;
+  }): void {
+    const { resolved } = input;
+    this.db
+      .prepare(
+        `INSERT INTO job_obligations
+           (id, job_id, logical_step, incident_key, generation, category, next_action, wake_condition,
+            authority, firing_rule, state, due_at, receipt_kind, deadline_at, receipt_correlation,
+            recorded_receipts, observations, first_origin_seq, last_origin_seq, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, '[]', 1, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.id,
+        input.jobId,
+        resolved.logicalStep,
+        resolved.incidentKey,
+        input.generation,
+        JSON.stringify(resolved.category),
+        JSON.stringify(resolved.nextAction),
+        JSON.stringify(resolved.wakeCondition),
+        resolved.authority === null ? null : JSON.stringify(resolved.authority),
+        resolved.firingRule,
+        resolved.dueAt,
+        resolved.receiptKind,
+        resolved.deadlineAt,
+        resolved.receiptCorrelation === null ? null : JSON.stringify(resolved.receiptCorrelation),
+        input.observedAtSeq,
+        input.observedAtSeq,
+        input.now,
+        input.now,
+      );
+  }
+
+  /** The tuple's live (non-terminal) incarnation, if any — the ONLY row a
+   * duplicate observation may coalesce into (ruling C). */
+  private activeIncarnation(jobId: string, logicalStep: string, incidentKey: string): ObligationRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM job_obligations
+          WHERE job_id = ? AND logical_step = ? AND incident_key = ?
+            AND state NOT IN ('settled', 'closed')
+          ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(jobId, logicalStep, incidentKey) as Row | undefined;
+    return row === undefined ? null : this.obligationFromRow(row);
+  }
+
+  /** The tuple's newest incarnation in any state (replay-guard anchor). */
+  private latestIncarnation(jobId: string, logicalStep: string, incidentKey: string): ObligationRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM job_obligations
+          WHERE job_id = ? AND logical_step = ? AND incident_key = ?
+          ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(jobId, logicalStep, incidentKey) as Row | undefined;
+    return row === undefined ? null : this.obligationFromRow(row);
+  }
+
+  /** Highest watermark across the tuple's incarnations, or null for a
+   * fresh tuple. An observation at/below it is a replay, not a reopen. */
+  private newestIncarnationWatermark(jobId: string, logicalStep: string, incidentKey: string): number | null {
+    const row = this.db
+      .prepare(
+        `SELECT MAX(last_origin_seq) AS watermark FROM job_obligations
+          WHERE job_id = ? AND logical_step = ? AND incident_key = ?`,
+      )
+      .get(jobId, logicalStep, incidentKey) as Row | undefined;
+    const value = row?.watermark;
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
   }
 
   /** The job's current blocked-generation = the max generation across its
@@ -2034,7 +2480,7 @@ export class LedgerApi {
   /** Suspend the job's applicable obligations (open/waiting). Used by the
    * parked transition; explicit human/chief resume re-opens. */
   private suspendApplicableObligations(jobId: string, reason: string): void {
-    for (const row of this.listObligations({ jobId })) {
+    for (const row of this.listObligations({ jobId, limit: 1000 })) {
       if (row.state === 'open' || row.state === 'waiting') {
         this.suspendObligation(row.id, reason);
       }
@@ -2044,7 +2490,7 @@ export class LedgerApi {
   /** Close the job's applicable obligations (open/waiting/suspended) on a
    * terminal transition — settled rows and history stay untouched. */
   private closeApplicableObligations(jobId: string, terminal: 'done' | 'merged'): void {
-    for (const row of this.listObligations({ jobId })) {
+    for (const row of this.listObligations({ jobId, limit: 1000 })) {
       if (row.state === 'open' || row.state === 'waiting' || row.state === 'suspended') {
         this.settleObligation({
           obligationId: row.id,
@@ -2077,11 +2523,274 @@ export class LedgerApi {
       deadlineAt: nstr(row.deadline_at),
       recordedReceipts: parseReceipts(str(row.recorded_receipts)),
       observations: Number(row.observations),
+      planRevision: Number(row.plan_revision),
       firstOriginSeq: Number(row.first_origin_seq),
       lastOriginSeq: Number(row.last_origin_seq),
       supersededBy: nstr(row.superseded_by),
       claim: parseClaim(row.claim === null || row.claim === undefined ? null : str(row.claim)),
-      claimHistory: Number(row.claim_history),
+      claimLog: parseClaimLog(str(row.claim_log)),
+      receiptCorrelation: parseReceiptCorrelation(
+        row.receipt_correlation === null || row.receipt_correlation === undefined
+          ? null
+          : str(row.receipt_correlation),
+      ),
+      createdAt: str(row.created_at),
+      updatedAt: str(row.updated_at),
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Durable directive requests (phase 3 slice): request-scoped
+  // intent/claim/admission/receipt/reconciliation. The durable row is the
+  // single source of truth; HTTP responses only report it. No prompt/
+  // spawn side effect may precede the atomic intent→dispatch claim, and
+  // no caller-supplied text can mark a request admitted or delivered —
+  // only a correlated ledger event can.
+  // ------------------------------------------------------------------
+
+  /** Accept a directive request: persists the atomic intent→dispatch
+   * claim BEFORE any side effect (ruling: an intent without admission is
+   * NOT proof of no side effect — but an intent with NO claim transition
+   * cannot have had one). Returns `created: false` when this call was a
+   * durable REPLAY of an existing request: the caller must NOT start
+   * another turn — only the creating call ever owns side effects. Same
+   * request id + same canonical payload replays to the SAME row; same id
+   * + different payload is a conflict. A caller without an identity
+   * (`requestId` omitted) that repeats while another request for the job
+   * is live fails CLOSED — never a silent duplicate turn. */
+  beginDirectiveIntent(input: {
+    jobId: string;
+    directive: string;
+    blockerFingerprint?: string;
+    holder: string;
+    requestId?: string;
+  }): { readonly record: DirectiveRequestRecord; readonly created: boolean } {
+    if (input.directive.trim() === '') throw new Error('directive text must be non-empty');
+    if (input.holder.trim() === '') throw new Error('directive intent requires a non-empty holder');
+    const job = this.getJob(input.jobId);
+    if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+    if (job.status === 'merged' || job.status === 'done') {
+      throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes take no directives`);
+    }
+    const payload = JSON.stringify({ directive: input.directive, blocker_fingerprint: input.blockerFingerprint ?? null });
+    const payloadHash = createHash('sha256').update(payload).digest('hex');
+    return this.transaction(() => {
+      if (input.requestId !== undefined) {
+        const existing = this.getDirective(input.requestId);
+        if (existing !== null) {
+          if (existing.payloadHash !== payloadHash) {
+            throw new DirectiveConflictError(
+              `directive request "${input.requestId}" was accepted with a different payload — ` +
+                'a request id identifies one exact request; submit the changed work under a new id',
+            );
+          }
+          if (existing.jobId !== input.jobId) {
+            throw new DirectiveConflictError(
+              `directive request "${input.requestId}" belongs to job ${existing.jobId}, not ${input.jobId}`,
+            );
+          }
+          return { record: existing, created: false }; // durable replay — the accepted request, unchanged
+        }
+      }
+      const live = this.listPendingDirectives({ jobId: input.jobId }).find(
+        (row) => row.state === 'dispatching' || row.state === 'admitted',
+      );
+      if (live !== undefined && input.requestId === undefined) {
+        throw new AmbiguousDirectiveError(
+          `a directive for job "${input.jobId}" is already live (request ${live.requestId}, state ${live.state}) ` +
+            'and this caller supplied no request id — identify retries with a stable request_id or reconcile the live request first',
+        );
+      }
+      const requestId = input.requestId ?? randomUUID();
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `INSERT INTO pending_directives
+             (request_id, job_id, payload, payload_hash, state, baseline_seq, claim, attempts, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'dispatching', ?, ?, 0, ?, ?)`,
+        )
+        .run(
+          requestId,
+          input.jobId,
+          payload,
+          payloadHash,
+          this.latestEventSeq(),
+          JSON.stringify({ holder: input.holder, since: ts }),
+          ts,
+          ts,
+        );
+      this.appendEvent({
+        kind: 'silas.directive-intent',
+        jobId: input.jobId,
+        payload: { request_id: requestId, holder: input.holder, directive_bytes: Buffer.byteLength(input.directive, 'utf-8') },
+      });
+      return { record: this.getDirective(requestId) as DirectiveRequestRecord, created: true };
+    });
+  }
+
+  getDirective(requestId: string): DirectiveRequestRecord | null {
+    const row = this.db.prepare('SELECT * FROM pending_directives WHERE request_id = ?').get(requestId) as Row | undefined;
+    return row === undefined ? null : this.directiveFromRow(row);
+  }
+
+  listPendingDirectives(
+    opts: { jobId?: string; state?: DirectiveState; limit?: number; cursor?: string } = {},
+  ): readonly DirectiveRequestRecord[] {
+    const limit = Math.min(Math.max(1, opts.limit ?? 200), 1000);
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (opts.jobId !== undefined) {
+      where.push('job_id = ?');
+      params.push(opts.jobId);
+    }
+    if (opts.state !== undefined) {
+      where.push('state = ?');
+      params.push(opts.state);
+    }
+    if (opts.cursor !== undefined) {
+      where.push('request_id > ?');
+      params.push(opts.cursor);
+    }
+    const sql = `SELECT * FROM pending_directives${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY request_id LIMIT ?`;
+    return (this.db.prepare(sql).all(...(params as never[]), limit) as Row[]).map((row) => this.directiveFromRow(row));
+  }
+
+  /** Bind a request to its ACTUAL native admission: the correlated
+   * `silas.directive-sent` event must exist, carry this request id, sit
+   * on this job and postdate the acceptance watermark. Adapter spawn
+   * returns, board idle and HTTP 200 prove nothing. */
+  recordDirectiveAdmission(input: { requestId: string; minionId: string; eventSeq: number }): DirectiveRequestRecord {
+    if (input.minionId.trim() === '') throw new Error('directive admission requires a non-empty minion id');
+    return this.transaction(() => {
+      const row = this.getDirective(input.requestId);
+      if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+      if (row.state === 'admitted' && row.admissionSeq === input.eventSeq) return row; // idempotent replay
+      if (row.state !== 'dispatching') {
+        throw new Error(`directive request "${input.requestId}" is ${row.state} — admission evidence cannot bind here`);
+      }
+      const event = this.getEvent(input.eventSeq);
+      if (event === null) throw new Error(`admission for "${input.requestId}" cites event seq ${input.eventSeq} which does not exist`);
+      if (event.kind !== 'silas.directive-sent') {
+        throw new Error(`admission for "${input.requestId}" must cite a silas.directive-sent event, got "${event.kind}"`);
+      }
+      if (event.jobId !== row.jobId) {
+        throw new Error(`admission for "${input.requestId}" cites event ${input.eventSeq} of job ${String(event.jobId)} — wrong job`);
+      }
+      if (event.seq <= row.baselineSeq) {
+        throw new Error(`admission for "${input.requestId}" cites event ${input.eventSeq} at/before the acceptance watermark ${row.baselineSeq}`);
+      }
+      const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
+      if (payload['request_id'] !== input.requestId) {
+        throw new Error(`admission for "${input.requestId}" cites an event whose payload is not correlated to this request`);
+      }
+      this.db
+        .prepare("UPDATE pending_directives SET state = 'admitted', admission_seq = ?, admission_minion = ?, updated_at = ? WHERE request_id = ?")
+        .run(input.eventSeq, input.minionId, nowIso(), input.requestId);
+      return this.getDirective(input.requestId) as DirectiveRequestRecord;
+    });
+  }
+
+  /** Record the request's terminal receipt: the correlated `job.delivered`
+   * event must exist, carry this request id, belong to the job and
+   * postdate admission. A delivery for another phase/request can never
+   * settle this one. */
+  recordDirectiveDelivery(input: { requestId: string; eventSeq: number }): DirectiveRequestRecord {
+    return this.transaction(() => {
+      const row = this.getDirective(input.requestId);
+      if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+      if (row.state === 'settled' && row.deliverySeq === input.eventSeq) return row; // idempotent replay
+      if (row.state !== 'admitted') {
+        throw new Error(`directive request "${input.requestId}" is ${row.state} — terminal delivery requires admitted state`);
+      }
+      const event = this.getEvent(input.eventSeq);
+      if (event === null) throw new Error(`delivery for "${input.requestId}" cites event seq ${input.eventSeq} which does not exist`);
+      if (event.kind !== 'job.delivered') {
+        throw new Error(`delivery for "${input.requestId}" must cite a job.delivered event, got "${event.kind}"`);
+      }
+      if (event.jobId !== row.jobId) {
+        throw new Error(`delivery for "${input.requestId}" cites event ${input.eventSeq} of job ${String(event.jobId)} — wrong job`);
+      }
+      if (row.admissionSeq !== null && event.seq <= row.admissionSeq) {
+        throw new Error(`delivery for "${input.requestId}" cites event ${input.eventSeq} at/before admission ${row.admissionSeq}`);
+      }
+      const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
+      if (payload['request_id'] !== input.requestId) {
+        throw new Error(`delivery for "${input.requestId}" cites an event whose payload is not correlated to this request`);
+      }
+      this.db
+        .prepare("UPDATE pending_directives SET state = 'settled', delivery_seq = ?, updated_at = ? WHERE request_id = ?")
+        .run(input.eventSeq, nowIso(), input.requestId);
+      return this.getDirective(input.requestId) as DirectiveRequestRecord;
+    });
+  }
+
+  /** Record a DURABLE failure for a request (positive failure evidence:
+   * the router returned an explicit no-delivery proof, or a late turn
+   * error surfaced). Never used for "no receipt yet" — that stays
+   * dispatching/admitted for reconciliation, visibly, with attempts
+   * counted. */
+  failDirective(input: { requestId: string; reason: string }): DirectiveRequestRecord {
+    if (input.reason.trim() === '') throw new Error('directive failure requires a reason');
+    return this.transaction(() => {
+      const row = this.getDirective(input.requestId);
+      if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+      if (row.state === 'settled') {
+        throw new Error(`directive request "${input.requestId}" already settled — a late failure cannot rewrite it`);
+      }
+      if (row.state === 'failed') return row;
+      this.db
+        .prepare("UPDATE pending_directives SET state = 'failed', fail_reason = ?, attempts = attempts + 1, updated_at = ? WHERE request_id = ?")
+        .run(input.reason, nowIso(), input.requestId);
+      this.appendEvent({
+        kind: 'silas.directive-failed',
+        jobId: row.jobId,
+        payload: { request_id: input.requestId, reason: input.reason },
+      });
+      return this.getDirective(input.requestId) as DirectiveRequestRecord;
+    });
+  }
+
+  /** Bump a request's attempt counter without changing state (durable
+   * reconcile passes are bounded and visible; "unknown" never silently
+   * becomes "retried"). */
+  recordDirectiveReconcile(input: { requestId: string; note: string }): DirectiveRequestRecord {
+    return this.transaction(() => {
+      const row = this.getDirective(input.requestId);
+      if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+      if (row.state === 'settled' || row.state === 'failed') return row;
+      this.db
+        .prepare('UPDATE pending_directives SET attempts = attempts + 1, fail_reason = ?, updated_at = ? WHERE request_id = ?')
+        .run(`reconcile: ${input.note}`, nowIso(), input.requestId);
+      return this.getDirective(input.requestId) as DirectiveRequestRecord;
+    });
+  }
+
+  private directiveFromRow(row: Row): DirectiveRequestRecord {
+    const state = str(row.state);
+    if (!isDirectiveState(state)) throw new Error(`pending_directives row "${str(row.request_id)}" has unknown state "${state}"`);
+    let claim: { holder: string; since: string } | null = null;
+    if (row.claim !== null && row.claim !== undefined) {
+      const parsed = JSON.parse(str(row.claim)) as Record<string, unknown>;
+      const holder = parsed['holder'];
+      const since = parsed['since'];
+      if (typeof holder !== 'string' || holder === '' || typeof since !== 'string' || since === '') {
+        throw new Error(`pending_directives row "${str(row.request_id)}" has a malformed claim`);
+      }
+      claim = { holder, since };
+    }
+    return {
+      requestId: str(row.request_id),
+      jobId: str(row.job_id),
+      payload: str(row.payload),
+      payloadHash: str(row.payload_hash),
+      state,
+      baselineSeq: Number(row.baseline_seq),
+      claim,
+      admissionSeq: row.admission_seq === null || row.admission_seq === undefined ? null : Number(row.admission_seq),
+      admissionMinion: nstr(row.admission_minion),
+      deliverySeq: row.delivery_seq === null || row.delivery_seq === undefined ? null : Number(row.delivery_seq),
+      attempts: Number(row.attempts),
+      failReason: nstr(row.fail_reason),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
     };
