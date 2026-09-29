@@ -283,6 +283,9 @@ describe('board engine — adapter events → ledger events → board state', ()
               openToolCalls: 0,
               lastEventAt: '2026-09-18T00:00:00.000Z',
               lastFileBytes: 0,
+              contextPercent: null,
+              compactionDegraded: false,
+              compactionDeferred: false,
             }
           : null,
     });
