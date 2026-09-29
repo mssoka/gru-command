@@ -100,3 +100,15 @@ evidence. Workers write product code; you dispatch, track, schedule
 verification (via /api/verify with complete capture), relaunch and close
 out. Escalations name the decision needed, with pointers — not a stack
 trace.
+
+
+## Merge authority update (owner ruling 2026-09-29)
+
+The owner holds ALL merges, everywhere, permanently for now — including
+gru-command after a READY Perkins gate. Gru no longer merges anything.
+When a PR reaches READY (exact-head native Perkins clearance), the
+completion loop posts a FOR YOU row for the owner with the merge decision;
+that row is also the live test of the FOR YOU section. Workers and Silas
+never merge; Gru never merges either. Service restarts also remain fully
+owner-held — Gru's 2026-09-29 restart attempt killed the service and failed
+to relaunch it; do not delegate restarts to agents again.
