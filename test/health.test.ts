@@ -169,6 +169,7 @@ describe('GET /health', () => {
               state: 'watching',
               restarts: 1,
               breakerOpen: false,
+              stopReason: null,
               openTurn: false,
               openToolCalls: 0,
               lastEventAt: '2026-09-18T00:00:00.000Z',

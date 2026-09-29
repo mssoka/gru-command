@@ -142,8 +142,9 @@ export interface BoardSnapshot {
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionRuntimeStatus;
-  /** Action-required notifications still awaiting a human ack (a
-   * system-resolved incident no longer needs human action). Counted from
+  /** LIVE action-required rows still awaiting a human ack: rows bound to
+   * a terminal (merged/done) job are closed receipts — the bell keeps
+   * them, this count (and the needs-you banding) does not. Counted from
    * the table, not the 30-row feed window, so the badge stays true. */
   readonly unackedActionRequired: number;
   /** Running build vs origin/main (null when the tracker is unwired). */
@@ -427,7 +428,7 @@ export class BoardEngine {
       agents,
       notifications: this.notifications(),
       decisions: this.decisionsStatus(),
-      unackedActionRequired: this.ledger.countPendingActionRequired(),
+      unackedActionRequired: this.ledger.countLivePendingActionRequired(),
       build: this.buildDrift(),
       silas: this.silasView(),
       verify: this.verifyQueue(),

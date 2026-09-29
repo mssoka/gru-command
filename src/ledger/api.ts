@@ -1183,6 +1183,27 @@ export class LedgerApi {
     return Number(row.n);
   }
 
+  /** The LIVE form of the count above: unacked action-required rows whose
+   * agent binding does NOT belong to a terminal (merged/done) job. A row
+   * bound to a terminal job is a closed receipt — the bell keeps it for
+   * the record (nothing is acked or resolved here), but it is not live
+   * Gru work, so the queue count does not count it. Rows with no agent
+   * binding stay global (no job → cannot be terminal). Same table-read
+   * discipline as `countPendingActionRequired` — never the feed window. */
+  countLivePendingActionRequired(): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM notifications
+         WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL
+           AND (agent_id IS NULL OR agent_id NOT IN (
+             SELECT agents.id FROM agents JOIN jobs ON agents.job_id = jobs.id
+             WHERE jobs.status IN ('merged', 'done')
+           ))`,
+      )
+      .get() as Row;
+    return Number(row.n);
+  }
+
   /** Enrich an already-durable provisional notification after async triage. */
   updateNotificationTriage(id: string, routing: NotificationRouting, detail: string | null): NotificationRecord | null {
     return this.transaction(() => {

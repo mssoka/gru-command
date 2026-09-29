@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { BoardSnapshot, JobView, NotificationView, RoundView } from './board-protocol.js';
+import type { AgentView, BoardSnapshot, JobView, NotificationView, RoundView } from './board-protocol.js';
+import { isJobConcluded } from './board-bands.js';
 import { jobSignal, pluralCount, roundSummary, unackedByJob } from './board-signals.js';
 
 function round(overrides: Partial<RoundView> = {}): RoundView {
@@ -113,6 +114,40 @@ describe('unackedByJob', () => {
     );
     expect([...counts.entries()]).toEqual([['job-1', 2]]);
   });
+
+  it('section truth: rows bound to a terminal job never attribute — closed receipts, not queue entries', () => {
+    const mergedAgent: AgentView = { id: 'am', role: 'minion', label: null, state: 'idle', lastActivity: null, sessionFile: null, jobId: 'merged-1', roundId: null, supervision: null };
+    const liveAgent: AgentView = { id: 'al', role: 'minion', label: null, state: 'idle', lastActivity: null, sessionFile: null, jobId: 'live-1', roundId: null, supervision: null };
+    const counts = unackedByJob(
+      snapshot({
+        repos: [
+          {
+            name: 'demo',
+            jobs: [
+              job({ id: 'merged-1', status: 'merged' }),
+              job({ id: 'done-1', status: 'done' }),
+              job({ id: 'live-1', status: 'working' }),
+            ],
+          },
+        ],
+        agents: [
+          mergedAgent,
+          { ...mergedAgent, id: 'ad', jobId: 'done-1' },
+          liveAgent,
+        ],
+        notifications: [
+          notification('n-merged-1', { agentId: 'am' }),
+          notification('n-merged-2', { agentId: 'am' }),
+          notification('n-done-1', { agentId: 'ad' }),
+          notification('n-live-1', { agentId: 'al' }),
+        ],
+      }),
+    );
+    expect([...counts.entries()]).toEqual([['live-1', 1]]);
+    expect(isJobConcluded('merged')).toBe(true);
+    expect(isJobConcluded('done')).toBe(true);
+    expect(isJobConcluded('working')).toBe(false);
+  });
 });
 
 describe('jobSignal', () => {
@@ -193,7 +228,7 @@ describe('jobSignal', () => {
   });
 });
 
-describe('jobSignal — v5 stale review pills on concluded cards', () => {
+describe('jobSignal — section truth: concluded cards are closed receipts', () => {
   it('suppresses live/pending review liveness on merged and done cards', () => {
     for (const status of ['merged', 'done']) {
       expect(jobSignal(job({ status, rounds: [round({ seq: 2, status: 'live' })] }), 0)).toBeNull();
@@ -203,19 +238,21 @@ describe('jobSignal — v5 stale review pills on concluded cards', () => {
     expect(jobSignal(job({ status: 'in-review', rounds: [round({ seq: 2, status: 'live' })] }), 0)?.label).toContain('live');
   });
 
-  it('keeps attention pills that explain why a concluded card needs you', () => {
-    const unacked = jobSignal(job({ status: 'merged' }), 2);
-    expect(unacked?.label).toBe('🔔 2 action-required');
-    const aborted = jobSignal(job({ status: 'done', rounds: [round({ seq: 3, status: 'aborted' })] }), 0);
-    expect(aborted?.label).toBe('⛔ round 3 aborted');
-    const failed = jobSignal(
-      job({
-        status: 'merged',
-        rounds: [round({ status: 'live', lenses: [{ lens: 'tests', state: 'error', agentId: null, note: 'boom', verdict: null }] })],
-      }),
-      0,
-    );
-    expect(failed?.label).toBe('✕ 1 lens failure');
+  it('renders NO pills on a concluded card, whatever is left over', () => {
+    // Leftover unacked escalation rows: the bell keeps them; the card is closed.
+    expect(jobSignal(job({ status: 'merged' }), 2)).toBeNull();
+    expect(jobSignal(job({ status: 'done' }), 2)).toBeNull();
+    // Stale history (aborted round, errored lens) never re-alarms a receipt.
+    expect(jobSignal(job({ status: 'done', rounds: [round({ seq: 3, status: 'aborted' })] }), 0)).toBeNull();
+    expect(
+      jobSignal(
+        job({
+          status: 'merged',
+          rounds: [round({ status: 'live', lenses: [{ lens: 'tests', state: 'error', agentId: null, note: 'boom', verdict: null }] })],
+        }),
+        0,
+      ),
+    ).toBeNull();
   });
 });
 

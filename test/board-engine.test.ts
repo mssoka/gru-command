@@ -279,6 +279,7 @@ describe('board engine — adapter events → ledger events → board state', ()
               state: 'stopped',
               restarts: 3,
               breakerOpen: true,
+              stopReason: 'crash loop',
               openTurn: false,
               openToolCalls: 0,
               lastEventAt: '2026-09-18T00:00:00.000Z',
@@ -409,5 +410,69 @@ describe('board engine — liveness-first rail and job trackers', () => {
     api.resolveNotificationsByKindPrefix('test.', 'runtime');
     expect(api.getNotification(resolved.id)?.resolvedAt).not.toBeNull();
     expect(engine.snapshot().unackedActionRequired).toBe(0);
+  });
+
+  it('unackedActionRequired counts LIVE rows only — rows bound to merged/done jobs are closed receipts', () => {
+    const { api, engine } = fresh();
+    // An unbound row stays global (no job → cannot be terminal).
+    api.recordNotification({ id: 'n-global', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Global' });
+
+    const live = api.addJob({ id: 'live-job', repo: 'demo-repo', title: 'Live lane' });
+    api.setJobStatus(live.id, 'working');
+    api.registerAgent({ id: 'live-minion', role: 'minion', jobId: live.id });
+    api.recordNotification({
+      id: 'n-live',
+      kind: 'supervision.provider-wall.live-job.quota_wall',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Agent live-minion stopped: quota wall',
+      agentId: 'live-minion',
+    });
+    expect(engine.snapshot().unackedActionRequired).toBe(2);
+
+    const merged = api.addJob({ id: 'merged-job', repo: 'demo-repo', title: 'Merged lane' });
+    api.registerAgent({ id: 'merged-minion', role: 'minion', jobId: merged.id });
+    api.recordNotification({
+      id: 'n-merged',
+      kind: 'supervision.provider-wall.merged-job.quota_wall',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Leftover escalation on a merged lane',
+      agentId: 'merged-minion',
+    });
+    api.setJobStatus(merged.id, 'working');
+    api.setJobStatus(merged.id, 'delivered');
+    api.setJobStatus(merged.id, 'in-review');
+    api.setJobStatus(merged.id, 'merged');
+    // The merged lane's leftover escalation is a closed receipt: the live
+    // count drops it while the row itself stays durable in the bell.
+    expect(engine.snapshot().unackedActionRequired).toBe(2); // global + live
+
+    const done = api.addJob({ id: 'done-job', repo: 'demo-repo', title: 'Done lane' });
+    api.registerAgent({ id: 'done-minion', role: 'minion', jobId: done.id });
+    api.recordNotification({
+      id: 'n-done',
+      kind: 'test.notice',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Leftover on a done lane',
+      agentId: 'done-minion',
+    });
+    api.setJobStatus(done.id, 'working');
+    api.setJobStatus(done.id, 'done');
+    expect(engine.snapshot().unackedActionRequired).toBe(2);
+
+    // Nothing was acked or resolved — the bell keeps the receipts.
+    for (const id of ['n-merged', 'n-done']) {
+      const row = api.getNotification(id);
+      expect(row?.ackedAt).toBeNull();
+      expect(row?.resolvedAt).toBeNull();
+    }
+
+    // Merging the live job closes its row the same way.
+    api.setJobStatus(live.id, 'delivered');
+    api.setJobStatus(live.id, 'in-review');
+    api.setJobStatus(live.id, 'merged');
+    expect(engine.snapshot().unackedActionRequired).toBe(1); // the unbound global row
   });
 });

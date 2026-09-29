@@ -73,11 +73,13 @@ export interface AgentView {
   readonly sessionFile: string | null;
   readonly jobId: string | null;
   readonly roundId: string | null;
-  /** E7 supervision view (null when unsupervised). */
+  /** E7 supervision view (null when unsupervised). `stopReason` is absent
+   * on pre-reason servers — the board renders the stop without a cause. */
   readonly supervision: {
     readonly state: 'watching' | 'restarting' | 'stopped';
     readonly restarts: number;
     readonly breakerOpen: boolean;
+    readonly stopReason?: string | null;
   } | null;
 }
 
@@ -381,10 +383,15 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       typeof agent.id === 'string' &&
       typeof agent.role === 'string' &&
       typeof agent.state === 'string' &&
-      // supervision is optional (null when the agent is unsupervised)
+      // supervision is optional (null when the agent is unsupervised);
+      // stopReason is optional too (pre-reason servers) — present, it is
+      // a nullable string.
       (agent.supervision === null ||
         agent.supervision === undefined ||
-        (isRecord(agent.supervision) && typeof agent.supervision.state === 'string')),
+        (isRecord(agent.supervision) && typeof agent.supervision.state === 'string' &&
+          (agent.supervision.stopReason === undefined ||
+            agent.supervision.stopReason === null ||
+            typeof agent.supervision.stopReason === 'string'))),
   );
   const notificationsOk = value.notifications.every(
     (notification) =>

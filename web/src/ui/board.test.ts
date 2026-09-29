@@ -789,3 +789,141 @@ describe('board v6 — job status tones', () => {
     expect(row?.querySelector('.board-job__dot')?.className).toContain('board-job__dot--work');
   });
 });
+
+describe('board v6 — section truth: closed receipts never queue, stopped lanes never lie', () => {
+  beforeEach(mountBoardDom);
+
+  it('a merged lane with a leftover unacked escalation leaves NEEDS YOU and renders as a closed receipt', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'merged-leftover', status: 'merged', rounds: [] })],
+        agents: [agent('minion-merged', { role: 'minion', jobId: 'merged-leftover' })],
+        notifications: [notification('n-leftover', { agentId: 'minion-merged' })],
+        unackedActionRequired: 0, // the service counts LIVE rows only
+      }),
+    );
+    const needsYou = document.querySelector('.board-band--needs-you');
+    // The calm green clear state is the truth: nothing needs you.
+    expect(needsYou?.querySelector('.board-job')).toBeNull();
+    expect(needsYou?.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs you');
+    // The merged lane renders as a closed receipt in its settle band —
+    // present for the record, never as an active queue entry.
+    const receipt = document.querySelector<HTMLElement>('.board-band--cold .board-job, .board-band--settled .board-job');
+    expect(receipt?.getAttribute('data-job-id')).toBe('merged-leftover');
+    expect(receipt?.getAttribute('data-status')).toBe('merged');
+    expect(receipt?.querySelector('.board-job__signal')).toBeNull(); // no 🔔 alert chip
+  });
+
+  it('the unacked chip counts only live rows while the bell keeps every durable row', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ id: 'live-walled', status: 'working', rounds: [] }),
+          baseJob({ id: 'merged-leftover', status: 'merged', rounds: [] }),
+        ],
+        agents: [
+          agent('minion-live', { role: 'minion', jobId: 'live-walled' }),
+          agent('minion-merged', { role: 'minion', jobId: 'merged-leftover' }),
+        ],
+        notifications: [
+          notification('n-live', { agentId: 'minion-live' }),
+          notification('n-closed', { agentId: 'minion-merged' }),
+        ],
+        unackedActionRequired: 1, // the live row only — the closed one is a receipt
+      }),
+    );
+    const unacked = document.querySelector<HTMLElement>('#board-unacked');
+    expect(unacked?.hidden).toBe(false);
+    expect(unacked?.textContent).toContain('1 action-required');
+    // The bell (owner path) keeps BOTH durable rows, ack control included.
+    const rows = [...document.querySelectorAll('.board-notification')];
+    expect(rows).toHaveLength(2);
+    expect(rows.filter((row) => row.querySelector('.board-notification__ack') !== null)).toHaveLength(2);
+    // And the live lane still carries its 🔔 signal; the receipt carries none.
+    const live = document.querySelector<HTMLElement>('.board-band--needs-you .board-job');
+    expect(live?.getAttribute('data-job-id')).toBe('live-walled');
+    expect(live?.querySelector('.board-job__signal')?.textContent).toContain('1 action-required');
+    expect(document.querySelector('.board-band--cold .board-job__signal, .board-band--settled .board-job__signal')).toBeNull();
+  });
+
+  it('a quota-walled lane shows its true waiting state instead of plain working', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'walled',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+        ],
+        agents: [
+          agent('minion-walled', {
+            role: 'minion',
+            jobId: 'walled',
+            supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' },
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-job-id')).toBe('walled');
+    expect(row?.getAttribute('data-worker-state')).toBe('waiting');
+    // Not COLD, not flagged stalled: the silence has a recorded cause.
+    expect(row?.getAttribute('data-band')).toBe('in-flight');
+    expect(row?.querySelector('.board-job__stale')).toBeNull();
+    const chip = row?.querySelector('.board-job__status');
+    expect(chip?.textContent).toBe('waiting · quota wall');
+    expect(chip?.className).toContain('pp-chip--park');
+    expect(chip?.getAttribute('title')).toContain('worker stopped by supervision (quota wall)');
+  });
+
+  it('a stopped lane with an unacked escalation sits in NEEDS YOU — waiting chip, honest section', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'walled', status: 'working', rounds: [] })],
+        agents: [
+          agent('minion-walled', {
+            role: 'minion',
+            jobId: 'walled',
+            supervision: { state: 'stopped', restarts: 0, breakerOpen: true, stopReason: 'quota_wall' },
+          }),
+        ],
+        notifications: [notification('n-escalation', { agentId: 'minion-walled' })],
+        unackedActionRequired: 1,
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-band--needs-you .board-job');
+    expect(row?.getAttribute('data-job-id')).toBe('walled');
+    expect(row?.getAttribute('data-worker-state')).toBe('waiting');
+    expect(row?.querySelector('.board-job__status')?.textContent).toBe('waiting · quota wall');
+    expect(row?.querySelector('.board-job__signal')?.textContent).toContain('1 action-required');
+    const unacked = document.querySelector<HTMLElement>('#board-unacked');
+    expect(unacked?.textContent).toContain('1 action-required');
+  });
+
+  it('without a stop the same silent lane still demotes to COLD with the stalled flag (COLD stays honest)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'silent',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-band--cold .board-job');
+    expect(row?.getAttribute('data-job-id')).toBe('silent');
+    expect(row?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+    expect(row?.getAttribute('data-worker-state')).toBeNull();
+    expect(row?.querySelector('.board-job__status')?.textContent).toBe('working');
+  });
+});

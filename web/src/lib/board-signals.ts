@@ -6,6 +6,7 @@
  */
 
 import type { BoardSnapshot, JobView, RoundView } from './board-protocol.js';
+import { isJobConcluded } from './board-bands.js';
 
 export interface RoundSummary {
   readonly done: number;
@@ -34,12 +35,22 @@ export function roundSummary(round: RoundView): RoundSummary {
  * Unacked action-required notifications attributed to jobs through the
  * rail's agent bindings (notifications carry an agent; agents carry the
  * job). A notification with no agent binding stays global — the tracker
- * chip above the board still counts it.
+ * chip above the board still counts it. Rows bound to a TERMINAL job
+ * (merged/done) are closed receipts: they never attribute to the banded
+ * view (the bell keeps them; machine-row lifecycle stays with
+ * dispositions) so a merged lane can never re-enter NEEDS YOU through a
+ * leftover escalation.
  */
 export function unackedByJob(snapshot: BoardSnapshot): Map<string, number> {
   const jobByAgent = new Map<string, string>();
   for (const agent of snapshot.agents) {
     if (agent.jobId !== null) jobByAgent.set(agent.id, agent.jobId);
+  }
+  const terminalJobs = new Set<string>();
+  for (const repo of snapshot.repos) {
+    for (const job of repo.jobs) {
+      if (isJobConcluded(job.status)) terminalJobs.add(job.id);
+    }
   }
   const byJob = new Map<string, number>();
   for (const notification of snapshot.notifications) {
@@ -48,7 +59,7 @@ export function unackedByJob(snapshot: BoardSnapshot): Map<string, number> {
     const agentId = notification.agentId;
     if (agentId === null) continue;
     const jobId = jobByAgent.get(agentId);
-    if (jobId === undefined) continue;
+    if (jobId === undefined || terminalJobs.has(jobId)) continue;
     byJob.set(jobId, (byJob.get(jobId) ?? 0) + 1);
   }
   return byJob;
@@ -67,14 +78,20 @@ export function pluralCount(count: number, noun: string): string {
  *
  * Attention is scoped to the round the operator can still act on: a live
  * or pending round's blockers/errored lenses, or an aborted round. A
- * verdict-posted round's verdict already carried its outcome; a merged or
- * finished job must not keep alarming from review history.
+ * verdict-posted round's verdict already carried its outcome.
  *
  * v5: a merged/done card also suppresses REVIEW LIVENESS pills ("round N
  * live/pending") — a concluded job cannot have a review in flight; the
  * pill is stale data, not a live state.
+ *
+ * Section-truth ruling (2026-09-29): a CONCLUDED card is a closed
+ * receipt — it renders NO pills at all. Attention pills explained why a
+ * concluded card landed in NEEDS YOU; terminal jobs can no longer land
+ * there (the banding enforces it), so the pills would be false alarms,
+ * never live queue entries.
  */
 export function jobSignal(job: JobView, unackedActionRequired: number): JobSignal | null {
+  if (isJobConcluded(job.status)) return null;
   const parts: string[] = [];
   const details: string[] = [];
   let attention = false;
@@ -86,10 +103,8 @@ export function jobSignal(job: JobView, unackedActionRequired: number): JobSigna
   }
 
   const round = job.rounds.at(-1) ?? null;
-  // A concluded job's review liveness pill is stale (merged/done cards
-  // never claim an in-flight review). Attention pills still explain why a
-  // concluded card landed in NEEDS YOU.
-  const concluded = job.status === 'merged' || job.status === 'done';
+  // A concluded job never reaches here (closed receipts render no pill);
+  // in-flight cards keep their review liveness pills.
   if (round !== null) {
     const summary = roundSummary(round);
     if (round.status === 'aborted') {
@@ -108,14 +123,12 @@ export function jobSignal(job: JobView, unackedActionRequired: number): JobSigna
         attention = true;
       }
     }
-    if (!concluded) {
-      if (round.status === 'live') {
-        parts.push(`◉ round ${round.seq} · live · ${summary.done}/${summary.total}`);
-        details.push(`round ${round.seq} live — ${summary.done}/${summary.total} lenses done`);
-      } else if (round.status === 'pending') {
-        parts.push(`○ round ${round.seq} pending`);
-        details.push(`round ${round.seq} pending`);
-      }
+    if (round.status === 'live') {
+      parts.push(`◉ round ${round.seq} · live · ${summary.done}/${summary.total}`);
+      details.push(`round ${round.seq} live — ${summary.done}/${summary.total} lenses done`);
+    } else if (round.status === 'pending') {
+      parts.push(`○ round ${round.seq} pending`);
+      details.push(`round ${round.seq} pending`);
     }
   }
 

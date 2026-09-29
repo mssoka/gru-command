@@ -13,7 +13,7 @@
  * every status × freshness × PR-state combination is unit-testable.
  */
 
-import type { BoardSnapshot, JobView } from './board-protocol.js';
+import type { AgentView, BoardSnapshot, JobView } from './board-protocol.js';
 import { derivedPrState } from './board-kpi.js';
 import { isSameLocalDay } from './board-time.js';
 
@@ -45,6 +45,9 @@ export interface BucketOptions {
   readonly stalledAfterMs?: number;
   /** Unacked action-required counts per job id (from board-signals). */
   readonly unackedByJob?: ReadonlyMap<string, number>;
+  /** Supervision-stopped worker views per job id (from the snapshot's
+   * agent rows) — a stopped lane is waiting, never silent-stalled. */
+  readonly stoppedWorkers?: ReadonlyMap<string, WorkerStopView>;
 }
 
 /** The newest frame-ish stamp on the job: agent activity, else the lane's
@@ -56,10 +59,45 @@ export function jobRecency(job: JobView): string {
   return newest;
 }
 
+/** The stop truth for one lane: the bound worker is supervision-stopped
+ * (or breaker-open) and the job still reads "working". */
+export interface WorkerStopView {
+  /** Failure class the supervisor recorded (e.g. `quota_wall`), null on
+   * pre-reason snapshots — the stop renders without a cause. */
+  readonly reason: string | null;
+  readonly restarts: number;
+}
+
+/** Stopped-worker views keyed by job id, from the snapshot's agent rows:
+ * any bound agent whose supervision is stopped or breaker-open marks the
+ * lane. A stopped lane is NOT silently working — it is waiting on a human
+ * re-arm with a recorded reason. */
+export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
+  const byJob = new Map<string, WorkerStopView>();
+  for (const agent of agents) {
+    const supervision = agent.supervision;
+    if (agent.jobId === null || supervision === null || supervision === undefined) continue;
+    if (supervision.state !== 'stopped' && supervision.breakerOpen !== true) continue;
+    if (byJob.has(agent.jobId)) continue;
+    byJob.set(agent.jobId, { reason: supervision.stopReason ?? null, restarts: supervision.restarts });
+  }
+  return byJob;
+}
+
+/** The status-chip label for a stopped lane: an explicit waiting state
+ * with its reason (`quota_wall` → "waiting · quota wall"). */
+export function workerStopLabel(stop: WorkerStopView): string {
+  const reason = stop.reason === null ? '' : stop.reason.replaceAll('_', ' ').trim();
+  return reason === '' ? 'waiting' : `waiting · ${reason}`;
+}
+
 /** A working lane that has shown no frames past the stall window. No
- * stamp at all is NOT evidence of stalling — never guess. */
+ * stamp at all is NOT evidence of stalling — never guess. A lane whose
+ * worker is supervision-stopped is not stalled either: the silence has a
+ * recorded cause (the stop), and COLD is for genuinely-silent lanes. */
 export function isStalledWorking(job: JobView, opts: BucketOptions = {}): boolean {
   if (job.status !== 'working') return false;
+  if (opts.stoppedWorkers?.has(job.id) === true) return false;
   const threshold = opts.stalledAfterMs ?? JOB_STALLED_AFTER_MS;
   const stamp = job.lastAgentActivity ?? job.lane?.createdAt ?? null;
   if (stamp === null) return false;
@@ -68,8 +106,17 @@ export function isStalledWorking(job: JobView, opts: BucketOptions = {}): boolea
   return (opts.now ?? Date.now()) - then > threshold;
 }
 
+/** A terminal job (merged/done) is a closed receipt: it can never be
+ * live Gru work, so no signal — leftover unacked escalation rows, an
+ * aborted historical round, stale lens noise — may promote it back into
+ * NEEDS YOU. The bell keeps the durable rows; the board moves on. */
+export function isJobConcluded(status: string): boolean {
+  return status === 'merged' || status === 'done';
+}
+
 /** Every reason a job earns Band 1 (exported for focused tests). */
 export function needsYouReasons(job: JobView, unacked: number): readonly string[] {
+  if (isJobConcluded(job.status)) return [];
   const reasons: string[] = [];
   if (unacked > 0) reasons.push('action-required');
   if (job.status === 'blocked' || job.status === 'error') reasons.push(job.status);

@@ -248,6 +248,44 @@ function sampleSnapshot(): unknown {
             lastAgentActivity: null,
           },
           {
+            // Section truth: a merged lane with a leftover unacked
+            // escalation row is a closed receipt — SETTLED, never NEEDS
+            // YOU, and the unacked chip does not count it.
+            id: 'demo-api-merged-leftover',
+            repo: 'demo-api',
+            title: 'Rotate the staging tokens',
+            status: 'merged',
+            updatedAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+            prUrl: 'https://example.invalid/pr/41',
+            prState: 'merged',
+            baseBranch: 'main',
+            note: 'merged — the leftover escalation row is a closed receipt, not live work',
+            rounds: [],
+            lane: null,
+            lastAgentActivity: null,
+          },
+          {
+            // Stopped-worker truth: the supervisor walled this lane on a
+            // provider quota — it waits with its reason, it is not "working".
+            id: 'demo-api-quota-walled',
+            repo: 'demo-api',
+            title: 'Migrate the search index',
+            status: 'working',
+            updatedAt: new Date(Date.now() - 12 * 60_000).toISOString(),
+            prUrl: null,
+            prState: null,
+            baseBranch: 'main',
+            note: 'worker stopped by supervision — waiting on provider',
+            rounds: [],
+            lane: {
+              branch: 'gru/demo-api-quota-walled',
+              sha: 'ccc3333ddd4444',
+              status: 'active',
+              createdAt: new Date(Date.now() - 40 * 60_000).toISOString(),
+            },
+            lastAgentActivity: new Date(Date.now() - 10 * 60_000).toISOString(),
+          },
+          {
             id: 'demo-api-conflict-probe',
             repo: 'demo-api',
             title: 'Merge main into the retry branch',
@@ -336,7 +374,9 @@ function sampleSnapshot(): unknown {
       { id: 'mock-gru', role: 'gru', label: 'gru · chat', state: 'idle', lastActivity: new Date().toISOString(), sessionFile: 'gru/--demo--aa111111/mock-session.jsonl', jobId: null, roundId: null, supervision: { state: 'watching', restarts: 0, breakerOpen: false } },
       { id: 'mock-silas', role: 'silas', label: 'silas · ops', state: 'streaming', lastActivity: new Date(Date.now() - 12_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: { state: 'watching', restarts: 1, breakerOpen: false } },
       { id: 'mock-lens-blind', role: 'perkins', label: 'blind:001', state: 'idle', lastActivity: new Date(Date.now() - 300_000).toISOString(), sessionFile: null, jobId: null, roundId: 'demo-api-payment-fix-r2', supervision: null },
-      { id: 'mock-minion', role: 'minion', label: 'demo-api-payment-fix', state: 'idle', lastActivity: null, sessionFile: null, jobId: 'demo-api-payment-fix', roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true } },
+      { id: 'mock-minion', role: 'minion', label: 'demo-api-payment-fix', state: 'idle', lastActivity: null, sessionFile: null, jobId: 'demo-api-payment-fix', roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' } },
+      { id: 'mock-minion-quota', role: 'minion', label: 'demo-api-quota-walled', state: 'idle', lastActivity: new Date(Date.now() - 10 * 60_000).toISOString(), sessionFile: null, jobId: 'demo-api-quota-walled', roundId: null, supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' } },
+      { id: 'mock-minion-merged', role: 'minion', label: 'demo-api-merged-leftover', state: 'idle', lastActivity: null, sessionFile: null, jobId: 'demo-api-merged-leftover', roundId: null, supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null } },
       { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: null, supervision: null },
       { id: 'mock-gru-old', role: 'gru', label: 'gru · chat (retired)', state: 'disposed', lastActivity: new Date(Date.now() - 7_200_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
     ],
@@ -344,6 +384,8 @@ function sampleSnapshot(): unknown {
       { id: 'mock-n1', ts: new Date().toISOString(), kind: 'job.status', routing: 'fyi', severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
       { id: 'mock-n2', ts: new Date(Date.now() - 120_000).toISOString(), kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'Round r1 verdict', detail: 'approved', agentId: null, shownAt: new Date().toISOString(), ackedAt: new Date().toISOString(), resolvedAt: null, resolvedBy: null },
       { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      { id: 'mock-n4', ts: new Date(Date.now() - 900_000).toISOString(), kind: 'supervision.provider-wall.demo-api-quota-walled.quota_wall', routing: 'action-required', severity: 'error', title: 'Agent mock-minion-quota stopped: quota wall', detail: 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.', agentId: 'mock-minion-quota', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      { id: 'mock-n5', ts: new Date(Date.now() - 2_400_000).toISOString(), kind: 'supervision.provider-wall.demo-api-merged-leftover.quota_wall', routing: 'action-required', severity: 'error', title: 'Agent mock-minion-merged stopped: quota wall', detail: 'Leftover escalation — the lane merged anyway. Closed receipt: kept for the record, never live queue.', agentId: 'mock-minion-merged', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
     ],
     decisions: {
       enabled: true,
@@ -357,7 +399,10 @@ function sampleSnapshot(): unknown {
       incarnation: 'mock-incarnation',
       generation: 1,
     },
-    unackedActionRequired: 1,
+    // LIVE unacked action-required rows only: n3 (payment-fix, in-review)
+    // + n4 (quota-walled, working). The merged lane's n5 is a closed
+    // receipt — the bell keeps it; this count (and NEEDS YOU) does not.
+    unackedActionRequired: 2,
     build: {
       buildRev: 'abc1234def5678abc1234def5678abc1234def56',
       buildCommittedAt: new Date(Date.now() - 5_400_000).toISOString(),

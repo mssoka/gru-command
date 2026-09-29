@@ -430,6 +430,7 @@ describe('supervisor — watchdog + restart ladder', () => {
     const view = supervisor.viewFor('minion-crashloop') as AgentSupervisionView;
     expect(view.state).toBe('stopped');
     expect(view.breakerOpen).toBe(true);
+    expect(view.stopReason).toBe('crash loop');
 
     // ---- ack re-arms: fresh window, the resume attempt succeeds -------
     registry.spawnImpl = async (role) => new FakeHandle(role, 'minion-crashloop-resumed', null);
@@ -438,6 +439,8 @@ describe('supervisor — watchdog + restart ladder', () => {
     const rearmView = supervisor.viewFor('minion-crashloop-resumed') as AgentSupervisionView;
     expect(rearmView.state).toBe('watching');
     expect(rearmView.breakerOpen).toBe(false);
+    // A re-armed agent is running again — no stop reason lingers.
+    expect(rearmView.stopReason).toBeNull();
     expect(rearmView.restarts).toBe(1); // ring cleared, one fresh rung
     expect(registry.spawnCalls.length).toBe(4);
     // The stopped record for the OLD agent id is gone (new session id) —
@@ -623,6 +626,8 @@ describe('supervisor — decision-backed failure guidance', () => {
     handle.emit({ type: 'error', error: 'quota exceeded (HTTP 429)', fatal: false });
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
+    // The stop carries its reason so the board can render the truth.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ stopReason: 'quota_wall' });
     expect(h.api.listNotifications({ limit: 20 }).some((row) => row.kind.includes('quota_wall'))).toBe(true);
     h.dispose();
   });

@@ -35,8 +35,12 @@ import {
   BAND_LABELS,
   BAND_ORDER,
   bucketSnapshot,
+  isJobConcluded,
   settledWindow,
+  stoppedWorkersByJob,
+  workerStopLabel,
   type BandId,
+  type WorkerStopView,
 } from '../lib/board-bands.js';
 import { railChips, type RailChip } from '../lib/board-rail.js';
 import { formatAge } from '../lib/board-time.js';
@@ -315,7 +319,11 @@ export class BoardView {
       return;
     }
     const unacked = unackedByJob(snapshot);
-    const bands = bucketSnapshot(snapshot, { now: Date.now(), unackedByJob: unacked });
+    // Section truth: the live needs-Gru view counts only LIVE rows. The
+    // stopped-worker map carries the supervision stop (waiting-on-rearm)
+    // truth for working lanes; terminal-job notifications stay in the bell.
+    const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
+    const bands = bucketSnapshot(snapshot, { now: Date.now(), unackedByJob: unacked, stoppedWorkers });
     const seenIds = new Set<string>();
     for (const band of BAND_ORDER) {
       const jobs = bands.find((group) => group.band === band)?.jobs ?? [];
@@ -333,7 +341,15 @@ export class BoardView {
         const window = band === 'settled' ? settledWindow(jobs, this.settledExpanded) : { jobs, hidden: 0 };
         const rows = el('div', 'board-band__rows');
         for (const entry of window.jobs) {
-          rows.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, band));
+          rows.append(
+            this.jobRow(
+              entry.job,
+              unacked.get(entry.job.id) ?? 0,
+              entry.stale,
+              band,
+              stoppedWorkers.get(entry.job.id) ?? null,
+            ),
+          );
         }
         section.append(rows);
         if (window.hidden > 0) {
@@ -373,11 +389,21 @@ export class BoardView {
    * the summary expands the v3 detail inline — the row is never a card
    * until it is expanded. Error/failing rows carry the alert accent.
    */
-  private jobRow(job: JobView, unackedActionRequired: number, stale: boolean, band: BandId): HTMLElement {
+  private jobRow(
+    job: JobView,
+    unackedActionRequired: number,
+    stale: boolean,
+    band: BandId,
+    workerStop: WorkerStopView | null,
+  ): HTMLElement {
     const row = el('article', 'board-job');
     row.dataset.jobId = job.id;
     row.dataset.band = band;
     row.dataset.status = job.status;
+    // Defect truth (2026-09-29): a supervision-stopped worker is waiting
+    // on a human re-arm — the row says so instead of a bare "working".
+    const waiting = workerStop !== null;
+    if (waiting) row.dataset.workerState = 'waiting';
     if (jobFailing(job)) row.classList.add('board-job--alert');
     // v5: a job that was not on screen slides in (8px); a snapshot push
     // re-rendering known rows stays still.
@@ -406,7 +432,19 @@ export class BoardView {
       chip.title = signal.title;
       toggle.append(chip);
     }
-    toggle.append(el('span', `pp-chip board-job__status ${jobChipTone(job.status)}`, job.status));
+    const status = el(
+      'span',
+      `pp-chip board-job__status ${waiting ? 'pp-chip--park' : jobChipTone(job.status)}`,
+      waiting ? workerStopLabel(workerStop) : job.status,
+    );
+    if (waiting && workerStop !== null) {
+      status.title =
+        `worker stopped by supervision` +
+        (workerStop.reason === null ? '' : ` (${workerStop.reason.replaceAll('_', ' ')})`) +
+        `${workerStop.restarts > 0 ? ` after ${workerStop.restarts} restart${workerStop.restarts === 1 ? '' : 's'}` : ''} — ` +
+        'the lane is not running: resolve the condition, then ack the escalation to re-arm';
+    }
+    toggle.append(status);
     head.append(toggle);
     row.append(head);
 
@@ -481,7 +519,7 @@ export class BoardView {
       body.append(lane);
     }
     if (job.note !== null && job.note !== '') body.append(el('div', 'board-job__note', job.note));
-    const concluded = job.status === 'merged' || job.status === 'done';
+    const concluded = isJobConcluded(job.status);
     const rounds = concluded ? job.rounds.slice(-1) : job.rounds;
     for (const round of rounds) body.append(this.roundRow(round, concluded));
     if (concluded && rounds.length > 0) {
@@ -777,8 +815,10 @@ export class BoardView {
 /** A row is "failing" when the record itself says so: blocked/error
  * status, an aborted newest round, or errored lenses in a round that has
  * not posted a verdict. Conflicting-PR-only rows stay calm — the band
- * already shouts. */
+ * already shouts. A CONCLUDED job (merged/done) is a closed receipt: its
+ * history renders quiescent and never carries the alert accent. */
 export function jobFailing(job: JobView): boolean {
+  if (isJobConcluded(job.status)) return false;
   if (job.status === 'blocked' || job.status === 'error') return true;
   const round = job.rounds.at(-1) ?? null;
   if (round === null) return false;

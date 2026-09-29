@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type {
+  AgentView,
   JobPrState,
   JobView,
   RoundView,
@@ -14,6 +15,8 @@ import {
   jobRecency,
   needsYouReasons,
   settledWindow,
+  stoppedWorkersByJob,
+  workerStopLabel,
 } from './board-bands.js';
 
 const NOW = new Date(2026, 8, 23, 12, 0, 0).getTime(); // local noon — day-boundary tests stay timezone-robust
@@ -53,6 +56,21 @@ function job(overrides: Partial<JobView> = {}): JobView {
   };
 }
 
+function agentView(id: string, overrides: Partial<AgentView> = {}): AgentView {
+  return {
+    id,
+    role: 'minion',
+    label: null,
+    state: 'idle',
+    lastActivity: null,
+    sessionFile: null,
+    jobId: null,
+    roundId: null,
+    supervision: null,
+    ...overrides,
+  };
+}
+
 describe('board bands — deterministic bucketing', () => {
   it('assigns every status × recency × PR state by the documented rules', () => {
     const statuses = [
@@ -69,15 +87,18 @@ describe('board bands — deterministic bucketing', () => {
     const prStates: (JobPrState | null)[] = [null, 'open', 'conflicting', 'merged'];
 
     /** Independent re-statement of the rules (never import the target's
-     * own helpers here — the point is to pin the behavior). */
+     * own helpers here — the point is to pin the behavior). Terminal jobs
+     * (merged/done) are closed receipts: no signal — conflicting PR
+     * guesses included — can promote them back into NEEDS YOU. */
     function expected(status: string, fresh: boolean, pr: JobPrState | null): string {
+      if (status === 'merged') return fresh ? 'settled' : 'cold';
+      if (status === 'done') return 'cold';
       if (pr === 'conflicting') return 'needs-you';
       if (status === 'blocked' || status === 'error') return 'needs-you';
       if (status === 'dispatched' || status === 'in-review') return 'in-flight';
       if (status === 'working') return fresh ? 'in-flight' : 'cold';
       if (status === 'delivered') return 'settled';
-      if (status === 'merged') return fresh ? 'settled' : 'cold';
-      return 'cold'; // parked, done, unknown
+      return 'cold'; // parked, unknown
     }
 
     for (const status of statuses) {
@@ -125,8 +146,10 @@ describe('board bands — deterministic bucketing', () => {
     expect(isStalledWorking(job({ status: 'parked', lastAgentActivity: ISO(-10 * 3_600_000) }), { now: NOW })).toBe(false);
   });
 
-  it('cascade promoter: a conflicting PR jumps ANY status to NEEDS YOU', () => {
-    for (const status of ['working', 'in-review', 'parked', 'done', 'delivered']) {
+  it('cascade promoter: a conflicting PR jumps any LIVE status to NEEDS YOU', () => {
+    // Terminal jobs are closed receipts (see the section-truth test below)
+    // — the cascade can never pull a merged/done lane back into the queue.
+    for (const status of ['working', 'in-review', 'parked', 'delivered']) {
       const conflicting = job({ status, prState: 'conflicting', prUrl: 'https://example.invalid/pr/1' });
       expect(bandForJob(conflicting, { now: NOW }), status).toBe('needs-you');
     }
@@ -134,7 +157,7 @@ describe('board bands — deterministic bucketing', () => {
 
   it('needs-you causes: unacked action-required, blocked, error, aborted round, failed lens', () => {
     expect(needsYouReasons(job({ status: 'parked' }), 1)).toContain('action-required');
-    expect(bandForJob(job({ status: 'done' }), { now: NOW, unackedByJob: new Map([['job-1', 1]]) })).toBe('needs-you');
+    expect(bandForJob(job({ status: 'parked' }), { now: NOW, unackedByJob: new Map([['job-1', 1]]) })).toBe('needs-you');
     expect(bandForJob(job({ status: 'blocked' }), { now: NOW })).toBe('needs-you');
     expect(bandForJob(job({ status: 'error' }), { now: NOW })).toBe('needs-you');
     expect(bandForJob(job({ status: 'working', rounds: [round({ status: 'aborted' })] }), { now: NOW })).toBe('needs-you');
@@ -235,5 +258,77 @@ describe('board bands — settled rolling window (v5)', () => {
 
   it('never needs a window for an empty band', () => {
     expect(settledWindow([], false)).toEqual({ jobs: [], hidden: 0 });
+  });
+});
+
+describe('board bands — section truth: terminal jobs are closed receipts', () => {
+  it('merged/done never re-enter NEEDS YOU, whatever is left over', () => {
+    for (const status of ['merged', 'done']) {
+      const closed = job({
+        id: `closed-${status}`,
+        status,
+        rounds: [round({ status: 'aborted' })], // stale history noise
+      });
+      expect(needsYouReasons(closed, 2)).toEqual([]);
+    }
+    // A merged lane from today with leftover unacked escalations is still
+    // a closed receipt: SETTLED, never the live queue.
+    const mergedToday = job({ id: 'closed-merged', status: 'merged', updatedAt: ISO(-60_000) });
+    expect(bandForJob(mergedToday, { now: NOW, unackedByJob: new Map([['closed-merged', 2]]) })).toBe('settled');
+    // An older done lane sinks to COLD — closed either way.
+    const doneOld = job({ id: 'closed-done', status: 'done', updatedAt: ISO(-26 * 3_600_000) });
+    expect(bandForJob(doneOld, { now: NOW, unackedByJob: new Map([['closed-done', 2]]) })).toBe('cold');
+  });
+});
+
+describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
+  const stop = { reason: 'quota_wall', restarts: 2 };
+
+  it('a supervision-stopped working lane waits in IN FLIGHT with its reason — never COLD/stalled', () => {
+    const stopped = job({ lastAgentActivity: ISO(-(JOB_STALLED_AFTER_MS + 60_000)) });
+    const opts = { now: NOW, stoppedWorkers: new Map([['job-1', stop]]) };
+    // Past the stall window, but the silence has a recorded cause.
+    expect(isStalledWorking(stopped, opts)).toBe(false);
+    expect(bandForJob(stopped, opts)).toBe('in-flight');
+    const [group] = bucketJobs([stopped], opts);
+    expect(group?.band).toBe('in-flight');
+    expect(group?.jobs[0]?.stale).toBe(false);
+  });
+
+  it('the waiting truth never masks other signals: an unacked escalation still cascades to NEEDS YOU', () => {
+    const opts = {
+      now: NOW,
+      stoppedWorkers: new Map([['job-1', stop]]),
+      unackedByJob: new Map([['job-1', 1]]),
+    };
+    expect(bandForJob(job(), opts)).toBe('needs-you');
+  });
+
+  it('COLD stays for genuinely-silent lanes — the stop map never invents silence', () => {
+    const silent = job({ lastAgentActivity: ISO(-(JOB_STALLED_AFTER_MS + 60_000)) });
+    expect(isStalledWorking(silent, { now: NOW })).toBe(true);
+    expect(bandForJob(silent, { now: NOW })).toBe('cold');
+    const [group] = bucketJobs([silent], { now: NOW });
+    expect(group?.jobs[0]?.stale).toBe(true);
+  });
+
+  it('stoppedWorkersByJob reads bound agents only; workerStopLabel renders the reason', () => {
+    const map = stoppedWorkersByJob([
+      agentView('m1', { jobId: 'job-1', supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' } }),
+      // breaker-open alone marks the lane even before the state settles.
+      agentView('m2', { jobId: 'job-2', supervision: { state: 'watching', restarts: 0, breakerOpen: true, stopReason: null } }),
+      agentView('m3', { jobId: 'job-3', supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null } }),
+      agentView('m4', { jobId: 'job-4', supervision: null }),
+      // An unbound stopped agent stays global — no lane to mark.
+      agentView('m5', { supervision: { state: 'stopped', restarts: 0, breakerOpen: true, stopReason: null } }),
+    ]);
+    expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 2 });
+    expect(map.get('job-2')).toEqual({ reason: null, restarts: 0 });
+    expect(map.has('job-3')).toBe(false);
+    expect(map.has('job-4')).toBe(false);
+    expect(map.size).toBe(2);
+    expect(workerStopLabel(map.get('job-1')!)).toBe('waiting · quota wall');
+    expect(workerStopLabel({ reason: 'crash loop', restarts: 3 })).toBe('waiting · crash loop');
+    expect(workerStopLabel({ reason: null, restarts: 0 })).toBe('waiting');
   });
 });
