@@ -2,7 +2,7 @@
 title: 'gh-97: integrate PR129 with post-68/76 main (bounded, behavior-preserving)'
 type: 'chore'
 created: '2026-09-27'
-status: 'in-progress'
+status: 'done'
 route: 'oneshot'
 review_loop_iteration: 0
 context:
@@ -34,3 +34,9 @@ context:
     3. Pty BMAD test pins its runtime answer to its own Pi-only fixture; the all-defaults test still exercises the probe default.
     Items 1-2 use the sibling lane's settled starvation shape (gru/owner-chime f5497b8/cfdc616) and item 3 matches f020dc6, so the two PRs reconcile in either merge order.
   - Pre-checks after repair: lint OK; typecheck OK; hygiene teeth tests pass (20.3s / 24.6s under co-tenant storm load). Scheduled full verification follows in a co-tenant-quiet window; all earlier failed outputs stay preserved.
+- 2026-09-29 (re-brief reconciliation of PR #129 onto fresh main `fb1e850`):
+  - Fresh-main delta since the lane's last integration: `85727de` (roles), `dd11a32` #137 compaction-gate (supervisor.ts / pi-adapter.ts / config.ts + tests), `fb1e850` #70 owner-chime (web/docs). Normal main-into-feature merge; all WIP/commits/repairs preserved; no reset/stash/force/rewrite (the frozen intent and lane contract here remain normative).
+  - Merge `4c6aded` (parents `243d09a` + `fb1e850`). One conflict only — `test/suite-shape.test.ts`, `supervisor.test.ts` pin: resolution derived from the combined tree, 50 = 43 base + 1 gh-97 regression + 6 compaction-gate. `notifications.test.ts` 19 and `pi-adapter.test.ts` 63 auto-merged from their single-changed side.
+  - Fix content unchanged: `src/notifications/center.ts` and `src/ledger/api.ts` diff vs `fb1e850` is exactly the gh-97 + R1/R2 change; the supervisor provider-wall `stopForGuidance` path (routing `needs-owner`, dedupe `unacked`) is intact beside the compaction gate.
+  - Focused local verification on the merged tree: notifications + ledger-api + decisions + suite-shape 87 passed; supervisor 50 passed (incl. the gh-97 full-chain regression and R1/R2 ties); board-engine/board-server/chat-server/pi-adapter/config/health/roles-definitions/static/config-generate 290 passed; wizard-interactive 8 passed; web 38 files / 341 passed; lint, typecheck, build exit 0. Full-suite trust signal is exact-head GitHub CI (local full runs on this shared host flake starvation-shaped under co-tenant load).
+  - Non-force push to `gru/gh-97-owner-stop-routing`; Silas owns the fresh native whole-PR Perkins round on the pushed head.
