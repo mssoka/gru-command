@@ -830,6 +830,77 @@ describe('verify config (contention fix 2026-09-22)', () => {
   });
 });
 
+describe('concurrency config (rate-limit backoff; owner heist 2026-09-29, scope-trimmed)', () => {
+  it('absent [concurrency] section = automatic retry OFF (current behavior)', () => {
+    const home = tmpHome();
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.concurrency).toEqual({
+      enabled: false,
+      backoffBaseMs: 1_000,
+      backoffMaxMs: 60_000,
+      maxAutoRetries: 5,
+      providers: {},
+    });
+  });
+
+  it('parses a full [concurrency] section with per-provider signatures', () => {
+    const home = tmpHome();
+    writeConfig(
+      home,
+      [
+        '[concurrency]',
+        'backoff_base_ms = 250',
+        'backoff_max_ms = 5000',
+        'max_auto_retries = 3',
+        '[concurrency.providers."provider-x"]',
+        'rate_limit_patterns = ["pacing code \\\\d+"]',
+        '',
+      ].join('\n'),
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').concurrency).toEqual({
+      enabled: true,
+      backoffBaseMs: 250,
+      backoffMaxMs: 5_000,
+      maxAutoRetries: 3,
+      providers: { 'provider-x': { rateLimitPatterns: ['pacing code \\d+'] } },
+    });
+  });
+
+  it('a present section with absent keys takes the documented defaults', () => {
+    const home = tmpHome();
+    writeConfig(home, '[concurrency]\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').concurrency).toEqual({
+      enabled: true,
+      backoffBaseMs: 1_000,
+      backoffMaxMs: 60_000,
+      maxAutoRetries: 5,
+      providers: {},
+    });
+  });
+
+  it('refuses garbage loudly (unknown keys, bad types, inverted ladder, bad patterns)', () => {
+    const bad: readonly string[] = [
+      '[concurrency]\nunknown = 1\n',
+      '[concurrency]\nmax_auto_retries = -1\n',
+      '[concurrency]\nmax_auto_retries = 1.5\n',
+      '[concurrency]\nbackoff_base_ms = 0\n',
+      '[concurrency]\nbackoff_max_ms = -5\n',
+      '[concurrency]\nbackoff_base_ms = 2000\nbackoff_max_ms = 1000\n',
+      '[concurrency]\nproviders = "nope"\n',
+      '[concurrency.providers.""]\nrate_limit_patterns = ["x"]\n',
+      '[concurrency.providers."provider-x"]\n',
+      '[concurrency.providers."provider-x"]\nrate_limit_patterns = "x"\n',
+      '[concurrency.providers."provider-x"]\nrate_limit_patterns = ["(unclosed"]\n',
+      '[concurrency.providers."provider-x"]\nrate_limit_patterns = ["ok"]\nother = true\n',
+    ];
+    for (const text of bad) {
+      const h2 = tmpHome();
+      writeFileSync(join(h2, 'config.toml'), text, 'utf-8');
+      expect(() => loadConfig({ GRU_COMMAND_HOME: h2 }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
+});
+
 describe('lessons config (Book of Lessons)', () => {
   it('dreams on boot + every 12h by default, with the pinned caps', () => {
     const home = tmpHome();
