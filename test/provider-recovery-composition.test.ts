@@ -112,48 +112,48 @@ describe('native-claude snapshot (selected keychain store, observed platform —
     const snapshot = await claudeSnapshot({
       command,
       context: { overridesPresent: false },
-      account: 'moses',
+      account: 'fixture-user',
       now: () => NOW,
     });
     expect(typeof snapshot).not.toBe('string');
     if (typeof snapshot === 'string') return;
     expect(snapshot.provider).toBe('anthropic-claude-native');
     expect(snapshot.authorization).toBe('Bearer claude-access-token');
-    expect(snapshot.accountClaim).toBe('moses'); // the selected keychain account is the observed identity
+    expect(snapshot.accountClaim).toBe('fixture-user'); // the selected keychain account is the observed identity
     expect(snapshot.store).toBe('macos-keychain:Claude Code-credentials');
-    expect(command.calls).toEqual([{ service: 'Claude Code-credentials', account: 'moses' }]);
+    expect(command.calls).toEqual([{ service: 'Claude Code-credentials', account: 'fixture-user' }]);
   });
 
   it('rejects overrides, missing items, expired tokens, wrong subscriptions, and malformed stores', async () => {
     const command = new FakeCommandPort();
     command.result = { exitCode: 0, stdout: JSON.stringify(CLAUDE_CREDENTIAL) };
     expect(
-      await claudeSnapshot({ command, context: { overridesPresent: true }, account: 'moses', now: () => NOW }),
+      await claudeSnapshot({ command, context: { overridesPresent: true }, account: 'fixture-user', now: () => NOW }),
     ).toBe('context-override-present');
     command.result = null;
-    expect(await claudeSnapshot({ command, context: { overridesPresent: false }, account: 'moses', now: () => NOW })).toBe(
+    expect(await claudeSnapshot({ command, context: { overridesPresent: false }, account: 'fixture-user', now: () => NOW })).toBe(
       'credential-missing',
     );
     command.result = { exitCode: 1, stdout: '' };
-    expect(await claudeSnapshot({ command, context: { overridesPresent: false }, account: 'moses', now: () => NOW })).toBe(
+    expect(await claudeSnapshot({ command, context: { overridesPresent: false }, account: 'fixture-user', now: () => NOW })).toBe(
       'credential-missing',
     );
     command.result = {
       exitCode: 0,
       stdout: JSON.stringify({ claudeAiOauth: { ...CLAUDE_CREDENTIAL.claudeAiOauth, expiresAt: NOW - 1 } }),
     };
-    expect(await claudeSnapshot({ command, context: { overridesPresent: false }, account: 'moses', now: () => NOW })).toBe(
+    expect(await claudeSnapshot({ command, context: { overridesPresent: false }, account: 'fixture-user', now: () => NOW })).toBe(
       'credential-expired',
     );
     command.result = {
       exitCode: 0,
       stdout: JSON.stringify({ claudeAiOauth: { ...CLAUDE_CREDENTIAL.claudeAiOauth, subscription: 'enterprise-x' } }),
     };
-    expect(await claudeSnapshot({ command, context: { overridesPresent: false }, account: 'moses', now: () => NOW })).toBe(
+    expect(await claudeSnapshot({ command, context: { overridesPresent: false }, account: 'fixture-user', now: () => NOW })).toBe(
       'credential-wrong-kind',
     );
     command.result = { exitCode: 0, stdout: 'not json' };
-    expect(await claudeSnapshot({ command, context: { overridesPresent: false }, account: 'moses', now: () => NOW })).toBe(
+    expect(await claudeSnapshot({ command, context: { overridesPresent: false }, account: 'fixture-user', now: () => NOW })).toBe(
       'credential-wrong-kind',
     );
   });
@@ -171,7 +171,7 @@ describe('native-claude snapshot (selected keychain store, observed platform —
     const snapshot = await claudeSnapshot({
       command,
       context: { overridesPresent: false },
-      account: 'moses',
+      account: 'fixture-user',
       now: () => NOW,
     });
     expect(typeof snapshot).not.toBe('string');
@@ -194,7 +194,7 @@ describe('BoundMetadataReader — provider + credential-generation fencing, zero
     },
   });
 
-  function makeReaders(authPath: string, fetchPort: MetadataFetchPort, account = 'moses') {
+  function makeReaders(authPath: string, fetchPort: MetadataFetchPort, account = 'fixture-user') {
     return composeMetadataReaders({
       config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, probeTimeoutMs: 30_000 },
       fetch: fetchPort,
@@ -282,7 +282,7 @@ describe('BoundMetadataReader — provider + credential-generation fencing, zero
     const snapshot = await claudeSnapshot({
       command,
       context: { overridesPresent: false },
-      account: 'moses',
+      account: 'fixture-user',
     });
     if (typeof snapshot === 'string') throw new Error('fixture snapshot unexpectedly rejected');
     let status = 200;
@@ -298,7 +298,7 @@ describe('BoundMetadataReader — provider + credential-generation fencing, zero
     const readers = composeMetadataReaders({
       config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, probeTimeoutMs: 30_000 },
       fetch: fetchPort,
-      claude: { command, context: () => ({ overridesPresent: false }), account: () => 'moses' },
+      claude: { command, context: () => ({ overridesPresent: false }), account: () => 'fixture-user' },
     });
     const route: ProbeRoute = {
       provider: 'anthropic-claude-native',

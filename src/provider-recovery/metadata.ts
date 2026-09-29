@@ -11,7 +11,8 @@ import type { LogLevel } from '../logger.js';
  * - native Claude (claude.ai Pro OAuth): GET
  *   https://api.anthropic.com/api/oauth/usage through the ACTUAL selected
  *   native store/platform/context (injected resolver — no hardcoded
- *   account/home/keychain discovery; never another provider's key).
+ *   account, home directory, or keychain discovery; never another
+ *   provider's key).
  *
  * ZERO generation for both. A failed/unusable metadata read NEVER falls back
  * to a generation probe (that path exists only for the bounded GLM
