@@ -310,4 +310,58 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_pending_rebriefs_job ON pending_rebriefs(job_id);
     `,
   },
+  {
+    // Durable follow-through obligations (blocked-heist follow-through,
+    // phase 2 — ledger foundation only; no scheduling/execution).
+    //
+    // LANDING COLLISION (chief ruling 2026-09-28): this id 9 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature. PR132
+    // privately also uses 9. Whichever lane lands second must first
+    // integrate owner-merged main and re-number ONLY its never-applied
+    // migration (never a hole, never importing the other lane's unaccepted
+    // schema), then reverify at the exact final head. Once applied on any
+    // database, this build refuses unknown/gapped versions — roll-forward
+    // is the only compatible direction (no old-binary compatibility
+    // claim, no live schema action).
+    //
+    // Identity: (job_id, logical_step, incident_key) — stable across
+    // duplicate observations; distinct incidents coexist. `generation` is
+    // the job's blocked-generation at creation: only a NEW distinct
+    // incident advances it; duplicates never invalidate live work.
+    // Discriminated unions persist as JSON in TEXT columns, validated in
+    // src/ledger/obligations.ts (types are the authority, never prose).
+    id: 9,
+    name: 'job-obligations',
+    sql: `
+      CREATE TABLE job_obligations (
+        id               TEXT PRIMARY KEY,
+        job_id           TEXT NOT NULL REFERENCES jobs(id),
+        logical_step     TEXT NOT NULL,
+        incident_key     TEXT NOT NULL,
+        generation       INTEGER NOT NULL,
+        category         TEXT NOT NULL,
+        next_action      TEXT NOT NULL,
+        wake_condition   TEXT NOT NULL,
+        authority        TEXT,
+        firing_rule      TEXT NOT NULL,
+        state            TEXT NOT NULL,
+        settlement       TEXT,
+        due_at           TEXT,
+        receipt_kind     TEXT,
+        deadline_at      TEXT,
+        recorded_receipts TEXT NOT NULL DEFAULT '[]',
+        observations     INTEGER NOT NULL DEFAULT 1,
+        first_origin_seq INTEGER NOT NULL,
+        last_origin_seq  INTEGER NOT NULL,
+        superseded_by    TEXT,
+        claim            TEXT,
+        claim_history    INTEGER NOT NULL DEFAULT 0,
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL,
+        UNIQUE (job_id, logical_step, incident_key)
+      );
+      CREATE INDEX idx_job_obligations_job ON job_obligations(job_id);
+      CREATE INDEX idx_job_obligations_state ON job_obligations(state);
+    `,
+  },
 ];

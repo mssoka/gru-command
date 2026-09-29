@@ -6,16 +6,38 @@ import type { AgentState } from '../runtime/types.js';
 import {
   assertJobTransition,
   assertLensTransition,
+  assertObligationTransition,
   assertRoundTransition,
   isJobStatus,
   isLensState,
+  isObligationState,
   isRoundStatus,
   isRoundVerdict,
   type JobStatus,
   type LensState,
+  type ObligationState,
   type RoundStatus,
   type RoundVerdict,
 } from './states.js';
+import {
+  categoryKey,
+  parseAuthority,
+  parseCategory,
+  parseClaim,
+  parseNextAction,
+  parseReceipts,
+  parseSettlement,
+  parseWakeCondition,
+  resolveObligation,
+  type BlockerContext,
+  type ObligationAuthority,
+  type ObligationCategory,
+  type ObligationClaim,
+  type ObligationNextAction,
+  type ObligationSettlement,
+  type ObligationWakeCondition,
+  type RecordedReceipt,
+} from './obligations.js';
 
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 
@@ -149,6 +171,57 @@ export class RecordNotFound extends Error {
     super(message);
     this.name = 'RecordNotFound';
   }
+}
+
+/** A continuation was fenced out: the obligation moved to a different
+ * generation (a newer distinct incident superseded the caller's view) or
+ * the request does not own the current claim. Never retried blind —
+ * re-derive from current durable state first. */
+export class StaleContinuationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StaleContinuationError';
+  }
+}
+
+/** The obligation is held by another live request's claim. Lease expiry
+ * alone does NOT authorize replacing the holder (see ObligationClaim). */
+export class ClaimHeldError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ClaimHeldError';
+  }
+}
+
+/** One durable follow-through obligation (current state; full history is
+ * the events table). See src/ledger/obligations.ts for the vocabulary. */
+export interface ObligationRecord {
+  readonly id: string;
+  readonly jobId: string;
+  readonly logicalStep: string;
+  readonly incidentKey: string;
+  /** The job's blocked-generation at this incident's creation. Only a NEW
+   * distinct incident advances the job generation; duplicates never do. */
+  readonly generation: number;
+  readonly category: ObligationCategory;
+  readonly nextAction: ObligationNextAction;
+  readonly wakeCondition: ObligationWakeCondition;
+  readonly authority: ObligationAuthority | null;
+  readonly firingRule: string;
+  readonly state: ObligationState;
+  readonly settlement: ObligationSettlement | null;
+  readonly dueAt: string | null;
+  readonly receiptKind: string | null;
+  readonly deadlineAt: string | null;
+  readonly recordedReceipts: readonly RecordedReceipt[];
+  readonly observations: number;
+  readonly firstOriginSeq: number;
+  readonly lastOriginSeq: number;
+  readonly supersededBy: string | null;
+  readonly claim: ObligationClaim | null;
+  readonly claimHistory: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 
 // ------------------------------------------------------------------
@@ -489,8 +562,11 @@ export class LedgerApi {
     return rows.map((row) => this.jobFromRow(row));
   }
 
-  setJobStatus(id: string, status: string): JobRecord {
+  setJobStatus(id: string, status: string, context?: BlockerContext): JobRecord {
     if (!isJobStatus(status)) throw new Error(`unknown job status "${status}"`);
+    if (context !== undefined && status !== 'blocked') {
+      throw new Error('a blocker context may only accompany a blocked transition');
+    }
     return this.transaction(() => {
       const current = this.getJob(id);
       if (current === null) throw new RecordNotFound(`job "${id}" not found`);
@@ -499,7 +575,33 @@ export class LedgerApi {
         this.db
           .prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?')
           .run(status, nowIso(), id);
-        this.appendEvent({ kind: 'job.status', jobId: id, payload: { from: current.status, to: status } });
+        const event = this.appendEvent({ kind: 'job.status', jobId: id, payload: { from: current.status, to: status } });
+        // Status/obligation consistency lives AT this transactional boundary
+        // (chief ruling A): every writer — dispatch, HTTP API, future hooks —
+        // rides it. A blocked transition synthesizes/refreshes obligations
+        // from the typed context, or from a safe unknown-triage default when
+        // no context is given (a legitimate block is never rejected for a
+        // missing description). Parking suspends the applicable obligations;
+        // terminal states close them (history preserved, never erased).
+        if (status === 'blocked') {
+          this.applyBlockedObservation(
+            id,
+            context ?? { logicalStep: 'operation', category: { kind: 'unknown' }, observedAtSeq: event.seq },
+          );
+        } else if (status === 'parked') {
+          this.suspendApplicableObligations(id, 'job parked — obligation suspended by explicit durable state');
+        } else if (status === 'done' || status === 'merged') {
+          this.closeApplicableObligations(id, status);
+        }
+      } else if (status === 'blocked' && context !== undefined) {
+        // A repeated blocked observation on an already-blocked job is still
+        // an observation: the same transactional boundary must record it.
+        const event = this.appendEvent({
+          kind: 'job.status',
+          jobId: id,
+          payload: { from: current.status, to: status, note: 're-observed blocked' },
+        });
+        this.applyBlockedObservation(id, context ?? { logicalStep: 'operation', category: { kind: 'unknown' }, observedAtSeq: event.seq });
       }
       return this.getJob(id) as JobRecord;
     });
@@ -1440,6 +1542,546 @@ export class LedgerApi {
       state: str(row.state) as AgentState,
       lastActivity: nstr(row.last_activity),
       sessionFile: nstr(row.session_file),
+      createdAt: str(row.created_at),
+      updatedAt: str(row.updated_at),
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Durable follow-through obligations (phase 2 foundation).
+  // Pure state + fences: nothing here executes work, schedules anything,
+  // or wakes anyone. API writers must go through setJobStatus (or
+  // recordBlockedObservation, the observer backstop) — never raw SQL.
+  // ------------------------------------------------------------------
+
+  /** The observer backstop for blocked observations that did not ride a
+   * setJobStatus call (e.g. an async event-bus reconcile noticing a gap).
+   * Same transactional path, same semantics; correctness does not depend
+   * on it (the boundary is authoritative). */
+  recordBlockedObservation(jobId: string, context: BlockerContext): ObligationRecord {
+    return this.transaction(() => {
+      if (this.getJob(jobId) === null) throw new RecordNotFound(`job "${jobId}" not found`);
+      return this.applyBlockedObservation(jobId, context);
+    });
+  }
+
+  getObligation(id: string): ObligationRecord | null {
+    const row = this.db.prepare('SELECT * FROM job_obligations WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : this.obligationFromRow(row);
+  }
+
+  listObligations(opts: { jobId?: string; state?: ObligationState } = {}): readonly ObligationRecord[] {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (opts.jobId !== undefined) {
+      where.push('job_id = ?');
+      params.push(opts.jobId);
+    }
+    if (opts.state !== undefined) {
+      where.push('state = ?');
+      params.push(opts.state);
+    }
+    const sql = `SELECT * FROM job_obligations${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY rowid`;
+    return (this.db.prepare(sql).all(...(params as never[])) as Row[]).map((row) => this.obligationFromRow(row));
+  }
+
+  /** Take a request/generation-fenced claim on an obligation's next
+   * action. Records the fence; NEVER authorizes executing work by itself,
+   * and lease expiry alone never licenses a replacement holder. */
+  claimObligation(input: {
+    obligationId: string;
+    requestId: string;
+    holder: string;
+    expiresAt: string;
+    expectedGeneration: number;
+  }): ObligationRecord {
+    if (input.requestId.trim() === '') throw new Error('claim requires a non-empty requestId');
+    if (input.holder.trim() === '') throw new Error('claim requires a non-empty holder');
+    return this.transaction(() => {
+      const row = this.getObligation(input.obligationId);
+      if (row === null) throw new RecordNotFound(`obligation "${input.obligationId}" not found`);
+      if (row.state !== 'open' && row.state !== 'waiting') {
+        throw new Error(`obligation "${row.id}" is ${row.state} — only open/waiting obligations can be claimed`);
+      }
+      if (row.generation !== input.expectedGeneration) {
+        throw new StaleContinuationError(
+          `generation fence on "${row.id}": continuation expected generation ${input.expectedGeneration}, ` +
+            `the obligation is at ${row.generation} — re-derive from current durable state before acting`,
+        );
+      }
+      const now = nowIso();
+      if (row.claim !== null && row.claim.requestId !== input.requestId && row.claim.expiresAt > now) {
+        throw new ClaimHeldError(
+          `obligation "${row.id}" is held by request ${row.claim.requestId} (${row.claim.holder}) until ${row.claim.expiresAt}`,
+        );
+      }
+      const replaced = row.claim !== null && row.claim.requestId !== input.requestId;
+      this.db
+        .prepare(
+          'UPDATE job_obligations SET claim = ?, claim_history = claim_history + ?, updated_at = ? WHERE id = ?',
+        )
+        .run(
+          JSON.stringify({
+            requestId: input.requestId,
+            holder: input.holder,
+            generation: row.generation,
+            expiresAt: input.expiresAt,
+          }),
+          replaced ? 1 : 0,
+          now,
+          row.id,
+        );
+      this.appendEvent({
+        kind: 'job.obligation-claimed',
+        jobId: row.jobId,
+        payload: { id: row.id, requestId: input.requestId, holder: input.holder, expiresAt: input.expiresAt, replacedExpired: replaced },
+      });
+      return this.getObligation(row.id) as ObligationRecord;
+    });
+  }
+
+  /** Release a claim; only the owning request may release it. */
+  releaseClaim(input: { obligationId: string; requestId: string }): ObligationRecord {
+    return this.transaction(() => {
+      const row = this.getObligation(input.obligationId);
+      if (row === null) throw new RecordNotFound(`obligation "${input.obligationId}" not found`);
+      if (row.claim === null) throw new Error(`obligation "${row.id}" has no claim to release`);
+      if (row.claim.requestId !== input.requestId) {
+        throw new ClaimHeldError(`obligation "${row.id}" is held by request ${row.claim.requestId}, not ${input.requestId}`);
+      }
+      this.db
+        .prepare('UPDATE job_obligations SET claim = NULL, updated_at = ? WHERE id = ?')
+        .run(nowIso(), row.id);
+      this.appendEvent({
+        kind: 'job.obligation-claim-released',
+        jobId: row.jobId,
+        payload: { id: row.id, requestId: input.requestId },
+      });
+      return this.getObligation(row.id) as ObligationRecord;
+    });
+  }
+
+  /** Record receipt evidence for an obligation. IDEMPOTENT per
+   * (kind, eventSeq). A receipt postdating the obligation's watermark may
+   * hand a waiting obligation back to open (the decision returns); a
+   * receipt NEVER settles — accepted gates require an explicit, validated
+   * settlement. A stale (older) receipt is kept as evidence only. */
+  recordObligationReceipt(input: {
+    obligationId: string;
+    kind: string;
+    eventSeq: number;
+    at?: string;
+  }): ObligationRecord {
+    if (!Number.isSafeInteger(input.eventSeq) || input.eventSeq < 0) {
+      throw new Error('receipt requires a safe non-negative eventSeq');
+    }
+    return this.transaction(() => {
+      const row = this.getObligation(input.obligationId);
+      if (row === null) throw new RecordNotFound(`obligation "${input.obligationId}" not found`);
+      const duplicate = row.recordedReceipts.some(
+        (receipt) => receipt.kind === input.kind && receipt.eventSeq === input.eventSeq,
+      );
+      if (duplicate) return row; // already recorded — replay is a no-op
+      const applied = input.eventSeq > row.lastOriginSeq;
+      const receipts: RecordedReceipt[] = [
+        ...row.recordedReceipts,
+        { kind: input.kind, eventSeq: input.eventSeq, at: input.at ?? nowIso(), applied },
+      ];
+      let state: ObligationState = row.state;
+      if (applied && row.state === 'waiting' && row.receiptKind === input.kind) {
+        state = 'open'; // phase completion hands the decision back — not delivery/approval
+      }
+      this.db
+        .prepare(
+          `UPDATE job_obligations
+             SET recorded_receipts = ?, last_origin_seq = MAX(last_origin_seq, ?), state = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(JSON.stringify(receipts), input.eventSeq, state, nowIso(), row.id);
+      this.appendEvent({
+        kind: 'job.obligation-receipt',
+        jobId: row.jobId,
+        payload: { id: row.id, receipt_kind: input.kind, event_seq: input.eventSeq, applied, from: row.state, to: state },
+      });
+      return this.getObligation(row.id) as ObligationRecord;
+    });
+  }
+
+  /** Settle or close an obligation with a validated, discriminated
+   * settlement. Evidence kinds settle; supersession/cancellation/
+   * job-terminal close. History is preserved (the row and its events
+   * stay); settled/closed are terminal — a recurring incident is a NEW
+   * obligation. */
+  settleObligation(input: {
+    obligationId: string;
+    settlement: ObligationSettlement;
+    requestId?: string;
+  }): ObligationRecord {
+    return this.transaction(() => {
+      const row = this.getObligation(input.obligationId);
+      if (row === null) throw new RecordNotFound(`obligation "${input.obligationId}" not found`);
+      const target: ObligationState =
+        input.settlement.kind === 'executed-action' || input.settlement.kind === 'accepted-evidence'
+          ? 'settled'
+          : 'closed';
+      assertObligationTransition(row.state, target);
+      // Evidence settlements are claim-fenced (the owning request proves
+      // its continuation). Administrative closes (superseded/cancelled/
+      // job-terminal) are durable truth from the job machine itself — they
+      // clear any claim rather than being vetoed by it, and the cleared
+      // claim stays in claim_history/events for the record.
+      if (
+        row.claim !== null &&
+        row.claim.requestId !== input.requestId &&
+        (input.settlement.kind === 'executed-action' || input.settlement.kind === 'accepted-evidence')
+      ) {
+        throw new ClaimHeldError(
+          `obligation "${row.id}" is held by request ${row.claim.requestId} — settle through the owning request or release it first`,
+        );
+      }
+      this.db
+        .prepare(
+          'UPDATE job_obligations SET state = ?, settlement = ?, claim = NULL, updated_at = ? WHERE id = ?',
+        )
+        .run(target, JSON.stringify(input.settlement), nowIso(), row.id);
+      this.appendEvent({
+        kind: 'job.obligation-settled',
+        jobId: row.jobId,
+        payload: { id: row.id, from: row.state, to: target, settlement: input.settlement },
+      });
+      return this.getObligation(row.id) as ObligationRecord;
+    });
+  }
+
+  /** Arm a receipt expectation: the obligation's next action is delegated
+   * to a phase that owes a typed receipt (e.g. job.delivered) by a
+   * deadline. Pure state — arming does NOT spawn, notify or execute
+   * anything; the phase-3 delegation hook calls this when it actually
+   * hands work over, so "waiting" is always backed by durable intent. */
+  armReceiptExpectation(input: {
+    obligationId: string;
+    receiptKind: string;
+    deadlineAt: string;
+    requestId?: string;
+    reason?: string;
+  }): ObligationRecord {
+    if (input.receiptKind.trim() === '') throw new Error('arming requires a non-empty receiptKind');
+    return this.transaction(() => {
+      const row = this.getObligation(input.obligationId);
+      if (row === null) throw new RecordNotFound(`obligation "${input.obligationId}" not found`);
+      assertObligationTransition(row.state, 'waiting');
+      if (row.claim !== null && row.claim.requestId !== input.requestId) {
+        throw new ClaimHeldError(
+          `obligation "${row.id}" is held by request ${row.claim.requestId} — arm through the owning request or release it first`,
+        );
+      }
+      this.db
+        .prepare(
+          `UPDATE job_obligations SET state = 'waiting', receipt_kind = ?, deadline_at = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(input.receiptKind, input.deadlineAt, nowIso(), row.id);
+      this.appendEvent({
+        kind: 'job.obligation-state',
+        jobId: row.jobId,
+        payload: {
+          id: row.id,
+          from: row.state,
+          to: 'waiting',
+          receipt_kind: input.receiptKind,
+          deadline_at: input.deadlineAt,
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        },
+      });
+      return this.getObligation(row.id) as ObligationRecord;
+    });
+  }
+
+  /** Explicit durable suspension (owner hold / parking). Never inferred
+   * from a notification ack, prose, or a check name. */
+  suspendObligation(id: string, reason: string): ObligationRecord {
+    return this.transaction(() => {
+      const row = this.getObligation(id);
+      if (row === null) throw new RecordNotFound(`obligation "${id}" not found`);
+      assertObligationTransition(row.state, 'suspended');
+      this.db
+        .prepare("UPDATE job_obligations SET state = 'suspended', updated_at = ? WHERE id = ?")
+        .run(nowIso(), row.id);
+      this.appendEvent({
+        kind: 'job.obligation-state',
+        jobId: row.jobId,
+        payload: { id: row.id, from: row.state, to: 'suspended', reason },
+      });
+      return this.getObligation(row.id) as ObligationRecord;
+    });
+  }
+
+  /** Explicit durable resume (only a human/chief decision does this). */
+  resumeObligation(id: string, reason: string): ObligationRecord {
+    return this.transaction(() => {
+      const row = this.getObligation(id);
+      if (row === null) throw new RecordNotFound(`obligation "${id}" not found`);
+      assertObligationTransition(row.state, 'open');
+      this.db
+        .prepare("UPDATE job_obligations SET state = 'open', updated_at = ? WHERE id = ?")
+        .run(nowIso(), row.id);
+      this.appendEvent({
+        kind: 'job.obligation-state',
+        jobId: row.jobId,
+        payload: { id: row.id, from: row.state, to: 'open', reason },
+      });
+      return this.getObligation(row.id) as ObligationRecord;
+    });
+  }
+
+  /** Close obligations whose continuations were fenced off by newer
+   * durable truth (head moved, completion, cancellation, revised ruling,
+   * owner hold). Acts ONLY on applicable rows (open/waiting, at or before
+   * the watermark); terminal rows and their history are untouched. */
+  invalidateStaleContinuations(input: {
+    jobId: string;
+    newerThanSeq: number;
+    reason: string;
+  }): readonly ObligationRecord[] {
+    return this.transaction(() => {
+      if (this.getJob(input.jobId) === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      const applicable = this.listObligations({ jobId: input.jobId }).filter(
+        (row) => (row.state === 'open' || row.state === 'waiting') && row.lastOriginSeq <= input.newerThanSeq,
+      );
+      const settled: ObligationRecord[] = [];
+      for (const row of applicable) {
+        settled.push(
+          this.settleObligation({
+            obligationId: row.id,
+            settlement: { kind: 'superseded', byObligationId: null, reason: input.reason },
+          }),
+        );
+      }
+      return settled;
+    });
+  }
+
+  // -- obligation internals (all inside a transaction) ----------------
+
+  /** Apply one typed blocked observation: create a new incident (new
+   * generation) or coalesce a duplicate (no generation advance, stable
+   * identity, latest plan wins). A terminal row for the same incident is
+   * history: the recurrence mints a new incarnation id (#n suffix). */
+  private applyBlockedObservation(jobId: string, context: BlockerContext): ObligationRecord {
+    const resolved = resolveObligation(context, jobId);
+    const existing = this.getObligation(resolved.id);
+    const now = nowIso();
+    if (existing === null) {
+      const id = this.nextIncarnationId(resolved.id);
+      const generation = this.currentJobGeneration(jobId) + 1;
+      this.db
+        .prepare(
+          `INSERT INTO job_obligations
+             (id, job_id, logical_step, incident_key, generation, category, next_action, wake_condition,
+              authority, firing_rule, state, due_at, receipt_kind, deadline_at, recorded_receipts,
+              observations, first_origin_seq, last_origin_seq, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, '[]', 1, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          jobId,
+          resolved.logicalStep,
+          resolved.incidentKey,
+          generation,
+          JSON.stringify(resolved.category),
+          JSON.stringify(resolved.nextAction),
+          JSON.stringify(resolved.wakeCondition),
+          resolved.authority === null ? null : JSON.stringify(resolved.authority),
+          resolved.firingRule,
+          resolved.dueAt,
+          resolved.receiptKind,
+          resolved.deadlineAt,
+          context.observedAtSeq,
+          context.observedAtSeq,
+          now,
+          now,
+        );
+      this.appendEvent({
+        kind: 'job.obligation-recorded',
+        jobId,
+        payload: {
+          id,
+          generation,
+          category: categoryKey(resolved.category),
+          next_action: resolved.nextAction,
+          firing_rule: resolved.firingRule,
+          authority: resolved.authority,
+        },
+      });
+      return this.getObligation(id) as ObligationRecord;
+    }
+    if (existing.state === 'settled' || existing.state === 'closed') {
+      // Same incident recurring after settlement: history stays, a new
+      // incarnation opens at a fresh generation.
+      const id = this.nextIncarnationId(existing.id);
+      const generation = this.currentJobGeneration(jobId) + 1;
+      this.db
+        .prepare(
+          `INSERT INTO job_obligations
+             (id, job_id, logical_step, incident_key, generation, category, next_action, wake_condition,
+              authority, firing_rule, state, due_at, receipt_kind, deadline_at, recorded_receipts,
+              observations, first_origin_seq, last_origin_seq, superseded_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, '[]', 1, ?, ?, NULL, ?, ?)`,
+        )
+        .run(
+          id,
+          jobId,
+          resolved.logicalStep,
+          resolved.incidentKey,
+          generation,
+          JSON.stringify(resolved.category),
+          JSON.stringify(resolved.nextAction),
+          JSON.stringify(resolved.wakeCondition),
+          resolved.authority === null ? null : JSON.stringify(resolved.authority),
+          resolved.firingRule,
+          resolved.dueAt,
+          resolved.receiptKind,
+          resolved.deadlineAt,
+          context.observedAtSeq,
+          context.observedAtSeq,
+          now,
+          now,
+        );
+      this.db
+        .prepare('UPDATE job_obligations SET superseded_by = ?, updated_at = ? WHERE id = ?')
+        .run(id, now, existing.id);
+      this.appendEvent({
+        kind: 'job.obligation-recorded',
+        jobId,
+        payload: {
+          id,
+          generation,
+          category: categoryKey(resolved.category),
+          next_action: resolved.nextAction,
+          firing_rule: resolved.firingRule,
+          authority: resolved.authority,
+          recurrence_of: existing.id,
+        },
+      });
+      return this.getObligation(id) as ObligationRecord;
+    }
+    // Duplicate observation of a live incident: coalesce. Identity,
+    // generation and history stay; the latest plan and watermark win.
+    const changed: string[] = [];
+    const nextPlanChanged =
+      JSON.stringify(existing.nextAction) !== JSON.stringify(resolved.nextAction) ||
+      JSON.stringify(existing.wakeCondition) !== JSON.stringify(resolved.wakeCondition) ||
+      JSON.stringify(existing.authority) !== JSON.stringify(resolved.authority);
+    if (nextPlanChanged) changed.push('plan');
+    if (existing.dueAt !== resolved.dueAt || existing.deadlineAt !== resolved.deadlineAt) changed.push('bounds');
+    this.db
+      .prepare(
+        `UPDATE job_obligations
+           SET observations = observations + 1,
+               last_origin_seq = MAX(last_origin_seq, ?),
+               next_action = ?, wake_condition = ?, authority = ?, firing_rule = ?,
+               due_at = COALESCE(?, due_at), receipt_kind = COALESCE(?, receipt_kind),
+               deadline_at = COALESCE(?, deadline_at),
+               updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        context.observedAtSeq,
+        JSON.stringify(resolved.nextAction),
+        JSON.stringify(resolved.wakeCondition),
+        resolved.authority === null ? null : JSON.stringify(resolved.authority),
+        resolved.firingRule,
+        resolved.dueAt,
+        resolved.receiptKind,
+        resolved.deadlineAt,
+        now,
+        existing.id,
+      );
+    this.appendEvent({
+      kind: 'job.obligation-updated',
+      jobId,
+      payload: {
+        id: existing.id,
+        observations: existing.observations + 1,
+        last_origin_seq: Math.max(existing.lastOriginSeq, context.observedAtSeq),
+        changed,
+      },
+    });
+    return this.getObligation(existing.id) as ObligationRecord;
+  }
+
+  /** The job's current blocked-generation = the max generation across its
+   * obligation rows (0 when none). */
+  private currentJobGeneration(jobId: string): number {
+    const row = this.db
+      .prepare('SELECT MAX(generation) AS generation FROM job_obligations WHERE job_id = ?')
+      .get(jobId) as Row | undefined;
+    const value = row?.generation;
+    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+  }
+
+  /** First free incarnation id for a recurring incident
+   * (base, base#2, base#3, ...). History is append-only. */
+  private nextIncarnationId(base: string): string {
+    let candidate = base;
+    let n = 1;
+    while (this.getObligation(candidate) !== null) {
+      n += 1;
+      candidate = `${base}#${n}`;
+    }
+    return candidate;
+  }
+
+  /** Suspend the job's applicable obligations (open/waiting). Used by the
+   * parked transition; explicit human/chief resume re-opens. */
+  private suspendApplicableObligations(jobId: string, reason: string): void {
+    for (const row of this.listObligations({ jobId })) {
+      if (row.state === 'open' || row.state === 'waiting') {
+        this.suspendObligation(row.id, reason);
+      }
+    }
+  }
+
+  /** Close the job's applicable obligations (open/waiting/suspended) on a
+   * terminal transition — settled rows and history stay untouched. */
+  private closeApplicableObligations(jobId: string, terminal: 'done' | 'merged'): void {
+    for (const row of this.listObligations({ jobId })) {
+      if (row.state === 'open' || row.state === 'waiting' || row.state === 'suspended') {
+        this.settleObligation({
+          obligationId: row.id,
+          settlement: { kind: 'job-terminal', jobStatus: terminal },
+        });
+      }
+    }
+  }
+
+  private obligationFromRow(row: Row): ObligationRecord {
+    const state = str(row.state);
+    if (!isObligationState(state)) {
+      throw new Error(`job_obligations row "${str(row.id)}" has unknown state "${state}"`);
+    }
+    return {
+      id: str(row.id),
+      jobId: str(row.job_id),
+      logicalStep: str(row.logical_step),
+      incidentKey: str(row.incident_key),
+      generation: Number(row.generation),
+      category: parseCategory(str(row.category)),
+      nextAction: parseNextAction(str(row.next_action)),
+      wakeCondition: parseWakeCondition(str(row.wake_condition)),
+      authority: parseAuthority(row.authority === null || row.authority === undefined ? null : str(row.authority)),
+      firingRule: str(row.firing_rule),
+      state,
+      settlement: row.settlement === null || row.settlement === undefined ? null : parseSettlement(str(row.settlement)),
+      dueAt: nstr(row.due_at),
+      receiptKind: nstr(row.receipt_kind),
+      deadlineAt: nstr(row.deadline_at),
+      recordedReceipts: parseReceipts(str(row.recorded_receipts)),
+      observations: Number(row.observations),
+      firstOriginSeq: Number(row.first_origin_seq),
+      lastOriginSeq: Number(row.last_origin_seq),
+      supersededBy: nstr(row.superseded_by),
+      claim: parseClaim(row.claim === null || row.claim === undefined ? null : str(row.claim)),
+      claimHistory: Number(row.claim_history),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
     };
