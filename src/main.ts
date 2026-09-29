@@ -5,6 +5,7 @@ import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
 import { RuntimeRegistry } from './runtime/registry.js';
+import { resolveRateLimitBackoff } from './runtime/pacing.js';
 import { SessionStore } from './sessions/store.js';
 import { LedgerDb } from './ledger/db.js';
 import { LedgerApi, type NotificationRecord } from './ledger/api.js';
@@ -595,6 +596,7 @@ async function main(): Promise<number> {
     ledger,
     notifications,
     decisions: decisionRuntime,
+    rateLimitBackoff: resolveRateLimitBackoff(config.concurrency),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   supervisor = supervisorLive;

@@ -11,8 +11,21 @@ import {
   supervisionDecisionRequest,
   type FailureClass,
 } from '../decisions/questions.js';
+import {
+  backoffDelayMs,
+  isRateLimitErrorText,
+  type RateLimitBackoffPolicy,
+} from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+/** Default backoff sleep: a real, unref'd timer (tests inject a fake). */
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
 
 /**
  * The registry surface supervision consumes (structural — the real
@@ -197,6 +210,29 @@ interface SupervisedAgent {
   providerCondition: ProviderCondition | null;
   /** Proactive context-compaction gate state. */
   compaction: CompactionGateState;
+  /** Active automatic rate-limit retry incident (null when none). While set
+   * it owns recovery for this agent; the watchdog skips hang detection
+   * until its next delivery attempt is actually running. */
+  rateLimitRetry: RateLimitRetryIncident | null;
+}
+
+/** One active automatic rate-limit retry incident: the failed turn's prompt
+ * is re-delivered on the SAME live session after each bounded backoff, and
+ * every failure inside the incident spends one retry from the resolved
+ * budget. Cleared by recovery, replacement, or a clean delivery. */
+interface RateLimitRetryIncident {
+  /** Retries scheduled so far (attempt numbers are 1-based at schedule). */
+  attempts: number;
+  readonly maxRetries: number;
+  /** The failed turn's prompt, captured synchronously at error time —
+   * before the adapter clears its live-turn snapshot. */
+  readonly pending: PendingTurn;
+  /** A delivery attempt is in flight right now. */
+  awaitingDelivery: boolean;
+  /** Failure signals observed in this incident: a delivery failed iff this
+   * counter moved across (i.e. during) that delivery. */
+  failureSeq: number;
+  lastError: string;
 }
 
 /** What a restart rung must know to recover a killed open turn. */
@@ -257,6 +293,15 @@ export interface SupervisorOptions {
   /** Test seam: wall clock used only for sleep/wake gap detection
    * (default Date.now; the `now` seam is free to be a fake clock). */
   readonly wallNow?: () => number;
+  /** Resolved rate-limit automatic retry policy (owner heist 2026-09-29);
+   * null/omitted = feature off — the failure keeps its current ladder
+   * behavior (stop for provider walls, nothing for other in-band errors). */
+  readonly rateLimitBackoff?: RateLimitBackoffPolicy | null;
+  /** Test seam: backoff sleep (default a real unref'd timer). */
+  readonly sleep?: (ms: number) => Promise<void>;
+  /** Test seam: jitter over [0, capMs) added to each backoff delay (default
+   * uniform random). Tests pin it for deterministic ladder-shape asserts. */
+  readonly jitter?: (capMs: number) => number;
 }
 
 export class Supervisor {
@@ -268,6 +313,9 @@ export class Supervisor {
   private readonly log: Log;
   private readonly now: () => number;
   private readonly wallNow: () => number;
+  private readonly rateLimitBackoff: RateLimitBackoffPolicy | null;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly jitter: (capMs: number) => number;
   private readonly agents = new Map<string, SupervisedAgent>();
   private readonly slots = new Map<string, SupervisedSlotInternal>();
   private readonly unsubscribeTap: () => void;
@@ -286,6 +334,9 @@ export class Supervisor {
     this.log = opts.log ?? (() => {});
     this.now = opts.now ?? Date.now;
     this.wallNow = opts.wallNow ?? Date.now;
+    this.rateLimitBackoff = opts.rateLimitBackoff ?? null;
+    this.sleep = opts.sleep ?? defaultSleep;
+    this.jitter = opts.jitter ?? ((capMs: number) => Math.random() * capMs);
     // Cadence: a quarter of the silence window, capped at 5 s so a tight
     // window still ticks promptly.
     this.tickMs = opts.tickMs ?? Math.min(this.cfg.turnSilenceMs / 4, 5_000);
@@ -566,6 +617,9 @@ export class Supervisor {
       if (envelope.phase === 'disposed') {
         const agent = this.agents.get(envelope.agentId);
         if (agent === undefined) return;
+        // A disposed handle can never deliver a pending retry: drop the
+        // incident with it (the delivery continuation self-cancels too).
+        agent.rateLimitRetry = null;
         agent.handle = null;
         agent.openTurn = false;
         agent.openControl = false;
@@ -662,9 +716,13 @@ export class Supervisor {
             void this.evaluateRecovery(agent, `fatal error: ${event.error}`, true, true);
           } else {
             // Preserve the adapter contract: in-band failures never restart.
-            // They still enter provider-wall classification so known auth or
-            // quota failures produce durable stop/re-arm guidance.
-            void this.evaluateRecovery(agent, `runtime error: ${event.error}`, false, true);
+            // Rate-limit-class failures first spend the bounded automatic
+            // retry budget; everything else enters provider-wall
+            // classification so known auth or quota failures produce durable
+            // stop/re-arm guidance.
+            if (!this.absorbRateLimitFailure(agent, event.error)) {
+              void this.evaluateRecovery(agent, `runtime error: ${event.error}`, false, true);
+            }
           }
           break;
         default:
@@ -916,6 +974,7 @@ export class Supervisor {
       queuedRecovery: null,
       providerCondition: null,
       compaction: freshCompactionGate(),
+      rateLimitRetry: null,
     });
     this.log('info', 'supervising agent', { agent_id: agentId, role, slot: slot?.id ?? null });
     return true;
@@ -934,6 +993,11 @@ export class Supervisor {
       // Idle-boundary gate: a session that was already over the threshold
       // (resumed, or crossed while a tick was missed) still compacts here.
       this.maybeProactiveCompact(agent);
+      // An automatic rate-limit retry waiting out its backoff owns recovery:
+      // the failed turn's residual silence must not read as a hang. A
+      // delivery that is actually running stays under the watchdog — a hung
+      // retry attempt is still a hang.
+      if (agent.rateLimitRetry !== null && !agent.rateLimitRetry.awaitingDelivery) continue;
       const busy = this.handleBusy(agent.handle);
       if (!busy && !agent.openTurn && !agent.openControl) continue;
       // Liveness = events OR bytes: session-file growth also resets the clock.
@@ -1084,6 +1148,178 @@ export class Supervisor {
   }
 
   // ------------------------------------------------------------------
+  // Automatic rate-limit retry (owner heist 2026-09-29, scope-trimmed)
+  // ------------------------------------------------------------------
+
+  /** Consume a non-fatal runtime error through the automatic retry path.
+   * True = absorbed (a retry was scheduled, or this duplicates the attempt
+   * already being retried); false = hand the failure to the existing
+   * recovery ladder. Never intercepts when the policy is off. */
+  private absorbRateLimitFailure(agent: SupervisedAgent, errorText: string): boolean {
+    const policy = this.rateLimitBackoff;
+    if (policy === null) return false;
+    if (!isRateLimitErrorText(errorText, policy.patterns)) return false;
+    const incident = agent.rateLimitRetry;
+    if (incident !== null) {
+      if (incident.awaitingDelivery) {
+        // The delivery we were waiting on failed; its error event is the
+        // one failure signal for this attempt.
+        incident.awaitingDelivery = false;
+        incident.failureSeq += 1;
+        incident.lastError = errorText;
+        return this.scheduleRateLimitRetry(agent, incident);
+      }
+      // Adapters duplicate failure signals (error + sticky state:error, or
+      // a second error frame for one failure): never double-count an
+      // attempt, and never schedule two rungs for one failure.
+      return true;
+    }
+    const captured = this.captureInterruptedTurn(agent.handle, agent);
+    if (captured === null || captured.pending === null) {
+      // Nothing re-deliverable was captured: the failure keeps its existing
+      // ladder behavior rather than parking the lane on an undeliverable
+      // retry.
+      return false;
+    }
+    const fresh: RateLimitRetryIncident = {
+      attempts: 0,
+      maxRetries: policy.maxRetries,
+      pending: captured.pending,
+      awaitingDelivery: false,
+      failureSeq: 1,
+      lastError: errorText,
+    };
+    agent.rateLimitRetry = fresh;
+    return this.scheduleRateLimitRetry(agent, fresh);
+  }
+
+  /** Schedule the next retry rung, or give up (false) when the budget is
+   * spent. One ledger event per scheduled retry is the observability
+   * contract; exhaustion is recorded before the ladder takes over. */
+  private scheduleRateLimitRetry(
+    agent: SupervisedAgent,
+    incident: RateLimitRetryIncident,
+  ): boolean {
+    const policy = this.rateLimitBackoff;
+    if (policy === null) {
+      agent.rateLimitRetry = null;
+      return false;
+    }
+    if (incident.attempts >= incident.maxRetries) {
+      agent.rateLimitRetry = null;
+      this.recordEvent('pacing.auto-retry-exhausted', agent.agentId, {
+        attempts: incident.attempts,
+        max_auto_retries: incident.maxRetries,
+        error: incident.lastError.slice(0, 500),
+      });
+      return false;
+    }
+    incident.attempts += 1;
+    const delayMs = backoffDelayMs(incident.attempts, policy.baseMs, policy.maxMs, this.jitter);
+    this.recordEvent('pacing.auto-retry', agent.agentId, {
+      attempt: incident.attempts,
+      max_auto_retries: incident.maxRetries,
+      delay_ms: delayMs,
+      error: incident.lastError.slice(0, 500),
+    });
+    this.log('warn', 'rate-limit failure — automatic retry scheduled', {
+      agent_id: agent.agentId,
+      attempt: incident.attempts,
+      max_auto_retries: incident.maxRetries,
+      delay_ms: delayMs,
+    });
+    void this.deliverRateLimitRetry(agent, incident, delayMs);
+    return true;
+  }
+
+  /** Wait out the backoff, then re-deliver the captured prompt on the SAME
+   * live session. Adapters report model failures in-band (the prompt may
+   * resolve while the turn errored), so an attempt's outcome is read from
+   * the failure counter, not from the promise alone; a rejection with no
+   * event signal is classified directly. */
+  private async deliverRateLimitRetry(
+    agent: SupervisedAgent,
+    incident: RateLimitRetryIncident,
+    delayMs: number,
+  ): Promise<void> {
+    try {
+      await this.sleep(delayMs);
+      // The incident may have been superseded (recovery, replacement,
+      // shutdown) while we waited — the identity check is the cancellation.
+      if (this.disposed || agent.rateLimitRetry !== incident) return;
+      if (this.agents.get(agent.agentId) !== agent) return;
+      const handle = agent.handle;
+      if (handle === null || agent.breakerOpen) {
+        agent.rateLimitRetry = null;
+        return;
+      }
+      incident.awaitingDelivery = true;
+      const failureSeqAtDelivery = incident.failureSeq;
+      this.log('info', 'delivering automatic rate-limit retry', {
+        agent_id: agent.agentId,
+        attempt: incident.attempts,
+        owner: incident.pending.owner,
+      });
+      let rejection: unknown = null;
+      try {
+        await handle.prompt(incident.pending.text, {
+          ...(incident.pending.owner !== null ? { owner: incident.pending.owner } : {}),
+          ...(incident.pending.images !== undefined ? { images: incident.pending.images } : {}),
+        });
+      } catch (error) {
+        rejection = error;
+      }
+      if (agent.rateLimitRetry !== incident) return; // superseded mid-flight
+      incident.awaitingDelivery = false;
+      if (incident.failureSeq !== failureSeqAtDelivery) {
+        // The attempt failed; its error event already scheduled the next
+        // rung — or spent the budget and handed off to the ladder.
+        return;
+      }
+      if (rejection === null) {
+        agent.rateLimitRetry = null;
+        this.recordEvent('pacing.auto-retry-recovered', agent.agentId, {
+          attempts: incident.attempts,
+        });
+        this.log('info', 'automatic rate-limit retry recovered the turn', {
+          agent_id: agent.agentId,
+          attempts: incident.attempts,
+        });
+        return;
+      }
+      const text = String(rejection);
+      const policy = this.rateLimitBackoff;
+      if (policy !== null && isRateLimitErrorText(text, policy.patterns)) {
+        incident.failureSeq += 1;
+        incident.lastError = text;
+        if (this.scheduleRateLimitRetry(agent, incident)) return;
+      } else if (/disposed/i.test(text)) {
+        // The session went away under the retry (shutdown or replacement):
+        // no failure to ladder, no retry to continue.
+        agent.rateLimitRetry = null;
+        this.log('warn', 'rate-limit retry delivery ended on a disposed session', {
+          agent_id: agent.agentId,
+          attempt: incident.attempts,
+        });
+        return;
+      } else {
+        agent.rateLimitRetry = null;
+      }
+      // No adapter event surfaced this failure (or the budget is spent):
+      // the existing recovery ladder still owns it.
+      void this.evaluateRecovery(agent, `runtime error: ${text}`, false, true);
+    } catch (error) {
+      // The retry machinery must never throw into the tap or leave a
+      // half-state behind.
+      agent.rateLimitRetry = null;
+      this.log('error', 'rate-limit retry delivery failed internally', {
+        agent_id: agent.agentId,
+        error: String(error),
+      });
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Decision-backed recovery guidance + restart ladder
   // ------------------------------------------------------------------
 
@@ -1150,6 +1386,11 @@ export class Supervisor {
     allowRestart = true,
     runtimeError = false,
   ): Promise<void> {
+    // Any recovery entry (hang, fatal, non-rate-limit error) supersedes an
+    // in-flight automatic retry: the failure it was retrying is no longer
+    // the failure being handled. The delivery continuation self-cancels on
+    // the cleared incident identity.
+    agent.rateLimitRetry = null;
     // Perkins review attempts are owned by the bounded review workflow. A
     // supervisor resume would drop that attempt's cwd/isolation contract and
     // race the workflow's one permitted retry, so abort the handle only; the
