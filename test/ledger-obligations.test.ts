@@ -69,12 +69,17 @@ describe('obligations — blocked-transition boundary', () => {
     api.addJob({ id: 'job-a', repo: 'r', title: 'Job A' });
     api.setJobStatus('job-a', 'working');
     const seq = api.latestEventSeq();
-    const job = api.setJobStatus('job-a', 'blocked', ownerHoldContext(seq));
+    // A date-only supplied due boundary must be canonicalized at the write
+    // boundary — the due selector compares stored strings lexicographically.
+    const job = api.setJobStatus('job-a', 'blocked', { ...ownerHoldContext(seq), dueAt: '2030-01-01' });
     expect(job.status).toBe('blocked');
     const obligations = api.listObligations({ jobId: 'job-a' });
     expect(obligations).toHaveLength(1);
     expect(obligations[0]?.id).toBe('job-a:operation:quota-exhausted');
     expect(obligations[0]?.category).toEqual({ kind: 'known', category: 'owner-hold' });
+    // Supplied human context persists (accepted is not discarded).
+    expect(obligations[0]?.description).toBe('owner quota hold observed at the boundary');
+    expect(obligations[0]?.dueAt).toBe('2030-01-01T00:00:00.000Z');
     // Owner holds route to the owner surface — never a machine turn.
     expect(obligations[0]?.nextAction.kind).toBe('owner-decision');
     expect(obligationRouting(obligations[0]!.nextAction)).toBe('needs-owner');
@@ -639,6 +644,9 @@ describe('obligations — restart persistence, reclassification, authority valid
     expect(api.verifyObligationAuthority(id).executable).toBe(false);
     // The matching ref+version IS current authority.
     api.appendCustomEvent({ kind: 'ruling.recorded', jobId: 'job-j', payload: { ref: 'chief-1', version: 'v1' } });
+    expect(api.verifyObligationAuthority(id)).toMatchObject({ executable: true });
+    // A later unrelated ruling must not shadow the matching one (N2).
+    api.appendCustomEvent({ kind: 'ruling.recorded', jobId: 'job-j', payload: { ref: 'chief-1', version: 'v9' } });
     expect(api.verifyObligationAuthority(id)).toMatchObject({ executable: true });
     // No authority at all: attention-only.
     api.recordBlockedObservation('job-j', {

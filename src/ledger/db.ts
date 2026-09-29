@@ -351,6 +351,7 @@ export const MIGRATIONS: readonly Migration[] = [
         logical_step     TEXT NOT NULL,
         incident_key     TEXT NOT NULL,
         generation       INTEGER NOT NULL,
+        description      TEXT,
         category         TEXT NOT NULL,
         next_action      TEXT NOT NULL,
         wake_condition   TEXT NOT NULL,

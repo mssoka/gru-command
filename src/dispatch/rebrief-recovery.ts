@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import type {
   DirectiveRequestRecord,
   EventRecord,
@@ -427,14 +428,15 @@ export interface DirectiveReconcileReport {
 
 /**
  * Boot reconciliation for directive requests. Deterministic and bounded:
- * one pass, one escalation per request (stable kind ⇒ the notification
- * dedupe holds across boots — no fresh alert ids to bypass dedupe), no
- * provider calls, no worker spawns, no re-dispatch.
+ * every LIVE (dispatching/admitted) request is examined — read in bounded
+ * cursor pages, never a request_id-ordered first page (the table is
+ * append-only, so terminal history would crowd live rows past a fixed
+ * page forever) — one escalation per request (stable kind ⇒ the
+ * notification dedupe holds across boots — no fresh alert ids to bypass
+ * dedupe), no provider calls, no worker spawns, no re-dispatch.
  */
 export function reconcilePendingDirectives(deps: ReconcileDirectivesDeps): DirectiveReconcileReport {
-  const live = deps.ledger
-    .listPendingDirectives()
-    .filter((row) => row.state === 'dispatching' || row.state === 'admitted');
+  const live = listAllLiveDirectives(deps.ledger);
   let completed = 0;
   let escalated = 0;
   for (const row of live) {
@@ -449,22 +451,26 @@ export function reconcilePendingDirectives(deps: ReconcileDirectivesDeps): Direc
       completed += 1;
       continue;
     }
-    const admissionUnknown = row.state === 'dispatching';
+    // Recovery may have JUST recorded the admission from correlated
+    // evidence: the note and card must describe the durable
+    // post-recovery state, never the pre-recovery snapshot (W1).
+    const current = deps.ledger.getDirective(row.requestId) ?? row;
+    const admissionUnknown = current.state === 'dispatching';
     deps.ledger.recordDirectiveReconcile({
-      requestId: row.requestId,
+      requestId: current.requestId,
       note: admissionUnknown ? 'admission-unknown at boot' : 'admitted without terminal receipt at boot',
     });
     try {
       deps.notifications.postIncident({
-        kind: `silas.directive-unreconciled.${row.requestId}`,
+        kind: `silas.directive-unreconciled.${current.requestId}`,
         routing: 'action-required',
         severity: 'error',
-        title: `Directive request ${row.requestId} unreconciled after restart (job ${row.jobId})`,
+        title: `Directive request ${current.requestId} unreconciled after restart (job ${current.jobId})`,
         detail: admissionUnknown
           ? 'The request was accepted and a dispatch claim was taken, but no native admission evidence ' +
             'exists after restart: a prompt may have been delivered (crash after I/O, before the admission ' +
             'record). Do NOT re-dispatch without a Gru decision; reconcile the actual minion/session state first.'
-          : `The request was admitted${row.admissionMinion === null ? '' : ` to minion ${row.admissionMinion}`} ` +
+          : `The request was admitted${current.admissionMinion === null ? '' : ` to minion ${current.admissionMinion}`} ` +
             'but no correlated terminal receipt exists after restart. The turn may still be completing in its ' +
             'session: do not re-dispatch; reconcile the actual completion before recording anything.',
         dedupe: 'unacked',
@@ -472,12 +478,37 @@ export function reconcilePendingDirectives(deps: ReconcileDirectivesDeps): Direc
       escalated += 1;
     } catch (error) {
       deps.log?.('error', 'directive recovery escalation could not be posted', {
-        request: row.requestId,
+        request: current.requestId,
         error: String(error),
       });
     }
   }
   return { examined: live.length, completed, escalated };
+}
+
+/** Page size for the boot pass: small enough to bound one query, large
+ * enough that the common case is one page. */
+const DIRECTIVE_RECONCILE_PAGE = 200;
+
+/** Every live request, read in bounded cursor pages: the cursor advances
+ * past each examined page, so a live row after any amount of terminal
+ * history is still examined (boundedness limits the work per query, it
+ * never drops live work). */
+function listAllLiveDirectives(ledger: LedgerApi): readonly DirectiveRequestRecord[] {
+  const live: DirectiveRequestRecord[] = [];
+  let cursor: string | undefined;
+  for (;;) {
+    const page = ledger.listPendingDirectives({
+      states: LIVE_DIRECTIVE_STATES,
+      limit: DIRECTIVE_RECONCILE_PAGE,
+      ...(cursor !== undefined ? { cursor } : {}),
+    });
+    live.push(...page);
+    if (page.length < DIRECTIVE_RECONCILE_PAGE) return live;
+    const last = page[page.length - 1];
+    if (last === undefined) return live;
+    cursor = last.requestId;
+  }
 }
 
 /** Complete a request from its own correlated ledger evidence — never

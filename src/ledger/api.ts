@@ -50,6 +50,7 @@ import {
 } from './obligations.js';
 import {
   isDirectiveState,
+  LIVE_DIRECTIVE_STATES,
   type DirectiveRequestRecord,
   type DirectiveState,
 } from './directives.js';
@@ -243,6 +244,9 @@ export interface ObligationRecord {
   readonly wakeCondition: ObligationWakeCondition;
   readonly authority: ObligationAuthority | null;
   readonly firingRule: string;
+  /** Optional human context supplied at the blocked boundary — evidence
+   * and triage material only, never execution authority. */
+  readonly description: string | null;
   readonly state: ObligationState;
   readonly settlement: ObligationSettlement | null;
   readonly dueAt: string | null;
@@ -609,6 +613,26 @@ export class LedgerApi {
       repo === undefined
         ? (this.db.prepare('SELECT * FROM jobs ORDER BY updated_at DESC, id').all() as Row[])
         : (this.db.prepare('SELECT * FROM jobs WHERE repo = ? ORDER BY updated_at DESC, id').all(repo) as Row[]);
+    return rows.map((row) => this.jobFromRow(row));
+  }
+
+  /** Blocked jobs with NO obligation history at all — the bounded boot
+   * adoption candidate set. Already-adopted lanes are excluded BY the
+   * query, so a fixed window can never keep re-scanning the adopted
+   * prefix while the tail starves (N3). */
+  listBlockedJobsWithoutObligations(limit: number): readonly JobRecord[] {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error(`listBlockedJobsWithoutObligations requires a positive integer limit, got ${String(limit)}`);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT j.* FROM jobs j
+          WHERE j.status = 'blocked'
+            AND NOT EXISTS (SELECT 1 FROM job_obligations o WHERE o.job_id = j.id)
+          ORDER BY j.updated_at DESC, j.id
+          LIMIT ?`,
+      )
+      .all(limit) as Row[];
     return rows.map((row) => this.jobFromRow(row));
   }
 
@@ -1723,15 +1747,18 @@ export class LedgerApi {
       }
       return { executable: true, reason: `operation ${authority.operationId} v${authority.version} is durably admitted` };
     }
-    const event = this.latestJobEvent(row.jobId, 'ruling.recorded');
-    if (event === null) {
-      return { executable: false, reason: `no durably recorded ruling event answers "${authority.rulingRef}" — attention decision required` };
-    }
-    const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
-    if (payload['ref'] !== authority.rulingRef || payload['version'] !== authority.version) {
+    // A ruling is valid while SOME durably recorded ruling event carries
+    // its exact ref+version — later unrelated rulings must not shadow an
+    // earlier matching one (latest-only would report a false negative).
+    const event = this.listJobEvents(row.jobId, { limit: 1000 }).find((candidate) => {
+      if (candidate.kind !== 'ruling.recorded') return false;
+      const payload = (typeof candidate.payload === 'object' && candidate.payload !== null ? candidate.payload : {}) as Record<string, unknown>;
+      return payload['ref'] === authority.rulingRef && payload['version'] === authority.version;
+    });
+    if (event === undefined) {
       return {
         executable: false,
-        reason: `the recorded ruling event does not carry ref "${authority.rulingRef}" v"${authority.version}" — attention decision required`,
+        reason: `no durably recorded ruling event answers "${authority.rulingRef}" v"${authority.version}" — attention decision required`,
       };
     }
     return { executable: true, reason: `ruling ${authority.rulingRef} v${authority.version} is durably recorded` };
@@ -2183,10 +2210,10 @@ export class LedgerApi {
         this.db
           .prepare(
             `INSERT INTO job_obligations
-               (id, job_id, logical_step, incident_key, generation, category, next_action, wake_condition,
+               (id, job_id, logical_step, incident_key, generation, description, category, next_action, wake_condition,
                 authority, firing_rule, state, recorded_receipts, observations, first_origin_seq, last_origin_seq,
                 created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'open', '[]', 1, ?, ?, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'open', '[]', 1, ?, ?, ?, ?)`,
           )
           .run(
             successorId,
@@ -2194,6 +2221,7 @@ export class LedgerApi {
             logicalStep,
             row.incidentKey,
             generation,
+            row.description,
             JSON.stringify(row.category),
             JSON.stringify(successorPlan),
             JSON.stringify(defaultFiringRule(row.category).wakeCondition),
@@ -2275,6 +2303,7 @@ export class LedgerApi {
         next_action: resolved.nextAction,
         firing_rule: resolved.firingRule,
         authority: resolved.authority,
+        description: resolved.description,
       },
     });
     return this.getObligation(id) as ObligationRecord;
@@ -2339,6 +2368,7 @@ export class LedgerApi {
         `UPDATE job_obligations
            SET observations = observations + 1,
                last_origin_seq = ?,
+               description = COALESCE(?, description),
                category = ?, next_action = ?, wake_condition = ?, authority = ?, firing_rule = ?,
                due_at = COALESCE(?, due_at), receipt_kind = COALESCE(?, receipt_kind),
                deadline_at = COALESCE(?, deadline_at),
@@ -2348,6 +2378,7 @@ export class LedgerApi {
       )
       .run(
         context.observedAtSeq,
+        resolved.description,
         JSON.stringify(resolved.category),
         JSON.stringify(resolved.nextAction),
         JSON.stringify(resolved.wakeCondition),
@@ -2369,6 +2400,7 @@ export class LedgerApi {
         id: existing.id,
         observations: existing.observations + 1,
         last_origin_seq: context.observedAtSeq,
+        ...(resolved.description !== null ? { description: resolved.description } : {}),
         changed,
         ...(planChanged ? { plan_revision: planRevision, claim_fenced: existing.claim !== null } : {}),
       },
@@ -2389,10 +2421,10 @@ export class LedgerApi {
     this.db
       .prepare(
         `INSERT INTO job_obligations
-           (id, job_id, logical_step, incident_key, generation, category, next_action, wake_condition,
+           (id, job_id, logical_step, incident_key, generation, description, category, next_action, wake_condition,
             authority, firing_rule, state, due_at, receipt_kind, deadline_at, receipt_correlation,
             recorded_receipts, observations, first_origin_seq, last_origin_seq, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, '[]', 1, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, '[]', 1, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -2400,6 +2432,7 @@ export class LedgerApi {
         resolved.logicalStep,
         resolved.incidentKey,
         input.generation,
+        resolved.description,
         JSON.stringify(resolved.category),
         JSON.stringify(resolved.nextAction),
         JSON.stringify(resolved.wakeCondition),
@@ -2511,6 +2544,7 @@ export class LedgerApi {
       logicalStep: str(row.logical_step),
       incidentKey: str(row.incident_key),
       generation: Number(row.generation),
+      description: nstr(row.description),
       category: parseCategory(str(row.category)),
       nextAction: parseNextAction(str(row.next_action)),
       wakeCondition: parseWakeCondition(str(row.wake_condition)),
@@ -2592,9 +2626,16 @@ export class LedgerApi {
           return { record: existing, created: false }; // durable replay — the accepted request, unchanged
         }
       }
-      const live = this.listPendingDirectives({ jobId: input.jobId }).find(
-        (row) => row.state === 'dispatching' || row.state === 'admitted',
-      );
+      // Fail CLOSED for identity-less callers while ANY live request for
+      // the job exists. Query the LIVE states directly (a bounded page
+      // ordered by request_id cannot be the live set: the table is
+      // append-only, so terminal rows would crowd live ones past the
+      // page forever).
+      const live = this.listPendingDirectives({
+        jobId: input.jobId,
+        states: LIVE_DIRECTIVE_STATES,
+        limit: 1,
+      })[0];
       if (live !== undefined && input.requestId === undefined) {
         throw new AmbiguousDirectiveError(
           `a directive for job "${input.jobId}" is already live (request ${live.requestId}, state ${live.state}) ` +
@@ -2634,8 +2675,17 @@ export class LedgerApi {
   }
 
   listPendingDirectives(
-    opts: { jobId?: string; state?: DirectiveState; limit?: number; cursor?: string } = {},
+    opts: {
+      jobId?: string;
+      state?: DirectiveState;
+      states?: readonly DirectiveState[];
+      limit?: number;
+      cursor?: string;
+    } = {},
   ): readonly DirectiveRequestRecord[] {
+    if (opts.state !== undefined && opts.states !== undefined) {
+      throw new Error('listPendingDirectives takes either "state" or "states", never both');
+    }
     const limit = Math.min(Math.max(1, opts.limit ?? 200), 1000);
     const where: string[] = [];
     const params: unknown[] = [];
@@ -2646,6 +2696,15 @@ export class LedgerApi {
     if (opts.state !== undefined) {
       where.push('state = ?');
       params.push(opts.state);
+    } else if (opts.states !== undefined) {
+      if (opts.states.length === 0) {
+        throw new Error('listPendingDirectives "states" filter must not be empty');
+      }
+      for (const state of opts.states) {
+        if (!isDirectiveState(state)) throw new Error(`listPendingDirectives got unknown directive state "${state}"`);
+      }
+      where.push(`state IN (${opts.states.map(() => '?').join(', ')})`);
+      params.push(...opts.states);
     }
     if (opts.cursor !== undefined) {
       where.push('request_id > ?');

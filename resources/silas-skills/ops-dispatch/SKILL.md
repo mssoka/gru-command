@@ -113,7 +113,13 @@ answer is `409` with `{"error":"branch_busy","blockers":[...]}`:
    round's blockers with `consecutive_rounds` and the advised rung:
    - `directive`: send a fix directive naming each blocker with its
      evidence, via `POST /api/silas/directive`
-     `{"job_id":"<job>","directive":"...","blocker_fingerprint":"..."}`.
+     `{"job_id":"<job>","directive":"...","blocker_fingerprint":"...","request_id":"<stable-id>"}`.
+     The call answers **202** with the stable `request_id` once the durable
+     intent is accepted — accepted is not admitted; read the durable state
+     back with `GET /api/silas/directives/{request_id}`. Retry only with the
+     SAME `request_id`; an identity-less repeat fails closed while another
+     request for the job is live, and a request that is still
+     `dispatching`/`admitted` must never get a second turn.
      A NEW blocker gets this rung too — it is the first fix directive, and
      without it the lane can never re-open. The service routes the
      directive to the live minion (or a fresh one on the lane), flips the

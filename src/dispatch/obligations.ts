@@ -8,8 +8,10 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * Dispatch-side follow-through observers (phase 3 slice). Pure wiring on
  * the existing event bus, ledger primitives and the existing single Gru
  * wake path (`NotificationCenter.postIncident` → awareness notify_wake).
- * No scheduler, no timer, no second wake path, no execution: these
- * observers only record debt and route attention.
+ * No scheduler, no timer, no second wake path, no execution: the
+ * phase-completion hand-back records debt AND routes one action-required
+ * Gru row; boot adoption records triage debt only — the digest / FOR YOU
+ * projection slices consume those rows later.
  *
  * Incident 131/132/133 (same-head audit completes, lane stays blocked):
  * `flipJobToWorking` intentionally has no effect on a blocked lane, so
@@ -135,16 +137,18 @@ export interface AdoptionReport {
  * jobs can never be blocked; parked lanes are not scanned (explicit
  * suspension territory, no revival); lanes that already have obligation
  * history — active or settled — are left exactly as the live system left
- * them. Bounded per pass.
+ * them. The candidate query excludes already-adopted lanes, so the
+ * bounded window always holds unadopted work and each pass can reach the
+ * next candidates instead of re-scanning an adopted prefix forever (N3).
  */
 export function adoptBlockedLanes(deps: FollowThroughDeps, opts: { limit?: number } = {}): AdoptionReport {
   const limit = Math.min(Math.max(1, opts.limit ?? 500), 2000);
-  const blocked = deps.ledger
-    .listJobs()
-    .filter((job) => job.status === 'blocked')
-    .slice(0, limit);
+  const candidates = deps.ledger.listBlockedJobsWithoutObligations(limit);
   let adopted = 0;
-  for (const job of blocked) {
+  for (const job of candidates) {
+    // The list is a bounded snapshot: re-check the contract it promises
+    // (no obligation history) before adopting, so a racing/late history
+    // row is skipped, never coalesced into.
     const history = deps.ledger.listObligations({ jobId: job.id, limit: 1 });
     if (history.length > 0) continue; // already tracked — not a migration case
     deps.ledger.recordBlockedObservation(job.id, {
@@ -156,5 +160,5 @@ export function adoptBlockedLanes(deps: FollowThroughDeps, opts: { limit?: numbe
     adopted += 1;
     deps.log?.('info', 'blocked lane adopted for triage', { job: job.id });
   }
-  return { scanned: blocked.length, adopted };
+  return { scanned: candidates.length, adopted };
 }

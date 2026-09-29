@@ -39,6 +39,12 @@ export function isDirectiveTerminal(state: DirectiveState): boolean {
   return state === 'settled' || state === 'failed';
 }
 
+/** The non-terminal states: a request that still owes completion
+ * (admission unknown or terminal receipt pending). Guard checks and boot
+ * reconciliation MUST query these by state — the table is append-only, so
+ * an unfiltered request_id page can never be the live set. */
+export const LIVE_DIRECTIVE_STATES = ['dispatching', 'admitted'] as const satisfies readonly DirectiveState[];
+
 /** The durable record of one directive request (current state; full
  * history is the events table). */
 export interface DirectiveRequestRecord {

@@ -155,6 +155,30 @@ describe('conservative boot adoption of pre-existing blocked lanes', () => {
     expect(second.adopted).toBe(0);
     expect(h.ledger.listObligations({ jobId: 'job-old' })).toHaveLength(1);
   });
+
+  it('adoption advances past already-adopted lanes across passes — the tail is never starved (N3)', () => {
+    const h = makeHarness();
+    // Three blocked orphans created before the feature, same updated_at so
+    // listJobs' id tiebreak fixes the candidate order (a, b, c).
+    seedJob(h.ledger, 'job-adopt-a');
+    seedJob(h.ledger, 'job-adopt-b');
+    seedJob(h.ledger, 'job-adopt-c');
+    h.db.handle
+      .prepare("UPDATE jobs SET status = 'blocked', updated_at = '2026-09-28T00:00:00.000Z' WHERE id LIKE 'job-adopt-%'")
+      .run();
+    const first = adoptBlockedLanes({ ledger: h.ledger, notifications: h.notifications }, { limit: 1 });
+    expect(first.adopted).toBe(1);
+    // The next pass must move PAST the adopted prefix, not re-scan it.
+    const second = adoptBlockedLanes({ ledger: h.ledger, notifications: h.notifications }, { limit: 1 });
+    expect(second.adopted).toBe(1);
+    const third = adoptBlockedLanes({ ledger: h.ledger, notifications: h.notifications }, { limit: 1 });
+    expect(third.adopted).toBe(1);
+    const fourth = adoptBlockedLanes({ ledger: h.ledger, notifications: h.notifications }, { limit: 1 });
+    expect(fourth.adopted).toBe(0); // exhausted, not starved
+    for (const jobId of ['job-adopt-a', 'job-adopt-b', 'job-adopt-c']) {
+      expect(h.ledger.listObligations({ jobId })).toHaveLength(1);
+    }
+  });
 });
 
 describe('attention disposition is not settlement; delegated work keeps its debt (incident 4)', () => {

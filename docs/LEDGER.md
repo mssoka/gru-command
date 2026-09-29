@@ -185,8 +185,11 @@ makes the handle non-reclaimable rather than presumed idle.
 
 Two tables carry the blocked-heist follow-through contract. Neither
 executes work, schedules anything or wakes anyone by itself: they make
-the NEXT obligation durable and route it to the existing attention
-surfaces (Silas digest / action-required machine wake / FOR YOU).
+the NEXT obligation durable. This slice wires attention for the
+phase-completion hand-back only (`observeFollowUpDelivery` posts one
+action-required Gru row); obligations recorded by blocked transitions
+and boot adoption are durable triage debt that the digest / FOR YOU
+projection slices consume later — not yet surfaced by a notification.
 
 **`job_obligations`** — one row per (job, logical step, incident key)
 incarnation. A blocked transition records its obligation in the SAME
@@ -194,7 +197,8 @@ transaction as the status write (`LedgerApi.setJobStatus`), with a typed
 blocker category (a closed list; anything else is `unknown` → Gru
 triage, never guessed into authority), the responsible role, the next
 action, optional typed authority, wake condition, bounded due/deadline
-state and firing-rule provenance (issue #117). Identity survives
+state, optional human description (evidence for triage, never
+authority) and firing-rule provenance (issue #117). Identity survives
 duplicate observations (coalesce, no generation advance); distinct
 incidents coexist; a settled incident recurring mints a NEW incarnation
 (`id#n`) — the partial unique index enforces one active incarnation per
@@ -238,4 +242,7 @@ admission first, then the terminal receipt — and otherwise posts ONE
 bounded, stable-kind action-required escalation naming the request: no
 automatic retry, no fabricated delivery, no fresh alert ids to bypass
 dedupe. A settled/failed request id never re-runs; recovered capacity is
-not permission.
+not permission. The identity-less duplicate guard and the boot pass
+both query the LIVE states directly, and the boot pass pages by
+`request_id` cursor — terminal history can never crowd a live request
+out of examination.

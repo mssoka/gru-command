@@ -51,6 +51,19 @@ function tmpDir(): string {
   return dir;
 }
 
+/** Drive one directive request to `settled` with real correlated events. */
+function settleDirective(api: LedgerApi, jobId: string, requestId: string, minionId: string): void {
+  api.beginDirectiveIntent({ jobId, directive: `settled ${requestId}`, holder: 'silas-ops', requestId });
+  const sent = api.appendCustomEvent({
+    kind: 'silas.directive-sent',
+    jobId,
+    payload: { request_id: requestId, minion_id: minionId },
+  });
+  api.recordDirectiveAdmission({ requestId, minionId, eventSeq: sent.seq });
+  const delivered = api.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { request_id: requestId } });
+  api.recordDirectiveDelivery({ requestId, eventSeq: delivered.seq });
+}
+
 const FAKE_CAPABILITIES: AgentCapabilities = {
   streaming: true,
   steer: 'native',
@@ -113,6 +126,24 @@ describe('directive requests — durable ledger contract', () => {
     api.addJob({ id: 'job-d2b', repo: 'r', title: 'Job D2b' });
     api.setJobStatus('job-d2b', 'working');
     expect(() => api.beginDirectiveIntent({ jobId: 'job-d2b', directive: 'other', holder: 'silas-ops' })).not.toThrow();
+  });
+
+  it('the identity-less guard sees a live request sorting past a long settled history (B1)', () => {
+    const api = new LedgerApi(new LedgerDb(tmpDir()).handle, { bus: new EventBus() });
+    api.addJob({ id: 'job-d5', repo: 'r', title: 'Job D5' });
+    api.setJobStatus('job-d5', 'working');
+    // 200 terminal rows whose request_ids sort BEFORE the live request:
+    // a request_id-ordered first page of 200 contains only history.
+    for (let i = 0; i < 200; i += 1) {
+      settleDirective(api, 'job-d5', `req-aaaa-${String(i).padStart(4, '0')}`, `minion-d5-${i}`);
+    }
+    const live = api.beginDirectiveIntent({ jobId: 'job-d5', directive: 'live work', holder: 'silas-ops', requestId: 'req-zzzz-live' }).record;
+    expect(live.state).toBe('dispatching');
+    // The live request is past the old page, but the repeat must still fail
+    // closed — a second live request would mean a second implementing turn.
+    expect(() => api.beginDirectiveIntent({ jobId: 'job-d5', directive: 'repeat', holder: 'silas-ops' })).toThrow(
+      AmbiguousDirectiveError,
+    );
   });
 
   it('admission binds only to a correlated REAL event; delivery requires admitted + correlated + post-admission', () => {
@@ -266,6 +297,75 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
     // No fabricated delivery event exists.
     expect(ledger.latestJobEvent('job-r3', 'job.delivered')).toBeNull();
     expect(ledger.findNotificationByKind('silas.directive-unreconciled.req-r3', 'unacked')).not.toBeNull();
+  });
+
+  it('reconciles a live request sorting past a long settled history (B1)', () => {
+    const dir = tmpDir();
+    {
+      const { ledger } = boot(dir);
+      ledger.addJob({ id: 'job-b1r', repo: 'r', title: 'Job B1r' });
+      ledger.setJobStatus('job-b1r', 'working');
+      for (let i = 0; i < 200; i += 1) {
+        settleDirective(ledger, 'job-b1r', `req-aaaa-${String(i).padStart(4, '0')}`, `minion-b1r-${i}`);
+      }
+      // Crash window: intent without admission, sorting past the old page.
+      ledger.beginDirectiveIntent({ jobId: 'job-b1r', directive: 'crash window', holder: 'silas-ops', requestId: 'req-zzzz-live' });
+    }
+    const { ledger, notifications } = boot(dir);
+    const report = reconcilePendingDirectives({ ledger, notifications });
+    expect(report).toMatchObject({ examined: 1, completed: 0, escalated: 1 });
+    expect(ledger.getDirective('req-zzzz-live')?.attempts).toBe(1);
+    expect(ledger.findNotificationByKind('silas.directive-unreconciled.req-zzzz-live', 'unacked')).not.toBeNull();
+  });
+
+  it('boot reconciliation pages with the cursor past the first page of live rows (B1)', () => {
+    const dir = tmpDir();
+    {
+      const { ledger } = boot(dir);
+      ledger.addJob({ id: 'job-b1p', repo: 'r', title: 'Job B1p' });
+      ledger.setJobStatus('job-b1p', 'working');
+      for (let i = 0; i < 201; i += 1) {
+        ledger.beginDirectiveIntent({
+          jobId: 'job-b1p',
+          directive: `live ${i}`,
+          holder: 'silas-ops',
+          requestId: `req-live-${String(i).padStart(4, '0')}`,
+        });
+      }
+    }
+    const { ledger, notifications } = boot(dir);
+    const report = reconcilePendingDirectives({ ledger, notifications });
+    expect(report).toMatchObject({ examined: 201, completed: 0, escalated: 201 });
+    expect(ledger.getDirective('req-live-0200')?.attempts).toBe(1);
+    expect(ledger.findNotificationByKind('silas.directive-unreconciled.req-live-0200', 'unacked')).not.toBeNull();
+  });
+
+  it('escalates a just-recorded admission from post-recovery state, not the stale snapshot (W1)', () => {
+    const dir = tmpDir();
+    {
+      const { ledger } = boot(dir);
+      ledger.addJob({ id: 'job-w1', repo: 'r', title: 'Job W1' });
+      ledger.setJobStatus('job-w1', 'working');
+      ledger.beginDirectiveIntent({ jobId: 'job-w1', directive: 'run', holder: 'silas-ops', requestId: 'req-w1' });
+      // Admission evidence exists; the terminal receipt does not. Boot
+      // recovery records the admission from the event, so the card must
+      // describe the request as ADMITTED — never as admission-unknown.
+      ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-w1',
+        payload: { request_id: 'req-w1', minion_id: 'minion-w1' },
+      });
+    }
+    const { ledger, notifications } = boot(dir);
+    const report = reconcilePendingDirectives({ ledger, notifications });
+    expect(report).toMatchObject({ examined: 1, completed: 0, escalated: 1 });
+    const row = ledger.getDirective('req-w1');
+    expect(row?.state).toBe('admitted');
+    expect(row?.admissionMinion).toBe('minion-w1');
+    expect(row?.failReason).toContain('admitted without terminal receipt at boot');
+    const card = ledger.findNotificationByKind('silas.directive-unreconciled.req-w1', 'unacked');
+    expect(card?.detail).toContain('minion-w1');
+    expect(card?.detail).not.toContain('no native admission evidence');
   });
 });
 

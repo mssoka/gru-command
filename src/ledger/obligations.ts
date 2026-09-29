@@ -282,6 +282,9 @@ export interface ResolvedObligation {
   readonly wakeCondition: ObligationWakeCondition;
   readonly authority: ObligationAuthority | null;
   readonly firingRule: FiringRuleId;
+  /** Optional human context as supplied (persisted verbatim, never
+   * parsed for authority or used in plan identity). */
+  readonly description: string | null;
   readonly dueAt: string | null;
   readonly receiptKind: string | null;
   readonly deadlineAt: string | null;
@@ -333,9 +336,19 @@ export function resolveObligation(context: BlockerContext, jobId: string): Resol
     wakeCondition: context.wakeCondition ?? rule.wakeCondition,
     authority: context.authority ?? null,
     firingRule: rule.id,
-    dueAt: context.dueAt ?? null,
+    description: context.description === undefined || context.description.trim() === '' ? null : context.description,
+    // Bounds are compared lexicographically by the due selectors: a
+    // date-only or offset input must be canonicalized at the write
+    // boundary or it silently mis-schedules (same rule as claim expiry).
+    dueAt:
+      context.dueAt === undefined || context.dueAt === null
+        ? null
+        : canonicalIsoTimestamp(context.dueAt, 'blocker context dueAt'),
     receiptKind: context.receiptKind ?? null,
-    deadlineAt: context.deadlineAt ?? null,
+    deadlineAt:
+      context.deadlineAt === undefined || context.deadlineAt === null
+        ? null
+        : canonicalIsoTimestamp(context.deadlineAt, 'blocker context deadlineAt'),
     receiptCorrelation: context.receiptCorrelation ?? null,
   };
 }
