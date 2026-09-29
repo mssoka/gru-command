@@ -837,17 +837,23 @@ export class BoardView {
       agent.id,
       agent.sessionFile !== null ? 'open transcript' : 'no session file yet',
     ].join(' — ');
-    if (agent.role === 'minion') row.setAttribute('aria-label', `${name} · ${agent.id}${job !== undefined ? ` — ${job.title}` : ''} — ${agent.role} · ${agent.state}`);
+    // G7: every rail row carries an accessible name; minions keep their
+    // full-identity shape, other roles announce label · id — role · state.
+    row.setAttribute('aria-label', agent.role === 'minion'
+      ? `${name} · ${agent.id}${job !== undefined ? ` — ${job.title}` : ''} — ${agent.role} · ${agent.state}`
+      : `${name} · ${agent.id} — ${agent.role} · ${agent.state}`);
     row.addEventListener('click', () => {
       if (agent.sessionFile !== null) {
-        this.onOpenTranscript({ file: agent.sessionFile, label: agentLabel(agent) });
+        // G6: minion tabs read under the heist rail name; the session file
+        // (never the label) drives the actual transcript selection.
+        this.onOpenTranscript({ file: agent.sessionFile, label: name });
       }
     });
     const body = el('span', 'board-agent__body');
     const top = el('span', 'board-agent__top');
     top.append(
       el('span', 'board-agent__name', name),
-      el('span', 'board-agent__hash lbl', agent.role === 'minion' ? (suffixes.get(agent.id) ?? agent.id.slice(-4)) : agent.id.slice(0, 8)),
+      el('span', 'board-agent__hash lbl', agent.role === 'minion' ? railSuffix(suffixes, agent.id) : agent.id.slice(0, 8)),
     );
     const subline = el('span', 'board-agent__sub lbl');
     subline.append(
@@ -1051,14 +1057,41 @@ export function jobFailing(job: JobView): boolean {
   return false;
 }
 
+type GraphemeSplitter = (text: string) => readonly string[];
+
+/** One grapheme splitter serves every rail name and suffix (G8); engines
+ * without `Intl.Segmenter` fall back to code points so an old browser
+ * renders the rail instead of aborting it (G12). */
+export function makeGraphemeSplitter(): GraphemeSplitter {
+  if (typeof Intl.Segmenter !== 'function') return (text) => [...text];
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  return (text) => [...segmenter.segment(text)].map((part) => part.segment);
+}
+
+const graphemes: GraphemeSplitter = makeGraphemeSplitter();
+
+/** Named failure for a rail identity the rail's own inputs cannot
+ * produce; a miss is a programming error, never a rendered guess. */
+export class RailIdentityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RailIdentityError';
+  }
+}
+
+/** Total lookup over the suffix map `minionSuffixes` computes for the
+ * rendered agents; a miss fails loud instead of printing a silent tail. */
+export function railSuffix(suffixes: ReadonlyMap<string, string>, id: string): string {
+  const suffix = suffixes.get(id);
+  if (suffix === undefined) throw new RailIdentityError(`crew rail suffix missing for agent ${id}`);
+  return suffix;
+}
+
 // The authored name is shared by a heist. Older titles are shortened only
 // for display; the full title stays on the job and in the row's tooltip.
 function heistName(source: string | undefined): string {
   if (source === undefined || source.trim() === '') return 'unassigned';
   const words = source.toLowerCase().trim().split(/\s+/u);
-  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
-  const graphemes = (text: string) => [...segmenter.segment(text)]
-    .map((part) => part.segment);
   let result = '';
   for (const word of words) {
     const next = result === '' ? word : `${result} ${word}`;
@@ -1070,7 +1103,10 @@ function heistName(source: string | undefined): string {
   return graphemes(result).slice(0, 24).join('');
 }
 
-function minionSuffixes(agents: readonly AgentView[], jobs: ReadonlyMap<string, JobView>): ReadonlyMap<string, string> {
+/** The normally four-character ID suffix; identical suffixes extend on
+ * grapheme boundaries (never halving an astral character) until the
+ * peers diverge, independent of row order (G11). */
+export function minionSuffixes(agents: readonly AgentView[], jobs: ReadonlyMap<string, JobView>): ReadonlyMap<string, string> {
   const groups = new Map<string, string[]>();
   for (const agent of agents) {
     if (agent.role !== 'minion') continue;
@@ -1081,12 +1117,18 @@ function minionSuffixes(agents: readonly AgentView[], jobs: ReadonlyMap<string, 
   }
   const suffixes = new Map<string, string>();
   for (const ids of groups.values()) {
-    // For each ID find the shortest suffix which distinguishes it from
-    // every peer's suffix at that length, independent of row ordering.
-    for (const id of ids) {
-      let length = Math.min(4, id.length);
-      while (length < id.length && ids.some((peer) => peer !== id && peer.slice(-length) === id.slice(-length))) length++;
-      suffixes.set(id, id.slice(-length));
+    const parts = new Map(ids.map((id) => [id, graphemes(id)] as const));
+    const cut = (source: readonly string[], length: number): string =>
+      source.slice(source.length - length).join('');
+    for (const [id, own] of parts) {
+      // For each ID find the shortest suffix which distinguishes it from
+      // every peer's suffix at that length, independent of row ordering.
+      let length = Math.min(4, own.length);
+      while (
+        length < own.length &&
+        ids.some((peer) => peer !== id && cut(parts.get(peer) ?? [], length) === cut(own, length))
+      ) length++;
+      suffixes.set(id, cut(own, length));
     }
   }
   return suffixes;

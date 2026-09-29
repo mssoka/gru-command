@@ -14,7 +14,7 @@ import type {
 } from '../lib/board-protocol.js';
 import { memoryStorage } from '../lib/chat-storage.js';
 import { boardKpis } from '../lib/board-kpi.js';
-import { BoardView, jobFailing } from './board.js';
+import { BoardView, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix } from './board.js';
 
 type DecisionsOverrides = Partial<BoardSnapshot['decisions']>;
 
@@ -161,8 +161,7 @@ describe('minion heist identity in the crew rail', () => {
   beforeEach(mountBoardDom);
 
   it('shows stable names and distinct suffixes for all states, without changing full-ID transcript selection', () => {
-    const opened = vi.fn();
-    const view = new BoardView(opened);
+    const view = new BoardView(() => {});
     const jobs = [baseJob({ id: 'wake', title: 'Full wake alert contract', displayName: 'Wake Alerts' }), baseJob({ id: 'model', title: 'Model repair with full details' })];
     const agents = [
       agent('worker-1234dec9', { role: 'minion', label: null, jobId: 'wake', state: 'idle' }),
@@ -194,12 +193,75 @@ describe('minion heist identity in the crew rail', () => {
     expect(byId('orphaned-1111').querySelector('.board-agent__name')?.textContent).toBe('unassigned');
     expect(byId('unlinked-1111').querySelector('.board-agent__hash')?.textContent).not.toBe(byId('orphaned-1111').querySelector('.board-agent__hash')?.textContent);
     expect(byId('lead-1234').querySelector('.board-agent__name')?.textContent).toBe('blind:001');
-    byId('worker-5678dec9').click();
-    expect(opened).toHaveBeenCalledWith({ file: '/sessions/worker-5678dec9.jsonl', label: expect.any(String) });
+    // G7: every row has an accessible name; minions keep the full-identity
+    // shape, non-minions announce label · id — role · state.
+    expect(byId('worker-1234dec9').getAttribute('aria-label')).toBe('wake alerts · worker-1234dec9 — Full wake alert contract — minion · idle');
+    expect(byId('lead-1234').getAttribute('aria-label')).toBe('blind:001 · lead-1234 — perkins · idle');
     view.render({ ...board, agents: [...agents].reverse() });
     const reordered = [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')];
     expect(collisions.map((id) => reordered.find((row) => row.title.includes(id))?.querySelector('.board-agent__hash')?.textContent)).toEqual(originalSuffixes);
     expect(document.querySelectorAll('.board-agent__hash')).toHaveLength(7);
+  });
+
+  it('opens transcripts under the rail name while the full-ID file drives the selection', () => {
+    const opened = vi.fn();
+    const view = new BoardView(opened);
+    const jobs = [baseJob({ id: 'wake', title: 'Full wake alert contract', displayName: 'Wake Alerts' })];
+    const agents = [
+      agent('worker-5678dec9', { role: 'minion', label: null, jobId: 'wake', state: 'error' }),
+      agent('lead-1234', { role: 'perkins', label: 'blind:001', jobId: 'wake' }),
+    ];
+    view.render(snapshot({ jobs, agents }));
+    const byId = (id: string) => [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')].find((row) => row.title.includes(id))!;
+    byId('worker-5678dec9').click();
+    expect(opened).toHaveBeenCalledWith({ file: '/sessions/worker-5678dec9.jsonl', label: 'wake alerts' });
+    byId('lead-1234').click();
+    expect(opened).toHaveBeenLastCalledWith({ file: '/sessions/lead-1234.jsonl', label: 'blind:001' });
+  });
+
+  it('cuts suffixes on grapheme boundaries, never halving an astral character', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [], agents: [agent('a😀bcd', { role: 'minion', label: null, jobId: null })] }));
+    expect(document.querySelector('.board-agent__hash')?.textContent).toBe('😀bcd');
+    view.render(snapshot({ jobs: [], agents: [
+      agent('x😀bcde', { role: 'minion', label: null, jobId: null }),
+      agent('y😀bcde', { role: 'minion', label: null, jobId: null }),
+    ] }));
+    expect([...document.querySelectorAll('.board-agent__hash')].map((node) => node.textContent)).toEqual(['x😀bcde', 'y😀bcde']);
+  });
+
+  it('renders exactly the suffixes the rail authority computes and fails loud on a miss', () => {
+    const view = new BoardView(() => {});
+    const jobs = [baseJob({ id: 'wake', title: 'Full wake alert contract', displayName: 'Wake Alerts' })];
+    const agents = [
+      agent('worker-1234dec9', { role: 'minion', label: null, jobId: 'wake' }),
+      agent('worker-5678dec9', { role: 'minion', label: null, jobId: 'wake' }),
+      agent('worker-9999dec9', { role: 'minion', label: null, jobId: 'wake' }),
+      agent('unlinked-1111', { role: 'minion', label: null, jobId: null }),
+    ];
+    view.render(snapshot({ jobs, agents }));
+    const expected = minionSuffixes(agents, new Map(jobs.map((job) => [job.id, job])));
+    for (const item of agents) {
+      const row = [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')].find((entry) => entry.title.includes(item.id))!;
+      expect(row.querySelector('.board-agent__hash')?.textContent).toBe(expected.get(item.id));
+    }
+    expect(railSuffix(expected, 'unlinked-1111')).toBe('1111');
+    expect(() => railSuffix(new Map(), 'ghost')).toThrow(RailIdentityError);
+    expect(() => railSuffix(new Map(), 'ghost')).toThrow('crew rail suffix missing for agent ghost');
+  });
+
+  it('keeps rendering with a code-point fallback when Intl.Segmenter is absent', () => {
+    const real = Intl.Segmenter;
+    const define = (value: typeof Intl.Segmenter | undefined) =>
+      Object.defineProperty(Intl, 'Segmenter', { value, writable: true, configurable: true });
+    try {
+      define(undefined);
+      const split = makeGraphemeSplitter();
+      expect(split('a😀b')).toEqual(['a', '😀', 'b']);
+    } finally {
+      define(real);
+    }
+    expect(makeGraphemeSplitter()('a😀b')).toEqual(['a', '😀', 'b']);
   });
 
   it('escapes and bounds special and grapheme-rich names, retaining full title and id for keyboard users', () => {
