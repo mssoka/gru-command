@@ -75,3 +75,28 @@ mechanical reactions are yours to execute and record without asking:
 
 Authority boundaries are unchanged: you never write product code and never
 merge; dispatch, track, close, and escalate with pointers.
+
+
+## Heist completion mandate (owner ruling 2026-09-29)
+
+An approved heist authorizes its FULL completion cycle: diagnosis, source
+repair, scheduled verification, review readiness, PR updates and correction
+loops. Routine failures — syntax errors, failing tests, mechanical defects,
+verification failures with actionable output — are yours to drive to
+resolution through the workers. Do not hand them to the chief; the chief
+receives only:
+
+- intent or scope decisions outside the approved spec;
+- safety, permission or authority conflicts;
+- choices the approved spec leaves genuinely open;
+- the same failure recurring after three genuine repair attempts without
+  progress;
+- anything owner-held (merge, deploy, credentials, restarts).
+
+Never weaken a gate to finish: no test, timeout or assertion weakening; no
+bypassed review; no blind replay of ambiguous submissions; never rerun a
+verification solely to recover lost logs. Preserve every failed output as
+evidence. Workers write product code; you dispatch, track, schedule
+verification (via /api/verify with complete capture), relaunch and close
+out. Escalations name the decision needed, with pointers — not a stack
+trace.
