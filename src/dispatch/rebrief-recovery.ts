@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs';
 import type {
+  DirectiveRequestRecord,
+  EventRecord,
   LedgerApi,
   NotificationRouting,
   NotificationSeverity,
@@ -393,4 +395,138 @@ function escalateRecoveryFailure(
     });
   }
   deps.log?.('error', 're-brief recovery failed', { job: jobId, error: String(error) });
+}
+
+// --------------------------------------------------------------------
+// Directive-request reconciliation (same coordinator, second marker
+// family). The contract (chief ruling 2026-09-28 phase 3): a durable
+// intent that never reached native admission is ADMISSION-UNKNOWN — a
+// crash may have happened after I/O and before the admission record, so
+// absence of a receipt is not proof of no side effect and NEVER licenses
+// an automatic retry. Admitted without a terminal receipt is STILL in
+// flight/unknown: nothing fabricates `job.delivered`. Both cases get ONE
+// bounded, stable-id action-required escalation naming the request; the
+// actual completion is reconciled from correlated evidence first.
+// --------------------------------------------------------------------
+
+export interface ReconcileDirectivesDeps {
+  readonly ledger: LedgerApi;
+  readonly notifications: RecoveryNotifications;
+  readonly log?: Log;
+}
+
+export interface DirectiveReconcileReport {
+  /** Live (dispatching/admitted) requests examined this pass. */
+  readonly examined: number;
+  /** Requests completed from their own correlated evidence — no retry,
+   * no new worker: the crash window contained only record-keeping. */
+  readonly completed: number;
+  /** Requests escalated action-required for a bounded Gru decision. */
+  readonly escalated: number;
+}
+
+/**
+ * Boot reconciliation for directive requests. Deterministic and bounded:
+ * one pass, one escalation per request (stable kind ⇒ the notification
+ * dedupe holds across boots — no fresh alert ids to bypass dedupe), no
+ * provider calls, no worker spawns, no re-dispatch.
+ */
+export function reconcilePendingDirectives(deps: ReconcileDirectivesDeps): DirectiveReconcileReport {
+  const live = deps.ledger
+    .listPendingDirectives()
+    .filter((row) => row.state === 'dispatching' || row.state === 'admitted');
+  let completed = 0;
+  let escalated = 0;
+  for (const row of live) {
+    const recovered = completeDirectiveFromEvidence(deps.ledger, row);
+    if (recovered !== null) {
+      deps.log?.('info', 'directive request completed from correlated evidence', {
+        request: row.requestId,
+        job: row.jobId,
+        admission_seq: recovered.admissionSeq,
+        delivery_seq: recovered.deliverySeq,
+      });
+      completed += 1;
+      continue;
+    }
+    const admissionUnknown = row.state === 'dispatching';
+    deps.ledger.recordDirectiveReconcile({
+      requestId: row.requestId,
+      note: admissionUnknown ? 'admission-unknown at boot' : 'admitted without terminal receipt at boot',
+    });
+    try {
+      deps.notifications.postIncident({
+        kind: `silas.directive-unreconciled.${row.requestId}`,
+        routing: 'action-required',
+        severity: 'error',
+        title: `Directive request ${row.requestId} unreconciled after restart (job ${row.jobId})`,
+        detail: admissionUnknown
+          ? 'The request was accepted and a dispatch claim was taken, but no native admission evidence ' +
+            'exists after restart: a prompt may have been delivered (crash after I/O, before the admission ' +
+            'record). Do NOT re-dispatch without a Gru decision; reconcile the actual minion/session state first.'
+          : `The request was admitted${row.admissionMinion === null ? '' : ` to minion ${row.admissionMinion}`} ` +
+            'but no correlated terminal receipt exists after restart. The turn may still be completing in its ' +
+            'session: do not re-dispatch; reconcile the actual completion before recording anything.',
+        dedupe: 'unacked',
+      });
+      escalated += 1;
+    } catch (error) {
+      deps.log?.('error', 'directive recovery escalation could not be posted', {
+        request: row.requestId,
+        error: String(error),
+      });
+    }
+  }
+  return { examined: live.length, completed, escalated };
+}
+
+/** Complete a request from its own correlated ledger evidence — never
+ * from a caller assertion. Admission first (a matching
+ * `silas.directive-sent` postdating acceptance), then delivery (a
+ * matching `job.delivered` postdating admission). Missing evidence
+ * returns null: unknown stays unknown. */
+function completeDirectiveFromEvidence(ledger: LedgerApi, row: DirectiveRequestRecord): DirectiveRequestRecord | null {
+  let current = row;
+  if (current.state === 'dispatching') {
+    const sent = findCorrelatedEvent(ledger, current.jobId, current.requestId, 'silas.directive-sent', (event) => event.seq > current.baselineSeq);
+    if (sent === null) return null;
+    const payload = (typeof sent.payload === 'object' && sent.payload !== null ? sent.payload : {}) as Record<string, unknown>;
+    const minionId = typeof payload['minion_id'] === 'string' && payload['minion_id'] !== '' ? payload['minion_id'] : null;
+    if (minionId === null) return null; // admission found but identity missing — escalate, never guess
+    current = ledger.recordDirectiveAdmission({ requestId: current.requestId, minionId, eventSeq: sent.seq });
+  }
+  if (current.state === 'admitted') {
+    const delivered = findCorrelatedEvent(
+      ledger,
+      current.jobId,
+      current.requestId,
+      'job.delivered',
+      (event) => current.admissionSeq === null || event.seq > current.admissionSeq,
+    );
+    if (delivered !== null) {
+      return ledger.recordDirectiveDelivery({ requestId: current.requestId, eventSeq: delivered.seq });
+    }
+    return null;
+  }
+  return current;
+}
+
+/** Newest event of one kind whose payload is correlated to the request
+ * id and passes the caller's watermark predicate. */
+function findCorrelatedEvent(
+  ledger: LedgerApi,
+  jobId: string,
+  requestId: string,
+  kind: string,
+  accept: (event: EventRecord) => boolean,
+): EventRecord | null {
+  const events = ledger.listJobEvents(jobId, { limit: 500 });
+  for (const event of events) {
+    if (event.kind !== kind) continue;
+    const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
+    if (payload['request_id'] !== requestId) continue;
+    if (!accept(event)) continue;
+    return event;
+  }
+  return null;
 }

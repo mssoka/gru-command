@@ -24,7 +24,8 @@ import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver } from './dispatch/silas-driver.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
-import { reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
+import { reconcilePendingRebriefs, reconcilePendingDirectives } from './dispatch/rebrief-recovery.js';
+import { adoptBlockedLanes, observeFollowUpDelivery } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
@@ -563,6 +564,26 @@ async function main(): Promise<number> {
     onNeedsOwner: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Durable follow-through observer: a settled silas directive/re-brief
+  // phase on a lane that is STILL BLOCKED records the owed next decision
+  // durably (one obligation + one action-required Gru hand-back on the
+  // existing wake path). Registered before boot recovery so recovered
+  // deliveries are observed too. Observer failures are logged, never
+  // bus-breaking.
+  bus.subscribe((event) => {
+    try {
+      observeFollowUpDelivery(
+        { ledger, notifications, log: (level, msg, fields) => logger.log(level, msg, fields) },
+        event,
+      );
+    } catch (error) {
+      logger.log('error', 'follow-through observer failed', {
+        kind: event.kind,
+        job: event.jobId,
+        error: String(error),
+      });
+    }
+  });
   const decisionRuntime = new DecisionRuntime(config.decisions, {
     instanceDir: config.instanceDir,
     env: decisionEnvironment,
@@ -804,6 +825,34 @@ async function main(): Promise<number> {
       completed: rebriefRecovery.completed,
       redispatched: rebriefRecovery.redispatched,
     });
+  }
+  // Directive-request restart safety (phase 3): a request accepted before
+  // the crash reconciles from correlated evidence when it exists; when
+  // admission or the terminal receipt is UNKNOWN, one bounded escalation
+  // names it for a Gru reconciliation — never an automatic retry
+  // (admission-unknown is not no-effect proof).
+  const directiveRecovery = reconcilePendingDirectives({
+    ledger,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  if (directiveRecovery.examined > 0) {
+    logger.info('directive reconciliation', {
+      examined: directiveRecovery.examined,
+      completed: directiveRecovery.completed,
+      escalated: directiveRecovery.escalated,
+    });
+  }
+  // Conservative migration of pre-existing blocked lanes: triage owed to
+  // Gru for lanes with NO obligation history; lanes the live system
+  // already tracks (active or settled) are left exactly as they are.
+  const adoption = adoptBlockedLanes({
+    ledger,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  if (adoption.adopted > 0) {
+    logger.info('blocked-lane triage adoption', { scanned: adoption.scanned, adopted: adoption.adopted });
   }
   const bobSlot = supervisorLive.declareSlot({
     id: 'bob-consolidator',

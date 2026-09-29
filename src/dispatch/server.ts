@@ -3,6 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi } from '../ledger/api.js';
+import { AmbiguousDirectiveError, DirectiveConflictError } from '../ledger/api.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
@@ -326,59 +327,219 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const jobId = strField(body, 'job_id');
       const directive = strField(body, 'directive');
       const fingerprint = optStrField(body, 'blocker_fingerprint');
+      const requestIdField = optStrField(body, 'request_id');
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
       if (job.status === 'merged' || job.status === 'done') {
         throw new Error(`job "${jobId}" is ${job.status} — terminal lanes take no directives`);
       }
+      // Durable intent BEFORE any prompt/spawn side effect (the PR133
+      // timeout window: the old flow awaited the whole model turn before
+      // recording anything). A retry of the same request id replays to the
+      // same row; without an id, a repeat while another request for the
+      // job is live fails CLOSED — never a silent duplicate turn.
+      let begun;
+      try {
+        begun = options.ledger.beginDirectiveIntent({
+          jobId,
+          directive,
+          holder: 'silas-ops',
+          ...(fingerprint !== undefined ? { blockerFingerprint: fingerprint } : {}),
+          ...(requestIdField !== undefined ? { requestId: requestIdField } : {}),
+        });
+      } catch (error) {
+        if (error instanceof AmbiguousDirectiveError) {
+          json(res, 409, { error: 'ambiguous_repeat', detail: error.message });
+          return true;
+        }
+        if (error instanceof DirectiveConflictError) {
+          json(res, 409, { error: 'request_conflict', detail: error.message });
+          return true;
+        }
+        throw error;
+      }
+      const intent = begun.record;
+      if (intent.state === 'settled' || intent.state === 'failed') {
+        // A consumed request id never re-runs (recovered capacity is not
+        // permission): report the durable outcome; changed work needs a
+        // NEW request id.
+        json(res, 200, {
+          request_id: intent.requestId,
+          job_id: jobId,
+          state: intent.state,
+          replay: true,
+          minion_id: intent.admissionMinion,
+          fail_reason: intent.failReason,
+          note: 'this request id already reached a terminal state — submit changed work under a new request id',
+        });
+        return true;
+      }
+      if (!begun.created) {
+        // A REPLAY of a live request (the PR133 timeout window): the same
+        // durable request is already in flight — accepted again, and the
+        // identical turn is never doubled. Readback carries the outcome.
+        json(res, 202, {
+          request_id: intent.requestId,
+          job_id: jobId,
+          state: intent.state,
+          replay: true,
+          note: 'this request is already live — no second turn was started; read back GET /api/silas/directives/{request_id}',
+        });
+        return true;
+      }
+      // The async turn stays owned and tracked by THIS server instance
+      // (the existing directiveControllers/inFlight coordinator — no
+      // detached helper, no second chief). Late errors surface durably.
       const controller = new AbortController();
       directiveControllers.add(controller);
-      let delivery: { delivered: boolean; minionId?: string; note?: string };
-      try {
-        delivery = await routeFixDirectiveToMinion({
-          registry: ops.registry,
+      const run = (async (): Promise<void> => {
+        let delivery: { delivered: boolean; minionId?: string; note?: string };
+        try {
+          delivery = await routeFixDirectiveToMinion({
+            registry: ops.registry,
+            ledger: options.ledger,
+            worktrees: ops.worktrees,
+            jobId,
+            directive,
+            signal: controller.signal,
+            owner: 'silas-ops',
+            ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
+          });
+        } catch (error) {
+          // The turn errored with no positive outcome. A prompt may or may
+          // not have been delivered (shutdown abort vs prompt failure):
+          // admission stays UNKNOWN — record the attempt, never fabricate
+          // an outcome, never auto-retry (boot reconciliation reconciles).
+          options.ledger.recordDirectiveReconcile({
+            requestId: intent.requestId,
+            note: `turn interrupted before admission evidence: ${String(error)}`,
+          });
+          log('error', 'silas directive turn interrupted — request left for reconciliation', {
+            job: jobId,
+            request: intent.requestId,
+            error: String(error),
+          });
+          return;
+        } finally {
+          directiveControllers.delete(controller);
+        }
+        if (!delivery.delivered) {
+          // Positive no-effect proof (no live minion and no job lane): a
+          // durable failure is honest; the caller resubmits fresh work.
+          options.ledger.failDirective({
+            requestId: intent.requestId,
+            reason: delivery.note ?? 'no implementing minion session and no job lane',
+          });
+          log('warn', 'silas directive undelivered — durable no-effect failure recorded', {
+            job: jobId,
+            request: intent.requestId,
+            note: delivery.note ?? null,
+          });
+          return;
+        }
+        const sent = options.ledger.appendCustomEvent({
+          kind: 'silas.directive-sent',
+          jobId,
+          payload: {
+            request_id: intent.requestId,
+            minion_id: delivery.minionId ?? null,
+            ...(fingerprint !== undefined ? { blocker_fingerprint: fingerprint } : {}),
+            directive_bytes: Buffer.byteLength(directive, 'utf-8'),
+          },
+        });
+        if (delivery.minionId === undefined) {
+          // Admission evidence without the actor identity cannot bind the
+          // request: leave it live for reconciliation, never guess.
+          options.ledger.recordDirectiveReconcile({
+            requestId: intent.requestId,
+            note: 'admission evidence lacked minion identity',
+          });
+          return;
+        }
+        // Native admission evidence: the request is now bound to an actual
+        // awaited turn — recordDirectiveAdmission validates the event.
+        options.ledger.recordDirectiveAdmission({
+          requestId: intent.requestId,
+          minionId: delivery.minionId,
+          eventSeq: sent.seq,
+        });
+        flipJobToWorking(options.ledger, jobId);
+        // The follow-up delivery signal: the directive turn settled, so record
+        // the delivery (with the lane head it produced) that re-arms review —
+        // correlated to THIS request, so a later unrelated delivery cannot
+        // clear this marker.
+        const followUp = recordFollowUpDelivery({
           ledger: options.ledger,
           worktrees: ops.worktrees,
           jobId,
-          directive,
-          signal: controller.signal,
-          owner: 'silas-ops',
-          ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
+          agentId: delivery.minionId,
+          source: 'silas-directive',
+          requestId: intent.requestId,
         });
-      } finally {
-        directiveControllers.delete(controller);
-      }
-      if (!delivery.delivered) {
-        json(res, 502, { error: 'undelivered', detail: delivery.note ?? 'the directive could not reach the implementing minion' });
+        if (followUp.note !== null) {
+          log('warn', 'silas follow-up delivery has no resolvable lane head', {
+            job: jobId,
+            lane: followUp.lanePath,
+            note: followUp.note,
+          });
+        }
+        options.ledger.recordDirectiveDelivery({ requestId: intent.requestId, eventSeq: followUp.eventSeq });
+      })().catch((error: unknown) => {
+        log('error', 'silas directive bookkeeping failed after admission', {
+          job: jobId,
+          request: intent.requestId,
+          error: String(error),
+        });
+        try {
+          options.ledger.recordDirectiveReconcile({
+            requestId: intent.requestId,
+            note: `post-admission bookkeeping error: ${String(error)}`,
+          });
+        } catch {
+          // The ledger itself failed — the event log already carries what
+          // committed; boot reconciliation reads it.
+        }
+      });
+      track(run);
+      // Accepted ≠ admitted: 202 reports the durable INTENT; actual native
+      // admission and the terminal receipt land on the request's record
+      // and are readable via GET /api/silas/directives/{request_id}.
+      json(res, 202, {
+        request_id: intent.requestId,
+        job_id: jobId,
+        state: 'dispatching',
+        note: 'accepted — dispatching is not admission; read back GET /api/silas/directives/{request_id}',
+      });
+      return true;
+    }
+    const directiveReadback = /^\/api\/silas\/directives\/([^/]+)$/.exec(path);
+    if (req.method === 'GET' && directiveReadback !== null) {
+      if (!authed(req, res)) return true;
+      const requestId = decodeURIComponent(directiveReadback[1] ?? '');
+      const record = options.ledger.getDirective(requestId);
+      if (record === null) {
+        json(res, 404, { error: 'not_found', detail: `no directive request "${requestId}"` });
         return true;
       }
-      options.ledger.appendCustomEvent({
-        kind: 'silas.directive-sent',
-        jobId,
-        payload: {
-          minion_id: delivery.minionId ?? null,
-          ...(fingerprint !== undefined ? { blocker_fingerprint: fingerprint } : {}),
-          directive_bytes: Buffer.byteLength(directive, 'utf-8'),
+      json(res, 200, {
+        request_id: record.requestId,
+        job_id: record.jobId,
+        state: record.state,
+        accepted_at: record.createdAt,
+        updated_at: record.updatedAt,
+        admission_seq: record.admissionSeq,
+        minion_id: record.admissionMinion,
+        delivery_seq: record.deliverySeq,
+        attempts: record.attempts,
+        fail_reason: record.failReason,
+        states: {
+          dispatching:
+            'accepted; a dispatch claim was taken before any side effect — native admission not yet recorded (or unknown after a crash)',
+          admitted: 'a correlated silas.directive-sent event bound an actual awaited turn; terminal receipt pending',
+          settled: 'the correlated job.delivered terminal receipt was recorded',
+          failed: 'a durable positive no-effect failure was recorded; resubmit changed work under a new request id',
         },
       });
-      flipJobToWorking(options.ledger, jobId);
-      // The follow-up delivery signal: the directive turn settled, so record
-      // the delivery (with the lane head it produced) that re-arms review.
-      const followUp = recordFollowUpDelivery({
-        ledger: options.ledger,
-        worktrees: ops.worktrees,
-        jobId,
-        agentId: delivery.minionId ?? null,
-        source: 'silas-directive',
-      });
-      if (followUp.note !== null) {
-        log('warn', 'silas follow-up delivery has no resolvable lane head', {
-          job: jobId,
-          lane: followUp.lanePath,
-          note: followUp.note,
-        });
-      }
-      json(res, 200, { job_id: jobId, minion_id: delivery.minionId ?? null, delivered_sha: followUp.sha });
       return true;
     }
     if (req.method === 'POST' && path === '/api/silas/rebrief') {

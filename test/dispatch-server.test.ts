@@ -220,6 +220,25 @@ function field<T>(json: unknown, key: string): T {
   return (json as Record<string, unknown>)[key] as T;
 }
 
+/** The directive endpoint now records durable intent first and answers 202:
+ * the async turn settles on the request record — poll it deterministically
+ * (no wall-clock sleeps in the assertions themselves). */
+async function awaitDirectiveTerminal(
+  h: { ledger: LedgerApi },
+  requestId: string,
+  timeoutMs = 10_000,
+): Promise<{ state: string; failReason: string | null }> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const row = h.ledger.getDirective(requestId);
+    if (row !== null && (row.state === 'settled' || row.state === 'failed')) {
+      return { state: row.state, failReason: row.failReason };
+    }
+    if (Date.now() > deadline) throw new Error(`directive ${requestId} did not reach a terminal state`);
+    await new Promise((resolveTick) => setTimeout(resolveTick, 20));
+  }
+}
+
 describe('dispatch server (E8)', () => {
   it('rejects unauthenticated and unconfigured access like the board does', async () => {
     const h = await boot();
@@ -637,8 +656,12 @@ describe('dispatch server (E8)', () => {
         directive: 'Fix the null deref at src/a.ts and re-run the suite.',
         blocker_fingerprint: 'correctness::src/a.ts::null deref',
       }, TOKEN);
-      expect(res.status).toBe(200);
-      expect(field<string>(res.json, 'minion_id')).toBe(minionId);
+      // Accepted ≠ admitted: 202 reports the durable intent; the turn settles
+      // on the request record (readback) instead of the HTTP response.
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      expect(field<string>(res.json, 'state')).toBe('dispatching');
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
       const job = h.ledger.getJob('dir-job');
       expect(job?.status).toBe('working');
       expect(job?.note ?? '').toContain('working');
@@ -646,13 +669,16 @@ describe('dispatch server (E8)', () => {
       expect(event).not.toBeNull();
       expect((event?.payload as { blocker_fingerprint?: string }).blocker_fingerprint).toBe('correctness::src/a.ts::null deref');
       // The follow-up delivery signal: the settled directive turn is recorded
-      // as a delivery carrying the lane's head (no-op minion → unchanged head).
+      // as a delivery carrying the lane's head (no-op minion → unchanged head),
+      // correlated to THIS request so it can only settle this one.
       const lane = h.worktrees.listWorktrees({ jobId: 'dir-job' }).find((candidate) => candidate.kind === 'job');
       const head = execFileSync('git', ['-C', lane!.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
       const delivered = h.ledger.listJobEvents('dir-job').find((candidate) => candidate.kind === 'job.delivered');
       expect(delivered).not.toBeNull();
-      expect(delivered?.payload).toMatchObject({ agentId: minionId, source: 'silas-directive', sha: head });
-      expect(field<string>(res.json, 'delivered_sha')).toBe(head);
+      expect(delivered?.payload).toMatchObject({ agentId: minionId, source: 'silas-directive', sha: head, request_id: requestId });
+      const readback = h.ledger.getDirective(requestId);
+      expect(readback?.deliverySeq).toBe(delivered?.seq);
+      expect(readback?.admissionMinion).toBe(minionId);
     } finally {
       await h.close();
     }
@@ -773,18 +799,23 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-  it('/api/silas/directive on a lane with no reachable minion answers 502 undelivered; terminal jobs refuse', async () => {
+  it('/api/silas/directive on a lane with no reachable minion records a durable no-effect FAILURE; terminal jobs refuse', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-undelivered');
     cleanupRepos.push(repo);
     try {
-      // a job row with no lane at all
+      // a job row with no lane at all: accepted durably, then the turn has a
+      // POSITIVE no-effect proof (no live minion, no lane) → failed, honestly.
       h.ledger.addJob({ id: 'ghost-job', repo: 'nowhere', title: 't', briefing: 'b' });
       const res = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'ghost-job', directive: 'fix it',
       }, TOKEN);
-      expect(res.status).toBe(502);
-      expect(field<string>(res.json, 'error')).toBe('undelivered');
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      const terminal = await awaitDirectiveTerminal(h, requestId);
+      expect(terminal.state).toBe('failed');
+      expect(terminal.failReason).toContain('no implementing minion session and no job lane');
+      expect(h.ledger.latestJobEvent('ghost-job', 'silas.directive-failed')).not.toBeNull();
       // terminal jobs take no directives
       h.ledger.addJob({ id: 'done-job', repo: 'nowhere', title: 't', briefing: 'b' });
       h.ledger.setJobStatus('done-job', 'working');
@@ -846,8 +877,13 @@ describe('dispatch server (E8)', () => {
       const noop = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'fresh-noop', directive: 'fix it',
       }, TOKEN);
-      expect(noop.status).toBe(200);
-      expect(field<string>(noop.json, 'delivered_sha')).toBe(noopHead);
+      expect(noop.status).toBe(202);
+      const noopRequest = field<string>(noop.json, 'request_id');
+      expect((await awaitDirectiveTerminal(h, noopRequest)).state).toBe('settled');
+      const noopDelivered = h.ledger
+        .listJobEvents('fresh-noop')
+        .find((candidate) => candidate.kind === 'job.delivered');
+      expect((noopDelivered?.payload as { sha?: string }).sha).toBe(noopHead);
       expect((await digestOf()).prWithoutReview).toEqual([]);
 
       // (B) a directive whose fallback minion committed: the delivery head
@@ -863,8 +899,13 @@ describe('dispatch server (E8)', () => {
       const moved = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'fresh-moved', directive: 'fix the real thing',
       }, TOKEN);
-      expect(moved.status).toBe(200);
-      const movedSha = field<string>(moved.json, 'delivered_sha');
+      expect(moved.status).toBe(202);
+      const movedRequest = field<string>(moved.json, 'request_id');
+      expect((await awaitDirectiveTerminal(h, movedRequest)).state).toBe('settled');
+      const movedDelivered = h.ledger
+        .listJobEvents('fresh-moved')
+        .find((candidate) => candidate.kind === 'job.delivered');
+      const movedSha = (movedDelivered?.payload as { sha?: string }).sha as string;
       expect(movedSha).not.toBe(reviewedHead);
       expect(movedSha).toBe(headOf(movedLane.path));
       const digest = await digestOf();
@@ -890,11 +931,13 @@ describe('dispatch server (E8)', () => {
       const res = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'dir-fresh', directive: 'Fix the dead lane and re-run the suite.',
       }, TOKEN);
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
       const fresh = h.spawns[spawnsBefore];
       expect(fresh?.role).toBe('minion');
       expect(fresh?.options.cwd).toBe(lane?.path);
-      expect(field<string>(res.json, 'minion_id')).toBe(`agent-${h.spawns.length}`);
+      expect(h.ledger.getDirective(requestId)?.admissionMinion).toBe(`agent-${h.spawns.length}`);
       expect(h.disposedHandles).toContain(`agent-${h.spawns.length}`);
     } finally {
       await h.close();

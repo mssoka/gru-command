@@ -180,3 +180,62 @@ observation — the failed
 worker keeps its permit; `resident.open-control-unknown` records (once
 per affected handle) that supervision lacked openControl evidence, which
 makes the handle non-reclaimable rather than presumed idle.
+
+### E9: durable follow-through obligations and directive requests (migration 9)
+
+Two tables carry the blocked-heist follow-through contract. Neither
+executes work, schedules anything or wakes anyone by itself: they make
+the NEXT obligation durable and route it to the existing attention
+surfaces (Silas digest / action-required machine wake / FOR YOU).
+
+**`job_obligations`** — one row per (job, logical step, incident key)
+incarnation. A blocked transition records its obligation in the SAME
+transaction as the status write (`LedgerApi.setJobStatus`), with a typed
+blocker category (a closed list; anything else is `unknown` → Gru
+triage, never guessed into authority), the responsible role, the next
+action, optional typed authority, wake condition, bounded due/deadline
+state and firing-rule provenance (issue #117). Identity survives
+duplicate observations (coalesce, no generation advance); distinct
+incidents coexist; a settled incident recurring mints a NEW incarnation
+(`id#n`) — the partial unique index enforces one active incarnation per
+tuple. `plan_revision` bumps when a duplicate observation CHANGES the
+plan (next action / authority / wake condition) and fences claims taken
+under the older plan. Receipts cite REAL ledger events (existence, kind,
+job, correlation) and never settle; evidence settlements and mechanical
+authority are validated against ledger facts (`verifyObligationAuthority`
+→ an unverifiable reference is a visible non-executable decision). Claim
+replacement across an expired lease requires positive reconciliation
+proof recorded with the full prior identity in `claim_log`. Parking
+suspends, terminal closes, `invalidateStaleContinuations` reclassifies
+stale continuations onto a LINKED successor — debt is never silently
+erased.
+
+**`pending_directives`** — one row per accepted Silas directive request,
+keyed by the caller's stable `request_id`. The atomic intent→dispatch
+claim is persisted BEFORE any prompt/spawn side effect, so a crash
+before the insert is provably side-effect-free while a crash after it
+is ADMISSION-UNKNOWN — never read as safe to retry. States:
+
+| state | meaning |
+|---|---|
+| `dispatching` | accepted; a claim was taken before any side effect; native admission not yet recorded (or unknown after a crash) |
+| `admitted` | a correlated `silas.directive-sent` event bound an actual awaited turn; terminal receipt pending |
+| `settled` | the correlated `job.delivered` terminal receipt was recorded |
+| `failed` | a durable positive no-effect failure was recorded; resubmit changed work under a NEW request id |
+
+`POST /api/silas/directive` returns **202** with the stable `request_id`
+once the durable intent is accepted — accepted ≠ admitted. The async
+turn stays owned and tracked by the existing dispatch server instance
+(no detached helper, no second chief); late errors surface durably.
+`GET /api/silas/directives/{request_id}` is the authenticated readback
+of the same request. Same id + same canonical payload replays to the
+SAME row; same id + different payload is a 409 conflict; a caller
+without an id fails closed (409 `ambiguous_repeat`) while another
+request for the job is live. Boot reconciliation
+(`reconcilePendingDirectives` in the existing recovery coordinator)
+completes a request from its own correlated evidence when it exists —
+admission first, then the terminal receipt — and otherwise posts ONE
+bounded, stable-kind action-required escalation naming the request: no
+automatic retry, no fabricated delivery, no fresh alert ids to bypass
+dedupe. A settled/failed request id never re-runs; recovered capacity is
+not permission.

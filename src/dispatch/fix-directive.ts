@@ -132,7 +132,11 @@ export function recordFollowUpDelivery(input: {
   readonly jobId: string;
   readonly agentId: string | null;
   readonly source: 'dispatch' | 'silas-directive' | 'silas-rebrief';
-}): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null } {
+  /** Request-scoped correlation: the durable directive request this
+   * delivery answers. When present the event can only settle THAT
+   * request — a later unrelated delivery cannot clear an older marker. */
+  readonly requestId?: string;
+}): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null; readonly eventSeq: number } {
   const jobLanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job');
   const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];
   let sha: string | null = null;
@@ -148,12 +152,17 @@ export function recordFollowUpDelivery(input: {
   } else {
     note = 'no job lane in the registry to resolve a head from';
   }
-  input.ledger.appendCustomEvent({
+  const event = input.ledger.appendCustomEvent({
     kind: 'job.delivered',
     jobId: input.jobId,
-    payload: { agentId: input.agentId, source: input.source, sha },
+    payload: {
+      agentId: input.agentId,
+      source: input.source,
+      sha,
+      ...(input.requestId !== undefined ? { request_id: input.requestId } : {}),
+    },
   });
-  return { sha, lanePath: lane?.path ?? null, note };
+  return { sha, lanePath: lane?.path ?? null, note, eventSeq: event.seq };
 }
 
 /** Render the prompt handed to a FRESH minion taking over a stuck lane:
