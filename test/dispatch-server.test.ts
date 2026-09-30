@@ -68,6 +68,9 @@ async function boot(opts: {
   silasOps?: boolean;
   /** Gate selected minion turns before they settle (in-flight assertions). */
   minionPromptGate?: (text: string) => Promise<void> | undefined;
+  /** Test-only seam: wrap the ledger the server and dispatch see, so
+   * defensive ledger dispositions can be forced deterministically. */
+  wrapLedger?: (ledger: LedgerApi) => LedgerApi;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -82,7 +85,8 @@ async function boot(opts: {
   const cfg = loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
   const db = new LedgerDb(dir);
   const bus = new EventBus({});
-  const ledger = new LedgerApi(db.handle, { bus });
+  const rawLedger = new LedgerApi(db.handle, { bus });
+  const ledger = opts.wrapLedger === undefined ? rawLedger : opts.wrapLedger(rawLedger);
   const notifications = new NotificationCenter({ ledger, bus });
   const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
   const spawns: { role: Role; options: SpawnOptions }[] = [];
@@ -829,6 +833,59 @@ describe('dispatch server (E8)', () => {
       expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief-retired')).not.toBeNull();
       expect(h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' })).toHaveLength(0);
       expect(h.ledger.getJob('terminal-rebrief-job')?.status).toBe('merged');
+    } finally {
+      releasePrompt();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief surfaces a retirement that retired nothing, keeping the markers', async () => {
+    let releasePrompt!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      releasePrompt = resolveGate;
+    });
+    const h = await boot({
+      minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined),
+      wrapLedger: (ledger) => {
+        const view = Object.create(ledger) as LedgerApi;
+        Object.defineProperty(view, 'retirePendingRebriefs', {
+          value: () => ({ retired: [], recorded: false, skippedIds: ['stale-generation'], refused: null }),
+        });
+        return view;
+      },
+    });
+    const repo = makeFixtureRepo('fixture-silas-rebrief-incomplete');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'incomplete-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
+      }, TOKEN);
+      // Let the initial briefing turn settle before the re-brief (same shape
+      // as the retirement test above).
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('incomplete-rebrief-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'incomplete-rebrief-job', note: 'fold the rebase',
+      }, TOKEN);
+      const markerDeadline = Date.now() + 10_000;
+      while (h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' }).length !== 2 && Date.now() < markerDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' })).toHaveLength(2);
+      // The job reaches terminal while the turn is gated (owner merged it).
+      h.ledger.setJobStatus('incomplete-rebrief-job', 'in-review');
+      h.ledger.setJobStatus('incomplete-rebrief-job', 'merged');
+      releasePrompt();
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.json)).toBe(200);
+      // The incomplete disposition is in-band and the markers survive for
+      // the next pass; nothing claims a recovery or a retirement.
+      expect(res.json).toMatchObject({ retirement: { refused: null, skipped_ids: ['stale-generation'] } });
+      expect(h.ledger.latestJobEvent('incomplete-rebrief-job', 'silas.rebrief-retired')).toBeNull();
+      expect(h.ledger.latestJobEvent('incomplete-rebrief-job', 'silas.rebrief-recovered')).toBeNull();
+      expect(h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' })).toHaveLength(2);
     } finally {
       releasePrompt();
       await h.close();

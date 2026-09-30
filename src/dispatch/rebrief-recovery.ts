@@ -72,6 +72,14 @@ export interface ReconcileRebriefDeps {
   readonly stopping?: () => boolean;
 }
 
+/** The incomplete-attempt disposition when the terminal branch examined
+ * the request but retired nothing (a refused boundary or an identity drift):
+ * the markers stay for the next pass. See `PendingRebriefFinalize.retirement`. */
+export interface PendingRebriefRetirementDetail {
+  readonly refused: PendingRebriefRetirement['refused'];
+  readonly skippedIds: PendingRebriefRetirement['skippedIds'];
+}
+
 export interface PendingRebriefFinalize {
   readonly minionId: string | null;
   readonly deliveredSha: string | null;
@@ -81,8 +89,14 @@ export interface PendingRebriefFinalize {
   /** True when this call actually retired the request: the job was terminal
    * and the identity-checked marker deletion committed (no event, no
    * delivery, no reopen). A defensive boundary that refuses, or an identity
-   * drift that skips every candidate, retires nothing and reports false. */
+   * drift that skips every candidate, retires nothing and reports false,
+   * carrying the disposition in `retirement`. */
   readonly retired: boolean;
+  /** Set when the terminal branch examined the request but retired nothing:
+   * the caller must not report the request as recovered; markers stay for
+   * the next pass. Null when no terminal retirement was attempted or when
+   * it actually retired the request. */
+  readonly retirement: PendingRebriefRetirementDetail | null;
 }
 
 export interface ReconcileReport {
@@ -133,23 +147,44 @@ export function finalizeRebriefRequest(input: {
     // No markers means the request already finalized (events landed) — a
     // replay is a no-op, never a duplicate event. Every live re-brief
     // begins its markers before it can reach here.
-    return { minionId: input.minionId, deliveredSha: null, deliveryNote: null, rebriefRecorded: false, deliveryRecorded: false, retired: false };
+    return { minionId: input.minionId, deliveredSha: null, deliveryNote: null, rebriefRecorded: false, deliveryRecorded: false, retired: false, retirement: null };
   }
   const missing = markers.filter((marker) => !pendingRebriefEventLanded(input.ledger, marker));
   const job = input.ledger.getJob(input.jobId);
+  if (missing.length > 0 && job === null) {
+    // Fail closed: a marker whose job row is gone can never be finalized
+    // truthfully — recording guarded events would mint history for an
+    // absent job. The markers stay for the next honest boundary.
+    throw new Error(`job "${input.jobId}" no longer exists — pending re-brief markers cannot be finalized`);
+  }
   if (missing.length > 0 && job !== null && isJobTerminal(job.status)) {
     // The job went terminal under the turn's feet: the guarded events can
     // no longer be honored truthfully. Retire the request instead of
     // recording a stale late completion (no reopen, no fabricated
     // delivery, no kill — the turn's artifacts stay on the lane).
     const retirement = retireTerminalRebriefs(input.ledger, job, markers);
+    if (retirement.retired.length === 0) {
+      // The defensive boundary refused or the identity drifted: nothing was
+      // deleted or recorded. Report the disposition so no caller claims a
+      // recovery that did not happen.
+      return {
+        minionId: input.minionId,
+        deliveredSha: null,
+        deliveryNote: null,
+        rebriefRecorded: false,
+        deliveryRecorded: false,
+        retired: false,
+        retirement: { refused: retirement.refused, skippedIds: retirement.skippedIds },
+      };
+    }
     return {
       minionId: input.minionId,
       deliveredSha: null,
       deliveryNote: null,
       rebriefRecorded: false,
       deliveryRecorded: false,
-      retired: retirement.retired.length > 0,
+      retired: true,
+      retirement: null,
     };
   }
   const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief') ?? null;
@@ -192,7 +227,7 @@ export function finalizeRebriefRequest(input: {
 
   // Markers clear ONLY now — every guarded event exists.
   input.ledger.clearPendingRebriefs(markers.map((marker) => marker.id));
-  return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false };
+  return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false, retirement: null };
 }
 
 /** Markers this process is actively recovering — a second reconcile pass
@@ -267,7 +302,10 @@ export async function reconcilePendingRebriefs(
     // The turn settled before the restart and only the follow-up delivery
     // record was lost (`silas.rebrief` posted first). The lane is already
     // delivered; record the delivery directly instead of rerunning a turn.
-    if (missing.every((marker) => marker.kind === 'job.delivered')) {
+    // A missing job row must NOT take this shortcut (it would mint a
+    // delivery for a job that does not exist): it falls through to the
+    // re-dispatch boundary, which escalates honestly with the markers kept.
+    if (job !== null && missing.every((marker) => marker.kind === 'job.delivered')) {
       const anchor = group.find((marker) => marker.kind === 'job.delivered') ?? group[0];
       const followUp = recordFollowUpDelivery({
         ledger: deps.ledger,
@@ -377,6 +415,18 @@ async function redispatchGroup(
       });
       return;
     }
+    if (finalized.retirement !== null) {
+      // The terminal boundary examined the request but retired nothing
+      // (refusal or identity drift). The markers stay for the next pass and
+      // no recovery event may claim the request was recovered.
+      deps.log?.('warn', 're-brief recovery closed without retirement: markers kept', {
+        job: jobId,
+        path,
+        refused: finalized.retirement.refused,
+        skipped: finalized.retirement.skippedIds,
+      });
+      return;
+    }
     deps.ledger.appendCustomEvent({
       kind: 'silas.rebrief-recovered',
       jobId,
@@ -468,7 +518,7 @@ const TERMINAL_REBRIEF_RETIREMENT_REASON =
  * forever. The ledger transaction re-verifies both the job status and each
  * marker's identity before deleting. */
 function retireTerminalRebriefs(
-  ledger: Pick<LedgerApi, 'latestJobEvent' | 'retirePendingRebriefs'>,
+  ledger: Pick<LedgerApi, 'retirePendingRebriefs'>,
   job: { readonly id: string; readonly status: JobStatus },
   group: readonly PendingRebriefRecord[],
 ): PendingRebriefRetirement {
@@ -477,7 +527,6 @@ function retireTerminalRebriefs(
     kind: marker.kind,
     payloadHash: marker.payloadHash,
     baselineSeq: marker.baselineSeq,
-    guardedEventLanded: pendingRebriefEventLanded(ledger, marker),
   }));
   return ledger.retirePendingRebriefs({
     jobId: job.id,

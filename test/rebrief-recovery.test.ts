@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus } from '../src/events/bus.js';
-import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerApi, type PendingRebriefRetirement } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -425,6 +425,24 @@ describe('terminal re-brief retirement', () => {
     return ((event?.payload as { retired?: readonly RetiredMarkerAudit[] }).retired ?? []);
   }
 
+  /** A delegating ledger view with single methods overridden: forces the
+   * defensive retirement boundaries deterministically without a second
+   * writer or a genuinely missing row. */
+  function ledgerWith(
+    h: Harness,
+    overrides: {
+      readonly getJob?: LedgerApi['getJob'];
+      readonly retirePendingRebriefs?: LedgerApi['retirePendingRebriefs'];
+    },
+  ): LedgerApi {
+    const view = Object.create(h.ledger) as LedgerApi;
+    if (overrides.getJob !== undefined) Object.defineProperty(view, 'getJob', { value: overrides.getJob });
+    if (overrides.retirePendingRebriefs !== undefined) {
+      Object.defineProperty(view, 'retirePendingRebriefs', { value: overrides.retirePendingRebriefs });
+    }
+    return view;
+  }
+
   it('boot retires an admitted re-brief on a merged job: audited, no spawn, no fabricated delivery, no alert', async () => {
     const h = makeHarness();
     const jobId = 'terminal-pair-job';
@@ -456,10 +474,17 @@ describe('terminal re-brief retirement', () => {
     const retired = retiredAudit(h, jobId);
     expect(retired.map((marker) => marker.kind).sort()).toEqual(['job.delivered', 'silas.rebrief']);
     expect(retired.map((marker) => marker.id).sort()).toEqual(markers.map((marker) => marker.id).sort());
+    const source = new Map(markers.map((marker) => [marker.id, marker] as const));
     for (const marker of retired) {
-      expect(marker.payload_hash).toMatch(/^[0-9a-f]{64}$/u);
-      expect(marker.baseline_seq).toBeGreaterThan(0);
-      expect(marker.requested_at).toBeTruthy();
+      const origin = source.get(marker.id);
+      expect(origin).toBeDefined();
+      // The audit is the only surviving copy once the rows are deleted:
+      // every identity scalar must EQUAL the request it retired, not merely
+      // look well-formed.
+      expect(marker.kind).toBe(origin?.kind);
+      expect(marker.payload_hash).toBe(origin?.payloadHash);
+      expect(marker.baseline_seq).toBe(origin?.baselineSeq);
+      expect(marker.requested_at).toBe(origin?.requestedAt);
       expect(marker.guarded_event_landed).toBe(false);
       // Worker/session attribution survives into the audit when the request
       // had a bound worker at retirement time.
@@ -601,5 +626,126 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).not.toBeNull();
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+  });
+
+  it('a missing job never takes the delivery-only shortcut: escalation, no fabricated delivery', async () => {
+    const h = makeHarness();
+    const jobId = 'missing-rebrief-job';
+    await seedPendingRebrief({ h, jobId });
+    // The turn settled and `silas.rebrief` posted; the delivery record never
+    // did — the exact shape the delivery-only crash shortcut exists for.
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'worker-1', note: 'n' } });
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: ledgerWith(h, { getJob: () => null }),
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    await report.settled;
+    // No delivery is minted for a job row that does not exist; the markers
+    // stay and the honest re-dispatch boundary escalates instead.
+    expect(report.completed).toBe(0);
+    expect(report.redispatched).toBe(1);
+    expect(h.registry.workers).toHaveLength(0);
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+    const notification = h.ledger
+      .listNotifications()
+      .find((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`);
+    expect(notification).toBeDefined();
+    expect(notification?.detail).toContain('no longer exists');
+  });
+
+  it('finalize fails closed for a missing job: no guarded event, markers kept', async () => {
+    const h = makeHarness();
+    const jobId = 'finalize-missing-job';
+    await seedPendingRebrief({ h, jobId });
+    const view = ledgerWith(h, { getJob: () => null });
+    expect(() =>
+      finalizeRebriefRequest({
+        ledger: view,
+        worktrees: h.worktrees,
+        jobId,
+        minionId: 'worker-9',
+        lanePath: h.lanePath,
+        note: 'n',
+      }),
+    ).toThrow(/no longer exists/u);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+  });
+
+  it('finalize reports an incomplete terminal retirement instead of a silent no-op', async () => {
+    const h = makeHarness();
+    const jobId = 'finalize-incomplete-retirement';
+    await seedPendingRebrief({ h, jobId });
+    merge(h, jobId);
+    const stale: PendingRebriefRetirement = {
+      retired: [],
+      recorded: false,
+      skippedIds: ['stale-generation'],
+      refused: null,
+    };
+    const view = ledgerWith(h, { retirePendingRebriefs: () => stale });
+    const result = finalizeRebriefRequest({
+      ledger: view,
+      worktrees: h.worktrees,
+      jobId,
+      minionId: 'worker-9',
+      lanePath: h.lanePath,
+      note: 'n',
+    });
+    expect(result.retired).toBe(false);
+    expect(result.retirement).toEqual({ refused: null, skippedIds: ['stale-generation'] });
+    expect(result.rebriefRecorded).toBe(false);
+    expect(result.deliveryRecorded).toBe(false);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+  });
+
+  it('a mid-turn retirement that retires nothing keeps the markers and is never reported as recovered', async () => {
+    const h = makeHarness();
+    const jobId = 'incomplete-retirement-job';
+    await seedPendingRebrief({ h, jobId });
+    let release!: () => void;
+    h.registry.gate = new Promise<void>((resolveGate) => {
+      release = resolveGate;
+    });
+    const logs: string[] = [];
+    const stale: PendingRebriefRetirement = {
+      retired: [],
+      recorded: false,
+      skippedIds: ['stale-generation'],
+      refused: null,
+    };
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: ledgerWith(h, { retirePendingRebriefs: () => stale }),
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+        log: (level, msg) => {
+          logs.push(`${level}:${msg}`);
+        },
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    expect(report.redispatched).toBe(1);
+    // The job reaches terminal while the re-dispatch turn is still in flight.
+    merge(h, jobId);
+    release();
+    await report.settled;
+    // The boundary kept the markers and said so; it did NOT claim recovery.
+    expect(h.registry.workers).toHaveLength(1);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+    expect(logs).toContain('warn:re-brief recovery closed without retirement: markers kept');
   });
 });

@@ -370,14 +370,12 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     kind: PendingRebriefRecord['kind'];
     payloadHash: string;
     baselineSeq: number;
-    guardedEventLanded: boolean;
   }[] {
     return markers.map((marker) => ({
       id: marker.id,
       kind: marker.kind,
       payloadHash: marker.payloadHash,
       baselineSeq: marker.baselineSeq,
-      guardedEventLanded: false,
     }));
   }
 
@@ -441,5 +439,27 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
 
     const missing = api.retirePendingRebriefs({ jobId: 'no-such-job', reason: 'x', candidates: [] });
     expect(missing.refused).toBe('job-missing');
+  });
+
+  it('the retirement audit recomputes guarded_event_landed from the ledger, not the caller', () => {
+    const jobId = 'retire-landed-flag';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'landed-flag truth' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    // The guarded `silas.rebrief` event lands; the delivery never does.
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'w', note: 'n' } });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    const result = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates: candidatesOf(markers) });
+    expect(result.retired).toHaveLength(2);
+    const audit = api.latestJobEvent(jobId, 'silas.rebrief-retired');
+    const retired =
+      (audit?.payload as { retired?: readonly { kind: string; guarded_event_landed?: boolean }[] }).retired ?? [];
+    const flagFor = (kind: string): boolean | undefined =>
+      retired.find((marker) => marker.kind === kind)?.guarded_event_landed;
+    // Recomputed in the transaction from the ledger's own events: the caller
+    // supplied no flag at all.
+    expect(flagFor('silas.rebrief')).toBe(true);
+    expect(flagFor('job.delivered')).toBe(false);
   });
 });

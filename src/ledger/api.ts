@@ -226,7 +226,9 @@ export interface PendingRebriefRecord {
 }
 
 /** A marker snapshot examined by a caller that wants to retire a request.
- * The row is deleted ONLY while it still matches this identity. */
+ * The row is deleted ONLY while it still matches this identity. The audit's
+ * `guarded_event_landed` flag is recomputed from the ledger's own events at
+ * transaction time, never taken from this snapshot. */
 export interface PendingRebriefRetireCandidate {
   readonly id: string;
   readonly kind: PendingRebriefKind;
@@ -234,9 +236,6 @@ export interface PendingRebriefRetireCandidate {
   readonly payloadHash: string;
   /** Request-time event watermark — identity half. */
   readonly baselineSeq: number;
-  /** True when this marker's guarded event had already landed when the
-   * caller examined it (recorded so the audit stays truthful). */
-  readonly guardedEventLanded: boolean;
 }
 
 /** The outcome of one terminal-retirement attempt. */
@@ -1180,7 +1179,9 @@ export class LedgerApi {
    * transaction. A candidate retires ONLY while its row still matches the
    * examined identity (id + kind + payload hash + baseline watermark): an
    * older pass can never erase a newer request generation, and a replay
-   * (or a concurrent pass) finds nothing to delete and records nothing. */
+   * (or a concurrent pass) finds nothing to delete and records nothing.
+   * The audit's `guarded_event_landed` flags are the ledger's own event
+   * truth at transaction time — never a caller snapshot. */
   retirePendingRebriefs(input: {
     jobId: string;
     reason: string;
@@ -1202,6 +1203,10 @@ export class LedgerApi {
       const rows = this.listPendingRebriefs({ jobId: input.jobId });
       const retired: PendingRebriefRecord[] = [];
       const skippedIds: string[] = [];
+      // The landed flag is ledger truth, recomputed here: a caller snapshot
+      // could otherwise write a permanently untruthful audit row (e.g.
+      // "never landed" for a delivery that did land).
+      const guardedEventLanded = new Map<string, boolean>();
       for (const candidate of input.candidates) {
         const row = rows.find((current) => current.id === candidate.id);
         if (
@@ -1213,6 +1218,8 @@ export class LedgerApi {
           skippedIds.push(candidate.id);
           continue;
         }
+        const latest = this.latestJobEvent(row.jobId, row.kind);
+        guardedEventLanded.set(row.id, latest !== null && latest.seq > row.baselineSeq);
         retired.push(row);
       }
       if (retired.length === 0) {
@@ -1235,8 +1242,7 @@ export class LedgerApi {
             agent_id: row.agentId,
             session_file: row.sessionFile,
             requested_at: row.requestedAt,
-            guarded_event_landed:
-              input.candidates.find((candidate) => candidate.id === row.id)?.guardedEventLanded ?? false,
+            guarded_event_landed: guardedEventLanded.get(row.id) ?? false,
           })),
           skipped_ids: skippedIds,
         },

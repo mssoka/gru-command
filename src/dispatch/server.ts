@@ -438,6 +438,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           job: jobId,
           minion_id: result.minionId,
         });
+      } else if (followUp.retirement !== null) {
+        // A defensive boundary refused the retirement or the marker identity
+        // drifted: the markers stay for the next pass and nothing was
+        // fabricated. Surface it instead of an unexplained ordinary 200.
+        log('warn', 'silas re-brief retirement incomplete: markers kept for the next pass', {
+          job: jobId,
+          refused: followUp.retirement.refused,
+          skipped: followUp.retirement.skippedIds,
+        });
       }
       if (followUp.deliveryNote !== null) {
         log('warn', 'silas follow-up delivery has no resolvable lane head', {
@@ -452,6 +461,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         lane: result.lanePath,
         delivered_sha: followUp.deliveredSha,
         ...(followUp.retired ? { retired: true } : {}),
+        ...(followUp.retirement !== null
+          ? { retirement: { refused: followUp.retirement.refused, skipped_ids: followUp.retirement.skippedIds } }
+          : {}),
       });
       return true;
     }
