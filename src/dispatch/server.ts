@@ -431,6 +431,14 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         lanePath: result.lanePath,
         note,
       });
+      if (followUp.retired) {
+        // The job reached terminal while the turn was in flight: the
+        // request was administratively retired; no events were fabricated.
+        log('info', 'silas re-brief retired: job went terminal before the turn settled', {
+          job: jobId,
+          minion_id: result.minionId,
+        });
+      }
       if (followUp.deliveryNote !== null) {
         log('warn', 'silas follow-up delivery has no resolvable lane head', {
           job: jobId,
@@ -438,7 +446,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           note: followUp.deliveryNote,
         });
       }
-      json(res, 200, { job_id: jobId, minion_id: result.minionId, lane: result.lanePath, delivered_sha: followUp.deliveredSha });
+      json(res, 200, {
+        job_id: jobId,
+        minion_id: result.minionId,
+        lane: result.lanePath,
+        delivered_sha: followUp.deliveredSha,
+        ...(followUp.retired ? { retired: true } : {}),
+      });
       return true;
     }
     if (req.method === 'POST' && path === '/api/silas/escalate') {

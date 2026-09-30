@@ -390,3 +390,175 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(events).toHaveLength(2);
   });
 });
+
+describe('terminal re-brief retirement', () => {
+  function deps(h: Harness): {
+    registry: FakeAgents;
+    ledger: LedgerApi;
+    worktrees: InMemoryWorktreePort;
+    notifications: NotificationCenter;
+  } {
+    return { registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications };
+  }
+
+  /** The seed leaves the job working; terminal is in-review → merged. */
+  function merge(h: Harness, jobId: string): void {
+    h.ledger.setJobStatus(jobId, 'in-review');
+    h.ledger.setJobStatus(jobId, 'merged');
+  }
+
+  interface RetiredMarkerAudit {
+    readonly id: string;
+    readonly kind: string;
+    readonly payload_hash: string;
+    readonly baseline_seq: number;
+    readonly note: string | null;
+    readonly agent_id: string | null;
+    readonly session_file: string | null;
+    readonly requested_at: string;
+    readonly guarded_event_landed: boolean;
+  }
+
+  function retiredAudit(h: Harness, jobId: string): readonly RetiredMarkerAudit[] {
+    const event = h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired');
+    expect(event).not.toBeNull();
+    return ((event?.payload as { retired?: readonly RetiredMarkerAudit[] }).retired ?? []);
+  }
+
+  it('boot retires an admitted re-brief on a merged job: audited, no spawn, no fabricated delivery, no alert', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-pair-job';
+    await seedPendingRebrief({ h, jobId });
+    merge(h, jobId);
+    const markers = h.ledger.listPendingRebriefs({ jobId });
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    expect(report.examined).toBe(2);
+    expect(report.retired).toBe(1);
+    expect(report.redispatched).toBe(0);
+    expect(report.completed).toBe(0);
+    await report.settled;
+
+    // No worker ever ran, no guarded event was fabricated, the lane stayed terminal.
+    expect(h.registry.workers).toHaveLength(0);
+    expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+
+    // The audit carries the full request identity for cold reads.
+    const audit = h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired');
+    expect(audit).not.toBeNull();
+    const payload = audit?.payload as { job_status?: string; reason?: string };
+    expect(payload.job_status).toBe('merged');
+    expect(payload.reason).toContain('terminal');
+    const retired = retiredAudit(h, jobId);
+    expect(retired.map((marker) => marker.kind).sort()).toEqual(['job.delivered', 'silas.rebrief']);
+    expect(retired.map((marker) => marker.id).sort()).toEqual(markers.map((marker) => marker.id).sort());
+    for (const marker of retired) {
+      expect(marker.payload_hash).toMatch(/^[0-9a-f]{64}$/u);
+      expect(marker.baseline_seq).toBeGreaterThan(0);
+      expect(marker.requested_at).toBeTruthy();
+      expect(marker.guarded_event_landed).toBe(false);
+    }
+
+    // The old per-boot action-required alert family is gone entirely.
+    expect(h.ledger.listNotifications().filter((row) => row.kind.startsWith('silas.rebrief-unreconciled.'))).toHaveLength(0);
+  });
+
+  it('retires a lone delivery marker on a terminal job instead of fabricating a delivery', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-delivery-only-job';
+    await seedPendingRebrief({ h, jobId });
+    // The turn settled and `silas.rebrief` posted; the crash hit before the
+    // delivery record — and the job merged before the next boot.
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'worker-1', note: 'n' } });
+    merge(h, jobId);
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    expect(report.retired).toBe(1);
+    expect(report.completed).toBe(0); // NOT the delivery-only crash shortcut
+    await report.settled;
+    expect(h.registry.workers).toHaveLength(0);
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    const retired = retiredAudit(h, jobId);
+    expect(retired.find((marker) => marker.kind === 'silas.rebrief')?.guarded_event_landed).toBe(true);
+    expect(retired.find((marker) => marker.kind === 'job.delivered')?.guarded_event_landed).toBe(false);
+  });
+
+  it('repeated and overlapping boot passes retire exactly once (idempotent by request identity)', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-replay-job';
+    await seedPendingRebrief({ h, jobId });
+    merge(h, jobId);
+    const first = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const second = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    expect(first.retired).toBe(1);
+    expect(second.examined).toBe(0);
+    await first.settled;
+    await second.settled;
+    const audits = h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired');
+    expect(audits).toHaveLength(1);
+  });
+
+  it('a terminal flip during a re-dispatch turn retires the request instead of recording a stale completion', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-midturn-job';
+    await seedPendingRebrief({ h, jobId });
+    let release!: () => void;
+    h.registry.gate = new Promise<void>((resolveGate) => {
+      release = resolveGate;
+    });
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    expect(report.redispatched).toBe(1);
+    // The job reaches terminal while the re-dispatch turn is still in flight.
+    merge(h, jobId);
+    release();
+    await report.settled;
+
+    // The live turn is preserved (not killed), but no stale completion is recorded.
+    expect(h.registry.workers).toHaveLength(1);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).not.toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+    expect(h.ledger.listNotifications().filter((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`)).toHaveLength(0);
+  });
+
+  it('retires only the terminal job’s obsolete markers; an unrelated unfinished request recovers unchanged', async () => {
+    const h = makeHarness();
+    const terminalJob = 'terminal-neighbour-job';
+    const workingJob = 'working-neighbour-job';
+    await seedPendingRebrief({ h, jobId: terminalJob });
+    await seedPendingRebrief({ h, jobId: workingJob });
+    merge(h, terminalJob);
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    expect(report.retired).toBe(1);
+    expect(report.redispatched).toBe(1);
+    await report.settled;
+
+    expect(h.ledger.listPendingRebriefs({ jobId: terminalJob })).toHaveLength(0);
+    expect(h.ledger.latestJobEvent(terminalJob, 'silas.rebrief')).toBeNull();
+    // The unrelated request walked the honest recovery path untouched.
+    expect(h.ledger.listPendingRebriefs({ jobId: workingJob })).toHaveLength(0);
+    expect(h.registry.workers).toHaveLength(1);
+    expect(h.registry.workers[0]?.prompts[0] ?? '').toContain(`Re-brief — job ${workingJob}`);
+    expect(h.ledger.latestJobEvent(workingJob, 'silas.rebrief')).not.toBeNull();
+  });
+
+  it('a parked job keeps the existing recovery path — not terminal cleanup', async () => {
+    const h = makeHarness();
+    const jobId = 'parked-rebrief-job';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.setJobStatus(jobId, 'parked');
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    expect(report.retired).toBe(0);
+    expect(report.redispatched).toBe(1);
+    await report.settled;
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).not.toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+  });
+});

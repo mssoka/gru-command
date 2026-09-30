@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
-import { LedgerApi, DEFAULT_LENSES } from '../src/ledger/api.js';
+import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 
 const cleanupDirs: string[] = [];
@@ -346,4 +346,100 @@ describe('ledger api — the record of state', () => {
     db2.close();
   });
 
+});
+
+describe('pending re-brief terminal retirement (ledger boundary)', () => {
+  let db: LedgerDb;
+  let api: LedgerApi;
+
+  beforeAll(() => {
+    db = new LedgerDb(tmpDir());
+    api = new LedgerApi(db.handle);
+  });
+  afterAll(() => db.close());
+
+  function mergedJob(id: string): void {
+    api.addJob({ id, repo: 'terminal-retirement', title: 'terminal retirement fixture' });
+    api.setJobStatus(id, 'working');
+    api.setJobStatus(id, 'in-review');
+    api.setJobStatus(id, 'merged');
+  }
+
+  function candidatesOf(markers: readonly PendingRebriefRecord[]): readonly {
+    id: string;
+    kind: PendingRebriefRecord['kind'];
+    payloadHash: string;
+    baselineSeq: number;
+    guardedEventLanded: boolean;
+  }[] {
+    return markers.map((marker) => ({
+      id: marker.id,
+      kind: marker.kind,
+      payloadHash: marker.payloadHash,
+      baselineSeq: marker.baselineSeq,
+      guardedEventLanded: false,
+    }));
+  }
+
+  it('beginPendingRebrief refuses a terminal job inside its own transaction (the HTTP guard is not the only boundary)', () => {
+    mergedJob('intake-terminal');
+    expect(() => api.beginPendingRebrief({ jobId: 'intake-terminal', note: 'n', briefing: 'b' }))
+      .toThrow(/terminal lanes are never re-briefed/u);
+    expect(api.listPendingRebriefs({ jobId: 'intake-terminal' })).toHaveLength(0);
+  });
+
+  it('retirePendingRebriefs commits audit + identity-checked deletion together; a replay is a no-op', () => {
+    const jobId = 'retire-atomic';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'audit atomicity' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    const candidates = candidatesOf(markers);
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+
+    const first = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates });
+    expect(first.recorded).toBe(true);
+    expect(first.refused).toBeNull();
+    expect(first.retired.map((marker) => marker.id).sort()).toEqual(markers.map((marker) => marker.id).sort());
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+    const audit = api.latestJobEvent(jobId, 'silas.rebrief-retired');
+    expect(audit).not.toBeNull();
+    expect((audit?.payload as { job_status?: string }).job_status).toBe('merged');
+
+    const replay = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates });
+    expect(replay.recorded).toBe(false);
+    expect(replay.retired).toHaveLength(0);
+    expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
+  });
+
+  it('a stale snapshot never erases a newer request generation; nonterminal and missing jobs are refused', () => {
+    const jobId = 'retire-generation';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'generation guard' });
+    api.setJobStatus(jobId, 'working');
+    const old = api.beginPendingRebrief({ jobId, note: 'old', briefing: 'b' });
+    const staleCandidates = candidatesOf(old);
+    const fresh = api.beginPendingRebrief({ jobId, note: 'fresh', briefing: 'b' });
+    expect(fresh.map((marker) => marker.id)).not.toEqual(old.map((marker) => marker.id));
+
+    // Nonterminal: refused, nothing deleted or recorded.
+    const refused = api.retirePendingRebriefs({ jobId, reason: 'x', candidates: staleCandidates });
+    expect(refused.refused).toBe('job-not-terminal');
+    expect(refused.recorded).toBe(false);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(2);
+
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    const stale = api.retirePendingRebriefs({ jobId, reason: 'x', candidates: staleCandidates });
+    expect(stale.retired).toHaveLength(0);
+    expect(stale.recorded).toBe(false);
+    expect(stale.skippedIds.slice().sort()).toEqual(staleCandidates.map((candidate) => candidate.id).sort());
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(2); // the newer generation survives
+
+    const current = api.retirePendingRebriefs({ jobId, reason: 'x', candidates: candidatesOf(fresh) });
+    expect(current.retired).toHaveLength(2);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+
+    const missing = api.retirePendingRebriefs({ jobId: 'no-such-job', reason: 'x', candidates: [] });
+    expect(missing.refused).toBe('job-missing');
+  });
 });

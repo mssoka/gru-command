@@ -8,6 +8,7 @@ import {
   assertLensTransition,
   assertRoundTransition,
   isJobStatus,
+  isJobTerminal,
   isLensState,
   isRoundStatus,
   isRoundVerdict,
@@ -193,7 +194,9 @@ export interface WorktreeRecord {
 // request marker written BEFORE a re-brief worker is spawned. Each marker
 // guards ONE ledger event; it clears only when that event lands. A boot
 // reconciliation consumes any marker whose event never landed, so a
-// service restart mid-turn can never silence the lane.
+// service restart mid-turn can never silence the lane. A terminal job
+// takes no fresh markers, and its obsolete markers are retired through
+// `retirePendingRebriefs` (audit + deletion, one transaction).
 // ------------------------------------------------------------------
 
 export const PENDING_REBRIEF_KINDS = ['silas.rebrief', 'job.delivered'] as const;
@@ -220,6 +223,35 @@ export interface PendingRebriefRecord {
   readonly agentId: string | null;
   readonly sessionFile: string | null;
   readonly requestedAt: string;
+}
+
+/** A marker snapshot examined by a caller that wants to retire a request.
+ * The row is deleted ONLY while it still matches this identity. */
+export interface PendingRebriefRetireCandidate {
+  readonly id: string;
+  readonly kind: PendingRebriefKind;
+  /** sha256 of the exact request payload — identity half. */
+  readonly payloadHash: string;
+  /** Request-time event watermark — identity half. */
+  readonly baselineSeq: number;
+  /** True when this marker's guarded event had already landed when the
+   * caller examined it (recorded so the audit stays truthful). */
+  readonly guardedEventLanded: boolean;
+}
+
+/** The outcome of one terminal-retirement attempt. */
+export interface PendingRebriefRetirement {
+  /** The markers this call deleted (identity matched at the boundary). */
+  readonly retired: readonly PendingRebriefRecord[];
+  /** True when the retirement audit event was appended with this call;
+   * false on a replay, an identity drift, or a boundary refusal. */
+  readonly recorded: boolean;
+  /** Candidate ids whose current row no longer matches the examined
+   * identity (a newer request generation, or an already-consumed marker). */
+  readonly skippedIds: readonly string[];
+  /** The boundary refusal when the job was not terminal at retirement
+   * time — nothing was deleted or recorded then. */
+  readonly refused: 'job-missing' | 'job-not-terminal' | null;
 }
 
 function nowIso(): string {
@@ -1067,14 +1099,21 @@ export class LedgerApi {
     note: string | null;
     briefing: string | null;
   }): readonly PendingRebriefRecord[] {
-    if (this.getJob(input.jobId) === null) {
-      throw new RecordNotFound(`job "${input.jobId}" not found — a re-brief marker belongs to a real job`);
-    }
     const payload = JSON.stringify({ note: input.note, briefing: input.briefing });
     const payloadHash = createHash('sha256').update(payload).digest('hex');
-    const baselineSeq = this.latestEventSeq();
-    const ts = nowIso();
     return this.transaction(() => {
+      // The HTTP caller pre-checks, but admission is the boundary of
+      // record: a terminal transition between that check and the write is
+      // refused HERE, so a terminal lane can never receive a fresh marker.
+      const job = this.getJob(input.jobId);
+      if (job === null) {
+        throw new RecordNotFound(`job "${input.jobId}" not found — a re-brief marker belongs to a real job`);
+      }
+      if (isJobTerminal(job.status)) {
+        throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes are never re-briefed`);
+      }
+      const baselineSeq = this.latestEventSeq();
+      const ts = nowIso();
       const upsert = this.db.prepare(
         `INSERT INTO pending_rebriefs
            (id, job_id, kind, payload, payload_hash, baseline_seq, agent_id, session_file, requested_at, updated_at)
@@ -1130,6 +1169,79 @@ export class LedgerApi {
     this.transaction(() => {
       const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
       for (const id of ids) remove.run(id);
+    });
+  }
+
+  /** Retire pending re-brief markers whose request can never be honored:
+   * the job is terminal, so no turn will ever record the guarded events
+   * and no re-dispatch is legal. Unlike `clearPendingRebriefs` (success:
+   * the guarded events landed), retirement is an administrative
+   * cancellation, so the audit event and the deletion commit in ONE
+   * transaction. A candidate retires ONLY while its row still matches the
+   * examined identity (id + kind + payload hash + baseline watermark): an
+   * older pass can never erase a newer request generation, and a replay
+   * (or a concurrent pass) finds nothing to delete and records nothing. */
+  retirePendingRebriefs(input: {
+    jobId: string;
+    reason: string;
+    candidates: readonly PendingRebriefRetireCandidate[];
+  }): PendingRebriefRetirement {
+    return this.transaction(() => {
+      const refused = (why: 'job-missing' | 'job-not-terminal'): PendingRebriefRetirement => ({
+        retired: [],
+        recorded: false,
+        skippedIds: input.candidates.map((candidate) => candidate.id),
+        refused: why,
+      });
+      // Boundary recheck: the caller saw terminal, but the deletion is
+      // irreversible, so the record re-verifies inside the transaction.
+      const job = this.getJob(input.jobId);
+      if (job === null) return refused('job-missing');
+      if (!isJobTerminal(job.status)) return refused('job-not-terminal');
+
+      const rows = this.listPendingRebriefs({ jobId: input.jobId });
+      const retired: PendingRebriefRecord[] = [];
+      const skippedIds: string[] = [];
+      for (const candidate of input.candidates) {
+        const row = rows.find((current) => current.id === candidate.id);
+        if (
+          row === undefined ||
+          row.kind !== candidate.kind ||
+          row.payloadHash !== candidate.payloadHash ||
+          row.baselineSeq !== candidate.baselineSeq
+        ) {
+          skippedIds.push(candidate.id);
+          continue;
+        }
+        retired.push(row);
+      }
+      if (retired.length === 0) {
+        return { retired: [], recorded: false, skippedIds, refused: null };
+      }
+      const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
+      for (const row of retired) remove.run(row.id);
+      this.appendEvent({
+        kind: 'silas.rebrief-retired',
+        jobId: input.jobId,
+        payload: {
+          job_status: job.status,
+          reason: input.reason,
+          retired: retired.map((row) => ({
+            id: row.id,
+            kind: row.kind,
+            payload_hash: row.payloadHash,
+            baseline_seq: row.baselineSeq,
+            note: row.note,
+            agent_id: row.agentId,
+            session_file: row.sessionFile,
+            requested_at: row.requestedAt,
+            guarded_event_landed:
+              input.candidates.find((candidate) => candidate.id === row.id)?.guardedEventLanded ?? false,
+          })),
+          skipped_ids: skippedIds,
+        },
+      });
+      return { retired, recorded: true, skippedIds, refused: null };
     });
   }
 

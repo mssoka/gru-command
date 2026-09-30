@@ -803,6 +803,7 @@ async function main(): Promise<number> {
       examined: rebriefRecovery.examined,
       completed: rebriefRecovery.completed,
       redispatched: rebriefRecovery.redispatched,
+      retired: rebriefRecovery.retired,
     });
   }
   const bobSlot = supervisorLive.declareSlot({
