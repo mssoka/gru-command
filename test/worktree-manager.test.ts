@@ -739,6 +739,62 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
     expect(repo.git(['rev-parse', 'refs/heads/gru/job-r8-reconcile'])).toBe(laneTip);
   });
 
+  it('a RENAMED default never lets the stale old default witness release (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-renamed');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-renamed', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-renamed' });
+    const rewrittenTip = forcePushOrigin(origin);
+    execFileSync('git', ['-C', origin, 'update-ref', 'refs/heads/trunk', rewrittenTip]);
+    execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/trunk']);
+    // Release fetches trunk only; the stale origin/main still names the
+    // lane's tip, but must not be mistaken for a freshly verified ref.
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/main'])).toBe(row.sha);
+
+    const result = await h.manager.release({ worktreeId: row.id });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') expect(result.branch).toBe('retained');
+    expect(repo.git(['rev-parse', `refs/heads/${row.branch}`])).toBe(row.sha);
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/trunk'])).toBe(rewrittenTip);
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/main'])).toBe(row.sha);
+  });
+
+  it('a STALE lane upstream cannot bypass containment via git branch -d (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-upstream');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-upstream', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-upstream' });
+    repo.git(['push', '--quiet', '--set-upstream', 'origin', `${row.branch}:${row.branch}`]);
+    forcePushOrigin(origin);
+    execFileSync('git', ['-C', origin, 'update-ref', '-d', `refs/heads/${row.branch}`]);
+    // A normal worker push configured an upstream; its tracking ref
+    // lingers after the remote deletes the lane. branch -d trusts that
+    // stale upstream even though HEAD does not contain the tip.
+    expect(repo.git(['rev-parse', `refs/remotes/origin/${row.branch}`])).toBe(row.sha);
+
+    const result = await h.manager.release({ worktreeId: row.id });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') expect(result.branch).toBe('retained');
+    expect(repo.git(['rev-parse', `refs/heads/${row.branch}`])).toBe(row.sha);
+  });
+
+  it('an explicit STALE remote base cannot bypass containment during an offline release (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-explicit-base');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-explicit-base', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-explicit-base' });
+    forcePushOrigin(origin);
+    repo.git(['remote', 'set-url', 'origin', join(repo.path, '..', 'missing-origin.git')]);
+
+    const result = await h.manager.release({ worktreeId: row.id, baseBranch: 'origin/main' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') expect(result.branch).toBe('retained');
+    expect(repo.git(['rev-parse', `refs/heads/${row.branch}`])).toBe(row.sha);
+  });
+
   it('an UNREACHABLE origin still consults the cached origin/HEAD as its declared offline guess (retained)', async () => {
     const h = harness();
     const { repo } = originBacked(h, 'fixture-offline-cache'); // cached origin/HEAD -> main

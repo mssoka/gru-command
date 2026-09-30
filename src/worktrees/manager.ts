@@ -1420,11 +1420,9 @@ export class WorktreeManager {
     }
   }
 
-  /**
-   * Containment-verified delete: `git branch -d` proves merge-containment
-   * itself; when it refuses (unmerged into HEAD), check containment
-   * against the job's base branch before any force; otherwise retain.
-   */
+  /** Containment-verified delete: prove the tip survives in a durable
+   * local ref or the freshly verified origin default before deleting.
+   * Never use `git branch -d`: it can trust a stale lane upstream. */
   private deleteBranchContained(
     row: WorktreeRecord,
     baseBranch: string | undefined,
@@ -1435,31 +1433,23 @@ export class WorktreeManager {
     // idempotent — never a misleading 'retained' for a missing branch.
     const present = spawnGit(row.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
     if (present.status !== 0) return 'deleted';
-    const soft = spawnGit(row.repoPath, ['branch', '-d', branch]);
-    if (soft.status === 0) return 'deleted';
-    let base: string;
-    if (baseBranch !== undefined) {
-      base = baseBranch;
-    } else {
-      try {
-        base = runGit(row.repoPath, ['symbolic-ref', '--short', 'HEAD']);
-      } catch {
-        // No explicit base and the main checkout is detached: containment
-        // is UNPROVABLE — retain loudly, never throw (Perkins lane-B r1).
-        this.opts.ledger.appendCustomEvent({
-          kind: 'worktree.branch-retained',
-          jobId: row.jobId,
-          payload: { id: row.id, branch, reason: 'base branch unresolvable (detached HEAD, none given)' },
-        });
-        this.opts.ledger.noteWorktree(row.id, `branch ${branch} retained: base branch unresolvable`);
-        return 'retained';
-      }
-    }
-    const contained = spawnGit(row.repoPath, ['merge-base', '--is-ancestor', branch, base]);
-    if (contained.status === 0) {
+    const laneRef = `refs/heads/${branch}`;
+    const freshRemoteRef = freshRemoteBranch === null ? null : `refs/remotes/origin/${freshRemoteBranch}`;
+    const baseRef = spawnGit(row.repoPath, baseBranch === undefined
+      ? ['symbolic-ref', '--quiet', 'HEAD']
+      : ['rev-parse', '--symbolic-full-name', '--verify', baseBranch]);
+    const base = baseRef.status === 0 ? baseRef.stdout.trim() : '';
+    // An explicit base must obey the SAME witness rule, never bypass it
+    // with a stale tracking ref, a bare SHA, or the lane itself.
+    const durableBase = base !== laneRef && base !== '' && (
+      base.startsWith('refs/heads/') || base.startsWith('refs/tags/') || base === freshRemoteRef
+    );
+    if (durableBase && spawnGit(row.repoPath, ['merge-base', '--is-ancestor', laneRef, base]).status === 0) {
       runGit(row.repoPath, ['branch', '-D', branch]);
       return 'deleted';
     }
+    // Detached HEAD or an unresolvable base is not proof of containment;
+    // the remaining durable refs can still witness the tip below.
     // The lane's tip must survive in a DURABLE ref — never a stale
     // remote-tracking ref (Perkins r7/r8): after a remote force-push the
     // old tracking ref still names the tip, but it is transient — the
@@ -1506,12 +1496,12 @@ export class WorktreeManager {
         id: row.id,
         branch,
         reason:
-          'tip not contained in any current ref (remote force-pushed?); retained to preserve the commits',
+          'tip not contained in any durable local or freshly verified remote ref (remote force-pushed?); retained to preserve the commits',
       },
     });
     this.opts.ledger.noteWorktree(
       row.id,
-      `branch ${branch} retained: tip not contained in any current ref`,
+      `branch ${branch} retained: no durable local or freshly verified remote ref contains the tip`,
     );
     this.log('warn', 'worktree branch retained (no surviving ref for the tip)', {
       id: row.id,

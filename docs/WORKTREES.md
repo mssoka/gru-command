@@ -69,10 +69,14 @@ for a lane is the lane's to tear down — not a stranger's.
    Survivors re-pause; newcomers get their own ask; `confirm_kill`
    without a recorded pause is not honored. Silent kills do not exist
    for processes the orchestrator did not spawn.
-5. **Remove** the worktree; **containment-verified** branch delete (a
-   branch dies only when provably contained in an existing ref;
-   otherwise retained and noted).
-6. **Re-resolve the fresh head** — follow-on work starts from now.
+5. **Remove** the worktree; **refresh the origin default**, then
+   **containment-verified** branch delete. The tip must survive in another
+   local branch/tag or the freshly verified origin default. Stale tracking
+   refs (including a lane's cached upstream or an explicit remote base)
+   never witness deletion; otherwise the branch is retained and noted.
+   Swept-row retries and missing-tree reconciliation refresh before
+   disposal too.
+6. **Return the fresh head** — follow-on work starts from now.
 
 ## 4. Detached-for-reviews, branch-for-jobs (18d)
 
