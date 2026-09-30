@@ -2614,6 +2614,11 @@ describe('chat context controls and durable new-chat boundaries', () => {
         ),
       ).toMatchObject({ ok: true, epoch: 2 });
       expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({ epoch: 2 });
+      // The retired handle's disposal is part of the deferred, best-effort
+      // post-commit finalize (chat/server.ts postCommit timer), so it may
+      // still be in flight when the control result arrives; wait for it like
+      // the first reset in this test already does.
+      await pollUntil(() => firstFresh.disposed, 'retired fresh handle disposal');
       expect(firstFresh.disposed).toBe(true);
       await reconnect.close();
       await client.close();
