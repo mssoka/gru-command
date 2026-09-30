@@ -191,10 +191,16 @@ interface LoadedBundle {
 /** Resolve the configured key_path to an absolute path. Absolute POSIX
  * paths, Windows drive paths and Windows UNC paths (`\\server\share\...`)
  * are used as written; anything else — including `..` segments — resolves
- * against the trusted bundle dir, never the CWD or a repository. Exported
- * so the resolution rule itself is directly testable. */
+ * against the trusted bundle dir, never the CWD or a repository. A single
+ * leading backslash is NOT an absolute form (only the UNC double backslash
+ * is): on POSIX it is an ordinary filename character and on Windows a
+ * drive-relative root, so it resolves against the bundle dir like any
+ * other relative path. Exported so the resolution rule itself is directly
+ * testable. */
 export function resolvePerkinsAppKeyPath(bundleDir: string, keyPath: string): string {
-  return /^\\|^\/|[A-Za-z]:[\\/]/u.test(keyPath) ? keyPath : join(bundleDir, keyPath);
+  return keyPath.startsWith('/') || keyPath.startsWith('\\\\') || /^[A-Za-z]:[\\/]/u.test(keyPath)
+    ? keyPath
+    : join(bundleDir, keyPath);
 }
 
 /** The bundle directory must mirror the credential-store rules: an
@@ -494,24 +500,34 @@ function usableProviderReviewId(id: unknown): string | null {
   return null;
 }
 
-/** Provider-proved evidence that OUR App bot published exactly this review
- * during this round: author login+type, event state, frozen head,
- * byte-identical body, and a submission time inside the round's window —
- * an older round's identical bytes are never credited as this delivery. */
-function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
-  const base = review.user?.login === botLogin &&
-    review.user?.type === 'Bot' &&
-    review.state === 'COMMENTED' &&
-    review.commit_id === targetSha &&
-    review.body === body &&
-    usableProviderReviewId(review.id) !== null;
-  if (!base) return false;
-  // With a recency bound (the ambiguous-POST path), only submissions from
-  // this round's window count; null (the idempotent recovery seam) matches
-  // any identical publication.
+/** The delivery predicate without the provider-id requirement: author
+ * login+type, event state, frozen head, and byte-identical body. With a
+ * recency bound (the ambiguous-POST path) only submissions from this
+ * round's window count; null (the idempotent recovery seam) matches any
+ * identical publication — an older round's identical bytes are never
+ * credited as this delivery. */
+function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
+  if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
+  if (review.state !== 'COMMENTED' || review.commit_id !== targetSha || review.body !== body) return false;
   if (notBeforeMs === null) return true;
   const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
   return Number.isFinite(submittedAt) && submittedAt >= notBeforeMs;
+}
+
+/** Provider-proved evidence that OUR App bot published exactly this review
+ * during this round: every delivery predicate plus a usable provider id
+ * (a receipt can only be certified with one). */
+function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
+  return usableProviderReviewId(review.id) !== null && matchesDeliveryPredicates(review, botLogin, targetSha, body, notBeforeMs);
+}
+
+/** A review matching every delivery predicate but carrying an unusable (or
+ * absent) provider id: it can never become a receipt, yet it may still BE
+ * this round's landed publication. The walk must neither credit it nor
+ * silently skip it into an absence certificate — one such review keeps the
+ * delivery unresolved. */
+function isMatchingAppReviewWithUnusableId(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
+  return usableProviderReviewId(review.id) === null && matchesDeliveryPredicates(review, botLogin, targetSha, body, notBeforeMs);
 }
 
 /** GitHub error bodies/markers that mean rate limiting, not permission. */
@@ -624,11 +640,16 @@ export class PerkinsAppPrPoster implements VerdictPoster {
    * proof of absence. */
   async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
     const { grant, botLogin, owner, repo, prNumber, baseSha } = await this.prepare(input);
-    const { matched, provablyAbsent } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, null);
+    const { matched, provablyAbsent, matchedButIdUnusable } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, null);
     if (matched !== null) {
       return verifyPostedReceipt(
         this.receiptFromReview(matched, botLogin, input.targetSha, input.targetSha, baseSha, input.body),
         { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+      );
+    }
+    if (matchedButIdUnusable) {
+      throw new PerkinsAppError(
+        'review reconciliation found a review matching every delivery predicate except its provider id — delivery stays unresolved; verify that review manually before any retry, never assume absence',
       );
     }
     if (provablyAbsent) return null;
@@ -865,7 +886,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // to trail the frozen base as main moves (same rule as GhPrPoster).
     if (headSha !== targetSha) {
       throw new PerkinsAppError(
-        `pull request identity moved before delivery (expected head ${targetSha}, got ${headSha || 'unknown'})`,
+        `pull request identity moved before delivery (expected head ${targetSha}, got ${headSha === '' ? 'unknown' : sanitize(headSha)})`,
       );
     }
     return { headSha, baseSha };
@@ -965,7 +986,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // Skew margin only: the review this round may have created was submitted
     // after the POST began; anything older is another round's bytes.
     const notBeforeMs = postStartMs - 60_000;
-    let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean };
+    let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButIdUnusable: boolean };
     try {
       walked = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, targetSha, body, notBeforeMs);
     } catch (lookupError) {
@@ -977,6 +998,11 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       return verifyPostedReceipt(
         this.receiptFromReview(walked.matched, botLogin, targetSha, targetSha, baseSha, body),
         { targetSha, bodySha256: receiptDigest(body) },
+      );
+    }
+    if (walked.matchedButIdUnusable) {
+      throw unproven(
+        'a review matching every delivery predicate except its provider id was found, so the POST can be neither credited nor proved absent',
       );
     }
     if (walked.provablyAbsent) {
@@ -997,7 +1023,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
    * the ENTIRE review list: the last-page number is tracked as the MAXIMUM
    * any response reported, so a list that grows mid-walk can never be
    * certified absent from a stale snapshot — lookup failures and malformed
-   * bodies throw, they are never absence. */
+   * bodies throw, they are never absence. `matchedButIdUnusable` records a
+   * review that matched every delivery predicate except a usable provider
+   * id: it can never be credited, but it also forbids an absence
+   * certificate (the publication may have landed). */
   private async lookupMatchingReview(
     grant: TokenGrant,
     owner: string,
@@ -1007,11 +1036,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     targetSha: string,
     body: string,
     notBeforeMs: number | null,
-  ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean }> {
+  ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButIdUnusable: boolean }> {
     const visited = new Set<number>();
     let lastPage: number | null = null;
     let page = 1;
     let sequentialEnd = false;
+    let matchedButIdUnusable = false;
     for (let fetched = 0; fetched < this.maxReconciliationPages; fetched += 1) {
       visited.add(page);
       const result = await this.callApi(
@@ -1029,7 +1059,16 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       const reviews = list as readonly ProviderReview[];
       const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, notBeforeMs));
       if (match !== undefined) {
-        return { matched: match, provablyAbsent: false };
+        return { matched: match, provablyAbsent: false, matchedButIdUnusable: false };
+      }
+      if (
+        !matchedButIdUnusable &&
+        reviews.some((review) => isMatchingAppReviewWithUnusableId(review, botLogin, targetSha, body, notBeforeMs))
+      ) {
+        // A predicate-complete publication whose id cannot form a receipt —
+        // keep walking for a credit-able copy, but never read this walk as
+        // absence afterwards.
+        matchedButIdUnusable = true;
       }
       let next: number;
       if (lastPage !== null) {
@@ -1053,13 +1092,15 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       page = next;
     }
     const provablyAbsent = lastPage !== null ? visited.size >= lastPage : sequentialEnd;
-    return { matched: null, provablyAbsent };
+    return { matched: null, provablyAbsent, matchedButIdUnusable };
   }
 }
 
 /** Options for the startup factories. `githubPosterOverride` is a TEST
  * seam: it replaces the selected github.com leg so the composite's
- * routing can be exercised without a real `gh` binary. */
+ * routing can be exercised without a real `gh` binary — for bundle-absent
+ * deployments only. When a Perkins App bundle is configured the override
+ * is refused by name instead of silently replacing the installed App. */
 export interface StartupPosterOptions extends Omit<PerkinsAppPosterOptions, 'instanceDir'> {
   readonly githubPosterOverride?: VerdictPoster;
 }
@@ -1098,17 +1139,25 @@ export function resolvePerkinsAppBundleRoot(config: {
 
 /** Startup selection: an existing App bundle routes github.com publication
  * through the App poster; deployments with no bundle keep the legacy `gh`
- * poster and its behavior byte-for-byte. GitLab routing is untouched. */
+ * poster and its behavior byte-for-byte. GitLab routing is untouched, and
+ * the test-only override is refused while a bundle is configured — an
+ * installed App is never silently replaced. */
 export function createGithubVerdictPoster(
   instanceDir: string,
   options?: StartupPosterOptions,
 ): VerdictPoster {
   requireBundleRoot(instanceDir, 'instance directory');
   const { githubPosterOverride, ...appOptions } = options ?? {};
-  if (githubPosterOverride !== undefined) return githubPosterOverride;
-  return perkinsAppBundleConfigured(instanceDir)
-    ? new PerkinsAppPrPoster({ instanceDir, ...appOptions })
-    : new GhPrPoster();
+  const appConfigured = perkinsAppBundleConfigured(instanceDir);
+  if (githubPosterOverride !== undefined) {
+    if (appConfigured) {
+      throw new PerkinsAppError(
+        'refusing githubPosterOverride while a Perkins App bundle is configured — the override is a bundle-absent test seam and must never replace the installed-App publisher; remove the override to publish through the App',
+      );
+    }
+    return githubPosterOverride;
+  }
+  return appConfigured ? new PerkinsAppPrPoster({ instanceDir, ...appOptions }) : new GhPrPoster();
 }
 
 /** The one seam `main()` wires: the auto host router with the App-selected

@@ -404,6 +404,25 @@ describe('startup poster selection (the seam main wires)', () => {
     }
   });
 
+  it('refuses the override test seam when an App bundle is configured', () => {
+    const fixture = bundleFixture();
+    const stub: VerdictPoster = {
+      post: async () => { throw new Error('the override must never be selected in App mode'); },
+    };
+    // An installed bundle makes the App publisher mandatory: the test seam
+    // must fail loudly rather than silently replace it with any poster.
+    expect(() => createGithubVerdictPoster(fixture.home, { githubPosterOverride: stub })).toThrow(/githubPosterOverride/u);
+    expect(() => createStartupVerdictPoster({ instanceDir: fixture.home }, { githubPosterOverride: stub })).toThrow(/githubPosterOverride/u);
+    // A bundle-absent home keeps the seam usable (also pinned behaviorally
+    // by the no-bundle routing test above).
+    const emptyHome = mkdtempSync(join(tmpdir(), 'perkins-app-override-empty-'));
+    try {
+      expect(createGithubVerdictPoster(emptyHome, { githubPosterOverride: stub })).toBe(stub);
+    } finally {
+      rmSync(emptyHome, { recursive: true, force: true });
+    }
+  });
+
   it('routes github.com through the App poster when the bundle exists, with GitLab routing untouched', async () => {
     const fixture = bundleFixture();
     const api = makeApiDouble();
@@ -567,6 +586,23 @@ describe('App publication happy path', () => {
       { method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/, handler: async () => ({ status: 200, body: { head: { sha: '9'.repeat(40) }, base: { sha: BASE } } }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/identity moved/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+  });
+
+  it('sanitizes provider-controlled head bytes in the moved-head diagnostic', async () => {
+    const fixture = bundleFixture();
+    const secret = `ghs_${'S'.repeat(36)}`;
+    const hostileSha = `9${'x'.repeat(79)}\n${secret}`;
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/, handler: async () => ({ status: 200, body: { head: { sha: hostileSha }, base: { sha: BASE } } }) },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    // The moved-head diagnostic is the one provider field that must go
+    // through the module's redaction discipline like every other one:
+    // token-shaped bytes never reach the record and newlines are collapsed.
+    expect(error?.message ?? '').toContain('[REDACTED]');
+    expect(error?.message ?? '').not.toContain(secret);
+    expect(error?.message ?? '').not.toContain('\n');
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
   });
 
@@ -890,6 +926,26 @@ describe('bounded ambiguous-POST reconciliation', () => {
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/NOT re-posted/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('never certifies absence when the only predicate-complete review has an unusable provider id', async () => {
+    const fixture = bundleFixture();
+    const unusableIdReview = { ...MATCHING_REVIEW, id: 0 };
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [unusableIdReview] }) },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+    // A review that matches every delivery predicate except its id is not
+    // "did not land": the POST may well have published it.
+    expect(error?.message ?? '').not.toMatch(/did not land/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+
+    // The recovery seam must not read the same walk as provable absence
+    // either — a null there re-authorizes publication against this head.
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/delivery stays unresolved/u);
   });
 
   it('treats lookup exhaustion and lookup errors as unproven, never as absence', async () => {
@@ -1690,6 +1746,15 @@ describe('key path resolution and external keys', () => {
     expect(resolvePerkinsAppKeyPath('/bundle', '\\\\server\\share\\k.pem')).toBe('\\\\server\\share\\k.pem');
     expect(resolvePerkinsAppKeyPath('/bundle', 'keys/k.pem')).toBe(join('/bundle', 'keys/k.pem'));
     expect(resolvePerkinsAppKeyPath('/bundle', '../keys/k.pem')).toBe(join('/bundle', '../keys/k.pem'));
+  });
+
+  it('treats a single leading backslash as bundle-relative — only UNC starts with two', () => {
+    // A lone leading backslash is not an absolute form on either platform:
+    // on POSIX it is an ordinary filename character, on Windows a
+    // drive-relative root. It must resolve under the bundle dir (the
+    // documented never-CWD rule), never be used as written.
+    expect(resolvePerkinsAppKeyPath('/bundle', '\\k.pem')).toBe(join('/bundle', '\\k.pem'));
+    expect(resolvePerkinsAppKeyPath('/bundle', '\\keys\\k.pem')).toBe(join('/bundle', '\\keys\\k.pem'));
   });
 
   it('accepts an external key reached through .. and rejects the same path when symlinked', () => {

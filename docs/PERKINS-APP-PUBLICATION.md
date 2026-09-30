@@ -37,10 +37,12 @@ installation_id_solarity-services=999888777
 
 - `key_path` may be quoted or unquoted; a relative path resolves against
 the bundle dir (but is not confined to it — `..` segments are permitted),
-and an absolute path, Windows drive path, or UNC path is accepted.
-Wherever the key lives, it passes the same file-level checks; the bundle
-dir remains the audit boundary — the config that names the key still
-lives there.
+and an absolute path, Windows drive path, or UNC path is accepted. A
+single leading backslash is not an absolute form — only a UNC path starts
+with two — so it resolves against the bundle dir like any other relative
+path, never the process working directory. Wherever the key lives, it
+passes the same file-level checks; the bundle dir remains the audit
+boundary — the config that names the key still lives there.
 - `installation_id_<owner>` takes one entry per reviewed repository owner,
   including hyphenated organization names. Lookup is case-insensitive.
 - The key must be the RSA PEM downloaded from the App settings page.
@@ -126,9 +128,15 @@ only on provider proof:
 - submitted at or after this round's POST began (a 60 s clock-skew
   margin) — an older round's identical bytes are never credited.
 
-A foreign author with the same bytes is never credited; an exhausted or
-failing lookup is never treated as absence — the delivery stays explicitly
-unproven and the review is never blindly re-posted.
+Absence is certified only by full coverage: the walk visits every page up
+to the largest `rel="last"` page number any response reported (a list that
+grows mid-walk keeps the delivery unresolved), or, when no Link header is
+present, it reaches a short final page (fewer than 100 reviews — GitHub's
+own end-of-list signal). A foreign author with the same bytes is never
+credited; a malformed list, a failed request, an exhausted page bound, or
+a predicate-complete review that cannot form a receipt id is never treated
+as absence — the delivery stays explicitly unproven and the review is
+never blindly re-posted.
 
 **Runbook for an unproven delivery.** Open the pull request's reviews. A
 COMMENT review authored by `<slug>[bot]` (for this App:
