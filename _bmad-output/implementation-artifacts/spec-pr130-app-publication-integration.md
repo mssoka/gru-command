@@ -71,6 +71,7 @@ context: []
 - Independent review round (integration final diff 128cdb8..8e1eab6, staged sha256 7ad798c69c22d2f820f0122b5a75595ea7cb2a13203c5a12ec2d172e74f1ac8d): five fresh read-only sessions under delivery/independent-review-integration/.
 - Review closures committed: 83802c2 (findings), 5ccde5b (recheck findings), 5489fa7 (final-delta findings), b6dca64 (final-delta guard snippets + closing hardening); inherited repairs 30bb354. Staged hashes: recheck 25a5d48a..., delta e3fac918..., final-delta fixes ff2f75b9..., closing 2138ceee.... Focused after each: 68/68, 70/70, 74/74, 77/77 (perkins-github-app + suite-shape; pin 52→66→67→68→72→75). No `src/dispatch/perkins.ts` edit.
 - Shared-contract boundary note for Gru: `VerdictPosterInput` carries no abort signal, so a bounded reconciliation can run up to its page/timeout budget after a round is cancelled; `perkins.ts` was left read-only per the ownership rule.
+- Scheduled full runs: `e35309ee` on 821ed30 failed 1/1534 (chat-server adoption race; repaired 4ee38fb); the rerun on the repaired candidate and its run id are recorded in the delivery receipt. Inherited full-gate repairs carried by this lane (all test-only, disclosed): suite-shape pins, wizard no-TTY isolation + T4 bound (cross-validated with revert-compaction-137/4bc28b8), chat-server adoption wait.
 
 ## Spec Change Log
 
@@ -127,4 +128,6 @@ context: []
 - `git merge-tree --write-tree --messages HEAD origin/main` — preflight exit 1: conflict in `src/main.ts`; no branch/working-tree mutation. Not a test pass.
 - `git diff --check` — planning whitespace gate.
 - Shared `POST /api/verify`, scope `full` — execute `npm test` once per meaningful candidate; preserve NDJSON and terminal outcome. Not run before the head-strategy decision.
+- Full run 1 (candidate 821ed30, run `e35309ee-e545-4e8d-903d-b7da23442b0d`, tracked_dirty=false): **FAILED** — 1 failed | 1521 passed | 12 skipped; the single failure was `chat-server.test.ts > invokes fresh-handle adoption after durable New chat activation` (adopted still null when the control result arrived). Complete NDJSON + decoded outcome preserved under delivery/verify/integration/ (output 109,509 bytes, sha256 89c0a271a193ca11edd36f6076ae603985fbb03305f92d6bf87173709bdc49d8). Root cause: a test race against the deliberate server design — post-commit adoption starts on a next-turn setTimeout AFTER the control result is released (`src/chat/server.ts` postCommit comment) — repaired test-only in `4ee38fb` by waiting for the adoption itself (pollUntil, the file's own helper); focused probes green (logs preserved).
+- Full run 2 (candidate 4ee38fb, run recorded below): result in the delivery receipt.
 - Fresh exact-head CI after authorized push — require full-suite success; prior-head CI does not verify a new candidate.
