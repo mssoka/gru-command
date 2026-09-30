@@ -203,6 +203,12 @@ describe('W5 — LAN-phone send path over the real socket', () => {
       (frame) => frame.type === 'user' && frame.client_msg_id === 'w5-desktop-1',
       'replayed own-side user frame',
     );
+    // Replay ends at the settled turn — only then is the delta set
+    // complete, so a late delta frame cannot race this assertion.
+    await phone.waitFor(
+      (frame) => frame.type === 'turn' && frame.state === 'end',
+      'replayed turn end',
+    );
     expect(deltaText(phone.frames)).toBe('echo: hello from the desktop');
 
     // The phone's send while another client holds the pen: a per-client
