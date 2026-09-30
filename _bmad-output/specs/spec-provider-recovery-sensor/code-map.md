@@ -1,5 +1,19 @@
 # Code map — provider recovery sensor (lane-local audit, 2026-09-28)
 
+> **Fresh-main integration (2026-09-30):** the historical maps below are
+> preserved for traceability, not readiness. PR #132 is reconciled onto
+> `c54bfbf89727bacfd27a27db65a9fab681c19c3e` (#129 owner routing, #140 async
+> setup, #131 resident budget, #133 FOR YOU). The current epoch's pre-edit
+> integration map and source preservation evidence are recorded in
+> `../../implementation-artifacts/spec-132-provider-recovery-main-integration.md`.
+> No cap behavior was changed by this reconciliation. Current-main
+> `src/runtime/residency-observations.ts` exposes pool/handle snapshots;
+> it does not supply the claim/incident/route/session-turn join required by
+> `provider-recovery/admission-observations.ts`, which still has no
+> production consumer. Native Claude metadata helpers exist, but runtime
+> provider provenance/route establishment remains ungrounded (r4 warning).
+> Neither limitation is waived by the rebase.
+
 Audited at branch base `128412db65f25183854b5d3b54768f51aa8bd862` merged with
 origin/main `df9fe01e87913c5f2ad47219ddc2f838eca6d045` (fast-forward merge in
 this lane; remote default verified `main`).

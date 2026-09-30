@@ -1,5 +1,23 @@
 # Gate matrix — provider recovery sensor
 
+> **Current integration epoch (2026-09-30): not ready.** Main/base is
+> `c54bfbf89727bacfd27a27db65a9fab681c19c3e`; exact final head and gate
+> receipts live in the approved delivery record. The coverage table below
+> names existing tests, not execution evidence at the moved head. R4
+> changes-requested at `c2036c34a5ef00b9b9c31a445595d752fe7ba6aa` remains
+> outstanding; the preserved r4 fix addresses blocked-settle attribution,
+> not every warning/note. Inherited full run
+> `e2eebb45-1601-4914-a9dc-072b3be4c8ed` at
+> `5cd62b19809d334c30f595d72ce60cfed63d1eb5` settled `ok=false`, nested
+> `exitCode=null`, `signal=SIGKILL`, `timedOut=false`, during lint. Complete
+> output/hash preserved; cause unknown. Bounded ruling and real Silas
+> checkpoint requested; no worker retry, timeout/pool weakening or waiver.
+> Exact-final-head CI, independent BMAD review, native Perkins and local
+> verification are distinct gates. Historical results below do not inherit.
+> G11's fan-out gate is still source-only in production; native Claude
+> runtime establishment and optional metadata exhaustion issues remain
+> open, as identified by r4. Owner activation remains manual.
+
 Deterministic (fake clock / deferred / mock provider; no live calls, no
 ambient credentials, no service spawn): these run under the normal backend
 Vitest suite (`npm test` backend segment).

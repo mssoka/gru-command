@@ -97,10 +97,24 @@ eligible-wait, incident-fencing, budget, owner-stop, review, verification
 and activation boundaries remain. Full text:
 `briefings/provider-recovery-sensor-approved-20260928/multi-provider-approved-overlay.md`.
 
-### Implementation status (2026-09-29)
+### Historical implementation status (2026-09-29)
 
-All r1 Perkins blockers and the multi-provider overlay are implemented on
-this branch; see `code-map.md` (final map) and `gate-matrix.md` (coverage +
-remaining gates). Metadata paths are zero-generation; GLM generation runs
-only when `glm_generation_fallback` is explicitly enabled. Activation stays
+The delivery then claimed all r1 Perkins blockers and the multi-provider
+overlay implemented; the subsequent r4 review did NOT confirm readiness.
+Metadata helpers are zero-generation; GLM generation runs only when
+`glm_generation_fallback` is explicitly enabled. Activation stays
 owner-manual; no live provider probing was performed.
+
+### Current integration status (2026-09-30)
+
+PR #132 is reconciled with main
+`c54bfbf89727bacfd27a27db65a9fab681c19c3e`, retaining the r4 blocked-settle
+fix and all approved policy bounds. The approved capabilities above remain
+the contract, not a claim of completed acceptance: progress-gated fan-out
+still has no production consumer, and native Claude runtime provider
+provenance/route establishment is ungrounded (metadata helpers alone do not
+ship that path). Other r4 warnings/notes remain for the routine fix loop.
+The interrupted local verification attempt is preserved and escalated for
+a bounded ruling; no moved-head CI/review result is inherited. See the
+current code-map and gate-matrix notices, the focused integration spec,
+and the approved delivery record. No owner approval choice is reopened.
