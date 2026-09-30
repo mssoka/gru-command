@@ -2,7 +2,7 @@
 title: 'Revert PR #137 compaction gate (rollback only)'
 type: 'refactor'
 created: '2026-09-30'
-status: 'ready-for-dev'
+status: 'in-progress'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: 'c54bfbf89727bacfd27a27db65a9fab681c19c3e'
@@ -62,10 +62,10 @@ Owner approval: dispatch briefing 2026-09-30 (explicit rollback approval + instr
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] Revert `dd11a328` (-m 1) via a new commit; resolve `test/suite-shape.test.ts` by actual counts; verify every reverted file keeps post-#137 changes -- rollback provenance and no collateral loss.
-- [ ] Confirm no shadow references remain (`proactive`, `compactionDeadline`, `COMPACTION_DEADLINE`, view fields) in `src/`, `test/`, `docs/` -- dangling references fail build/typecheck.
-- [ ] Verify old-key behavior with an isolated temp-home fixture via `loadConfig` (no live config writes) -- records the deployment prerequisite.
-- [ ] Add the `compaction-rollback` focused scope to `.gru-command/worktree.toml` -- scheduler-run focused regression evidence.
+- [x] Revert `dd11a328` (-m 1) via a new commit; resolve `test/suite-shape.test.ts` by actual counts; verify every reverted file keeps post-#137 changes -- rollback provenance and no collateral loss.
+- [x] Confirm no shadow references remain (`proactive`, `compactionDeadline`, `COMPACTION_DEADLINE`, view fields) in `src/`, `test/`, `docs/` -- dangling references fail build/typecheck.
+- [x] Verify old-key behavior with an isolated temp-home fixture via `loadConfig` (no live config writes) -- records the deployment prerequisite.
+- [x] Add the `compaction-rollback` focused scope to `.gru-command/worktree.toml` -- scheduler-run focused regression evidence.
 - [ ] Run focused regression, typecheck, and the full gate through `POST /api/verify` at the final head; exact-head GitHub CI; Perkins review handoff.
 
 **Acceptance Criteria:**
@@ -78,6 +78,32 @@ Owner approval: dispatch briefing 2026-09-30 (explicit rollback approval + instr
 
 ## Implementation Notes
 
+- Rollback commit `41986464f6a6e272abcf3890f3b8d03885dd379d` reverts `dd11a328`
+  against first parent `85727dea`; a three-way merge applied 12 of 13 files
+  cleanly and only `test/suite-shape.test.ts` conflicted.
+- Reconciliation: pins set from actual counts after removing #137's tests
+  (pi-adapter 61, supervisor 44); later `perkins-whole-review` pin 67 kept.
+  Later source changes preserved: supervisor `openControl` view fields, pi
+  adapter cessation-evidence / awaited-`dispose`; later gh-97 supervisor test
+  kept.
+- New deterministic regression tests (commit `d65e68d`) prove the rollback
+  contract; all four fail against the pre-revert code (verified by re-checking
+  out `c54bfbf` sources for the three source files and running the filtered
+  tests: config 1 failed, pi-adapter 2 failed, supervisor 1 failed) and pass
+  after the revert (focused local run: 171 passed across the three files).
+- Old-config-key fixture (isolated temp `GRU_COMMAND_HOME`, deleted after
+  the probe; no live config read or written): `loadConfig` throws
+  `ConfigError: unknown key 'proactive_compact_percent' in [supervision]
+  (valid keys: enabled, turn_silence_ms, restart_window_ms, max_restarts,
+  restart_backoff_ms) (file: <temp>/config.toml, field:
+  supervision.proactive_compact_percent)` — reproduced by probe and pinned
+  by the new `test/config.test.ts` case. Deployment prerequisite: the owner
+  must remove `supervision.proactive_compact_percent` from the installed
+  config before the reverted build is activated; the loader fails loud
+  otherwise and no compatibility semantics were added.
+- Focused verify scope `compaction-rollback` declared in
+  `.gru-command/worktree.toml` (pi-adapter, supervisor, config, health,
+  board-engine, suite-shape, config-generate).
 ## Spec Change Log
 
 ## Review Triage Log
@@ -91,4 +117,4 @@ Owner approval: dispatch briefing 2026-09-30 (explicit rollback approval + instr
 - Exact-head GitHub CI on the pushed branch; native Perkins review READY required.
 
 **Manual checks:**
-- Isolated fixture: `loadConfig` against a temp `GRU_COMMAND_HOME` whose config carries the old key; expect the fail-loud unknown-key `ConfigError` and no live-config reads/writes.
+- Isolated fixture: `loadConfig` against a temp `GRU_COMMAND_HOME` whose config carries the old key; expect the fail-loud unknown-key `ConfigError` and no live-config reads/writes. DONE — see Implementation Notes.
