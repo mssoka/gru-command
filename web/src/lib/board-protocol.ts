@@ -516,12 +516,26 @@ export function agentViewOf(agent: AgentView): { id: string; role: string; state
   return { id: agent.id, role: agent.role, state: agent.state };
 }
 
+/** One presentation classification for every lens chip. A lens recorded
+ * `done` with the canonical note (`not used — …`) never ran: it is
+ * `unused` — settled, never a pass. Only that canonical record downgrades,
+ * and it downgrades to neutral, not to success. `lensChipTone`, the chip
+ * icon/wording and `roundSummary` all read this result so they cannot
+ * disagree; any unknown state passes through unchanged (defensive against
+ * schema drift). */
+export function lensChipState(lens: Pick<LensChipView, 'state' | 'note'>): string {
+  if (lens.state === 'done' && lens.note !== null && lens.note.startsWith('not used')) return 'unused';
+  return lens.state;
+}
+
 export function lensChipTone(state: string): string {
   switch (state) {
     case 'live':
       return 'pp-chip--work';
     case 'done':
       return 'pp-chip--done';
+    case 'unused':
+      return 'pp-chip--unused';
     case 'error':
       return 'pp-chip--alert';
     default:

@@ -138,6 +138,22 @@ describe('roundSummary', () => {
     );
     expect(interrupted.ran).toBe(1);
   });
+
+  it('classifies unused lenses through the shared classifier: prose alone never downgrades a count', () => {
+    const summary = roundSummary(
+      round({
+        lenses: [
+          { lens: 'blind', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+          { lens: 'edge', state: 'done', agentId: null, note: 'clean — lead said not used', verdict: 'clean' },
+          { lens: 'tests', state: 'done', agentId: null, note: null, verdict: null },
+          { lens: 'security', state: 'pending', agentId: null, note: 'not used — prose', verdict: null },
+        ],
+      }),
+    );
+    // Only the canonical done+notused record is unused; prose on a pending
+    // record and a legacy null note keep their normal accounting.
+    expect(summary).toEqual({ done: 3, used: 2, unused: 1, ran: 2, total: 4, blockers: 0, failures: 0 });
+  });
 });
 
 describe('unackedByJob', () => {
