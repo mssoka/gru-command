@@ -102,6 +102,19 @@ re-asking — recorded here as the standing Checkpoint-1 approval.
   completed before disposal, and none of it is scheduled gate clearance.
   The declared focused scope below is the first admissible scheduled run
   at the pushed head.
+- Continuation (2026-09-30, same-job successor, CI repair): CI run
+  36773384950 at ed13cc8 failed exactly one test — the suite-shape pin
+  guard (test/suite-shape.test.ts:136, "bmad-onboarding.test.ts:
+  registered 14 tests, pin says 13"). The guard loop short-circuits on
+  the first stale pin, hiding two more stale pins: wizard-interactive
+  (8 → 10) and wizard (24 → 25). Every pin was re-derived from raw
+  sources with the guard's own regex (/\bit\(|\bit\.skipIf\(/g): only
+  those three files differ from their pins, each by exactly the tests
+  this lane added (bmad-onboarding +1, wizard-interactive +2, wizard
+  +1); all other 95 files match. Pins refreshed; no test identities or
+  oracles changed. The declared focused scope now includes
+  test/suite-shape.test.ts so the focused gate exercises the causal
+  defect; this remains source/CI/focused evidence, not gate clearance.
 
 ## Spec Change Log
 
@@ -110,7 +123,7 @@ re-asking — recorded here as the standing Checkpoint-1 approval.
 ## Verification
 
 **Commands:**
-- `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"wizard-bmad-retry"}` -- focused regression (`vitest run` on `test/bmad-onboarding.test.ts`, `test/wizard-interactive.test.ts`, `test/wizard.test.ts`).
+- `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"wizard-bmad-retry"}` -- focused regression (`vitest run` on `test/bmad-onboarding.test.ts`, `test/wizard-interactive.test.ts`, `test/wizard.test.ts`, `test/suite-shape.test.ts`).
 - `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"typecheck"}` -- `npm run typecheck` (covers the added test code under `tsconfig.test.json`).
 - `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"full"}` -- `npm test` (lint + typecheck + build + vitest + web).
 - Exact-head GitHub CI on the pushed branch; native Perkins review READY required.
