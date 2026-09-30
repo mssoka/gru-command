@@ -645,6 +645,108 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     ).toHaveLength(1);
   });
 
+  it('never aborts a pending explicit compaction when time crosses the former #137 deadline', async () => {
+    const fx = await fixture([{ deltas: ['first answer'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    type InternalSession = {
+      compact(): Promise<unknown>;
+      readonly sessionId: string;
+      readonly sessionFile: string | undefined;
+      readonly isIdle: boolean;
+      readonly isCompacting: boolean;
+    };
+    const internal = handle as unknown as {
+      session: InternalSession;
+      onPiEvent(event: unknown): void;
+    };
+    const nativeSession = internal.session;
+    let abortCalls = 0;
+    let release!: () => void;
+    internal.session = new Proxy(nativeSession, {
+      get(target, key) {
+        if (key === 'compact') {
+          return () => new Promise<void>((resolve) => {
+            release = () => {
+              // The native terminal arrives with the SDK call, as in the real
+              // adapter round-trip; then the summary call settles.
+              internal.onPiEvent({ type: 'compaction_end' });
+              resolve();
+            };
+          });
+        }
+        if (key === 'abort') {
+          return async () => {
+            abortCalls += 1;
+          };
+        }
+        return Reflect.get(target, key, target);
+      },
+    });
+    try {
+      await handle.prompt('prime');
+      vi.useFakeTimers();
+      const settled = handle.compact!().then(
+        () => null,
+        (error: Error) => error,
+      );
+      // Cross the former five-minute wrapper deadline: nothing may abort the
+      // compaction or settle the pending reply on this timer (rollback of
+      // PR #137's deadline).
+      await vi.advanceTimersByTimeAsync(300_001);
+      expect(abortCalls).toBe(0);
+      expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
+      release();
+      await expect(settled).resolves.toBeNull();
+      const ends = events.filter((event) => event.type === 'compaction_end');
+      expect(ends).toHaveLength(1);
+      expect((ends[0] as { success: boolean }).success).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      internal.session = nativeSession;
+      await handle.dispose();
+    }
+  });
+
+  it('never aborts a silent native compaction at the former #137 deadline and publishes its completion', async () => {
+    const fx = await fixture([{ deltas: ['first answer'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    const internal = handle as unknown as {
+      session: { abort?(): Promise<void> };
+      onPiEvent(event: unknown): void;
+    };
+    const nativeSession = internal.session;
+    let abortCalls = 0;
+    internal.session = new Proxy(nativeSession, {
+      get(target, key) {
+        if (key === 'abort') {
+          return async () => {
+            abortCalls += 1;
+          };
+        }
+        return Reflect.get(target, key, target);
+      },
+    });
+    try {
+      await handle.prompt('prime');
+      vi.useFakeTimers();
+      internal.onPiEvent({ type: 'compaction_start', reason: 'threshold' });
+      await vi.advanceTimersByTimeAsync(300_001);
+      expect(abortCalls).toBe(0);
+      expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
+      // Native completion proceeds promptly — no timer must be awaited.
+      internal.onPiEvent({ type: 'compaction_end' });
+      const ends = events.filter((event) => event.type === 'compaction_end');
+      expect(ends).toHaveLength(1);
+      expect((ends[0] as { success: boolean }).success).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      internal.session = nativeSession;
+      await handle.dispose();
+    }
+  });
+
   it('emits thinking deltas before text when the model reasons', async () => {
     const fx = await fixture([{ thinking: ['pondering'], deltas: ['answer'] }]);
     const handle = await fx.runtime.spawn('gru');

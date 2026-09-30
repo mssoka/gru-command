@@ -18,6 +18,7 @@ import type {
   AgentCapabilities,
   AgentHandle,
   AgentState,
+  ContextUsage,
   PendingTurn,
   PromptOptions,
   RuntimeEvent,
@@ -1497,5 +1498,52 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     expect(handle.disposed).toBe(true);
     expect(h.registry.spawnCalls).toHaveLength(spawns + 1);
     h.dispose();
+  });
+});
+
+/**
+ * #137 rollback probe: advertises the surface the removed proactive gate
+ * consumed, so a regression test can prove supervision no longer acts on it.
+ */
+class CompactionProbeHandle extends FakeHandle {
+  compactCalls = 0;
+  readonly getContextUsage = (): ContextUsage => ({
+    tokens: 90_000,
+    contextWindow: 100_000,
+    percent: 90,
+  });
+  readonly canCompact = (): boolean => !this.disposed;
+  readonly compact = async (): Promise<void> => {
+    this.compactCalls += 1;
+  };
+}
+
+describe('supervisor — #137 rollback: no proactive compaction gate', () => {
+  it('never compacts or defers an idle over-threshold session, even after a provider error', async () => {
+    const h = boot();
+    const handle = new CompactionProbeHandle('gru', 'gru-rollback-no-gate', null);
+    h.registry.adopt(handle);
+    try {
+      handle.setState('idle');
+      h.advance(5);
+      h.advance(5);
+      await sleep(0);
+      const compactionEvents = () =>
+        h.api
+          .listEvents({ limit: 100 })
+          .filter((e) => e.kind.startsWith('supervision.compaction'));
+      expect(handle.compactCalls).toBe(0);
+      expect(compactionEvents()).toHaveLength(0);
+
+      // A stream error must not arm a deferred retry either.
+      handle.emit({ type: 'error', error: 'Provider stream error: fetch failed', fatal: false });
+      h.advance(5);
+      h.advance(5);
+      await sleep(0);
+      expect(handle.compactCalls).toBe(0);
+      expect(compactionEvents()).toHaveLength(0);
+    } finally {
+      h.dispose();
+    }
   });
 });

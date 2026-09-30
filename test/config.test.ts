@@ -643,6 +643,14 @@ describe('supervision / logging / chat tables (E7)', () => {
       expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(ConfigError);
     }
   });
+
+  it('refuses the removed proactive_compact_percent key fail-loud (rollback: installed configs must drop it)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[supervision]\nproactive_compact_percent = 70\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /unknown key `proactive_compact_percent` in \[supervision\] \(valid keys: enabled, turn_silence_ms, restart_window_ms, max_restarts, restart_backoff_ms\)/,
+    );
+  });
 });
 
 describe('worktrees config (E8, manager lane)', () => {
