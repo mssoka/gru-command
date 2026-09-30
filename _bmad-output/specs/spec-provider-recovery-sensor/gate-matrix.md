@@ -52,6 +52,12 @@ Final gates (not self-served by this worker):
 | Fan-out gate: all claim/actor/session-turn/route/generation bindings enforced | `provider-recovery-admission.test.ts` |
 | Historical owner stops never resolved by the machine lifecycle; machine-owned incidents resolve with their wait | `provider-recovery-sensor.test.ts` |
 
+## r4 fix-round addition (2026-09-30)
+
+| Scenario | Deterministic coverage |
+| --- | --- |
+| A provider wall whose dispatch settle races the wait (the job is already `blocked` by this wait's own failing turn at establishment) keeps its wait: selection does not hold, the claim resumes instead of cancelling, and the lane re-opens blocked→working. Blocks WITHOUT that ledger attribution (no minion error, a different actor's error, or an intervening status hop) still hold/cancel. | `provider-recovery-sensor.test.ts` (2 new), `provider-recovery-resume.test.ts` (2 new); attribution helper `src/provider-recovery/settle-attribution.ts` |
+
 Verified on the lane at head `3692718` (local, isolated pure suites):
 `lint` green; both tsconfigs green; `build` green (incl. Perkins resource
 verifier); 21 adjacent test files / 459 tests green (nine provider-recovery

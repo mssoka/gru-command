@@ -258,8 +258,10 @@ export interface ProviderWaitRecord {
   /** Typed establishment evidence (r1 #1): the job status observed when the
    * provider stop was classified — post-establishment churn into
    * blocked/delivered/in-review is EXPECTED interrupted-turn settle, not a
-   * generic hold; a job already in those states at establishment is a
-   * pre-existing (generic/unknown) block and stays held. */
+   * generic hold; a job already in those states at establishment holds as a
+   * pre-existing (generic/unknown) block — except a `blocked` status the
+   * ledger attributes to this wait's own failing turn (the dispatch settle
+   * raced the wait), which stays eligible (r4). */
   readonly jobStatusAtEstablishment: string | null;
   /** Durable logical lineage across replacement actors (r1 #12):
    * `job:<id>` or `slot:<id>` — stable through rebriefs, unlike agent ids. */

@@ -265,6 +265,36 @@ describe('guarded claim — every recheck fails visible', () => {
     expect(h.ledger.getProviderWait(waitId)?.status).toBe('cancelled');
   });
 
+  it('a wall-settled blocked job resumes instead of cancelling, and the lane re-opens (r4)', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-wall-blocked';
+    const waitId = await h.recoveredMinionWait({ jobId });
+    // The dispatch settle raced the wait: this wait's own failing turn
+    // writes the minion error, then the job flips blocked.
+    h.ledger.appendCustomEvent({
+      kind: 'job.minion-error',
+      jobId,
+      payload: { agentId: `agent-${jobId}`, error: 'runtime error: 429: ...' },
+    });
+    h.ledger.setJobStatus(jobId, 'blocked');
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result).toMatchObject({ outcome: 'continued' });
+    expect(h.ledger.getProviderWait(waitId)?.status).toBe('claimed');
+    expect(h.ledger.getJob(jobId)?.status).toBe('working');
+    expect(h.registry.spawnCalls).toHaveLength(1);
+  });
+
+  it('a blocked job with no wall-settled attribution still cancels at claim (owner/ops hold)', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-foreign-block';
+    const waitId = await h.recoveredMinionWait({ jobId });
+    h.ledger.setJobStatus(jobId, 'blocked');
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result).toMatchObject({ outcome: 'skipped', why: expect.stringContaining('blocked') });
+    expect(h.ledger.getProviderWait(waitId)?.status).toBe('cancelled');
+    expect(h.registry.spawnCalls).toHaveLength(0);
+  });
+
   it('stale recovery evidence (marker cleared) skips the claim', async () => {
     const h = new ClaimHarness();
     const waitId = await h.recoveredMinionWait({ jobId: 'j-stale' });

@@ -15,6 +15,7 @@ import {
   type TypedProviderResponse,
 } from './classify.js';
 import type { ProbeRoute, ProviderProbePort } from './probe.js';
+import { blockedByOwnWallSettle } from './settle-attribution.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -403,8 +404,11 @@ export class ProviderRecoverySensor {
    * NEVER job.minion-error text, backlog membership, or `working` as
    * permission. Expected interrupted-turn churn (blocked/delivered/
    * in-review AFTER establishment) keeps the continuation ELIGIBLE;
-   * pre-existing/generic blocks (those states AT establishment), active
-   * review gates, stale incidents and suspensions HOLD with zero I/O. */
+   * pre-existing/generic blocks (those states AT establishment) HOLD with
+   * zero I/O — EXCEPT a block that the ledger attributes to this wait's
+   * OWN failed turn (the settle raced the wait): that is still this
+   * blocker's churn, never a generic hold. Active review gates, stale
+   * incidents and suspensions also HOLD. */
   private validateWaiter(wait: ProviderWaitRecord): 'eligible' | 'cancel' | 'supersede' | 'hold' {
     if (wait.waiterKind === 'job-minion') {
       const job = wait.jobId !== null ? this.ledger.getJob(wait.jobId) : null;
@@ -439,12 +443,15 @@ export class ProviderRecoverySensor {
       // Generic/unknown block: the job was ALREADY blocked/delivered/in-review
       // when the provider stop was classified — the interrupted-turn churn
       // explanation does not apply; hold with zero I/O until ruled otherwise.
+      // The one exception: a `blocked` status the ledger attributes to THIS
+      // wait's own failing turn (the dispatch settle raced the wait) is the
+      // blocker's own settlement, not a foreign hold (r4 directive).
       const atEstablishment = wait.jobStatusAtEstablishment;
-      if (
-        atEstablishment === 'blocked' ||
-        atEstablishment === 'delivered' ||
-        atEstablishment === 'in-review'
-      ) {
+      if (atEstablishment === 'blocked') {
+        if (!blockedByOwnWallSettle(this.ledger, { jobId: wait.jobId, agentId: wait.agentId })) {
+          return 'hold';
+        }
+      } else if (atEstablishment === 'delivered' || atEstablishment === 'in-review') {
         return 'hold';
       }
       // Otherwise: current approved continuation — eligible through the

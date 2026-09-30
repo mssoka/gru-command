@@ -7,6 +7,7 @@ import type { LogLevel } from '../logger.js';
 import { rebriefFreshMinion } from '../dispatch/fix-directive.js';
 import type { DirectiveRegistry } from '../dispatch/fix-directive.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
+import { blockedByOwnWallSettle } from './settle-attribution.js';
 import type { SlotReArmPort } from './sensor.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -110,14 +111,25 @@ async function claimJobMinion(
   by: string,
 ): Promise<RecoveryClaimResult> {
   // Guard 1 — the job is still approved, unfinished, and un-blocked.
+  // `parked` is always an explicit owner hold. A `blocked` status cancels
+  // UNLESS the ledger attributes the block to this wait's own failing turn
+  // (the dispatch settle raced the wait — r4 directive): that block IS this
+  // provider blocker's settlement and must not strand the recovery.
   const job = wait.jobId !== null ? deps.ledger.getJob(wait.jobId) : null;
   if (job === null || job.status === 'merged' || job.status === 'done') {
     deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job completed or missing', by });
     return { outcome: 'skipped', waitId: wait.id, why: 'job completed or missing' };
   }
-  if (job.status === 'blocked' || job.status === 'parked') {
-    deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: `job ${job.status} (owner/ops hold)`, by });
-    return { outcome: 'skipped', waitId: wait.id, why: `job ${job.status} (owner/ops hold)` };
+  if (job.status === 'parked') {
+    deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job parked (owner/ops hold)', by });
+    return { outcome: 'skipped', waitId: wait.id, why: 'job parked (owner/ops hold)' };
+  }
+  if (
+    job.status === 'blocked' &&
+    !blockedByOwnWallSettle(deps.ledger, { jobId: wait.jobId, agentId: wait.agentId })
+  ) {
+    deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job blocked (owner/ops hold)', by });
+    return { outcome: 'skipped', waitId: wait.id, why: 'job blocked (owner/ops hold)' };
   }
   // Guard 2 — this waiter is a member of a still-open recovery BATCH
   // (r1 #7: shared recoveries bind every matching waiter; membership is by
@@ -185,6 +197,14 @@ async function claimJobMinion(
     agentId: wait.agentId,
     payload: { wait_id: wait.id, waiter: 'job-minion', by, path: resumeFile !== null ? 'resumed' : 'redispatched' },
   });
+  if (job.status === 'blocked') {
+    // Wall-attributed block (Guard 1): the continuation re-opens the lane,
+    // mirroring the Silas follow-through re-open for delivered/in-review
+    // lanes. Without it the resumed lane would stay blocked and could
+    // never settle a later delivery.
+    deps.ledger.setJobStatus(job.id, 'working');
+    deps.ledger.noteJob(job.id, 'provider recovery: lane re-opened after a wall-settled block');
+  }
   const admitted = { recorded: false };
   let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
   try {

@@ -866,6 +866,47 @@ describe('phase2 — provider blocker vs generic state churn (r1 #1)', () => {
     expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(0);
   });
 
+  it('a job settled BLOCKED by this wall\'s own failing turn before establishment stays eligible (r4)', async () => {
+    const h = new Harness();
+    h.makeJob('job-hw');
+    h.ledger.registerAgent({ id: 'agent-hw', role: 'minion', jobId: 'job-hw' });
+    // The dispatch settle raced the wait: the failing turn's minion error
+    // lands first, then the job flips blocked — that block IS this
+    // blocker's own settlement, not a generic hold.
+    h.ledger.appendCustomEvent({
+      kind: 'job.minion-error',
+      jobId: 'job-hw',
+      payload: { agentId: 'agent-hw', error: 'runtime error: 429: ...' },
+    });
+    h.ledger.setJobStatus('job-hw', 'blocked');
+    const wait = await h.establishMinionWait({ jobId: 'job-hw', agentId: 'agent-hw' });
+    expect(wait?.jobStatusAtEstablishment).toBe('blocked');
+    await h.sensor.tick();
+    expect(h.probe.calls).toHaveLength(1); // eligible: this blocker owns the block
+    expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1);
+    expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(0);
+  });
+
+  it('a block separated from the failing turn by another status hop is never attributed (held)', async () => {
+    const h = new Harness();
+    h.makeJob('job-hx');
+    h.ledger.registerAgent({ id: 'agent-hx', role: 'minion', jobId: 'job-hx' });
+    h.ledger.appendCustomEvent({
+      kind: 'job.minion-error',
+      jobId: 'job-hx',
+      payload: { agentId: 'agent-hx', error: 'runtime error: 429: ...' },
+    });
+    h.ledger.setJobStatus('job-hx', 'blocked');
+    // An owner re-opens and re-blocks with no new failing turn: the current
+    // block does NOT directly follow the minion error — hold, zero I/O.
+    h.ledger.setJobStatus('job-hx', 'working');
+    h.ledger.setJobStatus('job-hx', 'blocked');
+    await h.establishMinionWait({ jobId: 'job-hx', agentId: 'agent-hx' });
+    await h.sensor.tick();
+    expect(h.probe.calls).toHaveLength(0);
+    expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1);
+  });
+
   it('an unchanged-head late DELIVERY stays eligible and is not superseded', async () => {
     const h = new Harness();
     h.makeJob('job-h2');
