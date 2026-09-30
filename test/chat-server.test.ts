@@ -2770,6 +2770,11 @@ describe('chat context controls and durable new-chat boundaries', () => {
         (frame) => frame.type === 'control_result' && frame.request_id === 'adopt-fresh',
         'fresh adoption result',
       );
+      // Post-commit adoption is intentionally started on the next event-loop
+      // turn AFTER the control result is released (chat/server.ts postCommit
+      // timer), so waiting for the result alone still races the server's
+      // timer under load. Wait for the adoption itself before asserting.
+      await pollUntil(() => adopted !== null, 'fresh handle adoption');
       expect(adopted).toBe(h.freshHandles[0]);
       expect(new GruSessionPointer(h.chatDir).current()?.sessionFile).toBe(
         h.freshHandles[0]?.sessionFile,
