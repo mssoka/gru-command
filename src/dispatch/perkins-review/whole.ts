@@ -1054,31 +1054,50 @@ export class PerkinsWholeReview {
         // consume lens attempts or the round's specialist budget — only
         // real starts do. The lead still sees a named error and retries
         // within its existing safeguards (no unlimited retries added).
-        let batch: { concurrency: number; finish(): void };
-        try {
-          batch = this.beginChildren();
-          if (scheduled.length > batch.concurrency) {
-            batch.finish();
-            throw new Error(
-              `perkins_run_specialists: ${scheduled.length} runs exceed this round's admitted wave of ${batch.concurrency}; split them across multiple calls`,
-            );
+        //
+        // Provider pacing liveness (r5): a lead waiting on its lens wave is
+        // not generating a turn, so it YIELDS its review slot for the whole
+        // wave — the children (and concurrent rounds) can then be admitted
+        // up to the combined cap. The slot is re-acquired before the result
+        // returns to the model, so the next lead turn is gated again.
+        const yieldedLeadSlot = reviewLease !== null;
+        const runWave = async (): Promise<PoolOutcome<SpecialistResult | undefined>> => {
+          if (yieldedLeadSlot) {
+            reviewLease!.release();
+            reviewLease = null;
           }
-        } catch (error) {
-          restoreAttempts(scheduled);
-          specialistsStarted -= scheduled.length;
-          throw error;
-        }
-        let poolOutcome: PoolOutcome<SpecialistResult | undefined>;
-        try {
-          // The resident wave admission (beginChildren) and the provider
-          // pacing cap both bound the fan-out: run the narrower of the two.
-          // Pacing never refuses a wave, it only throttles its width.
-          const waveWidth = Math.max(1, Math.min(batch.concurrency, this.specialistWaveWidth()));
-          poolOutcome = await pool(scheduled, waveWidth, (run) =>
-            runSpecialist(run.lens, run.attempt, run.previous, signal));
-        } finally {
-          batch.finish();
-        }
+          try {
+            let batch: { concurrency: number; finish(): void };
+            try {
+              batch = this.beginChildren();
+              if (scheduled.length > batch.concurrency) {
+                batch.finish();
+                throw new Error(
+                  `perkins_run_specialists: ${scheduled.length} runs exceed this round's admitted wave of ${batch.concurrency}; split them across multiple calls`,
+                );
+              }
+            } catch (error) {
+              restoreAttempts(scheduled);
+              specialistsStarted -= scheduled.length;
+              throw error;
+            }
+            try {
+              // The resident wave admission (beginChildren) and the provider
+              // pacing cap both bound the fan-out: run the narrower of the
+              // two. Pacing never refuses a wave, it only throttles width.
+              const waveWidth = Math.max(1, Math.min(batch.concurrency, this.specialistWaveWidth()));
+              return await pool(scheduled, waveWidth, (run) =>
+                runSpecialist(run.lens, run.attempt, run.previous, signal));
+            } finally {
+              batch.finish();
+            }
+          } finally {
+            if (yieldedLeadSlot) {
+              reviewLease = await this.acquireReviewTurnSlot('lead', input.signal);
+            }
+          }
+        };
+        const poolOutcome = await runWave();
         // Every settled child is REAL work (T13): commit its result before
         // any error handling, so executed runs are never restored to
         // "not used" or hidden from the durable record.
