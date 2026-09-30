@@ -203,6 +203,34 @@ describe('minion heist identity in the crew rail', () => {
     expect(document.querySelectorAll('.board-agent__hash')).toHaveLength(7);
   });
 
+  it('ignores invisible-only graphemes before shortening, keeping readable letters and ZWJ emoji', () => {
+    const view = new BoardView(() => {});
+    const jobs = [
+      baseJob({ id: 'wake', title: 'Full wake alert contract', displayName: '\u200b'.repeat(24) + 'wake alerts' }),
+      baseJob({ id: 'emoji', title: 'Emoji heist', displayName: '🧑\u200d🚀 launch' }),
+      baseJob({ id: 'blank', title: 'Legacy title survives', displayName: '\u200b\u200b' }),
+    ];
+    const agents = [
+      agent('worker-1234dec9', { role: 'minion', label: null, jobId: 'wake' }),
+      agent('worker-5678cafe', { role: 'minion', label: null, jobId: 'emoji' }),
+      agent('worker-9999fade', { role: 'minion', label: null, jobId: 'blank' }),
+    ];
+    view.render(snapshot({ jobs, agents }));
+    const rows = [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')];
+    const byId = (id: string) => rows.find((row) => row.title.includes(id))!;
+    // The 24 leading zero-width spaces no longer consume the rail bound:
+    // the readable letters survive with the suffix and the full identity.
+    expect(byId('worker-1234dec9').querySelector('.board-agent__name')?.textContent).toBe('wake alerts');
+    expect(byId('worker-1234dec9').querySelector('.board-agent__hash')?.textContent).toBe('dec9');
+    expect(byId('worker-1234dec9').getAttribute('aria-label')).toContain('wake alerts · worker-1234dec9');
+    expect(byId('worker-1234dec9').title).toContain('Full wake alert contract');
+    // A ZWJ emoji cluster is one grapheme and survives the filter intact.
+    expect(byId('worker-5678cafe').querySelector('.board-agent__name')?.textContent).toBe('🧑\u200d🚀 launch');
+    // A name with nothing visible after filtering degrades to the neutral
+    // label instead of an empty-looking card.
+    expect(byId('worker-9999fade').querySelector('.board-agent__name')?.textContent).toBe('unassigned');
+  });
+
   it('opens transcripts under the rail name while the full-ID file drives the selection', () => {
     const opened = vi.fn();
     const view = new BoardView(opened);

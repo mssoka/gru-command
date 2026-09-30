@@ -1087,20 +1087,36 @@ export function railSuffix(suffixes: ReadonlyMap<string, string>, id: string): s
   return suffix;
 }
 
+/** Graphemes that carry no visible ink: format/control characters
+ * (ZWSP, ZWJ, bidi marks) and bare combining marks. A grapheme
+ * containing a visible base — including a ZWJ emoji cluster — is never
+ * dropped. */
+const INVISIBLE_GRAPHEME = /^[\p{Cf}\p{Cc}\p{M}\s]+$/u;
+
 // The authored name is shared by a heist. Older titles are shortened only
 // for display; the full title stays on the job and in the row's tooltip.
+// Invisible-only graphemes are ignored BEFORE the bound is applied: an
+// authored name may start with a run of them, and counting those against
+// the 24-grapheme bound shortened the readable letters away (r5
+// display-correctness warning). The ledger and protocol keep and validate
+// the raw authored value; only the shortened rail label filters.
 function heistName(source: string | undefined): string {
   if (source === undefined || source.trim() === '') return 'unassigned';
   const words = source.toLowerCase().trim().split(/\s+/u);
   let result = '';
   for (const word of words) {
-    const next = result === '' ? word : `${result} ${word}`;
+    const visible = graphemes(word).filter((part) => !INVISIBLE_GRAPHEME.test(part)).join('');
+    if (visible === '') continue;
+    const next = result === '' ? visible : `${result} ${visible}`;
     if (graphemes(next).length > 24 && result !== '') break;
     result = next;
     if (graphemes(result).length >= 24) break;
   }
   // Don't split emoji sequences or combining marks in a long first word.
-  return graphemes(result).slice(0, 24).join('');
+  const shortened = graphemes(result).slice(0, 24).join('');
+  // Write boundaries reject an invisible-only name; a legacy/foreign row
+  // that still carries one renders the neutral fallback, never a blank.
+  return shortened.trim() === '' ? 'unassigned' : shortened;
 }
 
 /** The normally four-character ID suffix; identical suffixes extend on

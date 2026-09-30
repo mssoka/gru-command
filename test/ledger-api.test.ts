@@ -67,6 +67,14 @@ describe('ledger api — the record of state', () => {
       .toThrow(/visible characters/u);
     const named = api.addJob({ id: 'name-emoji-ok', repo: 'fixture', title: 'T', displayName: '🧑\u200d🚀 launch' });
     expect(named.displayName).toBe('🧑\u200d🚀 launch');
+    // Visible letters behind an invisible prefix are accepted and kept raw:
+    // the rail ignores the controls before shortening (r5 warning), so the
+    // stored authored value is never mutated to fit a display bound.
+    const prefixed = api.addJob({
+      id: 'name-invisible-prefix', repo: 'fixture', title: 'T',
+      displayName: '\u200b'.repeat(24) + 'wake alerts',
+    });
+    expect(prefixed.displayName).toBe('\u200b'.repeat(24) + 'wake alerts');
     const atCap = api.addJob({ id: 'name-at-cap', repo: 'fixture', title: 'T', displayName: 'y'.repeat(100) });
     expect(atCap.displayName).toHaveLength(100);
   });

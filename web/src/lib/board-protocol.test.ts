@@ -89,6 +89,11 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(board)).toBe(true);
     job.displayName = 'Wake & alerts';
     expect(isValidSnapshot(board)).toBe(true);
+    // Visible letters behind invisible formatting controls are accepted
+    // raw; ignoring the controls before shortening is the renderer's
+    // contract (r5 display-correctness warning).
+    job.displayName = '\u200b'.repeat(24) + 'wake alerts';
+    expect(isValidSnapshot(board)).toBe(true);
     job.displayName = '   ';
     expect(isValidSnapshot(board)).toBe(false);
     job.displayName = 123;
