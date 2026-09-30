@@ -406,6 +406,11 @@ async function readResponseBodyCapped(
         if (value === undefined) continue;
         total += value.byteLength;
         if (total > maxBytes) {
+          // Keep the prefix of the boundary chunk under the ceiling so a
+          // truncated refusal body still carries as much classifier-visible
+          // text as the budget allows.
+          const keep = maxBytes - (total - value.byteLength);
+          if (keep > 0) chunks.push(Buffer.from(value.subarray(0, keep)));
           try {
             await reader.cancel();
           } catch {
@@ -421,8 +426,9 @@ async function readResponseBodyCapped(
     return { text: Buffer.concat(chunks).toString('utf8'), overflowed: false };
   }
   const text = await response.text();
-  if (Buffer.byteLength(text, 'utf8') > maxBytes) {
-    return { text: text.slice(0, maxBytes), overflowed: true };
+  const bytes = Buffer.from(text, 'utf8');
+  if (bytes.byteLength > maxBytes) {
+    return { text: bytes.subarray(0, maxBytes).toString('utf8'), overflowed: true };
   }
   return { text, overflowed: false };
 }
@@ -477,7 +483,9 @@ interface ProviderReview {
  * must fail closed rather than being stringified into a receipt. */
 function usableProviderReviewId(id: unknown): string | null {
   if (typeof id === 'number' && Number.isSafeInteger(id) && id >= 1) return String(id);
-  if (typeof id === 'string' && id.trim() !== '' && id.length <= 200) return id;
+  // Provider-quoted ids keep the shared receipt contract's charset, so a
+  // certified receipt can never fail the ledger's promotion gate later.
+  if (typeof id === 'string' && /^[A-Za-z0-9._:-]{1,200}$/u.test(id)) return id;
   return null;
 }
 
@@ -505,7 +513,7 @@ function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha
 function providerIndicatesRateLimit(error: PerkinsAppHttpError): boolean {
   const documentationUrl = (error.body as { readonly documentation_url?: unknown } | null)?.documentation_url;
   return (typeof documentationUrl === 'string' && /rate-limit/u.test(documentationUrl)) ||
-    /\brate[- ]?limit(?:ed)?\b|abuse detection/iu.test(error.providerMessage);
+    /\brate[- ]?limits?\b|\brate[- ]?limited\b|abuse detection/iu.test(error.providerMessage);
 }
 
 /** HTTP-level provider rejection with a sanitized provider message. */
@@ -736,9 +744,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     }
     if (overflowed) {
       if (seam.ambiguousOutcome === true) {
-        throw new PerkinsAppError(`${label} response exceeded ${this.maxProviderBodyBytes} bytes — delivery identity is unproven`);
+        throw new PerkinsAppError(`${label} response exceeded ${this.maxProviderBodyBytes} bytes — delivery identity is unproven (if this is unexpected, check maxProviderBodyBytes)`);
       }
-      throw new PerkinsAppError(`${label} response exceeded ${this.maxProviderBodyBytes} bytes — refusing to parse an oversized body`);
+      throw new PerkinsAppError(`${label} response exceeded ${this.maxProviderBodyBytes} bytes — refusing to parse an oversized body (if this is unexpected, check maxProviderBodyBytes)`);
     }
     if (text === '') return { body: null, header };
     try {

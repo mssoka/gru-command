@@ -69,7 +69,7 @@ context: []
 - Integration repair committed: 8e1eab6 — suite-shape pins dropped by the main merge wave, verified by the file's own static counter and cross-validated by the independent identical repair in lane revert-compaction-137 (c0d0ec2): github-poll 22->24, owner-actions added at 8 (its static count; runtime 28 via its case loop).
 - Focused pre-checks (direct, 2-file suite; not the official gate): run1 failed (missing pins + unhandled worker-RPC timeout because the direct npx invocation bypassed the repo `pretest` patch), run2 failed (github-poll pin), run3 green 54/54 after repairs. Logs and hashes under delivery/verify/integration/.
 - Independent review round (integration final diff 128cdb8..8e1eab6, staged sha256 7ad798c69c22d2f820f0122b5a75595ea7cb2a13203c5a12ec2d172e74f1ac8d): five fresh read-only sessions under delivery/independent-review-integration/.
-- Review closures committed: 83802c2 (findings) and 5ccde5b (recheck findings); recheck round staged sha256 25a5d48a2231fbfe937de96f3308e3fcb2bff06d7cb886b511418ea56bd03532; final delta staged sha256 e3fac918df1780638e52efa963283ed0c7f09bf507c7f6d390f2406457919504. Focused after each: 68/68 then 70/70 (perkins-github-app + suite-shape, pin 52→66→67→68). No `src/dispatch/perkins.ts` edit.
+- Review closures committed: 83802c2 (findings), 5ccde5b (recheck findings), 5489fa7 (final-delta findings); inherited repairs 30bb354. Recheck round staged sha256 25a5d48a2231fbfe937de96f3308e3fcb2bff06d7cb886b511418ea56bd03532; delta staged sha256 e3fac918df1780638e52efa963283ed0c7f09bf507c7f6d390f2406457919504; final-delta fixes staged sha256 ff2f75b9852bf16ea15b4c0aeebd91a4997ef83ad902fee1129058d515ee3bb2. Focused after each: 68/68, 70/70, 74/74 (perkins-github-app + suite-shape, pin 52→66→67→68→72). No `src/dispatch/perkins.ts` edit.
 - Shared-contract boundary note for Gru: `VerdictPosterInput` carries no abort signal, so a bounded reconciliation can run up to its page/timeout budget after a round is cancelled; `perkins.ts` was left read-only per the ownership rule.
 
 ## Spec Change Log
@@ -114,9 +114,13 @@ context: []
 | rate-limit classifier over-match (adv) | Accepted: narrowed to `rate limit`/`abuse detection` |
 | `VerdictPosterInput` carries no abort signal (adv) | Recorded shared-contract boundary note for Gru; `perkins.ts` remains read-only. |
 
-### Round 3 — final delta check
+### Round 3 — final delta check over the recheck-fix commit
 
-- Fresh adversarial session over the recheck-fix delta (candidate 5ccde5b; staged sha256 e3fac918...): result recorded in the delivery evidence.
+- Fresh adversarial session over the recheck-fix delta (candidate 5ccde5b; staged sha256 e3fac918...): closures 1/3/5/7 verified and pinned; refinements accepted and applied in 5489fa7 — true streaming byte budget for provider replies, status-first classification of oversized refusals, symmetric rate-limit tightening, construction validation of the reply ceiling, zero/negative id pinning, stronger sanitize assertions + benign-text pin, neutral growth wording. One follow-up delta check (candidate 5489fa7; staged sha256 ff2f75b9...) records the final verification of those applications.
+
+### Inherited full-gate repairs (not PR130's diff)
+
+- The focused probes on this lane reproduced two inherited main-lineage failures: the wizard no-TTY test (exit 1 due to an ambient instance config the loader rejects) and the T4 WaveRunner test sitting at 22.4s against the 30s default on this shared host. Both are already repaired identically in the revert-compaction-137 lane (4bc28b8, pending on PR #147); this lane carries the same test-only repairs (commit 30bb354) so its required full-candidate verification can run honestly. No assertions or product behavior changed.
 
 ## Verification
 

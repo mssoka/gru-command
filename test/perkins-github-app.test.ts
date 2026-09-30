@@ -1366,6 +1366,18 @@ describe('review id discipline', () => {
     ]);
     await expect(stringZero.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .resolves.toMatchObject({ reviewId: '0' });
+
+    // A provider-quoted id outside the shared receipt charset is unusable
+    // too: the poster must not certify a receipt the ledger would later
+    // reject as malformed.
+    const spacedId = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/reviews$/,
+        handler: async () => ({ status: 200, body: { id: 'perkins review 42', user: { login: 'perkins-review[bot]', type: 'Bot' }, state: 'COMMENTED', commit_id: HEAD, body: 'review body\n' } }),
+      },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+    ]);
+    await expect(spacedId.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
   });
 
   it('refuses an oversized provider reply instead of parsing it', async () => {
@@ -1379,16 +1391,22 @@ describe('review id discipline', () => {
 
   it('applies the byte ceiling while streaming, stopping at the cap instead of buffering past it', async () => {
     const fixture = bundleFixture();
-    const chunks = [new Uint8Array(1_500).fill(120), new Uint8Array(1_500).fill(121), new Uint8Array(1_500).fill(122)];
+    const chunkCount = 100;
+    let pulls = 0;
+    let cancelled = false;
     const { poster } = posterWith(fixture, [
       {
         method: 'GET', test: /\/reviews\?/,
         handler: async () => ({
           status: 200,
           stream: new ReadableStream<Uint8Array>({
-            start(controller) {
-              for (const chunk of chunks) controller.enqueue(chunk);
-              controller.close();
+            pull(controller) {
+              pulls += 1;
+              if (pulls <= chunkCount) controller.enqueue(new Uint8Array(100).fill(65));
+              else controller.close();
+            },
+            cancel() {
+              cancelled = true;
             },
           }),
         }),
@@ -1396,6 +1414,69 @@ describe('review id discipline', () => {
     ], { maxProviderBodyBytes: 2_048 });
     await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/exceeded 2048 bytes/u);
+    // The reader stopped at the cap and cancelled the source long before
+    // the 100-chunk stream could be drained; a buffering implementation
+    // would read every chunk (pulls === chunkCount) and never cancel.
+    expect(cancelled).toBe(true);
+    expect(pulls).toBeLessThan(chunkCount);
+  });
+
+  it('parses a streamed reply on the happy path (the production read shape)', async () => {
+    const fixture = bundleFixture();
+    const { poster } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async () => ({
+          status: 200,
+          stream: new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(JSON.stringify([MATCHING_REVIEW])));
+              controller.close();
+            },
+          }),
+        }),
+      },
+    ]);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+  });
+
+  it('treats a mid-stream read failure on the delivery POST as ambiguous and reconciles, never re-posts', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/reviews$/,
+        handler: async () => ({
+          status: 200,
+          stream: new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.error(new Error('connection reset mid-body'));
+            },
+          }),
+        }),
+      },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('never labels a non-window abuse refusal as rate limiting', async () => {
+    const fixture = bundleFixture();
+    const { poster } = posterWith(fixture, [
+      {
+        method: 'POST', test: /access_tokens$/,
+        handler: async () => ({
+          status: 403,
+          body: {
+            message: 'Your account has been flagged.',
+            documentation_url: 'https://docs.github.com/en/site-policy/acceptable-use-policies/github-abuse',
+          },
+        }),
+      },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').not.toMatch(/rate limiting/u);
+    expect(error?.message ?? '').toMatch(/suspended or the App forbidden/u);
   });
 
   it('keeps an oversized refusal classified by its status (never as an unknown outcome)', async () => {
@@ -1410,6 +1491,28 @@ describe('review id discipline', () => {
     // A definitive refusal: no reconciliation lookup, no retry.
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(0);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+
+    // The realistic hostile shape: the refusal body arrives as a stream.
+    const streamed = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/reviews$/,
+        handler: async () => ({
+          status: 403,
+          stream: new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(2_049).fill(120));
+              controller.close();
+            },
+          }),
+        }),
+      },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+    ], { maxProviderBodyBytes: 2_048 });
+    const streamedError = await streamed.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })
+      .then(() => null, (cause: unknown) => cause as Error);
+    expect(streamedError).toBeInstanceOf(PerkinsAppHttpError);
+    expect((streamedError as PerkinsAppHttpError).status).toBe(403);
+    expect(streamed.calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(0);
   });
 
   it('routes an oversized OK delivery reply into bounded reconciliation, never a blind retry', async () => {
@@ -1426,6 +1529,10 @@ describe('review id discipline', () => {
     const fixture = bundleFixture();
     expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: 0 })).toThrow(/maxProviderBodyBytes/u);
     expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: -1 })).toThrow(/maxProviderBodyBytes/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: 1024.5 })).toThrow(/maxProviderBodyBytes/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: Number.NaN })).toThrow(/maxProviderBodyBytes/u);
+    // A small but sane ceiling stays accepted (the tests themselves use one).
+    expect(new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: 2_048 })).toBeInstanceOf(PerkinsAppPrPoster);
   });
 });
 
