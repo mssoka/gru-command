@@ -167,7 +167,7 @@ describe('branch state-change mapping', () => {
     expect(state().prOpen).toBeNull();
     // branchStatePayload/readBranchState round-trip the status (old events
     // without pr_open parse to null — fail closed until re-observed).
-    const lane = { jobId: 'job-1', repo: REPO, branch: 'gru/job-1' };
+    const lane = { jobId: 'job-1', repo: REPO, branch: 'gru/job-1', prNumber: 1, prUrl: null };
     const payload = branchStatePayload(lane, state({ prOpen: true }));
     expect(payload['pr_open']).toBe(true);
   });
