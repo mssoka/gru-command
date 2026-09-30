@@ -62,6 +62,15 @@ describe('role definitions (E8)', () => {
     expect(silas).toContain('owner-held');
   });
 
+  it('pins the ordinary non-draft PR creation order on minion and silas', () => {
+    const minion = ROLE_DEFINITIONS['minion'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(minion).toContain('create it ordinary and non-draft from the outset');
+    expect(minion).toContain('`gh pr create` without `--draft`/`-d`');
+    const silas = ROLE_DEFINITIONS['silas'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(silas).toContain('New pull requests are ordinary');
+    expect(silas).toContain('existing drafts are left untouched');
+  });
+
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {
     expect(ROLE_DEFINITIONS['gru'].cwd).toBe('workspace_root');
     expect(ROLE_DEFINITIONS['silas'].cwd).toBe('workspace_root');
