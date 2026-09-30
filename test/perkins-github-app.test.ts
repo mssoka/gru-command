@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, createVerify, generateKeyPairSync } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -12,6 +12,8 @@ import {
   PerkinsAppError,
   PerkinsAppHttpError,
   PerkinsAppPrPoster,
+  resolvePerkinsAppBundleRoot,
+  resolvePerkinsAppKeyPath,
   type AppFetch,
   type AppFetchInit,
 } from '../src/dispatch/perkins-github-app.js';
@@ -449,13 +451,22 @@ describe('startup poster selection (the seam main wires)', () => {
       chmodSync(join(home, 'perkins'), 0o700);
       symlinkSync(join(home, 'perkins', 'missing-config'), join(home, 'perkins', 'config'));
       // Selection sees the bundle; failure is loud and actionable at load.
-      const poster = createGithubVerdictPoster(home);
+      // The fetch double must never be reached: this path is offline by
+      // construction, not by statement ordering.
+      let networkAttempted = false;
+      const poster = createGithubVerdictPoster(home, {
+        fetchImpl: (async () => {
+          networkAttempted = true;
+          throw new Error('the fetch double must never run for a broken bundle');
+        }) as AppFetch,
+      });
       expect(poster).toBeInstanceOf(PerkinsAppPrPoster);
       const repo = makeFixtureRepo('perkins-app-dangling-repo');
       try {
         execFileSync('git', ['-C', repo.path, 'remote', 'add', 'origin', 'https://github.com/acme/widget.git'], { stdio: 'ignore' });
         await expect(poster.post({ ...PR_INPUT, repoPath: repo.path }))
           .rejects.toThrow(/symbolic link/u);
+        expect(networkAttempted).toBe(false);
       } finally {
         repo.cleanup();
       }
@@ -1057,7 +1068,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [] }) },
     ]);
     const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
-    expect(error?.message ?? '').toMatch(/<absent>/u);
+    expect(error?.message ?? '').toMatch(/id is not usable/u);
     expect(error?.message ?? '').toMatch(/NOT re-posted/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
@@ -1223,7 +1234,7 @@ describe('idempotent recovery reconciliation', () => {
           return { status: 200, body: foreignPage, headers: { link: links.join(', ') } };
         },
       },
-    ]);
+    ], { maxReconciliationPages: 3 });
     await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/delivery stays unresolved/u);
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(3);
@@ -1254,8 +1265,243 @@ describe('no personal-credential fallback in configured App mode', () => {
     const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
     expect(error).toBeInstanceOf(PerkinsAppError);
     // The configured-mode failure is the App's, surfaced for the operator;
-    // the poster resolves repo origins with git and never shells out to gh.
-    expect((poster as unknown as { gitBinary?: string }).gitBinary).toBe('git');
+    // a configured App bundle cannot select the personal gh poster, and the
+    // App poster class itself has no gh execution path.
+    expect(createGithubVerdictPoster(fixture.home)).toBeInstanceOf(PerkinsAppPrPoster);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration review closures (2026-09-30 independent review findings)
+// ---------------------------------------------------------------------------
+
+describe('credential hygiene on rejected URLs', () => {
+  it('sanitizes credential-shaped bytes in malformed and host-rejected PR URLs', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture);
+    const secret = `ghs_${'S'.repeat(40)}`;
+    const malformed = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), prUrl: `not-a-url ${secret}` })
+      .then(() => null, (cause: unknown) => cause as Error);
+    expect(malformed).toBeInstanceOf(PerkinsAppError);
+    expect(malformed?.message ?? '').not.toContain(secret);
+    expect(malformed?.message ?? '').toContain('[REDACTED]');
+
+    const userinfo = await poster.post({
+      ...PR_INPUT, repoPath: repoPathOf(fixture),
+      prUrl: `https://user:${secret}@github.com/acme/widget/pull/7`,
+    }).then(() => null, (cause: unknown) => cause as Error);
+    expect(userinfo).toBeInstanceOf(PerkinsAppError);
+    expect(userinfo?.message ?? '').not.toContain(secret);
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe('review id discipline', () => {
+  it('accepts a provider-quoted string id as the receipt identity', async () => {
+    const fixture = bundleFixture();
+    const { poster } = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/reviews$/,
+        handler: async () => ({ status: 200, body: { id: '987654', user: { login: 'perkins-review[bot]', type: 'Bot' }, state: 'COMMENTED', commit_id: HEAD, body: 'review body\n' } }),
+      },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+  });
+
+  it('routes a 2xx with an unusable review id into bounded reconciliation instead of a raw failure', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/reviews$/,
+        handler: async () => ({ status: 200, body: { user: { login: 'perkins-review[bot]', type: 'Bot' }, state: 'COMMENTED', commit_id: HEAD, body: 'review body\n' } }),
+      },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+});
+
+describe('bounded lookup growth and link sanity', () => {
+  const fullPage = Array.from({ length: 100 }, (_, index) => ({
+    id: 8000 + index,
+    user: { login: 'other-user', type: 'User' },
+    commit_id: HEAD,
+    state: 'COMMENTED',
+    body: 'review body\n',
+  }));
+
+  it('never certifies absence from a page=0 "last" link (a rewriting intermediary cannot mint coverage)', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async () => ({
+          status: 200,
+          body: fullPage,
+          headers: { link: '<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=0>; rel="last"' },
+        }),
+      },
+    ], { maxReconciliationPages: 2 });
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/delivery stays unresolved/u);
+    // The unusable Link header falls back to the sequential walk, still bounded.
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(2);
+  });
+
+  it('does not certify absence when the review list grows mid-walk beyond the visited pages', async () => {
+    const fixture = bundleFixture();
+    const lastLink = (last: number): Record<string, string> => ({
+      link: `<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${last}>; rel="last"`,
+    });
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => (call.url.includes('page=2')
+            ? { status: 200, body: fullPage, headers: lastLink(3) }
+            : { status: 200, body: fullPage, headers: lastLink(2) }),
+      },
+    ], { maxReconciliationPages: 2 });
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/delivery stays unresolved/u);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(2);
+  });
+
+  it('finds a recovered review deeper than the old three-page window (shared ten-page parity)', async () => {
+    const fixture = bundleFixture();
+    const lastLink = (last: number): Record<string, string> => ({
+      link: `<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${last}>; rel="last"`,
+    });
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => (call.url.includes('page=2')
+            ? { status: 200, body: [MATCHING_REVIEW], headers: lastLink(5) }
+            : { status: 200, body: fullPage, headers: lastLink(5) }),
+      },
+    ]);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+    const pages = calls
+      .filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))
+      .map((call) => /[?&]page=(\d+)/u.exec(call.url)?.[1]);
+    expect(pages).toEqual(['1', '5', '4', '3', '2']);
+  });
+});
+
+describe('key path resolution and external keys', () => {
+  it('resolves absolute, Windows drive, and UNC key paths as written, and relative paths against the bundle dir', () => {
+    expect(resolvePerkinsAppKeyPath('/bundle', '/abs/key.pem')).toBe('/abs/key.pem');
+    expect(resolvePerkinsAppKeyPath('/bundle', 'C:\\keys\\k.pem')).toBe('C:\\keys\\k.pem');
+    expect(resolvePerkinsAppKeyPath('/bundle', '\\\\server\\share\\k.pem')).toBe('\\\\server\\share\\k.pem');
+    expect(resolvePerkinsAppKeyPath('/bundle', 'keys/k.pem')).toBe(join('/bundle', 'keys/k.pem'));
+    expect(resolvePerkinsAppKeyPath('/bundle', '../keys/k.pem')).toBe(join('/bundle', '../keys/k.pem'));
+  });
+
+  it('accepts an external key reached through .. and rejects the same path when symlinked', () => {
+    const fixture = bundleFixture('app_id=424242\nkey_path=../keys/app-key.pem\ninstallation_id_acme=164552969\n');
+    mkdirSync(join(fixture.home, 'keys'), { recursive: true });
+    const externalKey = join(fixture.home, 'keys', 'app-key.pem');
+    writeFileSync(externalKey, fixture.key.privateKeyPem, 'utf8');
+    chmodSync(externalKey, 0o600);
+    expect(loadPerkinsAppBundle(fixture.home).config.appId).toBe(424242);
+
+    const linked = bundleFixture('app_id=424242\nkey_path=../keys/app-key.pem\ninstallation_id_acme=164552969\n');
+    mkdirSync(join(linked.home, 'keys'), { recursive: true });
+    symlinkSync(join(linked.home, 'perkins', 'app-key.pem'), join(linked.home, 'keys', 'app-key.pem'));
+    expect(() => loadPerkinsAppBundle(linked.home)).toThrow(/symbolic link/u);
+  });
+
+  it('accepts and safety-checks an absolute key outside the bundle dir', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'perkins-app-external-'));
+    try {
+      const key = syntheticAppKey();
+      const externalKey = join(outside, 'app-key.pem');
+      writeFileSync(externalKey, key.privateKeyPem, 'utf8');
+      chmodSync(externalKey, 0o600);
+      const fixture = bundleFixture(`app_id=424242\nkey_path=${externalKey}\ninstallation_id_acme=164552969\n`);
+      expect(loadPerkinsAppBundle(fixture.home).config.appId).toBe(424242);
+      chmodSync(externalKey, 0o644);
+      expect(() => loadPerkinsAppBundle(fixture.home)).toThrow(/owner-only/u);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an implausibly large credential file instead of buffering it', () => {
+    const fixture = bundleFixture('app_id=424242\nkey_path=app-key.pem\ninstallation_id_acme=164552969\n');
+    const configPath = join(fixture.home, 'perkins', 'config');
+    writeFileSync(configPath, 'x'.repeat(1_048_577), 'utf8');
+    chmodSync(configPath, 0o600);
+    expect(() => loadPerkinsAppBundle(fixture.home)).toThrow(/implausibly large/u);
+  });
+});
+
+describe('bundle root resolution (instance dir vs relocated data dir)', () => {
+  const writeBundle = (root: string): void => {
+    const key = syntheticAppKey();
+    mkdirSync(join(root, 'perkins'), { recursive: true });
+    chmodSync(join(root, 'perkins'), 0o700);
+    writeFileSync(join(root, 'perkins', 'app-key.pem'), key.privateKeyPem, 'utf8');
+    chmodSync(join(root, 'perkins', 'app-key.pem'), 0o600);
+    const configPath = join(root, 'perkins', 'config');
+    writeFileSync(configPath, 'app_id=424242\nkey_path=app-key.pem\ninstallation_id_acme=164552969\n', 'utf8');
+    chmodSync(configPath, 0o600);
+  };
+
+  it('prefers the instance dir, falls back to a relocated data dir, and defaults to the instance dir', () => {
+    const instance = mkdtempSync(join(tmpdir(), 'perkins-root-instance-'));
+    const data = mkdtempSync(join(tmpdir(), 'perkins-root-data-'));
+    try {
+      expect(resolvePerkinsAppBundleRoot({ instanceDir: instance, dataDir: data })).toBe(instance);
+      writeBundle(data);
+      expect(resolvePerkinsAppBundleRoot({ instanceDir: instance, dataDir: data })).toBe(data);
+      writeBundle(instance);
+      expect(resolvePerkinsAppBundleRoot({ instanceDir: instance, dataDir: data })).toBe(instance);
+    } finally {
+      rmSync(instance, { recursive: true, force: true });
+      rmSync(data, { recursive: true, force: true });
+    }
+  });
+
+  it('publishes through a bundle found under the relocated data dir', async () => {
+    const fixture = bundleFixture();
+    const instance = mkdtempSync(join(tmpdir(), 'perkins-root-boot-'));
+    const data = mkdtempSync(join(tmpdir(), 'perkins-root-data-only-'));
+    try {
+      writeBundle(data);
+      const api = makeApiDouble();
+      const auto = createStartupVerdictPoster({ instanceDir: instance, dataDir: data }, {
+        fetchImpl: api.fetchImpl,
+        now: () => NOW,
+      });
+      const legs = auto as unknown as { github: VerdictPoster; gitlab: VerdictPoster };
+      expect(legs.github).toBeInstanceOf(PerkinsAppPrPoster);
+      await expect(auto.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+    } finally {
+      rmSync(instance, { recursive: true, force: true });
+      rmSync(data, { recursive: true, force: true });
+    }
+  });
+
+  it('fails loud on malformed wiring roots instead of probing the CWD', () => {
+    expect(() => createGithubVerdictPoster('relative/path')).toThrow(/absolute instance directory/u);
+    expect(() => createGithubVerdictPoster('')).toThrow(PerkinsAppError);
+    const abs = mkdtempSync(join(tmpdir(), 'perkins-root-malformed-'));
+    try {
+      expect(() => createStartupVerdictPoster({ instanceDir: abs, dataDir: 'relative' })).toThrow(/absolute data directory/u);
+    } finally {
+      rmSync(abs, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('startup wiring pin (src/main.ts)', () => {
+  it('wires the App-selected factory and cannot revert to the personal poster unnoticed', () => {
+    const main = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf-8');
+    expect(main).toContain("import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';");
+    expect(main).toContain('poster: createStartupVerdictPoster(config),');
+    expect(main).not.toContain('poster: new AutoVerdictPoster()');
+    expect(main).not.toMatch(/poster:\s*new GhPrPoster\(/u);
   });
 });

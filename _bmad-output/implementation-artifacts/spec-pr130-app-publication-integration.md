@@ -62,6 +62,14 @@ context: []
 
 ## Implementation Notes
 
+- 2026-09-30: Owner decision recorded (gru-pr130-history-preserving-approved-20260930): history-preserving integration merge; answered Open Question removed; no rebase/force push.
+- State recheck before writing: lane HEAD 7980e32 clean, remote branch/PR #130 head d1391b6, no rounds for this job, no pending_rebrief markers, no other writer/process in the lane.
+- Fresh origin/main fetched: 128cdb8babed472464b3de0d1078929cec5ac4e1 (Merge PR #139).
+- Integration merge committed: 3c2b079 (parents 7980e32, 128cdb8). Conflict inventory: exactly one content conflict, src/main.ts WaveRunner construction, resolved to keep `poster: createStartupVerdictPoster(config)` alongside upstream `reserveReviewRound`/`maxConcurrentChildren`/`bus` plus `wave.resumeQueuedHandoffs()`. Auto-merge audit for files changed by both sides (docs/CONFIG.md, docs/FLOW.md, test/suite-shape.test.ts): both sides' edits retained (verified per file against each parent). PR diff vs fresh main = lane-owned files only.
+- Integration repair committed: 8e1eab6 — suite-shape pins dropped by the main merge wave, verified by the file's own static counter and cross-validated by the independent identical repair in lane revert-compaction-137 (c0d0ec2): github-poll 22->24, owner-actions added at 8 (its static count; runtime 28 via its case loop).
+- Focused pre-checks (direct, 2-file suite; not the official gate): run1 failed (missing pins + unhandled worker-RPC timeout because the direct npx invocation bypassed the repo `pretest` patch), run2 failed (github-poll pin), run3 green 54/54 after repairs. Logs and hashes under delivery/verify/integration/.
+- Independent review round (integration final diff 128cdb8..8e1eab6, staged sha256 7ad798c69c22d2f820f0122b5a75595ea7cb2a13203c5a12ec2d172e74f1ac8d): five fresh read-only sessions under delivery/independent-review-integration/; results pending.
+
 ## Spec Change Log
 
 ## Review Triage Log

@@ -182,9 +182,10 @@ delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
 than gating, since a pinned base is expected to trail a moving main), and
 the GitLab probe and poster resolve their token
-identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`); GitHub
-authenticates through the `gh` CLI when no Perkins App bundle is
-installed — with a bundle, github.com publication is App-authored (see
+identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). GitHub
+**publication** authenticates through the `gh` CLI when no Perkins App
+bundle is installed; with a bundle, github.com publication is App-authored
+while the review preflight still probes remotes through `gh` (see
 [PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)).
 
 Report artifacts persist before delivery, but the local round verdict is

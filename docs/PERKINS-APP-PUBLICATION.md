@@ -14,7 +14,11 @@ and no merge authority are granted or changed.
 ## The runtime bundle
 
 The App credential bundle lives under the service's **instance dir**
-(default `~/.gru-command/`), never inside a repository checkout:
+(the directory holding `config.toml`, default `~/.gru-command/`), never
+inside a repository checkout. The resolution rule is exact: the instance
+dir is authoritative; when `data_dir` relocates service state and the
+instance dir holds no bundle, a bundle under `<data_dir>/perkins/` is
+honored as a fallback, and the instance dir wins if both exist.
 
 ```
 <instance_dir>/perkins/config      literal KEY=VALUE data (0600)
@@ -32,38 +36,38 @@ installation_id_solarity-services=999888777
 ```
 
 - `key_path` may be quoted or unquoted; a relative path resolves against
-  `<instance_dir>/perkins/` (but is not confined to it — `..` segments are
-  permitted), and an absolute path is permitted. Wherever the key lives,
-  it passes the same file-level checks; the bundle dir remains the audit
-  boundary — the config that names the key still lives there.
+the bundle dir (but is not confined to it — `..` segments are permitted),
+and an absolute path, Windows drive path, or UNC path is accepted.
+Wherever the key lives, it passes the same file-level checks; the bundle
+dir remains the audit boundary — the config that names the key still
+lives there.
 - `installation_id_<owner>` takes one entry per reviewed repository owner,
   including hyphenated organization names. Lookup is case-insensitive.
 - The key must be the RSA PEM downloaded from the App settings page.
-- Both files must be regular files owned by the service user, readable by
-  the owner and by nobody else (0600 recommended — a hardened 0400 key is
-  fine), with no setuid/setgid/sticky bits, and `<instance_dir>/perkins`
-  itself must be an owner-owned 0700 directory. Publication time enforces
-  all of this — including rejecting symlinked files — and fails closed,
-  naming the found mode in the message. (Windows deployments: ownership
-  and mode enforcement is not applied and symlink rejection is best-effort
-  (an lstat check without `O_NOFOLLOW` backstop) — restrict the bundle
-  with filesystem ACLs.)
+- The files must be regular files owned by the service user, owner-only
+  (no group/other access, no setuid/setgid/sticky bits) and owner-readable
+  — 0600 recommended, and a hardened 0400 works. The bundle directory
+  itself must be exactly an owner-owned 0700 directory; 0500 is rejected.
+  Publication time enforces all of this — including rejecting symlinked
+  files — and fails closed, naming the mode it found in the message.
+  (Windows deployments: ownership and mode enforcement are not applied,
+  and symlink rejection is best-effort — an lstat check without an
+  `O_NOFOLLOW` backstop; restrict the bundle with filesystem ACLs.)
 - The bundle is provisioned by the owner (App settings + installation);
   the service only reads it.
 
 ## Mode selection (startup)
 
-Selection is by bundle **presence**, checked once at service start. Any
+Selection is by bundle **presence**, checked once at service start: any
 bundle-shaped presence — a regular file, a symlink, a directory, even an
-unreadable path — selects App mode: **for selection**, presence is
-presence; a broken bundle then fails loudly at publication time and never
-silently degrades to a personal credential. Bundle problems surface at
-publication time, never at boot:
+unreadable path — selects App mode, and a broken bundle then fails loudly
+at publication time (never at boot) rather than silently degrading to a
+personal credential:
 
 | Bundle | github.com publication |
 |---|---|
-| `<instance_dir>/perkins/config` present | Perkins App poster |
-| absent | legacy `gh` poster, byte-for-byte unchanged |
+| `<instance_dir>/perkins/config` present (or `<data_dir>/perkins/config` for a relocated deployment) | Perkins App poster |
+| absent from both roots | legacy `gh` poster, byte-for-byte unchanged |
 
 GitLab routing is untouched in both modes.
 
@@ -80,10 +84,10 @@ another host requires a separate, explicit publisher decision.
 ## The identity chain (all before the irreversible POST)
 
 1. PR URL + repository-origin validation, identical to the legacy poster.
-2. Bundle load and validation — both files owner-owned 0600 regular files;
-   missing/invalid/inaccessible credentials fail closed with sanitized
-   diagnostics — key bytes never appear in an error, and no personal
-   credential is ever consulted.
+2. Bundle load and validation — both files owner-only, owner-readable
+   regular files (0600 recommended); missing/invalid/inaccessible
+   credentials fail closed with sanitized diagnostics — key bytes never
+   appear in an error, and no personal credential is ever consulted.
 3. A short-lived RS256 App JWT (`iss` = `app_id`, ≤ 10 minutes) mints an
    installation access token **down-scoped to the one repository and
    `pull_requests: write` (+ implicit metadata read)**.
@@ -128,30 +132,36 @@ unproven and the review is never blindly re-posted.
 
 **Runbook for an unproven delivery.** Open the pull request's reviews. A
 COMMENT review authored by `<slug>[bot]` (for this App:
-`perkins-review[bot]`) on the exact frozen head that matches the body the
-round published — and whose submission time falls within this round —
-means it landed: record the receipt manually per the escalation (the
-escalation names the expected bot login and head). Otherwise it was not
-delivered, and a retry on a **new** frozen head is safe; re-running
+`perkins-review[bot]`), on the exact frozen head, whose body matches the
+one the round published — and whose submission time falls within this
+round — means it landed: record the receipt manually per the escalation
+(the escalation names the expected bot login and head). Otherwise it was
+not delivered, and a retry on a **new** frozen head is safe; re-running
 against the same head without checking first is what duplicates reviews.
 
-Recovery across the publisher-identity change: a review attempt whose
-original author cannot be proved (the historical personal-identity era)
+Recovery across the publisher-identity change: a review attempt from the
+historical personal-identity era whose original author cannot be proved
 stays unresolved rather than being re-attributed or duplicated. Prior
 receipts and reports are preserved unchanged.
 
 ## Activation and live check (owner-controlled)
 
 1. Land and deploy the approved code (owner merges; worker never merges).
-2. Confirm the bundle exists under the *deployed instance dir* (it
-   already does on the owner's production deployment; no App reinstall, no
-   new permissions are required).
+2. Confirm the bundle exists under the *deployed instance dir* (or its
+   relocated `data_dir`); no App reinstall and no new permissions are
+   required.
 3. Restart the service (owner action).
 4. Trigger one authorized review round; the delivered review must show
    **`perkins-review[bot]`** as the reviewer on the exact frozen head.
 
+Note that App mode changes the **publisher**, not the review preflight:
+the round still routes through the preflight's `gh`-based code-host probe,
+so the worker's `gh` login must remain valid for a round to reach Perkins
+at all (a failed probe routes to the bmad-review fallback, never to a
+personal-identity publication).
+
 Until 3–4 are done, reviews are still posted by the deployed personal
-publisher — do not claim App activation before that.
+publisher — do not claim App activation before then.
 
 ## Where the code lives
 

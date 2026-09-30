@@ -1,6 +1,6 @@
 import { createHash, createPrivateKey, createSign } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import type { PostedReviewReceipt, PrIdentity, VerdictPoster, VerdictPosterInput } from './perkins.js';
 import { AutoVerdictPoster, GhPrPoster, verifyPostedReceipt } from './perkins.js';
 import { repoRemote } from './review-path.js';
@@ -52,8 +52,9 @@ export function perkinsAppBundleDir(instanceDir: string): string {
  * ANY successful lstat — regular file, symlink (even dangling), directory,
  * anything else — counts as present, and so does any lstat error other than
  * a definitive ENOENT (a dangling perkins-dir symlink is detected and also
- * counts): selection must never silently degrade App mode to a personal
- * credential; a broken bundle fails loudly at publication time instead. */
+ * counts, and a racing unreadable stat must never be mistaken for absence):
+ * selection must never silently degrade App mode to a personal credential;
+ * a broken bundle fails loudly at publication time instead. */
 export function perkinsAppBundleConfigured(instanceDir: string): boolean {
   const configPath = join(perkinsAppBundleDir(instanceDir), 'config');
   try {
@@ -62,11 +63,13 @@ export function perkinsAppBundleConfigured(instanceDir: string): boolean {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return true;
     // ENOENT can mean a dangling perkins-dir symlink rather than genuine
-    // absence — that is a broken bundle, not a missing one.
+    // absence — that is a broken bundle, not a missing one. Only a
+    // definitive ENOENT on the directory itself is absence; any other
+    // stat failure (EACCES, ELOOP, a race) stays fail-closed as present.
     try {
       return lstatSync(perkinsAppBundleDir(instanceDir)).isSymbolicLink();
-    } catch {
-      return false;
+    } catch (dirError) {
+      return (dirError as NodeJS.ErrnoException).code !== 'ENOENT';
     }
   }
 }
@@ -179,6 +182,15 @@ interface LoadedBundle {
   readonly privateKeyPem: string;
 }
 
+/** Resolve the configured key_path to an absolute path. Absolute POSIX
+ * paths, Windows drive paths and Windows UNC paths (`\\server\share\...`)
+ * are used as written; anything else — including `..` segments — resolves
+ * against the trusted bundle dir, never the CWD or a repository. Exported
+ * so the resolution rule itself is directly testable. */
+export function resolvePerkinsAppKeyPath(bundleDir: string, keyPath: string): string {
+  return /^\\|^\/|[A-Za-z]:[\\/]/u.test(keyPath) ? keyPath : join(bundleDir, keyPath);
+}
+
 /** The bundle directory must mirror the credential-store rules: an
  * owner-owned 0700 directory (never a symlink) so no other local uid can
  * swap the bundle files underneath the file checks. */
@@ -246,6 +258,11 @@ function readBundleFileChecked(path: string, label: string, sourceLabel: string)
     if (!info.isFile()) {
       throw new PerkinsAppError(`${sourceLabel}: ${label} is not a regular file`);
     }
+    // A credential file is a few KB; anything orders of magnitude larger is
+    // not a bundle file, and buffering it would stall the round.
+    if (info.size > 1_048_576) {
+      throw new PerkinsAppError(`${sourceLabel}: ${label} is implausibly large (${info.size} bytes) for a credential file — check the perkins bundle deployment`);
+    }
     if (process.platform !== 'win32') {
       const uid = process.getuid?.();
       if (uid !== undefined && info.uid !== uid) {
@@ -279,7 +296,7 @@ export function loadPerkinsAppBundle(instanceDir: string): LoadedBundle {
   // key outside the bundle dir); that file passes the same file-level
   // safety checks, and the bundle dir remains the audit boundary for the
   // config that names it.
-  const keyPath = /^\/|[A-Za-z]:[\\/]/u.test(config.keyPath) ? config.keyPath : join(dir, config.keyPath);
+  const keyPath = resolvePerkinsAppKeyPath(dir, config.keyPath);
   const pem = readBundleFileChecked(keyPath, 'configured private key file', sourceLabel);
   try {
     const keyObject = createPrivateKey({ key: pem, format: 'pem' });
@@ -363,6 +380,9 @@ interface TokenGrant {
 // ---------------------------------------------------------------------------
 
 export interface PerkinsAppPosterOptions {
+  /** Root holding `perkins/`: the service instance dir, or the data dir
+   * when the startup factory resolved the bundle there (relocated
+   * deployments). See resolvePerkinsAppBundleRoot. */
   readonly instanceDir: string;
   /** Test seam; production uses the global fetch. */
   readonly fetchImpl?: AppFetch;
@@ -383,6 +403,15 @@ interface ProviderReview {
   readonly submitted_at?: unknown;
 }
 
+/** Provider review ids: safe integers, or a provider-quoted non-empty
+ * string (the legacy receipts accept both); anything else is unusable and
+ * must fail closed rather than being stringified into a receipt. */
+function usableProviderReviewId(id: unknown): string | null {
+  if (typeof id === 'number' && Number.isSafeInteger(id)) return String(id);
+  if (typeof id === 'string' && id.trim() !== '' && id.length <= 200) return id;
+  return null;
+}
+
 /** Provider-proved evidence that OUR App bot published exactly this review
  * during this round: author login+type, event state, frozen head,
  * byte-identical body, and a submission time inside the round's window —
@@ -393,7 +422,7 @@ function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha
     review.state === 'COMMENTED' &&
     review.commit_id === targetSha &&
     review.body === body &&
-    typeof review.id === 'number';
+    usableProviderReviewId(review.id) !== null;
   if (!base) return false;
   // With a recency bound (the ambiguous-POST path), only submissions from
   // this round's window count; null (the idempotent recovery seam) matches
@@ -408,6 +437,20 @@ function providerIndicatesRateLimit(error: PerkinsAppHttpError): boolean {
   const documentationUrl = (error.body as { readonly documentation_url?: unknown } | null)?.documentation_url;
   return (typeof documentationUrl === 'string' && /rate-limit|abuse/u.test(documentationUrl)) ||
     /rate limit|abuse/iu.test(error.providerMessage);
+}
+
+/** HTTP-level provider rejection with a sanitized provider message. */
+export class PerkinsAppHttpError extends PerkinsAppError {
+  readonly providerMessage: string;
+
+  constructor(label: string, readonly status: number, readonly body: unknown, text: string) {
+    const providerBody = body as { readonly message?: unknown } | null;
+    let providerMessage = sanitize(typeof providerBody?.message === 'string' ? providerBody.message : text);
+    if (providerMessage === '') providerMessage = 'no provider message';
+    super(`${label} exited HTTP ${status}: ${providerMessage}`);
+    this.name = 'PerkinsAppHttpError';
+    this.providerMessage = providerMessage;
+  }
 }
 
 /** GitHub App poster: the same SHA-bound COMMENT-only delivery contract as
@@ -430,10 +473,11 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     this.gitBinary = options.gitBinary ?? 'git';
     this.probeTimeoutMs = options.probeTimeoutMs ?? 15_000;
     this.postTimeoutMs = options.postTimeoutMs ?? 30_000;
-    // Three pages: page 1 (Link discovery) + the jump to the newest page +
-    // one decrement, so the default window can prove a delivery even when
-    // newer reviews pushed ours off the newest page.
-    this.maxReconciliationPages = options.maxReconciliationPages ?? 3;
+    // Bounded like the shared receipt contract: up to ten review-list pages
+    // (the jump-to-last walk normally resolves in two or three fetches; the
+    // extra headroom is for the idempotent recovery lookup on busy PRs,
+    // which may search deeper than the in-round ambiguous-POST case).
+    this.maxReconciliationPages = options.maxReconciliationPages ?? 10;
   }
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
@@ -446,7 +490,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         headers: this.bearerHeaders(grant.token),
         body: JSON.stringify({ body: input.body, event: 'COMMENT', commit_id: input.targetSha }),
         signal: AbortSignal.timeout(this.postTimeoutMs),
-      })).body;
+      }, { ambiguousOutcome: true })).body;
     } catch (error) {
       // Only a 4xx is the provider's definitive refusal — no review exists;
       // the rejection surfaces directly (a rate-limit refusal says so by
@@ -525,14 +569,16 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     try {
       url = new URL(input.prUrl.trim());
     } catch {
-      throw new PerkinsAppError(`cannot parse pull request URL: ${input.prUrl}`);
+      // A malformed URL can carry credential-shaped bytes; sanitize it the
+      // same way provider text is sanitized before it reaches the record.
+      throw new PerkinsAppError(`cannot parse pull request URL: ${sanitize(input.prUrl)}`);
     }
     const match = /^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)\/?$/u.exec(url.pathname);
     if (
       url.protocol !== 'https:' || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '' ||
       match === null || input.host !== url.host || !/^[A-Za-z0-9.-]+$/u.test(input.host)
     ) {
-      throw new PerkinsAppError(`invalid or host-mismatched GitHub pull request URL: ${input.prUrl}`);
+      throw new PerkinsAppError(`invalid or host-mismatched GitHub pull request URL: ${sanitize(input.prUrl)}`);
     }
     const owner = match[1]!;
     const repo = match[2]!;
@@ -566,19 +612,28 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     return { ...API_HEADERS, 'AUTHORIZATION': `Bearer ${token}`, 'CONTENT-TYPE': 'application/json' };
   }
 
-  private async callApi(label: string, url: string, init: AppFetchInit): Promise<{ readonly body: unknown; readonly header: (name: string) => string | null }> {
+  private async callApi(
+    label: string,
+    url: string,
+    init: AppFetchInit,
+    seam: { readonly ambiguousOutcome?: boolean } = {},
+  ): Promise<{ readonly body: unknown; readonly header: (name: string) => string | null }> {
     let response: AppFetchResponse;
     try {
       response = await this.fetchImpl(url, { redirect: 'error', ...init });
     } catch (error) {
-      if (init.method === 'POST' && url.endsWith('/reviews')) throw error;
+      // A delivery-POST failure must stay unclassified so post() can treat
+      // the outcome as unknown and reconcile against provider evidence;
+      // every other request failure is a definite setup/lookup failure and
+      // gets the named wrapper.
+      if (seam.ambiguousOutcome === true) throw error;
       throw new PerkinsAppError(`${label} request failed: ${error instanceof Error ? sanitize(error.message) : 'network error'}`);
     }
     let text = '';
     try {
       text = await response.text();
     } catch (error) {
-      if (init.method === 'POST' && url.endsWith('/reviews')) throw error;
+      if (seam.ambiguousOutcome === true) throw error;
       throw new PerkinsAppError(`${label} response could not be read: ${error instanceof Error ? sanitize(error.message) : 'unreadable body'}`);
     }
     const rawHeaders = response.headers ?? {};
@@ -731,7 +786,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     publishedBody: string,
   ): PostedReviewReceipt {
     const parsed = review as { id?: unknown; user?: { login?: unknown; type?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown } | null;
-    const reviewId = typeof parsed?.id === 'number' ? String(parsed.id) : 'unknown';
+    const reviewId = usableProviderReviewId(parsed?.id);
+    if (reviewId === null) {
+      throw new PerkinsAppError(
+        `provider review id is not usable (${parsed?.id === undefined ? 'absent' : sanitize(String(parsed?.id))}) — delivery identity is unproven`,
+      );
+    }
     const loginText = typeof parsed?.user?.login === 'string' ? parsed.user.login : '<absent>';
     const typeText = typeof parsed?.user?.type === 'string' ? parsed.user.type : '<absent>';
     if (parsed?.user?.login !== botLogin || parsed?.user?.type !== 'Bot') {
@@ -766,13 +826,18 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     };
   }
 
-  /** Parse the last page number out of a GitHub Link header, if present. */
+  /** Parse the last page number out of a GitHub Link header, if present.
+   * Only a sane integer >= 1 counts — a provider or intermediary reporting
+   * `page=0` must never be read as "zero pages remain" (which would certify
+   * full coverage it never had). */
   private parseLastPage(linkHeader: string | null): number | null {
     if (linkHeader === null) return null;
     const last = /<([^>]+)>;\s*rel="last"/u.exec(linkHeader);
     if (last === null) return null;
     const page = /[?&]page=(\d+)/u.exec(last[1]!);
-    return page === null ? null : Number(page[1]);
+    if (page === null) return null;
+    const parsed = Number(page[1]);
+    return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : null;
   }
 
   /** Bounded ambiguous-POST reconciliation (the delivery path): a bounded
@@ -829,8 +894,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
    * `notBeforeMs` bounds credit to this round's submissions when given;
    * null matches any identical publication (the idempotent recovery
    * seam). `provablyAbsent` is true ONLY when the walk provably covered
-   * the ENTIRE review list; lookup failures and malformed bodies throw —
-   * they are never absence. */
+   * the ENTIRE review list: the last-page number is tracked as the MAXIMUM
+   * any response reported, so a list that grows mid-walk can never be
+   * certified absent from a stale snapshot — lookup failures and malformed
+   * bodies throw, they are never absence. */
   private async lookupMatchingReview(
     grant: TokenGrant,
     owner: string,
@@ -847,15 +914,14 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     let sequentialEnd = false;
     for (let fetched = 0; fetched < this.maxReconciliationPages; fetched += 1) {
       visited.add(page);
-      let linkHeader: string | null = null;
       const result = await this.callApi(
         'review reconciliation',
         `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`,
         { headers: this.bearerHeaders(grant.token), signal: AbortSignal.timeout(this.probeTimeoutMs) },
       );
       const list = result.body;
-      linkHeader = result.header('link');
-      if (lastPage === null) lastPage = this.parseLastPage(linkHeader);
+      const seenLast = this.parseLastPage(result.header('link'));
+      if (seenLast !== null) lastPage = lastPage === null ? seenLast : Math.max(lastPage, seenLast);
       if (!Array.isArray(list)) {
         // Never report "searched and not found" when no usable list was read.
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
@@ -867,8 +933,11 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       }
       let next: number;
       if (lastPage !== null) {
-        // Jump to the newest page first, then walk backward through it.
-        next = page < lastPage ? lastPage : page - 1;
+        // Jump to the newest page once, then walk backward one page at a
+        // time for the rest of the window: re-checking the jump on every
+        // iteration would pin the walk to {1, last, last-1} and silently
+        // cap the covered set no matter how large the bound is.
+        next = visited.has(lastPage) || page >= lastPage ? page - 1 : lastPage;
       } else {
         // No Link header: the classic short-page end-of-list heuristic.
         if (reviews.length < 100) {
@@ -885,25 +954,43 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   }
 }
 
-/** HTTP-level provider rejection with a sanitized provider message. */
-export class PerkinsAppHttpError extends PerkinsAppError {
-  readonly providerMessage: string;
-
-  constructor(label: string, readonly status: number, readonly body: unknown, text: string) {
-    const providerBody = body as { readonly message?: unknown } | null;
-    let providerMessage = sanitize(typeof providerBody?.message === 'string' ? providerBody.message : text);
-    if (providerMessage === '') providerMessage = 'no provider message';
-    super(`${label} exited HTTP ${status}: ${providerMessage}`);
-    this.name = 'PerkinsAppHttpError';
-    this.providerMessage = providerMessage;
-  }
-}
-
 /** Options for the startup factories. `githubPosterOverride` is a TEST
  * seam: it replaces the selected github.com leg so the composite's
  * routing can be exercised without a real `gh` binary. */
 export interface StartupPosterOptions extends Omit<PerkinsAppPosterOptions, 'instanceDir'> {
   readonly githubPosterOverride?: VerdictPoster;
+}
+
+/** A malformed wiring root must fail with a named, actionable error
+ * instead of silently joining a relative path (which would probe the CWD)
+ * or leaking a raw TypeError out of service boot. */
+function requireBundleRoot(root: unknown, label: string): asserts root is string {
+  if (typeof root !== 'string' || root === '' || !isAbsolute(root)) {
+    throw new PerkinsAppError(
+      `Perkins App publication wiring requires an absolute ${label} (received: ${sanitize(String(root))}) — check the service configuration passed to the startup poster factory`,
+    );
+  }
+}
+
+/** The root the `perkins/` bundle is read from. The service instance dir
+ * (where config.toml lives) is authoritative; a relocated deployment that
+ * keeps its state under `data_dir` is honored as a fallback when the
+ * instance dir holds no bundle. Absent from both keeps the legacy poster.
+ * Documented in docs/PERKINS-APP-PUBLICATION.md. */
+export function resolvePerkinsAppBundleRoot(config: {
+  readonly instanceDir: string;
+  readonly dataDir?: string;
+}): string {
+  requireBundleRoot(config.instanceDir, 'instance directory');
+  if (config.dataDir !== undefined && config.dataDir !== '') {
+    requireBundleRoot(config.dataDir, 'data directory');
+  }
+  if (perkinsAppBundleConfigured(config.instanceDir)) return config.instanceDir;
+  const dataDir = config.dataDir;
+  if (dataDir !== undefined && dataDir !== '' && dataDir !== config.instanceDir && perkinsAppBundleConfigured(dataDir)) {
+    return dataDir;
+  }
+  return config.instanceDir;
 }
 
 /** Startup selection: an existing App bundle routes github.com publication
@@ -913,6 +1000,7 @@ export function createGithubVerdictPoster(
   instanceDir: string,
   options?: StartupPosterOptions,
 ): VerdictPoster {
+  requireBundleRoot(instanceDir, 'instance directory');
   const { githubPosterOverride, ...appOptions } = options ?? {};
   if (githubPosterOverride !== undefined) return githubPosterOverride;
   return perkinsAppBundleConfigured(instanceDir)
@@ -921,13 +1009,14 @@ export function createGithubVerdictPoster(
 }
 
 /** The one seam `main()` wires: the auto host router with the App-selected
- * github.com leg. Takes the CONFIG OBJECT (any `{ instanceDir }`), not a
- * bare path, so the property selection itself lives inside this tested
- * unit — a wrong-property or dropped-call edit at the wiring site fails
- * the selection tests instead of silently restoring the personal poster. */
+ * github.com leg. Takes the CONFIG OBJECT (any `{ instanceDir, dataDir? }`),
+ * not a bare path, so the property selection itself lives inside this
+ * tested unit; the wiring site is additionally pinned by a source assertion
+ * in the suite, so a dropped call cannot silently restore the personal
+ * poster. */
 export function createStartupVerdictPoster(
-  config: { readonly instanceDir: string },
+  config: { readonly instanceDir: string; readonly dataDir?: string },
   options?: StartupPosterOptions,
 ): AutoVerdictPoster {
-  return new AutoVerdictPoster(createGithubVerdictPoster(config.instanceDir, options));
+  return new AutoVerdictPoster(createGithubVerdictPoster(resolvePerkinsAppBundleRoot(config), options));
 }
