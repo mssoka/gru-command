@@ -794,11 +794,18 @@ describe('dispatch server (E8)', () => {
       const pending = call(h.port, 'POST', '/api/silas/rebrief', {
         job_id: 'terminal-rebrief-job', note: 'fold the rebase',
       }, TOKEN);
-      // Wait until the re-brief turn is in flight (its markers bound).
+      // Wait until the re-brief turn is in flight (its markers bound), and
+      // capture the request watermark: a guarded event after this baseline
+      // would answer the retired request.
       const deadline = Date.now() + 10_000;
       while (h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' }).length !== 2 && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
+      const markers = h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' });
+      expect(markers).toHaveLength(2);
+      const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief');
+      expect(rebriefMarker).toBeDefined();
+      const baseline = rebriefMarker?.baselineSeq ?? Number.NaN;
       // The job reaches terminal while the turn is gated (owner merged it).
       h.ledger.setJobStatus('terminal-rebrief-job', 'in-review');
       h.ledger.setJobStatus('terminal-rebrief-job', 'merged');
@@ -808,8 +815,15 @@ describe('dispatch server (E8)', () => {
       // The disposition is in-band: retired, no fabricated delivery.
       expect(field<boolean>(res.json, 'retired')).toBe(true);
       expect(field<string | null>(res.json, 'delivered_sha')).toBeNull();
-      expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief')).toBeNull();
-      expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'job.delivered')).toBeNull();
+      // No POST-BOUNDARY delivery/re-brief was fabricated for the retired
+      // request. The initial briefing turn's own `job.delivered` (source
+      // `dispatch`) legitimately predates the request watermark and is
+      // retained — history is preserved, never erased to satisfy a test.
+      const delivered = h.ledger.latestJobEvent('terminal-rebrief-job', 'job.delivered');
+      expect(delivered === null || delivered.seq <= baseline).toBe(true);
+      if (delivered !== null) expect(delivered.payload).toMatchObject({ source: 'dispatch' });
+      const rebrief = h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief');
+      expect(rebrief === null || rebrief.seq <= baseline).toBe(true);
       expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief-recovered')).toBeNull();
       // The audit is durable and the obsolete markers are gone; the lane stays terminal.
       expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief-retired')).not.toBeNull();
