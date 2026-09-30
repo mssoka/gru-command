@@ -47,6 +47,12 @@ let failNextCompact = false;
 let failNextNewChat = false;
 let compactGeneration = 0;
 let newChatGeneration = 0;
+/** Reflow stress controls (owner heist 2026-09-29, tests only): the next
+ * scripted reply runs under this tool name and/or emits this error line.
+ * Long unbroken tokens prove the chat pane never scrolls horizontally;
+ * consumed once, cleared by /__reset. */
+let stressTool: string | null = null;
+let stressError: string | null = null;
 const deferredUsers: Array<{ socket: WebSocket; frame: UserFrame }> = [];
 const chatClients = new Map<WebSocket, { writer: boolean }>();
 
@@ -113,10 +119,14 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     `Mock Gru here, boss! You said: "${userText}". ` +
     (chipLines === '' ? '' : `${chipLines}. `) +
     'The real brain plugs in when E4 lands — until then I echo with pride. 🪐';
+  const toolName = stressTool ?? 'mock-echo';
+  stressTool = null;
+  const toolError = stressError;
+  stressError = null;
   const tokens = reply.split(/(?<=\s)/); // word-sized chunks, spaces kept
 
   emit({ type: 'turn', state: 'start', seq: nextSeq() });
-  emit({ type: 'tool', name: 'mock-echo', state: 'start', seq: nextSeq() });
+  emit({ type: 'tool', name: toolName, state: 'start', seq: nextSeq() });
 
   let index = 0;
   let toolEnded = false;
@@ -128,7 +138,8 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     }
     if (index === 2 && !toolEnded) {
       toolEnded = true;
-      emit({ type: 'tool', name: 'mock-echo', state: 'end', seq: nextSeq() });
+      emit({ type: 'tool', name: toolName, state: 'end', seq: nextSeq() });
+      if (toolError !== null) emit({ type: 'error', message: toolError, seq: nextSeq() });
     }
     const chunk = tokens[index];
     if (chunk === undefined) {
@@ -155,7 +166,7 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     clearInterval(timer);
     if (!toolEnded) {
       toolEnded = true;
-      const toolEnd = record({ type: 'tool', name: 'mock-echo', state: 'end', seq: nextSeq() });
+      const toolEnd = record({ type: 'tool', name: toolName, state: 'end', seq: nextSeq() });
       broadcastFrame(toolEnd);
     }
     const turnEnd = record({ type: 'turn', state: 'end', seq: nextSeq() });
@@ -696,8 +707,10 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     return;
   }
   // Dev control plane (tests): POST /__reset clears the frame log;
-  // POST /__drop terminates every connected socket; the failure endpoints
-  // fail the next matching context control after its visible progress state.
+  // POST /__drop terminates every connected socket; POST /__stress fits
+  // the next scripted reply with a long tool name / error line (reflow
+  // evidence); the failure endpoints fail the next matching context
+  // control after its visible progress state.
   if (req.method === 'POST' && req.url === '/__compact-fail') {
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' });
@@ -731,6 +744,31 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     res.end('{"ok":true}\n');
     return;
   }
+  if (req.method === 'POST' && req.url === '/__stress') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    let body = '';
+    req.on('data', (chunk: Buffer) => {
+      body += chunk.toString('utf-8');
+    });
+    req.on('end', () => {
+      try {
+        const parsed = JSON.parse(body) as { tool?: string; error?: string };
+        stressTool = typeof parsed.tool === 'string' && parsed.tool !== '' ? parsed.tool : null;
+        stressError =
+          typeof parsed.error === 'string' && parsed.error !== '' ? parsed.error : null;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}\n');
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end('{"error":"bad stress body"}\n');
+      }
+    });
+    return;
+  }
   if (req.method === 'POST' && req.url === '/__reset') {
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' });
@@ -748,6 +786,8 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     controlState = 'idle';
     failNextCompact = false;
     failNextNewChat = false;
+    stressTool = null;
+    stressError = null;
     compactGeneration += 1;
     newChatGeneration += 1;
     deferredUsers.length = 0;

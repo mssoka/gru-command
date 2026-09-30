@@ -18,6 +18,7 @@ typecheck = "npm run typecheck"
 # plain vitest invocations, no worker/timeout flags, never the npm chain).
 residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-resident-registry.test.ts test/fix-directive.test.ts test/silas-deterministic-seam.test.ts"
 handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"
+compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 
 # Board acceptance evidence: mock browser services run under the scheduler,
 # not beside it. Keep each run's screenshots in a distinct artifact root.
