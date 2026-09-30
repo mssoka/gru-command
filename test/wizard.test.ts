@@ -234,6 +234,18 @@ describe('wizard config generation', () => {
     // operator's token instead of silently regenerating it.
     const w3 = writeWizardConfig(instanceDir, parseAnswers('{}'), home, true);
     expect(readFileSync(w3.configPath, 'utf-8')).toContain('second-token');
+    // Unprompted worker settings survive a wizard re-run alongside unrelated state.
+    const customized = readFileSync(w3.configPath, 'utf-8')
+      .replace('max_workers = 4', 'max_workers = 8')
+      .replace('max_concurrent_children = 2', 'max_concurrent_children = 6');
+    writeFileSync(w3.configPath, customized);
+    const w4 = writeWizardConfig(instanceDir, parseAnswers('{}'), home, true);
+    expect(readFileSync(w4.configPath, 'utf-8')).toContain('max_workers = 8');
+    expect(readFileSync(w4.configPath, 'utf-8')).toContain('max_concurrent_children = 6');
+    expect(loadConfig({ GRU_COMMAND_HOME: instanceDir }, home)).toMatchObject({
+      concurrency: { maxWorkers: 8 }, review: { maxConcurrentChildren: 6 },
+      auth: { token: 'second-token' },
+    });
     // The backup timestamp is filesystem-safe (no colons).
     expect(backupTimestamp()).not.toContain(':');
   });
@@ -336,8 +348,15 @@ describe('wizard CLI surface', () => {
   it('interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)', () => {
     const repoRoot = join(import.meta.dirname, '..');
     // stdin: 'ignore' = not a TTY — exactly the piped one-liner's world.
+    // GRU_COMMAND_HOME is isolated so the no-TTY guard never depends on
+    // whether an ambient instance config exists (or whether the loader
+    // accepts it): the guard must be reached on a fresh instance.
     const res = spawnSync(process.execPath, [join(repoRoot, 'dist', 'wizard', 'main.js')], {
-      env: { ...process.env, GRU_COMMAND_TEST_NO_TTY: '1' },
+      env: {
+        ...process.env,
+        GRU_COMMAND_TEST_NO_TTY: '1',
+        GRU_COMMAND_HOME: tempDir('gru-command-wizard-notty-'),
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 30_000,
     });

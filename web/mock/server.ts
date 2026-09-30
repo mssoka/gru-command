@@ -47,6 +47,12 @@ let failNextCompact = false;
 let failNextNewChat = false;
 let compactGeneration = 0;
 let newChatGeneration = 0;
+/** Reflow stress controls (owner heist 2026-09-29, tests only): the next
+ * scripted reply runs under this tool name and/or emits this error line.
+ * Long unbroken tokens prove the chat pane never scrolls horizontally;
+ * consumed once, cleared by /__reset. */
+let stressTool: string | null = null;
+let stressError: string | null = null;
 const deferredUsers: Array<{ socket: WebSocket; frame: UserFrame }> = [];
 const chatClients = new Map<WebSocket, { writer: boolean }>();
 
@@ -113,10 +119,14 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     `Mock Gru here, boss! You said: "${userText}". ` +
     (chipLines === '' ? '' : `${chipLines}. `) +
     'The real brain plugs in when E4 lands — until then I echo with pride. 🪐';
+  const toolName = stressTool ?? 'mock-echo';
+  stressTool = null;
+  const toolError = stressError;
+  stressError = null;
   const tokens = reply.split(/(?<=\s)/); // word-sized chunks, spaces kept
 
   emit({ type: 'turn', state: 'start', seq: nextSeq() });
-  emit({ type: 'tool', name: 'mock-echo', state: 'start', seq: nextSeq() });
+  emit({ type: 'tool', name: toolName, state: 'start', seq: nextSeq() });
 
   let index = 0;
   let toolEnded = false;
@@ -128,7 +138,8 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     }
     if (index === 2 && !toolEnded) {
       toolEnded = true;
-      emit({ type: 'tool', name: 'mock-echo', state: 'end', seq: nextSeq() });
+      emit({ type: 'tool', name: toolName, state: 'end', seq: nextSeq() });
+      if (toolError !== null) emit({ type: 'error', message: toolError, seq: nextSeq() });
     }
     const chunk = tokens[index];
     if (chunk === undefined) {
@@ -155,7 +166,7 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     clearInterval(timer);
     if (!toolEnded) {
       toolEnded = true;
-      const toolEnd = record({ type: 'tool', name: 'mock-echo', state: 'end', seq: nextSeq() });
+      const toolEnd = record({ type: 'tool', name: toolName, state: 'end', seq: nextSeq() });
       broadcastFrame(toolEnd);
     }
     const turnEnd = record({ type: 'turn', state: 'end', seq: nextSeq() });
@@ -343,7 +354,10 @@ function sampleSnapshot(): unknown {
     notifications: [
       { id: 'mock-n1', ts: new Date().toISOString(), kind: 'job.status', routing: 'fyi', severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
       { id: 'mock-n2', ts: new Date(Date.now() - 120_000).toISOString(), kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'Round r1 verdict', detail: 'approved', agentId: null, shownAt: new Date().toISOString(), ackedAt: new Date().toISOString(), resolvedAt: null, resolvedBy: null },
-      { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Needs-owner stops (ack re-arms supervision) ring the FOR YOU band.
+      { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Machine attention lives in the self-clearing NEEDS GRU queue.
+      { id: 'mock-n4', ts: new Date(Date.now() - 300_000).toISOString(), kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Review round demo-api-payment-fix-r1 is INCOMPLETE', detail: 'lead session aborted — the lane can be re-armed', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
     ],
     decisions: {
       enabled: true,
@@ -358,6 +372,23 @@ function sampleSnapshot(): unknown {
       generation: 1,
     },
     unackedActionRequired: 1,
+    unackedNeedsOwner: 1,
+    // FOR YOU (owner approval 2026-09-28): one evidence-bound ready PR.
+    // Generic sample data only — the readiness story is exact-head
+    // (approved round + clean + green CI at the same sha); the row's
+    // action is OPEN PR (external), never an in-app merge.
+    ownerPrs: [
+      {
+        id: 'owner-pr:demo-api-payment-fix',
+        jobId: 'demo-api-payment-fix',
+        jobTitle: 'Fix the payment retry loop',
+        repo: 'demo-api',
+        prUrl: 'https://example.invalid/pr/41',
+        sha: '5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a',
+        checkedAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+    ],
+    wakes: { count: 2, lastAt: new Date(Date.now() - 180_000).toISOString() },
     build: {
       buildRev: 'abc1234def5678abc1234def5678abc1234def56',
       buildCommittedAt: new Date(Date.now() - 5_400_000).toISOString(),
@@ -617,8 +648,10 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     return;
   }
   // Dev control plane (tests): POST /__reset clears the frame log;
-  // POST /__drop terminates every connected socket; the failure endpoints
-  // fail the next matching context control after its visible progress state.
+  // POST /__drop terminates every connected socket; POST /__stress fits
+  // the next scripted reply with a long tool name / error line (reflow
+  // evidence); the failure endpoints fail the next matching context
+  // control after its visible progress state.
   if (req.method === 'POST' && req.url === '/__compact-fail') {
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' });
@@ -652,6 +685,31 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     res.end('{"ok":true}\n');
     return;
   }
+  if (req.method === 'POST' && req.url === '/__stress') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    let body = '';
+    req.on('data', (chunk: Buffer) => {
+      body += chunk.toString('utf-8');
+    });
+    req.on('end', () => {
+      try {
+        const parsed = JSON.parse(body) as { tool?: string; error?: string };
+        stressTool = typeof parsed.tool === 'string' && parsed.tool !== '' ? parsed.tool : null;
+        stressError =
+          typeof parsed.error === 'string' && parsed.error !== '' ? parsed.error : null;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}\n');
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end('{"error":"bad stress body"}\n');
+      }
+    });
+    return;
+  }
   if (req.method === 'POST' && req.url === '/__reset') {
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' });
@@ -669,6 +727,8 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     controlState = 'idle';
     failNextCompact = false;
     failNextNewChat = false;
+    stressTool = null;
+    stressError = null;
     compactGeneration += 1;
     newChatGeneration += 1;
     deferredUsers.length = 0;

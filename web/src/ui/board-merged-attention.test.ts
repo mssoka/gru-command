@@ -125,6 +125,8 @@ function snapshot(
       generation: 0,
     },
     unackedActionRequired: 0,
+    unackedNeedsOwner: 0,
+    wakes: { count: 0, lastAt: null },
     build: null,
     silas: null,
     verify: null,
@@ -133,11 +135,15 @@ function snapshot(
 }
 
 function mountBoardDom(): void {
+  // Mirrors web/index.html's mounts, including the FOR YOU owner band and
+  // the wakes chip the BoardView constructor requires on current main.
   document.body.innerHTML = `
     <div id="chip-rail" hidden>
       <span id="board-decisions"></span>
       <span id="board-unacked" hidden></span>
+      <span id="board-wakes" hidden></span>
     </div>
+    <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
     <span id="rail-agents-count">0</span>
@@ -155,7 +161,7 @@ function bandIds(band: string): string[] {
 describe('board rendered regression — concluded jobs and stale review history', () => {
   beforeEach(mountBoardDom);
 
-  it('merged jobs with aborted latest rounds render in SETTLED/COLD, and NEEDS YOU reports calm', () => {
+  it('merged jobs with aborted latest rounds render in SETTLED/COLD, and NEEDS GRU reports calm', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -182,8 +188,9 @@ describe('board rendered regression — concluded jobs and stale review history'
       }),
     );
     expect(bandIds('needs-you')).toEqual([]);
+    // The band's calm clear copy carries current main's Gru-theme label.
     expect(document.querySelector('.board-band--needs-you .board-band__clear-text')?.textContent).toBe(
-      'nothing needs you',
+      'nothing needs Gru',
     );
     expect(bandIds('settled')).toEqual(['lane-parity-fix']);
     expect(bandIds('cold')).toEqual(['lane-audit-fix']);

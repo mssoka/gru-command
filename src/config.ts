@@ -2,6 +2,7 @@ import { lstatSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { parse, type TomlPrimitive } from 'smol-toml';
+import { parseQuietHours } from './chat/wake-policy.js';
 
 /** Roles are product-native and runtime-agnostic (SPEC ruling 15). */
 export const ROLES = ['gru', 'silas', 'minion', 'perkins', 'bob'] as const;
@@ -121,13 +122,30 @@ export interface LoggingConfig {
   readonly keep: number;
 }
 
-/** Gru awareness wake policy (dispatch briefing 2026-09-22): whether the
- * service may start a Gru turn by itself when notifications land. */
+/** Gru awareness wake policy (dispatch briefing 2026-09-22; owner ruling
+ * 2026-09-23): whether the service may start a Gru turn by itself when
+ * notifications land. */
 export const NOTIFY_WAKE_MODES = ['never', 'action-required', 'all'] as const;
 export type NotifyWakeMode = (typeof NOTIFY_WAKE_MODES)[number];
 
 export function isNotifyWakeMode(value: string): value is NotifyWakeMode {
   return (NOTIFY_WAKE_MODES as readonly string[]).includes(value);
+}
+
+/** Severity floor for a wake turn ('info' = every routed notification may
+ * wake; 'error' = only error-severity rows burn a turn). */
+export const WAKE_MIN_SEVERITIES = ['info', 'error'] as const;
+export type WakeMinSeverity = (typeof WAKE_MIN_SEVERITIES)[number];
+
+export function isWakeMinSeverity(value: string): value is WakeMinSeverity {
+  return (WAKE_MIN_SEVERITIES as readonly string[]).includes(value);
+}
+
+/** Local-time quiet window for autonomous wakes (minutes since midnight;
+ * start > end wraps midnight). `null` = quiet hours off. */
+export interface QuietHours {
+  readonly startMinute: number;
+  readonly endMinute: number;
 }
 
 /** Chat frame-log rotation (E4 replay-cost deferral — same ruling) and the
@@ -138,11 +156,28 @@ export interface ChatConfig {
   /** Rotated shards retained; replay spans shards oldest→newest. */
   readonly frameLogKeep: number;
   /** When the service may start a Gru turn on its own for awareness:
-   * 'never' (default) injects escalations + a ledger digest passively
-   * before the next turn at no turn cost by itself; 'action-required'
-   * also wakes a turn for action-required events; 'all' wakes for every
-   * notification. Each wake is a full model turn — see CONFIG.md. */
+   * 'never' injects escalations + a ledger digest passively before the
+   * next turn at no turn cost by itself; 'action-required' (default,
+   * owner ruling 2026-09-23) wakes a turn for machine-attention rows so
+   * a critical alert is acted on without the user pinging; 'all' wakes
+   * for every notification. Each wake is a full model turn — see
+   * CONFIG.md. */
   readonly notifyWake: NotifyWakeMode;
+  /** Minimum interval between autonomous wake turns (ms); candidates
+   * inside the window coalesce into ONE trailing wake. 0 disables the
+   * rate limit. */
+  readonly wakeMinIntervalMs: number;
+  /** Severity floor for a wake ('info' wakes for every routed row;
+   * 'error' only for error-severity rows). */
+  readonly wakeMinSeverity: WakeMinSeverity;
+  /** Local-time quiet window (empty/off by default). Inside it, wakes
+   * defer to the window's end. */
+  readonly wakeQuietHours: QuietHours | null;
+  /** Morning digest gap (ms): the first delivered block after this much
+   * quiet time carries a "while you were away" digest (fires, actions,
+   * merges, staged PRs) so the chief catches up without the owner
+   * relaying. 0 disables the digest. */
+  readonly morningDigestGapMs: number;
 }
 
 /** Worktree manager policy (E8; SPEC ruling 18). */
@@ -255,6 +290,21 @@ export const DEFAULT_VERIFY_CONFIG: VerifyConfig = {
   runTimeoutMs: 1_800_000,
 };
 
+export interface ConcurrencyConfig {
+  /** Live non-core worker sessions across all jobs, including idle sessions. */
+  readonly maxWorkers: number;
+}
+
+export const DEFAULT_CONCURRENCY_CONFIG: ConcurrencyConfig = { maxWorkers: 4 };
+export const DEFAULT_REVIEW_CHILDREN = 2;
+/** Explicit finite tool-batch bound; higher settings are rejected at load time
+ * (review-gated, like the max_workers >= 2 requirement: both bounds govern
+ * the review path only). */
+export const MAX_REVIEW_CHILDREN = 32;
+/** Documented finite sanity ceiling for resident workers: a typo must fail
+ * load with an actionable bound, not silently oversubscribe the host. */
+export const MAX_RESIDENT_WORKERS = 128;
+
 /** Review gate policy (Perkins primary; bmad-review fallback gate per the
  * 2026-09-20 amendment, fork-3). */
 export interface ReviewConfig {
@@ -265,6 +315,8 @@ export interface ReviewConfig {
    * pre-flight capability check. A failed pre-flight is always reported, never
    * a silent downgrade. */
   readonly enabled: boolean;
+  /** Maximum simultaneously resident lens children within the global pool. */
+  readonly maxConcurrentChildren: number;
 }
 
 export interface JevConfig {
@@ -319,6 +371,7 @@ export interface GruCommandConfig {
   readonly lessons: LessonsConfig;
   readonly silas: SilasConfig;
   readonly roll: RollConfig;
+  readonly concurrency: ConcurrencyConfig;
   readonly review: ReviewConfig;
   readonly verify: VerifyConfig;
   readonly decisions: DecisionsConfig;
@@ -442,6 +495,7 @@ const TOP_LEVEL_KEYS = [
   'lessons',
   'silas',
   'roll',
+  'concurrency',
   'review',
   'verify',
   'decisions',
@@ -537,6 +591,15 @@ function requirePositiveInt(value: unknown, file: string, field: string): number
       field,
     );
   }
+  // Integers beyond the safe range are representable but lose exactness;
+  // they are rejected with their own actionable message.
+  if (!Number.isSafeInteger(value)) {
+    throw new ConfigError(
+      `${field} exceeds the maximum safe integer (2^53 - 1); use a bounded value, got: ${String(value)}`,
+      file,
+      field,
+    );
+  }
   return value;
 }
 
@@ -568,6 +631,31 @@ function requireNotifyWakeMode(value: unknown, file: string, field: string): Not
     );
   }
   return mode;
+}
+
+function requireWakeMinSeverity(value: unknown, file: string, field: string): WakeMinSeverity {
+  const severity = requireString(value, file, field);
+  if (!isWakeMinSeverity(severity)) {
+    throw new ConfigError(
+      `unknown wake severity floor \`${severity}\` (valid: ${WAKE_MIN_SEVERITIES.join(', ')})`,
+      file,
+      field,
+    );
+  }
+  return severity;
+}
+
+/** Validate the operator's quiet-hours window. The parsing rule is stated
+ * once, in wake-policy (`parseQuietHours`), so config and policy cannot
+ * drift; a bad window refuses boot rather than silently disabling the
+ * guard. */
+function requireQuietHours(value: unknown, file: string, field: string): QuietHours | null {
+  const text = requireString(value, file, field, { allowEmpty: true });
+  try {
+    return parseQuietHours(text);
+  } catch (error) {
+    throw new ConfigError((error as Error).message, file, field);
+  }
 }
 
 function isInsideOrEqual(outer: string, inner: string): boolean {
@@ -630,13 +718,24 @@ export function loadConfig(
     restartBackoffMs: 2_000,
   };
   let logging: LoggingConfig = { maxBytes: 10_485_760, keep: 5 };
-  let chat: ChatConfig = { frameLogMaxBytes: 8_388_608, frameLogKeep: 3, notifyWake: 'never' };
+  let chat: ChatConfig = {
+    frameLogMaxBytes: 8_388_608,
+    frameLogKeep: 3,
+    // Owner ruling 2026-09-23: machine attention OPENS a turn by default;
+    // 'never' remains available for strictly passive installs.
+    notifyWake: 'action-required',
+    wakeMinIntervalMs: 300_000,
+    wakeMinSeverity: 'info',
+    wakeQuietHours: null,
+    morningDigestGapMs: 28_800_000,
+  };
   let worktrees: WorktreesConfig | null = null;
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
   let lessons: LessonsConfig = DEFAULT_LESSONS_CONFIG;
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let roll: RollConfig = DEFAULT_ROLL_CONFIG;
-  let review: ReviewConfig = { enabled: true };
+  let concurrency: ConcurrencyConfig = DEFAULT_CONCURRENCY_CONFIG;
+  let review: ReviewConfig = { enabled: true, maxConcurrentChildren: DEFAULT_REVIEW_CHILDREN };
   let verify: VerifyConfig = DEFAULT_VERIFY_CONFIG;
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
   let sourceFile: string | null = null;
@@ -851,10 +950,19 @@ export function loadConfig(
     }
     if (raw['chat'] !== undefined) {
       const table = requireTable(raw['chat'], file, 'chat');
+      const VALID = [
+        'frame_log_max_bytes',
+        'frame_log_keep',
+        'notify_wake',
+        'wake_min_interval_ms',
+        'wake_min_severity',
+        'wake_quiet_hours',
+        'morning_digest_gap_ms',
+      ];
       for (const key of Object.keys(table)) {
-        if (!['frame_log_max_bytes', 'frame_log_keep', 'notify_wake'].includes(key)) {
+        if (!VALID.includes(key)) {
           throw new ConfigError(
-            `unknown key \`${key}\` in [chat] (valid keys: frame_log_max_bytes, frame_log_keep, notify_wake)`,
+            `unknown key \`${key}\` in [chat] (valid keys: ${VALID.join(', ')})`,
             file,
             `chat.${key}`,
           );
@@ -867,6 +975,22 @@ export function loadConfig(
           table['notify_wake'] !== undefined
             ? requireNotifyWakeMode(table['notify_wake'], file, 'chat.notify_wake')
             : chat.notifyWake,
+        wakeMinIntervalMs:
+          table['wake_min_interval_ms'] !== undefined
+            ? requireNonNegativeInt(table['wake_min_interval_ms'], file, 'chat.wake_min_interval_ms')
+            : chat.wakeMinIntervalMs,
+        wakeMinSeverity:
+          table['wake_min_severity'] !== undefined
+            ? requireWakeMinSeverity(table['wake_min_severity'], file, 'chat.wake_min_severity')
+            : chat.wakeMinSeverity,
+        wakeQuietHours:
+          table['wake_quiet_hours'] !== undefined
+            ? requireQuietHours(table['wake_quiet_hours'], file, 'chat.wake_quiet_hours')
+            : chat.wakeQuietHours,
+        morningDigestGapMs:
+          table['morning_digest_gap_ms'] !== undefined
+            ? requireNonNegativeInt(table['morning_digest_gap_ms'], file, 'chat.morning_digest_gap_ms')
+            : chat.morningDigestGapMs,
       };
     }
     if (raw['worktrees'] !== undefined) {
@@ -1009,12 +1133,25 @@ export function loadConfig(
             : roll.drainTimeoutMs,
       };
     }
+    if (raw['concurrency'] !== undefined) {
+      const table = requireTable(raw['concurrency'], file, 'concurrency');
+      for (const key of Object.keys(table)) {
+        if (key !== 'max_workers') throw new ConfigError(
+          `unknown key \`${key}\` in [concurrency] (valid key: max_workers)`, file, `concurrency.${key}`,
+        );
+      }
+      concurrency = {
+        maxWorkers: table['max_workers'] !== undefined
+          ? requirePositiveInt(table['max_workers'], file, 'concurrency.max_workers')
+          : concurrency.maxWorkers,
+      };
+    }
     if (raw['review'] !== undefined) {
       const table = requireTable(raw['review'], file, 'review');
       for (const key of Object.keys(table)) {
-        if (!['enabled'].includes(key)) {
+        if (!['enabled', 'max_concurrent_children'].includes(key)) {
           throw new ConfigError(
-            `unknown key \`${key}\` in [review] (valid keys: enabled)`,
+            `unknown key \`${key}\` in [review] (valid keys: enabled, max_concurrent_children)`,
             file,
             `review.${key}`,
           );
@@ -1025,6 +1162,9 @@ export function loadConfig(
           table['enabled'] !== undefined
             ? requireBool(table['enabled'], file, 'review.enabled')
             : review.enabled,
+        maxConcurrentChildren: table['max_concurrent_children'] !== undefined
+          ? requirePositiveInt(table['max_concurrent_children'], file, 'review.max_concurrent_children')
+          : review.maxConcurrentChildren,
       };
     }
     if (raw['verify'] !== undefined) {
@@ -1061,6 +1201,16 @@ export function loadConfig(
     if (raw['decisions'] !== undefined) {
       decisions = readDecisionsConfig(raw['decisions'], file, decisions);
     }
+  }
+
+  if (concurrency.maxWorkers > MAX_RESIDENT_WORKERS) {
+    throw new ConfigError(`concurrency.max_workers must be <= ${MAX_RESIDENT_WORKERS} (documented resident sanity ceiling)`, file, 'concurrency.max_workers');
+  }
+  if (review.enabled && concurrency.maxWorkers < 2) {
+    throw new ConfigError('Perkins requires concurrency.max_workers >= 2 for a lead and child', file, 'concurrency.max_workers');
+  }
+  if (review.enabled && review.maxConcurrentChildren > MAX_REVIEW_CHILDREN) {
+    throw new ConfigError(`review.max_concurrent_children must be <= ${MAX_REVIEW_CHILDREN} (bounded lens tool batch)`, file, 'review.max_concurrent_children');
   }
 
   for (const [label, dir] of [
@@ -1120,6 +1270,7 @@ export function loadConfig(
     lessons,
     silas,
     roll,
+    concurrency,
     review,
     verify,
     decisions,

@@ -170,7 +170,13 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: WS_PROMPT, send: workspace },
         { expect: REPOS_PROMPT, send: '1' },
         { expect: BMAD_A_PROMPT, send: '' },
-        { expect: RUNTIME_PROMPT, send: '' },
+        // The runtime answer is explicit, not Enter: this test's fixture
+        // installer binds ONLY Pi (`ides: [pi]`), so the host-probe default
+        // (first installed runtime, claude-code when pi is absent) must
+        // not decide it. Enter at BMAD_A stays — that default is the
+        // behavior under test here; the all-defaults coverage lives in
+        // the separate test above.
+        { expect: RUNTIME_PROMPT, send: 'pi' },
         { expect: MODEL_PROMPT, send: '' },
         { expect: THINKING_PROMPT, send: '' },
         { expect: HOST_PROMPT, send: '' },

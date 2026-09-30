@@ -14,6 +14,11 @@ export default tseslint.config(
       'web/dist/**',
       'web/playwright-report/**',
       'web/test-results/**',
+      // Evidence-capture scripts under docs/evidence/ drive the real browser
+      // through Playwright (browser globals inside page.evaluate) and Node
+      // fetch/timers; they are archived verification artifacts, not
+      // repository source, so they are not linted.
+      'docs/evidence/**',
     ],
   },
   js.configs.recommended,

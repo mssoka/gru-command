@@ -397,17 +397,288 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(roundView?.lenses.find((chip) => chip.lens === 'edge')?.verdict).toBe('clean');
   });
 
+  it('counts whole-PR bare-lens specialist attempts (blind, blind#2) alongside legacy lens:chunk labels', () => {
+    const { api, engine } = fresh();
+    const job = api.addJob({ id: 'whole-job', repo: 'demo-repo', title: 'Whole' });
+    api.setJobStatus(job.id, 'working');
+    api.registerWorktree({
+      id: job.id,
+      kind: 'job',
+      repoPath: '/repos/demo-repo',
+      repoName: 'demo-repo',
+      path: '/worktrees/demo-repo/job-whole-job',
+      branch: 'gru/whole-job',
+      sha: 'def456base',
+      jobId: job.id,
+    });
+    const round = api.addRound({ jobId: job.id, targetRef: 'def456base' });
+    // Whole-PR specialists mint bare lens labels; retries append #attempt.
+    api.registerAgent({ id: 'sp-blind-1', role: 'perkins', label: 'blind', roundId: round.id, jobId: job.id });
+    api.registerAgent({ id: 'sp-blind-2', role: 'perkins', label: 'blind#2', roundId: round.id, jobId: job.id });
+    api.registerAgent({ id: 'sp-security-1', role: 'perkins', label: 'security', roundId: round.id, jobId: job.id });
+    api.setAgentState('sp-blind-2', 'streaming');
+    api.setLensOutcome(round.id, 'blind', 'done', 'clean — lead retained no finding sourced from this specialist');
+    api.setLensOutcome(round.id, 'security', 'done', 'not used — lead-owned whole-PR review');
+    const view = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((entry) => entry.id === job.id);
+    const roundView = view?.rounds[0];
+    expect(roundView?.lensAttempts).toEqual([
+      { lens: 'blind', attempts: 2 },
+      { lens: 'security', attempts: 1 },
+    ]);
+    // The 'lead' agent label is not a lens and never becomes an attempt.
+    api.registerAgent({ id: 'lead-1', role: 'perkins', label: 'lead', roundId: round.id, jobId: job.id });
+    const after = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((entry) => entry.id === job.id)?.rounds[0];
+    expect(after?.lensAttempts).toEqual([
+      { lens: 'blind', attempts: 2 },
+      { lens: 'security', attempts: 1 },
+    ]);
+  });
+
   it('counts unacked action-required rows from the whole table, not the feed window', () => {
     const { api, engine } = fresh();
     api.recordNotification({ id: 'n-action', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Ack me' });
     api.recordNotification({ id: 'n-fyi', kind: 'test.notice', routing: 'fyi', severity: 'info', title: 'FYI' });
     expect(engine.snapshot().unackedActionRequired).toBe(1);
-    api.ackNotification('n-action', 'web');
+    expect(() => api.ackNotification('n-action', 'web')).toThrow(/require a Gru disposition/);
+    expect(engine.snapshot().unackedActionRequired).toBe(1);
+    api.disposeMachineNotification('n-action', 'Fixed the cause');
     expect(engine.snapshot().unackedActionRequired).toBe(0);
     const resolved = api.recordNotification({ id: 'n-resolved', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Resolved' });
     expect(engine.snapshot().unackedActionRequired).toBe(1);
     api.resolveNotificationsByKindPrefix('test.', 'runtime');
     expect(api.getNotification(resolved.id)?.resolvedAt).not.toBeNull();
     expect(engine.snapshot().unackedActionRequired).toBe(0);
+  });
+
+  it('counts needs-owner rows separately (the FOR YOU band never borrows the machine queue)', () => {
+    const { api, engine } = fresh();
+    api.recordNotification({ id: 'n-machine', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Machine' });
+    api.recordNotification({ id: 'n-owner', kind: 'test.notice', routing: 'needs-owner', severity: 'error', title: 'Owner' });
+    let snapshot = engine.snapshot();
+    expect(snapshot.unackedActionRequired).toBe(1);
+    expect(snapshot.unackedNeedsOwner).toBe(1);
+    api.ackNotification('n-owner', 'web');
+    snapshot = engine.snapshot();
+    expect(snapshot.unackedActionRequired).toBe(1);
+    expect(snapshot.unackedNeedsOwner).toBe(0);
+  });
+
+  it('keeps pending owner-only stops visible despite thirty newer machine/FYI rows', () => {
+    const { api, engine } = fresh();
+    const owner = api.recordNotification({ id: 'owner-stop', kind: 'supervision.breaker', routing: 'needs-owner', severity: 'info', title: 'Owner-only re-arm' });
+    for (let i = 0; i < 35; i += 1) {
+      api.recordNotification({ id: `noise-${i}`, kind: 'noise', routing: i % 2 ? 'fyi' : 'action-required', severity: 'info', title: `Noise ${i}` });
+    }
+    const snap = engine.snapshot();
+    expect(snap.unackedNeedsOwner).toBe(1);
+    expect(snap.notifications.find((row) => row.id === owner.id)).toMatchObject({ routing: 'needs-owner', ackedAt: null });
+  });
+
+  it('keeps pending machine incidents visible beyond the recent feed while closed rows stay bounded', () => {
+    const { api, engine } = fresh();
+    api.recordNotification({ id: 'old-machine', kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Still needs Gru' });
+    for (let i = 0; i < 35; i += 1) {
+      api.recordNotification({ id: `feed-${i}`, kind: 'noise', routing: 'fyi', severity: 'info', title: `Noise ${i}` });
+    }
+    expect(engine.snapshot().notifications.find((row) => row.id === 'old-machine')).toMatchObject({ routing: 'action-required', resolvedAt: null });
+    api.disposeMachineNotification('old-machine', 'Remediated');
+    expect(engine.snapshot().notifications.some((row) => row.id === 'old-machine')).toBe(false);
+  });
+
+  it('tracks autonomous wakes from the durable gru.wake events', () => {
+    const { api, engine } = fresh();
+    expect(engine.snapshot().wakes).toEqual({ count: 0, lastAt: null });
+    api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+    const first = engine.snapshot().wakes;
+    expect(first.count).toBe(1);
+    expect(first.lastAt).not.toBeNull();
+    api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n2'], count: 1 } });
+    expect(engine.snapshot().wakes.count).toBe(2);
+  });
+});
+
+describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
+  function fresh(): { api: LedgerApi; bus: EventBus; engine: BoardEngine } {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    return { api, bus, engine: new BoardEngine({ ledger: api, bus }) };
+  }
+
+  const SHA = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
+  const PR_URL = 'https://github.com/example/demo/pull/7';
+
+  /** Stage one job exactly as the real flow would: in-review + PR + a
+   * head-bound approved round + a matching branch-state observation. */
+  function stageReadyJob(api: LedgerApi, id: string, sha: string = SHA): void {
+    const job = api.addJob({ id, repo: 'demo', title: `Heist ${id}` });
+    api.setJobPr(id, PR_URL);
+    // The legal staging path: dispatched → working → in-review (a PR on
+    // record is exactly what moves a lane into review).
+    api.setJobStatus(id, 'working');
+    api.setJobStatus(id, 'in-review');
+    const round = api.addRound({ jobId: id, targetRef: sha });
+    api.setRoundStatus(round.id, 'live');
+    api.setRoundVerdict(round.id, 'approved');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: id,
+      payload: {
+        repo: 'example/demo',
+        branch: `gru/${id}`,
+        sha,
+        merged: false,
+        pr_open: true,
+        mergeable_state: 'clean',
+        pr_number: 7,
+        pr_url: PR_URL,
+        merge_commit_sha: null,
+        ci: { sha, status: 'green', signature: '', failures: [], checks: ['ci'] },
+      },
+    });
+    void job;
+  }
+
+  it('ships one ownerPrs row for the exact-head ready job (stable id, job order)', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-b');
+    stageReadyJob(api, 'job-a');
+    const snap = engine.snapshot();
+    expect(snap.ownerPrs.map((row) => row.id)).toEqual(['owner-pr:job-a', 'owner-pr:job-b']);
+    expect(snap.ownerPrs[0]).toMatchObject({ jobId: 'job-a', prUrl: PR_URL, sha: SHA });
+  });
+
+  it('drops the row when the head moves after the approval (stale CI/verdict at the old sha)', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-moved', SHA);
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'job-moved',
+      payload: {
+        repo: 'example/demo',
+        branch: 'gru/job-moved',
+        sha: 'ffff0000aaaa1111bbbb2222cccc3333dddd4444',
+        merged: false,
+        pr_open: true,
+        // The FIXED poll writes null here: GitHub had not computed
+        // mergeability for the new head, and the old head's 'clean' no
+        // longer certifies it.
+        mergeable_state: null,
+        pr_number: 7,
+        pr_url: PR_URL,
+        merge_commit_sha: null,
+        ci: null,
+      },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('drops the row when the job takes a hold (blocked) or a newer round is changes-requested', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-hold');
+    api.setJobStatus('job-hold', 'blocked');
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+
+    stageReadyJob(api, 'job-rejected');
+    const round = api.addRound({ jobId: 'job-rejected', targetRef: SHA });
+    api.setRoundStatus(round.id, 'live');
+    api.setRoundVerdict(round.id, 'changes-requested');
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('settles the row only on confirmed merged state, never on a link click', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-merged');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'job-merged',
+      payload: {
+        repo: 'example/demo',
+        branch: 'gru/job-merged',
+        sha: SHA,
+        merged: true,
+        pr_open: false,
+        mergeable_state: 'clean',
+        pr_number: 7,
+        pr_url: PR_URL,
+        merge_commit_sha: 'abcd0000abcd0000abcd0000abcd0000abcd0000',
+        ci: { sha: SHA, status: 'green', signature: '', failures: [], checks: ['ci'] },
+      },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('FOR YOU r1: drops the row when the PR closes WITHOUT merging (close-after-ready transition)', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-closed');
+    // The PR is closed on GitHub but never merged: only the explicitly-open
+    // gate settles it now — the row must not survive on stale readiness.
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'job-closed',
+      payload: {
+        repo: 'example/demo',
+        branch: 'gru/job-closed',
+        sha: SHA,
+        merged: false,
+        pr_open: false,
+        mergeable_state: 'clean',
+        pr_number: 7,
+        pr_url: PR_URL,
+        merge_commit_sha: null,
+        ci: { sha: SHA, status: 'green', signature: '', failures: [], checks: ['ci'] },
+      },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('FOR YOU r1: a legacy branch-state event without pr_open fails closed until the poll re-observes', () => {
+    const { api, engine } = fresh();
+    // Exactly stageReadyJob but with the pre-r1 payload (no pr_open key) —
+    // an event written before this change parses to prOpen null and must
+    // not qualify; the next poll tick rewrites the cursor with the status.
+    const job = api.addJob({ id: 'job-legacy', repo: 'demo', title: 'Heist job-legacy' });
+    api.setJobPr('job-legacy', PR_URL);
+    api.setJobStatus('job-legacy', 'working');
+    api.setJobStatus('job-legacy', 'in-review');
+    const round = api.addRound({ jobId: 'job-legacy', targetRef: SHA });
+    api.setRoundStatus(round.id, 'live');
+    api.setRoundVerdict(round.id, 'approved');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'job-legacy',
+      payload: {
+        repo: 'example/demo',
+        branch: 'gru/job-legacy',
+        sha: SHA,
+        merged: false,
+        mergeable_state: 'clean',
+        pr_number: 7,
+        pr_url: PR_URL,
+        merge_commit_sha: null,
+        ci: { sha: SHA, status: 'green', signature: '', failures: [], checks: ['ci'] },
+      },
+    });
+    void job;
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('keeps an old pending owner stop AND a fresh ownerPrs row in one snapshot (distinct classes coexist)', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-ready');
+    api.recordNotification({
+      id: 'old-owner-stop',
+      kind: 'supervision.breaker',
+      routing: 'needs-owner',
+      severity: 'info',
+      title: 'Owner-only re-arm',
+    });
+    for (let i = 0; i < 35; i += 1) {
+      api.recordNotification({ id: `feed-${i}`, kind: 'noise', routing: 'fyi', severity: 'info', title: `Noise ${i}` });
+    }
+    const snap = engine.snapshot();
+    expect(snap.unackedNeedsOwner).toBe(1);
+    expect(snap.notifications.find((row) => row.id === 'old-owner-stop')).toMatchObject({ ackedAt: null });
+    expect(snap.ownerPrs.map((row) => row.jobId)).toEqual(['job-ready']);
   });
 });

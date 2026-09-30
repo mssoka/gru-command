@@ -538,7 +538,15 @@ describe('supervision / logging / chat tables (E7)', () => {
       restartBackoffMs: 2_000,
     });
     expect(config.logging).toEqual({ maxBytes: 10_485_760, keep: 5 });
-    expect(config.chat).toEqual({ frameLogMaxBytes: 8_388_608, frameLogKeep: 3, notifyWake: 'never' });
+    expect(config.chat).toEqual({
+      frameLogMaxBytes: 8_388_608,
+      frameLogKeep: 3,
+      notifyWake: 'action-required',
+      wakeMinIntervalMs: 300_000,
+      wakeMinSeverity: 'info',
+      wakeQuietHours: null,
+      morningDigestGapMs: 28_800_000,
+    });
   });
 
   it('loads explicit [supervision] / [logging] / [chat] values', () => {
@@ -559,6 +567,10 @@ describe('supervision / logging / chat tables (E7)', () => {
         'frame_log_max_bytes = 2048',
         'frame_log_keep = 2',
         'notify_wake = "action-required"',
+        'wake_min_interval_ms = 60000',
+        'wake_min_severity = "error"',
+        'wake_quiet_hours = "22:30-07:15"',
+        'morning_digest_gap_ms = 0',
         '',
       ].join('\n'),
       'utf-8',
@@ -572,7 +584,15 @@ describe('supervision / logging / chat tables (E7)', () => {
       restartBackoffMs: 250,
     });
     expect(config.logging).toEqual({ maxBytes: 1_024, keep: 1 });
-    expect(config.chat).toEqual({ frameLogMaxBytes: 2_048, frameLogKeep: 2, notifyWake: 'action-required' });
+    expect(config.chat).toEqual({
+      frameLogMaxBytes: 2_048,
+      frameLogKeep: 2,
+      notifyWake: 'action-required',
+      wakeMinIntervalMs: 60_000,
+      wakeMinSeverity: 'error',
+      wakeQuietHours: { startMinute: 22 * 60 + 30, endMinute: 7 * 60 + 15 },
+      morningDigestGapMs: 0,
+    });
   });
 
   it('fail-loud: unknown wake policies are rejected, all documented modes load', () => {
@@ -586,6 +606,26 @@ describe('supervision / logging / chat tables (E7)', () => {
       writeConfig(modeHome, `[chat]\nnotify_wake = "${mode}"\n`);
       expect(loadConfig({ GRU_COMMAND_HOME: modeHome }, '/home/tester').chat.notifyWake).toBe(mode);
     }
+  });
+
+  it('fail-loud: wake severity floor and quiet-hours window are validated', () => {
+    const badSeverity = tmpHome();
+    writeConfig(badSeverity, '[chat]\nwake_min_severity = "loud"\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: badSeverity }, '/home/tester')).toThrow(
+      /unknown wake severity floor `loud` \(valid: info, error\)/,
+    );
+    for (const window of ['22:00', '22:00-25:00', '9:00-17:00', '22:00-22:00']) {
+      const badWindow = tmpHome();
+      writeConfig(badWindow, `[chat]\nwake_quiet_hours = "${window}"\n`);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: badWindow }, '/home/tester')).toThrow(
+        /chat\.wake_quiet_hours/,
+      );
+    }
+    const off = tmpHome();
+    writeConfig(off, '[chat]\nwake_quiet_hours = ""\nwake_min_interval_ms = 0\n');
+    const config = loadConfig({ GRU_COMMAND_HOME: off }, '/home/tester');
+    expect(config.chat.wakeQuietHours).toBeNull();
+    expect(config.chat.wakeMinIntervalMs).toBe(0);
   });
 
   it('fail-loud: unknown keys and non-positive integers are rejected', () => {
@@ -602,6 +642,14 @@ describe('supervision / logging / chat tables (E7)', () => {
       writeFileSync(join(home, 'config.toml'), text, 'utf-8');
       expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(ConfigError);
     }
+  });
+
+  it('refuses the removed proactive_compact_percent key fail-loud (rollback: installed configs must drop it)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[supervision]\nproactive_compact_percent = 70\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /unknown key `proactive_compact_percent` in \[supervision\] \(valid keys: enabled, turn_silence_ms, restart_window_ms, max_restarts, restart_backoff_ms\)/,
+    );
   });
 });
 
@@ -705,6 +753,35 @@ describe('dispatch config (E8)', () => {
       const h2 = tmpHome();
       writeFileSync(join(h2, 'config.toml'), text, 'utf-8');
       expect(() => loadConfig({ GRU_COMMAND_HOME: h2 }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
+});
+
+describe('resident worker and Perkins child configuration', () => {
+  it('defaults to a shared four-worker pool with two children, and accepts overrides', () => {
+    const home = tmpHome();
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toMatchObject({
+      concurrency: { maxWorkers: 4 }, review: { enabled: true, maxConcurrentChildren: 2 },
+    });
+    writeConfig(home, '[concurrency]\nmax_workers = 2\n[review]\nmax_concurrent_children = 1\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toMatchObject({
+      concurrency: { maxWorkers: 2 }, review: { enabled: true, maxConcurrentChildren: 1 },
+    });
+  });
+
+  it('rejects invalid sizes and impossible Perkins capacity with actionable fields', () => {
+    for (const [text, field] of [
+      ['[concurrency]\nmax_workers = 0', 'concurrency.max_workers'],
+      ['[concurrency]\nmax_workers = 1', 'concurrency.max_workers'],
+      ['[concurrency]\nmax_workers = 1.5', 'concurrency.max_workers'],
+      ['[concurrency]\nother = 3', 'concurrency.other'],
+      ['[review]\nmax_concurrent_children = 0', 'review.max_concurrent_children'],
+      ['[review]\nmax_concurrent_children = 33', 'review.max_concurrent_children'],
+      ['[review]\nmax_concurrent_children = 1.5', 'review.max_concurrent_children'],
+    ] as const) {
+      const home = tmpHome();
+      writeConfig(home, `${text}\n`);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(field);
     }
   });
 });
@@ -827,5 +904,32 @@ describe('self-roll table', () => {
       writeFileSync(join(home, 'config.toml'), text, 'utf-8');
       expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(ConfigError);
     }
+  });
+});
+
+describe('resident config bounds completions (phase 2)', () => {
+  it('rejects unsafe integers with their own actionable message', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-config-unsafe-'));
+    const file = join(home, 'config.toml');
+    // 2^53 parses as a valid TOML float but is not a JS safe integer, so
+    // the schema (not the TOML parser) must reject it.
+    writeFileSync(file, '[concurrency]\nmax_workers = 9007199254740992.0\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/exceeds the maximum safe integer/);
+  });
+
+  it('caps resident workers at the documented sanity ceiling', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-config-cap-'));
+    const file = join(home, 'config.toml');
+    writeFileSync(file, '[concurrency]\nmax_workers = 500\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/max_workers must be <= 128/);
+  });
+
+  it('gates the children ceiling on review enablement, symmetric with the >= 2 rule', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-config-children-'));
+    const file = join(home, 'config.toml');
+    writeFileSync(file, '[review]\nenabled = false\nmax_concurrent_children = 64\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).not.toThrow();
+    writeFileSync(file, '[review]\nenabled = true\nmax_concurrent_children = 64\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/max_concurrent_children must be <= 32/);
   });
 });

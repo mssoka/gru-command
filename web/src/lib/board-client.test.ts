@@ -48,6 +48,8 @@ function snapshotFor(jobId: string): BoardSnapshot {
       generation: 0,
     },
     unackedActionRequired: 0,
+    unackedNeedsOwner: 0,
+    wakes: { count: 0, lastAt: null },
   };
 }
 

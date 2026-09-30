@@ -1,9 +1,11 @@
 import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { requireSpawnCwd } from '../roles.js';
 import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
+import { appendPrCreationRule, PR_CREATION_RULE } from './pr-creation.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import type { WorktreePort } from './worktree-port.js';
 
@@ -25,7 +27,7 @@ export interface DirectiveRegistry {
 
 export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
-  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent'>;
+  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent' | 'getJob'>;
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
@@ -43,18 +45,32 @@ export async function routeFixDirectiveToMinion(
   },
 ): Promise<{ delivered: boolean; minionId?: string; note?: string }> {
   const owner = input.owner ?? 'fix-directive';
-  const directive = appendLessonPointers(
-    input.directive,
-    input.lessons?.referencesFor(input.directive) ?? [],
+  // Follow-up turns carry the CURRENT creation rule too: a legacy briefing
+  // that permitted drafts must not outrank it on the live/resumed paths.
+  const directive = appendPrCreationRule(
+    appendLessonPointers(
+      input.directive,
+      input.lessons?.referencesFor(input.directive) ?? [],
+    ),
   );
   const minions = input.ledger
     .listAgents()
     .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+  let evictedSessionFile: string | null = null;
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
-      await racedPrompt(handle, directive, input.signal, owner);
-      return { delivered: true, minionId: minion.id };
+      try {
+        await racedPrompt(handle, directive, input.signal, owner);
+        return { delivered: true, minionId: minion.id };
+      } catch (error) {
+        // A resident-budget reclaim may be disposing this handle under us
+        // (typed handshake): fall through to the resume/re-brief path —
+        // remembering THIS handle's logical session — instead of dropping
+        // the directive with an opaque failure.
+        if (!(error instanceof WorkerDisposalInProgressError)) throw error;
+        evictedSessionFile = handle.sessionFile;
+      }
     }
   }
   const lane = input.worktrees
@@ -63,9 +79,32 @@ export async function routeFixDirectiveToMinion(
   if (lane === undefined) {
     return { delivered: false, note: 'no implementing minion session and no job lane' };
   }
-  const handle = await input.registry.spawn('minion', { cwd: lane.path });
+  // Prefer the CURRENT failing logical session; only when the evicted
+  // handle exposed none fall back to the newest session-bearing record —
+  // never an arbitrary older disposed minion's session.
+  const fallback = evictedSessionFile === null
+    ? ([...minions].reverse().find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
+    : null;
+  const resumeFile = evictedSessionFile ?? fallback;
+  let handle: AgentHandle;
+  let prompt = directive;
   try {
-    await racedPrompt(handle, directive, input.signal, owner);
+    handle = await input.registry.spawn('minion', {
+      cwd: lane.path, signal: input.signal,
+      ...(resumeFile !== null ? { resumeFile } : {}),
+    });
+  } catch (error) {
+    if (resumeFile === null || input.signal.aborted) throw error;
+    const job = input.ledger.getJob(input.jobId);
+    if (job == null || job.briefing == null) {
+      throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
+    }
+    handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal });
+    prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
+  }
+  try {
+    input.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: input.jobId, sessionFile: handle.sessionFile });
+    await racedPrompt(handle, prompt, input.signal, owner);
   } finally {
     await handle.dispose();
   }
@@ -97,7 +136,7 @@ export function recordFollowUpDelivery(input: {
   readonly worktrees: Pick<WorktreePort, 'listWorktrees'>;
   readonly jobId: string;
   readonly agentId: string | null;
-  readonly source: 'silas-directive' | 'silas-rebrief';
+  readonly source: 'dispatch' | 'silas-directive' | 'silas-rebrief';
 }): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null } {
   const jobLanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job');
   const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];
@@ -144,6 +183,8 @@ export function renderRebriefPrompt(input: {
     'ORIGINAL BRIEFING (still the contract):',
     input.briefing ?? '(the job row carries no stored briefing — read the job note on the board)',
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
+    '',
+    PR_CREATION_RULE,
     '',
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',

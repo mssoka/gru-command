@@ -75,6 +75,7 @@ describe('config-generate CLI', () => {
       'lessons',
       'silas',
       'roll',
+      'concurrency',
       'review',
       'verify',
     ]);
@@ -108,6 +109,10 @@ describe('config-generate CLI', () => {
     expect(loaded.dataDir).toBe(instance);
     expect(loaded.models.default).toBe('default');
     expect(loaded.thinking.default).toBe('default');
+    expect(raw.concurrency).toMatchObject({ max_workers: 4 });
+    expect(raw.review).toMatchObject({ max_concurrent_children: 2 });
+    expect(loaded.concurrency.maxWorkers).toBe(4);
+    expect(loaded.review.maxConcurrentChildren).toBe(2);
     expect(loaded.supervision).toMatchObject({
       enabled: true,
       turnSilenceMs: 900_000,
@@ -175,6 +180,52 @@ describe('config-generate CLI', () => {
     expect(text).toContain('# [runtimes.claude-code]');
   });
 
+  it('carries the [verify] scheduler teaching comments next to each key', () => {
+    // Config-as-docs for the verification scheduler (owner ask
+    // 2026-09-26): every key's comment must teach what the scheduler
+    // actually does (validated against src/verify/scheduler.ts) — the
+    // API-only scope, the worker-budget vs AI-agent distinction, and the
+    // timeout semantics — so a comment drift fails here, not in the field.
+    const root = tempDir('gru-command-config-verify-comments-');
+    const instance = join(root, 'instance');
+    const result = run(instance);
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const text = readFileSync(join(instance, 'config.toml'), 'utf-8');
+    // Section: API-only scope, cross-lane budget, NOT AI-agent counts.
+    expect(text).toContain('through POST /api/verify');
+    expect(text).toContain('across lanes/repos');
+    expect(text).toContain('does not set AI-agent/reviewer counts');
+    expect(text).toContain('not govern arbitrary commands run directly outside it');
+    // max_concurrent: simultaneous commands, FIFO, not a worker count.
+    expect(text).toContain('Maximum simultaneous verification commands; 1 serializes');
+    expect(text).toContain('Not a per-command test-worker count');
+    // worker_budget: test runners not AI agents; auto formula; split;
+    // runner-settings enforcement, not an OS quota.
+    expect(text).toContain('test-runner worker allowance across admitted runs, NOT AI');
+    expect(text).toContain('max(1, OS-available CPU parallelism - 2)');
+    expect(text).toContain('split across the effective concurrency');
+    expect(text).toContain('vitest pool env vars + GRU_VERIFY_*');
+    expect(text).toContain('not an OS CPU');
+    // lock_wait_timeout_ms: queue deadline; fails the queued request only.
+    expect(text).toContain('900000 = 15 minutes');
+    expect(text).toContain('Expiry fails that queued request loud without');
+    expect(text).toContain('starting it; the current holder is not terminated');
+    // run_timeout_ms: post-start deadline; SIGTERM group, 5s grace, SIGKILL.
+    expect(text).toContain('queue wait excluded');
+    expect(text).toContain('1800000 = 30 minutes');
+    expect(text).toContain("SIGTERMs");
+    expect(text).toContain('5-second grace');
+    expect(text).toContain('timed out / non-success');
+    // Teaching comments never change the parsed [verify] values.
+    const raw = parse(text) as { verify: Record<string, unknown> };
+    expect(raw.verify).toEqual({
+      max_concurrent: 1,
+      worker_budget: 0,
+      lock_wait_timeout_ms: 900000,
+      run_timeout_ms: 1800000,
+    });
+  });
+
   it('round trip: a --force re-run preserves user-set values and hand-tuned sections, with backup', () => {
     const root = tempDir('gru-command-config-roundtrip-');
     const instance = join(root, 'instance');
@@ -206,6 +257,10 @@ describe('config-generate CLI', () => {
       'turn_silence_ms = 600000',
       '[dispatch]',
       'bob_interval_ms = 120000',
+      '[concurrency]',
+      'max_workers = 8',
+      '[review]',
+      'max_concurrent_children = 6',
       '[worktrees]',
       `root = ${JSON.stringify(join(root, 'lanes'))}`,
     ].join('\n');
@@ -233,6 +288,8 @@ describe('config-generate CLI', () => {
     expect(claudePolicy.roles).toMatchObject({ minion: { thinking_level: 'low' } });
     expect((raw.supervision as Record<string, number>).turn_silence_ms).toBe(600000);
     expect((raw.dispatch as Record<string, number>).bob_interval_ms).toBe(120000);
+    expect(raw.concurrency).toMatchObject({ max_workers: 8 });
+    expect(raw.review).toMatchObject({ max_concurrent_children: 6 });
     expect((raw.worktrees as Record<string, string>).root).toBe(join(root, 'lanes'));
 
     // Fail-loud-clean: the round-tripped file boots through the REAL loader.
@@ -241,6 +298,8 @@ describe('config-generate CLI', () => {
     expect(loaded.server.host).toBe('192.168.1.23');
     expect(loaded.auth.token).toBe('prior-secret-token');
     expect(loaded.dispatch.bobIntervalMs).toBe(120000);
+    expect(loaded.concurrency.maxWorkers).toBe(8);
+    expect(loaded.review.maxConcurrentChildren).toBe(6);
     expect(loaded.worktrees.root).toBe(join(root, 'lanes'));
   });
 

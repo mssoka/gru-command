@@ -42,3 +42,6 @@ plain and factual.
    not this project's own, no secrets in the record.
 4. If you did not write it down, it did not happen — leave the trail in
    commits and notes.
+5. Pull requests: when the briefing authorizes one, create it ordinary
+   and non-draft from the outset — `gh pr create` without `--draft`/`-d`;
+   never a draft first, never a later conversion.

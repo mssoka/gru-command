@@ -4,22 +4,10 @@ import { existsSync, linkSync, lstatSync, mkdirSync, realpathSync, unlinkSync, w
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BranchIdleTag } from '../branch-idle.js';
 
-/** Tool-transport ceiling any frozen chunk may reach (perkins_read_chunk bound). */
-export const MAX_TRANSPORT_CHUNK_BYTES = 900 * 1024;
-
 const GIT_MAX_BUFFER = 128 * 1024 * 1024;
 export const FROZEN_DIFF_MAX_BYTES = 8 * 1024 * 1024;
 export const FROZEN_SPEC_MAX_BYTES = 256 * 1024;
 export const FROZEN_CONVENTIONS_MAX_BYTES = 256 * 1024;
-export const FROZEN_CHUNK_MAX_BYTES = 128 * 1024;
-
-export interface ReviewChunk {
-  readonly id: string;
-  readonly files: readonly string[];
-  readonly lineCount: number;
-  readonly diff: string;
-  readonly oversizeSingleFile: boolean;
-}
 
 export interface FrozenReviewInputs {
   readonly schemaVersion: 1;
@@ -35,7 +23,8 @@ export interface FrozenReviewInputs {
   readonly specSha256: string;
   readonly conventionsSha256: string;
   readonly createdAt: string;
-  readonly chunks: readonly Omit<ReviewChunk, 'diff'>[];
+  /** Changed file paths of the frozen diff (the whole-PR review unit). */
+  readonly changedFiles: readonly string[];
   /** Present only for a `force: true` arm: the branch-idle blockers the
    * override bypassed (the audit tag for a forced round). */
   readonly branchIdle?: BranchIdleTag;
@@ -52,9 +41,6 @@ export interface FreezeReviewInput {
   readonly spec?: string;
   readonly noSpec?: boolean;
   readonly now?: () => Date;
-  /** Policy-pinned chunking threshold (SPEC: the pinned policy is the
-   * operative source for review sizing). Defaults to 3000 lines. */
-  readonly chunkLineThreshold?: number;
   /** Forced-arm tag (branch-idle override) recorded in the manifest. */
   readonly branchIdle?: BranchIdleTag;
 }
@@ -65,7 +51,8 @@ export interface FrozenReview {
   readonly diff: string;
   readonly specContext: string;
   readonly projectConventions: string;
-  readonly chunks: readonly ReviewChunk[];
+  /** Changed file paths of the complete frozen diff. */
+  readonly changedFiles: readonly string[];
 }
 
 function gitRaw(repoPath: string, args: readonly string[]): string {
@@ -126,7 +113,7 @@ function ensureDirectoryWithoutSymlinks(path: string, boundary = path): string {
   const rel = relative(root, absolute);
   for (const component of rel.split(sep).filter(Boolean)) {
     cursor = join(cursor, component);
-    if (!existsSync(cursor)) mkdirSync(cursor, { mode: 0o700 });
+    if (!existsSync(cursor)) mkdirSync(cursor, { recursive: true, mode: 0o700 });
     const info = lstatSync(cursor);
     if (info.isSymbolicLink() || !info.isDirectory()) {
       throw new Error(`review artifact directory component must be a real directory: ${cursor}`);
@@ -178,206 +165,6 @@ export function reviewArtifactDirectory(artifactRoot: string, roundId: string): 
   return directory;
 }
 
-function gitHeaderToken(line: string, start: number): { readonly value: string; readonly next: number } | null {
-  let cursor = start;
-  while (line[cursor] === ' ') cursor += 1;
-  if (cursor >= line.length) return null;
-  if (line[cursor] !== '"') {
-    const end = line.indexOf(' ', cursor);
-    return { value: line.slice(cursor, end === -1 ? line.length : end), next: end === -1 ? line.length : end };
-  }
-  cursor += 1;
-  const bytes: number[] = [];
-  while (cursor < line.length) {
-    const char = line[cursor]!;
-    if (char === '"') return { value: Buffer.from(bytes).toString('utf8'), next: cursor + 1 };
-    if (char !== '\\') {
-      bytes.push(...Buffer.from(char));
-      cursor += 1;
-      continue;
-    }
-    cursor += 1;
-    const escaped = line[cursor];
-    if (escaped === undefined) return null;
-    const simple: Readonly<Record<string, number>> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
-    if (simple[escaped] !== undefined) {
-      bytes.push(simple[escaped]);
-      cursor += 1;
-      continue;
-    }
-    if (/[0-7]/.test(escaped)) {
-      const octal = line.slice(cursor).match(/^[0-7]{1,3}/)?.[0];
-      if (octal === undefined) return null;
-      bytes.push(Number.parseInt(octal, 8));
-      cursor += octal.length;
-      continue;
-    }
-    bytes.push(...Buffer.from(escaped));
-    cursor += 1;
-  }
-  return null;
-}
-
-function changedPath(block: string): string {
-  const newline = block.indexOf('\n');
-  const first = newline === -1 ? block : block.slice(0, newline);
-  if (!first.startsWith('diff --git ')) return 'unknown';
-  const remainder = first.slice('diff --git '.length);
-  // Quoted form (paths with spaces/special chars): "a/…" "b/…" — decode each.
-  if (remainder.startsWith('"')) {
-    const source = gitHeaderToken(remainder, 0);
-    if (source === null) return 'unknown';
-    const destination = gitHeaderToken(remainder, source.next + 1);
-    if (destination === null || !destination.value.startsWith('b/')) return 'unknown';
-    return destination.value.slice(2);
-  }
-  // Unquoted form: anchor on the LAST ' b/' so the destination extends to the
-  // end of the line even in the presence of unusual bytes.
-  const marker = remainder.lastIndexOf(' b/');
-  if (marker === -1) return 'unknown';
-  const destination = remainder.slice(marker + 3);
-  return destination === '' ? 'unknown' : destination;
-}
-
-function topLevel(path: string): string {
-  const slash = path.indexOf('/');
-  return slash === -1 ? '.' : path.slice(0, slash);
-}
-
-function splitFileBlocks(diff: string): readonly { path: string; block: string; lines: number }[] {
-  const starts: number[] = [];
-  const marker = /^diff --git /gm;
-  for (let match = marker.exec(diff); match !== null; match = marker.exec(diff)) starts.push(match.index);
-  if (starts.length === 0) return [];
-  return starts.map((start, index) => {
-    const raw = diff.slice(start, starts[index + 1] ?? diff.length);
-    const block = raw.endsWith('\n') ? raw : `${raw}\n`;
-    return { path: changedPath(block), block, lines: block.split('\n').length - 1 };
-  });
-}
-
-/** Deterministic directory grouping with a complete, never-truncated diff.
- * Groups respect the line threshold AND the per-chunk byte bound so an
- * ordinary mid-size diff never produces an over-bound chunk; a single file
- * whose own block exceeds the byte bound is split at hunk boundaries. */
-export function chunkUnifiedDiff(
-  diff: string,
-  threshold = 3000,
-  maxBytes = FROZEN_CHUNK_MAX_BYTES,
-): readonly ReviewChunk[] {
-  if (!Number.isSafeInteger(threshold) || threshold < 1) throw new Error('review chunk threshold must be a positive integer');
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('review chunk byte bound must be a positive integer');
-  const blocks = splitFileBlocks(diff);
-  if (blocks.length === 0) return [];
-  const totalLines = blocks.reduce((sum, block) => sum + block.lines, 0);
-  const totalBytes = blocks.reduce((sum, block) => sum + Buffer.byteLength(block.block, 'utf8'), 0);
-  if (totalLines <= threshold && totalBytes <= maxBytes) {
-    return [{
-      id: '001',
-      files: blocks.map((block) => block.path),
-      lineCount: totalLines,
-      diff: blocks.map((block) => block.block).join(''),
-      oversizeSingleFile: false,
-    }];
-  }
-  const groups = new Map<string, typeof blocks[number][]>();
-  for (const block of blocks) {
-    const key = topLevel(block.path);
-    const group = groups.get(key) ?? [];
-    group.push(block);
-    groups.set(key, group);
-  }
-
-  const pieces: { files: string[]; blocks: string[]; lines: number; oversize: boolean }[] = [];
-  for (const group of groups.values()) {
-    let current: { files: string[]; blocks: string[]; lines: number; oversize: boolean } | null = null;
-    const pushCurrent = (): void => {
-      if (current !== null) pieces.push(current);
-      current = null;
-    };
-    for (const block of group) {
-      const blockBytes = Buffer.byteLength(block.block, 'utf8');
-      if (block.lines > threshold || blockBytes > maxBytes) {
-        pushCurrent();
-        // One file over the bounds: split at hunk boundaries so every piece
-        // fits the byte bound (a single hunk larger than the bound stays
-        // oversize and is flagged).
-        for (const piece of splitBlockByHunks(block, threshold, maxBytes)) pieces.push(piece);
-        continue;
-      }
-      if (
-        current === null || current.lines + block.lines > threshold ||
-        Buffer.byteLength(current.blocks.join(''), 'utf8') + blockBytes > maxBytes
-      ) {
-        pushCurrent();
-        current = { files: [], blocks: [], lines: 0, oversize: false };
-      }
-      current.files.push(block.path);
-      current.blocks.push(block.block);
-      current.lines += block.lines;
-    }
-    pushCurrent();
-  }
-  return pieces.map((part, index) => ({
-    id: String(index + 1).padStart(3, '0'),
-    files: part.files,
-    lineCount: part.lines,
-    diff: part.blocks.join(''),
-    oversizeSingleFile: part.oversize,
-  }));
-}
-
-function splitBlockByHunks(
-  block: { path: string; block: string; lines: number },
-  threshold: number,
-  maxBytes: number,
-): { files: string[]; blocks: string[]; lines: number; oversize: boolean }[] {
-  const headerMatch = /^@@/m.exec(block.block);
-  const headerEnd = headerMatch === null ? -1 : headerMatch.index;
-  if (headerEnd === -1) {
-    return [{ files: [block.path], blocks: [block.block], lines: block.lines, oversize: true }];
-  }
-  const header = block.block.slice(0, headerEnd);
-  const body = block.block.slice(headerEnd);
-  const hunks: string[] = [];
-  const starts: number[] = [];
-  const marker = /^@@/gm;
-  for (let match = marker.exec(body); match !== null; match = marker.exec(body)) starts.push(match.index);
-  for (let i = 0; i < starts.length; i += 1) {
-    const piece = body.slice(starts[i]!, starts[i + 1] ?? body.length);
-    if (piece !== '') hunks.push(piece);
-  }
-  const pieces: { files: string[]; blocks: string[]; lines: number; oversize: boolean }[] = [];
-  let current: { blocks: string[]; lines: number; bytes: number } | null = null;
-  const flush = (): void => {
-    if (current !== null) {
-      pieces.push({
-        files: [block.path],
-        blocks: [header + current.blocks.join('')],
-        lines: current.lines,
-        oversize: false,
-      });
-    }
-    current = null;
-  };
-  for (const hunk of hunks) {
-    const hunkBytes = Buffer.byteLength(hunk, 'utf8');
-    const hunkLines = hunk.split('\n').length - 1;
-    if (hunkBytes > maxBytes || hunkLines > threshold) {
-      flush();
-      pieces.push({ files: [block.path], blocks: [header + hunk], lines: hunkLines, oversize: true });
-      continue;
-    }
-    if (current === null || current.bytes + hunkBytes > maxBytes || current.lines + hunkLines > threshold) flush();
-    if (current === null) current = { blocks: [], lines: 0, bytes: 0 };
-    current.blocks.push(hunk);
-    current.lines += hunkLines;
-    current.bytes += hunkBytes;
-  }
-  flush();
-  return pieces;
-}
-
 function assertFrozenTreeHasNoSymlinks(repoPath: string, targetSha: string): void {
   const entries = gitRaw(repoPath, ['ls-tree', '-r', '-z', targetSha, '--']).split('\0').filter(Boolean);
   for (const entry of entries) {
@@ -396,6 +183,14 @@ function assertReviewCheckoutClean(repoPath: string): void {
     const first = status.split('\0').find(Boolean)?.slice(0, 300) ?? 'unknown checkout mutation';
     throw new Error(`detached review checkout is not pristine (tracked/staged/untracked/ignored content: ${first})`);
   }
+}
+
+/** Changed file paths of the frozen delta, straight from the same frozen
+ * revisions the diff came from (rename-aware destination names). */
+function changedFilePaths(repoPath: string, diffBaseSha: string, targetSha: string): readonly string[] {
+  return gitRaw(repoPath, ['diff', '--no-ext-diff', '--no-color', '--find-renames', '--name-only', '-z', diffBaseSha, targetSha, '--'])
+    .split('\0')
+    .filter(Boolean);
 }
 
 function conventionPaths(changedFiles: readonly string[], tracked: ReadonlySet<string>): readonly string[] {
@@ -444,7 +239,7 @@ function readConventions(repoPath: string, targetSha: string, changedFiles: read
   return parts.length === 0 ? 'No repository convention file was supplied.' : `${parts.join('\n\n')}\n`;
 }
 
-export function assertFrozenPromptBounds(review: Pick<FrozenReview, 'diff' | 'specContext' | 'projectConventions' | 'chunks'>): void {
+export function assertFrozenPromptBounds(review: Pick<FrozenReview, 'diff' | 'specContext' | 'projectConventions'>): void {
   const diffBytes = Buffer.byteLength(review.diff, 'utf8');
   if (diffBytes > FROZEN_DIFF_MAX_BYTES) {
     throw new Error(`frozen diff exceeds ${FROZEN_DIFF_MAX_BYTES} UTF-8 bytes`);
@@ -456,23 +251,6 @@ export function assertFrozenPromptBounds(review: Pick<FrozenReview, 'diff' | 'sp
   const conventionBytes = Buffer.byteLength(review.projectConventions, 'utf8');
   if (conventionBytes > FROZEN_CONVENTIONS_MAX_BYTES) {
     throw new Error(`frozen project conventions exceed ${FROZEN_CONVENTIONS_MAX_BYTES} UTF-8 bytes`);
-  }
-  for (const chunk of review.chunks) {
-    const chunkBytes = Buffer.byteLength(chunk.diff, 'utf8');
-    // Oversize single-hunk chunks are flagged by the splitter: they exceed
-    // the per-chunk prompt target but must stay under the tool transport
-    // bound or the review would be unreadable end-to-end.
-    // Oversize single-hunk chunks are bounded by their JSON-SERIALIZED size
-    // (perkins_read_chunk returns JSON.stringify(chunk), whose escaping can
-    // inflate bytes ~2x), not the raw byte count.
-    if (chunk.oversizeSingleFile) {
-      const serialized = Buffer.byteLength(JSON.stringify(chunk.diff), 'utf8');
-      if (serialized > MAX_TRANSPORT_CHUNK_BYTES) {
-        throw new Error(`frozen chunk ${chunk.id} exceeds ${MAX_TRANSPORT_CHUNK_BYTES} serialized bytes`);
-      }
-    } else if (chunkBytes > FROZEN_CHUNK_MAX_BYTES) {
-      throw new Error(`frozen chunk ${chunk.id} exceeds ${FROZEN_CHUNK_MAX_BYTES} UTF-8 bytes`);
-    }
   }
 }
 
@@ -499,19 +277,19 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
     targetSha,
     '--',
   ]);
-  const chunks = chunkUnifiedDiff(diff, input.chunkLineThreshold ?? 3_000);
-  if (chunks.length === 0) throw new Error(`frozen review diff is empty for ${diffBaseSha}..${targetSha}`);
+  const changedFiles = changedFilePaths(input.repoPath, diffBaseSha, targetSha);
+  if (changedFiles.length === 0) throw new Error(`frozen review diff is empty for ${diffBaseSha}..${targetSha}`);
 
   const specContext = input.noSpec === true ? 'EXPLICIT NO-SPEC REVIEW' : input.spec!.trimEnd();
   const specBytes = `${specContext}\n`;
-  const projectConventions = readConventions(input.repoPath, targetSha, chunks.flatMap((chunk) => chunk.files));
-  assertFrozenPromptBounds({ diff, specContext, projectConventions, chunks });
+  const projectConventions = readConventions(input.repoPath, targetSha, changedFiles);
+  assertFrozenPromptBounds({ diff, specContext, projectConventions });
   const directory = reviewArtifactDirectory(input.artifactRoot, input.roundId);
   ensureDirectoryWithoutSymlinks(directory);
   atomicWrite(join(directory, 'diff.patch'), diff, directory);
   atomicWrite(join(directory, 'spec-context.md'), specBytes, directory);
   atomicWrite(join(directory, 'project-conventions.md'), projectConventions, directory);
-  for (const chunk of chunks) atomicWrite(join(directory, 'chunks', `${chunk.id}.patch`), chunk.diff, directory);
+  atomicWrite(join(directory, 'changed-files.json'), `${JSON.stringify(changedFiles, null, 2)}\n`, directory);
 
   const manifest: FrozenReviewInputs = {
     schemaVersion: 1,
@@ -527,11 +305,11 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
     specSha256: hash(specBytes),
     conventionsSha256: hash(projectConventions),
     createdAt: (input.now ?? (() => new Date()))().toISOString(),
-    chunks: chunks.map(({ diff: _diff, ...chunk }) => chunk),
+    changedFiles,
     ...(input.branchIdle !== undefined ? { branchIdle: input.branchIdle } : {}),
   };
   atomicWrite(join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, directory);
-  return { directory, manifest, diff, specContext, projectConventions, chunks };
+  return { directory, manifest, diff, specContext, projectConventions, changedFiles };
 }
 
 export function baseMovedSinceFreeze(review: FrozenReview): boolean {

@@ -40,6 +40,13 @@ async function sendAndWaitReply(page: Page, text: string): Promise<void> {
 test('pair, send, streamed reply with tool line', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'build me a rocket');
+  // Clean-chat clause: the tool line sits in a collapsed service band —
+  // one tap reveals the machinery.
+  const toolBand = page.locator('.service-band', {
+    has: page.locator('.tool-line', { hasText: 'mock-echo' }),
+  });
+  await expect(toolBand).toHaveCount(1);
+  await toolBand.locator('.service-band__head').click();
   await expect(page.locator('.tool-line', { hasText: 'mock-echo' })).toBeVisible();
 });
 
@@ -178,6 +185,7 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
   await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(1);
+  // Ephemeral UI note (not a frame): stays directly visible, never banded.
   await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
 
   const compactFailure = await page.request.post('http://localhost:8788/__compact-fail', {
@@ -187,6 +195,13 @@ test('context controls compact in place and New chat advances a reload-safe empt
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Compacting context…');
+  // Failed controls are durable service machinery (r2 53): the notice
+  // bands — expand the band head to reveal it, never an ephemeral note.
+  const compactFailBand = page.locator('.service-band', {
+    has: page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
+  });
+  await expect(compactFailBand.locator('.service-band__head')).toBeVisible();
+  await compactFailBand.locator('.service-band__head').click();
   await expect(
     page.locator('.notice-line', { hasText: 'compact context failed: mock native compact failed' }),
   ).toBeVisible();
@@ -223,10 +238,14 @@ test('failed New chat restores history and delivers a word typed in the pending 
   await expect(page.locator('#chat-view')).toBeVisible();
   await expect(page.locator('.msg--user', { hasText: 'word typed during failed reset' })).toHaveCount(1);
 
-  // The failed reset surfaces on reconnect: the notice lands and history is
-  // restored EXACTLY once. (The transient empty view between reload and the
-  // inferred failure is not deterministically observable — this lane asserts
-  // the end state, not a racing intermediate frame.)
+  // The failed reset surfaces on reconnect; reveal the service notice and
+  // assert that the restored history is present exactly once.
+  await page
+    .locator('.service-band', {
+      has: page.locator('.notice-line', { hasText: 'New chat did not complete before reconnect' }),
+    })
+    .locator('.service-band__head')
+    .click();
   await expect(
     page.locator('.notice-line', { hasText: 'New chat did not complete before reconnect' }),
   ).toBeVisible();
@@ -359,7 +378,7 @@ test('mock controls reject missing/wrong tokens without state changes and valid 
   await pair(page);
   await sendAndWaitReply(page, 'control-state-survives');
 
-  for (const route of ['__pulse', '__drop', '__reset', '__compact-fail', '__new-chat-fail']) {
+  for (const route of ['__pulse', '__drop', '__reset', '__stress', '__compact-fail', '__new-chat-fail']) {
     const missing = await page.request.post(`http://localhost:8788/${route}`);
     expect(missing.status(), `${route} missing token`).toBe(401);
     const wrong = await page.request.post(`http://localhost:8788/${route}`, {
@@ -438,12 +457,47 @@ test('socket drop shows a degraded banner that clears on recovery', async ({ pag
 });
 
 test.describe('board (E6, mock feed)', () => {
+  test('FOR YOU owner band renders the pending owner obligations above the job bands', async ({ page }) => {
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const band = page.locator('#board-owner');
+    await expect(band).toBeVisible();
+    await expect(band.locator('.board-band__label')).toHaveText('FOR YOU');
+    // The mock owes two owner actions: one unacked needs-owner stop and
+    // one evidence-bound ready PR — the count is owed actions, not rows.
+    await expect(band.locator('.board-band__count')).toHaveText('2 pending');
+    // The owner stop carries its Ack control and the honest scope copy.
+    const stop = band.locator('.board-owner__row', { hasText: 'Crash-loop breaker tripped' });
+    await expect(stop).toBeVisible();
+    await expect(stop.locator('.board-owner__ack')).toHaveText('Ack');
+    await expect(stop).toContainText('does NOT clear code/test/review holds');
+    // The ready PR row: exact-head reason + OPEN PR as an external link
+    // (never an in-app merge button).
+    const pr = band.locator('.board-owner__row--pr', { hasText: 'Fix the payment retry loop' });
+    await expect(pr).toBeVisible();
+    await expect(pr).toContainText('ready for you');
+    await expect(pr).toContainText('CI green');
+    const open = pr.locator('.board-owner__open');
+    await expect(open).toHaveText('OPEN PR ↗');
+    await expect(open).toHaveAttribute('href', 'https://example.invalid/pr/41');
+    await expect(open).toHaveAttribute('target', '_blank');
+    // Machine attention stays OUT of the owner band (NEEDS GRU owns it).
+    await expect(band).not.toContainText('Review round demo-api-payment-fix-r1 is INCOMPLETE');
+  });
+
   test('dense rows collapse by default; expanding reveals the round lens chips', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
-    // v4 bands lead the board; rows group under sticky band separators.
-    await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS YOU');
+    // v6.1 ruling 1: the Chat/Board segmented toggle is GONE — chat is
+    // always docked on desktop, the FAB owns mobile. Absence is pinned,
+    // not implied (a restored toggle must fail here).
+    await expect(page.locator('#tab-chat')).toHaveCount(0);
+    await expect(page.locator('#tab-board')).toHaveCount(0);
+    await expect(page.locator('.command-bar__tabs')).toHaveCount(0);
+    // FOR YOU (owner approval 2026-09-28) leads the board — the permanent
+    // owner-action band — then the v4 job bands; rows group under sticky
+    // band separators.
+    await expect(page.locator('.board-band__label').first()).toHaveText('FOR YOU');
     await expect(
       page.locator('.board-band--needs-you .board-job', { hasText: 'Merge main into the retry branch' }),
     ).toBeVisible();
@@ -456,10 +510,12 @@ test.describe('board (E6, mock feed)', () => {
     // Line 1 carries the status dot + chip; line 2 the repo/branch/ages.
     await expect(job.locator('.board-job__dot')).toBeVisible();
     await expect(job.locator('.board-job__branch')).toContainText('gru/demo-api-payment-fix');
-    // The one compact signal carries the live round + the unacked notice.
+    // The one compact signal carries this job's live round; the mock's
+    // unbound machine notification stays in the global NEEDS GRU tracker.
     const signal = job.locator('.board-job__signal');
     await expect(signal).toContainText('live');
-    await expect(signal).toContainText('action-required');
+    await expect(signal).toContainText('1 blocker');
+    await expect(page.locator('#board-unacked')).toContainText('needs Gru');
 
     // Expand the row, then the round row: all 7 lens chips appear.
     await job.locator('.board-job__toggle').click();
@@ -480,7 +536,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('v6: the chip rail carries the v4 health row + folded KPI counts, bands stay ordered', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
 
     // The global rail replaces the old KPI strip + health row: seven chips.
@@ -515,13 +570,21 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('.rail-chip[data-chip="verify"]')).toContainText('lock free');
     await expect(page.locator('.rail-chip[data-chip="cure"] .rail-chip__value')).toHaveText('n/a');
 
-    // Bands in priority order, headers sticky separators with counts.
-    await expect(page.locator('.board-band__label')).toHaveText(['NEEDS YOU', 'IN FLIGHT', 'SETTLED', 'COLD']);
+    // Bands in priority order, headers sticky separators with counts: the
+    // permanent FOR YOU owner band first (owner approval 2026-09-28), then
+    // the unchanged v4 job-band order.
+    await expect(page.locator('.board-band__label')).toHaveText([
+      'FOR YOU',
+      'NEEDS GRU',
+      'IN FLIGHT',
+      'SETTLED',
+      'COLD',
+    ]);
     const bandSticky = await page
       .locator('.board-band--in-flight .board-band__head')
       .evaluate((node) => getComputedStyle(node).position);
     expect(bandSticky).toBe('sticky');
-    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('12 jobs');
+    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('12 heists');
     // The stalled working lane sank to COLD carrying the stale flag.
     const stalled = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
     await expect(stalled).toBeVisible();
@@ -530,7 +593,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('row disclosure persists per job across a reload (v3)', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     const job = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
     await expect(job).toHaveAttribute('data-expanded', 'false');
 
@@ -548,21 +610,18 @@ test.describe('board (E6, mock feed)', () => {
 
     // Reload: the expanded job comes back expanded (per-job localStorage).
     await page.reload();
-    await page.locator('#tab-board').click();
     await expect(job).toHaveAttribute('data-expanded', 'true');
 
     // Collapse it again; the next reload comes back collapsed.
     await job.locator('.board-job__toggle').click();
     await expect(job).toHaveAttribute('data-expanded', 'false');
     await page.reload();
-    await page.locator('#tab-board').click();
     await expect(job).toHaveAttribute('data-expanded', 'false');
     await expect(job.locator('.board-job__body')).toHaveCount(0);
   });
 
   test('trackers: lane strip, round progress, decisions + unacked, disposed collapse', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     await expect(page.locator('#board-view')).toBeVisible();
 
     // The lane strip lives in the expanded detail (v2 surface, v3 default).
@@ -572,8 +631,8 @@ test.describe('board (E6, mock feed)', () => {
     await expect(lane).toBeVisible();
     await expect(lane.locator('.board-lane__branch')).toContainText('gru/demo-api-payment-fix');
     await expect(lane.locator('.board-lane__base')).toContainText('abc1234');
-    await expect(lane.locator('.board-lane__age')).toContainText('lane');
-    await expect(lane.locator('.board-lane__activity')).toContainText('agent');
+    await expect(lane.locator('.board-lane__age')).toContainText('heist');
+    await expect(lane.locator('.board-lane__activity')).toContainText('minion');
 
     // Round header: lens count, blockers, elapsed; chips behind the row.
     const round = card.locator('.board-round__toggle');
@@ -588,8 +647,15 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('#board-decisions')).toContainText('Jev: READY');
     await expect(page.locator('#board-unacked')).toBeVisible();
 
-    // Disposed rows collapse by default behind the toggle on the AGENTS tab.
+    // Disposed rows collapse by default behind the toggle on the CREW tab.
     const rail = page.locator('#board-agents');
+    // v6.1 ruling 2: the rail tab renders CREW (n) — pinned against the
+    // real DOM, not a test fixture (vgap r3). The button's markup carries
+    // source whitespace, so assert on the normalized text.
+    await expect
+      .poll(async () => (await page.locator('#rail-tab-agents').textContent())?.trim() ?? '')
+      .toMatch(/^CREW \(\d+\)$/);
+    await expect(page.locator('.agents-rail__tabs')).toHaveAttribute('aria-label', 'Crew and transcripts');
     await expect(rail.locator('.board-agent--disposed')).toHaveCount(0);
     const toggle = rail.locator('.board-agent-toggle');
     await expect(toggle).toContainText('1 disposed');
@@ -601,7 +667,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('trackers render in dark theme and on a narrow phone viewport', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     const card = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
     await card.locator('.board-job__toggle').click();
     await expect(card.locator('.board-lane')).toBeVisible();
@@ -623,7 +688,6 @@ test.describe('board (E6, mock feed)', () => {
 
   test('transcript drawer: mock transcript lists, opens, searches', async ({ page }) => {
     await pair(page);
-    await page.locator('#tab-board').click();
     // Transcripts live behind the rail's TRANSCRIPTS tab (v6).
     await page.locator('#rail-tab-transcripts').click();
     const row = page.locator('#board-transcripts .board-agent', { hasText: 'gru' }).first();
@@ -676,7 +740,6 @@ test.describe('cockpit layout (v6)', () => {
 
     // Reload: the user's widths come back (poll through the 180ms grid tween).
     await page.reload();
-    await page.locator('#tab-board').click();
     await expect
       .poll(async () => Math.abs((await page.locator('#chat-main-mount').boundingBox())!.width - widened.width))
       .toBeLessThanOrEqual(2);
@@ -770,6 +833,146 @@ test.describe('cockpit layout (v6)', () => {
   });
 });
 
+test.describe('chat pane reflow (owner heist)', () => {
+  /** Long enough to overflow any pane width if it did not wrap. */
+  const LONG_TOKEN = 'x'.repeat(180);
+  const LONG_CODE = `const token = "${'q'.repeat(140)}";`;
+  const LONG_TABLE = [
+    '| endpoint | method | description |',
+    '| --- | --- | --- |',
+    `| /api/${'p'.repeat(90)} | POST | ${'w'.repeat(90)} |`,
+  ].join('\n');
+
+  /** The pane, the log and every block that once scrolled internally must
+   * fit their own boxes — AND no element may escape the log's clip edge
+   * (wrapping, never clipping). */
+  async function assertChatReflows(page: Page, label: string): Promise<void> {
+    const facts = await page.evaluate(() => {
+      const log = document.getElementById('chat-log') as HTMLElement;
+      const pane = document.getElementById('chat-view') as HTMLElement;
+      const sheet = document.getElementById('chat-sheet') as HTMLElement;
+      const logRect = log.getBoundingClientRect();
+      const clipped: string[] = [];
+      const scrollers: string[] = [];
+      for (const el of log.querySelectorAll(
+        '.md-code, .md-table, .tool-line, .notice-line, .msg',
+      )) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.right > logRect.right + 1) {
+          clipped.push(`${el.className || el.tagName} +${Math.round(rect.right - logRect.right)}px`);
+        }
+        if (el.scrollWidth > el.clientWidth + 1) {
+          scrollers.push(`${el.className || el.tagName} ${el.scrollWidth}>${el.clientWidth}`);
+        }
+      }
+      return {
+        logSW: log.scrollWidth,
+        logCW: log.clientWidth,
+        paneSW: pane.scrollWidth,
+        paneCW: pane.clientWidth,
+        sheetOpen: sheet.dataset.open === 'true' && sheet.contains(pane),
+        sheetSW: sheet.scrollWidth,
+        sheetCW: sheet.clientWidth,
+        clipped,
+        scrollers,
+      };
+    });
+    expect(facts.logSW, `${label}: #chat-log scrolls horizontally`).toBeLessThanOrEqual(facts.logCW);
+    expect(facts.paneSW, `${label}: #chat-view scrolls horizontally`).toBeLessThanOrEqual(facts.paneCW);
+    if (facts.sheetOpen) {
+      expect(facts.sheetSW, `${label}: #chat-sheet scrolls horizontally`).toBeLessThanOrEqual(
+        facts.sheetCW,
+      );
+    }
+    expect(facts.clipped, `${label}: content escapes the log`).toEqual([]);
+    expect(facts.scrollers, `${label}: blocks scroll internally`).toEqual([]);
+  }
+
+  async function sendStress(page: Page, text: string, marker: string): Promise<void> {
+    await page.locator('#chat-input').fill(text);
+    await page.locator('#chat-send').click();
+    const reply = page.locator('.msg--gru', { hasText: marker }).last();
+    await expect(reply).toBeVisible();
+    await expect(reply).not.toHaveClass(/msg--streaming/);
+  }
+
+  /** ONE reply carrying every shape that used to overflow the pane: an
+   * unbroken token, a fenced code line, a wide table — plus the mock's dev
+   * stress control fitting the tool + error line with unbreakable tokens
+   * (the log-level overflow this heist fixes). */
+  async function sendStressReply(page: Page): Promise<void> {
+    const stress = await page.request.post('http://localhost:8788/__stress', {
+      headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+      data: { tool: `mcp__${'x'.repeat(90)}`, error: `failed: /opt/minion/${'y'.repeat(90)}` },
+    });
+    expect(stress.ok()).toBe(true);
+    await sendStress(
+      page,
+      `reflow-all ${LONG_TOKEN}\n\n\`\`\`\n${LONG_CODE}\n\`\`\`\n\n${LONG_TABLE}\n\ntail after table`,
+      'reflow-all',
+    );
+    await expect(page.locator('.tool-line', { hasText: 'mcp__' })).toBeVisible();
+    await expect(page.locator('.tool-line', { hasText: 'failed:' })).toBeVisible();
+  }
+
+  test('stress content reflows at floor/default/ceiling through a live drag, light and dark', async ({ page }) => {
+    const reset = await page.request.post('http://localhost:8788/__reset', {
+      headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+    });
+    expect(reset.ok()).toBe(true);
+
+    // 1920px keeps floor/default/ceiling distinct: 420 / ~30% / 640.
+    await page.setViewportSize({ width: 1920, height: 1000 });
+    await pair(page);
+    await sendStressReply(page);
+    await assertChatReflows(page, '1920 default pane');
+    const defaultWidth = (await page.locator('#chat-main-mount').boundingBox())!.width;
+
+    // ONE live drag: floor first, ceiling second, asserting mid-gesture.
+    // The floor move stays INSIDE the viewport — a pointer moved off-screen
+    // delivers no further pointermove events to the page.
+    const handle = page.locator('#splitter-chat');
+    const box = (await handle.boundingBox())!;
+    await page.mouse.move(box.x + 2, box.y + 120);
+    await page.mouse.down();
+    await page.mouse.move(box.x + 2 - 400, box.y + 120, { steps: 8 });
+    await expect
+      .poll(async () => (await page.locator('#chat-main-mount').boundingBox())!.width)
+      .toBeLessThan(defaultWidth - 100);
+    await assertChatReflows(page, 'live drag at the floor');
+    await page.mouse.move(box.x + 2 + 600, box.y + 120, { steps: 8 });
+    await expect
+      .poll(async () => (await page.locator('#chat-main-mount').boundingBox())!.width)
+      .toBeGreaterThan(defaultWidth + 60);
+    await assertChatReflows(page, 'live drag at the ceiling');
+    await page.mouse.up();
+
+    // Dark theme keeps the same wrap contract.
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    await assertChatReflows(page, 'dark theme, wide pane');
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).not.toHaveClass(/dark/);
+  });
+
+  test('stress content reflows inside the tablet drawer and the phone sheet', async ({ page }) => {
+    const reset = await page.request.post('http://localhost:8788/__reset', {
+      headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+    });
+    expect(reset.ok()).toBe(true);
+
+    await page.setViewportSize({ width: 1000, height: 800 });
+    await pair(page);
+    await page.locator('#gru-fab').click();
+    await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
+    await sendStressReply(page);
+    await assertChatReflows(page, '1000px overlay drawer');
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await assertChatReflows(page, '390px bottom sheet');
+  });
+});
+
 test.describe('themes', () => {
   // Hermetic snapshots: reset the mock log so prior tests' history
   // cannot leak into the frame.
@@ -820,7 +1023,7 @@ test.describe('phone chrome', () => {
     expect(box!.x + box!.width, `${selector} right edge on screen`).toBeLessThanOrEqual(vw);
   }
 
-  const CHROME_CONTROLS = ['#tab-chat', '#tab-board', '#theme-toggle', '#settings-toggle'];
+  const CHROME_CONTROLS = ['#theme-toggle', '#settings-toggle', '#sound-toggle'];
 
   /** Top-anchored overlays must clear the nav, whatever its wrapped
    * height: kills any mutation of --phone-nav-clearance to less than the

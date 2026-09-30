@@ -1,8 +1,9 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
+import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
@@ -14,8 +15,10 @@ import {
   type BranchIdlePhase,
 } from './branch-idle.js';
 import type { AgentSpawner } from './service.js';
-import type { CanonicalReviewVerdict, LensEnvelope, VerifiedFinding } from './perkins-review/types.js';
-import { CoverageExhaustedError, PerkinsHybridReview, type PerkinsHybridResult } from './perkins-review/hybrid.js';
+import type { EventBus } from '../events/bus.js';
+import type { ResidentReviewRound } from '../runtime/registry.js';
+import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
+import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
 import {
   freezeReviewInputs,
@@ -53,13 +56,12 @@ import {
 
 export const FALLBACK_REVIEW_TIMEOUT_MS = 15 * 60 * 1_000;
 
-/** The agent-rail label for one Perkins lens child. First attempts mint
- * the classic `${lens}:${chunk}`; a RETRY suffixes the wave's attempt
- * counter (`blind:001#2`) so two attempts on one chunk can never collide
- * into duplicate agent rows and transcript labels. */
-export function lensAgentLabel(lens: string, chunk: string, attempt: number): string {
-  const base = `${lens}:${chunk}`;
-  return attempt > 1 ? `${base}#${attempt}` : base;
+/** The agent-rail label for one Perkins specialist child. First attempts
+ * mint the plain lens name; a RETRY suffixes the attempt counter
+ * (`blind#2`) so two attempts on one lens can never collide into duplicate
+ * agent rows and transcript labels. */
+export function lensAgentLabel(lens: string, attempt: number): string {
+  return attempt > 1 ? `${lens}#${attempt}` : lens;
 }
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -86,6 +88,130 @@ export function redactReviewForPublication(body: string): string {
   return patterns.reduce((text, pattern) => text.replace(pattern, redaction), body);
 }
 
+/** Publication kinds the appendix can describe truthfully. The wording
+ * follows the PR/MR URL FORM (pull/N vs merge_requests/N), which is the
+ * provider family the posting adapter enacts; credential routing stays
+ * with the stricter isGitHubRemote/isGitLabRemote checks. */
+export type PublicationProviderKind = 'github' | 'gitlab' | 'unknown';
+
+export function publicationProviderKindFor(prUrl: string | null): PublicationProviderKind {
+  if (prUrl === null) return 'unknown';
+  try {
+    const url = new URL(prUrl.trim());
+    if (isGitHubRemote(url.host) || /^\/[^/]+\/[^/]+\/pull\/\d+\/?$/u.test(url.pathname)) return 'github';
+    if (isGitLabRemote(url.host) || /\/-\/merge_requests\/\d+\/?$/u.test(url.pathname)) return 'gitlab';
+  } catch {
+    // An unparsable URL never gets a provider-specific publication claim.
+  }
+  return 'unknown';
+}
+
+/** Render one untrusted string as ONE sanitized inline-code span (T9):
+ * newlines/control characters are collapsed (an embedded heading or list
+ * item can never start a line), backticks are neutralized so the span
+ * cannot be escaped, and overlong values are visibly truncated. */
+function renderUntrustedInline(value: string, maxChars = 240): string {
+  const single = value
+    .split('')
+    .map((character) => (character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127 ? ' ' : character))
+    .join('')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .replace(/`+/gu, "'");
+  if (single === '') return '(unspecified)';
+  return single.length > maxChars ? `${single.slice(0, maxChars)}…[truncated]` : single;
+}
+
+/** Compact host-owned factual appendix for the published body: retained
+ * findings and execution facts (specialists ran/failed/not-used, prior
+ * dispositions) assembled deterministically from the structured result, so
+ * PR readers receive the real outcome regardless of the lead's prose. No
+ * model transcription is involved; substantive judgment stays with the
+ * reviewer. EVERY retained finding is listed (R8): there is no silent
+ * first-50 cutoff — a body that cannot fit fails publication explicitly
+ * before it is posted. */
+export function hostDisclosureAppendix(
+  review: {
+    readonly findings: ReadonlyArray<{ readonly severity: string; readonly title: string; readonly location: string; readonly source: string }>;
+    readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string; readonly findingsDelivered?: boolean; readonly cleanupRecordingError?: string }>;
+    readonly priorDispositions: ReadonlyArray<{ readonly status: string }>;
+  },
+  provider: PublicationProviderKind = 'github',
+): string {
+  const counts = new Map<string, number>();
+  for (const finding of review.findings) counts.set(finding.severity, (counts.get(finding.severity) ?? 0) + 1);
+  const severityLine = ['blocker', 'warning', 'note']
+    .filter((severity) => (counts.get(severity) ?? 0) > 0)
+    .map((severity) => `${counts.get(severity)} ${severity}`)
+    .join(', ');
+  const findingsLines = review.findings.length === 0
+    ? ['- none retained']
+    : review.findings.map((finding) =>
+        `- [${finding.severity}] \`${renderUntrustedInline(finding.title)}\` — \`${renderUntrustedInline(finding.location)}\` (source: ${renderUntrustedInline(finding.source, 40)})`);
+  const byLens = new Map<string, { valid: number; failed: number; undelivered: boolean; cleanupGap: boolean }>();
+  for (const run of review.specialistRuns) {
+    const entry = byLens.get(run.lens) ?? { valid: 0, failed: 0, undelivered: false, cleanupGap: false };
+    if (run.status === 'valid') entry.valid += 1;
+    else entry.failed += 1;
+    if (run.findingsDelivered === false) entry.undelivered = true;
+    if (run.cleanupRecordingError !== undefined) entry.cleanupGap = true;
+    byLens.set(run.lens, entry);
+  }
+  const ran = [...byLens.entries()].sort(([left], [right]) => left.localeCompare(right));
+  const failed = ran.filter(([, entry]) => entry.failed > 0);
+  const undelivered = ran.filter(([, entry]) => entry.undelivered);
+  const cleanupGaps = ran.filter(([, entry]) => entry.cleanupGap);
+  const notUsed = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests']
+    .filter((lens) => !byLens.has(lens));
+  const prior = review.priorDispositions;
+  const priorFixed = prior.filter((disposition) => disposition.status === 'fixed').length;
+  const priorStill = prior.length - priorFixed;
+  const publicationLine = provider === 'github'
+    ? 'Publication: authenticated COMMENT review on the reviewed commit by the service posting account; the substantive verdict is the independent review judgment recorded in this report, not a formal GitHub APPROVED/CHANGES_REQUESTED event.'
+    : provider === 'gitlab'
+      ? 'Publication: GitLab merge-request note by the service posting account — GitLab notes are not server-side commit-bound, so delivery is verified against the frozen head at post time; the substantive verdict is the independent review judgment recorded in this report, not a formal GitLab approval event.'
+      : 'Publication: provider publication by the service posting account; the substantive verdict is the independent review judgment recorded in this report, not a formal provider approval event.';
+  return [
+    '---',
+    '',
+    '## Execution and findings (host-recorded facts)',
+    '',
+    `- Retained findings: ${review.findings.length}${severityLine === '' ? '' : ` (${severityLine})`}`,
+    ...findingsLines,
+    `- Specialists run: ${ran.length === 0 ? 'none (lead-owned whole-change review)' : ran.map(([lens, entry]) => `${lens}${entry.failed > 0 ? ` (attempts: ${entry.valid} valid, ${entry.failed} failed)` : ''}`).join(', ')}`,
+    ...(failed.length > 0 ? [`- Failed specialist attempts: ${failed.map(([lens, entry]) => `${lens} ×${entry.failed}`).join(', ')} — the lead judged the change on its own whole-change verification`] : []),
+    ...(undelivered.length > 0 ? [`- Specialist findings were NOT delivered to the lead: ${undelivered.map(([lens]) => lens).join(', ')} — those runs completed but the transport response failed, so the lead judged without their findings`] : []),
+    ...(cleanupGaps.length > 0 ? [`- Specialist cleanup failures that could not be recorded durably: ${cleanupGaps.map(([lens]) => lens).join(', ')}`] : []),
+    ...(notUsed.length > 0 ? [`- Lenses not used this round: ${notUsed.join(', ')}`]: []),
+    ...(prior.length > 0 ? [`- Prior findings revisited: ${prior.length} (${priorFixed} fixed, ${priorStill} still present)`] : []),
+    publicationLine,
+  ].join('\n');
+}
+
+/** Conservative provider review-body bound (GitHub's is 65,536 characters;
+ * the margin absorbs transport growth). A body over this bound is NEVER
+ * silently trimmed: publication fails explicitly with complete local
+ * evidence instead (R8). */
+export const PUBLICATION_BODY_MAX_BYTES = 60_000;
+
+/** Assemble the exact publication body (report + host appendix) and refuse
+ * one that cannot carry the complete disclosure: the caller preserves the
+ * complete retained-finding evidence locally and fails loudly. */
+export function publicationBodyFor(
+  reportText: string,
+  review: Parameters<typeof hostDisclosureAppendix>[0],
+  provider: PublicationProviderKind,
+): string {
+  const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider)}\n`;
+  if (Buffer.byteLength(body, 'utf8') > PUBLICATION_BODY_MAX_BYTES) {
+    throw new Error(
+      `publication body (${Buffer.byteLength(body, 'utf8')} bytes) exceeds the provider review-body limit (${PUBLICATION_BODY_MAX_BYTES} bytes); ` +
+      'complete retained-finding evidence is preserved locally — refusing to publish a partial disclosure',
+    );
+  }
+  return body;
+}
+
 type ReviewLensResult =
   | { readonly state: 'done'; readonly verdict: 'blocker' | 'warning' | 'note' | 'clean'; readonly evidence: string }
   | { readonly state: 'error'; readonly note: string };
@@ -101,30 +227,325 @@ export interface PrIdentity {
   readonly baseSha: string;
 }
 
+/** Provider-verified proof that ONE review was actually published: parsed
+ * from the provider's own response (never from a bare CLI exit), bound to
+ * the exact published body digest and — where the provider records one —
+ * the commit the review is attached to. The reviewer's transport is an
+ * authenticated COMMENT on the operator's account; `event` and `actor`
+ * expose exactly what the provider enacted so nothing downstream can claim
+ * a formal APPROVED/CHANGES_REQUESTED GitHub event that never happened. */
+export interface PostedReviewReceipt extends PrIdentity {
+  /** Provider review/note id (non-empty). */
+  readonly reviewId: string;
+  /** Provider account that authored the publication (non-empty). */
+  readonly actor: string;
+  /** Provider review event actually enacted (e.g. 'COMMENTED', 'note'). */
+  readonly event: string;
+  /** Provider-recorded commit binding when the provider records one. */
+  readonly commitId: string | null;
+  /** sha256 of the exact published body, UTF-8. */
+  readonly bodySha256: string;
+}
+
+export interface VerdictPosterInput {
+  readonly prUrl: string;
+  readonly host: string;
+  readonly repoPath: string;
+  readonly body: string;
+  readonly targetSha: string;
+  readonly baseSha: string;
+}
+
 export interface VerdictPoster {
-  post(input: {
-    readonly prUrl: string;
-    readonly host: string;
-    readonly repoPath: string;
-    readonly body: string;
-    readonly targetSha: string;
-    readonly baseSha: string;
-  }): Promise<PrIdentity>;
+  post(input: VerdictPosterInput): Promise<PostedReviewReceipt>;
+  /** Idempotent reconciliation for an ambiguous post (e.g. a timeout after
+   * the provider may have committed): find an already-published review for
+   * this exact head whose body digest matches, or return null. Never
+   * creates anything. Optional: a poster without provider lookup leaves an
+   * ambiguous failure honestly unposted. */
+  reconcile?(input: VerdictPosterInput): Promise<PostedReviewReceipt | null>;
+}
+
+/** Bounded pagination for ambiguous-delivery lookups (R4): both providers
+ * page past the first hundred; an exhausted bound is an UNRESOLVED error,
+ * never proof of absence or permission for a second POST. */
+const MAX_RECONCILE_PAGES = 10;
+
+function receiptDigest(body: string): string {
+  return createHash('sha256').update(body, 'utf8').digest('hex');
+}
+
+/** The exact `round.posted` payload the production writer appends (see
+ * recordDelivery). ONE shared shape for writer and restart-recovery reader
+ * (R2/R21): the reader can never be more permissive than the writer. */
+export interface PostedEventPayload {
+  readonly verdict: RoundVerdict;
+  readonly canonicalVerdict: CanonicalReviewVerdict;
+  readonly url: string;
+  readonly host: string;
+  readonly targetSha: string;
+  readonly baseSha: string;
+  readonly publicationFile: string;
+  readonly publicationSha256: string;
+  readonly receipt: PostedReviewReceipt;
+  readonly reconciled: boolean;
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+/** Strict, THROW-FREE parse of a `round.posted` payload (R1): a null
+ * receipt, mistyped fields or a non-object all return null so one corrupt
+ * row can never crash startup recovery; the round simply stays
+ * interrupted. */
+export function parsePostedEventPayload(payload: unknown): PostedEventPayload | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
+  const value = payload as Record<string, unknown>;
+  const verdict = value['verdict'];
+  const canonicalVerdict = value['canonicalVerdict'];
+  const url = value['url'];
+  const host = value['host'];
+  const targetSha = value['targetSha'];
+  const baseSha = value['baseSha'];
+  const publicationFile = value['publicationFile'];
+  const publicationSha256 = value['publicationSha256'];
+  const reconciled = value['reconciled'];
+  const receiptValue = value['receipt'];
+  if (verdict !== 'approved' && verdict !== 'changes-requested') return null;
+  if (typeof canonicalVerdict !== 'string') return null;
+  // The ledger verdict and the recorded canonical verdict must agree — a
+  // posted event claiming approval beside a NEEDS CHANGES review is not a
+  // coherent writer product.
+  if (verdict === 'approved' ? canonicalVerdict !== 'READY TO MERGE' : !['NEEDS CHANGES', 'MAJOR REWORK NEEDED'].includes(canonicalVerdict)) {
+    return null;
+  }
+  if (!nonEmptyString(url) || !nonEmptyString(host) || !nonEmptyString(targetSha) || !nonEmptyString(baseSha)) return null;
+  if (!nonEmptyString(publicationFile) || !nonEmptyString(publicationSha256)) return null;
+  if (typeof reconciled !== 'boolean') return null;
+  if (typeof receiptValue !== 'object' || receiptValue === null || Array.isArray(receiptValue)) return null;
+  const receipt = receiptValue as Record<string, unknown>;
+  if (
+    !nonEmptyString(receipt['reviewId']) || (receipt['reviewId'] as string).length > 200 ||
+    !nonEmptyString(receipt['actor']) || (receipt['actor'] as string).length > 200 ||
+    !nonEmptyString(receipt['event']) || (receipt['event'] as string).length > 64 ||
+    !nonEmptyString(receipt['headSha']) || !nonEmptyString(receipt['baseSha']) ||
+    !nonEmptyString(receipt['bodySha256'])
+  ) return null;
+  const commitId = receipt['commitId'];
+  if (commitId !== null && !nonEmptyString(commitId)) return null;
+  return {
+    verdict,
+    canonicalVerdict: canonicalVerdict as CanonicalReviewVerdict,
+    url,
+    host,
+    targetSha,
+    baseSha,
+    publicationFile,
+    publicationSha256,
+    reconciled,
+    receipt: {
+      reviewId: receipt['reviewId'], actor: receipt['actor'], event: receipt['event'],
+      commitId: commitId as string | null, headSha: receipt['headSha'], baseSha: receipt['baseSha'],
+      bodySha256: receipt['bodySha256'],
+    },
+  };
+}
+
+/** Host-side binding of a provider receipt before anything is recorded as
+ * delivered: the receipt must name the reviewed commit, carry the digest of
+ * the exact published body, and identify the provider review/actor/event. A
+ * zero-exit post whose response fails any of this is NOT a delivery. */
+export function verifyPostedReceipt(
+  receipt: PostedReviewReceipt,
+  expected: { readonly targetSha: string; readonly bodySha256: string },
+): PostedReviewReceipt {
+  if (receipt.headSha !== expected.targetSha) {
+    throw new Error(
+      `provider receipt head ${receipt.headSha || 'unknown'} does not match the reviewed commit ${expected.targetSha} — delivery not recorded`,
+    );
+  }
+  if (receipt.commitId !== null && receipt.commitId !== expected.targetSha) {
+    throw new Error(
+      `provider receipt is bound to commit ${receipt.commitId}, not the reviewed commit ${expected.targetSha} — delivery not recorded`,
+    );
+  }
+  if (receipt.bodySha256 !== expected.bodySha256) {
+    throw new Error('provider receipt body digest does not match the published body — delivery not recorded');
+  }
+  if (receipt.reviewId.trim() === '' || receipt.reviewId.length > 200) {
+    throw new Error('provider receipt is missing a review id — delivery not recorded');
+  }
+  if (receipt.actor.trim() === '' || receipt.event.trim() === '') {
+    throw new Error('provider receipt is missing the posting actor or event — delivery not recorded');
+  }
+  return receipt;
 }
 
 /** GitHub poster using a commit-bound pull-request review, not an unbound
  * comment. The API's commit_id makes a head race rejectable server-side. */
 export class GhPrPoster implements VerdictPoster {
+  /** Login per host: one poster instance may serve several GitHub hosts,
+   * each authenticating a different account. */
+  private readonly authenticatedLogins = new Map<string, string>();
+
   constructor(private readonly binary = 'gh') {}
 
-  async post(input: {
-    readonly prUrl: string;
-    readonly host: string;
-    readonly repoPath: string;
-    readonly body: string;
-    readonly targetSha: string;
-    readonly baseSha: string;
-  }): Promise<PrIdentity> {
+  /** The account gh actually authenticates as on this host — the ONLY
+   * identity a receipt's actor may match (R5). Resolved once per poster
+   * instance; no account is hard-coded and no new credential path exists. */
+  private resolveAuthenticatedLogin(host: string): string {
+    const cached = this.authenticatedLogins.get(host);
+    if (cached !== undefined) return cached;
+    const who = spawnSync(
+      this.binary,
+      ['api', '--hostname', host, 'user', '--jq', '.login'],
+      { encoding: 'utf8', timeout: 15_000 },
+    );
+    if (who.error !== undefined || who.status !== 0) {
+      throw new Error(`cannot resolve the authenticated gh account on ${host} (${String(who.error ?? who.stderr).trim().slice(0, 200)}) — delivery not recorded`);
+    }
+    const login = (who.stdout ?? '').trim();
+    if (login === '') throw new Error(`gh authenticated account on ${host} is unknown — delivery not recorded`);
+    this.authenticatedLogins.set(host, login);
+    return login;
+  }
+
+  /** Provider review ids are integers (or provider-quoted strings); a null
+   * or otherwise unusable id must never be stringified into a receipt
+   * (R13). */
+  private static reviewIdOf(id: unknown): string {
+    if (typeof id === 'number' && Number.isSafeInteger(id)) return String(id);
+    if (typeof id === 'string' && id.trim() !== '') return id;
+    return '';
+  }
+
+  async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
+    const { apiPath, observedHead, observedBase } = this.githubPrIdentity(input);
+    const result = spawnSync(
+      this.binary,
+      ['api', '--hostname', input.host, '--method', 'POST', `${apiPath}/reviews`, '--input', '-'],
+      {
+        input: `${JSON.stringify({ body: input.body, event: 'COMMENT', commit_id: input.targetSha })}\n`,
+        encoding: 'utf8',
+        timeout: 30_000,
+      },
+    );
+    if (result.error !== undefined) {
+      throw new Error(`gh is unavailable (${String(result.error)}) — SHA-bound review not delivered`);
+    }
+    if (result.status !== 0) {
+      throw new Error(`gh api review delivery exited ${result.status}: ${(result.stderr ?? '').trim().slice(0, 500)}`);
+    }
+    // The receipt is the provider's own review object, never the CLI exit:
+    // id, actor, enacted event, bound commit and echoed body are each
+    // verified against what this delivery claimed to publish.
+    let created: { id?: unknown; user?: { login?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown };
+    try {
+      created = JSON.parse((result.stdout ?? '').trim()) as typeof created;
+    } catch {
+      throw new Error('gh api review delivery returned no parsable review receipt — delivery not recorded');
+    }
+    const reviewId = GhPrPoster.reviewIdOf(created.id);
+    const actor = typeof created.user?.login === 'string' ? created.user.login : '';
+    const event = typeof created.state === 'string' ? created.state : '';
+    // The provider must have enacted the requested COMMENT review — a
+    // response carrying any other state is not the delivery we asked for
+    // (R6), and the receipt's author must be the authenticated posting
+    // account, never somebody else's review (R5).
+    if (event !== 'COMMENTED') {
+      throw new Error(`provider enacted review state ${event === '' ? '(none)' : event} instead of COMMENTED — delivery not recorded`);
+    }
+    const authenticatedLogin = this.resolveAuthenticatedLogin(input.host);
+    if (actor.toLowerCase() !== authenticatedLogin.toLowerCase()) {
+      throw new Error(`provider receipt actor ${actor === '' ? '(none)' : actor} is not the authenticated posting account ${authenticatedLogin} — delivery not recorded`);
+    }
+    // A GitHub pull-request review MUST name the commit it is bound to: a
+    // response without a usable commit_id is not a SHA-bound receipt, no
+    // matter what else it carries (T5).
+    if (typeof created.commit_id !== 'string' || created.commit_id.trim() === '') {
+      throw new Error('provider receipt is missing the GitHub commit binding (commit_id) — delivery not recorded');
+    }
+    const commitId = created.commit_id;
+    const echoedBody = typeof created.body === 'string' ? created.body : null;
+    if (echoedBody === null || receiptDigest(echoedBody) !== receiptDigest(input.body)) {
+      throw new Error('provider receipt body does not match the published body — delivery not recorded');
+    }
+    return verifyPostedReceipt(
+      { reviewId, actor, event, commitId, headSha: observedHead, baseSha: observedBase, bodySha256: receiptDigest(echoedBody) },
+      { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+    );
+  }
+
+  /** Ambiguous-post reconciliation: find an existing provider review bound
+   * to the frozen head whose body is byte-identical to ours, authored by
+   * the authenticated account in the enacted COMMENTED state. Read-only,
+   * paged past the first hundred under an explicit bound — an exhausted
+   * bound is UNRESOLVED, never proof of absence or permission to repost
+   * (R4). */
+  async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
+    const { apiPath, observedHead, observedBase } = this.githubPrIdentity(input);
+    const authenticatedLogin = this.resolveAuthenticatedLogin(input.host);
+    const reviews: Array<{ id?: unknown; user?: { login?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown }> = [];
+    for (let page = 1; page <= MAX_RECONCILE_PAGES; page += 1) {
+      const listed = spawnSync(
+        this.binary,
+        ['api', '--hostname', input.host, `${apiPath}/reviews?per_page=100&page=${page}`],
+        { encoding: 'utf8', timeout: 30_000 },
+      );
+      if (listed.error !== undefined || listed.status !== 0) {
+        throw new Error(`gh api review reconciliation query failed (${(listed.stderr ?? String(listed.error ?? '')).trim().slice(0, 300)})`);
+      }
+      let pageReviews: ReadonlyArray<{ id?: unknown; user?: { login?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown }>;
+      try {
+        const parsed = JSON.parse((listed.stdout ?? '').trim()) as unknown;
+        if (!Array.isArray(parsed)) throw new Error('not an array');
+        pageReviews = parsed as typeof pageReviews;
+      } catch {
+        throw new Error('gh api review reconciliation response was not a review list');
+      }
+      reviews.push(...pageReviews);
+      if (pageReviews.length < 100) break;
+      if (page === MAX_RECONCILE_PAGES) {
+        throw new Error(
+          `GitHub review reconciliation exceeded the ${MAX_RECONCILE_PAGES}-page lookup bound without exhausting the review list; delivery stays unresolved — verify manually before any retry, never assume absence`,
+        );
+      }
+    }
+    const matches = reviews.filter((review) =>
+      review.commit_id === input.targetSha &&
+      typeof review.body === 'string' && receiptDigest(review.body) === receiptDigest(input.body) &&
+      typeof review.user?.login === 'string' && review.user.login.toLowerCase() === authenticatedLogin.toLowerCase() &&
+      review.state === 'COMMENTED');
+    if (matches.length === 0) return null;
+    const found = matches[matches.length - 1]!;
+    // The filter already demands commit equality; keep the construction
+    // honest too — a review without a usable string commit_id is never
+    // turned into a bound receipt (T5).
+    if (typeof found.commit_id !== 'string' || found.commit_id.trim() === '') return null;
+    return verifyPostedReceipt(
+      {
+        reviewId: GhPrPoster.reviewIdOf(found.id),
+        actor: typeof found.user?.login === 'string' ? found.user.login : '',
+        event: typeof found.state === 'string' ? found.state : '',
+        commitId: typeof found.commit_id === 'string' ? found.commit_id : null,
+        headSha: observedHead,
+        baseSha: observedBase,
+        bodySha256: receiptDigest(input.body),
+      },
+      { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+    );
+  }
+
+  /** URL/origin checks plus the live pre-POST PR identity probe. Only HEAD
+   * equality gates delivery: the PR's recorded base (pinned at open/link
+   * time) is expected to trail the frozen base as main moves; the frozen
+   * diff is immutable, so a stale recorded base is never a refusal. */
+  private githubPrIdentity(input: VerdictPosterInput): {
+    readonly apiPath: string;
+    readonly observedHead: string;
+    readonly observedBase: string;
+  } {
     let url: URL;
     try {
       url = new URL(input.prUrl.trim());
@@ -134,7 +555,7 @@ export class GhPrPoster implements VerdictPoster {
     const match = /^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)\/?$/u.exec(url.pathname);
     if (
       url.protocol !== 'https:' || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '' ||
-      match === null || input.host !== url.host || !/^[A-Za-z0-9.-]+(?::\d+)?$/u.test(input.host)
+      match === null || input.host !== url.host || !/^[A-Za-z0-9.-]+(?::\d+)?$/.test(input.host)
     ) {
       throw new Error(`invalid or host-mismatched GitHub pull request URL: ${input.prUrl}`);
     }
@@ -152,7 +573,7 @@ export class GhPrPoster implements VerdictPoster {
     const identity = spawnSync(
       this.binary,
       ['api', '--hostname', input.host, apiPath, '--jq', '[.head.sha,.base.sha] | @tsv'],
-      { encoding: 'utf-8', timeout: 30_000 },
+      { encoding: 'utf8', timeout: 30_000 },
     );
     if (identity.error !== undefined) {
       throw new Error(`gh is unavailable (${String(identity.error)}) — review not delivered`);
@@ -161,32 +582,13 @@ export class GhPrPoster implements VerdictPoster {
       throw new Error(`gh api pull identity exited ${identity.status}: ${(identity.stderr ?? '').trim().slice(0, 500)}`);
     }
     const [observedHead = '', observedBase = ''] = (identity.stdout ?? '').trim().split('\t');
-    // Only HEAD equality gates delivery. The PR's recorded base (GitHub
-    // pins `.base.sha` at open/link time) is expected to trail the round's
-    // frozen base as main moves during a long round; the frozen diff is
-    // immutable, so a stale recorded base is never a refusal reason.
     if (observedHead !== input.targetSha) {
       throw new Error(
         `pull request identity moved before delivery (expected head ${input.targetSha}, ` +
         `got ${observedHead || 'unknown'})`,
       );
     }
-    const result = spawnSync(
-      this.binary,
-      ['api', '--hostname', input.host, '--method', 'POST', `${apiPath}/reviews`, '--input', '-'],
-      {
-        input: `${JSON.stringify({ body: input.body, event: 'COMMENT', commit_id: input.targetSha })}\n`,
-        encoding: 'utf-8',
-        timeout: 30_000,
-      },
-    );
-    if (result.error !== undefined) {
-      throw new Error(`gh is unavailable (${String(result.error)}) — SHA-bound review not delivered`);
-    }
-    if (result.status !== 0) {
-      throw new Error(`gh api review delivery exited ${result.status}: ${(result.stderr ?? '').trim().slice(0, 500)}`);
-    }
-    return { headSha: observedHead, baseSha: observedBase };
+    return { apiPath, observedHead, observedBase };
   }
 }
 
@@ -204,6 +606,9 @@ export class GitLabMrPoster implements VerdictPoster {
   private readonly tokenResolver: () => string | undefined;
   private readonly fetchImpl: (input: string, init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
   private readonly gitBinary: string;
+  /** Username per host: one poster instance may serve several GitLab
+   * hosts, each with its own token and account. */
+  private readonly authenticatedUsers = new Map<string, string>();
 
   constructor(options: GitLabMrPosterOptions = {}) {
     this.token = options.token;
@@ -212,14 +617,141 @@ export class GitLabMrPoster implements VerdictPoster {
     this.gitBinary = options.gitBinary ?? 'git';
   }
 
-  async post(input: {
-    readonly prUrl: string;
-    readonly host: string;
-    readonly repoPath: string;
-    readonly body: string;
-    readonly targetSha: string;
-    readonly baseSha: string;
-  }): Promise<PrIdentity> {
+  /** The account the PRIVATE-TOKEN authenticates as on this host — the only
+   * author whose notes this service may claim (R5). Resolved once per
+   * poster instance through the SAME token, no new credential path. */
+  private async resolveAuthenticatedUser(host: string, headers: { readonly 'PRIVATE-TOKEN': string; readonly 'CONTENT-TYPE': string }): Promise<string> {
+    const cached = this.authenticatedUsers.get(host);
+    if (cached !== undefined) return cached;
+    let response: Awaited<ReturnType<typeof this.fetchImpl>>;
+    try {
+      response = await this.fetchImpl(`https://${host}/api/v4/user`, { headers, signal: AbortSignal.timeout(15_000) });
+    } catch (error) {
+      throw new Error(`GitLab authenticated-account probe failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!response.ok) {
+      throw new Error(`GitLab authenticated-account probe exited HTTP ${response.status} — delivery stays unresolved`);
+    }
+    let user: { username?: unknown };
+    try {
+      user = JSON.parse((await response.text()).slice(0, 1024 * 1024)) as typeof user;
+    } catch {
+      throw new Error('GitLab authenticated-account response was not valid JSON');
+    }
+    const username = typeof user.username === 'string' ? user.username.trim() : '';
+    if (username === '') throw new Error('GitLab token authenticates no named account — delivery stays unresolved');
+    this.authenticatedUsers.set(host, username);
+    return username;
+  }
+
+  async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
+    const { mrUrl, headers } = await this.gitLabIdentity(input);
+    // Resolve the token's account BEFORE creating anything (V1/R5): the
+    // note's echoed author must match it, and an unnamed account refuses
+    // delivery before a note exists.
+    const author = await this.resolveAuthenticatedUser(input.host, headers);
+    let noteResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
+    try {
+      noteResponse = await this.fetchImpl(`${mrUrl}/notes`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ body: input.body }),
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (error) {
+      throw new Error(`GitLab note delivery failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!noteResponse.ok) {
+      throw new Error(`GitLab note delivery exited HTTP ${noteResponse.status}: ${(await noteResponse.text()).slice(0, 300)}`);
+    }
+    // The receipt is the provider's own note object: id, author and the
+    // echoed body are verified against what this delivery published.
+    let created: { id?: unknown; body?: unknown; author?: { username?: unknown } };
+    try {
+      created = JSON.parse((await noteResponse.text()).slice(0, 4 * 1024 * 1024)) as typeof created;
+    } catch {
+      throw new Error('GitLab note delivery returned no parsable note receipt — delivery not recorded');
+    }
+    const reviewId = created.id !== undefined ? String(created.id) : '';
+    const actor = typeof created.author?.username === 'string' ? created.author.username : '';
+    const echoedBody = typeof created.body === 'string' ? created.body : null;
+    if (echoedBody === null || receiptDigest(echoedBody) !== receiptDigest(input.body)) {
+      throw new Error('provider receipt body does not match the published body — delivery not recorded');
+    }
+    if (actor.toLowerCase() !== author.toLowerCase()) {
+      throw new Error(`provider receipt actor ${actor === '' ? '(none)' : actor} is not the authenticated posting account ${author} — delivery not recorded`);
+    }
+    const confirmed = await this.confirmHead(mrUrl, headers, input.targetSha);
+    // GitLab notes are not commit-bound server-side; the post-delivery head
+    // re-probe IS the binding, and the refresh record carries whatever base
+    // the MR now reports so a moving main never refuses a proven head.
+    return verifyPostedReceipt(
+      {
+        reviewId, actor, event: 'note', commitId: null,
+        headSha: confirmed.headSha, baseSha: confirmed.baseSha,
+        bodySha256: receiptDigest(echoedBody),
+      },
+      { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+    );
+  }
+
+  /** Ambiguous-post reconciliation FAILS CLOSED (R3/T7): GitLab notes
+   * carry no server-side commit binding, so a body-matching note — even by
+   * the authenticated author, even on the MR's current head — proves
+   * neither the head it was created on nor the attempt that created it.
+   * A historical match can therefore NEVER become a delivered receipt;
+   * only exhaustive pagination with zero authored matches is an honest
+   * `null` (nothing was posted). No new correlation protocol exists. */
+  async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
+    const { mrUrl, headers } = await this.gitLabIdentity(input);
+    const author = await this.resolveAuthenticatedUser(input.host, headers);
+    const matches: ReadonlyArray<{ body?: unknown }> = [];
+    for (let page = 1; page <= MAX_RECONCILE_PAGES; page += 1) {
+      let listResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
+      try {
+        listResponse = await this.fetchImpl(`${mrUrl}/notes?per_page=100&page=${page}`, {
+          headers,
+          signal: AbortSignal.timeout(15_000),
+        });
+      } catch (error) {
+        throw new Error(`GitLab note reconciliation query failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (!listResponse.ok) {
+        throw new Error(`GitLab note reconciliation exited HTTP ${listResponse.status} — cannot verify delivery`);
+      }
+      let notes: ReadonlyArray<{ id?: unknown; body?: unknown; author?: { username?: unknown } }>;
+      try {
+        const parsed = JSON.parse((await listResponse.text()).slice(0, 8 * 1024 * 1024)) as unknown;
+        if (!Array.isArray(parsed)) throw new Error('not an array');
+        notes = parsed as typeof notes;
+      } catch {
+        throw new Error('GitLab note reconciliation response was not a note list');
+      }
+      const pageMatches = notes.filter((note) =>
+        typeof note.body === 'string' && receiptDigest(note.body) === receiptDigest(input.body) &&
+        typeof note.author?.username === 'string' && note.author.username.trim().toLowerCase() === author.toLowerCase());
+      (matches as Array<{ body?: unknown }>).push(...pageMatches);
+      if (notes.length < 100) break;
+      if (page === MAX_RECONCILE_PAGES) {
+        throw new Error(
+          `GitLab note reconciliation exceeded the ${MAX_RECONCILE_PAGES}-page lookup bound without exhausting the note list; delivery stays unresolved — verify manually before any retry, never assume absence`,
+        );
+      }
+    }
+    if (matches.length === 0) return null;
+    throw new Error(
+      `GitLab reconciliation found a body-matching note by ${author}, but GitLab notes carry no server-side commit binding — ` +
+      'the note\'s creation head and creating attempt cannot be proved, so this historical match is NOT delivery evidence (fail closed); the round stays honestly unposted',
+    );
+  }
+
+  /** URL/origin/token checks plus the live pre-POST MR identity probe. Only
+   * HEAD equality gates delivery: the MR's recorded base is pinned at
+   * open/link time and is expected to trail the frozen base as main moves. */
+  private async gitLabIdentity(input: VerdictPosterInput): Promise<{
+    readonly mrUrl: string;
+    readonly headers: { readonly 'PRIVATE-TOKEN': string; readonly 'CONTENT-TYPE': string };
+  }> {
     const token = this.token ?? this.tokenResolver();
     if (token === undefined || token.trim() === '') {
       throw new Error('GitLab delivery requires GITLAB_TOKEN — review not delivered');
@@ -233,7 +765,7 @@ export class GitLabMrPoster implements VerdictPoster {
     const match = /^\/(.+)\/-\/merge_requests\/(\d+)\/?$/u.exec(url.pathname);
     if (
       url.protocol !== 'https:' || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '' ||
-      match === null || input.host !== url.host || !/^[A-Za-z0-9.-]+(?::\d+)?$/u.test(input.host)
+      match === null || input.host !== url.host || !/^[A-Za-z0-9.-]+(?::\d+)?$/.test(input.host)
     ) {
       throw new Error(`invalid or host-mismatched GitLab merge request URL: ${input.prUrl}`);
     }
@@ -263,64 +795,49 @@ export class GitLabMrPoster implements VerdictPoster {
     if (!identityResponse.ok) {
       throw new Error(`GitLab merge request identity probe exited HTTP ${identityResponse.status} — review not delivered`);
     }
-    let identity: { sha?: unknown; diff_refs?: { base_sha?: unknown } | null };
+    let identity: { sha?: unknown };
     try {
       identity = JSON.parse((await identityResponse.text()).slice(0, 4 * 1024 * 1024)) as typeof identity;
     } catch {
       throw new Error('GitLab merge request identity response was not valid JSON');
     }
     const observedHead = typeof identity.sha === 'string' ? identity.sha : '';
-    // HEAD equality is the delivery invariant. The MR's recorded base
-    // (diff_refs.base_sha is pinned at open/link time) is expected to trail
-    // the round's frozen base as main moves during a long round, so base
-    // age is refreshed into the delivery record below, never a refusal
-    // reason.
     if (observedHead !== input.targetSha) {
       throw new Error(
         `merge request identity moved before delivery (expected head ${input.targetSha}, got ${observedHead || 'unknown'})`,
       );
     }
-    let noteResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
+    return { mrUrl, headers };
+  }
+
+  /** Live MR identity probe with HEAD equality enforced. */
+  private async confirmHead(
+    mrUrl: string,
+    headers: { readonly 'PRIVATE-TOKEN': string; readonly 'CONTENT-TYPE': string },
+    targetSha: string,
+  ): Promise<{ readonly headSha: string; readonly baseSha: string }> {
+    let response: Awaited<ReturnType<typeof this.fetchImpl>>;
     try {
-      noteResponse = await this.fetchImpl(`${mrUrl}/notes`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ body: input.body }),
-        signal: AbortSignal.timeout(30_000),
-      });
+      response = await this.fetchImpl(mrUrl, { headers, signal: AbortSignal.timeout(15_000) });
     } catch (error) {
-      throw new Error(`GitLab merge request note delivery failed: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`GitLab merge request identity probe failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (!noteResponse.ok) {
-      throw new Error(`GitLab merge request note delivery exited HTTP ${noteResponse.status}: ${(await noteResponse.text()).slice(0, 300)}`);
+    if (!response.ok) {
+      throw new Error(`GitLab merge request identity probe exited HTTP ${response.status}`);
     }
-    // GitLab notes are not commit-bound server-side; re-probe the MR after
-    // delivery and fail loudly when the HEAD moved under the note. The
-    // re-probe IS the refreshed record: whatever base the MR now reports is
-    // delivered onward, so a moving main never refuses a proven head.
-    let confirmResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
+    let identity: { sha?: unknown; diff_refs?: { base_sha?: unknown } | null };
     try {
-      confirmResponse = await this.fetchImpl(mrUrl, { headers, signal: AbortSignal.timeout(15_000) });
-    } catch (error) {
-      throw new Error(`GitLab merge request post-delivery probe failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    if (!confirmResponse.ok) {
-      throw new Error(`GitLab merge request post-delivery probe exited HTTP ${confirmResponse.status} — delivery cannot be confirmed`);
-    }
-    let confirmed: { sha?: unknown; diff_refs?: { base_sha?: unknown } | null };
-    try {
-      confirmed = JSON.parse((await confirmResponse.text()).slice(0, 4 * 1024 * 1024)) as typeof confirmed;
+      identity = JSON.parse((await response.text()).slice(0, 4 * 1024 * 1024)) as typeof identity;
     } catch {
-      throw new Error('GitLab merge request post-delivery response was not valid JSON');
+      throw new Error('GitLab merge request identity response was not valid JSON');
     }
-    const confirmedHead = typeof confirmed.sha === 'string' ? confirmed.sha : '';
-    const confirmedBase = typeof confirmed.diff_refs?.base_sha === 'string' ? confirmed.diff_refs.base_sha : '';
-    if (confirmedHead !== observedHead) {
+    const headSha = typeof identity.sha === 'string' ? identity.sha : '';
+    if (headSha !== targetSha) {
       throw new Error(
-        `merge request identity moved after delivery (expected head ${observedHead}, got ${confirmedHead || 'unknown'})`,
+        `merge request identity moved (expected head ${targetSha}, got ${headSha || 'unknown'}) — delivery not recorded`,
       );
     }
-    return { headSha: confirmedHead, baseSha: confirmedBase };
+    return { headSha, baseSha: typeof identity.diff_refs?.base_sha === 'string' ? identity.diff_refs.base_sha : '' };
   }
 }
 
@@ -333,15 +850,30 @@ export class AutoVerdictPoster implements VerdictPoster {
     private readonly gitlab: VerdictPoster = new GitLabMrPoster(),
   ) {}
 
-  async post(input: Parameters<VerdictPoster['post']>[0]): Promise<PrIdentity> {
+  async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
+    return this.select(input).post(input);
+  }
+
+  /** Reconciliation reaches the SAME host-selected provider as posting —
+   * an ambiguous post must be reconciled by the backend that created it,
+   * never by a hand-picked alternate. */
+  async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
+    const poster = this.select(input);
+    if (typeof poster.reconcile !== 'function') {
+      throw new Error(`the selected ${new URL(input.prUrl.trim()).host} poster does not support reconciliation — delivery stays honestly unresolved`);
+    }
+    return poster.reconcile(input);
+  }
+
+  private select(input: VerdictPosterInput): VerdictPoster {
     let host = '';
     try {
       host = new URL(input.prUrl.trim()).host;
     } catch {
       throw new Error(`cannot parse pull request URL: ${input.prUrl}`);
     }
-    if (isGitHubRemote(host)) return this.github.post(input);
-    if (isGitLabRemote(host)) return this.gitlab.post(input);
+    if (isGitHubRemote(host)) return this.github;
+    if (isGitLabRemote(host)) return this.gitlab;
     throw new Error(
       `unsupported code host for verdict delivery: ${host} — the review gate supports GitHub (gh) and GitLab (GITLAB_TOKEN) remotes`,
     );
@@ -415,6 +947,7 @@ export interface FallbackGateOutcome {
 
 export type ReviewRequestOutcome =
   | { readonly route: 'perkins'; readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }
+  | { readonly route: 'queued'; readonly jobId: string; readonly requestSeq: number; readonly run: Promise<void> }
   | FallbackGateOutcome;
 
 /** Thrown when a direct beginRound caller bypasses requestReview while the
@@ -433,10 +966,24 @@ function sanitizeErrorLog(error: unknown): string {
   return String(error).replace(/[\r\n]+/gu, ' ').slice(0, 300);
 }
 
+/** The durable handoff can no longer be authorized from CURRENT job
+ * state; the obligation stays visible and needs a new validated request. */
+export class HandoffHeldError extends Error {
+  constructor(readonly status: string, readonly requestSeq: number) {
+    super(`handoff held: job status ${status}`);
+    this.name = 'HandoffHeldError';
+  }
+}
+
 export interface WaveRunnerOptions {
   readonly ledger: LedgerApi;
   readonly worktrees: WorktreePort;
   readonly spawner: AgentSpawner;
+  /** Service-wide paired resident admission; omitted by standalone workflow tests. */
+  readonly reserveReviewRound?: (signal: AbortSignal) => Promise<ResidentReviewRound>;
+  readonly maxConcurrentChildren?: number;
+  /** Ledger bus used to admit a worker's durable handoff after its turn delivers. */
+  readonly bus?: EventBus;
   readonly poster?: VerdictPoster;
   readonly escalate?: (title: string, detail: string) => void;
   /** Stable service-owned root. Required for every production review. */
@@ -473,14 +1020,101 @@ export class WaveRunner {
   private readonly activeOperations = new Set<Promise<unknown>>();
   private readonly activeControllers = new Set<AbortController>();
   private readonly activeFallbackGates = new Set<string>();
+  private readonly handoffs = new Map<string, {
+    readonly input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean };
+    readonly seq: number;
+    starting: boolean;
+    /** Post-intake hold: visible obligation, NOT sweep-rearmable. */
+    held: boolean;
+    readonly run: Promise<void>;
+    readonly resolve: () => void;
+  }>();
+  private readonly stopHandoffListener: () => void;
   private shuttingDown = false;
 
   constructor(opts: WaveRunnerOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    this.stopHandoffListener = opts.bus?.subscribe((event) => {
+      if (event.kind !== 'job.delivered' || event.jobId === null) return;
+      const pending = this.handoffs.get(event.jobId);
+      if (pending !== undefined && event.seq > pending.seq) void this.startHandoff(event.jobId, pending);
+    }) ?? (() => {});
+  }
+
+  /** Restore acknowledged handoffs after restart; never freeze a branch
+   * until a delivery newer than the handoff has cleared the idle guard. */
+  resumeQueuedHandoffs(): void {
+    for (const job of this.opts.ledger.listJobs()) {
+      const queued = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-queued');
+      if (queued === null) continue;
+      const started = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-started');
+      const failed = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-failed');
+      if ((started?.seq ?? 0) > queued.seq || (failed?.seq ?? 0) > queued.seq) continue;
+      if (this.handoffs.has(job.id)) continue;
+      // A terminal job or a swept lane can never admit this handoff: skip
+      // truthfully (no failure, no escalation) instead of a spurious retry.
+      const jobNow = this.opts.ledger.getJob(job.id);
+      if (jobNow !== null && (jobNow.status === 'merged' || jobNow.status === 'done')) {
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-skipped', jobId: job.id,
+          payload: { requestSeq: queued.seq, reason: 'terminal-job', status: jobNow.status },
+        });
+        continue;
+      }
+      const liveLane = this.opts.worktrees
+        .listWorktrees({ jobId: job.id })
+        .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
+      if (liveLane === undefined) {
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-skipped', jobId: job.id,
+          payload: { requestSeq: queued.seq, reason: 'no-live-lane' },
+        });
+        continue;
+      }
+      // Crash window: a claim was recorded but no started/failed terminal
+      // marker followed. Ownership of any begun round is ambiguous — fail
+      // closed with evidence; restart recovery terminalizes a begun round.
+      const claimed = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-claimed');
+      const requeued = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-requeued');
+      // A REQUEUED marker NEWER than the claim, for the SAME request, is a
+      // PROVEN no-admission attempt (known outcome) — safe to re-arm. Only
+      // a claim with no later same-request outcome stays ambiguous.
+      const provenNoAdmission = requeued !== null && claimed !== null &&
+        requeued.seq > claimed.seq &&
+        (requeued.payload as { requestSeq?: number } | null)?.requestSeq === (claimed.payload as { requestSeq?: number } | null)?.requestSeq;
+      if (claimed !== null && claimed.seq > queued.seq && !provenNoAdmission &&
+        (started?.seq ?? 0) < claimed.seq && (failed?.seq ?? 0) < claimed.seq) {
+        const error = 'queued review handoff was claimed but never terminalized (crash window); refusing blind replay — reconcile the begun round, then re-request';
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId: job.id,
+          payload: { requestSeq: queued.seq, claimedSeq: claimed.seq, error },
+        });
+        this.opts.escalate?.(`Queued review handoff for job ${job.id} needs reconciliation`, error);
+        continue;
+      }
+      const payload = queued.payload as { input?: unknown } | null;
+      const input = payload?.input;
+      if (typeof input !== 'object' || input === null || (input as { jobId?: unknown }).jobId !== job.id) {
+        const error = 'malformed queued review handoff requires operator repair';
+        this.log('error', error, { job: job.id, seq: queued.seq });
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId: job.id,
+          payload: { requestSeq: queued.seq, error },
+        });
+        this.opts.escalate?.(`Queued review handoff failed for job ${job.id}`, error);
+        continue;
+      }
+      const pending = this.trackHandoff(input as { jobId: string }, queued.seq);
+      const startedFor = (started?.payload as { requestSeq?: number } | null)?.requestSeq;
+      if (startedFor !== undefined && startedFor !== queued.seq) {
+        // A terminal marker for a DIFFERENT request does not satisfy this one.
+      }
+      const delivered = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
+      if (delivered !== null && delivered.seq > queued.seq) void this.startHandoff(job.id, pending);
+    }
   }
 
   async shutdown(): Promise<void> {
+    this.stopHandoffListener();
+    for (const pending of this.handoffs.values()) pending.resolve();
+    this.handoffs.clear();
     this.shuttingDown = true;
     const deadline = Date.now() + 30_000;
     while (this.activeOperations.size > 0) {
@@ -552,6 +1186,57 @@ export class WaveRunner {
     }
   }
 
+  /** Binding check for a parsed `round.posted` event against the
+   * AUTHORITATIVE frozen facts (R2/R21): the round's frozen target, the
+   * job's actual pull request, a known enacted provider event with its
+   * commit-binding discipline, and the round's OWN canonical publication
+   * path — never a self-declared foreign path or an alias. Returns null
+   * when correctly bound, or a human-readable problem otherwise. */
+  private postedEventBindingProblem(
+    event: PostedEventPayload,
+    round: RoundRecord,
+  ): string | null {
+    if (event.receipt.headSha !== round.targetRef) return 'receipt head does not match the round\'s frozen target';
+    if (event.targetSha !== round.targetRef) return 'posted target does not match the round\'s frozen target';
+    const job = this.opts.ledger.getJob(round.jobId);
+    if (job === null || job.prUrl === null || event.url !== job.prUrl) {
+      return 'posted event URL does not match the job\'s recorded pull request';
+    }
+    if (!/^[A-Za-z0-9._:-]{1,200}$/u.test(event.receipt.reviewId)) {
+      return 'receipt review id is malformed';
+    }
+    if (event.receipt.actor.split('').some((character) => character.charCodeAt(0) < 32)) return 'receipt actor is malformed';
+    if (!/^[0-9a-f]{64}$/u.test(event.receipt.bodySha256)) return 'receipt body digest is malformed';
+    // The enacted provider event is bound to the job's actual PR form: a
+    // GitHub pull-request URL must carry a COMMENTED review commit-bound to
+    // the frozen target; a GitLab merge-request URL must carry a note with
+    // NO server-side commit binding. Any other pairing — a GitLab note on a
+    // GitHub PR, an unknown event — is not a promotable publication.
+    const providerKind = publicationProviderKindFor(job.prUrl);
+    if (providerKind === 'github') {
+      if (event.receipt.event !== 'COMMENTED') return `receipt event "${event.receipt.event}" is not the GitHub COMMENT review this pull request requires`;
+      if (event.receipt.commitId !== round.targetRef) return 'COMMENTED receipt is not commit-bound to the frozen target';
+    } else if (providerKind === 'gitlab') {
+      if (event.receipt.event !== 'note') return `receipt event "${event.receipt.event}" is not the GitLab merge-request note this merge request requires`;
+      if (event.receipt.commitId !== null) return 'note receipt must not claim a commit binding GitLab does not record';
+    } else {
+      // Unknown provider form: fall back to the per-event discipline so an
+      // odd-but-consistent record is not rejected for its host alone.
+      if (event.receipt.event === 'COMMENTED') {
+        if (event.receipt.commitId !== round.targetRef) return 'COMMENTED receipt is not commit-bound to the frozen target';
+      } else if (event.receipt.event === 'note') {
+        if (event.receipt.commitId !== null) return 'note receipt must not claim a commit binding GitLab does not record';
+      } else {
+        return `receipt event "${event.receipt.event}" is not a known enacted provider event`;
+      }
+    }
+    const canonical = join(reviewArtifactDirectory(this.artifactRoot(), round.id), 'perkins-report.publication.md');
+    if (resolve(event.publicationFile) !== resolve(canonical)) {
+      return 'publication path is not this round\'s canonical publication artifact';
+    }
+    return null;
+  }
+
   /** Mark crash-interrupted proof INCOMPLETE and release every owned lane. */
   async recoverInterruptedRounds(): Promise<number> {
     let recovered = 0;
@@ -563,6 +1248,7 @@ export class WaveRunner {
     );
     for (const lane of lanes) {
       if (lane.kind !== 'review' || lane.status === 'swept' || lane.roundId === null) continue;
+      try {
       const round = this.opts.ledger.getRound(lane.roundId);
       if (round === null) {
         await this.sweepReviewWorktree(lane.id);
@@ -579,17 +1265,64 @@ export class WaveRunner {
       const postedVerdict = typeof payload === 'object' && payload !== null
         ? (payload as { verdict?: unknown }).verdict
         : undefined;
+      // A delivered verdict is only recoverable when the posted event
+      // parses through the SAME shared contract the writer emits and the
+      // receipt is correctly bound to this round, this job's actual pull
+      // request, a known enacted provider event, and the round's OWN
+      // canonical publication artifact (R1/R2/R21). A bare, malformed or
+      // unbound local event — forged, corrupted, or written by an older
+      // build — is NOT promoted; it terminalizes honestly as an
+      // interrupted round instead. Completed historical rounds are never
+      // rewritten, and one malformed round never aborts the recovery of
+      // the rest.
       if (postedVerdict === 'approved' || postedVerdict === 'changes-requested') {
-        this.opts.ledger.setRoundVerdict(round.id, postedVerdict);
-        this.opts.ledger.appendCustomEvent({
-          kind: 'round.post-recovered',
-          jobId: round.jobId,
-          roundId: round.id,
-          payload: { verdict: postedVerdict, postedEventSeq: posted?.seq ?? null },
-        });
-        await this.sweepReviewWorktree(lane.id);
-        recovered += 1;
-        continue;
+        const event = parsePostedEventPayload(payload);
+        const bindingProblem = event === null
+          ? 'the round.posted payload is malformed (receipt, publication or identity fields missing or mistyped)'
+          : this.postedEventBindingProblem(event, round);
+        // The preserved publication artifact is REQUIRED evidence, not an
+        // optional extra: promotion verifies the round's OWN canonical
+        // publication file still exists as a regular non-symlink file and
+        // carries exactly the digested bytes (T3/R21).
+        let bound = false;
+        if (event !== null && bindingProblem === null) {
+          bound = true;
+          try {
+            const canonical = join(reviewArtifactDirectory(this.artifactRoot(), round.id), 'perkins-report.publication.md');
+            const info = lstatSync(canonical);
+            if (!info.isFile() || info.isSymbolicLink()) {
+              bound = false;
+            } else {
+              const digest = createHash('sha256').update(readFileSync(canonical, 'utf8')).digest('hex');
+              bound = digest === event.publicationSha256 && digest === event.receipt.bodySha256;
+            }
+          } catch {
+            bound = false;
+          }
+        }
+        if (bound && event !== null) {
+          this.opts.ledger.setRoundVerdict(round.id, postedVerdict);
+          this.opts.ledger.appendCustomEvent({
+            kind: 'round.post-recovered',
+            jobId: round.jobId,
+            roundId: round.id,
+            payload: {
+              verdict: postedVerdict,
+              postedEventSeq: posted?.seq ?? null,
+              receipt: {
+                reviewId: event.receipt.reviewId, actor: event.receipt.actor, event: event.receipt.event,
+                headSha: event.receipt.headSha, bodySha256: event.receipt.bodySha256,
+              },
+            },
+          });
+          await this.sweepReviewWorktree(lane.id);
+          recovered += 1;
+          continue;
+        }
+        this.opts.escalate?.(
+          `Review round ${round.id} carries a posted verdict without a provider-bound receipt`,
+          `restart recovery cannot verify the delivery of an unbound round.posted event (${bindingProblem ?? 'the preserved publication artifact did not match the posted digest'}); the round terminalizes as interrupted rather than promoting an unverifiable approval`,
+        );
       }
       const note = 'review interrupted by service restart; required lens/verification proof is incomplete';
       this.abortRound(round, note);
@@ -603,6 +1336,20 @@ export class WaveRunner {
       this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE after service restart`, note);
       await this.sweepReviewWorktree(lane.id);
       recovered += 1;
+      } catch (error) {
+        // One unexpectedly failing row must never abort startup recovery of
+        // the remaining rounds (R1): the failure is escalated loudly and
+        // the round is left untouched for inspection and the next restart.
+        this.log('error', 'startup recovery failed for one review round', {
+          lane: lane.id,
+          round: lane.roundId,
+          error: String(error),
+        });
+        this.opts.escalate?.(
+          `Review round ${String(lane.roundId)} could not be processed during startup recovery`,
+          `${String(error)} — the round is left as recorded for inspection; other rounds continue to recover`,
+        );
+      }
     }
 
     for (const job of this.opts.ledger.listJobs()) {
@@ -648,6 +1395,9 @@ export class WaveRunner {
   }): Promise<WaveOutcome | FallbackGateOutcome> {
     const outcome = await this.requestReview(input);
     if (outcome.route === 'perkins') return outcome.run;
+    if (outcome.route === 'queued') {
+      throw new Error('direct round invocation cannot await a deferred worker handoff');
+    }
     await outcome.run;
     return outcome;
   }
@@ -661,19 +1411,203 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    /** Worker tool handoff: acknowledge without waiting for its own turn. */
+    handoff?: boolean;
+    /** Internal replay marker; never accepted from the public HTTP endpoint. */
+    fromHandoff?: boolean;
   }): Promise<ReviewRequestOutcome> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
-    // Branch-idle guard FIRST, before any route decision: manual, Silas, and
-    // integration callers all inherit one rule, Perkins and fallback alike.
-    this.enforceBranchIdleForRequest(input);
+    // Branch-idle still gates the freeze. A minion's own busy turn may
+    // acknowledge an intent now; it is armed only after job.delivered.
+    try {
+      this.enforceBranchIdleForRequest(input);
+    } catch (error) {
+      if (!(error instanceof BranchBusyError) || input.handoff !== true || input.force === true ||
+        error.blockers.length === 0 || error.blockers.some((blocker) => blocker.jobId !== input.jobId)) throw error;
+      if (this.opts.bus === undefined) throw new Error('worker review handoff requires a ledger event bus');
+      const existing = this.handoffs.get(input.jobId);
+      if (existing !== undefined) {
+        // First-wins, but never silent: a differing duplicate records its
+        // exact folded scope as a truthful conflict outcome.
+        const differs =
+          (input.lenses !== undefined && JSON.stringify(input.lenses) !== JSON.stringify((existing.input as { lenses?: readonly string[] }).lenses ?? undefined)) ||
+          (input.targetRef !== undefined && input.targetRef !== (existing.input as { targetRef?: string }).targetRef) ||
+          (input.noSpec !== undefined && input.noSpec !== (existing.input as { noSpec?: boolean }).noSpec);
+        if (differs) {
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.review-handoff-conflict', jobId: input.jobId,
+            payload: { requestSeq: existing.seq, folded: {
+              ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
+              ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+              ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+            } },
+          });
+        }
+        // A genuinely NEW validated review request rearms a held intent
+        // (never a sweep/ACK/status flip alone); the fresh request is the
+        // authority, and the queue keeps first-request identity visible.
+        if (existing.held) this.supersedeHeldHandoff(input.jobId, input);
+        return { route: 'queued', jobId: input.jobId, requestSeq: existing.seq, run: existing.run };
+      }
+      const safeInput = { jobId: input.jobId,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
+        ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+      };
+      const event = this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-queued', jobId: input.jobId, payload: { input: safeInput } });
+      const pending = this.trackHandoff(safeInput, event.seq);
+      return { route: 'queued', jobId: input.jobId, requestSeq: event.seq, run: pending.run };
+    }
+    const pendingHandoff = this.handoffs.get(input.jobId);
+    if (pendingHandoff !== undefined && input.fromHandoff !== true) {
+      // Reconcile on this genuine observation: the lane may have gone idle
+      // without a delivery event (aborted/failed turn), in which case the
+      // replay below re-runs every current fence (branch-idle, exact-head,
+      // freeze, capacity) and arms the review now. Legitimate busy/capacity
+      // waits stay pending (the replay re-queues, M1); nothing is skipped.
+      this.reconcileQueuedHandoff(input.jobId);
+      return { route: 'queued', jobId: input.jobId, requestSeq: pendingHandoff.seq, run: pendingHandoff.run };
+    }
     const repoPath = this.resolveReviewRequestRepo(input);
     const preflight = this.opts.reviewPreflight;
     const result: ReviewPreflightResult = preflight !== undefined && repoPath !== null
       ? await preflight({ repoPath })
       : { ok: true, failures: [] };
     if (!result.ok) return this.beginFallbackGate(input, result.failures, repoPath);
+    // Post-await recheck (handoff replays only): permission is re-proven
+    // after preflight/capacity waits, BEFORE freeze/admission effects.
+    if (input.fromHandoff === true) {
+      const pending = this.handoffs.get(input.jobId);
+      this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
+    }
     const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel });
     return { route: 'perkins', round: begun.round, run: begun.run };
+  }
+
+  private trackHandoff(input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean }, seq: number) {
+    let resolve!: () => void;
+    const run = new Promise<void>((done) => { resolve = done; });
+    const pending = { input, seq, starting: false, held: false, run, resolve };
+    this.handoffs.set(input.jobId, pending);
+    return pending;
+  }
+
+  /** Review-authorizable job statuses at replay time. Branch idleness and
+   * a current head are NOT authorization: a job that became blocked/parked/
+   * cancelled/owner-held/terminal after the durable request was accepted
+   * is HELD for reconciliation attention, never auto-reviewed. */
+  private static readonly HANDOFF_AUTHORIZED_STATUSES: ReadonlySet<string> = new Set(['working', 'delivered', 'in-review']);
+
+  /** Fence: throws when the CURRENT job state does not authorize this
+   * handoff. Called BEFORE any claim/spawn/freeze effect and re-checked
+   * after awaited preflight/capacity, before round admission. */
+  private assertHandoffAuthorized(jobId: string, requestSeq: number): void {
+    const jobNow = this.opts.ledger.getJob(jobId);
+    if (jobNow === null || !WaveRunner.HANDOFF_AUTHORIZED_STATUSES.has(jobNow.status)) {
+      throw new HandoffHeldError(jobNow?.status ?? 'missing', requestSeq);
+    }
+  }
+
+  private async startHandoff(jobId: string, pending: NonNullable<ReturnType<WaveRunner['trackHandoff']>>): Promise<void> {
+    if (pending.starting || pending.held || this.shuttingDown || this.handoffs.get(jobId) !== pending) return;
+    pending.starting = true;
+    let requeued = false;
+    let held = false;
+    try {
+      // Current-permission fence BEFORE any claim/spawn/freeze effect.
+      this.assertHandoffAuthorized(jobId, pending.seq);
+      // Claim binds this attempt to the request; a crash between claim and
+      // the started marker reconciles fail-closed at boot.
+      this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-claimed', jobId,
+        payload: { requestSeq: pending.seq },
+      });
+      const outcome = await this.requestReview({ ...pending.input, fromHandoff: true });
+      if (this.shuttingDown) return; // claim stands; boot recovery reconciles fail-closed
+      if (outcome.route === 'bmad-review-fallback' && !outcome.skillInstalled) {
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId,
+          payload: { requestSeq: pending.seq, error: outcome.note },
+        });
+        return;
+      }
+      this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-started', jobId, payload: {
+        requestSeq: pending.seq, route: outcome.route,
+        ...(outcome.route === 'perkins' ? { roundId: outcome.round.id } : {}),
+      } });
+      void outcome.run.catch((error: unknown) => {
+        this.log('error', 'queued review run failed after admission', { job: jobId, error: String(error) });
+      });
+    } catch (error) {
+      // HELD: a post-intake hold/status flip invalidates the prior
+      // execution permission — the obligation stays visible and requires a
+      // genuinely NEW validated review request to rearm (never a sweep,
+      // job.delivered, ACK, or a later status flip alone).
+      if (error instanceof HandoffHeldError) {
+        held = true;
+        pending.held = true;
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-held', jobId,
+          payload: { requestSeq: pending.seq, reason: `job-status-${error.status}` },
+        });
+        this.opts.escalate?.(
+          `Queued review handoff for job ${jobId} is held`,
+          `The durable review request can no longer be authorized automatically: job status is ${error.status}. Re-request the review after the hold clears.`,
+        );
+        return;
+      }
+      // Same-job re-busy preserves the durable intent: re-queue for the
+      // NEXT delivery; only foreign blockers terminalize the handoff.
+      if (error instanceof BranchBusyError && !this.shuttingDown &&
+        error.blockers.length > 0 && error.blockers.every((blocker) => blocker.jobId === jobId)) {
+        requeued = true;
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-requeued', jobId,
+          payload: { requestSeq: pending.seq, blockers: error.blockers },
+        });
+        return; // starting reset in finally; next delivery re-arms
+      }
+      if (!this.shuttingDown) {
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId, payload: { requestSeq: pending.seq, error: String(error) } });
+        this.opts.escalate?.(`Queued review handoff failed for job ${jobId}`, String(error));
+      }
+    } finally {
+      pending.starting = false;
+      if (!requeued && !held) {
+        if (this.handoffs.get(jobId) === pending) this.handoffs.delete(jobId);
+        pending.resolve();
+      }
+      // requeued: stays pending and re-armable. held: stays pending and
+      // VISIBLE but not sweep-rearmable — only a new validated request
+      // (which supersedes via the queue path) may clear `held`.
+    }
+  }
+
+  /** Reconsider ONE job's queued handoff on a genuine observation (the
+   * requestReview re-entry path): the replay re-runs every current fence
+   * (branch-idle, exact-head, freeze, capacity) and arms the review now.
+   * Legitimate busy/capacity waits stay pending (the replay re-queues);
+   * held or in-flight pendings are left untouched by startHandoff's
+   * guards. Nothing is skipped. */
+  private reconcileQueuedHandoff(jobId: string): void {
+    const pending = this.handoffs.get(jobId);
+    if (pending !== undefined) void this.startHandoff(jobId, pending);
+  }
+
+  /** Deterministic-pass reconsideration of every queued handoff — the
+   * exact callback main wires into the Silas seam. No API call, no timer,
+   * no follow-through lane: each pending is offered to startHandoff, whose
+   * guards keep held pendings held (only a genuinely new validated request
+   * rearms them) and whose terminal bookkeeping removes settled entries, so
+   * repeated passes are bounded and cannot double-start. */
+  reconcilePendingHandoffs(): void {
+    for (const [jobId, pending] of this.handoffs) void this.startHandoff(jobId, pending);
+  }
+
+  /** A genuinely new validated review request clears a prior hold and
+   * supersedes the pending intent (queue-path rearm), keyed by identity. */
+  private supersedeHeldHandoff(jobId: string, newInput: { targetRef?: string; lenses?: readonly string[]; noSpec?: boolean }): boolean {
+    const pending = this.handoffs.get(jobId);
+    if (pending === undefined || !pending.held) return false;
+    void newInput;
+    pending.held = false; // a NEW request is fresh validated intent
+    return true;
   }
 
   /** Legacy direct entry: a failed pre-flight never silently starts a
@@ -989,7 +1923,7 @@ export class WaveRunner {
   }
 
   private async defaultFallbackReview(input: FallbackReviewRunInput): Promise<readonly FallbackFinding[]> {
-    const handle = await this.opts.spawner('minion', { cwd: input.lanePath });
+    const handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
     try {
       const prompt = [
         `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
@@ -1115,13 +2049,12 @@ export class WaveRunner {
         baseRef,
         targetRef: targetSha,
         movementRef,
-        chunkLineThreshold: policy.portableContract.rules.chunkLineThreshold,
         ...(input.noSpec === true ? { noSpec: true } : { spec }),
         ...(input.force === true
           ? { branchIdle: { forced: true as const, targetBranch: idle.targetBranch, blockers: idle.blockers } }
           : {}),
       });
-      this.opts.ledger.setRoundStatus(round.id, 'live');
+      if (this.opts.reserveReviewRound === undefined) this.opts.ledger.setRoundStatus(round.id, 'live');
     } catch (error) {
       const failures: unknown[] = [error];
       const interrupted = this.shuttingDown || setupSignal.aborted;
@@ -1164,12 +2097,18 @@ export class WaveRunner {
       throw error;
     }
 
-    this.log('info', 'review round live', {
+    if (this.opts.reserveReviewRound !== undefined) {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.residency-queued', jobId: job.id, roundId: round.id,
+        payload: { reason: 'awaiting lead and child resident slots', targetSha },
+      });
+    }
+    this.log('info', 'review round queued or live', {
       job: job.id,
       round: round.id,
       lenses: canonicalLenses.length,
       targetRef: targetSha,
-      workflow: 'perkins-hybrid',
+      workflow: 'perkins-whole-pr',
     });
     const runController = new AbortController();
     const run = this.track(
@@ -1271,10 +2210,51 @@ export class WaveRunner {
     signal: AbortSignal,
     reviewModel?: ReviewPreflightResult['reviewModel'],
   ): Promise<WaveOutcome> {
+    let reservation: ResidentReviewRound | undefined;
+    let settledOutcome: WaveOutcome | null = null;
     try {
-      return await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel);
+      reservation = this.opts.reserveReviewRound === undefined
+        ? undefined : await this.opts.reserveReviewRound(signal);
+      if (reservation !== undefined) {
+        if (signal.aborted) {
+          await reservation.close();
+          throw new Error('review cancelled before admission');
+        }
+        this.opts.ledger.setRoundStatus(round.id, 'live');
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.residency-admitted', jobId: job.id, roundId: round.id,
+          payload: { reason: 'lead and child resident slots admitted' },
+        });
+      }
+      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, reservation);
+      settledOutcome = outcome;
+      return outcome;
+    } catch (error) {
+      if (this.opts.ledger.getRound(round.id)?.status === 'pending') {
+        this.abortRound(this.opts.ledger.getRound(round.id) ?? round, `review admission cancelled: ${String(error)}`);
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.residency-cancelled', jobId: job.id, roundId: round.id,
+          payload: { error: String(error) },
+        });
+      }
+      throw error;
     } finally {
-      await this.sweepReviewWorktree(reviewLaneId);
+      // A settled review outcome outranks a close-time disposal failure:
+      // the verdict/record is the durable truth; the failed disposal is
+      // escalated loudly without masking the returned result.
+      try {
+        await reservation?.close();
+      } catch (closeError) {
+        this.log('error', 'review reservation disposal failed', { round: round.id, error: String(closeError) });
+        if (settledOutcome !== null) {
+          this.opts.escalate?.(
+            `Review round ${round.id} disposal failed after completion`,
+            `The settled review outcome was preserved, but releasing its resident handles failed: ${String(closeError)}`,
+          );
+        }
+      } finally {
+        await this.sweepReviewWorktree(reviewLaneId);
+      }
     }
   }
 
@@ -1288,46 +2268,68 @@ export class WaveRunner {
     policy: PerkinsPolicy,
     signal: AbortSignal,
     reviewModel?: ReviewPreflightResult['reviewModel'],
+    reservation?: ResidentReviewRound,
   ): Promise<WaveOutcome> {
-    const workflow = new PerkinsHybridReview({
-      // This closure belongs to one round. A concurrent preflight cannot
-      // replace the proof used by its lead or lens children.
-      spawner: (role, options) => this.opts.spawner(role, {
+    // The model-resolution closure belongs to one round. A concurrent
+    // preflight cannot replace the proof used by its lead or specialist
+    // children, and a reserved round routes through its own admission.
+    const spawnWithOptions: AgentSpawner = (role, options) => {
+      if (reservation !== undefined && role !== 'perkins') {
+        throw new Error(`review reservation spawns perkins sessions only, got role "${role}"`);
+      }
+      const resolved = {
         ...options,
         ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
           ? { reviewModel } : {}),
-      }),
+      };
+      return reservation === undefined
+        ? this.opts.spawner(role, resolved)
+        : reservation.spawn(resolved);
+    };
+    const workflow = new PerkinsWholeReview({
+      spawner: spawnWithOptions,
+      ...(reservation !== undefined ? { beginChildren: () => reservation.beginChildren(this.opts.maxConcurrentChildren ?? DEFAULT_REVIEW_CHILDREN) } : {}),
+      ...(this.opts.maxConcurrentChildren !== undefined ? { maxConcurrentChildren: this.opts.maxConcurrentChildren } : {}),
       policy,
-      onAgent: ({ phase, lens, chunk, attempt, handle }) => {
+      onAgent: ({ phase, lens, attempt, handle }) => {
         this.opts.ledger.registerAgent({
           id: handle.id,
           role: 'perkins',
           label:
-            phase === 'lens' && lens !== undefined
-              ? lensAgentLabel(lens, chunk ?? '', attempt ?? 1)
+            phase === 'specialist' && lens !== undefined
+              ? lensAgentLabel(lens, attempt ?? 1)
               : 'lead',
           sessionFile: handle.sessionFile,
           roundId: round.id,
           jobId: job.id,
         });
-        if (phase === 'lens' && lens !== undefined) this.opts.ledger.markLensLive(round.id, lens);
+        if (phase === 'specialist' && lens !== undefined) this.opts.ledger.markLensLive(round.id, lens);
       },
     });
 
-    let review: PerkinsHybridResult;
+    let review: PerkinsWholeResult;
     try {
-      const priorConsolidatedFile = this.opts.ledger
+      // The NEWEST completed predecessor is the required prior record: a
+      // missing or corrupt consolidated file for it fails loudly instead of
+      // silently presenting an older past as the whole history.
+      let priorConsolidatedFile: string | undefined;
+      const newestPredecessor = this.opts.ledger
         .listRounds(job.id)
         .filter((candidate) =>
           candidate.seq < round.seq && candidate.status === 'verdict-posted' && candidate.verdict !== null &&
           this.opts.ledger.latestRoundEvent(candidate.id, 'round.perkins-review') !== null,
         )
-        .sort((left, right) => right.seq - left.seq)
-        .map((candidate) => ({
-          file: join(reviewArtifactDirectory(this.artifactRoot(), candidate.id), 'consolidated.json'),
-          targetSha: candidate.targetRef,
-        }))
-        .find(({ file, targetSha }) => targetSha !== null && this.isCompleteConsolidated(file, targetSha))?.file;
+        .sort((left, right) => right.seq - left.seq)[0];
+      if (newestPredecessor !== undefined) {
+        const file = join(reviewArtifactDirectory(this.artifactRoot(), newestPredecessor.id), 'consolidated.json');
+        if (newestPredecessor.targetRef === null || !this.isCompleteConsolidated(file, newestPredecessor.targetRef)) {
+          throw new Error(
+            `required prior review record for round ${newestPredecessor.id} is missing or invalid; ` +
+            'refusing to review against a partial history — restore the record, then rerun the review',
+          );
+        }
+        priorConsolidatedFile = file;
+      }
       review = await workflow.run({
         roundId: round.id,
         roundNumber: round.seq,
@@ -1338,7 +2340,7 @@ export class WaveRunner {
         ...(priorConsolidatedFile !== undefined ? { priorConsolidatedFile } : {}),
       });
     } catch (error) {
-      const detail = `Perkins hybrid workflow failed: ${String(error).replace(/[\r\n]+/gu, ' ').slice(0, 500)}`;
+      const detail = `Perkins whole-PR workflow failed: ${String(error).replace(/[\r\n]+/gu, ' ').slice(0, 500)}`;
       this.abortRound(this.opts.ledger.getRound(round.id) ?? round, detail.slice(0, 500));
       const errorArtifact = join(frozenReview.directory, 'workflow-error.json');
       if (!existsSync(errorArtifact)) {
@@ -1355,39 +2357,13 @@ export class WaveRunner {
       if (!existsSync(primaryReport)) {
         writeFileSync(primaryReport, incompleteContents, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
       }
-      if (error instanceof CoverageExhaustedError) {
-        // Host-detected dead coverage: the hybrid engine already aborted the
-        // round before the lead could spend a terminal submission. Escalate
-        // action-required with the round, lens/chunk, and each attempt's
-        // failureKind and error, and record the same exhaustive reasons.
-        this.opts.ledger.appendCustomEvent({
-          kind: 'round.perkins-incomplete',
-          jobId: job.id,
-          roundId: round.id,
-          payload: {
-            reason: 'coverage_exhausted',
-            error: detail.slice(0, 500),
-            exhausted: error.exhausted.map((entry) => ({
-              lens: entry.lens,
-              chunk: entry.chunk,
-              attempts: entry.attempts,
-            })),
-            reportFile,
-          },
-        });
-        this.opts.escalate?.(
-          `Action required: review round ${round.id} cannot complete — coverage exhausted for ${error.exhausted.map((entry) => `${entry.lens}/${entry.chunk}`).join(', ')}`,
-          `${error.message}. The host aborted the round immediately; no terminal submission was consumed. Restore the lens output path, then rerun a complete review against a newly frozen target.`,
-        );
-      } else {
-        this.opts.ledger.appendCustomEvent({
-          kind: 'round.perkins-incomplete',
-          jobId: job.id,
-          roundId: round.id,
-          payload: { reason: signal.aborted ? 'cancelled' : 'workflow_error', error: detail.slice(0, 500), reportFile },
-        });
-        this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail);
-      }
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.perkins-incomplete',
+        jobId: job.id,
+        roundId: round.id,
+        payload: { reason: signal.aborted ? 'cancelled' : 'workflow_error', error: detail.slice(0, 500), reportFile },
+      });
+      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail);
       return {
         round: this.opts.ledger.getRound(round.id) as RoundRecord,
         results: lenses.map(() => ({ state: 'error' as const, note: detail })),
@@ -1433,49 +2409,196 @@ export class WaveRunner {
 
     let posted = false;
     let deliveryError: unknown;
+    let deliveryFailureKind: 'report_not_posted' | 'no_pr_link' = 'report_not_posted';
     if (canonical !== 'INCOMPLETE' && job.prUrl !== null && this.opts.poster !== undefined) {
-      try {
-        if (signal.aborted) throw new Error('review operation aborted before report delivery');
-        if (refMovedSinceFreeze(frozenReview)) throw new Error('source head/base moved immediately before report delivery');
-        const prUrl = new URL(job.prUrl);
-        const privateBody = `${readFileSync(reportFile, 'utf8').trimEnd()}\n`;
-        const publicationBody = redactReviewForPublication(privateBody);
-        const publicationFile = writeReviewArtifact(frozenReview, 'perkins-report.publication.md', publicationBody);
-        const publicationSha256 = createHash('sha256').update(publicationBody).digest('hex');
-        const delivered = await this.opts.poster.post({
-          prUrl: job.prUrl,
-          host: prUrl.host,
-          repoPath: frozenReview.manifest.repoPath,
-          body: publicationBody,
-          targetSha: review.targetSha,
-          baseSha: frozenReview.manifest.baseRefSha,
-        });
-        if (signal.aborted) throw new Error('review operation aborted while the report was being delivered');
-        if (refMovedSinceFreeze(frozenReview)) throw new Error('source head/base moved while the report was being delivered');
+      const poster = this.opts.poster;
+      const providerKind = publicationProviderKindFor(job.prUrl);
+      const deliveryInput = () => {
+        const prUrl = new URL(job.prUrl!);
+        // The publication carries the lead-authored report PLUS a compact
+        // host-owned factual appendix assembled from the structured result:
+        // EVERY retained finding and the real execution facts
+        // (ran/failed/not-used/nondelivered) reach PR readers
+        // deterministically, with no model transcription. A body that
+        // cannot carry the COMPLETE disclosure is refused before posting —
+        // the full evidence is preserved locally instead (R8).
+        let publicationBody: string;
+        try {
+          publicationBody = publicationBodyFor(readFileSync(reportFile, 'utf8'), review, providerKind);
+        } catch (overflow) {
+          if (!(overflow instanceof Error) || !overflow.message.includes('exceeds the provider review-body limit')) throw overflow;
+          writeReviewArtifact(frozenReview, 'perkins-report.publication-overflow.json', {
+            schemaVersion: 1,
+            reason: overflow.message,
+            provider: providerKind,
+            retainedFindings: review.findings.map((finding) => ({
+              severity: finding.severity, title: finding.title, location: finding.location, source: finding.source,
+            })),
+            reportFile,
+            specialistRuns: review.specialistRuns,
+          });
+          throw overflow;
+        }
+        const redactedBody = redactReviewForPublication(publicationBody);
+        // Redaction can EXPAND the body (fixed placeholders replace short
+        // matches), so the provider bound is enforced on the FINAL bytes
+        // that will actually be posted.
+        if (Buffer.byteLength(redactedBody, 'utf8') > PUBLICATION_BODY_MAX_BYTES) {
+          writeReviewArtifact(frozenReview, 'perkins-report.publication-overflow.json', {
+            schemaVersion: 1,
+            reason: 'redaction expanded the assembled publication body past the provider review-body limit',
+            provider: providerKind,
+            retainedFindings: review.findings.map((finding) => ({
+              severity: finding.severity, title: finding.title, location: finding.location, source: finding.source,
+            })),
+            reportFile,
+            specialistRuns: review.specialistRuns,
+          });
+          throw new Error(
+            `redacted publication body (${Buffer.byteLength(redactedBody, 'utf8')} bytes) exceeds the provider review-body limit (${PUBLICATION_BODY_MAX_BYTES} bytes); ` +
+            'complete retained-finding evidence is preserved locally — refusing to publish a partial disclosure',
+          );
+        }
+        return { prUrl, publicationBody: redactedBody };
+      };
+      const recordDelivery = (delivered: PostedReviewReceipt, publicationFile: string, publicationSha256: string, reconciled: boolean): void => {
+        // The payload IS the shared PostedEventPayload contract: recovery
+        // parses this exact shape through parsePostedEventPayload, so the
+        // writer and reader can never drift apart (R2/R21).
+        if (verdict === null) throw new Error('internal: delivery recorded without a conclusive verdict');
+        const postedPayload: PostedEventPayload = {
+            verdict, canonicalVerdict: canonical, url: job.prUrl!, host: new URL(job.prUrl!).host,
+            // The delivery record carries the identity and receipt the
+            // poster PROVED: the provider review id, the actual actor and
+            // event (an authenticated COMMENT — never a formal
+            // APPROVED/CHANGES_REQUESTED claim), the commit binding, the
+            // frozen head delivered against and the PR's live base at
+            // delivery.
+            targetSha: delivered.headSha, baseSha: delivered.baseSha,
+            publicationFile, publicationSha256,
+            receipt: {
+              reviewId: delivered.reviewId, actor: delivered.actor, event: delivered.event,
+              commitId: delivered.commitId, headSha: delivered.headSha, baseSha: delivered.baseSha, bodySha256: delivered.bodySha256,
+            },
+            reconciled,
+        };
         this.opts.ledger.appendCustomEvent({
           kind: 'round.posted',
           jobId: job.id,
           roundId: round.id,
-          payload: {
-            verdict, canonicalVerdict: canonical, url: job.prUrl, host: prUrl.host,
-            // The delivery record carries the identity the poster PROVED:
-            // the frozen head it delivered against and the PR's live base
-            // at delivery. The frozen base stays in round.perkins-review;
-            // recording it here asserted a pairing the PR never had once
-            // main moved on.
-            targetSha: delivered.headSha, baseSha: delivered.baseSha,
-            publicationFile, publicationSha256,
-          },
+          payload: postedPayload,
         });
         posted = true;
-      } catch (error) {
-        deliveryError = error;
-        this.opts.escalate?.(
-          `Perkins report for round ${round.id} was recorded but NOT posted safely to the pull request`,
-          String(error),
+      };
+      try {
+        if (signal.aborted) throw new Error('review operation aborted before report delivery');
+        if (refMovedSinceFreeze(frozenReview)) throw new Error('source head/base moved immediately before report delivery');
+        const { prUrl, publicationBody } = deliveryInput();
+        const publicationFile = writeReviewArtifact(frozenReview, 'perkins-report.publication.md', publicationBody);
+        const publicationSha256 = createHash('sha256').update(publicationBody).digest('hex');
+        const delivered = verifyPostedReceipt(
+          await poster.post({
+            prUrl: job.prUrl!,
+            host: prUrl.host,
+            repoPath: frozenReview.manifest.repoPath,
+            body: publicationBody,
+            targetSha: review.targetSha,
+            baseSha: frozenReview.manifest.baseRefSha,
+          }),
+          { targetSha: review.targetSha, bodySha256: publicationSha256 },
         );
-        this.log('error', 'Perkins report post failed', { round: round.id, error: String(error) });
+        if (signal.aborted) throw new Error('review operation aborted while the report was being delivered');
+        if (refMovedSinceFreeze(frozenReview)) throw new Error('source head/base moved while the report was being delivered');
+        recordDelivery(delivered, publicationFile, publicationSha256, false);
+      } catch (error) {
+        // Ambiguous publication (the provider may have committed our POST
+        // before the failure): reconcile once against provider evidence
+        // bound to the frozen head and the exact published body. A verified
+        // match becomes the receipt — no duplicate post. Anything else
+        // stays honestly unposted.
+        let reconciledDelivery: PostedReviewReceipt | null = null;
+        if (typeof poster.reconcile === 'function' && !signal.aborted) {
+          try {
+            const { prUrl, publicationBody } = deliveryInput();
+            const publicationSha256 = createHash('sha256').update(publicationBody).digest('hex');
+            // The attempt path above already published these exact bytes;
+            // write-once tolerates the collision instead of failing the
+            // reconciliation before it can run.
+            let publicationFile: string;
+            try {
+              publicationFile = writeReviewArtifact(frozenReview, 'perkins-report.publication.md', publicationBody);
+            } catch (writeError) {
+              if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) throw writeError;
+              publicationFile = join(frozenReview.directory, 'perkins-report.publication.md');
+            }
+            const found = await poster.reconcile!({
+              prUrl: job.prUrl!,
+              host: prUrl.host,
+              repoPath: frozenReview.manifest.repoPath,
+              body: publicationBody,
+              targetSha: review.targetSha,
+              baseSha: frozenReview.manifest.baseRefSha,
+            });
+            reconciledDelivery = found === null
+              ? null
+              : verifyPostedReceipt(found, { targetSha: review.targetSha, bodySha256: publicationSha256 });
+            if (reconciledDelivery !== null) {
+              // The SAME stale-head/cancellation safeguards as a normal
+              // POST apply AFTER the lookup, before anything is recorded
+              // (T4): a receipt discovered while the ref moved (or the
+              // operation aborted) is preserved as evidence but never
+              // recorded as delivery — the changed head was not reviewed.
+              if (signal.aborted || refMovedSinceFreeze(frozenReview)) {
+                const reason = signal.aborted
+                  ? 'review operation aborted while the reconciliation lookup was outstanding'
+                  : 'source head/base moved while the reconciliation lookup was outstanding';
+                try {
+                  writeReviewArtifact(frozenReview, 'perkins-report.reconciled-unrecorded.json', {
+                    recorded: false, reconciled: true, reason,
+                    receipt: {
+                      reviewId: reconciledDelivery.reviewId, actor: reconciledDelivery.actor,
+                      event: reconciledDelivery.event, commitId: reconciledDelivery.commitId,
+                      headSha: reconciledDelivery.headSha, baseSha: reconciledDelivery.baseSha,
+                      bodySha256: reconciledDelivery.bodySha256,
+                    },
+                  });
+                } catch (artifactError) {
+                  if (!(artifactError instanceof Error && 'code' in artifactError && (artifactError as { code?: string }).code === 'EEXIST')) throw artifactError;
+                }
+                this.opts.escalate?.(
+                  `Perkins report for round ${round.id} reconciled a provider review but did NOT record it`,
+                  `${reason}; the remote comment is preserved as unrecorded evidence and the round stays honestly unposted — the changed head was not reviewed`,
+                );
+                reconciledDelivery = null;
+              } else {
+                recordDelivery(reconciledDelivery, publicationFile, publicationSha256, true);
+                this.log('info', 'Perkins report delivery reconciled against provider evidence', {
+                  round: round.id, reviewId: reconciledDelivery.reviewId,
+                });
+              }
+            }
+          } catch (reconcileError) {
+            this.log('error', 'Perkins report delivery reconciliation failed', { round: round.id, error: String(reconcileError) });
+          }
+        }
+        if (reconciledDelivery === null) {
+          deliveryError = error;
+          this.opts.escalate?.(
+            `Perkins report for round ${round.id} was recorded but NOT posted safely to the pull request`,
+            String(error),
+          );
+          this.log('error', 'Perkins report post failed', { round: round.id, error: String(error) });
+        }
       }
+    } else if (canonical !== 'INCOMPLETE' && job.prUrl === null) {
+      // No linked PR means publication is impossible: a conclusive verdict
+      // can never become a completed published round.
+      deliveryFailureKind = 'no_pr_link';
+      deliveryError = new Error('the job has no pull request link; a conclusive review cannot be published');
+      this.opts.escalate?.(
+        `Perkins report for round ${round.id} was recorded but has NO pull request to publish to`,
+        'the job has no pull request link; a conclusive review cannot be published',
+      );
     } else if (canonical !== 'INCOMPLETE' && job.prUrl !== null) {
       deliveryError = new Error('the PR poster is unavailable');
       this.opts.escalate?.(
@@ -1485,8 +2608,9 @@ export class WaveRunner {
     }
 
     if (signal.aborted) deliveryError = new Error('review operation aborted during finalization');
-    const postingRequired = job.prUrl !== null;
-    const recordedVerdict = verdict !== null && (!postingRequired || posted) && !signal.aborted ? verdict : null;
+    // Publication is required for ANY conclusive verdict: an unposted review
+    // is never complete, with or without a linked PR.
+    const recordedVerdict = verdict !== null && posted && !signal.aborted ? verdict : null;
     if (recordedVerdict === null && verdict !== null) {
       reportFile = writeReviewArtifact(frozenReview, 'perkins-report.delivery-incomplete.md', [
         '# Perkins Code Review',
@@ -1514,7 +2638,7 @@ export class WaveRunner {
           artifactDirectory: review.artifactDirectory,
           reportFile,
           headMoved,
-          complete: review.completeness.complete && !headMoved,
+          complete: canonical !== 'INCOMPLETE' && !headMoved,
         },
       });
       this.opts.ledger.setRoundVerdict(round.id, recordedVerdict);
@@ -1525,7 +2649,7 @@ export class WaveRunner {
         jobId: job.id,
         roundId: round.id,
         payload: {
-          reason: verdict === null ? 'review_incomplete' : 'report_not_posted',
+          reason: verdict === null ? 'review_incomplete' : deliveryFailureKind,
           reportFile,
           ...(deliveryError !== undefined ? { error: String(deliveryError).slice(0, 500) } : {}),
         },
@@ -1613,21 +2737,24 @@ export class WaveRunner {
   private recordLensResults(
     round: RoundRecord,
     lenses: readonly PerkinsLens[],
-    review: PerkinsHybridResult,
+    review: PerkinsWholeResult,
   ): ReviewLensResult[] {
     const results: ReviewLensResult[] = [];
     for (const lens of lenses) {
-      const finalByChunk = new Map<string, LensEnvelope>();
-      for (const envelope of review.lensEnvelopes) {
-        if (envelope.lens !== lens) continue;
-        const prior = finalByChunk.get(envelope.chunk);
-        if (prior === undefined || envelope.attempt > prior.attempt) finalByChunk.set(envelope.chunk, envelope);
+      const runs = review.specialistRuns.filter((run) => run.lens === lens);
+      if (runs.length === 0) {
+        // Whole-PR review: the lead owns the review; a lens it never used is
+        // a truthful 'not used', never missing required coverage.
+        const note = 'not used — lead-owned whole-PR review';
+        this.opts.ledger.setLensOutcome(round.id, lens, 'done', note);
+        results.push({ state: 'done', verdict: 'clean', evidence: note });
+        continue;
       }
-      const failed = [...finalByChunk.values()].filter((entry) => entry.status !== 'valid');
-      if (failed.length > 0 || finalByChunk.size === 0 || !review.completeness.verificationComplete) {
-        const note = failed.length > 0
-          ? `incomplete chunks: ${failed.map((entry) => entry.chunk).join(', ')}`
-          : 'independent verification did not complete';
+      const failed = runs.filter((run) => run.status !== 'valid');
+      if (failed.length === runs.length) {
+        // Every attempt on this lens failed: honest execution error, named
+        // per attempt. The lead's own review still stands apart from it.
+        const note = `specialist attempts failed: ${failed.map((run) => `a${run.attempt} ${run.failureKind ?? 'error'}: ${(run.error ?? 'no host-recorded reason').slice(0, 200)}`).join('; ')}`;
         this.opts.ledger.setLensOutcome(round.id, lens, 'error', note);
         results.push({ state: 'error', note });
         continue;
@@ -1635,12 +2762,24 @@ export class WaveRunner {
       const findings = review.findings.filter((finding) => finding.sources.includes(lens));
       const verdict: 'blocker' | 'warning' | 'note' | 'clean' = this.lensVerdict(findings);
       const evidence = findings.length === 0
-        ? 'lead verification retained no finding for this lens'
+        ? 'lead retained no finding sourced from this specialist'
         : findings.slice(0, 10).map((finding) =>
             `${finding.severity}: ${finding.title} @ ${finding.location} — ${finding.evidence.slice(0, 240)}`,
           ).join('\n');
-      this.opts.ledger.setLensOutcome(round.id, lens, 'done', `${verdict} — ${evidence}`);
-      results.push({ state: 'done', verdict, evidence });
+      // Truthful accounting on the done chip (T12/R17): an earlier FAILED
+      // attempt stays visible after a later success, and valid runs whose
+      // findings never reached the lead say so — 'ran' must never read as
+      // 'delivered and considered'.
+      const history: string[] = [];
+      if (failed.length > 0) {
+        history.push(`earlier failed attempts: ${failed.map((run) => `a${run.attempt} ${run.failureKind ?? 'error'}`).join(', ')}`);
+      }
+      if (runs.some((run) => run.status === 'valid' && run.findingsDelivered === false)) {
+        history.push('specialist findings for this lens were NOT delivered to the lead (transport overflow); the lead judged without them');
+      }
+      const note = `${verdict} — ${evidence}${history.length > 0 ? ` · ${history.join(' · ')}` : ''}`;
+      this.opts.ledger.setLensOutcome(round.id, lens, 'done', note);
+      results.push({ state: 'done', verdict, evidence: note });
     }
     return results;
   }
@@ -1660,18 +2799,22 @@ export class WaveRunner {
       const bytes = readFileSync(file);
       if (bytes.byteLength !== info.size) return false;
       const parsed = JSON.parse(bytes.toString('utf8')) as {
+        schemaVersion?: unknown;
         architecture?: unknown;
         canonicalVerdict?: unknown;
         completeness?: { complete?: unknown; verificationComplete?: unknown };
+        complete?: unknown;
         frozen?: { targetSha?: unknown };
         headMoved?: unknown;
         findings?: unknown;
       };
-      return parsed.architecture === 'perkins-hybrid' &&
+      const complete = parsed.schemaVersion === 3
+        ? parsed.complete === true
+        : parsed.completeness?.complete === true && parsed.completeness.verificationComplete === true;
+      return (parsed.architecture === 'perkins-hybrid' || parsed.architecture === 'perkins-whole-pr') &&
         parsed.frozen?.targetSha === expectedTargetSha &&
         parsed.canonicalVerdict !== 'INCOMPLETE' &&
-        parsed.completeness?.complete === true &&
-        parsed.completeness.verificationComplete === true &&
+        complete &&
         parsed.headMoved === false &&
         Array.isArray(parsed.findings);
     } catch {

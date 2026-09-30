@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,7 +13,7 @@ import { loadConfig, DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
-import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { NotificationCenter } from '../src/notifications/center.js';
@@ -87,7 +88,7 @@ async function boot(opts: {
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const reviewSessions = join(dir, 'review-sessions');
   mkdirSync(reviewSessions, { recursive: true });
-  const hybrid = fakeHybridSpawner(reviewSessions, { childAnswer: () => '[]' });
+  const hybrid = fakeWholeSpawner(reviewSessions, { childAnswer: () => '[]' });
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
     if (role === 'perkins') return hybrid.spawner(role, options);
@@ -141,7 +142,8 @@ async function boot(opts: {
     ledger,
     worktrees,
     spawner,
-    poster: { async post(input) { return { headSha: input.targetSha, baseSha: 'stub-base' }; } },
+    bus,
+    poster: { async post(input: { readonly targetSha: string; readonly body: string }) { return { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'stub-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') }; } },
     reviewArtifactRoot: join(dir, 'reviews'),
     prHeadProbe: originHeadProbe(),
     ...(opts.reviewPreflight !== undefined ? { reviewPreflight: opts.reviewPreflight } : {}),
@@ -264,6 +266,52 @@ describe('dispatch server (E8)', () => {
       expect(worktreeRows).toHaveLength(1);
       expect(worktreeRows[0]?.branch).toBe('gru/http-job');
     } finally {
+      await h.close();
+    }
+  });
+
+  it('returns a durable 202 review receipt to an implementing minion without waiting on its open turn', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const skillDir = mkdtempSync(join(tmpdir(), 'bmad-review-handoff-'));
+    cleanupDirs.push(skillDir);
+    const skillFile = join(skillDir, 'SKILL.md');
+    writeFileSync(skillFile, '---\nname: bmad-review\n---\ninstalled', 'utf8');
+    const h = await boot({
+      minionPromptGate: () => gate,
+      reviewPreflight: async () => ({ ok: false, failures: [{ leg: 'review-policy', detail: 'disabled', remediation: 'enable review' }] }),
+      fallbackGate: { skillPath: skillFile, runFallbackReview: async () => [],
+        fixDirectiveSink: async () => ({ delivered: true }),
+      },
+    });
+    const repo = makeFixtureRepo('fixture-http-handoff');
+    cleanupRepos.push(repo);
+    try {
+      const dispatch = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-handoff', repo_path: repo.path, title: 'reviewable', briefing: 'ship it',
+      }, TOKEN);
+      expect(dispatch.status).toBe(202);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'http-handoff', by: 'minion',
+      }, TOKEN);
+      expect(review.status).toBe(202);
+      expect(review.json).toMatchObject({ route: 'queued', job_id: 'http-handoff' });
+      expect(h.ledger.listRounds('http-handoff')).toHaveLength(0);
+      expect(h.ledger.latestJobEvent('http-handoff', 'job.delivered')).toBeNull();
+      release();
+      for (let tick = 0; tick < 40 && h.ledger.latestJobEvent('http-handoff', 'job.review-handoff-started') === null; tick += 1) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      }
+      expect(h.ledger.latestJobEvent('http-handoff', 'job.review-handoff-started')?.payload).toMatchObject({
+        route: 'bmad-review-fallback',
+      });
+      for (let tick = 0; tick < 40 &&
+        (h.ledger.latestJobEvent('http-handoff', 'job.fallback-review')?.payload as { phase?: string } | undefined)?.phase !== 'pass'; tick += 1) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      }
+      expect(h.ledger.latestJobEvent('http-handoff', 'job.fallback-review')?.payload).toMatchObject({ phase: 'pass' });
+    } finally {
+      release();
       await h.close();
     }
   });
@@ -517,6 +565,47 @@ describe('dispatch server (E8)', () => {
       await h.close();
     }
   });
+
+  it('re-arms one proven same-head service-restart abort through the guarded Silas review API', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: 'clean-abort', repo_path: repo.path, title: 'clean', briefing: 'b' }, TOKEN);
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('clean-abort', 'job.delivered') === null && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(h.ledger.latestJobEvent('clean-abort', 'job.delivered')).not.toBeNull();
+      expect((await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'clean-abort', url: PR_URL }, TOKEN)).status).toBe(200);
+      const lane = h.worktrees.listWorktrees({ jobId: 'clean-abort' }).find((row) => row.kind === 'job')!;
+      const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: lane.path, encoding: 'utf8' }).trim();
+      expect(h.ledger.latestJobEvent('clean-abort', 'job.delivered')?.payload).toMatchObject({ sha, source: 'dispatch' });
+      const round = h.ledger.addRound({ jobId: 'clean-abort', targetRef: sha, lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      const body = { job_id: 'clean-abort', by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: round.id };
+      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean-abort', roundId: round.id, payload: { reason: 'cancelled' } });
+      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean-abort', roundId: round.id, payload: { reason: 'service_restart' } });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'clean-abort', payload: { sha: 'new-unreviewed-head' } });
+      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'clean-abort', payload: { sha } });
+      expect((await call(h.port, 'POST', '/api/dispatch/review', { ...body, force: true }, TOKEN)).status).toBe(400);
+      expect((await call(h.port, 'POST', '/api/dispatch/review', { ...body, by: 'gru' }, TOKEN)).status).toBe(400);
+      const digest = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      expect(digest.prWithoutReview).toMatchObject([{ jobId: 'clean-abort', cleanAbort: { roundId: round.id } }]);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);
+      expect(review).toMatchObject({ status: 202, json: { route: 'perkins', round_id: 'clean-abort-r2',
+        rule_id: 'clean-abort-service-restart', source_round_id: round.id } });
+      expect(h.ledger.latestJobEvent('clean-abort', 'silas.review-triggered')?.payload).toMatchObject({
+        rule_id: 'clean-abort-service-restart', source_round_id: round.id, round_id: 'clean-abort-r2',
+      });
+      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+    } finally { await h.close(); }
+  }, 90_000);
 
   it('/api/silas/directive routes to the live minion, flips the lane back to working, records the event', async () => {
     const h = await boot();

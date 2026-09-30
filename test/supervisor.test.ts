@@ -18,6 +18,7 @@ import type {
   AgentCapabilities,
   AgentHandle,
   AgentState,
+  ContextUsage,
   PendingTurn,
   PromptOptions,
   RuntimeEvent,
@@ -383,7 +384,7 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(handle.disposed).toBe(true);
   });
 
-  it('breaker trips after 3 failed rungs in the window: stop + action-required + board mark', async () => {
+  it('breaker trips after 3 failed rungs in the window: stop + needs-owner + board mark', async () => {
     const dir = tmpDir();
     const db = new LedgerDb(dir);
     const bus = new EventBus();
@@ -423,7 +424,7 @@ describe('supervisor — watchdog + restart ladder', () => {
       .listNotifications({ limit: 50 })
       .filter((n) => n.kind === 'supervision.breaker');
     expect(escalations.length).toBe(1);
-    expect(escalations[0]?.routing).toBe('action-required');
+    expect(escalations[0]?.routing).toBe('needs-owner');
     expect(escalations[0]?.agentId).toBe('minion-crashloop');
     // Exactly 3 spawns attempted, then STOPPED.
     expect(registry.spawnCalls.length).toBe(3);
@@ -609,7 +610,7 @@ describe('supervisor — decision-backed failure guidance', () => {
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     const incident = h.api.listNotifications({ limit: 50 }).find((row) => row.kind.includes('restart_confirmation_required'));
-    expect(incident).toMatchObject({ routing: 'action-required' });
+    expect(incident).toMatchObject({ routing: 'needs-owner' });
     h.center.ack(incident!.id, 'test-human');
     h.supervisor.onNotificationAcked(incident!.id);
     await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
@@ -674,10 +675,51 @@ describe('supervisor — decision-backed failure guidance', () => {
       class: 'authentication_wall', restart_advised: false, source: 'deterministic_guard', route: 'fallback',
     });
     const incident = h.api.listNotifications({ limit: 50 }).find((row) => row.kind.includes('provider-wall'));
-    expect(incident).toMatchObject({ routing: 'action-required' });
+    expect(incident).toMatchObject({ routing: 'needs-owner' });
 
     h.center.ack(incident!.id, 'test-human');
     h.supervisor.onNotificationAcked(incident!.id);
+    await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
+    h.dispose();
+  });
+
+  it('a legacy machine-routed provider-wall row never strands a new owner stop: fresh Ack-able row, ack re-arms the ladder (gh-97)', async () => {
+    const h = boot({ decide: vi.fn(async () => { throw new Error('decision service down'); }) } as unknown as DecisionService);
+    const handle = new FakeHandle('minion', 'minion-legacy-wall', null);
+    h.registry.adopt(handle);
+    // Pre-routing-split ledger state: an unresolved MACHINE-routed wall of
+    // exactly the kind this stop will dedupe against.
+    const wallKind = `supervision.provider-wall.${handle.id}.authentication_wall`;
+    h.api.recordNotification({
+      id: 'legacy-provider-wall',
+      kind: wallKind,
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Legacy machine wall',
+      agentId: handle.id,
+    });
+    const spawns = h.registry.spawnCalls.length;
+    handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
+    // The stop honors its owner routing against the legacy machine row: a
+    // FRESH needs-owner row exists and the legacy row stays machine-held.
+    const rows = h.api.listNotifications({ limit: 50 }).filter((row) => row.kind === wallKind);
+    expect(rows).toHaveLength(2);
+    const ownerStop = rows.find((row) => row.routing === 'needs-owner');
+    expect(ownerStop).toMatchObject({ ackedAt: null, resolvedAt: null });
+    expect(rows.find((row) => row.id === 'legacy-provider-wall')).toMatchObject({
+      routing: 'action-required',
+      ackedAt: null,
+      resolvedAt: null,
+    });
+    // The real owner ACK entry chain works on the fresh row (the same calls
+    // the board ack endpoint makes) and re-arms the restart ladder.
+    expect(() => h.center.ack(ownerStop!.id, 'test-human')).not.toThrow();
+    h.supervisor.onNotificationAcked(ownerStop!.id);
+    // Synchronous read: the ack closed the breaker before the async rung
+    // replaces the disposed agent slot.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ breakerOpen: false });
     await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
     h.dispose();
   });
@@ -1275,6 +1317,25 @@ describe('supervisor — Perkins r1 fixes', () => {
     h.dispose();
   });
 
+  it('autonomous slot use cannot re-arm or Ack an owner-held Gru breaker', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({ id: 'gru-autonomous-stop', role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options) });
+    const first = (await slot.ensure({ intent: 'autonomous' })) as FakeHandle;
+    h.registry.spawnImpl = async () => { throw new Error('spawn exploded'); };
+    hang(first);
+    h.advance(60);
+    await sleep(250);
+    const escalation = h.notificationsOfKind('supervision.breaker')[0]!;
+    expect(escalation).toBeDefined();
+    h.registry.spawnImpl = async (role) => new FakeHandle(role, 'should-not-spawn', null);
+    await expect(slot.ensure({ intent: 'autonomous' })).rejects.toThrow(/owner-held breaker is open/);
+    expect(h.api.getNotification(escalation.id)).toMatchObject({ ackedAt: null, routing: 'needs-owner' });
+    expect(h.api.listEventsAfter(0, { kinds: ['supervision.rearmed'] })).toEqual([]);
+    expect(h.supervisor.viewFor(first.id)?.breakerOpen).toBe(true);
+    h.dispose();
+  });
+
   it('r1-17/#24: slot use on an open breaker re-arms supervision AND acks the escalation row', async () => {
     const h = boot();
     const slot = h.supervisor.declareSlot({
@@ -1437,5 +1498,52 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     expect(handle.disposed).toBe(true);
     expect(h.registry.spawnCalls).toHaveLength(spawns + 1);
     h.dispose();
+  });
+});
+
+/**
+ * #137 rollback probe: advertises the surface the removed proactive gate
+ * consumed, so a regression test can prove supervision no longer acts on it.
+ */
+class CompactionProbeHandle extends FakeHandle {
+  compactCalls = 0;
+  readonly getContextUsage = (): ContextUsage => ({
+    tokens: 90_000,
+    contextWindow: 100_000,
+    percent: 90,
+  });
+  readonly canCompact = (): boolean => !this.disposed;
+  readonly compact = async (): Promise<void> => {
+    this.compactCalls += 1;
+  };
+}
+
+describe('supervisor — #137 rollback: no proactive compaction gate', () => {
+  it('never compacts or defers an idle over-threshold session, even after a provider error', async () => {
+    const h = boot();
+    const handle = new CompactionProbeHandle('gru', 'gru-rollback-no-gate', null);
+    h.registry.adopt(handle);
+    try {
+      handle.setState('idle');
+      h.advance(5);
+      h.advance(5);
+      await sleep(0);
+      const compactionEvents = () =>
+        h.api
+          .listEvents({ limit: 100 })
+          .filter((e) => e.kind.startsWith('supervision.compaction'));
+      expect(handle.compactCalls).toBe(0);
+      expect(compactionEvents()).toHaveLength(0);
+
+      // A stream error must not arm a deferred retry either.
+      handle.emit({ type: 'error', error: 'Provider stream error: fetch failed', fatal: false });
+      h.advance(5);
+      h.advance(5);
+      await sleep(0);
+      expect(handle.compactCalls).toBe(0);
+      expect(compactionEvents()).toHaveLength(0);
+    } finally {
+      h.dispose();
+    }
   });
 });

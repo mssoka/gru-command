@@ -52,6 +52,8 @@ function snapshot(jobs: readonly JobView[]): BoardSnapshot {
       generation: 0,
     },
     unackedActionRequired: 0,
+    unackedNeedsOwner: 0,
+    wakes: { count: 0, lastAt: null },
     build: null,
     silas: null,
     verify: null,
@@ -62,13 +64,12 @@ function snapshot(jobs: readonly JobView[]): BoardSnapshot {
 describe('command ticker (v6)', () => {
   it('renders MODE / RADAR / ROUND segments in order', () => {
     const segments = tickerSegments({
-      view: 'board',
       layout: 'cockpit',
       boardState: 'open',
       snapshot: snapshot([job('j1', [round(4, 'live')]), job('j2', [round(6, 'pending')])]),
     });
     expect(segments.map((segment) => segment.key)).toEqual(['mode', 'radar', 'round']);
-    expect(segments[0]?.label).toBe('MODE: COCKPIT · BOARD');
+    expect(segments[0]?.label).toBe('MODE: COCKPIT');
     expect(segments[1]?.label).toBe('RADAR: LIVE');
     expect(segments[1]?.tone).toBe('ok');
     expect(segments[2]?.label).toBe('ROUND 4 ACTIVE');
@@ -85,14 +86,13 @@ describe('command ticker (v6)', () => {
     expect(radarLabel(null)).toEqual({ label: 'IDLE', tone: 'plain' });
   });
 
-  it('labels the mobile lens and a quiet board honestly', () => {
+  it('labels the mobile layout and a quiet board honestly', () => {
     const segments = tickerSegments({
-      view: 'chat',
       layout: 'single',
       boardState: null,
       snapshot: null,
     });
-    expect(segments[0]?.label).toBe('MODE: MOBILE · CHAT');
+    expect(segments[0]?.label).toBe('MODE: MOBILE');
     expect(segments[1]?.label).toBe('RADAR: IDLE');
     expect(segments[2]?.label).toBe('NO ROUND ACTIVE');
   });

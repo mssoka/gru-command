@@ -163,10 +163,10 @@ export function alertsCard(unacked: number): HealthCardView {
     'alerts',
     'alerts',
     String(unacked),
-    unacked === 0 ? 'nothing awaiting ack' : 'action-required awaiting ack',
+    unacked === 0 ? 'machine queue clear' : 'machine attention awaiting Gru',
     unacked > 0 ? 'alert' : 'ok',
-    unacked > 0 ? 'ACK NEEDED' : null,
-    `${unacked} unacked action-required notification(s)`,
+    unacked > 0 ? 'NEEDS GRU' : null,
+    `${unacked} machine-attention notification(s) awaiting Gru; owner bell stays quiet`,
   );
 }
 

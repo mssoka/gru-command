@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +17,7 @@ import { BoardEngine } from '../src/board/engine.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
-import { fakeHybridSpawner } from './helpers/perkins-hybrid-double.js';
+import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import type { AgentCapabilities, AgentHandle, AgentState, PromptOptions, RuntimeEvent, SpawnOptions } from '../src/runtime/types.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
@@ -106,7 +107,7 @@ function makeDispatchHarness(opts: {
   const handles: FakeHandle[] = [];
   const reviewSessions = join(dataDir, 'review-sessions');
   mkdirSync(reviewSessions, { recursive: true });
-  const hybrid = fakeHybridSpawner(reviewSessions, { childAnswer: () => '[]' });
+  const hybrid = fakeWholeSpawner(reviewSessions, { childAnswer: () => '[]' });
   let n = 0;
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
@@ -135,7 +136,7 @@ function makeDispatchHarness(opts: {
     return handle;
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
-  const poster = { post: vi.fn(async (input: { readonly targetSha: string }) => ({ headSha: input.targetSha, baseSha: 'e2e-delivered-base' })) };
+  const poster = { post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({ reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'e2e-delivered-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') })) };
   const wave = new WaveRunner({
     ledger,
     worktrees,
@@ -196,6 +197,9 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     expect(minion?.prompts[0]?.text).toContain('Dispatch briefing — job widget-polish');
     expect(minion?.prompts[0]?.text).toContain('Acceptance: tests pass.');
     expect(minion?.prompts[0]?.text).toContain(outcome.worktree.branch!);
+    // The dispatched contract carries the current non-draft PR rule.
+    expect(minion?.prompts[0]?.text).toContain('ordinary, non-draft PR');
+    expect(minion?.prompts[0]?.text).toContain('gh pr create without --draft/-d');
 
     // The lane: branch-for-jobs, registered through the port.
     expect(outcome.worktree.branch).toBe('gru/widget-polish');
@@ -216,7 +220,10 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     const events = h.ledger.listEvents({ limit: 100 });
     expect(events.some((e) => e.kind === 'job.handoff')).toBe(true);
     expect(events.some((e) => e.kind === 'job.minion-spawned')).toBe(true);
-    expect(events.some((e) => e.kind === 'job.delivered')).toBe(true);
+    const delivered = events.find((e) => e.kind === 'job.delivered');
+    expect(delivered?.payload).toMatchObject({ agentId: outcome.agentId, source: 'dispatch',
+      sha: execFileSync('git', ['rev-parse', outcome.worktree.branch!], { cwd: outcome.worktree.path, encoding: 'utf8' }).trim(),
+    });
     const agentRow = h.ledger.getAgent(outcome.agentId);
     expect(agentRow?.jobId).toBe('widget-polish');
     expect(agentRow?.role).toBe('minion');

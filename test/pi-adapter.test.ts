@@ -9,7 +9,7 @@ import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubResponder, type StubTurn } from './helpers/stub-model.js';
-import { PerkinsHybridReview } from '../src/dispatch/perkins-review/hybrid.js';
+import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
@@ -211,49 +211,53 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
-  it('runs a hybrid Perkins lead through the production registry and real Pi adapter', async () => {
+  it('runs a whole-PR Perkins lead through the production registry and real Pi adapter', async () => {
     let leadTurns = 0;
-    const confirmed = new Map<string, { candidate_ref: string }>();
+    const harvested: Array<{
+      severity: string; category: string; title: string; location: string;
+      evidence: string; detail: string; recommended_fix: string; source: string;
+    }> = [];
     const harvest = (prompt: string): void => {
-      for (const markerText of prompt.split('[TOOL_RESULT perkins_run_lenses]').slice(1)) {
+      // A resumed prompt replays earlier tool results; only NEW blocks count.
+      for (const markerText of prompt.split('[TOOL_RESULT perkins_run_specialists]').slice(1)) {
         const payload = markerText.split(/\n\[TOOL_RESULT /)[0]!.trim();
         try {
-          const parsed = JSON.parse(payload) as { results: Array<{ findings: Array<{ ref: string }> }> };
+          const parsed = JSON.parse(payload) as { results: Array<{ findings: Array<Record<string, unknown>> }> };
           for (const result of parsed.results) {
-            for (const candidate of result.findings) confirmed.set(candidate.ref, { candidate_ref: candidate.ref });
+            for (const finding of result.findings) {
+              const key = `${finding['title']}\0${finding['location']}`;
+              if (harvestedIds.has(key)) continue;
+              harvestedIds.add(key);
+              harvested.push(finding as never);
+            }
           }
         } catch { /* non-JSON tool text */ }
       }
     };
+    const harvestedIds = new Set<string>();
     const fx = await fixture((prompt) => {
-      if (prompt.includes('REQUIRED CHILD COVERAGE')) {
+      if (prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)')) {
         leadTurns += 1;
         harvest(prompt);
         if (leadTurns === 1) {
           return {
             deltas: [],
-            toolCall: { id: 'lead-read-1', name: 'perkins_read_chunk', args: { chunk: '001' } },
+            toolCall: {
+              id: 'lead-run-1', name: 'perkins_run_specialists',
+              args: { runs: ['blind', 'edge', 'acceptance', 'security'].map((lens) => ({ lens })) },
+            },
           };
         }
         if (leadTurns === 2) {
           return {
             deltas: [],
             toolCall: {
-              id: 'lead-run-1', name: 'perkins_run_lenses',
-              args: { runs: ['blind', 'edge', 'acceptance', 'security'].map((lens) => ({ lens, chunk: '001' })) },
+              id: 'lead-run-2', name: 'perkins_run_specialists',
+              args: { runs: ['architecture', 'codebase', 'tests'].map((lens) => ({ lens })) },
             },
           };
         }
-        if (leadTurns === 3) {
-          return {
-            deltas: [],
-            toolCall: {
-              id: 'lead-run-2', name: 'perkins_run_lenses',
-              args: { runs: ['architecture', 'codebase', 'tests'].map((lens) => ({ lens, chunk: '001' })) },
-            },
-          };
-        }
-        if (leadTurns >= 5) return { deltas: ['hybrid lead complete'] };
+        if (leadTurns >= 4) return { deltas: ['whole-PR lead complete'] };
         const targetSha = /^Frozen target SHA: (.+)$/m.exec(prompt)?.[1] ?? '';
         const baseSha = /^Frozen diff base SHA: (.+)$/m.exec(prompt)?.[1] ?? '';
         return {
@@ -261,23 +265,18 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
           toolCall: {
             id: 'lead-submit', name: 'perkins_submit_review',
             args: {
-              canonical_verdict: 'READY TO MERGE',
-              candidate_decisions: [...confirmed.values()].map((candidate) => ({
-                ...candidate,
-                disposition: 'confirmed',
-                evidence: 'export function answer(): number {',
-                reason: 'lead verified against the frozen tree',
-              })),
-              prior_audit: [],
+              verdict: 'READY TO MERGE',
+              findings: harvested,
+              prior_dispositions: [],
               report_markdown: [
                 '# Perkins Code Review',
                 '',
                 '**Verdict: READY TO MERGE**',
                 `Target: ${targetSha}`,
                 `Base: ${baseSha}`,
-                'Coverage: blind edge acceptance security architecture codebase tests',
+                'Specialists: blind edge acceptance security architecture codebase tests',
                 'warning Verified adapter finding src/main.ts:2',
-                '  return 43;',
+                'warning Changed behavior lacks test tracing src/main.ts:2 — add an assertion for the changed return value.',
                 'Retain verification coverage for this path.',
               ].join('\n'),
             },
@@ -296,10 +295,10 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
           }]
         : lens === 'tests'
           ? [{
-              severity: 'warning', category: 'coverage-gate', title: 'Coverage gate: CONCERNS',
-              location: 'N/A', evidence: 'N/A',
-              detail: 'Changed behavior has no executed live-credential smoke proof.',
-              recommended_fix: 'Run the opt-in live-credential smoke test before release.',
+              severity: 'warning', category: 'coverage', title: 'Changed behavior lacks test tracing',
+              location: 'src/main.ts:2', evidence: '  return 43;',
+              detail: 'The changed return value has no direct assertion.',
+              recommended_fix: 'Add an assertion for the changed return value.',
             }]
           : [];
       return {
@@ -327,7 +326,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         store: fx.store,
         pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
       });
-      const engine = new PerkinsHybridReview({
+      const engine = new PerkinsWholeReview({
         spawner: async (role, options) => {
           const handle = await registry!.spawn(role, options);
           owned.push(handle);
@@ -340,10 +339,10 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         movementRef: 'feature/review', noSpec: false,
       });
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
-      expect(result.completeness).toMatchObject({ requiredLensRuns: 7, validLensRuns: 7 });
-      expect(leadTurns).toBe(4);
-      expect(fx.script.calls.filter((call) => !call.prompt.includes('REQUIRED CHILD COVERAGE'))).toHaveLength(7);
-      expect(result.findings).toHaveLength(1);
+      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(7);
+      expect(leadTurns).toBe(3);
+      expect(fx.script.calls.filter((call) => !call.prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)'))).toHaveLength(7);
+      expect(result.findings).toHaveLength(2);
       expect(owned).toHaveLength(8);
       expect(new Set(owned.map((handle) => handle.id)).size).toBe(8);
       expect(new Set(owned.map((handle) => handle.sessionFile)).size).toBe(8);
@@ -644,6 +643,108 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     expect(
       events.filter((event) => event.type === 'compaction_end' && !event.success),
     ).toHaveLength(1);
+  });
+
+  it('never aborts a pending explicit compaction when time crosses the former #137 deadline', async () => {
+    const fx = await fixture([{ deltas: ['first answer'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    type InternalSession = {
+      compact(): Promise<unknown>;
+      readonly sessionId: string;
+      readonly sessionFile: string | undefined;
+      readonly isIdle: boolean;
+      readonly isCompacting: boolean;
+    };
+    const internal = handle as unknown as {
+      session: InternalSession;
+      onPiEvent(event: unknown): void;
+    };
+    const nativeSession = internal.session;
+    let abortCalls = 0;
+    let release!: () => void;
+    internal.session = new Proxy(nativeSession, {
+      get(target, key) {
+        if (key === 'compact') {
+          return () => new Promise<void>((resolve) => {
+            release = () => {
+              // The native terminal arrives with the SDK call, as in the real
+              // adapter round-trip; then the summary call settles.
+              internal.onPiEvent({ type: 'compaction_end' });
+              resolve();
+            };
+          });
+        }
+        if (key === 'abort') {
+          return async () => {
+            abortCalls += 1;
+          };
+        }
+        return Reflect.get(target, key, target);
+      },
+    });
+    try {
+      await handle.prompt('prime');
+      vi.useFakeTimers();
+      const settled = handle.compact!().then(
+        () => null,
+        (error: Error) => error,
+      );
+      // Cross the former five-minute wrapper deadline: nothing may abort the
+      // compaction or settle the pending reply on this timer (rollback of
+      // PR #137's deadline).
+      await vi.advanceTimersByTimeAsync(300_001);
+      expect(abortCalls).toBe(0);
+      expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
+      release();
+      await expect(settled).resolves.toBeNull();
+      const ends = events.filter((event) => event.type === 'compaction_end');
+      expect(ends).toHaveLength(1);
+      expect((ends[0] as { success: boolean }).success).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      internal.session = nativeSession;
+      await handle.dispose();
+    }
+  });
+
+  it('never aborts a silent native compaction at the former #137 deadline and publishes its completion', async () => {
+    const fx = await fixture([{ deltas: ['first answer'] }]);
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    const internal = handle as unknown as {
+      session: { abort?(): Promise<void> };
+      onPiEvent(event: unknown): void;
+    };
+    const nativeSession = internal.session;
+    let abortCalls = 0;
+    internal.session = new Proxy(nativeSession, {
+      get(target, key) {
+        if (key === 'abort') {
+          return async () => {
+            abortCalls += 1;
+          };
+        }
+        return Reflect.get(target, key, target);
+      },
+    });
+    try {
+      await handle.prompt('prime');
+      vi.useFakeTimers();
+      internal.onPiEvent({ type: 'compaction_start', reason: 'threshold' });
+      await vi.advanceTimersByTimeAsync(300_001);
+      expect(abortCalls).toBe(0);
+      expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
+      // Native completion proceeds promptly — no timer must be awaited.
+      internal.onPiEvent({ type: 'compaction_end' });
+      const ends = events.filter((event) => event.type === 'compaction_end');
+      expect(ends).toHaveLength(1);
+      expect((ends[0] as { success: boolean }).success).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      internal.session = nativeSession;
+      await handle.dispose();
+    }
   });
 
   it('emits thinking deltas before text when the model reasons', async () => {
@@ -1389,11 +1490,11 @@ describe('RuntimeRegistry', () => {
   it('resolves claude-code to a fallback-wrapped adapter and still rejects unknown ids', () => {
     const store = new SessionStore(mkdtempSync(join(tmpdir(), 'gru-command-reg-')));
     cleanupDirs.push(store.dataDir);
-    // Minimal config stand-in: the registry only reads runtimes for this
-    // path; constructing the claude-code adapter must not touch disk or
-    // probe the binary (that happens lazily at spawn).
+    // Minimal config stand-in: the registry reads runtimes and the resident
+    // concurrency limit for this path; constructing the claude-code adapter
+    // must not touch disk or probe the binary (that happens lazily at spawn).
     const registry = new RuntimeRegistry({
-      config: { runtimes: { default: 'pi', roles: {} } } as never,
+      config: { runtimes: { default: 'pi', roles: {} }, concurrency: { maxWorkers: 4 } } as never,
       store,
     });
     // Pre-E3 this threw "no adapter implementation yet" (red → green flip):

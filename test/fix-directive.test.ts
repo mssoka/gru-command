@@ -3,7 +3,8 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { recordFollowUpDelivery, renderRebriefPrompt } from '../src/dispatch/fix-directive.js';
+import { recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -170,5 +171,111 @@ describe('renderRebriefPrompt (the fresh worker contract)', () => {
     // silently receive an empty contract.
     const bare = renderRebriefPrompt({ jobId: 'job-2', briefing: null, note: 'n' });
     expect(bare).toContain('the job row carries no stored briefing');
+  });
+});
+describe('eviction-safe fix directives (phase 3)', () => {
+  const CAPS = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
+
+  function stubRegistry(liveRejectsWith: Error | null) {
+    const failing = {
+      id: 'minion-live', role: 'minion' as const, sessionFile: '/sessions/failing.jsonl', capabilities: CAPS,
+      health: () => ({ state: 'idle', lastActivity: null, sessionFile: '/sessions/failing.jsonl' }),
+      prompt: async () => { if (liveRejectsWith !== null) throw liveRejectsWith; },
+      steer: async () => {}, followUp: async () => {}, subscribe: () => () => {}, dispose: async () => {},
+    };
+    const controller = new AbortController();
+    const calls: Array<{ role: string; options: { resumeFile?: string | null } }> = [];
+    const prompted: string[] = [];
+    const registry = {
+      getHandle: () => failing,
+      spawn: async (_role: string, options: { resumeFile?: string | null } = {}) => {
+        calls.push({ role: _role, options });
+        return {
+          ...failing, id: `minion-resumed-${calls.length}`,
+          sessionFile: options.resumeFile ?? `/sessions/fresh-${calls.length}.jsonl`,
+          prompt: async (text: string) => { prompted.push(text); },
+        };
+      },
+    };
+    return { registry, failing, controller, calls, prompted };
+  }
+
+  it('falls through a typed eviction rejection and resumes the FAILING logical session', async () => {
+    const { WorkerDisposalInProgressError } = await import('../src/runtime/registry.js');
+    const { registry, controller, calls } = stubRegistry(new WorkerDisposalInProgressError());
+    const root = mkdtempSync(join(tmpdir(), 'fix-directive-evict-'));
+    const worktrees = new InMemoryWorktreePort(root);
+    const repo = makeFixtureRepo('fixture-fix-evict');
+    cleanupRepos.push(repo);
+    await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-evict' });
+    const ledgerEvents: Array<{ kind: string; payload: unknown }> = [];
+    const ledger = {
+      listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-evict', sessionFile: '/sessions/failing.jsonl' }],
+      registerAgent: (fields: { id: string }) => { ledgerEvents.push({ kind: 'agent', payload: fields }); },
+      getJob: () => ({ briefing: 'original contract' }),
+    };
+    const outcome = await routeFixDirectiveToMinion({
+      registry: registry as never, ledger: ledger as never, worktrees,
+      jobId: 'job-evict', directive: 'fix the blocker', signal: controller.signal,
+    });
+    expect(outcome.delivered).toBe(true);
+    expect(calls[0]?.options.resumeFile).toBe('/sessions/failing.jsonl'); // the failing session, not an arbitrary record
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a successful resume prompts the directive itself; only a failed resume re-briefs from the original contract', async () => {
+    const { WorkerDisposalInProgressError } = await import('../src/runtime/registry.js');
+    const { registry, controller, prompted } = stubRegistry(new WorkerDisposalInProgressError());
+    const root = mkdtempSync(join(tmpdir(), 'fix-directive-resume-'));
+    const worktrees = new InMemoryWorktreePort(root);
+    const repo = makeFixtureRepo('fixture-fix-resume');
+    cleanupRepos.push(repo);
+    await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-resume' });
+    const ledger = {
+      listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
+      registerAgent: () => {},
+      getJob: () => ({ briefing: 'original contract' }),
+    };
+    await routeFixDirectiveToMinion({
+      registry: registry as never, ledger: ledger as never, worktrees,
+      jobId: 'job-resume', directive: 'fix the blocker', signal: controller.signal,
+    });
+    expect(prompted[0]).toBe(`fix the blocker\n\n${PR_CREATION_RULE}`); // resumed session gets the directive (never the re-brief wrapper), now carrying the current non-draft PR rule
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('the non-draft PR rule on follow-up directives', () => {
+  const CAPS = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
+
+  it('a directive to the live minion carries the current non-draft PR creation rule', async () => {
+    const prompted: string[] = [];
+    const handle = {
+      id: 'minion-live', role: 'minion' as const, sessionFile: null, capabilities: CAPS,
+      health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }),
+      prompt: async (text: string) => { prompted.push(text); },
+      steer: async () => {}, followUp: async () => {}, subscribe: () => () => {}, dispose: async () => {},
+    };
+    const outcome = await routeFixDirectiveToMinion({
+      registry: {
+        getHandle: () => handle as never,
+        spawn: async () => { throw new Error('a live minion must be used, not a spawn'); },
+        disposeHandle: async () => {},
+      },
+      ledger: {
+        listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
+        registerAgent: () => {},
+        getJob: () => ({ briefing: 'original contract' }),
+      } as never,
+      worktrees: {} as never,
+      jobId: 'job-live',
+      directive: 'open the PR for the finished fix',
+      signal: new AbortController().signal,
+    });
+    expect(outcome).toEqual({ delivered: true, minionId: 'minion-live' });
+    expect(prompted).toHaveLength(1);
+    expect(prompted[0]).toContain('open the PR for the finished fix');
+    expect(prompted[0]).toContain('ordinary, non-draft PR');
+    expect(prompted[0]).toContain('gh pr create without --draft/-d');
   });
 });

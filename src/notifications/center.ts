@@ -5,6 +5,7 @@ import type { DecisionService } from '../decisions/types.js';
 import { eventDecisionRequest, redactedText } from '../decisions/questions.js';
 import {
   LedgerApi,
+  isOwnerHeldNotificationKind,
   type NotificationRecord,
   type NotificationRouting,
   type NotificationSeverity,
@@ -13,14 +14,16 @@ import {
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 /**
- * NotificationCenter (EPICS E7 story 2; SPEC ruling 13): the single write
- * path for notifications. Everything the operator must see lands here —
- * direct posts (supervisor escalations) and FYI derivation from board
- * events (the E6 notification-center feed, made durable) — and every
- * mutation echoes on the event bus so all surfaces converge: the board
- * snapshot pushes, the chat surfaces action-required items, and the ack
- * columns are the proven-ack contract (nothing is "shown" without a
- * receipt; nothing action-required clears without a human ack).
+ * NotificationCenter (EPICS E7 story 2; SPEC ruling 13; owner routing
+ * split 2026-09-23): the single write path for notifications. Everything
+ * the operator must see lands here — direct posts (supervisor escalations)
+ * and FYI derivation from board events (the E6 notification-center feed,
+ * made durable) — and every mutation echoes on the event bus so all
+ * surfaces converge. Routing is the attention channel: 'action-required'
+ * is MACHINE attention (wakes Gru via the awareness policy; never rings
+ * the owner bell), 'needs-owner' is the only human-facing class (FOR YOU
+ * + bell + digest), 'fyi' is the standing feed. Ack columns stay the
+ * proven-ack contract (nothing is "shown" without a receipt).
  *
  * Derivation is event-time only: one bus event → at most one durable row.
  * Snapshots never derive — the standing feed IS the table.
@@ -73,14 +76,20 @@ const DERIVED_KINDS: Readonly<Record<string, { severity: NotificationSeverity; t
 export interface NotificationCenterOptions {
   readonly ledger: LedgerApi;
   readonly bus: EventBus;
-  /** Fired for action-required rows (the queued item Gru surfaces in chat). */
+  /** Fired for action-required rows — the machine attention queue that
+   * wakes Gru (the awareness layer subscribes independently; this hook is
+   * for machine-side observers). */
   readonly onActionRequired?: (notification: NotificationRecord) => void;
+  /** Fired for needs-owner rows — the ONLY human-facing class (the chat
+   * notice / owner bell surface rides this). */
+  readonly onNeedsOwner?: (notification: NotificationRecord) => void;
   readonly log?: Log;
 }
 
 export class NotificationCenter {
   private readonly ledger: LedgerApi;
   private readonly onActionRequired: (notification: NotificationRecord) => void;
+  private readonly onNeedsOwner: (notification: NotificationRecord) => void;
   private readonly log: Log;
   private decisions: DecisionService | null = null;
   private decisionsReady: () => boolean = () => false;
@@ -88,7 +97,10 @@ export class NotificationCenter {
   constructor(opts: NotificationCenterOptions) {
     this.ledger = opts.ledger;
     this.onActionRequired = opts.onActionRequired ?? (() => {});
+    this.onNeedsOwner = opts.onNeedsOwner ?? (() => {});
     this.log = opts.log ?? (() => {});
+    // Existing machine-routed rows stay in Gru's first-wake backlog. Only
+    // newly posted owner stops or explicit Gru escalations ring the bell.
     // Derive AFTER the write that published the event: the bus delivers
     // synchronously in write order, so the source row is already durable
     // when the FYI row lands.
@@ -113,6 +125,7 @@ export class NotificationCenter {
     const record = this.ledger.recordNotification({
       id: randomUUID(),
       ...input,
+      routing: isOwnerHeldNotificationKind(input.kind) ? 'needs-owner' : input.routing,
     });
     this.log(input.severity === 'error' ? 'warn' : 'info', 'notification posted', {
       id: record.id,
@@ -123,6 +136,7 @@ export class NotificationCenter {
       agent_id: record.agentId ?? null,
     });
     if (record.routing === 'action-required') this.onActionRequired(record);
+    if (record.routing === 'needs-owner') this.onNeedsOwner(record);
     return record;
   }
 
@@ -140,7 +154,35 @@ export class NotificationCenter {
       input.kind,
       input.dedupe === 'all' ? 'any' : input.dedupe,
     );
-    if (existing !== null) return existing;
+    if (existing !== null) {
+      // A routing mismatch must not strand an owner-held stop (gh-97): an
+      // UNACKED machine row is not owner-Ack-able (ledger.ackNotification
+      // throws for action-required), so honoring the requested owner routing
+      // means an owner-held row. The legacy row stays machine-held for Gru
+      // triage: never migrated, auto-acked, resolved, or grandfathered into
+      // FOR YOU. Same-routing hits and previously ACKED rows still reuse the
+      // old ID.
+      if (input.routing === 'needs-owner' && existing.routing !== 'needs-owner' && existing.ackedAt === null) {
+        // Perkins R1/R2: the kind lookup tie-breaks by id (ts DESC, id
+        // ASC), so a same-millisecond legacy row can keep WINNING this
+        // dedupe after the owner row exists. Reuse the open owner incident
+        // before inserting — one owner row, one bell ring per incident —
+        // with the producer's OWN dedupe mode: 'unacked' reuse requires an
+        // unacked owner row (an ack spends the row, so a NEW trip mints a
+        // NEW owner row), 'active' reuse keeps the one unresolved owner
+        // row even if acked until something resolves it.
+        const openOwnerRow = this.ledger.findNotificationByKindAndRouting(
+          input.kind,
+          'needs-owner',
+          input.dedupe === 'all' ? 'any' : input.dedupe,
+        );
+        if (openOwnerRow !== null) return openOwnerRow;
+        return this.post(input);
+      }
+      // Do not grandfather an old machine row into FOR YOU merely because
+      // a newer post of the same kind is owner-held. Gru triages the old ID.
+      return existing;
+    }
     return this.post(input);
   }
 

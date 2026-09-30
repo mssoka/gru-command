@@ -216,42 +216,6 @@ body {
 .command-ticker__segment--alert { color: var(--band-needs-you-ink); }
 .command-ticker__sep { color: var(--faint); }
 
-/* The Chat/Board segmented lens toggle. */
-.command-bar__tabs {
-  display: flex;
-  gap: 0;
-  border: var(--outline-thin);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-  flex: none;
-}
-
-.command-bar__tab {
-  font: inherit;
-  font-size: 12px;
-  font-weight: 800;
-  padding: 6px 12px;
-  border: 0;
-  background: var(--card);
-  color: var(--muted);
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.command-bar__tab + .command-bar__tab {
-  border-left: var(--outline-thin);
-}
-
-.command-bar__tab:hover {
-  background: var(--soft);
-  color: var(--ink);
-}
-
-.command-bar__tab--active {
-  background: var(--work);
-  color: var(--on-state);
-}
-
 .conn-dot {
   width: 12px;
   height: 12px;
@@ -288,10 +252,10 @@ body {
   top: var(--command-bar-h, 56px);
   z-index: 29;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   flex-wrap: wrap;
-  gap: 6px;
-  padding: 6px 12px;
+  gap: 8px;
+  padding: 8px 12px;
   background: var(--paper);
   border-bottom: 1.5px solid var(--line);
 }
@@ -312,26 +276,28 @@ body {
 .rail-chip {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 9px;
   flex: none;
-  padding: 4px 11px;
+  min-height: 48px;
+  padding: 8px 14px;
   border: var(--outline-thin);
   border-radius: 999px;
   background: var(--card);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
 
 .rail-chip__label {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 800;
   letter-spacing: 0.14em;
   color: var(--faint);
 }
 
 .rail-chip__value {
+  font-size: 14px;
   font-weight: 800;
   color: var(--ink);
 }
@@ -343,42 +309,55 @@ body {
 .rail-chip--muted { border-left: 5px solid var(--muted); }
 
 .rail-chip__flag {
-  font-size: 9px;
-  padding: 1px 8px;
+  font-size: 10px;
+  padding: 2px 8px;
 }
 
-/* Folded KPI count strips (TRACKERS): label + total, slash-separated
-   numbers in the mockup's telemetry style. */
+/* Folded KPI fields (TRACKERS): group label + total, then one labeled
+   field per count — every value carries its own visible label (v6.1). */
 .rail-kpi {
   display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
+  align-items: center;
+  gap: 8px;
 }
 
 .rail-kpi__label {
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 800;
   letter-spacing: 0.12em;
   color: var(--faint);
 }
 
 .rail-kpi__total {
-  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+  font-weight: 800;
   color: var(--ink);
+  font-variant-numeric: tabular-nums;
 }
 
-.rail-kpi__nums {
+.rail-kpi__field {
   display: inline-flex;
   align-items: baseline;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10px;
-  font-weight: 700;
+  gap: 3px;
+  padding-left: 6px;
+  border-left: 1.5px solid color-mix(in srgb, var(--line) 30%, transparent);
+}
+
+.rail-kpi__field-label {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
   color: var(--muted);
 }
 
-.rail-kpi__sep {
-  padding: 0 1px;
-  color: var(--faint);
+.rail-kpi__num {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
 }
 
 .rail-kpi__num--alert {
@@ -387,7 +366,20 @@ body {
 }
 
 .rail-chip--trackers {
-  gap: 6px;
+  gap: 8px;
+}
+
+/* Desktop: TRACKERS grows into the rail's remaining width and its
+   labeled fields flow there, instead of dead-ending in a pill wider than
+   the viewport. Below 900px the rail is a horizontal scroller and the
+   chip stays one nowrap pill like every other chip. */
+@media (min-width: 900px) {
+  .rail-chip--trackers {
+    flex: 1 1 560px;
+    min-width: 0;
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
 }
 
 .rail-chip--trackers .board-decisions,
@@ -908,10 +900,12 @@ body {
 .md-h2 { font-size: 1.02em; }
 .md-h3, .md-h4, .md-h5, .md-h6 { font-size: 0.98em; }
 
+/* Tables shrink to the bubble: fixed layout plus break-anywhere cells
+   wraps every column at the pane width — no internal horizontal scroll
+   (owner heist 2026-09-29). */
 .md-table {
-  display: block;
-  max-width: 100%;
-  overflow-x: auto;
+  width: 100%;
+  table-layout: fixed;
   border-collapse: collapse;
   font-weight: 600;
   font-size: 0.95em;
@@ -924,6 +918,7 @@ body {
   padding: 4px 9px;
   text-align: left;
   vertical-align: top;
+  overflow-wrap: anywhere;
 }
 
 .md-table th {
@@ -933,10 +928,14 @@ body {
 
 .md-table tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.18); }
 
+/* Fenced code wraps at the pane width (owner heist 2026-09-29): pre-wrap
+   keeps the code's own newlines/indentation, anywhere breaks overlong
+   unbroken tokens — the block never scrolls sideways and the pane never
+   does either. */
 .md-code {
   position: relative;
   max-width: 100%;
-  overflow-x: auto;
+  overflow-wrap: anywhere;
   background: rgba(34, 48, 74, 0.09);
   border-radius: 10px;
   padding: 10px 12px;
@@ -944,7 +943,7 @@ body {
   font-size: 12.5px;
   font-weight: 600;
   line-height: 1.5;
-  white-space: pre;
+  white-space: pre-wrap;
   tab-size: 2;
 }
 
@@ -993,6 +992,11 @@ body {
 
 .tool-line {
   align-self: center;
+  /* Long tool names / unbroken error paths wrap instead of scrolling the
+     log sideways (owner heist 2026-09-29: the chat pane never scrolls
+     horizontally). max-width caps the pill at the log's content width. */
+  max-width: 100%;
+  overflow-wrap: anywhere;
   font-size: 12px;
   font-weight: 800;
   color: var(--muted);
@@ -1014,6 +1018,46 @@ body {
   background: var(--work);
   border: 2px solid var(--line);
   animation: conn-pulse 1s ease-in-out infinite;
+}
+
+/* Service band (owner clean-chat clause 2026-09-23): one collapsed run of
+   tool lines + product notices; the chat reads as conversation, machinery
+   one tap away. */
+.service-band {
+  display: grid;
+  gap: 4px;
+  align-self: stretch;
+}
+
+.service-band__head {
+  all: unset;
+  cursor: pointer;
+  align-self: flex-start;
+  font-size: 11px;
+  font-weight: 800;
+  color: var(--muted);
+  opacity: 0.85;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+
+.service-band__head:hover,
+.service-band__head:focus-visible {
+  opacity: 1;
+  background: var(--park);
+}
+
+.service-band__detail {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+  margin-left: 6px;
+  padding-left: 8px;
+  border-left: 2px dashed var(--line);
+}
+
+.service-band__detail[hidden] {
+  display: none;
 }
 
 .chat-context {
@@ -1086,6 +1130,9 @@ body {
   overflow-y: auto;
   max-height: 10rem;
   line-height: 1.45;
+  /* A drafted word with no break opportunities wraps inside the field
+     instead of opening the textarea's own horizontal scrollbar. */
+  overflow-wrap: anywhere;
 }
 
 /* The Gru FAB (v5): bottom-right, everywhere. At/above the console
@@ -1488,6 +1535,158 @@ body {
   transition: background 0.15s ease, color 0.15s ease;
 }
 
+/* ── FOR YOU (owner approval 2026-09-28): the permanent owner-action
+   band above the machine bands. Same band skeleton, owner accent;
+   rows are dense two-liners with the control on the right, hairline
+   dividers like the job rows — never a card grid. ───────────────── */
+.board-band--owner {
+  --band-accent: var(--rev);
+}
+
+.board-owner__rows {
+  display: grid;
+}
+
+.board-owner__row {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'title action'
+    'meta action'
+    'note action';
+  align-items: center;
+  column-gap: 12px;
+  padding: 8px 6px 9px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 22%, transparent);
+}
+
+.board-owner__row:last-child {
+  border-bottom: 0;
+}
+
+/* Error-severity obligations keep the left alert accent (a stop is a
+   stop); info-severity owner asks stay calm. */
+.board-owner__row--error::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 4px;
+  border-radius: 999px;
+  background: var(--alert);
+}
+
+.board-owner__row--error {
+  padding-left: 12px;
+}
+
+.board-owner__row--pr {
+  padding-left: 12px;
+}
+
+.board-owner__row--pr::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 4px;
+  border-radius: 999px;
+  background: var(--done);
+}
+
+.board-owner__title {
+  grid-area: title;
+  font-weight: 800;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.board-owner__ready {
+  flex: none;
+}
+
+.board-owner__meta {
+  grid-area: meta;
+  overflow-wrap: anywhere;
+}
+
+.board-owner__consequence {
+  grid-area: note;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.board-owner__ack,
+.board-owner__open {
+  grid-area: action;
+  justify-self: end;
+  align-self: center;
+  flex: none;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 2px solid var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.board-owner__ack {
+  margin-top: 0; /* reset the panel row's flow margin — this is a grid area */
+  background: var(--accent-soft, var(--soft));
+  color: var(--ink);
+}
+
+.board-owner__ack:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.board-owner__open {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+  background: var(--done);
+  color: var(--on-state);
+}
+
+.board-owner__open:hover {
+  filter: brightness(1.05);
+}
+
+.board-owner__nolink {
+  grid-area: action;
+  justify-self: end;
+}
+
+/* Narrow viewports: the control drops under the text instead of
+   squeezing it — no horizontal overflow, thumb-sized targets. */
+@media (max-width: 560px) {
+  .board-owner__row {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      'title'
+      'meta'
+      'note'
+      'action';
+    row-gap: 6px;
+  }
+
+  .board-owner__ack,
+  .board-owner__open,
+  .board-owner__nolink {
+    justify-self: start;
+  }
+}
+
 .board-band__more:hover {
   background: var(--soft);
   color: var(--ink);
@@ -1774,7 +1973,8 @@ body {
 /* Tracker chips (inside the rail's TRACKERS chip) */
 
 .board-decisions,
-.board-unacked {
+.board-unacked,
+.board-wakes {
   font-size: 10px;
   padding: 3px 10px;
 }
@@ -2056,6 +2256,53 @@ body {
   position: relative;
 }
 
+/* Owner chime speaker: subtle by design. Unarmed = dimmed (the first
+   gesture enables it), armed = full icon, muted = crossed speaker. */
+.board-sound {
+  opacity: 0.6;
+  transition: opacity 0.15s ease, filter 0.15s ease;
+}
+
+.board-sound[data-armed='true'] {
+  opacity: 1;
+}
+
+.board-sound[data-muted='true'] {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+
+/* No Web Audio stack in this browser: the speaker disables itself with
+   an honest tooltip instead of promising a click that can never work. */
+.board-sound[data-unavailable='true'] {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* Unarmed fallback: a needs-owner arrival pulses the bell harder (the
+   chime could not play yet). Bounded — the class is removed by the
+   chime service; reduced-motion tames it globally. */
+.board-bell--nudge {
+  animation: bell-nudge 0.8s var(--ease-pop) 3;
+}
+
+.board-bell--nudge .board-bell__badge {
+  animation: bell-badge-nudge 0.8s var(--ease-pop) 3;
+}
+
+@keyframes bell-nudge {
+  0%, 100% { transform: rotate(0deg) scale(1); }
+  20% { transform: rotate(-6deg) scale(1.05); }
+  45% { transform: rotate(5deg) scale(1.05); }
+  70% { transform: rotate(-3deg) scale(1.02); }
+}
+
+@keyframes bell-badge-nudge {
+  0%, 100% { transform: scale(1); }
+  40% { transform: scale(1.5); }
+  70% { transform: scale(1.15); }
+}
+
 .board-bell__badge {
   position: absolute;
   top: -6px;
@@ -2092,6 +2339,21 @@ body {
   gap: 8px;
   max-height: 320px;
   overflow-y: auto;
+}
+
+.board-notification-section {
+  display: grid;
+  gap: 6px;
+}
+
+.board-notification-section__head {
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  opacity: 0.75;
+}
+
+.board-notification-section__empty {
+  opacity: 0.6;
 }
 
 .board-notification {
@@ -2312,7 +2574,7 @@ body {
 }
 
 .toast--error {
-  background: var(--danger-soft, #ffe3d8);
+  background: var(--danger-soft);
 }
 
 .toast__text { flex: 1; min-width: 0; }
@@ -2344,11 +2606,11 @@ body {
   margin: 6px 0;
   padding: 8px 10px;
   border-radius: 10px;
-  border: 2px dashed var(--ink-soft, #7a6a5f);
-  background: var(--paper-soft, #fdf3e4);
+  border: 2px dashed var(--ink-soft);
+  background: var(--paper-soft);
   font-size: 13px;
   font-weight: 600;
-  color: var(--muted, #6b5e56);
+  color: var(--muted);
   overflow-wrap: anywhere;
 }
 
@@ -2359,8 +2621,9 @@ body {
   font-weight: 800;
   padding: 4px 10px;
   border-radius: 999px;
-  border: 2px solid var(--ink, #2b2320);
-  background: var(--accent-soft, #ffe9a8);
+  border: 2px solid var(--ink);
+  background: var(--accent-soft);
+  color: var(--ink);
   cursor: pointer;
 }
 
@@ -2408,8 +2671,8 @@ body {
   max-width: 100%;
   padding: 3px 8px;
   border-radius: 999px;
-  background: var(--card, #fff);
-  border: var(--outline-width, 1px) solid var(--border, #ccc);
+  background: var(--card);
+  border: var(--outline-width, 1px) solid var(--border);
   font-size: 12px;
   font-weight: 600;
   line-height: 1.4;
@@ -2437,7 +2700,7 @@ body {
 }
 
 .attach-chip__remove:hover {
-  color: var(--danger, #c0392b);
+  color: var(--danger);
 }
 
 .attach-chip--busy {
@@ -2464,8 +2727,8 @@ body {
   max-height: min(52vh, 380px);
   display: flex;
   flex-direction: column;
-  background: var(--card, #fff);
-  border: var(--outline-width, 1px) solid var(--border, #ccc);
+  background: var(--card);
+  border: var(--outline-width, 1px) solid var(--border);
   border-radius: 12px;
   box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
   z-index: 30;
@@ -2477,7 +2740,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
-  border-bottom: var(--outline-width, 1px) solid var(--border, #ccc);
+  border-bottom: var(--outline-width, 1px) solid var(--border);
 }
 
 .attach-picker__path {
@@ -2494,7 +2757,7 @@ body {
 
 .attach-picker__error {
   padding: 8px 12px;
-  color: var(--danger, #c0392b);
+  color: var(--danger);
   font-size: 12px;
   font-weight: 600;
 }
@@ -2508,12 +2771,12 @@ body {
 .attach-picker__empty,
 .attach-picker__truncated {
   padding: 10px 12px;
-  color: var(--muted, #888);
+  color: var(--muted);
   font-size: 13px;
 }
 
 .attach-picker__truncated {
-  border-top: 1px dashed var(--border, #ccc);
+  border-top: 1px dashed var(--border);
   font-weight: 600;
 }
 
@@ -2532,7 +2795,7 @@ body {
 }
 
 .attach-row:hover {
-  background: var(--soft, #f3f4f6);
+  background: var(--soft);
 }
 
 .attach-row:disabled {
@@ -2555,20 +2818,19 @@ body {
 }
 
 /* ------------------------------------------------------------------ */
-/* Phone chrome: compact two-row nav (≤560px)                          */
+/* Phone chrome (≤560px + ≤640px icon compaction)                     */
 /*                                                                     */
-/* Below ~560px the single-row header (logo + title + tabs + status +  */
-/* bell/theme/settings) does not fit: on a 390px phone it measured     */
-/* scrollWidth 519 on the board view with theme/settings clipped       */
-/* off-screen (natural width 581 unpaired / 643 paired; 519 is the     */
-/* flex-shrink floor). Phone-only treatment: tabs wrap onto their own  */
-/* full-width row, the title block tightens, spacing shrinks — the     */
-/* header's minimum width drops under the phone budget. flex-wrap      */
-/* lets the header grow rows instead of pushing sideways; it is        */
-/* layout, not a CSS overflow guarantee — the e2e is the guarantee     */
-/* (scrollWidth <= clientWidth asserted on chat + board at 390px and   */
-/* 561px). Desktop (≥768px) is untouched; 561–768px still fits on one  */
-/* row (shrink floor ≈ 519px < 561px, e2e-pinned), so no rules there.  */
+/* The single-row header (logo + title + status + speaker/bell/        */
+/* theme/settings) tightens on a phone: the decorative tagline and     */
+/* the wide-viewport ticker drop, the title block shrinks, spacing     */
+/* narrows — the header fits a 390px viewport with zero horizontal     */
+/* overflow. Below 640px the command-bar icon controls compact         */
+/* further so the owner-chime speaker keeps row 1 inside the phone    */
+/* budget. flex-wrap is insurance: the header grows rows instead of    */
+/* pushing sideways. It is layout, not a CSS overflow guarantee —     */
+/* the e2e is the guarantee (scrollWidth <= clientWidth asserted on    */
+/* chat + board at 390px and 561px). Desktop (≥768px) is untouched;   */
+/* 561–768px keeps the full single row, e2e-pinned.                    */
 /* ------------------------------------------------------------------ */
 @media (max-width: 560px) {
   .command-bar {
@@ -2597,13 +2859,18 @@ body {
   .command-bar__ticker {
     display: none;
   }
+}
 
-  .command-bar__tabs {
-    order: 10;
-    flex: 1 1 100%;
+/* ≤640px: command-bar icon controls compact so the owner-chime speaker
+   fits the phone row-1 budget (≤560px) and the bar has control-room to
+   spare at 561–640px. Height stays full — only padding tightens. */
+@media (max-width: 640px) {
+  .command-bar {
+    gap: 8px;
   }
 
-  .command-bar__tab {
-    flex: 1 1 0;
+  .command-bar .pp-btn--icon {
+    padding: 8px 6px;
+    font-size: 15px;
   }
 }

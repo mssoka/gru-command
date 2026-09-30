@@ -17,7 +17,7 @@ import { clearBanner, showBanner } from './ui/banner.js';
 import { ChatView, renderConnectionDot } from './ui/chat.js';
 import { BoardView } from './ui/board.js';
 import { CommandBar, renderChatOnline } from './ui/command-bar.js';
-import { ConsoleShell, CONSOLE_QUERY, type ChatPaneHandle } from './ui/console.js';
+import { ConsoleShell, type ChatPaneHandle } from './ui/console.js';
 import { RailTabs } from './ui/rail-tabs.js';
 import { SplitterController } from './ui/splitters.js';
 import { ToastStack } from './ui/toast.js';
@@ -26,6 +26,7 @@ import { mustGet } from './ui/dom.js';
 import { initPairing, showPairingError } from './ui/pairing.js';
 import { initSettings, THEME_EVENT } from './ui/settings.js';
 import { DecisionStatusCard } from './ui/decisions-status.js';
+import { OwnerChime } from './ui/owner-chime.js';
 
 const TOKEN_KEY = 'gru-pairing-token';
 
@@ -51,6 +52,13 @@ let transcriptView: TranscriptView | null = null;
 const decisionStatusCard = new DecisionStatusCard(() => boardClient?.recheckDecisions() ?? null);
 /** E7: the live toast surface — one stack, reused across re-pairs. */
 const toastStack = new ToastStack(document.getElementById('toasts'));
+/** Owner chime: the ONE sound — needs-owner arrivals only (owner ruling
+ * 2026-09-23). Armed by the first user interaction; mute is persisted. */
+const ownerChime = new OwnerChime({
+  storage,
+  indicator: mustGet<HTMLButtonElement>('sound-toggle'),
+  bell: mustGet<HTMLButtonElement>('notification-bell'),
+});
 /** E7: browser Notification permission — requested on the pair gesture,
  * used opportunistically when granted (toasts remain the in-app floor). */
 let browserNotifications: NotificationPermission = typeof Notification === 'undefined' ? 'denied' : Notification.permission;
@@ -141,7 +149,7 @@ const splitterController = new SplitterController({
   storage,
 });
 
-// The agents rail's AGENTS / TRANSCRIPTS tabs (v6).
+// The agents rail's CREW / TRANSCRIPTS tabs (v6).
 new RailTabs(mustGet('agents-rail'));
 
 /** Keep the ticker's layout segment and the splitter bounds in step with
@@ -160,10 +168,10 @@ window.addEventListener('resize', syncCockpit);
 // At/above 1100px the estate is the cockpit — chat | board | agents-rail
 // with drag splitters — and the FAB toggles the chat pane; below it the
 // board carries the page and the FAB opens the chat overlay (SPEC ruling
-// 11's dashboard-first stance, extended to laptop widths).
+// 11's dashboard-first stance, extended to laptop widths). The command
+// bar carries no lens toggle (v6.1): the chat pane is always docked on
+// desktop, the board is always on the page, and the FAB owns mobile chat.
 // ---------------------------------------------------------------------
-
-const consoleQuery = window.matchMedia(CONSOLE_QUERY);
 
 /** The shell drives the chat through this handle; the view is created at
  * pair time, so before that every call is a no-op. */
@@ -174,7 +182,9 @@ const chatPaneHandle: ChatPaneHandle = {
   setPaneCollapsed: (collapsed) => chatView?.setPaneCollapsed(collapsed),
 };
 
-const consoleShell = new ConsoleShell({
+// The shell owns the FAB/rail/collapse gestures itself; main only
+// constructs it (the chat view is handed over through the handle above).
+new ConsoleShell({
   root: mustGet('console'),
   fab: mustGet<HTMLButtonElement>('gru-fab'),
   rail: mustGet<HTMLButtonElement>('chat-rail'),
@@ -191,37 +201,6 @@ function showPairing(): void {
   mustGet('board-view').hidden = true;
   mustGet('gru-fab').hidden = true;
 }
-
-type ViewId = 'chat' | 'board';
-
-function setActiveTab(id: ViewId): void {
-  mustGet('tab-chat').classList.toggle('command-bar__tab--active', id === 'chat');
-  mustGet('tab-board').classList.toggle('command-bar__tab--active', id === 'board');
-  commandBar.setView(id);
-}
-
-/** Nav Chat: console focuses the pane; below it the sheet opens. */
-function focusChat(): void {
-  setActiveTab('chat');
-  if (consoleQuery.matches) {
-    consoleShell.setCollapsed(false);
-    chatView?.focusComposer();
-  } else {
-    chatView?.openSheet();
-  }
-}
-
-/** Nav Board: the board is always on the page; this dismisses the
- * overlay when one is open and marks the board tab. */
-function focusBoard(): void {
-  setActiveTab('board');
-  chatView?.closeSheet();
-}
-
-mustGet<HTMLButtonElement>('tab-chat').addEventListener('click', () => focusChat());
-mustGet<HTMLButtonElement>('tab-board').addEventListener('click', () => focusBoard());
-// Board-first below the console breakpoint; chat-first on the console.
-setActiveTab(consoleQuery.matches ? 'chat' : 'board');
 
 function onConnection(state: ConnectionState): void {
   renderConnectionDot(state);
@@ -386,9 +365,13 @@ function startBoard(token: string): void {
     },
   );
   // E7: the view gains the live client (receipts + acks) and the toast
-  // surface for newly-arrived notifications.
+  // surface for newly-arrived notifications. New arrivals also ring the
+  // owner chime — it decides on routing (needs-owner only) and throttle.
   boardView.bindClient(boardClient);
-  boardView.setToastHandler((notification) => surfaceNotification(notification));
+  boardView.setToastHandler((notification) => {
+    surfaceNotification(notification);
+    ownerChime.notify(notification);
+  });
   // Rebound on EVERY startBoard: a re-pair mints a fresh client, and a
   // stale view holding the old client would 401-and-bounce valid sessions.
   transcriptView = new TranscriptView(boardClient, mustGet('board-transcripts'));

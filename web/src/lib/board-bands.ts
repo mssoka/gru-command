@@ -2,7 +2,7 @@
  * Attention-bucketed job ordering (board UX v4): the board answers WHAT
  * TO DO NEXT, not what happened last. Bands, in order:
  *
- *   1 NEEDS YOU  — unacked action-required, blocked/error, PR conflicting,
+ *   1 NEEDS GRU  — unacked action-required, blocked/error, PR conflicting,
  *                  aborted review, failed lenses in the newest round —
  *                  review-history causes apply only to work that is
  *                  still open (concluded merged/done never revives)
@@ -29,7 +29,7 @@ export const JOB_STALLED_AFTER_MS = 30 * 60_000;
 export const BAND_ORDER: readonly BandId[] = ['needs-you', 'in-flight', 'settled', 'cold'];
 
 export const BAND_LABELS: Readonly<Record<BandId, string>> = {
-  'needs-you': 'NEEDS YOU',
+  'needs-you': 'NEEDS GRU',
   'in-flight': 'IN FLIGHT',
   settled: 'SETTLED',
   cold: 'COLD',

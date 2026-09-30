@@ -49,7 +49,7 @@ try {
   git(repo, ['worktree', 'add', worktree, 'HEAD']);
   const manifest = loadWorktreeManifest(repo);
   if (manifest === null) throw new Error('worktree manifest missing after onboarding');
-  applyWorktreeManifest(manifest, { sourceRoot: repo, worktreePath: worktree, setupTimeoutMs: 120_000 });
+  await applyWorktreeManifest(manifest, { sourceRoot: repo, worktreePath: worktree, setupTimeoutMs: 120_000 });
 
   const skill = join(worktree, '.agents', 'skills', 'bmad-build');
   const renderer = join(worktree, '_bmad', 'scripts', 'render_skill.py');

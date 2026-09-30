@@ -8,6 +8,8 @@ import { renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
+import { recordFollowUpDelivery } from './fix-directive.js';
+import { PR_CREATION_RULE } from './pr-creation.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -68,6 +70,8 @@ export function renderMinionBriefing(input: {
     'BRIEFING:',
     input.briefing,
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
+    '',
+    PR_CREATION_RULE,
     '',
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',
@@ -177,10 +181,10 @@ export class DispatchService {
         )
         .then(
           async () => {
-            this.opts.ledger.appendCustomEvent({
-              kind: 'job.delivered',
-              jobId: job.id,
-              payload: { agentId: handle.id },
+            const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
+              worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch' });
+            if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
+              job: job.id, note: delivery.note, lane: delivery.lanePath,
             });
             this.recordSettleOutcome(job.id, 'delivered');
             this.captureLessons(handle, job.id);

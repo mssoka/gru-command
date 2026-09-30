@@ -151,6 +151,11 @@ export interface CiState {
 export interface NormalizedBranchState {
   readonly sha: string | null;
   readonly merged: boolean;
+  /** The PR's observed open/closed status (null = not observed this
+   * tick and never before). A CLOSED pull is a state change even when
+   * unmerged — closed-without-merge must never keep masquerading as an
+   * open obligation (FOR YOU r1: carry it, compare it, project on it). */
+  readonly prOpen: boolean | null;
   readonly mergeableState: string | null;
   readonly ci: CiState | null;
   readonly prNumber: number | null;
@@ -208,8 +213,13 @@ export function ciFailureTier(failures: readonly CiFailure[]): CiFailureTier {
  * - merged is monotonic once observed;
  * - sha/prNumber/prUrl/mergeCommitSha carry past observations forward when
  *   this tick did not see the PR (window miss or fetch failure);
+ * - prOpen reflects the observed open/closed status and carries forward
+ *   only while the pull was not seen this tick;
  * - mergeableState 'unknown'/absent is NOT a state change (GitHub computes
- *   it asynchronously) — the previous value persists;
+ *   it asynchronously) — the previous value persists ONLY while the head
+ *   sha is unchanged: a moved head invalidates the old conclusion (fail
+ *   closed until mergeability is observed for the NEW head) — a 'clean'
+ *   read for the old head must never certify the new one (FOR YOU r1);
  * - CI carries only for the same sha: a moved head resets CI to "unobserved"
  *   rather than mislabeling the old conclusion.
  */
@@ -220,15 +230,32 @@ export function nextBranchState(
   const pull = obs.pull;
   const sha = pull?.headSha ?? prev?.sha ?? null;
   const merged = pull?.merged === true || prev?.merged === true;
+  const prOpen =
+    pull === null
+      ? prev?.prOpen ?? null
+      : pull.state === 'open'
+        ? true
+        : pull.state === 'closed'
+          ? false
+          : prev?.prOpen ?? null;
   const rawMergeable = pull?.mergeableState ?? null;
+  // Head-invalidation: carry the previous mergeability only when the head
+  // did not move (a never-observed sha is not a move — the async-unknown
+  // retry keeps its pinned same-PR behavior). An unknown value at a NEW
+  // head yields null — the board fails closed on anything but 'clean'.
+  const observedHead = pull?.headSha ?? null;
+  const headMoved = observedHead !== null && prev?.sha != null && observedHead !== prev.sha;
   const mergeableState =
     rawMergeable !== null && rawMergeable !== 'unknown'
       ? rawMergeable
-      : prev?.mergeableState ?? null;
+      : headMoved
+        ? null
+        : prev?.mergeableState ?? null;
   const ci = obs.ci ?? (prev?.ci != null && prev.ci.sha === sha ? prev.ci : null);
   return {
     sha,
     merged,
+    prOpen,
     mergeableState,
     ci,
     prNumber: pull?.number ?? prev?.prNumber ?? null,
@@ -242,6 +269,7 @@ export function sameBranchState(left: NormalizedBranchState | null, right: Norma
   return (
     left.sha === right.sha &&
     left.merged === right.merged &&
+    left.prOpen === right.prOpen &&
     left.mergeableState === right.mergeableState &&
     left.prNumber === right.prNumber &&
     left.prUrl === right.prUrl &&
@@ -652,6 +680,7 @@ export function branchStatePayload(lane: TrackedLane, state: NormalizedBranchSta
     branch: lane.branch,
     sha: state.sha,
     merged: state.merged,
+    pr_open: state.prOpen,
     mergeable_state: state.mergeableState,
     pr_number: state.prNumber,
     pr_url: state.prUrl,
@@ -710,6 +739,7 @@ export function readBranchState(ledger: Pick<GitHubPollLedger, 'latestJobEvent'>
   return {
     sha: strOrNull(payload['sha']),
     merged: payload['merged'] === true,
+    prOpen: payload['pr_open'] === true ? true : payload['pr_open'] === false ? false : null,
     mergeableState: strOrNull(payload['mergeable_state']),
     ci,
     prNumber: numOrNull(payload['pr_number']),

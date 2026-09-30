@@ -108,6 +108,9 @@ function snapshot(
     verify?: VerifyQueueView | null;
     selfHeal?: SelfHealView | null;
     repos?: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
+    unackedNeedsOwner?: number;
+    wakes?: { readonly count: number; readonly lastAt: string | null };
+    ownerPrs?: NonNullable<BoardSnapshot['ownerPrs']>;
   } = {},
 ): BoardSnapshot {
   return {
@@ -132,6 +135,9 @@ function snapshot(
     silas: options.silas ?? null,
     verify: options.verify ?? null,
     selfHeal: options.selfHeal ?? null,
+    unackedNeedsOwner: options.unackedNeedsOwner ?? 0,
+    wakes: options.wakes ?? { count: 0, lastAt: null },
+    ownerPrs: options.ownerPrs,
   };
 }
 
@@ -140,7 +146,9 @@ function mountBoardDom(): void {
     <div id="chip-rail" hidden>
       <span id="board-decisions"></span>
       <span id="board-unacked" hidden></span>
+      <span id="board-wakes" hidden></span>
     </div>
+    <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
     <span id="rail-agents-count">0</span>
@@ -156,7 +164,7 @@ describe('board view resolved-notification rendering', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});
     view.setToastHandler(toast);
-    const first = notification('first');
+    const first = notification('first', { routing: 'needs-owner' });
     view.render(snapshot({ notifications: [first] }));
     expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1);
 
@@ -173,13 +181,64 @@ describe('board view resolved-notification rendering', () => {
         notifications: [
           resolved,
           notification('arrived-resolved', { resolvedAt: '2026-01-01T00:02:00.000Z', resolvedBy: 'runtime' }),
-          notification('active'),
+          notification('active', { routing: 'needs-owner' }),
         ],
       }),
     );
     expect(toast).toHaveBeenCalledTimes(1);
     expect(toast).toHaveBeenCalledWith(expect.objectContaining({ id: 'active' }));
     expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1);
+  });
+
+  it('an informational owner stop remains in the bell until seen and is ackable; machine rows have no manual Ack', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [notification('owner-stop', { routing: 'needs-owner', severity: 'info' }), notification('machine')] }));
+    expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('1');
+    const sections = [...document.querySelectorAll<HTMLElement>('.board-notification-section')];
+    expect(sections[0]?.querySelector('.board-notification__title')?.textContent).toContain('owner-stop');
+    expect(sections[0]?.querySelector('.board-notification__ack')).not.toBeNull();
+    expect(sections[1]?.querySelector('.board-notification__ack')).toBeNull();
+  });
+
+  it('places pre-disposition acknowledged machine rows in FEED, not an unresolvable NEEDS GRU queue', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [notification('legacy-machine', { ackedAt: '2026-01-01T00:01:00.000Z' })] }));
+    const sections = [...document.querySelectorAll<HTMLElement>('.board-notification-section')];
+    expect(sections[1]?.textContent).toContain('machine queue is clear');
+    expect(sections[1]?.textContent).not.toContain('Notice legacy-machine');
+    expect(sections[2]?.textContent).toContain('Notice legacy-machine');
+    expect(sections[2]?.querySelector('.board-notification__ack')).toBeNull();
+  });
+
+  it('routing split: machine rows never ring the bell or toast; needs-owner rows do', () => {
+    const toast = vi.fn();
+    const view = new BoardView(() => {});
+    view.setToastHandler(toast);
+    view.render(snapshot({ notifications: [] })); // first snapshot suppresses history only
+    view.render(snapshot({ notifications: [notification('machine'), notification('info', { routing: 'fyi' })] }));
+    expect(toast).not.toHaveBeenCalled();
+    expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('0');
+    expect(document.querySelector('.board-notification-section__head')?.textContent).toContain('FOR YOU');
+    const sections = [...document.querySelectorAll('.board-notification-section__head')].map(
+      (head) => head.textContent,
+    );
+    expect(sections).toEqual(['FOR YOU', 'NEEDS GRU', 'FEED']);
+
+    view.render(
+      snapshot({
+        notifications: [
+          notification('machine'),
+          notification('info', { routing: 'fyi' }),
+          notification('owner', { routing: 'needs-owner' }),
+        ],
+      }),
+    );
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ id: 'owner' }));
+    const forYou = document.querySelector('.board-notification-section');
+    expect(forYou?.querySelector('.board-notification__title')?.textContent).toContain('Notice owner');
+    const needsGru = document.querySelectorAll('.board-notification-section')[1];
+    expect(needsGru?.querySelector('.board-notification__title')?.textContent).toContain('Notice machine');
   });
 });
 
@@ -288,6 +347,25 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     // A conflict is the loudest PR state: the number carries the alert ink.
     const conflicting = [...document.querySelectorAll<HTMLElement>('[data-kpi="prs.conflicting"]')][0];
     expect(conflicting?.classList.contains('rail-kpi__num--alert')).toBe(true);
+
+    // v6.1 ruling 5: every rendered number carries its visible label —
+    // adjacency in the DOM, not a tooltip promise.
+    const fields = [...document.querySelectorAll<HTMLElement>('.rail-kpi__field')];
+    expect(fields.length).toBeGreaterThan(0);
+    for (const field of fields) {
+      const label = field.querySelector<HTMLElement>('.rail-kpi__field-label');
+      const num = field.querySelector<HTMLElement>('[data-kpi]');
+      expect(label?.textContent, `${num?.dataset.kpi} label text`).toBeTruthy();
+      expect(num, `${label?.textContent} number`).not.toBeNull();
+      expect(label?.nextElementSibling).toBe(num);
+    }
+    const groupLabels = [...document.querySelectorAll<HTMLElement>('.rail-kpi__label')].map(
+      (node) => node.textContent ?? '',
+    );
+    expect(groupLabels.some((text) => text.startsWith('HEISTS'))).toBe(true);
+    expect(groupLabels.some((text) => text.startsWith('PRS'))).toBe(true);
+    expect(groupLabels.some((text) => text.startsWith('CREW'))).toBe(true);
+    expect(groupLabels.some((text) => text.includes('MINIONS'))).toBe(false);
   });
 
   it('keeps the Jev decisions chip and unacked badge inside the TRACKERS chip', () => {
@@ -314,7 +392,28 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     expect(chip?.classList.contains('pp-chip--done')).toBe(true);
     const unacked = trackers?.querySelector<HTMLElement>('#board-unacked');
     expect(unacked?.hidden).toBe(false);
-    expect(unacked?.textContent).toContain('2 action-required');
+    expect(unacked?.textContent).toContain('2 needs Gru');
+  });
+
+  it('shows the NEEDS GRU machine-queue chip only when the table has pending rows', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ unackedActionRequired: 0 }));
+    const chip = document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-unacked');
+    expect(chip?.hidden).toBe(true);
+    view.render(snapshot({ unackedActionRequired: 2 }));
+    expect(chip?.hidden).toBe(false);
+    expect(chip?.textContent).toContain('2 needs Gru');
+  });
+
+  it('shows the wake tracker inside TRACKERS with the durable count and last-fire stamp', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ wakes: { count: 0, lastAt: null } }));
+    expect(document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-wakes')?.hidden).toBe(true);
+    view.render(snapshot({ wakes: { count: 3, lastAt: '2026-01-01T00:00:00.000Z' } }));
+    const chip = document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-wakes');
+    expect(chip?.hidden).toBe(false);
+    expect(chip?.textContent).toContain('3 wakes');
+    expect(chip?.title).toContain('wake turn');
   });
 });
 
@@ -338,8 +437,8 @@ describe('board v6 — dense job rows', () => {
     const meta = row.querySelector('.board-job__meta');
     expect(meta?.querySelector('.board-job__repo')?.textContent).toBe('📦 demo');
     expect(meta?.querySelector('.board-job__branch')?.textContent).toContain('gru/job-1');
-    expect(meta?.querySelector('.board-job__lane-age')?.textContent).toMatch(/lane \d+[smhd]/);
-    expect(meta?.querySelector('.board-job__agent-age')?.textContent).toMatch(/agent \d+[smhd]/);
+    expect(meta?.querySelector('.board-job__lane-age')?.textContent).toMatch(/^heist \d+[smhd]$/);
+    expect(meta?.querySelector('.board-job__agent-age')?.textContent).toMatch(/^minion \d+[smhd]$/);
     expect(meta?.querySelector<HTMLAnchorElement>('.board-job__pr')?.getAttribute('href')).toBe(
       'https://example.invalid/pr/7',
     );
@@ -450,7 +549,7 @@ describe('board v6 — dense job rows', () => {
       }),
     );
     const signal = document.querySelector('.board-job__signal');
-    expect(signal?.textContent).toContain('1 action-required');
+    expect(signal?.textContent).toContain('1 needs Gru');
     expect(signal?.textContent).toContain('1 blocker');
     expect(signal?.textContent).toContain('1 lens failure');
     expect(signal?.classList.contains('pp-chip--alert')).toBe(true);
@@ -493,10 +592,71 @@ describe('board v6 — dense job rows', () => {
   });
 });
 
+describe('board round progress labels (R9/T14/N8)', () => {
+  beforeEach(mountBoardDom);
+
+  it('renders the truthful lenses-ran label counting failed-and-ran lenses, with the failure history on the chip', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({
+      jobs: [baseJob({
+        status: 'in-review',
+        rounds: [baseRound({
+          status: 'live',
+          lensAttempts: [{ lens: 'blind', attempts: 2 }, { lens: 'security', attempts: 1 }, { lens: 'edge', attempts: 2 }],
+          lenses: [
+            { lens: 'blind', state: 'done', agentId: null, note: 'blocker — unsafe retry; earlier failed attempt: a1 timeout', verdict: 'blocker' },
+            { lens: 'security', state: 'done', agentId: null, note: 'clean — nothing found', verdict: 'clean' },
+            { lens: 'edge', state: 'error', agentId: null, note: 'specialist attempts failed: a1 timeout: x; a2 timeout: y', verdict: null },
+            { lens: 'tests', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+          ],
+        })],
+      })],
+    }));
+    const row = document.querySelector<HTMLElement>('.board-job');
+    if (row === null) throw new Error('row missing');
+    // Reveal the round body to render the round header row.
+    row.querySelector<HTMLElement>('.board-job__meta')?.click();
+    const label = row.querySelector<HTMLElement>('.board-round__lens-progress');
+    if (label === null) throw new Error('lens progress label missing');
+    // blind + security + edge actually ran (edge failed): 3 ran, 1 failed,
+    // 1 not used — the label must mean what it counts.
+    expect(label.textContent).toBe('3/4 lenses ran · 1 failed · 1 not used');
+    // Reveal the per-lens chips: the failure history stays visible on the
+    // errored chip after the later success of its siblings (T12).
+    row.querySelector<HTMLButtonElement>('.board-round__toggle')?.click();
+    const edgeChip = [...row.querySelectorAll<HTMLElement>('.board-lens')].find((chip) => chip.textContent?.includes('edge'));
+    expect(edgeChip?.title).toContain('specialist attempts failed');
+    const blindChip = [...row.querySelectorAll<HTMLElement>('.board-lens')].find((chip) => chip.textContent?.includes('blind'));
+    expect(blindChip?.title).toContain('earlier failed attempt');
+  });
+
+  it('keeps the clean full-usage label unchanged (7/7 lenses)', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({
+      jobs: [baseJob({
+        status: 'in-review',
+        rounds: [baseRound({
+          status: 'live',
+          lensAttempts: [],
+          lenses: [
+            { lens: 'blind', state: 'done', agentId: null, note: 'blocker — x', verdict: 'blocker' },
+            { lens: 'security', state: 'done', agentId: null, note: 'clean', verdict: 'clean' },
+          ],
+        })],
+      })],
+    }));
+    const row = document.querySelector<HTMLElement>('.board-job');
+    if (row === null) throw new Error('row missing');
+    row.querySelector<HTMLElement>('.board-job__meta')?.click();
+    const label = row.querySelector<HTMLElement>('.board-round__lens-progress');
+    expect(label?.textContent).toBe('2/2 lenses');
+  });
+});
+
 describe('board v6 — bands', () => {
   beforeEach(mountBoardDom);
 
-  it('renders sticky band headers with counts in NEEDS YOU → IN FLIGHT → SETTLED → COLD order', () => {
+  it('renders sticky band headers with counts in NEEDS GRU → IN FLIGHT → SETTLED → COLD order', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -510,7 +670,7 @@ describe('board v6 — bands', () => {
     );
     const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
     expect(bands.map((band) => band.querySelector('.board-band__label')?.textContent)).toEqual([
-      'NEEDS YOU',
+      'NEEDS GRU',
       'IN FLIGHT',
       'SETTLED',
       'COLD',
@@ -518,7 +678,7 @@ describe('board v6 — bands', () => {
     // Sticky separators: a header per band, carrying the count.
     for (const band of bands) {
       expect(band.querySelector('.board-band__head')).not.toBeNull();
-      expect(band.querySelector('.board-band__count')?.textContent).toBe('1 job');
+      expect(band.querySelector('.board-band__count')?.textContent).toBe('1 heist');
     }
     expect(bands[0]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('needs-1');
     expect(bands[1]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('flight-1');
@@ -530,7 +690,7 @@ describe('board v6 — bands', () => {
     expect(document.querySelector('.board-band__rows')).not.toBeNull();
   });
 
-  it('promotes a conflicting PR to NEEDS YOU and demotes a stalled working lane to COLD with a stale flag', () => {
+  it('promotes a conflicting PR to NEEDS GRU and demotes a stalled working lane to COLD with a stale flag', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -551,12 +711,17 @@ describe('board v6 — bands', () => {
       }),
     );
     const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
-    expect(bands.map((band) => band.querySelector('.board-band__label')?.textContent)).toEqual(['NEEDS YOU', 'IN FLIGHT', 'COLD']);
+    expect(bands.map((band) => band.querySelector('.board-band__label')?.textContent)).toEqual(['NEEDS GRU', 'IN FLIGHT', 'COLD']);
     expect(bands[0]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('conflicting-job');
     expect(bands[1]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('fresh-job');
     const stalled = bands[2]?.querySelector<HTMLElement>('.board-job');
     expect(stalled?.getAttribute('data-job-id')).toBe('stalled-job');
     expect(stalled?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+    // v6.1 vocabulary rides the flag's tooltip too: the worker word is
+    // minion, never agent (owner ruling 3).
+    expect(stalled?.querySelector<HTMLElement>('.board-job__stale')?.title).toBe(
+      'working with no minion frames past the stall window',
+    );
   });
 
   it('attributes unacked action-required notifications through agent bindings', () => {
@@ -570,7 +735,7 @@ describe('board v6 — bands', () => {
       }),
     );
     const band = document.querySelector<HTMLElement>('#board-jobs .board-band');
-    expect(band?.querySelector('.board-band__label')?.textContent).toBe('NEEDS YOU');
+    expect(band?.querySelector('.board-band__label')?.textContent).toBe('NEEDS GRU');
     expect(band?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('quiet-job');
   });
 
@@ -592,7 +757,7 @@ describe('board v6 — bands', () => {
     );
     const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
     const needsYou = bands[0];
-    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS YOU');
+    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS GRU');
     const needsRepos = [...(needsYou?.querySelectorAll('.board-job__repo') ?? [])].map((node) => node.textContent);
     expect(needsRepos).toContain('📦 alpha');
     expect(needsRepos).toContain('📦 beta');
@@ -613,7 +778,7 @@ describe('board v6 — bands', () => {
 
     const settled = document.querySelector('.board-band--settled');
     expect(settled?.querySelectorAll('.board-job')).toHaveLength(10);
-    expect(settled?.querySelector('.board-band__count')?.textContent).toBe('12 jobs');
+    expect(settled?.querySelector('.board-band__count')?.textContent).toBe('12 heists');
     const more = settled?.querySelector<HTMLButtonElement>('.board-band__more');
     expect(more?.textContent).toBe('+2 older settled');
 
@@ -627,13 +792,28 @@ describe('board v6 — bands', () => {
     expect(document.querySelectorAll('.board-band--settled .board-job')).toHaveLength(12);
   });
 
-  it('never hides an empty NEEDS YOU — a calm satisfied state carries the good news', () => {
+  it('never hides an empty NEEDS GRU — a calm satisfied state carries the good news', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ jobs: [baseJob({ id: 'flight', status: 'in-review' })] }));
     const needsYou = document.querySelector('.board-band--needs-you');
-    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS YOU');
-    expect(needsYou?.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs you');
+    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS GRU');
+    expect(needsYou?.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs Gru');
     expect(needsYou?.querySelector('.board-band__clear-mark')?.textContent).toBe('✓');
+  });
+
+  it('v6.1 vocabulary pins the quiet states: empty board and empty crew (vgap r5)', () => {
+    const view = new BoardView(() => {});
+    // No repos, no jobs: the board's empty hint speaks heists.
+    view.render(snapshot({ repos: [] }));
+    expect(document.querySelector('.board-empty__title')?.textContent).toBe('The board is quiet');
+    expect(document.querySelector('.board-empty__hint')?.textContent).toBe(
+      'Heists land here once work is dispatched — the ledger is the record, this board is the window.',
+    );
+
+    // Jobs on the board but nobody aboard: the crew rail says crew, not agents.
+    view.render(snapshot({ jobs: [baseJob({ id: 'solo', status: 'working' })], agents: [] }));
+    expect(document.querySelector('#board-agents')?.textContent).toContain('no crew yet');
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('0');
   });
 });
 
@@ -787,5 +967,214 @@ describe('board v6 — job status tones', () => {
     expect(chip?.className).toContain('pp-chip--work');
     expect(chip?.className).not.toContain('pp-chip--rev');
     expect(row?.querySelector('.board-job__dot')?.className).toContain('board-job__dot--work');
+  });
+});
+
+describe('FOR YOU owner band (permanent, top of board)', () => {
+  beforeEach(mountBoardDom);
+
+  function ownerPr(jobId: string, overrides: Partial<NonNullable<BoardSnapshot['ownerPrs']>[number]> = {}) {
+    return {
+      id: `owner-pr:${jobId}`,
+      jobId,
+      jobTitle: `Heist ${jobId}`,
+      repo: 'demo',
+      prUrl: 'https://github.com/example/demo/pull/7',
+      sha: 'aaaa1111bbbb2222cccc3333dddd4444eeee5555',
+      checkedAt: '2026-01-01T00:05:00.000Z',
+      ...overrides,
+    };
+  }
+
+  function stubClient(ackResult: Promise<void> | Error = Promise.resolve()) {
+    return {
+      ackNotification: vi.fn(() => (ackResult instanceof Error ? Promise.reject(ackResult) : ackResult)),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+  }
+
+  it('shows only the owner stop under FOR YOU with count; the machine incident stays in NEEDS GRU (bell), not the band', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        notifications: [
+          notification('owner-stop', { routing: 'needs-owner', kind: 'supervision.breaker', severity: 'info' }),
+          notification('machine', { routing: 'action-required' }),
+        ],
+        unackedActionRequired: 1,
+        unackedNeedsOwner: 1,
+      }),
+    );
+    const band = document.getElementById('board-owner')!;
+    expect(band.hidden).toBe(false);
+    expect(band.querySelector('.board-band__label')?.textContent).toBe('FOR YOU');
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    const actionIds = [...band.querySelectorAll('[data-action-id]')].map((node) => (node as HTMLElement).dataset.actionId);
+    expect(actionIds).toEqual(['owner-ack:owner-stop']);
+    // The machine row is in the bell panel's NEEDS GRU section, never in the band.
+    expect(document.getElementById('notification-list')?.textContent).toContain('Notice machine');
+    expect(band.textContent).not.toContain('Notice machine');
+    // The other board groups still render below the band.
+    expect(document.getElementById('board-jobs')!.compareDocumentPosition(band) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+  });
+
+  it('an empty owner list is the calm clear state — never hidden, never an alarm', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.hidden).toBe(false);
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('0 pending');
+    expect(band.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs you');
+  });
+
+  it('seen/opened does not reduce the pending count (only an authoritative ack closes a row)', () => {
+    const view = new BoardView(() => {});
+    const seen = notification('seen-stop', { routing: 'needs-owner', shownAt: '2026-01-01T00:00:00.000Z' });
+    view.render(snapshot({ notifications: [seen], unackedNeedsOwner: 1 }));
+    // Opening the bell panel marks seen but completes nothing.
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    view.render(snapshot({ notifications: [seen], unackedNeedsOwner: 1 }));
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    // The authoritative snapshot (ack from ANY device) is what closes it.
+    view.render(snapshot({ notifications: [{ ...seen, ackedAt: '2026-01-01T00:09:00.000Z' }], unackedNeedsOwner: 0 }));
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('0 pending');
+  });
+
+  it('ack click: optimistic pending state, stays pending on failure (control reverts), closes only on the authoritative snapshot', async () => {
+    const client = stubClient(new Error('network ambiguity'));
+    const view = new BoardView(() => {}, client);
+    const stop = notification('ack-me', { routing: 'needs-owner', kind: 'supervision.provider-wall.a1.quota_exceeded' });
+    view.render(snapshot({ notifications: [stop] }));
+    const band = document.getElementById('board-owner')!;
+    const button = band.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:ack-me"]')!;
+    // Honest consequence copy rides the row (quota ack scope).
+    expect(band.textContent).toContain('does NOT clear code/test/review holds');
+    button.click();
+    expect(button.textContent).toBe('acking…');
+    expect(button.disabled).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(client.ackNotification).toHaveBeenCalledWith('ack-me');
+    // Failed HTTP → the obligation stands and the control returns.
+    expect(button.textContent).toBe('Ack');
+    expect(button.disabled).toBe(false);
+    view.render(snapshot({ notifications: [stop] }));
+    expect(band.querySelector('[data-action-id="owner-ack:ack-me"]')).not.toBeNull();
+    // Success → STILL pending until the authoritative snapshot lands.
+    const okClient = stubClient();
+    const view2 = new BoardView(() => {}, okClient);
+    view2.render(snapshot({ notifications: [stop] }));
+    const button2 = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__ack')!;
+    button2.click();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).not.toBeNull();
+    view2.render(snapshot({ notifications: [{ ...stop, ackedAt: '2026-01-01T00:09:00.000Z' }] }));
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).toBeNull();
+  });
+
+  it('ready PR row: affected heist + exact-head reason + OPEN PR external link; non-https URLs fail closed', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ ownerPrs: [ownerPr('job-ready')] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    const row = band.querySelector('.board-owner__row--pr')!;
+    expect(row.textContent).toContain('Heist job-ready');
+    expect(row.textContent).toContain('aaaa1111');
+    expect(row.textContent).toContain('CI green');
+    const link = row.querySelector<HTMLAnchorElement>('.board-owner__open');
+    expect(link?.href).toBe('https://github.com/example/demo/pull/7');
+    expect(link?.target).toBe('_blank');
+    expect(link?.rel).toContain('noreferrer');
+    // Fail closed on an unsafe URL: no link is fabricated.
+    view.render(snapshot({ ownerPrs: [ownerPr('bad-url', { prUrl: 'javascript:alert(1)' })] }));
+    const badRow = document.getElementById('board-owner')!.querySelectorAll('.board-owner__row--pr')[0]!;
+    expect(badRow.querySelector('a')).toBeNull();
+    expect(badRow.textContent).toContain('PR link unavailable');
+  });
+
+  it('older pending obligations stay reachable behind the +N older expander', () => {
+    const view = new BoardView(() => {});
+    const stops = Array.from({ length: 9 }, (_, i) =>
+      notification(`old-${String(i).padStart(2, '0')}`, { routing: 'needs-owner', ts: `2026-01-01T00:${String(i).padStart(2, '0')}:00.000Z` }),
+    );
+    view.render(snapshot({ notifications: stops }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelectorAll('.board-owner__row')).toHaveLength(6);
+    const more = band.querySelector<HTMLButtonElement>('.board-band__more')!;
+    expect(more.textContent).toBe('+3 older pending');
+    more.click();
+    expect(document.getElementById('board-owner')!.querySelectorAll('.board-owner__row')).toHaveLength(9);
+  });
+
+  it('a snapshot re-render preserves focus on the same action and fires no toast', () => {
+    const toast = vi.fn();
+    const view = new BoardView(() => {});
+    view.setToastHandler(toast);
+    const stop = notification('focus-me', { routing: 'needs-owner' });
+    view.render(snapshot({ notifications: [stop] }));
+    const button = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:focus-me"]')!;
+    button.focus();
+    expect(document.activeElement).toBe(button);
+    // A refresh of the SAME data re-renders the band: no new arrival, so
+    // no toast — and the focused control keeps its place.
+    view.render(snapshot({ notifications: [stop] }));
+    expect(toast).not.toHaveBeenCalled();
+    const refocused = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-action-id="owner-ack:focus-me"]');
+    expect(document.activeElement).toBe(refocused);
+    expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('owner-ack:focus-me');
+  });
+
+  it('FOR YOU r1 parity: a PR-only obligation shows on BOTH the board band and the bell — never a contradiction', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [], ownerPrs: [ownerPr('job-only-pr')] }));
+    // Board band: 1 pending, OPEN PR row.
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    expect(band.querySelector('.board-owner__open')?.textContent).toContain('OPEN PR');
+    // Bell panel: the SAME authoritative projection — the FOR YOU section
+    // carries the PR row instead of claiming "nothing needs you".
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const panel = document.getElementById('notification-list')!;
+    expect(panel.textContent).not.toContain('nothing needs attention');
+    expect(panel.textContent).not.toContain('nothing needs you');
+    const heads = [...panel.querySelectorAll('.board-notification-section__head')].map((node) => node.textContent);
+    expect(heads[0]).toBe('FOR YOU');
+    expect(panel.querySelector('.board-owner__row--pr')?.textContent).toContain('Heist job-only-pr');
+    expect(panel.querySelector('.board-owner__open')).not.toBeNull();
+    // Alert semantics preserved: the badge counts unseen needs-owner
+    // NOTIFICATIONS only — a ready PR never rings the bell.
+    expect(document.getElementById('notification-badge')?.textContent).toBe('0');
+  });
+
+  it('FOR YOU r1 parity: an empty projection shows the honest empty state on BOTH surfaces', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [notification('fyi-1', { routing: 'fyi' })] }));
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('0 pending');
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    expect(document.getElementById('notification-list')!.textContent).toContain('nothing needs you');
+  });
+
+  it('a visible band sends one web-board shown receipt per notification; a hidden band sends none', async () => {
+    const client = stubClient();
+    const stop = notification('show-me', { routing: 'needs-owner' });
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [stop] }));
+    // Visible band → receipt once; a re-render of the same row never repeats it.
+    view.render(snapshot({ notifications: [stop] }));
+    expect(client.markNotificationShown).toHaveBeenCalledTimes(1);
+    expect(client.markNotificationShown).toHaveBeenCalledWith('show-me', 'web-board');
+
+    // Hidden ancestor (pre-pairing board) → nothing was displayed.
+    const client2 = stubClient();
+    document.body.innerHTML = `<div hidden><section id="board-owner"></section></div>
+      <div id="chip-rail" hidden><span id="board-decisions"></span><span id="board-unacked" hidden></span><span id="board-wakes" hidden></span></div>
+      <div id="board-jobs"></div><div id="board-agents"></div><span id="rail-agents-count">0</span>
+      <button id="notification-bell"><span id="notification-badge">0</span></button>
+      <div id="notification-panel"><div id="notification-list"></div></div>`;
+    const view2 = new BoardView(() => {}, client2);
+    view2.render(snapshot({ notifications: [stop] }));
+    expect(client2.markNotificationShown).not.toHaveBeenCalled();
   });
 });

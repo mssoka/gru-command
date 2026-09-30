@@ -134,13 +134,16 @@ agents, lens binding/outcomes); see [BOARD.md](./BOARD.md).
 The `notifications` table is the durable notification log (SPEC ruling
 13): one row per notification, written once at event time. Columns:
 `id` (uuid — the ack contract), `ts`, `kind`, `routing`
-(`fyi` | `action-required`), `severity` (`info` | `error`), `title`,
-`detail`, `agent_id`, and the proven-ack pair: `shown_at`/`shown_by`
+(`fyi` | `action-required` | `needs-owner`), `severity` (`info` |
+`error`), `title`, `detail`, `agent_id`, and the proven-ack pair: `shown_at`/`shown_by`
 (display receipts, one per surface, idempotent) and `acked_at`/
 `acked_by` (the human clearance). Every mutation appends a
 `notification.created` / `notification.shown` / `notification.acked`
-event and publishes on the bus — the board pushes, the chat surfaces
-action-required items, and the breaker re-arm rides the ack. The
+event and publishes on the bus — the board pushes, machine-attention
+rows wake Gru, needs-owner rows surface in chat, and the breaker re-arm
+rides the ack. Legacy row routing is never promoted on boot or by age;
+`notification.resolved` with Gru's action detail closes machine work,
+while only an explicit `needs-owner` post creates a human decision stop. The
 board's notification center renders this table directly; nothing is
 derived per-snapshot.
 
@@ -159,3 +162,21 @@ marker. Boot reconciliation (`src/dispatch/rebrief-recovery.ts`)
 consumes leftovers: resume the interrupted session (or re-dispatch fresh
 on the same lane), record the missing events, or escalate
 action-required when recovery fails.
+
+### Residency admission + durable review handoffs (custom events)
+
+The resident-budget cap emits durable custom events (all carry truthful
+provenance; none grant admission authority): `round.residency-queued` /
+`round.residency-admitted` / `round.residency-cancelled` track a review
+round's paired lead+child admission through the FIFO budget;
+`job.review-handoff-queued` / `-claimed` / `-requeued` / `-started` /
+`-failed` / `-skipped` / `-conflict` (a differing duplicate records its
+folded scope truthfully) track a minion's durable 202 review receipt — a
+claim with no terminal marker reconciles fail-closed at boot (never a
+blind replay), same-job re-busy re-queues, and terminal/swept lanes skip
+truthfully. `resident.reclaim-failed` records a deduplicated (per boot; one attempt
+per handle per drain-epoch by construction) failed idle-disposal
+observation — the failed
+worker keeps its permit; `resident.open-control-unknown` records (once
+per affected handle) that supervision lacked openControl evidence, which
+makes the handle non-reclaimable rather than presumed idle.

@@ -28,19 +28,20 @@ describe('role definitions (E8)', () => {
     expect(gru).toContain('briefing');
   });
 
-  it('pins the Perkins hybrid persona contract phrases', () => {
+  it('pins the Perkins whole-PR persona contract phrases', () => {
     const perkins = ROLE_DEFINITIONS['perkins'].systemPrompt;
     for (const phrase of [
-      'perkins_run_lenses',
+      'perkins_run_specialists',
       'perkins_submit_review',
       'perkins_preflight_submission',
-      'perkins_record_decision',
+      'perkins_read_prior_revision',
+      'perkins_submit_findings',
       'READY TO MERGE',
       'NEEDS CHANGES',
       'MAJOR REWORK NEEDED',
       'INCOMPLETE',
       'Exact evidence is mandatory',
-      'The blind child has no tools',
+      'The blind specialist has no tools',
     ]) expect(perkins).toContain(phrase);
   });
 
@@ -56,6 +57,18 @@ describe('role definitions (E8)', () => {
       'bmad-review',
       'never a silent downgrade',
     ]) expect(silas).toContain(clause);
+    expect(silas).toContain('never\nmerge');
+    expect(silas).toContain('service-restart clean abort');
+    expect(silas).toContain('owner-held');
+  });
+
+  it('pins the ordinary non-draft PR creation order on minion and silas', () => {
+    const minion = ROLE_DEFINITIONS['minion'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(minion).toContain('create it ordinary and non-draft from the outset');
+    expect(minion).toContain('`gh pr create` without `--draft`/`-d`');
+    const silas = ROLE_DEFINITIONS['silas'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(silas).toContain('New pull requests are ordinary');
+    expect(silas).toContain('existing drafts are left untouched');
   });
 
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {
@@ -78,7 +91,7 @@ describe('role definitions (E8)', () => {
   });
 
   it('maps runtime-agnostic skills per role (declared, not injected)', () => {
-    // Hybrid review sessions override skills to empty; the lens-* fleet is retired.
+    // Review sessions override skills to empty; the lens-* fleet is retired.
     expect(ROLE_DEFINITIONS['perkins'].skills).toEqual([]);
     expect(ROLE_DEFINITIONS['minion'].skills.length).toBeGreaterThan(0);
     expect(ROLE_DEFINITIONS['bob'].skills).toContain('memory-consolidation');
