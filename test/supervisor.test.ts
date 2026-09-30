@@ -1127,7 +1127,14 @@ describe('supervisor — intentional slot generations', () => {
     };
     hang(first);
     h.advance(60);
-    await sleep(50);
+    // The breaker trips only after the 1/2/4ms backoff rungs settle, and that
+    // settle is asynchronous to the fixed clock: a fixed real-time slice
+    // raced the rung chain under CI load (the alert was sampled before the
+    // trip). Wait for the condition itself — this file's vi.waitFor shape —
+    // then assert the same facts.
+    await vi.waitFor(() => {
+      expect(h.notificationsOfKind('supervision.breaker').length).toBeGreaterThan(0);
+    });
     const alert = h.notificationsOfKind('supervision.breaker').find((item) => item.ackedAt === null);
     expect(alert).toBeDefined();
     expect(slot.canReplace()).toBe(false);
