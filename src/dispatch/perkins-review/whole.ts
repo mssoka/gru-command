@@ -1036,8 +1036,26 @@ export class PerkinsWholeReview {
         }
         for (const run of scheduled) attempts.set(run.lens, run.attempt);
         specialistsStarted += scheduled.length;
-        const batch = await pool(scheduled, this.specialistWaveWidth(), (run) =>
-          runSpecialist(run.lens, run.attempt, run.previous, signal));
+        // Provider pacing liveness (r5): a lead waiting on its lens wave is
+        // not generating a turn, so it YIELDS its review slot for the whole
+        // wave — the children (and concurrent rounds) can then be admitted
+        // up to the combined cap. The slot is re-acquired before the result
+        // returns to the model, so the next lead turn is gated again.
+        const batch = await (async (): Promise<PoolOutcome<SpecialistResult>> => {
+          const yieldedLeadSlot = reviewLease !== null;
+          if (yieldedLeadSlot) {
+            reviewLease!.release();
+            reviewLease = null;
+          }
+          try {
+            return await pool(scheduled, this.specialistWaveWidth(), (run) =>
+              runSpecialist(run.lens, run.attempt, run.previous, signal));
+          } finally {
+            if (yieldedLeadSlot) {
+              reviewLease = await this.acquireReviewTurnSlot('lead', input.signal);
+            }
+          }
+        })();
         // Every settled child is REAL work (T13): commit its result before
         // any error handling, so executed runs are never restored to
         // "not used" or hidden from the durable record.

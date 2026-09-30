@@ -5,7 +5,7 @@ import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   assertFrozenPromptBounds,
   freezeReviewInputs,
@@ -1698,7 +1698,7 @@ describe('whole-PR engine: repair pass 3', () => {
 });
 
 describe('provider pacing: combined review-turn gate (owner heist 2026-09-29)', () => {
-  it('throttles specialist fan-out under max_concurrent_review_turns without failing the round', async () => {
+  it('a lead waiting on its lens wave yields its slot: the round cannot wedge and the cap still holds (r5 liveness)', async () => {
     const events: string[] = [];
     const gate = new PacingGate({
       enabled: true,
@@ -1706,20 +1706,45 @@ describe('provider pacing: combined review-turn gate (owner heist 2026-09-29)', 
       maxConcurrentReviewTurns: 2,
       record: (event) => events.push(event.kind),
     });
-    const h = wholeHarness(
-      { childAnswer: () => '[]', specialists: ['blind', 'edge'] },
-      { reviewGate: gate },
-    );
-    const result = await h.run();
-    expect(result.canonicalVerdict).toBe('READY TO MERGE');
-    expect(h.childCalls).toHaveLength(2);
-    // The lead holds one combined slot; the second lens waited FIFO for the
-    // first to release — throttled, never failed.
-    expect(events).toContain('pacing.queued');
-    expect(events).toContain('pacing.admitted');
-    // Every lease came back: no leak behind a completed round.
+    // A concurrent round's lead holds one of the two combined slots for the
+    // whole window — the shape that wedged every concurrent round before the
+    // lead-yield fix (holders: concurrent lead + this lead = 2/2, and the
+    // wave's child could never be admitted).
+    const concurrentLead = await gate.acquireReviewTurn({ id: 'other-round', label: 'other lead' });
+    let peak = 0;
+    try {
+      const h = wholeHarness(
+        {
+          childAnswer: () => {
+            peak = Math.max(peak, gate.view().review.running);
+            return '[]';
+          },
+          specialists: ['blind', 'edge'],
+        },
+        { reviewGate: gate },
+      );
+      const running = h.run();
+      // Liveness probe, scoped to the one thing under test: with the lead
+      // yielding, the wave's first child spawns as soon as the pool runs.
+      // Without the yield it can NEVER spawn (both slots held), so this
+      // waits out and fails — no wall-clock bound on the rest of the round.
+      await vi.waitFor(() => expect(h.childCalls.length).toBeGreaterThan(0), { timeout: 20_000 });
+      const result = await running;
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      expect(h.childCalls).toHaveLength(2);
+      // The wave's second lens waited FIFO for the first to release —
+      // throttled, never failed, never wedged; the combined cap never broke.
+      expect(events).toContain('pacing.queued');
+      expect(events).toContain('pacing.admitted');
+      expect(peak).toBe(2);
+      // Only the concurrent lead's slot remains: the round's own lead
+      // re-acquired after the wave and released on disposal.
+      expect(gate.view().review.running).toBe(1);
+      expect(gate.view().review.queued).toHaveLength(0);
+    } finally {
+      concurrentLead.release();
+    }
     expect(gate.view().review.running).toBe(0);
-    expect(gate.view().review.queued).toHaveLength(0);
   });
 
   it('runs an unlimited review gate without any queue events (behavior-preserving default)', async () => {
