@@ -112,11 +112,6 @@ export interface SupervisionConfig {
   /** Backoff base between restart rungs; doubles per consecutive failure,
    * capped at 60 s. */
   readonly restartBackoffMs: number;
-  /** Proactively compact an IDLE session at a turn boundary once reported
-   * context usage reaches this percent; pi's own threshold compaction
-   * stays enabled as the backstop. 1-100 (100 = effectively the backstop
-   * only). */
-  readonly proactiveCompactPercent: number;
 }
 
 /** Size-based log rotation (E1 deferral, E7 home). */
@@ -655,17 +650,6 @@ function requirePositiveInt(value: unknown, file: string, field: string): number
   return value;
 }
 
-function requirePercent(value: unknown, file: string, field: string): number {
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 100) {
-    throw new ConfigError(
-      `${field} must be an integer between 1 and 100, got: ${String(value)}`,
-      file,
-      field,
-    );
-  }
-  return value;
-}
-
 function requireNonNegativeInt(value: unknown, file: string, field: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
     throw new ConfigError(
@@ -779,7 +763,6 @@ export function loadConfig(
     restartWindowMs: 600_000,
     maxRestarts: 3,
     restartBackoffMs: 2_000,
-    proactiveCompactPercent: 70,
   };
   let logging: LoggingConfig = { maxBytes: 10_485_760, keep: 5 };
   let chat: ChatConfig = {
@@ -979,7 +962,7 @@ export function loadConfig(
     }
     if (raw['supervision'] !== undefined) {
       const table = requireTable(raw['supervision'], file, 'supervision');
-      const VALID = ['enabled', 'turn_silence_ms', 'restart_window_ms', 'max_restarts', 'restart_backoff_ms', 'proactive_compact_percent'];
+      const VALID = ['enabled', 'turn_silence_ms', 'restart_window_ms', 'max_restarts', 'restart_backoff_ms'];
       for (const key of Object.keys(table)) {
         if (!VALID.includes(key)) {
           throw new ConfigError(
@@ -995,7 +978,6 @@ export function loadConfig(
         restartWindowMs: table['restart_window_ms'] !== undefined ? requirePositiveInt(table['restart_window_ms'], file, 'supervision.restart_window_ms') : supervision.restartWindowMs,
         maxRestarts: table['max_restarts'] !== undefined ? requirePositiveInt(table['max_restarts'], file, 'supervision.max_restarts') : supervision.maxRestarts,
         restartBackoffMs: table['restart_backoff_ms'] !== undefined ? requirePositiveInt(table['restart_backoff_ms'], file, 'supervision.restart_backoff_ms') : supervision.restartBackoffMs,
-        proactiveCompactPercent: table['proactive_compact_percent'] !== undefined ? requirePercent(table['proactive_compact_percent'], file, 'supervision.proactive_compact_percent') : supervision.proactiveCompactPercent,
       };
     }
     if (raw['logging'] !== undefined) {

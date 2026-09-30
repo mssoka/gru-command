@@ -536,7 +536,6 @@ describe('supervision / logging / chat tables (E7)', () => {
       restartWindowMs: 600_000,
       maxRestarts: 3,
       restartBackoffMs: 2_000,
-      proactiveCompactPercent: 70,
     });
     expect(config.logging).toEqual({ maxBytes: 10_485_760, keep: 5 });
     expect(config.chat).toEqual({
@@ -561,7 +560,6 @@ describe('supervision / logging / chat tables (E7)', () => {
         'restart_window_ms = 120000',
         'max_restarts = 2',
         'restart_backoff_ms = 250',
-        'proactive_compact_percent = 80',
         '[logging]',
         'max_bytes = 1024',
         'keep = 1',
@@ -584,7 +582,6 @@ describe('supervision / logging / chat tables (E7)', () => {
       restartWindowMs: 120_000,
       maxRestarts: 2,
       restartBackoffMs: 250,
-      proactiveCompactPercent: 80,
     });
     expect(config.logging).toEqual({ maxBytes: 1_024, keep: 1 });
     expect(config.chat).toEqual({
@@ -637,8 +634,6 @@ describe('supervision / logging / chat tables (E7)', () => {
       '[supervision]\nturn_silence_ms = 0\n',
       '[supervision]\nmax_restarts = -1\n',
       '[supervision]\nenabled = "yes"\n',
-      '[supervision]\nproactive_compact_percent = 0\n',
-      '[supervision]\nproactive_compact_percent = 101\n',
       '[logging]\nkeep = 0\n',
       '[chat]\nframe_log_keep = 1.5\n',
     ];
@@ -647,6 +642,14 @@ describe('supervision / logging / chat tables (E7)', () => {
       writeFileSync(join(home, 'config.toml'), text, 'utf-8');
       expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(ConfigError);
     }
+  });
+
+  it('refuses the removed proactive_compact_percent key fail-loud (rollback: installed configs must drop it)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[supervision]\nproactive_compact_percent = 70\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
+      /unknown key `proactive_compact_percent` in \[supervision\] \(valid keys: enabled, turn_silence_ms, restart_window_ms, max_restarts, restart_backoff_ms\)/,
+    );
   });
 });
 

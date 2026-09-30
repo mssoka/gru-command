@@ -332,7 +332,6 @@ export function renderReferenceConfig(
     restartWindowMs: 600_000,
     maxRestarts: 3,
     restartBackoffMs: 2_000,
-    proactiveCompactPercent: 70,
   };
   lines.push(
     '',
@@ -346,9 +345,6 @@ export function renderReferenceConfig(
     `max_restarts = ${supervision.maxRestarts}`,
     `# Backoff base between failed restart rungs (doubles, capped at 60s).`,
     `restart_backoff_ms = ${supervision.restartBackoffMs}`,
-    `# Compact an IDLE session proactively once context usage reaches this`,
-    `# percent (1-100); pi's own threshold compaction stays as the backstop.`,
-    `proactive_compact_percent = ${supervision.proactiveCompactPercent}`,
   );
   // Preserve explicit pacing policy independently of residency settings.
   const pacing = preserved?.pacing;
