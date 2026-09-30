@@ -284,6 +284,15 @@ sight).
 
 ### Attention bands (v4 → v6: dense rows)
 
+A permanent **FOR YOU** owner band (owner approval 2026-09-28) sits
+ABOVE the job bands — pending owner acks (with honest consequence copy)
+and evidence-bound ready PRs (OPEN PR, external https link only) —
+see [BOARD.md](./BOARD.md) for the semantics and the fail-closed
+readiness rule. Its empty state is the calm clear state (an empty owner
+list is healthy); its rows are keyboard-focusable and a snapshot
+re-render preserves focus (stable action ids) and never toasts or rings
+a chime.
+
 Jobs bucket NEEDS GRU → IN FLIGHT → SETTLED → COLD (recency inside each
 band; see [BOARD.md](./BOARD.md)). v6 renders every band as a full-width
 **dense row list**, not a card grid: line 1 = status dot + title +
@@ -332,7 +341,8 @@ pointer).
   TRANSCRIPTS rail. At ≥1100px the chat pane joins it on the left with
   drag splitters; below that the board is the full page and chat
   overlays. Round rows carry 7 per-lens live chips behind the row's
-  disclosure; the notification center rides the bell (see
+  disclosure; the notification center rides the bell, and the header
+  speaker enables/mutes the `needs-owner` owner chime (see
   [BOARD.md](./BOARD.md)). **Phone:** board-first (SPEC ruling 11) — the
   landing view, with chat one FAB tap away.
 - **Transcripts (E6)** — drawer from the crew rail / transcripts list:

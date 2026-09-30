@@ -214,7 +214,7 @@ describe('[review] config leg', () => {
     const dir = mkdtempSync(join(tmpdir(), 'review-path-config-'));
     try {
       const config = loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
-      expect(config.review).toEqual({ enabled: true });
+      expect(config.review).toEqual({ enabled: true, maxConcurrentChildren: 2 });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -227,7 +227,7 @@ describe('[review] config leg', () => {
         writeFileSync(join(dir, 'config.toml'), toml, 'utf-8');
         return loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
       };
-      expect(write('[review]\nenabled = false\n').review).toEqual({ enabled: false });
+      expect(write('[review]\nenabled = false\n').review).toEqual({ enabled: false, maxConcurrentChildren: 2 });
       expect(() => write('[review]\nmode = "off"\n')).toThrow(ConfigError);
       expect(() => write('[review]\nenabled = "no"\n')).toThrow(ConfigError);
     } finally {

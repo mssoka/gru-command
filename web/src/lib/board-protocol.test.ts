@@ -6,6 +6,7 @@ import {
   lensChipTone,
   parseBoardServerFrame,
   type BoardSnapshot,
+  type NotificationView,
 } from './board-protocol.js';
 
 /** A minimal valid snapshot; tests mutate copies to break it. */
@@ -172,6 +173,36 @@ describe('board server-frame validator', () => {
     }
   });
 
+
+  it('FOR YOU ownerPrs: absent/null tolerated (pre-upgrade servers), well-formed accepted, malformed rejected', () => {
+    expect(isValidSnapshot(snapshot())).toBe(true);
+    const nullPrs = { ...snapshot(), ownerPrs: null } as unknown;
+    expect(isValidSnapshot(nullPrs)).toBe(true);
+
+    const ready = {
+      id: 'owner-pr:job-1',
+      jobId: 'job-1',
+      jobTitle: 'Ready heist',
+      repo: 'demo-repo',
+      prUrl: 'https://github.com/example/demo/pull/7',
+      sha: 'a'.repeat(40),
+      checkedAt: '2026-01-01T00:00:00.000Z',
+    };
+    expect(isValidSnapshot({ ...snapshot(), ownerPrs: [ready] } as unknown)).toBe(true);
+
+    // Readiness is server authority: a malformed row never reaches the band.
+    for (const broken of [
+      { ...ready, id: '' },
+      { ...ready, jobId: 7 },
+      { ...ready, sha: null },
+      { ...ready, checkedAt: 12 },
+      { ...ready, prUrl: 'javascript:alert(1)' },
+    ]) {
+      expect(isValidSnapshot({ ...snapshot(), ownerPrs: [broken] } as unknown), JSON.stringify(broken)).toBe(false);
+    }
+    expect(isValidSnapshot({ ...snapshot(), ownerPrs: { not: 'an array' } } as unknown)).toBe(false);
+  });
+
   it('accepts prState present, null, or absent; rejects junk states', () => {
     for (const prState of ['open', 'conflicting', 'merged', null, undefined]) {
       const candidate = snapshot();
@@ -181,6 +212,30 @@ describe('board server-frame validator', () => {
     const junk = snapshot();
     (junk.repos[0]!.jobs[0] as unknown as { prState: unknown }).prState = 'draft';
     expect(isValidSnapshot(junk)).toBe(false);
+  });
+
+  it('accepts the needs-owner routing (the human-attention class) and still rejects unknowns', () => {
+    const row: NotificationView = {
+      id: 'n-owner',
+      ts: '2026-09-23T00:00:00.000Z',
+      kind: 'owner.request',
+      routing: 'needs-owner',
+      severity: 'info',
+      title: 'Needs the owner',
+      detail: null,
+      agentId: null,
+      shownAt: null,
+      ackedAt: null,
+      resolvedAt: null,
+      resolvedBy: null,
+    };
+    const valid = snapshot();
+    (valid.notifications as NotificationView[]).push(row);
+    expect(isValidSnapshot(valid)).toBe(true);
+
+    const unknown = snapshot();
+    (unknown.notifications as unknown[]).push({ ...row, id: 'n-unknown', routing: 'mystery' });
+    expect(isValidSnapshot(unknown)).toBe(false);
   });
 
   it('tone mapping covers every chip state with a design-token class', () => {

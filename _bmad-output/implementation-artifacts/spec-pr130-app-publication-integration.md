@@ -2,7 +2,7 @@
 title: 'PR130 Perkins App publication: fresh-main integration'
 type: 'chore'
 created: '2026-09-30'
-status: 'draft'
+status: 'in-progress'
 route: 'dispatch'
 baseline_commit: 'd1391b65143e32b4d09a1e2a5d6cee038d87ad58'
 investigated_main: 'c54bfbf89727bacfd27a27db65a9fab681c19c3e'
@@ -17,6 +17,8 @@ context: []
 **Problem:** PR #130's installed-App publisher is conflicted after the main integration wave. Prior exact-head CI passed, but scheduled local full verification failed and remains failed. Reviewing identity must still be the installed Perkins App, not a personal account.
 
 **Approach:** Reconcile the existing candidate with freshly fetched main, preserve its approved authorship-only intent, then complete independent review, serialized verification, and exact-head CI before handing settled source to Silas. Integration is not deployment or live acceptance.
+
+**Head strategy (owner decision 2026-09-30, correlation gru-pr130-history-preserving-approved-20260930):** history-preserving integration merge. Fetch fresh origin/main, record its full SHA, merge it into this existing branch, resolve conflicts narrowly, preserve both commits and later work, then normal non-force push to the existing PR #130 branch. This supersedes only the previous rebrief's "rebase onto fresh main" wording; rebase and any force push remain unauthorized.
 
 ## Boundaries & Constraints
 
@@ -33,10 +35,6 @@ context: []
 | Failed gate | Candidate verification fails | Preserve evidence; no delivered claim | Stop broad reruns and report the failed gate |
 
 </frozen-after-approval>
-
-## Open Questions
-
-1. **Published-head strategy:** The re-brief requests rebase while retaining the original normal non-force push requirement. A conventional rebase rewrites the published baseline above and cannot be delivered by a fast-forward push. Choose **history-preserving integration merge** (recommended: resolve fresh main into this branch, push normally), or **explicitly authorize rebase plus an exact-old-head force-with-lease push** (revises the non-force requirement). Do not integrate source or push the PR head until answered.
 
 ## Code Map
 

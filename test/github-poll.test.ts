@@ -48,6 +48,7 @@ function state(overrides: Partial<NormalizedBranchState> = {}): NormalizedBranch
   return {
     sha: null,
     merged: false,
+    prOpen: null,
     mergeableState: null,
     ci: null,
     prNumber: null,
@@ -119,6 +120,56 @@ describe('branch state-change mapping', () => {
     expect(diffBranchState(CTX, fromUnknown, state({ mergeableState: 'dirty' })).map((s) => s.kind)).toEqual([
       'pr-conflict',
     ]);
+  });
+
+  it('FOR YOU r1: a moved head does NOT inherit the old head\'s mergeability — unknown at the new head fails closed to null', () => {
+    const prev = state({ sha: 'sha-old', mergeableState: 'clean', prOpen: true });
+    const moved = nextBranchState(prev, {
+      pull: pull({ headSha: 'sha-new', mergeableState: 'unknown' }),
+      ci: null,
+    });
+    // 'clean' observed for sha-old must never certify sha-new.
+    expect(moved.sha).toBe('sha-new');
+    expect(moved.mergeableState).toBeNull();
+    // The same unknown at the SAME head still carries (the async retry
+    // keeps its pinned same-PR behavior).
+    const settled = nextBranchState(
+      state({ sha: 'sha-old', mergeableState: 'clean', prOpen: true }),
+      { pull: pull({ headSha: 'sha-old', mergeableState: 'unknown' }), ci: null },
+    );
+    expect(settled.mergeableState).toBe('clean');
+    // A clean OBSERVED at the new head is the new head's own conclusion.
+    const observedClean = nextBranchState(prev, {
+      pull: pull({ headSha: 'sha-new', mergeableState: 'clean' }),
+      ci: null,
+    });
+    expect(observedClean.mergeableState).toBe('clean');
+    // The invalidated state is a dedupe CHANGE: the poll writes a fresh
+    // branch-state event so the board re-projects and fails closed.
+    expect(sameBranchState(prev, moved)).toBe(false);
+  });
+
+  it('FOR YOU r1: the observed open/closed status is carried, compared, and never guessed', () => {
+    const prev = state({ prOpen: true, sha: 'sha-1', mergeableState: 'clean' });
+    // A window miss (no pull this tick) carries the previous status.
+    expect(nextBranchState(prev, { pull: null, ci: null }).prOpen).toBe(true);
+    // A close without merge is a REAL state change: the event is written.
+    const closed = nextBranchState(prev, { pull: pull({ state: 'closed' }), ci: null });
+    expect(closed.prOpen).toBe(false);
+    expect(closed.merged).toBe(false);
+    expect(sameBranchState(prev, closed)).toBe(false);
+    // Re-observing the same closed state writes nothing new.
+    expect(sameBranchState(closed, nextBranchState(closed, { pull: pull({ state: 'closed' }), ci: null }))).toBe(true);
+    // An unparseable pull state never invents a status.
+    expect(nextBranchState(prev, { pull: pull({ state: 'weird' }), ci: null }).prOpen).toBe(true);
+    // First observation with no prior: explicitly null until seen.
+    expect(nextBranchState(null, { pull: pull({ state: 'open' }), ci: null }).prOpen).toBe(true);
+    expect(state().prOpen).toBeNull();
+    // branchStatePayload/readBranchState round-trip the status (old events
+    // without pr_open parse to null — fail closed until re-observed).
+    const lane = { jobId: 'job-1', repo: REPO, branch: 'gru/job-1', prNumber: 1, prUrl: null };
+    const payload = branchStatePayload(lane, state({ prOpen: true }));
+    expect(payload['pr_open']).toBe(true);
   });
 
   it('CI failure fires per moved sha and per extended failing set, never for the same recorded state', () => {

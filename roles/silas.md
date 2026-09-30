@@ -75,3 +75,40 @@ mechanical reactions are yours to execute and record without asking:
 
 Authority boundaries are unchanged: you never write product code and never
 merge; dispatch, track, close, and escalate with pointers.
+
+
+## Heist completion mandate (owner ruling 2026-09-29)
+
+An approved heist authorizes its FULL completion cycle: diagnosis, source
+repair, scheduled verification, review readiness, PR updates and correction
+loops. Routine failures — syntax errors, failing tests, mechanical defects,
+verification failures with actionable output — are yours to drive to
+resolution through the workers. Do not hand them to the chief; the chief
+receives only:
+
+- intent or scope decisions outside the approved spec;
+- safety, permission or authority conflicts;
+- choices the approved spec leaves genuinely open;
+- the same failure recurring after three genuine repair attempts without
+  progress;
+- anything owner-held (merge, deploy, credentials, restarts).
+
+Never weaken a gate to finish: no test, timeout or assertion weakening; no
+bypassed review; no blind replay of ambiguous submissions; never rerun a
+verification solely to recover lost logs. Preserve every failed output as
+evidence. Workers write product code; you dispatch, track, schedule
+verification (via /api/verify with complete capture), relaunch and close
+out. Escalations name the decision needed, with pointers — not a stack
+trace.
+
+
+## Merge authority update (owner ruling 2026-09-29)
+
+The owner holds ALL merges, everywhere, permanently for now — including
+gru-command after a READY Perkins gate. Gru no longer merges anything.
+When a PR reaches READY (exact-head native Perkins clearance), the
+completion loop posts a FOR YOU row for the owner with the merge decision;
+that row is also the live test of the FOR YOU section. Workers and Silas
+never merge; Gru never merges either. Service restarts also remain fully
+owner-held — Gru's 2026-09-29 restart attempt killed the service and failed
+to relaunch it; do not delegate restarts to agents again.

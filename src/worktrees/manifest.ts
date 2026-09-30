@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, symlinkSync, copyFileSync, mkdirSync, statSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { parse } from 'smol-toml';
 import type { LogLevel } from '../logger.js';
@@ -215,10 +215,16 @@ export interface ApplyManifestOptions {
 
 /**
  * Apply a bootstrap manifest to a fresh worktree. Order: links, copies,
- * setup commands. Any failure throws — the caller rolls the worktree
- * back; a half-bootstrapped tree is never handed to an agent.
+ * setup commands. Any failure rejects — the caller rolls the worktree
+ * back; a half-bootstrapped tree is never handed to an agent. Async by
+ * contract: setup commands run as child processes OFF the event loop, so
+ * a slow `npm ci` never freezes chat/supervision while dispatch awaits
+ * the lane (the 2026-09-29 wall-clock-gap incident).
  */
-export function applyWorktreeManifest(manifest: WorktreeManifest, opts: ApplyManifestOptions): void {
+export async function applyWorktreeManifest(
+  manifest: WorktreeManifest,
+  opts: ApplyManifestOptions,
+): Promise<void> {
   const log = opts.log ?? (() => {});
 
   for (const link of manifest.links) {
@@ -253,7 +259,7 @@ export function applyWorktreeManifest(manifest: WorktreeManifest, opts: ApplyMan
 
   for (const [index, entry] of manifest.setup.entries()) {
     const started = Date.now();
-    execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs);
+    await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs);
     log('info', 'worktree manifest: setup command ran', {
       command: entry.command,
       index,
@@ -262,21 +268,105 @@ export function applyWorktreeManifest(manifest: WorktreeManifest, opts: ApplyMan
   }
 }
 
-/** Run one setup command in the worktree (shell, captured, bounded);
- * non-zero exit or timeout fails loud with the output tail. */
-function execSetupCommand(command: string, cwd: string, timeoutMs: number): void {
-  const result = spawnSync('/bin/sh', ['-c', command], { cwd, timeout: timeoutMs, encoding: 'utf-8' });
-  if (result.error !== undefined) {
-    throw new Error(`worktree setup command failed to spawn (${command}): ${String(result.error)}`);
+/** Per-stream cap on captured setup output; failures surface the tail. */
+const SETUP_OUTPUT_TAIL_BYTES = 64 * 1024;
+
+/** Grace for a timed-out setup command to honor SIGTERM before SIGKILL. */
+const SETUP_KILL_GRACE_MS = 1_000;
+
+/** Bounded tail buffer for captured setup output (a chatty command must
+ * never grow the service's memory unboundedly). */
+class OutputTail {
+  private readonly chunks: Buffer[] = [];
+  private bytes = 0;
+
+  push(chunk: Buffer): void {
+    this.chunks.push(chunk);
+    this.bytes += chunk.length;
+    while (this.bytes > SETUP_OUTPUT_TAIL_BYTES && this.chunks.length > 1) {
+      const dropped = this.chunks.shift();
+      if (dropped === undefined) return;
+      this.bytes -= dropped.length;
+    }
   }
-  if (result.signal === 'SIGTERM') {
+
+  text(): string {
+    return Buffer.concat(this.chunks).toString('utf-8');
+  }
+}
+
+/** Run one setup command in the worktree (shell, captured, bounded);
+ * non-zero exit or timeout fails loud with the output tail. The command
+ * runs as its own process group so a timeout kill reaches the children a
+ * shell command spawns (npm ci), and awaiting it never blocks the event
+ * loop. */
+async function execSetupCommand(command: string, cwd: string, timeoutMs: number): Promise<void> {
+  let child: ChildProcess;
+  try {
+    child = spawn('/bin/sh', ['-c', command], {
+      cwd,
+      detached: true, // own process group: the timeout kill reaps children too
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    throw new Error(`worktree setup command failed to spawn (${command}): ${String(error)}`);
+  }
+  const stdout = new OutputTail();
+  const stderr = new OutputTail();
+  child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk));
+  child.stderr?.on('data', (chunk: Buffer) => stderr.push(chunk));
+
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => resolve({ code, signal }));
+    },
+  );
+  const signalTree = (signal: NodeJS.Signals): void => {
+    if (child.pid === undefined) return;
+    try {
+      process.kill(-child.pid, signal); // the detached setup group
+    } catch {
+      try {
+        child.kill(signal);
+      } catch {
+        /* already gone */
+      }
+    }
+  };
+  let timedOut = false;
+  let forceKillTimer: NodeJS.Timeout | undefined;
+  const killTimer = setTimeout(() => {
+    timedOut = true;
+    signalTree('SIGTERM');
+    // A command that ignores SIGTERM must not hold the dispatch forever.
+    forceKillTimer = setTimeout(() => signalTree('SIGKILL'), SETUP_KILL_GRACE_MS);
+  }, timeoutMs);
+
+  let outcome: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    outcome = await closed;
+  } catch (error) {
+    throw new Error(`worktree setup command failed to spawn (${command}): ${String(error)}`);
+  } finally {
+    clearTimeout(killTimer);
+    if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+  }
+
+  const outputTail = tail(stdout.text()) + tail(stderr.text());
+  if (timedOut) {
     throw new Error(
-      `worktree setup command timed out after ${timeoutMs}ms: ${command}\noutput tail:\n${tail(result.stdout ?? '')}${tail(result.stderr ?? '')}`,
+      `worktree setup command timed out after ${timeoutMs}ms: ${command}\noutput tail:\n${outputTail}`,
     );
   }
-  if (result.status !== 0) {
+  if (outcome.code === null) {
     throw new Error(
-      `worktree setup command exited ${result.status}: ${command}\noutput tail:\n${tail(result.stdout ?? '')}${tail(result.stderr ?? '')}`,
+      `worktree setup command was killed by ${String(outcome.signal)}: ${command}\noutput tail:\n${outputTail}`,
+    );
+  }
+  if (outcome.code !== 0) {
+    throw new Error(
+      `worktree setup command exited ${outcome.code}: ${command}\noutput tail:\n${outputTail}`,
     );
   }
 }

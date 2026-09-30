@@ -112,6 +112,11 @@ export interface SupervisionConfig {
   /** Backoff base between restart rungs; doubles per consecutive failure,
    * capped at 60 s. */
   readonly restartBackoffMs: number;
+  /** Proactively compact an IDLE session at a turn boundary once reported
+   * context usage reaches this percent; pi's own threshold compaction
+   * stays enabled as the backstop. 1-100 (100 = effectively the backstop
+   * only). */
+  readonly proactiveCompactPercent: number;
 }
 
 /** Size-based log rotation (E1 deferral, E7 home). */
@@ -290,6 +295,21 @@ export const DEFAULT_VERIFY_CONFIG: VerifyConfig = {
   runTimeoutMs: 1_800_000,
 };
 
+export interface ConcurrencyConfig {
+  /** Live non-core worker sessions across all jobs, including idle sessions. */
+  readonly maxWorkers: number;
+}
+
+export const DEFAULT_CONCURRENCY_CONFIG: ConcurrencyConfig = { maxWorkers: 4 };
+export const DEFAULT_REVIEW_CHILDREN = 2;
+/** Explicit finite tool-batch bound; higher settings are rejected at load time
+ * (review-gated, like the max_workers >= 2 requirement: both bounds govern
+ * the review path only). */
+export const MAX_REVIEW_CHILDREN = 32;
+/** Documented finite sanity ceiling for resident workers: a typo must fail
+ * load with an actionable bound, not silently oversubscribe the host. */
+export const MAX_RESIDENT_WORKERS = 128;
+
 /** Review gate policy (Perkins primary; bmad-review fallback gate per the
  * 2026-09-20 amendment, fork-3). */
 export interface ReviewConfig {
@@ -300,6 +320,8 @@ export interface ReviewConfig {
    * pre-flight capability check. A failed pre-flight is always reported, never
    * a silent downgrade. */
   readonly enabled: boolean;
+  /** Maximum simultaneously resident lens children within the global pool. */
+  readonly maxConcurrentChildren: number;
 }
 
 export interface JevConfig {
@@ -354,6 +376,7 @@ export interface GruCommandConfig {
   readonly lessons: LessonsConfig;
   readonly silas: SilasConfig;
   readonly roll: RollConfig;
+  readonly concurrency: ConcurrencyConfig;
   readonly review: ReviewConfig;
   readonly verify: VerifyConfig;
   readonly decisions: DecisionsConfig;
@@ -477,6 +500,7 @@ const TOP_LEVEL_KEYS = [
   'lessons',
   'silas',
   'roll',
+  'concurrency',
   'review',
   'verify',
   'decisions',
@@ -568,6 +592,26 @@ function requirePositiveInt(value: unknown, file: string, field: string): number
   if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
     throw new ConfigError(
       `${field} must be a positive integer, got: ${String(value)}`,
+      file,
+      field,
+    );
+  }
+  // Integers beyond the safe range are representable but lose exactness;
+  // they are rejected with their own actionable message.
+  if (!Number.isSafeInteger(value)) {
+    throw new ConfigError(
+      `${field} exceeds the maximum safe integer (2^53 - 1); use a bounded value, got: ${String(value)}`,
+      file,
+      field,
+    );
+  }
+  return value;
+}
+
+function requirePercent(value: unknown, file: string, field: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 100) {
+    throw new ConfigError(
+      `${field} must be an integer between 1 and 100, got: ${String(value)}`,
       file,
       field,
     );
@@ -688,6 +732,7 @@ export function loadConfig(
     restartWindowMs: 600_000,
     maxRestarts: 3,
     restartBackoffMs: 2_000,
+    proactiveCompactPercent: 70,
   };
   let logging: LoggingConfig = { maxBytes: 10_485_760, keep: 5 };
   let chat: ChatConfig = {
@@ -706,7 +751,8 @@ export function loadConfig(
   let lessons: LessonsConfig = DEFAULT_LESSONS_CONFIG;
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let roll: RollConfig = DEFAULT_ROLL_CONFIG;
-  let review: ReviewConfig = { enabled: true };
+  let concurrency: ConcurrencyConfig = DEFAULT_CONCURRENCY_CONFIG;
+  let review: ReviewConfig = { enabled: true, maxConcurrentChildren: DEFAULT_REVIEW_CHILDREN };
   let verify: VerifyConfig = DEFAULT_VERIFY_CONFIG;
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
   let sourceFile: string | null = null;
@@ -885,7 +931,7 @@ export function loadConfig(
     }
     if (raw['supervision'] !== undefined) {
       const table = requireTable(raw['supervision'], file, 'supervision');
-      const VALID = ['enabled', 'turn_silence_ms', 'restart_window_ms', 'max_restarts', 'restart_backoff_ms'];
+      const VALID = ['enabled', 'turn_silence_ms', 'restart_window_ms', 'max_restarts', 'restart_backoff_ms', 'proactive_compact_percent'];
       for (const key of Object.keys(table)) {
         if (!VALID.includes(key)) {
           throw new ConfigError(
@@ -901,6 +947,7 @@ export function loadConfig(
         restartWindowMs: table['restart_window_ms'] !== undefined ? requirePositiveInt(table['restart_window_ms'], file, 'supervision.restart_window_ms') : supervision.restartWindowMs,
         maxRestarts: table['max_restarts'] !== undefined ? requirePositiveInt(table['max_restarts'], file, 'supervision.max_restarts') : supervision.maxRestarts,
         restartBackoffMs: table['restart_backoff_ms'] !== undefined ? requirePositiveInt(table['restart_backoff_ms'], file, 'supervision.restart_backoff_ms') : supervision.restartBackoffMs,
+        proactiveCompactPercent: table['proactive_compact_percent'] !== undefined ? requirePercent(table['proactive_compact_percent'], file, 'supervision.proactive_compact_percent') : supervision.proactiveCompactPercent,
       };
     }
     if (raw['logging'] !== undefined) {
@@ -1104,12 +1151,25 @@ export function loadConfig(
             : roll.drainTimeoutMs,
       };
     }
+    if (raw['concurrency'] !== undefined) {
+      const table = requireTable(raw['concurrency'], file, 'concurrency');
+      for (const key of Object.keys(table)) {
+        if (key !== 'max_workers') throw new ConfigError(
+          `unknown key \`${key}\` in [concurrency] (valid key: max_workers)`, file, `concurrency.${key}`,
+        );
+      }
+      concurrency = {
+        maxWorkers: table['max_workers'] !== undefined
+          ? requirePositiveInt(table['max_workers'], file, 'concurrency.max_workers')
+          : concurrency.maxWorkers,
+      };
+    }
     if (raw['review'] !== undefined) {
       const table = requireTable(raw['review'], file, 'review');
       for (const key of Object.keys(table)) {
-        if (!['enabled'].includes(key)) {
+        if (!['enabled', 'max_concurrent_children'].includes(key)) {
           throw new ConfigError(
-            `unknown key \`${key}\` in [review] (valid keys: enabled)`,
+            `unknown key \`${key}\` in [review] (valid keys: enabled, max_concurrent_children)`,
             file,
             `review.${key}`,
           );
@@ -1120,6 +1180,9 @@ export function loadConfig(
           table['enabled'] !== undefined
             ? requireBool(table['enabled'], file, 'review.enabled')
             : review.enabled,
+        maxConcurrentChildren: table['max_concurrent_children'] !== undefined
+          ? requirePositiveInt(table['max_concurrent_children'], file, 'review.max_concurrent_children')
+          : review.maxConcurrentChildren,
       };
     }
     if (raw['verify'] !== undefined) {
@@ -1156,6 +1219,16 @@ export function loadConfig(
     if (raw['decisions'] !== undefined) {
       decisions = readDecisionsConfig(raw['decisions'], file, decisions);
     }
+  }
+
+  if (concurrency.maxWorkers > MAX_RESIDENT_WORKERS) {
+    throw new ConfigError(`concurrency.max_workers must be <= ${MAX_RESIDENT_WORKERS} (documented resident sanity ceiling)`, file, 'concurrency.max_workers');
+  }
+  if (review.enabled && concurrency.maxWorkers < 2) {
+    throw new ConfigError('Perkins requires concurrency.max_workers >= 2 for a lead and child', file, 'concurrency.max_workers');
+  }
+  if (review.enabled && review.maxConcurrentChildren > MAX_REVIEW_CHILDREN) {
+    throw new ConfigError(`review.max_concurrent_children must be <= ${MAX_REVIEW_CHILDREN} (bounded lens tool batch)`, file, 'review.max_concurrent_children');
   }
 
   for (const [label, dir] of [
@@ -1215,6 +1288,7 @@ export function loadConfig(
     lessons,
     silas,
     roll,
+    concurrency,
     review,
     verify,
     decisions,

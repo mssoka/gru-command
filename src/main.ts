@@ -599,6 +599,49 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   supervisor = supervisorLive;
+  // Reclaim quiescence: supervisor truth only. An UNKNOWN openControl
+  // (field absent) is explicitly non-reclaimable and observed once per
+  // affected handle — never silently treated as closed.
+  const openControlUnknownSeen = new Set<string>();
+  registry.setReclaimProbe((agentId) => {
+    const view = supervisorLive.viewFor(agentId);
+    if (view === null) return false;
+    if (view.openControl === undefined) {
+      if (!openControlUnknownSeen.has(agentId)) {
+        openControlUnknownSeen.add(agentId);
+        ledger.appendCustomEvent({
+          kind: 'resident.open-control-unknown', jobId: null,
+          payload: { agentId, note: 'supervision view lacks openControl evidence; handle treated as non-reclaimable' },
+        });
+      }
+      return false;
+    }
+    return view.state === 'watching' && view.slotId === null &&
+      !view.openTurn && view.openControl === false && view.openToolCalls === 0;
+  });
+  // Durable, deduplicated reclaim-failure relay: one event per handle per
+  // drain epoch (the budget guarantees the bound); capacity accounting is
+  // untouched — a failed disposal keeps its permit.
+  // Per-boot dedup only (memory set): the durable bound is the budget's
+  // one-attempt-per-handle-per-epoch rule; nothing here promises an
+  // across-restart guarantee. The relayed error is truncated and scrubbed
+  // of credential-shaped content — diagnostics never carry secrets.
+  const reclaimFailedSeen = new Set<string>();
+  registry.residents.onReclaimFailure = (observation) => {
+    const dedupeKey = `${observation.agentId}:${observation.generation}:${observation.attempt}`;
+    if (reclaimFailedSeen.has(dedupeKey)) return;
+    reclaimFailedSeen.add(dedupeKey);
+    // Controlled reason codes only: no arbitrary exception text (which can
+    // embed bearer/basic headers, URL credentials, or assignments) enters
+    // the durable record.
+    const reason = /token|secret|password|api[_-]?key|authorization|bearer|basic\s/iu.test(observation.error)
+      ? 'disposal-rejected-credential-shaped'
+      : 'disposal-rejected';
+    ledger.appendCustomEvent({
+      kind: 'resident.reclaim-failed', jobId: null,
+      payload: { agentId: observation.agentId, generation: observation.generation, attempt: observation.attempt, reason },
+    });
+  };
   const gruSlot = supervisorLive.declareSlot({
     id: 'gru-main',
     role: 'gru',
@@ -716,6 +759,9 @@ async function main(): Promise<number> {
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
     poster: createStartupVerdictPoster(config),
+    reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
+    maxConcurrentChildren: config.review.maxConcurrentChildren,
+    bus,
     reviewArtifactRoot: join(config.dataDir, 'reviews'),
     reviewPreflight: (input) => reviewPreflightCheck(config, registry, input.repoPath),
     fallbackGate: {
@@ -737,6 +783,7 @@ async function main(): Promise<number> {
   });
   state.wave = wave;
   await wave.recoverInterruptedRounds();
+  wave.resumeQueuedHandoffs();
   // Re-brief restart safety (Silas finding 2026-09-23): a re-brief request
   // mid-flight at restart left no events and no worker. The durable
   // markers written before each worker spawned are consumed here — the
@@ -971,6 +1018,10 @@ async function main(): Promise<number> {
         configPath: configPathFor(config.instanceDir),
       },
       bus,
+      // Chief phase-3 seam: every deterministic Silas pass (bus wake events
+      // and sweep ticks) reconsidered pending review handoffs BEFORE any
+      // LLM wake — bounded, no-overlap, fence-preserving.
+      onDeterministicPass: () => state.wave?.reconcilePendingHandoffs(),
       githubPoll: new GitHubSignalPoll({
         ledger,
         notifications,

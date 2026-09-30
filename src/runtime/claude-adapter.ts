@@ -688,6 +688,12 @@ export class ClaudeCodeHandle implements AgentHandle {
   private compacting = false;
   private readonly listeners = new Set<RuntimeEventListener>();
   private disposed = false;
+  /** Per-disposal-generation cessation evidence (identity: the ORIGINAL
+ * live child captured when disposal began). */
+  private cessationKind: 'live' | 'no-child' | 'close-observed' | 'error' | 'deadline' | 'close-observed-late' = 'live';
+  private bridgeCloseSettled = false;
+  private bridgeCloseFailed = false;
+  private evidenceEmitted = false;
   private disposalPromise: Promise<void> | null = null;
 
   constructor(
@@ -813,13 +819,27 @@ export class ClaudeCodeHandle implements AgentHandle {
     let killTimer: ReturnType<typeof setTimeout> | null = null;
     let exitDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
     if (live !== null) {
+      this.cessationKind = 'live'; // identity: THIS original child
+      // Distinguish observed close from ChildProcess error and from the
+      // deadline; keep a LATE latch on the ORIGINAL child so a real close
+      // after deadline settlement still upgrades the evidence later.
+      let exitKind: 'close-observed' | 'error' | null =
+        live.exitCode !== null || live.signalCode !== null ? 'close-observed' : null;
       const childExited =
-        live.exitCode !== null || live.signalCode !== null
+        exitKind !== null
           ? Promise.resolve()
           : new Promise<void>((resolve) => {
-              live.once('close', () => resolve());
-              live.once('error', () => resolve());
+              live.once('close', () => { exitKind = exitKind ?? 'close-observed'; resolve(); });
+              live.once('error', () => { exitKind = exitKind ?? 'error'; resolve(); });
             });
+      // Late-observation latch: survives the race; fires even after the
+      // deadline already settled bookkeeping (no new kill policy/timer).
+      live.once('close', () => {
+        if (this.cessationKind === 'deadline') {
+          this.cessationKind = 'close-observed-late';
+          this.emitEvidence();
+        }
+      });
       // SIGTERM is the documented abort (the CLI exits 143); escalate to
       // SIGKILL if the process ignores it. A second bounded grace after the
       // forced kill prevents a broken ChildProcess implementation from
@@ -843,7 +863,11 @@ export class ClaudeCodeHandle implements AgentHandle {
         exitDeadlineTimer = setTimeout(resolve, this.params.killGraceMs * 2);
         exitDeadlineTimer.unref();
       });
-      await Promise.race([childExited, exitDeadline]);
+      await Promise.race([childExited, exitDeadline]).then(() => {
+        if (exitKind === 'close-observed') this.cessationKind = 'close-observed';
+        else if (exitKind === 'error') this.cessationKind = 'error';
+        else this.cessationKind = 'deadline';
+      });
       clearTimeout(killTimer);
       if (exitDeadlineTimer !== null) clearTimeout(exitDeadlineTimer);
 
@@ -863,17 +887,45 @@ export class ClaudeCodeHandle implements AgentHandle {
         }
         this.settleLiveOnDispose?.();
       }
+    } else {
+      this.cessationKind = 'no-child'; // never-prompted: settles with owned resources below
     }
     try {
       this.store.releaseLock(this.sessionFile);
     } finally {
       try {
-        await this.params.reviewBridge?.close();
+        const closing = this.params.reviewBridge?.close();
+        if (closing === undefined) { this.bridgeCloseSettled = true; }
+        else await closing.then(
+          () => { this.bridgeCloseSettled = true; },
+          () => { this.bridgeCloseSettled = true; this.bridgeCloseFailed = true; },
+        );
       } finally {
         this.setState('disposed');
         this.onDispose();
+        this.emitEvidence();
       }
     }
+  }
+
+  /** Once-only evidence transition; identity-bound to the original child
+   * of THIS disposal generation. Child exit alone is not cessation: the
+   * scoped review bridge must have settled too; a failed bridge close
+   * reports UNKNOWN without upgrading native state. */
+  private emitEvidence(): void {
+    if (this.evidenceEmitted && this.cessationEvidence() === 'ceased') return;
+    const evidence = this.cessationEvidence();
+    this.evidenceEmitted = true;
+    this.emit({ type: 'cessation_evidence', evidence });
+  }
+
+  cessationEvidence(): 'ceased' | 'unknown' {
+    if (this.disposed !== true) return 'unknown';
+    if (this.bridgeCloseSettled !== true || this.bridgeCloseFailed) return 'unknown';
+    if (this.cessationKind === 'close-observed' || this.cessationKind === 'close-observed-late' || this.cessationKind === 'no-child') {
+      return 'ceased';
+    }
+    return 'unknown'; // 'live' mid-disposal, 'error', or 'deadline' without a late close
   }
 
   private assertLive(): void {

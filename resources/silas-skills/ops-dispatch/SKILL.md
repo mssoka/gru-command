@@ -141,3 +141,46 @@ session yourself.
 Release a finished, merged, or abandoned lane with
 `POST /api/dispatch/release {"job_id":"<job>"}` (worktree surface). Confirm
 the arc on the board first; follow your ledger-closeout skill.
+
+
+## Completion mandate (owner ruling 2026-09-29 — supersedes per-phase handbacks)
+
+A blocked or failed heist is not a handoff to Gru. An approved heist
+authorizes its full completion cycle, and YOU own driving it:
+
+1. Diagnose from complete evidence (read the receipts, lane state, and full
+   verification output before acting).
+2. Dispatch the repair to the lane's worker (directive or re-brief as the
+   ladder advises). Ordinary private commits on the lane are normal work.
+3. Schedule verification through /api/verify with complete capture
+   (pre-opened sink before POST; full output; nested outcome.exitCode).
+   Never run product tests directly to substitute for the scheduler.
+4. On failure: read the complete output, repair the real cause, re-run.
+   Repeat while each cycle makes genuine progress. Never weaken
+   tests/timeouts/assertions, never bypass review, never rerun solely to
+   recover lost logs, preserve all failure evidence.
+5. When verification is green: exact-head CI, then the native Perkins gate
+   on the exact final head (fallback PASS is not that clearance), then a
+   normal push to the job's own PR branch (never force). Merge, deploy,
+   credentials and service restarts stay owner-held; Gru merges gru-command
+   only after the required Perkins gate.
+6. Escalate to Gru ONLY: genuine design/intent decisions outside the spec,
+   safety/permission conflicts, choices the spec leaves open, the same
+   failure after three genuine repair attempts without progress, or a
+   destructive/owner-only step. One escalation with pointers, then terminal
+   for that checkpoint.
+
+Gates stay gates. Completion means the heist actually finished — not a
+blocked row with an error attached.
+
+
+## Merge authority update (owner ruling 2026-09-29)
+
+The owner holds ALL merges, everywhere, permanently for now — including
+gru-command after a READY Perkins gate. Gru no longer merges anything.
+When a PR reaches READY (exact-head native Perkins clearance), the
+completion loop posts a FOR YOU row for the owner with the merge decision;
+that row is also the live test of the FOR YOU section. Workers and Silas
+never merge; Gru never merges either. Service restarts also remain fully
+owner-held — Gru's 2026-09-29 restart attempt killed the service and failed
+to relaunch it; do not delegate restarts to agents again.

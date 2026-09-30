@@ -88,6 +88,9 @@ class FallbackHandle implements AgentHandle {
   private explicitCompactionActive = false;
   private pumping = false;
   private disposed = false;
+  /** Single-flight disposal: every duplicate caller awaits the SAME owned
+   * completion (the inner adapter is disposed exactly once). */
+  private disposing: Promise<void> | null = null;
   private readonly queue: QueuedTurn[] = [];
   private readonly listeners = new Set<RuntimeEventListener>();
 
@@ -166,7 +169,34 @@ class FallbackHandle implements AgentHandle {
     return this.inFlight || this.controlInFlight || this.stateBusy || this.nativeCompacting;
   }
 
+  /** Wrapper-owned work must genuinely settle too: queue empty, no
+   * in-flight/control/compaction/pump activity. Inner 'disposed' events
+   * clearing booleans are NOT sufficient — the inner adapter's own
+   * evidence governs, combined with this wrapper's settled state. */
+  private wrapperSettled(): boolean {
+    return this.disposed && !this.inFlight && !this.controlInFlight && !this.nativeCompacting && !this.pumping && this.queue.length === 0;
+  }
+
+  cessationEvidence(): 'ceased' | 'unknown' {
+    if (!this.wrapperSettled()) return 'unknown';
+    try {
+      const innerEvidence = this.inner.cessationEvidence?.();
+      return innerEvidence === 'ceased' ? 'ceased' : 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private emitEvidence(): void {
+    this.emit({ type: 'cessation_evidence', evidence: this.cessationEvidence() });
+  }
+
   private onInnerEvent(event: RuntimeEvent): void {
+    if ((event as { type?: string }).type === 'cessation_evidence') {
+      // Late inner proof: re-emit the COMBINED evidence once the wrapper
+      // has genuinely settled too (its own queue/in-flight/control/pump).
+      if (this.wrapperSettled()) this.emitEvidence();
+    }
     if (event.type === 'state') {
       this.stateBusy = isStreamingState(event.state);
       if (event.state === 'disposed') {
@@ -285,10 +315,19 @@ class FallbackHandle implements AgentHandle {
     return this.inner.health();
   }
 
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    if (this.disposing !== null) return this.disposing;
     this.disposed = true;
     this.rejectQueue('agent session disposed before queued message was delivered');
-    await this.inner.dispose();
+    // On settlement, publish the COMBINED evidence once (inner truth +
+    // this wrapper's own settled state) so consumers that only observe the
+    // event surface still get the terminal answer. Fulfillment alone is
+    // never proof — cessationEvidence() recomputes truthfully here.
+    this.disposing = this.inner.dispose().then(
+      () => { this.emitEvidence(); },
+      (error: unknown) => { this.emitEvidence(); throw error; },
+    );
+    return this.disposing;
   }
 
   private rejectQueue(message: string): void {
