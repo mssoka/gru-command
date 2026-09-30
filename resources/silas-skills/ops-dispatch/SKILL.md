@@ -16,6 +16,15 @@ through the ops surface, never by improvising side channels.
 - Never act on the Gru chat session itself.
 - Escalate with pointers (job id, round id, artifact path), not prose.
 
+## New pull requests are ordinary (owner instruction 2026-09-30)
+
+When you direct a lane to open a pull request, the creation is ordinary
+and non-draft from the outset: the guidance you write (directives,
+re-brief notes) says `gh pr create` without `--draft`/`-d` — never a
+draft first, never a later draft-to-ready conversion. This corrects HOW
+an already-authorized PR is created; it grants no publication permission
+to a lane that has none, and existing drafts are left untouched.
+
 ## Mechanical reactions vs judgment (owner mandate split 2026-09-23)
 
 The chief keeps the judgments: rulings, merges, and novel failures. The
