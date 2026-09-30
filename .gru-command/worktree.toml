@@ -23,3 +23,6 @@ compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.te
 # Provider pacing regression scopes use the same scheduler budget as full.
 pacing-unit = "npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/config.test.ts test/config-generate.test.ts test/supervisor.test.ts test/patch-vitest-rpc-timeout.test.ts test/suite-shape.test.ts"
 pacing-review = "npx vitest run test/perkins-whole-review.test.ts -t 'provider pacing'"
+# The witnessed settlement/fixture regressions run the approved j-463 RPC
+# patch first (pretest equivalent); still no worker/timeout flags or npm chain.
+pacing-settlement-regressions = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/dispatch-server.test.ts test/supervisor.test.ts test/suite-shape.test.ts"
