@@ -801,12 +801,14 @@ describe('verify config (contention fix 2026-09-22)', () => {
   });
 });
 
-describe('concurrency config (rate-limit backoff; owner heist 2026-09-29, scope-trimmed)', () => {
-  it('absent [concurrency] section = automatic retry OFF (current behavior)', () => {
+describe('pacing config (FIFO admission caps + rate-limit backoff; owner heist 2026-09-29)', () => {
+  it('absent section = feature OFF: unlimited turns, no automatic retry (current behavior)', () => {
     const home = tmpHome();
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
-    expect(config.concurrency).toEqual({
+    expect(config.pacing).toEqual({
       enabled: false,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
       backoffBaseMs: 1_000,
       backoffMaxMs: 60_000,
       maxAutoRetries: 5,
@@ -814,22 +816,27 @@ describe('concurrency config (rate-limit backoff; owner heist 2026-09-29, scope-
     });
   });
 
-  it('parses a full [concurrency] section with per-provider signatures', () => {
+  it('parses the brief-shaped [pacing] surface: enabled, caps, backoff, provider signatures', () => {
     const home = tmpHome();
     writeConfig(
       home,
       [
-        '[concurrency]',
+        '[pacing]',
+        'enabled = true',
+        'max_concurrent_minions = 3',
+        'max_concurrent_review_turns = 3',
         'backoff_base_ms = 250',
         'backoff_max_ms = 5000',
         'max_auto_retries = 3',
-        '[concurrency.providers."provider-x"]',
+        '[pacing.providers."provider-x"]',
         'rate_limit_patterns = ["pacing code \\\\d+"]',
         '',
       ].join('\n'),
     );
-    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').concurrency).toEqual({
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').pacing).toEqual({
       enabled: true,
+      maxConcurrentMinions: 3,
+      maxConcurrentReviewTurns: 3,
       backoffBaseMs: 250,
       backoffMaxMs: 5_000,
       maxAutoRetries: 3,
@@ -837,11 +844,13 @@ describe('concurrency config (rate-limit backoff; owner heist 2026-09-29, scope-
     });
   });
 
-  it('a present section with absent keys takes the documented defaults', () => {
+  it('accepts the [concurrency] alias with the shared max_workers / max_review_turns key names', () => {
     const home = tmpHome();
-    writeConfig(home, '[concurrency]\n');
-    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').concurrency).toEqual({
+    writeConfig(home, '[concurrency]\nmax_workers = 2\nmax_review_turns = 2\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').pacing).toEqual({
       enabled: true,
+      maxConcurrentMinions: 2,
+      maxConcurrentReviewTurns: 2,
       backoffBaseMs: 1_000,
       backoffMaxMs: 60_000,
       maxAutoRetries: 5,
@@ -849,20 +858,57 @@ describe('concurrency config (rate-limit backoff; owner heist 2026-09-29, scope-
     });
   });
 
-  it('refuses garbage loudly (unknown keys, bad types, inverted ladder, bad patterns)', () => {
+  it('a present section with absent keys takes the documented defaults (unlimited caps)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[pacing]\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').pacing).toEqual({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
+      backoffBaseMs: 1_000,
+      backoffMaxMs: 60_000,
+      maxAutoRetries: 5,
+      providers: {},
+    });
+  });
+
+  it('enabled = false keeps the section parsed but the feature off', () => {
+    const home = tmpHome();
+    writeConfig(home, '[pacing]\nenabled = false\nmax_concurrent_minions = 3\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').pacing).toEqual({
+      enabled: false,
+      maxConcurrentMinions: 3,
+      maxConcurrentReviewTurns: 0,
+      backoffBaseMs: 1_000,
+      backoffMaxMs: 60_000,
+      maxAutoRetries: 5,
+      providers: {},
+    });
+  });
+
+  it('refuses garbage loudly (unknown keys, bad types, inverted ladder, bad patterns, aliases, both sections)', () => {
     const bad: readonly string[] = [
-      '[concurrency]\nunknown = 1\n',
-      '[concurrency]\nmax_auto_retries = -1\n',
-      '[concurrency]\nmax_auto_retries = 1.5\n',
-      '[concurrency]\nbackoff_base_ms = 0\n',
-      '[concurrency]\nbackoff_max_ms = -5\n',
-      '[concurrency]\nbackoff_base_ms = 2000\nbackoff_max_ms = 1000\n',
-      '[concurrency]\nproviders = "nope"\n',
-      '[concurrency.providers.""]\nrate_limit_patterns = ["x"]\n',
-      '[concurrency.providers."provider-x"]\n',
-      '[concurrency.providers."provider-x"]\nrate_limit_patterns = "x"\n',
-      '[concurrency.providers."provider-x"]\nrate_limit_patterns = ["(unclosed"]\n',
-      '[concurrency.providers."provider-x"]\nrate_limit_patterns = ["ok"]\nother = true\n',
+      '[pacing]\nunknown = 1\n',
+      '[pacing]\nenabled = "yes"\n',
+      '[pacing]\nmax_concurrent_minions = -1\n',
+      '[pacing]\nmax_concurrent_minions = 1.5\n',
+      '[pacing]\nmax_concurrent_review_turns = -1\n',
+      '[pacing]\nmax_concurrent_review_turns = 1\n',
+      '[pacing]\nmax_auto_retries = -1\n',
+      '[pacing]\nmax_auto_retries = 1.5\n',
+      '[pacing]\nbackoff_base_ms = 0\n',
+      '[pacing]\nbackoff_max_ms = -5\n',
+      '[pacing]\nbackoff_base_ms = 2000\nbackoff_max_ms = 1000\n',
+      '[pacing]\nproviders = "nope"\n',
+      '[pacing.providers.""]\nrate_limit_patterns = ["x"]\n',
+      '[pacing.providers."provider-x"]\n',
+      '[pacing.providers."provider-x"]\nrate_limit_patterns = "x"\n',
+      '[pacing.providers."provider-x"]\nrate_limit_patterns = ["(unclosed"]\n',
+      '[pacing.providers."provider-x"]\nrate_limit_patterns = ["ok"]\nother = true\n',
+      '[pacing]\nmax_concurrent_minions = 3\nmax_workers = 3\n',
+      '[pacing]\nmax_concurrent_review_turns = 3\nmax_review_turns = 3\n',
+      '[concurrency]\nmax_concurrent_minions = 3\nmax_workers = 3\n',
+      '[pacing]\nmax_concurrent_minions = 3\n[concurrency]\nmax_workers = 2\n',
     ];
     for (const text of bad) {
       const h2 = tmpHome();

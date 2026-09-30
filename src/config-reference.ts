@@ -62,7 +62,7 @@ export const CONFIG_SECTION_HEADERS: readonly string[] = [
   '[runtimes.claude-code]',
   '[runtimes.claude-code.roles]',
   '[supervision]',
-  '[concurrency]',
+  '[pacing]',
   '[logging]',
   '[chat]',
   '[worktrees]',
@@ -348,49 +348,62 @@ export function renderReferenceConfig(
     `# percent (1-100); pi's own threshold compaction stays as the backstop.`,
     `proactive_compact_percent = ${supervision.proactiveCompactPercent}`,
   );
-  // Provider pacing (owner heist 2026-09-29, scope-trimmed): the [concurrency]
-  // section ships as a commented example — the section being present is the
-  // feature switch, so activating it by default would change behavior. A
-  // user-set section is preserved ACTIVE on regeneration, never dropped.
-  const concurrency = preserved?.concurrency;
-  if (concurrency?.enabled === true) {
+  // Provider pacing (owner heist 2026-09-29): the [pacing] section ships as
+  // a commented example — the section being present is the feature switch,
+  // so activating it by default would change behavior. A user-set section is
+  // preserved ACTIVE on regeneration, never dropped (the [concurrency]
+  // spelling, when a file used it, is canonicalized to [pacing] here; both
+  // spellings parse identically).
+  const pacing = preserved?.pacing;
+  if (pacing?.enabled === true) {
     lines.push(
       '',
-      '[concurrency]',
-      '# Bounded automatic retry for the provider rate-limit error class',
-      '# (HTTP 429 and plain-language throttling). Every automatic retry is',
-      '# recorded as a pacing.auto-retry ledger event; non-rate-limit failures',
-      '# and an exhausted budget still stop to the supervisor ladder + owner',
-      '# ACK. Remove this section to disable (current behavior).',
-      `backoff_base_ms = ${concurrency.backoffBaseMs}`,
-      `backoff_max_ms = ${concurrency.backoffMaxMs}`,
-      `max_auto_retries = ${concurrency.maxAutoRetries}`,
+      '[pacing]',
+      '# Provider pacing: FIFO admission caps for minion turns and Perkins',
+      '# review turns, plus bounded automatic retry for the provider',
+      '# rate-limit error class (HTTP 429 and plain-language throttling).',
+      '# Queued turns render on the board with the honest reason; every',
+      '# automatic retry is recorded as a pacing.auto-retry ledger event.',
+      '# Remove this section (or set enabled = false) to disable.',
+      `max_concurrent_minions = ${pacing.maxConcurrentMinions}`,
+      `max_concurrent_review_turns = ${pacing.maxConcurrentReviewTurns}`,
+      `backoff_base_ms = ${pacing.backoffBaseMs}`,
+      `backoff_max_ms = ${pacing.backoffMaxMs}`,
+      `max_auto_retries = ${pacing.maxAutoRetries}`,
     );
-    for (const [providerId, override] of Object.entries(concurrency.providers)) {
+    for (const [providerId, override] of Object.entries(pacing.providers)) {
       lines.push(
         '',
-        `[concurrency.providers.${tomlString(providerId)}]`,
-        '# Extra provider-specific rate-limit signatures (regex bodies matched',
-        '# against error text only — never a brand baked into code).',
+        `[pacing.providers.${tomlString(providerId)}]`,
+        '# Extra rate-limit signatures (regex bodies matched against error text',
+        '# only — global text signatures, never a brand baked into code).',
         `rate_limit_patterns = [${override.rateLimitPatterns.map((pattern) => tomlString(pattern)).join(', ')}]`,
       );
     }
   } else {
     lines.push(
       '',
-      '# [concurrency]',
-      '# Provider pacing: bounded automatic retry for the rate-limit error',
-      '# class (HTTP 429, "rate limit", "too many requests", throttling).',
-      '# Each automatic retry is recorded as a pacing.auto-retry ledger event;',
-      '# non-rate-limit failures and an exhausted budget still stop to the',
-      '# supervisor ladder + owner ACK. Absent section = disabled (current',
-      '# behavior). Suggested starting point: 1s, capped at 60s, 5 retries.',
+      '# [pacing]',
+      '# Provider pacing: FIFO admission caps for minion and Perkins review',
+      '# turns (queued lanes render honestly; live turns are never preempted),',
+      '# plus bounded automatic retry for the rate-limit error class',
+      '# (HTTP 429, "rate limit", "too many requests", throttling). Every',
+      '# automatic retry is recorded as a pacing.auto-retry ledger event.',
+      '# Absent section = disabled (current behavior). Suggested starting',
+      '# point: cap minion and review turns at 3; 1s backoff, capped at 60s,',
+      '# 5 retries.',
+      '# max_concurrent_minions = 3',
+      '# max_concurrent_review_turns = 3   # 0 = unlimited; >= 2 (lead + lens)',
       '# backoff_base_ms = 1000',
       '# backoff_max_ms = 60000',
       '# max_auto_retries = 5',
-      '# Optional per-provider extra signatures live alongside the section.',
-      '# [concurrency.providers."<provider-id>"]',
+      '# enabled = true',
+      '# Optional provider-keyed extra signatures (global text signatures):',
+      '# [pacing.providers."<provider-id>"]',
       '# rate_limit_patterns = ["pacing code \\\\d+"]',
+      '#',
+      '# The [concurrency] spelling is accepted as an alias, as are the shared',
+      '# key names max_workers / max_review_turns.',
     );
   }
   lines.push(

@@ -21,6 +21,7 @@ import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/per
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { PacingGate } from '../src/runtime/pacing.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall, type WholeSubmission } from './helpers/perkins-whole-double.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
 
@@ -60,7 +61,13 @@ interface WholeHarness {
 
 function wholeHarness(
   brain: WholeLeadOptions,
-  options?: { noSpec?: boolean; spec?: string; priorConsolidatedFile?: string; beforeFreeze?: (repo: FixtureRepo) => void },
+  options?: {
+    noSpec?: boolean;
+    spec?: string;
+    priorConsolidatedFile?: string;
+    beforeFreeze?: (repo: FixtureRepo) => void;
+    reviewGate?: PacingGate;
+  },
 ): WholeHarness {
   const fixture = makeReviewRepo();
   repos.push(fixture.repo);
@@ -80,7 +87,11 @@ function wholeHarness(
       : { spec: options?.spec ?? 'return 43' }),
   });
   const fake = fakeWholeSpawner(temp('perkins-whole-sessions-'), brain);
-  const engine = new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+  const engine = new PerkinsWholeReview({
+    spawner: fake.spawner,
+    policy: loadPerkinsPolicy(),
+    ...(options?.reviewGate !== undefined ? { reviewGate: options.reviewGate } : {}),
+  });
   return {
     ...fixture,
     base,
@@ -1684,4 +1695,47 @@ describe('whole-PR engine: repair pass 3', () => {
     expect(childPrompts.length).toBeGreaterThanOrEqual(1);
     expect(childPrompts.every((prompt) => prompt.includes(sentinel))).toBe(true);
   }, 120_000);
+});
+
+describe('provider pacing: combined review-turn gate (owner heist 2026-09-29)', () => {
+  it('throttles specialist fan-out under max_concurrent_review_turns without failing the round', async () => {
+    const events: string[] = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 2,
+      record: (event) => events.push(event.kind),
+    });
+    const h = wholeHarness(
+      { childAnswer: () => '[]', specialists: ['blind', 'edge'] },
+      { reviewGate: gate },
+    );
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.childCalls).toHaveLength(2);
+    // The lead holds one combined slot; the second lens waited FIFO for the
+    // first to release — throttled, never failed.
+    expect(events).toContain('pacing.queued');
+    expect(events).toContain('pacing.admitted');
+    // Every lease came back: no leak behind a completed round.
+    expect(gate.view().review.running).toBe(0);
+    expect(gate.view().review.queued).toHaveLength(0);
+  });
+
+  it('runs an unlimited review gate without any queue events (behavior-preserving default)', async () => {
+    const events: string[] = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => events.push(event.kind),
+    });
+    const h = wholeHarness(
+      { childAnswer: () => '[]', specialists: ['blind', 'edge'] },
+      { reviewGate: gate },
+    );
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(events).toEqual([]);
+  });
 });

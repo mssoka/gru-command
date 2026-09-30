@@ -9,6 +9,7 @@ import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 import { recordFollowUpDelivery } from './fix-directive.js';
+import type { PacingGate, PacingLease } from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -41,6 +42,9 @@ export interface DispatchServiceOptions {
    * split: the manager implementation is its own lane. */
   readonly worktrees: WorktreePort;
   readonly spawner: AgentSpawner;
+  /** Provider pacing: FIFO worker (minion turn) admission gate. Absent =
+   * off; an unlimited or disabled gate admits immediately. */
+  readonly workerGate?: PacingGate;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
   /** Extracts a minion's opt-in lessons block at delivery settle. */
@@ -130,13 +134,29 @@ export class DispatchService {
 
       // (4) The minion: a fresh agent session rooted in the PROJECT
       // worktree (ruling 17: dispatch cwd = project root, all runtimes).
+      // Provider pacing: the minion turn waits FIFO for a worker slot when
+      // at the configured cap — the lane lands queued on the board with the
+      // honest reason and is admitted in order (never rejected, never
+      // preempted). Unlimited default admits immediately: zero change.
+      let workerLease: PacingLease | null = null;
+      if (this.opts.workerGate !== undefined) {
+        workerLease = await this.opts.workerGate.acquireWorkerTurn({
+          id: job.id,
+          label: input.title,
+          jobId: job.id,
+          queued: (info) => {
+            this.opts.ledger.noteJob(job.id, info.reason);
+          },
+        });
+      }
       let handle: AgentHandle;
       try {
         const cwd = requireSpawnCwd('minion', worktree.path);
         handle = await this.opts.spawner('minion', { cwd });
       } catch (error) {
-        // The lane cannot start — sweep the fresh worktree (preserve
-        // first, per ruling 18c) and block the job.
+        // The lane cannot start — release the pacing slot, sweep the fresh
+        // worktree (preserve first, per ruling 18c) and block the job.
+        workerLease?.release();
         await this.sweepQuietly(worktree.id);
         throw error;
       }
@@ -202,7 +222,10 @@ export class DispatchService {
             });
             return { ok: false as const, error: String(error) };
           },
-        );
+        )
+        .finally(() => {
+          workerLease?.release();
+        });
 
       return { job: working, worktree, agentId: handle.id, settled };
     } catch (error) {

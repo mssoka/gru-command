@@ -6,6 +6,7 @@ import { appendLessonPointers, renderLessonsSection } from '../lessons/reference
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import type { WorktreePort } from './worktree-port.js';
+import type { PacingGate, PacingLease } from '../runtime/pacing.js';
 
 /**
  * Fix-directive routing (E8 follow-through; owner ruling 2026-09-21): the
@@ -29,6 +30,32 @@ export interface DirectiveRoutingDeps {
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
+  /** Provider pacing: worker (minion turn) admission gate. Absent = off. */
+  readonly workerGate?: PacingGate;
+}
+
+/** Hold a worker turn slot around one minion delivery. The gate queues
+ * FIFO while at the limit (never rejects, never preempts); the lease is
+ * released when the delivery settles. */
+async function withWorkerTurn<T>(
+  gate: PacingGate | undefined,
+  input: { readonly jobId: string; readonly label: string; readonly signal?: AbortSignal },
+  run: () => Promise<T>,
+): Promise<T> {
+  let lease: PacingLease | null = null;
+  if (gate !== undefined) {
+    lease = await gate.acquireWorkerTurn({
+      id: input.jobId,
+      label: input.label,
+      jobId: input.jobId,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    });
+  }
+  try {
+    return await run();
+  } finally {
+    lease?.release();
+  }
 }
 
 /** Route a directive to the implementing minion: the live job minion
@@ -53,8 +80,14 @@ export async function routeFixDirectiveToMinion(
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
-      await racedPrompt(handle, directive, input.signal, owner);
-      return { delivered: true, minionId: minion.id };
+      return withWorkerTurn(
+        input.workerGate,
+        { jobId: input.jobId, label: `directive → ${minion.id}`, signal: input.signal },
+        async () => {
+          await racedPrompt(handle, directive, input.signal, owner);
+          return { delivered: true, minionId: minion.id };
+        },
+      );
     }
   }
   const lane = input.worktrees
@@ -63,13 +96,19 @@ export async function routeFixDirectiveToMinion(
   if (lane === undefined) {
     return { delivered: false, note: 'no implementing minion session and no job lane' };
   }
-  const handle = await input.registry.spawn('minion', { cwd: lane.path });
-  try {
-    await racedPrompt(handle, directive, input.signal, owner);
-  } finally {
-    await handle.dispose();
-  }
-  return { delivered: true, minionId: handle.id };
+  return withWorkerTurn(
+    input.workerGate,
+    { jobId: input.jobId, label: `directive (fresh minion) → ${input.jobId}`, signal: input.signal },
+    async () => {
+      const handle = await input.registry.spawn('minion', { cwd: lane.path });
+      try {
+        await racedPrompt(handle, directive, input.signal, owner);
+      } finally {
+        await handle.dispose();
+      }
+      return { delivered: true, minionId: handle.id };
+    },
+  );
 }
 
 /** Race a prompt against cancellation so shutdown cannot stall on an
@@ -205,29 +244,41 @@ export async function rebriefFreshMinion(
     throw new Error(`job "${input.jobId}" has no active job lane — a re-brief needs its worktree`);
   }
   const cwd = requireSpawnCwd('minion', lane.path);
-  const handle = await input.registry.spawn('minion', {
-    cwd,
-    ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
-  });
-  input.ledger.registerAgent({
-    id: handle.id,
-    role: 'minion',
-    sessionFile: handle.sessionFile,
-    jobId: input.jobId,
-  });
-  input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
-  const prompt = renderRebriefPrompt({
-    jobId: input.jobId,
-    briefing: input.briefing,
-    note: input.note,
-    ...(input.lessons !== undefined
-      ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
-      : {}),
-  });
-  try {
-    await handle.prompt(prompt, { owner: `silas-rebrief:${input.jobId}` });
-  } catch (error) {
-    throw new Error(`re-brief turn failed on ${handle.id}: ${String(error)}`);
+  let lease: PacingLease | null = null;
+  if (input.workerGate !== undefined) {
+    lease = await input.workerGate.acquireWorkerTurn({
+      id: input.jobId,
+      label: `re-brief → ${input.jobId}`,
+      jobId: input.jobId,
+    });
   }
-  return { minionId: handle.id, lanePath: lane.path, prompt, sessionFile: handle.sessionFile };
+  try {
+    const handle = await input.registry.spawn('minion', {
+      cwd,
+      ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
+    });
+    input.ledger.registerAgent({
+      id: handle.id,
+      role: 'minion',
+      sessionFile: handle.sessionFile,
+      jobId: input.jobId,
+    });
+    input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
+    const prompt = renderRebriefPrompt({
+      jobId: input.jobId,
+      briefing: input.briefing,
+      note: input.note,
+      ...(input.lessons !== undefined
+        ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
+        : {}),
+    });
+    try {
+      await handle.prompt(prompt, { owner: `silas-rebrief:${input.jobId}` });
+    } catch (error) {
+      throw new Error(`re-brief turn failed on ${handle.id}: ${String(error)}`);
+    }
+    return { minionId: handle.id, lanePath: lane.path, prompt, sessionFile: handle.sessionFile };
+  } finally {
+    lease?.release();
+  }
 }

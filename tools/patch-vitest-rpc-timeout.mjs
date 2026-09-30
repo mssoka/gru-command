@@ -48,6 +48,7 @@ function rpcChunks() {
   for (const root of DIST_ROOTS) {
     const dir = join(root, 'vitest', 'dist', 'chunks');
     if (!existsSync(dir)) continue;
+    distDirs.push(dir);
     for (const entry of readdirSync(dir)) {
       if (/^rpc\..+\.js$/.test(entry)) files.push(join(dir, entry));
     }
@@ -55,8 +56,18 @@ function rpcChunks() {
   return files;
 }
 
+/** vitest/dist/chunks directories that exist — distinguishes "vitest is not
+ * installed" (skip cleanly) from "vitest is installed but its shape no longer
+ * matches the pinned patch" (fail LOUD, never silently disable the fix). */
+const distDirs = [];
 const chunks = rpcChunks();
 if (chunks.length === 0) {
+  if (distDirs.length > 0) {
+    throw new Error(
+      `vitest-rpc-timeout: vitest dist present but no rpc chunk found (${distDirs.join(', ')}) — ` +
+        'the installed vitest layout changed; update tools/patch-vitest-rpc-timeout.mjs before testing',
+    );
+  }
   note('vitest-rpc-timeout: no installed vitest dist found — skipped (production install?)');
   process.exit(0);
 }

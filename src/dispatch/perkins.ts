@@ -14,6 +14,7 @@ import {
   type BranchIdlePhase,
 } from './branch-idle.js';
 import type { AgentSpawner } from './service.js';
+import type { PacingGate } from '../runtime/pacing.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
@@ -966,6 +967,9 @@ export interface WaveRunnerOptions {
   readonly ledger: LedgerApi;
   readonly worktrees: WorktreePort;
   readonly spawner: AgentSpawner;
+  /** Provider pacing: combined lead+lens review-turn gate for Perkins
+   * rounds. Absent = off; an unlimited or disabled gate admits at once. */
+  readonly reviewGate?: PacingGate;
   readonly poster?: VerdictPoster;
   readonly escalate?: (title: string, detail: string) => void;
   /** Stable service-owned root. Required for every production review. */
@@ -1938,6 +1942,7 @@ export class WaveRunner {
         ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
           ? { reviewModel } : {}),
       }),
+      ...(this.opts.reviewGate !== undefined ? { reviewGate: this.opts.reviewGate } : {}),
       policy,
       onAgent: ({ phase, lens, attempt, handle }) => {
         this.opts.ledger.registerAgent({

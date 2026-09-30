@@ -227,6 +227,11 @@ interface RateLimitRetryIncident {
   readonly pending: PendingTurn;
   /** A delivery attempt is in flight right now. */
   awaitingDelivery: boolean;
+  /** Monotonic per-delivery token; only the owning delivery may clear
+   * awaitingDelivery or act on its own settlement. */
+  deliveryToken: number;
+  /** Token of the delivery currently in flight (null when none). */
+  activeDelivery: number | null;
   /** Failure signals observed in this incident: a delivery failed iff this
    * counter moved across (i.e. during) that delivery. */
   failureSeq: number;
@@ -1166,8 +1171,11 @@ export class Supervisor {
     if (incident !== null) {
       if (incident.awaitingDelivery) {
         // The delivery we were waiting on failed; its error event is the
-        // one failure signal for this attempt.
+        // one failure signal for this attempt. The delivery token is
+        // consumed here — a stale delivery that settles late must never
+        // clear the next rung's flag (per-delivery ownership).
         incident.awaitingDelivery = false;
+        incident.activeDelivery = null;
         incident.failureSeq += 1;
         incident.lastError = errorText;
         return this.scheduleRateLimitRetry(agent, incident);
@@ -1189,6 +1197,8 @@ export class Supervisor {
       maxRetries: policy.maxRetries,
       pending: captured.pending,
       awaitingDelivery: false,
+      deliveryToken: 0,
+      activeDelivery: null,
       failureSeq: 1,
       lastError: errorText,
     };
@@ -1256,6 +1266,18 @@ export class Supervisor {
         agent.rateLimitRetry = null;
         return;
       }
+      // Defensive: a scheduled rung must never start while another delivery
+      // is still in flight. Its settlement owns the next transition.
+      if (incident.awaitingDelivery) {
+        this.log('error', 'rate-limit retry rung refused: a delivery is still in flight', {
+          agent_id: agent.agentId,
+          attempt: incident.attempts,
+        });
+        return;
+      }
+      incident.deliveryToken += 1;
+      const deliveryToken = incident.deliveryToken;
+      incident.activeDelivery = deliveryToken;
       incident.awaitingDelivery = true;
       const failureSeqAtDelivery = incident.failureSeq;
       this.log('info', 'delivering automatic rate-limit retry', {
@@ -1273,7 +1295,17 @@ export class Supervisor {
         rejection = error;
       }
       if (agent.rateLimitRetry !== incident) return; // superseded mid-flight
+      if (incident.activeDelivery !== deliveryToken) {
+        // A newer rung owns the incident now; this stale settlement must
+        // not clear its flag, swallow its failure, or claim recovery.
+        this.log('warn', 'stale rate-limit retry delivery settled after a newer rung started', {
+          agent_id: agent.agentId,
+          attempt: incident.attempts,
+        });
+        return;
+      }
       incident.awaitingDelivery = false;
+      incident.activeDelivery = null;
       if (incident.failureSeq !== failureSeqAtDelivery) {
         // The attempt failed; its error event already scheduled the next
         // rung — or spent the budget and handed off to the ladder.
