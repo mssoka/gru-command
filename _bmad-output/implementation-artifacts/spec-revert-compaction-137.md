@@ -86,11 +86,18 @@ Owner approval: dispatch briefing 2026-09-30 (explicit rollback approval + instr
   Later source changes preserved: supervisor `openControl` view fields, pi
   adapter cessation-evidence / awaited-`dispose`; later gh-97 supervisor test
   kept.
-- New deterministic regression tests (commit `d65e68d`) prove the rollback
-  contract; all four fail against the pre-revert code (verified by re-checking
-  out `c54bfbf` sources for the three source files and running the filtered
-  tests: config 1 failed, pi-adapter 2 failed, supervisor 1 failed) and pass
-  after the revert (focused local run: 171 passed across the three files).
+- Exact-head verification (all after the merge of origin/main and the
+  host repairs; head `4bc28b85267805dafdcdcc60db2374b3ed0cec84`):
+  - `compaction-rollback` focused scope: ok, exit 0, 223 tests / 6 files
+    (run `0692f5b6-fcca-4e61-9bf5-ac69e0018009`).
+  - `typecheck`: ok, exit 0 (run `c00addb2-6cf8-46a2-85f2-328ecda79e95`).
+  - `full` (`npm test`): ok, exit 0, backend 1443 passed + web 368 passed
+    (run `b965f218-2d6d-4d8d-8b92-611bf124da80`).
+  Earlier red full runs at `c0d0ec2` / `199eca6` remain recorded in the
+  ledger as failed; the repairs above are why the final run is green.
+- Red/green proof for the rollback itself: the four new regression tests
+  fail against the pre-revert sources (config 1, pi-adapter 2, supervisor
+  1) and pass after the revert, per the earlier note.
 - Old-config-key fixture (isolated temp `GRU_COMMAND_HOME`, deleted after
   the probe; no live config read or written): `loadConfig` throws
   `ConfigError: unknown key 'proactive_compact_percent' in [supervision]
