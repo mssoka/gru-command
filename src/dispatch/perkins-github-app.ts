@@ -292,7 +292,7 @@ function readBundleFileChecked(path: string, label: string, sourceLabel: string)
       if (read === 0) break;
       filled += read;
       if (filled > MAX_BUNDLE_FILE_BYTES) {
-        throw new PerkinsAppError(`${sourceLabel}: ${label} grew beyond ${MAX_BUNDLE_FILE_BYTES} bytes while being read — check the perkins bundle deployment`);
+        throw new PerkinsAppError(`${sourceLabel}: ${label} exceeded ${MAX_BUNDLE_FILE_BYTES} bytes when read (its stat reported ${info.size}) — check the perkins bundle deployment`);
       }
     }
     return buffer.subarray(0, filled).toString('utf-8');
@@ -366,6 +366,9 @@ export interface AppFetchResponse {
   /** Production fetch supplies a `Headers` instance; test doubles may
    * supply a plain record. Both are supported. */
   readonly headers?: Headers | Readonly<Record<string, string>>;
+  /** Production fetch exposes the reply byte stream; when present the
+   * reader applies the byte ceiling without buffering past it. */
+  readonly body?: ReadableStream<Uint8Array> | null;
   readonly text: () => Promise<string>;
 }
 
@@ -379,6 +382,49 @@ function parseJsonBestEffort(text: string): unknown {
   } catch {
     return null;
   }
+}
+
+/** Read a provider reply under a hard byte ceiling. Production fetch
+ * exposes a byte stream, so the reader stops at the ceiling instead of
+ * buffering past it; a test double that only offers `text()` gets the same
+ * ceiling applied to the returned string. `overflowed` tells the caller the
+ * reply was truncated at the ceiling (status classification uses the
+ * truncated text; oversized OK replies fail closed). */
+async function readResponseBodyCapped(
+  response: AppFetchResponse,
+  maxBytes: number,
+): Promise<{ readonly text: string; readonly overflowed: boolean }> {
+  const stream = response.body ?? null;
+  if (stream !== null && typeof stream.getReader === 'function') {
+    const reader = stream.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value === undefined) continue;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          try {
+            await reader.cancel();
+          } catch {
+            // The overflow error owns the outcome; a cancel failure is not one.
+          }
+          return { text: Buffer.concat(chunks).toString('utf8'), overflowed: true };
+        }
+        chunks.push(Buffer.from(value));
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+    return { text: Buffer.concat(chunks).toString('utf8'), overflowed: false };
+  }
+  const text = await response.text();
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+    return { text: text.slice(0, maxBytes), overflowed: true };
+  }
+  return { text, overflowed: false };
 }
 
 /** api.github.com is the ONLY host the App's credentials ever touch; every
@@ -458,8 +504,8 @@ function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha
 /** GitHub error bodies/markers that mean rate limiting, not permission. */
 function providerIndicatesRateLimit(error: PerkinsAppHttpError): boolean {
   const documentationUrl = (error.body as { readonly documentation_url?: unknown } | null)?.documentation_url;
-  return (typeof documentationUrl === 'string' && /rate-limit|abuse/u.test(documentationUrl)) ||
-    /\brate limit\b|abuse detection/iu.test(error.providerMessage);
+  return (typeof documentationUrl === 'string' && /rate-limit/u.test(documentationUrl)) ||
+    /\brate[- ]?limit(?:ed)?\b|abuse detection/iu.test(error.providerMessage);
 }
 
 /** HTTP-level provider rejection with a sanitized provider message. */
@@ -502,7 +548,13 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // extra headroom is for the idempotent recovery lookup on busy PRs,
     // which may search deeper than the in-round ambiguous-POST case).
     this.maxReconciliationPages = options.maxReconciliationPages ?? 10;
-    this.maxProviderBodyBytes = options.maxProviderBodyBytes ?? 16 * 1024 * 1024;
+    const requestedBodyCap = options.maxProviderBodyBytes;
+    if (requestedBodyCap !== undefined && (!Number.isSafeInteger(requestedBodyCap) || requestedBodyCap < 1024)) {
+      throw new PerkinsAppError(
+        `maxProviderBodyBytes must be an integer >= 1024 (received: ${sanitize(String(requestedBodyCap))}) — refusing to arm a broken reply-size ceiling`,
+      );
+    }
+    this.maxProviderBodyBytes = requestedBodyCap ?? 16 * 1024 * 1024;
   }
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
@@ -655,20 +707,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       throw new PerkinsAppError(`${label} request failed: ${error instanceof Error ? sanitize(error.message) : 'network error'}`);
     }
     let text = '';
+    let overflowed = false;
     try {
-      text = await response.text();
+      ({ text, overflowed } = await readResponseBodyCapped(response, this.maxProviderBodyBytes));
     } catch (error) {
       if (seam.ambiguousOutcome === true) throw error;
       throw new PerkinsAppError(`${label} response could not be read: ${error instanceof Error ? sanitize(error.message) : 'unreadable body'}`);
-    }
-    // Reply-size ceiling: durations bound the wait, not the bytes; a runaway
-    // or hostile body must not be parsed into memory without a cap (the
-    // largest legitimate review-list page is a few MiB).
-    if (Buffer.byteLength(text, 'utf8') > this.maxProviderBodyBytes) {
-      if (seam.ambiguousOutcome === true) {
-        throw new PerkinsAppError(`${label} response exceeded ${this.maxProviderBodyBytes} bytes — delivery identity is unproven`);
-      }
-      throw new PerkinsAppError(`${label} response exceeded ${this.maxProviderBodyBytes} bytes — refusing to parse an oversized body`);
     }
     const rawHeaders = response.headers ?? {};
     // Production fetch returns a `Headers` instance (no own enumerable
@@ -682,10 +726,19 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       return null;
     };
     // The provider's status is authoritative even when the body is not
-    // JSON: a proxy's HTML refusal is still a definitive refusal with a
-    // status, never a JSON-parse error that hides it.
+    // JSON (a proxy's HTML refusal is still a definitive refusal with a
+    // status, never a JSON-parse error that hides it) — and an oversized
+    // refusal body is still classified by its status, not as an unknown
+    // outcome. The byte ceiling only decides whether an OK reply is
+    // parseable.
     if (!response.ok) {
       throw new PerkinsAppHttpError(label, response.status, parseJsonBestEffort(text), text);
+    }
+    if (overflowed) {
+      if (seam.ambiguousOutcome === true) {
+        throw new PerkinsAppError(`${label} response exceeded ${this.maxProviderBodyBytes} bytes — delivery identity is unproven`);
+      }
+      throw new PerkinsAppError(`${label} response exceeded ${this.maxProviderBodyBytes} bytes — refusing to parse an oversized body`);
     }
     if (text === '') return { body: null, header };
     try {

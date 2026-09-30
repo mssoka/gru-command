@@ -93,7 +93,7 @@ interface RecordedCall {
   readonly redirect?: string;
 }
 
-type RouteHandler = (call: RecordedCall) => Promise<{ status: number; body?: unknown; rawText?: string; headers?: Headers | Record<string, string> }>;
+type RouteHandler = (call: RecordedCall) => Promise<{ status: number; body?: unknown; rawText?: string; headers?: Headers | Record<string, string>; stream?: ReadableStream<Uint8Array> }>;
 
 interface Route {
   readonly method: string;
@@ -167,6 +167,7 @@ function makeApiDouble(overrides: ReadonlyArray<Partial<Route> & { readonly meth
       ok: response.status >= 200 && response.status < 300,
       status: response.status,
       ...(response.headers !== undefined ? { headers: response.headers } : {}),
+      ...(response.stream !== undefined ? { body: response.stream } : {}),
       text: async () => response.rawText ?? JSON.stringify(response.body ?? null),
     };
   };
@@ -1292,11 +1293,21 @@ describe('credential hygiene on rejected URLs', () => {
     const pat = `github_pat_${'P'.repeat(30)}`;
     const patError = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), prUrl: `not-a-url${pat}` })
       .then(() => null, (cause: unknown) => cause as Error);
+    expect(patError).toBeInstanceOf(PerkinsAppError);
     expect(patError?.message ?? '').not.toContain(pat);
+    expect(patError?.message ?? '').toContain('[REDACTED]');
     const jwt = `eyJ${'A'.repeat(12)}.${'B'.repeat(12)}.${'C'.repeat(12)}`;
     const jwtError = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), prUrl: `not-a-url${jwt}` })
       .then(() => null, (cause: unknown) => cause as Error);
+    expect(jwtError).toBeInstanceOf(PerkinsAppError);
     expect(jwtError?.message ?? '').not.toContain(jwt);
+    expect(jwtError?.message ?? '').toContain('[REDACTED]');
+
+    // The unanchored token patterns must not widen to ordinary prose: a
+    // benign snake_case word with no token prefix survives as-is.
+    const benign = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), prUrl: 'not-a-url weight_groups_used_by_x' })
+      .then(() => null, (cause: unknown) => cause as Error);
+    expect(benign?.message ?? '').toContain('weight_groups_used_by_x');
 
     const userinfo = await poster.post({
       ...PR_INPUT, repoPath: repoPathOf(fixture),
@@ -1332,17 +1343,29 @@ describe('review id discipline', () => {
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
 
-    // Zero is not a usable provider id either: the 2xx is reconciled like
-    // any other unprovable receipt, so the receipt's id comes from the
-    // provider list, never from '0'.
-    const zeroId = posterWith(fixture, [
+    // Zero and negative are not usable provider ids either: the 2xx is
+    // reconciled like any other unprovable receipt, so the receipt's id
+    // comes from the provider list, never from the numeric bound check.
+    for (const badId of [0, -1]) {
+      const badNumeric = posterWith(fixture, [
+        {
+          method: 'POST', test: /\/reviews$/,
+          handler: async () => ({ status: 200, body: { id: badId, user: { login: 'perkins-review[bot]', type: 'Bot' }, state: 'COMMENTED', commit_id: HEAD, body: 'review body\n' } }),
+        },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+      ]);
+      await expect(badNumeric.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+    }
+
+    // String parity with the legacy receipts: a provider-quoted '0' stays usable.
+    const stringZero = posterWith(fixture, [
       {
         method: 'POST', test: /\/reviews$/,
-        handler: async () => ({ status: 200, body: { id: 0, user: { login: 'perkins-review[bot]', type: 'Bot' }, state: 'COMMENTED', commit_id: HEAD, body: 'review body\n' } }),
+        handler: async () => ({ status: 200, body: { id: '0', user: { login: 'perkins-review[bot]', type: 'Bot' }, state: 'COMMENTED', commit_id: HEAD, body: 'review body\n' } }),
       },
-      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
     ]);
-    await expect(zeroId.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+    await expect(stringZero.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .resolves.toMatchObject({ reviewId: '0' });
   });
 
   it('refuses an oversized provider reply instead of parsing it', async () => {
@@ -1352,6 +1375,57 @@ describe('review id discipline', () => {
     ], { maxProviderBodyBytes: 2_048 });
     await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/exceeded 2048 bytes/u);
+  });
+
+  it('applies the byte ceiling while streaming, stopping at the cap instead of buffering past it', async () => {
+    const fixture = bundleFixture();
+    const chunks = [new Uint8Array(1_500).fill(120), new Uint8Array(1_500).fill(121), new Uint8Array(1_500).fill(122)];
+    const { poster } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async () => ({
+          status: 200,
+          stream: new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const chunk of chunks) controller.enqueue(chunk);
+              controller.close();
+            },
+          }),
+        }),
+      },
+    ], { maxProviderBodyBytes: 2_048 });
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/exceeded 2048 bytes/u);
+  });
+
+  it('keeps an oversized refusal classified by its status (never as an unknown outcome)', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => ({ status: 403, rawText: 'x'.repeat(2_049), headers: { 'x-ratelimit-remaining': '0' } }) },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+    ], { maxProviderBodyBytes: 2_048 });
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error).toBeInstanceOf(PerkinsAppHttpError);
+    expect((error as PerkinsAppHttpError).status).toBe(403);
+    // A definitive refusal: no reconciliation lookup, no retry.
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(0);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('routes an oversized OK delivery reply into bounded reconciliation, never a blind retry', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => ({ status: 200, rawText: 'x'.repeat(2_049) }) },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+    ], { maxProviderBodyBytes: 2_048 });
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('rejects an armed-style broken reply-size ceiling at construction', () => {
+    const fixture = bundleFixture();
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: 0 })).toThrow(/maxProviderBodyBytes/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: -1 })).toThrow(/maxProviderBodyBytes/u);
   });
 });
 
