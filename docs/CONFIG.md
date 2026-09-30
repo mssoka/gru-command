@@ -201,11 +201,11 @@ proactive_compact_percent = 70
 # plus bounded automatic retry for the rate-limit error class
 # (HTTP 429, "rate limit", "too many requests", throttling). Every
 # automatic retry is recorded as a pacing.auto-retry ledger event.
-# Absent section = disabled (current behavior). Suggested starting
+# Enabled by default with unlimited admission caps. Suggested starting
 # point: cap minion and review turns at 3; 1s backoff, capped at 60s,
 # 5 retries.
 # max_concurrent_minions = 3
-# max_concurrent_review_turns = 3   # 0 = unlimited; >= 2 (lead + lens)
+# max_concurrent_review_turns = 3   # 0 = unlimited
 # backoff_base_ms = 1000
 # backoff_max_ms = 60000
 # max_auto_retries = 5
@@ -213,9 +213,7 @@ proactive_compact_percent = 70
 # Optional provider-keyed extra signatures (global text signatures):
 # [pacing.providers."<provider-id>"]
 # rate_limit_patterns = ["pacing code \\d+"]
-#
-# The [concurrency] spelling is accepted as an alias, as are the shared
-# key names max_workers / max_review_turns.
+# [concurrency] controls resident sessions separately from these turn caps.
 
 [logging]
 # service.log size-based rotation.

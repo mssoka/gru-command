@@ -47,7 +47,12 @@ function rpcChunks() {
   const files = [];
   for (const root of DIST_ROOTS) {
     const dir = join(root, 'vitest', 'dist', 'chunks');
-    if (!existsSync(dir)) continue;
+    if (!existsSync(dir)) {
+      if (existsSync(join(root, 'vitest', 'package.json'))) {
+        throw new Error('vitest-rpc-timeout: installed vitest has no dist/chunks — update tools/patch-vitest-rpc-timeout.mjs before testing');
+      }
+      continue;
+    }
     distDirs.push(dir);
     for (const entry of readdirSync(dir)) {
       if (/^rpc\..+\.js$/.test(entry)) files.push(join(dir, entry));

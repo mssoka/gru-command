@@ -518,8 +518,8 @@ async function main(): Promise<number> {
   // process — the optional rate-limit backoff plus the FIFO admission gate
   // shared by worker dispatches, directive deliveries, and Perkins rounds.
   // Every queue/admission lands on the ledger; the board reads the live
-  // gate view. A section-absent config resolves to an off backoff and an
-  // unlimited gate: exactly the pre-pacing behavior.
+  // gate view. Default admission is enabled and unlimited; operators set
+  // turn caps independently of the resident-session budget.
   const pacing = resolvePacingPolicy(config.pacing, {
     record: (event) => {
       ledger.appendCustomEvent({
@@ -614,6 +614,7 @@ async function main(): Promise<number> {
     notifications,
     decisions: decisionRuntime,
     rateLimitBackoff: pacing.backoff,
+    workerGate: pacing.gate,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   supervisor = supervisorLive;
@@ -778,6 +779,8 @@ async function main(): Promise<number> {
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
     reviewGate: pacing.gate,
+    workerGate: pacing.gate,
+    rateLimitBackoff: pacing.backoff,
     poster: new AutoVerdictPoster(),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     maxConcurrentChildren: config.review.maxConcurrentChildren,
@@ -787,6 +790,7 @@ async function main(): Promise<number> {
     fallbackGate: {
       skillPath: resolveBmadReviewSkillPath(),
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
+        workerGate: pacing.gate,
         registry,
         ledger,
         worktrees: worktreeManager,

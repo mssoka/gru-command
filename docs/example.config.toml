@@ -84,19 +84,18 @@ proactive_compact_percent = 70
 # retry for the provider rate-limit error class (HTTP 429, "rate limit"/"too
 # many requests"/throttling). Every automatic retry is recorded as a
 # pacing.auto-retry ledger event; non-rate-limit failures and an exhausted
-# budget still stop to the supervisor ladder + owner ACK. Absent section =
-# disabled (current behavior). Provider-agnostic: signatures match error text,
+# budget still stop to the supervisor ladder + owner ACK. Enabled by default
+# with unlimited admission caps. Provider-agnostic: signatures match error text,
 # never a provider brand baked into code.
 # max_concurrent_minions = 3
-# max_concurrent_review_turns = 3      # 0 = unlimited; >= 2 (lead + lens)
+# max_concurrent_review_turns = 3      # 0 = unlimited
 # backoff_base_ms = 1000
 # backoff_max_ms = 60000
 # max_auto_retries = 5
 # enabled = true
 # [pacing.providers."<provider-id>"]  # extra signatures (global text signatures)
 # rate_limit_patterns = ["pacing code \\d+"]
-# The [concurrency] spelling is accepted as an alias (max_workers /
-# max_review_turns are the shared cap key names).
+# [concurrency] controls resident sessions separately from these turn caps.
 
 [logging]
 max_bytes = 10485760

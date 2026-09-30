@@ -14,7 +14,7 @@ import {
 import {
   backoffDelayMs,
   isRateLimitErrorText,
-  type RateLimitBackoffPolicy,
+  type PacingGate, type PacingLease, type RateLimitBackoffPolicy,
 } from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -221,6 +221,7 @@ interface SupervisedAgent {
  * every failure inside the incident spends one retry from the resolved
  * budget. Cleared by recovery, replacement, or a clean delivery. */
 interface RateLimitRetryIncident {
+  readonly admissionAbort: AbortController;
   /** Retries scheduled so far (attempt numbers are 1-based at schedule). */
   attempts: number;
   readonly maxRetries: number;
@@ -302,6 +303,7 @@ export interface SupervisorOptions {
    * null/omitted = feature off — the failure keeps its current ladder
    * behavior (stop for provider walls, nothing for other in-band errors). */
   readonly rateLimitBackoff?: RateLimitBackoffPolicy | null;
+  readonly workerGate?: PacingGate;
   /** Test seam: backoff sleep (default a real unref'd timer). */
   readonly sleep?: (ms: number) => Promise<void>;
   /** Test seam: jitter over [0, capMs) added to each backoff delay (default
@@ -319,6 +321,7 @@ export class Supervisor {
   private readonly now: () => number;
   private readonly wallNow: () => number;
   private readonly rateLimitBackoff: RateLimitBackoffPolicy | null;
+  private readonly workerGate: PacingGate | undefined;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly jitter: (capMs: number) => number;
   private readonly agents = new Map<string, SupervisedAgent>();
@@ -340,6 +343,7 @@ export class Supervisor {
     this.now = opts.now ?? Date.now;
     this.wallNow = opts.wallNow ?? Date.now;
     this.rateLimitBackoff = opts.rateLimitBackoff ?? null;
+    this.workerGate = opts.workerGate;
     this.sleep = opts.sleep ?? defaultSleep;
     this.jitter = opts.jitter ?? ((capMs: number) => Math.random() * capMs);
     // Cadence: a quarter of the silence window, capped at 5 s so a tight
@@ -624,6 +628,7 @@ export class Supervisor {
         if (agent === undefined) return;
         // A disposed handle can never deliver a pending retry: drop the
         // incident with it (the delivery continuation self-cancels too).
+        agent.rateLimitRetry?.admissionAbort.abort();
         agent.rateLimitRetry = null;
         agent.handle = null;
         agent.openTurn = false;
@@ -1153,7 +1158,7 @@ export class Supervisor {
   }
 
   // ------------------------------------------------------------------
-  // Automatic rate-limit retry (owner heist 2026-09-29, scope-trimmed)
+  // Automatic rate-limit retry (owner heist 2026-09-29)
   // ------------------------------------------------------------------
 
   /** Consume a non-fatal runtime error through the automatic retry path.
@@ -1163,11 +1168,12 @@ export class Supervisor {
   private absorbRateLimitFailure(agent: SupervisedAgent, errorText: string): boolean {
     const policy = this.rateLimitBackoff;
     if (policy === null) return false;
-    // Workflow-owned review attempts keep their existing contract: the
-    // enclosing Perkins workflow owns session-isolation and retry
-    // accounting, so an in-place automatic retry here would race it. Fall
-    // through to the ladder, which aborts the attempt for the workflow.
-    if (agent.handle?.reviewIsolation === true) return false;
+    if (agent.handle?.reviewIsolation === true) {
+      // The isolated workflow owns bounded rate-limit backoff and admission;
+      // supervisor disposal would race its next prompt. Other errors still
+      // enter the isolated-attempt abort contract.
+      return isRateLimitErrorText(errorText, policy.patterns);
+    }
     if (!isRateLimitErrorText(errorText, policy.patterns)) return false;
     const incident = agent.rateLimitRetry;
     if (incident !== null) {
@@ -1196,6 +1202,7 @@ export class Supervisor {
     }
     const fresh: RateLimitRetryIncident = {
       attempts: 0,
+      admissionAbort: new AbortController(),
       maxRetries: policy.maxRetries,
       pending: captured.pending,
       awaitingDelivery: false,
@@ -1217,10 +1224,12 @@ export class Supervisor {
   ): boolean {
     const policy = this.rateLimitBackoff;
     if (policy === null) {
+      agent.rateLimitRetry?.admissionAbort.abort();
       agent.rateLimitRetry = null;
       return false;
     }
     if (incident.attempts >= incident.maxRetries) {
+      agent.rateLimitRetry?.admissionAbort.abort();
       agent.rateLimitRetry = null;
       this.recordEvent('pacing.auto-retry-exhausted', agent.agentId, {
         attempts: incident.attempts,
@@ -1257,6 +1266,7 @@ export class Supervisor {
     incident: RateLimitRetryIncident,
     delayMs: number,
   ): Promise<void> {
+    let retryLease: PacingLease | null = null;
     try {
       await this.sleep(delayMs);
       // The incident may have been superseded (recovery, replacement,
@@ -1265,8 +1275,16 @@ export class Supervisor {
       if (this.agents.get(agent.agentId) !== agent) return;
       const handle = agent.handle;
       if (handle === null || agent.breakerOpen) {
+        agent.rateLimitRetry?.admissionAbort.abort();
         agent.rateLimitRetry = null;
         return;
+      }
+      if (agent.role === 'minion' && this.workerGate !== undefined) {
+        retryLease = await this.workerGate.acquireWorkerTurn({
+          id: agent.agentId, label: `rate-limit retry → ${agent.agentId}`, agentId: agent.agentId,
+          signal: incident.admissionAbort.signal,
+        });
+        if (this.disposed || agent.rateLimitRetry !== incident || this.agents.get(agent.agentId) !== agent) return;
       }
       // Defensive: a scheduled rung must never start while another delivery
       // is still in flight. Its settlement owns the next transition.
@@ -1314,6 +1332,7 @@ export class Supervisor {
         return;
       }
       if (rejection === null) {
+        agent.rateLimitRetry?.admissionAbort.abort();
         agent.rateLimitRetry = null;
         this.recordEvent('pacing.auto-retry-recovered', agent.agentId, {
           attempts: incident.attempts,
@@ -1333,6 +1352,7 @@ export class Supervisor {
       } else if (/disposed/i.test(text)) {
         // The session went away under the retry (shutdown or replacement):
         // no failure to ladder, no retry to continue.
+        agent.rateLimitRetry?.admissionAbort.abort();
         agent.rateLimitRetry = null;
         this.log('warn', 'rate-limit retry delivery ended on a disposed session', {
           agent_id: agent.agentId,
@@ -1340,19 +1360,20 @@ export class Supervisor {
         });
         return;
       } else {
+        agent.rateLimitRetry?.admissionAbort.abort();
         agent.rateLimitRetry = null;
       }
       // No adapter event surfaced this failure (or the budget is spent):
       // the existing recovery ladder still owns it.
       void this.evaluateRecovery(agent, `runtime error: ${text}`, false, true);
     } catch (error) {
-      // The retry machinery must never throw into the tap or leave a
-      // half-state behind.
+      if (agent.rateLimitRetry !== incident || this.disposed) return;
+      incident.admissionAbort.abort();
       agent.rateLimitRetry = null;
-      this.log('error', 'rate-limit retry delivery failed internally', {
-        agent_id: agent.agentId,
-        error: String(error),
-      });
+      this.log('error', 'rate-limit retry delivery failed internally', { agent_id: agent.agentId, error: String(error) });
+      void this.evaluateRecovery(agent, `rate-limit retry failed: ${String(error)}`, false, true);
+    } finally {
+      retryLease?.release();
     }
   }
 
@@ -1427,6 +1448,7 @@ export class Supervisor {
     // in-flight automatic retry: the failure it was retrying is no longer
     // the failure being handled. The delivery continuation self-cancels on
     // the cleared incident identity.
+    agent.rateLimitRetry?.admissionAbort.abort();
     agent.rateLimitRetry = null;
     // Perkins review attempts are owned by the bounded review workflow. A
     // supervisor resume would drop that attempt's cwd/isolation contract and
@@ -2077,6 +2099,7 @@ export class Supervisor {
     }
     this.unsubscribeTap();
     for (const agent of this.agents.values()) {
+      agent.rateLimitRetry?.admissionAbort.abort();
       if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
     }
     this.agents.clear();

@@ -831,11 +831,11 @@ describe('verify config (contention fix 2026-09-22)', () => {
 });
 
 describe('pacing config (FIFO admission caps + rate-limit backoff; owner heist 2026-09-29)', () => {
-  it('absent section = feature OFF: unlimited turns, no automatic retry (current behavior)', () => {
+  it('absent section ships enabled with unlimited admission caps', () => {
     const home = tmpHome();
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     expect(config.pacing).toEqual({
-      enabled: false,
+      enabled: true,
       maxConcurrentMinions: 0,
       maxConcurrentReviewTurns: 0,
       backoffBaseMs: 1_000,
@@ -873,18 +873,12 @@ describe('pacing config (FIFO admission caps + rate-limit backoff; owner heist 2
     });
   });
 
-  it('accepts the [concurrency] alias with the shared max_workers / max_review_turns key names', () => {
+  it('keeps resident concurrency and turn pacing independent when both sections are present', () => {
     const home = tmpHome();
-    writeConfig(home, '[concurrency]\nmax_workers = 2\nmax_review_turns = 2\n');
-    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').pacing).toEqual({
-      enabled: true,
-      maxConcurrentMinions: 2,
-      maxConcurrentReviewTurns: 2,
-      backoffBaseMs: 1_000,
-      backoffMaxMs: 60_000,
-      maxAutoRetries: 5,
-      providers: {},
-    });
+    writeConfig(home, '[concurrency]\nmax_workers = 4\n[pacing]\nmax_concurrent_minions = 2\nmax_concurrent_review_turns = 1\n');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.concurrency.maxWorkers).toBe(4);
+    expect(config.pacing).toMatchObject({ enabled: true, maxConcurrentMinions: 2, maxConcurrentReviewTurns: 1 });
   });
 
   it('a present section with absent keys takes the documented defaults (unlimited caps)', () => {
@@ -922,7 +916,6 @@ describe('pacing config (FIFO admission caps + rate-limit backoff; owner heist 2
       '[pacing]\nmax_concurrent_minions = -1\n',
       '[pacing]\nmax_concurrent_minions = 1.5\n',
       '[pacing]\nmax_concurrent_review_turns = -1\n',
-      '[pacing]\nmax_concurrent_review_turns = 1\n',
       '[pacing]\nmax_auto_retries = -1\n',
       '[pacing]\nmax_auto_retries = 1.5\n',
       '[pacing]\nbackoff_base_ms = 0\n',
@@ -937,7 +930,6 @@ describe('pacing config (FIFO admission caps + rate-limit backoff; owner heist 2
       '[pacing]\nmax_concurrent_minions = 3\nmax_workers = 3\n',
       '[pacing]\nmax_concurrent_review_turns = 3\nmax_review_turns = 3\n',
       '[concurrency]\nmax_concurrent_minions = 3\nmax_workers = 3\n',
-      '[pacing]\nmax_concurrent_minions = 3\n[concurrency]\nmax_workers = 2\n',
     ];
     for (const text of bad) {
       const h2 = tmpHome();

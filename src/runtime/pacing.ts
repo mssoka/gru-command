@@ -8,7 +8,7 @@ import { ConfigError, type PacingConfig } from '../config.js';
  *
  * Provider-agnostic by ruling: no provider name, model, or limit is
  * hardcoded. Limits and the master switch come from the [pacing] config
- * section (the [concurrency] spelling is the shared alias); provider-keyed
+ * section; provider-keyed
  * error signatures match ERROR TEXT only — a CLI or adapter brand is never
  * provider identity (bible: align-preflight-with-runtime-resolution). The
  * signatures are global text signatures; the provider keys are
@@ -135,7 +135,8 @@ export interface PacingGateView {
 }
 
 /** Durable-record hook (the ledger in production) so queuing and admission
- * land on the record for observability. Must never throw into the gate. */
+ * land on the record for observability. A throw fails the affected acquire
+ * loudly without consuming a slot. */
 export type PacingEventRecorder = (event: {
   readonly kind: string;
   readonly jobId?: string | null;
@@ -243,7 +244,7 @@ export class PacingGate {
 
   private poolView(kind: PacingPool): PacingPoolView {
     return {
-      limit: this.limits[kind],
+      limit: this.limitFor(kind),
       running: this.running[kind],
       queued: this.queues[kind].map((waiter) => ({
         id: waiter.id,
@@ -266,6 +267,7 @@ export class PacingGate {
   }
 
   private acquire(kind: PacingPool, input: PacingAcquireInput): Promise<PacingLease> {
+    if (input.signal?.aborted === true) return Promise.reject(new Error('pacing wait aborted'));
     const limit = this.limitFor(kind);
     if (limit === 0 || this.running[kind] < limit) {
       this.running[kind] += 1;
@@ -300,23 +302,29 @@ export class PacingGate {
         reject(error);
       };
       this.queues[kind].push(waiter);
-      this.recordEvent('pacing.queued', waiter, {
-        pool: kind,
-        position: this.queues[kind].length,
-        limit,
-      });
-      input.queued?.({
-        position: this.queues[kind].length,
-        limit,
-        reason: this.queueReason(kind),
-      });
+      try {
+        this.recordEvent('pacing.queued', waiter, {
+          pool: kind, position: this.queues[kind].length, limit,
+        });
+        input.queued?.({
+          position: this.queues[kind].length, limit, reason: this.queueReason(kind),
+        });
+      } catch (error) {
+        this.queues[kind].splice(this.queues[kind].indexOf(waiter), 1);
+        waiter.reject(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
       if (input.signal !== undefined) {
         waiter.onAbort = () => {
           const index = this.queues[kind].indexOf(waiter);
           if (index < 0) return; // already admitted; the lease holder releases
           this.queues[kind].splice(index, 1);
-          this.recordEvent('pacing.wait-cancelled', waiter, { pool: kind });
-          waiter.reject(new Error('pacing wait aborted'));
+          try {
+            this.recordEvent('pacing.wait-cancelled', waiter, { pool: kind });
+            waiter.reject(new Error('pacing wait aborted'));
+          } catch (error) {
+            waiter.reject(error instanceof Error ? error : new Error(String(error)));
+          }
         };
         if (input.signal.aborted) {
           waiter.onAbort();
@@ -336,15 +344,22 @@ export class PacingGate {
         }
         this.released.add(lease);
         this.running[kind] = Math.max(0, this.running[kind] - 1);
-        const next = this.queues[kind].shift();
-        if (next === undefined) return;
-        this.running[kind] += 1;
-        const waited = Math.max(0, this.now() - next.enqueueMs);
-        this.recordEvent('pacing.admitted', next, {
-          pool: kind,
-          waited_ms: waited,
-        });
-        next.resolve(this.mintLease(kind, waited));
+        // A recorder failure rejects THAT waiter loudly, not an orphaned
+        // lease. Continue draining so healthy queued callers cannot starve.
+        for (;;) {
+          const next = this.queues[kind].shift();
+          if (next === undefined) return;
+          const waited = Math.max(0, this.now() - next.enqueueMs);
+          try {
+            this.recordEvent('pacing.admitted', next, { pool: kind, waited_ms: waited });
+          } catch (error) {
+            next.reject(error instanceof Error ? error : new Error(String(error)));
+            continue;
+          }
+          this.running[kind] += 1;
+          next.resolve(this.mintLease(kind, waited));
+          return;
+        }
       },
     };
     return lease;

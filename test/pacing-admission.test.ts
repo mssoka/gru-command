@@ -6,8 +6,9 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { DispatchService } from '../src/dispatch/service.js';
-import { routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { routeFixDirectiveToMinion, rebriefFreshMinion } from '../src/dispatch/fix-directive.js';
 import { PacingGate } from '../src/runtime/pacing.js';
+import { BoardEngine } from '../src/board/engine.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import type { WorktreeLane, WorktreePort } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -253,5 +254,61 @@ describe('worker admission through directive deliveries', () => {
     expect(gate.view().worker.running).toBe(1);
     holder.release();
     expect(gate.view().worker.running).toBe(0);
+  });
+});
+
+
+describe('pacing plumbing and failure cleanup', () => {
+  it('a post-spawn bookkeeping throw releases the worker slot', async () => {
+    const repo = makeFixtureRepo('pacing-register-error'); repos.push(repo);
+    const root = mkdtempSync(join(tmpdir(), 'pacing-register-error-')); dirs.push(root);
+    const { api, close } = ledgerIn();
+    try {
+      const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+      vi.spyOn(api, 'registerAgent').mockImplementationOnce(() => { throw new Error('register unavailable'); });
+      const service = new DispatchService({ ledger: api, worktrees: new InMemoryWorktreePort(root), workerGate: gate,
+        spawner: async () => makeFakeMinion('spawned').handle });
+      await expect(service.dispatch({ jobId: 'job-bad', repoPath: repo.path, title: 'bad', briefing: 'brief' })).rejects.toThrow('register unavailable');
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+      expect(api.getJob('job-bad')?.status).toBe('blocked');
+    } finally { close(); }
+  });
+
+  it('a refused spawn releases the worker slot too', async () => {
+    const repo = makeFixtureRepo('pacing-spawn-error'); repos.push(repo);
+    const root = mkdtempSync(join(tmpdir(), 'pacing-spawn-error-')); dirs.push(root);
+    const { api, close } = ledgerIn();
+    try {
+      const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+      const service = new DispatchService({ ledger: api, worktrees: new InMemoryWorktreePort(root), workerGate: gate,
+        spawner: async () => { throw new Error('spawn refused'); } });
+      await expect(service.dispatch({ jobId: 'job-bad', repoPath: repo.path, title: 'bad', briefing: 'brief' })).rejects.toThrow('spawn refused');
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally { close(); }
+  });
+
+  it('re-brief spawn queues and the board snapshot exposes its identity and honest reason', async () => {
+    const repo = makeFixtureRepo('pacing-rebrief'); repos.push(repo);
+    const { api, close } = ledgerIn();
+    try {
+      api.addJob({ id: 'job-rebrief', repo: 'fixture', title: 'rebrief', briefing: 'brief' });
+      const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+      const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+      const worker = makeFakeMinion('rebrief-minion');
+      const spawner = vi.fn(async () => worker.handle);
+      const routing = rebriefFreshMinion({ registry: { getHandle: () => null, spawn: spawner, disposeHandle: async () => {} },
+        ledger: api, workerGate: gate, worktrees: { listWorktrees: () => [{ kind: 'job', status: 'active', path: repo.path }] } as unknown as WorktreePort,
+        jobId: 'job-rebrief', note: 'continue', briefing: 'brief' });
+      await flush();
+      expect(spawner).not.toHaveBeenCalled();
+      const board = new BoardEngine({ ledger: api, bus: new EventBus(), pacing: () => gate.view() });
+      expect(board.snapshot().pacing?.worker.queued).toMatchObject([{ id: 'job-rebrief', label: 're-brief → job-rebrief', reason: expect.stringContaining('1/1 minion turns running') }]);
+      holder.release();
+      await flush();
+      expect(spawner).toHaveBeenCalledTimes(1);
+      worker.settle();
+      await routing;
+      expect(board.snapshot().pacing?.worker).toMatchObject({ running: 0, queued: [] });
+    } finally { close(); }
   });
 });

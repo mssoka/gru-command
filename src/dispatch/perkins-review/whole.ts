@@ -4,7 +4,8 @@ import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool } from '../../runtime/types.js';
-import type { PacingGate, PacingLease } from '../../runtime/pacing.js';
+import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
+import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
 import { assertFrozenPromptBounds, refMovedSinceFreeze, writeReviewArtifact, type FrozenReview } from './artifacts.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -133,6 +134,10 @@ export interface PerkinsWholeReviewOptions {
   /** Provider pacing: FIFO combined lead+lens review-turn gate. Absent =
    * off; an unlimited or disabled gate admits immediately. */
   readonly reviewGate?: PacingGate;
+  readonly rateLimitBackoff?: RateLimitBackoffPolicy | null;
+  readonly recordPacing?: PacingEventRecorder;
+  readonly pacingSleep?: RateLimitRetryOptions['sleep'];
+  readonly pacingJitter?: RateLimitRetryOptions['jitter'];
   readonly onProgress?: (progress: ReviewProgress) => void;
   readonly onAgent?: (input: {
     readonly phase: 'lead' | 'specialist';
@@ -547,6 +552,12 @@ async function boundedPrompt(
   timeoutMs: number,
   signals: readonly (AbortSignal | undefined)[] = [],
 ): Promise<void> {
+  let failure: string | null = null;
+  const unsubscribe = handle.subscribe((event) => {
+    if (event.type === 'error' || (event.type === 'state' && event.state === 'error')) {
+      failure = event.error ?? 'review model turn failed';
+    }
+  });
   let timer: ReturnType<typeof setTimeout> | null = null;
   let rejectAbort: ((error: Error) => void) | null = null;
   const listeners: Array<{ signal: AbortSignal; listener: () => void }> = [];
@@ -572,8 +583,10 @@ async function boundedPrompt(
       }),
       abort,
     ]);
+    if (failure !== null) throw new Error(failure);
   } finally {
     rejectAbort = null;
+    unsubscribe();
     if (timer !== null) clearTimeout(timer);
     for (const { signal, listener } of listeners) signal.removeEventListener('abort', listener);
   }
@@ -654,10 +667,12 @@ export class PerkinsWholeReview {
   private readonly beginChildren: NonNullable<PerkinsWholeReviewOptions['beginChildren']>;
   private readonly maxConcurrentChildren: number;
   private readonly reviewGate: PacingGate | null;
+  private readonly pacingOptions: PerkinsWholeReviewOptions;
   private readonly onProgress: (progress: ReviewProgress) => void;
   private readonly onAgent: NonNullable<PerkinsWholeReviewOptions['onAgent']>;
 
   constructor(options: PerkinsWholeReviewOptions) {
+    this.pacingOptions = options;
     this.spawner = options.spawner;
     this.policy = options.policy;
     this.maxConcurrentChildren = options.maxConcurrentChildren ?? STANDALONE_SPECIALIST_CONCURRENCY;
@@ -690,7 +705,7 @@ export class PerkinsWholeReview {
    * rounds (extra tasks simply wait their turn). */
   private specialistWaveWidth(): number {
     const limit = this.reviewGate?.view().review.limit ?? 0;
-    return limit > 0 ? Math.max(1, Math.min(STANDALONE_SPECIALIST_CONCURRENCY, limit)) : STANDALONE_SPECIALIST_CONCURRENCY;
+    return limit > 0 ? Math.max(1, Math.min(this.maxConcurrentChildren, limit)) : this.maxConcurrentChildren;
   }
 
   async run(input: RunWholeReviewInput): Promise<PerkinsWholeResult> {
@@ -731,6 +746,39 @@ export class PerkinsWholeReview {
       if (sessionFiles.has(sessionFile)) throw new Error(`duplicate review session file: ${sessionFile}`);
       agentIds.add(handle.id);
       sessionFiles.add(sessionFile);
+    };
+
+    const retryPrompt = async (
+      handle: AgentHandle, prompt: string, budgetMs: number, label: string,
+      signals: readonly (AbortSignal | undefined)[], acquire: () => Promise<void>, release: () => void,
+      hasSubmission: () => boolean,
+    ): Promise<void> => {
+      let remaining = budgetMs;
+      await withRateLimitRetries(async () => {
+        await acquire();
+        const start = Date.now();
+        try {
+          if (remaining <= 0) throw new ReviewTurnTimeoutError(budgetMs);
+          await boundedPrompt(handle, prompt, remaining, signals);
+        } catch (error) {
+          // A terminal native submission outranks later transport noise.
+          if (hasSubmission()) return;
+          release();
+          throw error;
+        } finally {
+          remaining -= Math.max(0, Date.now() - start);
+        }
+      }, {
+        policy: this.pacingOptions.rateLimitBackoff ?? null,
+        signals,
+        ...(this.pacingOptions.pacingSleep !== undefined ? { sleep: this.pacingOptions.pacingSleep } : {}),
+        ...(this.pacingOptions.pacingJitter !== undefined ? { jitter: this.pacingOptions.pacingJitter } : {}),
+        record: (event) => {
+          const payload = { ...event.payload, round_id: input.roundId, label, agent_id: handle.id };
+          writeReviewArtifact(review, `pacing/${randomUUID()}.json`, { kind: event.kind, ...payload });
+          this.pacingOptions.recordPacing?.({ kind: event.kind, agentId: handle.id, payload });
+        },
+      });
     };
 
     const runSpecialist = async (
@@ -811,14 +859,17 @@ export class PerkinsWholeReview {
         // native-tool child is tool-only, a text child (non-pi runtimes)
         // keeps the tolerant text path. The request alone proves nothing.
         nativeSubmit = handle.reviewTools?.includes(FINDINGS_TOOL_NAME) === true;
-        await boundedPrompt(
+        await retryPrompt(
           handle,
           renderSpecialistPrompt(
             this.policy, review, lens, nativeSubmit ? 'nativeTool' : 'text',
             attempt > 1 && previous !== undefined ? { attempt, previous } : undefined,
           ),
-          CHILD_TURN_TIMEOUT_MS,
+          CHILD_TURN_TIMEOUT_MS, `lens:${lens}#${attempt}`,
           [signal, input.signal],
+          async () => { reviewLease ??= await this.acquireReviewTurnSlot(`lens:${lens}#${attempt}`, signal ?? input.signal); },
+          () => { const lease = reviewLease; reviewLease = null; lease?.release(); },
+          () => capturedSubmission() !== null,
         );
         promptResolved = true;
       } catch (error) {
@@ -1538,7 +1589,11 @@ export class PerkinsWholeReview {
           if (turns > MAX_LEAD_TURNS) void lead?.dispose();
         }
       });
-      await boundedPrompt(lead, initialPrompt, LEAD_TOTAL_TIMEOUT_MS, [input.signal]);
+      await retryPrompt(lead, initialPrompt, LEAD_TOTAL_TIMEOUT_MS, 'lead', [input.signal],
+        async () => { reviewLease ??= await this.acquireReviewTurnSlot('lead', input.signal); },
+        () => { const lease = reviewLease; reviewLease = null; lease?.release(); },
+        () => accepted !== null,
+      );
       if (input.signal?.aborted === true) throw new Error('review operation aborted');
       if (turns > MAX_LEAD_TURNS) throw new Error(`Perkins lead exceeded ${MAX_LEAD_TURNS} turns`);
       if (accepted === null) throw new Error('Perkins lead exited without an accepted terminal submission');
@@ -1553,9 +1608,12 @@ export class PerkinsWholeReview {
       });
       return accepted;
     } finally {
-      unsubscribe();
-      await lead?.dispose();
-      reviewLease?.release();
+      try {
+        unsubscribe();
+        await lead?.dispose();
+      } finally {
+        reviewLease?.release();
+      }
     }
   }
 

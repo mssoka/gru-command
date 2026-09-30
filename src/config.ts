@@ -271,22 +271,10 @@ export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   escalateAt: 4,
 };
 
-/** Provider pacing (owner heist 2026-09-29): config-driven FIFO admission
- * caps for minion turns and Perkins review turns, plus bounded automatic
- * retry for the provider rate-limit error class — replacing per-429 owner
- * ACKs. The review round r4 (2026-09-30) restored the gates to this lane
- * per the frozen brief.
- *
- * Provider-agnostic by ruling: no provider name, model, or limit appears in
- * code. Error signatures are the generic HTTP 429 family plus optional
- * provider-keyed additions (matched against ERROR TEXT only; the keys are
- * organizational labels, the signatures are global — a CLI or adapter brand
- * is never identity). Absent section = feature off (current behavior);
- * absent keys inside a present section = the documented defaults below.
- * Both the [pacing] spelling from the brief and the [concurrency] spelling
- * shared with the worker-residency-budget design are accepted (one section
- * per file); limit keys accept both the brief's max_concurrent_* names and
- * the max_workers / max_review_turns aliases. */
+/** Provider pacing is independent of resident-session [concurrency].
+ * Admission caps ship enabled and unlimited; explicit enabled=false disables
+ * both admission and automatic rate-limit retry. Provider-keyed signatures
+ * match error text only, not the CLI or adapter brand. */
 export interface PacingProviderOverride {
   /** Extra case-insensitive regex bodies classified as rate-limit class,
    * matched against the runtime error text alongside the generic 429-family
@@ -296,8 +284,7 @@ export interface PacingProviderOverride {
 }
 
 export interface PacingConfig {
-  /** True when the loaded file carries a [pacing]/[concurrency] section and
-   * `enabled` is not false. Off = no automatic retry and no caps (current
+  /** Master switch (enabled by default). Off = no automatic retry and no caps (current
    * behavior). */
   readonly enabled: boolean;
   /** FIFO cap on concurrent minion turns; 0 = unlimited (the shipped
@@ -319,7 +306,7 @@ export interface PacingConfig {
 }
 
 export const DEFAULT_PACING_CONFIG: PacingConfig = {
-  enabled: false,
+  enabled: true,
   maxConcurrentMinions: 0,
   maxConcurrentReviewTurns: 0,
   backoffBaseMs: 1_000,
@@ -1277,18 +1264,8 @@ export function loadConfig(
             : verify.runTimeoutMs,
       };
     }
-    if (raw['pacing'] !== undefined && raw['concurrency'] !== undefined) {
-      throw new ConfigError(
-        'both [pacing] and [concurrency] sections are present — use one spelling of the same settings',
-        file,
-        'pacing',
-      );
-    }
     if (raw['pacing'] !== undefined) {
       pacing = readPacingConfig(raw['pacing'], file, 'pacing', pacing);
-    }
-    if (raw['concurrency'] !== undefined) {
-      pacing = readPacingConfig(raw['concurrency'], file, 'concurrency', pacing);
     }
     if (raw['decisions'] !== undefined) {
       decisions = readDecisionsConfig(raw['decisions'], file, decisions);
@@ -1375,16 +1352,14 @@ export function loadConfig(
 const PACING_KEYS = [
   'enabled',
   'max_concurrent_minions',
-  'max_workers',
   'max_concurrent_review_turns',
-  'max_review_turns',
   'backoff_base_ms',
   'backoff_max_ms',
   'max_auto_retries',
   'providers',
 ] as const;
 
-/** Parse a [pacing] table (or its [concurrency] alias). Fail loud on unknown
+/** Parse a [pacing] table. Fail loud on unknown
  * keys, wrong types, conflicting alias spellings, non-compiling patterns,
  * and an inverted backoff ladder — a pacing misconfiguration must never
  * silently disable or distort the bounds. The section being present is the
@@ -1394,7 +1369,7 @@ const PACING_KEYS = [
 function readPacingConfig(
   value: unknown,
   file: string,
-  section: 'pacing' | 'concurrency',
+  section: 'pacing',
   defaults: PacingConfig,
 ): PacingConfig {
   const table = requireTable(value, file, section);
@@ -1410,32 +1385,14 @@ function readPacingConfig(
   // Limit keys accept both spellings named in the brief and in the shared
   // worker-residency-budget design; a file that sets both is ambiguous and
   // fails loud rather than picking one silently.
-  const limit = (primary: string, alias: string): number | undefined => {
-    const hasPrimary = table[primary] !== undefined;
-    const hasAlias = table[alias] !== undefined;
-    if (hasPrimary && hasAlias) {
-      throw new ConfigError(
-        `[${section}] sets both \`${primary}\` and its alias \`${alias}\` — use one spelling`,
-        file,
-        `${section}.${primary}`,
-      );
-    }
-    if (hasPrimary) return requireNonNegativeInt(table[primary], file, `${section}.${primary}`);
-    if (hasAlias) return requireNonNegativeInt(table[alias], file, `${section}.${alias}`);
-    return undefined;
-  };
   const enabled =
     table['enabled'] !== undefined ? requireBool(table['enabled'], file, `${section}.enabled`) : true;
-  const maxConcurrentMinions = limit('max_concurrent_minions', 'max_workers') ?? defaults.maxConcurrentMinions;
-  const maxConcurrentReviewTurns =
-    limit('max_concurrent_review_turns', 'max_review_turns') ?? defaults.maxConcurrentReviewTurns;
-  if (maxConcurrentReviewTurns === 1) {
-    throw new ConfigError(
-      `${section}.max_concurrent_review_turns must be 0 (unlimited) or at least 2 — a review round needs its lead plus at least one lens`,
-      file,
-      `${section}.max_concurrent_review_turns`,
-    );
-  }
+  const maxConcurrentMinions = table['max_concurrent_minions'] !== undefined
+    ? requireNonNegativeInt(table['max_concurrent_minions'], file, `${section}.max_concurrent_minions`)
+    : defaults.maxConcurrentMinions;
+  const maxConcurrentReviewTurns = table['max_concurrent_review_turns'] !== undefined
+    ? requireNonNegativeInt(table['max_concurrent_review_turns'], file, `${section}.max_concurrent_review_turns`)
+    : defaults.maxConcurrentReviewTurns;
   const backoffBaseMs =
     table['backoff_base_ms'] !== undefined
       ? requirePositiveInt(table['backoff_base_ms'], file, `${section}.backoff_base_ms`)

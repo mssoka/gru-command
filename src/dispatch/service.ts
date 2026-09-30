@@ -123,6 +123,12 @@ export class DispatchService {
       payload: { repo: repoName, repoPath: input.repoPath },
     });
 
+    let workerLease: PacingLease | null = null;
+    const releaseWorker = (): void => {
+      const lease = workerLease;
+      workerLease = null;
+      lease?.release();
+    };
     try {
       const working = this.opts.ledger.setJobStatus(job.id, 'working');
 
@@ -138,7 +144,6 @@ export class DispatchService {
       // at the configured cap — the lane lands queued on the board with the
       // honest reason and is admitted in order (never rejected, never
       // preempted). Unlimited default admits immediately: zero change.
-      let workerLease: PacingLease | null = null;
       if (this.opts.workerGate !== undefined) {
         workerLease = await this.opts.workerGate.acquireWorkerTurn({
           id: job.id,
@@ -156,7 +161,7 @@ export class DispatchService {
       } catch (error) {
         // The lane cannot start — release the pacing slot, sweep the fresh
         // worktree (preserve first, per ruling 18c) and block the job.
-        workerLease?.release();
+        releaseWorker();
         await this.sweepQuietly(worktree.id);
         throw error;
       }
@@ -224,11 +229,12 @@ export class DispatchService {
           },
         )
         .finally(() => {
-          workerLease?.release();
+          releaseWorker();
         });
 
       return { job: working, worktree, agentId: handle.id, settled };
     } catch (error) {
+      releaseWorker();
       this.opts.ledger.setJobStatus(job.id, 'blocked');
       this.opts.ledger.noteJob(job.id, `dispatch failed: ${String(error)}`);
       throw error;

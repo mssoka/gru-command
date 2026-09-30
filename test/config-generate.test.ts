@@ -342,31 +342,17 @@ describe('config-generate CLI', () => {
     });
   });
 
-  it('round trip preserves an active [concurrency] alias section by canonicalizing it to [pacing]', () => {
-    const root = tempDir('gru-command-config-pacing-alias-');
+  it('round trip preserves disabled pacing independently of resident concurrency', () => {
+    const root = tempDir('gru-command-config-pacing-independent-');
     const instance = join(root, 'instance');
     mkdirSync(instance, { recursive: true });
-    const prior = ['[concurrency]', 'max_workers = 2', 'max_review_turns = 2', 'max_auto_retries = 1'].join('\n');
+    const prior = '[concurrency]\nmax_workers = 6\n[pacing]\nenabled = false\nmax_concurrent_minions = 2\nmax_concurrent_review_turns = 2\nmax_auto_retries = 1';
     writeFileSync(join(instance, 'config.toml'), `${prior}\n`);
-
     const forced = run(instance, ['--force']);
     expect(forced.status, `${forced.stdout}\n${forced.stderr}`).toBe(0);
-    const text = readFileSync(join(instance, 'config.toml'), 'utf-8');
-    expect(text).toContain('[pacing]');
-    expect(text).not.toContain('[concurrency]');
-    const raw = parse(text) as Record<string, unknown>;
-    expect(raw.pacing).toMatchObject({
-      max_concurrent_minions: 2,
-      max_concurrent_review_turns: 2,
-      max_auto_retries: 1,
-    });
     const loaded = loadConfig({ GRU_COMMAND_HOME: instance }, root);
-    expect(loaded.pacing).toMatchObject({
-      enabled: true,
-      maxConcurrentMinions: 2,
-      maxConcurrentReviewTurns: 2,
-      maxAutoRetries: 1,
-    });
+    expect(loaded.concurrency.maxWorkers).toBe(6);
+    expect(loaded.pacing).toMatchObject({ enabled: false, maxConcurrentMinions: 2, maxConcurrentReviewTurns: 2, maxAutoRetries: 1 });
   });
 
   it('data_dir is emitted ~-anchored for home-under instances (restore-on-new-machine portability)', () => {

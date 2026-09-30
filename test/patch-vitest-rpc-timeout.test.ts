@@ -56,6 +56,15 @@ describe('vitest rpc-timeout patch tool', () => {
     expect(result.stdout).toContain('skipped (production install?)');
   });
 
+  it('fails loud when vitest is installed but dist/chunks was relocated', () => {
+    const cwd = fixtureDir();
+    mkdirSync(join(cwd, 'node_modules', 'vitest'), { recursive: true });
+    writeFileSync(join(cwd, 'node_modules', 'vitest', 'package.json'), '{}');
+    const result = runTool(cwd);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('installed vitest has no dist/chunks');
+  });
+
   it('applies the upstream fix and is idempotent on a second run', () => {
     const cwd = fixtureDir();
     const file = writeRpcChunk(cwd, `${OPEN}\n}));\n`);

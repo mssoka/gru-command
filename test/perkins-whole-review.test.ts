@@ -18,7 +18,7 @@ import {
 } from '../src/dispatch/perkins-review/artifacts.js';
 import { loadPerkinsPolicy, PERKINS_LENSES, PERKINS_POLICY_SHA256 } from '../src/dispatch/perkins-review/policy.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../src/config.js';
-import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult } from '../src/dispatch/perkins-review/whole.js';
+import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult, type PerkinsWholeReviewOptions } from '../src/dispatch/perkins-review/whole.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -68,6 +68,7 @@ function wholeHarness(
     priorConsolidatedFile?: string;
     beforeFreeze?: (repo: FixtureRepo) => void;
     reviewGate?: PacingGate;
+    pacing?: Pick<PerkinsWholeReviewOptions, 'rateLimitBackoff' | 'recordPacing' | 'pacingSleep' | 'pacingJitter'>;
   },
 ): WholeHarness {
   const fixture = makeReviewRepo();
@@ -92,6 +93,7 @@ function wholeHarness(
     spawner: fake.spawner,
     policy: loadPerkinsPolicy(),
     ...(options?.reviewGate !== undefined ? { reviewGate: options.reviewGate } : {}),
+    ...(options?.pacing ?? {}),
   });
   return {
     ...fixture,
@@ -1836,3 +1838,88 @@ describe('provider pacing: combined review-turn gate (owner heist 2026-09-29)', 
   });
 });
 
+
+
+describe('provider pacing: workflow rate-limit retry and cleanup', () => {
+  it('lead and lens in-band rate limits retry automatically, release slots during backoff, and record evidence', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 1 });
+    const failures = new Set<string>();
+    const events: string[] = [];
+    const delays: number[] = [];
+    const h = wholeHarness({ childAnswer: () => '[]', specialists: ['edge'],
+      promptError: (call) => {
+        if (failures.has(call.agentId)) return null;
+        failures.add(call.agentId);
+        return '429 too many requests';
+      },
+    }, { reviewGate: gate, pacing: {
+      rateLimitBackoff: { baseMs: 100, maxMs: 300, maxRetries: 2, patterns: [] },
+      recordPacing: (event) => events.push(event.kind), pacingJitter: () => 0,
+      pacingSleep: async (ms) => { delays.push(ms); expect(gate.view().review.running).toBe(0); },
+    } });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(delays).toEqual([100, 100]);
+    // The lead's retry prompt runs the lens wave, so the lens retry and its
+    // recovery land inside the lead's turn: retry(lead), retry(lens),
+    // recovered(lens), recovered(lead).
+    expect(events).toEqual([
+      'pacing.auto-retry', 'pacing.auto-retry',
+      'pacing.auto-retry-recovered', 'pacing.auto-retry-recovered',
+    ]);
+    expect(h.leadCalls).toHaveLength(1);
+    expect(h.childCalls).toHaveLength(1); // transport retries do not burn policy lens attempts
+    expect(result.specialistRuns).toMatchObject([{ attempt: 1, status: 'valid' }]);
+    expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
+    expect(readdirSync(join(result.artifactDirectory, 'pacing'))).toHaveLength(4);
+  });
+
+  it('lead rate-limit retries exhaust at the configured bound and retain the original failure', async () => {
+    let calls = 0;
+    const events: string[] = [];
+    const delays: number[] = [];
+    const h = wholeHarness({ childAnswer: () => '[]', specialists: [], onLeadStart: () => { calls += 1; throw new Error('429 rate limit'); } }, {
+      pacing: { rateLimitBackoff: { baseMs: 100, maxMs: 150, maxRetries: 2, patterns: [] },
+        recordPacing: (event) => events.push(event.kind), pacingJitter: () => 0,
+        pacingSleep: async (ms) => { delays.push(ms); } },
+    });
+    await expect(h.run()).rejects.toThrow('429 rate limit');
+    expect(calls).toBe(3);
+    expect(delays).toEqual([100, 150]);
+    expect(events).toEqual(['pacing.auto-retry', 'pacing.auto-retry', 'pacing.auto-retry-exhausted']);
+    expect(h.leadCalls[0]?.disposed).toBe(true);
+  });
+
+  it('non-rate-limit lead errors are not retried', async () => {
+    const sleep = vi.fn();
+    const h = wholeHarness({ childAnswer: () => '[]', specialists: [], onLeadStart: () => { throw new Error('401 unauthorized'); } }, {
+      pacing: { rateLimitBackoff: { baseMs: 100, maxMs: 150, maxRetries: 2, patterns: [] }, pacingSleep: sleep },
+    });
+    await expect(h.run()).rejects.toThrow('401 unauthorized');
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('rejecting lead disposal still returns every pacing lease', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 1 });
+    const h = wholeHarness({ childAnswer: () => '[]', specialists: [], disposeRejects: (call) => call.options.reviewLead !== undefined }, { reviewGate: gate });
+    await expect(h.run()).rejects.toThrow('simulated session dispose failure');
+    expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
+  });
+
+  it('disabled pacing keeps the normal lens fan-out even with configured caps', async () => {
+    const gate = new PacingGate({ enabled: false, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 1 });
+    let firstWave = 0;
+    let starts = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const h = wholeHarness({ specialists: ['blind', 'edge'], childAnswer: async () => {
+      if (++starts === 2) { firstWave = gate.view().review.running; release(); }
+      await barrier;
+      return '[]';
+    } }, { reviewGate: gate });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(firstWave).toBe(2);
+    expect(gate.view().review).toMatchObject({ limit: 0, running: 0, queued: [] });
+  });
+});

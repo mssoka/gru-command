@@ -1,3 +1,4 @@
+import { PacingGate } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -2378,6 +2379,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
   async function makeProductionGateHarness(options: {
     findingToWrite: readonly Record<string, string>[];
     skillContent?: string;
+    workerGate?: PacingGate;
   }): Promise<{
     wave: WaveRunner;
     job: { readonly id: string };
@@ -2443,6 +2445,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       worktrees: port,
       spawner,
       reviewArtifactRoot: artifacts,
+      ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
       reviewPreflight: async () => ({
         ok: false,
         failures: [preflightFailure('review-policy', 'the Perkins review gate is disabled')],
@@ -2474,6 +2477,28 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         .map((event) => (event.payload as { phase?: string }).phase)
         .reverse();
       expect(phases).toEqual(['started', 'triaged', 'pass']);
+    } finally {
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it('the production fallback review takes a worker pacing slot before it spawns', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    const h = await makeProductionGateHarness({ findingToWrite: [], workerGate: gate });
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+      expect(h.prompts).toHaveLength(0);
+      expect(h.spawnCwds).toHaveLength(0);
+      holder.release();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(true);
+      expect(h.prompts).toHaveLength(1);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
     } finally {
       rmSync(h.root, { recursive: true, force: true });
       rmSync(h.artifacts, { recursive: true, force: true });
@@ -3671,4 +3696,52 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     expect(spawner).not.toHaveBeenCalled();
     await wave.shutdown();
   }, 120_000);
+});
+
+
+describe('provider pacing through WaveRunner', () => {
+  it('passes review admission and retry policy to the native workflow with round-bound ledger events', async () => {
+    const repo = makeFixtureRepo('pacing-wave-port'); repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/pacing-wave']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number { return 43; }\n');
+    const root = mkdtempSync(join(tmpdir(), 'pacing-wave-root-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'pacing-wave-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'pacing-wave-sessions-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'pacing-wave-db-'))); dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/pacing-wave', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'pacing-wave' });
+    ledger.addJob({ id: 'pacing-wave', repo: 'fixture', title: 'pacing wave', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus('pacing-wave', 'working'); settleLane(ledger, 'pacing-wave');
+    ledger.setJobPr('pacing-wave', 'https://git.example.invalid/acme/fixture/pull/11');
+    attachOrigin(repo, 'feature/pacing-wave', root);
+    const poster = { post: vi.fn(async (input: { readonly prUrl: string; readonly body: string; readonly targetSha: string }) => ({
+      reviewId: '9101', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+      headSha: input.targetSha, baseSha: input.targetSha,
+      bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
+    })) };
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 1 });
+    const holder = await gate.acquireReviewTurn({ id: 'other', label: 'other' });
+    let failed = false;
+    const fake = fakeWholeSpawner(sessions, { childAnswer: () => '[]', specialists: [],
+      promptError: () => { if (failed) return null; failed = true; return '429 too many requests'; } });
+    const wave = new WaveRunner({ ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts, reviewGate: gate,
+      poster, prHeadProbe: localHeadProbe('feature/pacing-wave'),
+      rateLimitBackoff: { baseMs: 1, maxMs: 1, maxRetries: 1, patterns: [] } });
+    try {
+      const running = wave.runRound({ jobId: 'pacing-wave' });
+      await vi.waitFor(() => expect(gate.view().review.queued).toHaveLength(1));
+      expect(fake.leadCalls).toHaveLength(0);
+      holder.release();
+      const result = asWave(await running);
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      const event = ledger.latestRoundEvent(result.round.id, 'pacing.auto-retry');
+      expect(event?.jobId).toBe('pacing-wave');
+      expect(event?.payload).toMatchObject({ retry: 1, delay_ms: 1, label: 'lead' });
+      expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
+    } finally {
+      await wave.shutdown();
+      for (const dir of [root, artifacts, sessions]) rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

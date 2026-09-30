@@ -67,8 +67,9 @@ describe('rate-limit error class (provider-agnostic)', () => {
     expect(isRateLimitErrorText('PACING CODE 1302', [/pacing code \d+/i])).toBe(true);
   });
 
-  it('resolveRateLimitBackoff is off when the section is absent or the budget is zero', () => {
-    expect(resolveRateLimitBackoff(DEFAULT_PACING_CONFIG)).toBeNull();
+  it('resolveRateLimitBackoff is enabled by default, off when disabled or the budget is zero', () => {
+    expect(resolveRateLimitBackoff(DEFAULT_PACING_CONFIG)).toMatchObject({ maxRetries: 5 });
+    expect(resolveRateLimitBackoff(pacingConfig({ enabled: false }))).toBeNull();
     expect(resolveRateLimitBackoff(pacingConfig({ maxAutoRetries: 0 }))).toBeNull();
     expect(resolveRateLimitBackoff(pacingConfig({ maxAutoRetries: -1 }))).toBeNull();
   });
@@ -298,5 +299,41 @@ describe('FIFO admission gate (minion turns + Perkins review turns)', () => {
     a.release();
     b.release();
     (await queued).release();
+  });
+});
+
+
+describe('pacing callback failures never strand admission', () => {
+  it('rejects a throwing queue callback and removes its ghost waiter', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'a', label: 'a' });
+    await expect(gate.acquireWorkerTurn({ id: 'bad', label: 'bad', queued: () => { throw new Error('note failed'); } })).rejects.toThrow('note failed');
+    expect(gate.view().worker.queued).toEqual([]);
+    holder.release();
+    const next = await gate.acquireWorkerTurn({ id: 'next', label: 'next' });
+    next.release();
+    expect(gate.view().worker.running).toBe(0);
+  });
+
+  it('a throwing queue recorder rejects loudly without leaking a waiter', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0,
+      record: () => { throw new Error('ledger unavailable'); } });
+    const holder = await gate.acquireWorkerTurn({ id: 'a', label: 'a' });
+    await expect(gate.acquireWorkerTurn({ id: 'bad', label: 'bad' })).rejects.toThrow('ledger unavailable');
+    holder.release();
+    expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+  });
+
+  it('admission recorder failure rejects only its waiter and drains the next FIFO entry', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0,
+      record: (event) => { if (event.kind === 'pacing.admitted' && (event.payload as { id: string }).id === 'bad') throw new Error('admit failed'); } });
+    const holder = await gate.acquireWorkerTurn({ id: 'a', label: 'a' });
+    const bad = gate.acquireWorkerTurn({ id: 'bad', label: 'bad' });
+    const failed = expect(bad).rejects.toThrow('admit failed');
+    const next = gate.acquireWorkerTurn({ id: 'next', label: 'next' });
+    holder.release();
+    await failed;
+    (await next).release();
+    expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
   });
 });

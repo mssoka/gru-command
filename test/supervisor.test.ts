@@ -25,7 +25,7 @@ import type {
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
-import type { RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
+import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
 
 /**
  * Supervisor tests (EPICS E7 story 4): a controllable registry + handles
@@ -218,6 +218,7 @@ function boot(
   opts: {
     wallNow?: () => number;
     rateLimitBackoff?: RateLimitBackoffPolicy | null;
+    workerGate?: PacingGate;
     sleep?: (ms: number) => Promise<void>;
     jitter?: (capMs: number) => number;
   } = {},
@@ -265,6 +266,7 @@ function boot(
     ...(opts.wallNow !== undefined ? { wallNow: opts.wallNow } : {}),
     ...(opts.rateLimitBackoff !== undefined ? { rateLimitBackoff: opts.rateLimitBackoff } : {}),
     ...(opts.sleep !== undefined ? { sleep: opts.sleep } : {}),
+    ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     ...(opts.jitter !== undefined ? { jitter: opts.jitter } : {}),
     tickMs: 5,
     now: () => harness.nowMs,
@@ -1952,7 +1954,7 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     h.dispose();
   });
 
-  it('never auto-retries an isolated (workflow-owned) review attempt', async () => {
+  it('delegates eligible isolated rate-limit retries to the workflow without disposal or supervisor delivery', async () => {
     const sleeper = new ManualSleeper();
     const h = boot(undefined, {
       rateLimitBackoff: rateLimitPolicy(),
@@ -1967,16 +1969,19 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     h.api.registerAgent({ id: handle.id, role: 'perkins' });
     hang(handle);
     emitFailure(handle, '429 too many requests');
-    await vi.waitFor(() => expect(handle.disposed).toBe(true));
-    // The workflow-owned abort contract is unchanged: no retry scheduled,
-    // no prompt re-delivered, and the durable abort bookkeeping lands.
+    await sleep(20);
+    expect(handle.disposed).toBe(false);
+    // The workflow owns the bounded backoff. Supervisor never schedules or
+    // disposes the isolated transport under that retry.
     expect(sleeper.delays).toEqual([]);
     expect(handle.promptCalls).toHaveLength(0);
     expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind.startsWith('pacing.'))).toBe(false);
     expect(h.api.listEvents({ limit: 100 }).some((event) =>
       event.kind === 'supervision.review-attempt-aborted' && event.agentId === handle.id,
-    )).toBe(true);
-    expect(h.api.getAgent(handle.id)?.state).toBe('error');
+    )).toBe(false);
+    // Supervision writes no failure state either: the workflow owns the
+    // retry, so the attempt must not look aborted to the board.
+    expect(h.api.getAgent(handle.id)?.state).not.toBe('error');
     h.dispose();
   });
   it('a stale retry settlement never clears the newer rung’s flag or fakes recovery (r4 race)', async () => {
@@ -2157,5 +2162,37 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
       h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered'),
     ).toBe(false);
     h.dispose();
+  });
+});
+
+
+describe('supervisor pacing admission and workflow boundary', () => {
+  it('a worker automatic retry queues behind running work and releases its lease', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    try {
+      const handle = new FakeHandle('minion', 'retry-queued', null);
+      handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch' };
+      h.registry.adopt(handle); hang(handle); emitFailure(handle, '429 too many requests');
+      await sleeper.release();
+      expect(handle.promptCalls).toHaveLength(0);
+      expect(gate.view().worker.queued.map((entry) => entry.id)).toEqual([handle.id]);
+      holder.release();
+      await vi.waitFor(() => expect(handle.promptCalls).toHaveLength(1));
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally { h.dispose(); }
+  });
+
+  it('non-rate-limit isolated failures still abort even when backoff is enabled', async () => {
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy() });
+    try {
+      const handle = new FakeHandle('perkins', 'non-rate-review', null, true);
+      h.registry.adopt(handle); hang(handle); emitFailure(handle, '401 unauthorized');
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(h.registry.spawnCalls).toHaveLength(0);
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry')).toBe(false);
+    } finally { h.dispose(); }
   });
 });

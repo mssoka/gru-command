@@ -1,3 +1,4 @@
+import type { AgentHandle } from '../runtime/types.js';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -17,7 +18,7 @@ import {
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
 import type { ResidentReviewRound } from '../runtime/registry.js';
-import type { PacingGate } from '../runtime/pacing.js';
+import type { PacingGate, PacingLease, RateLimitBackoffPolicy } from '../runtime/pacing.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
@@ -988,6 +989,8 @@ export interface WaveRunnerOptions {
   /** Provider pacing: combined lead+lens review-turn gate for Perkins
    * rounds. Absent = off; an unlimited or disabled gate admits at once. */
   readonly reviewGate?: PacingGate;
+  readonly workerGate?: PacingGate;
+  readonly rateLimitBackoff?: RateLimitBackoffPolicy | null;
   readonly poster?: VerdictPoster;
   readonly escalate?: (title: string, detail: string) => void;
   /** Stable service-owned root. Required for every production review. */
@@ -1927,8 +1930,12 @@ export class WaveRunner {
   }
 
   private async defaultFallbackReview(input: FallbackReviewRunInput): Promise<readonly FallbackFinding[]> {
-    const handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
+    const lease: PacingLease | null = this.opts.workerGate === undefined ? null : await this.opts.workerGate.acquireWorkerTurn({
+      id: input.jobId, label: `fallback review → ${input.jobId}`, jobId: input.jobId, signal: input.signal,
+    });
+    let handle: AgentHandle | null = null;
     try {
+      handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
       const prompt = [
         `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
         'This session runs ONE review pass inside a release gate. The host performs triage and every gate decision afterwards: do NOT approve, merge, or gate anything yourself, and do not modify implementation code.',
@@ -1951,7 +1958,7 @@ export class WaveRunner {
       ]);
       if (reviewTimer !== null) clearTimeout(reviewTimer);
     } finally {
-      await handle.dispose();
+      try { await handle?.dispose(); } finally { lease?.release(); }
     }
     return parseFallbackFindingsReport(input.reportFile);
   }
@@ -2295,6 +2302,10 @@ export class WaveRunner {
       ...(reservation !== undefined ? { beginChildren: () => reservation.beginChildren(this.opts.maxConcurrentChildren ?? DEFAULT_REVIEW_CHILDREN) } : {}),
       ...(this.opts.maxConcurrentChildren !== undefined ? { maxConcurrentChildren: this.opts.maxConcurrentChildren } : {}),
       ...(this.opts.reviewGate !== undefined ? { reviewGate: this.opts.reviewGate } : {}),
+      rateLimitBackoff: this.opts.rateLimitBackoff ?? null,
+      recordPacing: (event) => this.opts.ledger.appendCustomEvent({
+        kind: event.kind, jobId: job.id, roundId: round.id, agentId: event.agentId ?? null, payload: event.payload,
+      }),
       policy,
       onAgent: ({ phase, lens, attempt, handle }) => {
         this.opts.ledger.registerAgent({
