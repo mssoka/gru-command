@@ -614,6 +614,10 @@ describe('silas skills and wake prompt', () => {
       expect(skill.body.length).toBeGreaterThan(200);
       expect(skill.body).toContain('## ');
     }
+    // The ops skill carries the current ordinary non-draft PR rule.
+    const ops = skills.find((skill) => skill.name === 'ops-dispatch')!.body.replace(/\s+/gu, ' ');
+    expect(ops).toContain('New pull requests are ordinary');
+    expect(ops).toContain('`gh pr create` without `--draft`/`-d`');
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);
   });
 
