@@ -13,7 +13,7 @@ import {
   type DirectiveRegistry,
 } from './fix-directive.js';
 import type { WorktreePort } from './worktree-port.js';
-import type { PacingGate } from '../runtime/pacing.js';
+import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -63,6 +63,11 @@ export interface ReconcileRebriefDeps {
   /** Provider pacing: worker (minion turn) admission gate for re-dispatched
    * re-briefs. Absent = off. */
   readonly workerGate?: PacingGate;
+  /** Provider pacing: bounded settlement of an automatic rate-limit retry
+   * covering a re-dispatched re-brief turn (supervisor-backed in
+   * production). The recovery records delivered only for
+   * 'none'/'recovered'. */
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   /** True while the process is deliberately stopping: a turn killed by
    * shutdown is not a recovery failure — the next boot retries the marker. */
   readonly stopping?: () => boolean;
@@ -338,6 +343,7 @@ function runRebriefTurn(
     ledger: deps.ledger,
     worktrees: deps.worktrees,
     ...(deps.workerGate !== undefined ? { workerGate: deps.workerGate } : {}),
+    ...(deps.retrySettlement !== undefined ? { retrySettlement: deps.retrySettlement } : {}),
     jobId: input.jobId,
     note: input.note,
     briefing: input.briefing,

@@ -12,7 +12,7 @@ import type { LessonsReferencePort } from '../lessons/types.js';
 import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha } from './silas-driver.js';
 import type { WorktreePort } from './worktree-port.js';
-import type { PacingGate } from '../runtime/pacing.js';
+import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -42,6 +42,10 @@ export interface DispatchServerOptions {
   /** Provider pacing: worker (minion turn) admission gate for directive
    * deliveries and re-briefs. Absent = off. */
   readonly workerGate?: PacingGate;
+  /** Provider pacing: bounded settlement of an automatic rate-limit retry
+   * covering a just-delivered directive/re-brief turn (supervisor-backed
+   * in production). The route records delivered only for 'none'/'recovered'. */
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   /** Absent = /api/silas/* answers 503 (silas ops not hosted). */
   readonly silasOps?: SilasOpsSurface;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
@@ -348,6 +352,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           signal: controller.signal,
           owner: 'silas-ops',
           ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+          ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
           ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
         });
       } finally {
@@ -411,6 +416,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           ledger: options.ledger,
           worktrees: ops.worktrees,
           ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+          ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
           jobId,
           note,
           briefing: job.briefing,

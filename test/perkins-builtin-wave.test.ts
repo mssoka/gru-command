@@ -2380,6 +2380,12 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     findingToWrite: readonly Record<string, string>[];
     skillContent?: string;
     workerGate?: PacingGate;
+    /** Provider pacing: the bounded retry settlement to report for a
+     * delivered fallback-review turn. Absent = no interlock. */
+    retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
+    /** Make the fallback turn reject after writing its report (a transport
+     * rejection whose automatic retry may still recover the delivery). */
+    failPrompt?: boolean;
   }): Promise<{
     wave: WaveRunner;
     job: { readonly id: string };
@@ -2432,6 +2438,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
           if (reportMatch !== null) {
             writeFileSync(reportMatch[1]!, JSON.stringify(options.findingToWrite), 'utf8');
           }
+          if (options.failPrompt === true) throw new Error('429 too many requests');
         },
         async steer() {},
         async followUp() {},
@@ -2446,6 +2453,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       spawner,
       reviewArtifactRoot: artifacts,
       ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+      ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
       reviewPreflight: async () => ({
         ok: false,
         failures: [preflightFailure('review-policy', 'the Perkins review gate is disabled')],
@@ -2499,6 +2507,50 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       expect(outcome.clearToMerge).toBe(true);
       expect(h.prompts).toHaveLength(1);
       expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally {
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it('a fallback rejection whose automatic retry recovers is parsed as delivered', async () => {
+    const h = await makeProductionGateHarness({
+      findingToWrite: [],
+      failPrompt: true,
+      retrySettlement: async () => 'recovered',
+    });
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(true);
+      expect(h.prompts).toHaveLength(1);
+      const phases = h.ledger.listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'job.fallback-review')
+        .map((event) => (event.payload as { phase?: string }).phase)
+        .reverse();
+      expect(phases).toEqual(['started', 'triaged', 'pass']);
+    } finally {
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it('a fallback resolution whose bounded retry exhausts is recorded blocked, never delivered', async () => {
+    const h = await makeProductionGateHarness({
+      findingToWrite: [],
+      retrySettlement: async () => 'exhausted',
+    });
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(h.escalations.some((entry) => entry.includes('BLOCKED'))).toBe(true);
+      const phases = h.ledger.listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'job.fallback-review')
+        .map((event) => (event.payload as { phase?: string }).phase);
+      expect(phases[0]).toBe('blocked'); // newest-first order
     } finally {
       rmSync(h.root, { recursive: true, force: true });
       rmSync(h.artifacts, { recursive: true, force: true });

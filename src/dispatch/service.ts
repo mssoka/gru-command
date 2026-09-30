@@ -154,14 +154,26 @@ export class DispatchService {
       // honest reason and is admitted in order (never rejected, never
       // preempted). Unlimited default admits immediately: zero change.
       if (this.opts.workerGate !== undefined) {
-        workerLease = await this.opts.workerGate.acquireWorkerTurn({
+        let queuedReason: string | null = null;
+        const lease = await this.opts.workerGate.acquireWorkerTurn({
           id: job.id,
           label: input.title,
           jobId: job.id,
           queued: (info) => {
+            queuedReason = info.reason;
             this.opts.ledger.noteJob(job.id, info.reason);
           },
         });
+        workerLease = lease;
+        if (queuedReason !== null) {
+          // The lane waited at the cap and is now admitted: replace the queue
+          // note so the durable note never keeps claiming a running lane is
+          // still queued (the live gate view carries the queue truth).
+          this.opts.ledger.noteJob(
+            job.id,
+            `pacing: admitted after ${lease.waitedMs} ms queue wait`,
+          );
+        }
       }
       let handle: AgentHandle;
       try {

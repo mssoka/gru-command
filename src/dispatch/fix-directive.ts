@@ -87,20 +87,24 @@ export async function routeFixDirectiveToMinion(
         lease?.release();
         lease = null;
       }
-      if (promptError !== null) {
+      if (promptError instanceof WorkerDisposalInProgressError) {
         // A resident-budget reclaim may be disposing this handle under us
         // (typed handshake): fall through to the resume/re-brief path —
         // remembering THIS handle's logical session — instead of dropping
         // the directive with an opaque failure.
-        if (!(promptError instanceof WorkerDisposalInProgressError)) throw promptError;
         evictedSessionFile = handle.sessionFile;
         continue;
       }
+      // A rejected prompt keeps the same bounded settlement interlock as a
+      // resolved one: an in-band rate-limit incident may still be carrying
+      // the directive, so failure is reported only after the disposition is
+      // known (never duplicating a delivery the retry still owns).
       const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
       if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
       if (disposition === 'exhausted' || disposition === 'superseded') {
         return { delivered: false, note: `automatic rate-limit retry ${disposition} before delivery` };
       }
+      if (promptError !== null && disposition !== 'recovered') throw promptError;
       return { delivered: true, minionId: minion.id };
     }
   }
@@ -143,9 +147,12 @@ export async function routeFixDirectiveToMinion(
       handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal });
       prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
     }
+    let promptError: unknown = null;
     try {
       input.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: input.jobId, sessionFile: handle.sessionFile });
       await racedPrompt(handle, prompt, input.signal, owner);
+    } catch (error) {
+      promptError = error;
     } finally {
       // Release before the settlement wait: the retry reacquires the slot.
       lease?.release();
@@ -156,6 +163,7 @@ export async function routeFixDirectiveToMinion(
     if (disposition === 'exhausted' || disposition === 'superseded') {
       return { delivered: false, note: `automatic rate-limit retry ${disposition} before delivery` };
     }
+    if (promptError !== null && disposition !== 'recovered') throw promptError;
     return { delivered: true, minionId: handle.id };
   } finally {
     lease?.release();
@@ -326,10 +334,29 @@ export async function rebriefFreshMinion(
         ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
         : {}),
     });
+    let promptError: unknown = null;
     try {
       await handle.prompt(prompt, { owner: `silas-rebrief:${input.jobId}` });
     } catch (error) {
-      throw new Error(`re-brief turn failed on ${handle.id}: ${String(error)}`);
+      promptError = error;
+    } finally {
+      // Release before the settlement wait: the retry reacquires the slot.
+      lease?.release();
+      lease = null;
+    }
+    // The re-brief delivery reports success only for 'none'/'recovered': a
+    // rate-limited turn whose bounded retry is still carrying the prompt
+    // must not land the re-brief/delivery markers early, and a rejection
+    // whose retry recovers is a delivery, not a failure.
+    const disposition = await settleRetries(input.retrySettlement, handle.id);
+    if (disposition === 'cancelled') {
+      throw new Error(`re-brief turn on ${handle.id} was cancelled before its automatic retries settled`);
+    }
+    if (disposition === 'exhausted' || disposition === 'superseded') {
+      throw new Error(`re-brief turn failed on ${handle.id}: automatic rate-limit retry ${disposition} before delivery`);
+    }
+    if (promptError !== null && disposition !== 'recovered') {
+      throw new Error(`re-brief turn failed on ${handle.id}: ${String(promptError)}`);
     }
     return { minionId: handle.id, lanePath: lane.path, prompt, sessionFile: handle.sessionFile };
   } finally {

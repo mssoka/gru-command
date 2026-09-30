@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,6 +12,7 @@ import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtim
 import type { Role } from '../src/config.js';
 import { finalizeRebriefRequest, reconcilePendingRebriefs } from '../src/dispatch/rebrief-recovery.js';
 import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
+import { PacingGate } from '../src/runtime/pacing.js';
 
 /**
  * Re-brief restart safety (Silas finding 2026-09-23): the durable marker
@@ -237,6 +238,41 @@ describe('re-brief restart safety (durable markers)', () => {
     // The recovery itself is on the record.
     const recovered = h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered');
     expect(recovered?.payload).toMatchObject({ path: 'redispatched', minion_id: 'worker-1' });
+  });
+
+  it('the re-dispatched re-brief waits for a worker pacing slot before spawning', async () => {
+    const h = makeHarness();
+    const jobId = 'gated-rebrief-job';
+    await seedPendingRebrief({ h, jobId });
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    let holderReleased = false;
+    const releaseHolder = (): void => { if (!holderReleased) { holderReleased = true; holder.release(); } };
+    try {
+      const report = await reconcilePendingRebriefs(
+        {
+          registry: h.registry,
+          ledger: h.ledger,
+          worktrees: h.worktrees,
+          notifications: h.notifications,
+          workerGate: gate,
+        },
+        { bootAt: new Date(Date.now() + 60_000) },
+      );
+      // The admission queues before any worker exists; the cap is honest.
+      await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1), { timeout: 5_000 });
+      expect(h.registry.workers).toHaveLength(0);
+      releaseHolder();
+      await report.settled;
+      expect(h.registry.workers).toHaveLength(1);
+      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).not.toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally {
+      releaseHolder();
+      h.close();
+    }
   });
 
   it('boot resumes the interrupted worker session when one exists on disk', async () => {

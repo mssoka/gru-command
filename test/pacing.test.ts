@@ -7,6 +7,7 @@ import {
   PacingGate,
   resolvePacingPolicy,
   resolveRateLimitBackoff,
+  settleRetries,
 } from '../src/runtime/pacing.js';
 
 /**
@@ -287,8 +288,11 @@ describe('FIFO admission gate (minion turns + Perkins review turns)', () => {
   });
 
   it('resolvePacingPolicy wires the backoff policy and the gate from one config', async () => {
+    const events: string[] = [];
+    let clock = 1_000;
     const resolved = resolvePacingPolicy(
       pacingConfig({ maxConcurrentMinions: 2, maxConcurrentReviewTurns: 3, maxAutoRetries: 2 }),
+      { record: (event) => events.push(event.kind), now: () => clock },
     );
     expect(resolved.backoff).toMatchObject({ baseMs: 1_000, maxMs: 60_000, maxRetries: 2 });
     const a = await resolved.gate.acquireWorkerTurn({ id: 'a', label: 'A' });
@@ -296,9 +300,47 @@ describe('FIFO admission gate (minion turns + Perkins review turns)', () => {
     expect(resolved.gate.view().worker.running).toBe(2);
     const queued = resolved.gate.acquireWorkerTurn({ id: 'c', label: 'C' });
     expect(resolved.gate.view().worker.queued).toHaveLength(1);
+    // The injected recorder and clock reach the gate: the queued wait is
+    // recorded and its waited_ms is measured on the injected clock.
+    expect(events).toEqual(['pacing.queued']);
+    clock = 1_500;
     a.release();
+    expect(events).toEqual(['pacing.queued', 'pacing.admitted']);
+    const admitted = await queued;
+    expect(admitted.waitedMs).toBe(500);
     b.release();
-    (await queued).release();
+    admitted.release();
+  });
+});
+
+describe('retry settlement consumption gate', () => {
+  it('maps hook faults to exhausted, missing hooks to none, and passes dispositions through', async () => {
+    expect(await settleRetries(undefined, 'agent-a')).toBe('none');
+    expect(await settleRetries(() => { throw new Error('hook fault'); }, 'agent-a')).toBe('exhausted');
+    expect(await settleRetries(async () => { throw new Error('hook rejection'); }, 'agent-a')).toBe('exhausted');
+    expect(await settleRetries(async () => 'recovered', 'agent-a')).toBe('recovered');
+    expect(await settleRetries(async () => 'superseded', 'agent-a')).toBe('superseded');
+  });
+
+  it('a pre-aborted or mid-wait abort settles cancelled without invoking the hook', async () => {
+    const preAborted = new AbortController();
+    preAborted.abort();
+    let called = false;
+    expect(
+      await settleRetries(async () => { called = true; return 'recovered'; }, 'agent-a', preAborted.signal),
+    ).toBe('cancelled');
+    expect(called).toBe(false);
+
+    const controller = new AbortController();
+    let release!: (value: 'recovered') => void;
+    const pending = settleRetries(
+      () => new Promise<'recovered'>((resolve) => { release = resolve; }),
+      'agent-a',
+      controller.signal,
+    );
+    controller.abort();
+    await expect(pending).resolves.toBe('cancelled');
+    release('recovered');
   });
 });
 

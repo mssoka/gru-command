@@ -1953,6 +1953,7 @@ export class WaveRunner {
       ].join('\n');
       if (input.signal.aborted) throw new Error('review operation aborted');
       let reviewTimer: ReturnType<typeof setTimeout> | null = null;
+      let promptError: unknown = null;
       try {
         await Promise.race([
           handle.prompt(prompt, { owner: 'bmad-review-gate' }),
@@ -1962,6 +1963,8 @@ export class WaveRunner {
             reviewTimer.unref?.();
           }),
         ]);
+      } catch (error) {
+        promptError = error;
       } finally {
         if (reviewTimer !== null) clearTimeout(reviewTimer);
         // Release before the settlement wait: the retry reacquires the slot.
@@ -1973,6 +1976,10 @@ export class WaveRunner {
       if (disposition === 'exhausted' || disposition === 'superseded') {
         throw new Error(`automatic rate-limit retry ${disposition} before the fallback review delivered`);
       }
+      // A rejection whose automatic retry recovered IS the delivery: the
+      // report file the retried turn wrote is parsed below; only a
+      // rejection with no recovered retry keeps the fail-loud throw.
+      if (promptError !== null && disposition !== 'recovered') throw promptError;
     } finally {
       try { await handle?.dispose(); } finally { lease?.release(); }
     }

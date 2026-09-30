@@ -349,6 +349,11 @@ export class Supervisor {
         for (const agent of this.agents.values()) {
           if (agent.slot === internal) {
             if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
+            // Retiring the record must conclude its pacing state exactly as
+            // the disposed/shutdown funnels do, or a delivery already
+            // awaiting `settled` is left hanging.
+            this.clearRateLimitRetry(agent, 'superseded');
+            this.clearRecoveryAdmission(agent);
             this.agents.delete(agent.agentId);
           }
         }
@@ -472,7 +477,10 @@ export class Supervisor {
       if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
       // Intentional session replacement invalidates stale work by generation;
       // it does not erase restart history or acknowledge a human-facing
-      // breaker notification. Both follow the stable supervised slot.
+      // breaker notification. Both follow the stable supervised slot. The
+      // pacing state is concluded like every other retirement funnel.
+      this.clearRateLimitRetry(agent, 'superseded');
+      this.clearRecoveryAdmission(agent);
       this.agents.delete(agent.agentId);
       const old = agent.handle;
       agent.handle = null;
@@ -527,6 +535,8 @@ export class Supervisor {
         }
       }
       if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
+      this.clearRateLimitRetry(agent, 'superseded');
+      this.clearRecoveryAdmission(agent);
       this.agents.delete(agent.agentId);
       this.log('info', 'retired stale slot-bound supervision record', {
         agent_id: agent.agentId,
@@ -1721,6 +1731,36 @@ export class Supervisor {
     } catch (error) {
       // Cancellation is not an orphan: the attempt was superseded.
       if (!stillCurrent()) return;
+      // Release the slot before consulting the settlement: the retry
+      // reacquires admission per attempt, exactly like the resolve path.
+      lease?.release();
+      lease = null;
+      // The rejection may itself have opened a rate-limit incident whose
+      // bounded retry is still carrying this turn: consult its settlement
+      // before classifying. A recovered retry is recorded as resumed — never
+      // escalated to the owner as a failed resume; a spent budget keeps the
+      // same ladder truth as the resolve path.
+      const disposition = await this.awaitRetrySettlement(agent.agentId);
+      if (!stillCurrent()) return;
+      if (disposition === 'recovered') {
+        this.recordEvent('supervision.turn-recovery', laneAgentId, {
+          disposition: 'resumed',
+          reason,
+        });
+        this.log('info', 'interrupted turn resumed on the restarted session', {
+          agent_id: laneAgentId,
+          reason,
+        });
+        return;
+      }
+      if (disposition === 'exhausted' || disposition === 'superseded') {
+        this.log('warn', 'interrupted turn did not resume under its automatic retries', {
+          agent_id: laneAgentId,
+          reason,
+          disposition,
+        });
+        return;
+      }
       this.log('error', 'interrupted turn could not be resumed — posting recoverable-lane note', {
         agent_id: laneAgentId,
         reason,

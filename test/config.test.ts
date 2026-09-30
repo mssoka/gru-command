@@ -199,7 +199,19 @@ describe('config fail-loud validation', () => {
   it('rejects unknown top-level keys', () => {
     const home = tmpHome();
     writeConfig(home, 'worskapce_root = "~/code"');
-    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/unknown top-level key `worskapce_root`/);
+    try {
+      loadConfig({ GRU_COMMAND_HOME: home });
+      expect.unreachable('expected ConfigError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      const message = (error as ConfigError).message;
+      expect(message).toContain('unknown top-level key `worskapce_root`');
+      // The valid-key list must name each section exactly once (a duplicated
+      // entry both misreads the config and misleads the user debugging it).
+      const validKeys = /valid keys: (.+)\)/u.exec(message)?.[1]?.split(', ') ?? [];
+      expect(validKeys.length).toBeGreaterThan(0);
+      expect(new Set(validKeys).size).toBe(validKeys.length);
+    }
   });
 
   it('rejects wrong types', () => {

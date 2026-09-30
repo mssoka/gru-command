@@ -137,6 +137,10 @@ describe('worker admission through dispatch (FIFO queue, honest queue note, rele
       expect(b.agentId).toBe('minion-2');
       expect(spawned).toHaveLength(2);
       expect(spawned[1]!.calls.map((call) => call.text).join('\n')).toContain('brief B');
+      // The admission rewrite replaces the queue note: a running lane never
+      // keeps claiming it is still queued.
+      expect(api.getJob('job-b')?.note ?? '').toContain('pacing: admitted after');
+      expect(api.getJob('job-b')?.note ?? '').not.toContain('queued:');
       expect(recordingGate.view().worker.queued).toHaveLength(0);
       expect(recordingGate.view().worker.running).toBe(1);
       expect(events).toEqual(['pacing.queued', 'pacing.admitted']);
@@ -310,6 +314,77 @@ describe('pacing plumbing and failure cleanup', () => {
       worker.settle();
       await routing;
       expect(board.snapshot().pacing?.worker).toMatchObject({ running: 0, queued: [] });
+    } finally { close(); }
+  });
+
+  it('a re-brief turn whose bounded retry exhausts fails loud instead of recording a delivery', async () => {
+    const repo = makeFixtureRepo('pacing-rebrief-exhausted');
+    repos.push(repo);
+    const { api, close } = ledgerIn();
+    try {
+      api.addJob({ id: 'job-rebrief-exhausted', repo: 'fixture', title: 'rebrief', briefing: 'brief' });
+      const worker = makeFakeMinion('rebrief-exhausted-minion');
+      const routing = rebriefFreshMinion({
+        registry: { getHandle: () => null, spawn: async () => worker.handle, disposeHandle: async () => {} },
+        ledger: api,
+        retrySettlement: async () => 'exhausted',
+        worktrees: { listWorktrees: () => [{ kind: 'job', status: 'active', path: repo.path }] } as unknown as WorktreePort,
+        jobId: 'job-rebrief-exhausted', note: 'continue', briefing: 'brief',
+      });
+      await flush();
+      worker.settle();
+      await expect(routing).rejects.toThrow(/automatic rate-limit retry exhausted/);
+    } finally { close(); }
+  });
+});
+
+describe('worker delivery settlement through the dispatcher', () => {
+  it('marks the lane blocked when the bounded retry budget is spent', async () => {
+    const repo = makeFixtureRepo('pacing-dispatch-exhausted');
+    repos.push(repo);
+    const root = mkdtempSync(join(tmpdir(), 'pacing-dispatch-exhausted-lanes-'));
+    dirs.push(root);
+    const { api, close } = ledgerIn();
+    try {
+      const minion = makeFakeMinion('minion-exhausted');
+      const service = new DispatchService({
+        ledger: api,
+        worktrees: new InMemoryWorktreePort(root),
+        spawner: async () => minion.handle,
+        retrySettlement: async () => 'exhausted',
+      });
+      const outcome = await service.dispatch({
+        jobId: 'job-exhausted', repoPath: repo.path, title: 'exhausted', briefing: 'brief',
+      });
+      minion.settle();
+      await expect(outcome.settled).resolves.toMatchObject({ ok: false });
+      expect(api.getJob('job-exhausted')?.status).toBe('blocked');
+      expect(api.listJobEvents('job-exhausted').some((event) => event.kind === 'job.minion-error')).toBe(true);
+      expect(api.listJobEvents('job-exhausted').some((event) => event.kind === 'job.delivered')).toBe(false);
+    } finally { close(); }
+  });
+
+  it('a rejected briefing turn whose retry recovers is still reported delivered', async () => {
+    const repo = makeFixtureRepo('pacing-dispatch-rejected');
+    repos.push(repo);
+    const root = mkdtempSync(join(tmpdir(), 'pacing-dispatch-rejected-lanes-'));
+    dirs.push(root);
+    const { api, close } = ledgerIn();
+    try {
+      const minion = makeFakeMinion('minion-rejected');
+      const service = new DispatchService({
+        ledger: api,
+        worktrees: new InMemoryWorktreePort(root),
+        spawner: async () => minion.handle,
+        retrySettlement: async () => 'recovered',
+      });
+      const outcome = await service.dispatch({
+        jobId: 'job-rejected', repoPath: repo.path, title: 'rejected', briefing: 'brief',
+      });
+      minion.fail(new Error('429 too many requests'));
+      await expect(outcome.settled).resolves.toEqual({ ok: true });
+      expect(api.getJob('job-rejected')?.status).toBe('delivered');
+      expect(api.listJobEvents('job-rejected').some((event) => event.kind === 'job.delivered')).toBe(true);
     } finally { close(); }
   });
 });

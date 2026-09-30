@@ -824,6 +824,7 @@ async function main(): Promise<number> {
     worktrees: worktreeManager,
     notifications,
     workerGate: pacing.gate,
+    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,
   });
@@ -880,6 +881,7 @@ async function main(): Promise<number> {
     wave,
     ledger,
     workerGate: pacing.gate,
+    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     ...(config.silas.enabled && silasSlot !== null
       ? { silasOps: { registry, worktrees: worktreeManager, notifications } }
       : {}),

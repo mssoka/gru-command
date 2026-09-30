@@ -544,7 +544,6 @@ const TOP_LEVEL_KEYS = [
   'review',
   'verify',
   'pacing',
-  'concurrency',
   'decisions',
 ] as const;
 
@@ -1342,12 +1341,11 @@ const PACING_KEYS = [
 ] as const;
 
 /** Parse a [pacing] table. Fail loud on unknown
- * keys, wrong types, conflicting alias spellings, non-compiling patterns,
- * and an inverted backoff ladder — a pacing misconfiguration must never
- * silently disable or distort the bounds. The section being present is the
- * feature switch unless an explicit `enabled = false` turns it off; this
- * function only ever runs when a section is present, so the default is
- * `enabled: true`. */
+ * keys, wrong types, non-compiling patterns, and an inverted backoff
+ * ladder — a pacing misconfiguration must never silently disable or
+ * distort the bounds. The section being present is the feature switch
+ * unless an explicit `enabled = false` turns it off; this function only
+ * ever runs when a section is present, so the default is `enabled: true`. */
 function readPacingConfig(
   value: unknown,
   file: string,
@@ -1364,9 +1362,10 @@ function readPacingConfig(
       );
     }
   }
-  // Limit keys accept both spellings named in the brief and in the shared
-  // worker-residency-budget design; a file that sets both is ambiguous and
-  // fails loud rather than picking one silently.
+  // One canonical spelling per limit key (max_concurrent_minions,
+  // max_concurrent_review_turns); unknown spellings fail loud above rather
+  // than being silently accepted or aliased. A file that sets both is
+  // therefore impossible to write.
   const enabled =
     table['enabled'] !== undefined ? requireBool(table['enabled'], file, `${section}.enabled`) : true;
   const maxConcurrentMinions = table['max_concurrent_minions'] !== undefined

@@ -68,6 +68,9 @@ async function boot(opts: {
   silasOps?: boolean;
   /** Gate selected minion turns before they settle (in-flight assertions). */
   minionPromptGate?: (text: string) => Promise<void> | undefined;
+  /** Provider pacing: the bounded retry settlement to report for a
+   * delivered directive/re-brief turn. Absent = no interlock. */
+  retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -154,6 +157,7 @@ async function boot(opts: {
     dispatch,
     wave,
     ledger,
+    ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
     ...(opts.silasOps === false
       ? {}
       : {
@@ -653,6 +657,63 @@ describe('dispatch server (E8)', () => {
       expect(delivered).not.toBeNull();
       expect(delivered?.payload).toMatchObject({ agentId: minionId, source: 'silas-directive', sha: head });
       expect(field<string>(res.json, 'delivered_sha')).toBe(head);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/directive answers undelivered (never a delivery) when the bounded retry exhausts', async () => {
+    const h = await boot({ retrySettlement: async () => 'exhausted' });
+    const repo = makeFixtureRepo('fixture-silas-directive-settle');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'dir-settle', repo_path: repo.path, title: 'settle lane', briefing: 'b',
+      }, TOKEN);
+      const minionId = `agent-${h.spawns.length}`;
+      h.ledger.registerAgent({ id: minionId, role: 'minion', jobId: 'dir-settle' });
+      h.liveHandles.set(minionId, {
+        role: 'minion',
+        id: minionId,
+        sessionFile: null,
+        capabilities: FAKE_CAPABILITIES,
+        prompt: async () => {},
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
+        async dispose() {},
+      });
+      h.ledger.setJobStatus('dir-settle', 'in-review');
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-settle',
+        directive: 'Fix the retry settlement path.',
+      }, TOKEN);
+      expect(res.status).toBe(502);
+      expect(field<string>(res.json, 'error')).toBe('undelivered');
+      expect(h.ledger.listJobEvents('dir-settle').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
+      expect(h.ledger.listJobEvents('dir-settle').some((event) => event.kind === 'job.delivered')).toBe(false);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief keeps its durable markers pending when the bounded retry exhausts', async () => {
+    const h = await boot({ retrySettlement: async () => 'exhausted' });
+    const repo = makeFixtureRepo('fixture-silas-rebrief-settle');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'reb-settle', repo_path: repo.path, title: 'settle lane', briefing: 'b',
+      }, TOKEN);
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'reb-settle', note: 'try again',
+      }, TOKEN);
+      expect(res.status).toBe(400);
+      expect(field<string>(res.json, 'detail')).toContain('automatic rate-limit retry exhausted');
+      expect(h.ledger.listJobEvents('reb-settle').some((event) => event.kind === 'silas.rebrief')).toBe(false);
+      expect(h.ledger.listJobEvents('reb-settle').some((event) => event.kind === 'job.delivered')).toBe(false);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'reb-settle' })).toHaveLength(2);
     } finally {
       await h.close();
     }

@@ -1836,6 +1836,55 @@ describe('provider pacing: combined review-turn gate (owner heist 2026-09-29)', 
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
     expect(events).toEqual([]);
   });
+
+  it('a failed lead-slot re-acquire keeps the settled lens runs committed (T13/R17)', async () => {
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 2,
+      record: (event) => {
+        if (event.kind === 'pacing.queued' && (event.payload as { id?: string } | undefined)?.id === 'lead') {
+          throw new Error('pacing recorder unavailable');
+        }
+      },
+    });
+    // One slot is held for the whole round, so when the wave ends the freed
+    // slot goes to the external FIFO waiter below and the lead's re-acquire
+    // has to queue — where the recorder then fails it.
+    const holder = await gate.acquireReviewTurn({ id: 'holder', label: 'holder' });
+    let releaseChild!: () => void;
+    const childGate = new Promise<void>((resolve) => { releaseChild = resolve; });
+    try {
+      const h = wholeHarness(
+        {
+          childAnswer: async () => {
+            await childGate;
+            return '[]';
+          },
+          specialists: ['blind', 'edge'],
+        },
+        { reviewGate: gate },
+      );
+      const running = h.run();
+      await vi.waitFor(() => expect(gate.view().review.queued).toHaveLength(1), { timeout: 20_000 });
+      const external = gate.acquireReviewTurn({ id: 'external', label: 'external' });
+      await vi.waitFor(() => expect(gate.view().review.queued).toHaveLength(2), { timeout: 20_000 });
+      releaseChild();
+      const result = await running;
+      expect(h.toolErrors.some((entry) =>
+        entry.tool === 'perkins_run_specialists' && /pacing recorder unavailable/.test(entry.error),
+      )).toBe(true);
+      // The lens runs really executed once each and stayed committed as
+      // undelivered findings — never erased and re-executed by the retry.
+      expect(h.childCalls).toHaveLength(2);
+      const runs = result.specialistRuns.filter((run) => run.status === 'valid');
+      expect(runs.map((run) => run.lens).sort()).toEqual(['blind', 'edge']);
+      expect(runs.every((run) => run.findingsDelivered === false)).toBe(true);
+      (await external).release();
+    } finally {
+      holder.release();
+    }
+  });
 });
 
 

@@ -1112,11 +1112,16 @@ export class PerkinsWholeReview {
         // up to the combined cap. The slot is re-acquired before the result
         // returns to the model, so the next lead turn is gated again.
         const yieldedLeadSlot = reviewLease !== null;
-        const runWave = async (): Promise<PoolOutcome<SpecialistResult | undefined>> => {
+        const runWave = async (): Promise<{
+          readonly outcome: PoolOutcome<SpecialistResult | undefined>;
+          readonly acquireError: unknown | null;
+        }> => {
           if (yieldedLeadSlot) {
             reviewLease!.release();
             reviewLease = null;
           }
+          let outcome: PoolOutcome<SpecialistResult | undefined> | null = null;
+          let acquireError: unknown = null;
           try {
             let batch: { concurrency: number; finish(): void };
             try {
@@ -1137,18 +1142,30 @@ export class PerkinsWholeReview {
               // pacing cap both bound the fan-out: run the narrower of the
               // two. Pacing never refuses a wave, it only throttles width.
               const waveWidth = Math.max(1, Math.min(batch.concurrency, this.specialistWaveWidth()));
-              return await pool(scheduled, waveWidth, (run) =>
+              outcome = await pool(scheduled, waveWidth, (run) =>
                 runSpecialist(run.lens, run.attempt, run.previous, signal));
             } finally {
               batch.finish();
             }
           } finally {
             if (yieldedLeadSlot) {
-              reviewLease = await this.acquireReviewTurnSlot('lead', input.signal);
+              // A failed re-acquire must not erase the settled pool outcome:
+              // carry the error back so the caller commits the children
+              // before it surfaces (T13/R17).
+              try {
+                reviewLease = await this.acquireReviewTurnSlot('lead', input.signal);
+              } catch (error) {
+                acquireError = error;
+              }
             }
           }
+          if (outcome === null) {
+            // Unreachable: a thrown body propagates before this point.
+            throw new Error('perkins_run_specialists: the wave settled without an outcome');
+          }
+          return { outcome, acquireError };
         };
-        const poolOutcome = await runWave();
+        const { outcome: poolOutcome, acquireError } = await runWave();
         // Every settled child is REAL work (T13): commit its result before
         // any error handling, so executed runs are never restored to
         // "not used" or hidden from the durable record.
@@ -1229,6 +1246,15 @@ export class PerkinsWholeReview {
           for (const result of childResults) undeliveredRuns.add(result.resultId);
           commitResults();
           throw new Error(`${(error instanceof Error ? error.message : String(error))}; the completed runs are recorded but their findings were not delivered to you`);
+        }
+        if (acquireError !== null) {
+          // The wave completed, but the lead could not re-acquire its review
+          // slot before this result would return to it. The tool call fails,
+          // so no finding reaches the lead: commit the real runs as
+          // undelivered instead of erasing them (T13/R17).
+          for (const result of childResults) undeliveredRuns.add(result.resultId);
+          commitResults();
+          throw acquireError instanceof Error ? acquireError : new Error(String(acquireError));
         }
         commitResults();
         return {

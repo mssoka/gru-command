@@ -2154,3 +2154,141 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
     }
   });
 });
+
+describe('pacing settlement across rejection, recovery, and slot retirement', () => {
+  it('a rejected live-minion directive waits out its automatic retry before reporting', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    try {
+      const handle = new FakeHandle('minion', 'minion-live-reject', null);
+      h.registry.adopt(handle);
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-live-reject' });
+      let failed = false;
+      handle.promptHook = (text) => {
+        if (failed) return;
+        failed = true;
+        handle.pendingTurnSnapshot = { text, owner: 'fix-directive' };
+        handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+        throw new Error('429 too many requests');
+      };
+      const routing = routeFixDirectiveToMinion({
+        registry: h.registry,
+        ledger: h.api,
+        worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
+        workerGate: gate,
+        retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
+        jobId: 'job-live-reject',
+        directive: 'fix it',
+        signal: new AbortController().signal,
+      });
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]), { timeout: 5_000 });
+      // The rejection is not the verdict: the retry still owns the delivery.
+      await sleeper.release();
+      await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-live-reject' });
+      expect(handle.promptCalls).toHaveLength(2);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a rejected fresh-minion directive is not disposed while its automatic retry can still deliver', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    const lanePath = tmpDir();
+    try {
+      h.api.addJob({ id: 'job-fresh-reject', repo: 'fixture', title: 'fresh reject', briefing: 'brief' });
+      let spawned: FakeHandle | null = null;
+      h.registry.spawnImpl = async (role, options) => {
+        const handle = new FakeHandle(role, 'minion-fresh-reject', options?.resumeFile ?? null);
+        let failed = false;
+        handle.promptHook = (text) => {
+          if (failed) return;
+          failed = true;
+          handle.pendingTurnSnapshot = { text, owner: 'fix-directive' };
+          handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+          throw new Error('429 too many requests');
+        };
+        spawned = handle;
+        return handle;
+      };
+      const routing = routeFixDirectiveToMinion({
+        registry: h.registry,
+        ledger: h.api,
+        worktrees: { listWorktrees: () => [{ kind: 'job', status: 'active', path: lanePath }] } as unknown as WorktreePort,
+        workerGate: gate,
+        retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
+        jobId: 'job-fresh-reject',
+        directive: 'fix it',
+        signal: new AbortController().signal,
+      });
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]), { timeout: 5_000 });
+      const handle = spawned as FakeHandle | null;
+      expect(handle).not.toBeNull();
+      // The rejection must not dispose the session out from under its retry.
+      expect(handle!.disposed).toBe(false);
+      await sleeper.release();
+      await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-fresh-reject' });
+      expect(handle!.promptCalls).toHaveLength(2);
+      expect(handle!.disposed).toBe(true);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a restart-recovered turn that 429-rejects resumes through its automatic retry instead of escalating', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const handle = new FakeHandle('minion', 'minion-recovery-retry', null);
+      h.registry.adopt(handle);
+      hang(handle);
+      handle.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:job-rec' };
+      let promptCalls = 0;
+      h.registry.spawnImpl = async (role, options) => {
+        const resumed = new FakeHandle(role, 'minion-recovery-retry-resumed', options?.resumeFile ?? null);
+        resumed.promptHook = (text, promptOptions) => {
+          promptCalls += 1;
+          if (promptCalls > 1) return;
+          resumed.pendingTurnSnapshot = { text, owner: promptOptions?.owner ?? null };
+          resumed.emit({ type: 'error', error: '429 too many requests', fatal: false });
+          throw new Error('429 too many requests');
+        };
+        return resumed;
+      };
+      h.advance(60);
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]), { timeout: 5_000 });
+      await sleeper.release();
+      await vi.waitFor(() => {
+        const events = h.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.turn-recovery');
+        expect(events.some((event) => (event.payload as { disposition?: string }).disposition === 'resumed')).toBe(true);
+      }, { timeout: 5_000 });
+      expect(h.notificationsOfKind('supervision.turn-orphaned.minion-recovery-retry')).toHaveLength(0);
+      expect(promptCalls).toBe(2);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('retiring a slot record concludes its pending rate-limit settlement instead of leaving it hanging', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-retire-settle',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options),
+      });
+      const handle = (await slot.ensure({})) as FakeHandle;
+      handle.pendingTurnSnapshot = { text: 'stale turn', owner: null };
+      emitFailure(handle, '429 too many requests');
+      expect(sleeper.delays).toEqual([100]);
+      const settled = h.supervisor.awaitRetrySettlement(handle.id);
+      slot.release();
+      await expect(settled).resolves.toBe('superseded');
+    } finally {
+      h.dispose();
+    }
+  });
+});
