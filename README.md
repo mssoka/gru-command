@@ -60,9 +60,13 @@ here before the v1.0.0 tag)*
 - **Node.js ≥ 22.19** — the service runtime and build toolchain.
 - **git** — per-job worktree lanes and branch inspection.
 - **GitHub CLI (`gh`), authenticated for every managed repo** — the
-  GitHub signal poll and SHA-bound Perkins verdict delivery both ride
-  `gh`. Run `gh auth login` with a token that can read the repositories
-  (`repo` scope for private repos) and confirm with `gh auth status`.
+  GitHub signal poll and the round's code-host preflight always ride
+  `gh`. SHA-bound Perkins verdict delivery also rides `gh` unless a
+  Perkins App bundle is installed, in which case github.com publication
+  is App-authored while the preflight still uses `gh`
+  ([PERKINS-APP-PUBLICATION.md](docs/PERKINS-APP-PUBLICATION.md)). Run
+  `gh auth login` with a token that can read the repositories (`repo`
+  scope for private repos) and confirm with `gh auth status`.
 
 GitHub signal ingestion is poll-only — no webhooks, no inbound tunnel.
 

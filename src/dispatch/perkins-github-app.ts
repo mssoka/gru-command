@@ -189,18 +189,28 @@ interface LoadedBundle {
 }
 
 /** Resolve the configured key_path to an absolute path. Absolute POSIX
- * paths, Windows drive paths and Windows UNC paths (`\\server\share\...`)
- * are used as written; anything else — including `..` segments — resolves
- * against the trusted bundle dir, never the CWD or a repository. A single
- * leading backslash is NOT an absolute form (only the UNC double backslash
- * is): on POSIX it is an ordinary filename character and on Windows a
- * drive-relative root, so it resolves against the bundle dir like any
- * other relative path. Exported so the resolution rule itself is directly
- * testable. */
+ * paths are used as written; anything else — including `..` segments —
+ * resolves against the trusted bundle dir, never the CWD or a repository.
+ * Windows drive (`C:\...`, `C:/...`) and UNC (`\\server\share\...`) forms
+ * are absolute on Windows and are used as written there; on the supported
+ * POSIX deployment they are NOT absolute, so using one verbatim would
+ * silently resolve it against the process working directory — they are
+ * refused by name instead. A single leading backslash is NOT an absolute
+ * form (only the UNC double backslash is): it resolves against the bundle
+ * dir like any other relative path. Exported so the resolution rule itself
+ * is directly testable. */
 export function resolvePerkinsAppKeyPath(bundleDir: string, keyPath: string): string {
-  return keyPath.startsWith('/') || keyPath.startsWith('\\\\') || /^[A-Za-z]:[\\/]/u.test(keyPath)
-    ? keyPath
-    : join(bundleDir, keyPath);
+  if (keyPath.startsWith('/')) return keyPath;
+  const windowsForm = keyPath.startsWith('\\\\') || /^[A-Za-z]:[\\/]/u.test(keyPath);
+  if (windowsForm) {
+    if (process.platform !== 'win32') {
+      throw new PerkinsAppError(
+        `configured key_path "${sanitize(keyPath)}" is a Windows path form on a POSIX host — bundle key paths must be POSIX-absolute or relative to the bundle dir; refusing to resolve it against the process working directory`,
+      );
+    }
+    return keyPath;
+  }
+  return join(bundleDir, keyPath);
 }
 
 /** The bundle directory must mirror the credential-store rules: an
@@ -224,9 +234,9 @@ function bundleDirSafe(dir: string, sourceLabel: string): void {
     if (uid !== undefined && info.uid !== uid) {
       throw new PerkinsAppError(`${sourceLabel}: bundle directory is owned by another user — the App credential must be owned by the service user`);
     }
-    if ((info.mode & 0o777) !== 0o700) {
+    if ((info.mode & 0o7777) !== 0o700) {
       throw new PerkinsAppError(
-        `${sourceLabel}: bundle directory must have mode 0700 (found ${(info.mode & 0o777).toString(8).padStart(3, '0')}) — another local user could otherwise replace the bundle files`,
+        `${sourceLabel}: bundle directory must have mode 0700 exactly (found ${(info.mode & 0o7777).toString(8).padStart(3, '0')}) — another local user could otherwise replace the bundle files`,
       );
     }
   }
@@ -502,10 +512,11 @@ function usableProviderReviewId(id: unknown): string | null {
 
 /** The delivery predicate without the provider-id requirement: author
  * login+type, event state, frozen head, and byte-identical body. With a
- * recency bound (the ambiguous-POST path) only submissions from this
- * round's window count; null (the idempotent recovery seam) matches any
- * identical publication — an older round's identical bytes are never
- * credited as this delivery. */
+ * recency bound (the ambiguous-POST path) only submissions inside this
+ * round's window — POST start minus the 60 s clock-skew margin — count;
+ * null (the idempotent recovery seam) matches any identical publication.
+ * Older rounds' identical bytes outside the margin are never credited as
+ * this delivery. */
 function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
   if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
   if (review.state !== 'COMMENTED' || review.commit_id !== targetSha || review.body !== body) return false;
@@ -532,22 +543,28 @@ function isMatchingAppReviewWithUnusableId(review: ProviderReview, botLogin: str
 
 /** GitHub error bodies/markers that mean rate limiting, not permission. */
 function providerIndicatesRateLimit(error: PerkinsAppHttpError): boolean {
-  const documentationUrl = (error.body as { readonly documentation_url?: unknown } | null)?.documentation_url;
-  return (typeof documentationUrl === 'string' && /rate-limit/u.test(documentationUrl)) ||
+  const documentationUrl = error.documentationUrl;
+  return (documentationUrl !== null && /rate-limit/u.test(documentationUrl)) ||
     /\brate[- ]?limits?\b|\brate[- ]?limited\b|\brate[- ]?limiting\b|abuse detection/iu.test(error.providerMessage);
 }
 
-/** HTTP-level provider rejection with a sanitized provider message. */
+/** HTTP-level provider rejection carrying only sanitized classification
+ * state: the sanitized provider message and the extracted
+ * `documentation_url` marker. Raw provider bytes are never retained on the
+ * error object — a future structured log or snapshot must not be able to
+ * echo credential-shaped provider bytes. */
 export class PerkinsAppHttpError extends PerkinsAppError {
   readonly providerMessage: string;
+  readonly documentationUrl: string | null;
 
-  constructor(label: string, readonly status: number, readonly body: unknown, text: string) {
-    const providerBody = body as { readonly message?: unknown } | null;
+  constructor(label: string, readonly status: number, body: unknown, text: string) {
+    const providerBody = body as { readonly message?: unknown; readonly documentation_url?: unknown } | null;
     let providerMessage = sanitize(typeof providerBody?.message === 'string' ? providerBody.message : text);
     if (providerMessage === '') providerMessage = 'no provider message';
     super(`${label} exited HTTP ${status}: ${providerMessage}`);
     this.name = 'PerkinsAppHttpError';
     this.providerMessage = providerMessage;
+    this.documentationUrl = typeof providerBody?.documentation_url === 'string' ? sanitize(providerBody.documentation_url) : null;
   }
 }
 
@@ -567,6 +584,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   private readonly maxProviderBodyBytes: number;
 
   constructor(private readonly options: PerkinsAppPosterOptions) {
+    // The exported class is a public boundary: a direct construction with
+    // a relative root must fail before any probe of the process CWD.
+    requireBundleRoot(options.instanceDir, 'instance directory');
     this.fetchImpl = options.fetchImpl ?? ((fetch as unknown) as AppFetch);
     this.now = options.now ?? (() => Date.now());
     this.gitBinary = options.gitBinary ?? 'git';
@@ -576,7 +596,13 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // (the jump-to-last walk normally resolves in two or three fetches; the
     // extra headroom is for the idempotent recovery lookup on busy PRs,
     // which may search deeper than the in-round ambiguous-POST case).
-    this.maxReconciliationPages = options.maxReconciliationPages ?? 10;
+    const requestedPages = options.maxReconciliationPages;
+    if (requestedPages !== undefined && (!Number.isSafeInteger(requestedPages) || requestedPages < 1)) {
+      throw new PerkinsAppError(
+        `maxReconciliationPages must be an integer >= 1 (received: ${sanitize(String(requestedPages))}) — refusing to arm a broken lookup window`,
+      );
+    }
+    this.maxReconciliationPages = requestedPages ?? 10;
     const requestedBodyCap = options.maxProviderBodyBytes;
     if (requestedBodyCap !== undefined && (!Number.isSafeInteger(requestedBodyCap) || requestedBodyCap < 1024)) {
       throw new PerkinsAppError(
@@ -983,8 +1009,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     const unproven = (what: string): PerkinsAppError => new PerkinsAppError(
       `review POST outcome is ambiguous (${causeText}) and ${what} — delivery stays unproven; the review was NOT re-posted. Resolve the pull request manually before retrying (expected author ${botLogin} on head ${targetSha}; the round's publication body is in the review artifact report).`,
     );
-    // Skew margin only: the review this round may have created was submitted
-    // after the POST began; anything older is another round's bytes.
+    // Skew margin only: a submission up to 60 s before the POST began still
+    // counts as this round's (provider clock drift); anything older is
+    // another round's bytes.
     const notBeforeMs = postStartMs - 60_000;
     let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButIdUnusable: boolean };
     try {
@@ -1022,9 +1049,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
    * seam). `provablyAbsent` is true ONLY when the walk provably covered
    * the ENTIRE review list: the last-page number is tracked as the MAXIMUM
    * any response reported, so a list that grows mid-walk can never be
-   * certified absent from a stale snapshot — lookup failures and malformed
-   * bodies throw, they are never absence. `matchedButIdUnusable` records a
-   * review that matched every delivery predicate except a usable provider
+   * certified absent from a stale snapshot, and the short-page end signal
+   * requires a response with no Link header at all — lookup failures and
+   * malformed bodies throw, they are never absence. `matchedButIdUnusable`
+   * records a review that matched every delivery predicate except a usable provider
    * id: it can never be credited, but it also forbids an absence
    * certificate (the publication may have landed). */
   private async lookupMatchingReview(
@@ -1050,7 +1078,8 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         { headers: this.bearerHeaders(grant.token), signal: AbortSignal.timeout(this.probeTimeoutMs) },
       );
       const list = result.body;
-      const seenLast = this.parseLastPage(result.header('link'));
+      const linkHeader = result.header('link');
+      const seenLast = this.parseLastPage(linkHeader);
       if (seenLast !== null) lastPage = lastPage === null ? seenLast : Math.max(lastPage, seenLast);
       if (!Array.isArray(list)) {
         // Never report "searched and not found" when no usable list was read.
@@ -1081,8 +1110,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         // any growth-uncovered state unresolved.
         next = visited.has(lastPage) || page >= lastPage ? page - 1 : lastPage;
       } else {
-        // No Link header: the classic short-page end-of-list heuristic.
-        if (reviews.length < 100) {
+        // The classic short-page end-of-list heuristic applies ONLY when no
+        // Link header is present at all. A Link header that exists but
+        // carries no usable rel="last" is not an end-of-list signal — an
+        // intermediary could be rewriting it — so that walk stays unresolved
+        // rather than certifying absence from a short page.
+        if (linkHeader === null && reviews.length < 100) {
           sequentialEnd = true;
           break;
         }

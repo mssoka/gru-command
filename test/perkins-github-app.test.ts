@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, createVerify, generateKeyPairSync } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -349,14 +349,46 @@ describe('bundle file safety', () => {
     expect(loaded.config.appId).toBe(424242);
   });
 
-  it('rejects a bundle file owned by another user', () => {
+  it('rejects a bundle directory carrying setuid/setgid/sticky bits — exact 0700 includes the high bits', () => {
+    const fixture = bundleFixture('app_id=424242\nkey_path=app-key.pem\ninstallation_id_acme=164552969\n');
+    const dir = join(fixture.home, 'perkins');
+    chmodSync(dir, 0o2700);
+    try {
+      // The chmod must actually carry the special bit; otherwise this
+      // oracle would silently prove nothing.
+      expect(lstatSync(dir).mode & 0o7777).toBe(0o2700);
+      expect(() => loadPerkinsAppBundle(fixture.home)).toThrow(/mode 0700 exactly \(found 2700\)/u);
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+  });
+
+  it('rejects a bundle file owned by another user (directory and file branches both)', () => {
     if (process.getuid === undefined || process.getuid() === 0) return; // not observable on this platform
     const fixture = bundleFixture('app_id=424242\nkey_path=app-key.pem\ninstallation_id_acme=164552969\n');
     const original = process.getuid;
     const seam = process as { getuid?: () => number };
     try {
-      seam.getuid = () => original() + 1;
+      // Directory-level: the first uid read belongs to the bundle dir, so
+      // the directory check fires before any file is inspected.
+      let calls = 0;
+      seam.getuid = () => {
+        calls += 1;
+        return original() + 1;
+      };
       expect(() => loadPerkinsAppBundle(fixture.home)).toThrow(/bundle directory is owned by another user/u);
+      expect(calls).toBe(1);
+
+      // File-level: pass the directory (uid read #1) and the config file
+      // (#2), then fail the KEY file (#3). A regression that drops the
+      // per-file ownership check would load the bundle instead of failing.
+      calls = 0;
+      seam.getuid = () => {
+        calls += 1;
+        return calls >= 3 ? original() + 1 : original();
+      };
+      expect(() => loadPerkinsAppBundle(fixture.home)).toThrow(/configured private key file is owned by another user/u);
+      expect(calls).toBe(3);
     } finally {
       seam.getuid = original;
     }
@@ -529,6 +561,49 @@ describe('startup poster selection (the seam main wires)', () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it('selects App mode when the config stat fails EACCES — an unreadable bundle is never mistaken for absence', () => {
+    if (process.getuid === undefined || process.getuid() === 0) return; // permission failure not observable as root
+    const home = mkdtempSync(join(tmpdir(), 'perkins-app-eacces-'));
+    const perkins = join(home, 'perkins');
+    mkdirSync(perkins, { recursive: true });
+    try {
+      chmodSync(perkins, 0o000);
+      // lstat(<home>/perkins/config) now fails EACCES (the parent denies
+      // search). Selection must read that as presence, never as absence —
+      // a racing unreadable stat can never demote an App deployment to the
+      // personal gh poster.
+      expect(createGithubVerdictPoster(home)).toBeInstanceOf(PerkinsAppPrPoster);
+      const legs = createStartupVerdictPoster({ instanceDir: home }) as unknown as { github: VerdictPoster };
+      expect(legs.github).toBeInstanceOf(PerkinsAppPrPoster);
+    } finally {
+      chmodSync(perkins, 0o700);
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the legacy gh poster when a real perkins/ directory exists without a config — the directory alone is not a bundle', () => {
+    const home = mkdtempSync(join(tmpdir(), 'perkins-app-dir-no-config-'));
+    try {
+      mkdirSync(join(home, 'perkins'), { recursive: true });
+      chmodSync(join(home, 'perkins'), 0o700);
+      expect(createGithubVerdictPoster(home)).toBeInstanceOf(GhPrPoster);
+      const legs = createStartupVerdictPoster({ instanceDir: home }) as unknown as { github: VerdictPoster; gitlab: VerdictPoster };
+      expect(legs.github).toBeInstanceOf(GhPrPoster);
+      expect(legs.gitlab).toBeInstanceOf(GitLabMrPoster);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the legacy gh poster when only the bundle config is removed — the documented restoration path', () => {
+    const fixture = bundleFixture();
+    expect(createGithubVerdictPoster(fixture.home)).toBeInstanceOf(PerkinsAppPrPoster);
+    rmSync(join(fixture.home, 'perkins', 'config'));
+    expect(createGithubVerdictPoster(fixture.home)).toBeInstanceOf(GhPrPoster);
+    const legs = createStartupVerdictPoster({ instanceDir: fixture.home }) as unknown as { github: VerdictPoster };
+    expect(legs.github).toBeInstanceOf(GhPrPoster);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -661,6 +736,17 @@ describe('fail-closed credential and identity checks', () => {
     expect(calls.filter((call) => call.url.endsWith('/reviews'))).toHaveLength(0);
   });
 
+  it('refuses a missing, blank, or charset-invalid App slug before POST — the bot identity must be derivable', async () => {
+    const fixture = bundleFixture();
+    for (const body of [{ id: 424242 }, { id: 424242, slug: '' }, { id: 424242, slug: 'bad slug!' }]) {
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'GET', test: /\/app$/, handler: async () => ({ status: 200, body }) },
+      ]);
+      await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/usable slug/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+    }
+  });
+
   it('fails before POST when the token grant lacks the permission or the repository binding', async () => {
     const fixture = bundleFixture();
     const noWrite = posterWith(fixture, [
@@ -790,6 +876,26 @@ describe('fail-closed credential and identity checks', () => {
     expect(error).toBeInstanceOf(PerkinsAppHttpError);
     expect(error?.message ?? '').not.toContain(TOKEN);
     expect(error?.message ?? '').toContain('[REDACTED]');
+  });
+
+  it('retains no raw provider bytes on the HTTP error object — only sanitized classification state', async () => {
+    const fixture = bundleFixture();
+    const secret = `ghs_${'L'.repeat(36)}`;
+    const { poster } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/app$/,
+        handler: async () => ({ status: 500, body: { message: 'server error', leaked: secret } }),
+      },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })
+      .then(() => null, (cause: unknown) => cause as PerkinsAppHttpError);
+    expect(error).toBeInstanceOf(PerkinsAppHttpError);
+    // Structured state carries no raw provider body: a future log or
+    // snapshot of the error must not be able to echo credential-shaped
+    // provider bytes the classification never needed.
+    expect((error as unknown as { body?: unknown }).body).toBeUndefined();
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect((error as PerkinsAppHttpError).providerMessage).toBe('server error');
   });
 
   it('refuses GitHub hosts the router accepts but the App does not — www.github.com and *.github', async () => {
@@ -1636,14 +1742,19 @@ describe('review id discipline', () => {
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
-  it('rejects an armed-style broken reply-size ceiling at construction', () => {
+  it('rejects armed-style broken reply ceilings and lookup windows at construction', () => {
     const fixture = bundleFixture();
     expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: 0 })).toThrow(/maxProviderBodyBytes/u);
     expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: -1 })).toThrow(/maxProviderBodyBytes/u);
     expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: 1024.5 })).toThrow(/maxProviderBodyBytes/u);
     expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: Number.NaN })).toThrow(/maxProviderBodyBytes/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxReconciliationPages: 0 })).toThrow(/maxReconciliationPages must be an integer >= 1/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxReconciliationPages: -1 })).toThrow(/maxReconciliationPages/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxReconciliationPages: 1.5 })).toThrow(/maxReconciliationPages/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, maxReconciliationPages: Number.NaN })).toThrow(/maxReconciliationPages/u);
     // A small but sane ceiling stays accepted (the tests themselves use one).
     expect(new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: 2_048 })).toBeInstanceOf(PerkinsAppPrPoster);
+    expect(new PerkinsAppPrPoster({ instanceDir: fixture.home, maxReconciliationPages: 1 })).toBeInstanceOf(PerkinsAppPrPoster);
   });
 });
 
@@ -1737,15 +1848,47 @@ describe('bounded lookup growth and link sanity', () => {
       .map((call) => /[?&]page=(\d+)/u.exec(call.url)?.[1]);
     expect(pages).toEqual(['1', '5', '4', '3', '2']);
   });
+
+  it('never certifies absence from a short page when a Link header is present without rel="last"', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async () => ({
+          status: 200,
+          body: [],
+          headers: { link: '<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=2>; rel="next"' },
+        }),
+      },
+    ], { maxReconciliationPages: 2 });
+    // A rewriting intermediary's header must not turn a short page into an
+    // end-of-list signal: the walk stays bounded and unresolved, never an
+    // absence certificate that would re-authorize publication.
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/delivery stays unresolved/u);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(2);
+  });
 });
 
 describe('key path resolution and external keys', () => {
-  it('resolves absolute, Windows drive, and UNC key paths as written, and relative paths against the bundle dir', () => {
+  it('resolves absolute and relative key paths; Windows-form paths are refused on POSIX instead of probing the CWD', () => {
     expect(resolvePerkinsAppKeyPath('/bundle', '/abs/key.pem')).toBe('/abs/key.pem');
-    expect(resolvePerkinsAppKeyPath('/bundle', 'C:\\keys\\k.pem')).toBe('C:\\keys\\k.pem');
-    expect(resolvePerkinsAppKeyPath('/bundle', '\\\\server\\share\\k.pem')).toBe('\\\\server\\share\\k.pem');
     expect(resolvePerkinsAppKeyPath('/bundle', 'keys/k.pem')).toBe(join('/bundle', 'keys/k.pem'));
     expect(resolvePerkinsAppKeyPath('/bundle', '../keys/k.pem')).toBe(join('/bundle', '../keys/k.pem'));
+    if (process.platform === 'win32') {
+      expect(resolvePerkinsAppKeyPath('/bundle', 'C:\\keys\\k.pem')).toBe('C:\\keys\\k.pem');
+      expect(resolvePerkinsAppKeyPath('/bundle', '\\\\server\\share\\k.pem')).toBe('\\\\server\\share\\k.pem');
+    } else {
+      // On POSIX neither form is absolute: used verbatim they would resolve
+      // against the process working directory, so they are refused by name.
+      for (const form of ['C:\\keys\\k.pem', 'C:/keys/k.pem', '\\\\server\\share\\k.pem']) {
+        expect(() => resolvePerkinsAppKeyPath('/bundle', form)).toThrow(/Windows path form on a POSIX host/u);
+      }
+      // Integration: a bundle config naming a Windows-form key refuses at
+      // load, before any CWD file could be opened as the App key.
+      const fixture = bundleFixture('app_id=424242\nkey_path=C:\\keys\\k.pem\ninstallation_id_acme=164552969\n');
+      expect(() => loadPerkinsAppBundle(fixture.home)).toThrow(/Windows path form on a POSIX host/u);
+    }
   });
 
   it('treats a single leading backslash as bundle-relative — only UNC starts with two', () => {
@@ -1846,6 +1989,10 @@ describe('bundle root resolution (instance dir vs relocated data dir)', () => {
   it('fails loud on malformed wiring roots instead of probing the CWD', () => {
     expect(() => createGithubVerdictPoster('relative/path')).toThrow(/absolute instance directory/u);
     expect(() => createGithubVerdictPoster('')).toThrow(PerkinsAppError);
+    // The exported poster class is a public boundary too: a direct
+    // construction with a relative or empty root fails before any probe.
+    expect(() => new PerkinsAppPrPoster({ instanceDir: 'relative/path' })).toThrow(/absolute instance directory/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: '' })).toThrow(PerkinsAppError);
     const abs = mkdtempSync(join(tmpdir(), 'perkins-root-malformed-'));
     try {
       expect(() => createStartupVerdictPoster({ instanceDir: abs, dataDir: 'relative' })).toThrow(/absolute data directory/u);
