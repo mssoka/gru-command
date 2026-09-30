@@ -1,5 +1,5 @@
 import { createHash, createPrivateKey, createSign } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import type { PostedReviewReceipt, PrIdentity, VerdictPoster, VerdictPosterInput } from './perkins.js';
 import { AutoVerdictPoster, GhPrPoster, verifyPostedReceipt } from './perkins.js';
@@ -30,9 +30,11 @@ export class PerkinsAppError extends Error {
 function sanitize(text: string): string {
   return text
     .replace(/-----BEGIN [^-\r\n]+ PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]+ PRIVATE KEY-----/gu, '[REDACTED]')
-    .replace(/\bgh[pousra]_[A-Za-z0-9_]{16,}\b/gu, '[REDACTED]')
-    .replace(/\bgithub_pat_[A-Za-z0-9_]{16,}\b/gu, '[REDACTED]')
-    .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu, '[REDACTED]')
+    // Token shapes are matched unanchored: a credential pasted without a
+    // clean separator before its prefix must still be redacted.
+    .replace(/gh[pousra]_[A-Za-z0-9_]{16,}/gu, '[REDACTED]')
+    .replace(/github_pat_[A-Za-z0-9_]{16,}/gu, '[REDACTED]')
+    .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/gu, '[REDACTED]')
     .replace(/[\r\n]+/gu, ' ')
     .slice(0, 300);
 }
@@ -83,6 +85,10 @@ export interface PerkinsAppBundleConfig {
 }
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]+$/u;
+
+/** Credential files are a few KB; anything orders of magnitude larger is
+ * not a bundle file, and buffering it would stall (or exhaust) the round. */
+const MAX_BUNDLE_FILE_BYTES = 1_048_576;
 
 function unquote(value: string): string {
   if (value.length >= 2) {
@@ -260,7 +266,7 @@ function readBundleFileChecked(path: string, label: string, sourceLabel: string)
     }
     // A credential file is a few KB; anything orders of magnitude larger is
     // not a bundle file, and buffering it would stall the round.
-    if (info.size > 1_048_576) {
+    if (info.size > MAX_BUNDLE_FILE_BYTES) {
       throw new PerkinsAppError(`${sourceLabel}: ${label} is implausibly large (${info.size} bytes) for a credential file — check the perkins bundle deployment`);
     }
     if (process.platform !== 'win32') {
@@ -275,7 +281,21 @@ function readBundleFileChecked(path: string, label: string, sourceLabel: string)
         );
       }
     }
-    return readFileSync(fd, 'utf-8');
+    // Read through the SAME descriptor with a hard byte ceiling as the
+    // backstop to the fstat check: a file that grows (or lies about its
+    // size) between fstat and read still cannot push unbounded bytes into
+    // memory.
+    const buffer = Buffer.allocUnsafe(MAX_BUNDLE_FILE_BYTES + 1);
+    let filled = 0;
+    for (;;) {
+      const read = readSync(fd, buffer, filled, MAX_BUNDLE_FILE_BYTES + 1 - filled, null);
+      if (read === 0) break;
+      filled += read;
+      if (filled > MAX_BUNDLE_FILE_BYTES) {
+        throw new PerkinsAppError(`${sourceLabel}: ${label} grew beyond ${MAX_BUNDLE_FILE_BYTES} bytes while being read — check the perkins bundle deployment`);
+      }
+    }
+    return buffer.subarray(0, filled).toString('utf-8');
   } finally {
     closeSync(fd);
   }
@@ -392,6 +412,9 @@ export interface PerkinsAppPosterOptions {
   readonly postTimeoutMs?: number;
   /** Bounded reviews-list pages consulted when reconciling an ambiguous POST. */
   readonly maxReconciliationPages?: number;
+  /** Reply-size ceiling for provider bodies (defense against a runaway or
+   * hostile response; the largest legitimate review-list page is a few MiB). */
+  readonly maxProviderBodyBytes?: number;
 }
 
 interface ProviderReview {
@@ -407,7 +430,7 @@ interface ProviderReview {
  * string (the legacy receipts accept both); anything else is unusable and
  * must fail closed rather than being stringified into a receipt. */
 function usableProviderReviewId(id: unknown): string | null {
-  if (typeof id === 'number' && Number.isSafeInteger(id)) return String(id);
+  if (typeof id === 'number' && Number.isSafeInteger(id) && id >= 1) return String(id);
   if (typeof id === 'string' && id.trim() !== '' && id.length <= 200) return id;
   return null;
 }
@@ -436,7 +459,7 @@ function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha
 function providerIndicatesRateLimit(error: PerkinsAppHttpError): boolean {
   const documentationUrl = (error.body as { readonly documentation_url?: unknown } | null)?.documentation_url;
   return (typeof documentationUrl === 'string' && /rate-limit|abuse/u.test(documentationUrl)) ||
-    /rate limit|abuse/iu.test(error.providerMessage);
+    /\brate limit\b|abuse detection/iu.test(error.providerMessage);
 }
 
 /** HTTP-level provider rejection with a sanitized provider message. */
@@ -466,6 +489,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   private readonly probeTimeoutMs: number;
   private readonly postTimeoutMs: number;
   private readonly maxReconciliationPages: number;
+  private readonly maxProviderBodyBytes: number;
 
   constructor(private readonly options: PerkinsAppPosterOptions) {
     this.fetchImpl = options.fetchImpl ?? ((fetch as unknown) as AppFetch);
@@ -478,6 +502,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // extra headroom is for the idempotent recovery lookup on busy PRs,
     // which may search deeper than the in-round ambiguous-POST case).
     this.maxReconciliationPages = options.maxReconciliationPages ?? 10;
+    this.maxProviderBodyBytes = options.maxProviderBodyBytes ?? 16 * 1024 * 1024;
   }
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
@@ -635,6 +660,15 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     } catch (error) {
       if (seam.ambiguousOutcome === true) throw error;
       throw new PerkinsAppError(`${label} response could not be read: ${error instanceof Error ? sanitize(error.message) : 'unreadable body'}`);
+    }
+    // Reply-size ceiling: durations bound the wait, not the bytes; a runaway
+    // or hostile body must not be parsed into memory without a cap (the
+    // largest legitimate review-list page is a few MiB).
+    if (Buffer.byteLength(text, 'utf8') > this.maxProviderBodyBytes) {
+      if (seam.ambiguousOutcome === true) {
+        throw new PerkinsAppError(`${label} response exceeded ${this.maxProviderBodyBytes} bytes — delivery identity is unproven`);
+      }
+      throw new PerkinsAppError(`${label} response exceeded ${this.maxProviderBodyBytes} bytes — refusing to parse an oversized body`);
     }
     const rawHeaders = response.headers ?? {};
     // Production fetch returns a `Headers` instance (no own enumerable
@@ -933,10 +967,13 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       }
       let next: number;
       if (lastPage !== null) {
-        // Jump to the newest page once, then walk backward one page at a
-        // time for the rest of the window: re-checking the jump on every
-        // iteration would pin the walk to {1, last, last-1} and silently
-        // cap the covered set no matter how large the bound is.
+        // Jump to the newest page once for a stable list, then walk backward
+        // one page at a time for the rest of the window: re-checking the
+        // jump on every iteration would pin the walk to {1, last, last-1}
+        // whatever the bound. A response revealing a strictly larger
+        // lastPage (mid-walk growth) re-fires the jump toward the new
+        // newest page — fail-closed, since the max-tracked bound then keeps
+        // any growth-uncovered state unresolved.
         next = visited.has(lastPage) || page >= lastPage ? page - 1 : lastPage;
       } else {
         // No Link header: the classic short-page end-of-list heuristic.

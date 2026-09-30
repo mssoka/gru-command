@@ -1281,11 +1281,22 @@ describe('credential hygiene on rejected URLs', () => {
     const fixture = bundleFixture();
     const { poster, calls } = posterWith(fixture);
     const secret = `ghs_${'S'.repeat(40)}`;
-    const malformed = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), prUrl: `not-a-url ${secret}` })
+    const malformed = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), prUrl: `not-a-url tokenX${secret}` })
       .then(() => null, (cause: unknown) => cause as Error);
     expect(malformed).toBeInstanceOf(PerkinsAppError);
     expect(malformed?.message ?? '').not.toContain(secret);
     expect(malformed?.message ?? '').toContain('[REDACTED]');
+
+    // Other credential shapes are redacted in URL errors too, including a
+    // token embedded directly after a word character (no separator).
+    const pat = `github_pat_${'P'.repeat(30)}`;
+    const patError = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), prUrl: `not-a-url${pat}` })
+      .then(() => null, (cause: unknown) => cause as Error);
+    expect(patError?.message ?? '').not.toContain(pat);
+    const jwt = `eyJ${'A'.repeat(12)}.${'B'.repeat(12)}.${'C'.repeat(12)}`;
+    const jwtError = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), prUrl: `not-a-url${jwt}` })
+      .then(() => null, (cause: unknown) => cause as Error);
+    expect(jwtError?.message ?? '').not.toContain(jwt);
 
     const userinfo = await poster.post({
       ...PR_INPUT, repoPath: repoPathOf(fixture),
@@ -1320,6 +1331,27 @@ describe('review id discipline', () => {
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+
+    // Zero is not a usable provider id either: the 2xx is reconciled like
+    // any other unprovable receipt, so the receipt's id comes from the
+    // provider list, never from '0'.
+    const zeroId = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/reviews$/,
+        handler: async () => ({ status: 200, body: { id: 0, user: { login: 'perkins-review[bot]', type: 'Bot' }, state: 'COMMENTED', commit_id: HEAD, body: 'review body\n' } }),
+      },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+    ]);
+    await expect(zeroId.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+  });
+
+  it('refuses an oversized provider reply instead of parsing it', async () => {
+    const fixture = bundleFixture();
+    const { poster } = posterWith(fixture, [
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, rawText: 'x'.repeat(2_049) }) },
+    ], { maxProviderBodyBytes: 2_048 });
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/exceeded 2048 bytes/u);
   });
 });
 
@@ -1366,6 +1398,32 @@ describe('bounded lookup growth and link sanity', () => {
     await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/delivery stays unresolved/u);
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(2);
+  });
+
+  it('never certifies absence from an inconsistent shrinking last-page snapshot', async () => {
+    // The maximum any response reported governs coverage: page 1 announces
+    // five pages, then page 5 claims two. Written assignment would shrink
+    // the tracked bound and certify {1,5,4} as full coverage; the maximum
+    // keeps the walk honestly unresolved instead of minting a duplicate-
+    // review permission.
+    const fixture = bundleFixture();
+    const lastLink = (last: number): Record<string, string> => ({
+      link: `<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${last}>; rel="last"`,
+    });
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => (/[?&]page=1$/u.test(call.url)
+            ? { status: 200, body: fullPage, headers: lastLink(5) }
+            : { status: 200, body: fullPage, headers: lastLink(2) }),
+      },
+    ], { maxReconciliationPages: 3 });
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/delivery stays unresolved/u);
+    const pages = calls
+      .filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))
+      .map((call) => /[?&]page=(\d+)/u.exec(call.url)?.[1]);
+    expect(pages).toEqual(['1', '5', '4']);
   });
 
   it('finds a recovered review deeper than the old three-page window (shared ten-page parity)', async () => {
