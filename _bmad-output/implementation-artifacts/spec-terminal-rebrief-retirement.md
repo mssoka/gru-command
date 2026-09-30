@@ -77,9 +77,46 @@ Shared seams if main/#136 moves: #136 appends directive reconciliation to `rebri
 ## Implementation Notes
 
 - Checkpoint 1 approval is carried by the dispatched work order (this slice is pre-approved/staged; the dispatch briefing is the human intent). No Open Questions were raised; the full spec is kept (est. ~1900 tokens, over the 1600 proposal, single cohesive goal — splitting would be artificial).
-- Implemented by the lane minion directly (no subagent capability in this runtime). Red phase: `test/rebrief-recovery.test.ts` + `test/ledger-api.test.ts` → 9 failed / 31 passed (only the new cases). Green phase after implementation → 40/40; `test/dispatch-server.test.ts` 20/20 and `test/suite-shape.test.ts` 2/2 at the lane head. Evidence transcripts: `/tmp/terminal-rebrief-evidence/{red-phase,green-phase,seam-tests}.log`.
+- Implemented by the lane minion directly (no subagent capability in this runtime). Red phase: `test/rebrief-recovery.test.ts` + `test/ledger-api.test.ts` → 9 failed / 31 passed (only the new cases). Green phase after implementation → 40/40; `test/dispatch-server.test.ts` 20/20 and `test/suite-shape.test.ts` 2/2 at the lane head. Evidence transcripts (durable, in-tree): `_bmad-output/implementation-artifacts/terminal-rebrief-evidence/{red-phase,green-phase,seam-tests}.log` (the `/tmp/...` copies of the first note were ephemeral source copies).
 - Inherited (pre-existing at baseline c54bfbf) suite-shape drift reconciled as part of the pin task: `owner-actions.test.ts` was absent from PINS (actual 8) and `github-poll.test.ts` was pinned 22 vs actual 24. Both are mechanical test-count pins; #136 fixes the same drifts independently (its `owner-actions` count is 28 because its branch grows that suite). Revalidate the `owner-actions.test.ts` line if #136 merges first.
 - No deviations from the spec's frozen block; no schema change; no notification path added.
+- Independent review receipts (not a conforming Perkins gate; not self-attested): three fresh same-model sessions ran the staged blind-hunter / edge-case-hunter / verification-gap prompts at pinned head `ba7f2d6`. Operational copies: `/Users/moses/.gru-command/recovery/silas-interlock-0857-R2YFB9/independent-finding-artifacts-preserved/{blind,edge,verification}/` with per-file hashes in `independent-finding-artifact-preservation.json`. 11 + 3 + 3 findings + 1 other, triaged individually below as untrusted observations (every claim re-verified against the pinned code; the verification layer's recorded input-contract limit — it read its own clean base checkout beyond the strict supplied-only packet — means that layer is held non-conforming and none of its claims were pre-trusted).
+- Exact-head CI receipt: run `36693133112` at `ba7f2d6` failed on the single inherited supervisor fixture race (`test/supervisor.test.ts:1132`, alert sampled after a fixed 50 ms while the 1/2/4 ms backoff rungs settle asynchronously; complete log preserved at `/Users/moses/.gru-command/recovery/silas-interlock-0857-R2YFB9/terminal-ci-failure-complete.log`, sha256 `30404663f06753d2b4089657df39de52b28fd7d67839cab445d9fa58f73d517a`). Causal fix: the test now waits on the condition itself (`vi.waitFor`, this file's own convention) instead of a fixed real-time slice; no assertion weakened, no timeout raised, no semantics changed.
+- Full suite + native Perkins + exact-final-head CI remain owed gates; the two focused local runs are not a substitute and no READY/PASS is claimed.
+
+## Review Triage Log
+
+Every original finding is preserved and individually auditable in the preservation directory named above; verdicts were rendered after re-reading the pinned code (not from reviewer severity). Grouped dispositions follow the table.
+
+| ID | Layer | Original finding (own anchor) | Verdict | Evidence / disposition |
+|---|---|---|---|---|
+| B1 | blind | `retired` flag conflates "terminal branch examined" with "retired" | false | The refusal/skip state is unreachable: the terminal branch requires a terminal, non-null job and the ledger re-read runs in the same synchronous section (no await, single writer); jobs are never deleted. Comment tightened to "actually retired". |
+| B2 | blind | `skippedIds` never logged; spec promises caller logs skipped ids | low | Fact confirmed. All-skipped is defensive-only today, but the promised trace now exists: `warn` else-branch at both terminal call sites. |
+| B3 | blind | `refused` outcome silently dropped at both call sites | low | Same root cause as B2; refusal unreachable (B1), now logged with `refused` + `skipped` instead of silence. |
+| B4 | blind | terminal intake throws generic `Error`, not a typed "named error" | low | Message names job + status and is asserted; no consumer branches by type; HTTP fails closed with 400 either way. Adding an exported error class would widen the ledger public API against the mandate. Rejected, reason recorded. |
+| B5 | blind | `guarded_event_landed` caller snapshot could go stale before deletion | false | Candidate construction and the retire transaction run in one synchronous section on the single-writer ledger; no event can land between them. |
+| B6 | blind | no test covers the new HTTP retirement disposition | medium | Confirmed. Fixed: new `/api/silas/rebrief` test (gate turn → merge mid-turn → 200 + `retired:true` + `delivered_sha:null` + no fabricated events + retirement audit); `dispatch-server` pin 20→21. |
+| B7 | blind | `redispatchGroup` terminal branch untested/unreachable | low | Unreachable only because the same-tick loop check precedes it; it is the fail-closed boundary the frozen intent requires ("recovery ... recheck the job at their boundary") and is documented in code. Keeping it. Rejected, reason recorded. |
+| B8 | blind | `done` status never exercised | low | Confirmed. Fixed: new deterministic `done` test asserts a retired audit with `job_status:"done"`, no spawn, markers gone. |
+| B9 | blind | suite-shape pin repairs bundled into this change | low | Fact; splitting a pushed commit needs rebase/reset (prohibited). Bundling is recorded here, in the commit body and in the PR body with the #136 merge-order caveat. Rejected, reason recorded. |
+| B10 | blind | "no notification" asserted only for one family | low | Confirmed. Fixed: the terminal-pair and spent-marker tests now assert the whole notification log is empty. |
+| B11 | blind | evidence cited `/tmp`; deferred suite/verify should be a merge precondition | low | Evidence was already preserved in-tree before the review; the Implementation Notes now cite the durable path. The deferred full gate is already stated as a precondition. |
+| E1 | edge | `finalizeRebriefRequest` with a null job proceeds without a missing-job guard | false | Jobs have no deletion path; `pending_rebriefs.job_id` references `jobs(id)`; the pre-existing null-job behavior is unchanged for a state the service cannot produce. |
+| E2 | edge | zero-retired runs drop `skippedIds`/`refused` silently | low | Same root cause/fix as B2/B3. |
+| E3 | edge | duplicate candidate ids double-retire/double-audit | false | In-tree callers pass PK-unique marker sets from one listing; no caller can produce duplicates. |
+| V1 | verification | endpoint retirement disposition has no test | medium | Independently re-verified against the pinned head despite the layer's non-conforming input limit; same fix as B6. |
+| V2 | verification | audit `agent_id`/`session_file` refs carried by no test | low | Confirmed. Fixed: the boot-retire test now binds a worker/session and asserts both refs (and `note`) in the retirement audit. |
+| V3 | verification | spent markers on a terminal job not pinned to the completed/clear path | low | Confirmed. Fixed: new spent-markers test asserts `completed:1`, `retired:0`, markers cleared, no retirement audit. |
+| V-O | verification | caller never logs skipped ids (other finding) | low | Same root cause/fix as B2/B3. |
+
+**Grouped dispositions (no loopback required — no intent_gap or bad_spec entries):**
+- G1 (B2, B3, E2, V-O): low — patch applied (defensive disposition logging + truthful `retired` doc comment).
+- G2 (B6, V1): medium — patch applied (endpoint test + pin).
+- G3 (B8): low — patch applied (`done` test).
+- G4 (V3): low — patch applied (spent-markers test).
+- G5 (B10): low — patch applied (full notification-log assertions).
+- G6 (B11): low — patch applied (durable evidence path in these notes).
+- False with recorded reasons: B1, B5, E1, E3. Low rejected with recorded reasons: B4, B7, B9. Originals remain untouched in the preservation directory.
 
 ## Verification
 

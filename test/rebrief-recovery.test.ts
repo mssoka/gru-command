@@ -428,7 +428,9 @@ describe('terminal re-brief retirement', () => {
   it('boot retires an admitted re-brief on a merged job: audited, no spawn, no fabricated delivery, no alert', async () => {
     const h = makeHarness();
     const jobId = 'terminal-pair-job';
-    await seedPendingRebrief({ h, jobId });
+    const boundAgent = 'worker-bound-1';
+    const boundSession = '/sessions/bound-worker.jsonl';
+    await seedPendingRebrief({ h, jobId, bindWorker: { agentId: boundAgent, sessionFile: boundSession } });
     merge(h, jobId);
     const markers = h.ledger.listPendingRebriefs({ jobId });
     const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
@@ -459,10 +461,15 @@ describe('terminal re-brief retirement', () => {
       expect(marker.baseline_seq).toBeGreaterThan(0);
       expect(marker.requested_at).toBeTruthy();
       expect(marker.guarded_event_landed).toBe(false);
+      // Worker/session attribution survives into the audit when the request
+      // had a bound worker at retirement time.
+      expect(marker.agent_id).toBe(boundAgent);
+      expect(marker.session_file).toBe(boundSession);
+      expect(marker.note).toBe('same blocker three rounds; try differently');
     }
 
-    // The old per-boot action-required alert family is gone entirely.
-    expect(h.ledger.listNotifications().filter((row) => row.kind.startsWith('silas.rebrief-unreconciled.'))).toHaveLength(0);
+    // Retirement posts NO notification at all — not merely no unreconciled alert.
+    expect(h.ledger.listNotifications()).toHaveLength(0);
   });
 
   it('retires a lone delivery marker on a terminal job instead of fabricating a delivery', async () => {
@@ -546,6 +553,40 @@ describe('terminal re-brief retirement', () => {
     expect(h.registry.workers).toHaveLength(1);
     expect(h.registry.workers[0]?.prompts[0] ?? '').toContain(`Re-brief — job ${workingJob}`);
     expect(h.ledger.latestJobEvent(workingJob, 'silas.rebrief')).not.toBeNull();
+  });
+
+  it('retires a terminal request on a done job exactly as on a merged one', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-done-job';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.setJobStatus(jobId, 'done');
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    expect(report.retired).toBe(1);
+    expect(report.redispatched).toBe(0);
+    await report.settled;
+    expect(h.registry.workers).toHaveLength(0);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    const audit = h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired');
+    expect((audit?.payload as { job_status?: string }).job_status).toBe('done');
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+  });
+
+  it('spent markers on a terminal job keep the completed clear path (no retirement audit)', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-spent-job';
+    await seedPendingRebrief({ h, jobId });
+    // Both guarded events landed before the job went terminal: the request
+    // was honored, so the clear is a completion — not a cancellation.
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'worker-1', note: 'n' } });
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { agentId: 'worker-1', source: 'silas-rebrief', sha: null } });
+    merge(h, jobId);
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    expect(report.completed).toBe(1);
+    expect(report.retired).toBe(0);
+    await report.settled;
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    expect(h.ledger.listNotifications()).toHaveLength(0);
   });
 
   it('a parked job keeps the existing recovery path — not terminal cleanup', async () => {

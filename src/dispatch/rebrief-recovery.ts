@@ -78,9 +78,10 @@ export interface PendingRebriefFinalize {
   readonly deliveryNote: string | null;
   readonly rebriefRecorded: boolean;
   readonly deliveryRecorded: boolean;
-  /** True when the job was already terminal at the boundary: the request
-   * was administratively retired instead of recorded (no event, no
-   * delivery, no reopen). */
+  /** True when this call actually retired the request: the job was terminal
+   * and the identity-checked marker deletion committed (no event, no
+   * delivery, no reopen). A defensive boundary that refuses, or an identity
+   * drift that skips every candidate, retires nothing and reports false. */
   readonly retired: boolean;
 }
 
@@ -251,6 +252,15 @@ export async function reconcilePendingRebriefs(
           status: job.status,
           markers: retirement.retired.map((marker) => `${marker.kind}:${marker.id}`).join(', '),
         });
+      } else {
+        // Defensive boundary: a refusal or identity drift leaves the markers
+        // for the next pass — surface it rather than skipping in silence.
+        deps.log?.('warn', 're-brief retirement retired nothing', {
+          job: jobId,
+          status: job.status,
+          refused: retirement.refused,
+          skipped: retirement.skippedIds,
+        });
       }
       continue;
     }
@@ -309,6 +319,13 @@ async function redispatchGroup(
         deps.log?.('info', 're-brief request retired: job terminal before re-dispatch', {
           job: jobId,
           status: job.status,
+        });
+      } else {
+        deps.log?.('warn', 're-brief retirement retired nothing before re-dispatch', {
+          job: jobId,
+          status: job.status,
+          refused: retirement.refused,
+          skipped: retirement.skippedIds,
         });
       }
       return;

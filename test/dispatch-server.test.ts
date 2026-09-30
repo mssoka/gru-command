@@ -773,6 +773,54 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('/api/silas/rebrief reports an administrative retirement when the job goes terminal mid-turn', async () => {
+    let releasePrompt!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      releasePrompt = resolveGate;
+    });
+    const h = await boot({ minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined) });
+    const repo = makeFixtureRepo('fixture-silas-rebrief-terminal');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'terminal-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
+      }, TOKEN);
+      // Let the initial briefing turn settle before the re-brief (same shape
+      // as the marker test above).
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('terminal-rebrief-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'terminal-rebrief-job', note: 'fold the rebase',
+      }, TOKEN);
+      // Wait until the re-brief turn is in flight (its markers bound).
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' }).length !== 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      // The job reaches terminal while the turn is gated (owner merged it).
+      h.ledger.setJobStatus('terminal-rebrief-job', 'in-review');
+      h.ledger.setJobStatus('terminal-rebrief-job', 'merged');
+      releasePrompt();
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.json)).toBe(200);
+      // The disposition is in-band: retired, no fabricated delivery.
+      expect(field<boolean>(res.json, 'retired')).toBe(true);
+      expect(field<string | null>(res.json, 'delivered_sha')).toBeNull();
+      expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief')).toBeNull();
+      expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'job.delivered')).toBeNull();
+      expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief-recovered')).toBeNull();
+      // The audit is durable and the obsolete markers are gone; the lane stays terminal.
+      expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief-retired')).not.toBeNull();
+      expect(h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' })).toHaveLength(0);
+      expect(h.ledger.getJob('terminal-rebrief-job')?.status).toBe('merged');
+    } finally {
+      releasePrompt();
+      await h.close();
+    }
+  });
+
   it('/api/silas/directive on a lane with no reachable minion answers 502 undelivered; terminal jobs refuse', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-undelivered');
