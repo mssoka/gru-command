@@ -49,9 +49,9 @@ context: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `src/main.ts` — resolve integration using the approved head strategy; retain App selection and upstream wiring.
-- [ ] `src/dispatch/perkins-github-app.ts`, `test/perkins-github-app.test.ts`, `test/suite-shape.test.ts` — check compatibility and close material independent findings with deterministic regressions. Shared publisher source needs prior coordination.
-- [ ] `docs/PERKINS-APP-PUBLICATION.md` — correct statements affected by accepted findings, without claiming live success.
+- [x] `src/main.ts` — resolve integration using the approved head strategy; retain App selection and upstream wiring.
+- [x] `src/dispatch/perkins-github-app.ts`, `test/perkins-github-app.test.ts`, `test/suite-shape.test.ts` — check compatibility and close material independent findings with deterministic regressions. Shared publisher source needs prior coordination.
+- [x] `docs/PERKINS-APP-PUBLICATION.md` — correct statements affected by accepted findings, without claiming live success.
 - [ ] This spec — append source refs, independent review binding, gate results, and disposition. Private transcripts/verification evidence stay outside the repository.
 
 **Acceptance Criteria:**
@@ -68,11 +68,55 @@ context: []
 - Integration merge committed: 3c2b079 (parents 7980e32, 128cdb8). Conflict inventory: exactly one content conflict, src/main.ts WaveRunner construction, resolved to keep `poster: createStartupVerdictPoster(config)` alongside upstream `reserveReviewRound`/`maxConcurrentChildren`/`bus` plus `wave.resumeQueuedHandoffs()`. Auto-merge audit for files changed by both sides (docs/CONFIG.md, docs/FLOW.md, test/suite-shape.test.ts): both sides' edits retained (verified per file against each parent). PR diff vs fresh main = lane-owned files only.
 - Integration repair committed: 8e1eab6 — suite-shape pins dropped by the main merge wave, verified by the file's own static counter and cross-validated by the independent identical repair in lane revert-compaction-137 (c0d0ec2): github-poll 22->24, owner-actions added at 8 (its static count; runtime 28 via its case loop).
 - Focused pre-checks (direct, 2-file suite; not the official gate): run1 failed (missing pins + unhandled worker-RPC timeout because the direct npx invocation bypassed the repo `pretest` patch), run2 failed (github-poll pin), run3 green 54/54 after repairs. Logs and hashes under delivery/verify/integration/.
-- Independent review round (integration final diff 128cdb8..8e1eab6, staged sha256 7ad798c69c22d2f820f0122b5a75595ea7cb2a13203c5a12ec2d172e74f1ac8d): five fresh read-only sessions under delivery/independent-review-integration/; results pending.
+- Independent review round (integration final diff 128cdb8..8e1eab6, staged sha256 7ad798c69c22d2f820f0122b5a75595ea7cb2a13203c5a12ec2d172e74f1ac8d): five fresh read-only sessions under delivery/independent-review-integration/.
+- Review closures committed: 83802c2 (findings) and 5ccde5b (recheck findings); recheck round staged sha256 25a5d48a2231fbfe937de96f3308e3fcb2bff06d7cb886b511418ea56bd03532; final delta staged sha256 e3fac918df1780638e52efa963283ed0c7f09bf507c7f6d390f2406457919504. Focused after each: 68/68 then 70/70 (perkins-github-app + suite-shape, pin 52→66→67→68). No `src/dispatch/perkins.ts` edit.
+- Shared-contract boundary note for Gru: `VerdictPosterInput` carries no abort signal, so a bounded reconciliation can run up to its page/timeout budget after a round is cancelled; `perkins.ts` was left read-only per the ownership rule.
 
 ## Spec Change Log
 
 ## Review Triage Log
+
+### Round 1 — five fresh read-only BMAD lens sessions on the final diff (candidate 8e1eab6; staged sha256 7ad798c6...)
+
+| Finding (lens) | Disposition |
+|---|---|
+| bundle root vs `data_dir` (adv/struct) | Accepted: `resolvePerkinsAppBundleRoot` (instance dir first, relocated data-dir fallback), docs + tests |
+| unprovable 2xx receipt / 'unknown' id escape (adv/ec) | Accepted: usable-id helper (safe positive int or quoted string ≤200), `PerkinsAppError` routed into reconciliation + tests |
+| `main.ts` wiring unpinned (adv/vg) | Accepted: static source pin in the suite |
+| recovery walk depth vs shared 10 (adv) | Accepted: default 10 — and the underlying re-jump defect was found and fixed (coverage was capped at {1,last,last−1}) |
+| PR URL unsanitized in diagnostics (adv/ec) | Accepted: both branches sanitized + tests |
+| non-github.com GitHub hosts lack a boot signal (adv) | Not adopted: fail-closed at publication with an actionable error; boot-time remote scanning is outside this integration's scope. Recorded. |
+| key_path `..`/absolute untested (adv) | Accepted: `resolvePerkinsAppKeyPath` exported + three tests |
+| doc mode-class mismatch (adv/prose) | Accepted doc-side (exact classes; dir exactly 0700) |
+| spec artifact unpopulated (adv) | Accepted: populated with this record |
+| absence-certificate snapshot assumptions (adv/ec) | Accepted: max-tracked lastPage + growth/shrink regressions |
+| factory root validation (adv) | Accepted: named errors + tests |
+| dangling-symlink test used production fetch incidentally (adv) | Accepted: fetch double + zero-call assertion |
+| no-fallback test read a private field (adv) | Accepted: behavioral assertions |
+| selection EACCES race (ec) | Accepted: non-ENOENT stat stays present |
+| file size cap (ec) | Accepted: cap + bounded same-descriptor read |
+| UNC key path (ec) | Accepted: regex + exported-resolution tests |
+| page=0 last link (ec) | Accepted: page ≥ 1 validation + test |
+| gh preflight dependency + FLOW over-claim (vg) | Accepted docs-only: FLOW grounded to publication; activation notes the retained preflight dependency |
+| structure/prose rows (struct/prose) | Accepted: class order, explicit ambiguity seam, mode-selection merge, runbook/Windows/prose fixes |
+
+### Round 2 — three fresh read-only recheck sessions on the updated diff (candidate 83802c2; staged sha256 25a5d48a...)
+
+| Finding (lens) | Disposition |
+|---|---|
+| all eight claimed closures | Verified closed (edge-case-hunter returned empty findings) |
+| `Math.max` shrink direction unpinned (vg) | Accepted: shrink-direction regression (assignment would certify {1,5,4}) |
+| no-Link short-page absence certificate (adv) | Not adopted: this is the provider's own end-of-list signal (Link headers are absent only when no further pages exist) and the legacy posters' identical rule; requiring more would leave every single-page reconciliation unresolved. The rule is now stated in the operator doc. |
+| unbounded provider reply buffering (adv) | Accepted: 16 MiB ceiling with an options seam + test |
+| fstat→read TOCTOU on the bundle cap (adv) | Accepted: bounded `readSync` on the same descriptor |
+| sanitize word-boundary gap + URL shape coverage (adv) | Accepted: unanchored token/JWT patterns, URL tests cover PAT/JWT/embedded cases |
+| zero/negative review ids (adv) | Accepted: ids require ≥ 1 |
+| rate-limit classifier over-match (adv) | Accepted: narrowed to `rate limit`/`abuse detection` |
+| `VerdictPosterInput` carries no abort signal (adv) | Recorded shared-contract boundary note for Gru; `perkins.ts` remains read-only. |
+
+### Round 3 — final delta check
+
+- Fresh adversarial session over the recheck-fix delta (candidate 5ccde5b; staged sha256 e3fac918...): result recorded in the delivery evidence.
 
 ## Verification
 
