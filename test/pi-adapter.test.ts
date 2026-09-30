@@ -116,6 +116,15 @@ function collect(handle: { subscribe(listener: (event: RuntimeEvent) => void): (
   return events;
 }
 
+/** Bounded real-time wait for short fixture transitions. */
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 4_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 /** Await a spawn that MUST fail and return its message for content pins. */
 async function rejection(promise: Promise<unknown>): Promise<Error> {
   try {
@@ -722,6 +731,116 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(handle.health().state).not.toBe('disposed');
       await handle.prompt('still usable');
       expect(fx.script.calls.map((call) => call.prompt)).toContain('still usable');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('a mid-run deadline cancels only the summary: the pending turn still answers', async () => {
+    const history = 'history '.repeat(12_000); // ~24k estimated tokens: forces a discarding cut point
+    const fx = await fixture(
+      (prompt, index) => {
+        if (prompt.startsWith('<conversation>')) {
+          // The summarizer stalls until the request signal aborts (real
+          // transport behavior), then settles with an aborted message.
+          return { deltas: [], hold: new Promise<void>(() => {}), honorAbort: true };
+        }
+        if (index === 0) return { deltas: [history] };
+        if (index === 1) {
+          // The tool call keeps the run live through prepareNextTurnWithContext
+          // (agent-session.js), where pi runs native threshold compaction
+          // mid-run; 90k usage crosses the 100k window's threshold.
+          return {
+            deltas: [],
+            toolCall: { id: 'call-1', name: 'read', args: { path: 'missing.txt' } },
+            usageTokens: 90_000,
+          };
+        }
+        return { deltas: [`answer-${index}`] };
+      },
+      ['text'],
+      { compactionDeadlineMs: 40 },
+    );
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    try {
+      await handle.prompt('start');
+      const turn = handle.prompt('do the work').then(
+        () => 'resolved',
+        (error: Error) => `rejected:${error.message}`,
+      );
+      const queued = handle.prompt('queued work', { owner: 'other' }).then(
+        () => 'resolved',
+        (error: Error) => `rejected:${error.message}`,
+      );
+      await waitFor(
+        () => events.some((event) => event.type === 'compaction_start'),
+        'compaction_start',
+      );
+      await waitFor(
+        () => events.some((event) => event.type === 'compaction_end'),
+        'compaction_end',
+      );
+      expect(await turn).toBe('resolved');
+      expect(await queued).toBe('resolved');
+      // The deadline cancelled only the compaction: nothing user-visible failed.
+      expect(events.filter((event) => event.type === 'error')).toEqual([]);
+      expect(events.some((event) => event.type === 'state' && event.state === 'error')).toBe(false);
+      // The pending turn's continuation actually reached the model after the stall.
+      expect(
+        fx.script.calls.some(
+          (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
+        ),
+      ).toBe(true);
+      // No assistant message settled as an SDK error (the broad-abort shape).
+      const internal = handle as unknown as {
+        session: { agent: { state: { messages: Array<{ role: string; stopReason?: string }> } } };
+      };
+      expect(
+        internal.session.agent.state.messages.filter(
+          (message) => message.role === 'assistant' && message.stopReason === 'error',
+        ),
+      ).toEqual([]);
+      // Queued work was not lost or duplicated, and the session stays usable.
+      expect(fx.script.calls.filter((call) => call.prompt === 'queued work')).toHaveLength(1);
+      expect(handle.health().state).not.toBe('disposed');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('keeps the 5s reconcile/dispose protection for a signal-ignoring summary', async () => {
+    const history = 'context '.repeat(10_000); // ~22.5k estimated tokens: a valid compaction exists
+    const fx = await fixture(
+      (prompt) => (prompt.startsWith('<conversation>')
+        ? { deltas: [], hold: new Promise<void>(() => {}), honorAbort: false }
+        : { deltas: ['ok'] }),
+      ['text'],
+      { compactionDeadlineMs: 25 },
+    );
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    const sessionFile = handle.sessionFile!;
+    try {
+      await handle.prompt('task: begin');
+      await handle.prompt(history);
+      const outcome = await handle.compact!().then(
+        () => 'resolved',
+        (error: Error) => error.message,
+      );
+      // The summary never obeys cancellation: only the existing settle
+      // window can reconcile, publishing one authoritative terminal and
+      // disposing rather than leaving a wedged control open.
+      expect(outcome).toMatch(/native compaction state did not settle after its terminal event/);
+      const failures = events.filter(
+        (event) => event.type === 'compaction_end' && !event.success,
+      );
+      expect(failures).toHaveLength(1);
+      expect((failures[0] as { error?: string }).error).toMatch(
+        /native compaction state did not settle after its terminal event/,
+      );
+      await waitFor(() => handle.health().state === 'disposed', 'dispose after the settle window');
+      expect(existsSync(`${sessionFile}.lock`)).toBe(false);
     } finally {
       await handle.dispose();
     }
