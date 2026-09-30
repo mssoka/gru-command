@@ -17,6 +17,7 @@ import {
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
 import type { ResidentReviewRound } from '../runtime/registry.js';
+import type { PacingGate } from '../runtime/pacing.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
@@ -984,6 +985,9 @@ export interface WaveRunnerOptions {
   readonly maxConcurrentChildren?: number;
   /** Ledger bus used to admit a worker's durable handoff after its turn delivers. */
   readonly bus?: EventBus;
+  /** Provider pacing: combined lead+lens review-turn gate for Perkins
+   * rounds. Absent = off; an unlimited or disabled gate admits at once. */
+  readonly reviewGate?: PacingGate;
   readonly poster?: VerdictPoster;
   readonly escalate?: (title: string, detail: string) => void;
   /** Stable service-owned root. Required for every production review. */
@@ -2290,6 +2294,7 @@ export class WaveRunner {
       spawner: spawnWithOptions,
       ...(reservation !== undefined ? { beginChildren: () => reservation.beginChildren(this.opts.maxConcurrentChildren ?? DEFAULT_REVIEW_CHILDREN) } : {}),
       ...(this.opts.maxConcurrentChildren !== undefined ? { maxConcurrentChildren: this.opts.maxConcurrentChildren } : {}),
+      ...(this.opts.reviewGate !== undefined ? { reviewGate: this.opts.reviewGate } : {}),
       policy,
       onAgent: ({ phase, lens, attempt, handle }) => {
         this.opts.ledger.registerAgent({

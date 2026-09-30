@@ -195,19 +195,27 @@ restart_backoff_ms = 2000
 # percent (1-100); pi's own threshold compaction stays as the backstop.
 proactive_compact_percent = 70
 
-# [concurrency]
-# Provider pacing: bounded automatic retry for the rate-limit error
-# class (HTTP 429, "rate limit", "too many requests", throttling).
-# Each automatic retry is recorded as a pacing.auto-retry ledger event;
-# non-rate-limit failures and an exhausted budget still stop to the
-# supervisor ladder + owner ACK. Absent section = disabled (current
-# behavior). Suggested starting point: 1s, capped at 60s, 5 retries.
+# [pacing]
+# Provider pacing: FIFO admission caps for minion and Perkins review
+# turns (queued lanes render honestly; live turns are never preempted),
+# plus bounded automatic retry for the rate-limit error class
+# (HTTP 429, "rate limit", "too many requests", throttling). Every
+# automatic retry is recorded as a pacing.auto-retry ledger event.
+# Absent section = disabled (current behavior). Suggested starting
+# point: cap minion and review turns at 3; 1s backoff, capped at 60s,
+# 5 retries.
+# max_concurrent_minions = 3
+# max_concurrent_review_turns = 3   # 0 = unlimited; >= 2 (lead + lens)
 # backoff_base_ms = 1000
 # backoff_max_ms = 60000
 # max_auto_retries = 5
-# Optional per-provider extra signatures live alongside the section.
-# [concurrency.providers."<provider-id>"]
+# enabled = true
+# Optional provider-keyed extra signatures (global text signatures):
+# [pacing.providers."<provider-id>"]
 # rate_limit_patterns = ["pacing code \\d+"]
+#
+# The [concurrency] spelling is accepted as an alias, as are the shared
+# key names max_workers / max_review_turns.
 
 [logging]
 # service.log size-based rotation.

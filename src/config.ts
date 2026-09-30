@@ -271,29 +271,41 @@ export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   escalateAt: 4,
 };
 
-/** Bounded automatic retry for the provider rate-limit error class (owner
- * heist 2026-09-29; owner scope-trim 2026-09-29 keeps only the
- * non-overlapping half — admission/concurrency gating is PR #131's
- * territory under this same [concurrency] namespace, so the key can be
- * superseded there without config churn).
+/** Provider pacing (owner heist 2026-09-29): config-driven FIFO admission
+ * caps for minion turns and Perkins review turns, plus bounded automatic
+ * retry for the provider rate-limit error class — replacing per-429 owner
+ * ACKs. The review round r4 (2026-09-30) restored the gates to this lane
+ * per the frozen brief.
  *
  * Provider-agnostic by ruling: no provider name, model, or limit appears in
  * code. Error signatures are the generic HTTP 429 family plus optional
- * per-provider additions under [concurrency.providers."<id>"] (matched
- * against ERROR TEXT only — a CLI or adapter brand is never identity).
- * Absent section = feature off (current behavior); absent keys inside a
- * present section = the documented defaults below. */
-export interface ConcurrencyProviderOverride {
-  /** Extra case-insensitive regex bodies classified as rate-limit class for
-   * this provider id (e.g. provider-specific pacing codes). Matched against
-   * the runtime error text alongside the generic 429-family signatures. */
+ * provider-keyed additions (matched against ERROR TEXT only; the keys are
+ * organizational labels, the signatures are global — a CLI or adapter brand
+ * is never identity). Absent section = feature off (current behavior);
+ * absent keys inside a present section = the documented defaults below.
+ * Both the [pacing] spelling from the brief and the [concurrency] spelling
+ * shared with the worker-residency-budget design are accepted (one section
+ * per file); limit keys accept both the brief's max_concurrent_* names and
+ * the max_workers / max_review_turns aliases. */
+export interface PacingProviderOverride {
+  /** Extra case-insensitive regex bodies classified as rate-limit class,
+   * matched against the runtime error text alongside the generic 429-family
+   * signatures. Signatures are global text signatures, not scoped per
+   * provider. */
   readonly rateLimitPatterns: readonly string[];
 }
 
-export interface ConcurrencyConfig {
-  /** True when the loaded file carries a [concurrency] section. The section
-   * is the feature switch: absent = no automatic retry (current behavior). */
+export interface PacingConfig {
+  /** True when the loaded file carries a [pacing]/[concurrency] section and
+   * `enabled` is not false. Off = no automatic retry and no caps (current
+   * behavior). */
   readonly enabled: boolean;
+  /** FIFO cap on concurrent minion turns; 0 = unlimited (the shipped
+   * default — behavior-preserving). */
+  readonly maxConcurrentMinions: number;
+  /** FIFO cap on combined Perkins review turns (lead + lenses); 0 =
+   * unlimited (the shipped default). */
+  readonly maxConcurrentReviewTurns: number;
   /** Backoff base between automatic retries; doubles per attempt, with
    * additive jitter, clamped by backoffMaxMs. */
   readonly backoffBaseMs: number;
@@ -302,12 +314,14 @@ export interface ConcurrencyConfig {
   /** Automatic retries per rate-limit incident before the failure stops to
    * the existing supervisor ladder + owner ACK. 0 = no automatic retry. */
   readonly maxAutoRetries: number;
-  /** Per-provider rate-limit signature overrides, keyed by provider id. */
-  readonly providers: Readonly<Record<string, ConcurrencyProviderOverride>>;
+  /** Provider-keyed extra rate-limit signatures (global text signatures). */
+  readonly providers: Readonly<Record<string, PacingProviderOverride>>;
 }
 
-export const DEFAULT_CONCURRENCY_CONFIG: ConcurrencyConfig = {
+export const DEFAULT_PACING_CONFIG: PacingConfig = {
   enabled: false,
+  maxConcurrentMinions: 0,
+  maxConcurrentReviewTurns: 0,
   backoffBaseMs: 1_000,
   backoffMaxMs: 60_000,
   maxAutoRetries: 5,
@@ -422,7 +436,7 @@ export interface GruCommandConfig {
   readonly concurrency: ConcurrencyConfig;
   readonly review: ReviewConfig;
   readonly verify: VerifyConfig;
-  readonly concurrency: ConcurrencyConfig;
+  readonly pacing: PacingConfig;
   readonly decisions: DecisionsConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
@@ -547,6 +561,7 @@ const TOP_LEVEL_KEYS = [
   'concurrency',
   'review',
   'verify',
+  'pacing',
   'concurrency',
   'decisions',
 ] as const;
@@ -799,7 +814,7 @@ export function loadConfig(
   let concurrency: ConcurrencyConfig = DEFAULT_CONCURRENCY_CONFIG;
   let review: ReviewConfig = { enabled: true, maxConcurrentChildren: DEFAULT_REVIEW_CHILDREN };
   let verify: VerifyConfig = DEFAULT_VERIFY_CONFIG;
-  let concurrency: ConcurrencyConfig = DEFAULT_CONCURRENCY_CONFIG;
+  let pacing: PacingConfig = DEFAULT_PACING_CONFIG;
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
   let sourceFile: string | null = null;
 
@@ -1262,8 +1277,18 @@ export function loadConfig(
             : verify.runTimeoutMs,
       };
     }
+    if (raw['pacing'] !== undefined && raw['concurrency'] !== undefined) {
+      throw new ConfigError(
+        'both [pacing] and [concurrency] sections are present — use one spelling of the same settings',
+        file,
+        'pacing',
+      );
+    }
+    if (raw['pacing'] !== undefined) {
+      pacing = readPacingConfig(raw['pacing'], file, 'pacing', pacing);
+    }
     if (raw['concurrency'] !== undefined) {
-      concurrency = readConcurrencyConfig(raw['concurrency'], file, concurrency);
+      pacing = readPacingConfig(raw['concurrency'], file, 'concurrency', pacing);
     }
     if (raw['decisions'] !== undefined) {
       decisions = readDecisionsConfig(raw['decisions'], file, decisions);
@@ -1340,106 +1365,142 @@ export function loadConfig(
     concurrency,
     review,
     verify,
-    concurrency,
+    pacing,
     decisions,
     sourceFile,
     instanceDir,
   };
 }
 
-const CONCURRENCY_KEYS = [
+const PACING_KEYS = [
+  'enabled',
+  'max_concurrent_minions',
+  'max_workers',
+  'max_concurrent_review_turns',
+  'max_review_turns',
   'backoff_base_ms',
   'backoff_max_ms',
   'max_auto_retries',
   'providers',
 ] as const;
 
-/** Parse one [concurrency] table. Fail loud on unknown keys, wrong types,
- * non-compiling patterns, and an inverted backoff ladder — a pacing
- * misconfiguration must never silently disable or distort the retry
- * bounds. The section itself is the feature switch; this function only
- * ever runs when the section is present, so `enabled: true` is the honest
- * return. */
-function readConcurrencyConfig(
+/** Parse a [pacing] table (or its [concurrency] alias). Fail loud on unknown
+ * keys, wrong types, conflicting alias spellings, non-compiling patterns,
+ * and an inverted backoff ladder — a pacing misconfiguration must never
+ * silently disable or distort the bounds. The section being present is the
+ * feature switch unless an explicit `enabled = false` turns it off; this
+ * function only ever runs when a section is present, so the default is
+ * `enabled: true`. */
+function readPacingConfig(
   value: unknown,
   file: string,
-  defaults: ConcurrencyConfig,
-): ConcurrencyConfig {
-  const table = requireTable(value, file, 'concurrency');
+  section: 'pacing' | 'concurrency',
+  defaults: PacingConfig,
+): PacingConfig {
+  const table = requireTable(value, file, section);
   for (const key of Object.keys(table)) {
-    if (!(CONCURRENCY_KEYS as readonly string[]).includes(key)) {
+    if (!(PACING_KEYS as readonly string[]).includes(key)) {
       throw new ConfigError(
-        `unknown key \`${key}\` in [concurrency] (valid keys: ${CONCURRENCY_KEYS.join(', ')})`,
+        `unknown key \`${key}\` in [${section}] (valid keys: ${PACING_KEYS.join(', ')})`,
         file,
-        `concurrency.${key}`,
+        `${section}.${key}`,
       );
     }
   }
+  // Limit keys accept both spellings named in the brief and in the shared
+  // worker-residency-budget design; a file that sets both is ambiguous and
+  // fails loud rather than picking one silently.
+  const limit = (primary: string, alias: string): number | undefined => {
+    const hasPrimary = table[primary] !== undefined;
+    const hasAlias = table[alias] !== undefined;
+    if (hasPrimary && hasAlias) {
+      throw new ConfigError(
+        `[${section}] sets both \`${primary}\` and its alias \`${alias}\` — use one spelling`,
+        file,
+        `${section}.${primary}`,
+      );
+    }
+    if (hasPrimary) return requireNonNegativeInt(table[primary], file, `${section}.${primary}`);
+    if (hasAlias) return requireNonNegativeInt(table[alias], file, `${section}.${alias}`);
+    return undefined;
+  };
+  const enabled =
+    table['enabled'] !== undefined ? requireBool(table['enabled'], file, `${section}.enabled`) : true;
+  const maxConcurrentMinions = limit('max_concurrent_minions', 'max_workers') ?? defaults.maxConcurrentMinions;
+  const maxConcurrentReviewTurns =
+    limit('max_concurrent_review_turns', 'max_review_turns') ?? defaults.maxConcurrentReviewTurns;
+  if (maxConcurrentReviewTurns === 1) {
+    throw new ConfigError(
+      `${section}.max_concurrent_review_turns must be 0 (unlimited) or at least 2 — a review round needs its lead plus at least one lens`,
+      file,
+      `${section}.max_concurrent_review_turns`,
+    );
+  }
   const backoffBaseMs =
     table['backoff_base_ms'] !== undefined
-      ? requirePositiveInt(table['backoff_base_ms'], file, 'concurrency.backoff_base_ms')
+      ? requirePositiveInt(table['backoff_base_ms'], file, `${section}.backoff_base_ms`)
       : defaults.backoffBaseMs;
   const backoffMaxMs =
     table['backoff_max_ms'] !== undefined
-      ? requirePositiveInt(table['backoff_max_ms'], file, 'concurrency.backoff_max_ms')
+      ? requirePositiveInt(table['backoff_max_ms'], file, `${section}.backoff_max_ms`)
       : defaults.backoffMaxMs;
   if (backoffBaseMs > backoffMaxMs) {
     throw new ConfigError(
-      `concurrency.backoff_base_ms (${backoffBaseMs}) must not exceed concurrency.backoff_max_ms (${backoffMaxMs})`,
+      `${section}.backoff_base_ms (${backoffBaseMs}) must not exceed ${section}.backoff_max_ms (${backoffMaxMs})`,
       file,
-      'concurrency.backoff_base_ms',
+      `${section}.backoff_base_ms`,
     );
   }
   let providers = defaults.providers;
   if (table['providers'] !== undefined) {
-    const providersTable = requireTable(table['providers'], file, 'concurrency.providers');
-    const parsed: Record<string, ConcurrencyProviderOverride> = {};
+    const providersTable = requireTable(table['providers'], file, `${section}.providers`);
+    const parsed: Record<string, PacingProviderOverride> = {};
     for (const [providerId, entry] of Object.entries(providersTable)) {
       if (providerId.trim() === '') {
         throw new ConfigError(
-          'concurrency.providers keys must be non-empty provider ids',
+          `${section}.providers keys must be non-empty provider ids`,
           file,
-          'concurrency.providers',
+          `${section}.providers`,
         );
       }
-      const entryTable = requireTable(entry, file, `concurrency.providers."${providerId}"`);
+      const entryTable = requireTable(entry, file, `${section}.providers."${providerId}"`);
       for (const key of Object.keys(entryTable)) {
         if (key !== 'rate_limit_patterns') {
           throw new ConfigError(
-            `unknown key \`${key}\` in [concurrency.providers."${providerId}"] (valid keys: rate_limit_patterns)`,
+            `unknown key \`${key}\` in [${section}.providers."${providerId}"] (valid keys: rate_limit_patterns)`,
             file,
-            `concurrency.providers."${providerId}".${key}`,
+            `${section}.providers."${providerId}".${key}`,
           );
         }
       }
       const rawPatterns = entryTable['rate_limit_patterns'];
       if (rawPatterns === undefined) {
         throw new ConfigError(
-          `[concurrency.providers."${providerId}"] must set rate_limit_patterns`,
+          `[${section}.providers."${providerId}"] must set rate_limit_patterns`,
           file,
-          `concurrency.providers."${providerId}"`,
+          `${section}.providers."${providerId}"`,
         );
       }
       if (!Array.isArray(rawPatterns)) {
         throw new ConfigError(
-          `concurrency.providers."${providerId}".rate_limit_patterns must be an array of strings`,
+          `${section}.providers."${providerId}".rate_limit_patterns must be an array of strings`,
           file,
-          `concurrency.providers."${providerId}".rate_limit_patterns`,
+          `${section}.providers."${providerId}".rate_limit_patterns`,
         );
       }
       const patterns = rawPatterns.map((pattern, index) => {
         const text = requireString(
           pattern,
           file,
-          `concurrency.providers."${providerId}".rate_limit_patterns[${index}]`,
+          `${section}.providers."${providerId}".rate_limit_patterns[${index}]`,
         );
         try {
           new RegExp(text, 'i');
         } catch (error) {
           throw new ConfigError(
-            `concurrency.providers."${providerId}".rate_limit_patterns[${index}] is not a valid regex: ${(error as Error).message}`,
+            `${section}.providers."${providerId}".rate_limit_patterns[${index}] is not a valid regex: ${(error as Error).message}`,
             file,
-            `concurrency.providers."${providerId}".rate_limit_patterns[${index}]`,
+            `${section}.providers."${providerId}".rate_limit_patterns[${index}]`,
           );
         }
         return text;
@@ -1449,12 +1510,14 @@ function readConcurrencyConfig(
     providers = parsed;
   }
   return {
-    enabled: true,
+    enabled,
+    maxConcurrentMinions,
+    maxConcurrentReviewTurns,
     backoffBaseMs,
     backoffMaxMs,
     maxAutoRetries:
       table['max_auto_retries'] !== undefined
-        ? requireNonNegativeInt(table['max_auto_retries'], file, 'concurrency.max_auto_retries')
+        ? requireNonNegativeInt(table['max_auto_retries'], file, `${section}.max_auto_retries`)
         : defaults.maxAutoRetries,
     providers,
   };

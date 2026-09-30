@@ -4,6 +4,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool } from '../../runtime/types.js';
+import type { PacingGate, PacingLease } from '../../runtime/pacing.js';
 import { assertFrozenPromptBounds, refMovedSinceFreeze, writeReviewArtifact, type FrozenReview } from './artifacts.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -129,6 +130,9 @@ export interface PerkinsWholeReviewOptions {
   /** Effective specialist ceiling for this round; bounded by the host's
    * per-call input bound below. */
   readonly maxConcurrentChildren?: number;
+  /** Provider pacing: FIFO combined lead+lens review-turn gate. Absent =
+   * off; an unlimited or disabled gate admits immediately. */
+  readonly reviewGate?: PacingGate;
   readonly onProgress?: (progress: ReviewProgress) => void;
   readonly onAgent?: (input: {
     readonly phase: 'lead' | 'specialist';
@@ -649,6 +653,7 @@ export class PerkinsWholeReview {
   private readonly policy: PerkinsPolicy;
   private readonly beginChildren: NonNullable<PerkinsWholeReviewOptions['beginChildren']>;
   private readonly maxConcurrentChildren: number;
+  private readonly reviewGate: PacingGate | null;
   private readonly onProgress: (progress: ReviewProgress) => void;
   private readonly onAgent: NonNullable<PerkinsWholeReviewOptions['onAgent']>;
 
@@ -657,8 +662,35 @@ export class PerkinsWholeReview {
     this.policy = options.policy;
     this.maxConcurrentChildren = options.maxConcurrentChildren ?? STANDALONE_SPECIALIST_CONCURRENCY;
     this.beginChildren = options.beginChildren ?? (() => ({ concurrency: this.maxConcurrentChildren, finish: () => {} }));
+    this.reviewGate = options.reviewGate ?? null;
     this.onProgress = options.onProgress ?? (() => {});
     this.onAgent = options.onAgent ?? (() => {});
+  }
+
+  /** Provider pacing (review-turn gate): claim one combined review slot
+   * BEFORE the spawn — a queued FIFO wait never consumes the spawn or turn
+   * timeouts. The caller releases the lease in its own finally, beside the
+   * child disposal. Null when the gate is absent. */
+  private async acquireReviewTurnSlot(
+    label: string,
+    signal: AbortSignal | undefined,
+  ): Promise<PacingLease | null> {
+    const gate = this.reviewGate;
+    if (gate === null) return null;
+    return gate.acquireReviewTurn({
+      id: label,
+      label,
+      ...(signal !== undefined ? { signal } : {}),
+    });
+  }
+
+  /** Provider pacing: the wave's own fan-out width. When a review-turn cap
+   * is configured, a wave never starts more lens tasks than the global cap;
+   * the shared FIFO gate still enforces the combined lead+lens limit across
+   * rounds (extra tasks simply wait their turn). */
+  private specialistWaveWidth(): number {
+    const limit = this.reviewGate?.view().review.limit ?? 0;
+    return limit > 0 ? Math.max(1, Math.min(STANDALONE_SPECIALIST_CONCURRENCY, limit)) : STANDALONE_SPECIALIST_CONCURRENCY;
   }
 
   async run(input: RunWholeReviewInput): Promise<PerkinsWholeResult> {
@@ -709,6 +741,7 @@ export class PerkinsWholeReview {
     ): Promise<SpecialistResult> => {
       this.onProgress({ lens, state: 'running' });
       let handle: AgentHandle | null = null;
+      let reviewLease: PacingLease | null = null;
       let settled: SpecialistResult | null = null;
       let disposeArtifactError: unknown | null = null;
       let raw: string | null = null;
@@ -760,6 +793,7 @@ export class PerkinsWholeReview {
         },
       };
       try {
+        reviewLease = await this.acquireReviewTurnSlot(`lens:${lens}#${attempt}`, signal);
         handle = await boundedSpawn(() => this.spawner('perkins', {
           // The blind child is rooted OUTSIDE the repository: even a future
           // tool leak would find no repo to read. Other children read the
@@ -938,6 +972,8 @@ export class PerkinsWholeReview {
             }
           }
         }
+        reviewLease?.release();
+        reviewLease = null;
       }
       if (disposeArtifactError !== null && settled !== null) {
         settled = {
@@ -1034,7 +1070,11 @@ export class PerkinsWholeReview {
         }
         let poolOutcome: PoolOutcome<SpecialistResult | undefined>;
         try {
-          poolOutcome = await pool(scheduled, batch.concurrency, (run) =>
+          // The resident wave admission (beginChildren) and the provider
+          // pacing cap both bound the fan-out: run the narrower of the two.
+          // Pacing never refuses a wave, it only throttles its width.
+          const waveWidth = Math.max(1, Math.min(batch.concurrency, this.specialistWaveWidth()));
+          poolOutcome = await pool(scheduled, waveWidth, (run) =>
             runSpecialist(run.lens, run.attempt, run.previous, signal));
         } finally {
           batch.finish();
@@ -1458,9 +1498,11 @@ export class PerkinsWholeReview {
     ].join('\n');
     const initialPrompt = this.leadPrompt(review, prior, priorReview.targetSha);
     let lead: AgentHandle | null = null;
+    let reviewLease: PacingLease | null = null;
     let unsubscribe = (): void => {};
     let turns = 0;
     try {
+      reviewLease = await this.acquireReviewTurnSlot('lead', input.signal);
       lead = await boundedSpawn(() => this.spawner('perkins', {
         cwd: review.manifest.repoPath,
         reviewLead: {
@@ -1494,6 +1536,7 @@ export class PerkinsWholeReview {
     } finally {
       unsubscribe();
       await lead?.dispose();
+      reviewLease?.release();
     }
   }
 

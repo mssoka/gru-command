@@ -5,7 +5,7 @@ import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
 import { RuntimeRegistry } from './runtime/registry.js';
-import { resolveRateLimitBackoff } from './runtime/pacing.js';
+import { resolvePacingPolicy } from './runtime/pacing.js';
 import { SessionStore } from './sessions/store.js';
 import { LedgerDb } from './ledger/db.js';
 import { LedgerApi, type NotificationRecord } from './ledger/api.js';
@@ -514,10 +514,27 @@ async function main(): Promise<number> {
   // Late-bound (the verification server lands below) — same pattern as
   // supervisionFor / decisionsStatus above.
   let verificationView: () => VerificationQueueView | null = () => null;
+  // Provider pacing (owner heist 2026-09-29): one resolved policy for the
+  // process — the optional rate-limit backoff plus the FIFO admission gate
+  // shared by worker dispatches, directive deliveries, and Perkins rounds.
+  // Every queue/admission lands on the ledger; the board reads the live
+  // gate view. A section-absent config resolves to an off backoff and an
+  // unlimited gate: exactly the pre-pacing behavior.
+  const pacing = resolvePacingPolicy(config.pacing, {
+    record: (event) => {
+      ledger.appendCustomEvent({
+        kind: event.kind,
+        agentId: event.agentId ?? null,
+        jobId: event.jobId ?? null,
+        payload: event.payload,
+      });
+    },
+  });
   const engine = new BoardEngine({
     ledger,
     bus,
     supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
+    pacing: () => (config.pacing.enabled ? pacing.gate.view() : null),
     decisionsStatus: () => decisions?.status() ?? {
       enabled: false,
       status: 'disabled',
@@ -596,7 +613,7 @@ async function main(): Promise<number> {
     ledger,
     notifications,
     decisions: decisionRuntime,
-    rateLimitBackoff: resolveRateLimitBackoff(config.concurrency),
+    rateLimitBackoff: pacing.backoff,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   supervisor = supervisorLive;
@@ -752,6 +769,7 @@ async function main(): Promise<number> {
     ledger,
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
+    workerGate: pacing.gate,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -759,6 +777,7 @@ async function main(): Promise<number> {
     ledger,
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
+    reviewGate: pacing.gate,
     poster: new AutoVerdictPoster(),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     maxConcurrentChildren: config.review.maxConcurrentChildren,
@@ -797,6 +816,7 @@ async function main(): Promise<number> {
     ledger,
     worktrees: worktreeManager,
     notifications,
+    workerGate: pacing.gate,
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,
   });
@@ -852,6 +872,7 @@ async function main(): Promise<number> {
     dispatch: dispatcher,
     wave,
     ledger,
+    workerGate: pacing.gate,
     ...(config.silas.enabled && silasSlot !== null
       ? { silasOps: { registry, worktrees: worktreeManager, notifications } }
       : {}),

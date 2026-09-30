@@ -13,6 +13,7 @@ import {
   type DirectiveRegistry,
 } from './fix-directive.js';
 import type { WorktreePort } from './worktree-port.js';
+import type { PacingGate } from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -59,6 +60,9 @@ export interface ReconcileRebriefDeps {
   readonly worktrees: WorktreePort;
   readonly notifications: RecoveryNotifications;
   readonly log?: Log;
+  /** Provider pacing: worker (minion turn) admission gate for re-dispatched
+   * re-briefs. Absent = off. */
+  readonly workerGate?: PacingGate;
   /** True while the process is deliberately stopping: a turn killed by
    * shutdown is not a recovery failure — the next boot retries the marker. */
   readonly stopping?: () => boolean;
@@ -333,6 +337,7 @@ function runRebriefTurn(
     registry: deps.registry,
     ledger: deps.ledger,
     worktrees: deps.worktrees,
+    ...(deps.workerGate !== undefined ? { workerGate: deps.workerGate } : {}),
     jobId: input.jobId,
     note: input.note,
     briefing: input.briefing,
