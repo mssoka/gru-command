@@ -34,7 +34,7 @@ const PINS: Record<string, number> = {
   'dispatch-joins.test.ts': 2,
   'dispatch-server.test.ts': 20,
   'fix-directive.test.ts': 7,
-  'github-poll.test.ts': 22,
+  'github-poll.test.ts': 24,
   'health.test.ts': 19,
   'identity.test.ts': 3,
   'install-one-line.test.ts': 35,
@@ -54,6 +54,7 @@ const PINS: Record<string, number> = {
   'logger.test.ts': 3,
   'native-tools-parity.test.ts': 2,
   'notifications.test.ts': 19,
+  'owner-actions.test.ts': 8,
   'perkins-builtin-wave.test.ts': 88,
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
   'perkins-freeze-freshhead.test.ts': 13,
