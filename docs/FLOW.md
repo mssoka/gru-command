@@ -234,6 +234,29 @@ Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a
 tenant's CI.
 
+## 4d. Resident worker admission
+
+`[concurrency] max_workers` (default 4) bounds live non-core worker sessions
+across every heist, including idle minions, review leads and children, on both
+runtime adapters. Gru, Silas, Bob and the separate `[verify]` scheduler are not
+charged to this pool. At capacity, new sessions wait FIFO; an eligible idle
+minion is disposed through its normal session path before a waiting request is
+admitted. A display `idle` state alone is insufficient: pending prompts,
+control/tool activity, supervision's open-turn truth, and an as-yet-undelivered
+first prompt prohibit eviction. A residency release never sweeps the transcript
+or job worktree.
+
+A Perkins round waits for two permits together before starting its lead,
+reserving room for at least one child. Optional parallel lens children use
+spare slots only when no older admission is waiting; the configured
+`[review] max_concurrent_children` (default 2) is a ceiling *inside* the
+shared pool, not extra capacity. A minion sending `POST /api/dispatch/review`
+with `by: "minion"` while its own branch is busy receives a durable queued
+handoff receipt (202) immediately. The branch-idle guard still prevents
+freezing until that minion's delivery event; a queued round then appears in
+the ledger as `round.residency-queued` until its lead/child pair is admitted.
+Queued waits consume no reviewer turn or spawn timeout.
+
 ## 5. Release (the sweep)
 
 `POST /api/dispatch/release` `{job_id, confirm_kill?, base_branch?}` —

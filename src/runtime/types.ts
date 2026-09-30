@@ -116,6 +116,8 @@ export interface IsolatedReviewPolicy {
 
 /** Options for spawn(). */
 export interface SpawnOptions {
+  /** Cancel a queued resident admission without starting an adapter spawn. */
+  readonly signal?: AbortSignal;
   /**
    * Resume an existing session file instead of creating a new one.
    * When omitted a fresh session is created.
@@ -169,7 +171,8 @@ export type RuntimeEvent =
   | { readonly type: 'tool_end'; readonly callId: string; readonly isError: boolean }
   | { readonly type: 'turn_start' }
   | { readonly type: 'turn_end' }
-  | { readonly type: 'compaction_start' }
+  | { readonly type: 'cessation_evidence'; readonly evidence: 'ceased' | 'unknown' }
+| { readonly type: 'compaction_start' }
   | {
       readonly type: 'compaction_end';
       readonly success: boolean;
@@ -218,6 +221,15 @@ export interface PendingTurn {
 
 /** One live agent session hosted by a runtime. */
 export interface AgentHandle {
+  /** Adapter-owned cessation evidence. 'ceased': the adapter observed the
+   * real completion of ALL work and cleanup resources it owns for this
+   * handle (runs, retries, continuations, compaction, summaries, native
+   * child exit where applicable, bridges/locks/control). 'unknown':
+   * anything less — missing/throwing evidence, unobserved exits, deadline
+   * settlement, or owned-but-independently-running work (e.g. an SDK bash
+   * controller still active). Metadata flags, dispose fulfillment, and
+   * heartbeat predicates are NEVER proof. Optional: absence = unknown. */
+  cessationEvidence?: () => 'ceased' | 'unknown';
   readonly role: Role;
   readonly id: string;
   readonly sessionFile: string | null;

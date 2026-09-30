@@ -75,6 +75,7 @@ describe('config-generate CLI', () => {
       'lessons',
       'silas',
       'roll',
+      'concurrency',
       'review',
       'verify',
     ]);
@@ -108,6 +109,10 @@ describe('config-generate CLI', () => {
     expect(loaded.dataDir).toBe(instance);
     expect(loaded.models.default).toBe('default');
     expect(loaded.thinking.default).toBe('default');
+    expect(raw.concurrency).toMatchObject({ max_workers: 4 });
+    expect(raw.review).toMatchObject({ max_concurrent_children: 2 });
+    expect(loaded.concurrency.maxWorkers).toBe(4);
+    expect(loaded.review.maxConcurrentChildren).toBe(2);
     expect(loaded.supervision).toMatchObject({
       enabled: true,
       turnSilenceMs: 900_000,
@@ -252,6 +257,10 @@ describe('config-generate CLI', () => {
       'turn_silence_ms = 600000',
       '[dispatch]',
       'bob_interval_ms = 120000',
+      '[concurrency]',
+      'max_workers = 8',
+      '[review]',
+      'max_concurrent_children = 6',
       '[worktrees]',
       `root = ${JSON.stringify(join(root, 'lanes'))}`,
     ].join('\n');
@@ -279,6 +288,8 @@ describe('config-generate CLI', () => {
     expect(claudePolicy.roles).toMatchObject({ minion: { thinking_level: 'low' } });
     expect((raw.supervision as Record<string, number>).turn_silence_ms).toBe(600000);
     expect((raw.dispatch as Record<string, number>).bob_interval_ms).toBe(120000);
+    expect(raw.concurrency).toMatchObject({ max_workers: 8 });
+    expect(raw.review).toMatchObject({ max_concurrent_children: 6 });
     expect((raw.worktrees as Record<string, string>).root).toBe(join(root, 'lanes'));
 
     // Fail-loud-clean: the round-tripped file boots through the REAL loader.
@@ -287,6 +298,8 @@ describe('config-generate CLI', () => {
     expect(loaded.server.host).toBe('192.168.1.23');
     expect(loaded.auth.token).toBe('prior-secret-token');
     expect(loaded.dispatch.bobIntervalMs).toBe(120000);
+    expect(loaded.concurrency.maxWorkers).toBe(8);
+    expect(loaded.review.maxConcurrentChildren).toBe(6);
     expect(loaded.worktrees.root).toBe(join(root, 'lanes'));
   });
 

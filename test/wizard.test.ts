@@ -234,6 +234,18 @@ describe('wizard config generation', () => {
     // operator's token instead of silently regenerating it.
     const w3 = writeWizardConfig(instanceDir, parseAnswers('{}'), home, true);
     expect(readFileSync(w3.configPath, 'utf-8')).toContain('second-token');
+    // Unprompted worker settings survive a wizard re-run alongside unrelated state.
+    const customized = readFileSync(w3.configPath, 'utf-8')
+      .replace('max_workers = 4', 'max_workers = 8')
+      .replace('max_concurrent_children = 2', 'max_concurrent_children = 6');
+    writeFileSync(w3.configPath, customized);
+    const w4 = writeWizardConfig(instanceDir, parseAnswers('{}'), home, true);
+    expect(readFileSync(w4.configPath, 'utf-8')).toContain('max_workers = 8');
+    expect(readFileSync(w4.configPath, 'utf-8')).toContain('max_concurrent_children = 6');
+    expect(loadConfig({ GRU_COMMAND_HOME: instanceDir }, home)).toMatchObject({
+      concurrency: { maxWorkers: 8 }, review: { maxConcurrentChildren: 6 },
+      auth: { token: 'second-token' },
+    });
     // The backup timestamp is filesystem-safe (no colons).
     expect(backupTimestamp()).not.toContain(':');
   });

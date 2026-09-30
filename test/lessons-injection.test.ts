@@ -149,6 +149,40 @@ describe('progressive-disclosure injection', () => {
     expect(prompt).not.toContain(BODY_SENTINEL);
   });
 
+  it('re-briefs from the original contract when an evicted minion transcript cannot resume', async () => {
+    const root = tmpDir('gru-command-directive-resume-');
+    const ledgerDb = new LedgerDb(join(root, 'data'));
+    const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus() });
+    const repoPath = join(root, 'repo');
+    mkdirSync(repoPath);
+    const worktrees = new InMemoryWorktreePort(join(root, 'lanes'));
+    ledger.addJob({ id: 'job-resume', repo: 'fixture', title: 'resume', briefing: 'original implementation contract' });
+    await worktrees.createJobWorktree({ repoPath, jobId: 'job-resume' });
+    ledger.registerAgent({ id: 'old-minion', role: 'minion', jobId: 'job-resume', sessionFile: join(root, 'old-session.jsonl') });
+    const spawns: Array<string | null> = [];
+    const prompts: string[] = [];
+    try {
+      const result = await routeFixDirectiveToMinion({
+        registry: {
+          getHandle: () => null,
+          spawn: async (role, options) => {
+            spawns.push(options?.resumeFile ?? null);
+            if (options?.resumeFile !== undefined) throw new Error('resume unavailable');
+            return fakeHandle(role, prompts);
+          },
+          disposeHandle: async () => {},
+        },
+        ledger, worktrees, jobId: 'job-resume', directive: 'fix the failing test',
+        signal: new AbortController().signal,
+      });
+      expect(spawns).toEqual([join(root, 'old-session.jsonl'), null]);
+      expect(result.delivered).toBe(true);
+      expect(prompts[0]).toContain('original implementation contract');
+      expect(prompts[0]).toContain('fix the failing test');
+      expect(ledger.listAgents().some((agent) => agent.id === result.minionId && agent.jobId === 'job-resume')).toBe(true);
+    } finally { ledgerDb.close(); }
+  });
+
   it('injects pointers when routing a fix directive to the implementing minion', async () => {
     const root = tmpDir('gru-command-directive-injection-');
     const dataDir = join(root, 'data');
@@ -158,6 +192,7 @@ describe('progressive-disclosure injection', () => {
     const repoPath = join(root, 'repo');
     mkdirSync(repoPath, { recursive: true });
     const worktrees = new InMemoryWorktreePort(join(root, 'wt'));
+    ledger.addJob({ id: 'job-3', repo: 'fixture', title: 'directive', briefing: 'original contract' });
     await worktrees.createJobWorktree({ repoPath, jobId: 'job-3' });
     const prompts: string[] = [];
     try {
