@@ -626,7 +626,14 @@ describe('install.sh setup mode (one-line path)', () => {
       GRU_COMMAND_LAUNCHCTL: manager,
       GRU_COMMAND_SYSTEMCTL: manager,
     };
-    expect(run(join(bare, 'install.sh'), ['--answers', '{}'], env).status).toBe(0);
+    // The instance is provisioned directly (the retained-config pattern the
+    // neighbouring update test uses). The contract under test is service
+    // ownership on the update path, and the first bare run below still
+    // exercises clone-when-absent + build before the restart decision; the
+    // setup+wizard leg this replaces spent a full extra installer cycle on
+    // coverage this file carries in its own dedicated cases.
+    mkdirSync(instance, { recursive: true });
+    writeFileSync(join(instance, 'config.toml'), 'retained-user-config\n');
 
     mkdirSync(dirname(unit), { recursive: true });
     writeFileSync(unit, '/someone/else/dist/main.js\n/someone/else/.gru-command\n');
