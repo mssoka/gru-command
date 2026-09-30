@@ -840,7 +840,7 @@ test.describe('chat pane reflow (owner heist)', () => {
   async function sendStressReply(page: Page): Promise<void> {
     const stress = await page.request.post('http://localhost:8788/__stress', {
       headers: { authorization: `Bearer ${MOCK_TOKEN}` },
-      data: { tool: `mcp__${'x'.repeat(90)}`, error: `failed: /Users/minion/${'y'.repeat(90)}` },
+      data: { tool: `mcp__${'x'.repeat(90)}`, error: `failed: /opt/minion/${'y'.repeat(90)}` },
     });
     expect(stress.ok()).toBe(true);
     await sendStress(
