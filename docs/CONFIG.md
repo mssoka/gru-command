@@ -191,6 +191,9 @@ restart_window_ms = 600000
 max_restarts = 3
 # Backoff base between failed restart rungs (doubles, capped at 60s).
 restart_backoff_ms = 2000
+# Compact an IDLE session proactively once context usage reaches this
+# percent (1-100); pi's own threshold compaction stays as the backstop.
+proactive_compact_percent = 70
 
 [logging]
 # service.log size-based rotation.
@@ -280,6 +283,16 @@ escalate_at = 4
 # interrupted rounds INCOMPLETE and resumes sessions).
 drain_timeout_ms = 900000
 
+[concurrency]
+# Service-wide resident worker sessions (including idle minions, review
+# leads and lens children). Gru, Silas and Bob do not use this pool.
+# With Perkins reviews enabled (the default), at least 2 are required so
+# a review lead and one child can be admitted together; at capacity new
+# work queues FIFO and only genuinely idle workers are reclaimed
+# (sessions, lanes and untracked work are preserved for resume).
+# Positive integer <= 128 (documented sanity ceiling).
+max_workers = 4
+
 [review]
 # Review gate policy. true keeps Perkins as the primary gate behind the
 # fail-closed four-leg pre-flight (bundled resource integrity, review-model
@@ -289,6 +302,10 @@ drain_timeout_ms = 900000
 # gate (findings triaged; blockers routed to the implementing minion as fix
 # directives; 0 blockers = clear to merge; merge stays user-held).
 enabled = true
+# Simultaneous lens children inside the global resident pool (not extra slots).
+# Positive integer <= 32 (review-gated bound); effective concurrency also
+# depends on spare global slots.
+max_concurrent_children = 2
 
 [verify]
 # Verification scheduler: lanes request their project's verify command

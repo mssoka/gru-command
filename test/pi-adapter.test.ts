@@ -73,6 +73,7 @@ interface FixtureOptions {
   readonly modelCatalogRefresh?: PiRuntimeOptions['modelCatalogRefresh'];
   readonly configExtra?: string;
   readonly log?: PiRuntimeOptions['log'];
+  readonly compactionDeadlineMs?: number;
 }
 
 async function fixture(
@@ -102,6 +103,9 @@ async function fixture(
       ? { modelCatalogRefresh: options.modelCatalogRefresh }
       : {}),
     ...(options.log !== undefined ? { log: options.log } : {}),
+    ...(options.compactionDeadlineMs !== undefined
+      ? { compactionDeadlineMs: options.compactionDeadlineMs }
+      : {}),
   });
   return { home, workspace, agentDir, store, script, config, modelRuntime, runtime };
 }
@@ -643,6 +647,84 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     expect(
       events.filter((event) => event.type === 'compaction_end' && !event.success),
     ).toHaveLength(1);
+  });
+
+  it('bounds an explicit compaction at the deadline, aborts the native call, and stays usable', async () => {
+    const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }], ['text'], {
+      compactionDeadlineMs: 25,
+    });
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    try {
+      await handle.prompt('prime');
+      type InternalSession = {
+        compact(): Promise<unknown>;
+        abort(): Promise<void>;
+        readonly sessionId: string;
+        readonly sessionFile: string | undefined;
+        readonly isIdle: boolean;
+        readonly isCompacting: boolean;
+      };
+      const internal = handle as unknown as { session: InternalSession };
+      const nativeSession = internal.session;
+      let abortCalls = 0;
+      internal.session = new Proxy(nativeSession, {
+        get(target, key) {
+          if (key === 'compact') {
+            return () => new Promise<void>(() => {}); // a summary call that never settles
+          }
+          if (key === 'abort') {
+            return async () => {
+              abortCalls += 1;
+            };
+          }
+          return Reflect.get(target, key, target);
+        },
+      });
+      await expect(handle.compact?.()).rejects.toThrow(/exceeded the 25ms deadline/);
+      expect(abortCalls).toBe(1);
+      const failures = events.filter(
+        (event) => event.type === 'compaction_end' && !event.success,
+      );
+      expect(failures).toHaveLength(1);
+      expect((failures[0] as { error?: string }).error).toMatch(/25ms deadline/);
+      // The session identity survived and the lane still accepts turns.
+      internal.session = nativeSession;
+      expect(handle.health().state).not.toBe('disposed');
+      await handle.prompt('after the deadline');
+      expect(fx.script.calls.map((call) => call.prompt)).toContain('after the deadline');
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('bounds a silent pi-auto compaction at the deadline without a session restart', async () => {
+    const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }], ['text'], {
+      compactionDeadlineMs: 25,
+    });
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    try {
+      // Pi's threshold/overflow compaction has no caller to own a timeout;
+      // inject the start event the adapter forwards to supervision.
+      (handle as unknown as { onPiEvent(event: unknown): void }).onPiEvent({
+        type: 'compaction_start',
+        reason: 'threshold',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(events.some((event) => event.type === 'compaction_start')).toBe(true);
+      const failures = events.filter(
+        (event) => event.type === 'compaction_end' && !event.success,
+      );
+      expect(failures).toHaveLength(1);
+      expect((failures[0] as { error?: string }).error).toMatch(/25ms deadline/);
+      // The deadline closes the open control without disposing the handle.
+      expect(handle.health().state).not.toBe('disposed');
+      await handle.prompt('still usable');
+      expect(fx.script.calls.map((call) => call.prompt)).toContain('still usable');
+    } finally {
+      await handle.dispose();
+    }
   });
 
   it('emits thinking deltas before text when the model reasons', async () => {
@@ -1388,11 +1470,11 @@ describe('RuntimeRegistry', () => {
   it('resolves claude-code to a fallback-wrapped adapter and still rejects unknown ids', () => {
     const store = new SessionStore(mkdtempSync(join(tmpdir(), 'gru-command-reg-')));
     cleanupDirs.push(store.dataDir);
-    // Minimal config stand-in: the registry only reads runtimes for this
-    // path; constructing the claude-code adapter must not touch disk or
-    // probe the binary (that happens lazily at spawn).
+    // Minimal config stand-in: the registry reads runtimes and the resident
+    // concurrency limit for this path; constructing the claude-code adapter
+    // must not touch disk or probe the binary (that happens lazily at spawn).
     const registry = new RuntimeRegistry({
-      config: { runtimes: { default: 'pi', roles: {} } } as never,
+      config: { runtimes: { default: 'pi', roles: {} }, concurrency: { maxWorkers: 4 } } as never,
       store,
     });
     // Pre-E3 this threw "no adapter implementation yet" (red → green flip):

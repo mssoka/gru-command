@@ -1,12 +1,16 @@
 import { statSync } from 'node:fs';
 import type { Role, SupervisionConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { AgentHandle, AgentState, PendingTurn, SpawnOptions } from '../runtime/types.js';
+import type { AgentHandle, AgentState, ContextUsage, PendingTurn, SpawnOptions } from '../runtime/types.js';
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DecisionService } from '../decisions/types.js';
-import { deterministicFailureClass, supervisionDecisionRequest } from '../decisions/questions.js';
+import {
+  deterministicFailureClass,
+  supervisionDecisionRequest,
+  type FailureClass,
+} from '../decisions/questions.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -51,6 +55,14 @@ export interface SupervisorRegistry {
  * In-band turn errors (state 'error', next turn recovers — the adapter
  * contract) are NEVER restarts. Only hangs (open turn, silence past the
  * timeout) and fatal runtime errors climb the ladder.
+ *
+ * Proactive context compaction (dispatch briefing 2026-09-29): an idle
+ * session past `proactive_compact_percent` is compacted explicitly at a
+ * turn boundary so pi's own threshold compaction never fires mid-turn.
+ * A provider-wall / stream-error condition defers any attempt until a
+ * clean turn proves recovery (one durable deferred-retry ledger event per
+ * episode); a failed attempt degrades the session and never climbs the
+ * restart ladder. Pi's threshold compaction stays enabled as the backstop.
  */
 
 export type SupervisionState = 'watching' | 'restarting' | 'stopped';
@@ -74,10 +86,61 @@ export interface AgentSupervisionView {
    * "working" so a stopped lane never reads as live work. */
   readonly stopReason: string | null;
   readonly openTurn: boolean;
+  /** Control operations are always emitted by the real supervisor. */
+  readonly openControl?: boolean;
   /** Tool calls currently open (a live process here is activity, not a hang). */
   readonly openToolCalls: number;
   readonly lastEventAt: string | null;
   readonly lastFileBytes: number | null;
+  /** Latest context-usage percentage the proactive compaction gate saw
+   * (null = not measured or already compacted). */
+  readonly contextPercent: number | null;
+  /** A failed compaction attempt degraded this session; no restart was
+   * spent. Cleared by a later successful compaction. */
+  readonly compactionDegraded: boolean;
+  /** The gate is holding a needed compaction until provider recovery. */
+  readonly compactionDeferred: boolean;
+}
+
+/** Provider health for one supervised session: set by a stream error or a
+ * failed compaction summary call, cleared by the next clean turn. */
+interface ProviderCondition {
+  readonly failureClass: FailureClass;
+  readonly reason: string;
+  readonly at: number;
+}
+
+/** Proactive context-compaction bookkeeping (dispatch briefing 2026-09-29). */
+interface CompactionGateState {
+  /** An explicit compact() call is in flight from the gate. */
+  inFlight: boolean;
+  /** The gate held a needed compaction for provider recovery. */
+  deferred: boolean;
+  /** Dedupe: one deferred-retry ledger event per provider episode. */
+  deferredRecorded: boolean;
+  /** Last failed attempt, or null while the session is healthy. */
+  degradedReason: string | null;
+  /** A failed attempt retries only after a clean turn proves recovery. */
+  retryBlocked: boolean;
+  /** Last percentage observed at a gate evaluation. */
+  lastPercent: number | null;
+  /** activityGeneration at the last attempt; same generation = no retry. */
+  lastAttemptGeneration: number | null;
+  /** Attempt counter (ledger evidence). */
+  attempts: number;
+}
+
+function freshCompactionGate(): CompactionGateState {
+  return {
+    inFlight: false,
+    deferred: false,
+    deferredRecorded: false,
+    degradedReason: null,
+    retryBlocked: false,
+    lastPercent: null,
+    lastAttemptGeneration: null,
+    attempts: 0,
+  };
 }
 
 export interface SupervisionStatus {
@@ -85,6 +148,8 @@ export interface SupervisionStatus {
   readonly turnSilenceMs: number;
   readonly restartWindowMs: number;
   readonly maxRestarts: number;
+  /** Idle-boundary context percentage that triggers proactive compaction. */
+  readonly proactiveCompactPercent: number;
   readonly agents: readonly AgentSupervisionView[];
 }
 
@@ -133,6 +198,11 @@ interface SupervisedAgent {
     activityGeneration: number;
     openTurn: boolean;
   } | null;
+  /** Active provider-wall / stream-error condition for this session's
+   * model route; compaction attempts are deferred while it holds. */
+  providerCondition: ProviderCondition | null;
+  /** Proactive context-compaction gate state. */
+  compaction: CompactionGateState;
 }
 
 /** What a restart rung must know to recover a killed open turn. */
@@ -548,6 +618,15 @@ export class Supervisor {
           break;
         case 'compaction_end':
           agent.openControl = false;
+          // A compaction that failed OUTSIDE the gate's own attempt (pi's
+          // threshold backstop) degrades the session; it never restarts.
+          if (!event.success && !agent.compaction.inFlight) {
+            this.noteCompactionFailure(
+              agent,
+              event.error ?? 'native compaction failed',
+              agent.compaction.lastPercent,
+            );
+          }
           break;
         case 'tool_start':
           agent.openToolCalls.set(event.callId, event.tool);
@@ -560,9 +639,22 @@ export class Supervisor {
             agent.openTurn = false;
             agent.openControl = false;
             agent.openToolCalls.clear();
+          } else if (event.state === 'idle') {
+            // A clean turn boundary is recovery proof for the model route:
+            // the next compaction attempt may try.
+            this.settleProviderCondition(agent);
+            this.maybeProactiveCompact(agent);
           }
           break;
         case 'error':
+          // Any in-band stream error is a provider-health signal for the
+          // compaction gate, independent of supervision policy: a summary
+          // call issued now would very likely fail the same way.
+          agent.providerCondition = {
+            failureClass: deterministicFailureClass(event.error),
+            reason: event.error,
+            at: this.now(),
+          };
           if (!this.cfg.enabled) {
             // Supervision off = pure registry behavior: errors are the
             // runtime's/owner's business — observed, never acted on.
@@ -596,6 +688,187 @@ export class Supervisor {
         error: String(error),
       });
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Proactive context compaction gate (dispatch briefing 2026-09-29)
+  // ------------------------------------------------------------------
+
+  /**
+   * A large session must not have pi's threshold compaction fire mid-turn
+   * into a provider outage. When a session is IDLE at a turn boundary and
+   * reported usage crosses `proactive_compact_percent`, compact explicitly
+   * here. While a provider-wall / stream-error condition holds, the attempt
+   * is deferred (one durable ledger event per episode) and retried only
+   * after a clean turn proves recovery. A failed attempt degrades the
+   * session; it never climbs the restart ladder. Pi's own threshold
+   * compaction stays enabled as the backstop.
+   */
+  private maybeProactiveCompact(agent: SupervisedAgent): void {
+    if (this.disposed || !this.cfg.enabled) return;
+    const handle = agent.handle;
+    if (handle === null || agent.state !== 'watching' || agent.breakerOpen || agent.inRestart) return;
+    const gate = agent.compaction;
+    if (gate.inFlight || handle.compact === undefined) return;
+    if (gate.lastAttemptGeneration !== null && gate.lastAttemptGeneration === agent.activityGeneration) {
+      return; // no new activity since the last attempt
+    }
+    let canCompact = false;
+    try {
+      canCompact = handle.canCompact?.() === true;
+    } catch (error) {
+      this.log('warn', 'compaction availability probe failed', {
+        agent_id: agent.agentId,
+        error: String(error),
+      });
+      return;
+    }
+    if (!canCompact) return; // a live turn, queued message, or compaction owns the session
+    let usage: ContextUsage | null = null;
+    try {
+      usage = handle.getContextUsage?.() ?? null;
+    } catch (error) {
+      this.log('warn', 'context-usage probe failed', {
+        agent_id: agent.agentId,
+        error: String(error),
+      });
+      return;
+    }
+    if (usage === null) return;
+    gate.lastPercent = usage.percent;
+    if (usage.percent < this.cfg.proactiveCompactPercent) return;
+    if (agent.providerCondition !== null) {
+      gate.deferred = true;
+      this.deferCompaction(agent, usage.percent, agent.providerCondition);
+      return;
+    }
+    if (gate.retryBlocked) return; // a failed attempt waits for recovery proof
+    void this.runProactiveCompaction(agent, handle, usage);
+  }
+
+  /** Defer a needed compaction while the provider condition holds; the
+   * deferred-retry ledger event lands at most once per provider episode. */
+  private deferCompaction(
+    agent: SupervisedAgent,
+    percent: number | null,
+    condition: ProviderCondition,
+  ): void {
+    agent.compaction.deferred = true;
+    if (agent.compaction.deferredRecorded) return;
+    agent.compaction.deferredRecorded = true;
+    this.recordEvent('supervision.compaction-deferred', agent.agentId, {
+      percent,
+      threshold: this.cfg.proactiveCompactPercent,
+      failure_class: condition.failureClass,
+      reason: condition.reason,
+      condition_since: new Date(condition.at).toISOString(),
+      retry: 'after-provider-recovery',
+    });
+    this.log('warn', 'proactive compaction deferred — provider condition active', {
+      agent_id: agent.agentId,
+      percent,
+      threshold: this.cfg.proactiveCompactPercent,
+      failure_class: condition.failureClass,
+      error: condition.reason,
+    });
+  }
+
+  private async runProactiveCompaction(
+    agent: SupervisedAgent,
+    handle: AgentHandle,
+    usage: ContextUsage,
+  ): Promise<void> {
+    const gate = agent.compaction;
+    gate.inFlight = true;
+    gate.attempts += 1;
+    const attempt = gate.attempts;
+    try {
+      await handle.compact!();
+      if (this.agents.get(agent.agentId) !== agent || agent.handle !== handle) return;
+      gate.degradedReason = null;
+      gate.deferred = false;
+      gate.deferredRecorded = false;
+      gate.retryBlocked = false;
+      gate.lastAttemptGeneration = agent.activityGeneration;
+      this.recordEvent('supervision.compaction', agent.agentId, {
+        action: 'proactive',
+        attempt,
+        percent_before: usage.percent,
+        tokens_before: usage.tokens,
+      });
+      this.log('info', 'proactive context compaction completed', {
+        agent_id: agent.agentId,
+        percent_before: usage.percent,
+        tokens_before: usage.tokens,
+      });
+    } catch (error) {
+      if (this.agents.get(agent.agentId) !== agent || agent.handle !== handle) return;
+      gate.lastAttemptGeneration = agent.activityGeneration;
+      const message = error instanceof Error ? error.message : String(error);
+      if (/\bbusy\b|compacting/i.test(message)) {
+        // Lost a race with another control actor (for example the owner's
+        // manual compact). That is not a failed attempt; the next idle
+        // boundary re-evaluates.
+        this.log('info', 'proactive compaction skipped — session became busy', {
+          agent_id: agent.agentId,
+          error: message,
+        });
+        return;
+      }
+      this.noteCompactionFailure(agent, message, usage.percent);
+    } finally {
+      gate.inFlight = false;
+    }
+  }
+
+  /** A failed compaction summary marks the session degraded and arms a
+   * recovery-gated retry. It never enters the restart ladder or the
+   * provider-wall stop: the session must stay connected through the
+   * outage. */
+  private noteCompactionFailure(
+    agent: SupervisedAgent,
+    message: string,
+    percent: number | null,
+  ): void {
+    const failureClass = deterministicFailureClass(message);
+    const condition: ProviderCondition = { failureClass, reason: message, at: this.now() };
+    agent.providerCondition = condition;
+    agent.compaction.degradedReason = message;
+    agent.compaction.retryBlocked = true;
+    if (failureClass === 'authentication_wall' || failureClass === 'quota_wall') {
+      // A wall refusal during compaction is its own deferral episode: reset
+      // the per-episode dedupe so this failed attempt is recorded once.
+      agent.compaction.deferredRecorded = false;
+      this.deferCompaction(agent, percent, condition);
+      return;
+    }
+    agent.compaction.deferred = false;
+    this.recordEvent('supervision.compaction-degraded', agent.agentId, {
+      percent,
+      failure_class: failureClass,
+      error: message,
+    });
+    this.log('warn', 'compaction failed — session degraded, no restart', {
+      agent_id: agent.agentId,
+      percent,
+      failure_class: failureClass,
+      error: message,
+    });
+  }
+
+  /** A clean turn proves the route recovered: allow the next compaction
+   * attempt (the gate re-fires from the same boundary). */
+  private settleProviderCondition(agent: SupervisedAgent): void {
+    if (agent.providerCondition === null) return;
+    const condition = agent.providerCondition;
+    agent.providerCondition = null;
+    agent.compaction.deferred = false;
+    agent.compaction.deferredRecorded = false;
+    agent.compaction.retryBlocked = false;
+    this.log('info', 'provider condition cleared — compaction retry permitted', {
+      agent_id: agent.agentId,
+      failure_class: condition.failureClass,
+    });
   }
 
   /** Idempotent adoption by agent id; creates or refreshes the record. */
@@ -652,6 +925,8 @@ export class Supervisor {
       decisionPending: false,
       failureTerminalPending: false,
       queuedRecovery: null,
+      providerCondition: null,
+      compaction: freshCompactionGate(),
     });
     this.log('info', 'supervising agent', { agent_id: agentId, role, slot: slot?.id ?? null });
     return true;
@@ -667,6 +942,9 @@ export class Supervisor {
     this.detectWake(now);
     for (const agent of this.agents.values()) {
       if (agent.handle === null || agent.state !== 'watching' || agent.breakerOpen) continue;
+      // Idle-boundary gate: a session that was already over the threshold
+      // (resumed, or crossed while a tick was missed) still compacts here.
+      this.maybeProactiveCompact(agent);
       const busy = this.handleBusy(agent.handle);
       if (!busy && !agent.openTurn && !agent.openControl) continue;
       // Liveness = events OR bytes: session-file growth also resets the clock.
@@ -1248,6 +1526,11 @@ export class Supervisor {
     adopted.restartRing = old.restartRing;
     adopted.breakerOpen = old.breakerOpen;
     adopted.breakerNotificationId = old.breakerNotificationId;
+    // Provider health is route-level, not session-level: a resumed session
+    // must not compact into the outage the restart happened in. The gate's
+    // own bookkeeping restarts fresh for the new handle.
+    adopted.providerCondition = old.providerCondition;
+    adopted.compaction = freshCompactionGate();
     // A turn interrupted by an earlier failed rung (or by the breaker
     // stop) still awaits resume on the next live handle.
     adopted.pendingRecovery = old.pendingRecovery;
@@ -1478,6 +1761,7 @@ export class Supervisor {
       turnSilenceMs: this.cfg.turnSilenceMs,
       restartWindowMs: this.cfg.restartWindowMs,
       maxRestarts: this.cfg.maxRestarts,
+      proactiveCompactPercent: this.cfg.proactiveCompactPercent,
       agents: [...this.agents.values()].map((agent) => ({
         agentId: agent.agentId,
         role: agent.role,
@@ -1487,10 +1771,14 @@ export class Supervisor {
         breakerOpen: agent.breakerOpen,
         stopReason: agent.stopReason,
         openTurn: agent.openTurn,
+        openControl: agent.openControl,
         openToolCalls: agent.openToolCalls.size,
         lastEventAt:
           agent.lastEventAt > 0 ? new Date(agent.lastEventAt).toISOString() : null,
         lastFileBytes: agent.lastFileBytes,
+        contextPercent: agent.compaction.lastPercent,
+        compactionDegraded: agent.compaction.degradedReason !== null,
+        compactionDeferred: agent.compaction.deferred,
       })),
     };
   }
@@ -1508,10 +1796,14 @@ export class Supervisor {
       breakerOpen: agent.breakerOpen,
       stopReason: agent.stopReason,
       openTurn: agent.openTurn,
+      openControl: agent.openControl,
       openToolCalls: agent.openToolCalls.size,
       lastEventAt:
         agent.lastEventAt > 0 ? new Date(agent.lastEventAt).toISOString() : null,
       lastFileBytes: agent.lastFileBytes,
+      contextPercent: agent.compaction.lastPercent,
+      compactionDegraded: agent.compaction.degradedReason !== null,
+      compactionDeferred: agent.compaction.deferred,
     };
   }
 

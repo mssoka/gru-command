@@ -150,6 +150,24 @@ export interface SelfHealView {
   readonly since: string | null;
 }
 
+/** FOR YOU (owner approval 2026-09-28): one PR genuinely ready for the
+ * owner — the SERVER-computed, evidence-bound projection (approved
+ * head-bound review round + clean mergeable state + green CI at the
+ * exact head). The browser never re-derives readiness. */
+export interface OwnerPrView {
+  /** Stable row/action id: `owner-pr:{jobId}`. */
+  readonly id: string;
+  readonly jobId: string;
+  readonly jobTitle: string;
+  readonly repo: string;
+  /** https PR URL — the OPEN PR target, never an in-app merge. */
+  readonly prUrl: string;
+  /** The exact head sha every piece of evidence is bound to. */
+  readonly sha: string;
+  /** ISO stamp of the branch-state observation the row rests on. */
+  readonly checkedAt: string;
+}
+
 export interface BoardSnapshot {
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
@@ -166,6 +184,9 @@ export interface BoardSnapshot {
   readonly silas?: SilasView | null;
   readonly verify?: VerifyQueueView | null;
   readonly selfHeal?: SelfHealView | null;
+  /** FOR YOU PR rows (owner approval 2026-09-28); absent on pre-upgrade
+  * servers (validator tolerates; the band renders ack rows only). */
+  readonly ownerPrs?: readonly OwnerPrView[] | null;
 }
 
 export interface TranscriptInfo {
@@ -363,6 +384,29 @@ function isSelfHealView(value: unknown): value is SelfHealView {
   );
 }
 
+function isOwnerPrView(value: unknown): value is OwnerPrView {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== 'string' || value.id === '' ||
+    typeof value.jobId !== 'string' || value.jobId === '' ||
+    typeof value.jobTitle !== 'string' ||
+    typeof value.repo !== 'string' ||
+    typeof value.prUrl !== 'string' ||
+    typeof value.sha !== 'string' || value.sha === '' ||
+    typeof value.checkedAt !== 'string'
+  ) {
+    return false;
+  }
+  // OPEN PR targets are https only — a non-https prUrl can never render a
+  // link, so it fails closed at the validator, the projection, AND the
+  // render (three guards, one rule).
+  try {
+    return new URL(value.prUrl).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 function isWakesView(value: unknown): boolean {
   return (
     isRecord(value) &&
@@ -396,6 +440,10 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (value.silas !== undefined && value.silas !== null && !isSilasView(value.silas)) return false;
   if (value.verify !== undefined && value.verify !== null && !isVerifyQueueView(value.verify)) return false;
   if (value.selfHeal !== undefined && value.selfHeal !== null && !isSelfHealView(value.selfHeal)) return false;
+  // FOR YOU PR rows: absent on pre-upgrade servers (tolerated), but a
+  // present block must match its shape — readiness is server authority.
+  if (value.ownerPrs !== undefined && value.ownerPrs !== null && !Array.isArray(value.ownerPrs)) return false;
+  if (Array.isArray(value.ownerPrs) && !value.ownerPrs.every(isOwnerPrView)) return false;
   const agentsOk = value.agents.every(
     (agent) =>
       isRecord(agent) &&

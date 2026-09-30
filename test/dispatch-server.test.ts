@@ -142,6 +142,7 @@ async function boot(opts: {
     ledger,
     worktrees,
     spawner,
+    bus,
     poster: { async post(input: { readonly targetSha: string; readonly body: string }) { return { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'stub-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') }; } },
     reviewArtifactRoot: join(dir, 'reviews'),
     prHeadProbe: originHeadProbe(),
@@ -265,6 +266,52 @@ describe('dispatch server (E8)', () => {
       expect(worktreeRows).toHaveLength(1);
       expect(worktreeRows[0]?.branch).toBe('gru/http-job');
     } finally {
+      await h.close();
+    }
+  });
+
+  it('returns a durable 202 review receipt to an implementing minion without waiting on its open turn', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const skillDir = mkdtempSync(join(tmpdir(), 'bmad-review-handoff-'));
+    cleanupDirs.push(skillDir);
+    const skillFile = join(skillDir, 'SKILL.md');
+    writeFileSync(skillFile, '---\nname: bmad-review\n---\ninstalled', 'utf8');
+    const h = await boot({
+      minionPromptGate: () => gate,
+      reviewPreflight: async () => ({ ok: false, failures: [{ leg: 'review-policy', detail: 'disabled', remediation: 'enable review' }] }),
+      fallbackGate: { skillPath: skillFile, runFallbackReview: async () => [],
+        fixDirectiveSink: async () => ({ delivered: true }),
+      },
+    });
+    const repo = makeFixtureRepo('fixture-http-handoff');
+    cleanupRepos.push(repo);
+    try {
+      const dispatch = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-handoff', repo_path: repo.path, title: 'reviewable', briefing: 'ship it',
+      }, TOKEN);
+      expect(dispatch.status).toBe(202);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'http-handoff', by: 'minion',
+      }, TOKEN);
+      expect(review.status).toBe(202);
+      expect(review.json).toMatchObject({ route: 'queued', job_id: 'http-handoff' });
+      expect(h.ledger.listRounds('http-handoff')).toHaveLength(0);
+      expect(h.ledger.latestJobEvent('http-handoff', 'job.delivered')).toBeNull();
+      release();
+      for (let tick = 0; tick < 40 && h.ledger.latestJobEvent('http-handoff', 'job.review-handoff-started') === null; tick += 1) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      }
+      expect(h.ledger.latestJobEvent('http-handoff', 'job.review-handoff-started')?.payload).toMatchObject({
+        route: 'bmad-review-fallback',
+      });
+      for (let tick = 0; tick < 40 &&
+        (h.ledger.latestJobEvent('http-handoff', 'job.fallback-review')?.payload as { phase?: string } | undefined)?.phase !== 'pass'; tick += 1) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      }
+      expect(h.ledger.latestJobEvent('http-handoff', 'job.fallback-review')?.payload).toMatchObject({ phase: 'pass' });
+    } finally {
+      release();
       await h.close();
     }
   });

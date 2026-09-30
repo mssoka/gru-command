@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { existsSync, lstatSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -73,7 +73,7 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
     }
   });
 
-  it('applies links, copies, and setup commands to a fresh worktree', () => {
+  it('applies links, copies, and setup commands to a fresh worktree', async () => {
     const repo = makeFixtureRepo('fixture-manifest');
     try {
       // Source-checkout state the fresh worktree will need.
@@ -100,7 +100,7 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
 
       const manifest = loadWorktreeManifest(repo.path);
       expect(manifest).not.toBeNull();
-      applyWorktreeManifest(manifest!, {
+      await applyWorktreeManifest(manifest!, {
         sourceRoot: repo.path,
         worktreePath,
         setupTimeoutMs: 30_000,
@@ -123,7 +123,7 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
     }
   });
 
-  it('fails loud when a setup command exits non-zero (never half-bootstrapped)', () => {
+  it('fails loud when a setup command exits non-zero (never half-bootstrapped)', async () => {
     const repo = makeFixtureRepo('fixture-setupfail');
     try {
       mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
@@ -132,20 +132,61 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
       expect(manifest).not.toBeNull();
       const worktreePath = join(repo.path, '..', 'fixture-setupfail-wt');
       repo.git(['worktree', 'add', worktreePath, 'HEAD']);
-      expect(() =>
+      await expect(
         applyWorktreeManifest(manifest!, {
           sourceRoot: repo.path,
           worktreePath,
           setupTimeoutMs: 30_000,
         }),
-      ).toThrowError(/exited 3/);
+      ).rejects.toThrowError(/exited 3/);
       repo.git(['worktree', 'remove', '--force', worktreePath]);
     } finally {
       repo.cleanup();
     }
   });
 
-  it('refuses to overwrite anything already present in the worktree', () => {
+  it('keeps the event loop responsive while a setup command sleeps past its timeout', async () => {
+    const repo = makeFixtureRepo('fixture-slowsetup');
+    try {
+      mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
+      writeFileSync(
+        manifestFile(repo.path),
+        '[[setup]]\ncommand = "echo $$ > .setup-pid; sleep 30"',
+      );
+      const manifest = loadWorktreeManifest(repo.path);
+      expect(manifest).not.toBeNull();
+      const worktreePath = join(repo.path, '..', 'fixture-slowsetup-wt');
+      repo.git(['worktree', 'add', worktreePath, 'HEAD']);
+
+      // The command sleeps far past the 1s timeout. If setup blocked the
+      // event loop (spawnSync), this 50ms timer could not land until the
+      // timeout completed; it must fire while setup is still running.
+      const started = Date.now();
+      const applied = applyWorktreeManifest(manifest!, {
+        sourceRoot: repo.path,
+        worktreePath,
+        setupTimeoutMs: 1_000,
+      });
+      const timerFiredAfterMs = await new Promise<number>((resolve) => {
+        setTimeout(() => resolve(Date.now() - started), 50);
+      });
+      expect(timerFiredAfterMs).toBeLessThan(500);
+
+      await expect(applied).rejects.toThrowError(/timed out after 1000ms/);
+
+      // The timeout killed the whole setup tree — the sleeping pid is gone.
+      const pid = Number(readFileSync(join(worktreePath, '.setup-pid'), 'utf-8').trim());
+      expect(Number.isInteger(pid)).toBe(true);
+      await vi.waitFor(() => {
+        expect(() => process.kill(pid, 0)).toThrow();
+      });
+      repo.git(['worktree', 'remove', '--force', worktreePath]);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('refuses to overwrite anything already present in the worktree', async () => {
     const repo = makeFixtureRepo('fixture-clash');
     try {
       writeFileSync(join(repo.path, '.env.local'), 'TOKEN=fixture\n');
@@ -159,9 +200,9 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
       const manifest = parseWorktreeManifest(
         '[[copy]]\nfrom = ".env.local"\nto = "README.md"',
       );
-      expect(() =>
+      await expect(
         applyWorktreeManifest(manifest, { sourceRoot: repo.path, worktreePath, setupTimeoutMs: 30_000 }),
-      ).toThrowError(/already exists/);
+      ).rejects.toThrowError(/already exists/);
       repo.git(['worktree', 'remove', '--force', worktreePath]);
     } finally {
       repo.cleanup();

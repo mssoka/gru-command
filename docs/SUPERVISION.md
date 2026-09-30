@@ -81,6 +81,25 @@ reset failure.
 the adapter contract already recovers on the next turn. Only hangs and
 fatal errors climb.
 
+**Proactive compaction, provider-gated.** Large sessions must not have
+pi's threshold compaction fire mid-turn into a provider outage: the
+summary call itself is a model call, and a hung summary used to march a
+session up the restart ladder and drop the owner chat. When a supervised
+session is IDLE at a turn boundary and runtime-reported context usage
+crosses `proactive_compact_percent` (default 70), the supervisor calls
+the runtime's `compact()` explicitly. While a provider-wall or
+stream-error condition holds for that session (an error not yet cleared
+by a clean turn), attempts are deferred: one durable
+`supervision.compaction-deferred` ledger event records the deferral, and
+the retry waits for a clean turn to prove recovery. A failed attempt
+marks the session degraded (its supervision view reports
+`compactionDegraded`, the ledger carries `supervision.compaction-degraded`
+or `supervision.compaction-deferred`) and never climbs the restart
+ladder — the session stays connected through the outage. Pi's own
+threshold compaction stays enabled as the backstop, and explicit and
+pi-initiated compactions are both bounded by an adapter deadline (5 min)
+that aborts a silent summary call instead of wedging the session.
+
 **Crash-loop breaker.** ≥ `max_restarts` (default 3) restarts within a
 rolling `restart_window_ms` (default 10 min) trips the breaker: the agent
 is **stopped** (no further restarts), a **needs-owner** notification
@@ -100,6 +119,7 @@ agent across a service restart.
 | `restart_window_ms` | `600000` | rolling breaker window |
 | `max_restarts` | `3` | restarts allowed per window before the breaker trips |
 | `restart_backoff_ms` | `2000` | base backoff between failed rungs (doubling, 60 s cap) |
+| `proactive_compact_percent` | `70` | idle session at this context-usage percent compacts proactively (1-100) |
 
 `/health` carries the full supervision state under `supervision`:
 per-agent state (`watching`/`restarting`/`stopped`), restart counts, breaker
@@ -204,3 +224,11 @@ heartbeats end to end and answers the live-process probe.
 (post → show → ack → events + board snapshot fields). OS units are
 covered by `install.sh --print` rendering tests (path escaping,
 placeholder substitution).
+
+The compaction gate has its own pinned coverage: the idle-boundary
+percent trigger (fires at the threshold, once per idle window), provider
+deferral with exactly one deferred-retry ledger event and
+retry-after-clean-turn, and zero restart-ladder events on compaction
+failure. The pi adapter suite bounds both an explicit compaction and a
+silent pi-auto compaction at their deadline and proves the session stays
+usable.

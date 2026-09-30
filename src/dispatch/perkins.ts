@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
+import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
@@ -14,6 +15,8 @@ import {
   type BranchIdlePhase,
 } from './branch-idle.js';
 import type { AgentSpawner } from './service.js';
+import type { EventBus } from '../events/bus.js';
+import type { ResidentReviewRound } from '../runtime/registry.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
@@ -944,6 +947,7 @@ export interface FallbackGateOutcome {
 
 export type ReviewRequestOutcome =
   | { readonly route: 'perkins'; readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }
+  | { readonly route: 'queued'; readonly jobId: string; readonly requestSeq: number; readonly run: Promise<void> }
   | FallbackGateOutcome;
 
 /** Thrown when a direct beginRound caller bypasses requestReview while the
@@ -962,10 +966,24 @@ function sanitizeErrorLog(error: unknown): string {
   return String(error).replace(/[\r\n]+/gu, ' ').slice(0, 300);
 }
 
+/** The durable handoff can no longer be authorized from CURRENT job
+ * state; the obligation stays visible and needs a new validated request. */
+export class HandoffHeldError extends Error {
+  constructor(readonly status: string, readonly requestSeq: number) {
+    super(`handoff held: job status ${status}`);
+    this.name = 'HandoffHeldError';
+  }
+}
+
 export interface WaveRunnerOptions {
   readonly ledger: LedgerApi;
   readonly worktrees: WorktreePort;
   readonly spawner: AgentSpawner;
+  /** Service-wide paired resident admission; omitted by standalone workflow tests. */
+  readonly reserveReviewRound?: (signal: AbortSignal) => Promise<ResidentReviewRound>;
+  readonly maxConcurrentChildren?: number;
+  /** Ledger bus used to admit a worker's durable handoff after its turn delivers. */
+  readonly bus?: EventBus;
   readonly poster?: VerdictPoster;
   readonly escalate?: (title: string, detail: string) => void;
   /** Stable service-owned root. Required for every production review. */
@@ -1002,14 +1020,101 @@ export class WaveRunner {
   private readonly activeOperations = new Set<Promise<unknown>>();
   private readonly activeControllers = new Set<AbortController>();
   private readonly activeFallbackGates = new Set<string>();
+  private readonly handoffs = new Map<string, {
+    readonly input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean };
+    readonly seq: number;
+    starting: boolean;
+    /** Post-intake hold: visible obligation, NOT sweep-rearmable. */
+    held: boolean;
+    readonly run: Promise<void>;
+    readonly resolve: () => void;
+  }>();
+  private readonly stopHandoffListener: () => void;
   private shuttingDown = false;
 
   constructor(opts: WaveRunnerOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    this.stopHandoffListener = opts.bus?.subscribe((event) => {
+      if (event.kind !== 'job.delivered' || event.jobId === null) return;
+      const pending = this.handoffs.get(event.jobId);
+      if (pending !== undefined && event.seq > pending.seq) void this.startHandoff(event.jobId, pending);
+    }) ?? (() => {});
+  }
+
+  /** Restore acknowledged handoffs after restart; never freeze a branch
+   * until a delivery newer than the handoff has cleared the idle guard. */
+  resumeQueuedHandoffs(): void {
+    for (const job of this.opts.ledger.listJobs()) {
+      const queued = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-queued');
+      if (queued === null) continue;
+      const started = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-started');
+      const failed = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-failed');
+      if ((started?.seq ?? 0) > queued.seq || (failed?.seq ?? 0) > queued.seq) continue;
+      if (this.handoffs.has(job.id)) continue;
+      // A terminal job or a swept lane can never admit this handoff: skip
+      // truthfully (no failure, no escalation) instead of a spurious retry.
+      const jobNow = this.opts.ledger.getJob(job.id);
+      if (jobNow !== null && (jobNow.status === 'merged' || jobNow.status === 'done')) {
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-skipped', jobId: job.id,
+          payload: { requestSeq: queued.seq, reason: 'terminal-job', status: jobNow.status },
+        });
+        continue;
+      }
+      const liveLane = this.opts.worktrees
+        .listWorktrees({ jobId: job.id })
+        .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
+      if (liveLane === undefined) {
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-skipped', jobId: job.id,
+          payload: { requestSeq: queued.seq, reason: 'no-live-lane' },
+        });
+        continue;
+      }
+      // Crash window: a claim was recorded but no started/failed terminal
+      // marker followed. Ownership of any begun round is ambiguous — fail
+      // closed with evidence; restart recovery terminalizes a begun round.
+      const claimed = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-claimed');
+      const requeued = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-requeued');
+      // A REQUEUED marker NEWER than the claim, for the SAME request, is a
+      // PROVEN no-admission attempt (known outcome) — safe to re-arm. Only
+      // a claim with no later same-request outcome stays ambiguous.
+      const provenNoAdmission = requeued !== null && claimed !== null &&
+        requeued.seq > claimed.seq &&
+        (requeued.payload as { requestSeq?: number } | null)?.requestSeq === (claimed.payload as { requestSeq?: number } | null)?.requestSeq;
+      if (claimed !== null && claimed.seq > queued.seq && !provenNoAdmission &&
+        (started?.seq ?? 0) < claimed.seq && (failed?.seq ?? 0) < claimed.seq) {
+        const error = 'queued review handoff was claimed but never terminalized (crash window); refusing blind replay — reconcile the begun round, then re-request';
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId: job.id,
+          payload: { requestSeq: queued.seq, claimedSeq: claimed.seq, error },
+        });
+        this.opts.escalate?.(`Queued review handoff for job ${job.id} needs reconciliation`, error);
+        continue;
+      }
+      const payload = queued.payload as { input?: unknown } | null;
+      const input = payload?.input;
+      if (typeof input !== 'object' || input === null || (input as { jobId?: unknown }).jobId !== job.id) {
+        const error = 'malformed queued review handoff requires operator repair';
+        this.log('error', error, { job: job.id, seq: queued.seq });
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId: job.id,
+          payload: { requestSeq: queued.seq, error },
+        });
+        this.opts.escalate?.(`Queued review handoff failed for job ${job.id}`, error);
+        continue;
+      }
+      const pending = this.trackHandoff(input as { jobId: string }, queued.seq);
+      const startedFor = (started?.payload as { requestSeq?: number } | null)?.requestSeq;
+      if (startedFor !== undefined && startedFor !== queued.seq) {
+        // A terminal marker for a DIFFERENT request does not satisfy this one.
+      }
+      const delivered = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
+      if (delivered !== null && delivered.seq > queued.seq) void this.startHandoff(job.id, pending);
+    }
   }
 
   async shutdown(): Promise<void> {
+    this.stopHandoffListener();
+    for (const pending of this.handoffs.values()) pending.resolve();
+    this.handoffs.clear();
     this.shuttingDown = true;
     const deadline = Date.now() + 30_000;
     while (this.activeOperations.size > 0) {
@@ -1290,6 +1395,9 @@ export class WaveRunner {
   }): Promise<WaveOutcome | FallbackGateOutcome> {
     const outcome = await this.requestReview(input);
     if (outcome.route === 'perkins') return outcome.run;
+    if (outcome.route === 'queued') {
+      throw new Error('direct round invocation cannot await a deferred worker handoff');
+    }
     await outcome.run;
     return outcome;
   }
@@ -1303,19 +1411,203 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    /** Worker tool handoff: acknowledge without waiting for its own turn. */
+    handoff?: boolean;
+    /** Internal replay marker; never accepted from the public HTTP endpoint. */
+    fromHandoff?: boolean;
   }): Promise<ReviewRequestOutcome> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
-    // Branch-idle guard FIRST, before any route decision: manual, Silas, and
-    // integration callers all inherit one rule, Perkins and fallback alike.
-    this.enforceBranchIdleForRequest(input);
+    // Branch-idle still gates the freeze. A minion's own busy turn may
+    // acknowledge an intent now; it is armed only after job.delivered.
+    try {
+      this.enforceBranchIdleForRequest(input);
+    } catch (error) {
+      if (!(error instanceof BranchBusyError) || input.handoff !== true || input.force === true ||
+        error.blockers.length === 0 || error.blockers.some((blocker) => blocker.jobId !== input.jobId)) throw error;
+      if (this.opts.bus === undefined) throw new Error('worker review handoff requires a ledger event bus');
+      const existing = this.handoffs.get(input.jobId);
+      if (existing !== undefined) {
+        // First-wins, but never silent: a differing duplicate records its
+        // exact folded scope as a truthful conflict outcome.
+        const differs =
+          (input.lenses !== undefined && JSON.stringify(input.lenses) !== JSON.stringify((existing.input as { lenses?: readonly string[] }).lenses ?? undefined)) ||
+          (input.targetRef !== undefined && input.targetRef !== (existing.input as { targetRef?: string }).targetRef) ||
+          (input.noSpec !== undefined && input.noSpec !== (existing.input as { noSpec?: boolean }).noSpec);
+        if (differs) {
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.review-handoff-conflict', jobId: input.jobId,
+            payload: { requestSeq: existing.seq, folded: {
+              ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
+              ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+              ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+            } },
+          });
+        }
+        // A genuinely NEW validated review request rearms a held intent
+        // (never a sweep/ACK/status flip alone); the fresh request is the
+        // authority, and the queue keeps first-request identity visible.
+        if (existing.held) this.supersedeHeldHandoff(input.jobId, input);
+        return { route: 'queued', jobId: input.jobId, requestSeq: existing.seq, run: existing.run };
+      }
+      const safeInput = { jobId: input.jobId,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
+        ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+      };
+      const event = this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-queued', jobId: input.jobId, payload: { input: safeInput } });
+      const pending = this.trackHandoff(safeInput, event.seq);
+      return { route: 'queued', jobId: input.jobId, requestSeq: event.seq, run: pending.run };
+    }
+    const pendingHandoff = this.handoffs.get(input.jobId);
+    if (pendingHandoff !== undefined && input.fromHandoff !== true) {
+      // Reconcile on this genuine observation: the lane may have gone idle
+      // without a delivery event (aborted/failed turn), in which case the
+      // replay below re-runs every current fence (branch-idle, exact-head,
+      // freeze, capacity) and arms the review now. Legitimate busy/capacity
+      // waits stay pending (the replay re-queues, M1); nothing is skipped.
+      this.reconcileQueuedHandoff(input.jobId);
+      return { route: 'queued', jobId: input.jobId, requestSeq: pendingHandoff.seq, run: pendingHandoff.run };
+    }
     const repoPath = this.resolveReviewRequestRepo(input);
     const preflight = this.opts.reviewPreflight;
     const result: ReviewPreflightResult = preflight !== undefined && repoPath !== null
       ? await preflight({ repoPath })
       : { ok: true, failures: [] };
     if (!result.ok) return this.beginFallbackGate(input, result.failures, repoPath);
+    // Post-await recheck (handoff replays only): permission is re-proven
+    // after preflight/capacity waits, BEFORE freeze/admission effects.
+    if (input.fromHandoff === true) {
+      const pending = this.handoffs.get(input.jobId);
+      this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
+    }
     const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel });
     return { route: 'perkins', round: begun.round, run: begun.run };
+  }
+
+  private trackHandoff(input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean }, seq: number) {
+    let resolve!: () => void;
+    const run = new Promise<void>((done) => { resolve = done; });
+    const pending = { input, seq, starting: false, held: false, run, resolve };
+    this.handoffs.set(input.jobId, pending);
+    return pending;
+  }
+
+  /** Review-authorizable job statuses at replay time. Branch idleness and
+   * a current head are NOT authorization: a job that became blocked/parked/
+   * cancelled/owner-held/terminal after the durable request was accepted
+   * is HELD for reconciliation attention, never auto-reviewed. */
+  private static readonly HANDOFF_AUTHORIZED_STATUSES: ReadonlySet<string> = new Set(['working', 'delivered', 'in-review']);
+
+  /** Fence: throws when the CURRENT job state does not authorize this
+   * handoff. Called BEFORE any claim/spawn/freeze effect and re-checked
+   * after awaited preflight/capacity, before round admission. */
+  private assertHandoffAuthorized(jobId: string, requestSeq: number): void {
+    const jobNow = this.opts.ledger.getJob(jobId);
+    if (jobNow === null || !WaveRunner.HANDOFF_AUTHORIZED_STATUSES.has(jobNow.status)) {
+      throw new HandoffHeldError(jobNow?.status ?? 'missing', requestSeq);
+    }
+  }
+
+  private async startHandoff(jobId: string, pending: NonNullable<ReturnType<WaveRunner['trackHandoff']>>): Promise<void> {
+    if (pending.starting || pending.held || this.shuttingDown || this.handoffs.get(jobId) !== pending) return;
+    pending.starting = true;
+    let requeued = false;
+    let held = false;
+    try {
+      // Current-permission fence BEFORE any claim/spawn/freeze effect.
+      this.assertHandoffAuthorized(jobId, pending.seq);
+      // Claim binds this attempt to the request; a crash between claim and
+      // the started marker reconciles fail-closed at boot.
+      this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-claimed', jobId,
+        payload: { requestSeq: pending.seq },
+      });
+      const outcome = await this.requestReview({ ...pending.input, fromHandoff: true });
+      if (this.shuttingDown) return; // claim stands; boot recovery reconciles fail-closed
+      if (outcome.route === 'bmad-review-fallback' && !outcome.skillInstalled) {
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId,
+          payload: { requestSeq: pending.seq, error: outcome.note },
+        });
+        return;
+      }
+      this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-started', jobId, payload: {
+        requestSeq: pending.seq, route: outcome.route,
+        ...(outcome.route === 'perkins' ? { roundId: outcome.round.id } : {}),
+      } });
+      void outcome.run.catch((error: unknown) => {
+        this.log('error', 'queued review run failed after admission', { job: jobId, error: String(error) });
+      });
+    } catch (error) {
+      // HELD: a post-intake hold/status flip invalidates the prior
+      // execution permission — the obligation stays visible and requires a
+      // genuinely NEW validated review request to rearm (never a sweep,
+      // job.delivered, ACK, or a later status flip alone).
+      if (error instanceof HandoffHeldError) {
+        held = true;
+        pending.held = true;
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-held', jobId,
+          payload: { requestSeq: pending.seq, reason: `job-status-${error.status}` },
+        });
+        this.opts.escalate?.(
+          `Queued review handoff for job ${jobId} is held`,
+          `The durable review request can no longer be authorized automatically: job status is ${error.status}. Re-request the review after the hold clears.`,
+        );
+        return;
+      }
+      // Same-job re-busy preserves the durable intent: re-queue for the
+      // NEXT delivery; only foreign blockers terminalize the handoff.
+      if (error instanceof BranchBusyError && !this.shuttingDown &&
+        error.blockers.length > 0 && error.blockers.every((blocker) => blocker.jobId === jobId)) {
+        requeued = true;
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-requeued', jobId,
+          payload: { requestSeq: pending.seq, blockers: error.blockers },
+        });
+        return; // starting reset in finally; next delivery re-arms
+      }
+      if (!this.shuttingDown) {
+        this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId, payload: { requestSeq: pending.seq, error: String(error) } });
+        this.opts.escalate?.(`Queued review handoff failed for job ${jobId}`, String(error));
+      }
+    } finally {
+      pending.starting = false;
+      if (!requeued && !held) {
+        if (this.handoffs.get(jobId) === pending) this.handoffs.delete(jobId);
+        pending.resolve();
+      }
+      // requeued: stays pending and re-armable. held: stays pending and
+      // VISIBLE but not sweep-rearmable — only a new validated request
+      // (which supersedes via the queue path) may clear `held`.
+    }
+  }
+
+  /** Reconsider ONE job's queued handoff on a genuine observation (the
+   * requestReview re-entry path): the replay re-runs every current fence
+   * (branch-idle, exact-head, freeze, capacity) and arms the review now.
+   * Legitimate busy/capacity waits stay pending (the replay re-queues);
+   * held or in-flight pendings are left untouched by startHandoff's
+   * guards. Nothing is skipped. */
+  private reconcileQueuedHandoff(jobId: string): void {
+    const pending = this.handoffs.get(jobId);
+    if (pending !== undefined) void this.startHandoff(jobId, pending);
+  }
+
+  /** Deterministic-pass reconsideration of every queued handoff — the
+   * exact callback main wires into the Silas seam. No API call, no timer,
+   * no follow-through lane: each pending is offered to startHandoff, whose
+   * guards keep held pendings held (only a genuinely new validated request
+   * rearms them) and whose terminal bookkeeping removes settled entries, so
+   * repeated passes are bounded and cannot double-start. */
+  reconcilePendingHandoffs(): void {
+    for (const [jobId, pending] of this.handoffs) void this.startHandoff(jobId, pending);
+  }
+
+  /** A genuinely new validated review request clears a prior hold and
+   * supersedes the pending intent (queue-path rearm), keyed by identity. */
+  private supersedeHeldHandoff(jobId: string, newInput: { targetRef?: string; lenses?: readonly string[]; noSpec?: boolean }): boolean {
+    const pending = this.handoffs.get(jobId);
+    if (pending === undefined || !pending.held) return false;
+    void newInput;
+    pending.held = false; // a NEW request is fresh validated intent
+    return true;
   }
 
   /** Legacy direct entry: a failed pre-flight never silently starts a
@@ -1631,7 +1923,7 @@ export class WaveRunner {
   }
 
   private async defaultFallbackReview(input: FallbackReviewRunInput): Promise<readonly FallbackFinding[]> {
-    const handle = await this.opts.spawner('minion', { cwd: input.lanePath });
+    const handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
     try {
       const prompt = [
         `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
@@ -1762,7 +2054,7 @@ export class WaveRunner {
           ? { branchIdle: { forced: true as const, targetBranch: idle.targetBranch, blockers: idle.blockers } }
           : {}),
       });
-      this.opts.ledger.setRoundStatus(round.id, 'live');
+      if (this.opts.reserveReviewRound === undefined) this.opts.ledger.setRoundStatus(round.id, 'live');
     } catch (error) {
       const failures: unknown[] = [error];
       const interrupted = this.shuttingDown || setupSignal.aborted;
@@ -1805,7 +2097,13 @@ export class WaveRunner {
       throw error;
     }
 
-    this.log('info', 'review round live', {
+    if (this.opts.reserveReviewRound !== undefined) {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.residency-queued', jobId: job.id, roundId: round.id,
+        payload: { reason: 'awaiting lead and child resident slots', targetSha },
+      });
+    }
+    this.log('info', 'review round queued or live', {
       job: job.id,
       round: round.id,
       lenses: canonicalLenses.length,
@@ -1912,10 +2210,51 @@ export class WaveRunner {
     signal: AbortSignal,
     reviewModel?: ReviewPreflightResult['reviewModel'],
   ): Promise<WaveOutcome> {
+    let reservation: ResidentReviewRound | undefined;
+    let settledOutcome: WaveOutcome | null = null;
     try {
-      return await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel);
+      reservation = this.opts.reserveReviewRound === undefined
+        ? undefined : await this.opts.reserveReviewRound(signal);
+      if (reservation !== undefined) {
+        if (signal.aborted) {
+          await reservation.close();
+          throw new Error('review cancelled before admission');
+        }
+        this.opts.ledger.setRoundStatus(round.id, 'live');
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.residency-admitted', jobId: job.id, roundId: round.id,
+          payload: { reason: 'lead and child resident slots admitted' },
+        });
+      }
+      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, reservation);
+      settledOutcome = outcome;
+      return outcome;
+    } catch (error) {
+      if (this.opts.ledger.getRound(round.id)?.status === 'pending') {
+        this.abortRound(this.opts.ledger.getRound(round.id) ?? round, `review admission cancelled: ${String(error)}`);
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.residency-cancelled', jobId: job.id, roundId: round.id,
+          payload: { error: String(error) },
+        });
+      }
+      throw error;
     } finally {
-      await this.sweepReviewWorktree(reviewLaneId);
+      // A settled review outcome outranks a close-time disposal failure:
+      // the verdict/record is the durable truth; the failed disposal is
+      // escalated loudly without masking the returned result.
+      try {
+        await reservation?.close();
+      } catch (closeError) {
+        this.log('error', 'review reservation disposal failed', { round: round.id, error: String(closeError) });
+        if (settledOutcome !== null) {
+          this.opts.escalate?.(
+            `Review round ${round.id} disposal failed after completion`,
+            `The settled review outcome was preserved, but releasing its resident handles failed: ${String(closeError)}`,
+          );
+        }
+      } finally {
+        await this.sweepReviewWorktree(reviewLaneId);
+      }
     }
   }
 
@@ -1929,15 +2268,28 @@ export class WaveRunner {
     policy: PerkinsPolicy,
     signal: AbortSignal,
     reviewModel?: ReviewPreflightResult['reviewModel'],
+    reservation?: ResidentReviewRound,
   ): Promise<WaveOutcome> {
-    const workflow = new PerkinsWholeReview({
-      // This closure belongs to one round. A concurrent preflight cannot
-      // replace the proof used by its lead or specialist children.
-      spawner: (role, options) => this.opts.spawner(role, {
+    // The model-resolution closure belongs to one round. A concurrent
+    // preflight cannot replace the proof used by its lead or specialist
+    // children, and a reserved round routes through its own admission.
+    const spawnWithOptions: AgentSpawner = (role, options) => {
+      if (reservation !== undefined && role !== 'perkins') {
+        throw new Error(`review reservation spawns perkins sessions only, got role "${role}"`);
+      }
+      const resolved = {
         ...options,
         ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
           ? { reviewModel } : {}),
-      }),
+      };
+      return reservation === undefined
+        ? this.opts.spawner(role, resolved)
+        : reservation.spawn(resolved);
+    };
+    const workflow = new PerkinsWholeReview({
+      spawner: spawnWithOptions,
+      ...(reservation !== undefined ? { beginChildren: () => reservation.beginChildren(this.opts.maxConcurrentChildren ?? DEFAULT_REVIEW_CHILDREN) } : {}),
+      ...(this.opts.maxConcurrentChildren !== undefined ? { maxConcurrentChildren: this.opts.maxConcurrentChildren } : {}),
       policy,
       onAgent: ({ phase, lens, attempt, handle }) => {
         this.opts.ledger.registerAgent({

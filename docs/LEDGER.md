@@ -162,3 +162,21 @@ marker. Boot reconciliation (`src/dispatch/rebrief-recovery.ts`)
 consumes leftovers: resume the interrupted session (or re-dispatch fresh
 on the same lane), record the missing events, or escalate
 action-required when recovery fails.
+
+### Residency admission + durable review handoffs (custom events)
+
+The resident-budget cap emits durable custom events (all carry truthful
+provenance; none grant admission authority): `round.residency-queued` /
+`round.residency-admitted` / `round.residency-cancelled` track a review
+round's paired lead+child admission through the FIFO budget;
+`job.review-handoff-queued` / `-claimed` / `-requeued` / `-started` /
+`-failed` / `-skipped` / `-conflict` (a differing duplicate records its
+folded scope truthfully) track a minion's durable 202 review receipt — a
+claim with no terminal marker reconciles fail-closed at boot (never a
+blind replay), same-job re-busy re-queues, and terminal/swept lanes skip
+truthfully. `resident.reclaim-failed` records a deduplicated (per boot; one attempt
+per handle per drain-epoch by construction) failed idle-disposal
+observation — the failed
+worker keeps its permit; `resident.open-control-unknown` records (once
+per affected handle) that supervision lacked openControl evidence, which
+makes the handle non-reclaimable rather than presumed idle.

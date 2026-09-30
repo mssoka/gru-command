@@ -457,6 +457,37 @@ test('socket drop shows a degraded banner that clears on recovery', async ({ pag
 });
 
 test.describe('board (E6, mock feed)', () => {
+  test('FOR YOU owner band renders the pending owner obligations above the job bands', async ({ page }) => {
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const band = page.locator('#board-owner');
+    await expect(band).toBeVisible();
+    await expect(band.locator('.board-band__label')).toHaveText('FOR YOU');
+    // The combined fixtures owe three owner actions: crash-loop and
+    // provider-wall stops plus one evidence-bound ready PR.
+    await expect(band.locator('.board-band__count')).toHaveText('3 pending');
+    const providerStop = band.locator('.board-owner__row', { hasText: 'Agent mock-minion-quota stopped: quota wall' });
+    await expect(providerStop).toBeVisible();
+    await expect(providerStop.locator('.board-owner__ack')).toHaveText('Ack');
+    // The owner stop carries its Ack control and the honest scope copy.
+    const stop = band.locator('.board-owner__row', { hasText: 'Crash-loop breaker tripped' });
+    await expect(stop).toBeVisible();
+    await expect(stop.locator('.board-owner__ack')).toHaveText('Ack');
+    await expect(stop).toContainText('does NOT clear code/test/review holds');
+    // The ready PR row: exact-head reason + OPEN PR as an external link
+    // (never an in-app merge button).
+    const pr = band.locator('.board-owner__row--pr', { hasText: 'Fix the payment retry loop' });
+    await expect(pr).toBeVisible();
+    await expect(pr).toContainText('ready for you');
+    await expect(pr).toContainText('CI green');
+    const open = pr.locator('.board-owner__open');
+    await expect(open).toHaveText('OPEN PR ↗');
+    await expect(open).toHaveAttribute('href', 'https://example.invalid/pr/41');
+    await expect(open).toHaveAttribute('target', '_blank');
+    // Machine attention stays OUT of the owner band (NEEDS GRU owns it).
+    await expect(band).not.toContainText('Review round demo-api-payment-fix-r1 is INCOMPLETE');
+  });
+
   test('dense rows collapse by default; expanding reveals the round lens chips', async ({ page }) => {
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
@@ -466,8 +497,10 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('#tab-chat')).toHaveCount(0);
     await expect(page.locator('#tab-board')).toHaveCount(0);
     await expect(page.locator('.command-bar__tabs')).toHaveCount(0);
-    // v4 bands lead the board; rows group under sticky band separators.
-    await expect(page.locator('.board-band__label').first()).toHaveText('NEEDS GRU');
+    // FOR YOU (owner approval 2026-09-28) leads the board — the permanent
+    // owner-action band — then the v4 job bands; rows group under sticky
+    // band separators.
+    await expect(page.locator('.board-band__label').first()).toHaveText('FOR YOU');
     await expect(
       page.locator('.board-band--needs-you .board-job', { hasText: 'Merge main into the retry branch' }),
     ).toBeVisible();
@@ -540,8 +573,16 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('.rail-chip[data-chip="verify"]')).toContainText('lock free');
     await expect(page.locator('.rail-chip[data-chip="cure"] .rail-chip__value')).toHaveText('n/a');
 
-    // Bands in priority order, headers sticky separators with counts.
-    await expect(page.locator('.board-band__label')).toHaveText(['NEEDS GRU', 'IN FLIGHT', 'SETTLED', 'COLD']);
+    // Bands in priority order, headers sticky separators with counts: the
+    // permanent FOR YOU owner band first (owner approval 2026-09-28), then
+    // the unchanged v4 job-band order.
+    await expect(page.locator('.board-band__label')).toHaveText([
+      'FOR YOU',
+      'NEEDS GRU',
+      'IN FLIGHT',
+      'SETTLED',
+      'COLD',
+    ]);
     const bandSticky = await page
       .locator('.board-band--in-flight .board-band__head')
       .evaluate((node) => getComputedStyle(node).position);
@@ -553,46 +594,63 @@ test.describe('board (E6, mock feed)', () => {
     await expect(stalled.locator('.board-job__stale')).toHaveText('stalled');
   });
 
-  test('section truth: a merged leftover leaves NEEDS GRU; a quota-walled lane waits with its reason', async ({ page }) => {
+  test('section truth: a merged leftover leaves NEEDS GRU; a quota-walled lane waits with its reason', async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1440, height: 1200 });
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
 
-    // The merged lane with a leftover unacked escalation row is a closed
-    // receipt: SETTLED, no signal chip, never a NEEDS GRU queue entry.
-    const receipt = page.locator('.board-band--settled .board-job', { hasText: 'Rotate the staging tokens' });
-    await expect(receipt).toBeVisible();
-    await expect(receipt).toHaveAttribute('data-status', 'merged');
-    await expect(receipt.locator('.board-job__signal')).toHaveCount(0);
-    await expect(
-      page.locator('.board-band--needs-you .board-job', { hasText: 'Rotate the staging tokens' }),
-    ).toHaveCount(0);
+    // Exercise the same acceptance assertions in BOTH themes and retain
+    // the captures. The scheduled board-browser scope gives this test a
+    // unique output directory under the lane's artifact root.
+    for (const theme of ['light', 'dark']) {
+      if (theme === 'dark') await page.locator('#theme-toggle').click();
+      if (theme === 'light') await expect(page.locator('html')).not.toHaveClass(/dark/);
+      else await expect(page.locator('html')).toHaveClass(/dark/);
 
-    // The quota-walled lane shows its true state: waiting on the provider,
-    // never a bare "working" and never stalled/COLD.
-    const walled = page.locator('.board-band--in-flight .board-job', { hasText: 'Migrate the search index' });
-    await expect(walled).toBeVisible();
-    await expect(walled).toHaveAttribute('data-worker-state', 'waiting');
-    await expect(walled.locator('.board-job__status')).toHaveText('waiting · quota wall');
-    await expect(walled.locator('.board-job__stale')).toHaveCount(0);
+      // The merged lane with a leftover unacked escalation row is a closed
+      // receipt: SETTLED, no signal chip, never a NEEDS GRU queue entry.
+      const receipt = page.locator('.board-band--settled .board-job', { hasText: 'Rotate the staging tokens' });
+      await expect(receipt).toBeVisible();
+      await expect(receipt).toHaveAttribute('data-status', 'merged');
+      await expect(receipt.locator('.board-job__signal')).toHaveCount(0);
+      await expect(
+        page.locator('.board-band--needs-you .board-job', { hasText: 'Rotate the staging tokens' }),
+      ).toHaveCount(0);
 
-    // Chip and bands agree: only the live machine row (mock-n5) counts.
-    await expect(page.locator('#board-unacked')).toContainText('1 needs Gru');
+      // The quota-walled lane shows its true state: waiting on the provider,
+      // never a bare "working" and never stalled/COLD.
+      const walled = page.locator('.board-band--in-flight .board-job', { hasText: 'Migrate the search index' });
+      await expect(walled).toBeVisible();
+      await expect(walled).toHaveAttribute('data-worker-state', 'waiting');
+      await expect(walled.locator('.board-job__status')).toHaveText('waiting · quota wall');
+      await expect(walled.locator('.board-job__stale')).toHaveCount(0);
 
-    // The bell keeps the durable record: the merged lane's leftover row
-    // renders as a closed receipt under FEED, not as live NEEDS GRU work.
-    await page.locator('#notification-bell').click();
-    const closedRow = page.locator('.board-notification[data-receipt="closed"]', {
-      hasText: 'Leftover machine escalation on the merged lane',
-    });
-    await expect(closedRow).toBeVisible();
-    await expect(closedRow).toContainText('closed receipt');
-    const needsGruSection = page.locator('.board-notification-section').filter({
-      has: page.locator('.board-notification-section__head', { hasText: 'NEEDS GRU' }),
-    });
-    await expect(
-      needsGruSection.locator('.board-notification', { hasText: 'Leftover machine escalation on the merged lane' }),
-    ).toHaveCount(0);
-    await page.locator('#notification-bell').click();
+      // COLD is still for genuinely silent working lanes.
+      const silent = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
+      await expect(silent.locator('.board-job__stale')).toHaveText('stalled');
+      await expect(silent.locator('.board-job__status')).toHaveText('working');
+
+      // Chip and bands agree: only the live machine row (mock-n5) counts.
+      await expect(page.locator('#board-unacked')).toContainText('1 needs Gru');
+      await page.screenshot({ path: testInfo.outputPath(`board-truth-${theme}.png`), fullPage: true });
+
+      // The bell keeps the durable record: the merged lane's leftover row
+      // renders as a closed receipt under FEED, not as live NEEDS GRU work.
+      await page.locator('#notification-bell').click();
+      const closedRow = page.locator('.board-notification[data-receipt="closed"]', {
+        hasText: 'Leftover machine escalation on the merged lane',
+      });
+      await expect(closedRow).toBeVisible();
+      await expect(closedRow).toContainText('closed receipt');
+      const needsGruSection = page.locator('.board-notification-section').filter({
+        has: page.locator('.board-notification-section__head', { hasText: 'NEEDS GRU' }),
+      });
+      await expect(
+        needsGruSection.locator('.board-notification', { hasText: 'Leftover machine escalation on the merged lane' }),
+      ).toHaveCount(0);
+      await page.screenshot({ path: testInfo.outputPath(`board-truth-${theme}-bell.png`), fullPage: true });
+      await page.locator('#notification-bell').click();
+    }
   });
 
   test('row disclosure persists per job across a reload (v3)', async ({ page }) => {
@@ -887,7 +945,7 @@ test.describe('phone chrome', () => {
     expect(box!.x + box!.width, `${selector} right edge on screen`).toBeLessThanOrEqual(vw);
   }
 
-  const CHROME_CONTROLS = ['#theme-toggle', '#settings-toggle'];
+  const CHROME_CONTROLS = ['#theme-toggle', '#settings-toggle', '#sound-toggle'];
 
   /** Top-anchored overlays must clear the nav, whatever its wrapped
    * height: kills any mutation of --phone-nav-clearance to less than the

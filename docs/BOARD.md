@@ -76,7 +76,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 
 - **Cockpit (v6.1):** the estate is full-width. The sticky **command bar**
   carries the brand + `ONE GRU · ONE WINDOW`, the monospace ticker
-  (`MODE` · `RADAR` · top review round), the notification bell, theme and
+  (`MODE` · `RADAR` · top review round), the notification bell, the
+  owner-chime speaker, theme and
   settings — no lens toggle: chat is always docked on desktop and the FAB
   owns mobile chat. Below it the sticky **status chip rail** relocates the
   v4 health row globally (DEPLOY → REVIEWS → SILAS → ALERTS → VERIFY →
@@ -89,14 +90,44 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   hold the page and chat overlays via the Gru FAB (right drawer, dimmed
   board behind); below 900px the rail stacks under the board and the FAB
   opens a bottom sheet.
-- **Dashboard:** **attention bands** — NEEDS GRU → IN FLIGHT → SETTLED →
+- **Dashboard:** a permanent **FOR YOU** owner band sits ABOVE the job
+  bands (owner approval 2026-09-28): the owner's pending obligations —
+  unacked `needs-owner` rows (Ack, with consequence copy that names what
+  the ack does and does NOT do — a quota/breaker ack re-arms the worker
+  but never clears code/test/review holds) plus the server-projected,
+  evidence-bound **ready PRs** (see below). Viewing completes nothing:
+  the header count is owed actions, not unseen rows; the count only
+  moves on an authoritative ack (any device) or confirmed merged/closed
+  state. Rows are deterministic (newest first, stable
+  `owner-ack:{id}`/`owner-pr:{jobId}` ids), focus survives snapshot
+  re-renders, and the older tail hides behind a `+N older pending`
+  expander — the engine already merges EVERY unacked needs-owner row
+  into the snapshot, so no pending obligation is lost to the bounded
+  feed. The PR action is **OPEN PR** (external https link only) — a
+  link click is never a merge; readiness is projected SERVER-side
+  (`ownerPrs` on the snapshot) from the conjunction of durable exact-head
+  facts: `in-review` job + recorded PR, a `github.branch-state`
+  observation whose `pr_url` matches the recorded PR with the pull
+  explicitly OPEN (`pr_open:true` — a closed-without-merge pull is never
+  an open obligation), `merged:false`, `mergeable_state:clean` observed
+  for THAT head (a moved head invalidates the old mergeability — the
+  poll fails closed until GitHub answers for the new head), CI observed
+  **green at that exact sha**, and the job's NEWEST review round
+  `verdict-posted` / `approved` with its frozen `targetRef` equal to that
+  sha. Anything
+  missing, stale, moved, dirty, blocked, pending/failed, or
+  changes-requested renders no row (fail closed — no heuristic).
+  Known limitation (deliberate): GitHub-native review approvals beyond
+  `mergeable_state` are not separately projected; the Perkins verdict is
+  represented by the head-bound approved round. Then the **attention
+  bands** — NEEDS GRU → IN FLIGHT → SETTLED →
   COLD, recency inside each band — rendered as full-width **dense rows**
   (line 1: dot + title + status chip; line 2: repo + branch + heist/minion
   ages + PR link), with sticky band headers carrying counts and hairline
   dividers. Failing rows (blocked/error, aborted round, errored lenses
   without a verdict) are tinted with a left alert accent. NEEDS GRU is
   always visible (empty = calm “nothing needs Gru”); FOR YOU belongs only
-  to the owner notification band. SETTLED is a rolling
+  to the owner band. SETTLED is a rolling
   window (latest 10 + `+K older settled`, session-expanded; concluded
   jobs render their last round quiescent — no stale blocker pills). Click
   a row to disclose lane + rounds (v3 collapse, persisted per job).
@@ -119,7 +150,12 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   (all pending needs-owner rows, even older than the bounded latest feed:
   owner-only decisions and stops whose ack re-arms supervision), NEEDS GRU
   (all pending machine rows, including those older than the recent feed;
-  it wakes Gru once and refuses human Ack), and FEED (FYI rows). A machine
+  it wakes Gru once and refuses human Ack), and FEED (FYI rows). The bell
+  is the alert/history surface: it shares the SAME authoritative owner
+  projection as the board's permanent FOR YOU band — pending acks AND
+  ready PRs, so the two surfaces never disagree about what the owner
+  owes (the badge and toasts still count needs-owner notifications
+  only); opening it never completes an obligation. A machine
   alert left unresolved 30 minutes after delivery opens a separate
   owner-only follow-up in FOR YOU; Gru's later disposition resolves it. The badge and live
   toasts serve needs-owner only; every displayed row earns a shown receipt
@@ -130,6 +166,14 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   wake tracker chip counts durable Gru wakes (`gru.wake` events). Live
   needs-owner arrivals toast (plus a browser notification when permission
   was granted).
+- **Owner chime (owner ruling 2026-09-23):** the ONE sound — a soft
+  two-note Web Audio chime on NEW unresolved `needs-owner` arrivals
+  only (`action-required`/NEEDS GRU/FYI stay silent by design — machine
+  queue, machine noise). Audio arms on the first user gesture; an
+  unarmed arrival pulses the bell badge instead (visual fallback). The
+  header speaker toggles a persisted mute, separate from the bell's
+  panel navigation (badges still count), and chimes are throttled to
+  one per 30 s (a burst is one sound + the merged badge).
 - **Transcripts:** drawer with newest-first pages (`load older` by entry
   cursor), debounced server-side search with snippet matches that
   scroll+flash the entry, a wrap toggle (default `pre-wrap` — long lines
