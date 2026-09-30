@@ -14,7 +14,7 @@ import {
 import {
   backoffDelayMs,
   isRateLimitErrorText,
-  type PacingGate, type PacingLease, type RateLimitBackoffPolicy,
+  type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement,
 } from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -177,6 +177,11 @@ interface SupervisedAgent {
   /** An interrupted turn awaiting resume on the next live handle. Survives
    * failed rungs and breaker re-arms — the lane must never be forgotten. */
   pendingRecovery: InterruptedTurn | null;
+  /** Provider pacing: the abort handle for a restart-recovery delivery
+   * waiting on (or running under) a worker admission slot. Aborted when
+   * the recovery attempt is superseded, disposed, or a new failure lands;
+   * the waiting coroutine then exits without consuming a turn. */
+  recoveryAdmission: AbortController | null;
   lastEventAt: number;
   lastFileBytes: number | null;
   /** Restart timestamps (epoch ms) — the breaker ring. */
@@ -239,6 +244,12 @@ interface RateLimitRetryIncident {
    * counter moved across (i.e. during) that delivery. */
   failureSeq: number;
   lastError: string;
+  /** Resolved exactly once as the incident concludes, so a delivery call
+   * site can keep its own lifecycle pending until the bounded recovery
+   * succeeded or exhausted (instead of settling/disposing the handle out
+   * from under the retry). */
+  readonly settled: Promise<Exclude<RetrySettlement, 'none'>>;
+  resolveSettled: (disposition: Exclude<RetrySettlement, 'none'>) => void;
 }
 
 /** What a restart rung must know to recover a killed open turn. */
@@ -626,10 +637,11 @@ export class Supervisor {
       if (envelope.phase === 'disposed') {
         const agent = this.agents.get(envelope.agentId);
         if (agent === undefined) return;
-        // A disposed handle can never deliver a pending retry: drop the
-        // incident with it (the delivery continuation self-cancels too).
-        agent.rateLimitRetry?.admissionAbort.abort();
-        agent.rateLimitRetry = null;
+        // A disposed handle can never deliver a pending retry: conclude
+        // the incident with it (the delivery continuation self-cancels
+        // too) and supersede any restart-recovery admission wait.
+        this.clearRateLimitRetry(agent, 'superseded');
+        this.clearRecoveryAdmission(agent);
         agent.handle = null;
         agent.openTurn = false;
         agent.openControl = false;
@@ -985,6 +997,7 @@ export class Supervisor {
       providerCondition: null,
       compaction: freshCompactionGate(),
       rateLimitRetry: null,
+      recoveryAdmission: null,
     });
     this.log('info', 'supervising agent', { agent_id: agentId, role, slot: slot?.id ?? null });
     return true;
@@ -1161,6 +1174,42 @@ export class Supervisor {
   // Automatic rate-limit retry (owner heist 2026-09-29)
   // ------------------------------------------------------------------
 
+  /** Consumption gate for worker delivery call sites: after a prompt
+   * resolves, await the bounded outcome of any automatic rate-limit retry
+   * that covers the just-ended turn. The adapter tap is synchronous, so an
+   * in-band error has already become an incident by the time the prompt
+   * promise resolves. Callers MUST release their own worker admission
+   * before awaiting — the retry reacquires the slot per attempt — and may
+   * then record delivery only for `none`/`recovered`. */
+  async awaitRetrySettlement(agentId: string): Promise<RetrySettlement> {
+    const incident = this.agents.get(agentId)?.rateLimitRetry ?? null;
+    if (incident === null) return 'none';
+    return incident.settled;
+  }
+
+  /** Conclude the active incident (if any) with a disposition and clear it.
+   * Every clear site funnels here so a delivery call site awaiting
+   * `settled` is never left hanging. */
+  private clearRateLimitRetry(
+    agent: SupervisedAgent,
+    disposition: Exclude<RetrySettlement, 'none'>,
+  ): void {
+    const incident = agent.rateLimitRetry;
+    if (incident === null) return;
+    incident.admissionAbort.abort();
+    agent.rateLimitRetry = null;
+    incident.resolveSettled(disposition);
+  }
+
+  /** Supersede a restart-recovery admission wait or in-flight delivery:
+   * the waiting coroutine exits without consuming a turn. */
+  private clearRecoveryAdmission(agent: SupervisedAgent): void {
+    const controller = agent.recoveryAdmission;
+    if (controller === null) return;
+    agent.recoveryAdmission = null;
+    controller.abort();
+  }
+
   /** Consume a non-fatal runtime error through the automatic retry path.
    * True = absorbed (a retry was scheduled, or this duplicates the attempt
    * already being retried); false = hand the failure to the existing
@@ -1200,6 +1249,10 @@ export class Supervisor {
       // retry.
       return false;
     }
+    let resolveSettled!: (disposition: Exclude<RetrySettlement, 'none'>) => void;
+    const settled = new Promise<Exclude<RetrySettlement, 'none'>>((resolve) => {
+      resolveSettled = resolve;
+    });
     const fresh: RateLimitRetryIncident = {
       attempts: 0,
       admissionAbort: new AbortController(),
@@ -1210,6 +1263,8 @@ export class Supervisor {
       activeDelivery: null,
       failureSeq: 1,
       lastError: errorText,
+      settled,
+      resolveSettled,
     };
     agent.rateLimitRetry = fresh;
     return this.scheduleRateLimitRetry(agent, fresh);
@@ -1224,18 +1279,16 @@ export class Supervisor {
   ): boolean {
     const policy = this.rateLimitBackoff;
     if (policy === null) {
-      agent.rateLimitRetry?.admissionAbort.abort();
-      agent.rateLimitRetry = null;
+      this.clearRateLimitRetry(agent, 'superseded');
       return false;
     }
     if (incident.attempts >= incident.maxRetries) {
-      agent.rateLimitRetry?.admissionAbort.abort();
-      agent.rateLimitRetry = null;
       this.recordEvent('pacing.auto-retry-exhausted', agent.agentId, {
         attempts: incident.attempts,
         max_auto_retries: incident.maxRetries,
         error: incident.lastError.slice(0, 500),
       });
+      this.clearRateLimitRetry(agent, 'exhausted');
       return false;
     }
     incident.attempts += 1;
@@ -1275,8 +1328,7 @@ export class Supervisor {
       if (this.agents.get(agent.agentId) !== agent) return;
       const handle = agent.handle;
       if (handle === null || agent.breakerOpen) {
-        agent.rateLimitRetry?.admissionAbort.abort();
-        agent.rateLimitRetry = null;
+        this.clearRateLimitRetry(agent, 'superseded');
         return;
       }
       if (agent.role === 'minion' && this.workerGate !== undefined) {
@@ -1332,11 +1384,10 @@ export class Supervisor {
         return;
       }
       if (rejection === null) {
-        agent.rateLimitRetry?.admissionAbort.abort();
-        agent.rateLimitRetry = null;
         this.recordEvent('pacing.auto-retry-recovered', agent.agentId, {
           attempts: incident.attempts,
         });
+        this.clearRateLimitRetry(agent, 'recovered');
         this.log('info', 'automatic rate-limit retry recovered the turn', {
           agent_id: agent.agentId,
           attempts: incident.attempts,
@@ -1352,24 +1403,21 @@ export class Supervisor {
       } else if (/disposed/i.test(text)) {
         // The session went away under the retry (shutdown or replacement):
         // no failure to ladder, no retry to continue.
-        agent.rateLimitRetry?.admissionAbort.abort();
-        agent.rateLimitRetry = null;
+        this.clearRateLimitRetry(agent, 'superseded');
         this.log('warn', 'rate-limit retry delivery ended on a disposed session', {
           agent_id: agent.agentId,
           attempt: incident.attempts,
         });
         return;
       } else {
-        agent.rateLimitRetry?.admissionAbort.abort();
-        agent.rateLimitRetry = null;
+        this.clearRateLimitRetry(agent, 'exhausted');
       }
       // No adapter event surfaced this failure (or the budget is spent):
       // the existing recovery ladder still owns it.
       void this.evaluateRecovery(agent, `runtime error: ${text}`, false, true);
     } catch (error) {
       if (agent.rateLimitRetry !== incident || this.disposed) return;
-      incident.admissionAbort.abort();
-      agent.rateLimitRetry = null;
+      this.clearRateLimitRetry(agent, 'exhausted');
       this.log('error', 'rate-limit retry delivery failed internally', { agent_id: agent.agentId, error: String(error) });
       void this.evaluateRecovery(agent, `rate-limit retry failed: ${String(error)}`, false, true);
     } finally {
@@ -1447,9 +1495,10 @@ export class Supervisor {
     // Any recovery entry (hang, fatal, non-rate-limit error) supersedes an
     // in-flight automatic retry: the failure it was retrying is no longer
     // the failure being handled. The delivery continuation self-cancels on
-    // the cleared incident identity.
-    agent.rateLimitRetry?.admissionAbort.abort();
-    agent.rateLimitRetry = null;
+    // the cleared incident identity; a pending restart-recovery admission
+    // wait is superseded too.
+    this.clearRateLimitRetry(agent, 'superseded');
+    this.clearRecoveryAdmission(agent);
     // Perkins review attempts are owned by the bounded review workflow. A
     // supervisor resume would drop that attempt's cwd/isolation contract and
     // race the workflow's one permitted retry, so abort the handle only; the
@@ -1711,6 +1760,7 @@ export class Supervisor {
       // open turn FIRST: a killed turn must be resumed or visibly orphaned,
       // never silently dead (E7 false-positive follow-up).
       const old = agent.handle;
+      this.clearRecoveryAdmission(agent);
       const captured = this.captureInterruptedTurn(old, agent);
       if (captured !== null) agent.pendingRecovery = captured;
       agent.handle = null;
@@ -1877,34 +1927,7 @@ export class Supervisor {
         reason,
         owner: pending.owner,
       });
-      try {
-        void handle
-          .prompt(pending.text, {
-            ...(pending.owner !== null ? { owner: pending.owner } : {}),
-            ...(pending.images !== undefined ? { images: pending.images } : {}),
-          })
-          .then(() => {
-            this.recordEvent('supervision.turn-recovery', laneAgentId, {
-              disposition: 'resumed',
-              reason,
-            });
-            this.log('info', 'interrupted turn resumed on the restarted session', {
-              agent_id: laneAgentId,
-              reason,
-            });
-          })
-          .catch((error: unknown) => {
-            this.log('error', 'interrupted turn could not be resumed — posting recoverable-lane note', {
-              agent_id: laneAgentId,
-              reason,
-              error: String(error),
-            });
-            this.postOrphanedTurn(laneAgentId, reason, String(error));
-          });
-      } catch (error) {
-        // A synchronous throw still never orphans: fall through to the note.
-        this.postOrphanedTurn(laneAgentId, reason, String(error));
-      }
+      void this.deliverRecoveredTurn(agent, handle, laneAgentId, pending, reason);
       return;
     }
     this.postOrphanedTurn(
@@ -1914,6 +1937,81 @@ export class Supervisor {
         ? 'the runtime did not expose the pending prompt'
         : 'the pending prompt was empty',
     );
+  }
+
+  /**
+   * Deliver one interrupted turn on a restarted session under the same
+   * worker admission cap as every other minion turn. With the cap occupied
+   * the delivery waits FIFO and is cancelled cleanly when the attempt is
+   * superseded; the lease is released unconditionally, including on
+   * synchronous prompt faults. A rate-limited delivery keeps its lifecycle
+   * pending until the bounded retry recovery concludes.
+   */
+  private async deliverRecoveredTurn(
+    agent: SupervisedAgent,
+    handle: AgentHandle,
+    laneAgentId: string,
+    pending: PendingTurn,
+    reason: string,
+  ): Promise<void> {
+    let lease: PacingLease | null = null;
+    const controller = new AbortController();
+    this.clearRecoveryAdmission(agent); // supersede any older recovery wait
+    agent.recoveryAdmission = controller;
+    const stillCurrent = (): boolean =>
+      !this.disposed &&
+      !controller.signal.aborted &&
+      this.agents.get(agent.agentId) === agent &&
+      agent.handle === handle;
+    try {
+      if (agent.role === 'minion' && this.workerGate !== undefined) {
+        lease = await this.workerGate.acquireWorkerTurn({
+          id: laneAgentId,
+          label: `restart recovery → ${laneAgentId}`,
+          agentId: laneAgentId,
+          signal: controller.signal,
+        });
+        if (!stillCurrent()) return;
+      }
+      await handle.prompt(pending.text, {
+        ...(pending.owner !== null ? { owner: pending.owner } : {}),
+        ...(pending.images !== undefined ? { images: pending.images } : {}),
+      });
+      if (!stillCurrent()) return;
+      // Release the slot before waiting on a bounded rate-limit retry so
+      // the retry can reacquire admission for its next attempt.
+      lease?.release();
+      lease = null;
+      const disposition = await this.awaitRetrySettlement(agent.agentId);
+      if (disposition === 'exhausted' || disposition === 'superseded') {
+        this.log('warn', 'interrupted turn did not resume under its automatic retries', {
+          agent_id: laneAgentId,
+          reason,
+          disposition,
+        });
+        return;
+      }
+      this.recordEvent('supervision.turn-recovery', laneAgentId, {
+        disposition: 'resumed',
+        reason,
+      });
+      this.log('info', 'interrupted turn resumed on the restarted session', {
+        agent_id: laneAgentId,
+        reason,
+      });
+    } catch (error) {
+      // Cancellation is not an orphan: the attempt was superseded.
+      if (!stillCurrent()) return;
+      this.log('error', 'interrupted turn could not be resumed — posting recoverable-lane note', {
+        agent_id: laneAgentId,
+        reason,
+        error: String(error),
+      });
+      this.postOrphanedTurn(laneAgentId, reason, String(error));
+    } finally {
+      if (agent.recoveryAdmission === controller) agent.recoveryAdmission = null;
+      lease?.release();
+    }
   }
 
   private postOrphanedTurn(laneAgentId: string, reason: string, detail: string): void {
@@ -2099,7 +2197,8 @@ export class Supervisor {
     }
     this.unsubscribeTap();
     for (const agent of this.agents.values()) {
-      agent.rateLimitRetry?.admissionAbort.abort();
+      this.clearRateLimitRetry(agent, 'superseded');
+      this.clearRecoveryAdmission(agent);
       if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
     }
     this.agents.clear();

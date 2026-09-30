@@ -26,6 +26,11 @@ import type {
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
+import { DispatchService } from '../src/dispatch/service.js';
+import { routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { makeFixtureRepo } from './helpers/fixture-repo.js';
+import type { WorktreePort } from '../src/dispatch/worktree-port.js';
 
 /**
  * Supervisor tests (EPICS E7 story 4): a controllable registry + handles
@@ -2194,5 +2199,138 @@ describe('supervisor pacing admission and workflow boundary', () => {
       expect(h.registry.spawnCalls).toHaveLength(0);
       expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry')).toBe(false);
     } finally { h.dispose(); }
+  });
+});
+
+describe('worker delivery settlement under automatic rate-limit retry', () => {
+  it('an initial dispatch keeps its delivery pending until an in-band 429 retry recovers', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    const repo = makeFixtureRepo('pacing-dispatch-retry');
+    cleanupDirs.push(repo.path);
+    const root = tmpDir();
+    try {
+      const handle = new FakeHandle('minion', 'minion-dispatch-retry', null);
+      handle.pendingTurnSnapshot = { text: 'retry me', owner: 'dispatch:job-dispatch-retry' };
+      let failed = false;
+      handle.promptHook = () => {
+        if (failed) return;
+        failed = true;
+        handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+      };
+      h.registry.adopt(handle);
+      const service = new DispatchService({
+        ledger: h.api,
+        worktrees: new InMemoryWorktreePort(root),
+        spawner: async () => handle,
+        workerGate: gate,
+        retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
+      });
+      const outcome = await service.dispatch({
+        jobId: 'job-dispatch-retry', repoPath: repo.path, title: 'retry', briefing: 'brief',
+      });
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]));
+      // No premature settlement: not delivered, not disposed, and the slot
+      // is back with the gate so the retry can reacquire it.
+      expect(h.api.getJob('job-dispatch-retry')?.status).toBe('working');
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'job.delivered')).toBe(false);
+      expect(handle.disposed).toBe(false);
+      expect(gate.view().worker.running).toBe(0);
+      await sleeper.release();
+      const settled = await outcome.settled;
+      expect(settled).toEqual({ ok: true });
+      expect(handle.promptCalls).toEqual([
+        { text: expect.stringContaining('BRIEFING:'), owner: 'dispatch:job-dispatch-retry' },
+        { text: 'retry me', owner: 'dispatch:job-dispatch-retry' },
+      ]);
+      expect(h.api.getJob('job-dispatch-retry')?.status).toBe('delivered');
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'job.delivered')).toBe(true);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally { h.dispose(); }
+  });
+
+  it('a fresh-minion directive waits out an in-band 429 before it is disposed or reported delivered', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    const lanePath = tmpDir();
+    try {
+      h.api.addJob({ id: 'job-fresh-directive', repo: 'fixture', title: 'fresh directive', briefing: 'brief' });
+      let spawned: FakeHandle | null = null;
+      h.registry.spawnImpl = async (role, options) => {
+        const handle = new FakeHandle(role, 'minion-fresh-directive', options?.resumeFile ?? null);
+        let failed = false;
+        handle.promptHook = () => {
+          if (failed) return;
+          failed = true;
+          handle.pendingTurnSnapshot = { text: 'fix the thing', owner: 'fix-directive' };
+          handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+        };
+        spawned = handle;
+        return handle;
+      };
+      const routing = routeFixDirectiveToMinion({
+        registry: h.registry,
+        ledger: h.api,
+        worktrees: { listWorktrees: () => [{ kind: 'job', status: 'active', path: lanePath }] } as unknown as WorktreePort,
+        workerGate: gate,
+        retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
+        jobId: 'job-fresh-directive',
+        directive: 'fix the thing',
+        signal: new AbortController().signal,
+      });
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]));
+      const handle = spawned as FakeHandle | null;
+      expect(handle).not.toBeNull();
+      expect(handle!.disposed).toBe(false);
+      expect(handle!.promptCalls).toHaveLength(1);
+      await sleeper.release();
+      await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-fresh-directive' });
+      expect(handle!.promptCalls).toEqual([
+        { text: 'fix the thing', owner: 'fix-directive' },
+        { text: 'fix the thing', owner: 'fix-directive' },
+      ]);
+      expect(handle!.disposed).toBe(true);
+    } finally { h.dispose(); }
+  });
+
+  it('restart recovery waits for a worker slot: cap one keeps a single active minion turn', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    let holderReleased = false;
+    const releaseHolder = (): void => { if (!holderReleased) { holderReleased = true; holder.release(); } };
+    const h = boot(undefined, { workerGate: gate });
+    try {
+      const handle = new FakeHandle('minion', 'minion-restart-cap', null);
+      h.registry.adopt(handle);
+      hang(handle);
+      handle.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:job-cap' };
+      let releasePrompt!: () => void;
+      const openPrompt = new Promise<void>((resolve) => { releasePrompt = resolve; });
+      h.registry.spawnImpl = async (role, options) => {
+        const resumed = new FakeHandle(role, 'minion-cap-resumed', options?.resumeFile ?? null);
+        // Hold the resumed turn open so the assertion sees the admitted slot.
+        resumed.promptHook = async () => { await openPrompt; };
+        return resumed;
+      };
+      h.advance(60);
+      await vi.waitFor(() => expect(h.registry.spawnCalls).toHaveLength(1), { timeout: 5_000 });
+      const resumed = [...h.registry.handlesById.values()].find((candidate) => candidate.id !== handle.id);
+      expect(resumed).toBeDefined();
+      // The gate is full: the recovery delivery queues instead of running a
+      // second minion turn beside the holder.
+      await vi.waitFor(() => expect(gate.view().worker.queued.map((entry) => entry.id)).toContain('minion-restart-cap'), { timeout: 5_000 });
+      expect(resumed?.promptCalls).toHaveLength(0);
+      expect(gate.view().worker.running).toBe(1);
+      releaseHolder();
+      await vi.waitFor(() => expect(resumed?.promptCalls).toHaveLength(1), { timeout: 5_000 });
+      expect(resumed?.promptCalls[0]).toEqual({ text: 'finish the briefing', owner: 'dispatch:job-cap' });
+      releasePrompt();
+      await vi.waitFor(() => expect(gate.view().worker).toMatchObject({ running: 0, queued: [] }), { timeout: 5_000 });
+    } finally {
+      releaseHolder();
+      h.dispose();
+    }
   });
 });

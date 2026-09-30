@@ -18,7 +18,7 @@ import {
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
 import type { ResidentReviewRound } from '../runtime/registry.js';
-import type { PacingGate, PacingLease, RateLimitBackoffPolicy } from '../runtime/pacing.js';
+import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
@@ -991,6 +991,11 @@ export interface WaveRunnerOptions {
   readonly reviewGate?: PacingGate;
   readonly workerGate?: PacingGate;
   readonly rateLimitBackoff?: RateLimitBackoffPolicy | null;
+  /** Provider pacing: the bounded settlement of an automatic rate-limit
+   * retry covering a fallback-review minion turn. The review records the
+   * turn as delivered only for 'none'/'recovered'; the worker lease is
+   * released before the wait so the retry can reacquire admission. */
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   readonly poster?: VerdictPoster;
   readonly escalate?: (title: string, detail: string) => void;
   /** Stable service-owned root. Required for every production review. */
@@ -1930,7 +1935,7 @@ export class WaveRunner {
   }
 
   private async defaultFallbackReview(input: FallbackReviewRunInput): Promise<readonly FallbackFinding[]> {
-    const lease: PacingLease | null = this.opts.workerGate === undefined ? null : await this.opts.workerGate.acquireWorkerTurn({
+    let lease: PacingLease | null = this.opts.workerGate === undefined ? null : await this.opts.workerGate.acquireWorkerTurn({
       id: input.jobId, label: `fallback review → ${input.jobId}`, jobId: input.jobId, signal: input.signal,
     });
     let handle: AgentHandle | null = null;
@@ -1948,15 +1953,26 @@ export class WaveRunner {
       ].join('\n');
       if (input.signal.aborted) throw new Error('review operation aborted');
       let reviewTimer: ReturnType<typeof setTimeout> | null = null;
-      await Promise.race([
-        handle.prompt(prompt, { owner: 'bmad-review-gate' }),
-        new Promise<never>((_resolve, reject) => {
-          input.signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
-          reviewTimer = setTimeout(() => reject(new Error(`fallback review timed out after ${FALLBACK_REVIEW_TIMEOUT_MS}ms`)), FALLBACK_REVIEW_TIMEOUT_MS);
-          reviewTimer.unref?.();
-        }),
-      ]);
-      if (reviewTimer !== null) clearTimeout(reviewTimer);
+      try {
+        await Promise.race([
+          handle.prompt(prompt, { owner: 'bmad-review-gate' }),
+          new Promise<never>((_resolve, reject) => {
+            input.signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
+            reviewTimer = setTimeout(() => reject(new Error(`fallback review timed out after ${FALLBACK_REVIEW_TIMEOUT_MS}ms`)), FALLBACK_REVIEW_TIMEOUT_MS);
+            reviewTimer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (reviewTimer !== null) clearTimeout(reviewTimer);
+        // Release before the settlement wait: the retry reacquires the slot.
+        lease?.release();
+        lease = null;
+      }
+      const disposition = await settleRetries(this.opts.retrySettlement, handle.id, input.signal);
+      if (disposition === 'cancelled') throw new Error('review operation aborted');
+      if (disposition === 'exhausted' || disposition === 'superseded') {
+        throw new Error(`automatic rate-limit retry ${disposition} before the fallback review delivered`);
+      }
     } finally {
       try { await handle?.dispose(); } finally { lease?.release(); }
     }

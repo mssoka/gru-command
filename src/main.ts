@@ -771,6 +771,7 @@ async function main(): Promise<number> {
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
     workerGate: pacing.gate,
+    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -781,6 +782,7 @@ async function main(): Promise<number> {
     reviewGate: pacing.gate,
     workerGate: pacing.gate,
     rateLimitBackoff: pacing.backoff,
+    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     poster: new AutoVerdictPoster(),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     maxConcurrentChildren: config.review.maxConcurrentChildren,
@@ -791,6 +793,7 @@ async function main(): Promise<number> {
       skillPath: resolveBmadReviewSkillPath(),
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
         workerGate: pacing.gate,
+        retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
         registry,
         ledger,
         worktrees: worktreeManager,

@@ -100,6 +100,46 @@ export function backoffDelayMs(
   return Math.min(jittered, maxMs);
 }
 
+/** How a worker delivery's automatic rate-limit retry phase concluded.
+ * `none` = no retry was pending when the delivery settled; `recovered` =
+ * the retried turn delivered; `exhausted` = the bounded budget ran out (or
+ * a retry failed in a non-rate-limit class) without delivering the turn;
+ * `superseded` = a restart, replacement, or shutdown took the turn over. */
+export type RetrySettlement = 'none' | 'recovered' | 'exhausted' | 'superseded';
+
+/** Await a delivered turn's bounded retry settlement, optionally raced
+ * against a cancellation signal (shutdown must never hang a delivery).
+ * A missing hook means no retry machinery is wired ('none'); a hook fault
+ * fails loud as 'exhausted' rather than reporting a silent success. */
+export async function settleRetries(
+  hook: ((agentId: string) => Promise<RetrySettlement>) | undefined,
+  agentId: string,
+  signal?: AbortSignal,
+): Promise<RetrySettlement | 'cancelled'> {
+  if (hook === undefined) return 'none';
+  if (signal?.aborted === true) return 'cancelled';
+  let settle: Promise<RetrySettlement>;
+  try {
+    settle = hook(agentId);
+  } catch {
+    return 'exhausted';
+  }
+  const raced = settle.catch(() => 'exhausted' as const);
+  if (signal === undefined) return raced;
+  let listener: (() => void) | null = null;
+  try {
+    return await Promise.race([
+      raced,
+      new Promise<'cancelled'>((resolve) => {
+        listener = () => resolve('cancelled');
+        signal.addEventListener('abort', listener, { once: true });
+      }),
+    ]);
+  } finally {
+    if (listener !== null) signal.removeEventListener('abort', listener);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Admission gate (FIFO, no starvation, no rejection, never preempt)
 // ---------------------------------------------------------------------------

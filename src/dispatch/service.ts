@@ -9,7 +9,7 @@ import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 import { recordFollowUpDelivery } from './fix-directive.js';
-import type { PacingGate, PacingLease } from '../runtime/pacing.js';
+import { settleRetries, type PacingGate, type PacingLease } from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -45,6 +45,12 @@ export interface DispatchServiceOptions {
   /** Provider pacing: FIFO worker (minion turn) admission gate. Absent =
    * off; an unlimited or disabled gate admits immediately. */
   readonly workerGate?: PacingGate;
+  /** Provider pacing: the bounded settlement of an automatic rate-limit
+   * retry covering a just-delivered worker turn (supervisor-backed in
+   * production). The delivery records success only for 'none'/'recovered'
+   * and releases its worker lease before waiting so the retry can
+   * reacquire admission. Absent = no interlock. */
+  readonly retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
   /** Extracts a minion's opt-in lessons block at delivery settle. */
@@ -186,8 +192,56 @@ export class DispatchService {
       });
 
       // (5) Deliver the briefing. The turn runs in the background; the
-      // board shows the arc through ledger events, not this await.
+      // board shows the arc through ledger events, not this await. A
+      // rate-limited turn stays pending until its bounded automatic retry
+      // path concludes — never recorded as delivered while a retry could
+      // still carry it, never disposed out from under that retry.
       const lessons = this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
+      const settleTurn = async (failure: unknown | null): Promise<{ readonly ok: boolean; readonly error?: string }> => {
+        // Release the slot first: the retry reacquires admission per attempt.
+        releaseWorker();
+        const disposition = await settleRetries(this.opts.retrySettlement, handle.id);
+        const retryFailed = disposition === 'exhausted' || disposition === 'superseded';
+        if (failure !== null && disposition !== 'recovered') {
+          const error = String(failure);
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.minion-error',
+            jobId: job.id,
+            payload: { agentId: handle.id, error },
+          });
+          this.recordSettleOutcome(job.id, 'blocked');
+          this.log('error', 'minion briefing turn failed', {
+            job: job.id,
+            agent: handle.id,
+            error,
+          });
+          return { ok: false as const, error };
+        }
+        if (retryFailed) {
+          const error = `automatic rate-limit retry ${disposition} — the briefing turn did not deliver`;
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.minion-error',
+            jobId: job.id,
+            payload: { agentId: handle.id, error },
+          });
+          this.recordSettleOutcome(job.id, 'blocked');
+          this.log('error', 'minion briefing turn did not survive its automatic retries', {
+            job: job.id,
+            agent: handle.id,
+            disposition,
+          });
+          return { ok: false as const, error };
+        }
+        const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
+          worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch' });
+        if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
+          job: job.id, note: delivery.note, lane: delivery.lanePath,
+        });
+        this.recordSettleOutcome(job.id, 'delivered');
+        this.captureLessons(handle, job.id);
+        this.log('info', 'minion briefing turn completed', { job: job.id, agent: handle.id, disposition });
+        return { ok: true as const };
+      };
       const settled = handle
         .prompt(
           renderMinionBriefing({
@@ -202,31 +256,8 @@ export class DispatchService {
           { owner: `dispatch:${job.id}` },
         )
         .then(
-          async () => {
-            const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
-              worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch' });
-            if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
-              job: job.id, note: delivery.note, lane: delivery.lanePath,
-            });
-            this.recordSettleOutcome(job.id, 'delivered');
-            this.captureLessons(handle, job.id);
-            this.log('info', 'minion briefing turn completed', { job: job.id, agent: handle.id });
-            return { ok: true as const };
-          },
-          (error: unknown) => {
-            this.opts.ledger.appendCustomEvent({
-              kind: 'job.minion-error',
-              jobId: job.id,
-              payload: { agentId: handle.id, error: String(error) },
-            });
-            this.recordSettleOutcome(job.id, 'blocked');
-            this.log('error', 'minion briefing turn failed', {
-              job: job.id,
-              agent: handle.id,
-              error: String(error),
-            });
-            return { ok: false as const, error: String(error) };
-          },
+          () => settleTurn(null),
+          (error: unknown) => settleTurn(error),
         )
         .finally(() => {
           releaseWorker();

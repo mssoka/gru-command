@@ -58,7 +58,6 @@ const PINS: Record<string, number> = {
   'notifications.test.ts': 19,
   'pacing-admission.test.ts': 6,
   'pacing.test.ts': 19,
-  'patch-vitest-rpc-timeout.test.ts': 7,
   'perkins-builtin-wave.test.ts': 90,
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
   'perkins-freeze-freshhead.test.ts': 13,
@@ -93,7 +92,7 @@ const PINS: Record<string, number> = {
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
   'suite-shape.test.ts': 2,
-  'supervisor.test.ts': 67,
+  'supervisor.test.ts': 70,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 13,
   'uploads-dir.test.ts': 3,

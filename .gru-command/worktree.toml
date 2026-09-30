@@ -20,5 +20,5 @@ residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-re
 handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"
 
 # Provider pacing regression scopes use the same scheduler budget as full.
-pacing-unit = "npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/config.test.ts test/config-generate.test.ts test/supervisor.test.ts test/patch-vitest-rpc-timeout.test.ts test/suite-shape.test.ts"
+pacing-unit = "npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/config.test.ts test/config-generate.test.ts test/supervisor.test.ts test/suite-shape.test.ts"
 pacing-review = "npx vitest run test/perkins-whole-review.test.ts -t 'provider pacing'"
