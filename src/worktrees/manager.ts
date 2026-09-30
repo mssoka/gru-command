@@ -858,7 +858,13 @@ export class WorktreeManager {
             `refs/heads/${row.branch}`,
           ]);
           if (present.status === 0) {
-            branchOutcome = this.disposeLaneBranch(row, input.baseBranch);
+            // Fresh remote state BEFORE the retry disposal (Perkins r8):
+            // the old tracking refs must not witness containment.
+            branchOutcome = this.disposeLaneBranch(
+              row,
+              input.baseBranch,
+              this.safeFreshRemoteBranch(row.repoPath),
+            );
           }
         }
         return {
@@ -1233,19 +1239,25 @@ export class WorktreeManager {
     let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
     let freshHead = '';
     try {
-      // Release re-resolves the FRESH head FIRST (ruling 18e; Perkins r7):
-      // the fetch makes the CURRENT remote state known BEFORE the branch
-      // decision, so containment is judged against surviving refs that
-      // exist now — a remote that force-pushed the lane's base away can
-      // no longer be masked by a stale tracking ref. (A freshHead failure
-      // here skips the disposition — fail-safe: the branch is retained.)
-      freshHead = this.freshHead(row.repoPath);
+      // Release re-resolves the FRESH head FIRST (ruling 18e; Perkins
+      // r7/r8): the fetch makes the CURRENT remote state known BEFORE the
+      // branch decision, and ONLY a successfully-fetched, verified default
+      // yields a remote witness for the disposal — a fetch failure or an
+      // unverified default means stale tracking refs witness nothing.
+      // (A freshHead failure here skips the disposition — fail-safe: the
+      // branch is retained.)
+      const base = this.resolveBase(row.repoPath);
+      freshHead = base.sha;
       // Containment-verified branch delete — job lanes only; a branch
-      // is deleted only when its tip is provably contained in a ref that
-      // survives the release; otherwise it is RETAINED, noted, and the
-      // reason reported.
+      // is deleted only when its tip is provably contained in a durable
+      // local ref or the freshly verified remote default; otherwise it
+      // is RETAINED, noted, and the reason reported.
       if (row.kind === 'job' && row.branch !== null) {
-        branchOutcome = this.deleteBranchContained(row, baseBranch);
+        branchOutcome = this.deleteBranchContained(
+          row,
+          baseBranch,
+          base.baseSource === 'origin' ? base.defaultBranch : null,
+        );
       }
     } catch (error) {
       this.log('error', 'sweep tail failed after removal — row still flips swept', {
@@ -1289,7 +1301,13 @@ export class WorktreeManager {
     // DISPOSE FIRST, flip second (Perkins lane-B r4: mirror finishSweep —
     // flipping first re-opened the r3 wedge silently: a crash between the
     // flip and the disposal left every retry early-returning 'none').
-    const branchOutcome = this.disposeLaneBranch(row, baseBranch);
+    // The disposal resolves FRESH remote state first (Perkins r8): a
+    // retry must never delete on the witness of stale tracking refs.
+    const branchOutcome = this.disposeLaneBranch(
+      row,
+      baseBranch,
+      this.safeFreshRemoteBranch(row.repoPath),
+    );
     try {
       this.opts.ledger.setWorktreeStatus(row.id, 'swept');
       this.opts.ledger.appendCustomEvent({
@@ -1314,10 +1332,11 @@ export class WorktreeManager {
   private disposeLaneBranch(
     row: WorktreeRecord,
     baseBranch: string | undefined,
+    freshRemoteBranch: string | null,
   ): 'deleted' | 'retained' | 'none' {
     if (row.kind !== 'job' || row.branch === null) return 'none';
     try {
-      return this.deleteBranchContained(row, baseBranch);
+      return this.deleteBranchContained(row, baseBranch, freshRemoteBranch);
     } catch (error) {
       this.log('error', 'lane branch disposal failed — recorded for retry', {
         id: row.id,
@@ -1345,6 +1364,20 @@ export class WorktreeManager {
       return this.freshHead(repoPath);
     } catch {
       return '';
+    }
+  }
+
+  /** The remote default branch FRESHLY VERIFIED for a disposal decision
+   * (Perkins r8): resolveBase with a successful, verified fetch names the
+   * one remote ref this decision may trust as a containment witness; a
+   * fetch failure, an unverified default, or any resolution error yields
+   * null — stale tracking refs then witness nothing. Never throws. */
+  private safeFreshRemoteBranch(repoPath: string): string | null {
+    try {
+      const base = this.resolveBase(repoPath);
+      return base.baseSource === 'origin' ? base.defaultBranch : null;
+    } catch {
+      return null;
     }
   }
 
@@ -1395,6 +1428,7 @@ export class WorktreeManager {
   private deleteBranchContained(
     row: WorktreeRecord,
     baseBranch: string | undefined,
+    freshRemoteBranch: string | null,
   ): 'deleted' | 'retained' {
     const branch = row.branch as string;
     // Already gone (a healed retry, a prior disposal): disposal is
@@ -1426,33 +1460,40 @@ export class WorktreeManager {
       runGit(row.repoPath, ['branch', '-D', branch]);
       return 'deleted';
     }
-    // The lane's tip must survive in a CURRENT REF — never a bare
-    // recorded sha (Perkins r6 W1 → r7): containment in row.sha only
-    // proves the lane was UNTOUCHED; after a remote force-push the old
-    // tip has no surviving ref anywhere, and deleting the lane's only
-    // branch would orphan it (the release's own fetch then overwrites
-    // the tracking ref, losing the tip for good). Prove containment in
-    // a ref that exists NOW — on the release path the fresh remote
-    // state is fetched FIRST, so a retained remote tip shows up as
-    // origin/<default> containment and the common case still deletes.
-    // Any current ref counts (another branch, a tracking ref, a tag);
-    // the lane's own branch is excluded — it cannot witness itself.
+    // The lane's tip must survive in a DURABLE ref — never a stale
+    // remote-tracking ref (Perkins r7/r8): after a remote force-push the
+    // old tracking ref still names the tip, but it is transient — the
+    // next successful fetch of that branch overwrites it, orphaning the
+    // tip if the lane branch was deleted on its witness. Durable
+    // witnesses: another LOCAL branch or tag (they never move under a
+    // fetch), plus the ONE remote ref freshly verified for THIS
+    // decision — the default branch this release actually fetched
+    // (freshRemoteBranch; null when the fetch failed or the default was
+    // unverified). A stale/unverified tracking ref witnesses nothing.
     const branchTip = spawnGit(row.repoPath, ['rev-parse', `refs/heads/${branch}^{commit}`]);
     if (branchTip.status === 0 && branchTip.stdout.trim() !== '') {
-      const surviving = spawnGit(row.repoPath, [
+      const tip = branchTip.stdout.trim();
+      const durableLocal = spawnGit(row.repoPath, [
         'for-each-ref',
-        `--contains=${branchTip.stdout.trim()}`,
+        `--contains=${tip}`,
         '--format=%(refname)',
         'refs/heads',
-        'refs/remotes',
         'refs/tags',
       ]);
-      if (surviving.status === 0) {
-        const otherRefs = surviving.stdout
+      if (durableLocal.status === 0) {
+        const others = durableLocal.stdout
           .split('\n')
           .map((name) => name.trim())
           .filter((name) => name !== '' && name !== `refs/heads/${branch}`);
-        if (otherRefs.length > 0) {
+        const freshRemoteWitness =
+          freshRemoteBranch !== null &&
+          spawnGit(row.repoPath, [
+            'merge-base',
+            '--is-ancestor',
+            tip,
+            `refs/remotes/origin/${freshRemoteBranch}`,
+          ]).status === 0;
+        if (others.length > 0 || freshRemoteWitness) {
           runGit(row.repoPath, ['branch', '-D', branch]);
           return 'deleted';
         }

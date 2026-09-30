@@ -646,6 +646,99 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
     );
   });
 
+  /** The R8 loss shapes: a STALE remote-tracking ref (the tip's last
+   * apparent witness) must never justify deleting the lane branch — only
+   * a durable LOCAL ref or the remote default FRESHLY fetched for this
+   * decision may witness. Each case leaves the old tip reachable. */
+  const forcePushOrigin = (origin: string): string => {
+    const clone = mkdtempSync(join(tmpdir(), 'gru-wt-r8-clone-'));
+    try {
+      execFileSync('git', ['clone', '--quiet', '--branch', 'main', origin, clone], { stdio: 'ignore' });
+      execFileSync(
+        'git',
+        ['-C', clone, ...GIT_IDENTITY, 'commit', '--allow-empty', '--amend', '-m', 'force-pushed history'],
+        { stdio: 'ignore' },
+      );
+      execFileSync('git', ['-C', clone, 'push', '--quiet', '--force', 'origin', 'HEAD:refs/heads/main'], {
+        stdio: 'ignore',
+      });
+      return execFileSync('git', ['-C', clone, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    } finally {
+      rmSync(clone, { recursive: true, force: true });
+    }
+  };
+
+  it('an OFFLINE force-push release retains — the stale tracking ref witnesses nothing (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-offline');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-offline', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-offline' });
+    const laneTip = row.sha;
+    forcePushOrigin(origin);
+    // Origin becomes unreachable: the release fetch FALLS BACK, and the
+    // stale refs/remotes/origin/main (still naming the tip) is the false
+    // witness the old code deleted on.
+    repo.git(['remote', 'set-url', 'origin', join(repo.path, '..', 'missing-origin.git')]);
+
+    const result = await h.manager.release({ worktreeId: 'job-r8-offline' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') expect(result.branch).toBe('retained');
+    expect(repo.git(['rev-parse', 'refs/heads/gru/job-r8-offline'])).toBe(laneTip);
+  });
+
+  it('a DELETED remote default on release retains — the stale tracking ref witnesses nothing (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-default-gone');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-defaultgone', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-defaultgone' });
+    const laneTip = row.sha;
+    // The remote deletes its default entirely; the local tracking ref
+    // lingers, stale — and the live probe authoritatively finds no HEAD.
+    execFileSync('git', ['-C', origin, 'update-ref', '-d', 'refs/heads/main'], { stdio: 'ignore' });
+
+    const result = await h.manager.release({ worktreeId: 'job-r8-defaultgone' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') expect(result.branch).toBe('retained');
+    expect(repo.git(['rev-parse', 'refs/heads/gru/job-r8-defaultgone'])).toBe(laneTip);
+  });
+
+  it('a force-push through the SWEPT-ROW retry retains — fresh remote state is resolved before disposal (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-swept');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-swept', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-swept' });
+    const laneTip = row.sha;
+    forcePushOrigin(origin);
+    // The crash window: row flipped swept, tree gone, disposal skipped.
+    repo.git(['worktree', 'remove', '--force', row.path]);
+    h.ledger.setWorktreeStatus('job-r8-swept', 'swept');
+
+    const healed = await h.manager.release({ worktreeId: 'job-r8-swept' });
+    expect(healed.status).toBe('swept');
+    if (healed.status === 'swept') expect(healed.branch).toBe('retained');
+    expect(repo.git(['rev-parse', 'refs/heads/gru/job-r8-swept'])).toBe(laneTip);
+  });
+
+  it('a force-push through MISSING-TREE reconciliation retains — fresh remote state is resolved before disposal (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-reconcile');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-reconcile', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-reconcile' });
+    const laneTip = row.sha;
+    forcePushOrigin(origin);
+    // Crash window: tree gone, row never flipped.
+    repo.git(['worktree', 'remove', '--force', row.path]);
+
+    const reconciled = await h.manager.release({ worktreeId: 'job-r8-reconcile' });
+    expect(reconciled.status).toBe('swept');
+    if (reconciled.status === 'swept') expect(reconciled.branch).toBe('retained');
+    expect(repo.git(['rev-parse', 'refs/heads/gru/job-r8-reconcile'])).toBe(laneTip);
+  });
+
   it('an UNREACHABLE origin still consults the cached origin/HEAD as its declared offline guess (retained)', async () => {
     const h = harness();
     const { repo } = originBacked(h, 'fixture-offline-cache'); // cached origin/HEAD -> main
