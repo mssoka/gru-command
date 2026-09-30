@@ -195,9 +195,6 @@ restart_window_ms = 600000
 max_restarts = 3
 # Backoff base between failed restart rungs (doubles, capped at 60s).
 restart_backoff_ms = 2000
-# Compact an IDLE session proactively once context usage reaches this
-# percent (1-100); pi's own threshold compaction stays as the backstop.
-proactive_compact_percent = 70
 
 [logging]
 # service.log size-based rotation.
