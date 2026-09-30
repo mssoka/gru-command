@@ -107,6 +107,15 @@ Owner approval: dispatch briefing 2026-09-30 (explicit rollback approval + instr
   during verification: it shells out to `dist/cli/config-generate.js` and
   needs a prior build, so it belongs to the full gate's build step, not a
   plain focused vitest scope.
+- Full-gate host repairs (inherited, not #137): the first full run at
+  `c0d0ec2` was red with 3 test timeouts + the wizard failure + 5 vitest
+  worker-RPC unhandled errors on this loaded shared host. Merged
+  origin/main (128cdb8) for the vitest RPC timeout patch (#139); made the
+  wizard no-TTY child hermetic (isolated `GRU_COMMAND_HOME`, so it no
+  longer trips on an ambient installed config the current loader rejects);
+  and gave the two-round T4 wave test an explicit 180s bound per the
+  c5d20bc precedent for neighbouring multi-round tests. No assertions or
+  product behavior changed by these repairs.
 - Inherited main drift (not caused by #137): `test/owner-actions.test.ts`
   and the `github-poll.test.ts` count both lost their 3300165 pin updates
   in the `a755cfd` merge resolution, so the suite-shape pin test fails on
