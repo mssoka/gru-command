@@ -108,12 +108,14 @@ Owner approval: dispatch briefing 2026-09-30 (explicit rollback approval + instr
   needs a prior build, so it belongs to the full gate's build step, not a
   plain focused vitest scope.
 - Inherited main drift (not caused by #137): `test/owner-actions.test.ts`
-  is tracked but its `PINS` entry was lost in the `a755cfd` merge
-  resolution, so the suite-shape pin test fails on c54bfbf and on current
-  origin/main 128cdb8 (GitHub CI runs 36681310262 and 36737944061 red on
-  exactly that assertion). Restored the pin (`8`, the FOR YOU branch's own
-  value and the actual static count) so the required full gate can be
-  green for this head; documented in its own commit and in the PR.
+  and the `github-poll.test.ts` count both lost their 3300165 pin updates
+  in the `a755cfd` merge resolution, so the suite-shape pin test fails on
+  c54bfbf and on current origin/main 128cdb8 (GitHub CI runs 36681310262
+  and 36737944061 red on exactly that surface; a full pin audit found no
+  other drift). Restored both pins from the FOR YOU branch and the actual
+  static counts (owner-actions 8, github-poll 24) so the required full
+  gate can be green for this head; documented in its own commit and in
+  the PR.
 ## Spec Change Log
 
 ## Review Triage Log
