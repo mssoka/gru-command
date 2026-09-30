@@ -66,11 +66,6 @@ class FakeHandle implements AgentHandle {
   liveProcess = false;
   /** pendingTurn snapshot; null = the runtime cannot name the live prompt. */
   pendingTurnSnapshot: PendingTurn | null = null;
-  /** Proactive context gate: usage the adapter would report (null = unknown). */
-  contextUsage: ContextUsage | null = null;
-  /** Explicit compaction behavior; null = the runtime cannot compact. */
-  compactImpl: (() => Promise<void>) | null = null;
-  compactCalls = 0;
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
 
   constructor(role: Role, id: string, sessionFile: string | null, reviewIsolation = false) {
@@ -99,13 +94,6 @@ class FakeHandle implements AgentHandle {
   readonly hasLiveProcess = (): boolean => this.liveProcess;
   /** E7 resume snapshot: what the runtime knows about the open turn. */
   readonly pendingTurn = (): PendingTurn | null => this.pendingTurnSnapshot;
-  /** Proactive compaction gate surface: usage + explicit compact. */
-  readonly getContextUsage = (): ContextUsage | null => this.contextUsage;
-  readonly canCompact = (): boolean => !this.disposed && this.compactImpl !== null;
-  compact = async (): Promise<void> => {
-    this.compactCalls += 1;
-    await this.compactImpl!();
-  };
   subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.listeners.add(listener);
     return () => {
@@ -244,7 +232,6 @@ function boot(decisions?: DecisionService, opts: { wallNow?: () => number } = {}
       restartWindowMs: 600_000,
       maxRestarts: 3,
       restartBackoffMs: 1,
-      proactiveCompactPercent: 70,
     },
     registry,
     ledger: api,
@@ -416,7 +403,6 @@ describe('supervisor — watchdog + restart ladder', () => {
         restartWindowMs: 600_000,
         maxRestarts: 3,
         restartBackoffMs: 1,
-        proactiveCompactPercent: 70,
       },
       registry,
       ledger: api,
@@ -921,7 +907,6 @@ describe('supervisor — hang-loop breaker flavor (successful restarts that keep
         restartWindowMs: 600_000,
         maxRestarts: 3,
         restartBackoffMs: 1,
-        proactiveCompactPercent: 70,
       },
       registry,
       ledger: api,
@@ -1284,7 +1269,6 @@ describe('supervisor — Perkins r1 fixes', () => {
         restartWindowMs: 600_000,
         maxRestarts: 3,
         restartBackoffMs: 1,
-        proactiveCompactPercent: 70,
       },
       registry,
       ledger: api,
@@ -1517,212 +1501,47 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
   });
 });
 
-describe('supervisor — proactive compaction gate', () => {
-  it('compacts an idle session at the configured percent, once per idle window', async () => {
-    const h = boot();
-    const handle = new FakeHandle('gru', 'gru-gate-trigger', null);
-    handle.compactImpl = async () => {};
-    h.registry.adopt(handle);
-    try {
-      // Below the threshold: nothing happens, not even on a tick.
-      handle.contextUsage = { tokens: 69_000, contextWindow: 100_000, percent: 69 };
-      h.advance(5);
-      await sleep(0);
-      expect(handle.compactCalls).toBe(0);
-
-      // The idle turn boundary at 70% fires exactly one explicit compaction.
-      handle.contextUsage = { tokens: 70_000, contextWindow: 100_000, percent: 70 };
-      handle.setState('idle');
-      await sleep(0);
-      expect(handle.compactCalls).toBe(1);
-      expect(
-        h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.compaction'),
-      ).toHaveLength(1);
-
-      // No new activity since: later ticks must not re-fire.
-      h.advance(5);
-      h.advance(5);
-      await sleep(0);
-      expect(handle.compactCalls).toBe(1);
-      expect(h.supervisor.viewFor('gru-gate-trigger')?.compactionDegraded).toBe(false);
-    } finally {
-      h.dispose();
-    }
+/**
+ * #137 rollback probe: advertises the surface the removed proactive gate
+ * consumed, so a regression test can prove supervision no longer acts on it.
+ */
+class CompactionProbeHandle extends FakeHandle {
+  compactCalls = 0;
+  readonly getContextUsage = (): ContextUsage => ({
+    tokens: 90_000,
+    contextWindow: 100_000,
+    percent: 90,
   });
+  readonly canCompact = (): boolean => !this.disposed;
+  readonly compact = async (): Promise<void> => {
+    this.compactCalls += 1;
+  };
+}
 
-  it('defers compaction during a stream error and retries after a clean turn', async () => {
+describe('supervisor — #137 rollback: no proactive compaction gate', () => {
+  it('never compacts or defers an idle over-threshold session, even after a provider error', async () => {
     const h = boot();
-    const handle = new FakeHandle('gru', 'gru-gate-defer', null);
-    handle.contextUsage = { tokens: 80_000, contextWindow: 100_000, percent: 80 };
-    handle.compactImpl = async () => {};
+    const handle = new CompactionProbeHandle('gru', 'gru-rollback-no-gate', null);
     h.registry.adopt(handle);
     try {
+      handle.setState('idle');
+      h.advance(5);
+      h.advance(5);
+      await sleep(0);
+      const compactionEvents = () =>
+        h.api
+          .listEvents({ limit: 100 })
+          .filter((e) => e.kind.startsWith('supervision.compaction'));
+      expect(handle.compactCalls).toBe(0);
+      expect(compactionEvents()).toHaveLength(0);
+
+      // A stream error must not arm a deferred retry either.
       handle.emit({ type: 'error', error: 'Provider stream error: fetch failed', fatal: false });
       h.advance(5);
+      h.advance(5);
       await sleep(0);
       expect(handle.compactCalls).toBe(0);
-      const deferred = h.api
-        .listEvents({ limit: 100 })
-        .filter((e) => e.kind === 'supervision.compaction-deferred');
-      expect(deferred).toHaveLength(1);
-      expect(deferred[0]?.payload).toMatchObject({
-        failure_class: 'network_failure',
-        retry: 'after-provider-recovery',
-      });
-      expect(h.supervisor.viewFor('gru-gate-defer')?.compactionDeferred).toBe(true);
-
-      // Ticks while the condition holds never duplicate the deferral.
-      h.advance(5);
-      h.advance(5);
-      await sleep(0);
-      expect(
-        h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.compaction-deferred'),
-      ).toHaveLength(1);
-      expect(handle.compactCalls).toBe(0);
-
-      // Recovery: a clean turn boundary clears the condition and retries.
-      handle.emit({ type: 'turn_start' });
-      handle.emit({ type: 'turn_end' });
-      handle.setState('idle');
-      await sleep(0);
-      expect(handle.compactCalls).toBe(1);
-      expect(
-        h.api.listEvents({ limit: 100 }).some((e) => e.kind === 'supervision.compaction'),
-      ).toBe(true);
-    } finally {
-      h.dispose();
-    }
-  });
-
-  it('a provider-wall compaction failure defers once, degrades, never restarts, and retries after recovery', async () => {
-    const h = boot();
-    const handle = new FakeHandle('gru', 'gru-gate-wall', null);
-    handle.contextUsage = { tokens: 90_000, contextWindow: 100_000, percent: 90 };
-    let failures = 1;
-    handle.compactImpl = async () => {
-      if (failures > 0) {
-        failures -= 1;
-        throw new Error('quota exceeded: 429 rate limit');
-      }
-    };
-    h.registry.adopt(handle);
-    try {
-      const spawnsBefore = h.registry.spawnCalls.length;
-      h.advance(5);
-      await sleep(0);
-      expect(handle.compactCalls).toBe(1);
-      // Exactly one deferred-retry event; zero restart-ladder evidence.
-      expect(
-        h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.compaction-deferred'),
-      ).toHaveLength(1);
-      for (const kind of ['supervision.restart', 'supervision.escalated', 'supervision.breaker']) {
-        expect(
-          h.api.listEvents({ limit: 100 }).some((e) => e.kind === kind),
-          kind,
-        ).toBe(false);
-      }
-      expect(h.registry.spawnCalls).toHaveLength(spawnsBefore);
-      expect(handle.disposed).toBe(false);
-      const view = h.supervisor.viewFor('gru-gate-wall');
-      expect(view?.compactionDegraded).toBe(true);
-      expect(view?.compactionDeferred).toBe(true);
-
-      // The recovery gate: a tick in the same state does not burn another attempt.
-      h.advance(5);
-      await sleep(0);
-      expect(handle.compactCalls).toBe(1);
-
-      // Recovery proves the route: the clean boundary retries and succeeds.
-      handle.emit({ type: 'turn_start' });
-      handle.emit({ type: 'turn_end' });
-      handle.setState('idle');
-      await sleep(0);
-      expect(handle.compactCalls).toBe(2);
-      const recovered = h.supervisor.viewFor('gru-gate-wall');
-      expect(recovered?.compactionDegraded).toBe(false);
-      expect(recovered?.compactionDeferred).toBe(false);
-      expect(
-        h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.compaction-deferred'),
-      ).toHaveLength(1);
-    } finally {
-      h.dispose();
-    }
-  });
-
-  it('a non-wall compaction failure records degradation and never restarts', async () => {
-    const h = boot();
-    const handle = new FakeHandle('gru', 'gru-gate-failed', null);
-    handle.contextUsage = { tokens: 75_000, contextWindow: 100_000, percent: 75 };
-    handle.compactImpl = async () => {
-      throw new Error('Nothing to compact (session too small)');
-    };
-    h.registry.adopt(handle);
-    try {
-      const spawnsBefore = h.registry.spawnCalls.length;
-      h.advance(5);
-      await sleep(0);
-      expect(handle.compactCalls).toBe(1);
-      expect(
-        h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.compaction-degraded'),
-      ).toHaveLength(1);
-      expect(
-        h.api.listEvents({ limit: 100 }).some((e) => e.kind === 'supervision.restart'),
-      ).toBe(false);
-      expect(h.registry.spawnCalls).toHaveLength(spawnsBefore);
-      expect(handle.disposed).toBe(false);
-      expect(h.supervisor.viewFor('gru-gate-failed')?.compactionDegraded).toBe(true);
-    } finally {
-      h.dispose();
-    }
-  });
-
-  it('a lost race with another control actor is not a compaction failure', async () => {
-    const h = boot();
-    const handle = new FakeHandle('gru', 'gru-gate-busy', null);
-    handle.contextUsage = { tokens: 80_000, contextWindow: 100_000, percent: 80 };
-    handle.compactImpl = async () => {
-      throw new Error('agent session is busy; compaction requires an idle session');
-    };
-    h.registry.adopt(handle);
-    try {
-      h.advance(5);
-      await sleep(0);
-      expect(handle.compactCalls).toBe(1);
-      expect(
-        h.api.listEvents({ limit: 100 }).some((e) => e.kind === 'supervision.compaction-degraded'),
-      ).toBe(false);
-      expect(
-        h.api.listEvents({ limit: 100 }).some((e) => e.kind === 'supervision.compaction-deferred'),
-      ).toBe(false);
-      expect(h.supervisor.viewFor('gru-gate-busy')?.compactionDegraded).toBe(false);
-      expect(handle.disposed).toBe(false);
-    } finally {
-      h.dispose();
-    }
-  });
-
-  it('a failed native compaction (backstop) degrades the session without a restart', async () => {
-    const h = boot();
-    const handle = new FakeHandle('gru', 'gru-gate-native-fail', null);
-    h.registry.adopt(handle);
-    try {
-      const spawnsBefore = h.registry.spawnCalls.length;
-      handle.emit({ type: 'compaction_start' });
-      handle.emit({
-        type: 'compaction_end',
-        success: false,
-        error: 'Compaction failed: 429 quota exceeded',
-      });
-      await sleep(0);
-      expect(
-        h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.compaction-deferred'),
-      ).toHaveLength(1);
-      expect(
-        h.api.listEvents({ limit: 100 }).some((e) => e.kind === 'supervision.restart'),
-      ).toBe(false);
-      expect(h.registry.spawnCalls).toHaveLength(spawnsBefore);
-      expect(handle.disposed).toBe(false);
-      expect(h.supervisor.viewFor('gru-gate-native-fail')?.compactionDegraded).toBe(true);
+      expect(compactionEvents()).toHaveLength(0);
     } finally {
       h.dispose();
     }
