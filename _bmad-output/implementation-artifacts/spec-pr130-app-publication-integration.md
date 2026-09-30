@@ -71,9 +71,11 @@ context: []
 - Independent review round (integration final diff 128cdb8..8e1eab6, staged sha256 7ad798c69c22d2f820f0122b5a75595ea7cb2a13203c5a12ec2d172e74f1ac8d): five fresh read-only sessions under delivery/independent-review-integration/.
 - Review closures committed: 83802c2 (findings), 5ccde5b (recheck findings), 5489fa7 (final-delta findings), b6dca64 (final-delta guard snippets + closing hardening); inherited repairs 30bb354. Staged hashes: recheck 25a5d48a..., delta e3fac918..., final-delta fixes ff2f75b9..., closing 2138ceee.... Focused after each: 68/68, 70/70, 74/74, 77/77 (perkins-github-app + suite-shape; pin 52→66→67→68→72→75). No `src/dispatch/perkins.ts` edit.
 - Shared-contract boundary note for Gru: `VerdictPosterInput` carries no abort signal, so a bounded reconciliation can run up to its page/timeout budget after a round is cancelled; `perkins.ts` was left read-only per the ownership rule.
-- Scheduled full runs: `e35309ee` on 821ed30 failed 1/1534 (chat-server adoption race; repaired 4ee38fb); the rerun on the repaired candidate and its run id are recorded in the delivery receipt. Inherited full-gate repairs carried by this lane (all test-only, disclosed): suite-shape pins, wizard no-TTY isolation + T4 bound (cross-validated with revert-compaction-137/4bc28b8), chat-server adoption wait.
+- Scheduled full runs: `e35309ee` on 821ed30 failed 1/1534 (chat-server adoption race; repaired 4ee38fb); the rerun on the repaired candidate and its run id are recorded in the delivery receipt. Inherited full-gate repairs carried by this lane (all test-only, disclosed): suite-shape pins, wizard no-TTY isolation, chat-server adoption wait. (Correction 2026-09-30: the earlier "T4 bound" item is withdrawn — the explicit 180s timeout on the T4 WaveRunner test was an unauthorized verification-bound extension and has been removed; the cross-validation cited against revert-compaction-137/4bc28b8 was invalid because that source carried the same extension, later ruled unauthorized and removed on PR #147. Accepted current main ends the T4 test with the inherited suite default.)
 
 ## Spec Change Log
+
+- 2026-09-30 (rebrief continuation): Removed the unauthorized 180s timeout extension on the T4 WaveRunner reconciliation test — the test now ends with the inherited suite default, exactly as accepted on current main; every T4 assertion is untouched. Corrected the stale cross-validation note: revert-compaction-137/4bc28b8 carried the same rejected extension, so it never validated this bound; the identical extension was ruled unauthorized and removed on PR #147. No assertion, product, or other timeout change.
 
 ## Review Triage Log
 
@@ -121,7 +123,7 @@ context: []
 
 ### Inherited full-gate repairs (not PR130's diff)
 
-- The focused probes on this lane reproduced two inherited main-lineage failures: the wizard no-TTY test (exit 1 due to an ambient instance config the loader rejects) and the T4 WaveRunner test sitting at 22.4s against the 30s default on this shared host. Both are already repaired identically in the revert-compaction-137 lane (4bc28b8, pending on PR #147); this lane carries the same test-only repairs (commit 30bb354) so its required full-candidate verification can run honestly. No assertions or product behavior changed.
+- The focused probes on this lane reproduced two inherited main-lineage failures: the wizard no-TTY test (exit 1 due to an ambient instance config the loader rejects) and the T4 WaveRunner test sitting at 22.4s against the 30s default on this shared host. The wizard no-TTY isolation is repaired test-only in commit 30bb354 and stays carried by this lane. The second item — the explicit 180s timeout 30bb354 gave the T4 test — is withdrawn: it was an unauthorized verification-bound extension, not an accepted repair; the same extension was ruled unauthorized and removed on PR #147, and accepted current main ends this exact test with the inherited default. The earlier cross-validation citation of revert-compaction-137/4bc28b8 was stale (that source carried the same rejected extension). All T4 assertions are untouched; no product behavior changed.
 
 ## Verification
 
