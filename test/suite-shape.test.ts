@@ -74,7 +74,7 @@ const PINS: Record<string, number> = {
   'roll-state.test.ts': 7,
   'runtime-cessation-evidence.test.ts': 4,
   'runtime-probe.test.ts': 7,
-  'runtime-resident-registry.test.ts': 20,
+  'runtime-resident-registry.test.ts': 21,
   'service-port-guard.test.ts': 14,
   'silas-deterministic-seam.test.ts': 1,
   'session-store.test.ts': 14,

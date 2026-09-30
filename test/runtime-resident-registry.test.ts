@@ -292,6 +292,39 @@ describe('registry resident boundary across adapters', () => {
     } finally { h.cleanup(); }
   });
 
+  it('a failed review child spawn is delivered to its caller, never an unhandled rejection', async () => {
+    let failPerkins = false;
+    const h = harness(4, (role) => role === 'perkins' && failPerkins);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const round = await h.registry.reserveReviewRound();
+      const lead = await round.spawn({ reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } });
+      const batch = round.beginChildren(1);
+      failPerkins = true;
+      await expect(round.spawn({ isolatedReview: { systemPrompt: 'lens', tools: [] } }))
+        .rejects.toThrow(/refused spawn/);
+      failPerkins = false;
+      // Node reports an unobserved rejection after the microtask queue
+      // drains; both ticks must see nothing.
+      await tick();
+      await tick();
+      expect(unhandled).toEqual([]);
+      // Graceful degradation: the failed child released its in-flight slot,
+      // so the same round still admits the child it needs.
+      const child = await round.spawn({ isolatedReview: { systemPrompt: 'lens', tools: [] } });
+      await child.dispose();
+      batch.finish();
+      await lead.dispose();
+      await round.close();
+      expect(h.registry.residents.occupied).toBe(0);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      h.cleanup();
+    }
+  });
+
   it('holds the pair for an unproven live handle at close, then releases exactly once on proven cessation', async () => {
     const h = harness(4);
     try {

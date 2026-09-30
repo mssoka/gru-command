@@ -381,7 +381,12 @@ export class RuntimeRegistry {
       if (isPairSlot) pairPending += 1;
       const operation = this.spawnReserved('perkins', options, spare);
       spawnPromises.add(operation);
-      void operation.finally(() => { spawnPromises.delete(operation); });
+      // Track in-flight settlements for close. The derived chain MUST swallow
+      // its rejection: the failed spawn is already owned by the awaiting
+      // caller (which rethrows to the review engine) and by the
+      // late-settlement observer below — an unobserved derivative would exit
+      // the service through the process-level unhandledRejection handler.
+      void operation.finally(() => { spawnPromises.delete(operation); }).catch(() => {});
       // Owned late-settlement observer (attached at spawn time): post-close
       // resolution enters owned disposal; rejection is adapter-owned
       // no-admission (positive unused) for pair slots.
