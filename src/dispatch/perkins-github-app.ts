@@ -367,7 +367,10 @@ export interface AppFetchResponse {
    * supply a plain record. Both are supported. */
   readonly headers?: Headers | Readonly<Record<string, string>>;
   /** Production fetch exposes the reply byte stream; when present the
-   * reader applies the byte ceiling without buffering past it. */
+   * reader applies the byte ceiling without buffering past it (the bound
+   * is the ceiling plus at most one stream chunk held whole). A response
+   * without a stream falls back to text() — that path exists for test
+   * doubles, which return finite fixture bodies. */
   readonly body?: ReadableStream<Uint8Array> | null;
   readonly text: () => Promise<string>;
 }
@@ -387,9 +390,11 @@ function parseJsonBestEffort(text: string): unknown {
 /** Read a provider reply under a hard byte ceiling. Production fetch
  * exposes a byte stream, so the reader stops at the ceiling instead of
  * buffering past it; a test double that only offers `text()` gets the same
- * ceiling applied to the returned string. `overflowed` tells the caller the
- * reply was truncated at the ceiling (status classification uses the
- * truncated text; oversized OK replies fail closed). */
+ * ceiling applied to the returned string (the bytes-read bound is exact;
+ * when a boundary splits a multi-byte UTF-8 sequence the re-encoded string
+ * can carry at most two replacement bytes more). `overflowed` tells the
+ * caller the reply was truncated at the ceiling (status classification
+ * uses the truncated text; oversized OK replies fail closed). */
 async function readResponseBodyCapped(
   response: AppFetchResponse,
   maxBytes: number,
@@ -513,7 +518,7 @@ function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha
 function providerIndicatesRateLimit(error: PerkinsAppHttpError): boolean {
   const documentationUrl = (error.body as { readonly documentation_url?: unknown } | null)?.documentation_url;
   return (typeof documentationUrl === 'string' && /rate-limit/u.test(documentationUrl)) ||
-    /\brate[- ]?limits?\b|\brate[- ]?limited\b|abuse detection/iu.test(error.providerMessage);
+    /\brate[- ]?limits?\b|\brate[- ]?limited\b|\brate[- ]?limiting\b|abuse detection/iu.test(error.providerMessage);
 }
 
 /** HTTP-level provider rejection with a sanitized provider message. */

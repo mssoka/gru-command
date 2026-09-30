@@ -706,6 +706,19 @@ describe('fail-closed credential and identity checks', () => {
     ]);
     await expect(tooMany.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/429/u);
+
+    // Message-only variants: the plural and gerund forms carry the same
+    // window-reset meaning with no documentation_url at all.
+    const plural = posterWith(fixture, [
+      { method: 'POST', test: /access_tokens$/, handler: async () => ({ status: 403, body: { message: 'You have exceeded the secondary rate limits.' } }) },
+    ]);
+    await expect(plural.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/rate limiting/u);
+    const gerund = posterWith(fixture, [
+      { method: 'POST', test: /access_tokens$/, handler: async () => ({ status: 403, body: { message: 'secondary rate limiting is in effect' } }) },
+    ]);
+    await expect(gerund.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/rate limiting/u);
   });
 
   it('labels a rate-limited review POST as rate limiting — a definitive refusal with no retry', async () => {
@@ -1418,7 +1431,7 @@ describe('review id discipline', () => {
     // the 100-chunk stream could be drained; a buffering implementation
     // would read every chunk (pulls === chunkCount) and never cancel.
     expect(cancelled).toBe(true);
-    expect(pulls).toBeLessThan(chunkCount);
+    expect(pulls).toBeLessThanOrEqual(23);
   });
 
   it('parses a streamed reply on the happy path (the production read shape)', async () => {
@@ -1477,6 +1490,27 @@ describe('review id discipline', () => {
     const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
     expect(error?.message ?? '').not.toMatch(/rate limiting/u);
     expect(error?.message ?? '').toMatch(/suspended or the App forbidden/u);
+
+    // The same classifier guards the delivery-POST refusal branch: an abuse
+    // suspension must not be relabeled as a rate-limit wait there either.
+    const postPath = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/reviews$/,
+        handler: async () => ({
+          status: 403,
+          body: {
+            message: 'Your account has been flagged.',
+            documentation_url: 'https://docs.github.com/en/site-policy/acceptable-use-policies/github-abuse',
+          },
+        }),
+      },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+    ]);
+    const postError = await postPath.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })
+      .then(() => null, (cause: unknown) => cause as Error);
+    expect(postError?.message ?? '').not.toMatch(/rate limiting/u);
+    expect((postError as PerkinsAppHttpError).status).toBe(403);
+    expect(postPath.calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(0);
   });
 
   it('keeps an oversized refusal classified by its status (never as an unknown outcome)', async () => {
@@ -1513,6 +1547,27 @@ describe('review id discipline', () => {
     expect(streamedError).toBeInstanceOf(PerkinsAppHttpError);
     expect((streamedError as PerkinsAppHttpError).status).toBe(403);
     expect(streamed.calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(0);
+
+    // The retained overflow prefix is what preserves prefix-borne
+    // classification evidence: a rate-limit marker in the first bytes of an
+    // oversized refusal must still classify as rate limiting (dropping the
+    // whole boundary chunk would erase it and mislabel the refusal).
+    const prefixClassifier = posterWith(fixture, [
+      {
+        method: 'POST', test: /access_tokens$/,
+        handler: async () => ({
+          status: 403,
+          stream: new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(`API rate limit exceeded. ${'x'.repeat(2_100)}`));
+              controller.close();
+            },
+          }),
+        }),
+      },
+    ], { maxProviderBodyBytes: 2_048 });
+    await expect(prefixClassifier.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/rate limiting/u);
   });
 
   it('routes an oversized OK delivery reply into bounded reconciliation, never a blind retry', async () => {
