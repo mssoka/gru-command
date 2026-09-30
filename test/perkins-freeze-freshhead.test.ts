@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -15,6 +15,7 @@ import type { AgentSpawner } from '../src/dispatch/service.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { WorktreeManager } from '../src/worktrees/manager.js';
 import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
@@ -519,12 +520,20 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-nopr-move-artifacts-');
     const sessions = tempDir('gru-freeze-nopr-move-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', stale);
-    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-nopr-moving' });
+    // Exercise the production manager through the WHOLE round, not the
+    // copied GitReviewPort resolver. Job creation fetches main only;
+    // origin/topic is still stale until freeze resolves it.
+    const port = new WorktreeManager({
+      ledger, root, preserveRoot: tempDir('gru-freeze-nopr-move-preserves-'),
+      setupTimeoutMs: 30_000, enumerateProcesses: () => [],
+    });
+    const resolveTarget = vi.spyOn(port, 'resolveReviewTarget');
     const job = ledger.addJob({
       id: 'job-nopr-moving', repo: 'fixture', title: 'moving origin target', baseBranch: 'main',
       briefing: 'Acceptance: moved returns true.',
     });
+    await port.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/topic'])).toBe(stale);
     ledger.setJobStatus(job.id, 'working');
     settleLane(ledger, job.id);
     const probe = vi.fn(async () => {
@@ -547,7 +556,10 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(tip);
-    // The fetch went through the port: the tracking ref now names the tip.
+    // Freeze called the real manager's fetch-aware resolver. Its real
+    // detached worktree registered the same SHA as the frozen manifest.
+    expect(resolveTarget).toHaveBeenCalledWith({ repoPath: realpathSync(repo.path), ref: 'origin/topic' });
+    expect(port.getWorktree(outcome.round.id)?.sha).toBe(tip);
     expect(repo.git(['rev-parse', 'refs/remotes/origin/topic'])).toBe(tip);
   });
 
@@ -604,32 +616,39 @@ describe('freeze-time integration on PR rounds', () => {
     const repo = makeFixtureRepo('freeze-nopr-refuse');
     repos.push(repo);
     repo.git(['checkout', '-b', 'feature/lane']);
-    const laneSha = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    repo.commitFile('src/lane.ts', 'export const lane = true;\n');
     attachBareOrigin(repo);
     repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
     repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane:refs/heads/topic']);
     repo.git(['remote', 'set-url', 'origin', join(repo.path, '..', 'missing-origin.git')]);
     const root = tempDir('gru-freeze-nopr-refuse-port-');
     const artifacts = tempDir('gru-freeze-nopr-refuse-artifacts-');
-    const sessions = tempDir('gru-freeze-nopr-refuse-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', laneSha);
-    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-nopr-refuse' });
+    const port = new WorktreeManager({
+      ledger, root, preserveRoot: tempDir('gru-freeze-nopr-refuse-preserves-'),
+      setupTimeoutMs: 30_000, enumerateProcesses: () => [],
+    });
+    const resolveTarget = vi.spyOn(port, 'resolveReviewTarget');
+    const spawner = vi.fn() as unknown as AgentSpawner;
     const job = ledger.addJob({
       id: 'job-nopr-refuse', repo: 'fixture', title: 'unfetchable target', baseBranch: 'main',
       briefing: 'Acceptance: lane returns true.',
     });
+    await port.createJobWorktree({ repoPath: repo.path, jobId: job.id });
     ledger.setJobStatus(job.id, 'working');
     settleLane(ledger, job.id);
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      spawner,
       reviewArtifactRoot: artifacts,
     });
 
     const failure = await captureFailure(() => wave.runRound({ jobId: job.id, targetRef: 'origin/topic' }));
-    expect((failure as Error).message).toMatch(/refusing to freeze a possibly stale tip/);
+    expect((failure as Error).message).toMatch(/refusing to check out a possibly stale origin tip/);
+    expect(resolveTarget).toHaveBeenCalledWith({ repoPath: realpathSync(repo.path), ref: 'origin/topic' });
+    expect(spawner).not.toHaveBeenCalled();
+    expect(port.listWorktrees({ jobId: job.id }).filter((lane) => lane.kind === 'review')).toHaveLength(0);
     expect(ledger.listRounds(job.id)).toHaveLength(0);
     expect(ledger.getJob(job.id)?.status).toBe('working');
   });
