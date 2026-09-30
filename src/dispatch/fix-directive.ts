@@ -5,6 +5,7 @@ import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { requireSpawnCwd } from '../roles.js';
 import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
+import { appendPrCreationRule, PR_CREATION_RULE } from './pr-creation.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import type { WorktreePort } from './worktree-port.js';
 import { settleRetries, type PacingGate, type PacingLease } from '../runtime/pacing.js';
@@ -52,9 +53,13 @@ export async function routeFixDirectiveToMinion(
   },
 ): Promise<{ delivered: boolean; minionId?: string; note?: string }> {
   const owner = input.owner ?? 'fix-directive';
-  const directive = appendLessonPointers(
-    input.directive,
-    input.lessons?.referencesFor(input.directive) ?? [],
+  // Follow-up turns carry the CURRENT creation rule too: a legacy briefing
+  // that permitted drafts must not outrank it on the live/resumed paths.
+  const directive = appendPrCreationRule(
+    appendLessonPointers(
+      input.directive,
+      input.lessons?.referencesFor(input.directive) ?? [],
+    ),
   );
   const minions = input.ledger
     .listAgents()
@@ -230,6 +235,8 @@ export function renderRebriefPrompt(input: {
     'ORIGINAL BRIEFING (still the contract):',
     input.briefing ?? '(the job row carries no stored briefing — read the job note on the board)',
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
+    '',
+    PR_CREATION_RULE,
     '',
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',
