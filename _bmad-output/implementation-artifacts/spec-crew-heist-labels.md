@@ -2,7 +2,7 @@
 title: 'Short heist names on minion cards'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'in-review'
 baseline_commit: 'c54bfbf89727bacfd27a27db65a9fab681c19c3e'
 route: 'dispatch'
 review_loop_iteration: 1
@@ -71,7 +71,7 @@ Plan checkpoint approved by owner (journals j-24/j-25); continuation authorized 
 
 | r3 finding | Disposition / evidence |
 | --- | --- |
-| Required end-to-end verification absent | Still open until a clean scheduler full run and exact-head CI are recorded. Twelve older-head runs did not pass; none is approval. |
+| Required end-to-end verification absent | Execution/evidence gap addressed, but full local gate remains blocked: run `64dc5548-ae80-4b0c-a088-66643c363f67` failed at the clean rebased implementation head. Exact-head Linux CI passed. Await independent disposition; neither isolated passes nor CI erase the failed scheduler result. |
 | Restarted implementer loses job binding | Fixed: snapshot the predecessor ledger association before spawn, then register the replacement before recovering its prompt. Real board-tap tests cover fresh/same IDs and neutral legacy rows. A failed binding write disposes the replacement before prompt recovery. |
 | Review role overwritten by spawn re-registration | Fixed: preserve a durable Perkins role against generic minion spawn registration; test the fallback row's role, label, job binding and exclusion. Fresh fallback restarts inherit the explicit metadata, not guessed ownership. |
 | Dispatch caps raw rather than trimmed name | Fixed: trim before HTTP length validation; padded/exact-cap accepted and padded-over-cap rejected by deterministic HTTP tests. |
@@ -99,5 +99,8 @@ The 2026-09-24 focused backend/web/build checks and four Playwright captures pas
 - Affected backend suites: ledger-api/db, supervisor, board-engine, fix-directive, rebrief-recovery, Silas driver, dispatch-server, lessons-injection and suite-shape: 204 passed; after adding the binding-write failure regression, supervisor + suite-shape: 56 passed (54 supervisor cases).
 - `npm run test:web`: 39 files / 370 tests passed, including protocol and crew DOM identity/collision cases.
 - Focused Playwright mock crew-rail test: passed. Inspected all four desktop/phone light/dark captures: lowercase heist names and one suffix remain visible, role/state/pills and crew/Perkins labels remain intact, no crew-card overflow. The incoming FOR YOU presentation is preserved. No unrelated design changes.
-- Full scheduler verification, fresh exact-head Linux CI and independent Perkins re-review remain required for delivery. The declared `full` scope is now available; request it through `POST /api/verify` on a clean committed head. Do not repeat unchanged failed runs or inflate unrelated timeouts.
+- Scheduler `POST /api/verify {job_id:"crew-heist-labels",scope:"full"}` ran at clean implementation head `7590131b3481798715f384283e0a97ea8122d2c4`: run `64dc5548-ae80-4b0c-a088-66643c363f67`, exit 1, not timed out, duration 774779 ms, 90 files / 1463 tests passed, three tests failed, four files skipped and five Vitest RPC timeout errors. Output SHA-256 `87f92e6f520b15cc829521cef088157586e07dfec24d130a1b508816b542a114`; local complete capture: `_bmad-output/implementation-artifacts/verify-crew-heist-labels-rebrief-full.ndjson`. Failed cases: install-one-line owned-service restart (30 s timeout), LAN-phone replay (empty delta text), Perkins unknown/foreign receipt (30 s timeout). This is NOT a full PASS.
+- Diagnostic reruns: all six LAN-phone cases passed when the entire stateful file ran with a one-worker pool (filtering the phone case alone omits required desktop history and is invalid evidence); the install case passed with the same one-worker pool; the Perkins receipt case passed in the focused diagnostic run. No failing assertions were weakened and no unrelated test/config/runtime edits were made. These passes narrow the local failure but do not prove a root cause or replace the scheduler full gate.
+- Linux CI run [36684697753](https://github.com/mssoka/gru-command/actions/runs/36684697753) explicitly reports `head_sha=7590131b3481798715f384283e0a97ea8122d2c4`, SUCCESS on Ubuntu / Node 22: 93 backend files, 1469 tests passed (Linux-only cases included); 39 web files, 370 tests passed. CI tests the normal PR merge-result checkout. PR #141 is mergeable after the rebase. This evidence-only checkpoint changes no product/test code; its pushed head still requires fresh CI.
+- **Blocked checkpoint:** shared-host scheduler full is not green; independent Perkins re-review/acceptance is still owed. Stop unchanged full retries and report the concrete failures instead of treating fallback PASS, focused tests or Linux CI as a local scheduler PASS. PR fixes are published, not merged or deployed.
 - No live configuration/database edits, maintenance restart, merge or deployment.
