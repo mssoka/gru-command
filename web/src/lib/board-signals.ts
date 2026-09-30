@@ -55,17 +55,13 @@ export function roundSummary(round: RoundView): RoundSummary {
   };
 }
 
-/**
- * Unacked action-required notifications attributed to jobs through the
- * rail's agent bindings (notifications carry an agent; agents carry the
- * job). A notification with no agent binding stays global — the tracker
- * chip above the board still counts it. Rows bound to a TERMINAL job
- * (merged/done) are closed receipts: they never attribute to the banded
- * view (the bell keeps them; machine-row lifecycle stays with
- * dispositions) so a merged lane can never re-enter NEEDS YOU through a
- * leftover escalation.
- */
-export function unackedByJob(snapshot: BoardSnapshot): Map<string, number> {
+/** The attribution index the live/receipt split rides on: notification
+ * agent → job, plus the set of terminal (merged/done) job ids. Unknown
+ * bindings are simply absent — never guessed. */
+function jobAttribution(snapshot: BoardSnapshot): {
+  readonly jobByAgent: ReadonlyMap<string, string>;
+  readonly terminalJobs: ReadonlySet<string>;
+} {
   const jobByAgent = new Map<string, string>();
   for (const agent of snapshot.agents) {
     if (agent.jobId !== null) jobByAgent.set(agent.id, agent.jobId);
@@ -76,6 +72,21 @@ export function unackedByJob(snapshot: BoardSnapshot): Map<string, number> {
       if (isJobConcluded(job.status)) terminalJobs.add(job.id);
     }
   }
+  return { jobByAgent, terminalJobs };
+}
+
+/**
+ * Unacked action-required notifications attributed to jobs through the
+ * rail's agent bindings (notifications carry an agent; agents carry the
+ * job). A notification with no agent binding stays global — the tracker
+ * chip above the board still counts it. Rows bound to a TERMINAL job
+ * (merged/done) are closed receipts: they never attribute to the banded
+ * view (the bell keeps them as receipts; machine-row lifecycle stays
+ * with dispositions) so a merged lane can never re-enter NEEDS YOU
+ * through a leftover escalation.
+ */
+export function unackedByJob(snapshot: BoardSnapshot): Map<string, number> {
+  const { jobByAgent, terminalJobs } = jobAttribution(snapshot);
   const byJob = new Map<string, number>();
   for (const notification of snapshot.notifications) {
     if (notification.routing !== 'action-required') continue;
@@ -87,6 +98,27 @@ export function unackedByJob(snapshot: BoardSnapshot): Map<string, number> {
     byJob.set(jobId, (byJob.get(jobId) ?? 0) + 1);
   }
   return byJob;
+}
+
+/**
+ * Ids of unresolved action-required rows bound (agent → job) to a
+ * terminal (merged/done) job: closed receipts. The record keeps them;
+ * the bell renders them under FEED as receipts, never as entries in the
+ * live NEEDS GRU queue. Unbound rows and bindings to unknown jobs stay
+ * live — the board never guesses a receipt.
+ */
+export function terminalBoundNotificationIds(snapshot: BoardSnapshot): Set<string> {
+  const { jobByAgent, terminalJobs } = jobAttribution(snapshot);
+  const ids = new Set<string>();
+  for (const notification of snapshot.notifications) {
+    if (notification.routing !== 'action-required') continue;
+    if (notification.ackedAt !== null || notification.resolvedAt !== null) continue;
+    const agentId = notification.agentId;
+    if (agentId === null) continue;
+    const jobId = jobByAgent.get(agentId);
+    if (jobId !== undefined && terminalJobs.has(jobId)) ids.add(notification.id);
+  }
+  return ids;
 }
 
 export function pluralCount(count: number, noun: string): string {

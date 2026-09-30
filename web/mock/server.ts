@@ -180,6 +180,15 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
  */
 const LENSES = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'] as const;
 
+/** A stamp 20 minutes ago, clamped to stay inside the current LOCAL day:
+ * the merged-receipt fixture must keep bucketing SETTLED even when the
+ * mock boots just after midnight (the rolling-window pins depend on it). */
+function mergedReceiptStamp(): string {
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  return new Date(Math.max(Date.now() - 20 * 60_000, startOfToday.getTime() + 60_000)).toISOString();
+}
+
 function sampleSnapshot(): unknown {
   return {
     repos: [
@@ -255,7 +264,7 @@ function sampleSnapshot(): unknown {
             repo: 'demo-api',
             title: 'Rotate the staging tokens',
             status: 'merged',
-            updatedAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+            updatedAt: mergedReceiptStamp(),
             prUrl: 'https://example.invalid/pr/41',
             prState: 'merged',
             baseBranch: 'main',

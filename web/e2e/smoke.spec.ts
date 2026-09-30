@@ -546,11 +546,53 @@ test.describe('board (E6, mock feed)', () => {
       .locator('.board-band--in-flight .board-band__head')
       .evaluate((node) => getComputedStyle(node).position);
     expect(bandSticky).toBe('sticky');
-    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('12 heists');
+    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('13 heists');
     // The stalled working lane sank to COLD carrying the stale flag.
     const stalled = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
     await expect(stalled).toBeVisible();
     await expect(stalled.locator('.board-job__stale')).toHaveText('stalled');
+  });
+
+  test('section truth: a merged leftover leaves NEEDS GRU; a quota-walled lane waits with its reason', async ({ page }) => {
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+
+    // The merged lane with a leftover unacked escalation row is a closed
+    // receipt: SETTLED, no signal chip, never a NEEDS GRU queue entry.
+    const receipt = page.locator('.board-band--settled .board-job', { hasText: 'Rotate the staging tokens' });
+    await expect(receipt).toBeVisible();
+    await expect(receipt).toHaveAttribute('data-status', 'merged');
+    await expect(receipt.locator('.board-job__signal')).toHaveCount(0);
+    await expect(
+      page.locator('.board-band--needs-you .board-job', { hasText: 'Rotate the staging tokens' }),
+    ).toHaveCount(0);
+
+    // The quota-walled lane shows its true state: waiting on the provider,
+    // never a bare "working" and never stalled/COLD.
+    const walled = page.locator('.board-band--in-flight .board-job', { hasText: 'Migrate the search index' });
+    await expect(walled).toBeVisible();
+    await expect(walled).toHaveAttribute('data-worker-state', 'waiting');
+    await expect(walled.locator('.board-job__status')).toHaveText('waiting · quota wall');
+    await expect(walled.locator('.board-job__stale')).toHaveCount(0);
+
+    // Chip and bands agree: only the live machine row (mock-n5) counts.
+    await expect(page.locator('#board-unacked')).toContainText('1 needs Gru');
+
+    // The bell keeps the durable record: the merged lane's leftover row
+    // renders as a closed receipt under FEED, not as live NEEDS GRU work.
+    await page.locator('#notification-bell').click();
+    const closedRow = page.locator('.board-notification[data-receipt="closed"]', {
+      hasText: 'Leftover machine escalation on the merged lane',
+    });
+    await expect(closedRow).toBeVisible();
+    await expect(closedRow).toContainText('closed receipt');
+    const needsGruSection = page.locator('.board-notification-section').filter({
+      has: page.locator('.board-notification-section__head', { hasText: 'NEEDS GRU' }),
+    });
+    await expect(
+      needsGruSection.locator('.board-notification', { hasText: 'Leftover machine escalation on the merged lane' }),
+    ).toHaveCount(0);
+    await page.locator('#notification-bell').click();
   });
 
   test('row disclosure persists per job across a reload (v3)', async ({ page }) => {
@@ -716,12 +758,12 @@ test.describe('cockpit layout (v6)', () => {
       .poll(async () => Math.abs((await page.locator('#chat-main-mount').boundingBox())!.width - chatBox.width))
       .toBeLessThanOrEqual(2);
 
-    // The settled window rolls: 12 settled → 10 rows + a +2 footer.
+    // The settled window rolls: 13 settled → 10 rows + a +3 footer.
     await expect(page.locator('.board-band--settled .board-job')).toHaveCount(10);
     const more = page.locator('.board-band--settled .board-band__more');
-    await expect(more).toHaveText('+2 older settled');
+    await expect(more).toHaveText('+3 older settled');
     await more.click();
-    await expect(page.locator('.board-band--settled .board-job')).toHaveCount(12);
+    await expect(page.locator('.board-band--settled .board-job')).toHaveCount(13);
     await expect(page.locator('.board-band--settled .board-band__more')).toHaveCount(0);
 
     // The FAB collapses the pane to the slim rail (and back); the choice persists.

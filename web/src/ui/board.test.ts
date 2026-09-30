@@ -473,6 +473,32 @@ describe('board v6 — dense job rows', () => {
     expect(jobFailing(baseJob({ status: 'done', rounds: [] }))).toBe(false);
   });
 
+  it('keeps concluded rows calm even when their stale history is failing', () => {
+    const view = new BoardView(() => {});
+    const erroredLenses = [{ lens: 'blind', state: 'error' as const, agentId: null, note: null, verdict: null }];
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ id: 'merged-aborted', status: 'merged', rounds: [baseRound({ status: 'aborted', verdict: null })] }),
+          baseJob({ id: 'done-lens-error', status: 'done', rounds: [baseRound({ status: 'live', lenses: erroredLenses })] }),
+        ],
+      }),
+    );
+    const alert = new Map(
+      [...document.querySelectorAll<HTMLElement>('.board-job')].map((row) => [
+        row.dataset.jobId,
+        row.classList.contains('board-job--alert'),
+      ]),
+    );
+    // The concluded guard is load-bearing: without it an aborted newest
+    // round / errored lens would tint each merged/done row with the alert
+    // accent (a closed receipt is history, not a live alarm).
+    expect(jobFailing(baseJob({ status: 'merged', rounds: [baseRound({ status: 'aborted', verdict: null })] }))).toBe(false);
+    expect(jobFailing(baseJob({ status: 'done', rounds: [baseRound({ status: 'live', lenses: erroredLenses })] }))).toBe(false);
+    expect(alert.get('merged-aborted')).toBe(false);
+    expect(alert.get('done-lens-error')).toBe(false);
+  });
+
   it('expands inline from a click anywhere on the summary and collapses again; the PR link does not toggle', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ jobs: [baseJob({ prUrl: 'https://example.invalid/pr/7' })] }));
@@ -1019,6 +1045,18 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     const rows = [...document.querySelectorAll('.board-notification')];
     expect(rows).toHaveLength(2);
     expect(rows.filter((row) => row.querySelector('.board-notification__ack') !== null)).toHaveLength(0);
+    // The closed receipt renders under FEED with its marker — never in the
+    // live NEEDS GRU queue the operator acts on; the live row stays queued.
+    const sectionOf = (needle: string): string | undefined =>
+      rows
+        .find((row) => row.textContent?.includes(needle))
+        ?.closest('.board-notification-section')
+        ?.querySelector('.board-notification-section__head')?.textContent ?? undefined;
+    const closedRow = rows.find((row) => row.textContent?.includes('Notice n-closed'));
+    expect(closedRow?.textContent).toContain('closed receipt');
+    expect(closedRow?.getAttribute('data-receipt')).toBe('closed');
+    expect(sectionOf('Notice n-closed')).toBe('FEED');
+    expect(sectionOf('Notice n-live')).toBe('NEEDS GRU');
     // The live lane still carries its machine signal; the receipt carries none.
     const live = document.querySelector<HTMLElement>('.board-band--needs-you .board-job');
     expect(live?.getAttribute('data-job-id')).toBe('live-walled');
@@ -1057,6 +1095,32 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expect(chip?.textContent).toBe('waiting · quota wall');
     expect(chip?.className).toContain('pp-chip--park');
     expect(chip?.getAttribute('title')).toContain('worker stopped by supervision (quota wall)');
+  });
+
+  it('an aborted isolated review never marks a working lane as waiting', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'reworking', status: 'working', rounds: [] })],
+        agents: [
+          agent('minion-working', { role: 'minion', jobId: 'reworking', state: 'streaming' }),
+          agent('perkins-aborted', {
+            role: 'perkins',
+            roundId: 'r1',
+            jobId: 'reworking',
+            supervision: { state: 'stopped', restarts: 0, breakerOpen: false, stopReason: 'review aborted' },
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-job-id')).toBe('reworking');
+    // The workflow-owned stop belongs to the round lifecycle: the lane
+    // keeps its true working state (and its own minion's stop would still
+    // swap it to waiting).
+    expect(row?.getAttribute('data-worker-state')).toBeNull();
+    expect(row?.querySelector('.board-job__status')?.textContent).toBe('working');
+    expect(row?.getAttribute('data-band')).toBe('in-flight');
   });
 
   it('a stopped lane with an unacked escalation sits in NEEDS GRU — waiting chip, honest section', () => {

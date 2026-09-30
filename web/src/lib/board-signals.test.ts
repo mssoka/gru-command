@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentView, BoardSnapshot, JobView, NotificationView, RoundView } from './board-protocol.js';
 import { isJobConcluded } from './board-bands.js';
-import { jobSignal, pluralCount, roundSummary, unackedByJob } from './board-signals.js';
+import { jobSignal, pluralCount, roundSummary, terminalBoundNotificationIds, unackedByJob } from './board-signals.js';
 
 function round(overrides: Partial<RoundView> = {}): RoundView {
   return {
@@ -195,6 +195,32 @@ describe('unackedByJob', () => {
     expect(isJobConcluded('merged')).toBe(true);
     expect(isJobConcluded('done')).toBe(true);
     expect(isJobConcluded('working')).toBe(false);
+  });
+
+  it('terminalBoundNotificationIds names the closed receipts — terminal bindings only, never guessing', () => {
+    const bound = (id: string, jobId: string): AgentView => ({
+      id, role: 'minion', label: null, state: 'idle', lastActivity: null, sessionFile: null, jobId, roundId: null, supervision: null,
+    });
+    const ids = terminalBoundNotificationIds(
+      snapshot({
+        repos: [
+          {
+            name: 'demo',
+            jobs: [job({ id: 'merged-1', status: 'merged' }), job({ id: 'live-1', status: 'working' })],
+          },
+        ],
+        agents: [bound('am', 'merged-1'), bound('al', 'live-1'), bound('ax', 'unknown-job')],
+        notifications: [
+          notification('n-merged', { agentId: 'am' }),
+          notification('n-live', { agentId: 'al' }),
+          notification('n-unknown', { agentId: 'ax' }),
+          notification('n-unbound', { agentId: null }),
+          notification('n-acked', { agentId: 'am', ackedAt: '2026-01-01T00:01:00.000Z' }),
+          notification('n-fyi', { agentId: 'am', routing: 'fyi' }),
+        ],
+      }),
+    );
+    expect([...ids]).toEqual(['n-merged']);
   });
 });
 

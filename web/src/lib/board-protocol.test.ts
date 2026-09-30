@@ -172,6 +172,31 @@ describe('board server-frame validator', () => {
     }
   });
 
+  it('validates a present supervision block at the parse boundary (stopReason null | string; junk rejects)', () => {
+    const withSupervision = (supervision: unknown): unknown => {
+      const candidate = snapshot();
+      (candidate.agents[0] as unknown as { supervision: unknown }).supervision = supervision;
+      return candidate;
+    };
+    // Accept: a stopped lane with a recorded reason, a stop without one
+    // (pre-reason server), and the watching baseline with stopReason absent.
+    expect(
+      isValidSnapshot(withSupervision({ state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' })),
+    ).toBe(true);
+    expect(
+      isValidSnapshot(withSupervision({ state: 'stopped', restarts: 0, breakerOpen: true, stopReason: null })),
+    ).toBe(true);
+    expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: 0, breakerOpen: false }))).toBe(true);
+    // Reject: a present-but-junk block is a server bug, never "no reason".
+    expect(
+      isValidSnapshot(withSupervision({ state: 'stopped', restarts: 0, breakerOpen: true, stopReason: 7 })),
+    ).toBe(false);
+    expect(
+      isValidSnapshot(withSupervision({ state: 'stopped', restarts: 0, breakerOpen: true, stopReason: {} })),
+    ).toBe(false);
+    expect(isValidSnapshot(withSupervision('stopped'))).toBe(false);
+  });
+
   it('accepts prState present, null, or absent; rejects junk states', () => {
     for (const prState of ['open', 'conflicting', 'merged', null, undefined]) {
       const candidate = snapshot();

@@ -59,8 +59,9 @@ export function jobRecency(job: JobView): string {
   return newest;
 }
 
-/** The stop truth for one lane: the bound worker is supervision-stopped
- * (or breaker-open) and the job still reads "working". */
+/** The stop truth for one lane: the lane's bound minion worker is
+ * supervision-stopped (or breaker-open) and the job still reads
+ * "working". */
 export interface WorkerStopView {
   /** Failure class the supervisor recorded (e.g. `quota_wall`), null on
    * pre-reason snapshots — the stop renders without a cause. */
@@ -69,14 +70,19 @@ export interface WorkerStopView {
 }
 
 /** Stopped-worker views keyed by job id, from the snapshot's agent rows:
- * any bound agent whose supervision is stopped or breaker-open marks the
- * lane. A stopped lane is NOT silently working — it is waiting on a human
- * re-arm with a recorded reason. */
+ * the LANE'S WORKER (role `minion`) bound to a job whose supervision is
+ * stopped or breaker-open marks the lane. A stopped lane is NOT silently
+ * working — it is waiting on a human re-arm with a recorded reason.
+ * Review agents (role `perkins`) are bound to the job too, but their
+ * stops are workflow-owned (e.g. an aborted isolated attempt with the
+ * breaker closed): they belong to the round lifecycle and must never
+ * make a working lane read as waiting. */
 export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
   const byJob = new Map<string, WorkerStopView>();
   for (const agent of agents) {
+    if (agent.jobId === null || agent.role !== 'minion') continue;
     const supervision = agent.supervision;
-    if (agent.jobId === null || supervision === null || supervision === undefined) continue;
+    if (supervision === null || supervision === undefined) continue;
     if (supervision.state !== 'stopped' && supervision.breakerOpen !== true) continue;
     if (byJob.has(agent.jobId)) continue;
     byJob.set(agent.jobId, { reason: supervision.stopReason ?? null, restarts: supervision.restarts });

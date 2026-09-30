@@ -304,16 +304,21 @@ Two section-truth rules keep the bands honest (2026-09-29):
 
 - **Closed receipts stay closed.** A terminal job (merged/done) never
   re-enters NEEDS YOU, whatever is left over — leftover unacked
-  escalation rows keep living in the notification bell (the owner can
-  still ack them), but they no longer promote the lane, alert its row,
-  or count into the unacked tracker chip (the service counts live rows
-  only). A merged lane renders in SETTLED/COLD as a receipt.
-- **Stopped lanes wait with their reason.** A working lane whose worker
-  is supervision-stopped (breaker open) shows an explicit
+  escalation rows keep living in the notification record as closed
+  receipts (they clear through a Gru disposition, never a human Ack),
+  but they no longer promote the lane, alert its row, or count into the
+  unacked tracker chip (the service counts live rows only); in the bell
+  they render under FEED, not in the live NEEDS GRU queue. A merged lane
+  renders in SETTLED/COLD as a receipt.
+- **Stopped lanes wait with their reason.** A working lane whose minion
+  worker is supervision-stopped (breaker open) shows an explicit
   `waiting · <reason>` status chip (e.g. `waiting · quota wall`) instead
   of a bare `working` — the supervisor records why it stopped, and the
-  board relays it. Such a lane is never flagged `stalled` and never
-  sinks to COLD: COLD stays for genuinely-silent lanes.
+  board relays it. Only the lane's own minion speaks for the lane:
+  workflow-owned stops (e.g. an aborted isolated review attempt) belong
+  to the round lifecycle and never render a working lane as waiting.
+  Such a lane is never flagged `stalled` and never sinks to COLD: COLD
+  stays for genuinely-silent lanes.
 
 ## Views
 

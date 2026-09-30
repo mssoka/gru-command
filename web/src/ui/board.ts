@@ -45,7 +45,14 @@ import {
 import { railChips, type RailChip } from '../lib/board-rail.js';
 import { BOARD_WORDS, heistCount } from '../lib/board-vocabulary.js';
 import { formatAge } from '../lib/board-time.js';
-import { jobSignal, pluralCount, roundSummary, unackedByJob, type RoundSummary } from '../lib/board-signals.js';
+import {
+  jobSignal,
+  pluralCount,
+  roundSummary,
+  terminalBoundNotificationIds,
+  unackedByJob,
+  type RoundSummary,
+} from '../lib/board-signals.js';
 
 /** Truthful lens progress for whole-PR rounds: show what actually ran —
  * including lenses that ran and failed — and name unused lenses instead of
@@ -185,7 +192,7 @@ export class BoardView {
     this.renderRail(snapshot);
     this.renderJobs(snapshot);
     this.renderAgents(snapshot.agents);
-    this.renderNotifications(snapshot.notifications);
+    this.renderNotifications(snapshot);
     this.surfaceNewNotifications(previous, snapshot.notifications);
   }
 
@@ -748,7 +755,8 @@ export class BoardView {
   // Notification center
   // ------------------------------------------------------------------
 
-  private renderNotifications(notifications: readonly NotificationView[]): void {
+  private renderNotifications(snapshot: BoardSnapshot): void {
+    const notifications = snapshot.notifications;
     const list = mustGet('notification-list');
     list.replaceChildren();
     this.updateBadge(notifications);
@@ -763,15 +771,21 @@ export class BoardView {
     // the standing feed.
     // A pre-disposition release could Ack machine rows. Those legacy rows
     // are closed receipts, not active NEEDS GRU work, even if unresolved.
+    // A row bound to a TERMINAL job is the same kind of receipt (section
+    // truth, 2026-09-29): the record keeps it — FEED renders it as a
+    // closed receipt — but the live queue never counts or lists it.
     const unresolved = (item: NotificationView): boolean => item.resolvedAt === null && item.ackedAt === null;
+    const receipts = terminalBoundNotificationIds(snapshot);
     const forYou = notifications.filter((item) => item.routing === 'needs-owner' && unresolved(item));
-    const needsGru = notifications.filter((item) => item.routing === 'action-required' && unresolved(item));
-    const feed = notifications.filter(
-      (item) => item.routing === 'fyi' || !unresolved(item),
+    const needsGru = notifications.filter(
+      (item) => item.routing === 'action-required' && unresolved(item) && !receipts.has(item.id),
     );
-    this.renderNotificationSection(list, 'FOR YOU', forYou, 'nothing needs you');
-    this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'machine queue is clear');
-    if (feed.length > 0) this.renderNotificationSection(list, 'FEED', feed, null);
+    const feed = notifications.filter(
+      (item) => item.routing === 'fyi' || !unresolved(item) || receipts.has(item.id),
+    );
+    this.renderNotificationSection(list, 'FOR YOU', forYou, 'nothing needs you', receipts);
+    this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'machine queue is clear', receipts);
+    if (feed.length > 0) this.renderNotificationSection(list, 'FEED', feed, null, receipts);
   }
 
   private renderNotificationSection(
@@ -779,26 +793,34 @@ export class BoardView {
     label: string,
     rows: readonly NotificationView[],
     empty: string | null,
+    receipts: ReadonlySet<string>,
   ): void {
     const section = el('section', 'board-notification-section');
     section.append(el('div', 'board-notification-section__head lbl', label));
     if (rows.length === 0) {
       if (empty !== null) section.append(el('div', 'board-notification-section__empty lbl', empty));
     } else {
-      for (const item of rows) section.append(this.notificationRow(item));
+      for (const item of rows) section.append(this.notificationRow(item, receipts.has(item.id)));
     }
     list.append(section);
   }
 
-  private notificationRow(item: NotificationView): HTMLElement {
-    const row = el('div', `board-notification board-notification--${item.severity}`);
+  private notificationRow(item: NotificationView, closedReceipt = false): HTMLElement {
+    const row = el(
+      'div',
+      `board-notification board-notification--${item.severity}${closedReceipt ? ' board-notification--receipt' : ''}`,
+    );
+    if (closedReceipt) row.dataset.receipt = 'closed';
     const icon = item.routing === 'needs-owner' ? '🔔' : item.routing === 'action-required' ? '🛠' : item.severity === 'error' ? '🚨' : 'ℹ️';
+    const suffix = closedReceipt
+      ? ' · closed receipt'
+      : item.resolvedAt !== null
+        ? ' · resolved'
+        : item.ackedAt !== null
+          ? ' ✓'
+          : '';
     row.append(
-      el(
-        'div',
-        'board-notification__title',
-        `${icon} ${item.title}${item.resolvedAt !== null ? ' · resolved' : item.ackedAt !== null ? ' ✓' : ''}`,
-      ),
+      el('div', 'board-notification__title', `${icon} ${item.title}${suffix}`),
       el(
         'div',
         'board-notification__meta lbl',
@@ -808,6 +830,7 @@ export class BoardView {
     // Only an owner stop or FYI row has a human Ack/Mark seen control.
     // Gru records a machine disposition through the authenticated API
     // after acting; a human click must not silently clear NEEDS GRU.
+    // A closed receipt is machine-attention history: same rule, no Ack.
     if (item.routing !== 'action-required' && item.ackedAt === null && item.resolvedAt === null) {
       const ack = document.createElement('button');
       ack.type = 'button';

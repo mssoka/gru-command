@@ -331,4 +331,42 @@ describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
     expect(workerStopLabel({ reason: 'crash loop', restarts: 3 })).toBe('waiting · crash loop');
     expect(workerStopLabel({ reason: null, restarts: 0 })).toBe('waiting');
   });
+
+  it('only the lane worker (minion) speaks for the lane — a workflow-owned review stop never does', () => {
+    const map = stoppedWorkersByJob([
+      // Perkins review agents are bound to the job too, but an aborted
+      // isolated attempt ('review aborted', breaker left closed) is owned
+      // by the round workflow — it must never render the working lane as
+      // waiting.
+      agentView('p1', {
+        role: 'perkins',
+        jobId: 'job-1',
+        roundId: 'r1',
+        supervision: { state: 'stopped', restarts: 0, breakerOpen: false, stopReason: 'review aborted' },
+      }),
+      // Even a breaker-open perkins stop stays off the lane: only the
+      // worker's stop says the lane is not running.
+      agentView('p2', {
+        role: 'perkins',
+        jobId: 'job-1',
+        roundId: 'r1',
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      // The lane's minion is working — the lane stays working.
+      agentView('m1', {
+        role: 'minion',
+        jobId: 'job-1',
+        supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null },
+      }),
+      // And when the lane's own minion stops, the lane waits as before.
+      agentView('m2', {
+        role: 'minion',
+        jobId: 'job-2',
+        supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+    ]);
+    expect(map.has('job-1')).toBe(false);
+    expect(map.get('job-2')).toEqual({ reason: 'quota_wall', restarts: 2 });
+    expect(map.size).toBe(1);
+  });
 });
