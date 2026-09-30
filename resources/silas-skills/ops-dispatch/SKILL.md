@@ -90,8 +90,13 @@ mechanical reactions are YOURS — execute them without asking:
 
 A review arm is refused while a lane is actively working/pushing the
 branch it would freeze: the round would race the push and die obsolete.
-The API owns this guard — your arm path needs NO special logic. When the
-answer is `409` with `{"error":"branch_busy","blockers":[...]}`:
+The API owns this guard — your arm path needs NO special logic. An
+unresolved re-brief also answers `branch_busy` for that job: its durable
+pending markers (written before the re-brief worker spawns) stay until the
+request genuinely settles, and the digest does not list the job for review
+while they stand — wait for the re-brief's own delivery instead of
+retrying. When the answer is `409` with
+`{"error":"branch_busy","blockers":[...]}`:
 
 - **Defer the arm to the next sweep.** The service records the refusal
   (`branch-idle.refused`) and, because you pass `"by":"silas"`, your

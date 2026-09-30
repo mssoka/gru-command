@@ -2,7 +2,7 @@
 title: 'Review eligibility and admission during pending re-briefs'
 type: 'bugfix'
 created: '2026-09-30'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 baseline_commit: 'c54bfbf89727bacfd27a27db65a9fab681c19c3e'
 review_loop_iteration: 0
@@ -79,14 +79,17 @@ Seams owned elsewhere (read-only here):
 
 ## Implementation Notes
 
-Pending implementation.
+- Implemented by the lane minion directly (no subagent capability in this runtime). Step-02 planning was resumed from the preserved render at `_bmad/render/bmad-build/job-review-rebrief-interlock-a3916df71acc/389474823968c3ab9eb6/`; bmad-build was NOT invoked a second time and nothing was reinstalled or re-rendered.
+- No `src/dispatch/perkins.ts` edit was needed: arm (`enforceBranchIdleForRequest`) and freeze (`setupRound` → `enforceBranchIdle`) already pass the live `LedgerApi` into `findBusyLanes`, which satisfies the extended `BranchIdleLedger`; the existing freeze re-read after `createReviewWorktree` is what catches a re-brief admitted during asynchronous setup. No `src/ledger/api.ts` change: `listPendingRebriefs` already exists.
+- Change shape: `laneIsBusy` gains the presence-based marker fence (plus the terminal short-circuit); `computeSilasDigest` reads the pending job-id set once and gates every `prWithoutReview` push. Tests: 4 new in `branch-idle-guard.test.ts` (marker unit fence; arm refusal before preflight with late-delivery/partial-settlement; freeze race; queued-handoff replay) and 2 new in `silas-driver.test.ts` (first + moved-head fence with late delivery; clean-abort rearm fence) — all deterministic, no sleeps, no provider spawn. Suite-shape pins bumped (6→10, 33→35); no existing assertion weakened.
+- Verification posture: global scheduler pacing FULL783ac932 held this lane's window, so no product test/typecheck/build/listener/provider command was run here. Red-phase (fails on baseline) and green-phase execution are declared below for ops via `/api/verify`; the completion report carries the exact-head verification-readiness receipt with scopes and remaining gates. No failures to preserve — nothing was executed.
 
 ## Verification
 
 **Commands (ops schedules via `/api/verify`; this lane does not run product checks — global scheduler pacing FULL783ac932):**
-- `npx vitest run test/branch-idle-guard.test.ts test/silas-driver.test.ts` — expected: new cases fail on baseline (`laneIsBusy` ignores markers; digest offers fenced targets), pass at the lane head.
+- `npx vitest run test/branch-idle-guard.test.ts test/silas-driver.test.ts` — expected: the 6 new cases fail on baseline (`laneIsBusy` ignores markers; digest offers fenced targets), pass at the lane head.
 - `npm run lint && npm run typecheck` — expected clean.
 - `npm run build` — expected clean (no pinned-resource change).
 - `npm test` — full backend + web gate at a media/process-safe checkpoint (≥36GiB free).
 
-**Gates:** exact-final-head CI, independent final-diff review, native Perkins READY. Worker never self-arms; owner merges/restarts remain manual.
+**Gates:** exact-final-head CI, independent final-diff review, native Perkins READY. Worker never self-arms; owner merges/restarts remain manual. A source-only checkpoint is not a passed gate.
