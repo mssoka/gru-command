@@ -180,6 +180,7 @@ observation — the failed
 worker keeps its permit; `resident.open-control-unknown` records (once
 per affected handle) that supervision lacked openControl evidence, which
 makes the handle non-reclaimable rather than presumed idle.
+
 ### E9: short heist names (migration 9)
 
 `jobs.display_name` is the optional short name the crew rail shows on

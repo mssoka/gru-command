@@ -240,6 +240,20 @@ describe('ledger api — the record of state', () => {
     expect(api.listImplementerMinions('no-such-job')).toEqual([]);
   });
 
+  it('preserves the review-worker role when a fallback reviewer is re-registered by the spawn tap', () => {
+    api.addJob({ id: 'fallback-role-heist', repo: 'fixture', title: 'Review title' });
+    api.registerAgent({ id: 'fallback-reviewer', role: 'minion', sessionFile: '/review.jsonl' });
+    api.registerAgent({ id: 'fallback-reviewer', role: 'perkins', label: 'fallback-review', jobId: 'fallback-role-heist' });
+    // A resumed fallback restart uses the runtime spawn role, not the
+    // durable review-worker role. The observer must not downgrade it.
+    api.registerAgent({ id: 'fallback-reviewer', role: 'minion', sessionFile: '/review-resumed.jsonl' });
+    expect(api.getAgent('fallback-reviewer')).toMatchObject({
+      id: 'fallback-reviewer', role: 'perkins', label: 'fallback-review',
+      jobId: 'fallback-role-heist', sessionFile: '/review-resumed.jsonl', roundId: null,
+    });
+    expect(api.listImplementerMinions('fallback-role-heist').map((agent) => agent.id)).not.toContain('fallback-reviewer');
+  });
+
   it('lens binding + outcome transitions; unknown rounds/lenses fail loud', () => {
     api.registerAgent({ id: 'lens-blind', role: 'perkins', roundId: 'fix-login-flow-r1' });
     let round = api.bindLens('fix-login-flow-r1', 'blind', 'lens-blind');

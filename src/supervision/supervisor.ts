@@ -1430,6 +1430,9 @@ export class Supervisor {
 
       if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
 
+      // Snapshot the explicit durable association BEFORE spawning: the tap
+      // carries no job context and a resumed spawn may reuse this row's id.
+      const predecessor = this.ledger.getAgent(agent.agentId);
       // Respawn with resume (crash = resume, SPEC ruling 3).
       const resumeFile = agent.sessionFile;
       try {
@@ -1448,6 +1451,23 @@ export class Supervisor {
           // adopt it or notify swap listeners.
           await this.registry.disposeHandle(spawned).catch(() => {});
           return;
+        }
+        if (predecessor !== null) {
+          try {
+            this.ledger.registerAgent({
+              id: spawned.id,
+              role: predecessor.role,
+              label: predecessor.label,
+              jobId: predecessor.jobId,
+              roundId: predecessor.roundId,
+              sessionFile: spawned.sessionFile,
+            });
+          } catch (error) {
+            // Never recover a prompt on a replacement whose known ownership
+            // could not be recorded; the existing ladder reports/retries it.
+            await this.registry.disposeHandle(spawned);
+            throw error;
+          }
         }
         this.adopt(spawned, restartSlot, resumeFile);
         // A resumed session keeps its id; a fresh mint does NOT — the

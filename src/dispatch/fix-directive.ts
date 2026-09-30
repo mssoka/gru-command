@@ -51,7 +51,7 @@ export async function routeFixDirectiveToMinion(
   const minions = input.ledger
     .listImplementerMinions(input.jobId);
   let evictedSessionFile: string | null = null;
-  for (const minion of [...minions].reverse()) {
+  for (const minion of minions) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
       try {
@@ -77,7 +77,7 @@ export async function routeFixDirectiveToMinion(
   // handle exposed none fall back to the newest session-bearing record —
   // never an arbitrary older disposed minion's session.
   const fallback = evictedSessionFile === null
-    ? ([...minions].reverse().find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
+    ? (minions.find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
     : null;
   const resumeFile = evictedSessionFile ?? fallback;
   let handle: AgentHandle;

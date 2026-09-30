@@ -439,6 +439,30 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('caps the trimmed authored-name value consistently at the HTTP and ledger boundaries', async () => {
+    const h = await boot();
+    try {
+      for (const [jobId, displayName] of [
+        ['name-at-cap', 'x'.repeat(100)],
+        ['name-padded-cap', `  ${'x'.repeat(100)}  `],
+      ]) {
+        const accepted = await call(h.port, 'POST', '/api/dispatch', {
+          job_id: jobId, repo_path: '/fixture', title: 'Full title', briefing: 'B', display_name: displayName,
+        }, TOKEN);
+        expect(accepted.status).toBe(202);
+        expect(h.ledger.getJob(jobId!)?.displayName).toBe('x'.repeat(100));
+      }
+      const oversized = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'name-padded-over-cap', repo_path: '/fixture', title: 'T', briefing: 'B',
+        display_name: ` ${'x'.repeat(101)} `,
+      }, TOKEN);
+      expect(oversized.status).toBe(400);
+      expect(h.ledger.getJob('name-padded-over-cap')).toBeNull();
+    } finally {
+      await h.close();
+    }
+  });
+
   it('routes a failed pre-flight to the bmad-review fallback gate over HTTP', async () => {
     const skillDir = mkdtempSync(join(tmpdir(), 'bmad-review-skill-'));
     cleanupDirs.push(skillDir);

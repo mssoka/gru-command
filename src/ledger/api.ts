@@ -978,13 +978,17 @@ export class LedgerApi {
           payload: { role: input.role, label: input.label ?? null },
         });
       } else {
+        // The runtime spawn tap knows the spawn role only. Fallback review
+        // workers spawn as minions, then receive their durable Perkins role;
+        // a resumed spawn must never turn them into implementer candidates.
+        const role = existing.role === 'perkins' && input.role === 'minion' ? existing.role : input.role;
         this.db
           .prepare(
             `UPDATE agents SET role = ?, label = COALESCE(?, label), job_id = COALESCE(?, job_id),
              round_id = COALESCE(?, round_id), session_file = COALESCE(?, session_file), updated_at = ? WHERE id = ?`,
           )
           .run(
-            input.role,
+            role,
             input.label ?? null,
             input.jobId ?? null,
             input.roundId ?? null,

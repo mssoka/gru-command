@@ -2,10 +2,10 @@
 title: 'Short heist names on minion cards'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-review'
-baseline_commit: '05514215fc2125024a30279e59375fff35184148'
+status: 'in-progress'
+baseline_commit: 'c54bfbf89727bacfd27a27db65a9fab681c19c3e'
 route: 'dispatch'
-review_loop_iteration: 0
+review_loop_iteration: 1
 context: []
 ---
 
@@ -61,11 +61,20 @@ context: []
 
 ## Implementation Notes
 
-Plan checkpoint approved by owner (journals j-24/j-25); continuation authorized after verified maintenance in re-brief. The checkpoint commit is not implementation. Main is still at e86d92e; #68/#71/#72/#73 remain open at resumption. Integrate landed dependencies before final-head verification/review.
+Plan checkpoint approved by owner (journals j-24/j-25); continuation authorized after verified maintenance in re-brief. The checkpoint commit was not implementation. The 2026-09-30 fix loop rebased the existing PR #141 onto main `c54bfbf89727bacfd27a27db65a9fab681c19c3e`, including #140/#131/#133 and the earlier #68/#71 integration. No source checkout or sibling branch was modified. The pre-rebase head and ignored verification/WIP artifacts remain preserved locally. No review round was live at the rebase checkpoint; check again before publishing a head move.
 
 ## Spec Change Log
 
+- 2026-09-30: apply the settled r3 restart/registration and padded-name findings without changing frozen intent. KEEP lowercase names, collision suffixes, raw identity and transcript selection, Perkins labels, v6.1 presentation and incoming residency eviction/resume behavior. Compose the newest-first implementer query with the incoming directive fallback; reconcile inherited test-count pins, not runtime/config policy.
+
 ## Review Triage Log
+
+| r3 finding | Disposition / evidence |
+| --- | --- |
+| Required end-to-end verification absent | Still open until a clean scheduler full run and exact-head CI are recorded. Twelve older-head runs did not pass; none is approval. |
+| Restarted implementer loses job binding | Fixed: snapshot the predecessor ledger association before spawn, then register the replacement before recovering its prompt. Real board-tap tests cover fresh/same IDs and neutral legacy rows. A failed binding write disposes the replacement before prompt recovery. |
+| Review role overwritten by spawn re-registration | Fixed: preserve a durable Perkins role against generic minion spawn registration; test the fallback row's role, label, job binding and exclusion. Fresh fallback restarts inherit the explicit metadata, not guessed ownership. |
+| Dispatch caps raw rather than trimmed name | Fixed: trim before HTTP length validation; padded/exact-cap accepted and padded-over-cap rejected by deterministic HTTP tests. |
 
 ## Design Notes
 
@@ -79,6 +88,16 @@ Checks actually run: `npm run typecheck`, `npm run build`, `npm run build:web`, 
 
 ## Verification
 
-Focused checks on the feature tree: `npm run typecheck`; `npm run build`; `npm run build:web`; targeted `npx eslint` on affected files; backend Vitest: ledger-db/api, board-engine, lessons-injection (56 passing), dispatch-server dispatch/validation/fresh directive (3), Perkins fallback (1), fix-directive association (1), dispatch-e2e full heist arc (1); web Vitest board/protocol (38 passing); Playwright mock heist names desktop/mobile light/dark (1 passing; four captures inspected). Initial parallel backend/server run hit co-tenant timeouts and exposed a missing test fixture job; fixture repaired and targeted tests re-ran green. `git diff --check` clean. Full `npm run lint` fails on 40 existing generated BMAD hook errors (`tea-enforce.cjs` in `.agents`/`.claude`), assigned to #72; targeted eslint for changed files passes. Full `npm test` and exact-head Linux CI remain pending: #72 owns the missing `.gru-command/worktree.toml` scheduler full scope and shared CI fixes; #73 owns runtime model resolver; #68/#71 are open incoming UI/board changes. Do not bypass scheduler or claim fallback PASS as exact-head review. No service restart, live config edit, or merge.
+### Historical evidence (not final-head verification)
 
-- Run affected Vitest suites above, `npm run test:web`, `npm run lint`, `npm run typecheck`, `npm run build`, `npm run build:web`; obtain scheduler-backed full run via `POST /api/verify {job_id,scope:"full"}` after implementation, then exact-head Linux PR CI and independent review. Inspect desktop/mobile light/dark captures, including focus/tooltip and clipping. Deliver PR; never merge/deploy or reopen ended design sessions.
+The 2026-09-24 focused backend/web/build checks and four Playwright captures passed as recorded in the hold checkpoint above. At that time the shared lint/bootstrap fixes and incoming UI changes were not landed; that checkpoint was not delivery. PR #141 subsequently received NEEDS CHANGES reviews, most recently r3 at `01716c5b6998d28a6091731df22751c2413f5658`. CI was green on that old head, but local scheduler runs 1–12 failed. The last run (`9db75246-1fe6-4b57-a672-c47a3fd22910`) failed with 19 failed tests and seven Vitest RPC timeout errors; the worker's stream ended early but the host's completion record retains the result. No fallback PASS substitutes for Perkins.
+
+### Rebased fix-loop checks — 2026-09-30
+
+- Red/green: restart binding, fallback role downgrade, trimmed HTTP cap and newest-spawn directive selection failed before their corresponding fixes and passed afterwards. The neutral legacy case passed throughout.
+- `npm run lint`, `npm run typecheck`, `npm run build`, `npm run build:web`: passed.
+- Affected backend suites: ledger-api/db, supervisor, board-engine, fix-directive, rebrief-recovery, Silas driver, dispatch-server, lessons-injection and suite-shape: 204 passed; after adding the binding-write failure regression, supervisor + suite-shape: 56 passed (54 supervisor cases).
+- `npm run test:web`: 39 files / 370 tests passed, including protocol and crew DOM identity/collision cases.
+- Focused Playwright mock crew-rail test: passed. Inspected all four desktop/phone light/dark captures: lowercase heist names and one suffix remain visible, role/state/pills and crew/Perkins labels remain intact, no crew-card overflow. The incoming FOR YOU presentation is preserved. No unrelated design changes.
+- Full scheduler verification, fresh exact-head Linux CI and independent Perkins re-review remain required for delivery. The declared `full` scope is now available; request it through `POST /api/verify` on a clean committed head. Do not repeat unchanged failed runs or inflate unrelated timeouts.
+- No live configuration/database edits, maintenance restart, merge or deployment.

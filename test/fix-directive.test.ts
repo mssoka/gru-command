@@ -292,6 +292,42 @@ describe('eviction-safe fix directives (phase 3)', () => {
     return { registry, failing, controller, calls, prompted };
   }
 
+  it('uses newest spawn order for both live picks and session fallback after integration', async () => {
+    for (const live of [true, false]) {
+      const root = mkdtempSync(join(tmpdir(), 'fix-directive-order-'));
+      cleanupDirs.push(root);
+      const db = new LedgerDb(root);
+      try {
+        const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+        ledger.addJob({ id: 'ordered-heist', repo: 'fixture', title: 'T', briefing: 'original contract' });
+        for (const id of ['old', 'new']) {
+          ledger.registerAgent({ id, role: 'minion', jobId: 'ordered-heist', sessionFile: `/sessions/${id}.jsonl` });
+        }
+        const stamp = db.handle.prepare('UPDATE agents SET created_at = ?, updated_at = ? WHERE id = ?');
+        stamp.run('2026-09-29T12:00:01Z', '2026-09-29T12:00:03Z', 'old');
+        stamp.run('2026-09-29T12:00:02Z', '2026-09-29T12:00:02Z', 'new');
+        const { registry, controller, calls, failing } = stubRegistry(null);
+        const prompted: string[] = [];
+        await routeFixDirectiveToMinion({
+          registry: {
+            ...registry,
+            getHandle: (id: string) => live ? { ...failing, id, prompt: async () => { prompted.push(id); } } : null,
+          } as never,
+          ledger, worktrees: { listWorktrees: () => [laneAt(root)] } as unknown as WorktreePort,
+          jobId: 'ordered-heist', directive: 'repair', signal: controller.signal,
+        });
+        if (live) {
+          expect(prompted).toEqual(['new']);
+          expect(calls).toEqual([]);
+        } else {
+          expect(calls[0]?.options.resumeFile).toBe('/sessions/new.jsonl');
+        }
+      } finally {
+        db.close();
+      }
+    }
+  });
+
   it('falls through a typed eviction rejection and resumes the FAILING logical session', async () => {
     const { WorkerDisposalInProgressError } = await import('../src/runtime/registry.js');
     const { registry, controller, calls } = stubRegistry(new WorkerDisposalInProgressError());
@@ -302,7 +338,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-evict' });
     const ledgerEvents: Array<{ kind: string; payload: unknown }> = [];
     const ledger = {
-      listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-evict', sessionFile: '/sessions/failing.jsonl' }],
+      listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-evict', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: (fields: { id: string }) => { ledgerEvents.push({ kind: 'agent', payload: fields }); },
       getJob: () => ({ briefing: 'original contract' }),
     };
@@ -324,7 +360,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
     cleanupRepos.push(repo);
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-resume' });
     const ledger = {
-      listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
+      listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: () => {},
       getJob: () => ({ briefing: 'original contract' }),
     };

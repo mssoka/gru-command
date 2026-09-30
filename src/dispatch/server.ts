@@ -175,7 +175,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // Optional-field idiom (target_ref and friends): an absent, null, or
       // blank display_name means "no authored name" — the job falls back
       // to its title. A real name is bounded here AND at the ledger write.
-      const displayName = optStrField(body, 'display_name');
+      const displayName = optStrField(body, 'display_name')?.trim();
       if (displayName !== undefined && displayName.length > JOB_DISPLAY_NAME_MAX_LENGTH) {
         throw new Error(`display_name exceeds ${JOB_DISPLAY_NAME_MAX_LENGTH} characters`);
       }
