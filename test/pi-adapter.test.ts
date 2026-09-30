@@ -658,7 +658,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     ).toHaveLength(1);
   });
 
-  it('bounds an explicit compaction at the deadline, aborts the native call, and stays usable', async () => {
+  it('bounds an explicit compaction at the deadline, cancels only the compaction, and stays usable', async () => {
     const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }], ['text'], {
       compactionDeadlineMs: 25,
     });
@@ -669,6 +669,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       type InternalSession = {
         compact(): Promise<unknown>;
         abort(): Promise<void>;
+        abortCompaction(): void;
         readonly sessionId: string;
         readonly sessionFile: string | undefined;
         readonly isIdle: boolean;
@@ -677,6 +678,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       const internal = handle as unknown as { session: InternalSession };
       const nativeSession = internal.session;
       let abortCalls = 0;
+      let compactionAbortCalls = 0;
       internal.session = new Proxy(nativeSession, {
         get(target, key) {
           if (key === 'compact') {
@@ -687,11 +689,19 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
               abortCalls += 1;
             };
           }
+          if (key === 'abortCompaction') {
+            return () => {
+              compactionAbortCalls += 1;
+            };
+          }
           return Reflect.get(target, key, target);
         },
       });
       await expect(handle.compact?.()).rejects.toThrow(/exceeded the 25ms deadline/);
-      expect(abortCalls).toBe(1);
+      // The deadline cancels the compaction only; the broad session abort
+      // (owner stop semantics) must not run at this boundary.
+      expect(compactionAbortCalls).toBe(1);
+      expect(abortCalls).toBe(0);
       const failures = events.filter(
         (event) => event.type === 'compaction_end' && !event.success,
       );

@@ -784,9 +784,15 @@ export class PiAgentHandle implements AgentHandle {
       readonly isBashRunning?: boolean;
       readonly hasPendingBashMessages?: boolean;
       compact(customInstructions?: string): Promise<unknown>;
-      /** Present on the SDK session; used to cancel a compaction whose
-       * summary call outlived its deadline. */
+      /** Broad SDK abort (retry gap + both compaction controllers + branch
+       * summary + active run + waitForIdle). Owner stop/disposal semantics
+       * keep this surface; the compaction deadline does NOT use it. */
       abort?(): Promise<void>;
+      /** Compaction-only cancellation (the SDK's compaction abort
+       * controllers). The deadline cancels only the summary: native
+       * threshold compaction also runs mid-run (prepareNextTurn) while the
+       * agent run is live, and the broad abort would cancel that turn. */
+      abortCompaction?(): void;
       getContextUsage(): {
         readonly tokens: number | null;
         readonly contextWindow: number;
@@ -1288,19 +1294,28 @@ export class PiAgentHandle implements AgentHandle {
   }
 
   /** Ask the SDK to cancel an in-flight compaction. Fire-and-forget: a
-   * wedged provider transport must never keep the deadline from settling. */
+   * wedged provider transport must never keep the deadline from settling.
+   *
+   * Cancellation is compaction-scoped (SDK AgentSession.abortCompaction):
+   * pi can start native threshold compaction mid-run from
+   * prepareNextTurnWithContext (agent-session.js) while the agent run is
+   * still active; the broad session.abort() would abort that live run too,
+   * and the pending turn would surface the SDK's "This operation was
+   * aborted" error instead of its answer (proven by the mid-run deadline
+   * fixture in test/pi-adapter.test.ts). The broad surface remains with the
+   * owner stop/disposal paths. */
   private abortNativeCompaction(reason: string): void {
-    const abort = this.session.abort;
-    if (typeof abort !== 'function') return;
-    try {
-      void Promise.resolve(abort.call(this.session)).catch((error: unknown) => {
-        this.log('warn', 'native compaction abort failed', {
-          role: this.role,
-          session: this.id,
-          reason,
-          error: String(error),
-        });
+    const abortCompaction = this.session.abortCompaction;
+    if (typeof abortCompaction !== 'function') {
+      this.log('warn', 'native compaction abort unavailable', {
+        role: this.role,
+        session: this.id,
+        reason,
       });
+      return;
+    }
+    try {
+      abortCompaction.call(this.session);
     } catch (error) {
       this.log('warn', 'native compaction abort threw', {
         role: this.role,
