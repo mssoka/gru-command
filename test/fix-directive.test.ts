@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -239,7 +240,42 @@ describe('eviction-safe fix directives (phase 3)', () => {
       registry: registry as never, ledger: ledger as never, worktrees,
       jobId: 'job-resume', directive: 'fix the blocker', signal: controller.signal,
     });
-    expect(prompted[0]).toBe('fix the blocker'); // resumed session gets the directive, not a re-brief
+    expect(prompted[0]).toBe(`fix the blocker\n\n${PR_CREATION_RULE}`); // resumed session gets the directive (never the re-brief wrapper), now carrying the current non-draft PR rule
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('the non-draft PR rule on follow-up directives', () => {
+  const CAPS = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
+
+  it('a directive to the live minion carries the current non-draft PR creation rule', async () => {
+    const prompted: string[] = [];
+    const handle = {
+      id: 'minion-live', role: 'minion' as const, sessionFile: null, capabilities: CAPS,
+      health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }),
+      prompt: async (text: string) => { prompted.push(text); },
+      steer: async () => {}, followUp: async () => {}, subscribe: () => () => {}, dispose: async () => {},
+    };
+    const outcome = await routeFixDirectiveToMinion({
+      registry: {
+        getHandle: () => handle as never,
+        spawn: async () => { throw new Error('a live minion must be used, not a spawn'); },
+        disposeHandle: async () => {},
+      },
+      ledger: {
+        listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
+        registerAgent: () => {},
+        getJob: () => ({ briefing: 'original contract' }),
+      } as never,
+      worktrees: {} as never,
+      jobId: 'job-live',
+      directive: 'open the PR for the finished fix',
+      signal: new AbortController().signal,
+    });
+    expect(outcome).toEqual({ delivered: true, minionId: 'minion-live' });
+    expect(prompted).toHaveLength(1);
+    expect(prompted[0]).toContain('open the PR for the finished fix');
+    expect(prompted[0]).toContain('ordinary, non-draft PR');
+    expect(prompted[0]).toContain('gh pr create without --draft/-d');
   });
 });
