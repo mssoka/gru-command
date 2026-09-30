@@ -9,6 +9,7 @@ import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 import { recordFollowUpDelivery } from './fix-directive.js';
+import { PR_CREATION_RULE } from './pr-creation.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -69,6 +70,8 @@ export function renderMinionBriefing(input: {
     'BRIEFING:',
     input.briefing,
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
+    '',
+    PR_CREATION_RULE,
     '',
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',
