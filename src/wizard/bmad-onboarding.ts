@@ -62,6 +62,31 @@ export interface BmadRepoResult {
   readonly ready: boolean;
   readonly message: string;
   readonly recordPath?: string;
+  /**
+   * True only when `ready === false` and the failure is deterministic
+   * (gh-32): it validated unchanged on-disk state, so retrying re-runs the
+   * identical check and fails identically. The wizard must offer skip-only
+   * plus the deliberate repair path, never another identical retry.
+   * Absent for transient failures (prerequisites, installer
+   * network/download), which keep the retry/skip offer.
+   */
+  readonly deterministic?: true;
+}
+
+/**
+ * A BMAD setup failure caused by unchanged on-disk repo state (a manifest
+ * declaring a missing/unsafe/escaping module directory, a runtime-binding
+ * mismatch, a malformed existing manifest/record, a refused unsafe path).
+ * A retry cannot change the outcome — the user must repair deliberately
+ * (`npx bmad-method install` in that repo) or skip. Transient failures
+ * (missing prerequisites, installer network/download/output) stay plain
+ * `Error`s and keep the retry/skip offer.
+ */
+export class BmadDeterministicSetupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BmadDeterministicSetupError';
+  }
 }
 
 export interface BmadOnboardingOptions {
@@ -184,6 +209,21 @@ function manifestFor(repoPath: string): { text: string; summary: BmadManifestSum
   return { text, summary: parseBmadManifest(text, path) };
 }
 
+/**
+ * Read an EXISTING install's manifest for reuse: an existing manifest that
+ * fails validation is unchanged on-disk state (gh-32) — a retry re-parses
+ * the same bytes and fails identically — so parse failures here are
+ * deterministic. Fresh-installer output keeps using manifestFor, where a
+ * bad manifest stays a transient installer-output failure.
+ */
+function existingManifestFor(repoPath: string): { text: string; summary: BmadManifestSummary } | null {
+  try {
+    return manifestFor(repoPath);
+  } catch (error) {
+    throw new BmadDeterministicSetupError((error as Error).message);
+  }
+}
+
 function assertNoPartialInstall(repoPath: string): void {
   const suspicious = [
     join(repoPath, '_bmad'),
@@ -191,7 +231,7 @@ function assertNoPartialInstall(repoPath: string): void {
     join(repoPath, '.claude', 'skills', 'bmad-build'),
   ];
   if (suspicious.some((path) => existsSync(path))) {
-    throw new Error(
+    throw new BmadDeterministicSetupError(
       'partial BMAD installation detected without a valid _bmad/_config/manifest.yaml; preserve it and repair or choose skip',
     );
   }
@@ -223,7 +263,7 @@ function assertNoSymlinkComponents(base: string, relativePath: string): void {
     if (!existsSync(current)) return;
     const info = lstatSync(current);
     if (info.isSymbolicLink()) {
-      throw new Error(`refusing BMAD path through symlink: ${current}`);
+      throw new BmadDeterministicSetupError(`refusing BMAD path through symlink: ${current}`);
     }
   }
 }
@@ -293,10 +333,10 @@ function verifyModuleDirectories(repoPath: string, summary: BmadManifestSummary)
   for (const module of summary.modules) {
     const path = join(repoPath, '_bmad', module.name);
     if (!existsSync(path) || lstatSync(path).isSymbolicLink() || !statSync(path).isDirectory()) {
-      throw new Error(`BMAD manifest declares missing or unsafe module directory: ${path}`);
+      throw new BmadDeterministicSetupError(`BMAD manifest declares missing or unsafe module directory: ${path}`);
     }
     if (!insideOrEqual(repoPath, realpathSync(path))) {
-      throw new Error(`BMAD module directory escapes selected repo: ${path}`);
+      throw new BmadDeterministicSetupError(`BMAD module directory escapes selected repo: ${path}`);
     }
   }
 }
@@ -307,10 +347,10 @@ function verifySkills(repoPath: string, tools: readonly string[]): void {
     assertNoSymlinkComponents(repoPath, `${root}/skills/bmad-build`);
     const skill = join(repoPath, root, 'skills', 'bmad-build', 'SKILL.md');
     if (!existsSync(skill) || lstatSync(skill).isSymbolicLink() || !statSync(skill).isFile()) {
-      throw new Error(`BMAD ${tool} binding is missing required bmad-build skill: ${skill}`);
+      throw new BmadDeterministicSetupError(`BMAD ${tool} binding is missing required bmad-build skill: ${skill}`);
     }
     if (!insideOrEqual(repoPath, realpathSync(skill))) {
-      throw new Error(`BMAD ${tool} binding escapes selected repo: ${skill}`);
+      throw new BmadDeterministicSetupError(`BMAD ${tool} binding escapes selected repo: ${skill}`);
     }
   }
 }
@@ -333,7 +373,7 @@ function verifyNoAmbiguousSkillConfig(
         const text = readFileSync(file, 'utf-8');
         for (const key of ['planning_artifacts', 'implementation_artifacts', 'project_knowledge']) {
           if (text.includes(`{{.${key}}}`)) {
-            throw new Error(
+            throw new BmadDeterministicSetupError(
               `existing BMAD binding has ambiguous BMM/GDS config token in ${file}; ` +
                 'reuse preserved it unchanged, so repair or deliberately reinstall before marking ready',
             );
@@ -490,11 +530,13 @@ function runtimeSkillNames(repoPath: string, tool: string): string[] {
   assertNoSymlinkComponents(repoPath, `${rootName}/skills`);
   const root = runtimeSkillsRoot(repoPath, tool);
   if (!existsSync(root)) return [];
-  if (!statSync(root).isDirectory()) throw new Error(`BMAD skill root is not a directory: ${root}`);
+  if (!statSync(root).isDirectory()) {
+    throw new BmadDeterministicSetupError(`BMAD skill root is not a directory: ${root}`);
+  }
   const names: string[] = [];
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const path = join(root, entry.name);
-    if (entry.isSymbolicLink()) throw new Error(`BMAD skill binding is a symlink: ${path}`);
+    if (entry.isSymbolicLink()) throw new BmadDeterministicSetupError(`BMAD skill binding is a symlink: ${path}`);
     if (entry.isDirectory()) names.push(entry.name);
   }
   return names.sort();
@@ -510,9 +552,11 @@ function observedBmadSkills(repoPath: string, tools: readonly string[]): Runtime
 }
 
 function validatedSkillPath(repoPath: string, tool: string, skill: string): string {
-  if (tool !== 'pi' && tool !== 'claude-code') throw new Error(`unsafe BMAD runtime tool: ${tool}`);
+  if (tool !== 'pi' && tool !== 'claude-code') {
+    throw new BmadDeterministicSetupError(`unsafe BMAD runtime tool: ${tool}`);
+  }
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(skill) || skill === '.' || skill === '..') {
-    throw new Error(`unsafe BMAD recorded skill name: ${skill}`);
+    throw new BmadDeterministicSetupError(`unsafe BMAD recorded skill name: ${skill}`);
   }
   const root = runtimeSkillsRoot(repoPath, tool);
   const path = join(root, skill);
@@ -522,7 +566,7 @@ function validatedSkillPath(repoPath: string, tool: string, skill: string): stri
   const realSkill = realpathSync(path);
   if (!insideOrEqual(realRepo, realRoot) || !insideOrEqual(realRoot, realSkill) ||
       !lstatSync(path).isDirectory()) {
-    throw new Error(`unsafe BMAD recorded skill path: ${path}`);
+    throw new BmadDeterministicSetupError(`unsafe BMAD recorded skill path: ${path}`);
   }
   return path;
 }
@@ -536,7 +580,7 @@ function hashOwnedPayload(repoPath: string, runtimeSkills: RuntimeSkillMap, incl
     if (!includeDerived && (relativePath === '_bmad/render' ||
         (relativePath.startsWith('_bmad/') && relativePath.split('/').includes('__pycache__')))) return;
     const info = lstatSync(path);
-    if (info.isSymbolicLink()) throw new Error(`BMAD owned payload contains symlink: ${path}`);
+    if (info.isSymbolicLink()) throw new BmadDeterministicSetupError(`BMAD owned payload contains symlink: ${path}`);
     if (info.isDirectory()) {
       hash.update(`d\0${relativePath}\0`);
       for (const name of readdirSync(path).sort()) visit(join(path, name));
@@ -545,7 +589,7 @@ function hashOwnedPayload(repoPath: string, runtimeSkills: RuntimeSkillMap, incl
       hash.update(readFileSync(path));
       hash.update('\0');
     } else {
-      throw new Error(`BMAD owned payload contains unsupported entry: ${path}`);
+      throw new BmadDeterministicSetupError(`BMAD owned payload contains unsupported entry: ${path}`);
     }
   };
   visit(join(repoPath, '_bmad'));
@@ -804,7 +848,7 @@ function assertControlFilesSafe(repoPath: string): void {
   if (existsSync(controlDir)) {
     const info = lstatSync(controlDir);
     if (info.isSymbolicLink() || !info.isDirectory()) {
-      throw new Error(`refusing BMAD control writes through unsafe path: ${controlDir}`);
+      throw new BmadDeterministicSetupError(`refusing BMAD control writes through unsafe path: ${controlDir}`);
     }
   }
   for (const relativePath of [RECORD_PATH, BOOTSTRAP_PATH, WORKTREE_MANIFEST_PATH]) {
@@ -812,7 +856,7 @@ function assertControlFilesSafe(repoPath: string): void {
     if (existsSync(path)) {
       const info = lstatSync(path);
       if (info.isSymbolicLink() || !info.isFile()) {
-        throw new Error(`refusing BMAD control write through unsafe path: ${path}`);
+        throw new BmadDeterministicSetupError(`refusing BMAD control write through unsafe path: ${path}`);
       }
     }
   }
@@ -822,22 +866,24 @@ function assertControlFilesSafe(repoPath: string): void {
     try {
       managedBy = (JSON.parse(readFileSync(recordPath, 'utf-8')) as { managed_by?: unknown }).managed_by;
     } catch {
-      throw new Error(`existing BMAD record is malformed: ${recordPath}`);
+      throw new BmadDeterministicSetupError(`existing BMAD record is malformed: ${recordPath}`);
     }
     if (managedBy !== 'gru-command') {
-      throw new Error(`refusing to overwrite non-Gru BMAD record: ${recordPath}`);
+      throw new BmadDeterministicSetupError(`refusing to overwrite non-Gru BMAD record: ${recordPath}`);
     }
   }
   const bootstrapPath = join(repoPath, BOOTSTRAP_PATH);
   if (existsSync(bootstrapPath) && !readFileSync(bootstrapPath, 'utf-8').includes(BOOTSTRAP_MARKER)) {
-    throw new Error(`refusing to overwrite non-Gru BMAD bootstrap: ${bootstrapPath}`);
+    throw new BmadDeterministicSetupError(`refusing to overwrite non-Gru BMAD bootstrap: ${bootstrapPath}`);
   }
   const manifestPath = join(repoPath, WORKTREE_MANIFEST_PATH);
   if (existsSync(manifestPath)) {
     try {
       parse(readFileSync(manifestPath, 'utf-8'));
     } catch (error) {
-      throw new Error(`existing worktree manifest is malformed: ${manifestPath}: ${String(error)}`);
+      throw new BmadDeterministicSetupError(
+        `existing worktree manifest is malformed: ${manifestPath}: ${String(error)}`,
+      );
     }
   }
 }
@@ -849,15 +895,21 @@ function validateRepo(
 ): string {
   const workspace = realpathSync(workspaceRoot);
   const candidate = join(workspace, repoName);
-  if (!existsSync(candidate)) throw new Error(`selected repo no longer exists: ${candidate}`);
+  if (!existsSync(candidate)) {
+    throw new BmadDeterministicSetupError(`selected repo no longer exists: ${candidate}`);
+  }
   if (lstatSync(candidate).isSymbolicLink()) {
-    throw new Error(`selected repo is a symlink; refusing BMAD writes outside the workspace: ${candidate}`);
+    throw new BmadDeterministicSetupError(
+      `selected repo is a symlink; refusing BMAD writes outside the workspace: ${candidate}`,
+    );
   }
   const repoPath = realpathSync(candidate);
   if (!insideOrEqual(workspace, repoPath) || repoPath === workspace) {
-    throw new Error(`selected repo escapes the workspace root: ${candidate}`);
+    throw new BmadDeterministicSetupError(`selected repo escapes the workspace root: ${candidate}`);
   }
-  if (!existsSync(join(repoPath, '.git'))) throw new Error(`selected directory is not a Git repo: ${repoPath}`);
+  if (!existsSync(join(repoPath, '.git'))) {
+    throw new BmadDeterministicSetupError(`selected directory is not a Git repo: ${repoPath}`);
+  }
   const gitRoot = spawnSync('git', ['-C', repoPath, 'rev-parse', '--show-toplevel'], {
     encoding: 'utf-8',
     env,
@@ -865,16 +917,16 @@ function validateRepo(
     timeout: 10_000,
   });
   if (gitRoot.status !== 0 || gitRoot.stdout.trim() === '') {
-    throw new Error(`selected directory is not a usable Git repo: ${repoPath}`);
+    throw new BmadDeterministicSetupError(`selected directory is not a usable Git repo: ${repoPath}`);
   }
   let actualRoot: string;
   try {
     actualRoot = realpathSync(gitRoot.stdout.trim());
   } catch {
-    throw new Error(`selected Git repo reported an invalid top-level path: ${repoPath}`);
+    throw new BmadDeterministicSetupError(`selected Git repo reported an invalid top-level path: ${repoPath}`);
   }
   if (actualRoot !== repoPath) {
-    throw new Error(`selected directory is not the Git repository root: ${repoPath}`);
+    throw new BmadDeterministicSetupError(`selected directory is not the Git repository root: ${repoPath}`);
   }
   return repoPath;
 }
@@ -895,27 +947,31 @@ export function onboardBmadRepo(
     assertNoSymlinkComponents(repoPath, '_bmad');
     for (const tool of tools) runtimeSkillNames(repoPath, tool);
     assertPrerequisites(tools, env, repoPath, options.prerequisiteCheck ?? commandAvailable);
-    const existing = manifestFor(repoPath);
+    const existing = existingManifestFor(repoPath);
     let installed: InstalledBmad;
     let fresh = false;
     let verifiedLegacyRecord: Record<string, unknown> | undefined;
     if (action === 'install') {
       if (existing !== null) {
-        throw new Error('BMAD already exists; choose reuse to preserve it (automatic overwrite/upgrade is disabled)');
+        throw new BmadDeterministicSetupError(
+          'BMAD already exists; choose reuse to preserve it (automatic overwrite/upgrade is disabled)',
+        );
       }
       installed = installFresh(repoPath, tools, env, options.run ?? spawnSync);
       fresh = true;
     } else {
       if (existing === null) {
         assertNoPartialInstall(repoPath);
-        throw new Error('reuse requested but no existing BMAD manifest was found');
+        throw new BmadDeterministicSetupError('reuse requested but no existing BMAD manifest was found');
       }
       let recordedSkills: RuntimeSkillMap | undefined;
       const priorRecord = join(repoPath, RECORD_PATH);
       if (existsSync(priorRecord)) {
         const prior = JSON.parse(readFileSync(priorRecord, 'utf-8')) as Record<string, unknown>;
         if (typeof prior.source_payload_sha256 !== 'string') {
-          throw new Error(`existing BMAD record lacks a source payload fingerprint: ${priorRecord}`);
+          throw new BmadDeterministicSetupError(
+            `existing BMAD record lacks a source payload fingerprint: ${priorRecord}`,
+          );
         }
         const raw = prior.runtime_skills;
         if (raw !== undefined && raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
@@ -923,7 +979,9 @@ export function onboardBmadRepo(
           for (const [tool, names] of Object.entries(raw)) {
             if ((tool !== 'pi' && tool !== 'claude-code') || !Array.isArray(names) ||
                 names.some((name) => typeof name !== 'string')) {
-              throw new Error(`existing BMAD record has invalid runtime_skills: ${priorRecord}`);
+              throw new BmadDeterministicSetupError(
+                `existing BMAD record has invalid runtime_skills: ${priorRecord}`,
+              );
             }
             for (const name of names as string[]) validatedSkillPath(repoPath, tool, name);
             parsed[tool] = [...names] as string[];
@@ -931,11 +989,13 @@ export function onboardBmadRepo(
           recordedSkills = parsed;
         }
         if (prior.source_payload_format !== undefined && prior.source_payload_format !== 'without-derived-caches-v1') {
-          throw new Error('existing BMAD record has unsupported source payload format');
+          throw new BmadDeterministicSetupError('existing BMAD record has unsupported source payload format');
         }
         if (!recordedSkills ||
             hashOwnedPayload(repoPath, recordedSkills, prior.source_payload_format === undefined) !== prior.source_payload_sha256) {
-          throw new Error('BMAD source payload changed since onboarding; reuse cannot refresh an unverified fingerprint (including legacy render caches). Review source and re-onboard deliberately');
+          throw new BmadDeterministicSetupError(
+            'BMAD source payload changed since onboarding; reuse cannot refresh an unverified fingerprint (including legacy render caches). Review source and re-onboard deliberately',
+          );
         }
         if (prior.source_payload_format === undefined) verifiedLegacyRecord = prior;
       }
@@ -952,7 +1012,7 @@ export function onboardBmadRepo(
       const existingTools = new Set(installed.summary.tools);
       const missingBindings = tools.filter((tool) => !existingTools.has(tool));
       if (missingBindings.length > 0) {
-        throw new Error(
+        throw new BmadDeterministicSetupError(
           `existing BMAD install lacks selected runtime binding(s): ${missingBindings.join(', ')}; ` +
             'reuse will not modify it—choose skip or deliberately update it with the official installer',
         );
@@ -1000,6 +1060,7 @@ export function onboardBmadRepo(
       action,
       ready: false,
       message: String((error as Error).message),
+      deterministic: error instanceof BmadDeterministicSetupError ? true : undefined,
     };
   }
 }

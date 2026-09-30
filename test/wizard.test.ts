@@ -369,6 +369,61 @@ describe('wizard CLI surface', () => {
     expect(err).toContain('--no-interact');
   });
 
+  it('noninteractive deterministic BMAD failure fails loud without offering retry; explicit skip completes (gh-32)', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-det-ws-');
+    const repoA = join(workspace, 'repo-a');
+    mkdirSync(join(repoA, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoA });
+    // Broken existing install in a temporary fixture: the manifest declares
+    // core, whose directory is missing (the gh-32 class).
+    mkdirSync(join(repoA, '_bmad', '_config'), { recursive: true });
+    writeFileSync(
+      join(repoA, '_bmad', '_config', 'manifest.yaml'),
+      'installation:\n  version: 6.12.0\nmodules:\n  - name: core\n    version: 6.12.0\nides:\n  - pi\n',
+    );
+    const bin = tempDir('gru-command-wizard-det-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    const baseEnv = {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
+    };
+    const answersJson = JSON.stringify({
+      workspace_root: workspace,
+      repos: ['repo-a'],
+      bmad: { 'repo-a': 'reuse' },
+      runtime: 'pi',
+      port: 0,
+      smoke: false,
+    });
+    const instance = tempDir('gru-command-wizard-det-home-');
+    const failed = spawnSync(
+      process.execPath,
+      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson],
+      { env: { ...baseEnv, GRU_COMMAND_HOME: instance }, encoding: 'utf-8', timeout: 60_000 },
+    );
+    expect(failed.status, failed.stderr).toBe(1);
+    expect(failed.stderr).toContain('deterministic failure — retrying cannot fix it');
+    expect(failed.stderr).toContain('BMAD manifest declares missing or unsafe module directory');
+    // The truthful contract names the deliberate fix and the explicit skip
+    // escape hatch — and never suggests the futile retry.
+    expect(failed.stderr).toContain('npx bmad-method install');
+    expect(failed.stderr).toContain('answers.bmad.repo-a="skip"');
+    expect(failed.stderr).not.toContain('Retry after fixing it');
+    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
+
+    // Explicit skip keeps the existing opt-out contract: headless completion.
+    const skipHome = tempDir('gru-command-wizard-det-skip-home-');
+    const skipped = spawnSync(
+      process.execPath,
+      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson.replace('"reuse"', '"skip"')],
+      { env: { ...baseEnv, GRU_COMMAND_HOME: skipHome }, encoding: 'utf-8', timeout: 60_000 },
+    );
+    expect(skipped.status, skipped.stderr).toBe(0);
+    expect(skipped.stdout).toContain('BMAD not ready in repo-a: skipped by explicit per-repo choice');
+    expect(readFileSync(join(skipHome, 'config.toml'), 'utf-8')).toContain('port = 0');
+  }, 120_000);
+
   it('host validation accepts every VALID IPv6 form (Perkins r2 note)', () => {
     for (const good of ['::', '::1', 'fe80::1', 'fe80::1%en0', '1:2:3:4:5:6:7:8', '::ffff:127.0.0.1']) {
       expect(parseAnswers(JSON.stringify({ host: good })).host, good).toBe(good);

@@ -664,6 +664,123 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(existsSync(join(outside.repo, '.gru-command'))).toBe(false);
   });
 
+  it('classifies deterministic state failures as retry-futile and keeps transient failures retryable (gh-32)', () => {
+    // Missing declared module directory: the exact field report — retry
+    // re-checks unchanged bytes, so it must be skip-only, never retry.
+    const missing = fixtureRepo('missing-module-dir');
+    materializeOfficialInstall(missing.repo);
+    rmSync(join(missing.repo, '_bmad', 'tea'), { recursive: true, force: true });
+    const missingResult = onboardBmadRepo(missing.name, 'reuse', {
+      workspaceRoot: missing.workspace,
+      answers: answers(missing.workspace, missing.name, 'reuse'),
+    });
+    expect(missingResult.ready).toBe(false);
+    expect(missingResult.deterministic).toBe(true);
+    expect(missingResult.message).toContain('BMAD manifest declares missing or unsafe module directory');
+
+    // Unsafe (symlinked) declared module directory: same skip-only class.
+    const symlinked = fixtureRepo('symlinked-module-dir');
+    materializeOfficialInstall(symlinked.repo);
+    const outsideModule = tempDir('gru-command-bmad-outside-module-');
+    rmSync(join(symlinked.repo, '_bmad', 'gds'), { recursive: true, force: true });
+    symlinkSync(outsideModule, join(symlinked.repo, '_bmad', 'gds'));
+    const symlinkedResult = onboardBmadRepo(symlinked.name, 'reuse', {
+      workspaceRoot: symlinked.workspace,
+      answers: answers(symlinked.workspace, symlinked.name, 'reuse'),
+    });
+    expect(symlinkedResult.ready).toBe(false);
+    expect(symlinkedResult.deterministic).toBe(true);
+    expect(symlinkedResult.message).toContain('missing or unsafe module directory');
+
+    // Escaping declared module directory: same skip-only class. The
+    // declared name carries enough ../ traversal that the resolved module
+    // directory lands OUTSIDE the repo (join normalizes the path).
+    const escape = fixtureRepo('escaping-module-dir');
+    materializeOfficialInstall(escape.repo, '  - name: x/../../../outside-module\n    version: v1.0.0');
+    mkdirSync(join(escape.workspace, 'outside-module'), { recursive: true });
+    const escapeResult = onboardBmadRepo(escape.name, 'reuse', {
+      workspaceRoot: escape.workspace,
+      answers: answers(escape.workspace, escape.name, 'reuse'),
+    });
+    expect(escapeResult.ready).toBe(false);
+    expect(escapeResult.deterministic).toBe(true);
+    expect(escapeResult.message).toContain('BMAD module directory escapes selected repo');
+
+    // Selected-runtime binding mismatch (the issue's sibling class):
+    // same skip-only class. Short config tokens are pre-qualified the way
+    // a customized install may carry them, so verification reaches the
+    // binding check rather than refusing the ambiguous token first.
+    const mismatch = fixtureRepo('binding-mismatch');
+    materializeOfficialInstall(mismatch.repo);
+    writeFileSync(
+      join(mismatch.repo, '.agents', 'skills', 'bmad-build', 'workflow.md'),
+      'write to {{config.modules.bmm.implementation_artifacts}}\n',
+    );
+    writeFileSync(
+      join(mismatch.repo, '.agents', 'skills', 'gds-quick-dev', 'workflow.md'),
+      'write to {{config.modules.gds.implementation_artifacts}}\n',
+    );
+    const mismatchResult = onboardBmadRepo(mismatch.name, 'reuse', {
+      workspaceRoot: mismatch.workspace,
+      answers: parseAnswers(
+        JSON.stringify({
+          workspace_root: mismatch.workspace,
+          repos: [mismatch.name],
+          bmad: { [mismatch.name]: 'reuse' },
+          runtime: 'claude-code',
+          smoke: false,
+        }),
+      ),
+    });
+    expect(mismatchResult.ready).toBe(false);
+    expect(mismatchResult.deterministic).toBe(true);
+    expect(mismatchResult.message).toContain(
+      'existing BMAD install lacks selected runtime binding(s): claude-code',
+    );
+
+    // A malformed existing manifest is unchanged bytes: deterministic too.
+    const malformed = fixtureRepo('malformed-classification');
+    mkdirSync(join(malformed.repo, '_bmad', '_config'), { recursive: true });
+    writeFileSync(join(malformed.repo, '_bmad', '_config', 'manifest.yaml'), 'not-a-manifest\n');
+    const malformedResult = onboardBmadRepo(malformed.name, 'reuse', {
+      workspaceRoot: malformed.workspace,
+      answers: answers(malformed.workspace, malformed.name, 'reuse'),
+    });
+    expect(malformedResult.ready).toBe(false);
+    expect(malformedResult.deterministic).toBe(true);
+    expect(malformedResult.message).toContain('existing BMAD manifest is malformed');
+
+    // Transient installer failure keeps the retry offer — no flag.
+    const transient = fixtureRepo('transient-classification');
+    const transientResult = onboardBmadRepo(transient.name, 'install', {
+      workspaceRoot: transient.workspace,
+      answers: answers(transient.workspace, transient.name, 'install'),
+      run: ((_command: string, _args: string[]) => ({
+        status: 1,
+        signal: null,
+        stdout: '',
+        stderr: 'fixture network unavailable',
+        pid: 1,
+        output: [],
+      })) as unknown as typeof spawnSync,
+    });
+    expect(transientResult.ready).toBe(false);
+    expect(transientResult.deterministic).toBeUndefined();
+    expect(transientResult.message).toContain('retry this repo or skip it');
+
+    // Missing prerequisites stay transient (install them, then retry).
+    const prereq = fixtureRepo('prereq-classification');
+    const prereqResult = onboardBmadRepoImpl(prereq.name, 'install', {
+      workspaceRoot: prereq.workspace,
+      answers: answers(prereq.workspace, prereq.name, 'install'),
+      run: successfulInstaller(prereq.repo, []),
+      prerequisiteCheck: (command) => command !== 'uv',
+    });
+    expect(prereqResult.ready).toBe(false);
+    expect(prereqResult.deterministic).toBeUndefined();
+    expect(prereqResult.message).toContain('missing BMAD prerequisite(s): uv');
+  });
+
   it('bootstraps isolated copies into a real fresh worktree and fails when a required source module disappears', async () => {
     const fixture = fixtureRepo('worktree-proof');
     const customSkill = join(fixture.repo, '.agents', 'skills', 'user-custom');

@@ -636,6 +636,35 @@ async function main(argv: readonly string[]): Promise<number> {
         stdout.write(`BMAD not ready in ${repo}: ${result.message}; repo remains managed.\n`);
         break;
       }
+      if (result.deterministic) {
+        // Deterministic state failure (gh-32): the check ran against
+        // unchanged on-disk state, so another identical retry can never
+        // succeed. Offer skip-only plus the deliberate repair path — the
+        // wizard never repairs or overwrites an existing install itself.
+        const repairHint =
+          'Fix deliberately by running `npx bmad-method install` in that repo, then re-run the wizard';
+        if (terminal === null) {
+          fail(
+            `BMAD setup for ${repo} is not ready (deterministic failure — retrying cannot fix it): ${result.message}\n` +
+              `${repairHint}, or explicitly set answers.bmad.${repo}="skip".`,
+          );
+        }
+        terminal.output.write(
+          `BMAD setup for ${repo} failed (deterministic — retrying cannot fix it): ${result.message}\n` +
+            `  ${repairHint}; Gru never repairs an existing install automatically.\n`,
+        );
+        for (;;) {
+          const skipRl = createInterface({ input: terminal.input, output: terminal.output });
+          const choice = (await ask(skipRl, 'Skip this repo? [skip]: ')).toLowerCase();
+          skipRl.close();
+          if (['', 'skip', 's', 'y', 'yes'].includes(choice)) {
+            action = 'skip';
+            break;
+          }
+          terminal.output.write('  ✗ this failure is deterministic — retry cannot fix it; enter skip\n');
+        }
+        continue;
+      }
       if (terminal === null) {
         fail(
           `BMAD setup for ${repo} is not ready: ${result.message}\n` +
