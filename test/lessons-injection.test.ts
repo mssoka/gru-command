@@ -179,6 +179,9 @@ describe('progressive-disclosure injection', () => {
       expect(result.delivered).toBe(true);
       expect(prompts[0]).toContain('original implementation contract');
       expect(prompts[0]).toContain('fix the failing test');
+      // The fresh fallback worker still receives the CURRENT creation rule.
+      expect(prompts[0]).toContain('ordinary, non-draft PR');
+      expect(prompts[0]).toContain('gh pr create without --draft/-d');
       expect(ledger.listAgents().some((agent) => agent.id === result.minionId && agent.jobId === 'job-resume')).toBe(true);
     } finally { ledgerDb.close(); }
   });
