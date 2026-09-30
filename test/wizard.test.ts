@@ -348,8 +348,15 @@ describe('wizard CLI surface', () => {
   it('interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)', () => {
     const repoRoot = join(import.meta.dirname, '..');
     // stdin: 'ignore' = not a TTY — exactly the piped one-liner's world.
+    // GRU_COMMAND_HOME is isolated so the no-TTY guard never depends on
+    // whether an ambient instance config exists (or whether the loader
+    // accepts it): the guard must be reached on a fresh instance.
     const res = spawnSync(process.execPath, [join(repoRoot, 'dist', 'wizard', 'main.js')], {
-      env: { ...process.env, GRU_COMMAND_TEST_NO_TTY: '1' },
+      env: {
+        ...process.env,
+        GRU_COMMAND_TEST_NO_TTY: '1',
+        GRU_COMMAND_HOME: tempDir('gru-command-wizard-notty-'),
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 30_000,
     });
