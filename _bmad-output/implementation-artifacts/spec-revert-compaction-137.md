@@ -2,7 +2,7 @@
 title: 'Revert PR #137 compaction gate (rollback only)'
 type: 'refactor'
 created: '2026-09-30'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: 'c54bfbf89727bacfd27a27db65a9fab681c19c3e'
@@ -86,15 +86,14 @@ Owner approval: dispatch briefing 2026-09-30 (explicit rollback approval + instr
   Later source changes preserved: supervisor `openControl` view fields, pi
   adapter cessation-evidence / awaited-`dispose`; later gh-97 supervisor test
   kept.
-- Exact-head verification (all after the merge of origin/main and the
-  host repairs; head `4bc28b85267805dafdcdcc60db2374b3ed0cec84`):
-  - `compaction-rollback` focused scope: ok, exit 0, 223 tests / 6 files
-    (run `0692f5b6-fcca-4e61-9bf5-ac69e0018009`).
-  - `typecheck`: ok, exit 0 (run `c00addb2-6cf8-46a2-85f2-328ecda79e95`).
-  - `full` (`npm test`): ok, exit 0, backend 1443 passed + web 368 passed
-    (run `b965f218-2d6d-4d8d-8b92-611bf124da80`).
-  Earlier red full runs at `c0d0ec2` / `199eca6` remain recorded in the
-  ledger as failed; the repairs above are why the final run is green.
+- Exact-head verification (ledger-authoritative): three green
+  `POST /api/verify` runs (focused `compaction-rollback`, `typecheck`,
+  `full` = 1443 backend + 368 web tests) were recorded at code head
+  `4bc28b8` and re-run at the final head; the run IDs and their SHA
+  binding live in PR #147 and in the service's `verification.completed`
+  records consumed by the review's tests lens. Earlier red full runs at
+  `c0d0ec2` / `199eca6` stay recorded as failures; the reconciliation and
+  host repairs above are why the final runs are green.
 - Red/green proof for the rollback itself: the four new regression tests
   fail against the pre-revert sources (config 1, pi-adapter 2, supervisor
   1) and pass after the revert, per the earlier note.
