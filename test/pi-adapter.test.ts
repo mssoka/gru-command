@@ -73,7 +73,6 @@ interface FixtureOptions {
   readonly modelCatalogRefresh?: PiRuntimeOptions['modelCatalogRefresh'];
   readonly configExtra?: string;
   readonly log?: PiRuntimeOptions['log'];
-  readonly compactionDeadlineMs?: number;
 }
 
 async function fixture(
@@ -103,9 +102,6 @@ async function fixture(
       ? { modelCatalogRefresh: options.modelCatalogRefresh }
       : {}),
     ...(options.log !== undefined ? { log: options.log } : {}),
-    ...(options.compactionDeadlineMs !== undefined
-      ? { compactionDeadlineMs: options.compactionDeadlineMs }
-      : {}),
   });
   return { home, workspace, agentDir, store, script, config, modelRuntime, runtime };
 }
@@ -649,80 +645,104 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     ).toHaveLength(1);
   });
 
-  it('bounds an explicit compaction at the deadline, aborts the native call, and stays usable', async () => {
-    const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }], ['text'], {
-      compactionDeadlineMs: 25,
-    });
+  it('never aborts a pending explicit compaction when time crosses the former #137 deadline', async () => {
+    const fx = await fixture([{ deltas: ['first answer'] }]);
     const handle = await fx.runtime.spawn('gru');
     const events = collect(handle);
+    type InternalSession = {
+      compact(): Promise<unknown>;
+      readonly sessionId: string;
+      readonly sessionFile: string | undefined;
+      readonly isIdle: boolean;
+      readonly isCompacting: boolean;
+    };
+    const internal = handle as unknown as {
+      session: InternalSession;
+      onPiEvent(event: unknown): void;
+    };
+    const nativeSession = internal.session;
+    let abortCalls = 0;
+    let release!: () => void;
+    internal.session = new Proxy(nativeSession, {
+      get(target, key) {
+        if (key === 'compact') {
+          return () => new Promise<void>((resolve) => {
+            release = () => {
+              // The native terminal arrives with the SDK call, as in the real
+              // adapter round-trip; then the summary call settles.
+              internal.onPiEvent({ type: 'compaction_end' });
+              resolve();
+            };
+          });
+        }
+        if (key === 'abort') {
+          return async () => {
+            abortCalls += 1;
+          };
+        }
+        return Reflect.get(target, key, target);
+      },
+    });
     try {
       await handle.prompt('prime');
-      type InternalSession = {
-        compact(): Promise<unknown>;
-        abort(): Promise<void>;
-        readonly sessionId: string;
-        readonly sessionFile: string | undefined;
-        readonly isIdle: boolean;
-        readonly isCompacting: boolean;
-      };
-      const internal = handle as unknown as { session: InternalSession };
-      const nativeSession = internal.session;
-      let abortCalls = 0;
-      internal.session = new Proxy(nativeSession, {
-        get(target, key) {
-          if (key === 'compact') {
-            return () => new Promise<void>(() => {}); // a summary call that never settles
-          }
-          if (key === 'abort') {
-            return async () => {
-              abortCalls += 1;
-            };
-          }
-          return Reflect.get(target, key, target);
-        },
-      });
-      await expect(handle.compact?.()).rejects.toThrow(/exceeded the 25ms deadline/);
-      expect(abortCalls).toBe(1);
-      const failures = events.filter(
-        (event) => event.type === 'compaction_end' && !event.success,
+      vi.useFakeTimers();
+      const settled = handle.compact!().then(
+        () => null,
+        (error: Error) => error,
       );
-      expect(failures).toHaveLength(1);
-      expect((failures[0] as { error?: string }).error).toMatch(/25ms deadline/);
-      // The session identity survived and the lane still accepts turns.
-      internal.session = nativeSession;
-      expect(handle.health().state).not.toBe('disposed');
-      await handle.prompt('after the deadline');
-      expect(fx.script.calls.map((call) => call.prompt)).toContain('after the deadline');
+      // Cross the former five-minute wrapper deadline: nothing may abort the
+      // compaction or settle the pending reply on this timer (rollback of
+      // PR #137's deadline).
+      await vi.advanceTimersByTimeAsync(300_001);
+      expect(abortCalls).toBe(0);
+      expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
+      release();
+      await expect(settled).resolves.toBeNull();
+      const ends = events.filter((event) => event.type === 'compaction_end');
+      expect(ends).toHaveLength(1);
+      expect((ends[0] as { success: boolean }).success).toBe(true);
     } finally {
+      vi.useRealTimers();
+      internal.session = nativeSession;
       await handle.dispose();
     }
   });
 
-  it('bounds a silent pi-auto compaction at the deadline without a session restart', async () => {
-    const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }], ['text'], {
-      compactionDeadlineMs: 25,
-    });
+  it('never aborts a silent native compaction at the former #137 deadline and publishes its completion', async () => {
+    const fx = await fixture([{ deltas: ['first answer'] }]);
     const handle = await fx.runtime.spawn('gru');
     const events = collect(handle);
+    const internal = handle as unknown as {
+      session: { abort?(): Promise<void> };
+      onPiEvent(event: unknown): void;
+    };
+    const nativeSession = internal.session;
+    let abortCalls = 0;
+    internal.session = new Proxy(nativeSession, {
+      get(target, key) {
+        if (key === 'abort') {
+          return async () => {
+            abortCalls += 1;
+          };
+        }
+        return Reflect.get(target, key, target);
+      },
+    });
     try {
-      // Pi's threshold/overflow compaction has no caller to own a timeout;
-      // inject the start event the adapter forwards to supervision.
-      (handle as unknown as { onPiEvent(event: unknown): void }).onPiEvent({
-        type: 'compaction_start',
-        reason: 'threshold',
-      });
-      await new Promise((resolve) => setTimeout(resolve, 60));
-      expect(events.some((event) => event.type === 'compaction_start')).toBe(true);
-      const failures = events.filter(
-        (event) => event.type === 'compaction_end' && !event.success,
-      );
-      expect(failures).toHaveLength(1);
-      expect((failures[0] as { error?: string }).error).toMatch(/25ms deadline/);
-      // The deadline closes the open control without disposing the handle.
-      expect(handle.health().state).not.toBe('disposed');
-      await handle.prompt('still usable');
-      expect(fx.script.calls.map((call) => call.prompt)).toContain('still usable');
+      await handle.prompt('prime');
+      vi.useFakeTimers();
+      internal.onPiEvent({ type: 'compaction_start', reason: 'threshold' });
+      await vi.advanceTimersByTimeAsync(300_001);
+      expect(abortCalls).toBe(0);
+      expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
+      // Native completion proceeds promptly — no timer must be awaited.
+      internal.onPiEvent({ type: 'compaction_end' });
+      const ends = events.filter((event) => event.type === 'compaction_end');
+      expect(ends).toHaveLength(1);
+      expect((ends[0] as { success: boolean }).success).toBe(true);
     } finally {
+      vi.useRealTimers();
+      internal.session = nativeSession;
       await handle.dispose();
     }
   });
