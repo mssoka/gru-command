@@ -18,6 +18,37 @@ afterAll(() => {
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
 });
 
+/**
+ * Poll /health like every other boot test in this suite does — the
+ * service-port-guard suite's waitForHealth, the wizard's own first-boot
+ * smoke fetchHealth, and helpers/real-service healthOk all retry with a
+ * short per-attempt cap until a bounded deadline. A SINGLE 2s shot is
+ * not the liveness contract: the post-listen Gru warmup performs
+ * real work on one loop, so on a busy host the first /health response
+ * can land just past 2s while the service is healthy (recorded full run
+ * ab2ce8e8 at 6a09349: this test aborted, the two non-fetch tests in the
+ * same file passed). Every assertion below is unchanged; the per-attempt
+ * cap is unchanged.
+ */
+async function fetchHealthAnswered(port: number): Promise<Response> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/health`, {
+        headers: { authorization: 'Bearer uploads-test-token' },
+        signal: AbortSignal.timeout(2_000),
+      });
+      if (res.ok) return res;
+    } catch {
+      /* not answering yet — the loop is bounded by the deadline */
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`service never answered /health on port ${port}`);
+    }
+    await new Promise((wake) => setTimeout(wake, 100));
+  }
+}
+
 describe('uploads dir scaffolding (SPEC ruling 19)', () => {
   it('boot creates <data_dir>/uploads/ and logs an uploads_dir boot line', async () => {
     const home = mkdtempSync(join(tmpdir(), 'gru-command-uploads-'));
@@ -47,10 +78,7 @@ describe('uploads dir scaffolding (SPEC ruling 19)', () => {
 
       // Liveness briefly (the boot completed far enough to serve /health)
       // and the structured uploads_dir boot line is on the log stream.
-      const res = await fetch(`http://127.0.0.1:${port}/health`, {
-        headers: { authorization: 'Bearer uploads-test-token' },
-        signal: AbortSignal.timeout(2_000),
-      });
+      const res = await fetchHealthAnswered(port);
       expect(res.ok).toBe(true);
       // The FULL smoke oracle, not just res.ok (Perkins r1 W8): the
       // default suite boots the real service, so it asserts the same
