@@ -42,6 +42,13 @@ import { railChips, type RailChip } from '../lib/board-rail.js';
 import { BOARD_WORDS, heistCount } from '../lib/board-vocabulary.js';
 import { formatAge } from '../lib/board-time.js';
 import { jobSignal, pluralCount, roundSummary, unackedByJob, type RoundSummary } from '../lib/board-signals.js';
+import {
+  ownerRows,
+  ownerWindow,
+  safePrUrl,
+  type OwnerAckRow,
+  type OwnerPrRow,
+} from '../lib/owner-band.js';
 
 /** Truthful lens progress for whole-PR rounds: show what actually ran —
  * including lenses that ran and failed — and name unused lenses instead of
@@ -83,6 +90,7 @@ export interface TranscriptOpenRequest {
 
 export class BoardView {
   private readonly mount: HTMLElement;
+  private readonly ownerMount: HTMLElement;
   private readonly chipRail: HTMLElement;
   private readonly agentsCount: HTMLElement;
   private readonly notificationBell: HTMLButtonElement;
@@ -127,6 +135,9 @@ export class BoardView {
   /** v5: job ids already on screen (new rows slide in; old ones do not). */
   private readonly knownJobIds = new Set<string>();
   private firstJobsRender = true;
+  /** FOR YOU: the older pending tail lives behind the expander
+   * (session-expanded, like the SETTLED window). */
+  private ownerExpanded = false;
 
   constructor(
     onOpenTranscript: (request: TranscriptOpenRequest) => void,
@@ -134,6 +145,7 @@ export class BoardView {
     collapseStorage: StorageLike | null = null,
   ) {
     this.mount = mustGet('board-jobs');
+    this.ownerMount = mustGet('board-owner');
     this.chipRail = mustGet('chip-rail');
     this.agentsCount = mustGet('rail-agents-count');
     this.notificationBell = mustGet<HTMLButtonElement>('notification-bell');
@@ -178,11 +190,168 @@ export class BoardView {
   render(snapshot: BoardSnapshot): void {
     const previous = this.snapshot;
     this.snapshot = snapshot;
+    this.renderOwnerActions(snapshot);
     this.renderRail(snapshot);
     this.renderJobs(snapshot);
     this.renderAgents(snapshot.agents);
-    this.renderNotifications(snapshot.notifications);
+    this.renderNotifications(snapshot);
     this.surfaceNewNotifications(previous, snapshot.notifications);
+  }
+
+  // ------------------------------------------------------------------
+  // FOR YOU — the permanent owner-action band (owner approval 2026-09-28)
+  // ------------------------------------------------------------------
+
+  /** The owner's pending obligations, always at the top of the board:
+   * unacked needs-owner rows (Ack closes them on the authoritative
+   * snapshot) plus the server-projected, evidence-bound ready PRs (OPEN
+   * PR only — a link click never claims a merge). Viewing completes
+   * nothing: the count is owed actions, not unseen rows. */
+  private renderOwnerActions(snapshot: BoardSnapshot): void {
+    const mount = this.ownerMount;
+    const rows = ownerRows(snapshot);
+    // Focus preservation: a snapshot push re-renders the band; a focused
+    // control keeps its place (stable action ids make it the same
+    // control, not a lookalike).
+    const active = document.activeElement;
+    const focusId =
+      active instanceof HTMLElement && mount.contains(active)
+        ? active.dataset.actionId ?? null
+        : null;
+    const bandVisible = !mount.hidden && mount.closest('[hidden]') === null;
+    mount.replaceChildren();
+    const head = el('h2', 'board-band__head');
+    head.id = 'board-owner-head';
+    head.append(
+      el('span', 'board-band__label', 'FOR YOU'),
+      el('span', 'board-band__count lbl', `${rows.length} pending`),
+    );
+    mount.append(head);
+    mount.hidden = false;
+    if (rows.length === 0) {
+      // An empty owner list is healthy, not absence — the calm clear
+      // state NEEDS GRU uses (never hidden, never a false alarm).
+      const clear = el('div', 'board-band__clear board-owner__clear');
+      clear.append(
+        el('span', 'board-band__clear-mark', '✓'),
+        el('div', 'board-band__clear-text', 'nothing needs you'),
+        el('div', 'lbl board-band__clear-hint', 'pending owner actions land here'),
+      );
+      mount.append(clear);
+    } else {
+      const window = ownerWindow(rows, this.ownerExpanded);
+      const list = el('div', 'board-band__rows board-owner__rows');
+      for (const row of window.rows) {
+        if (row.kind === 'ack') {
+          list.append(this.ownerAckRow(row, bandVisible));
+        } else {
+          list.append(this.ownerPrRow(row));
+        }
+      }
+      mount.append(list);
+      if (window.hidden > 0) {
+        const more = el('button', 'board-band__more', `+${window.hidden} older pending`);
+        more.type = 'button';
+        more.setAttribute('aria-expanded', String(this.ownerExpanded));
+        more.addEventListener('click', () => {
+          this.ownerExpanded = true;
+          if (this.snapshot !== null) this.render(this.snapshot);
+        });
+        mount.append(more);
+      }
+    }
+    if (focusId !== null) this.refocusAction(focusId);
+  }
+
+  private refocusAction(actionId: string): void {
+    for (const node of this.ownerMount.querySelectorAll<HTMLElement>('[data-action-id]')) {
+      if (node.dataset.actionId === actionId) {
+        node.focus();
+        return;
+      }
+    }
+  }
+
+  /** One pending ack obligation: what it is, why it is owed, what the
+   * Ack does AND does not do. The control stays pending on any HTTP
+   * ambiguity — only the authoritative snapshot closes the row. */
+  private ownerAckRow(row: OwnerAckRow, bandVisible: boolean): HTMLElement {
+    const item = row.notification;
+    // The interactive control carries the action id (focus/addressing
+    // target); the wrapper stays anonymous so a query always lands on
+    // the control, never a lookalike parent.
+    const node = el('article', `board-owner__row board-owner__row--${item.severity}`);
+    node.append(
+      el('div', 'board-owner__title', `🔔 ${item.title}`),
+      el(
+        'div',
+        'board-owner__meta lbl',
+        `${formatTs(item.ts)} · owner ack owed${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
+      ),
+      el('div', 'lbl board-owner__consequence', row.consequence),
+    );
+    const ack = document.createElement('button');
+    ack.type = 'button';
+    ack.className = 'board-owner__ack';
+    ack.textContent = 'Ack';
+    ack.dataset.actionId = row.actionId;
+    ack.addEventListener('click', () => {
+      ack.disabled = true;
+      ack.textContent = 'acking…';
+      void this.boardClient
+        ?.ackNotification(item.id)
+        .then(() => {
+          /* Success is NOT completion — the row closes only when the
+           * authoritative snapshot carries ackedAt (any device). */
+        })
+        .catch(() => {
+          // Ambiguous/failed HTTP: the obligation stands. Restore the
+          // control; the next snapshot reconciles one authoritative truth.
+          ack.disabled = false;
+          ack.textContent = 'Ack';
+        });
+    });
+    node.append(ack);
+    // Display receipt for what the band actually displayed (shown:true
+    // doctrine) — a receipt is proof of display, never of completion.
+    if (bandVisible) this.sendShown(item, 'web-board');
+    return node;
+  }
+
+  /** One evidence-bound ready PR: affected heist, the exact head every
+   * piece of evidence is bound to, and OPEN PR — an external link, not
+   * an in-app merge. Nothing here claims the merge happened. */
+  private ownerPrRow(row: OwnerPrRow): HTMLElement {
+    const pr = row.pr;
+    const node = el('article', 'board-owner__row board-owner__row--pr');
+    node.append(
+      el('div', 'board-owner__title', `🔀 ${pr.jobTitle}`),
+      el(
+        'span',
+        'pp-chip pp-chip--done board-owner__ready',
+        'ready for you',
+      ),
+      el(
+        'div',
+        'board-owner__meta lbl',
+        `📦 ${pr.repo} · review approved @ ${pr.sha.slice(0, 8)} · CI green at that head · mergeable`,
+      ),
+    );
+    const href = safePrUrl(pr.prUrl);
+    if (href !== null) {
+      const open = el('a', 'board-owner__open', 'OPEN PR ↗');
+      open.href = href;
+      open.target = '_blank';
+      open.rel = 'noreferrer';
+      open.dataset.actionId = row.actionId;
+      open.title = 'Opens the PR on GitHub — merging stays your call there';
+      node.append(open);
+    } else {
+      // Fail closed: an unsafe URL never becomes a link (the server
+      // already refuses to project these; this is the browser guard).
+      node.append(el('span', 'lbl board-owner__nolink', 'PR link unavailable'));
+    }
+    return node;
   }
 
   // ------------------------------------------------------------------
@@ -708,15 +877,12 @@ export class BoardView {
   // Notification center
   // ------------------------------------------------------------------
 
-  private renderNotifications(notifications: readonly NotificationView[]): void {
+  private renderNotifications(snapshot: BoardSnapshot): void {
+    const notifications = snapshot.notifications;
     const list = mustGet('notification-list');
     list.replaceChildren();
     this.updateBadge(notifications);
     this.notificationBell.hidden = false;
-    if (notifications.length === 0) {
-      list.append(el('div', 'lbl', 'nothing needs attention'));
-      return;
-    }
     // Routing split (owner ruling 2026-09-23): FOR YOU is the only
     // human-facing band; NEEDS GRU is the self-clearing machine queue
     // (Gru dispositions, the owner bell stays quiet); everything else is
@@ -724,12 +890,30 @@ export class BoardView {
     // A pre-disposition release could Ack machine rows. Those legacy rows
     // are closed receipts, not active NEEDS GRU work, even if unresolved.
     const unresolved = (item: NotificationView): boolean => item.resolvedAt === null && item.ackedAt === null;
-    const forYou = notifications.filter((item) => item.routing === 'needs-owner' && unresolved(item));
     const needsGru = notifications.filter((item) => item.routing === 'action-required' && unresolved(item));
     const feed = notifications.filter(
       (item) => item.routing === 'fyi' || !unresolved(item),
     );
-    this.renderNotificationSection(list, 'FOR YOU', forYou, 'nothing needs you');
+    if (notifications.length === 0 && (snapshot.ownerPrs ?? []).length === 0) {
+      list.append(el('div', 'lbl', 'nothing needs attention'));
+      return;
+    }
+    // FOR YOU parity (FOR YOU r1): the bell renders the SAME authoritative
+    // owner projection the board band renders — pending acks AND ready PRs
+    // — so the two surfaces can never disagree about what the owner owes.
+    // Alert/history behavior is untouched: the badge and toasts still ride
+    // needs-owner notifications only, and acked/resolved rows stay in FEED.
+    const ownerRowsForBell = ownerRows(snapshot);
+    const forYou = el('section', 'board-notification-section');
+    forYou.append(el('div', 'board-notification-section__head lbl', 'FOR YOU'));
+    if (ownerRowsForBell.length === 0) {
+      forYou.append(el('div', 'board-notification-section__empty lbl', 'nothing needs you'));
+    } else {
+      for (const row of ownerRowsForBell) {
+        forYou.append(row.kind === 'ack' ? this.notificationRow(row.notification) : this.ownerPrRow(row));
+      }
+    }
+    list.append(forYou);
     this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'machine queue is clear');
     if (feed.length > 0) this.renderNotificationSection(list, 'FEED', feed, null);
   }

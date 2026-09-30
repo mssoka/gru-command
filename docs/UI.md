@@ -284,6 +284,15 @@ sight).
 
 ### Attention bands (v4 → v6: dense rows)
 
+A permanent **FOR YOU** owner band (owner approval 2026-09-28) sits
+ABOVE the job bands — pending owner acks (with honest consequence copy)
+and evidence-bound ready PRs (OPEN PR, external https link only) —
+see [BOARD.md](./BOARD.md) for the semantics and the fail-closed
+readiness rule. Its empty state is the calm clear state (an empty owner
+list is healthy); its rows are keyboard-focusable and a snapshot
+re-render preserves focus (stable action ids) and never toasts or rings
+a chime.
+
 Jobs bucket NEEDS GRU → IN FLIGHT → SETTLED → COLD (recency inside each
 band; see [BOARD.md](./BOARD.md)). v6 renders every band as a full-width
 **dense row list**, not a card grid: line 1 = status dot + title +

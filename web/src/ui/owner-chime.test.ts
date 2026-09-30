@@ -173,6 +173,7 @@ function mountDom(): void {
       <span id="board-wakes" hidden></span>
     </div>
     <div id="board-jobs"></div>
+    <section id="board-owner" hidden></section>
     <div id="board-agents"></div>
     <span id="rail-agents-count">0</span>
     <button id="sound-toggle">🔈</button>
@@ -693,7 +694,10 @@ describe('owner chime — live board wiring', () => {
     // returned 'nudge' and left the throttle unconsumed.
     expect(() => view.render(boardSnapshot([arrival('owner-1', 'needs-owner')]))).not.toThrow();
     expect(outcomes).toEqual(['nudge']);
-    expect(shown.map((entry) => entry.id)).toEqual(['owner-1']); // receipt landed (R2 intact)
+    // Both surfaces record their own display receipt for the visible row:
+    // the toast path and the FOR YOU band.
+    expect(shown.filter((entry) => entry.surface === 'web-toast').map((entry) => entry.id)).toEqual(['owner-1']);
+    expect(shown.filter((entry) => entry.surface === 'web-board').map((entry) => entry.id)).toEqual(['owner-1']);
     expect(
       document.getElementById('notification-bell')?.classList.contains(OWNER_CHIME_NUDGE_CLASS),
     ).toBe(true);
@@ -707,7 +711,8 @@ describe('owner chime — live board wiring', () => {
     // full two-note chime, both notes ringing their scheduled decay.
     expect(() => view.render(boardSnapshot([arrival('owner-2', 'needs-owner')]))).not.toThrow();
     expect(outcomes).toEqual(['nudge', 'chime']);
-    expect(shown.map((entry) => entry.id)).toEqual(['owner-1', 'owner-2']);
+    expect(shown.filter((entry) => entry.surface === 'web-toast').map((entry) => entry.id)).toEqual(['owner-1', 'owner-2']);
+    expect(shown.filter((entry) => entry.surface === 'web-board').map((entry) => entry.id)).toEqual(['owner-1', 'owner-2']);
     expect(context.oscillators).toHaveLength(4);
     const retryNotes = context.oscillators.slice(2);
     expect(retryNotes.every((note) => note.startAt !== null)).toBe(true);
@@ -746,7 +751,10 @@ describe('owner chime — live board wiring', () => {
     // bypassed the throttle — repeated attempts rang partial chimes.
     expect(() => view.render(boardSnapshot([arrival('owner-1', 'needs-owner')]))).not.toThrow();
     expect(outcomes).toEqual(['nudge']);
-    expect(shown.map((entry) => entry.id)).toEqual(['owner-1']); // receipt landed (R2 intact)
+    // Both surfaces record their own display receipt for the visible row:
+    // the toast path and the FOR YOU band.
+    expect(shown.filter((entry) => entry.surface === 'web-toast').map((entry) => entry.id)).toEqual(['owner-1']);
+    expect(shown.filter((entry) => entry.surface === 'web-board').map((entry) => entry.id)).toEqual(['owner-1']);
     expect(
       document.getElementById('notification-bell')?.classList.contains(OWNER_CHIME_NUDGE_CLASS),
     ).toBe(true); // visual fallback carried the arrival
@@ -759,7 +767,8 @@ describe('owner chime — live board wiring', () => {
     context.failOnNthOscillator = null;
     expect(() => view.render(boardSnapshot([arrival('owner-2', 'needs-owner')]))).not.toThrow();
     expect(outcomes).toEqual(['nudge', 'chime']);
-    expect(shown.map((entry) => entry.id)).toEqual(['owner-1', 'owner-2']);
+    expect(shown.filter((entry) => entry.surface === 'web-toast').map((entry) => entry.id)).toEqual(['owner-1', 'owner-2']);
+    expect(shown.filter((entry) => entry.surface === 'web-board').map((entry) => entry.id)).toEqual(['owner-1', 'owner-2']);
     expect(context.oscillators).toHaveLength(3); // cancelled note + the two fresh ones
     const retryNotes = context.oscillators.slice(1);
     expect(retryNotes[0]?.startAt).toBeCloseTo(100.01, 6); // the rising pair,
@@ -804,8 +813,9 @@ describe('owner chime — live board wiring', () => {
       ),
     ).not.toThrow();
     expect(outcomes).toEqual(['nudge', 'nudge']); // failure ≠ chime, ≠ throttled
-    expect(shown.map((entry) => entry.id).sort()).toEqual(['owner-1', 'owner-2']);
-    expect(shown.every((entry) => entry.surface === 'web-toast')).toBe(true);
+    // Each surface records its own receipt for the rows it displayed.
+    expect(shown.filter((entry) => entry.surface === 'web-toast').map((entry) => entry.id).sort()).toEqual(['owner-1', 'owner-2']);
+    expect(shown.filter((entry) => entry.surface === 'web-board').map((entry) => entry.id).sort()).toEqual(['owner-1', 'owner-2']);
     expect(
       document.getElementById('notification-bell')?.classList.contains(OWNER_CHIME_NUDGE_CLASS),
     ).toBe(true); // the visual fallback carried the arrival
