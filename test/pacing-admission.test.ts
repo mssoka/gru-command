@@ -191,6 +191,7 @@ describe('worker admission through directive deliveries', () => {
           { id: 'minion-1', jobId: 'job-1', role: 'minion' } as unknown as ReturnType<LedgerApi['listAgents']>[number],
         ],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
+        getJob: (() => null) as unknown as LedgerApi['getJob'],
       },
       worktrees: { listWorktrees: () => [lane] } as unknown as WorktreePort,
       jobId: 'job-1',
@@ -233,6 +234,7 @@ describe('worker admission through directive deliveries', () => {
       ledger: {
         listAgents: () => [],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
+        getJob: (() => null) as unknown as LedgerApi['getJob'],
       },
       worktrees: { listWorktrees: () => [lane] } as unknown as WorktreePort,
       jobId: 'job-1',
