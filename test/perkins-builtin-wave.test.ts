@@ -1775,7 +1775,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { reason?: string };
     expect(unrecordedAbort.reason).toContain('aborted while the reconciliation lookup was outstanding');
     expect(aborted.ledger.latestRoundEvent(abortedOutcome.round.id, 'round.posted')).toBeNull();
-  }, 180_000);
+  });
 });
 
 describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => {

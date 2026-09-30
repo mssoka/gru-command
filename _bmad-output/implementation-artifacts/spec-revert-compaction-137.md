@@ -131,6 +131,25 @@ Owner approval: dispatch briefing 2026-09-30 (explicit rollback approval + instr
   static counts (owner-actions 8, github-poll 24) so the required full
   gate can be green for this head; documented in its own commit and in
   the PR.
+- Post-triage timeout correction (2026-09-30, PR #147 correction commit):
+  the explicit `180_000` bound this lane briefly added to the T4 wave
+  test in `4bc28b8` changed a test timeout, which the original stored
+  briefing explicitly forbids ("Do not ... change worker budgets,
+  timeouts, Vitest RPC behavior, or verification policy"). Neighbouring
+  precedent and green runs with the enlarged bound are not owner
+  approval; the override was removed and the test runs again under the
+  inherited `vitest.config.ts` default (`testTimeout: 30_000`). The green
+  full-gate receipts recorded at `4bc28b8`, `eec1352` and `3ed1b61` were
+  produced with that enlarged bound in the tree, so none of them
+  evidences the restored default; scheduled gates at the corrected
+  settled head remain required and prior-head success is not clearance.
+  No assertions, fixtures, or product behavior were changed by this
+  correction.
+- Pin-count correction (2026-09-30): the pin values recorded above
+  (`pi-adapter 61`, `supervisor 44`) are the initial post-revert counts;
+  after the added rollback regression tests the actual counts — and the
+  shipped `test/suite-shape.test.ts` pins — are pi-adapter 63 and
+  supervisor 45.
 ## Spec Change Log
 
 ## Review Triage Log
