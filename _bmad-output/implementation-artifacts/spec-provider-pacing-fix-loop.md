@@ -83,6 +83,29 @@ Restored on this lane (r8):
 
 B1/B2 fixes in c338a0e are untouched. Historical FAILED receipt `d81a57e5` at `c338a0e` (zero test failures; 4× upstream `onTaskUpdate` runner errors; `verify-full-r7.ndjson` / `.outcome.json`) and the prior green-with-patch `c803b394` capture stay preserved under `provider-pacing/`. The patch is **not** green evidence until scheduled verification on the new head completes; focused/typecheck/full/CI gates are handed to Silas.
 
+## Fresh-main integration (r9 continuation, 2026-09-30)
+
+Fresh continuation worker (prior writer settled `15:58:52Z`; its pushed head `804fa62` preserved).
+Fresh `origin/main` `128cdb8babed472464b3de0d1078929cec5ac4e1` merged history-preservingly into
+`gru/provider-pacing` for the existing PR #135:
+
+- Merge commit `7032eb672b0bede7527c4edc00a94a58963cbe5a` (parents `804fa62` + `128cdb8`);
+  `origin/main` is an ancestor; no rebase, force-push, reset or stash.
+- Single textual conflict: `tools/patch-vitest-rpc-timeout.mjs` (add/add). Both sides carry the same
+  PR #139 fix; the lane copy is the exact superset (main + the two j-463 fail-loud layout guards +
+  provenance note), verified byte-for-byte against both parents. Resolution keeps the lane copy.
+- Clean incoming from main: `eslint.config.js`, `test/uploads-dir.test.ts`, `web/e2e/smoke.spec.ts`,
+  `web/mock/server.ts`, `web/src/styles/components.css`, `web/src/ui/chat-reflow.test.ts`;
+  `package.json` pretest/files entries were identical on both sides; `vitest.config.ts` clamp was
+  net-identical between merge-base and fresh main.
+- B1/B2 (`c338a0e`) and the r8 harness restoration (`1326dfc`, `804fa62`) untouched.
+- Sanity only — no direct tests started (the scheduler is owned by the rollback lane): `node --check`
+  on the resolved tool; the tool itself ran green and applied the identical patch to this worktree's
+  vitest dist.
+- Remaining gates on the pushed head: scheduled focused (`pacing-unit`), scheduled typecheck/full via
+  `POST /api/verify` with complete capture and nested `outcome.exitCode = 0`, exact-head CI, fresh
+  native Perkins READY. Not end-to-end DONE until then; Silas owns routine verification admission.
+
 ## Verification
 
 Focused deterministic tests first; scheduled `POST /api/verify` full scope with an opened output sink and complete NDJSON capture; require nested `outcome.exitCode = 0`, clean exact-head SHA, CI on the same head and native Perkins READY. Do not rerun to recover lost evidence.
