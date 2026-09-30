@@ -115,6 +115,25 @@ re-asking — recorded here as the standing Checkpoint-1 approval.
   oracles changed. The declared focused scope now includes
   test/suite-shape.test.ts so the focused gate exercises the causal
   defect; this remains source/CI/focused evidence, not gate clearance.
+- Continuation (2026-09-30, same-job successor, verification-setup
+  correction): the first scheduled focused run at c770f95 (run
+  cdb660f5-7283-46f3-922c-d1551d9d0659, scope wizard-bmad-retry) exited
+  1 with all 4 files / 51 tests passed and exactly one unhandled
+  `[vitest-worker]: Timeout calling "onTaskUpdate"` — vitest 3.2.7's
+  60 s worker→host birpc timer on a loaded host (upstream removed the
+  timer; the repo carries the approved fix in
+  tools/patch-vitest-rpc-timeout.mjs). `npm test` applies that patch via
+  `pretest`, but the bare focused scope did not. The declared scope now
+  runs `node tools/patch-vitest-rpc-timeout.mjs` before the same
+  `npx vitest run` of the same four files — the settled existing fix
+  only: no new deadline/fixture/scheduler/runner/pool change, no
+  RPC/test-budget increase, and patch guards plus every test identity,
+  assertion and 30 s bound are unchanged. This is a verification-setup
+  correction, not a product causal repair. The recorded exit 1 stands
+  and all-51-pass is not clearance. Local `dist/build-rev.json` still
+  labels `rev: 2aa836abe262759c651683deb40d05f02c9ede86` (pre-commit WIP
+  build, builtAt 2026-09-30T20:08:53.983Z); focused runs are not a fresh
+  full installed-build claim — ops FULL rebuilds the exact final head.
 
 ## Spec Change Log
 
@@ -123,7 +142,7 @@ re-asking — recorded here as the standing Checkpoint-1 approval.
 ## Verification
 
 **Commands:**
-- `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"wizard-bmad-retry"}` -- focused regression (`vitest run` on `test/bmad-onboarding.test.ts`, `test/wizard-interactive.test.ts`, `test/wizard.test.ts`, `test/suite-shape.test.ts`).
+- `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"wizard-bmad-retry"}` -- focused regression (`node tools/patch-vitest-rpc-timeout.mjs && npx vitest run` on `test/bmad-onboarding.test.ts`, `test/wizard-interactive.test.ts`, `test/wizard.test.ts`, `test/suite-shape.test.ts`).
 - `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"typecheck"}` -- `npm run typecheck` (covers the added test code under `tsconfig.test.json`).
 - `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"full"}` -- `npm test` (lint + typecheck + build + vitest + web).
 - Exact-head GitHub CI on the pushed branch; native Perkins review READY required.
