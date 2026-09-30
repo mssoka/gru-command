@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import type { EventRecord, JobRecord } from '../ledger/api.js';
-import type { JobStatus } from '../ledger/states.js';
+import type { EventRecord, JobRecord, PendingRebriefRecord } from '../ledger/api.js';
+import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import type { WorktreeLane } from './worktree-port.js';
 
 /**
@@ -15,12 +15,24 @@ import type { WorktreeLane } from './worktree-port.js';
  * `force: true` flag is the human escape hatch, and forced rounds are tagged
  * in the round manifest and the event log.
  *
- * "Busy" means the lane's CURRENT attempt has not delivered: status
- * dispatched/working and no `job.delivered` event newer than the attempt
- * start (the latest `job.status → working` hop). A settled delivery clears
- * busy even while the status still reads working — `delivered` is the
- * review-ready point, and the refusal's own hint says "wait for lane
- * delivery".
+ * "Busy" means either:
+ *
+ * 1. the lane's CURRENT attempt has not delivered: status
+ *    dispatched/working and no `job.delivered` event newer than the attempt
+ *    start (the latest `job.status → working` hop) — a settled delivery
+ *    clears busy even while the status still reads working (`delivered` is
+ *    the review-ready point, and the refusal's own hint says "wait for lane
+ *    delivery"); or
+ * 2. the job has an UNRESOLVED re-brief request: any durable pending marker
+ *    (`pending_rebriefs`) means target-owned work is in flight — the
+ *    re-brief worker's open turn, or a restart-recovered request not yet
+ *    reconciled. A status flip to delivered/in-review and a late
+ *    `job.delivered` from the pre-re-brief worker cannot clear a newer
+ *    request; the marker clears only when the request genuinely settles
+ *    (`finalizeRebriefRequest` / boot reconciliation).
+ *
+ * Terminal (`merged`/`done`) jobs are never busy: a stale marker left on a
+ * terminal job must not block an unrelated review or resurrect the job.
  */
 
 export const BRANCH_BUSY_HINT = 'wait for lane delivery or dispatch with force';
@@ -95,6 +107,9 @@ export class BranchBusyError extends Error {
 export interface BranchIdleLedger {
   listJobs(): readonly JobRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
+  /** Durable re-brief markers; any row for a job is an unresolved
+   * target-owned request (presence is the fact — see laneIsBusy). */
+  listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
 }
 
 /** The branch a job lane is created on (worktree manager convention; also
@@ -164,8 +179,17 @@ function attemptStartedSeq(ledger: BranchIdleLedger, jobId: string): number {
   return to === 'working' ? latest.seq : 0;
 }
 
-/** The busy predicate: the attempt is open and has not delivered yet. */
+/** The busy predicate: the attempt is open and has not delivered yet, or a
+ * newer re-brief request is still unresolved. */
 export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
+  // Terminal lanes are never busy: the marker retirement lane owns stale
+  // terminal markers, and they must not block anything in the meantime.
+  if (isJobTerminal(job.status)) return false;
+  // An unresolved re-brief fences the lane regardless of delivery or status:
+  // the worker's turn may push a new head after this check. Deliberately
+  // presence-based — a late delivery event from the previous worker cannot
+  // answer a newer request, so it must not release this fence.
+  if (ledger.listPendingRebriefs({ jobId: job.id }).length > 0) return true;
   if (!BRANCH_BUSY_STATUSES.includes(job.status)) return false;
   const delivered = ledger.latestJobEvent(job.id, 'job.delivered');
   if (delivered === null) return true;
