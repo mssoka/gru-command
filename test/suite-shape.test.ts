@@ -13,7 +13,7 @@ const PINS: Record<string, number> = {
   'awareness.test.ts': 43,
   'bmad-onboarding.test.ts': 13,
   'board-engine-v4.test.ts': 4,
-  'board-engine.test.ts': 24,
+  'board-engine.test.ts': 31,
   'board-frames.test.ts': 3,
   'board-server.test.ts': 17,
   'bob-scheduler.test.ts': 5,

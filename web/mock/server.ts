@@ -362,6 +362,21 @@ function sampleSnapshot(): unknown {
     },
     unackedActionRequired: 1,
     unackedNeedsOwner: 1,
+    // FOR YOU (owner approval 2026-09-28): one evidence-bound ready PR.
+    // Generic sample data only — the readiness story is exact-head
+    // (approved round + clean + green CI at the same sha); the row's
+    // action is OPEN PR (external), never an in-app merge.
+    ownerPrs: [
+      {
+        id: 'owner-pr:demo-api-payment-fix',
+        jobId: 'demo-api-payment-fix',
+        jobTitle: 'Fix the payment retry loop',
+        repo: 'demo-api',
+        prUrl: 'https://example.invalid/pr/41',
+        sha: '5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a',
+        checkedAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+    ],
     wakes: { count: 2, lastAt: new Date(Date.now() - 180_000).toISOString() },
     build: {
       buildRev: 'abc1234def5678abc1234def5678abc1234def56',

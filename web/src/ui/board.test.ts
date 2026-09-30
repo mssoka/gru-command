@@ -110,6 +110,7 @@ function snapshot(
     repos?: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
     unackedNeedsOwner?: number;
     wakes?: { readonly count: number; readonly lastAt: string | null };
+    ownerPrs?: NonNullable<BoardSnapshot['ownerPrs']>;
   } = {},
 ): BoardSnapshot {
   return {
@@ -136,6 +137,7 @@ function snapshot(
     selfHeal: options.selfHeal ?? null,
     unackedNeedsOwner: options.unackedNeedsOwner ?? 0,
     wakes: options.wakes ?? { count: 0, lastAt: null },
+    ownerPrs: options.ownerPrs,
   };
 }
 
@@ -146,6 +148,7 @@ function mountBoardDom(): void {
       <span id="board-unacked" hidden></span>
       <span id="board-wakes" hidden></span>
     </div>
+    <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
     <span id="rail-agents-count">0</span>
@@ -964,5 +967,214 @@ describe('board v6 — job status tones', () => {
     expect(chip?.className).toContain('pp-chip--work');
     expect(chip?.className).not.toContain('pp-chip--rev');
     expect(row?.querySelector('.board-job__dot')?.className).toContain('board-job__dot--work');
+  });
+});
+
+describe('FOR YOU owner band (permanent, top of board)', () => {
+  beforeEach(mountBoardDom);
+
+  function ownerPr(jobId: string, overrides: Partial<NonNullable<BoardSnapshot['ownerPrs']>[number]> = {}) {
+    return {
+      id: `owner-pr:${jobId}`,
+      jobId,
+      jobTitle: `Heist ${jobId}`,
+      repo: 'demo',
+      prUrl: 'https://github.com/example/demo/pull/7',
+      sha: 'aaaa1111bbbb2222cccc3333dddd4444eeee5555',
+      checkedAt: '2026-01-01T00:05:00.000Z',
+      ...overrides,
+    };
+  }
+
+  function stubClient(ackResult: Promise<void> | Error = Promise.resolve()) {
+    return {
+      ackNotification: vi.fn(() => (ackResult instanceof Error ? Promise.reject(ackResult) : ackResult)),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+  }
+
+  it('shows only the owner stop under FOR YOU with count; the machine incident stays in NEEDS GRU (bell), not the band', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        notifications: [
+          notification('owner-stop', { routing: 'needs-owner', kind: 'supervision.breaker', severity: 'info' }),
+          notification('machine', { routing: 'action-required' }),
+        ],
+        unackedActionRequired: 1,
+        unackedNeedsOwner: 1,
+      }),
+    );
+    const band = document.getElementById('board-owner')!;
+    expect(band.hidden).toBe(false);
+    expect(band.querySelector('.board-band__label')?.textContent).toBe('FOR YOU');
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    const actionIds = [...band.querySelectorAll('[data-action-id]')].map((node) => (node as HTMLElement).dataset.actionId);
+    expect(actionIds).toEqual(['owner-ack:owner-stop']);
+    // The machine row is in the bell panel's NEEDS GRU section, never in the band.
+    expect(document.getElementById('notification-list')?.textContent).toContain('Notice machine');
+    expect(band.textContent).not.toContain('Notice machine');
+    // The other board groups still render below the band.
+    expect(document.getElementById('board-jobs')!.compareDocumentPosition(band) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+  });
+
+  it('an empty owner list is the calm clear state — never hidden, never an alarm', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.hidden).toBe(false);
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('0 pending');
+    expect(band.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs you');
+  });
+
+  it('seen/opened does not reduce the pending count (only an authoritative ack closes a row)', () => {
+    const view = new BoardView(() => {});
+    const seen = notification('seen-stop', { routing: 'needs-owner', shownAt: '2026-01-01T00:00:00.000Z' });
+    view.render(snapshot({ notifications: [seen], unackedNeedsOwner: 1 }));
+    // Opening the bell panel marks seen but completes nothing.
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    view.render(snapshot({ notifications: [seen], unackedNeedsOwner: 1 }));
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    // The authoritative snapshot (ack from ANY device) is what closes it.
+    view.render(snapshot({ notifications: [{ ...seen, ackedAt: '2026-01-01T00:09:00.000Z' }], unackedNeedsOwner: 0 }));
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('0 pending');
+  });
+
+  it('ack click: optimistic pending state, stays pending on failure (control reverts), closes only on the authoritative snapshot', async () => {
+    const client = stubClient(new Error('network ambiguity'));
+    const view = new BoardView(() => {}, client);
+    const stop = notification('ack-me', { routing: 'needs-owner', kind: 'supervision.provider-wall.a1.quota_exceeded' });
+    view.render(snapshot({ notifications: [stop] }));
+    const band = document.getElementById('board-owner')!;
+    const button = band.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:ack-me"]')!;
+    // Honest consequence copy rides the row (quota ack scope).
+    expect(band.textContent).toContain('does NOT clear code/test/review holds');
+    button.click();
+    expect(button.textContent).toBe('acking…');
+    expect(button.disabled).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(client.ackNotification).toHaveBeenCalledWith('ack-me');
+    // Failed HTTP → the obligation stands and the control returns.
+    expect(button.textContent).toBe('Ack');
+    expect(button.disabled).toBe(false);
+    view.render(snapshot({ notifications: [stop] }));
+    expect(band.querySelector('[data-action-id="owner-ack:ack-me"]')).not.toBeNull();
+    // Success → STILL pending until the authoritative snapshot lands.
+    const okClient = stubClient();
+    const view2 = new BoardView(() => {}, okClient);
+    view2.render(snapshot({ notifications: [stop] }));
+    const button2 = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__ack')!;
+    button2.click();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).not.toBeNull();
+    view2.render(snapshot({ notifications: [{ ...stop, ackedAt: '2026-01-01T00:09:00.000Z' }] }));
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).toBeNull();
+  });
+
+  it('ready PR row: affected heist + exact-head reason + OPEN PR external link; non-https URLs fail closed', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ ownerPrs: [ownerPr('job-ready')] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    const row = band.querySelector('.board-owner__row--pr')!;
+    expect(row.textContent).toContain('Heist job-ready');
+    expect(row.textContent).toContain('aaaa1111');
+    expect(row.textContent).toContain('CI green');
+    const link = row.querySelector<HTMLAnchorElement>('.board-owner__open');
+    expect(link?.href).toBe('https://github.com/example/demo/pull/7');
+    expect(link?.target).toBe('_blank');
+    expect(link?.rel).toContain('noreferrer');
+    // Fail closed on an unsafe URL: no link is fabricated.
+    view.render(snapshot({ ownerPrs: [ownerPr('bad-url', { prUrl: 'javascript:alert(1)' })] }));
+    const badRow = document.getElementById('board-owner')!.querySelectorAll('.board-owner__row--pr')[0]!;
+    expect(badRow.querySelector('a')).toBeNull();
+    expect(badRow.textContent).toContain('PR link unavailable');
+  });
+
+  it('older pending obligations stay reachable behind the +N older expander', () => {
+    const view = new BoardView(() => {});
+    const stops = Array.from({ length: 9 }, (_, i) =>
+      notification(`old-${String(i).padStart(2, '0')}`, { routing: 'needs-owner', ts: `2026-01-01T00:${String(i).padStart(2, '0')}:00.000Z` }),
+    );
+    view.render(snapshot({ notifications: stops }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelectorAll('.board-owner__row')).toHaveLength(6);
+    const more = band.querySelector<HTMLButtonElement>('.board-band__more')!;
+    expect(more.textContent).toBe('+3 older pending');
+    more.click();
+    expect(document.getElementById('board-owner')!.querySelectorAll('.board-owner__row')).toHaveLength(9);
+  });
+
+  it('a snapshot re-render preserves focus on the same action and fires no toast', () => {
+    const toast = vi.fn();
+    const view = new BoardView(() => {});
+    view.setToastHandler(toast);
+    const stop = notification('focus-me', { routing: 'needs-owner' });
+    view.render(snapshot({ notifications: [stop] }));
+    const button = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:focus-me"]')!;
+    button.focus();
+    expect(document.activeElement).toBe(button);
+    // A refresh of the SAME data re-renders the band: no new arrival, so
+    // no toast — and the focused control keeps its place.
+    view.render(snapshot({ notifications: [stop] }));
+    expect(toast).not.toHaveBeenCalled();
+    const refocused = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-action-id="owner-ack:focus-me"]');
+    expect(document.activeElement).toBe(refocused);
+    expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('owner-ack:focus-me');
+  });
+
+  it('FOR YOU r1 parity: a PR-only obligation shows on BOTH the board band and the bell — never a contradiction', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [], ownerPrs: [ownerPr('job-only-pr')] }));
+    // Board band: 1 pending, OPEN PR row.
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    expect(band.querySelector('.board-owner__open')?.textContent).toContain('OPEN PR');
+    // Bell panel: the SAME authoritative projection — the FOR YOU section
+    // carries the PR row instead of claiming "nothing needs you".
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const panel = document.getElementById('notification-list')!;
+    expect(panel.textContent).not.toContain('nothing needs attention');
+    expect(panel.textContent).not.toContain('nothing needs you');
+    const heads = [...panel.querySelectorAll('.board-notification-section__head')].map((node) => node.textContent);
+    expect(heads[0]).toBe('FOR YOU');
+    expect(panel.querySelector('.board-owner__row--pr')?.textContent).toContain('Heist job-only-pr');
+    expect(panel.querySelector('.board-owner__open')).not.toBeNull();
+    // Alert semantics preserved: the badge counts unseen needs-owner
+    // NOTIFICATIONS only — a ready PR never rings the bell.
+    expect(document.getElementById('notification-badge')?.textContent).toBe('0');
+  });
+
+  it('FOR YOU r1 parity: an empty projection shows the honest empty state on BOTH surfaces', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [notification('fyi-1', { routing: 'fyi' })] }));
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('0 pending');
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    expect(document.getElementById('notification-list')!.textContent).toContain('nothing needs you');
+  });
+
+  it('a visible band sends one web-board shown receipt per notification; a hidden band sends none', async () => {
+    const client = stubClient();
+    const stop = notification('show-me', { routing: 'needs-owner' });
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [stop] }));
+    // Visible band → receipt once; a re-render of the same row never repeats it.
+    view.render(snapshot({ notifications: [stop] }));
+    expect(client.markNotificationShown).toHaveBeenCalledTimes(1);
+    expect(client.markNotificationShown).toHaveBeenCalledWith('show-me', 'web-board');
+
+    // Hidden ancestor (pre-pairing board) → nothing was displayed.
+    const client2 = stubClient();
+    document.body.innerHTML = `<div hidden><section id="board-owner"></section></div>
+      <div id="chip-rail" hidden><span id="board-decisions"></span><span id="board-unacked" hidden></span><span id="board-wakes" hidden></span></div>
+      <div id="board-jobs"></div><div id="board-agents"></div><span id="rail-agents-count">0</span>
+      <button id="notification-bell"><span id="notification-badge">0</span></button>
+      <div id="notification-panel"><div id="notification-list"></div></div>`;
+    const view2 = new BoardView(() => {}, client2);
+    view2.render(snapshot({ notifications: [stop] }));
+    expect(client2.markNotificationShown).not.toHaveBeenCalled();
   });
 });

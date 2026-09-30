@@ -173,6 +173,36 @@ describe('board server-frame validator', () => {
     }
   });
 
+
+  it('FOR YOU ownerPrs: absent/null tolerated (pre-upgrade servers), well-formed accepted, malformed rejected', () => {
+    expect(isValidSnapshot(snapshot())).toBe(true);
+    const nullPrs = { ...snapshot(), ownerPrs: null } as unknown;
+    expect(isValidSnapshot(nullPrs)).toBe(true);
+
+    const ready = {
+      id: 'owner-pr:job-1',
+      jobId: 'job-1',
+      jobTitle: 'Ready heist',
+      repo: 'demo-repo',
+      prUrl: 'https://github.com/example/demo/pull/7',
+      sha: 'a'.repeat(40),
+      checkedAt: '2026-01-01T00:00:00.000Z',
+    };
+    expect(isValidSnapshot({ ...snapshot(), ownerPrs: [ready] } as unknown)).toBe(true);
+
+    // Readiness is server authority: a malformed row never reaches the band.
+    for (const broken of [
+      { ...ready, id: '' },
+      { ...ready, jobId: 7 },
+      { ...ready, sha: null },
+      { ...ready, checkedAt: 12 },
+      { ...ready, prUrl: 'javascript:alert(1)' },
+    ]) {
+      expect(isValidSnapshot({ ...snapshot(), ownerPrs: [broken] } as unknown), JSON.stringify(broken)).toBe(false);
+    }
+    expect(isValidSnapshot({ ...snapshot(), ownerPrs: { not: 'an array' } } as unknown)).toBe(false);
+  });
+
   it('accepts prState present, null, or absent; rejects junk states', () => {
     for (const prState of ['open', 'conflicting', 'merged', null, undefined]) {
       const candidate = snapshot();

@@ -8,6 +8,7 @@ import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
 import type { DeployDriftView } from './deploy-drift.js';
 import type { VerificationQueueView } from '../verify/scheduler.js';
 import type { PacingGateView } from '../runtime/pacing.js';
+import { ownerReadyPr, readBranchEvidence, type OwnerPrView } from './owner-actions.js';
 import {
   DEFAULT_LENSES,
   LedgerApi,
@@ -162,6 +163,11 @@ export interface BoardSnapshot {
   readonly pacing: PacingGateView | null;
   /** Self-healing session stats (null until its producer exists). */
   readonly selfHeal: SelfHealView | null;
+  /** FOR YOU (owner approval 2026-09-28): PRs with exact-head evidence
+   * that they are genuinely ready for the owner — approved head-bound
+   * review round + clean mergeable state + green CI at the same sha.
+   * Fail-closed: absent readiness renders no row, never a guess. */
+  readonly ownerPrs: readonly OwnerPrView[];
 }
 
 /** Agent-rail ordering: the standing crew first, workers after. */
@@ -452,7 +458,23 @@ export class BoardEngine {
       verify: this.verifyQueue(),
       pacing: this.pacing(),
       selfHeal: this.selfHeal(),
+      ownerPrs: this.ownerPrs(repos),
     };
+  }
+
+  /** The FOR YOU PR projection: one authoritative, evidence-bound ready
+   * list over the snapshot's own job views (deterministic job-id order —
+   * a stable row order across pushes). Only in-review jobs with a PR
+   * reach the evidence read — the cheap gates run first. */
+  private ownerPrs(
+    repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[],
+  ): readonly OwnerPrView[] {
+    return repos
+      .flatMap((repo) => repo.jobs)
+      .filter((job) => job.status === 'in-review' && job.prUrl !== null)
+      .map((job) => ownerReadyPr(job, readBranchEvidence(this.ledger, job.id)))
+      .filter((row): row is OwnerPrView => row !== null)
+      .sort((left, right) => left.jobId.localeCompare(right.jobId));
   }
 
   /** Silas ops health from the durable event stream: newest wake + today's
