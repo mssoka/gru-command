@@ -103,7 +103,17 @@ Owner approval: dispatch briefing 2026-09-30 (explicit rollback approval + instr
   otherwise and no compatibility semantics were added.
 - Focused verify scope `compaction-rollback` declared in
   `.gru-command/worktree.toml` (pi-adapter, supervisor, config, health,
-  board-engine, suite-shape, config-generate).
+  board-engine, suite-shape). `test/config-generate.test.ts` was dropped
+  during verification: it shells out to `dist/cli/config-generate.js` and
+  needs a prior build, so it belongs to the full gate's build step, not a
+  plain focused vitest scope.
+- Inherited main drift (not caused by #137): `test/owner-actions.test.ts`
+  is tracked but its `PINS` entry was lost in the `a755cfd` merge
+  resolution, so the suite-shape pin test fails on c54bfbf and on current
+  origin/main 128cdb8 (GitHub CI runs 36681310262 and 36737944061 red on
+  exactly that assertion). Restored the pin (`8`, the FOR YOU branch's own
+  value and the actual static count) so the required full gate can be
+  green for this head; documented in its own commit and in the PR.
 ## Spec Change Log
 
 ## Review Triage Log
@@ -111,7 +121,7 @@ Owner approval: dispatch briefing 2026-09-30 (explicit rollback approval + instr
 ## Verification
 
 **Commands:**
-- `POST /api/verify {job_id:"revert-compaction-137", scope:"compaction-rollback"}` -- focused regression (`vitest run` on pi-adapter, supervisor, config, health, board-engine, suite-shape, config-generate)
+- `POST /api/verify {job_id:"revert-compaction-137", scope:"compaction-rollback"}` -- focused regression (`vitest run` on pi-adapter, supervisor, config, health, board-engine, suite-shape); the docs-drift guard is covered by the full gate (needs `dist/`).
 - `POST /api/verify {job_id:"revert-compaction-137", scope:"typecheck"}` -- `npm run typecheck`
 - `POST /api/verify {job_id:"revert-compaction-137", scope:"full"}` -- `npm test` (lint + typecheck + build + vitest + web)
 - Exact-head GitHub CI on the pushed branch; native Perkins review READY required.
