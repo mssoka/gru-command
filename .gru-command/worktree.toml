@@ -19,3 +19,9 @@ typecheck = "npm run typecheck"
 residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-resident-registry.test.ts test/fix-directive.test.ts test/silas-deterministic-seam.test.ts"
 handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
+
+# One narrow FAILED-FULL discriminator at the frozen head (diagnostic,
+# not a gate): same runner/config and inherited 30 s budget. The RPC
+# patch is the repo's existing approved pretest hook — the one declared
+# scope that is not a bare vitest invocation.
+publisher-timeout-discriminator = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/dispatch-e2e.test.ts test/perkins-builtin-wave.test.ts test/wizard.test.ts"
