@@ -593,6 +593,11 @@ export interface SilasDriverOptions {
   readonly skills?: readonly SkillModule[];
   readonly blockersForRound?: BlockersForRound;
   readonly log?: Log;
+  /** Deterministic no-LLM pass hook (chief phase-3 seam): invoked at the top
+   * of every trigger — bus wake events and sweep ticks alike — BEFORE any
+   * slot wake/LLM work. Must be bounded and no-overlap by construction; a
+   * thrown error is logged and never breaks the driver. */
+  readonly onDeterministicPass?: () => void;
   /** Clock + timer seams for tests. */
   readonly setInterval?: typeof setInterval;
   readonly clearInterval?: typeof clearInterval;
@@ -721,6 +726,15 @@ export class SilasDriver {
   async trigger(trigger: SilasTrigger): Promise<void> {
     if (this.disposed) return;
     if (!this.opts.config.enabled) return;
+    // Deterministic, bounded reconsideration happens before any LLM wake:
+    // pending-duty reconciliation never waits for a model turn.
+    if (this.opts.onDeterministicPass !== undefined) {
+      try {
+        this.opts.onDeterministicPass();
+      } catch (error) {
+        this.log('error', 'deterministic pass hook failed', { error: String(error) });
+      }
+    }
     if (this.wakeInFlight !== null) {
       this.queuedTrigger = trigger;
       return;

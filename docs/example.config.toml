@@ -130,7 +130,11 @@ directive_at = 2                  # consecutive same-blocker rounds before a fix
 rebrief_at = 3                    # …before a re-brief to a fresh minion on the lane
 escalate_at = 4                   # …before escalation to the chief (always beats an endless loop)
 
+[concurrency]
+max_workers = 4                 # service-wide resident workers, including idle sessions (<= 128)
+
 [review]
+max_concurrent_children = 2     # lens children within the pool (<= 32, review-gated)
 # Review gate policy (user amendment 2026-09-20). Optional; enabled by default.
 # enabled: false routes every review request to the bmad-review fallback gate
 # (when installed; otherwise escalate-only). true keeps Perkins as the primary

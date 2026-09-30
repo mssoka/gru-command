@@ -324,7 +324,7 @@ export class WorktreeManager {
       // the debris.
       let record;
       try {
-        this.bootstrap(repo.repoPath, path);
+        await this.bootstrap(repo.repoPath, path);
         record = this.opts.ledger.registerWorktree({
           id: input.jobId,
           kind: 'job',
@@ -395,11 +395,13 @@ export class WorktreeManager {
     });
   }
 
-  /** Bootstrap manifest (18a): auto-apply at creation; missing = no-op. */
-  private bootstrap(sourceRoot: string, worktreePath: string): void {
+  /** Bootstrap manifest (18a): auto-apply at creation; missing = no-op.
+   * Async: setup commands run off the event loop, so a slow bootstrap
+   * (npm ci) never freezes chat/supervision while dispatch awaits the lane. */
+  private async bootstrap(sourceRoot: string, worktreePath: string): Promise<void> {
     const manifest = loadWorktreeManifest(sourceRoot, this.log);
     if (manifest === null) return;
-    applyWorktreeManifest(manifest, {
+    await applyWorktreeManifest(manifest, {
       sourceRoot,
       worktreePath,
       setupTimeoutMs: this.opts.setupTimeoutMs,

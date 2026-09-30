@@ -754,6 +754,35 @@ describe('dispatch config (E8)', () => {
   });
 });
 
+describe('resident worker and Perkins child configuration', () => {
+  it('defaults to a shared four-worker pool with two children, and accepts overrides', () => {
+    const home = tmpHome();
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toMatchObject({
+      concurrency: { maxWorkers: 4 }, review: { enabled: true, maxConcurrentChildren: 2 },
+    });
+    writeConfig(home, '[concurrency]\nmax_workers = 2\n[review]\nmax_concurrent_children = 1\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toMatchObject({
+      concurrency: { maxWorkers: 2 }, review: { enabled: true, maxConcurrentChildren: 1 },
+    });
+  });
+
+  it('rejects invalid sizes and impossible Perkins capacity with actionable fields', () => {
+    for (const [text, field] of [
+      ['[concurrency]\nmax_workers = 0', 'concurrency.max_workers'],
+      ['[concurrency]\nmax_workers = 1', 'concurrency.max_workers'],
+      ['[concurrency]\nmax_workers = 1.5', 'concurrency.max_workers'],
+      ['[concurrency]\nother = 3', 'concurrency.other'],
+      ['[review]\nmax_concurrent_children = 0', 'review.max_concurrent_children'],
+      ['[review]\nmax_concurrent_children = 33', 'review.max_concurrent_children'],
+      ['[review]\nmax_concurrent_children = 1.5', 'review.max_concurrent_children'],
+    ] as const) {
+      const home = tmpHome();
+      writeConfig(home, `${text}\n`);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(field);
+    }
+  });
+});
+
 describe('verify config (contention fix 2026-09-22)', () => {
   it('defaults: one concurrent run, auto worker budget, bounded waits', () => {
     const home = tmpHome();
@@ -872,5 +901,32 @@ describe('self-roll table', () => {
       writeFileSync(join(home, 'config.toml'), text, 'utf-8');
       expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(ConfigError);
     }
+  });
+});
+
+describe('resident config bounds completions (phase 2)', () => {
+  it('rejects unsafe integers with their own actionable message', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-config-unsafe-'));
+    const file = join(home, 'config.toml');
+    // 2^53 parses as a valid TOML float but is not a JS safe integer, so
+    // the schema (not the TOML parser) must reject it.
+    writeFileSync(file, '[concurrency]\nmax_workers = 9007199254740992.0\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/exceeds the maximum safe integer/);
+  });
+
+  it('caps resident workers at the documented sanity ceiling', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-config-cap-'));
+    const file = join(home, 'config.toml');
+    writeFileSync(file, '[concurrency]\nmax_workers = 500\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/max_workers must be <= 128/);
+  });
+
+  it('gates the children ceiling on review enablement, symmetric with the >= 2 rule', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-config-children-'));
+    const file = join(home, 'config.toml');
+    writeFileSync(file, '[review]\nenabled = false\nmax_concurrent_children = 64\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).not.toThrow();
+    writeFileSync(file, '[review]\nenabled = true\nmax_concurrent_children = 64\n', 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/max_concurrent_children must be <= 32/);
   });
 });

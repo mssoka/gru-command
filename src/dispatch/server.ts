@@ -222,6 +222,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(optStrArray(body, 'lenses') !== undefined ? { lenses: optStrArray(body, 'lenses') } : {}),
         ...(optBoolField(body, 'no_spec') !== undefined ? { noSpec: optBoolField(body, 'no_spec') } : {}),
         ...(force !== undefined ? { force } : {}),
+        ...(by === 'minion' ? { handoff: true } : {}),
       };
       if (sourceRoundId !== undefined) {
         if (force === true) throw new Error('mechanical clean-abort re-arm cannot force past the branch-idle guard');
@@ -279,6 +280,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             ...(outcome.route === 'perkins' ? { round_id: outcome.round.id } : {}),
           },
         });
+      }
+      if (outcome.route === 'queued') {
+        track(outcome.run);
+        json(res, 202, { route: 'queued', job_id: outcome.jobId, request_seq: outcome.requestSeq,
+          status: 'awaiting minion delivery before review admission' });
+        return true;
       }
       if (outcome.route !== 'perkins') {
         // bmad-review fallback gate: findings, triage, and fix directives run

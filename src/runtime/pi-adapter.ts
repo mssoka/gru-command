@@ -753,6 +753,8 @@ export class PiAgentHandle implements AgentHandle {
   private readonly listeners = new Set<RuntimeEventListener>();
   /** Covers the await gap before Pi exposes session.isCompacting. */
   private compacting = false;
+  /** Adapter-owned cessation evidence state (once-only transition). */
+  private cessationState: 'live' | 'ceased' | 'unknown' = 'live';
   private pendingCompactionEnd: RuntimeEvent | null = null;
   private nativeCompactionOpen = false;
   private compactionEndDeadline = 0;
@@ -772,7 +774,15 @@ export class PiAgentHandle implements AgentHandle {
       steer(text: string, images?: unknown): Promise<void>;
       followUp(text: string, images?: unknown): Promise<void>;
       subscribe(listener: (event: unknown) => void): () => void;
-      dispose(): void;
+      /** SDK 0.85.1 AgentSession.dispose awaits session-level waitForIdle
+       * (run, retry/continuation, compaction, branch summary). The wrapper
+       * MUST await it — calling it synchronously discards that proof. */
+      dispose(): Promise<void> | void;
+      waitForIdle?(): Promise<void>;
+      /** Real controller-set queries (executeBash controllers, removed in
+       * executeBash's finally) — truthful, unlike the metadata heartbeat. */
+      readonly isBashRunning?: boolean;
+      readonly hasPendingBashMessages?: boolean;
       compact(customInstructions?: string): Promise<unknown>;
       /** Present on the SDK session; used to cancel a compaction whose
        * summary call outlived its deadline. */
@@ -1059,12 +1069,52 @@ export class PiAgentHandle implements AgentHandle {
       item.reject(new Error('agent session disposed before queued message was delivered'));
     }
     try {
-      this.session.dispose();
+      // AWAIT the SDK's dispose: AgentSession.dispose() itself awaits
+      // session-level waitForIdle (agent run + awaited listeners + retry
+      // gap + post-run continuations + compaction + branch summary).
+      // Calling it synchronously discards the only real completion proof.
+      await this.session.dispose();
     } finally {
       this.store.releaseLock(this.sessionFile);
       this.setState('disposed');
       this.onDispose();
+      this.settleCessationEvidence();
     }
+  }
+
+  /** Compute + emit the once-only cessation evidence transition. Called
+   * after disposal settles; re-queryable (UNKNOWN can later flip to
+   * 'ceased' when an independently owned bash controller finishes — the
+   * evidence event fires on that late transition too). */
+  private settleCessationEvidence(): void {
+    if (this.cessationState === 'ceased') return; // once-only positive
+    let evidence: 'ceased' | 'unknown';
+    try {
+      const bashActive = this.session.isBashRunning === true || this.session.hasPendingBashMessages === true;
+      // The session-level idle was awaited inside dispose (proof for runs,
+      // retries, continuations, compaction, summary). Independent executeBash
+      // controllers are NOT part of isIdle: if still active, evidence is
+      // UNKNOWN (observable later by re-query; no timer/watcher added).
+      evidence = bashActive ? 'unknown' : 'ceased';
+    } catch {
+      evidence = 'unknown'; // throwing probes are unknown, never false
+    }
+    this.cessationState = evidence;
+    this.emit({ type: 'cessation_evidence', evidence });
+  }
+
+  cessationEvidence(): 'ceased' | 'unknown' {
+    if (this.cessationState === 'live') return 'unknown';
+    if (this.cessationState === 'ceased') return 'ceased';
+    // UNKNOWN may have settled since: re-query the truthful controller
+    // sets (bounded, read-only; a throw stays unknown).
+    try {
+      if (this.session.isBashRunning !== true && this.session.hasPendingBashMessages !== true) {
+        this.cessationState = 'ceased';
+        this.emit({ type: 'cessation_evidence', evidence: 'ceased' });
+      }
+    } catch { /* stays unknown */ }
+    return this.cessationState === 'ceased' ? 'ceased' : 'unknown';
   }
 
   private assertLive(): void {
