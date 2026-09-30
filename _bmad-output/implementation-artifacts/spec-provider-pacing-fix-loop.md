@@ -109,3 +109,40 @@ Fresh `origin/main` `128cdb8babed472464b3de0d1078929cec5ac4e1` merged history-pr
 ## Verification
 
 Focused deterministic tests first; scheduled `POST /api/verify` full scope with an opened output sink and complete NDJSON capture; require nested `outcome.exitCode = 0`, clean exact-head SHA, CI on the same head and native Perkins READY. Do not rerun to recover lost evidence.
+
+## Final-head advice triage (r11, pending gates on this new head)
+
+The 25 raw findings delivered by three independently observed reviewer sessions on the immutable
+packet head `1f26905` (adversarial 13 / edge 4 / verification 8; the edge lens ran from a
+worktree-installed copy whose hash matched but inode did not — raw preserved, fresh compliant edge
+still owed) were triaged against the current code. Repairs landed on this head:
+
+- Duplicate `concurrency` in `TOP_LEVEL_KEYS` and the stale alias-capable comment/docstring in
+  `readPacingConfig`: the implemented contract is one canonical spelling per limit key, unknown
+  spellings fail loud; wording now matches the code.
+- Queued-note staleness: admission rewrites the lane note (`pacing: admitted after <n> ms queue
+  wait`) instead of leaving `queued: …` on a running lane; the live gate view remains the queue
+  truth.
+- The rejection side of the B1 delivery interlock now awaits the bounded retry settlement before
+  classifying (and, where applicable, disposing): live and fresh directive paths, the re-brief
+  turn, and the production fallback review. The resume-into-recovery catch consults the same
+  settlement before posting an orphan escalation, and releases its worker lease before waiting.
+- The silas directive/re-brief HTTP surfaces and the boot re-brief reconciler now receive the same
+  supervisor-backed `retrySettlement` hook as the other delivery sites.
+- A failed lead-slot re-acquire can no longer erase a settled lens wave: the pool outcome is
+  committed (undelivered, T13/R17) before the acquire error surfaces, and the wave's own error is
+  not replaced by it.
+- Slot-record retirement paths (slot release, intentional replacement, stale records) conclude
+  pending pacing state exactly like the disposed/shutdown funnels, so a delivery awaiting
+  `settled` cannot hang.
+
+Refuted/out-of-scope rows (cancellation plumbing for dispatch/re-brief acquires, idempotent
+releases, provider-scoped pattern matching, per-delivery settlement identities, review-queue lane
+attribution, adapter-ordering extras) carry code/test counter-evidence in the ops triage receipt;
+none is a repair to make here. The j-463 upstream worker-RPC harness patch and its guards are
+untouched. Suite-shape pins were recomputed from the raw `it(`/`it.skipIf(` counts for the seven
+test files with added tests (plus the strengthened config assertion and the pin file itself); no
+timeout, cap, budget or scheduler semantics changed and no existing assertion was weakened. New-head gates (focused, scheduled FULL with `outcome.exitCode = 0`,
+exact-head CI, fresh independent review and native Perkins readiness) are owed before any
+done/native-ready claim. PR #135 stays a draft; the owner holds merge, deployment, config and
+restart.
