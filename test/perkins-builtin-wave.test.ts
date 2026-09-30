@@ -2825,15 +2825,21 @@ describe('repair pass 3: GitLab note reconciliation fails closed (R3/T7)', () =>
 describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
 
   async function recoveryFixture(name: string, shared?: {
-    ledger: LedgerApi; port: GitReviewPort; artifacts: string;
+    ledger: LedgerApi; port: GitReviewPort; artifacts: string; repo?: FixtureRepo; commit?: string;
   }): Promise<{
     ledger: LedgerApi; port: GitReviewPort; artifacts: string; job: ReturnType<LedgerApi['getJob']>;
-    roundId: string; targetSha: string;
+    roundId: string; targetSha: string; repo: FixtureRepo; commit: string;
   }> {
-    const repo = makeFixtureRepo(name);
-    repos.push(repo);
-    repo.git(['checkout', '-b', `feature/${name}`]);
-    const commit = repo.commitFile('src/main.ts', 'export const p3 = 3;\n');
+    // A shared repo/ledger/port reuses the expensive git plumbing across
+    // cases that only need their own round (the R1 case above shares the
+    // same way). The first call builds it; later calls ride it and return
+    // the same handles.
+    const repo = shared?.repo ?? makeFixtureRepo(name);
+    if (shared?.repo === undefined) {
+      repos.push(repo);
+      repo.git(['checkout', '-b', `feature/${name}`]);
+    }
+    const commit = shared?.commit ?? repo.commitFile('src/main.ts', 'export const p3 = 3;\n');
     let artifacts: string;
     let ledger: LedgerApi;
     let port: GitReviewPort;
@@ -2858,7 +2864,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     ledger.setRoundStatus(round.id, 'live');
     // Return the REFRESHED job record (with prUrl) — the addJob snapshot
     // predates setJobPr.
-    return { ledger, port, artifacts, job: ledger.getJob(job.id), roundId: round.id, targetSha: commit };
+    return { ledger, port, artifacts, job: ledger.getJob(job.id), roundId: round.id, targetSha: commit, repo, commit };
   }
 
   function healthyEvent(roundId: string, artifacts: string, prUrl: string, targetSha: string): { payload: Record<string, unknown>; publicationFile: string; sha: string } {
@@ -2950,6 +2956,14 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
   });
 
   it('a receipt with an unknown enacted event or foreign PR URL never promotes (R2)', async () => {
+    // One shared repo/ledger/port serves all eight mutations: the contract
+    // under test is the receipt binding, and a fresh repo + db per case
+    // spent most of this test's budget on git plumbing (the R1 case above
+    // shares the same way). Every mutation keeps its own round and every
+    // assertion is unchanged.
+    let shared: {
+      ledger: LedgerApi; port: GitReviewPort; artifacts: string; repo: FixtureRepo; commit: string;
+    } | undefined;
     for (const [label, mutate] of [
       ['unknown event', (payload: Record<string, unknown>) => ({ ...payload, receipt: { ...(payload.receipt as object), event: 'APPROVED' } })],
       ['foreign url', (payload: Record<string, unknown>) => ({ ...payload, url: 'https://elsewhere.invalid/acme/other/pull/9' })],
@@ -2960,7 +2974,12 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
       ['malformed review id', (payload: Record<string, unknown>) => ({ ...payload, receipt: { ...(payload.receipt as object), reviewId: '9001\ninjected' } })],
       ['missing actor', (payload: Record<string, unknown>) => ({ ...payload, receipt: { ...(payload.receipt as object), actor: ' ' } })],
     ] as const) {
-      const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture(`p3-r2-${label.replace(/\W+/gu, '-')}`);
+      const fixture = await recoveryFixture(`p3-r2-${label.replace(/\W+/gu, '-')}`, shared);
+      shared ??= {
+        ledger: fixture.ledger, port: fixture.port, artifacts: fixture.artifacts,
+        repo: fixture.repo, commit: fixture.commit,
+      };
+      const { ledger, port, artifacts, job, roundId, targetSha } = fixture;
       const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
       ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: mutate(good.payload) });
       const wave = new WaveRunner({
