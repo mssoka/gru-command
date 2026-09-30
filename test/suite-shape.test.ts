@@ -25,7 +25,7 @@ const PINS: Record<string, number> = {
   'chat-session-state.test.ts': 6,
   'claude-adapter.test.ts': 89,
   'config-generate.test.ts': 8,
-  'config.test.ts': 62,
+  'config.test.ts': 63,
   'decisions-cli.test.ts': 4,
   'decisions-service-integration.test.ts': 1,
   'decisions.test.ts': 43,
@@ -57,6 +57,9 @@ const PINS: Record<string, number> = {
   'native-tools-parity.test.ts': 2,
   'notifications.test.ts': 19,
   'obligations-handback.test.ts': 5,
+  // Final-branch registration counts: owner-actions keeps this branch's
+  // expanded registration set (28); supervisor keeps main's post-rollback
+  // count (45). Verified against the merged tree, not ours/theirs copy.
   'owner-actions.test.ts': 28,
   'perkins-builtin-wave.test.ts': 88,
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
@@ -92,7 +95,7 @@ const PINS: Record<string, number> = {
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
   'suite-shape.test.ts': 2,
-  'supervisor.test.ts': 50,
+  'supervisor.test.ts': 45,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 13,
   'uploads-dir.test.ts': 3,
