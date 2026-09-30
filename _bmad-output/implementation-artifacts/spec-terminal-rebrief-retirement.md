@@ -2,7 +2,7 @@
 title: 'Audited retirement of stale re-brief requests on terminal jobs'
 type: 'bugfix'
 created: '2026-09-30'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 baseline_commit: 'c54bfbf89727bacfd27a27db65a9fab681c19c3e'
 review_loop_iteration: 0
