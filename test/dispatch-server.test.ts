@@ -692,7 +692,11 @@ describe('dispatch server (E8)', () => {
       expect(res.status).toBe(502);
       expect(field<string>(res.json, 'error')).toBe('undelivered');
       expect(h.ledger.listJobEvents('dir-settle').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
-      expect(h.ledger.listJobEvents('dir-settle').some((event) => event.kind === 'job.delivered')).toBe(false);
+      // The creation dispatch legitimately recorded its own delivery; the
+      // request must not add a REQUEST-sourced delivery on top of it.
+      expect(h.ledger.listJobEvents('dir-settle').some((event) =>
+        event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-directive',
+      )).toBe(false);
     } finally {
       await h.close();
     }
@@ -712,7 +716,11 @@ describe('dispatch server (E8)', () => {
       expect(res.status).toBe(400);
       expect(field<string>(res.json, 'detail')).toContain('automatic rate-limit retry exhausted');
       expect(h.ledger.listJobEvents('reb-settle').some((event) => event.kind === 'silas.rebrief')).toBe(false);
-      expect(h.ledger.listJobEvents('reb-settle').some((event) => event.kind === 'job.delivered')).toBe(false);
+      // The creation dispatch legitimately recorded its own delivery; the
+      // re-brief request must not add a REQUEST-sourced delivery.
+      expect(h.ledger.listJobEvents('reb-settle').some((event) =>
+        event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-rebrief',
+      )).toBe(false);
       expect(h.ledger.listPendingRebriefs({ jobId: 'reb-settle' })).toHaveLength(2);
     } finally {
       await h.close();

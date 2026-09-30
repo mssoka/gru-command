@@ -2163,6 +2163,7 @@ describe('pacing settlement across rejection, recovery, and slot retirement', ()
     try {
       const handle = new FakeHandle('minion', 'minion-live-reject', null);
       h.registry.adopt(handle);
+      h.api.addJob({ id: 'job-live-reject', repo: 'fixture', title: 'live reject', briefing: 'brief' });
       h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-live-reject' });
       let failed = false;
       handle.promptHook = (text) => {
