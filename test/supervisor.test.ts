@@ -28,6 +28,7 @@ import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 import type { WorktreePort } from '../src/dispatch/worktree-port.js';
@@ -2080,10 +2081,10 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
       h.registry.spawnImpl = async (role, options) => {
         const handle = new FakeHandle(role, 'minion-fresh-directive', options?.resumeFile ?? null);
         let failed = false;
-        handle.promptHook = () => {
+        handle.promptHook = (text) => {
           if (failed) return;
           failed = true;
-          handle.pendingTurnSnapshot = { text: 'fix the thing', owner: 'fix-directive' };
+          handle.pendingTurnSnapshot = { text, owner: 'fix-directive' };
           handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
         };
         spawned = handle;
@@ -2107,8 +2108,8 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
       await sleeper.release();
       await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-fresh-directive' });
       expect(handle!.promptCalls).toEqual([
-        { text: 'fix the thing', owner: 'fix-directive' },
-        { text: 'fix the thing', owner: 'fix-directive' },
+        { text: `fix the thing\n\n${PR_CREATION_RULE}`, owner: 'fix-directive' },
+        { text: `fix the thing\n\n${PR_CREATION_RULE}`, owner: 'fix-directive' },
       ]);
       expect(handle!.disposed).toBe(true);
     } finally { h.dispose(); }

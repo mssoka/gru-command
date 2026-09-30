@@ -7,6 +7,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { routeFixDirectiveToMinion, rebriefFreshMinion } from '../src/dispatch/fix-directive.js';
+import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import { BoardEngine } from '../src/board/engine.js';
 import type { AgentHandle } from '../src/runtime/types.js';
@@ -205,7 +206,7 @@ describe('worker admission through directive deliveries', () => {
     expect(gate.view().worker.queued.map((entry) => entry.id)).toEqual(['job-1']);
     holder.release();
     await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-1' });
-    expect(delivered).toEqual(['fix the lane']);
+    expect(delivered).toEqual([`fix the lane\n\n${PR_CREATION_RULE}`]);
     expect(events).toEqual(['pacing.queued', 'pacing.admitted']);
     expect(gate.view().worker.running).toBe(0);
     expect(gate.view().worker.queued).toHaveLength(0);
