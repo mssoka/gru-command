@@ -57,6 +57,7 @@ const PINS: Record<string, number> = {
   'owner-actions.test.ts': 8,
   'perkins-builtin-wave.test.ts': 88,
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
+  'perkins-findings-dedupe.test.ts': 11,
   'perkins-freeze-freshhead.test.ts': 13,
   'perkins-lead-schema-compat.test.ts': 6,
   'perkins-whole-review.test.ts': 67,
