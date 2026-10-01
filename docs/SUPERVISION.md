@@ -40,6 +40,23 @@ silence threshold and resets the clock rather than killing the process
 growth, and no live tool is still hung and climbs the ladder; a probe
 error reads as live.
 
+**An open native compaction is waited for, never restarted.** Provider
+compaction (`compaction_start` … `compaction_end`) can run silent far
+longer than a normal turn, so while it is open the silence threshold does
+not climb the restart ladder: at the threshold the supervisor posts ONE
+factual FYI per episode (`supervision.native-compaction-wait` —
+"compaction has not reported completion; continuing to wait", `fyi`/info
+— no owner bell, no machine wake) and keeps waiting. Repeated ticks and
+duplicate start signals never warn twice within one episode;
+`compaction_end` (success or failure) clears the latch and the warning
+state through the existing ownership path, so the next genuine episode
+may warn once again. Waiting is indefinite by design — a truly stalled
+provider is out-waited, and the owner's manual stop/reset remains the way
+to end one; there is no second automatic deadline. A silence
+classification already in flight when compaction starts is discarded as
+stale, so old silence evidence can never kill a handle that entered
+compaction.
+
 **Sleep/wake is not a hang.** A watchdog tick separated from the
 previous one by a wall-clock gap beyond the tick cadence means the
 machine was suspended; every open turn gets a fresh silence window, a
@@ -189,10 +206,17 @@ owns un-hanging the turn itself; `timeoutMs` is caller-side relief.
 
 ## Testing
 
+**Testing**
+
 `test/supervisor.test.ts` drives a controllable runtime: a killed stub
 agent climbs the ladder and is restored (resumed from its session file);
 three fast failures trip the breaker exactly once with a needs-owner
 notification; an ack re-arms; in-band errors never restart. The same
+suite pins the compaction wait policy: an open silent compaction warns
+exactly once and is never restarted (no pending-turn take, no breaker,
+no fake clock reset), duplicate start signals warn once per episode,
+`compaction_end` re-arms the warning for the next episode, and a stale
+silence decision returning after compaction started is discarded. The same
 suite pins the hung-turn follow-ups: a live open tool never trips the
 watchdog, heartbeats keep a quiet run alive, an interrupted turn is
 re-delivered on the resumed session, an unresumable turn posts its

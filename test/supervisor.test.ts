@@ -298,41 +298,159 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(h.notificationsOfKind('supervision.hang').length).toBe(1);
   });
 
-  it('a silent native compaction is bounded by the same hang watchdog', async () => {
-    const handle = new FakeHandle('gru', 'gru-compact-hang', null);
+  it('an open silent native compaction is warned about once and never restarted', async () => {
+    const handle = new FakeHandle('gru', 'gru-compact-wait', null);
     h.registry.adopt(handle);
     const spawnsBefore = h.registry.spawnCalls.length;
-    const notificationsBefore = h.notificationsOfKind('supervision.hang').length;
+    const hangsBefore = h.notificationsOfKind('supervision.hang').length;
+    const restartsBefore = h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.restart').length;
+    const guidanceBefore = h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.guidance').length;
+    const recoveryBefore = h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.turn-recovery').length;
+    // An open pending turn inside the compaction: the turn stays open too.
+    hang(handle);
+    handle.emit({ type: 'compaction_start' });
+    h.advance(60); // past turn_silence_ms (50)
+    await sleep(60);
+    h.advance(60); // several further silent windows
+    await sleep(60);
+    h.advance(60);
+    await sleep(60);
+    // No silence-triggered dispose/abort/restart...
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls.length).toBe(spawnsBefore);
+    // ...no failure classification, breaker, or pending-turn take/replay...
+    expect(h.notificationsOfKind('supervision.hang').length).toBe(hangsBefore);
+    expect(h.notificationsOfKind('supervision.breaker').length).toBe(0);
+    expect(h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.restart').length).toBe(restartsBefore);
+    expect(h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.guidance').length).toBe(guidanceBefore);
+    expect(h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.turn-recovery').length).toBe(recoveryBefore);
+    // ...the same handle stays owned, watching, with its pending turn retained...
+    expect(h.supervisor.viewFor('gru-compact-wait')).toMatchObject({
+      state: 'watching',
+      openControl: true,
+      openTurn: true,
+      restarts: 0,
+      breakerOpen: false,
+    });
+    // ...and exactly one factual FYI warning was posted (no owner bell).
+    const waits = h.notificationsOfKind('supervision.native-compaction-wait');
+    expect(waits.length).toBe(1);
+    expect(waits[0]?.routing).toBe('fyi');
+    expect(waits[0]?.severity).toBe('info');
+    expect(waits[0]?.agentId).toBe('gru-compact-wait');
+  });
+
+  it('repeated ticks and duplicate compaction_start signals warn at most once per episode', async () => {
+    const handle = new FakeHandle('gru', 'gru-compact-duplicate', null); // idle-labeled
+    h.registry.adopt(handle);
+    const waitsBefore = h.notificationsOfKind('supervision.native-compaction-wait').length;
     handle.emit({ type: 'compaction_start' });
     h.advance(60);
     await sleep(60);
-    expect(handle.disposed).toBe(true);
-    expect(h.registry.spawnCalls.length).toBe(spawnsBefore + 1);
-    expect(h.notificationsOfKind('supervision.hang').length).toBe(notificationsBefore + 1);
+    handle.emit({ type: 'compaction_start' }); // duplicate start while open
+    h.advance(60);
+    await sleep(60);
+    handle.emit({ type: 'compaction_start' }); // and another
+    h.advance(60);
+    await sleep(60);
+    expect(handle.disposed).toBe(false);
+    expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBe(waitsBefore + 1);
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', openControl: true });
+  });
+
+  it('compaction_end clears the wait state; a later genuine episode may warn once again', async () => {
+    const handle = new FakeHandle('gru', 'gru-compact-episodes', null);
+    h.registry.adopt(handle);
+    // Episode 1: warn exactly once at the threshold.
+    handle.emit({ type: 'compaction_start' });
+    h.advance(60);
+    await sleep(60);
+    expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBeGreaterThanOrEqual(1);
+    // Native success ends the episode: further silence warns nothing and
+    // the otherwise idle handle stays idle-owned.
+    handle.emit({ type: 'compaction_end', success: true });
+    const afterEpisode1 = h.notificationsOfKind('supervision.native-compaction-wait').length;
+    h.advance(60);
+    await sleep(60);
+    h.advance(60);
+    await sleep(60);
+    expect(handle.disposed).toBe(false);
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', openControl: false, openTurn: false });
+    expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBe(afterEpisode1);
+    // Episode 2 (ends in native failure): one fresh warning at its threshold.
+    handle.emit({ type: 'compaction_start' });
+    h.advance(60);
+    await sleep(60);
+    expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBe(afterEpisode1 + 1);
+    handle.emit({ type: 'compaction_end', success: false, error: 'provider declined' });
+    h.advance(60);
+    await sleep(60);
+    expect(handle.disposed).toBe(false);
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', openControl: false });
+    expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBe(afterEpisode1 + 1);
+  });
+
+  it('a stale silence decision that returns after compaction starts never restarts the handle', async () => {
+    let release!: (value: ReturnType<typeof deterministicOutcome>) => void;
+    const decide = vi.fn((_request: Parameters<DecisionService['decide']>[0]) =>
+      new Promise<ReturnType<typeof deterministicOutcome>>((resolve) => {
+        release = (value) => resolve(value);
+      }),
+    );
+    const lane = boot({ decide } as unknown as DecisionService);
+    const handle = new FakeHandle('gru', 'gru-compact-race', null);
+    lane.registry.adopt(handle);
+    const spawns = lane.registry.spawnCalls.length;
+    hang(handle); // open silent turn → silence fires the turn-hang decision
+    lane.advance(60);
+    await vi.waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
+    // Native compaction starts while the silence classification is in flight.
+    handle.emit({ type: 'compaction_start' });
+    const request = decide.mock.calls[0]![0];
+    release(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+    await sleep(60);
+    // The stale silence evidence is discarded: no restart, no disposal, no
+    // guidance row, and the compaction latch is untouched.
+    expect(handle.disposed).toBe(false);
+    expect(lane.registry.spawnCalls).toHaveLength(spawns);
+    expect(lane.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', openControl: true, restarts: 0 });
+    expect(lane.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.guidance')).toBe(false);
+    // The supervisor keeps waiting under the compaction policy: one FYI, no ladder.
+    lane.advance(60);
+    await sleep(60);
+    expect(handle.disposed).toBe(false);
+    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
+    expect(lane.notificationsOfKind('supervision.hang')).toHaveLength(0);
+    lane.dispose();
   });
 
   it('a completed native compaction disarms the hang watchdog', async () => {
     const handle = new FakeHandle('gru', 'gru-compact-complete', null);
     h.registry.adopt(handle);
     const spawnsBefore = h.registry.spawnCalls.length;
+    const waitsBefore = h.notificationsOfKind('supervision.native-compaction-wait').length;
     handle.emit({ type: 'compaction_start' });
     handle.emit({ type: 'compaction_end', success: true });
     h.advance(60);
     await sleep(60);
     expect(handle.disposed).toBe(false);
     expect(h.registry.spawnCalls.length).toBe(spawnsBefore);
+    // An episode that ended natively before the threshold never warns.
+    expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBe(waitsBefore);
   });
 
   it('a failed native compaction also disarms the hang watchdog', async () => {
     const handle = new FakeHandle('gru', 'gru-compact-failed', null);
     h.registry.adopt(handle);
     const spawnsBefore = h.registry.spawnCalls.length;
+    const waitsBefore = h.notificationsOfKind('supervision.native-compaction-wait').length;
     handle.emit({ type: 'compaction_start' });
     handle.emit({ type: 'compaction_end', success: false, error: 'provider declined' });
     h.advance(60);
     await sleep(60);
     expect(handle.disposed).toBe(false);
     expect(h.registry.spawnCalls.length).toBe(spawnsBefore);
+    expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBe(waitsBefore);
   });
 
   it('in-band errors NEVER restart (the adapter contract recovers)', async () => {
