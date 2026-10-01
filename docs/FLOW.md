@@ -383,7 +383,11 @@ the judgment; the dispatch surface is the mechanical hand.
   re-dispatches a fresh worker on the same lane) and records the missing
   events when that turn settles; a failed recovery escalates
   action-required and keeps the markers for the next boot, so the lane
-  can never stall silently on a lost turn.
+  can never stall silently on a lost turn. A leftover marker whose job
+  has since reached terminal (`merged`/`done`) cannot be honored: boot
+  retires it administratively — the identity-checked deletion and one
+  `silas.rebrief-retired` audit commit together, with no spawn and no
+  escalation.
 - **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,
   track, close; never product code; never merge; preserve before remove;
   escalate with pointers. Silas acts only through the authenticated ops

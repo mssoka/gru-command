@@ -419,10 +419,13 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const fresh = api.beginPendingRebrief({ jobId, note: 'fresh', briefing: 'b' });
     expect(fresh.map((marker) => marker.id)).not.toEqual(old.map((marker) => marker.id));
 
-    // Nonterminal: refused, nothing deleted or recorded.
+    // Nonterminal: refused, nothing deleted or recorded — and nothing is
+    // reported as "skipped" because no row was read or compared.
     const refused = api.retirePendingRebriefs({ jobId, reason: 'x', candidates: staleCandidates });
     expect(refused.refused).toBe('job-not-terminal');
     expect(refused.recorded).toBe(false);
+    expect(refused.skippedIds).toHaveLength(0);
+    expect(refused.retired).toHaveLength(0);
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(2);
 
     api.setJobStatus(jobId, 'in-review');

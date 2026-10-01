@@ -451,12 +451,19 @@ describe('terminal re-brief retirement', () => {
     await seedPendingRebrief({ h, jobId, bindWorker: { agentId: boundAgent, sessionFile: boundSession } });
     merge(h, jobId);
     const markers = h.ledger.listPendingRebriefs({ jobId });
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const logs: string[] = [];
+    const report = await reconcilePendingRebriefs(
+      { ...deps(h), log: (level, msg) => { logs.push(`${level}:${msg}`); } },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
     expect(report.examined).toBe(2);
     expect(report.retired).toBe(1);
     expect(report.redispatched).toBe(0);
     expect(report.completed).toBe(0);
     await report.settled;
+
+    // The boot summary's retirement surface is emitted for operators.
+    expect(logs).toContain('info:re-brief request retired: job is terminal');
 
     // No worker ever ran, no guarded event was fabricated, the lane stayed terminal.
     expect(h.registry.workers).toHaveLength(0);
@@ -523,12 +530,16 @@ describe('terminal re-brief retirement', () => {
     const jobId = 'terminal-replay-job';
     await seedPendingRebrief({ h, jobId });
     merge(h, jobId);
-    const first = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
-    const second = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
-    expect(first.retired).toBe(1);
-    expect(second.examined).toBe(0);
-    await first.settled;
-    await second.settled;
+    // Both passes start in the same tick: the first scan retires
+    // synchronously, so the second must find nothing left to retire.
+    const first = reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const second = reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const firstReport = await first;
+    const secondReport = await second;
+    expect(firstReport.retired).toBe(1);
+    expect(secondReport.examined).toBe(0);
+    await firstReport.settled;
+    await secondReport.settled;
     const audits = h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired');
     expect(audits).toHaveLength(1);
   });
@@ -541,7 +552,11 @@ describe('terminal re-brief retirement', () => {
     h.registry.gate = new Promise<void>((resolveGate) => {
       release = resolveGate;
     });
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const logs: string[] = [];
+    const report = await reconcilePendingRebriefs(
+      { ...deps(h), log: (level, msg) => { logs.push(`${level}:${msg}`); } },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
     expect(report.redispatched).toBe(1);
     // The job reaches terminal while the re-dispatch turn is still in flight.
     merge(h, jobId);
@@ -550,6 +565,7 @@ describe('terminal re-brief retirement', () => {
 
     // The live turn is preserved (not killed), but no stale completion is recorded.
     expect(h.registry.workers).toHaveLength(1);
+    expect(logs).toContain('info:re-brief recovery closed: job went terminal mid-turn');
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
@@ -707,6 +723,41 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+  });
+
+  it('a boot retirement that retires nothing keeps the markers, records no audit, and is logged', async () => {
+    const h = makeHarness();
+    const jobId = 'boot-incomplete-retirement';
+    await seedPendingRebrief({ h, jobId });
+    merge(h, jobId);
+    const logs: string[] = [];
+    const stale: PendingRebriefRetirement = {
+      retired: [],
+      recorded: false,
+      skippedIds: ['stale-generation'],
+      refused: null,
+    };
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: ledgerWith(h, { retirePendingRebriefs: () => stale }),
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+        log: (level, msg) => {
+          logs.push(`${level}:${msg}`);
+        },
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    expect(report.retired).toBe(0);
+    expect(report.redispatched).toBe(0);
+    await report.settled;
+    // The boundary retired nothing: no spawn, no audit, markers kept — and
+    // the disposition is surfaced instead of disappearing.
+    expect(h.registry.workers).toHaveLength(0);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+    expect(logs).toContain('warn:re-brief retirement retired nothing');
   });
 
   it('a mid-turn retirement that retires nothing keeps the markers and is never reported as recovered', async () => {

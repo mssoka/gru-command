@@ -62,7 +62,7 @@ const PINS: Record<string, number> = {
   'perkins-whole-review.test.ts': 67,
   'pi-adapter.test.ts': 63,
   'pr-creation-policy.test.ts': 5,
-  'rebrief-recovery.test.ts': 20,
+  'rebrief-recovery.test.ts': 21,
   'rehearsal.test.ts': 4,
   'resident-budget.test.ts': 7,
   'resident-saturation.test.ts': 2,

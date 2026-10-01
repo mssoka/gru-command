@@ -161,7 +161,10 @@ land; `UNIQUE (job_id, kind)` means a newer request supersedes an older
 marker. Boot reconciliation (`src/dispatch/rebrief-recovery.ts`)
 consumes leftovers: resume the interrupted session (or re-dispatch fresh
 on the same lane), record the missing events, or escalate
-action-required when recovery fails.
+action-required when recovery fails. A leftover whose job has since
+reached `merged`/`done` is instead retired administratively: the
+identity-checked marker deletion and a single `silas.rebrief-retired`
+audit commit in one transaction, with no spawn and no escalation.
 
 ### Residency admission + durable review handoffs (custom events)
 

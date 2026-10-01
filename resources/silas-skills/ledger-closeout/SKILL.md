@@ -27,7 +27,11 @@ close-out: a ledger-visible end state a stranger can audit.
 2. **Fix loops.** A directive or re-brief is closed when the minion's
    follow-up delivery lands and the re-review fires. If the same canonical
    blocker then recurs, the ladder continues (directive → re-brief →
-   escalate); if blockers evolve, keep looping — no cap.
+   escalate); if blockers evolve, keep looping — no cap. A re-brief whose
+   job reached terminal (`merged`/`done`) before the turn settled is
+   closed administratively instead: the pending markers are retired with
+   a `silas.rebrief-retired` event and no delivery is expected — do not
+   re-treat that lane as unclosed.
 3. **Escalations.** An escalation is closed by a human ack, not by you.
    After escalating, leave the lane exactly as it is and say so in your
    completion note. Do not re-escalate the same state on every sweep: the

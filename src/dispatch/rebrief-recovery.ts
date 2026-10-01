@@ -104,10 +104,13 @@ export interface ReconcileReport {
   readonly examined: number;
   /** Jobs whose guarded events were already landed and whose markers cleared. */
   readonly completed: number;
-  /** Jobs handed to a background re-dispatch (resume or fresh worker). */
+  /** Jobs QUEUED for a background re-dispatch (resume or fresh worker)
+   * during this scan. The turn settles after boot; a retirement it reaches
+   * mid-turn is logged per job and audited, not counted here. */
   readonly redispatched: number;
-  /** Jobs whose obsolete request family was administratively retired
-   * because the job is terminal (one per job group, this pass). */
+  /** Jobs retired synchronously during this scan because the job is
+   * terminal (one per job group). A retirement reached mid-turn is logged
+   * per job and audited, not counted here. */
   readonly retired: number;
   /** Settles when every background re-dispatch has settled — resumed,
    * escalated, or abandoned because the process is stopping. Boot does not

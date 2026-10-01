@@ -238,7 +238,10 @@ export interface PendingRebriefRetireCandidate {
   readonly baselineSeq: number;
 }
 
-/** The outcome of one terminal-retirement attempt. */
+/** The outcome of one terminal-retirement attempt. A refusal or a full
+ * identity skip leaves the markers in place and appends NO ledger row —
+ * that disposition is log-only by design; only an actual retirement is
+ * audited (`silas.rebrief-retired`). */
 export interface PendingRebriefRetirement {
   /** The markers this call deleted (identity matched at the boundary). */
   readonly retired: readonly PendingRebriefRecord[];
@@ -246,7 +249,8 @@ export interface PendingRebriefRetirement {
    * false on a replay, an identity drift, or a boundary refusal. */
   readonly recorded: boolean;
   /** Candidate ids whose current row no longer matches the examined
-   * identity (a newer request generation, or an already-consumed marker). */
+   * identity (a newer request generation, or an already-consumed marker).
+   * Empty on a boundary refusal: no row was read or compared there. */
   readonly skippedIds: readonly string[];
   /** The boundary refusal when the job was not terminal at retirement
    * time — nothing was deleted or recorded then. */
@@ -1191,7 +1195,10 @@ export class LedgerApi {
       const refused = (why: 'job-missing' | 'job-not-terminal'): PendingRebriefRetirement => ({
         retired: [],
         recorded: false,
-        skippedIds: input.candidates.map((candidate) => candidate.id),
+        // Refusal is a boundary outcome, not identity drift: no row was read
+        // or compared, so nothing is "skipped" — the `refused` discriminator
+        // carries the state and the markers stay untouched.
+        skippedIds: [],
         refused: why,
       });
       // Boundary recheck: the caller saw terminal, but the deletion is

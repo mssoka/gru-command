@@ -68,6 +68,8 @@ async function boot(opts: {
   silasOps?: boolean;
   /** Gate selected minion turns before they settle (in-flight assertions). */
   minionPromptGate?: (text: string) => Promise<void> | undefined;
+  /** Capture service log lines for operator-surface assertions. */
+  log?: (level: 'debug' | 'info' | 'warn' | 'error', msg: string) => void;
   /** Test-only seam: wrap the ledger the server and dispatch see, so
    * defensive ledger dispositions can be forced deterministically. */
   wrapLedger?: (ledger: LedgerApi) => LedgerApi;
@@ -158,6 +160,7 @@ async function boot(opts: {
     dispatch,
     wave,
     ledger,
+    ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.silasOps === false
       ? {}
       : {
@@ -782,7 +785,13 @@ describe('dispatch server (E8)', () => {
     const gate = new Promise<void>((resolveGate) => {
       releasePrompt = resolveGate;
     });
-    const h = await boot({ minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined) });
+    const logs: string[] = [];
+    const h = await boot({
+      minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined),
+      log: (level, msg) => {
+        logs.push(`${level}:${msg}`);
+      },
+    });
     const repo = makeFixtureRepo('fixture-silas-rebrief-terminal');
     cleanupRepos.push(repo);
     try {
@@ -833,6 +842,8 @@ describe('dispatch server (E8)', () => {
       expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief-retired')).not.toBeNull();
       expect(h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' })).toHaveLength(0);
       expect(h.ledger.getJob('terminal-rebrief-job')?.status).toBe('merged');
+      // The operator surface carries the disposition, not just the response.
+      expect(logs).toContain('info:silas re-brief retired: job went terminal before the turn settled');
     } finally {
       releasePrompt();
       await h.close();
