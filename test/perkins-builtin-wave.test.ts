@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1693,6 +1694,27 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
   });
 
   it('does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)', async () => {
+    // T4 phase evidence (phase pr144-t4-phase-evidence-20261001; test-local,
+    // observation only): monotonic elapsed per named boundary, emitted as
+    // bounded JSON lines so partial evidence survives an exceptional exit or
+    // the unchanged 30000 ms bound. Emits stdout lines only; never alters
+    // refs, ordering, mocks, or assertions.
+    const t4T0 = performance.now();
+    const t4Mark = (kase: 'moved' | 'aborted', phase: string, boundary: 'start' | 'end', outcome: string, elapsedMs?: number): void => {
+      console.log(`T4-PHASE ${JSON.stringify({ case: kase, phase, boundary, outcome, ...(elapsedMs !== undefined ? { elapsedMs: Math.round(elapsedMs) } : {}) })}`);
+    };
+    const t4Timed = async <T>(kase: 'moved' | 'aborted', phase: string, run: () => Promise<T>): Promise<T> => {
+      const started = performance.now();
+      t4Mark(kase, phase, 'start', 'begin');
+      try {
+        const result = await run();
+        t4Mark(kase, phase, 'end', 'completed', performance.now() - started);
+        return result;
+      } catch (error) {
+        t4Mark(kase, phase, 'end', error instanceof Error ? `rejected:${error.name}` : 'rejected', performance.now() - started);
+        throw error;
+      }
+    };
     const prepare = async (name: string, branch: string) => {
       const repo = makeFixtureRepo(name);
       repos.push(repo);
@@ -1716,23 +1738,28 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     };
     // (a) The movement ref advances while the reconciliation lookup is
     // outstanding: the receipt is preserved, never recorded as delivery.
-    const moved = await prepare('perkins-t4-moved', 'feature/t4-moved');
+    const moved = await t4Timed('moved', 'fixture-prep', () => prepare('perkins-t4-moved', 'feature/t4-moved'));
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
-      // The frozen BASE drifts while the lookup is outstanding — the
-      // stale-source guard refMovedSinceFreeze must refuse the recording.
-      // commit-tree needs an explicit identity: CI runners have no global
-      // git user (commitFile passes one the same way).
-      const newMain = moved.repo.git([
-        '-c', 'user.name=T4 Fixture', '-c', 'user.email=t4@example.invalid',
-        'commit-tree', 'main^{tree}', '-m', 'base moves during lookup',
-      ]).trim();
-      moved.repo.git(['branch', '-f', 'main', newMain]);
-      return {
-        reviewId: '9200', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
-        headSha: call.targetSha, baseSha: 'b'.repeat(40),
-        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
-      };
+      return t4Timed('moved', 'reconcile-lookup', async () => {
+        // The frozen BASE drifts while the lookup is outstanding — the
+        // stale-source guard refMovedSinceFreeze must refuse the recording.
+        // commit-tree needs an explicit identity: CI runners have no global
+        // git user (commitFile passes one the same way).
+        const gitStarted = performance.now();
+        t4Mark('moved', 'git-ops', 'start', 'begin');
+        const newMain = moved.repo.git([
+          '-c', 'user.name=T4 Fixture', '-c', 'user.email=t4@example.invalid',
+          'commit-tree', 'main^{tree}', '-m', 'base moves during lookup',
+        ]).trim();
+        moved.repo.git(['branch', '-f', 'main', newMain]);
+        t4Mark('moved', 'git-ops', 'end', 'completed', performance.now() - gitStarted);
+        return {
+          reviewId: '9200', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+          headSha: call.targetSha, baseSha: 'b'.repeat(40),
+          bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+        };
+      });
     });
     const escalations: string[] = [];
     const movedWave = new WaveRunner({
@@ -1741,7 +1768,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
       prHeadProbe: localHeadProbe('feature/t4-moved'),
     });
-    const movedOutcome = asWave(await movedWave.runRound({ jobId: moved.job.id }));
+    const movedOutcome = asWave(await t4Timed('moved', 'wave-round', () => movedWave.runRound({ jobId: moved.job.id })));
     expect(movedOutcome.posted).toBe(false);
     expect(movedOutcome.verdict).toBeNull();
     expect(movedOutcome.canonicalVerdict).toBe('INCOMPLETE');
@@ -1752,15 +1779,17 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(unrecorded.receipt?.reviewId).toBe('9200');
     expect(moved.ledger.latestRoundEvent(movedOutcome.round.id, 'round.posted')).toBeNull();
     // (b) The run's abort signal fires while the lookup is outstanding.
-    const aborted = await prepare('perkins-t4-aborted', 'feature/t4-aborted');
+    const aborted = await t4Timed('aborted', 'fixture-prep', () => prepare('perkins-t4-aborted', 'feature/t4-aborted'));
     const abortPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const abortReconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
-      for (const controller of (abortedWave as unknown as { activeControllers: Set<AbortController> }).activeControllers) controller.abort();
-      return {
-        reviewId: '9201', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
-        headSha: call.targetSha, baseSha: 'b'.repeat(40),
-        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
-      };
+      return t4Timed('aborted', 'reconcile-lookup', async () => {
+        for (const controller of (abortedWave as unknown as { activeControllers: Set<AbortController> }).activeControllers) controller.abort();
+        return {
+          reviewId: '9201', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+          headSha: call.targetSha, baseSha: 'b'.repeat(40),
+          bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+        };
+      });
     });
     const abortEscalations: string[] = [];
     const abortedWave = new WaveRunner({
@@ -1769,7 +1798,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       escalate: (title, detail) => abortEscalations.push(`${title}: ${detail}`),
       prHeadProbe: localHeadProbe('feature/t4-aborted'),
     });
-    const abortedOutcome = asWave(await abortedWave.runRound({ jobId: aborted.job.id }));
+    const abortedOutcome = asWave(await t4Timed('aborted', 'wave-round', () => abortedWave.runRound({ jobId: aborted.job.id })));
     expect(abortedOutcome.posted).toBe(false);
     expect(abortedOutcome.verdict).toBeNull();
     const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { reason?: string };
