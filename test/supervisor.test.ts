@@ -423,30 +423,36 @@ describe('supervisor — watchdog + restart ladder', () => {
       }),
     );
     const lane = boot({ decide } as unknown as DecisionService);
-    const handle = new FakeHandle('gru', 'gru-compact-race', null);
-    lane.registry.adopt(handle);
-    const spawns = lane.registry.spawnCalls.length;
-    hang(handle); // open silent turn → silence fires the turn-hang decision
-    lane.advance(60);
-    await vi.waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
-    // Native compaction starts while the silence classification is in flight.
-    handle.emit({ type: 'compaction_start' });
-    const request = decide.mock.calls[0]![0];
-    release(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
-    await sleep(60);
-    // The stale silence evidence is discarded: no restart, no disposal, no
-    // guidance row, and the compaction latch is untouched.
-    expect(handle.disposed).toBe(false);
-    expect(lane.registry.spawnCalls).toHaveLength(spawns);
-    expect(lane.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', openControl: true, restarts: 0 });
-    expect(lane.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.guidance')).toBe(false);
-    // The supervisor keeps waiting under the compaction policy: one FYI, no ladder.
-    lane.advance(60);
-    await sleep(60);
-    expect(handle.disposed).toBe(false);
-    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
-    expect(lane.notificationsOfKind('supervision.hang')).toHaveLength(0);
-    lane.dispose();
+    // The fresh harness owns a live interval timer and a real ledger db:
+    // dispose it on EVERY exit path, including an assertion failure, so no
+    // timer/ledger/logging activity leaks into later tests.
+    try {
+      const handle = new FakeHandle('gru', 'gru-compact-race', null);
+      lane.registry.adopt(handle);
+      const spawns = lane.registry.spawnCalls.length;
+      hang(handle); // open silent turn → silence fires the turn-hang decision
+      lane.advance(60);
+      await vi.waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
+      // Native compaction starts while the silence classification is in flight.
+      handle.emit({ type: 'compaction_start' });
+      const request = decide.mock.calls[0]![0];
+      release(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+      await sleep(60);
+      // The stale silence evidence is discarded: no restart, no disposal, no
+      // guidance row, and the compaction latch is untouched.
+      expect(handle.disposed).toBe(false);
+      expect(lane.registry.spawnCalls).toHaveLength(spawns);
+      expect(lane.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', openControl: true, restarts: 0 });
+      expect(lane.api.listEvents({ limit: 100 }).some((event) => event.kind === 'supervision.guidance')).toBe(false);
+      // The supervisor keeps waiting under the compaction policy: one FYI, no ladder.
+      lane.advance(60);
+      await sleep(60);
+      expect(handle.disposed).toBe(false);
+      expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
+      expect(lane.notificationsOfKind('supervision.hang')).toHaveLength(0);
+    } finally {
+      lane.dispose();
+    }
   });
 
   it('a synchronous warning-post failure before persistence never duplicates attempts or restarts', async () => {
@@ -461,28 +467,34 @@ describe('supervisor — watchdog + restart ladder', () => {
     const postSpy = vi
       .spyOn(lane.api, 'recordNotification')
       .mockImplementation(() => { throw new Error('ledger write failed'); });
-    lane.advance(60); // past turn_silence_ms (50): the one attempt fires and throws
-    await sleep(60);
-    expect(postSpy).toHaveBeenCalledTimes(1);
-    // Repeated silent ticks: the latch holds, no second attempt is made...
-    lane.advance(60);
-    await sleep(60);
-    lane.advance(60);
-    await sleep(60);
-    expect(postSpy).toHaveBeenCalledTimes(1);
-    expect(handle.disposed).toBe(false);
-    expect(lane.registry.spawnCalls).toHaveLength(0); // no restart, ever
-    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(0);
-    // ...and native end still re-arms: the next genuine episode warns once.
-    postSpy.mockRestore();
-    handle.emit({ type: 'compaction_end', success: true });
-    lane.advance(60);
-    await sleep(60);
-    handle.emit({ type: 'compaction_start' });
-    lane.advance(60);
-    await sleep(60);
-    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
-    lane.dispose();
+    // Restore the spy and dispose the fresh harness on EVERY exit path —
+    // an assertion failure must not leak the mock or the ticking lane.
+    try {
+      lane.advance(60); // past turn_silence_ms (50): the one attempt fires and throws
+      await sleep(60);
+      expect(postSpy).toHaveBeenCalledTimes(1);
+      // Repeated silent ticks: the latch holds, no second attempt is made...
+      lane.advance(60);
+      await sleep(60);
+      lane.advance(60);
+      await sleep(60);
+      expect(postSpy).toHaveBeenCalledTimes(1);
+      expect(handle.disposed).toBe(false);
+      expect(lane.registry.spawnCalls).toHaveLength(0); // no restart, ever
+      expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(0);
+      // ...and native end still re-arms: the next genuine episode warns once.
+      postSpy.mockRestore();
+      handle.emit({ type: 'compaction_end', success: true });
+      lane.advance(60);
+      await sleep(60);
+      handle.emit({ type: 'compaction_start' });
+      lane.advance(60);
+      await sleep(60);
+      expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
+    } finally {
+      postSpy.mockRestore();
+      lane.dispose();
+    }
   });
 
   it('a synchronous warning-post failure after persistence never duplicates rows or restarts', async () => {
@@ -495,30 +507,36 @@ describe('supervisor — watchdog + restart ladder', () => {
     // durable. The latch must stay set: no retry, no duplicate FYI row.
     const centerLog = lane.center as unknown as { log: () => void };
     const logSpy = vi.spyOn(centerLog, 'log').mockImplementation(() => { throw new Error('log write failed'); });
-    lane.advance(60); // the one attempt: row persists, then the log throws
-    await sleep(60);
-    expect(logSpy).toHaveBeenCalledTimes(1);
-    // The row IS durable despite the post throwing (after-persistence proof).
-    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
-    // Repeated silent ticks: no second attempt, no duplicate row, no restart.
-    lane.advance(60);
-    await sleep(60);
-    lane.advance(60);
-    await sleep(60);
-    expect(logSpy).toHaveBeenCalledTimes(1);
-    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
-    expect(handle.disposed).toBe(false);
-    expect(lane.registry.spawnCalls).toHaveLength(0);
-    // Native end re-arms; the next episode may warn once again.
-    logSpy.mockRestore();
-    handle.emit({ type: 'compaction_end', success: true });
-    lane.advance(60);
-    await sleep(60);
-    handle.emit({ type: 'compaction_start' });
-    lane.advance(60);
-    await sleep(60);
-    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(2);
-    lane.dispose();
+    // Restore the spy and dispose the fresh harness on EVERY exit path —
+    // an assertion failure must not leak the mock or the ticking lane.
+    try {
+      lane.advance(60); // the one attempt: row persists, then the log throws
+      await sleep(60);
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      // The row IS durable despite the post throwing (after-persistence proof).
+      expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
+      // Repeated silent ticks: no second attempt, no duplicate row, no restart.
+      lane.advance(60);
+      await sleep(60);
+      lane.advance(60);
+      await sleep(60);
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
+      expect(handle.disposed).toBe(false);
+      expect(lane.registry.spawnCalls).toHaveLength(0);
+      // Native end re-arms; the next episode may warn once again.
+      logSpy.mockRestore();
+      handle.emit({ type: 'compaction_end', success: true });
+      lane.advance(60);
+      await sleep(60);
+      handle.emit({ type: 'compaction_start' });
+      lane.advance(60);
+      await sleep(60);
+      expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(2);
+    } finally {
+      logSpy.mockRestore();
+      lane.dispose();
+    }
   });
 
   it('a completed native compaction disarms the hang watchdog', async () => {
