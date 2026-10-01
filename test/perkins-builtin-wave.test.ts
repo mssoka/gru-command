@@ -142,23 +142,32 @@ const dirs: string[] = [];
 // summed into in-test phases. Non-T4 tests arm nothing and behave identically.
 let t4Observe = false;
 let t4StartAt: number | null = null;
-let t4BodySettled = false;
+// True only when the test body reached its end. False proves only that the
+// body did NOT complete — a timeout abandonment or an already-thrown
+// assertion — never that the body is still settling.
+let t4BodyCompleted = false;
 afterEach(() => {
   const observing = t4Observe;
   t4Observe = false;
   const cleanupStarted = performance.now();
-  while (dbs.length > 0) dbs.pop()!.close();
-  while (repos.length > 0) repos.pop()!.cleanup();
-  while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
-  if (observing && t4StartAt !== null) {
-    console.log(`T4-ATTR ${JSON.stringify({
-      leg: 'suite', phase: 'outside-test-cleanup', boundary: 'end',
-      absMs: Math.round(performance.now() - t4StartAt),
-      elapsedMs: Math.round(performance.now() - cleanupStarted),
-      outcome: t4BodySettled ? 'completed' : 'test-body-still-settling',
-      note: 'db.close + repo.cleanup(prune+rm) + rmSync run in afterEach, OUTSIDE the test body and its inherited 30000 ms bound',
-    })}`);
-    t4StartAt = null;
+  try {
+    while (dbs.length > 0) dbs.pop()!.close();
+    while (repos.length > 0) repos.pop()!.cleanup();
+    while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  } finally {
+    // Observational finalization is exception-safe: it runs even when a
+    // cleanup call throws, WITHOUT catching, swallowing, or replacing the
+    // original cleanup error, which still propagates to the runner unchanged.
+    if (observing && t4StartAt !== null) {
+      console.log(`T4-ATTR ${JSON.stringify({
+        leg: 'suite', phase: 'outside-test-cleanup', boundary: 'end',
+        absMs: Math.round(performance.now() - t4StartAt),
+        elapsedMs: Math.round(performance.now() - cleanupStarted),
+        outcome: t4BodyCompleted ? 'completed' : 'test-body-incomplete',
+        note: 'db.close + repo.cleanup(prune+rm) + rmSync run in afterEach, OUTSIDE the test body and its inherited 30000 ms bound; observed even when cleanup throws; test-body-incomplete means only that the body did not complete',
+      })}`);
+      t4StartAt = null;
+    }
   }
 });
 
@@ -1748,7 +1757,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const t4Start = performance.now();
     t4StartAt = t4Start;
     t4Observe = true;
-    t4BodySettled = false;
+    t4BodyCompleted = false;
     const t4Attr = (leg: 'moved' | 'aborted' | 'suite', phase: string, boundary: 'start' | 'end', extra?: { elapsedMs?: number; outcome?: string; note?: string }): void => {
       console.log(`T4-ATTR ${JSON.stringify({
         leg, phase, boundary, absMs: Math.round(performance.now() - t4Start),
@@ -1757,7 +1766,10 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
         ...(extra?.note !== undefined ? { note: extra.note } : {}),
       })}`);
     };
-    const t4Step = async <T>(leg: 'moved' | 'aborted', phase: string, run: () => Promise<T>): Promise<T> => {
+    // run() may settle synchronously (plain value) or asynchronously
+    // (thenable); the awaited result is forwarded with its exact value and
+    // type, exactly one invocation, unchanged error propagation and ordering.
+    const t4Step = async <T>(leg: 'moved' | 'aborted', phase: string, run: () => T | Promise<T>): Promise<Awaited<T>> => {
       t4Attr(leg, phase, 'start');
       const started = performance.now();
       try {
@@ -1876,7 +1888,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(unrecordedAbort.reason).toContain('aborted while the reconciliation lookup was outstanding');
     expect(aborted.ledger.latestRoundEvent(abortedOutcome.round.id, 'round.posted')).toBeNull();
     t4Attr('aborted', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup is NESTED in wave-round — never summed' });
-    t4BodySettled = true;
+    t4BodyCompleted = true;
     t4Attr('suite', 'test-end', 'end', { outcome: 'completed' });
   });
 });
