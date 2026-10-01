@@ -18,6 +18,10 @@ typecheck = "npm run typecheck"
 # plain vitest invocations, no worker/timeout flags, never the npm chain).
 residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-resident-registry.test.ts test/fix-directive.test.ts test/silas-deterministic-seam.test.ts"
 handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"
+# T4 moved-ref/abort oracle only (phase pr144-t4-causal-repair-20261001):
+# scheduled-observation discriminator — T4's duration in isolation vs FULL
+# splits load-amplified structural cost from a new-head path regression.
+t4-oracle = 'npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"'
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 uploads-boot = "npx vitest run test/uploads-dir.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
