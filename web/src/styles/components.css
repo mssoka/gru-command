@@ -1073,8 +1073,35 @@ body {
 .chat-context__status {
   margin-right: auto;
   max-width: 100%;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Working flavor (owner-approved 2026-10-01): the chip shows either the
+   factual label or the rotating decorative phrase. Both stay on one line
+   and ellipsize inside the shrinkable chip, so short/long phrases never
+   wrap the strip or move the controls. The busy label keeps the stable
+   factual status in the a11y tree while the visible phrase (aria-hidden)
+   rotates without announcing. */
+.chat-context__status-label,
+.chat-context__status-flavor {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-context__status--busy .chat-context__status-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .chat-context__announcement {
