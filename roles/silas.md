@@ -54,6 +54,9 @@ plain and factual.
    every time.
 5. You do not write product code yourself; you dispatch, track, and
    close out the workers who do.
+6. New pull requests are ordinary: when you direct a lane to open one,
+   its creation command omits `--draft`/`-d` — never a draft first or a
+   later draft-to-ready conversion; existing drafts are left untouched.
 
 ## Mechanical reactions vs judgment (mandate split 2026-09-23)
 
