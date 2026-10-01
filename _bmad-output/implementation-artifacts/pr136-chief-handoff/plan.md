@@ -259,6 +259,34 @@ path at a clean frozen head — not in this worker session (source-only).
 - F: shown/ACK/disposition alone → §5.7; the obligation stays owed until
   accepted evidence settles it; no artifact/notification text is approval.
 
+## 6b. Shared surfaces touched — coordination status
+
+This delta edits branch-local copies of surfaces other active lanes also
+touch. Nothing here edits, copies or assumes deployed any other lane's
+branch; the final integration must reconcile them at merge time. Pinned
+context read (read-only, via each PR's diff at its current head):
+
+- **#142 terminal-rebrief-retirement** (`gru/terminal-rebrief-retirement`,
+  draft) edits `rebrief-recovery.ts`, `server.ts`, `api.ts`, `main.ts`,
+  `docs/LEDGER.md` and tests — it retires stale re-brief requests on
+  terminal jobs. Overlap: the same files, adjacent seams. This delta keeps
+  the existing terminal refusal and adds only the phase fence/close; the
+  two changes are semantically disjoint but will need a merge pass.
+- **#144 review-rebrief-interlock** (`gru/review-rebrief-interlock`,
+  draft) edits `branch-idle.ts`, `silas-driver.ts`, the ops-dispatch
+  skill and tests — it fences review eligibility/admission on unresolved
+  re-briefs. Overlap: `resources/silas-skills/ops-dispatch/SKILL.md`
+  (documentation only; different sections) and suite pins. No code-level
+  conflict with the phase guards.
+- **#135 provider-pacing** (`gru/provider-pacing`, draft) edits
+  `fix-directive.ts`, `rebrief-recovery.ts`, `server.ts`, `service.ts`,
+  `main.ts`, config and tests for runtime pacing/retry. Overlap: shared
+  files, different seams (admission gates/rate limits). No semantic
+  dependency; merge-order coordination only.
+- **#132 recovery/schema** — migration 10 is additive and carries the
+  same landing-collision note as migration 9; renumber on integration if
+  another lane lands first.
+
 ## 7. Explicit limits and non-claims (honesty)
 
 - No new runtime attestation interface was invented. For a crash mid-turn
