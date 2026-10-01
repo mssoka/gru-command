@@ -135,10 +135,31 @@ function makeSpawner(
 const repos: FixtureRepo[] = [];
 const dbs: LedgerDb[] = [];
 const dirs: string[] = [];
+// T4 attribution state (phase pr144-t4-deep-attribution-20261001; test-local,
+// observation only): the afterEach close/cleanup loop runs OUTSIDE the test
+// body and its inherited 30000 ms bound. When the T4 case arms the observer,
+// that loop's cost is measured and labelled here — never inferred, never
+// summed into in-test phases. Non-T4 tests arm nothing and behave identically.
+let t4Observe = false;
+let t4StartAt: number | null = null;
+let t4BodySettled = false;
 afterEach(() => {
+  const observing = t4Observe;
+  t4Observe = false;
+  const cleanupStarted = performance.now();
   while (dbs.length > 0) dbs.pop()!.close();
   while (repos.length > 0) repos.pop()!.cleanup();
   while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  if (observing && t4StartAt !== null) {
+    console.log(`T4-ATTR ${JSON.stringify({
+      leg: 'suite', phase: 'outside-test-cleanup', boundary: 'end',
+      absMs: Math.round(performance.now() - t4StartAt),
+      elapsedMs: Math.round(performance.now() - cleanupStarted),
+      outcome: t4BodySettled ? 'completed' : 'test-body-still-settling',
+      note: 'db.close + repo.cleanup(prune+rm) + rmSync run in afterEach, OUTSIDE the test body and its inherited 30000 ms bound',
+    })}`);
+    t4StartAt = null;
+  }
 });
 
 describe('GitHub SHA-bound Perkins delivery', () => {
@@ -1714,30 +1735,80 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
         throw error;
       }
     };
-    const prepare = async (name: string, branch: string) => {
-      const repo = makeFixtureRepo(name);
+    // Finer attribution (phase pr144-t4-deep-attribution-20261001; test-local,
+    // observation only): T4-ATTR carries the absolute elapsed relative to this
+    // test's monotonic start on EVERY boundary plus per-phase elapsed, and
+    // subdivides fixture prep, the review-lifecycle boundaries this test
+    // drives (head probe, native lead start, reconciliation lookup), and the
+    // outside-body cleanup (emitted from the gated afterEach). Every real
+    // call is forwarded exactly once; ordering, mocks, refs, and assertions
+    // are untouched. The T4-PHASE marks above are emitted unchanged.
+    // Nested intervals (reconcile-lookup inside wave-round) are reported
+    // separately and are never summed into totals.
+    const t4Start = performance.now();
+    t4StartAt = t4Start;
+    t4Observe = true;
+    t4BodySettled = false;
+    const t4Attr = (leg: 'moved' | 'aborted' | 'suite', phase: string, boundary: 'start' | 'end', extra?: { elapsedMs?: number; outcome?: string; note?: string }): void => {
+      console.log(`T4-ATTR ${JSON.stringify({
+        leg, phase, boundary, absMs: Math.round(performance.now() - t4Start),
+        ...(extra?.elapsedMs !== undefined ? { elapsedMs: Math.round(extra.elapsedMs) } : {}),
+        ...(extra?.outcome !== undefined ? { outcome: extra.outcome } : {}),
+        ...(extra?.note !== undefined ? { note: extra.note } : {}),
+      })}`);
+    };
+    const t4Step = async <T>(leg: 'moved' | 'aborted', phase: string, run: () => Promise<T>): Promise<T> => {
+      t4Attr(leg, phase, 'start');
+      const started = performance.now();
+      try {
+        const result = await run();
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: 'completed' });
+        return result;
+      } catch (error) {
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: error instanceof Error ? `rejected:${error.name}` : 'rejected' });
+        throw error;
+      }
+    };
+    const t4Probe = (leg: 'moved' | 'aborted', branch: string): PrHeadProbe => {
+      const inner = localHeadProbe(branch);
+      return (input) => t4Step(leg, 'wave/head-probe', () => inner(input));
+    };
+    t4Attr('suite', 'test-start', 'start', { note: 'single case, both discriminators, inherited 30000 ms bound unchanged; nested intervals are never summed' });
+    const prepare = async (name: string, branch: string, leg: 'moved' | 'aborted') => {
+      const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' })));
       repos.push(repo);
-      repo.git(['checkout', '-b', branch]);
-      const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
-      const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
-      const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
-      const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
-      dirs.push(root, artifacts, sessions);
-      const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
-      dbs.push(db);
-      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      await t4Step(leg, 'fixture/branch-create', async () => { repo.git(['checkout', '-b', branch]); });
+      const target = await t4Step(leg, 'fixture/target-commit', async () => repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n'));
+      const temps = await t4Step(leg, 'fixture/tempdirs', () => {
+        const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+        const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+        const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+        dirs.push(root, artifacts, sessions);
+        return { root, artifacts, sessions };
+      });
+      const root = temps.root;
+      const artifacts = temps.artifacts;
+      const sessions = temps.sessions;
+      const ledger = await t4Step(leg, 'fixture/ledger-open', () => {
+        const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+        dbs.push(db);
+        return new LedgerApi(db.handle, { bus: new EventBus() });
+      });
       const port = new GitReviewPort(root, branch, target);
-      await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
-      const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
-      ledger.setJobStatus(job.id, 'working');
-      settleLane(ledger, job.id);
-      ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
-      attachOrigin(repo, branch, root);
+      await t4Step(leg, 'fixture/worktree-create', () => port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` }));
+      const job = await t4Step(leg, 'fixture/lane-register', () => {
+        const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+        ledger.setJobStatus(job.id, 'working');
+        settleLane(ledger, job.id);
+        ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
+        return job;
+      });
+      await t4Step(leg, 'fixture/origin-push', async () => { attachOrigin(repo, branch, root); });
       return { repo, ledger, port, artifacts, sessions, target, job, root };
     };
     // (a) The movement ref advances while the reconciliation lookup is
     // outstanding: the receipt is preserved, never recorded as delivery.
-    const moved = await t4Timed('moved', 'fixture-prep', () => prepare('perkins-t4-moved', 'feature/t4-moved'));
+    const moved = await t4Timed('moved', 'fixture-prep', () => prepare('perkins-t4-moved', 'feature/t4-moved', 'moved'));
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
       return t4Timed('moved', 'reconcile-lookup', async () => {
@@ -1762,10 +1833,10 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     });
     const escalations: string[] = [];
     const movedWave = new WaveRunner({
-      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, []),
+      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, [], () => t4Attr('moved', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' })),
       poster: { post, reconcile }, reviewArtifactRoot: moved.artifacts,
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
-      prHeadProbe: localHeadProbe('feature/t4-moved'),
+      prHeadProbe: t4Probe('moved', 'feature/t4-moved'),
     });
     const movedOutcome = asWave(await t4Timed('moved', 'wave-round', () => movedWave.runRound({ jobId: moved.job.id })));
     expect(movedOutcome.posted).toBe(false);
@@ -1777,8 +1848,9 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(unrecorded.reason).toContain('moved while the reconciliation lookup was outstanding');
     expect(unrecorded.receipt?.reviewId).toBe('9200');
     expect(moved.ledger.latestRoundEvent(movedOutcome.round.id, 'round.posted')).toBeNull();
+    t4Attr('moved', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup/git-ops are NESTED in wave-round — never summed' });
     // (b) The run's abort signal fires while the lookup is outstanding.
-    const aborted = await t4Timed('aborted', 'fixture-prep', () => prepare('perkins-t4-aborted', 'feature/t4-aborted'));
+    const aborted = await t4Timed('aborted', 'fixture-prep', () => prepare('perkins-t4-aborted', 'feature/t4-aborted', 'aborted'));
     const abortPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const abortReconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
       return t4Timed('aborted', 'reconcile-lookup', async () => {
@@ -1792,10 +1864,10 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     });
     const abortEscalations: string[] = [];
     const abortedWave = new WaveRunner({
-      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, []),
+      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, [], () => t4Attr('aborted', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' })),
       poster: { post: abortPost, reconcile: abortReconcile }, reviewArtifactRoot: aborted.artifacts,
       escalate: (title, detail) => abortEscalations.push(`${title}: ${detail}`),
-      prHeadProbe: localHeadProbe('feature/t4-aborted'),
+      prHeadProbe: t4Probe('aborted', 'feature/t4-aborted'),
     });
     const abortedOutcome = asWave(await t4Timed('aborted', 'wave-round', () => abortedWave.runRound({ jobId: aborted.job.id })));
     expect(abortedOutcome.posted).toBe(false);
@@ -1803,6 +1875,9 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { reason?: string };
     expect(unrecordedAbort.reason).toContain('aborted while the reconciliation lookup was outstanding');
     expect(aborted.ledger.latestRoundEvent(abortedOutcome.round.id, 'round.posted')).toBeNull();
+    t4Attr('aborted', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup is NESTED in wave-round — never summed' });
+    t4BodySettled = true;
+    t4Attr('suite', 'test-end', 'end', { outcome: 'completed' });
   });
 });
 
