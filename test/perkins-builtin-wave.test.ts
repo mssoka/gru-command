@@ -1699,7 +1699,6 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // bounded JSON lines so partial evidence survives an exceptional exit or
     // the unchanged 30000 ms bound. Emits stdout lines only; never alters
     // refs, ordering, mocks, or assertions.
-    const t4T0 = performance.now();
     const t4Mark = (kase: 'moved' | 'aborted', phase: string, boundary: 'start' | 'end', outcome: string, elapsedMs?: number): void => {
       console.log(`T4-PHASE ${JSON.stringify({ case: kase, phase, boundary, outcome, ...(elapsedMs !== undefined ? { elapsedMs: Math.round(elapsedMs) } : {}) })}`);
     };
