@@ -100,6 +100,50 @@ export function backoffDelayMs(
   return Math.min(jittered, maxMs);
 }
 
+/** Canonical pacing.auto-retry* payloads shared by BOTH producers — the
+ * supervisor's minion-turn retries and the workflow-owned retry loop used by
+ * Perkins lead/lens turns — so job/round-scoped ledger consumers never have
+ * to special-case two schemas. Context that varies per producer (jobId,
+ * roundId, agentId) rides the event ENVELOPE, never the payload. */
+export interface PacingRetryPayload {
+  readonly attempt: number;
+  readonly max_auto_retries: number;
+  readonly delay_ms: number;
+  readonly error: string;
+}
+
+export interface PacingExhaustedPayload {
+  readonly attempts: number;
+  readonly max_auto_retries: number;
+  readonly error: string;
+}
+
+export interface PacingRecoveredPayload {
+  readonly attempts: number;
+  readonly max_auto_retries: number;
+}
+
+export function pacingRetryPayload(
+  attempt: number,
+  maxAutoRetries: number,
+  delayMs: number,
+  error: string,
+): PacingRetryPayload {
+  return { attempt, max_auto_retries: maxAutoRetries, delay_ms: delayMs, error };
+}
+
+export function pacingExhaustedPayload(
+  attempts: number,
+  maxAutoRetries: number,
+  error: string,
+): PacingExhaustedPayload {
+  return { attempts, max_auto_retries: maxAutoRetries, error };
+}
+
+export function pacingRecoveredPayload(attempts: number, maxAutoRetries: number): PacingRecoveredPayload {
+  return { attempts, max_auto_retries: maxAutoRetries };
+}
+
 /** How a worker delivery's automatic rate-limit retry phase concluded.
  * `none` = no retry was pending when the delivery settled; `recovered` =
  * the retried turn delivered; `exhausted` = the bounded budget ran out (or
@@ -107,10 +151,26 @@ export function backoffDelayMs(
  * `superseded` = a restart, replacement, or shutdown took the turn over. */
 export type RetrySettlement = 'none' | 'recovered' | 'exhausted' | 'superseded';
 
+/** A settlement hook fault, distinct from a spent retry budget: the retry
+ * machinery could not report a disposition (supervisor bug, unknown agent,
+ * wiring fault). Call sites surface this as an internal error — never as
+ * 'automatic rate-limit retry exhausted', which would narrate a retry that
+ * never ran and mask the real defect. */
+export class RetrySettlementUnavailableError extends Error {
+  constructor(
+    readonly agentId: string,
+    readonly cause: unknown,
+  ) {
+    super(`retry settlement unavailable for agent ${agentId}: ${String(cause)}`);
+    this.name = 'RetrySettlementUnavailableError';
+  }
+}
+
 /** Await a delivered turn's bounded retry settlement, optionally raced
  * against a cancellation signal (shutdown must never hang a delivery).
- * A missing hook means no retry machinery is wired ('none'); a hook fault
- * fails loud as 'exhausted' rather than reporting a silent success. */
+ * A missing hook means no retry machinery is wired ('none'). A hook fault
+ * throws a named RetrySettlementUnavailableError: a system fault is never
+ * reported as a spent retry budget. */
 export async function settleRetries(
   hook: ((agentId: string) => Promise<RetrySettlement>) | undefined,
   agentId: string,
@@ -121,15 +181,17 @@ export async function settleRetries(
   let settle: Promise<RetrySettlement>;
   try {
     settle = hook(agentId);
-  } catch {
-    return 'exhausted';
+  } catch (cause) {
+    throw new RetrySettlementUnavailableError(agentId, cause);
   }
-  const raced = settle.catch(() => 'exhausted' as const);
-  if (signal === undefined) return raced;
+  const surfaced = settle.catch((cause: unknown) => {
+    throw new RetrySettlementUnavailableError(agentId, cause);
+  });
+  if (signal === undefined) return surfaced;
   let listener: (() => void) | null = null;
   try {
     return await Promise.race([
-      raced,
+      surfaced,
       new Promise<'cancelled'>((resolve) => {
         listener = () => resolve('cancelled');
         signal.addEventListener('abort', listener, { once: true });
@@ -234,10 +296,13 @@ interface PacingWaiter {
 
 /**
  * FIFO admission gate for model turns (owner ruling: queue, never reject,
- * never starve, never preempt). Two independent pools — worker minion turns
- * and Perkins review turns — each bounded by its configured limit; a limit
- * of 0 (or a disabled feature) admits everyone immediately, which is the
- * shipped default and preserves pre-pacing behavior exactly.
+ * never starve, never preempt). Two independent pools — worker MINION turns
+ * (the bound is named max_concurrent_minions; silas/bob/distiller/chat core
+ * turns are outside this pool by design, and residency stays with the
+ * worker-residency-budget undertaking) and Perkins review turns — each
+ * bounded by its configured limit; a limit of 0 (or a disabled feature)
+ * admits everyone immediately, which is the shipped default and preserves
+ * pre-pacing behavior exactly.
  *
  * Releases hand the slot straight to the head waiter, so a new arrival can
  * never jump an existing queue (no starvation). Every wait is visible via
@@ -311,6 +376,18 @@ export class PacingGate {
     const limit = this.limitFor(kind);
     if (limit === 0 || this.running[kind] < limit) {
       this.running[kind] += 1;
+      if (limit > 0) {
+        // A capped pool's admission history is part of the observability
+        // contract: record the immediate admit too (waited_ms: 0). An
+        // unlimited/disabled pool stays silent — the pre-pacing default
+        // must never inflate the ledger with an event per turn.
+        try {
+          this.recordEvent('pacing.admitted', input, { pool: kind, waited_ms: 0 });
+        } catch (error) {
+          this.running[kind] = Math.max(0, this.running[kind] - 1);
+          return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      }
       return Promise.resolve(this.mintLease(kind, 0));
     }
     return new Promise<PacingLease>((resolve, reject) => {
@@ -342,15 +419,27 @@ export class PacingGate {
         reject(error);
       };
       this.queues[kind].push(waiter);
+      let queuedRecorded = false;
       try {
         this.recordEvent('pacing.queued', waiter, {
           pool: kind, position: this.queues[kind].length, limit,
         });
+        queuedRecorded = true;
         input.queued?.({
           position: this.queues[kind].length, limit, reason: this.queueReason(kind),
         });
       } catch (error) {
         this.queues[kind].splice(this.queues[kind].indexOf(waiter), 1);
+        if (queuedRecorded) {
+          // The public record must never show a queue entry that never
+          // existed: compensate best-effort (a recorder failure here must
+          // not mask the caller's original error).
+          try {
+            this.recordEvent('pacing.queued-rollback', waiter, { pool: kind });
+          } catch {
+            // best-effort only — the caller's error is the loud one
+          }
+        }
         waiter.reject(error instanceof Error ? error : new Error(String(error)));
         return;
       }
@@ -407,7 +496,7 @@ export class PacingGate {
 
   private recordEvent(
     kind: string,
-    waiter: Pick<PacingWaiter, 'id' | 'label' | 'jobId' | 'agentId'>,
+    waiter: { readonly id: string; readonly label: string; readonly jobId?: string | null; readonly agentId?: string | null },
     payload: Record<string, unknown>,
   ): void {
     this.record?.({

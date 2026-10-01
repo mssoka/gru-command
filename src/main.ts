@@ -305,9 +305,13 @@ async function main(): Promise<number> {
     deployDrift?: DeployDriftTracker;
   } = {};
   let shuttingDown = false;
+  /** Service-stopping signal (pacing): aborts QUEUED admission waits and
+   * lets delivery settlement observe shutdown instead of hanging. */
+  const serviceStop = new AbortController();
   const shutdown = (signal: string, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    serviceStop.abort();
     logger.info('shutdown begin', { signal, exit_code: exitCode });
     const forceExit = setTimeout(() => {
       logger.error('shutdown timeout — forcing exit', { signal });
@@ -772,6 +776,7 @@ async function main(): Promise<number> {
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    stopSignal: serviceStop.signal,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -825,6 +830,7 @@ async function main(): Promise<number> {
     notifications,
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    stopSignal: serviceStop.signal,
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,
   });

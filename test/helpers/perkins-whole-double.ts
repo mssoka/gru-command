@@ -232,6 +232,10 @@ export function fakeWholeSpawner(
     let waveLimit = 4;
     let stubbornLeft = options.stubbornBatches ?? 0;
     while (worklist.length > 0) {
+      // A session disposed MID-TURN (e.g. the host ending a round whose
+      // review slot could not be re-acquired) stops the scripted lead here:
+      // no later tool call may run without its slot.
+      if (call.disposed === true) throw new Error('lead session disposed');
       const batch = worklist.splice(0, waveLimit);
       let runs: readonly string[];
       if (first && options.badRuns !== undefined) {

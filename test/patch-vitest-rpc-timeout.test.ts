@@ -26,6 +26,7 @@ const OPEN = [
   '\t\t\t"onCancel"',
   '\t\t],',
 ].join('\n');
+const PATCHED = `${OPEN}\n\t\ttimeout: -1,`;
 
 const created: string[] = [];
 
@@ -163,6 +164,34 @@ describe('vitest rpc-timeout patch tool', () => {
     expect(result.stderr).toContain('2 createBirpc sites');
   });
 
+  it('fails LOUD when the patch marker is present but a second site is still unpatched (r4 adversarial#10)', () => {
+    const cwd = fixtureDir();
+    writeRpcChunk(cwd, `${PATCHED}\n}));\n${OPEN}\n}));\n`);
+
+    const result = runTool(cwd);
+    expect(result.status).not.toBe(0);
+    // The marker alone must never read as "already patched": the shape guard
+    // still runs and names both sides.
+    expect(result.stderr).toMatch(/1 patched \+ 2 createBirpc sites/);
+    expect(result.stderr).toContain('update tools/patch-vitest-rpc-timeout.mjs');
+  });
+
+  it('patches every chunk in a multi-chunk dist and keeps each single-site invariant', () => {
+    const cwd = fixtureDir();
+    const dir = join(cwd, 'node_modules', 'vitest', 'dist', 'chunks');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'rpc.one.js'), `${OPEN}\n}));\n`);
+    writeFileSync(join(dir, 'rpc.two.js'), `${OPEN}\n}));\n`);
+
+    const result = runTool(cwd);
+    expect(result.status, result.stderr).toBe(0);
+    for (const entry of ['rpc.one.js', 'rpc.two.js']) {
+      const chunk = readFileSync(join(dir, entry), 'utf-8');
+      expect(chunk.split(PATCHED).length - 1, entry).toBe(1);
+      expect(chunk.split(OPEN).length - 1, entry).toBe(1);
+    }
+  });
+
   it('applies cleanly against the repository’s real installed vitest dist', () => {
     const cwd = resolve(import.meta.dirname, '..');
     const result = runTool(cwd);
@@ -173,8 +202,13 @@ describe('vitest rpc-timeout patch tool', () => {
     const dir = join(cwd, 'node_modules', 'vitest', 'dist', 'chunks');
     const rpcFiles = readdirSync(dir).filter((entry) => /^rpc\..+\.js$/.test(entry));
     expect(rpcFiles.length).toBeGreaterThan(0);
-    const chunks = rpcFiles.map((entry) => readFileSync(join(dir, entry), 'utf-8')).join('\n');
-    expect(chunks).toContain('timeout: -1,');
+    // EVERY chunk must carry exactly one patched site and no unpatched site:
+    // a partially patched dist can no longer pass on a joined contains.
+    for (const entry of rpcFiles) {
+      const chunk = readFileSync(join(dir, entry), 'utf-8');
+      expect(chunk.split(PATCHED).length - 1, entry).toBe(1);
+      expect(chunk.split(OPEN).length - 1, entry).toBe(1);
+    }
   });
 
   it('still propagates real test failures under the patched runner', () => {

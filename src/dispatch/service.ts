@@ -9,7 +9,7 @@ import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 import { recordFollowUpDelivery } from './fix-directive.js';
-import { settleRetries, type PacingGate, type PacingLease } from '../runtime/pacing.js';
+import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease } from '../runtime/pacing.js';
 import { PR_CREATION_RULE } from './pr-creation.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -52,6 +52,10 @@ export interface DispatchServiceOptions {
    * and releases its worker lease before waiting so the retry can
    * reacquire admission. Absent = no interlock. */
   readonly retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
+  /** Service-stopping signal: aborts a QUEUED admission wait and lets the
+   * settlement wait below observe shutdown instead of hanging. Absent =
+   * settlement is hook-owned and the queue wait is uncancellable. */
+  readonly stopSignal?: AbortSignal;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
   /** Extracts a minion's opt-in lessons block at delivery settle. */
@@ -159,6 +163,7 @@ export class DispatchService {
           id: job.id,
           label: input.title,
           jobId: job.id,
+          ...(this.opts.stopSignal !== undefined ? { signal: this.opts.stopSignal } : {}),
           queued: (info) => {
             queuedReason = info.reason;
             this.opts.ledger.noteJob(job.id, info.reason);
@@ -215,7 +220,49 @@ export class DispatchService {
       const settleTurn = async (failure: unknown | null): Promise<{ readonly ok: boolean; readonly error?: string }> => {
         // Release the slot first: the retry reacquires admission per attempt.
         releaseWorker();
-        const disposition = await settleRetries(this.opts.retrySettlement, handle.id);
+        const settlement = await settleRetries(this.opts.retrySettlement, handle.id, this.opts.stopSignal).then(
+          (value) => ({ ok: true as const, value }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        if (!settlement.ok) {
+          if (!(settlement.error instanceof RetrySettlementUnavailableError)) throw settlement.error;
+          // A settlement-system fault is not a rate-limit narrative: block
+          // the lane loudly with the internal error instead of narrating a
+          // retry that never ran.
+          const detail = String(settlement.error);
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.minion-error',
+            jobId: job.id,
+            payload: { agentId: handle.id, error: detail },
+          });
+          this.recordSettleOutcome(job.id, 'blocked');
+          this.opts.ledger.noteJob(job.id, `pacing settlement unavailable — internal error: ${detail.slice(0, 200)}`);
+          this.log('error', 'briefing turn settlement unavailable', {
+            job: job.id,
+            agent: handle.id,
+            error: detail,
+          });
+          return { ok: false as const, error: detail };
+        }
+        const disposition = settlement.value;
+        if (disposition === 'cancelled') {
+          // Service stopping: the turn's outcome is unknown. Never report it
+          // delivered, and leave a named note instead of claiming the lane is
+          // still queued.
+          const detail = 'dispatch stopped before the automatic retries settled';
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.minion-error',
+            jobId: job.id,
+            payload: { agentId: handle.id, error: detail },
+          });
+          this.recordSettleOutcome(job.id, 'blocked');
+          this.opts.ledger.noteJob(job.id, `pacing: ${detail}`);
+          this.log('warn', 'briefing turn settlement cancelled by shutdown', {
+            job: job.id,
+            agent: handle.id,
+          });
+          return { ok: false as const, error: detail };
+        }
         const retryFailed = disposition === 'exhausted' || disposition === 'superseded';
         if (failure !== null && disposition !== 'recovered') {
           const error = String(failure);

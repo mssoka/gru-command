@@ -3789,7 +3789,7 @@ describe('provider pacing through WaveRunner', () => {
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
       const event = ledger.latestRoundEvent(result.round.id, 'pacing.auto-retry');
       expect(event?.jobId).toBe('pacing-wave');
-      expect(event?.payload).toMatchObject({ retry: 1, delay_ms: 1, label: 'lead' });
+      expect(event?.payload).toMatchObject({ attempt: 1, max_auto_retries: 1, delay_ms: 1, label: 'lead' });
       expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
     } finally {
       await wave.shutdown();

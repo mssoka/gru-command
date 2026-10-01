@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -15,6 +15,7 @@ import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
+import { PacingGate } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -71,6 +72,8 @@ async function boot(opts: {
   /** Provider pacing: the bounded retry settlement to report for a
    * delivered directive/re-brief turn. Absent = no interlock. */
   retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
+  /** Provider pacing: worker gate forwarded to the silas routes. */
+  workerGate?: PacingGate;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -158,6 +161,7 @@ async function boot(opts: {
     wave,
     ledger,
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
+    ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     ...(opts.silasOps === false
       ? {}
       : {
@@ -1018,6 +1022,82 @@ describe('dispatch server (E8)', () => {
       expect(unknown.status).toBe(400);
       const empty = await call(h.port, 'POST', '/api/silas/escalate', { title: '' }, TOKEN);
       expect(empty.status).toBe(400);
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+describe('provider pacing worker-gate pass-through on the silas routes (r4 verification#2)', () => {
+  it('/api/silas/directive queues at the cap and is admitted on release', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await boot({ workerGate: gate });
+    const repo = makeFixtureRepo('fixture-silas-gate-directive');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'gate-dir', repo_path: repo.path, title: 'gate lane', briefing: 'b',
+      }, TOKEN);
+      // The dispatch turn released its own slot once it settled.
+      await vi.waitFor(() => expect(gate.view().worker.running).toBe(0));
+      const minionId = `agent-${h.spawns.length}`;
+      h.ledger.registerAgent({ id: minionId, role: 'minion', jobId: 'gate-dir' });
+      h.liveHandles.set(minionId, {
+        role: 'minion',
+        id: minionId,
+        sessionFile: null,
+        capabilities: FAKE_CAPABILITIES,
+        prompt: async () => {},
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
+        async dispose() {},
+      });
+      h.ledger.setJobStatus('gate-dir', 'in-review');
+
+      const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'other lane' });
+      const pending = call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'gate-dir', directive: 'Fix under the cap.',
+      }, TOKEN);
+      await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+      expect(gate.view().worker.queued[0]?.id).toBe('gate-dir');
+      // Queued means NOT delivered: no directive event while the slot is held.
+      expect(h.ledger.listJobEvents('gate-dir').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
+      holder.release();
+      const res = await pending;
+      expect(res.status).toBe(200);
+      expect(field<string>(res.json, 'job_id')).toBe('gate-dir');
+      expect(h.ledger.listJobEvents('gate-dir').some((event) => event.kind === 'silas.directive-sent')).toBe(true);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief queues at the cap and is admitted on release', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await boot({ workerGate: gate });
+    const repo = makeFixtureRepo('fixture-silas-gate-rebrief');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'gate-reb', repo_path: repo.path, title: 'gate lane', briefing: 'b',
+      }, TOKEN);
+      await vi.waitFor(() => expect(gate.view().worker.running).toBe(0));
+
+      const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'other lane' });
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'gate-reb', note: 'try again under the cap',
+      }, TOKEN);
+      await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+      expect(gate.view().worker.queued[0]?.id).toBe('gate-reb');
+      holder.release();
+      const res = await pending;
+      expect(res.status).toBe(200);
+      expect(field<string>(res.json, 'job_id')).toBe('gate-reb');
+      expect(h.ledger.listJobEvents('gate-reb').some((event) => event.kind === 'silas.rebrief')).toBe(true);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
     } finally {
       await h.close();
     }

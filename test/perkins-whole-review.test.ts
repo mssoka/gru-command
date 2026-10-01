@@ -22,7 +22,7 @@ import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWhol
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
-import { PacingGate } from '../src/runtime/pacing.js';
+import { PacingGate, type PacingAcquireInput, type PacingLease } from '../src/runtime/pacing.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall, type WholeSubmission } from './helpers/perkins-whole-double.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
 
@@ -68,7 +68,7 @@ function wholeHarness(
     priorConsolidatedFile?: string;
     beforeFreeze?: (repo: FixtureRepo) => void;
     reviewGate?: PacingGate;
-    pacing?: Pick<PerkinsWholeReviewOptions, 'rateLimitBackoff' | 'recordPacing' | 'pacingSleep' | 'pacingJitter'>;
+    pacing?: Pick<PerkinsWholeReviewOptions, 'rateLimitBackoff' | 'recordPacing' | 'pacingSleep' | 'pacingJitter' | 'pacingNow'>;
   },
 ): WholeHarness {
   const fixture = makeReviewRepo();
@@ -1970,5 +1970,69 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
     expect(firstWave).toBe(2);
     expect(gate.view().review).toMatchObject({ limit: 0, running: 0, queued: [] });
+  });
+  it('a failed lead re-acquire ends the round instead of running later turns ungated (r5 edge#0)', async () => {
+    class FailingReacquireGate extends PacingGate {
+      calls = 0;
+      override acquireReviewTurn(input: PacingAcquireInput): Promise<PacingLease> {
+        this.calls += 1;
+        if (this.calls === 3) return Promise.reject(new Error('review slot re-acquire unavailable'));
+        return super.acquireReviewTurn(input);
+      }
+    }
+    const gate = new FailingReacquireGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 2 });
+    const h = wholeHarness({ childAnswer: () => '[]', specialists: ['blind'] }, { reviewGate: gate });
+    // The wave completed, but the lead could not re-acquire its slot: the
+    // tool call fails AND the round ends (the lead is disposed), so no later
+    // lead turn can run outside the combined cap.
+    await expect(h.run()).rejects.toThrow(/lead session disposed/);
+    expect(h.toolErrors.some((entry) => entry.error.includes('re-acquire unavailable'))).toBe(true);
+    expect(gate.calls).toBeGreaterThanOrEqual(3);
+    expect(h.leadCalls).toHaveLength(1);
+    expect(h.leadCalls[0]?.disposed).toBe(true);
+    expect(h.childCalls).toHaveLength(1);
+    expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
+  });
+
+  it('shares one turn budget across retries: an elapsed retry never invokes the model (r4 verification#1)', async () => {
+    let clock = 1_000_000_000;
+    let firstChild: string | null = null;
+    const promptsByChild = new Map<string, number>();
+    const h = wholeHarness(
+      {
+        specialists: ['blind'],
+        childAnswer: (_prompt, call) => {
+          if (firstChild === null) firstChild = call.agentId;
+          promptsByChild.set(call.agentId, (promptsByChild.get(call.agentId) ?? 0) + 1);
+          if (call.agentId === firstChild) {
+            // Consume most of the 10-minute child budget on each model call
+            // and stay in the rate-limit class so the bounded retry runs.
+            clock += 9_400_000;
+            throw new Error('429 too many requests');
+          }
+          return '[]';
+        },
+      },
+      {
+        pacing: {
+          rateLimitBackoff: { baseMs: 100, maxMs: 1_000, maxRetries: 3, patterns: [] },
+          pacingNow: () => clock,
+          pacingSleep: async (ms) => {
+            clock += ms;
+          },
+          pacingJitter: () => 0,
+        },
+      },
+    );
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    // First attempt: exactly TWO model invocations — the shared budget guard
+    // stopped the third BEFORE the model ran. The lead's attempt-2 child
+    // then succeeds (one more invocation), so the round still completes.
+    const firstChildId = [...promptsByChild.keys()][0]!;
+    expect(promptsByChild.get(firstChildId)).toBe(2);
+    expect([...promptsByChild.values()].reduce((sum, count) => sum + count, 0)).toBe(3);
+    const envelope = result.lensEnvelopes.find((entry) => entry.lens === 'blind' && entry.attempt === 1);
+    expect(envelope?.failureKind).toBe('timeout');
   });
 });

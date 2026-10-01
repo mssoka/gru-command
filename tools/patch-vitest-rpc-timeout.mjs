@@ -87,22 +87,36 @@ if (chunks.length === 0) {
 }
 
 let patchedCount = 0;
+const countOf = (text, needle) => text.split(needle).length - 1;
 for (const file of chunks) {
   const text = readFileSync(file, 'utf-8');
-  if (text.includes(PATCHED)) {
+  // Invariants for the single pinned site: either the site is OPEN-only
+  // (exactly one OPEN, zero PATCHED) or it carries the patch (exactly one
+  // PATCHED; its OPEN remains as the embedded prefix). Anything else —
+  // including a chunk that already carries the patch AND a second unpatched
+  // site — is a layout change and fails LOUD. The marker alone is NOT proof
+  // of a fully patched chunk.
+  const patchedSites = countOf(text, PATCHED);
+  const openSites = countOf(text, OPEN);
+  if (patchedSites === 1) {
+    if (openSites !== 1) {
+      throw new Error(
+        `vitest-rpc-timeout: unexpected ${file} shape (${patchedSites} patched + ${openSites} createBirpc sites) — ` +
+          'the pinned vitest dist changed; update tools/patch-vitest-rpc-timeout.mjs before testing',
+      );
+    }
     note(`vitest-rpc-timeout: already patched ${file}`);
     continue;
   }
-  const occurrences = text.split(OPEN).length - 1;
-  if (occurrences !== 1) {
+  if (patchedSites !== 0 || openSites !== 1) {
     throw new Error(
-      `vitest-rpc-timeout: unexpected ${file} shape (${occurrences} createBirpc sites) — ` +
+      `vitest-rpc-timeout: unexpected ${file} shape (${patchedSites} patched + ${openSites} createBirpc sites) — ` +
         'the pinned vitest dist changed; update tools/patch-vitest-rpc-timeout.mjs before testing',
     );
   }
   writeFileSync(file, text.replace(OPEN, PATCHED));
-  const verified = readFileSync(file, 'utf-8').includes(PATCHED);
-  if (!verified) {
+  const verified = readFileSync(file, 'utf-8');
+  if (countOf(verified, PATCHED) !== 1 || countOf(verified, OPEN) !== 1) {
     throw new Error(`vitest-rpc-timeout: write verification failed for ${file}`);
   }
   patchedCount += 1;

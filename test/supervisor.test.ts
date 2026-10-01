@@ -12,6 +12,7 @@ import {
   type SupervisorRegistry,
 } from '../src/supervision/supervisor.js';
 import { DEFAULT_DECISIONS_CONFIG, type Role } from '../src/config.js';
+import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import type { DecisionService } from '../src/decisions/types.js';
 import { deterministicOutcome } from '../src/decisions/service.js';
 import type {
@@ -1918,7 +1919,7 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     h.dispose();
   });
 
-  it('a disposed-session rejection clears the incident with no retry and no ladder (r4 coverage)', async () => {
+  it('a typed disposal rejection clears the incident as superseded with no retry and no ladder (r4 coverage/#11)', async () => {
     const sleeper = new ManualSleeper();
     const h = boot(undefined, {
       rateLimitBackoff: rateLimitPolicy(),
@@ -1929,10 +1930,12 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-gone' };
     h.registry.adopt(handle);
     handle.promptHook = () => {
-      throw new Error('session disposed while prompting');
+      throw new WorkerDisposalInProgressError();
     };
     emitFailure(handle, '429 too many requests');
+    const settled = h.supervisor.awaitRetrySettlement(handle.id);
     await sleeper.release();
+    await expect(settled).resolves.toBe('superseded');
     await sleep(20);
     expect(sleeper.delays).toEqual([100]);
     expect(
@@ -1941,6 +1944,85 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     expect(
       h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered'),
     ).toBe(false);
+    h.dispose();
+  });
+
+  it('untyped text merely containing “disposed” is NOT superseded: the failure ladders (r4 adversarial#11)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-text-disposed', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-text' };
+    h.registry.adopt(handle);
+    handle.promptHook = () => {
+      throw new Error('stream disposed before flush');
+    };
+    emitFailure(handle, '429 too many requests');
+    const settled = h.supervisor.awaitRetrySettlement(handle.id);
+    await sleeper.release();
+    // Not 'superseded' on a text sniff: the incident exhausts and the
+    // existing ladder owns the failure (no silent stop).
+    await expect(settled).resolves.toBe('exhausted');
+    await sleep(20);
+    expect(sleeper.delays).toEqual([100]);
+    h.dispose();
+  });
+
+  it('retries on a configured provider signature and misses without it (r4 verification#0)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy({ patterns: [/pacing code \d+/i] }),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-pattern', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-pattern' };
+    h.registry.adopt(handle);
+    let calls = 0;
+    handle.promptHook = () => {
+      calls += 1;
+      if (calls === 1) throw new Error('pacing code 1302 from the provider');
+    };
+    // The configured signature (outside the generic 429 family) reaches the
+    // consumer: retry scheduled, then a clean retry recovers.
+    emitFailure(handle, 'pacing code 1302 from the provider');
+    expect(sleeper.delays).toEqual([100]);
+    await sleeper.release();
+    expect(sleeper.delays).toEqual([100, 200]);
+    await sleeper.release();
+    await vi.waitFor(() =>
+      expect(
+        h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered'),
+      ).toBe(true),
+    );
+    h.dispose();
+  });
+
+  it('emits the canonical pacing payload with job attribution on supervisor retries (r4 adversarial#9)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-attributed', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-attributed' };
+    h.registry.adopt(handle);
+    h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-attributed' });
+    emitFailure(handle, '429 too many requests');
+    const retry = h.api.listEvents({ limit: 100 }).find((event) => event.kind === 'pacing.auto-retry');
+    // Same canonical keys as the workflow producer, and the job is findable
+    // by job-scoped queries (envelope, not payload).
+    expect(retry?.jobId).toBe('job-attributed');
+    expect(Object.keys(retry?.payload as Record<string, unknown>).sort()).toEqual([
+      'attempt',
+      'delay_ms',
+      'error',
+      'max_auto_retries',
+    ]);
     h.dispose();
   });
 

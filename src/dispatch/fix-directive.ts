@@ -68,6 +68,14 @@ export async function routeFixDirectiveToMinion(
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
+      // Active-incident attribution (B1): if an automatic retry is already
+      // covering this handle, wait for its settlement BEFORE prompting.
+      // Otherwise the new directive and the retry would deliver overlapping
+      // prompts on one session, and this turn's failure could be settled by
+      // the other turn's outcome. Await before taking the worker slot — the
+      // retry re-acquires its own slot and must not be blocked by ours.
+      const pending = await settleRetries(input.retrySettlement, handle.id, input.signal);
+      if (pending === 'cancelled') return { delivered: false, note: 'review operation aborted' };
       let lease: PacingLease | null = null;
       if (input.workerGate !== undefined) {
         lease = await input.workerGate.acquireWorkerTurn({
@@ -89,9 +97,14 @@ export async function routeFixDirectiveToMinion(
       }
       if (promptError instanceof WorkerDisposalInProgressError) {
         // A resident-budget reclaim may be disposing this handle under us
-        // (typed handshake): fall through to the resume/re-brief path —
-        // remembering THIS handle's logical session — instead of dropping
-        // the directive with an opaque failure.
+        // (typed handshake): settle any automatic retry covering it BEFORE
+        // falling through, so the retry's own delivery and a resumed /
+        // session-file fallback can never overlap (two writers on one
+        // session) — and a 'recovered' disposition is reported as the
+        // delivery it is.
+        const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+        if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+        if (disposition === 'recovered') return { delivered: true, minionId: minion.id };
         evictedSessionFile = handle.sessionFile;
         continue;
       }
@@ -281,6 +294,10 @@ export async function rebriefFreshMinion(
     briefing: string | null;
     /** Resume this session file instead of minting fresh (boot recovery). */
     resumeFile?: string | null;
+    /** Service-stopping signal: aborts a QUEUED admission wait and lets the
+     * settlement race below observe cancellation instead of hanging
+     * shutdown. Absent = settlement remains hook-owned. */
+    signal?: AbortSignal;
     /** Called after the worker is registered and BEFORE its prompt is
      * delivered — the durable re-brief marker binds the worker here, so a
      * crash mid-turn leaves a resumable pointer behind. */
@@ -312,6 +329,7 @@ export async function rebriefFreshMinion(
       id: input.jobId,
       label: `re-brief → ${input.jobId}`,
       jobId: input.jobId,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
     });
   }
   try {
@@ -348,7 +366,7 @@ export async function rebriefFreshMinion(
     // rate-limited turn whose bounded retry is still carrying the prompt
     // must not land the re-brief/delivery markers early, and a rejection
     // whose retry recovers is a delivery, not a failure.
-    const disposition = await settleRetries(input.retrySettlement, handle.id);
+    const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
     if (disposition === 'cancelled') {
       throw new Error(`re-brief turn on ${handle.id} was cancelled before its automatic retries settled`);
     }

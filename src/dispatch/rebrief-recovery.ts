@@ -344,6 +344,7 @@ function runRebriefTurn(
     worktrees: deps.worktrees,
     ...(deps.workerGate !== undefined ? { workerGate: deps.workerGate } : {}),
     ...(deps.retrySettlement !== undefined ? { retrySettlement: deps.retrySettlement } : {}),
+    ...(deps.stopSignal !== undefined ? { signal: deps.stopSignal } : {}),
     jobId: input.jobId,
     note: input.note,
     briefing: input.briefing,

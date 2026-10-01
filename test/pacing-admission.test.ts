@@ -8,6 +8,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { routeFixDirectiveToMinion, rebriefFreshMinion } from '../src/dispatch/fix-directive.js';
 import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
+import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import { BoardEngine } from '../src/board/engine.js';
 import type { AgentHandle } from '../src/runtime/types.js';
@@ -143,7 +144,8 @@ describe('worker admission through dispatch (FIFO queue, honest queue note, rele
       expect(api.getJob('job-b')?.note ?? '').not.toContain('queued:');
       expect(recordingGate.view().worker.queued).toHaveLength(0);
       expect(recordingGate.view().worker.running).toBe(1);
-      expect(events).toEqual(['pacing.queued', 'pacing.admitted']);
+      // Capped immediate admits are recorded too (waiter A), then B's wait.
+      expect(events).toEqual(['pacing.admitted', 'pacing.queued', 'pacing.admitted']);
 
       spawned[1]!.settle();
       await vi.waitFor(() => expect(recordingGate.view().worker.running).toBe(0));
@@ -211,9 +213,137 @@ describe('worker admission through directive deliveries', () => {
     holder.release();
     await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-1' });
     expect(delivered).toEqual([`fix the lane\n\n${PR_CREATION_RULE}`]);
-    expect(events).toEqual(['pacing.queued', 'pacing.admitted']);
+    expect(events).toEqual(['pacing.admitted', 'pacing.queued', 'pacing.admitted']);
     expect(gate.view().worker.running).toBe(0);
     expect(gate.view().worker.queued).toHaveLength(0);
+  });
+
+  it('waits out a pending retry incident before prompting the live minion (r4 edge#1 attribution)', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const delivered: string[] = [];
+    const handle = {
+      id: 'minion-1',
+      prompt: async (text: string) => { delivered.push(text); },
+    } as unknown as AgentHandle;
+    let settleNow!: (value: 'recovered') => void;
+    let settleCalls = 0;
+    const routing = routeFixDirectiveToMinion({
+      registry: {
+        getHandle: () => handle,
+        spawn: async () => handle,
+        disposeHandle: async () => {},
+      },
+      ledger: {
+        listAgents: () => [
+          { id: 'minion-1', jobId: 'job-1', role: 'minion' } as unknown as ReturnType<LedgerApi['listAgents']>[number],
+        ],
+        registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
+        getJob: (() => null) as unknown as LedgerApi['getJob'],
+      },
+      worktrees: { listWorktrees: () => [lane] } as unknown as WorktreePort,
+      jobId: 'job-1',
+      directive: 'fix the lane',
+      signal: new AbortController().signal,
+      workerGate: gate,
+      retrySettlement: () => {
+        settleCalls += 1;
+        if (settleCalls === 1) return new Promise((resolve) => { settleNow = resolve; });
+        return Promise.resolve('none');
+      },
+    });
+    await flush();
+    // The pending incident is awaited BEFORE the prompt and BEFORE a slot is
+    // taken: the other turn's retry still owns the handle and must not race
+    // this delivery (nor be blocked by this delivery's slot).
+    expect(delivered).toHaveLength(0);
+    expect(gate.view().worker.running).toBe(0);
+    settleNow('recovered');
+    await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-1' });
+    expect(delivered).toEqual([`fix the lane\n\n${PR_CREATION_RULE}`]);
+    expect(settleCalls).toBe(2); // pre-prompt interlock + post-prompt settlement
+    expect(gate.view().worker.running).toBe(0);
+  });
+
+  it('a disposal rejection consults the retry settlement first: recovered means the directive already landed (r4 adversarial#0)', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const spawns: string[] = [];
+    const handle = {
+      id: 'minion-1',
+      sessionFile: '/tmp/minion-1.jsonl',
+      prompt: async () => { throw new WorkerDisposalInProgressError(); },
+    } as unknown as AgentHandle;
+    const routing = routeFixDirectiveToMinion({
+      registry: {
+        getHandle: () => handle,
+        spawn: async () => { spawns.push('fresh'); return handle; },
+        disposeHandle: async () => {},
+      },
+      ledger: {
+        listAgents: () => [
+          { id: 'minion-1', jobId: 'job-1', role: 'minion', sessionFile: '/tmp/minion-1.jsonl' } as unknown as ReturnType<LedgerApi['listAgents']>[number],
+        ],
+        registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
+        getJob: (() => null) as unknown as LedgerApi['getJob'],
+      },
+      worktrees: { listWorktrees: () => [lane] } as unknown as WorktreePort,
+      jobId: 'job-1',
+      directive: 'fix the lane',
+      signal: new AbortController().signal,
+      workerGate: gate,
+      retrySettlement: async () => 'recovered',
+    });
+    // The retry covering the evicted handle delivered the directive: no
+    // resume/fresh spawn may run (two writers on one session).
+    await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-1' });
+    expect(spawns).toEqual([]);
+  });
+
+  it('a disposal rejection with an exhausted retry resumes the evicted session instead of overlapping it (r4 adversarial#0)', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const spawned: Array<{ id: string; resumeFile?: string }> = [];
+    const delivered: string[] = [];
+    const live = {
+      id: 'minion-1',
+      sessionFile: '/tmp/minion-1.jsonl',
+      prompt: async () => { throw new WorkerDisposalInProgressError(); },
+    } as unknown as AgentHandle;
+    const fresh = {
+      id: 'minion-2',
+      sessionFile: '/tmp/minion-2.jsonl',
+      prompt: async (text: string) => { delivered.push(text); },
+      dispose: async () => {},
+    } as unknown as AgentHandle;
+    let settleCalls = 0;
+    const routing = routeFixDirectiveToMinion({
+      registry: {
+        getHandle: () => live,
+        spawn: async (_role, options) => {
+          spawned.push({ id: 'minion-2', ...(options?.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}) });
+          return fresh;
+        },
+        disposeHandle: async () => {},
+      },
+      ledger: {
+        listAgents: () => [
+          { id: 'minion-1', jobId: 'job-1', role: 'minion', sessionFile: '/tmp/minion-1.jsonl' } as unknown as ReturnType<LedgerApi['listAgents']>[number],
+        ],
+        registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
+        getJob: (() => null) as unknown as LedgerApi['getJob'],
+      },
+      worktrees: { listWorktrees: () => [lane] } as unknown as WorktreePort,
+      jobId: 'job-1',
+      directive: 'fix the lane',
+      signal: new AbortController().signal,
+      workerGate: gate,
+      retrySettlement: async () => {
+        settleCalls += 1;
+        return settleCalls === 1 ? 'exhausted' : 'none';
+      },
+    });
+    await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-2' });
+    // The evicted logical session is resumed — never a second writer on it.
+    expect(spawned).toEqual([{ id: 'minion-2', resumeFile: '/tmp/minion-1.jsonl' }]);
+    expect(delivered).toEqual([`fix the lane\n\n${PR_CREATION_RULE}`]);
   });
 
   it('gates the fresh-minion fallback too: the spawn itself waits for a slot', async () => {

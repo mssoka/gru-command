@@ -415,6 +415,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           registry: ops.registry,
           ledger: options.ledger,
           worktrees: ops.worktrees,
+          signal: controller.signal,
           ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
           ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
           jobId,

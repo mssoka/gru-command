@@ -138,6 +138,9 @@ export interface PerkinsWholeReviewOptions {
   readonly recordPacing?: PacingEventRecorder;
   readonly pacingSleep?: RateLimitRetryOptions['sleep'];
   readonly pacingJitter?: RateLimitRetryOptions['jitter'];
+  /** Clock seam for the shared per-turn retry budget (tests pin
+   * remaining/elapsed deterministically; default Date.now). */
+  readonly pacingNow?: () => number;
   readonly onProgress?: (progress: ReviewProgress) => void;
   readonly onAgent?: (input: {
     readonly phase: 'lead' | 'specialist';
@@ -753,10 +756,11 @@ export class PerkinsWholeReview {
       signals: readonly (AbortSignal | undefined)[], acquire: () => Promise<void>, release: () => void,
       hasSubmission: () => boolean,
     ): Promise<void> => {
+      const now = this.pacingOptions.pacingNow ?? Date.now;
       let remaining = budgetMs;
       await withRateLimitRetries(async () => {
         await acquire();
-        const start = Date.now();
+        const start = now();
         try {
           if (remaining <= 0) throw new ReviewTurnTimeoutError(budgetMs);
           await boundedPrompt(handle, prompt, remaining, signals);
@@ -766,7 +770,7 @@ export class PerkinsWholeReview {
           release();
           throw error;
         } finally {
-          remaining -= Math.max(0, Date.now() - start);
+          remaining -= Math.max(0, now() - start);
         }
       }, {
         policy: this.pacingOptions.rateLimitBackoff ?? null,
@@ -1251,9 +1255,12 @@ export class PerkinsWholeReview {
           // The wave completed, but the lead could not re-acquire its review
           // slot before this result would return to it. The tool call fails,
           // so no finding reaches the lead: commit the real runs as
-          // undelivered instead of erasing them (T13/R17).
+          // undelivered instead of erasing them (T13/R17). End the round as
+          // well — error results must not let the lead run later turns
+          // WITHOUT a review slot (the combined cap would be exceeded).
           for (const result of childResults) undeliveredRuns.add(result.resultId);
           commitResults();
+          void lead?.dispose();
           throw acquireError instanceof Error ? acquireError : new Error(String(acquireError));
         }
         commitResults();

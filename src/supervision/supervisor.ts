@@ -10,8 +10,12 @@ import { deterministicFailureClass, supervisionDecisionRequest } from '../decisi
 import {
   backoffDelayMs,
   isRateLimitErrorText,
+  pacingExhaustedPayload,
+  pacingRecoveredPayload,
+  pacingRetryPayload,
   type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement,
 } from '../runtime/pacing.js';
+import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -1017,22 +1021,17 @@ export class Supervisor {
       return false;
     }
     if (incident.attempts >= incident.maxRetries) {
-      this.recordEvent('pacing.auto-retry-exhausted', agent.agentId, {
-        attempts: incident.attempts,
-        max_auto_retries: incident.maxRetries,
-        error: incident.lastError.slice(0, 500),
-      });
+      this.recordEvent('pacing.auto-retry-exhausted', agent.agentId, pacingExhaustedPayload(
+        incident.attempts, incident.maxRetries, incident.lastError.slice(0, 500),
+      ));
       this.clearRateLimitRetry(agent, 'exhausted');
       return false;
     }
     incident.attempts += 1;
     const delayMs = backoffDelayMs(incident.attempts, policy.baseMs, policy.maxMs, this.jitter);
-    this.recordEvent('pacing.auto-retry', agent.agentId, {
-      attempt: incident.attempts,
-      max_auto_retries: incident.maxRetries,
-      delay_ms: delayMs,
-      error: incident.lastError.slice(0, 500),
-    });
+    this.recordEvent('pacing.auto-retry', agent.agentId, pacingRetryPayload(
+      incident.attempts, incident.maxRetries, delayMs, incident.lastError.slice(0, 500),
+    ));
     this.log('warn', 'rate-limit failure — automatic retry scheduled', {
       agent_id: agent.agentId,
       attempt: incident.attempts,
@@ -1118,9 +1117,9 @@ export class Supervisor {
         return;
       }
       if (rejection === null) {
-        this.recordEvent('pacing.auto-retry-recovered', agent.agentId, {
-          attempts: incident.attempts,
-        });
+        this.recordEvent('pacing.auto-retry-recovered', agent.agentId, pacingRecoveredPayload(
+          incident.attempts, incident.maxRetries,
+        ));
         this.clearRateLimitRetry(agent, 'recovered');
         this.log('info', 'automatic rate-limit retry recovered the turn', {
           agent_id: agent.agentId,
@@ -1134,9 +1133,11 @@ export class Supervisor {
         incident.failureSeq += 1;
         incident.lastError = text;
         if (this.scheduleRateLimitRetry(agent, incident)) return;
-      } else if (/disposed/i.test(text)) {
-        // The session went away under the retry (shutdown or replacement):
-        // no failure to ladder, no retry to continue.
+      } else if (rejection instanceof WorkerDisposalInProgressError || handle.state === 'disposed') {
+        // The session went away under the retry (typed disposal handshake or
+        // a persisted disposed state): no failure to ladder, no retry to
+        // continue. Arbitrary text containing 'disposed' must NOT land here —
+        // a genuine non-rate-limit failure keeps its stop/escalation path.
         this.clearRateLimitRetry(agent, 'superseded');
         this.log('warn', 'rate-limit retry delivery ended on a disposed session', {
           agent_id: agent.agentId,
@@ -1803,7 +1804,12 @@ export class Supervisor {
   /** Durable ledger event that never breaks the watchdog on a ledger fault. */
   private recordEvent(kind: string, agentId: string | null, payload: Record<string, unknown>): void {
     try {
-      this.ledger.appendCustomEvent({ kind, agentId, payload });
+      // Job attribution rides the envelope: a supervisor-owned worker retry
+      // must be findable by job-scoped queries, exactly like the workflow
+      // producer's events. Resolved per event (bounded: retry events are
+      // rare) and best-effort (a missing row simply omits the job).
+      const jobId = agentId === null ? null : (this.ledger.getAgent(agentId)?.jobId ?? null);
+      this.ledger.appendCustomEvent({ kind, agentId, jobId, payload });
     } catch (error) {
       this.log('warn', 'supervision ledger event could not be recorded', {
         kind,

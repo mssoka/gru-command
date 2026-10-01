@@ -5,8 +5,12 @@ import {
   compileRateLimitPatterns,
   isRateLimitErrorText,
   PacingGate,
+  pacingExhaustedPayload,
+  pacingRecoveredPayload,
+  pacingRetryPayload,
   resolvePacingPolicy,
   resolveRateLimitBackoff,
+  RetrySettlementUnavailableError,
   settleRetries,
 } from '../src/runtime/pacing.js';
 
@@ -213,12 +217,13 @@ describe('FIFO admission gate (minion turns + Perkins review turns)', () => {
     expect(cLease.waitedMs).toBe(0);
     cLease.release();
     expect(events.map((event) => event.kind)).toEqual([
+      'pacing.admitted',
       'pacing.queued',
       'pacing.queued',
       'pacing.admitted',
       'pacing.admitted',
     ]);
-    expect(events[2]?.payload).toMatchObject({ id: 'job-b', pool: 'worker' });
+    expect(events[3]?.payload).toMatchObject({ id: 'job-b', pool: 'worker' });
   });
 
   it('never starves: a fresh arrival cannot jump an existing queue', async () => {
@@ -300,12 +305,13 @@ describe('FIFO admission gate (minion turns + Perkins review turns)', () => {
     expect(resolved.gate.view().worker.running).toBe(2);
     const queued = resolved.gate.acquireWorkerTurn({ id: 'c', label: 'C' });
     expect(resolved.gate.view().worker.queued).toHaveLength(1);
-    // The injected recorder and clock reach the gate: the queued wait is
-    // recorded and its waited_ms is measured on the injected clock.
-    expect(events).toEqual(['pacing.queued']);
+    // The injected recorder and clock reach the gate: capped immediate
+    // admits are recorded (waited_ms 0) and the queued wait is measured on
+    // the injected clock.
+    expect(events).toEqual(['pacing.admitted', 'pacing.admitted', 'pacing.queued']);
     clock = 1_500;
     a.release();
-    expect(events).toEqual(['pacing.queued', 'pacing.admitted']);
+    expect(events).toEqual(['pacing.admitted', 'pacing.admitted', 'pacing.queued', 'pacing.admitted']);
     const admitted = await queued;
     expect(admitted.waitedMs).toBe(500);
     b.release();
@@ -314,10 +320,12 @@ describe('FIFO admission gate (minion turns + Perkins review turns)', () => {
 });
 
 describe('retry settlement consumption gate', () => {
-  it('maps hook faults to exhausted, missing hooks to none, and passes dispositions through', async () => {
+  it('surfaces hook faults as a named unavailable error, missing hooks as none, and passes dispositions through', async () => {
     expect(await settleRetries(undefined, 'agent-a')).toBe('none');
-    expect(await settleRetries(() => { throw new Error('hook fault'); }, 'agent-a')).toBe('exhausted');
-    expect(await settleRetries(async () => { throw new Error('hook rejection'); }, 'agent-a')).toBe('exhausted');
+    await expect(settleRetries(() => { throw new Error('hook fault'); }, 'agent-a'))
+      .rejects.toBeInstanceOf(RetrySettlementUnavailableError);
+    await expect(settleRetries(async () => { throw new Error('hook rejection'); }, 'agent-a'))
+      .rejects.toThrow(/retry settlement unavailable for agent agent-a: Error: hook rejection/);
     expect(await settleRetries(async () => 'recovered', 'agent-a')).toBe('recovered');
     expect(await settleRetries(async () => 'superseded', 'agent-a')).toBe('superseded');
   });
@@ -357,12 +365,12 @@ describe('pacing callback failures never strand admission', () => {
     expect(gate.view().worker.running).toBe(0);
   });
 
-  it('a throwing queue recorder rejects loudly without leaking a waiter', async () => {
+  it('a throwing admission recorder rejects loudly without leaking a slot or waiter', async () => {
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0,
       record: () => { throw new Error('ledger unavailable'); } });
-    const holder = await gate.acquireWorkerTurn({ id: 'a', label: 'a' });
-    await expect(gate.acquireWorkerTurn({ id: 'bad', label: 'bad' })).rejects.toThrow('ledger unavailable');
-    holder.release();
+    // A capped immediate admit records too: the recorder failure rejects
+    // that acquire without consuming the slot.
+    await expect(gate.acquireWorkerTurn({ id: 'a', label: 'a' })).rejects.toThrow('ledger unavailable');
     expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
   });
 
@@ -377,5 +385,66 @@ describe('pacing callback failures never strand admission', () => {
     await failed;
     (await next).release();
     expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+  });
+});
+
+describe('pacing ledger honesty (r4 triage rows A3/A4/A9)', () => {
+  it('records a capped immediate admit with waited_ms 0 and stays silent without a limit', async () => {
+    const events: Array<{ kind: string; payload?: unknown }> = [];
+    const capped = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 1,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => events.push({ kind: event.kind, payload: event.payload }),
+    });
+    const lease = await capped.acquireWorkerTurn({ id: 'job-a', label: 'Job A', jobId: 'job-a' });
+    expect(events).toEqual([
+      { kind: 'pacing.admitted', payload: { id: 'job-a', label: 'Job A', pool: 'worker', waited_ms: 0 } },
+    ]);
+    lease.release();
+
+    const unlimited = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => events.push({ kind: event.kind, payload: event.payload }),
+    });
+    (await unlimited.acquireWorkerTurn({ id: 'job-b', label: 'Job B' })).release();
+    // No configured limit = pre-pacing behavior: the ledger stays untouched.
+    expect(events).toHaveLength(1);
+  });
+
+  it('compensates a phantom queue entry when the caller callback fails after the queued event', async () => {
+    const kinds: string[] = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 1,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => kinds.push(event.kind),
+    });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    await expect(
+      gate.acquireWorkerTurn({ id: 'job-x', label: 'job-x', queued: () => { throw new Error('lane note failed'); } }),
+    ).rejects.toThrow('lane note failed');
+    // The immediate holder admit, the queued entry, and the rollback that
+    // keeps the public record free of a queue entry that never existed.
+    expect(kinds).toEqual(['pacing.admitted', 'pacing.queued', 'pacing.queued-rollback']);
+    expect(gate.view().worker.queued).toEqual([]);
+    holder.release();
+  });
+
+  it('pins the canonical pacing payloads shared by both retry producers', () => {
+    expect(pacingRetryPayload(2, 5, 400, '429')).toEqual({
+      attempt: 2,
+      max_auto_retries: 5,
+      delay_ms: 400,
+      error: '429',
+    });
+    expect(pacingExhaustedPayload(5, 5, '429')).toEqual({
+      attempts: 5,
+      max_auto_retries: 5,
+      error: '429',
+    });
+    expect(pacingRecoveredPayload(2, 5)).toEqual({ attempts: 2, max_auto_retries: 5 });
   });
 });

@@ -15,7 +15,39 @@ describe('workflow-owned rate-limit retry', () => {
     expect(attempts).toBe(4);
     expect(delays).toEqual([150, 250, 250]);
     expect(events.map((event) => event.kind)).toEqual(['pacing.auto-retry', 'pacing.auto-retry', 'pacing.auto-retry', 'pacing.auto-retry-exhausted']);
-    expect(events.at(-1)?.payload.retry).toBe(3);
+    // Canonical payload schema shared with the supervisor's producer.
+    expect(Object.keys(events[0]!.payload).sort()).toEqual(['attempt', 'delay_ms', 'error', 'max_auto_retries']);
+    expect(events[0]!.payload).toMatchObject({ attempt: 1, max_auto_retries: 3, delay_ms: 150 });
+    const last = events.at(-1);
+    expect(Object.keys(last!.payload).sort()).toEqual(['attempts', 'error', 'max_auto_retries']);
+    expect((last!.payload as { attempts?: number }).attempts).toBe(3);
+  });
+
+  it('retries on a configured provider signature outside the generic 429 family (r4 verification#0)', async () => {
+    const events: RetryEvent[] = [];
+    let attempts = 0;
+    const recovered = await withRateLimitRetries(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('pacing code 1302 from the provider');
+      return 'ok';
+    }, {
+      policy: { ...policy, patterns: [/pacing code \d+/i] },
+      record: (event) => events.push(event),
+      jitter: () => 0,
+      sleep: async () => {},
+    });
+    expect(recovered).toBe('ok');
+    expect(events.map((event) => event.kind)).toEqual(['pacing.auto-retry', 'pacing.auto-retry-recovered']);
+    // The same text without the configured signature is NOT rate-limit class:
+    // it must ladder, proving the policy patterns actually reach the
+    // consumer's classifier.
+    const record = vi.fn();
+    const sleep = vi.fn();
+    await expect(withRateLimitRetries(async () => { throw new Error('pacing code 1302 from the provider'); }, {
+      policy, record, sleep,
+    })).rejects.toThrow('pacing code 1302');
+    expect(record).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it('non-rate-limit failure never sleeps or records a retry', async () => {

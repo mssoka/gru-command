@@ -26,3 +26,7 @@ pacing-review = "npx vitest run test/perkins-whole-review.test.ts -t 'provider p
 # The witnessed settlement/fixture regressions run the approved j-463 RPC
 # patch first (pretest equivalent); still no worker/timeout flags or npm chain.
 pacing-settlement-regressions = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/dispatch-server.test.ts test/supervisor.test.ts test/suite-shape.test.ts"
+
+# PR135 current18 raw-triage regressions (source-only fix pass; runs the
+# approved j-463 RPC patch first, same as the other witnessed scope).
+pacing-current18 = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/supervisor.test.ts test/fix-directive.test.ts test/dispatch-server.test.ts test/patch-vitest-rpc-timeout.test.ts test/suite-shape.test.ts"

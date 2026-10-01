@@ -201,6 +201,9 @@ restart_backoff_ms = 2000
 # Enabled by default with unlimited admission caps. Suggested starting
 # point: cap minion and review turns at 3; 1s backoff, capped at 60s,
 # 5 retries.
+# Caps count MINION and Perkins review turns only: silas/bob/distiller/
+# chat core turns are outside this pool (the board view is not a
+# provider-wide count).
 # max_concurrent_minions = 3
 # max_concurrent_review_turns = 3   # 0 = unlimited
 # backoff_base_ms = 1000
