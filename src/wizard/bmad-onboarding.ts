@@ -71,21 +71,46 @@ export interface BmadRepoResult {
    * network/download), which keep the retry/skip offer.
    */
   readonly deterministic?: true;
+  /**
+   * Class-specific deliberate repair guidance for deterministic failures
+   * (carried over from `BmadDeterministicSetupError.repairHint`); the
+   * wizard renders it, falling back to neutral repair wording when a class
+   * message already carries its own context.
+   */
+  readonly repairHint?: string;
 }
+
+/**
+ * Install-state deterministic failures keep the deliberate repair/update
+ * path the issue names (gh-32): the OFFICIAL installer, run by the user —
+ * never an automatic overwrite or upgrade by the wizard.
+ */
+const INSTALLER_REPAIR_HINT =
+  'Fix deliberately by running `npx bmad-method install` in that repo, then re-run the wizard';
+/**
+ * "BMAD already exists" is preserved, not repaired: the deliberate path is a
+ * fresh wizard run choosing reuse, because installer overwrite/upgrade is
+ * exactly what the guard refuses.
+ */
+const REUSE_REPAIR_HINT = 'Re-run the wizard and choose reuse to preserve the existing install';
 
 /**
  * A BMAD setup failure caused by unchanged on-disk repo state (a manifest
  * declaring a missing/unsafe/escaping module directory, a runtime-binding
  * mismatch, a malformed existing manifest/record, a refused unsafe path).
- * A retry cannot change the outcome — the user must repair deliberately
- * (`npx bmad-method install` in that repo) or skip. Transient failures
- * (missing prerequisites, installer network/download/output) stay plain
- * `Error`s and keep the retry/skip offer.
+ * A retry cannot change the outcome — the class-specific `repairHint` (or
+ * the wizard's neutral fallback) names the deliberate repair, and skip
+ * stays available. Read/IO and tool-availability failures are NOT this
+ * class: they stay plain `Error`s and keep the retry/skip offer.
  */
 export class BmadDeterministicSetupError extends Error {
-  constructor(message: string) {
+  /** Class-specific deliberate repair guidance; omitted when the message itself carries it. */
+  readonly repairHint?: string;
+
+  constructor(message: string, repairHint?: string) {
     super(message);
     this.name = 'BmadDeterministicSetupError';
+    this.repairHint = repairHint;
   }
 }
 
@@ -210,17 +235,21 @@ function manifestFor(repoPath: string): { text: string; summary: BmadManifestSum
 }
 
 /**
- * Read an EXISTING install's manifest for reuse: an existing manifest that
- * fails validation is unchanged on-disk state (gh-32) — a retry re-parses
- * the same bytes and fails identically — so parse failures here are
- * deterministic. Fresh-installer output keeps using manifestFor, where a
- * bad manifest stays a transient installer-output failure.
+ * Read an EXISTING install's manifest for reuse. A manifest that fails
+ * PARSE validation is unchanged on-disk state (gh-32) — a retry re-parses
+ * the same bytes and fails identically — so parse failures are
+ * deterministic with the installer repair path. Read/IO failures are
+ * recoverable (permissions or interference can change between attempts)
+ * and stay transient, as do fresh-installer outputs via manifestFor.
  */
 function existingManifestFor(repoPath: string): { text: string; summary: BmadManifestSummary } | null {
+  const path = join(repoPath, '_bmad', '_config', 'manifest.yaml');
+  if (!existsSync(path)) return null;
+  const text = readFileSync(path, 'utf-8');
   try {
-    return manifestFor(repoPath);
+    return { text, summary: parseBmadManifest(text, path) };
   } catch (error) {
-    throw new BmadDeterministicSetupError((error as Error).message);
+    throw new BmadDeterministicSetupError((error as Error).message, INSTALLER_REPAIR_HINT);
   }
 }
 
@@ -333,10 +362,16 @@ function verifyModuleDirectories(repoPath: string, summary: BmadManifestSummary)
   for (const module of summary.modules) {
     const path = join(repoPath, '_bmad', module.name);
     if (!existsSync(path) || lstatSync(path).isSymbolicLink() || !statSync(path).isDirectory()) {
-      throw new BmadDeterministicSetupError(`BMAD manifest declares missing or unsafe module directory: ${path}`);
+      throw new BmadDeterministicSetupError(
+        `BMAD manifest declares missing or unsafe module directory: ${path}`,
+        INSTALLER_REPAIR_HINT,
+      );
     }
     if (!insideOrEqual(repoPath, realpathSync(path))) {
-      throw new BmadDeterministicSetupError(`BMAD module directory escapes selected repo: ${path}`);
+      throw new BmadDeterministicSetupError(
+        `BMAD module directory escapes selected repo: ${path}`,
+        INSTALLER_REPAIR_HINT,
+      );
     }
   }
 }
@@ -347,10 +382,16 @@ function verifySkills(repoPath: string, tools: readonly string[]): void {
     assertNoSymlinkComponents(repoPath, `${root}/skills/bmad-build`);
     const skill = join(repoPath, root, 'skills', 'bmad-build', 'SKILL.md');
     if (!existsSync(skill) || lstatSync(skill).isSymbolicLink() || !statSync(skill).isFile()) {
-      throw new BmadDeterministicSetupError(`BMAD ${tool} binding is missing required bmad-build skill: ${skill}`);
+      throw new BmadDeterministicSetupError(
+        `BMAD ${tool} binding is missing required bmad-build skill: ${skill}`,
+        INSTALLER_REPAIR_HINT,
+      );
     }
     if (!insideOrEqual(repoPath, realpathSync(skill))) {
-      throw new BmadDeterministicSetupError(`BMAD ${tool} binding escapes selected repo: ${skill}`);
+      throw new BmadDeterministicSetupError(
+        `BMAD ${tool} binding escapes selected repo: ${skill}`,
+        INSTALLER_REPAIR_HINT,
+      );
     }
   }
 }
@@ -376,6 +417,7 @@ function verifyNoAmbiguousSkillConfig(
             throw new BmadDeterministicSetupError(
               `existing BMAD binding has ambiguous BMM/GDS config token in ${file}; ` +
                 'reuse preserved it unchanged, so repair or deliberately reinstall before marking ready',
+              INSTALLER_REPAIR_HINT,
             );
           }
         }
@@ -788,7 +830,7 @@ function updateWorktreeBootstrap(repoPath: string, env: NodeJS.ProcessEnv): void
     try {
       parse(original);
     } catch (error) {
-      throw new Error(`existing worktree manifest is malformed: ${manifestPath}: ${String(error)}`);
+      throw new BmadDeterministicSetupError(`existing worktree manifest is malformed: ${manifestPath}: ${String(error)}`);
     }
   }
   const next = managedBlock(original, BLOCK_START, BLOCK_END, [
@@ -799,7 +841,7 @@ function updateWorktreeBootstrap(repoPath: string, env: NodeJS.ProcessEnv): void
   ]);
   const bootstrapPath = join(repoPath, BOOTSTRAP_PATH);
   if (existsSync(bootstrapPath) && !readFileSync(bootstrapPath, 'utf-8').includes(BOOTSTRAP_MARKER)) {
-    throw new Error(`refusing to overwrite non-Gru BMAD bootstrap: ${bootstrapPath}`);
+    throw new BmadDeterministicSetupError(`refusing to overwrite non-Gru BMAD bootstrap: ${bootstrapPath}`);
   }
   atomicWrite(bootstrapPath, BOOTSTRAP_SOURCE, 0o755);
   atomicWrite(manifestPath, next);
@@ -823,7 +865,7 @@ function writeRecord(
   if (existsSync(path)) {
     const current = JSON.parse(readFileSync(path, 'utf-8')) as { managed_by?: unknown };
     if (current.managed_by !== 'gru-command') {
-      throw new Error(`refusing to overwrite non-Gru BMAD record: ${path}`);
+      throw new BmadDeterministicSetupError(`refusing to overwrite non-Gru BMAD record: ${path}`);
     }
   }
   const record = {
@@ -916,8 +958,26 @@ function validateRepo(
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 10_000,
   });
-  if (gitRoot.status !== 0 || gitRoot.stdout.trim() === '') {
+  // A spawn failure, signal, timeout (status null + error set) or empty
+  // output is tool availability, not repo state: installing/unblocking git
+  // and retrying can succeed, so it keeps the retry/skip offer — the same
+  // availability class the prerequisite probe reports. Only a clean
+  // non-zero exit that reports a non-repo / non-root path is deterministic.
+  if (gitRoot.error !== undefined || gitRoot.signal !== null || gitRoot.status === null) {
+    const detail = gitRoot.error !== undefined
+      ? gitRoot.error.message
+      : `terminated by signal ${gitRoot.signal ?? 'unknown'}`;
+    throw new Error(
+      `git probe failed for ${repoPath}: ${detail}; ensure Git runs on this host, then retry or skip this repo`,
+    );
+  }
+  if (gitRoot.status !== 0) {
     throw new BmadDeterministicSetupError(`selected directory is not a usable Git repo: ${repoPath}`);
+  }
+  if (gitRoot.stdout.trim() === '') {
+    throw new Error(
+      `git reported no repository root for ${repoPath}; retry or skip this repo`,
+    );
   }
   let actualRoot: string;
   try {
@@ -955,6 +1015,7 @@ export function onboardBmadRepo(
       if (existing !== null) {
         throw new BmadDeterministicSetupError(
           'BMAD already exists; choose reuse to preserve it (automatic overwrite/upgrade is disabled)',
+          REUSE_REPAIR_HINT,
         );
       }
       installed = installFresh(repoPath, tools, env, options.run ?? spawnSync);
@@ -1015,6 +1076,7 @@ export function onboardBmadRepo(
         throw new BmadDeterministicSetupError(
           `existing BMAD install lacks selected runtime binding(s): ${missingBindings.join(', ')}; ` +
             'reuse will not modify it—choose skip or deliberately update it with the official installer',
+          INSTALLER_REPAIR_HINT,
         );
       }
     }
@@ -1061,6 +1123,7 @@ export function onboardBmadRepo(
       ready: false,
       message: String((error as Error).message),
       deterministic: error instanceof BmadDeterministicSetupError ? true : undefined,
+      repairHint: error instanceof BmadDeterministicSetupError ? error.repairHint : undefined,
     };
   }
 }

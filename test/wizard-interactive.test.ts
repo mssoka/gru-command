@@ -225,6 +225,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: TOKEN_PROMPT, send: '' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: 'n' },
+        { expect: 'Skip this repo? [skip]:', send: 'retry' }, // rejected: retry cannot fix it
         { expect: 'Skip this repo? [skip]:', send: '' }, // Enter = skip
       ],
       { GRU_COMMAND_HOME: instance, PATH: `${bin}:${process.env.PATH ?? ''}` },
@@ -236,6 +237,9 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     // repairs the install itself, and the futile retry is not offered.
     expect(output).toContain('npx bmad-method install');
     expect(output).not.toContain('Retry or skip this repo?');
+    // The skip-only loop refuses a typed retry with its correction line
+    // before accepting the skip.
+    expect(output).toContain('retry cannot fix it; enter skip');
     expect(output).toContain('BMAD not ready in repo-a: skipped by explicit per-repo choice');
     expect(output).toContain('Setup complete');
     expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toContain('port = 0');

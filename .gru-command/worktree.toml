@@ -14,11 +14,14 @@ full = "npm test"
 typecheck = "npm run typecheck"
 
 # Declared focused verification scopes (phase 4; invoked only via the
-# authenticated /api/verify scheduler at unchanged budgets/thresholds —
-# plain vitest invocations, no worker/timeout flags, never the npm chain).
+# authenticated /api/verify scheduler — vitest invocations with unchanged
+# test budgets/thresholds, optionally prefixed by the repo-approved pretest
+# RPC patch and/or a build where the scope's legs execute dist/; no worker
+# or timeout flags, never the full `npm test` chain).
 residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-resident-registry.test.ts test/fix-directive.test.ts test/silas-deterministic-seam.test.ts"
 handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
-# wizard-bmad-retry prefixes the repo-approved vitest RPC pretest patch
+# wizard-bmad-retry builds first so its CLI/pty legs execute the reviewed
+# source's dist, then applies the repo-approved vitest RPC pretest patch
 # (tools/patch-vitest-rpc-timeout.mjs) that `npm test` also runs.
-wizard-bmad-retry = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts"
+wizard-bmad-retry = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts"

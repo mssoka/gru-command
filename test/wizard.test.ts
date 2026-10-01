@@ -388,14 +388,19 @@ describe('wizard CLI surface', () => {
       ...process.env,
       PATH: `${bin}:${process.env.PATH ?? ''}`,
     };
-    const answersJson = JSON.stringify({
-      workspace_root: workspace,
-      repos: ['repo-a'],
-      bmad: { 'repo-a': 'reuse' },
-      runtime: 'pi',
-      port: 0,
-      smoke: false,
-    });
+    // Explicit objects (no string surgery): each leg names its repo, action
+    // and runtime directly. Port 0 keeps the fixed-port pre-check out of
+    // the fixture; smoke is off because this leg is about the BMAD contract.
+    const answersFor = (repo: string, action: 'install' | 'reuse' | 'skip', runtime: string) =>
+      JSON.stringify({
+        workspace_root: workspace,
+        repos: [repo],
+        bmad: { [repo]: action },
+        runtime,
+        port: 0,
+        smoke: false,
+      });
+    const answersJson = answersFor('repo-a', 'reuse', 'pi');
     const instance = tempDir('gru-command-wizard-det-home-');
     const failed = spawnSync(
       process.execPath,
@@ -416,12 +421,67 @@ describe('wizard CLI surface', () => {
     const skipHome = tempDir('gru-command-wizard-det-skip-home-');
     const skipped = spawnSync(
       process.execPath,
-      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson.replace('"reuse"', '"skip"')],
+      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersFor('repo-a', 'skip', 'pi')],
       { env: { ...baseEnv, GRU_COMMAND_HOME: skipHome }, encoding: 'utf-8', timeout: 60_000 },
     );
     expect(skipped.status, skipped.stderr).toBe(0);
     expect(skipped.stdout).toContain('BMAD not ready in repo-a: skipped by explicit per-repo choice');
     expect(readFileSync(join(skipHome, 'config.toml'), 'utf-8')).toContain('port = 0');
+
+    // The issue's second named class — a selected-runtime binding mismatch —
+    // reaches the same skip-only branch with the installer repair text.
+    const repoB = join(workspace, 'repo-b');
+    mkdirSync(join(repoB, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoB });
+    for (const module of ['core', 'bmm', 'cis', 'tea', 'gds']) {
+      mkdirSync(join(repoB, '_bmad', module), { recursive: true });
+    }
+    mkdirSync(join(repoB, '_bmad', '_config'), { recursive: true });
+    writeFileSync(
+      join(repoB, '_bmad', '_config', 'manifest.yaml'),
+      'installation:\n  version: 6.12.0\nmodules:\n' +
+        '  - name: core\n    version: 6.12.0\n' +
+        '  - name: bmm\n    version: 6.12.0\n' +
+        '  - name: cis\n    version: v0.3.2\n' +
+        '  - name: tea\n    version: v1.27.2\n' +
+        '  - name: gds\n    version: v0.7.2\n' +
+        'ides:\n  - pi\n',
+    );
+    mkdirSync(join(repoB, '.agents', 'skills', 'bmad-build'), { recursive: true });
+    writeFileSync(join(repoB, '.agents', 'skills', 'bmad-build', 'SKILL.md'), '# build\n');
+    const bindingHome = tempDir('gru-command-wizard-binding-home-');
+    const binding = spawnSync(
+      process.execPath,
+      [
+        join(repoRoot, 'dist', 'wizard', 'main.js'),
+        '--answers',
+        answersFor('repo-b', 'reuse', 'claude-code'),
+      ],
+      { env: { ...baseEnv, GRU_COMMAND_HOME: bindingHome }, encoding: 'utf-8', timeout: 60_000 },
+    );
+    expect(binding.status, binding.stderr).toBe(1);
+    expect(binding.stderr).toContain(
+      'existing BMAD install lacks selected runtime binding(s): claude-code',
+    );
+    expect(binding.stderr).toContain('npx bmad-method install');
+    expect(binding.stderr).not.toContain('Retry after fixing it');
+
+    // "BMAD already exists" carries reuse guidance, not the installer hint:
+    // installer overwrite is exactly what the guard refuses.
+    const existsHome = tempDir('gru-command-wizard-exists-home-');
+    const exists = spawnSync(
+      process.execPath,
+      [
+        join(repoRoot, 'dist', 'wizard', 'main.js'),
+        '--answers',
+        answersFor('repo-a', 'install', 'pi'),
+      ],
+      { env: { ...baseEnv, GRU_COMMAND_HOME: existsHome }, encoding: 'utf-8', timeout: 60_000 },
+    );
+    expect(exists.status, exists.stderr).toBe(1);
+    expect(exists.stderr).toContain('BMAD already exists; choose reuse to preserve it');
+    expect(exists.stderr).toContain('Re-run the wizard and choose reuse');
+    expect(exists.stderr).not.toContain('npx bmad-method install');
   }, 120_000);
 
   it('host validation accepts every VALID IPv6 form (Perkins r2 note)', () => {

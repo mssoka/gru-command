@@ -639,10 +639,12 @@ async function main(argv: readonly string[]): Promise<number> {
       if (result.deterministic) {
         // Deterministic state failure (gh-32): the check ran against
         // unchanged on-disk state, so another identical retry can never
-        // succeed. Offer skip-only plus the deliberate repair path — the
-        // wizard never repairs or overwrites an existing install itself.
-        const repairHint =
-          'Fix deliberately by running `npx bmad-method install` in that repo, then re-run the wizard';
+        // succeed. Offer skip-only plus the class-appropriate deliberate
+        // repair path — install-repair classes keep the official-installer
+        // hint, other classes fall back to neutral wording. The wizard
+        // never repairs or overwrites an existing install itself.
+        const repairHint = result.repairHint ??
+          'Repair the reported condition deliberately, then re-run the wizard';
         if (terminal === null) {
           fail(
             `BMAD setup for ${repo} is not ready (deterministic failure — retrying cannot fix it): ${result.message}\n` +
