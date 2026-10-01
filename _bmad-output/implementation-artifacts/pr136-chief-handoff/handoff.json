@@ -14,6 +14,13 @@
   "source_commit": "d0035aeb52137b29af423df2a857adb44069c8cd",
   "feature_commit": "66ac37782720a0378337821f0935be8cccb675fa",
   "plan_checkpoint_commit": "e28bcfe8b63034bc66a06ff9bc55c33183242726",
+  "publication": {
+    "remote": "origin/gru/durable-blocked-followthrough",
+    "remote_head_at_push": "d57f0dd2c00c1f2ebf8e3e80aec7eac68d3273ee",
+    "pushed_at": "2026-10-01T01:48:02+01:00",
+    "pr_draft_preserved": true,
+    "note": "fast-forward push on top of the prior remote head 0bb5a03; no force, no rebase, no draft-flag change"
+  },
   "source_base": "2aa836abe262759c651683deb40d05f02c9ede86",
   "lane_base_before_session": "0bb5a03f80ac8f65da078420f29e86325214eccb",
   "merge_commit_this_session": "5ccae7981e9ec379463793574100cc180b958278",
