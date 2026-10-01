@@ -29,4 +29,4 @@ publisher-timeout-discriminator = "node tools/patch-vitest-rpc-timeout.mjs && np
 # Narrow scope for the final raw-advice triage repairs on the App
 # publisher (one focused vitest invocation; the suite pin travels with
 # the file it pins). Declared alongside real repairs, never standalone.
-app-contract-repair = "npx vitest run test/perkins-github-app.test.ts test/suite-shape.test.ts"
+app-contract-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/suite-shape.test.ts"
