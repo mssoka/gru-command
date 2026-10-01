@@ -108,6 +108,16 @@ function makeSpawner(
   order: string[],
   onLeadStart?: () => void,
   answerOverride?: (prompt: string) => string | undefined,
+  /** Canonical security-blocker evidence the scripted lead cites on its
+   * second attempt. Defaults to the historical `return 43;` snippet the
+   * pre-existing fixtures commit; T4's fixture commits `return 44;`, so it
+   * passes the snippet its frozen diff actually contains — the locatable-
+   * evidence contract (whole.ts evidenceAtCitedLocation) then accepts the
+   * canonical attempt instead of burning it. The malformed first attempt
+   * and the two-run attempt coverage are unchanged, and every caller that
+   * omits this behaves byte-for-byte as before
+   * (phase pr144-t4-cost-repair-20261001). */
+  securityEvidence?: string,
 ): AgentSpawner {
   let securityAttempts = 0;
   const brain: WholeLeadOptions = {
@@ -123,7 +133,7 @@ function makeSpawner(
         : source === 'security'
           ? JSON.stringify([{
               source: 'security', severity: 'blocker', category: 'auth', title: 'Verified security defect',
-              location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line demonstrates the security defect.',
+              location: 'src/main.ts:2', evidence: securityEvidence ?? '  return 43;', detail: 'The changed line demonstrates the security defect.',
               recommended_fix: 'Correct the implementation and add a regression test.',
             }])
           : '[]');
@@ -1790,7 +1800,22 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' })));
       repos.push(repo);
       await t4Step(leg, 'fixture/branch-create', async () => { repo.git(['checkout', '-b', branch]); });
-      const target = await t4Step(leg, 'fixture/target-commit', async () => repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n'));
+      const target = await t4Step(leg, 'fixture/target-commit', () => {
+        // Batched equivalent of commitFile's add+commit (phase
+        // pr144-t4-cost-repair-20261001): one git process stages the file
+        // and commits (`commit --include`), removing a Node-to-git spawn
+        // per leg while keeping the identical Fixture Tests identity, the
+        // identical default message, parent, and resulting tree/HEAD, and
+        // the same loud non-zero failure propagation on any git error.
+        const file = join(repo.path, 'src/main.ts');
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, 'export function answer(): number {\n  return 44;\n}\n');
+        repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit', '--include', 'src/main.ts', '-m', 'fixture: update src/main.ts',
+        ]);
+        return repo.git(['rev-parse', 'HEAD']);
+      });
       const temps = await t4Step(leg, 'fixture/tempdirs', () => {
         const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
         const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
@@ -1845,7 +1870,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     });
     const escalations: string[] = [];
     const movedWave = new WaveRunner({
-      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, [], () => t4Attr('moved', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' })),
+      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, [], () => t4Attr('moved', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' }), undefined, '  return 44;'),
       poster: { post, reconcile }, reviewArtifactRoot: moved.artifacts,
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
       prHeadProbe: t4Probe('moved', 'feature/t4-moved'),
@@ -1876,7 +1901,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     });
     const abortEscalations: string[] = [];
     const abortedWave = new WaveRunner({
-      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, [], () => t4Attr('aborted', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' })),
+      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, [], () => t4Attr('aborted', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' }), undefined, '  return 44;'),
       poster: { post: abortPost, reconcile: abortReconcile }, reviewArtifactRoot: aborted.artifacts,
       escalate: (title, detail) => abortEscalations.push(`${title}: ${detail}`),
       prHeadProbe: t4Probe('aborted', 'feature/t4-aborted'),
