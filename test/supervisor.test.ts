@@ -92,8 +92,14 @@ class FakeHandle implements AgentHandle {
   async followUp(): Promise<void> {}
   /** E7 live-work probe: a fake scheduler can declare a live child process. */
   readonly hasLiveProcess = (): boolean => this.liveProcess;
-  /** E7 resume snapshot: what the runtime knows about the open turn. */
-  readonly pendingTurn = (): PendingTurn | null => this.pendingTurnSnapshot;
+  /** E7 resume snapshot: what the runtime knows about the open turn.
+   * Every read (take/peek) is counted so tests can prove the supervisor
+   * never consumed the pending turn. */
+  pendingTurnProbes = 0;
+  readonly pendingTurn = (): PendingTurn | null => {
+    this.pendingTurnProbes += 1;
+    return this.pendingTurnSnapshot;
+  };
   subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.listeners.add(listener);
     return () => {
@@ -306,9 +312,15 @@ describe('supervisor — watchdog + restart ladder', () => {
     const restartsBefore = h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.restart').length;
     const guidanceBefore = h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.guidance').length;
     const recoveryBefore = h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.turn-recovery').length;
-    // An open pending turn inside the compaction: the turn stays open too.
+    // An open pending turn inside the compaction: the turn stays open too,
+    // holding a REAL snapshot (text + owner), not just an openTurn flag.
     hang(handle);
+    handle.pendingTurnSnapshot = { text: 'compact and continue the audit', owner: 'gru' };
     handle.emit({ type: 'compaction_start' });
+    // The real start event stamped the silence clock; the wait must never
+    // fake progress on top of it (public view only).
+    const startedAt = h.supervisor.viewFor('gru-compact-wait')?.lastEventAt;
+    expect(startedAt).toEqual(expect.any(String));
     h.advance(60); // past turn_silence_ms (50)
     await sleep(60);
     h.advance(60); // several further silent windows
@@ -324,7 +336,8 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.restart').length).toBe(restartsBefore);
     expect(h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.guidance').length).toBe(guidanceBefore);
     expect(h.api.listEvents({ limit: 100 }).filter((e) => e.kind === 'supervision.turn-recovery').length).toBe(recoveryBefore);
-    // ...the same handle stays owned, watching, with its pending turn retained...
+    // ...the SAME handle stays owned, watching, with its pending turn retained...
+    expect(h.registry.getHandle('gru-compact-wait')).toBe(handle);
     expect(h.supervisor.viewFor('gru-compact-wait')).toMatchObject({
       state: 'watching',
       openControl: true,
@@ -332,6 +345,15 @@ describe('supervisor — watchdog + restart ladder', () => {
       restarts: 0,
       breakerOpen: false,
     });
+    // ...nothing took, replayed, or re-delivered the pending turn while the
+    // supervisor waited: zero pendingTurn reads, zero prompts, same snapshot.
+    expect(handle.pendingTurnProbes).toBe(0);
+    expect(handle.promptCount).toBe(0);
+    expect(handle.promptCalls).toHaveLength(0);
+    expect(handle.pendingTurnSnapshot).toEqual({ text: 'compact and continue the audit', owner: 'gru' });
+    // ...and the silence clock still reads the REAL start event: silent
+    // waiting never mutates lastEventAt into fake progress.
+    expect(h.supervisor.viewFor('gru-compact-wait')?.lastEventAt).toBe(startedAt);
     // ...and exactly one factual FYI warning was posted (no owner bell).
     const waits = h.notificationsOfKind('supervision.native-compaction-wait');
     expect(waits.length).toBe(1);
@@ -361,11 +383,14 @@ describe('supervisor — watchdog + restart ladder', () => {
   it('compaction_end clears the wait state; a later genuine episode may warn once again', async () => {
     const handle = new FakeHandle('gru', 'gru-compact-episodes', null);
     h.registry.adopt(handle);
-    // Episode 1: warn exactly once at the threshold.
+    // Episode 1: warn exactly once at the threshold — an exact DELTA over
+    // the shared harness (earlier tests have already left notifications;
+    // a global toBe(1) would be wrong here).
+    const waitsBeforeEpisode1 = h.notificationsOfKind('supervision.native-compaction-wait').length;
     handle.emit({ type: 'compaction_start' });
     h.advance(60);
     await sleep(60);
-    expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBeGreaterThanOrEqual(1);
+    expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBe(waitsBeforeEpisode1 + 1);
     // Native success ends the episode: further silence warns nothing and
     // the otherwise idle handle stays idle-owned.
     handle.emit({ type: 'compaction_end', success: true });
@@ -421,6 +446,78 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(handle.disposed).toBe(false);
     expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
     expect(lane.notificationsOfKind('supervision.hang')).toHaveLength(0);
+    lane.dispose();
+  });
+
+  it('a synchronous warning-post failure before persistence never duplicates attempts or restarts', async () => {
+    const lane = boot();
+    const handle = new FakeHandle('gru', 'gru-compact-postfail-early', null);
+    lane.registry.adopt(handle);
+    handle.emit({ type: 'compaction_start' });
+    // The FYI is a best-effort AT-MOST-ONE attempt: the episode latch is
+    // set BEFORE the synchronous post. recordNotification is the first
+    // thing NotificationCenter.post does, so a throw here is a failure
+    // BEFORE persistence — the real sync contract, no invented async post.
+    const postSpy = vi
+      .spyOn(lane.api, 'recordNotification')
+      .mockImplementation(() => { throw new Error('ledger write failed'); });
+    lane.advance(60); // past turn_silence_ms (50): the one attempt fires and throws
+    await sleep(60);
+    expect(postSpy).toHaveBeenCalledTimes(1);
+    // Repeated silent ticks: the latch holds, no second attempt is made...
+    lane.advance(60);
+    await sleep(60);
+    lane.advance(60);
+    await sleep(60);
+    expect(postSpy).toHaveBeenCalledTimes(1);
+    expect(handle.disposed).toBe(false);
+    expect(lane.registry.spawnCalls).toHaveLength(0); // no restart, ever
+    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(0);
+    // ...and native end still re-arms: the next genuine episode warns once.
+    postSpy.mockRestore();
+    handle.emit({ type: 'compaction_end', success: true });
+    lane.advance(60);
+    await sleep(60);
+    handle.emit({ type: 'compaction_start' });
+    lane.advance(60);
+    await sleep(60);
+    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
+    lane.dispose();
+  });
+
+  it('a synchronous warning-post failure after persistence never duplicates rows or restarts', async () => {
+    const lane = boot();
+    const handle = new FakeHandle('gru', 'gru-compact-postfail-late', null);
+    lane.registry.adopt(handle);
+    handle.emit({ type: 'compaction_start' });
+    // NotificationCenter.post persists via recordNotification FIRST, then
+    // logs — a throwing later log makes the post throw AFTER the row is
+    // durable. The latch must stay set: no retry, no duplicate FYI row.
+    const centerLog = lane.center as unknown as { log: () => void };
+    const logSpy = vi.spyOn(centerLog, 'log').mockImplementation(() => { throw new Error('log write failed'); });
+    lane.advance(60); // the one attempt: row persists, then the log throws
+    await sleep(60);
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    // The row IS durable despite the post throwing (after-persistence proof).
+    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
+    // Repeated silent ticks: no second attempt, no duplicate row, no restart.
+    lane.advance(60);
+    await sleep(60);
+    lane.advance(60);
+    await sleep(60);
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(1);
+    expect(handle.disposed).toBe(false);
+    expect(lane.registry.spawnCalls).toHaveLength(0);
+    // Native end re-arms; the next episode may warn once again.
+    logSpy.mockRestore();
+    handle.emit({ type: 'compaction_end', success: true });
+    lane.advance(60);
+    await sleep(60);
+    handle.emit({ type: 'compaction_start' });
+    lane.advance(60);
+    await sleep(60);
+    expect(lane.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(2);
     lane.dispose();
   });
 
@@ -579,6 +676,23 @@ describe('supervisor — watchdog + restart ladder', () => {
     supervisor.dispose();
     db.close();
   });
+
+  it('a fatal error during open compaction still climbs the ladder (the wait is silence-only)', async () => {
+    const handle = new FakeHandle('gru', 'gru-compact-fatal', null);
+    h.registry.adopt(handle);
+    const spawnsBefore = h.registry.spawnCalls.length;
+    const waitsBefore = h.notificationsOfKind('supervision.native-compaction-wait').length;
+    const fatalsBefore = h.notificationsOfKind('supervision.fatal').length;
+    handle.emit({ type: 'compaction_start' });
+    handle.emit({ type: 'error', error: 'session stream died mid-compaction', fatal: true });
+    await sleep(60);
+    // The open-control latch shields SILENCE recovery only: a genuine fatal
+    // error still disposes and respawns, with no wait-FYI minted for it.
+    expect(h.registry.spawnCalls.length).toBe(spawnsBefore + 1);
+    expect(handle.disposed).toBe(true);
+    expect(h.notificationsOfKind('supervision.fatal').length).toBe(fatalsBefore + 1);
+    expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBe(waitsBefore);
+  });
 });
 
 describe('supervisor — workflow-owned review attempts', () => {
@@ -591,6 +705,24 @@ describe('supervisor — workflow-owned review attempts', () => {
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
+    h.dispose();
+  });
+
+  it('an open compaction does not shield an isolated review attempt from its own authorized deadline', async () => {
+    const h = boot();
+    const handle = new FakeHandle('perkins', 'perkins-isolated-compact', null, true);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    hang(handle);
+    handle.emit({ type: 'compaction_start' });
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ openControl: true });
+    h.advance(60); // past turn_silence_ms — the review deadline binds first; the wait policy never runs
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    // The isolated attempt aborts under its OWN review policy; no ordinary
+    // replacement spawns and no compaction-wait FYI is minted for it.
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
+    expect(h.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(0);
     h.dispose();
   });
 });
