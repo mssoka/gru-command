@@ -24,6 +24,9 @@ import {
   categoryKey,
   defaultFiringRule,
   isObligationLogicalStep,
+  isPhaseHandoffSource,
+  isPhaseHandoffState,
+  MAX_COMPLETION_HANDOFF_DECISION,
   obligationId,
   parseAuthority,
   parseCategory,
@@ -34,22 +37,28 @@ import {
   parseReceipts,
   parseSettlement,
   parseWakeCondition,
+  phaseHandoffId,
   resolveObligation,
   type BlockerContext,
   type ClaimLogEntry,
   type ClaimLogDisposition,
+  type CompletionHandoffIntent,
   type ObligationAuthority,
   type ObligationCategory,
   type ObligationClaim,
   type ObligationNextAction,
   type ObligationSettlement,
   type ObligationWakeCondition,
+  type PhaseHandoffRecord,
+  type PhaseHandoffSource,
+  type PhaseHandoffState,
   type ReceiptCorrelation,
   type RecordedReceipt,
   type ResolvedObligation,
 } from './obligations.js';
 import {
   isDirectiveState,
+  isDirectiveTerminal,
   LIVE_DIRECTIVE_STATES,
   type DirectiveRequestRecord,
   type DirectiveState,
@@ -57,6 +66,12 @@ import {
 
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 export type { DirectiveRequestRecord, DirectiveState } from './directives.js';
+export type {
+  CompletionHandoffIntent,
+  PhaseHandoffRecord,
+  PhaseHandoffSource,
+  PhaseHandoffState,
+} from './obligations.js';
 
 type Row = Record<string, unknown>;
 
@@ -229,6 +244,17 @@ export class AmbiguousDirectiveError extends Error {
   }
 }
 
+/** The phase-handoff row already exists under this request id with a
+ * DIFFERENT decision (or a second completion/binding contradicts the
+ * recorded one). The durable intent is part of the request identity;
+ * changed intent needs a new request. */
+export class PhaseHandoffConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PhaseHandoffConflictError';
+  }
+}
+
 /** One durable follow-through obligation (current state; full history is
  * the events table). See src/ledger/obligations.ts for the vocabulary. */
 export interface ObligationRecord {
@@ -338,6 +364,10 @@ export interface PendingRebriefRecord {
   /** The spawned re-brief worker, once known (resume hint after a crash). */
   readonly agentId: string | null;
   readonly sessionFile: string | null;
+  /** The phase-handoff row this marker pair belongs to, when the request
+   * carried an explicit completion intent (host-owned identity; the
+   * delivery event must carry it). Null = ordinary re-brief. */
+  readonly phaseId: string | null;
   readonly requestedAt: string;
 }
 
@@ -1237,11 +1267,17 @@ export class LedgerApi {
    * the request payload, its hash, and the event-sequence watermark below
    * which an event cannot answer this request. A newer request for the
    * same job+kind supersedes the older marker (upsert) — the latest note
-   * is the one the current worker runs. */
+   * is the one the current worker runs. When the request carries an
+   * explicit completion intent, the phase-handoff guard row is created in
+   * the SAME transaction (before any side effect) and its id lands on both
+   * markers; a newer re-brief supersedes the older awaiting phase — its
+   * late receipt can never hand back a lane the request no longer owns. */
   beginPendingRebrief(input: {
     jobId: string;
     note: string | null;
     briefing: string | null;
+    /** Explicit completion intent; omitted = ordinary re-brief (no phase). */
+    handoff?: CompletionHandoffIntent;
   }): readonly PendingRebriefRecord[] {
     if (this.getJob(input.jobId) === null) {
       throw new RecordNotFound(`job "${input.jobId}" not found — a re-brief marker belongs to a real job`);
@@ -1251,10 +1287,28 @@ export class LedgerApi {
     const baselineSeq = this.latestEventSeq();
     const ts = nowIso();
     return this.transaction(() => {
+      let phaseId: string | null = null;
+      if (input.handoff !== undefined) {
+        for (const prior of this.listPhaseHandoffs({
+          jobId: input.jobId,
+          source: 'silas-rebrief',
+          states: ['awaiting'],
+        })) {
+          this.closePhaseHandoff({
+            phaseId: prior.phaseId,
+            reason: 'superseded by a newer re-brief request',
+          });
+        }
+        phaseId = this.beginPhaseHandoff({
+          jobId: input.jobId,
+          source: 'silas-rebrief',
+          intent: input.handoff,
+        }).record.phaseId;
+      }
       const upsert = this.db.prepare(
         `INSERT INTO pending_rebriefs
-           (id, job_id, kind, payload, payload_hash, baseline_seq, agent_id, session_file, requested_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+           (id, job_id, kind, payload, payload_hash, baseline_seq, agent_id, session_file, phase_id, requested_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
          ON CONFLICT (job_id, kind) DO UPDATE SET
            id = excluded.id,
            payload = excluded.payload,
@@ -1262,11 +1316,12 @@ export class LedgerApi {
            baseline_seq = excluded.baseline_seq,
            agent_id = NULL,
            session_file = NULL,
+           phase_id = excluded.phase_id,
            requested_at = excluded.requested_at,
            updated_at = excluded.updated_at`,
       );
       for (const kind of PENDING_REBRIEF_KINDS) {
-        upsert.run(randomUUID(), input.jobId, kind, payload, payloadHash, baselineSeq, ts, ts);
+        upsert.run(randomUUID(), input.jobId, kind, payload, payloadHash, baselineSeq, phaseId, ts, ts);
       }
       return this.listPendingRebriefs({ jobId: input.jobId });
     });
@@ -2574,6 +2629,310 @@ export class LedgerApi {
   }
 
   // ------------------------------------------------------------------
+  // Explicit phase-completion handoffs (pr136-chief-handoff). A guard
+  // row persisted BEFORE admission/side effects; a validated correlated
+  // completion; publication recorded on the same row. Nothing here
+  // executes work, wakes anyone by itself, or mints authority — the debt
+  // lives in job_obligations and the wake rides NotificationCenter.
+  // ------------------------------------------------------------------
+
+  /** Persist the completion intent for an authorized phase. Idempotent
+   * per request id: a replay returns the SAME row (changed decision is a
+   * conflict — the intent is part of the request identity). The host mints
+   * the deterministic `phase-handoff:<job>:<source>:<generation>` id. */
+  beginPhaseHandoff(input: {
+    jobId: string;
+    source: PhaseHandoffSource;
+    intent: CompletionHandoffIntent;
+    requestId?: string | null;
+  }): { readonly record: PhaseHandoffRecord; readonly created: boolean } {
+    if (!isPhaseHandoffSource(input.source)) {
+      throw new Error(`phase handoff source "${String(input.source)}" is unknown`);
+    }
+    const decision = input.intent.decision.trim();
+    if (decision === '') throw new Error('phase handoff requires a non-empty decision');
+    if (decision.length > MAX_COMPLETION_HANDOFF_DECISION) {
+      throw new Error(`phase handoff decision exceeds ${MAX_COMPLETION_HANDOFF_DECISION} characters`);
+    }
+    return this.transaction(() => {
+      const job = this.getJob(input.jobId);
+      if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      const requestId = input.requestId ?? null;
+      if (requestId !== null) {
+        const existing = this.findPhaseHandoffByRequest({ jobId: input.jobId, requestId });
+        if (existing !== null) {
+          if (existing.decision !== decision) {
+            throw new PhaseHandoffConflictError(
+              `phase handoff for request "${requestId}" was accepted with a different decision — ` +
+                'the intent is part of the durable request; changed intent needs a new request',
+            );
+          }
+          return { record: existing, created: false };
+        }
+      }
+      const generation = this.nextPhaseHandoffGeneration(input.jobId);
+      const phaseId = phaseHandoffId(input.jobId, input.source, generation);
+      const intentEvent = this.appendEvent({
+        kind: 'job.phase-handoff-intent',
+        jobId: input.jobId,
+        payload: {
+          phase_id: phaseId,
+          source: input.source,
+          generation,
+          request_id: requestId,
+          decision,
+        },
+      });
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `INSERT INTO phase_handoffs
+             (phase_id, job_id, source, request_id, generation, decision, state, intent_seq, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'awaiting', ?, ?, ?)`,
+        )
+        .run(phaseId, input.jobId, input.source, requestId, generation, decision, intentEvent.seq, ts, ts);
+      return { record: this.getPhaseHandoff(phaseId) as PhaseHandoffRecord, created: true };
+    });
+  }
+
+  getPhaseHandoff(phaseId: string): PhaseHandoffRecord | null {
+    const row = this.db.prepare('SELECT * FROM phase_handoffs WHERE phase_id = ?').get(phaseId) as Row | undefined;
+    return row === undefined ? null : this.phaseHandoffFromRow(row);
+  }
+
+  /** Bounded listing for reconciliation/adoption. `cursor` is the rowid
+   * of the previous page's last row (append-only-safe paging). */
+  listPhaseHandoffs(
+    opts: {
+      jobId?: string;
+      source?: PhaseHandoffSource;
+      states?: readonly PhaseHandoffState[];
+      limit?: number;
+      cursor?: number;
+    } = {},
+  ): readonly PhaseHandoffRecord[] {
+    const limit = Math.min(Math.max(1, opts.limit ?? 200), 1000);
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (opts.jobId !== undefined) {
+      where.push('job_id = ?');
+      params.push(opts.jobId);
+    }
+    if (opts.source !== undefined) {
+      if (!isPhaseHandoffSource(opts.source)) {
+        throw new Error(`listPhaseHandoffs got unknown phase source "${String(opts.source)}"`);
+      }
+      where.push('source = ?');
+      params.push(opts.source);
+    }
+    if (opts.states !== undefined) {
+      if (opts.states.length === 0) throw new Error('listPhaseHandoffs "states" filter must not be empty');
+      for (const state of opts.states) {
+        if (!isPhaseHandoffState(state)) throw new Error(`listPhaseHandoffs got unknown phase state "${state}"`);
+      }
+      where.push(`state IN (${opts.states.map(() => '?').join(', ')})`);
+      params.push(...opts.states);
+    }
+    if (opts.cursor !== undefined) {
+      where.push('rowid > ?');
+      params.push(opts.cursor);
+    }
+    const sql = `SELECT rowid AS _rowid, * FROM phase_handoffs${
+      where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''
+    } ORDER BY rowid LIMIT ?`;
+    return (this.db.prepare(sql).all(...(params as never[]), limit) as Row[]).map((row) => this.phaseHandoffFromRow(row));
+  }
+
+  /** The rowid cursor for one phase (pagination anchor). */
+  phaseHandoffRowid(phaseId: string): number | null {
+    const row = this.db.prepare('SELECT rowid AS _rowid FROM phase_handoffs WHERE phase_id = ?').get(phaseId) as
+      | Row
+      | undefined;
+    return row === undefined ? null : Number(row._rowid);
+  }
+
+  /** The newest phase row a directive request authorized, if any. */
+  findPhaseHandoffByRequest(input: { jobId: string; requestId: string }): PhaseHandoffRecord | null {
+    if (input.requestId.trim() === '') throw new Error('findPhaseHandoffByRequest requires a non-empty requestId');
+    const row = this.db
+      .prepare('SELECT * FROM phase_handoffs WHERE job_id = ? AND request_id = ? ORDER BY rowid DESC LIMIT 1')
+      .get(input.jobId, input.requestId) as Row | undefined;
+    return row === undefined ? null : this.phaseHandoffFromRow(row);
+  }
+
+  /** Bind the spawned admitted worker to its awaiting phase (dispatch
+   * path). Idempotent for the same worker; a different worker is a
+   * conflict — a phase has exactly one admitted minion. */
+  bindPhaseHandoffMinion(input: { phaseId: string; minionId: string }): PhaseHandoffRecord {
+    if (input.minionId.trim() === '') throw new Error('phase handoff binding requires a non-empty minion id');
+    return this.transaction(() => {
+      const row = this.getPhaseHandoff(input.phaseId);
+      if (row === null) throw new RecordNotFound(`phase handoff "${input.phaseId}" not found`);
+      if (row.state !== 'awaiting') {
+        throw new PhaseHandoffConflictError(`phase handoff "${row.phaseId}" is ${row.state} — it takes no worker binding`);
+      }
+      if (row.minionId !== null) {
+        if (row.minionId !== input.minionId) {
+          throw new PhaseHandoffConflictError(
+            `phase handoff "${row.phaseId}" is already bound to minion ${row.minionId}, not ${input.minionId}`,
+          );
+        }
+        return row;
+      }
+      this.db
+        .prepare('UPDATE phase_handoffs SET minion_id = ?, updated_at = ? WHERE phase_id = ?')
+        .run(input.minionId, nowIso(), row.phaseId);
+      return this.getPhaseHandoff(row.phaseId) as PhaseHandoffRecord;
+    });
+  }
+
+  /** Record the VALIDATED terminal completion. Callers must have checked
+   * the correlation/admission gates (dispatch-side observers own that);
+   * this primitive only enforces the state machine and the one-completion
+   * invariant. A completion at/before the intent watermark is refused —
+   * an older receipt can never complete a newer phase. */
+  completePhaseHandoff(input: { phaseId: string; completionSeq: number }): PhaseHandoffRecord {
+    if (!Number.isSafeInteger(input.completionSeq) || input.completionSeq < 0) {
+      throw new Error('phase handoff completion requires a safe non-negative event seq');
+    }
+    return this.transaction(() => {
+      const row = this.getPhaseHandoff(input.phaseId);
+      if (row === null) throw new RecordNotFound(`phase handoff "${input.phaseId}" not found`);
+      if (row.state === 'closed') {
+        throw new PhaseHandoffConflictError(`phase handoff "${row.phaseId}" is closed — a late completion cannot reopen it`);
+      }
+      if (row.state === 'completed') {
+        if (row.completionSeq === input.completionSeq) return row; // idempotent replay
+        throw new PhaseHandoffConflictError(
+          `phase handoff "${row.phaseId}" already completed at event ${row.completionSeq} — a second receipt cannot rewrite it`,
+        );
+      }
+      if (input.completionSeq <= row.intentSeq) {
+        throw new PhaseHandoffConflictError(
+          `phase handoff "${row.phaseId}" completion cites event ${input.completionSeq} at/before its intent watermark ${row.intentSeq}`,
+        );
+      }
+      this.db
+        .prepare("UPDATE phase_handoffs SET state = 'completed', completion_seq = ?, updated_at = ? WHERE phase_id = ?")
+        .run(input.completionSeq, nowIso(), row.phaseId);
+      this.appendEvent({
+        kind: 'job.phase-handoff-completed',
+        jobId: row.jobId,
+        payload: { phase_id: row.phaseId, source: row.source, completion_seq: input.completionSeq },
+      });
+      return this.getPhaseHandoff(row.phaseId) as PhaseHandoffRecord;
+    });
+  }
+
+  /** Record the owed obligation on the completed phase (idempotent; a
+   * different obligation id would fork the debt and is refused). */
+  markPhaseHandoffObligation(input: { phaseId: string; obligationId: string }): PhaseHandoffRecord {
+    if (input.obligationId.trim() === '') throw new Error('phase handoff obligation id must be non-empty');
+    return this.transaction(() => {
+      const row = this.getPhaseHandoff(input.phaseId);
+      if (row === null) throw new RecordNotFound(`phase handoff "${input.phaseId}" not found`);
+      if (row.state !== 'completed') {
+        throw new PhaseHandoffConflictError(`phase handoff "${row.phaseId}" is ${row.state} — only a completed phase carries a debt`);
+      }
+      if (row.obligationId !== null) {
+        if (row.obligationId !== input.obligationId) {
+          throw new PhaseHandoffConflictError(
+            `phase handoff "${row.phaseId}" already names obligation ${row.obligationId}, not ${input.obligationId}`,
+          );
+        }
+        return row;
+      }
+      this.db
+        .prepare('UPDATE phase_handoffs SET obligation_id = ?, updated_at = ? WHERE phase_id = ?')
+        .run(input.obligationId, nowIso(), row.phaseId);
+      return this.getPhaseHandoff(row.phaseId) as PhaseHandoffRecord;
+    });
+  }
+
+  /** Record the published action-required row (idempotent; a different id
+   * would mean a second card for one phase and is refused). */
+  markPhaseHandoffPublished(input: { phaseId: string; notificationId: string }): PhaseHandoffRecord {
+    if (input.notificationId.trim() === '') throw new Error('phase handoff notification id must be non-empty');
+    return this.transaction(() => {
+      const row = this.getPhaseHandoff(input.phaseId);
+      if (row === null) throw new RecordNotFound(`phase handoff "${input.phaseId}" not found`);
+      if (row.state !== 'completed') {
+        throw new PhaseHandoffConflictError(`phase handoff "${row.phaseId}" is ${row.state} — only a completed phase publishes`);
+      }
+      if (row.notificationId !== null) {
+        if (row.notificationId !== input.notificationId) {
+          throw new PhaseHandoffConflictError(
+            `phase handoff "${row.phaseId}" already published ${row.notificationId}, not ${input.notificationId}`,
+          );
+        }
+        return row;
+      }
+      this.db
+        .prepare('UPDATE phase_handoffs SET notification_id = ?, updated_at = ? WHERE phase_id = ?')
+        .run(input.notificationId, nowIso(), row.phaseId);
+      return this.getPhaseHandoff(row.phaseId) as PhaseHandoffRecord;
+    });
+  }
+
+  /** Close an awaiting/completed phase without a hand-back (failure,
+   * cancellation, supersession, terminal/parked guard). Idempotent for a
+   * closed row; the reason is durable provenance. closed never reopens. */
+  closePhaseHandoff(input: { phaseId: string; reason: string }): PhaseHandoffRecord {
+    if (input.reason.trim() === '') throw new Error('phase handoff close requires a reason');
+    return this.transaction(() => {
+      const row = this.getPhaseHandoff(input.phaseId);
+      if (row === null) throw new RecordNotFound(`phase handoff "${input.phaseId}" not found`);
+      if (row.state === 'closed') return row;
+      this.db
+        .prepare("UPDATE phase_handoffs SET state = 'closed', close_reason = ?, updated_at = ? WHERE phase_id = ?")
+        .run(input.reason, nowIso(), row.phaseId);
+      this.appendEvent({
+        kind: 'job.phase-handoff-closed',
+        jobId: row.jobId,
+        payload: { phase_id: row.phaseId, source: row.source, from: row.state, reason: input.reason },
+      });
+      return this.getPhaseHandoff(row.phaseId) as PhaseHandoffRecord;
+    });
+  }
+
+  /** Per-job monotonic phase generation (1-based). */
+  private nextPhaseHandoffGeneration(jobId: string): number {
+    const row = this.db
+      .prepare('SELECT COALESCE(MAX(generation), 0) AS generation FROM phase_handoffs WHERE job_id = ?')
+      .get(jobId) as Row | undefined;
+    const value = row?.generation;
+    return (typeof value === 'number' && Number.isFinite(value) ? value : 0) + 1;
+  }
+
+  private phaseHandoffFromRow(row: Row): PhaseHandoffRecord {
+    const state = str(row.state);
+    if (!isPhaseHandoffState(state)) {
+      throw new Error(`phase_handoffs row "${str(row.phase_id)}" has unknown state "${state}"`);
+    }
+    const source = str(row.source);
+    if (!isPhaseHandoffSource(source)) {
+      throw new Error(`phase_handoffs row "${str(row.phase_id)}" has unknown source "${source}"`);
+    }
+    return {
+      phaseId: str(row.phase_id),
+      jobId: str(row.job_id),
+      source,
+      requestId: nstr(row.request_id),
+      generation: Number(row.generation),
+      decision: str(row.decision),
+      state,
+      intentSeq: Number(row.intent_seq),
+      minionId: nstr(row.minion_id),
+      completionSeq: row.completion_seq === null || row.completion_seq === undefined ? null : Number(row.completion_seq),
+      obligationId: nstr(row.obligation_id),
+      notificationId: nstr(row.notification_id),
+      closeReason: nstr(row.close_reason),
+      createdAt: str(row.created_at),
+      updatedAt: str(row.updated_at),
+    };
+  }
+
+  // ------------------------------------------------------------------
   // Durable directive requests (phase 3 slice): request-scoped
   // intent/claim/admission/receipt/reconciliation. The durable row is the
   // single source of truth; HTTP responses only report it. No prompt/
@@ -2591,13 +2950,20 @@ export class LedgerApi {
    * request id + same canonical payload replays to the SAME row; same id
    * + different payload is a conflict. A caller without an identity
    * (`requestId` omitted) that repeats while another request for the job
-   * is live fails CLOSED — never a silent duplicate turn. */
+   * is live fails CLOSED — never a silent duplicate turn. When the
+   * request carries an explicit completion intent (`handoff`), the
+   * phase-handoff guard row is persisted in the SAME transaction — before
+   * any side effect — and a live REPLAY may attach the intent to the
+   * existing request (idempotent by request id); an already-terminal
+   * request is never retro-marked. */
   beginDirectiveIntent(input: {
     jobId: string;
     directive: string;
     blockerFingerprint?: string;
     holder: string;
     requestId?: string;
+    /** Explicit completion intent; omitted = ordinary directive. */
+    handoff?: CompletionHandoffIntent;
   }): { readonly record: DirectiveRequestRecord; readonly created: boolean } {
     if (input.directive.trim() === '') throw new Error('directive text must be non-empty');
     if (input.holder.trim() === '') throw new Error('directive intent requires a non-empty holder');
@@ -2622,6 +2988,16 @@ export class LedgerApi {
             throw new DirectiveConflictError(
               `directive request "${input.requestId}" belongs to job ${existing.jobId}, not ${input.jobId}`,
             );
+          }
+          if (input.handoff !== undefined && !isDirectiveTerminal(existing.state)) {
+            // A live replay may attach (or confirm) the explicit completion
+            // intent for THIS request — same request identity, idempotent.
+            this.beginPhaseHandoff({
+              jobId: input.jobId,
+              source: 'silas-directive',
+              intent: input.handoff,
+              requestId: existing.requestId,
+            });
           }
           return { record: existing, created: false }; // durable replay — the accepted request, unchanged
         }
@@ -2665,6 +3041,14 @@ export class LedgerApi {
         jobId: input.jobId,
         payload: { request_id: requestId, holder: input.holder, directive_bytes: Buffer.byteLength(input.directive, 'utf-8') },
       });
+      if (input.handoff !== undefined) {
+        this.beginPhaseHandoff({
+          jobId: input.jobId,
+          source: 'silas-directive',
+          intent: input.handoff,
+          requestId,
+        });
+      }
       return { record: this.getDirective(requestId) as DirectiveRequestRecord, created: true };
     });
   }
@@ -2876,6 +3260,7 @@ export class LedgerApi {
       baselineSeq: Number(row.baseline_seq),
       agentId: nstr(row.agent_id),
       sessionFile: nstr(row.session_file),
+      phaseId: nstr(row.phase_id),
       requestedAt: str(row.requested_at),
     };
   }

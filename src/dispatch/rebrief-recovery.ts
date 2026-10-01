@@ -73,6 +73,11 @@ export interface PendingRebriefFinalize {
   readonly deliveryNote: string | null;
   readonly rebriefRecorded: boolean;
   readonly deliveryRecorded: boolean;
+  /** true when the markers were replaced by a NEWER re-brief request while
+   * this turn was in flight: nothing was recorded and nothing was cleared —
+   * the newer request owns the lane, and an older receipt can never
+   * complete a newer phase. */
+  readonly superseded: boolean;
 }
 
 export interface ReconcileReport {
@@ -114,23 +119,59 @@ export function finalizeRebriefRequest(input: {
   readonly minionId: string | null;
   readonly lanePath: string | null;
   readonly note: string | null;
+  /** The phase identity this turn was started under (host-owned). When the
+   * markers now carry a DIFFERENT identity, a newer request replaced them
+   * mid-turn: skip recording entirely. Omitted = legacy callers (no fence). */
+  readonly expectedPhaseId?: string | null;
 }): PendingRebriefFinalize {
   const markers = input.ledger.listPendingRebriefs({ jobId: input.jobId });
   if (markers.length === 0) {
     // No markers means the request already finalized (events landed) — a
     // replay is a no-op, never a duplicate event. Every live re-brief
     // begins its markers before it can reach here.
-    return { minionId: input.minionId, deliveredSha: null, deliveryNote: null, rebriefRecorded: false, deliveryRecorded: false };
+    return {
+      minionId: input.minionId,
+      deliveredSha: null,
+      deliveryNote: null,
+      rebriefRecorded: false,
+      deliveryRecorded: false,
+      superseded: false,
+    };
+  }
+  if (input.expectedPhaseId !== undefined) {
+    const currentPhaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
+    if (currentPhaseId !== input.expectedPhaseId) {
+      // A newer request's markers own the lane now: this settled turn's
+      // events must NOT be recorded against them (an older receipt cannot
+      // complete a newer phase), and the newer markers must stay pending.
+      return {
+        minionId: input.minionId,
+        deliveredSha: null,
+        deliveryNote: null,
+        rebriefRecorded: false,
+        deliveryRecorded: false,
+        superseded: true,
+      };
+    }
   }
   const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief') ?? null;
   const deliveryMarker = markers.find((marker) => marker.kind === 'job.delivered') ?? null;
+  // Host-owned phase identity: when this request carried an explicit
+  // completion intent, every guarded event must carry it so the delivery
+  // can complete exactly this phase (never an event-sequence guess).
+  const phaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
 
   let rebriefRecorded = false;
   if (rebriefMarker === null || !pendingRebriefEventLanded(input.ledger, rebriefMarker)) {
     input.ledger.appendCustomEvent({
       kind: 'silas.rebrief',
       jobId: input.jobId,
-      payload: { minion_id: input.minionId, lane: input.lanePath, note: input.note },
+      payload: {
+        minion_id: input.minionId,
+        lane: input.lanePath,
+        note: input.note,
+        ...(phaseId !== null ? { phase_id: phaseId } : {}),
+      },
     });
     rebriefRecorded = true;
   }
@@ -146,6 +187,7 @@ export function finalizeRebriefRequest(input: {
       jobId: input.jobId,
       agentId: input.minionId,
       source: 'silas-rebrief',
+      ...(phaseId !== null ? { phaseId } : {}),
     });
     deliveredSha = followUp.sha;
     deliveryNote = followUp.note;
@@ -162,7 +204,7 @@ export function finalizeRebriefRequest(input: {
 
   // Markers clear ONLY now — every guarded event exists.
   input.ledger.clearPendingRebriefs(markers.map((marker) => marker.id));
-  return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded };
+  return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, superseded: false };
 }
 
 /** Markers this process is actively recovering — a second reconcile pass
@@ -209,12 +251,14 @@ export async function reconcilePendingRebriefs(
     // delivered; record the delivery directly instead of rerunning a turn.
     if (missing.every((marker) => marker.kind === 'job.delivered')) {
       const anchor = group.find((marker) => marker.kind === 'job.delivered') ?? group[0];
+      const phaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
       const followUp = recordFollowUpDelivery({
         ledger: deps.ledger,
         worktrees: deps.worktrees,
         jobId,
         agentId: anchor?.agentId ?? null,
         source: 'silas-rebrief',
+        ...(phaseId !== null ? { phaseId } : {}),
       });
       deps.ledger.clearPendingRebriefs(group.map((marker) => marker.id));
       deps.ledger.appendCustomEvent({
@@ -260,6 +304,7 @@ async function redispatchGroup(
     }
     const rebriefMarker = group.find((marker) => marker.kind === 'silas.rebrief') ?? group[0];
     const note = rebriefMarker?.note ?? '';
+    const expectedPhaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
     const resumeFile = resolveResumeFile(deps, jobId, group);
     let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
     try {
@@ -287,7 +332,17 @@ async function redispatchGroup(
       minionId: result.minionId,
       lanePath: result.lanePath,
       note,
+      expectedPhaseId,
     });
+    if (finalized.superseded) {
+      // A newer re-brief request replaced the markers while this recovery
+      // turn ran: record nothing (its own turn owns the lane) and keep the
+      // newer markers pending. The older receipt is evidence only.
+      deps.log?.('warn', 're-brief recovery turn superseded by a newer request — nothing recorded', {
+        job: jobId,
+      });
+      return;
+    }
     deps.ledger.appendCustomEvent({
       kind: 'silas.rebrief-recovered',
       jobId,

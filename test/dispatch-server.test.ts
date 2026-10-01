@@ -289,6 +289,85 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('dispatches a marked completion phase: the intent is durable before the turn, the response still 202s', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-handoff');
+    cleanupRepos.push(repo);
+    try {
+      const res = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-marked',
+          repo_path: repo.path,
+          title: 'marked artifact phase',
+          briefing: 'audit only; no commit expected',
+          completion_handoff: { kind: 'gru-decision', decision: 'rule on the audit' },
+        },
+        TOKEN,
+      );
+      expect(res.status).toBe(202);
+      // The guard row exists BEFORE the minion turn completes, bound to the
+      // spawned worker: the completion observer matches on this identity.
+      const phases = h.ledger.listPhaseHandoffs({ jobId: 'http-marked' });
+      expect(phases).toHaveLength(1);
+      expect(phases[0]).toMatchObject({
+        source: 'dispatch',
+        state: 'awaiting',
+        decision: 'rule on the audit',
+      });
+      expect(phases[0]?.minionId).not.toBeNull();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('refuses a malformed completion_handoff before any job or phase exists', async () => {
+    const h = await boot();
+    try {
+      const badDispatch = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-bad-handoff',
+          repo_path: '/tmp/not-a-repo',
+          title: 't',
+          briefing: 'b',
+          completion_handoff: { kind: 'owner-decision', decision: 'no' },
+        },
+        TOKEN,
+      );
+      expect(badDispatch.status).toBe(400);
+      expect(h.ledger.getJob('http-bad-handoff')).toBeNull();
+
+      h.ledger.addJob({ id: 'http-bad-directive', repo: 'r', title: 't' });
+      h.ledger.setJobStatus('http-bad-directive', 'working');
+      const badDirective = await call(
+        h.port,
+        'POST',
+        '/api/silas/directive',
+        { job_id: 'http-bad-directive', directive: 'x', completion_handoff: { kind: 'gru-decision' } },
+        TOKEN,
+      );
+      expect(badDirective.status).toBe(400);
+      expect(h.ledger.listPhaseHandoffs({ jobId: 'http-bad-directive' })).toHaveLength(0);
+
+      const badRebrief = await call(
+        h.port,
+        'POST',
+        '/api/silas/rebrief',
+        { job_id: 'http-bad-directive', note: 'n', completion_handoff: 'gru' },
+        TOKEN,
+      );
+      expect(badRebrief.status).toBe(400);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'http-bad-directive' })).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('returns a durable 202 review receipt to an implementing minion without waiting on its open turn', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });

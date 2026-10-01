@@ -25,6 +25,29 @@ draft first, never a later draft-to-ready conversion. This corrects HOW
 an already-authorized PR is created; it grants no publication permission
 to a lane that has none, and existing drafts are left untouched.
 
+## Marking a phase that owes the chief a decision (pr136-chief-handoff)
+
+A bounded phase can complete with the lane unblocked and HEAD unmoved (an
+artifact-only audit; a same-head re-brief). When the authorizing request is
+EXPLICITLY marked, the SERVICE — not you, not a watcher — durably records
+the owed chief decision and publishes one action-required hand-back when
+that exact phase reaches validated completion. Add to the request:
+
+```json
+"completion_handoff": { "kind": "gru-decision", "decision": "<what the chief must rule on>" }
+```
+
+- `POST /api/dispatch` — the fresh artifact phase (omitted = ordinary
+  dispatch; the field is validated before any job exists).
+- `POST /api/silas/directive` — a bounded fix/repair phase.
+- `POST /api/silas/rebrief` — a fresh-worker phase.
+
+Mark only phases whose completion genuinely owes the chief a decision.
+An unmarked request keeps the ordinary flow. `job.delivered`, a 200, idle
+or a nonempty artifact is never completion by itself: the hand-back fires
+only for the marked phase's correlated, admitted terminal delivery. Never
+re-mark historical work; a changed decision needs a NEW request id.
+
 ## Mechanical reactions vs judgment (owner mandate split 2026-09-23)
 
 The chief keeps the judgments: rulings, merges, and novel failures. The

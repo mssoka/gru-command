@@ -141,6 +141,10 @@ export function recordFollowUpDelivery(input: {
    * delivery answers. When present the event can only settle THAT
    * request — a later unrelated delivery cannot clear an older marker. */
   readonly requestId?: string;
+  /** Host-owned phase-handoff identity: present when the phase was
+   * explicitly marked as owing a completion decision. The completion
+   * observer matches on THIS id (never the event sequence). */
+  readonly phaseId?: string;
 }): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null; readonly eventSeq: number } {
   const jobLanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job');
   const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];
@@ -165,6 +169,7 @@ export function recordFollowUpDelivery(input: {
       source: input.source,
       sha,
       ...(input.requestId !== undefined ? { request_id: input.requestId } : {}),
+      ...(input.phaseId !== undefined ? { phase_id: input.phaseId } : {}),
     },
   });
   return { sha, lanePath: lane?.path ?? null, note, eventSeq: event.seq };

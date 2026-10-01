@@ -246,3 +246,76 @@ not permission. The identity-less duplicate guard and the boot pass
 both query the LIVE states directly, and the boot pass pages by
 `request_id` cursor — terminal history can never crowd a live request
 out of examination.
+
+### Explicit phase-completion handoffs (migration 10, pr136-chief-handoff)
+
+The durable-follow-through contract above started with blocked lanes. A
+bounded phase can also complete on a lane that is NOT blocked and whose
+HEAD never moves (the fresh artifact-only dispatch and the same-head
+re-brief are the observed shapes). Migration 10 closes that gap with an
+EXPLICIT, durable intent — never inferred from a final message, an HTTP
+status, `job.delivered` alone, an idle board or an assistant claim.
+
+**The intent.** The phase-authorizing requests accept an optional typed
+field:
+
+```json
+"completion_handoff": { "kind": "gru-decision", "decision": "rule on the completed audit follow-through" }
+```
+
+on `POST /api/dispatch` (fresh artifact phase), `POST /api/silas/directive`
+(bounded fix/repair phase) and `POST /api/silas/rebrief` (fresh-worker
+phase). Omitting the field preserves the ordinary flow exactly. A
+malformed intent answers 400 BEFORE any job, marker or side effect. The
+decision text is a label for the owed obligation — never authority and
+never identity.
+
+**`phase_handoffs`** — one guard row per marked phase, written in the
+SAME transaction as the authorized request (before admission/side
+effects). Identity is host-owned:
+`phase-handoff:<job>:<source>:<generation>` (per-job monotonic
+generation). States:
+
+| state | meaning |
+|---|---|
+| `awaiting` | the intent is durable; the phase has not completed (the request's own reconcilers still own admission-unknown escalation) |
+| `completed` | a VALIDATED correlated terminal delivery landed; the obligation and its one card are reconciled from here |
+| `closed` | terminal without a hand-back (failed/cancelled/superseded/parked/terminal-job); closed never reopens |
+
+**Validated completion.** Only a `job.delivered` event carrying the
+phase's `phase_id` AND postdating its `intent_seq` AND passing the
+source's admission gate completes a phase: a directive request must be
+`admitted`/`settled` with the matching `request_id`; a re-brief must have
+recorded its `silas.rebrief` request event with the same phase id; a
+dispatch delivery must come from the phase's bound minion. Failed,
+error-settled and disposed attempts record no admission — they can never
+masquerade as completion. An older receipt cannot complete a newer phase
+(correlation, not sequence).
+
+**The hand-back.** On completion the service records ONE
+`phase-completion` obligation (`incidentKey phase-handoff@<phaseId>`,
+category `phase-completion`, firing rule
+`phase-completion-gru-decision`, no authority) and publishes ONE
+action-required row on the existing Gru wake path
+(`NotificationCenter.postIncident`, stable kind
+`silas.phase-handback.<phaseId>`, `dedupe: all`). No watcher, minion
+callback, model classification or second wake pipeline participates.
+Durable guards: a terminal job settles the debt `job-terminal`; a parked
+job SUSPENDS it — neither publishes a card, and neither is revived
+automatically. Shown/ACK/disposition is never settlement.
+
+**Reconciliation.** `reconcilePhaseHandoffs` rides the existing boot
+sequence (after the directive/re-brief reconcilers) in bounded cursor
+pages: an awaiting phase whose delivery committed before the observer
+ran is completed and published; a completed phase missing its obligation
+or card finishes them. Every step is idempotent, so duplicates, replays and
+restarts yield exactly one logical hand-back per phase — no re-dispatch,
+no duplicate Gru turn, no fresh alert ids. The legacy blocked-only
+observer skips any delivery naming an existing phase row, so a marked
+blocked hand-back is never double-published.
+
+**Limits.** This slice adds no runtime attestation interface, no
+provider recovery and no timer/scheduler: a crash mid-dispatch with no
+admission evidence leaves the phase `awaiting` (never a fabricated
+success). Migration 10 is additive; nothing here changes owner stops,
+merge/deploy/restart policy or any callers' notification semantics.

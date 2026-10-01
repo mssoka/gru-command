@@ -1,5 +1,5 @@
 import type { BusEvent } from '../events/bus.js';
-import type { LedgerApi } from '../ledger/api.js';
+import type { LedgerApi, PhaseHandoffRecord } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -33,7 +33,7 @@ export interface FollowThroughNotifications {
     detail?: string | null;
     agentId?: string | null;
     dedupe: 'unacked' | 'active' | 'all';
-  }): unknown;
+  }): { readonly id: string };
 }
 
 export interface FollowThroughDeps {
@@ -75,6 +75,11 @@ export function observeFollowUpDelivery(
   const payload = (event.payload ?? {}) as Record<string, unknown>;
   const source = typeof payload['source'] === 'string' ? payload['source'] : null;
   if (source === null || !FOLLOW_UP_SOURCES.has(source)) return null;
+  // An explicitly marked phase owns its own hand-back path
+  // (`observePhaseCompletion`), keyed on the host-owned phase id — never
+  // double-publish the event-sequence card for the same delivery.
+  const phaseId = typeof payload['phase_id'] === 'string' && payload['phase_id'] !== '' ? payload['phase_id'] : null;
+  if (phaseId !== null && deps.ledger.getPhaseHandoff(phaseId) !== null) return null;
   const job = deps.ledger.getJob(event.jobId);
   if (job === null) return null;
   if (job.status !== 'blocked') return null; // normal flow — review/digest owns it
@@ -161,4 +166,351 @@ export function adoptBlockedLanes(deps: FollowThroughDeps, opts: { limit?: numbe
     deps.log?.('info', 'blocked lane adopted for triage', { job: job.id });
   }
   return { scanned: candidates.length, adopted };
+}
+
+// --------------------------------------------------------------------
+// Explicit phase-completion handoff (pr136-chief-handoff): an authorized
+// bounded phase was MARKED as owing Gru a decision when its request was
+// accepted (before any side effect). When that exact phase reaches a
+// VALIDATED correlated terminal delivery, the service records the owed
+// obligation and publishes ONE deterministic action-required row on the
+// existing Gru wake path — no watcher, no minion callback, no LLM
+// routing, no second wake pipeline. This is the general case the
+// blocked-only legacy observer could not cover: a fresh artifact-only
+// dispatch (source=dispatch, working→delivered, no commit/PR) and a
+// same-head rebrief on a NONblocked lane both hand back here, while
+// omission of the intent keeps ordinary Silas completion unchanged.
+// --------------------------------------------------------------------
+
+/** Minimal terminal-event shape the observer/reconciler consume (BusEvent
+ * and EventRecord both fit). */
+interface DeliveryEventLike {
+  readonly kind: string;
+  readonly jobId: string | null;
+  readonly seq: number;
+  readonly payload: unknown;
+}
+
+export interface PhaseCompletionResult {
+  readonly phaseId: string;
+  readonly jobId: string;
+  readonly obligationId: string | null;
+  readonly notificationId: string | null;
+  /** true when THIS call completed an awaiting phase (recorded the debt);
+   * false when it finished/replayed an already-completed phase. */
+  readonly created: boolean;
+}
+
+function payloadOf(event: DeliveryEventLike): Record<string, unknown> {
+  return (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
+}
+
+/**
+ * Admission/correlation gate: a delivery can complete a phase only when
+ * the phase's OWN admission evidence exists. `job.delivered`, HTTP
+ * success/timeout, idle, a nonempty file or an assistant claim alone is
+ * never enough; a failed, error-settled or disposed attempt records no
+ * admission and therefore cannot masquerade as completion.
+ */
+function phaseAdmissionValid(
+  ledger: FollowThroughDeps['ledger'],
+  phase: PhaseHandoffRecord,
+  payload: Record<string, unknown>,
+): boolean {
+  switch (phase.source) {
+    case 'silas-directive': {
+      if (phase.requestId === null) return false;
+      if (payload['request_id'] !== phase.requestId) return false;
+      const directive = ledger.getDirective(phase.requestId);
+      return (
+        directive !== null &&
+        directive.jobId === phase.jobId &&
+        (directive.state === 'admitted' || directive.state === 'settled')
+      );
+    }
+    case 'silas-rebrief':
+      // The re-brief request records its own `silas.rebrief` event (with
+      // this phase id) BEFORE the delivery; an interrupted/failed re-brief
+      // records none and can never complete. (When the marker pair still
+      // exists the delivery is emitted by the same finalizer.)
+      return findPhaseRequestEvent(ledger, phase);
+    case 'dispatch':
+      // The dispatch flow binds the spawned minion before the prompt; a
+      // delivery from any other worker is not this phase's completion.
+      return phase.minionId !== null && payload['agentId'] === phase.minionId;
+  }
+}
+
+/** The phase's own request event, postdating its intent watermark. */
+function findPhaseRequestEvent(ledger: FollowThroughDeps['ledger'], phase: PhaseHandoffRecord): boolean {
+  for (const event of ledger.listJobEvents(phase.jobId, { limit: 1000 })) {
+    if (event.kind !== 'silas.rebrief') continue;
+    if (event.seq <= phase.intentSeq) continue;
+    const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
+    if (payload['phase_id'] === phase.phaseId) return true;
+  }
+  return false;
+}
+
+/** The newest correlated terminal delivery for an awaiting phase, or null
+ * when none (or none that passes the admission gates). Bounded scan of
+ * the job's events; the phase row is the authority, the event is evidence. */
+function findPhaseCompletionEvent(
+  ledger: FollowThroughDeps['ledger'],
+  phase: PhaseHandoffRecord,
+): DeliveryEventLike | null {
+  for (const event of ledger.listJobEvents(phase.jobId, { limit: 1000 })) {
+    if (event.kind !== 'job.delivered') continue;
+    if (event.seq <= phase.intentSeq) continue;
+    const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
+    if (payload['phase_id'] !== phase.phaseId) continue;
+    if (payload['source'] !== phase.source) continue;
+    if (!phaseAdmissionValid(ledger, phase, payload)) continue;
+    return { kind: event.kind, jobId: event.jobId, seq: event.seq, payload: event.payload };
+  }
+  return null;
+}
+
+/**
+ * Observe one bus event for a marked phase's validated terminal
+ * completion. Returns null when the event is not a completion for an
+ * explicitly marked phase; a closed phase stays closed (a late receipt
+ * never revives it). Publication is deterministic and deduped by the
+ * stable per-phase notification kind, so replays coalesce.
+ */
+export function observePhaseCompletion(
+  deps: FollowThroughDeps,
+  event: Pick<BusEvent, 'kind' | 'jobId' | 'seq' | 'payload'>,
+): PhaseCompletionResult | null {
+  if (event.kind !== 'job.delivered' || event.jobId === null) return null;
+  const payload = payloadOf(event);
+  const phaseId = typeof payload['phase_id'] === 'string' && payload['phase_id'] !== '' ? payload['phase_id'] : null;
+  if (phaseId === null) return null;
+  const phase = deps.ledger.getPhaseHandoff(phaseId);
+  if (phase === null || phase.jobId !== event.jobId) return null;
+  return settlePhaseCompletion(deps, phase, event);
+}
+
+/**
+ * The shared completion routine (observer and boot reconciliation ride
+ * it): complete the awaiting phase once its evidence validates, then
+ * record the debt and publish the one stable-kind action-required row.
+ * Guards re-read durable state: a terminal job settles the debt
+ * `job-terminal` and closes the phase; a parked job SUSPENDS the debt
+ * (explicit owner stop — no wake, no resume) and closes the phase. In
+ * both guarded cases nothing is published: an owner stop is never a Gru
+ * decision, and a terminal lane is never revived.
+ */
+function settlePhaseCompletion(
+  deps: FollowThroughDeps,
+  phase: PhaseHandoffRecord,
+  event: DeliveryEventLike,
+): PhaseCompletionResult | null {
+  if (phase.state === 'closed') return null; // terminal history — a late receipt cannot revive it
+  if (phase.state === 'completed') return finishPhaseHandoff(deps, phase, false);
+  const payload = payloadOf(event);
+  if (event.seq <= phase.intentSeq) return null; // an older receipt cannot complete this phase
+  if (payload['source'] !== phase.source) return null;
+  if (!phaseAdmissionValid(deps.ledger, phase, payload)) {
+    deps.log?.('info', 'phase completion evidence rejected — admission gate', {
+      phase: phase.phaseId,
+      source: phase.source,
+      seq: event.seq,
+    });
+    return null;
+  }
+  const completed = deps.ledger.completePhaseHandoff({ phaseId: phase.phaseId, completionSeq: event.seq });
+  deps.log?.('info', 'phase handoff completed', {
+    phase: completed.phaseId,
+    job: completed.jobId,
+    source: completed.source,
+    completion_seq: event.seq,
+  });
+  return finishPhaseHandoff(deps, completed, true);
+}
+
+/**
+ * Record the owed obligation (if missing) and publish the ONE stable
+ * action-required row (if not yet published), applying the durable
+ * terminal/parked guards. Every step is idempotent, so a crash between
+ * any two steps is repaired by the next boot reconciliation without a
+ * duplicate obligation or card.
+ */
+function finishPhaseHandoff(
+  deps: FollowThroughDeps,
+  phase: PhaseHandoffRecord,
+  created: boolean,
+): PhaseCompletionResult | null {
+  if (phase.completionSeq === null) return null; // defensive: completed rows always carry it
+  const job = deps.ledger.getJob(phase.jobId);
+  if (job === null) return null;
+  let obligation = phase.obligationId === null ? null : deps.ledger.getObligation(phase.obligationId);
+  if (obligation === null) {
+    obligation = deps.ledger.recordBlockedObservation(phase.jobId, {
+      logicalStep: 'operation',
+      category: { kind: 'known', category: 'phase-completion' },
+      incidentKey: `phase-handoff@${phase.phaseId}`,
+      observedAtSeq: phase.completionSeq,
+      description:
+        `explicitly marked ${phase.source} phase completed (event ${phase.completionSeq}); ` +
+        `the next decision is owed durably: ${phase.decision}`,
+      nextAction: { kind: 'gru-decision', decision: phase.decision },
+      firingRule: 'phase-completion-gru-decision',
+    });
+    deps.ledger.markPhaseHandoffObligation({ phaseId: phase.phaseId, obligationId: obligation.id });
+  }
+  const obligationId = obligation.id;
+  const terminal = job.status === 'done' || job.status === 'merged';
+  if (terminal) {
+    if (obligation.state === 'open' || obligation.state === 'waiting' || obligation.state === 'suspended') {
+      deps.ledger.settleObligation({
+        obligationId,
+        settlement: { kind: 'job-terminal', jobStatus: job.status },
+      });
+    }
+    deps.ledger.closePhaseHandoff({
+      phaseId: phase.phaseId,
+      reason: `job reached ${job.status} before the hand-back could be published`,
+    });
+    deps.log?.('info', 'phase handoff closed by terminal job', { phase: phase.phaseId, job: phase.jobId });
+    return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: null, created };
+  }
+  if (job.status === 'parked') {
+    if (obligation.state === 'open' || obligation.state === 'waiting') {
+      deps.ledger.suspendObligation(
+        obligationId,
+        'job parked — phase hand-back suspended by explicit durable state (no wake)',
+      );
+    }
+    deps.ledger.closePhaseHandoff({
+      phaseId: phase.phaseId,
+      reason: 'job parked before the hand-back could be published — debt suspended for explicit resume',
+    });
+    deps.log?.('info', 'phase handoff suspended by parked job', { phase: phase.phaseId, job: phase.jobId });
+    return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: null, created };
+  }
+  if (phase.notificationId !== null) {
+    return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: phase.notificationId, created };
+  }
+  const card = deps.notifications.postIncident({
+    kind: `silas.phase-handback.${phase.phaseId}`,
+    routing: 'action-required',
+    severity: 'info',
+    title: `Phase completed on job ${phase.jobId} — Gru decision owed`,
+    detail:
+      `An explicitly marked ${phase.source} phase completed (event ${phase.completionSeq}). ` +
+      `The durable obligation ${obligationId} owes the next Gru decision: ${phase.decision}. ` +
+      'Completion is evidence, never approval; this row is the machine hand-back on the existing wake path ' +
+      'and requires no owner prompt.',
+    dedupe: 'all',
+  });
+  deps.ledger.markPhaseHandoffPublished({ phaseId: phase.phaseId, notificationId: card.id });
+  deps.log?.('info', 'phase handoff published', {
+    phase: phase.phaseId,
+    job: phase.jobId,
+    obligation: obligationId,
+    notification: card.id,
+  });
+  return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: card.id, created };
+}
+
+export interface PhaseReconcileReport {
+  readonly examined: number;
+  /** Awaiting phases completed by this pass (completion evidence found). */
+  readonly completed: number;
+  /** Phases whose action-required row was published by this pass. */
+  readonly published: number;
+  /** Awaiting phases closed WITHOUT a hand-back by a durable guard. */
+  readonly closed: number;
+}
+
+/**
+ * Bounded boot/sweep reconciliation for phase handoffs — the crash-window
+ * backstop, riding the existing recovery coordinator (no timer, no new
+ * daemon, no re-dispatch). For each awaiting phase it looks for the
+ * correlated completion evidence the live observer may have missed
+ * (crash between the delivery commit and the observer write); for each
+ * completed phase it finishes the obligation/publication steps. An
+ * awaiting phase with no evidence is left exactly where it is: the phase
+ * is still live or its own request reconciler owns the escalation.
+ */
+export function reconcilePhaseHandoffs(
+  deps: FollowThroughDeps,
+  opts: { pageSize?: number; maxPages?: number } = {},
+): PhaseReconcileReport {
+  const pageSize = Math.min(Math.max(1, opts.pageSize ?? 200), 1000);
+  const maxPages = Math.min(Math.max(1, opts.maxPages ?? 20), 1000);
+  let examined = 0;
+  let completed = 0;
+  let published = 0;
+  let closed = 0;
+  let cursor: number | undefined;
+  for (let page = 0; page < maxPages; page += 1) {
+    const rows = deps.ledger.listPhaseHandoffs({
+      states: ['awaiting', 'completed'],
+      limit: pageSize,
+      ...(cursor !== undefined ? { cursor } : {}),
+    });
+    if (rows.length === 0) break;
+    for (const listed of rows) {
+      examined += 1;
+      try {
+        reconcileOnePhase(deps, listed.phaseId, (bump) => {
+          if (bump === 'completed') completed += 1;
+          if (bump === 'published') published += 1;
+          if (bump === 'closed') closed += 1;
+        });
+      } catch (error) {
+        // One malformed/conflicting row stays VISIBLE and never takes the
+        // boot pass down: the next boot retries it from durable state.
+        deps.log?.('error', 'phase handoff reconciliation row failed', {
+          phase: listed.phaseId,
+          error: String(error),
+        });
+      }
+    }
+    const last = rows[rows.length - 1];
+    cursor = last === undefined ? undefined : (deps.ledger.phaseHandoffRowid(last.phaseId) ?? undefined);
+    if (rows.length < pageSize) break;
+  }
+  return { examined, completed, published, closed };
+}
+
+/** Reconcile one phase; the counter bumps are reported to the caller. */
+function reconcileOnePhase(
+  deps: FollowThroughDeps,
+  phaseId: string,
+  bump: (counter: 'completed' | 'published' | 'closed') => void,
+): void {
+  // Re-read: a previous iteration may have advanced this row; a replay
+  // must always act on current durable state.
+  const phase = deps.ledger.getPhaseHandoff(phaseId);
+  if (phase === null) return;
+  if (phase.state === 'awaiting') {
+    const evidence = findPhaseCompletionEvent(deps.ledger, phase);
+    if (evidence !== null) {
+      const before = phase.notificationId;
+      const result = settlePhaseCompletion(deps, phase, evidence);
+      if (result !== null) {
+        if (result.created) bump('completed');
+        if (result.notificationId !== null && before === null) bump('published');
+      }
+      return;
+    }
+    // No completion evidence: a terminal job can never complete, so
+    // close the stale intent (no hand-back — the lane is finished).
+    const job = deps.ledger.getJob(phase.jobId);
+    if (job !== null && (job.status === 'done' || job.status === 'merged')) {
+      deps.ledger.closePhaseHandoff({
+        phaseId: phase.phaseId,
+        reason: `job reached ${job.status} with no completion evidence`,
+      });
+      bump('closed');
+    }
+    return;
+  }
+  // completed: finish the obligation/publication steps (crash windows).
+  const before = phase.notificationId;
+  const result = finishPhaseHandoff(deps, phase, false);
+  if (result !== null && result.notificationId !== null && before === null) bump('published');
 }

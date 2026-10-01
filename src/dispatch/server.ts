@@ -3,7 +3,8 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi } from '../ledger/api.js';
-import { AmbiguousDirectiveError, DirectiveConflictError } from '../ledger/api.js';
+import { AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError } from '../ledger/api.js';
+import { parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
@@ -84,6 +85,15 @@ function optStrArray(body: Record<string, unknown>, field: string): readonly str
     throw new Error(`${field} must be an array of non-empty strings`);
   }
   return value as readonly string[];
+}
+
+/** The optional explicit completion intent on phase-authorizing requests.
+ * Absent = ordinary flow; malformed = fail loud (the handler answers 400
+ * BEFORE any job/side effect runs). */
+function completionHandoffField(body: Record<string, unknown>): CompletionHandoffIntent | undefined {
+  const value = body['completion_handoff'];
+  if (value === undefined) return undefined;
+  return parseCompletionHandoffIntent(value);
 }
 
 export function createDispatchServer(options: DispatchServerOptions): DispatchServer {
@@ -172,11 +182,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     if (req.method === 'POST' && path === '/api/dispatch') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
+      const completionHandoff = completionHandoffField(body);
       const outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
         title: strField(body, 'title'),
         briefing: strField(body, 'briefing'),
+        ...(completionHandoff !== undefined ? { completionHandoff } : {}),
       });
       // The minion's turn runs in the background; the board carries the
       // lifecycle. Track it so dispose() never orphans a live lane.
@@ -328,6 +340,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const directive = strField(body, 'directive');
       const fingerprint = optStrField(body, 'blocker_fingerprint');
       const requestIdField = optStrField(body, 'request_id');
+      const completionHandoff = completionHandoffField(body);
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
       if (job.status === 'merged' || job.status === 'done') {
@@ -346,13 +359,14 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           holder: 'silas-ops',
           ...(fingerprint !== undefined ? { blockerFingerprint: fingerprint } : {}),
           ...(requestIdField !== undefined ? { requestId: requestIdField } : {}),
+          ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
         });
       } catch (error) {
         if (error instanceof AmbiguousDirectiveError) {
           json(res, 409, { error: 'ambiguous_repeat', detail: error.message });
           return true;
         }
-        if (error instanceof DirectiveConflictError) {
+        if (error instanceof DirectiveConflictError || error instanceof PhaseHandoffConflictError) {
           json(res, 409, { error: 'request_conflict', detail: error.message });
           return true;
         }
@@ -426,10 +440,17 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         if (!delivery.delivered) {
           // Positive no-effect proof (no live minion and no job lane): a
           // durable failure is honest; the caller resubmits fresh work.
+          const reason = delivery.note ?? 'no implementing minion session and no job lane';
           options.ledger.failDirective({
             requestId: intent.requestId,
-            reason: delivery.note ?? 'no implementing minion session and no job lane',
+            reason,
           });
+          // A marked phase whose request failed with positive no-effect
+          // proof can never complete: close the guard row (no hand-back).
+          const phase = options.ledger.findPhaseHandoffByRequest({ jobId, requestId: intent.requestId });
+          if (phase !== null && phase.state === 'awaiting') {
+            options.ledger.closePhaseHandoff({ phaseId: phase.phaseId, reason: `directive request failed: ${reason}` });
+          }
           log('warn', 'silas directive undelivered — durable no-effect failure recorded', {
             job: jobId,
             request: intent.requestId,
@@ -468,6 +489,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         // the delivery (with the lane head it produced) that re-arms review —
         // correlated to THIS request, so a later unrelated delivery cannot
         // clear this marker.
+        const markedPhase = options.ledger.findPhaseHandoffByRequest({ jobId, requestId: intent.requestId });
+        const markedPhaseId = markedPhase?.phaseId ?? null;
         const followUp = recordFollowUpDelivery({
           ledger: options.ledger,
           worktrees: ops.worktrees,
@@ -475,6 +498,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           agentId: delivery.minionId,
           source: 'silas-directive',
           requestId: intent.requestId,
+          // A marked phase carries its host-owned phase id on the delivery:
+          // the completion observer matches on that id, never the event seq.
+          ...(markedPhaseId !== null ? { phaseId: markedPhaseId } : {}),
         });
         if (followUp.note !== null) {
           log('warn', 'silas follow-up delivery has no resolvable lane head', {
@@ -549,6 +575,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const jobId = strField(body, 'job_id');
       const note = strField(body, 'note');
+      const completionHandoff = completionHandoffField(body);
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
       if (job.status === 'merged' || job.status === 'done') {
@@ -557,7 +584,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // Restart-safe by construction: the request markers are durable
       // BEFORE any worker exists, and clear only when their events land.
       // A restart mid-turn leaves them for the boot reconciler.
-      const markers = options.ledger.beginPendingRebrief({ jobId, note, briefing: job.briefing });
+      const markers = options.ledger.beginPendingRebrief({
+        jobId,
+        note,
+        briefing: job.briefing,
+        ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
+      });
+      const rebriefPhaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
       const controller = new AbortController();
       directiveControllers.add(controller);
       let result: { minionId: string; lanePath: string; prompt: string; sessionFile: string | null };
@@ -591,7 +624,14 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         minionId: result.minionId,
         lanePath: result.lanePath,
         note,
+        expectedPhaseId: rebriefPhaseId,
       });
+      if (followUp.superseded) {
+        log('warn', 're-brief request superseded while its turn ran — newer request owns the lane', {
+          job: jobId,
+          request_phase: rebriefPhaseId,
+        });
+      }
       if (followUp.deliveryNote !== null) {
         log('warn', 'silas follow-up delivery has no resolvable lane head', {
           job: jobId,

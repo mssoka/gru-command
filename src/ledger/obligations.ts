@@ -667,3 +667,105 @@ export function parseReceiptCorrelation(raw: string | null): ReceiptCorrelation 
     ...(minionId !== null ? { minionId } : {}),
   };
 }
+
+// ------------------------------------------------------------------
+// Explicit phase-completion handoffs (pr136-chief-handoff)
+// ------------------------------------------------------------------
+
+/** The typed intent a caller attaches to an authorized bounded phase:
+ * WHEN that phase reaches a VALIDATED terminal completion, the named
+ * decision is owed durably. The intent is a target plus a decision label
+ * — never authority, never identity (the host mints the phase id) and
+ * never a success claim. Exactly one target exists today (Gru); the
+ * shape is validated, not speculatively extended. */
+export interface CompletionHandoffIntent {
+  readonly kind: 'gru-decision';
+  readonly decision: string;
+}
+
+/** Bounded so a request cannot smuggle a document into the ledger. */
+export const MAX_COMPLETION_HANDOFF_DECISION = 500;
+
+/** Validate a caller-supplied completion-handoff intent at the boundary
+ * (HTTP body → typed value). Throws a named, actionable error; the
+ * caller decides the transport status. */
+export function parseCompletionHandoffIntent(raw: unknown): CompletionHandoffIntent {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new Error('completion_handoff must be an object {kind:"gru-decision", decision:"..."}');
+  }
+  const record = raw as Record<string, unknown>;
+  if (record['kind'] !== 'gru-decision') {
+    throw new Error('completion_handoff.kind must be "gru-decision" — no other handoff target is authorized here');
+  }
+  const decision = record['decision'];
+  if (typeof decision !== 'string' || decision.trim() === '') {
+    throw new Error('completion_handoff.decision must be a non-empty string');
+  }
+  const trimmed = decision.trim();
+  if (trimmed.length > MAX_COMPLETION_HANDOFF_DECISION) {
+    throw new Error(`completion_handoff.decision exceeds ${MAX_COMPLETION_HANDOFF_DECISION} characters`);
+  }
+  return { kind: 'gru-decision', decision: trimmed };
+}
+
+/** The phase-authorizing request families a handoff intent can ride. */
+export const PHASE_HANDOFF_SOURCES = ['dispatch', 'silas-directive', 'silas-rebrief'] as const;
+export type PhaseHandoffSource = (typeof PHASE_HANDOFF_SOURCES)[number];
+
+export function isPhaseHandoffSource(value: string): value is PhaseHandoffSource {
+  return (PHASE_HANDOFF_SOURCES as readonly string[]).includes(value);
+}
+
+/** `awaiting` = the intent is durable, the phase has not completed;
+ * `completed` = a validated correlated terminal delivery landed (the
+ * obligation and publication are reconciled from here); `closed` =
+ * terminal without a hand-back (cancelled/failed/superseded/parked or the
+ * job reached a terminal state first). closed is terminal. */
+export const PHASE_HANDOFF_STATES = ['awaiting', 'completed', 'closed'] as const;
+export type PhaseHandoffState = (typeof PHASE_HANDOFF_STATES)[number];
+
+export function isPhaseHandoffState(value: string): value is PhaseHandoffState {
+  return (PHASE_HANDOFF_STATES as readonly string[]).includes(value);
+}
+
+/** One durable phase-handoff guard row. Persisted BEFORE any admission or
+ * side effect; identity is host-owned (`phase-handoff:<job>:<source>:<n>`),
+ * never the delivery event's sequence. */
+export interface PhaseHandoffRecord {
+  readonly phaseId: string;
+  readonly jobId: string;
+  readonly source: PhaseHandoffSource;
+  /** Directive request id (provenance + delivery correlation), when a
+   * directive request authorized this phase. */
+  readonly requestId: string | null;
+  /** Per-job monotonic generation: a genuinely new phase advances it; a
+   * replay of the same request returns the same row. */
+  readonly generation: number;
+  /** The decision the completed phase owes (label only — no authority). */
+  readonly decision: string;
+  readonly state: PhaseHandoffState;
+  /** events.seq watermark at intent acceptance; completion must postdate it. */
+  readonly intentSeq: number;
+  /** The bound admitted worker (dispatch path — minion binding after spawn). */
+  readonly minionId: string | null;
+  /** The correlated terminal `job.delivered` seq, once validated. */
+  readonly completionSeq: number | null;
+  /** The owed obligation recorded for this phase. */
+  readonly obligationId: string | null;
+  /** The published action-required row for this phase (stable kind). */
+  readonly notificationId: string | null;
+  readonly closeReason: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/** Stable host-owned phase identity: a replay/reconciliation derives the
+ * same id from job+source+generation; the delivery event sequence never
+ * participates. */
+export function phaseHandoffId(jobId: string, source: PhaseHandoffSource, generation: number): string {
+  if (jobId.trim() === '') throw new Error('phase handoff requires a non-empty job id');
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error('phase handoff generation must be a positive safe integer');
+  }
+  return `phase-handoff:${jobId}:${source}:${generation}`;
+}

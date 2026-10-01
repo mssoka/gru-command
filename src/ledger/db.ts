@@ -400,4 +400,49 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_pending_directives_state ON pending_directives(state);
     `,
   },
+  {
+    // Explicit phase-completion handoffs (pr136-chief-handoff): the durable
+    // intent an authorized bounded phase persists BEFORE admission/side
+    // effects, its validated correlated completion, and the publication
+    // record for the owed Gru decision. The debt itself lives in
+    // job_obligations; the wake rides NotificationCenter's existing
+    // action-required path. `pending_rebriefs.phase_id` binds a re-brief
+    // marker pair to its phase row (host-owned identity, never the event
+    // sequence). Identity = `phase-handoff:<job>:<source>:<generation>` —
+    // generation is per-job monotonic; a replay of the same request returns
+    // the same row, a genuinely new phase advances it. `intent_seq` is the
+    // events watermark at acceptance: a completion at/before it can never
+    // answer this phase (an older receipt cannot complete a newer phase).
+    //
+    // LANDING COLLISION (same convention as migration 9): id 10 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // another lane's migration lands first, integrate owner-merged main and
+    // re-number ONLY this never-applied migration (never a hole).
+    id: 10,
+    name: 'phase-handoffs',
+    sql: `
+      CREATE TABLE phase_handoffs (
+        phase_id        TEXT PRIMARY KEY,
+        job_id          TEXT NOT NULL REFERENCES jobs(id),
+        source          TEXT NOT NULL CHECK (source IN ('dispatch','silas-directive','silas-rebrief')),
+        request_id      TEXT,
+        generation      INTEGER NOT NULL,
+        decision        TEXT NOT NULL,
+        state           TEXT NOT NULL CHECK (state IN ('awaiting','completed','closed')),
+        intent_seq      INTEGER NOT NULL,
+        minion_id       TEXT,
+        completion_seq  INTEGER,
+        obligation_id   TEXT,
+        notification_id TEXT,
+        close_reason    TEXT,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+      );
+      CREATE INDEX idx_phase_handoffs_job ON phase_handoffs(job_id);
+      CREATE INDEX idx_phase_handoffs_state ON phase_handoffs(state);
+      CREATE INDEX idx_phase_handoffs_request ON phase_handoffs(job_id, request_id);
+
+      ALTER TABLE pending_rebriefs ADD COLUMN phase_id TEXT;
+    `,
+  },
 ];

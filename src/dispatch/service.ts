@@ -1,5 +1,6 @@
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, JobRecord } from '../ledger/api.js';
+import type { CompletionHandoffIntent } from '../ledger/obligations.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
@@ -101,6 +102,11 @@ export class DispatchService {
     repoPath: string;
     title: string;
     briefing: string;
+    /** Explicit completion intent: when present, the phase-handoff guard
+     * row is persisted BEFORE any side effect and this exact phase's
+     * validated completion owes the named decision durably. Omitted =
+     * ordinary Silas completion. */
+    completionHandoff?: CompletionHandoffIntent;
   }): Promise<DispatchOutcome> {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
       throw new Error('dispatch requires a non-empty job id, title, and briefing');
@@ -122,8 +128,24 @@ export class DispatchService {
       payload: { repo: repoName, repoPath: input.repoPath },
     });
 
+    let handoffPhaseId: string | null = null;
+    // Tracks whether THIS run committed the terminal delivery event: a
+    // later bookkeeping failure must not close a phase whose completion
+    // evidence already exists (the boot reconciler finishes it instead).
+    let deliveredRecorded = false;
     try {
       const working = this.opts.ledger.setJobStatus(job.id, 'working');
+
+      // (2b) Explicit completion intent BEFORE admission/side effects: the
+      // durable guard row exists before any worktree or spawn, so a crash
+      // mid-dispatch is provably not a completion and the intent survives.
+      if (input.completionHandoff !== undefined) {
+        handoffPhaseId = this.opts.ledger.beginPhaseHandoff({
+          jobId: job.id,
+          source: 'dispatch',
+          intent: input.completionHandoff,
+        }).record.phaseId;
+      }
 
       // (3) One worktree per job, fresh head, own branch (ruling 18).
       const worktree = await this.opts.worktrees.createJobWorktree({
@@ -152,6 +174,11 @@ export class DispatchService {
         sessionFile: handle.sessionFile,
         jobId: job.id,
       });
+      // Bind the admitted worker to the marked phase BEFORE its prompt runs:
+      // a delivery from any other worker can never complete this phase.
+      if (handoffPhaseId !== null) {
+        this.opts.ledger.bindPhaseHandoffMinion({ phaseId: handoffPhaseId, minionId: handle.id });
+      }
       this.opts.ledger.appendCustomEvent({
         kind: 'job.minion-spawned',
         jobId: job.id,
@@ -182,7 +209,9 @@ export class DispatchService {
         .then(
           async () => {
             const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
-              worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch' });
+              worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch',
+              ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}) });
+            deliveredRecorded = true;
             if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
               job: job.id, note: delivery.note, lane: delivery.lanePath,
             });
@@ -198,6 +227,12 @@ export class DispatchService {
               payload: { agentId: handle.id, error: String(error) },
             });
             this.recordSettleOutcome(job.id, 'blocked');
+            // A failed attempt must never masquerade as a completed marked
+            // phase: close the guard row only when no delivery was recorded
+            // (delivered phases are finished by the completion reconcile).
+            if (!deliveredRecorded) {
+              this.closeHandoffQuietly(handoffPhaseId, `dispatch turn failed: ${String(error)}`);
+            }
             this.log('error', 'minion briefing turn failed', {
               job: job.id,
               agent: handle.id,
@@ -211,7 +246,24 @@ export class DispatchService {
     } catch (error) {
       this.opts.ledger.setJobStatus(job.id, 'blocked');
       this.opts.ledger.noteJob(job.id, `dispatch failed: ${String(error)}`);
+      this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${String(error)}`);
       throw error;
+    }
+  }
+
+  /** Close an awaiting marked-phase guard row after a positive failure.
+   * Never closes a completed phase (a recorded delivery already owns it),
+   * and a close failure is logged — the row stays awaiting, which is
+   * honest, and no completion evidence exists to fabricate a hand-back. */
+  private closeHandoffQuietly(phaseId: string | null, reason: string): void {
+    if (phaseId === null) return;
+    try {
+      const phase = this.opts.ledger.getPhaseHandoff(phaseId);
+      if (phase !== null && phase.state === 'awaiting') {
+        this.opts.ledger.closePhaseHandoff({ phaseId, reason });
+      }
+    } catch (error) {
+      this.log('error', 'phase handoff close after failure also failed', { phase: phaseId, error: String(error) });
     }
   }
 
