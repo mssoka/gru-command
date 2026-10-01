@@ -9,6 +9,7 @@ import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { PacingGate } from '../src/runtime/pacing.js';
+import type { AgentRecord } from '../src/ledger/api.js';
 
 /**
  * The follow-up delivery signal (R2 review B3): a settled directive or
@@ -62,6 +63,23 @@ function laneAt(path: string, status: WorktreeLane['status'] = 'active'): Worktr
     jobId: 'job-1',
     roundId: null,
     status,
+  };
+}
+
+/** A complete AgentRecord row for ledger-port doubles (the port returns full
+ * rows, never partial fixtures). */
+function minionRecord(id: string, jobId: string | null, sessionFile: string | null): AgentRecord {
+  return {
+    id,
+    role: 'minion',
+    label: null,
+    jobId,
+    roundId: null,
+    state: 'idle',
+    lastActivity: null,
+    sessionFile,
+    createdAt: '2026-09-21T00:00:00.000Z',
+    updatedAt: '2026-09-21T00:00:00.000Z',
   };
 }
 
@@ -300,8 +318,8 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     const routing = routeFixDirectiveToMinion({
       registry: { getHandle: () => handle as never, spawn: async () => handle as never, disposeHandle: async () => {} },
       ledger: {
-        listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-cancel', sessionFile: '/sessions/live.jsonl' }],
-        registerAgent: () => {},
+        listAgents: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -337,7 +355,11 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         spawn: async () => handle as never,
         disposeHandle: async () => {},
       },
-      ledger: { listAgents: () => [], registerAgent: () => {}, getJob: () => null },
+      ledger: {
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+      },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
       directive: 'fix the blocker',
@@ -360,7 +382,11 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         spawn: async () => { throw new Error('a queued re-brief must not spawn before admission'); },
         disposeHandle: async () => {},
       },
-      ledger: { listAgents: () => [], registerAgent: () => {}, getJob: () => null },
+      ledger: {
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+      },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
       note: 'resume',

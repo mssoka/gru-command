@@ -51,6 +51,7 @@ export async function withRateLimitRetries<T>(
   options: RateLimitRetryOptions,
 ): Promise<T> {
   const signals = options.signals ?? [];
+  const policy = options.policy;
   let retry = 0;
   for (;;) {
     if (signals.some((signal) => signal?.aborted === true)) throw new Error('pacing backoff aborted');
@@ -58,7 +59,6 @@ export async function withRateLimitRetries<T>(
     try {
       result = await operation();
     } catch (error) {
-      const policy = options.policy;
       const text = String(error);
       if (signals.some((signal) => signal?.aborted === true) || policy === null || !isRateLimitErrorText(text, policy.patterns)) throw error;
       if (retry >= policy.maxRetries) {
@@ -71,7 +71,12 @@ export async function withRateLimitRetries<T>(
       await (options.sleep ?? pacingSleep)(delay, signals);
       continue;
     }
-    if (retry > 0) options.record({ kind: 'pacing.auto-retry-recovered', payload: pacingRecoveredPayload(retry, policy.maxRetries) });
+    // retry > 0 proves a retry was scheduled, so policy was non-null on the
+    // failing pass; the guard is the static shape of that invariant, not a
+    // behavior switch.
+    if (retry > 0 && policy !== null) {
+      options.record({ kind: 'pacing.auto-retry-recovered', payload: pacingRecoveredPayload(retry, policy.maxRetries) });
+    }
     return result;
   }
 }

@@ -68,6 +68,10 @@ export interface ReconcileRebriefDeps {
    * production). The recovery records delivered only for
    * 'none'/'recovered'. */
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+  /** Service-stopping signal: aborts a QUEUED re-brief admission wait and
+   * lets the retry-settlement race observe cancellation instead of hanging
+   * shutdown. Absent = settlement remains hook-owned. */
+  readonly stopSignal?: AbortSignal;
   /** True while the process is deliberately stopping: a turn killed by
    * shutdown is not a recovery failure — the next boot retries the marker. */
   readonly stopping?: () => boolean;

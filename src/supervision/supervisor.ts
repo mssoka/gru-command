@@ -13,7 +13,9 @@ import {
   pacingExhaustedPayload,
   pacingRecoveredPayload,
   pacingRetryPayload,
-  type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement,
+  type PacingExhaustedPayload,
+  type PacingGate, type PacingLease, type PacingRecoveredPayload, type PacingRetryPayload,
+  type RateLimitBackoffPolicy, type RetrySettlement,
 } from '../runtime/pacing.js';
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 
@@ -1133,7 +1135,7 @@ export class Supervisor {
         incident.failureSeq += 1;
         incident.lastError = text;
         if (this.scheduleRateLimitRetry(agent, incident)) return;
-      } else if (rejection instanceof WorkerDisposalInProgressError || handle.state === 'disposed') {
+      } else if (rejection instanceof WorkerDisposalInProgressError || handle.health().state === 'disposed') {
         // The session went away under the retry (typed disposal handshake or
         // a persisted disposed state): no failure to ladder, no retry to
         // continue. Arbitrary text containing 'disposed' must NOT land here —
@@ -1801,8 +1803,14 @@ export class Supervisor {
     }
   }
 
-  /** Durable ledger event that never breaks the watchdog on a ledger fault. */
-  private recordEvent(kind: string, agentId: string | null, payload: Record<string, unknown>): void {
+  /** Durable ledger event that never breaks the watchdog on a ledger fault.
+   * The canonical pacing payloads are typed without an index signature and
+   * are part of the accepted event shapes here. */
+  private recordEvent(
+    kind: string,
+    agentId: string | null,
+    payload: Record<string, unknown> | PacingRetryPayload | PacingExhaustedPayload | PacingRecoveredPayload,
+  ): void {
     try {
       // Job attribution rides the envelope: a supervisor-owned worker retry
       // must be findable by job-scoped queries, exactly like the workflow

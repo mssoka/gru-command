@@ -30,3 +30,9 @@ pacing-settlement-regressions = "node tools/patch-vitest-rpc-timeout.mjs && npx 
 # PR135 current18 raw-triage regressions (source-only fix pass; runs the
 # approved j-463 RPC patch first, same as the other witnessed scope).
 pacing-current18 = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/supervisor.test.ts test/fix-directive.test.ts test/dispatch-server.test.ts test/patch-vitest-rpc-timeout.test.ts test/suite-shape.test.ts"
+
+# PR135 CI typecheck repair (silas-ops-pr135-ci-type-repair-20261001T014506Z):
+# the compiler diagnostics are covered by the [verify] typecheck scope; this
+# focused scope covers the touched seams' runtime regressions and keeps the
+# approved j-463 RPC patch first, same as the other witnessed scopes.
+pr135-ci-type-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/rebrief-recovery.test.ts test/fix-directive.test.ts test/rate-limit-retry.test.ts test/supervisor.test.ts test/pacing.test.ts"

@@ -159,7 +159,7 @@ export type RetrySettlement = 'none' | 'recovered' | 'exhausted' | 'superseded';
 export class RetrySettlementUnavailableError extends Error {
   constructor(
     readonly agentId: string,
-    readonly cause: unknown,
+    override readonly cause: unknown,
   ) {
     super(`retry settlement unavailable for agent ${agentId}: ${String(cause)}`);
     this.name = 'RetrySettlementUnavailableError';
