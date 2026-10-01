@@ -384,6 +384,12 @@ describe('wizard CLI surface', () => {
     );
     const bin = tempDir('gru-command-wizard-det-bin-');
     writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    // The binding-mismatch leg below selects claude-code, whose prerequisite
+    // probe needs a `claude` CLI; provide an owned harmless stub so the leg
+    // reaches the deterministic missing-binding branch instead of depending
+    // on an installed user CLI. Missing-tool retry ownership keeps its
+    // dedicated inverse coverage in the onboarding prerequisite cases.
+    writeFileSync(join(bin, 'claude'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
     const baseEnv = {
       ...process.env,
       PATH: `${bin}:${process.env.PATH ?? ''}`,

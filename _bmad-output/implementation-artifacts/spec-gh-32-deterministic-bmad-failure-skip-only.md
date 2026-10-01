@@ -134,6 +134,27 @@ re-asking — recorded here as the standing Checkpoint-1 approval.
   labels `rev: 2aa836abe262759c651683deb40d05f02c9ede86` (pre-commit WIP
   build, builtAt 2026-09-30T20:08:53.983Z); focused runs are not a fresh
   full installed-build claim — ops FULL rebuilds the exact final head.
+- Continuation (2026-10-01, same-job successor, CI fixture repair): CI
+  run 36801770035 at abfe7d2 (synthetic merge 1520f8b) was green on
+  lint/typecheck/build and failed exactly two classification fixtures.
+  (1) test/bmad-onboarding.test.ts's plain non-Git case routed through
+  `answers()`/parseAnswers first; parseAnswers correctly refuses a repo
+  name whose `.git` is absent, so the intended validateRepo deterministic
+  assertion was never reached. The fixture now validates answers while
+  the directory is still a Git repo, removes `.git` (the race validateRepo
+  guards), re-asserts that parseAnswers still refuses the now-invalid
+  name, and only then calls the direct onboarding seam — asserting
+  deterministic classification, neutral guidance and a no-write oracle.
+  (2) test/wizard.test.ts's binding-mismatch leg selects claude-code,
+  whose prerequisite probe hit the recoverable missing `claude` CLI
+  before the intended deterministic missing-binding check; the leg's
+  owned bin fixture now provides a harmless synthetic `claude` stub so it
+  reaches the deterministic branch without depending on an installed user
+  CLI, while missing-tool retry ownership keeps its dedicated inverse
+  coverage. No test identity, assertion, deadline, pin or expected text
+  changed; this pass executed nothing (static source only). The declared
+  focused scope already builds first for its dist-driven CLI/pty legs;
+  the command list below is trued up to match.
 
 ## Spec Change Log
 
@@ -142,7 +163,7 @@ re-asking — recorded here as the standing Checkpoint-1 approval.
 ## Verification
 
 **Commands:**
-- `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"wizard-bmad-retry"}` -- focused regression (`node tools/patch-vitest-rpc-timeout.mjs && npx vitest run` on `test/bmad-onboarding.test.ts`, `test/wizard-interactive.test.ts`, `test/wizard.test.ts`, `test/suite-shape.test.ts`).
+- `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"wizard-bmad-retry"}` -- focused regression (`npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run` on `test/bmad-onboarding.test.ts`, `test/wizard-interactive.test.ts`, `test/wizard.test.ts`, `test/suite-shape.test.ts`); the build prefix is required because the CLI/pty legs execute `dist/`.
 - `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"typecheck"}` -- `npm run typecheck` (covers the added test code under `tsconfig.test.json`).
 - `POST /api/verify {job_id:"wizard-bmad-deterministic-retry-32", scope:"full"}` -- `npm test` (lint + typecheck + build + vitest + web).
 - Exact-head GitHub CI on the pushed branch; native Perkins review READY required.

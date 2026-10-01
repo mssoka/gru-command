@@ -865,16 +865,28 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(absentResult.message).toContain('reuse requested but no existing BMAD manifest');
     expect(absentResult.repairHint).toBeUndefined();
 
-    const plainWorkspace = tempDir('gru-command-bmad-plain-');
-    mkdirSync(join(plainWorkspace, 'plain-dir'), { recursive: true });
-    const plainResult = onboardBmadRepo('plain-dir', 'reuse', {
-      workspaceRoot: plainWorkspace,
-      answers: answers(plainWorkspace, 'plain-dir', 'reuse'),
+    // A plain non-Git directory: production answers validation requires a
+    // `.git` entry, so the fixture validates answers while the directory is
+    // still a Git repo, then removes `.git` (the race validateRepo guards).
+    // parseAnswers still refuses the now-invalid name; the direct onboarding
+    // seam classifies the unchanged on-disk state deterministically and
+    // writes nothing.
+    const plain = fixtureRepo('plain-dir');
+    const parsedPlain = answers(plain.workspace, plain.name, 'reuse');
+    rmSync(join(plain.repo, '.git'), { recursive: true, force: true });
+    expect(() => answers(plain.workspace, plain.name, 'reuse')).toThrow(
+      /not a git repo under the workspace root/,
+    );
+    const plainBefore = readdirSync(plain.repo).sort();
+    const plainResult = onboardBmadRepo(plain.name, 'reuse', {
+      workspaceRoot: plain.workspace,
+      answers: parsedPlain,
     });
     expect(plainResult.ready).toBe(false);
     expect(plainResult.deterministic).toBe(true);
     expect(plainResult.message).toContain('selected directory is not a Git repo');
     expect(plainResult.repairHint).toBeUndefined();
+    expect(readdirSync(plain.repo).sort()).toEqual(plainBefore);
 
     // A .git that is not a real repository: a clean non-zero exit from the
     // probe, unchanged bytes — deterministic (unlike a spawn failure).
