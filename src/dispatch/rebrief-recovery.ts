@@ -96,7 +96,10 @@ export interface ReconcileReport {
 /**
  * Has this marker's guarded event landed? The event must post-date the
  * request's sequence watermark — an older event of the same kind cannot
- * answer a newer request.
+ * answer a newer request. When the marker belongs to a MARKED phase
+ * (`phaseId` set), the event must ALSO carry that phase id: an unrelated
+ * delivery/re-brief of the same kind can never satisfy this request's
+ * marker (an older/other receipt cannot complete or cancel it).
  */
 export function pendingRebriefEventLanded(
   ledger: Pick<LedgerApi, 'latestJobEvent'>,
@@ -104,6 +107,26 @@ export function pendingRebriefEventLanded(
 ): boolean {
   const event = ledger.latestJobEvent(marker.jobId, marker.kind);
   return event !== null && event.seq > marker.baselineSeq;
+}
+
+/** The marker's own guarded event, correlated to the phase when marked.
+ * Unmarked markers keep the legacy newest-event predicate. */
+function pendingRebriefGuardedEvent(
+  ledger: Pick<LedgerApi, 'latestJobEvent' | 'listJobEvents'>,
+  marker: PendingRebriefRecord,
+  phaseId: string | null,
+): EventRecord | null {
+  if (phaseId === null) {
+    const event = ledger.latestJobEvent(marker.jobId, marker.kind);
+    return event !== null && event.seq > marker.baselineSeq ? event : null;
+  }
+  for (const event of ledger.listJobEvents(marker.jobId, { limit: 1000 })) {
+    if (event.kind !== marker.kind) continue;
+    if (event.seq <= marker.baselineSeq) continue;
+    const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
+    if (payload['phase_id'] === phaseId) return event;
+  }
+  return null;
 }
 
 /**
@@ -162,7 +185,7 @@ export function finalizeRebriefRequest(input: {
   const phaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
 
   let rebriefRecorded = false;
-  if (rebriefMarker === null || !pendingRebriefEventLanded(input.ledger, rebriefMarker)) {
+  if (rebriefMarker === null || pendingRebriefGuardedEvent(input.ledger, rebriefMarker, phaseId) === null) {
     input.ledger.appendCustomEvent({
       kind: 'silas.rebrief',
       jobId: input.jobId,
@@ -180,7 +203,8 @@ export function finalizeRebriefRequest(input: {
   let deliveredSha: string | null = null;
   let deliveryNote: string | null = null;
   let deliveryRecorded = false;
-  if (deliveryMarker === null || !pendingRebriefEventLanded(input.ledger, deliveryMarker)) {
+  const landedDelivery = deliveryMarker === null ? null : pendingRebriefGuardedEvent(input.ledger, deliveryMarker, phaseId);
+  if (landedDelivery === null) {
     const followUp = recordFollowUpDelivery({
       ledger: input.ledger,
       worktrees: input.worktrees,
@@ -194,8 +218,9 @@ export function finalizeRebriefRequest(input: {
     deliveryRecorded = true;
   } else {
     // The delivery already landed (reconcile caught a crash window): report
-    // the recorded head without appending a duplicate.
-    const payload = input.ledger.latestJobEvent(input.jobId, 'job.delivered')?.payload;
+    // the recorded head without appending a duplicate — read from the
+    // phase-correlated event, never from an unrelated delivery.
+    const payload = landedDelivery.payload;
     if (typeof payload === 'object' && payload !== null) {
       const sha = (payload as { sha?: unknown }).sha;
       deliveredSha = typeof sha === 'string' && sha !== '' ? sha : null;
@@ -240,7 +265,8 @@ export async function reconcilePendingRebriefs(
   let redispatched = 0;
   const background: Promise<void>[] = [];
   for (const [jobId, group] of byJob) {
-    const missing = group.filter((marker) => !pendingRebriefEventLanded(deps.ledger, marker));
+    const groupPhaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
+    const missing = group.filter((marker) => pendingRebriefGuardedEvent(deps.ledger, marker, groupPhaseId) === null);
     if (missing.length === 0) {
       deps.ledger.clearPendingRebriefs(group.map((marker) => marker.id));
       completed += 1;
