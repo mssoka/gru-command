@@ -25,3 +25,8 @@ compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.te
 # patch is the repo's existing approved pretest hook — the one declared
 # scope that is not a bare vitest invocation.
 publisher-timeout-discriminator = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/dispatch-e2e.test.ts test/perkins-builtin-wave.test.ts test/wizard.test.ts"
+
+# Narrow scope for the final raw-advice triage repairs on the App
+# publisher (one focused vitest invocation; the suite pin travels with
+# the file it pins). Declared alongside real repairs, never standalone.
+app-contract-repair = "npx vitest run test/perkins-github-app.test.ts test/suite-shape.test.ts"

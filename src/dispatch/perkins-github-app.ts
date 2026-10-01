@@ -162,6 +162,10 @@ export function parsePerkinsAppConfig(text: string, sourceLabel: string): Perkin
   if (appIdRaw === undefined || !/^[1-9][0-9]*$/u.test(appIdRaw)) {
     throw new PerkinsAppError(`${sourceLabel}: missing or invalid required entry "app_id" (expected a positive integer)`);
   }
+  const appId = Number(appIdRaw);
+  if (!Number.isSafeInteger(appId)) {
+    throw new PerkinsAppError(`${sourceLabel}: app_id is outside the safe integer range — refusing an id that would lose precision or become Infinity`);
+  }
   const keyPathRaw = seen.get('key_path');
   if (keyPathRaw === undefined || keyPathRaw === '') {
     throw new PerkinsAppError(`${sourceLabel}: missing required entry "key_path"`);
@@ -175,9 +179,12 @@ export function parsePerkinsAppConfig(text: string, sourceLabel: string): Perkin
     if (!/^[1-9][0-9]*$/u.test(id)) {
       throw new PerkinsAppError(`${sourceLabel}: installation id for owner "${owner}" is not a positive integer`);
     }
+    if (!Number.isSafeInteger(Number(id))) {
+      throw new PerkinsAppError(`${sourceLabel}: installation id for owner "${owner}" is outside the safe integer range — refusing an id that would lose precision or aim a different installation`);
+    }
   }
   return {
-    appId: Number(appIdRaw),
+    appId,
     keyPath: keyPathRaw,
     installationIds,
   };
@@ -242,12 +249,19 @@ function bundleDirSafe(dir: string, sourceLabel: string): void {
   }
 }
 
+/** Test seam: replaces the descriptor read in the byte-ceiling backstop
+ * (grow-after-stat) so that branch is deterministically pinnable without a
+ * real file changing size mid-read. Never used by production wiring. */
+export interface BundleFileReadSeam {
+  readonly readImpl?: (fd: number, buffer: Buffer, offset: number, length: number) => number;
+}
+
 /** Read one bundle credential file with its safety checks bound to the
  * same inode (open with O_NOFOLLOW, then fstat the open descriptor): a
  * regular file, owned by the service user on unix, readable by the owner
  * and by nobody else, with no setuid/setgid/sticky bits. Fail-closed with
  * an actionable message carrying the errno where one exists. */
-function readBundleFileChecked(path: string, label: string, sourceLabel: string): string {
+function readBundleFileChecked(path: string, label: string, sourceLabel: string, seam?: BundleFileReadSeam): string {
   // lstat pre-check: rejects symlinks on EVERY platform (O_NOFOLLOW is not
   // available on win32) and carries the errno for missing paths.
   try {
@@ -301,12 +315,13 @@ function readBundleFileChecked(path: string, label: string, sourceLabel: string)
     // backstop to the fstat check: a file that grows (or lies about its
     // size) between fstat and read still cannot push unbounded bytes into
     // memory.
+    const read = seam?.readImpl ?? ((readFd: number, readBuffer: Buffer, offset: number, length: number) => readSync(readFd, readBuffer, offset, length, null));
     const buffer = Buffer.allocUnsafe(MAX_BUNDLE_FILE_BYTES + 1);
     let filled = 0;
     for (;;) {
-      const read = readSync(fd, buffer, filled, MAX_BUNDLE_FILE_BYTES + 1 - filled, null);
-      if (read === 0) break;
-      filled += read;
+      const readBytes = read(fd, buffer, filled, MAX_BUNDLE_FILE_BYTES + 1 - filled);
+      if (readBytes === 0) break;
+      filled += readBytes;
       if (filled > MAX_BUNDLE_FILE_BYTES) {
         throw new PerkinsAppError(`${sourceLabel}: ${label} exceeded ${MAX_BUNDLE_FILE_BYTES} bytes when read (its stat reported ${info.size}) — check the perkins bundle deployment`);
       }
@@ -320,12 +335,12 @@ function readBundleFileChecked(path: string, label: string, sourceLabel: string)
 /** Read and validate the bundle at publication time (never at service
  * boot): a broken bundle fails THIS review loudly, it never bricks the
  * service. Key bytes never appear in any diagnostic. */
-export function loadPerkinsAppBundle(instanceDir: string): LoadedBundle {
+export function loadPerkinsAppBundle(instanceDir: string, seam?: BundleFileReadSeam): LoadedBundle {
   const dir = perkinsAppBundleDir(instanceDir);
   const configPath = join(dir, 'config');
   const sourceLabel = 'perkins app bundle';
   bundleDirSafe(dir, sourceLabel);
-  const text = readBundleFileChecked(configPath, 'bundle config', sourceLabel);
+  const text = readBundleFileChecked(configPath, 'bundle config', sourceLabel, seam);
   const config = parsePerkinsAppConfig(text, sourceLabel);
   // The key path resolves against the trusted bundle dir, not the repo.
   // An absolute key_path is permitted (the deployed bundle may keep the
@@ -333,7 +348,7 @@ export function loadPerkinsAppBundle(instanceDir: string): LoadedBundle {
   // safety checks, and the bundle dir remains the audit boundary for the
   // config that names it.
   const keyPath = resolvePerkinsAppKeyPath(dir, config.keyPath);
-  const pem = readBundleFileChecked(keyPath, 'configured private key file', sourceLabel);
+  const pem = readBundleFileChecked(keyPath, 'configured private key file', sourceLabel, seam);
   try {
     const keyObject = createPrivateKey({ key: pem, format: 'pem' });
     if (keyObject.asymmetricKeyType !== 'rsa') {
@@ -541,6 +556,18 @@ function isMatchingAppReviewWithUnusableId(review: ProviderReview, botLogin: str
   return usableProviderReviewId(review.id) === null && matchesDeliveryPredicates(review, botLogin, targetSha, body, notBeforeMs);
 }
 
+/** A review identical on author/state/commit/body whose submission time is
+ * missing or unparseable: with a recency bound it can be neither credited
+ * (its window is unprovable) nor excluded as an older round's, so it also
+ * forbids an absence certificate. */
+function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
+  if (notBeforeMs === null) return false;
+  if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
+  if (review.state !== 'COMMENTED' || review.commit_id !== targetSha || review.body !== body) return false;
+  const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
+  return !Number.isFinite(submittedAt);
+}
+
 /** GitHub error bodies/markers that mean rate limiting, not permission. */
 function providerIndicatesRateLimit(error: PerkinsAppHttpError): boolean {
   const documentationUrl = error.documentationUrl;
@@ -590,8 +617,6 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     this.fetchImpl = options.fetchImpl ?? ((fetch as unknown) as AppFetch);
     this.now = options.now ?? (() => Date.now());
     this.gitBinary = options.gitBinary ?? 'git';
-    this.probeTimeoutMs = options.probeTimeoutMs ?? 15_000;
-    this.postTimeoutMs = options.postTimeoutMs ?? 30_000;
     // Bounded like the shared receipt contract: up to ten review-list pages
     // (the jump-to-last walk normally resolves in two or three fetches; the
     // extra headroom is for the idempotent recovery lookup on busy PRs,
@@ -610,6 +635,23 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       );
     }
     this.maxProviderBodyBytes = requestedBodyCap ?? 16 * 1024 * 1024;
+    // Timeouts are wiring, not provider state: an unarmed (<=0) or
+    // non-integer value must fail here by name — never later as an
+    // "ambiguous" delivery that sends the operator to the provider.
+    const requestedProbeTimeout = options.probeTimeoutMs;
+    if (requestedProbeTimeout !== undefined && (!Number.isSafeInteger(requestedProbeTimeout) || requestedProbeTimeout < 1)) {
+      throw new PerkinsAppError(
+        `probeTimeoutMs must be an integer >= 1 (received: ${sanitize(String(requestedProbeTimeout))}) — refusing to arm a broken timeout`,
+      );
+    }
+    this.probeTimeoutMs = requestedProbeTimeout ?? 15_000;
+    const requestedPostTimeout = options.postTimeoutMs;
+    if (requestedPostTimeout !== undefined && (!Number.isSafeInteger(requestedPostTimeout) || requestedPostTimeout < 1)) {
+      throw new PerkinsAppError(
+        `postTimeoutMs must be an integer >= 1 (received: ${sanitize(String(requestedPostTimeout))}) — refusing to arm a broken timeout`,
+      );
+    }
+    this.postTimeoutMs = requestedPostTimeout ?? 30_000;
   }
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
@@ -666,16 +708,16 @@ export class PerkinsAppPrPoster implements VerdictPoster {
    * proof of absence. */
   async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
     const { grant, botLogin, owner, repo, prNumber, baseSha } = await this.prepare(input);
-    const { matched, provablyAbsent, matchedButIdUnusable } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, null);
+    const { matched, provablyAbsent, matchedButUnreceiptable } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, null);
     if (matched !== null) {
       return verifyPostedReceipt(
         this.receiptFromReview(matched, botLogin, input.targetSha, input.targetSha, baseSha, input.body),
         { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
       );
     }
-    if (matchedButIdUnusable) {
+    if (matchedButUnreceiptable) {
       throw new PerkinsAppError(
-        'review reconciliation found a review matching every delivery predicate except its provider id — delivery stays unresolved; verify that review manually before any retry, never assume absence',
+        'review reconciliation found a review matching every delivery predicate except its provider id or its submission time — delivery stays unresolved; verify that review manually before any retry, never assume absence',
       );
     }
     if (provablyAbsent) return null;
@@ -699,7 +741,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   }> {
     if (input.host !== 'github.com') {
       throw new PerkinsAppError(
-        `Perkins App publication is configured, but host "${input.host}" is not github.com — the App's credentials are bound to api.github.com and are never used for other hosts; github.com is the only GitHub host supported while the bundle is installed. Remove the App bundle to restore the legacy publisher for this host, or escalate an explicit publisher decision`,
+        `Perkins App publication is configured, but host "${sanitize(input.host)}" is not github.com — the App's credentials are bound to api.github.com and are never used for other hosts; github.com is the only GitHub host supported while the bundle is installed. Remove the App bundle to restore the legacy publisher for this host, or escalate an explicit publisher decision`,
       );
     }
     let url: URL;
@@ -891,6 +933,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     if (typeof parsed?.slug !== 'string' || parsed.slug === '' || /[^\w-]/u.test(parsed.slug)) {
       throw new PerkinsAppError('App identity response did not contain a usable slug — cannot derive the expected bot identity; review not delivered');
     }
+    // The shared receipt contract bounds the recorded actor at 200 chars
+    // and the derived login is '<slug>[bot]': an over-long slug would mint
+    // receipts the ledger's own reader must reject on restart.
+    if (parsed.slug.length > 195) {
+      throw new PerkinsAppError('App identity slug is longer than the shared receipt contract allows (max 195 characters before "[bot]") — refusing an unrecordable bot identity; review not delivered');
+    }
     return `${parsed.slug}[bot]`;
   }
 
@@ -912,8 +960,11 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // to trail the frozen base as main moves (same rule as GhPrPoster).
     if (headSha !== targetSha) {
       throw new PerkinsAppError(
-        `pull request identity moved before delivery (expected head ${targetSha}, got ${headSha === '' ? 'unknown' : sanitize(headSha)})`,
+        `pull request identity moved before delivery (expected head ${sanitize(targetSha)}, got ${headSha === '' ? 'unknown' : sanitize(headSha)})`,
       );
+    }
+    if (baseSha === '') {
+      throw new PerkinsAppError('pull request identity response is missing the base sha — refusing an unrecordable receipt; review not delivered');
     }
     return { headSha, baseSha };
   }
@@ -953,7 +1004,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     }
     if (parsed?.commit_id !== targetSha) {
       throw new PerkinsAppError(
-        `review publication receipt mismatch: provider review ${reviewId} committed to ${sanitize(String(parsed?.commit_id))}, expected ${targetSha}`,
+        `review publication receipt mismatch: provider review ${reviewId} committed to ${sanitize(String(parsed?.commit_id))}, expected ${sanitize(targetSha)}`,
       );
     }
     const echoedBody = typeof parsed?.body === 'string' ? parsed.body : null;
@@ -974,17 +1025,26 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   }
 
   /** Parse the last page number out of a GitHub Link header, if present.
-   * Only a sane integer >= 1 counts — a provider or intermediary reporting
-   * `page=0` must never be read as "zero pages remain" (which would certify
-   * full coverage it never had). */
+   * Only a sane integer >= 1 counts, and a header whose rel="last" entries
+   * are malformed or CONFLICT with each other yields null: a page count an
+   * intermediary could have rewritten — or that disagrees with itself — must
+   * never become the basis of a completeness certificate. Picking one of two
+   * disagreeing numbers (e.g. their maximum) would still trust a number the
+   * header itself shows to be unreliable. */
   private parseLastPage(linkHeader: string | null): number | null {
     if (linkHeader === null) return null;
-    const last = /<([^>]+)>;\s*rel="last"/u.exec(linkHeader);
-    if (last === null) return null;
-    const page = /[?&]page=(\d+)/u.exec(last[1]!);
-    if (page === null) return null;
-    const parsed = Number(page[1]);
-    return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : null;
+    const entries = [...linkHeader.matchAll(/<([^>]+)>;\s*rel="last"/gu)];
+    if (entries.length === 0) return null;
+    const pages: number[] = [];
+    for (const entry of entries) {
+      const page = /[?&]page=(\d+)/u.exec(entry[1]!);
+      if (page === null) return null;
+      const parsed = Number(page[1]);
+      if (!Number.isSafeInteger(parsed) || parsed < 1) return null;
+      pages.push(parsed);
+    }
+    const first = pages[0]!;
+    return pages.every((candidate) => candidate === first) ? first : null;
   }
 
   /** Bounded ambiguous-POST reconciliation (the delivery path): a bounded
@@ -1007,13 +1067,13 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   ): Promise<PostedReviewReceipt> {
     const causeText = cause instanceof Error ? sanitize(cause.message) : 'network error';
     const unproven = (what: string): PerkinsAppError => new PerkinsAppError(
-      `review POST outcome is ambiguous (${causeText}) and ${what} — delivery stays unproven; the review was NOT re-posted. Resolve the pull request manually before retrying (expected author ${botLogin} on head ${targetSha}; the round's publication body is in the review artifact report).`,
+      `review POST outcome is ambiguous (${causeText}) and ${what} — delivery stays unproven; the review was NOT re-posted. Resolve the pull request manually before retrying (expected author ${botLogin} on head ${sanitize(targetSha)}; the round's publication body is in the review artifact report).`,
     );
     // Skew margin only: a submission up to 60 s before the POST began still
     // counts as this round's (provider clock drift); anything older is
     // another round's bytes.
     const notBeforeMs = postStartMs - 60_000;
-    let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButIdUnusable: boolean };
+    let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean };
     try {
       walked = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, targetSha, body, notBeforeMs);
     } catch (lookupError) {
@@ -1027,9 +1087,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         { targetSha, bodySha256: receiptDigest(body) },
       );
     }
-    if (walked.matchedButIdUnusable) {
+    if (walked.matchedButUnreceiptable) {
       throw unproven(
-        'a review matching every delivery predicate except its provider id was found, so the POST can be neither credited nor proved absent',
+        'a review matching every delivery predicate except its provider id or its submission time was found, so the POST can be neither credited nor proved absent',
       );
     }
     if (walked.provablyAbsent) {
@@ -1051,9 +1111,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
    * any response reported, so a list that grows mid-walk can never be
    * certified absent from a stale snapshot, and the short-page end signal
    * requires a response with no Link header at all — lookup failures and
-   * malformed bodies throw, they are never absence. `matchedButIdUnusable`
-   * records a review that matched every delivery predicate except a usable provider
-   * id: it can never be credited, but it also forbids an absence
+   * malformed bodies throw, they are never absence. `matchedButUnreceiptable`
+   * records a review that matched every delivery predicate but cannot form a
+   * this-round receipt (unusable provider id, or unverifiable submission
+   * time): it can never be credited, but it also forbids an absence
    * certificate (the publication may have landed). */
   private async lookupMatchingReview(
     grant: TokenGrant,
@@ -1064,12 +1125,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     targetSha: string,
     body: string,
     notBeforeMs: number | null,
-  ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButIdUnusable: boolean }> {
+  ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean }> {
     const visited = new Set<number>();
     let lastPage: number | null = null;
     let page = 1;
     let sequentialEnd = false;
-    let matchedButIdUnusable = false;
+    let matchedButUnreceiptable = false;
     for (let fetched = 0; fetched < this.maxReconciliationPages; fetched += 1) {
       visited.add(page);
       const result = await this.callApi(
@@ -1085,19 +1146,27 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         // Never report "searched and not found" when no usable list was read.
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
+      if (list.some((entry) => entry === null || typeof entry !== 'object')) {
+        // A null or primitive entry is a broken list, not absence: a lookup
+        // we cannot trust must never become a certificate.
+        throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
+      }
       const reviews = list as readonly ProviderReview[];
       const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, notBeforeMs));
       if (match !== undefined) {
-        return { matched: match, provablyAbsent: false, matchedButIdUnusable: false };
+        return { matched: match, provablyAbsent: false, matchedButUnreceiptable: false };
       }
       if (
-        !matchedButIdUnusable &&
-        reviews.some((review) => isMatchingAppReviewWithUnusableId(review, botLogin, targetSha, body, notBeforeMs))
+        !matchedButUnreceiptable &&
+        reviews.some((review) =>
+          isMatchingAppReviewWithUnusableId(review, botLogin, targetSha, body, notBeforeMs) ||
+          isMatchingAppReviewWithUnverifiableTime(review, botLogin, targetSha, body, notBeforeMs))
       ) {
-        // A predicate-complete publication whose id cannot form a receipt —
-        // keep walking for a credit-able copy, but never read this walk as
+        // A predicate-complete publication that cannot form a this-round
+        // receipt (unusable id, or an unverifiable submission time) — keep
+        // walking for a credit-able copy, but never read this walk as
         // absence afterwards.
-        matchedButIdUnusable = true;
+        matchedButUnreceiptable = true;
       }
       let next: number;
       if (lastPage !== null) {
@@ -1125,7 +1194,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       page = next;
     }
     const provablyAbsent = lastPage !== null ? visited.size >= lastPage : sequentialEnd;
-    return { matched: null, provablyAbsent, matchedButIdUnusable };
+    return { matched: null, provablyAbsent, matchedButUnreceiptable };
   }
 }
 

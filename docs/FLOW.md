@@ -154,9 +154,12 @@ route:
    claude-code runtime this is a CLI-availability probe; on pi it checks
    model resolution plus provider auth.
 3. **Code-host integration** — a GitHub (`gh`) or GitLab (`GITLAB_TOKEN`)
-   token valid for the exact repository remote, used for SHA-bound verdict
-   delivery. Only GitHub and GitLab hosts are supported; other origins fail
-   the leg closed (credentials are never sent to unknown hosts).
+   token valid for the exact repository remote: the preflight leg. Verdict
+   delivery rides the `gh` token only when no Perkins App bundle is
+   installed; with a bundle, github.com publication is App-authored (see
+   [PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)). Only GitHub
+   and GitLab hosts are supported; other origins fail the leg closed
+   (credentials are never sent to unknown hosts).
 4. **Review policy enabled** — `[review] enabled = true` in config.
 
 All legs pass → Perkins review (the gate). Any leg fails → the request

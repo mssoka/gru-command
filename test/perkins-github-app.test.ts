@@ -300,6 +300,13 @@ describe('Perkins App bundle config parsing', () => {
       rmSync(ecHome, { recursive: true, force: true });
     }
   });
+
+  it('rejects App and installation ids outside the safe integer range instead of converting them', () => {
+    expect(() => parsePerkinsAppConfig(`app_id=${'9'.repeat(400)}\nkey_path=/k.pem\ninstallation_id_acme=5\n`, 'perkins app bundle'))
+      .toThrow(/safe integer/u);
+    expect(() => parsePerkinsAppConfig(`app_id=1\nkey_path=/k.pem\ninstallation_id_acme=${'9'.repeat(20)}\n`, 'perkins app bundle'))
+      .toThrow(/safe integer/u);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -392,6 +399,31 @@ describe('bundle file safety', () => {
     } finally {
       seam.getuid = original;
     }
+  });
+
+  it('rejects a FIFO at the bundle file path promptly — the open must not hold the round hostage', () => {
+    if (process.platform === 'win32') return; // mkfifo is POSIX-only
+    const home = mkdtempSync(join(tmpdir(), 'perkins-app-fifo-'));
+    try {
+      mkdirSync(join(home, 'perkins'), { recursive: true });
+      chmodSync(join(home, 'perkins'), 0o700);
+      execFileSync('mkfifo', [join(home, 'perkins', 'config')]);
+      expect(() => loadPerkinsAppBundle(home)).toThrow(/not a regular file/u);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds the read stage itself: a file that exceeds the ceiling when read is refused, never buffered', () => {
+    const fixture = bundleFixture('app_id=424242\nkey_path=app-key.pem\ninstallation_id_acme=164552969\n');
+    // The stat reports a small credential file; the read stage is where the
+    // grow-after-stat backstop lives. The seam returns more bytes than any
+    // stat could have reported without ever touching the key.
+    const readImpl = (_fd: number, buffer: Buffer, offset: number, length: number): number => {
+      buffer.fill(0x61, offset, offset + length);
+      return length;
+    };
+    expect(() => loadPerkinsAppBundle(fixture.home, { readImpl })).toThrow(/exceeded 1048576 bytes when read/u);
   });
 });
 
@@ -645,6 +677,11 @@ describe('App publication happy path', () => {
       permissions: { 'pull_requests': 'write', 'metadata': 'read' },
     });
 
+    // Credential class per endpoint: the /app probe carries the App JWT,
+    // the repository APIs carry the installation token.
+    expect(calls[1]!.headers['AUTHORIZATION']).toBe(mint.headers['AUTHORIZATION']);
+    expect(calls[2]!.headers['AUTHORIZATION']).toBe(`Bearer ${TOKEN}`);
+
     const post = calls[3]!;
     expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'COMMENT', commit_id: HEAD });
     expect(post.headers['AUTHORIZATION']).toBe(`Bearer ${TOKEN}`);
@@ -661,6 +698,15 @@ describe('App publication happy path', () => {
       { method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/, handler: async () => ({ status: 200, body: { head: { sha: '9'.repeat(40) }, base: { sha: BASE } } }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/identity moved/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+  });
+
+  it('refuses a PR identity response missing the base sha before any POST', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/, handler: async () => ({ status: 200, body: { head: { sha: HEAD } } }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/base sha/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
   });
 
@@ -745,6 +791,15 @@ describe('fail-closed credential and identity checks', () => {
       await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/usable slug/u);
       expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
     }
+  });
+
+  it('refuses an over-length App slug whose derived bot login would break the shared receipt contract', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'GET', test: /\/app$/, handler: async () => ({ status: 200, body: { id: 424242, slug: 'a'.repeat(196) } }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/receipt contract/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
   });
 
   it('fails before POST when the token grant lacks the permission or the repository binding', async () => {
@@ -878,6 +933,20 @@ describe('fail-closed credential and identity checks', () => {
     expect(error?.message ?? '').toContain('[REDACTED]');
   });
 
+  it('redacts PEM private-key blocks in provider diagnostics', async () => {
+    const fixture = bundleFixture();
+    const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7Z\n-----END RSA PRIVATE KEY-----';
+    const { poster } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/,
+        handler: async () => ({ status: 403, body: { message: `refused: ${pem}` } }),
+      },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toContain('[REDACTED]');
+    expect(error?.message ?? '').not.toContain('PRIVATE KEY');
+  });
+
   it('retains no raw provider bytes on the HTTP error object — only sanitized classification state', async () => {
     const fixture = bundleFixture();
     const secret = `ghs_${'L'.repeat(36)}`;
@@ -934,6 +1003,20 @@ describe('fail-closed credential and identity checks', () => {
       ...PR_INPUT, repoPath: repoPathOf(fixture),
       prUrl: 'https://ghe.corp.example/acme/widget/pull/7', host: 'ghe.corp.example',
     })).rejects.toThrow(/not github\.com/u);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('sanitizes credential-shaped bytes in the host-refusal diagnostic', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture);
+    const secret = `ghs_${'H'.repeat(36)}`;
+    const hostileHost = `evil.example\n${secret}`;
+    const error = await poster.post({
+      ...PR_INPUT, repoPath: repoPathOf(fixture), host: hostileHost,
+      prUrl: `https://${hostileHost}/acme/widget/pull/7`,
+    }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toContain('[REDACTED]');
+    expect(error?.message ?? '').not.toContain(secret);
     expect(calls).toHaveLength(0);
   });
 });
@@ -1225,6 +1308,19 @@ describe('bounded ambiguous-POST reconciliation', () => {
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
+  it('treats a list with a null entry as a malformed body — named and unresolved, never a raw crash', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW, null] }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/malformed list body/u);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/malformed list body/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
   it('never credits an older round\u2019s identical bytes: stale submitted_at is not a match', async () => {
     const fixture = bundleFixture();
     const stale = { ...MATCHING_REVIEW, id: 111222, submitted_at: new Date(NOW - 3_600_000).toISOString() };
@@ -1235,6 +1331,49 @@ describe('bounded ambiguous-POST reconciliation', () => {
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/NOT re-posted/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('keeps a predicate-complete review with an unverifiable submission time out of absence certificates, while the recovery seam may still credit it', async () => {
+    const fixture = bundleFixture();
+    const noTime = {
+      id: 222333,
+      user: { login: 'perkins-review[bot]', type: 'Bot', id: 308038895 },
+      commit_id: HEAD,
+      state: 'COMMENTED',
+      body: 'review body\n',
+    };
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [noTime] }) },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+    expect(error?.message ?? '').not.toMatch(/did not land/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    // The recovery seam reads the same walk without a round window: the
+    // identical publication is credit-able there (its bytes and head are
+    // proven; only the in-round window was unprovable).
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .resolves.toEqual({ ...RECEIPT, reviewId: '222333' });
+  });
+
+  it('pins the recency margin edge: a submission exactly at postStart-60s is credited, one millisecond older is not', async () => {
+    const fixture = bundleFixture();
+    const atBoundary = { ...MATCHING_REVIEW, id: 333444, submitted_at: new Date(NOW - 60_000).toISOString() };
+    const justOutside = { ...MATCHING_REVIEW, id: 333555, submitted_at: new Date(NOW - 60_001).toISOString() };
+    const boundary = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [atBoundary] }) },
+    ]);
+    await expect(boundary.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .resolves.toEqual({ ...RECEIPT, reviewId: '333444' });
+
+    const outside = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [justOutside] }) },
+    ]);
+    const error = await outside.poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toMatch(/did not land/u);
   });
 
   it('treats a 2xx receipt with an empty body as an unprovable receipt and reconciles', async () => {
@@ -1756,6 +1895,19 @@ describe('review id discipline', () => {
     expect(new PerkinsAppPrPoster({ instanceDir: fixture.home, maxProviderBodyBytes: 2_048 })).toBeInstanceOf(PerkinsAppPrPoster);
     expect(new PerkinsAppPrPoster({ instanceDir: fixture.home, maxReconciliationPages: 1 })).toBeInstanceOf(PerkinsAppPrPoster);
   });
+
+  it('refuses broken timeout options at construction — a mis-wired timeout is never an ambiguous delivery', () => {
+    const fixture = bundleFixture();
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, probeTimeoutMs: 0 })).toThrow(/probeTimeoutMs/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, probeTimeoutMs: -1 })).toThrow(/probeTimeoutMs/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, probeTimeoutMs: 1.5 })).toThrow(/probeTimeoutMs/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, probeTimeoutMs: Number.NaN })).toThrow(/probeTimeoutMs/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, postTimeoutMs: 0 })).toThrow(/postTimeoutMs/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, postTimeoutMs: -1 })).toThrow(/postTimeoutMs/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, postTimeoutMs: 1.5 })).toThrow(/postTimeoutMs/u);
+    expect(() => new PerkinsAppPrPoster({ instanceDir: fixture.home, postTimeoutMs: Number.NaN })).toThrow(/postTimeoutMs/u);
+    expect(new PerkinsAppPrPoster({ instanceDir: fixture.home, probeTimeoutMs: 1, postTimeoutMs: 1 })).toBeInstanceOf(PerkinsAppPrPoster);
+  });
 });
 
 describe('bounded lookup growth and link sanity', () => {
@@ -1783,6 +1935,26 @@ describe('bounded lookup growth and link sanity', () => {
       .rejects.toThrow(/delivery stays unresolved/u);
     // The unusable Link header falls back to the sequential walk, still bounded.
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(2);
+  });
+
+  it('never certifies absence from conflicting rel="last" entries — a self-disagreeing header keeps uncertainty', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async () => ({
+          status: 200,
+          body: [],
+          headers: { link: '<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=1>; rel="last", <https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=5>; rel="last"' },
+        }),
+      },
+    ], { maxReconciliationPages: 2 });
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+    // A conflicting page count must never become "the POST did not land".
+    expect(error?.message ?? '').not.toMatch(/did not land/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
   it('does not certify absence when the review list grows mid-walk beyond the visited pages', async () => {
