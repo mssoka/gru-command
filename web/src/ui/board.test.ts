@@ -653,6 +653,211 @@ describe('board round progress labels (R9/T14/N8)', () => {
   });
 });
 
+describe('board lens chips — unused lenses are neutral, never a pass', () => {
+  beforeEach(mountBoardDom);
+
+  const notUsed = (lens: string): { lens: string; state: string; agentId: null; note: string; verdict: string } => ({
+    lens,
+    state: 'done',
+    agentId: null,
+    note: 'not used — lead-owned whole-PR review',
+    verdict: 'clean',
+  });
+
+  function expandFirstRound(): HTMLElement {
+    const row = document.querySelector<HTMLElement>('.board-job');
+    if (row === null) throw new Error('job row missing');
+    row.querySelector<HTMLElement>('.board-job__meta')?.click();
+    row.querySelector<HTMLButtonElement>('.board-round__toggle')?.click();
+    return row;
+  }
+
+  function chip(row: HTMLElement, lens: string): HTMLElement {
+    const found = [...row.querySelectorAll<HTMLElement>('.board-lens')].find((node) =>
+      node.textContent?.includes(lens),
+    );
+    if (found === undefined) throw new Error(`lens chip missing: ${lens}`);
+    return found;
+  }
+
+  it('renders the screenshot round honestly: four unused gray with no tick, blind/edge/tests green', () => {
+    const round5 = baseRound({
+      status: 'verdict-posted',
+      verdict: 'changes-requested',
+      lensAttempts: [],
+      lenses: [
+        { lens: 'blind', state: 'done', agentId: null, note: 'clean — nothing found', verdict: 'clean' },
+        { lens: 'edge', state: 'done', agentId: null, note: 'clean — nothing found', verdict: 'clean' },
+        { lens: 'tests', state: 'done', agentId: null, note: 'clean — nothing found', verdict: 'clean' },
+        notUsed('acceptance'),
+        notUsed('security'),
+        notUsed('architecture'),
+        notUsed('codebase'),
+      ],
+    });
+    const view = new BoardView(() => {});
+    const push = (): void => {
+      view.render(snapshot({ jobs: [baseJob({ status: 'in-review', rounds: [round5] })] }));
+    };
+    push();
+    const row = expandFirstRound();
+    // All seven pills stay visible.
+    expect([...row.querySelectorAll<HTMLElement>('.board-lens')]).toHaveLength(7);
+    expect(row.querySelectorAll('.board-lens.pp-chip--unused')).toHaveLength(4);
+    expect(row.querySelectorAll('.board-lens.pp-chip--done')).toHaveLength(3);
+    for (const lens of ['acceptance', 'security', 'architecture', 'codebase']) {
+      const node = chip(row, lens);
+      expect(node.classList.contains('pp-chip--unused')).toBe(true);
+      expect(node.classList.contains('pp-chip--done')).toBe(false);
+      expect(node.textContent).toContain('not used');
+      expect(node.textContent).not.toContain('✓');
+      expect(node.title).toBe('not used — lead-owned whole-PR review');
+    }
+    for (const lens of ['blind', 'edge', 'tests']) {
+      const node = chip(row, lens);
+      expect(node.classList.contains('pp-chip--done')).toBe(true);
+      expect(node.textContent).toContain('✓');
+      expect(node.textContent).not.toContain('not used');
+    }
+    expect(row.querySelector('.board-round__lens-progress')?.textContent).toBe('3/7 lenses ran · 4 not used');
+    // A repeat snapshot push re-renders the same honest classification
+    // (no stale green: the view keeps the job/round expanded).
+    push();
+    const pushed = document.querySelector<HTMLElement>('.board-job');
+    if (pushed === null) throw new Error('job row missing after push');
+    expect(pushed.querySelectorAll('.board-lens.pp-chip--unused')).toHaveLength(4);
+    expect(pushed.querySelectorAll('.board-lens.pp-chip--done')).toHaveLength(3);
+    expect(pushed.querySelector('.board-round__lens-progress')?.textContent).toBe('3/7 lenses ran · 4 not used');
+  });
+
+  it('keeps the four-unused/three-errors round distinct: unused gray, timeouts alert with attempts', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({
+      jobs: [baseJob({
+        status: 'in-review',
+        rounds: [baseRound({
+          status: 'verdict-posted',
+          verdict: 'changes-requested',
+          lensAttempts: [{ lens: 'edge', attempts: 2 }, { lens: 'codebase', attempts: 1 }, { lens: 'tests', attempts: 1 }],
+          lenses: [
+            notUsed('blind'),
+            notUsed('acceptance'),
+            notUsed('security'),
+            notUsed('architecture'),
+            { lens: 'edge', state: 'error', agentId: null, note: 'specialist attempts failed: a1 timeout; a2 timeout', verdict: null },
+            { lens: 'codebase', state: 'error', agentId: null, note: 'specialist attempts failed: a1 timeout', verdict: null },
+            { lens: 'tests', state: 'error', agentId: null, note: 'specialist attempts failed: a1 timeout', verdict: null },
+          ],
+        })],
+      })],
+    }));
+    const row = expandFirstRound();
+    expect(row.querySelectorAll('.board-lens.pp-chip--unused')).toHaveLength(4);
+    expect(row.querySelectorAll('.board-lens.pp-chip--alert')).toHaveLength(3);
+    for (const lens of ['blind', 'acceptance', 'security', 'architecture']) {
+      const node = chip(row, lens);
+      expect(node.classList.contains('pp-chip--unused')).toBe(true);
+      expect(node.textContent).not.toContain('✓');
+      expect(node.textContent).not.toContain('✕');
+    }
+    for (const lens of ['edge', 'codebase', 'tests']) {
+      const node = chip(row, lens);
+      expect(node.classList.contains('pp-chip--alert')).toBe(true);
+      expect(node.textContent).toContain('✕');
+      expect(node.title).toContain('specialist attempts failed');
+    }
+    // Attempt counts survive the failure (no used execution silently erased).
+    expect(chip(row, 'edge').textContent).toContain('×2');
+    expect(row.querySelector('.board-round__lens-progress')?.textContent).toBe('3/7 lenses ran · 3 failed · 4 not used');
+  });
+
+  it('keeps every state distinct in one mixed round: unused, clean, legacy done, live, pending, blocker, error', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({
+      jobs: [baseJob({
+        status: 'in-review',
+        rounds: [baseRound({
+          status: 'live',
+          lensAttempts: [],
+          lenses: [
+            { lens: 'blind', state: 'done', agentId: null, note: 'blocker — unsafe retry', verdict: 'blocker' },
+            { lens: 'edge', state: 'done', agentId: null, note: 'clean — nothing found', verdict: 'clean' },
+            { lens: 'tests', state: 'done', agentId: null, note: null, verdict: null },
+            notUsed('acceptance'),
+            { lens: 'security', state: 'live', agentId: null, note: null, verdict: null },
+            { lens: 'codebase', state: 'pending', agentId: null, note: null, verdict: null },
+            { lens: 'architecture', state: 'error', agentId: null, note: 'provider cap', verdict: null },
+          ],
+        })],
+      })],
+    }));
+    const row = expandFirstRound();
+    const blocker = chip(row, 'blind');
+    expect(blocker.classList.contains('board-lens--blocker')).toBe(true);
+    expect(blocker.classList.contains('pp-chip--done')).toBe(true);
+    expect(blocker.textContent).toContain('✓');
+    const clean = chip(row, 'edge');
+    expect(clean.classList.contains('pp-chip--done')).toBe(true);
+    expect(clean.textContent).toContain('✓');
+    // A legacy done record with a null note keeps the normal pass face.
+    const legacyDone = chip(row, 'tests');
+    expect(legacyDone.classList.contains('pp-chip--done')).toBe(true);
+    expect(legacyDone.textContent).toContain('✓');
+    const unused = chip(row, 'acceptance');
+    expect(unused.classList.contains('pp-chip--unused')).toBe(true);
+    expect(unused.textContent).not.toContain('✓');
+    const live = chip(row, 'security');
+    expect(live.classList.contains('pp-chip--work')).toBe(true);
+    expect(live.textContent).toContain('◉');
+    const pending = chip(row, 'codebase');
+    expect(pending.classList.contains('pp-chip--park')).toBe(true);
+    expect(pending.textContent).toContain('○');
+    expect(pending.textContent).not.toContain('not used');
+    const errored = chip(row, 'architecture');
+    expect(errored.classList.contains('pp-chip--alert')).toBe(true);
+    expect(errored.textContent).toContain('✕');
+  });
+
+  it('raw unknown unused state keeps the defensive ? + park face and honest counts', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({
+      jobs: [baseJob({
+        status: 'in-review',
+        rounds: [baseRound({
+          status: 'verdict-posted',
+          verdict: 'changes-requested',
+          lensAttempts: [],
+          lenses: [
+            { lens: 'blind', state: 'done', agentId: null, note: 'clean — nothing found', verdict: 'clean' },
+            { lens: 'edge', state: 'unused', agentId: null, note: null, verdict: null },
+            { lens: 'tests', state: 'unused', agentId: null, note: 'not used — prose', verdict: null },
+            notUsed('acceptance'),
+            { lens: 'security', state: 'pending', agentId: null, note: null, verdict: null },
+            { lens: 'architecture', state: 'pending', agentId: null, note: null, verdict: null },
+            { lens: 'codebase', state: 'pending', agentId: null, note: null, verdict: null },
+          ],
+        })],
+      })],
+    }));
+    const row = expandFirstRound();
+    // Seven pills stay visible; the two drift records show the frozen
+    // unknown face — never the derived unused class, marker or wording.
+    expect([...row.querySelectorAll<HTMLElement>('.board-lens')]).toHaveLength(7);
+    for (const lens of ['edge', 'tests']) {
+      const node = chip(row, lens);
+      expect(node.classList.contains('pp-chip--park')).toBe(true);
+      expect(node.classList.contains('pp-chip--unused')).toBe(false);
+      expect(node.textContent).toContain('?');
+      expect(node.textContent).not.toContain('not used');
+      expect(node.textContent).not.toContain('—');
+    }
+    // Only the canonical record is unused; used/ran stay non-negative
+    // (pre-fix the drift records drove ran to 0 and stole the unused slot).
+    expect(row.querySelectorAll('.board-lens.pp-chip--unused')).toHaveLength(1);
+    expect(row.querySelector('.board-round__lens-progress')?.textContent).toBe('1/7 lenses ran · 1 not used');
+  });
+});
+
 describe('board v6 — bands', () => {
   beforeEach(mountBoardDom);
 

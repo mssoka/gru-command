@@ -3,6 +3,7 @@ import {
   agentStateTone,
   isValidSnapshot,
   jobChipTone,
+  lensChipState,
   lensChipTone,
   parseBoardServerFrame,
   type BoardSnapshot,
@@ -238,9 +239,42 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(unknown)).toBe(false);
   });
 
+  it('classifies only done+canonical-notused records as unused — no prose downgrade', () => {
+    // The canonical record: done + the lead's not-used note.
+    expect(lensChipState({ state: 'done', note: 'not used — lead-owned whole-PR review' })).toBe('unused');
+    expect(lensChipState({ state: 'done', note: 'not used' })).toBe('unused');
+    // Backward compatibility: a done record without the canonical note is a pass.
+    expect(lensChipState({ state: 'done', note: null })).toBe('done');
+    expect(lensChipState({ state: 'done', note: 'clean — nothing found' })).toBe('done');
+    // Words that merely appear in prose are not authority.
+    expect(lensChipState({ state: 'done', note: 'clean — lead said not used' })).toBe('done');
+    expect(lensChipState({ state: 'pending', note: 'not used — lead-owned whole-PR review' })).toBe('pending');
+    expect(lensChipState({ state: 'live', note: 'not used' })).toBe('live');
+    expect(lensChipState({ state: 'error', note: 'not used — provider cap' })).toBe('error');
+    // Unknown state drift passes through so the defensive rendering still applies.
+    expect(lensChipState({ state: 'mystery', note: null })).toBe('mystery');
+  });
+
+  it('raw unused state strings never collide with the derived unused classification', () => {
+    // Schema drift: a raw record carrying the state string 'unused' is not
+    // canonical — only done + the canonical note classifies as unused.
+    expect(lensChipState({ state: 'unused', note: null })).toBe('unrecognized');
+    expect(lensChipState({ state: 'unused', note: 'not used — prose' })).toBe('unrecognized');
+    // Both drift variants keep the old defensive unknown face: '?' label
+    // slot (unrecognized is not in LENS_STATE_LABEL) and the park tone —
+    // never the derived unused class or the '—' marker.
+    expect(lensChipTone(lensChipState({ state: 'unused', note: null }))).toBe('pp-chip--park');
+    expect(lensChipTone(lensChipState({ state: 'unused', note: 'not used — prose' }))).toBe('pp-chip--park');
+    expect(lensChipTone(lensChipState({ state: 'unused', note: null }))).not.toBe('pp-chip--unused');
+    // Other unknown states still pass through untouched (existing behavior).
+    expect(lensChipState({ state: 'mystery', note: 'not used' })).toBe('mystery');
+  });
+
   it('tone mapping covers every chip state with a design-token class', () => {
     expect(lensChipTone('live')).toContain('work');
     expect(lensChipTone('done')).toContain('done');
+    expect(lensChipTone('unused')).toBe('pp-chip--unused');
+    expect(lensChipTone('unused')).not.toContain('done');
     expect(lensChipTone('error')).toContain('alert');
     expect(lensChipTone('pending')).toContain('park');
     expect(lensChipTone('anything-else')).toContain('park');
