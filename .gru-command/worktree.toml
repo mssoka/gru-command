@@ -39,7 +39,7 @@ crew-heist-labels = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node .
 # the complete mock project plus the dedicated crew-rail capture project.
 # Captures land under web/test-results/<project>-<title>/crew-captures/.
 crew-rail-captures = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-protocol.test.ts && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=crew-rail && node ../node_modules/@playwright/test/cli.js test --project=mock"
-crew-captures-fast = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=crew-rail && node ../node_modules/@playwright/test/cli.js test --project=mock"
+crew-captures-fast = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=crew-rail"
 
 # Provider-recovery sensor lane scopes (r4 fix round; invoked only via
 # the authenticated /api/verify scheduler at unchanged budgets/thresholds —

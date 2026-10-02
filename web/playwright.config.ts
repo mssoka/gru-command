@@ -63,8 +63,11 @@ export default defineConfig({
       // authored names, long/Unicode names and bounded rendering captured
       // for desktop/phone in light/dark. A dedicated project, like
       // lens-pills, so the capture run is a complete declared surface.
+      // Its own output dir keeps the captures from being cleaned by a
+      // later smoke run (each playwright invocation cleans its outputDir).
       name: 'crew-rail',
       testMatch: 'crew-rail.spec.ts',
+      outputDir: 'test-results-crew',
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
