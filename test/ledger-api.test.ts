@@ -396,7 +396,6 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     api.setJobStatus(jobId, 'merged');
 
     const first = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates });
-    expect(first.recorded).toBe(true);
     expect(first.refused).toBeNull();
     expect(first.retired.map((marker) => marker.id).sort()).toEqual(markers.map((marker) => marker.id).sort());
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
@@ -405,7 +404,6 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     expect((audit?.payload as { job_status?: string }).job_status).toBe('merged');
 
     const replay = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates });
-    expect(replay.recorded).toBe(false);
     expect(replay.retired).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
   });
@@ -423,7 +421,6 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     // reported as "skipped" because no row was read or compared.
     const refused = api.retirePendingRebriefs({ jobId, reason: 'x', candidates: staleCandidates });
     expect(refused.refused).toBe('job-not-terminal');
-    expect(refused.recorded).toBe(false);
     expect(refused.skippedIds).toHaveLength(0);
     expect(refused.retired).toHaveLength(0);
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(2);
@@ -432,7 +429,6 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     api.setJobStatus(jobId, 'merged');
     const stale = api.retirePendingRebriefs({ jobId, reason: 'x', candidates: staleCandidates });
     expect(stale.retired).toHaveLength(0);
-    expect(stale.recorded).toBe(false);
     expect(stale.skippedIds.slice().sort()).toEqual(staleCandidates.map((candidate) => candidate.id).sort());
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(2); // the newer generation survives
 
@@ -458,7 +454,6 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const matching = candidatesOf(fresh)[0]!;
     const drifted = candidatesOf(superseded).find((candidate) => candidate.kind === matching.kind)!;
     const result = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates: [matching, drifted] });
-    expect(result.recorded).toBe(true);
     expect(result.refused).toBeNull();
     expect(result.retired.map((marker) => marker.id)).toEqual([matching.id]);
     expect(result.skippedIds).toEqual([drifted.id]);
@@ -470,6 +465,28 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const payload = audits[0]!.payload as { retired: readonly { id: string }[]; skipped_ids: readonly string[] };
     expect(payload.retired.map((marker) => marker.id)).toEqual([matching.id]);
     expect(payload.skipped_ids).toEqual([drifted.id]);
+  });
+
+  it('duplicate candidate ids retire and audit ONCE — a caller-side duplicate cannot overstate the deletion', () => {
+    const jobId = 'retire-duplicate-ids';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'duplicate guard' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    const candidates = candidatesOf(markers);
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    // The same candidate twice (a caller-side duplicate): the id retires
+    // once, the audit names it once, and nothing is reported as skipped.
+    const result = api.retirePendingRebriefs({
+      jobId, reason: 'job terminal', candidates: [...candidates, ...candidates],
+    });
+    expect(result.retired.map((marker) => marker.id).sort()).toEqual(markers.map((marker) => marker.id).sort());
+    expect(result.skippedIds).toEqual([]);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+    const audit = api.latestJobEvent(jobId, 'silas.rebrief-retired');
+    const audited = (audit?.payload as { retired?: readonly { id: string }[] }).retired ?? [];
+    expect(audited.map((row) => row.id).sort()).toEqual(markers.map((marker) => marker.id).sort());
+    expect(audited).toHaveLength(2); // one audit row per real marker, not per candidate
   });
 
   it('the retirement audit recomputes guarded_event_landed from the ledger, not the caller', () => {

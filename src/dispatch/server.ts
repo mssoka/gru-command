@@ -455,9 +455,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (followUp.retired) {
         // The job reached terminal while the turn was in flight: the
         // request was administratively retired; no events were fabricated.
+        // A partial retirement carries its kept-marker ids here too — the
+        // response already carries `retirement`, and this log must not
+        // silently drop the same disposition.
         log('info', 'silas re-brief retired: job went terminal before the turn settled', {
           job: jobId,
           minion_id: result.minionId,
+          ...(followUp.retirement !== null
+            ? { refused: followUp.retirement.refused, skipped: followUp.retirement.skippedIds }
+            : {}),
         });
       } else if (followUp.retirement !== null) {
         // A defensive boundary refused the retirement or the marker identity

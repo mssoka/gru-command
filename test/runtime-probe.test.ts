@@ -119,20 +119,17 @@ describe('probeRuntimes on fixture PATHs', () => {
     // both adapters just for two static literals, dragging their agent-SDK
     // graphs into every wizard process (measured ~7s per invocation, which
     // made even a documented `--answers` refusal wait on SDK loading). The
-    // mocks below stand in for the adapters: if the probe (re)loads them,
-    // the sentinel values reach the report and these assertions fail.
+    // adapters are mocked to THROW on evaluation — not merely to return
+    // sentinel values — because the invariant is that the probe evaluates
+    // neither adapter module at all: a value-neutral side-effect import
+    // would silently re-couple the same SDK-graph cost.
     vi.resetModules();
-    const sentinel = {
-      streaming: false,
-      steer: 'sentinel',
-      resume: 'none',
-      images: false,
-      thinking: false,
-      thinkingLevelControl: false,
-      followUp: false,
-    };
-    vi.doMock('../src/runtime/claude-adapter.js', () => ({ CLAUDE_CODE_CAPABILITIES: sentinel }));
-    vi.doMock('../src/runtime/pi-adapter.js', () => ({ PI_CAPABILITIES: sentinel }));
+    vi.doMock('../src/runtime/claude-adapter.js', () => {
+      throw new Error('the claude adapter module must not be evaluated by the probe');
+    });
+    vi.doMock('../src/runtime/pi-adapter.js', () => {
+      throw new Error('the pi adapter module must not be evaluated by the probe');
+    });
     try {
       const fresh = await import('../src/runtime/probe.js');
       const report = fresh.probeRuntimes({ path: '' });

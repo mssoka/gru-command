@@ -371,9 +371,6 @@ export interface PendingRebriefRetireCandidate {
 export interface PendingRebriefRetirement {
   /** The markers this call deleted (identity matched at the boundary). */
   readonly retired: readonly PendingRebriefRecord[];
-  /** True when the retirement audit event was appended with this call;
-   * false on a replay, an identity drift, or a boundary refusal. */
-  readonly recorded: boolean;
   /** Candidate ids whose current row no longer matches the examined
    * identity (a newer request generation, or an already-consumed marker).
    * Empty on a boundary refusal: no row was read or compared there. */
@@ -1340,7 +1337,6 @@ export class LedgerApi {
     return this.transaction(() => {
       const refused = (why: 'job-missing' | 'job-not-terminal'): PendingRebriefRetirement => ({
         retired: [],
-        recorded: false,
         // Refusal is a boundary outcome, not identity drift: no row was read
         // or compared, so nothing is "skipped" — the `refused` discriminator
         // carries the state and the markers stay untouched.
@@ -1356,11 +1352,17 @@ export class LedgerApi {
       const rows = this.listPendingRebriefs({ jobId: input.jobId });
       const retired: PendingRebriefRecord[] = [];
       const skippedIds: string[] = [];
+      // Duplicate candidate ids are deduplicated before any row work: one
+      // marker id retires once and the audit names it once, so a caller-side
+      // duplicate can never overstate the deletion or double-list the audit.
+      const seen = new Set<string>();
       // The landed flag is ledger truth, recomputed here: a caller snapshot
       // could otherwise write a permanently untruthful audit row (e.g.
       // "never landed" for a delivery that did land).
       const guardedEventLanded = new Map<string, boolean>();
       for (const candidate of input.candidates) {
+        if (seen.has(candidate.id)) continue;
+        seen.add(candidate.id);
         const row = rows.find((current) => current.id === candidate.id);
         if (
           row === undefined ||
@@ -1376,7 +1378,7 @@ export class LedgerApi {
         retired.push(row);
       }
       if (retired.length === 0) {
-        return { retired: [], recorded: false, skippedIds, refused: null };
+        return { retired: [], skippedIds, refused: null };
       }
       const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
       for (const row of retired) remove.run(row.id);
@@ -1400,7 +1402,7 @@ export class LedgerApi {
           skipped_ids: skippedIds,
         },
       });
-      return { retired, recorded: true, skippedIds, refused: null };
+      return { retired, skippedIds, refused: null };
     });
   }
 

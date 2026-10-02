@@ -769,7 +769,6 @@ describe('terminal re-brief retirement', () => {
     merge(h, jobId);
     const stale: PendingRebriefRetirement = {
       retired: [],
-      recorded: false,
       skippedIds: ['stale-generation'],
       refused: null,
     };
@@ -799,7 +798,6 @@ describe('terminal re-brief retirement', () => {
     const logs: string[] = [];
     const stale: PendingRebriefRetirement = {
       retired: [],
-      recorded: false,
       skippedIds: ['stale-generation'],
       refused: null,
     };
@@ -837,7 +835,6 @@ describe('terminal re-brief retirement', () => {
     const logs: string[] = [];
     const stale: PendingRebriefRetirement = {
       retired: [],
-      recorded: false,
       skippedIds: ['stale-generation'],
       refused: null,
     };
@@ -864,6 +861,50 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
     expect(logs).toContain('warn:re-brief recovery closed without retirement: markers kept');
+  });
+
+  it('a mid-turn partial retirement keeps its skipped ids visible at the caller surface', async () => {
+    const h = makeHarness();
+    const jobId = 'partial-retirement-mid-turn';
+    await seedPendingRebrief({ h, jobId });
+    let release!: () => void;
+    h.registry.gate = new Promise<void>((resolveGate) => {
+      release = resolveGate;
+    });
+    // Drift ONE candidate's identity: the finalize-time retirement deletes
+    // the matching marker and keeps the drifted one — the partial shape
+    // that must stay visible at the mid-turn log surface too.
+    const driftedId = h.ledger.listPendingRebriefs({ jobId })[0]!.id;
+    const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: ledgerWith(h, {
+          retirePendingRebriefs: (input) => h.ledger.retirePendingRebriefs({
+            ...input,
+            candidates: input.candidates.map((candidate) =>
+              candidate.id === driftedId ? { ...candidate, payloadHash: 'drifted-hash' } : candidate),
+          }),
+        }),
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+        log: (level, msg, fields) => { logs.push({ level, msg, fields }); },
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    expect(report.redispatched).toBe(1);
+    // The job reaches terminal while the recovered turn is still in flight.
+    merge(h, jobId);
+    release();
+    await report.settled;
+    // The turn is preserved; one marker retired with its audit; the kept
+    // marker and its identity are named at this surface, not dropped.
+    expect(h.registry.workers).toHaveLength(1);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(1);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).not.toBeNull();
+    const closed = logs.find((line) => line.msg === 're-brief recovery closed: job went terminal mid-turn');
+    expect(closed?.level).toBe('info');
+    expect(closed?.fields?.['skipped']).toEqual([driftedId]);
   });
 
   it('one pass retires multiple terminal jobs: per-job audits, statuses, and an untouched working lane', async () => {

@@ -84,7 +84,7 @@ Shared seams if main/#136 moves: #136 appends directive reconciliation to `rebri
 - Independent review receipts (not a conforming Perkins gate; not self-attested): three fresh same-model sessions ran the staged blind-hunter / edge-case-hunter / verification-gap prompts at pinned head `ba7f2d6`. Operational copies are preserved in the ops interlock sweep bundle `silas-interlock-0857-R2YFB9` (per-file hashes in its `independent-finding-artifact-preservation.json`); 11 + 3 + 3 findings + 1 other, triaged individually below as untrusted observations (every claim re-verified against the pinned code; the verification layer's recorded input-contract limit — it read its own clean base checkout beyond the strict supplied-only packet — means that layer is held non-conforming and none of its claims were pre-trusted).
 - Exact-head CI receipts: run `36693133112` at `ba7f2d6` failed on the single inherited supervisor fixture race (`test/supervisor.test.ts:1132`, alert sampled after a fixed 50 ms while the 1/2/4 ms backoff rungs settle asynchronously; complete output preserved by the ops CI-failure capture for that run, sha256 `30404663f06753d2b4089657df39de52b28fd7d67839cab445d9fa58f73d517a`). Causal fix: the test now waits on the condition itself (`vi.waitFor`, this file's own convention) instead of a fixed real-time slice; no assertion weakened, no timeout raised, no semantics changed. Run `36697299977` at `ef5211` then failed on (a) the new administrative-retirement test asserting a null `job.delivered` where the initial dispatch turn's historical delivery (seq 6, source `dispatch`) is correctly retained, and (b) two personal absolute paths in these receipt notes. Both fixed in place: the test now proves no POST-boundary fabrication while preserving the historical event and terminal status, and the receipts are portable (second complete output sha256 `520de1d719d10a206c1f057f1fd9ed543ffca9969c9c29a239e4e70507db6d7f`).
 - Full suite + native Perkins + exact-final-head CI remain owed gates; the two focused local runs are not a substitute and no READY/PASS is claimed.
-- Final raw-advice triage (2026-10-01, packet head `62f5c54`): the 12-row factual disposition is preserved in the ignored `_bmad-output/implementation-artifacts/ops-triage/pr142-final/` (never force-added). Repaired in this head: `retirePendingRebriefs` refusals no longer report unexamined candidates as `skippedIds` (refuse/skip truth); the boot all-skip branch and the retirement log lines gained deterministic pins; FLOW/LEDGER/close-out docs describe the terminal-retirement outcome; queued-vs-settled counter semantics documented. Suite pins recomputed from the raw guard regex: `rebrief-recovery` 21 (`dispatch-server` 22, `ledger-api` 27 unchanged). No frozen-intent change, no new event kind.
+- Final raw-advice triage (2026-10-01, packet head `62f5c54`): the 12-row factual disposition is preserved in the ignored `_bmad-output/implementation-artifacts/ops-triage/pr142-final/` (never force-added). Repaired in this head: `retirePendingRebriefs` refusals no longer report unexamined candidates as `skippedIds` (refuse/skip truth); the boot all-skip branch and the retirement log lines gained deterministic pins; FLOW/LEDGER/close-out docs describe the terminal-retirement outcome; queued-vs-settled counter semantics documented. Suite pins recomputed from the raw guard regex: `rebrief-recovery` 21 (`dispatch-server` 22, `ledger-api` 27 unchanged) — historical figures at that head only; the live pins are asserted by `test/suite-shape.test.ts` and were recomputed again with every later test addition. No frozen-intent change, no new event kind.
 
 ## Review Triage Log
 
@@ -212,3 +212,50 @@ four tests, all `Test timed out in 30000ms` with zero assertion failures:
   Prescribed independent read-only reviews are dispatched as separate tracked jobs from
   the frozen actual-head packet; publish → exact-head CI → one native Perkins handoff
   follow the controlled full verification.
+
+### Continuation change map (packets outside the frozen block)
+
+The frozen block above owns the retirement seams; the continuation adds files the frozen
+block never names. That is a recorded continuation decision (the frozen intent itself is
+unchanged), and each addition carries its own acceptance evidence:
+
+- `src/runtime/capabilities.ts` + `src/runtime/probe.ts` + adapter re-exports — the
+  measured wizard SDK-graph defect repair (`ce62304`); evidence: the `runtime-capability`
+  focused PASS and the wizard case drop 36509ms → 4045ms.
+- `test/runtime-probe.test.ts` — the decoupling oracle, strengthened after review to
+  throwing adapter mocks (evaluation-level, not value-level).
+- `.gru-command/worktree.toml` — focused scopes (`runtime-capability-decoupling`,
+  `pr142-review-triage`) and the build-first `terminal-rebrief` scope; every scope names
+  its precondition and none changes budgets/timeouts.
+- `test/chat-server.test.ts`, `test/supervisor.test.ts`, `test/claude-adapter.test.ts`,
+  `test/perkins-builtin-wave.test.ts` (T4 cost relief) — inherited-suite continuity
+  repairs carried by the lane's main integrations; all pinned by their own suites.
+
+### Independent review round (2026-10-02, packet `fa8b591`)
+
+Three tracked read-only review jobs were dispatched through the authenticated
+`/api/dispatch` surface (separate sessions/worktrees, artifact-only outputs):
+`terminal-rebrief-review-{blind-hunter,edge-case-hunter,verification-gap}-fa8b591`.
+Packet: `_bmad-output/implementation-artifacts/pr142-review-packet-fa8b591/` (frozen diff
+sha256 `f1db5c10…`, 137700 bytes; briefing hashes in `packet.json`); harvested reports in
+the same directory. Every claim was re-verified against the pinned code before a verdict:
+
+| ID | Lens | Claim | Verdict |
+|---|---|---|---|
+| B1/E2 | blind/edge | partial retirement's kept ids dropped at the mid-turn log surfaces | accept — both logs now carry `refused`/`skipped`; new mid-turn partial test |
+| B2 | blind | `retired:true` + `skipped_ids` combined contract unpinned | accept — new endpoint partial test pins both; log carries the ids |
+| B3/E1 | blind/edge | `terminal-rebrief` scope can pass on a stale `dist` | accept — scope now inlines the build |
+| B4/B5 | blind | LEDGER API catalog stale; "cleared ONLY" contradicts retirement | accept — both reworded |
+| B6 | blind | spec pin figures historical vs live | accept — marked historical above |
+| B7 | blind | no endpoint test for the missing-job throw | reject, reason recorded — jobs have no deletion path; the unit test pins fail-closed; a forced wrapper would pin generic error mapping |
+| B8 | blind | dangling `silas.rebrief-unreconciled` incident disposition undocumented | reject, reason recorded — owner-alert disposition is an excluded boundary (prior R1); retirement posts no alert by contract |
+| B9 | blind | frozen boundary/Code Map vs bundled diff | accept — change map above (frozen block untouched) |
+| B10 | blind | `retired` counter partial semantics | accept (doc) — field comment + LEDGER clarified; counting semantics retained |
+| B11 | blind | duplicate candidate ids can double-delete/double-audit | accept — dedupe guard + test |
+| B12 | blind | `PendingRebriefRetirement.recorded` unread | accept — field dropped; tests assert the deletion/audit directly |
+| B13 | blind | `t4-oracle` prerequisite comment overclaims | accept — comment corrected |
+| VG1 | verification | endpoint warn line unpinned | accept — log capture + assertion |
+| VG2 | verification | decoupling oracle observes values, not evaluation | accept — throwing adapter factories (verified to catch a side-effect import) |
+
+Review returns are advisory artifacts, never native clearance; repairs are verified by the
+`pr142-review-triage` focused scope and the controlled FULL.

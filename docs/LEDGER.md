@@ -120,7 +120,9 @@ row, appends the event, and (with a bus attached) publishes it:
 - agents: `registerAgent` (upsert) · `setAgentState`
 - events: `appendCustomEvent` · `listEvents`
 - re-briefs: `beginPendingRebrief` · `bindPendingRebriefWorker` ·
-  `listPendingRebriefs` · `clearPendingRebriefs`
+  `listPendingRebriefs` · `clearPendingRebriefs` · `retirePendingRebriefs`
+  (the only cancellation seam: identity-checked deletion + one terminal
+  `silas.rebrief-retired` audit in the same transaction)
 - reads: `getJob` · `listJobs(repo?)` · `getRound` · `listRounds` ·
   `getAgent` · `listAgents`
 
@@ -156,8 +158,9 @@ event — `kind` is `silas.rebrief` or `job.delivered` — with `job_id`,
 the request `payload` (note + briefing) and its sha256 `payload_hash`,
 the `baseline_seq` event watermark the request must post-date, the bound
 worker (`agent_id`, `session_file`), and `requested_at`. The marker pair
-is written BEFORE any worker spawns and cleared ONLY when its events
-land; `UNIQUE (job_id, kind)` means a newer request supersedes an older
+is written BEFORE any worker spawns and cleared when its events land — or
+retired administratively when the job is already `merged`/`done` (below);
+`UNIQUE (job_id, kind)` means a newer request supersedes an older
 marker. Boot reconciliation (`src/dispatch/rebrief-recovery.ts`)
 consumes leftovers: resume the interrupted session (or re-dispatch fresh
 on the same lane), record the missing events, or escalate
@@ -171,7 +174,10 @@ markers (both guarded events already landed) are the exception: they
 clear as the completed request they are, with no retirement audit. The
 boot summary's units are mixed by design: `examined` counts markers
 while `completed`/`redispatched`/`retired` count jobs, so one retired
-marker pair reads `examined: 2 … retired: 1` — not a partial failure.
+marker pair reads `examined: 2 … retired: 1` — not a partial failure. A
+group counts once per scan in which at least one of its markers retires;
+a group partially retired by one scan and completed by a later scan is
+counted by each scan that retired part of it.
 
 ### Residency admission + durable review handoffs (custom events)
 

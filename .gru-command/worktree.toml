@@ -20,13 +20,24 @@ residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-re
 handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"
 working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
-terminal-rebrief = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/rebrief-recovery.test.ts test/ledger-api.test.ts test/dispatch-server.test.ts test/suite-shape.test.ts test/shutdown.test.ts"
+# The re-brief/retirement seams PLUS the dist-bound shutdown boot-summary case:
+# the build steps are inlined (never `npm test`'s chain) because
+# test/shutdown.test.ts spawns dist/main.js — without them the scope's verdict
+# can prove a stale dist rather than this head (the migration-skew false red
+# this lane already hit).
+terminal-rebrief = "node tools/patch-vitest-rpc-timeout.mjs && npx tsc && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs','dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs && npx vitest run test/rebrief-recovery.test.ts test/ledger-api.test.ts test/dispatch-server.test.ts test/suite-shape.test.ts test/shutdown.test.ts"
 # T4 moved-ref/abort oracle only (phase pr142-t4-source-repair-20261002):
 # the narrow T4 discriminator declaration, kept behind the guarded j-463
-# worker-to-host RPC prerequisite like every other declared command. It is a
-# diagnostic selector (name filter only; no timeout/worker/pool/reporter
-# flag) and never a FULL substitute.
+# worker-to-host RPC prerequisite (the lane's process-heavy scopes share it;
+# the older single-file scopes predate it). It is a diagnostic selector (name
+# filter only; no timeout/worker/pool/reporter flag) and never a FULL
+# substitute.
 t4-oracle = 'node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"'
+# Independent-review triage (phase pr142-review-triage-20261002): build-first
+# focused proof for the accepted findings on the re-brief/retirement seams and
+# the probe decoupling. Build steps inlined because shutdown.test.ts executes
+# dist/main.js.
+pr142-review-triage = "node tools/patch-vitest-rpc-timeout.mjs && npx tsc && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs','dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs && npx vitest run test/rebrief-recovery.test.ts test/ledger-api.test.ts test/dispatch-server.test.ts test/runtime-probe.test.ts test/suite-shape.test.ts test/shutdown.test.ts"
 # Runtime-capability decoupling (phase pr142-full-red-continuation-20261002):
 # the focused proof that runtime/probe.ts and the wizard no longer load the
 # adapter SDK graphs, that the adapter capability surfaces are unchanged, and

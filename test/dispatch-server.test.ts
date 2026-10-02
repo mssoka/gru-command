@@ -69,8 +69,8 @@ async function boot(opts: {
   silasOps?: boolean;
   /** Gate selected minion turns before they settle (in-flight assertions). */
   minionPromptGate?: (text: string) => Promise<void> | undefined;
-  /** Capture service log lines for operator-surface assertions. */
-  log?: (level: 'debug' | 'info' | 'warn' | 'error', msg: string) => void;
+  /** Capture service log lines (with their fields) for operator-surface assertions. */
+  log?: (level: 'debug' | 'info' | 'warn' | 'error', msg: string, fields?: Record<string, unknown>) => void;
   /** Test-only seam: wrap the ledger the server and dispatch see, so
    * defensive ledger dispositions can be forced deterministically. */
   wrapLedger?: (ledger: LedgerApi) => LedgerApi;
@@ -928,14 +928,18 @@ describe('dispatch server (E8)', () => {
     const gate = new Promise<void>((resolveGate) => {
       releasePrompt = resolveGate;
     });
+    const logs: string[] = [];
     const h = await boot({
       minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined),
       wrapLedger: (ledger) => {
         const view = Object.create(ledger) as LedgerApi;
         Object.defineProperty(view, 'retirePendingRebriefs', {
-          value: () => ({ retired: [], recorded: false, skippedIds: ['stale-generation'], refused: null }),
+          value: () => ({ retired: [], skippedIds: ['stale-generation'], refused: null }),
         });
         return view;
+      },
+      log: (level, msg) => {
+        logs.push(`${level}:${msg}`);
       },
     });
     const repo = makeFixtureRepo('fixture-silas-rebrief-incomplete');
@@ -973,6 +977,70 @@ describe('dispatch server (E8)', () => {
       expect(h.ledger.latestJobEvent('incomplete-rebrief-job', 'silas.rebrief-retired')).toBeNull();
       expect(h.ledger.latestJobEvent('incomplete-rebrief-job', 'silas.rebrief-recovered')).toBeNull();
       expect(h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' })).toHaveLength(2);
+      // The operator-facing warn line is part of this contract: an all-skip
+      // disposition must be visible in the log, not only in the 200 body.
+      expect(logs).toContain('warn:silas re-brief retirement incomplete: markers kept for the next pass');
+    } finally {
+      releasePrompt();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief surfaces a PARTIAL retirement: retired plus the kept-marker ids', async () => {
+    let releasePrompt!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      releasePrompt = resolveGate;
+    });
+    const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+    const h = await boot({
+      minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined),
+      wrapLedger: (ledger) => {
+        const view = Object.create(ledger) as LedgerApi;
+        Object.defineProperty(view, 'retirePendingRebriefs', {
+          value: (input: { jobId: string }) => {
+            const rows = ledger.listPendingRebriefs({ jobId: input.jobId });
+            // One marker retires; the other's identity drifted (kept).
+            return { retired: [rows[0]!], skippedIds: [rows[1]!.id], refused: null };
+          },
+        });
+        return view;
+      },
+      log: (level, msg, fields) => {
+        logs.push({ level, msg, fields });
+      },
+    });
+    const repo = makeFixtureRepo('fixture-silas-rebrief-partial');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'partial-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
+      }, TOKEN);
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('partial-rebrief-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'partial-rebrief-job', note: 'fold the rebase',
+      }, TOKEN);
+      const markerDeadline = Date.now() + 10_000;
+      while (h.ledger.listPendingRebriefs({ jobId: 'partial-rebrief-job' }).length !== 2 && Date.now() < markerDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const markers = h.ledger.listPendingRebriefs({ jobId: 'partial-rebrief-job' });
+      expect(markers).toHaveLength(2);
+      h.ledger.setJobStatus('partial-rebrief-job', 'in-review');
+      h.ledger.setJobStatus('partial-rebrief-job', 'merged');
+      releasePrompt();
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.json)).toBe(200);
+      // Partial means BOTH facts on the wire: retired true AND the kept
+      // marker ids named — a consumer keying on either alone reads it right.
+      expect((res.json as { retired?: unknown }).retired).toBe(true);
+      expect((res.json as { retirement?: unknown }).retirement)
+        .toEqual({ refused: null, skipped_ids: [markers[1]!.id] });
+      const retiredLog = logs.find((line) => line.msg === 'silas re-brief retired: job went terminal before the turn settled');
+      expect(retiredLog?.level).toBe('info');
+      expect(retiredLog?.fields?.['skipped']).toEqual([markers[1]!.id]);
     } finally {
       releasePrompt();
       await h.close();

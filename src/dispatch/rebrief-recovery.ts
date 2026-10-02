@@ -126,8 +126,10 @@ export interface ReconcileReport {
    * mid-turn is logged per job and audited, not counted here. */
   readonly redispatched: number;
   /** Jobs retired synchronously during this scan because the job is
-   * terminal (one per job group). A retirement reached mid-turn is logged
-   * per job and audited, not counted here. */
+   * terminal (one per job group with at least one marker retired in THIS
+   * scan; a group partially retired now and completed by a later scan is
+   * counted by each scan that retired part of it). A retirement reached
+   * mid-turn is logged per job and audited, not counted here. */
   readonly retired: number;
   /** Settles when every background re-dispatch has settled — resumed,
    * escalated, or abandoned because the process is stopping. Boot does not
@@ -434,10 +436,16 @@ async function redispatchGroup(
       // The job reached terminal while the recovered turn was in flight:
       // the ledger already recorded the retirement, the turn's artifacts
       // stay on the lane, and no recovery/delivery event is fabricated.
+      // A partial retirement keeps its kept-marker ids visible at this
+      // surface too (the audit is the durable record; the log must not
+      // drop what the caller-reported disposition carries).
       deps.log?.('info', 're-brief recovery closed: job went terminal mid-turn', {
         job: jobId,
         path,
         minion_id: result.minionId,
+        ...(finalized.retirement !== null
+          ? { refused: finalized.retirement.refused, skipped: finalized.retirement.skippedIds }
+          : {}),
       });
       return;
     }
