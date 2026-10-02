@@ -76,12 +76,25 @@ class DeferredReviewPort implements WorktreePort {
 
 /** Attach a fetchable bare origin inside the test's port root and push the
  * reviewed branch: the fresh-head freeze reads THIS tip, never the local
- * ref left behind by the fixture. */
-function attachOrigin(repo: FixtureRepo, branch: string, root: string): void {
+ * ref left behind by the fixture. `opts.batched` (T4 only) replaces
+ * `init --bare` + `push` with ONE `clone --bare` of the repo at the same
+ * commit: the bare carries refs/heads/<branch> at the identical sha (plus
+ * inert extra state nothing in the flow reads — the bare's HEAD, its own
+ * config, and a stale refs/heads/main copy; the head probe reads the LOCAL
+ * ref, review worktrees are created from the job repo, and the reconcile
+ * git-ops are local), and the job repo's `origin` remote is added exactly
+ * as before. Callers that omit the flag keep the historical three-process
+ * shape byte-for-byte (phase pr144-t4-second-cost-diagnosis-20261002). */
+function attachOrigin(repo: FixtureRepo, branch: string, root: string, opts?: { readonly batched?: boolean }): void {
   const origin = join(root, 'origin.git');
-  execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
-  repo.git(['remote', 'add', 'origin', origin]);
-  repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+  if (opts?.batched === true) {
+    execFileSync('git', ['clone', '--bare', '--quiet', repo.path, origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', origin]);
+  } else {
+    execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', origin]);
+    repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+  }
 }
 
 /** Probe double for PR rounds: report the reviewed branch's local tip (the
@@ -1797,7 +1810,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     };
     t4Attr('suite', 'test-start', 'start', { note: 'single case, both discriminators, inherited 30000 ms bound unchanged; nested intervals are never summed' });
     const prepare = async (name: string, branch: string, leg: 'moved' | 'aborted') => {
-      const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' })));
+      const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' }), { batchedInitialCommit: true }));
       repos.push(repo);
       await t4Step(leg, 'fixture/branch-create', async () => { repo.git(['checkout', '-b', branch]); });
       const target = await t4Step(leg, 'fixture/target-commit', () => {
@@ -1840,7 +1853,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
         ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
         return job;
       });
-      await t4Step(leg, 'fixture/origin-push', async () => { attachOrigin(repo, branch, root); });
+      await t4Step(leg, 'fixture/origin-push', async () => { attachOrigin(repo, branch, root, { batched: true }); });
       return { repo, ledger, port, artifacts, sessions, target, job, root };
     };
     // (a) The movement ref advances while the reconciliation lookup is

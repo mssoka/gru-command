@@ -38,7 +38,11 @@ export function attachBareOrigin(repo: FixtureRepo): string {
  * are identical for every caller that omits it (all pre-existing callers do). */
 export type FixtureRepoStep = 'tempdir' | 'git-init' | 'seed-files' | 'initial-commit';
 
-export function makeFixtureRepo(name = 'fixture-app', onStep?: (step: FixtureRepoStep) => void): FixtureRepo {
+export function makeFixtureRepo(
+  name = 'fixture-app',
+  onStep?: (step: FixtureRepoStep) => void,
+  opts?: { readonly batchedInitialCommit?: boolean },
+): FixtureRepo {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-fixture-'));
   onStep?.('tempdir');
   const path = join(dir, name);
@@ -56,8 +60,20 @@ export function makeFixtureRepo(name = 'fixture-app', onStep?: (step: FixtureRep
   mkdirSync(join(path, 'src'), { recursive: true });
   writeFileSync(join(path, 'src', 'main.ts'), 'export function answer(): number {\n  return 42;\n}\n');
   onStep?.('seed-files');
-  git([...GIT_IDENTITY, 'add', '.']);
-  git([...GIT_IDENTITY, 'commit', '-m', 'fixture: initial state']);
+  if (opts?.batchedInitialCommit === true) {
+    // T4-only equivalent primitive (phase pr144-t4-second-cost-diagnosis-20261002):
+    // ONE `git commit --include .` stages the same untracked seed files the
+    // pathspec matches — exactly what `git add .` staged — and commits, with
+    // the identical resulting tree, root parent, Fixture Tests identity,
+    // message, and loud non-zero failure propagation, at one fewer git
+    // process in the load-amplified fixture window. Callers that omit the
+    // flag keep the historical two-process `git add .` + `git commit` shape
+    // byte-for-byte.
+    git([...GIT_IDENTITY, 'commit', '--include', '.', '-m', 'fixture: initial state']);
+  } else {
+    git([...GIT_IDENTITY, 'add', '.']);
+    git([...GIT_IDENTITY, 'commit', '-m', 'fixture: initial state']);
+  }
   onStep?.('initial-commit');
 
   const repo: FixtureRepo = {
