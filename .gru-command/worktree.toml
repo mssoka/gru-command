@@ -27,6 +27,14 @@ terminal-rebrief = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run te
 # diagnostic selector (name filter only; no timeout/worker/pool/reporter
 # flag) and never a FULL substitute.
 t4-oracle = 'node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"'
+# Runtime-capability decoupling (phase pr142-full-red-continuation-20261002):
+# the focused proof that runtime/probe.ts and the wizard no longer load the
+# adapter SDK graphs, that the adapter capability surfaces are unchanged, and
+# that the wizard `--answers` refusal path stays fast with every oracle
+# unchanged. The build steps are inlined (never `npm test`'s chain) because
+# the wizard CLI cases execute dist/wizard/main.js — a stale dist would prove
+# nothing at this head.
+runtime-capability-decoupling = "node tools/patch-vitest-rpc-timeout.mjs && npx tsc && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs','dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs && npx vitest run test/runtime-probe.test.ts test/claude-adapter.test.ts test/wizard.test.ts test/suite-shape.test.ts"
 claude-adapter-cleanup = "npx vitest run test/claude-adapter.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
