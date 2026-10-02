@@ -26,6 +26,12 @@ compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.te
 # can prove a stale dist rather than this head (the migration-skew false red
 # this lane already hit).
 terminal-rebrief = "node tools/patch-vitest-rpc-timeout.mjs && npx tsc && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs','dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs && npx vitest run test/rebrief-recovery.test.ts test/ledger-api.test.ts test/dispatch-server.test.ts test/suite-shape.test.ts test/shutdown.test.ts"
+# Static preflight (phase pr142-review-triage-20261002): exactly the static
+# stages the FULL runs first (lint + the test-config typecheck the focused
+# build scopes do not cover), as plain commands — no budgets, timeouts or
+# npm chain. Declared after the 99d6e04 FULL red at lint so a full-suite
+# slot is not spent on a red static stage.
+pr142-static-preflight = "npx eslint . && npx tsc --noEmit -p tsconfig.test.json"
 # T4 moved-ref/abort oracle only (phase pr142-t4-source-repair-20261002):
 # the narrow T4 discriminator declaration, kept behind the guarded j-463
 # worker-to-host RPC prerequisite (the lane's process-heavy scopes share it;
