@@ -326,6 +326,28 @@ describe('Perkins App bundle config parsing', () => {
     expect(ownerError).toMatch(/configured twice with different values/u);
   });
 
+  it('sanitizes separator-free lines in diagnostics: full-value redaction for github_pat_ and embedded shapes', () => {
+    // A line without '=' is echoed as a key/line prefix. Pre-truncation
+    // (24 chars) left a separator-free github_pat_ token at prefix + 13
+    // suffix characters — below the sanitizer's 16-char threshold. The
+    // FULL line must be sanitized first.
+    for (const bareLine of [`github_pat_${'B'.repeat(36)}`, `token github_pat_${'B'.repeat(36)}`, `ghs_${'A'.repeat(36)}`]) {
+      const error = (() => {
+        try {
+          parsePerkinsAppConfig(`app_id=1\n${bareLine}\nkey_path=/k.pem\ninstallation_id_acme=5\n`, 'perkins app bundle');
+          return 'no error thrown';
+        } catch (caught) {
+          return caught instanceof Error ? caught.message : String(caught);
+        }
+      })();
+      expect(error).toMatch(/is not KEY=VALUE/u);
+      expect(error).toMatch(/line 2/u);
+      expect(error).not.toContain('github_pat_');
+      expect(error).not.toContain('ghs_');
+      expect(error).not.toContain(bareLine);
+    }
+  });
+
   it('loads a bundle whose relative key_path resolves against the trusted bundle dir, and rejects non-RSA keys', () => {
     const fixture = bundleFixture('app_id=424242\nkey_path=app-key.pem\ninstallation_id_acme=164552969\n');
     const loaded = loadPerkinsAppBundle(fixture.home);
@@ -1397,11 +1419,14 @@ describe('bounded ambiguous-POST reconciliation', () => {
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/NOT re-posted/u);
+    const callsBeforeReconcile = calls.length;
     await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }, { reason: 'post-failure' }))
       .rejects.toThrow(/refused for a failed publication attempt/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
-    // Only the single strict-window lookup post() already performed: no
-    // second recovery read touched the provider.
+    // Only the single strict-window lookup post() already performed: NO
+    // additional provider request of ANY route (prepare's token/App/PR
+    // calls included) — the refusal fires before prepare().
+    expect(calls.length).toBe(callsBeforeReconcile);
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(1);
   });
 
@@ -1413,11 +1438,13 @@ describe('bounded ambiguous-POST reconciliation', () => {
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(PerkinsAppHttpError);
+    const callsBeforeReconcile = calls.length;
     await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }, { reason: 'post-failure' }))
       .rejects.toThrow(/refused for a failed publication attempt/u);
     // Fail closed means fail closed: zero provider reads (a 4xx refusal
     // never reconciles internally either), and the error never implies a
     // POST landed or a first lookup happened.
+    expect(calls.length).toBe(callsBeforeReconcile);
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(0);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
@@ -1445,32 +1472,101 @@ describe('bounded ambiguous-POST reconciliation', () => {
     // is what refuses the second lookup, never a state change.
   });
 
-  it('another PR\u2019s successful attempt cannot upgrade or unblock this failed attempt (no shared state)', async () => {
+  it('a concurrent successful attempt between a held publication and its live second lookup cannot upgrade it (real deferred interleaving)', async () => {
+    // Genuine interleaving with an explicit event trace: A's publication
+    // POST is HELD in-flight, B publishes successfully through the SAME
+    // poster (same head/body inputs, different PR), THEN A is released to
+    // fail and its live second lookup must still refuse with zero
+    // additional provider requests of any route. No sleeps; the ordering
+    // is proven by the trace, never by silence.
     const fixture = bundleFixture();
+    let releaseA!: () => void;
+    const aPostGate = new Promise<void>((resolve) => { releaseA = resolve; });
+    const trace: string[] = [];
     const { poster, calls } = posterWith(fixture, [
       {
         method: 'GET', test: /\/repos\/acme\/widget\/pulls\/8$/,
         handler: async () => ({ status: 200, body: { number: 8, head: { sha: HEAD }, base: { sha: BASE } } }),
       },
-      { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/8\/reviews$/, handler: async () => ({ status: 200, body: { ...MATCHING_REVIEW } }) },
-      { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      {
+        method: 'POST', test: /\/repos\/acme\/widget\/pulls\/8\/reviews$/,
+        handler: async () => ({ status: 200, body: { ...MATCHING_REVIEW } }),
+      },
+      {
+        method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/,
+        handler: async () => {
+          trace.push('A:post-held');
+          await aPostGate;
+          trace.push('A:post-failed');
+          throw new Error('socket hang up after send');
+        },
+      },
       {
         method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7\/reviews\?/,
-        handler: async () => ({ status: 200, body: [{ ...MATCHING_REVIEW, id: 777888, submitted_at: new Date(NOW - 3_600_000).toISOString() }] }),
+        handler: async () => {
+          trace.push('A:strict-window-lookup');
+          return { status: 200, body: [{ ...MATCHING_REVIEW, id: 777888, submitted_at: new Date(NOW - 3_600_000).toISOString() }] };
+        },
       },
     ]);
     const pr8 = { ...PR_INPUT, prUrl: 'https://github.com/acme/widget/pull/8', repoPath: repoPathOf(fixture) } as typeof PR_INPUT;
-    // Another job/PR publishes successfully through the SAME poster...
+    // A starts first and blocks inside its publication POST (bounded
+    // microtask drain — no timers).
+    const attemptA = poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) });
+    for (let i = 0; i < 100 && !trace.includes('A:post-held'); i += 1) await Promise.resolve();
+    expect(trace).toEqual(['A:post-held']);
+    // B completes through the same poster while A is held.
+    trace.push('B:post-complete');
     await expect(poster.post(pr8)).resolves.toEqual(RECEIPT);
-    // ...this PR's POST then fails ambiguously...
-    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
-      .rejects.toThrow(/NOT re-posted/u);
-    // ...and its post-failure lookup still fails closed: the successful
-    // attempt neither upgrades it nor performs a second recovery read.
+    // A is released and fails ambiguously...
+    releaseA();
+    await expect(attemptA).rejects.toThrow(/NOT re-posted/u);
+    // ...and A's live second lookup still refuses with NO provider access
+    // of any route (prepare's token/App/PR-identity calls included).
+    const callsBeforeReconcile = calls.length;
     await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }, { reason: 'post-failure' }))
       .rejects.toThrow(/refused for a failed publication attempt/u);
+    expect(calls.length).toBe(callsBeforeReconcile);
+    // The trace proves the real order: A was held, B completed, THEN A
+    // failed and reconciled internally once.
+    expect(trace).toEqual(['A:post-held', 'B:post-complete', 'A:post-failed', 'A:strict-window-lookup']);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'))).toHaveLength(1);
-    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/pulls/7/reviews?'))).toHaveLength(1);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/pulls/8/reviews'))).toHaveLength(1);
+  });
+
+  it('a publication that failed BEFORE sending fails the live second lookup closed with no publication POST at all', async () => {
+    // The failure seam passes the post-failure context for ANY post error,
+    // including failures before the wire: the refusal stays honest — no
+    // publication POST occurred, no review lookup ever runs, nothing is
+    // upgraded or certified absent.
+    const fixture = bundleFixture();
+    const movedHead = 'f'.repeat(40);
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/, handler: async () => ({ status: 200, body: { number: 7, head: { sha: movedHead }, base: { sha: BASE } } }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/pull request identity moved before delivery/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+    const callsBeforeReconcile = calls.length;
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }, { reason: 'post-failure' }))
+      .rejects.toThrow(/refused for a failed publication attempt/u);
+    expect(calls.length).toBe(callsBeforeReconcile);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(0);
+  });
+
+  it('missing-mapping diagnostics sanitize credential-shaped configured owners', async () => {
+    // A VALID bundle whose only owner key is credential-shaped: the
+    // missing-mapping error lists the configured owners — the raw key
+    // bytes must never appear, and the check fires before any provider
+    // call.
+    const fixture = bundleFixture(`app_id=424242\nkey_path="$BUNDLE_DIR/app-key.pem"\ninstallation_id_ghs_${'D'.repeat(36)}=164552969\n`);
+    const { poster, calls } = posterWith(fixture, []);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toMatch(/no installation_id mapping for repository owner "acme"/u);
+    expect(error?.message ?? '').toMatch(/configured owners:/u);
+    expect(error?.message ?? '').not.toContain('ghs_');
+    expect(error?.message ?? '').not.toContain('D'.repeat(36));
+    expect(calls).toHaveLength(0);
   });
 
   it('keeps a predicate-complete review with an unverifiable submission time out of absence certificates, while the recovery seam may still credit it', async () => {
@@ -2210,6 +2306,89 @@ describe('bounded lookup growth and link sanity', () => {
         method: 'GET', test: /\/reviews\?/,
         handler: async (call) => (call.url.includes('page=2')
           ? { status: 200, body: [MATCHING_REVIEW], headers: lastLink('2junk') }
+          : { status: 200, body: fullPage, headers: lastLink('2') }),
+      },
+    ]);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .resolves.toEqual(RECEIPT);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(2);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+  });
+
+  it('keeps a valid earlier last-page bound from certifying absence when a later page carries duplicate page parameters (explicit reconcile)', async () => {
+    // `page=2&page=5` inside ONE last URL is duplicate/conflicting
+    // evidence: picking the first value would re-certify {1,2} as full
+    // coverage without reading pages 3-5.
+    const fixture = bundleFixture();
+    const lastLink = (last: string): Record<string, string> => ({
+      link: `<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${last}>; rel="last"`,
+    });
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => (call.url.includes('page=2')
+          ? { status: 200, body: fullPage, headers: lastLink('2&page=5') }
+          : { status: 200, body: fullPage, headers: lastLink('2') }),
+      },
+    ]);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/delivery stays unresolved/u);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(2);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+  });
+
+  it('keeps a valid earlier last-page bound from certifying absence when a later page mixes malformed and valid page parameters (explicit reconcile)', async () => {
+    // `page=2junk&page=2`: first-match extraction silently skipped the
+    // malformed prefix and accepted the later valid 2; the URL is
+    // self-contradictory and must poison completeness instead.
+    const fixture = bundleFixture();
+    const lastLink = (last: string): Record<string, string> => ({
+      link: `<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${last}>; rel="last"`,
+    });
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => (call.url.includes('page=2')
+          ? { status: 200, body: fullPage, headers: lastLink('2junk&page=2') }
+          : { status: 200, body: fullPage, headers: lastLink('2') }),
+      },
+    ]);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/delivery stays unresolved/u);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(2);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+  });
+
+  it('keeps duplicate page parameters from proving a POST did not land', async () => {
+    const fixture = bundleFixture();
+    const lastLink = (last: string): Record<string, string> => ({
+      link: `<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${last}>; rel="last"`,
+    });
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => (call.url.includes('page=2')
+          ? { status: 200, body: fullPage, headers: lastLink('2&page=5') }
+          : { status: 200, body: fullPage, headers: lastLink('2') }),
+      },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+    expect(error?.message ?? '').not.toMatch(/did not land/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('still credits an exact match when a later page carries duplicate page parameters', async () => {
+    const fixture = bundleFixture();
+    const lastLink = (last: string): Record<string, string> => ({
+      link: `<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${last}>; rel="last"`,
+    });
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => (call.url.includes('page=2')
+          ? { status: 200, body: [MATCHING_REVIEW], headers: lastLink('2&page=5') }
           : { status: 200, body: fullPage, headers: lastLink('2') }),
       },
     ]);

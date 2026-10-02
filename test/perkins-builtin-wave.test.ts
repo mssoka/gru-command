@@ -1522,9 +1522,11 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const NOW = 1_800_000_000_000;
     let postCount = 0;
     let lookupCount = 0;
+    let allRequests = 0;
     let deliveredBody = '';
     const fetchImpl: AppFetch = async (url, init: AppFetchInit = {}) => {
       const method = init.method ?? 'GET';
+      allRequests += 1;
       const json = (status: number, body: unknown) => ({
         ok: status >= 200 && status < 300,
         status,
@@ -1597,6 +1599,12 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // record round.posted).
     expect(postCount).toBe(1);
     expect(lookupCount).toBe(1);
+    // The WHOLE provider interaction is exactly the five requests of one
+    // post attempt (App identity, token mint, PR identity, the failed
+    // POST, and post()'s single strict-window lookup): any additional
+    // request — including anything the live second lookup might have sent
+    // — fails this pin.
+    expect(allRequests).toBe(5);
     // The stale identical review is NOT credited: honestly unposted.
     expect(outcome.posted).toBe(false);
     expect(outcome.round.status).not.toBe('verdict-posted');

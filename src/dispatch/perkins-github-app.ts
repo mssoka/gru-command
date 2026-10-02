@@ -113,8 +113,11 @@ export function parsePerkinsAppConfig(text: string, sourceLabel: string): Perkin
     if (line === '' || line.startsWith('#')) return;
     const separator = line.indexOf('=');
     if (separator <= 0) {
+      // Sanitize the FULL line before any shortening — truncating first can
+      // leave a still-identifiable credential prefix below the redaction
+      // threshold (a separator-free github_pat_ token).
       throw new PerkinsAppError(
-        `${sourceLabel}: line ${index + 1} is not KEY=VALUE (key/line prefix: ${sanitize(line.slice(0, 24))})`,
+        `${sourceLabel}: line ${index + 1} is not KEY=VALUE (key/line prefix: ${sanitize(line)})`,
       );
     }
     const key = line.slice(0, separator).trim();
@@ -792,9 +795,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     const { config, privateKeyPem } = loadPerkinsAppBundle(this.options.instanceDir);
     const installationId = config.installationIds.get(owner.toLowerCase());
     if (installationId === undefined) {
-      const owners = [...config.installationIds.keys()].sort().join(', ');
+      // Every untrusted echo in this diagnostic is sanitized in FULL: a
+      // valid parsed bundle may legitimately carry a credential-shaped
+      // owner key, and the missing-mapping message lists configured owners.
+      const owners = [...config.installationIds.keys()].sort().map((entry) => sanitize(entry)).join(', ');
       throw new PerkinsAppError(
-        `Perkins App bundle has no installation_id mapping for repository owner "${owner}" (configured owners: ${owners === '' ? 'none' : owners}) — add the mapping to the bundle config; App publication never falls back to a personal credential`,
+        `Perkins App bundle has no installation_id mapping for repository owner "${sanitize(owner)}" (configured owners: ${owners === '' ? 'none' : owners}) — add the mapping to the bundle config; App publication never falls back to a personal credential`,
       );
     }
 
@@ -1061,14 +1067,18 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     if (entries.length === 0) return { kind: 'absent' };
     const pages: number[] = [];
     for (const entry of entries) {
-      // Strict page-number validation: the digits must END the entry URL
-      // or be followed by another query parameter. A numeric PREFIX
-      // (`page=2junk`) is malformed evidence, not a valid bound — it must
-      // poison the walk's completeness evidence, never combine with an
-      // earlier bound into a false certificate.
-      const page = /[?&]page=(\d+)(?:&|$)/u.exec(entry[1]!);
-      if (page === null) return { kind: 'contradictory' };
-      const parsed = Number(page[1]);
+      // Strict UNAMBIGUOUS page-number validation: exactly one `page=`
+      // parameter may appear in the entry URL, and its value must be a
+      // strictly sane integer. Duplicates (`page=2&page=5`), a malformed
+      // value next to a valid one (`page=2junk&page=2` — first-match
+      // extraction would silently skip the malformed prefix and accept the
+      // later value), and numeric prefixes (`page=2junk`) are all
+      // contradictory evidence that must poison completeness, never
+      // combine with an earlier bound into a false certificate.
+      const pageMatches = [...entry[1]!.matchAll(/[?&]page=([^&]*)/gu)];
+      if (pageMatches.length !== 1) return { kind: 'contradictory' };
+      if (!/^\d+$/u.test(pageMatches[0]![1]!)) return { kind: 'contradictory' };
+      const parsed = Number(pageMatches[0]![1]);
       if (!Number.isSafeInteger(parsed) || parsed < 1) return { kind: 'contradictory' };
       pages.push(parsed);
     }
