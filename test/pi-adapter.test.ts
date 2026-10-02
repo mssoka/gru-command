@@ -1149,12 +1149,17 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
             return Reflect.get(target, key, target);
           },
         });
-        vi.useFakeTimers();
+        const started = Date.now();
         internal.onPiEvent({ type: 'compaction_start' });
         internal.onPiEvent({ type: 'compaction_end', aborted: true });
-        await vi.advanceTimersByTimeAsync(4_999);
+        // Nothing publishes before the bound.
+        await new Promise((resolve) => setTimeout(resolve, 4_000));
         expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
-        await vi.advanceTimersByTimeAsync(2);
+        await waitFor(
+          () => events.some((event) => event.type === 'compaction_end'),
+          'reconciled compaction_end',
+          8_000,
+        );
         const ends = events.filter(
           (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
             event.type === 'compaction_end',
@@ -1162,12 +1167,12 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         expect(ends).toHaveLength(1);
         expect(ends[0]!.success).toBe(false);
         expect(ends[0]!.error).toBe('native compaction state did not settle after its terminal event');
-        vi.useRealTimers();
+        // The bound was actually awaited, not bypassed.
+        expect(Date.now() - started).toBeGreaterThanOrEqual(5_000);
         // The reconcile path disposes instead of wedging on the stuck gate.
         await waitFor(() => handle.health().state === 'disposed', 'reconciled disposal');
         expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(false);
       } finally {
-        vi.useRealTimers();
         internal.session = nativeSession;
         await handle.dispose();
       }
