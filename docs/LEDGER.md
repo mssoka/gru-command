@@ -305,10 +305,18 @@ phase's `phase_id` AND postdating its `intent_seq` AND passing the
 source's admission gate completes a phase: a directive request must be
 `admitted`/`settled` with the matching `request_id`; a re-brief must have
 recorded its `silas.rebrief` request event with the same phase id; a
-dispatch delivery must come from the phase's bound minion. Failed,
-error-settled and disposed attempts record no admission — they can never
-masquerade as completion. An older receipt cannot complete a newer phase
-(correlation, not sequence).
+dispatch delivery must come from the phase's bound minion. A phase-tagged
+delivery is recorded ONLY when the prompt settled without an in-band
+runtime error: both adapters resolve a fulfilled prompt on an error turn
+(Claude `result.isError`; Pi assistant `stopReason: 'error'`), so every
+marked path correlates the handle's terminal health at settle
+(`promptTerminalVerdict`) before stamping a delivery. A failed turn
+records `job.minion-error` and NO delivery: the dispatch guard row
+closes, the directive request stays `admitted` with a reconcile note (the
+boot pass escalates it), and a re-brief keeps its marker pair for the
+recovery ladder — none can masquerade as completion. Disposed and
+admission-unknown attempts likewise record nothing. An older receipt
+cannot complete a newer phase (correlation, not sequence).
 
 **The hand-back.** On completion the service records ONE
 `phase-completion` obligation (`incidentKey phase-handoff@<phaseId>`,
@@ -323,17 +331,52 @@ job SUSPENDS it — neither publishes a card, and neither is revived
 automatically. Shown/ACK/disposition is never settlement.
 
 **Reconciliation.** `reconcilePhaseHandoffs` rides the existing boot
-sequence (after the directive/re-brief reconcilers) in bounded cursor
-pages: an awaiting phase whose delivery committed before the observer
-ran is completed and published; a completed phase missing its obligation
-or card finishes them. Every step is idempotent, so duplicates, replays and
-restarts yield exactly one logical hand-back per phase — no re-dispatch,
-no duplicate Gru turn, no fresh alert ids. The legacy blocked-only
-observer skips any delivery naming an existing phase row, so a marked
-blocked hand-back is never double-published.
+sequence (after the directive/re-brief reconcilers): an awaiting phase
+whose delivery committed before the observer ran is completed and
+published; a completed phase missing its obligation or card finishes
+them. It reads only ACTIONABLE rows (`awaiting` intents plus `completed`
+rows missing the obligation or card — already-published history is
+excluded, so no prefix can consume its budget) and persists a durable
+round-robin cursor (`reconcile_cursors`, migration 12): a pass that
+exhausts its page budget resumes from its last examined rowid on the next
+pass, and a pass that reaches the end wraps to the first row. Every
+actionable row is therefore examined within a bounded number of passes.
+Every step is idempotent, so duplicates, replays and restarts yield
+exactly one logical hand-back per phase — no re-dispatch, no duplicate
+Gru turn, no fresh alert ids. The legacy blocked-only observer skips any
+delivery naming an existing phase row, so a marked blocked hand-back is
+never double-published.
+
+**Unmarked hand-back crash windows.** The legacy event-sequence hand-back
+(`silas.phase-handback.<job>@<seq>` + obligation `phase-handback@<seq>`)
+is written by the live bus observer, which runs AFTER the delivery
+commits — a crash in that gap would lose it. `reconcileUnmarkedHandbacks`
+(boot, after the phase sweep) restores both windows from durable state:
+(a) follow-up `job.delivered` events on still-blocked lanes with no
+hand-back obligation yet, and (b) live `phase-handback@` obligations
+whose stable-kind card was never published. Both ride the SAME
+record/publish routine as the live observer; both candidate sets drop
+rows as they are processed, so bounded passes reach the tail and re-runs
+are no-ops. Recovery never spawns a worker, never rings the owner and
+never re-posts an existing card (even a resolved one); the one card is
+machine `action-required`.
 
 **Limits.** This slice adds no runtime attestation interface, no
 provider recovery and no timer/scheduler: a crash mid-dispatch with no
 admission evidence leaves the phase `awaiting` (never a fabricated
 success). Migration 11 is additive; nothing here changes owner stops,
 merge/deploy/restart policy or any callers' notification semantics.
+
+### Bounded reconcile cursors (migration 12, PR136 r4 repair)
+
+One tiny durable table backs fair bounded reconciliation:
+
+**`reconcile_cursors`** — `scope` (TEXT PRIMARY KEY), `cursor` (INTEGER
+rowid), `updated_at`. `LedgerApi.readReconcileCursor` /
+`writeReconcileCursor` are the only accessors. The `phase-handoffs`
+scope is used by `reconcilePhaseHandoffs`; the cursor rowid is the last
+row EXAMINED by a pass that hit its page budget, and `0` means “start
+from the first actionable row”. A cursor is operational state, never a
+write license: it only decides WHICH bounded slice of already-authorized
+reconciliation runs next. Migration 12 is additive and carries the same
+landing-collision convention as migrations 10/11.
