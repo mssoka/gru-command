@@ -26,8 +26,10 @@ phase.
 
 **Repair (no new runtime interface; the runtime's own terminal evidence).**
 - `src/dispatch/fix-directive.ts` — `promptTerminalVerdict(handle)` reads
-  the handle's health at settle; `state === 'error'` is a failed turn;
-  an unreadable health is unproven (fail closed, never success).
+  the handle's health at settle; `state === 'error'` is a failed turn. A
+  handle with no health surface (structural/test doubles) carries no
+  attestation and keeps the caller's existing settlement; a health read
+  that throws is unproven and never success.
   `routeFixDirectiveToMinion` and `rebriefFreshMinion` return the typed
   `outcome: 'completed' | 'error'` for the settled turn. (`outcome` is
   additive to the existing return shapes.)

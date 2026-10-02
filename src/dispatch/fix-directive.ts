@@ -48,13 +48,20 @@ export interface DirectiveRoutingDeps {
  * completion, NOT a successful phase: every marked completion path must
  * correlate this verdict or a failed turn masquerades as a completed
  * phase. The handle's own health at settle time is the runtime's terminal
- * evidence; an unreadable health is unproven and never becomes success. */
+ * evidence.
+ *
+ * A handle without the health surface (structural callers, test doubles)
+ * cannot attest either way: it carries NO failure evidence, so the
+ * caller's existing settlement decides (prompt resolution / retry
+ * disposition) exactly as before this gate. A health read that THROWS is
+ * a broken attestation and is unproven — it never becomes success. */
 export interface PromptTerminalVerdict {
   readonly ok: boolean;
   readonly error: string | null;
 }
 
 export function promptTerminalVerdict(handle: Pick<AgentHandle, 'health'>): PromptTerminalVerdict {
+  if (typeof handle.health !== 'function') return { ok: true, error: null };
   try {
     const health = handle.health();
     if (health.state === 'error') {
