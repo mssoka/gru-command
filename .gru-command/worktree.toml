@@ -21,6 +21,13 @@ handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-wh
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
+# PR136 durable follow-through focused scope: every suite the delta can
+# move — the directive single-writer guard (ledger + HTTP), obligations
+# and hand-backs, the phase-handoff delta, the wake-digest/ops-skill
+# regression that broke exact-head CI on 24b51f6, the always-on hygiene
+# check and the suite-shape pins.
+durable-followthrough-focused = "npx vitest run test/directive-markers.test.ts test/ledger-obligations.test.ts test/obligations-handback.test.ts test/phase-handoffs.test.ts test/rebrief-recovery.test.ts test/fix-directive.test.ts test/dispatch-server.test.ts test/silas-followthrough.test.ts test/rehearsal.test.ts test/suite-shape.test.ts"
+
 # Baseline comparison for the lane: identical final test files (git show
 # from the pinned head) run against an isolated baseline snapshot (git
 # archive of the pinned base) using the unchanged baseline Vitest
