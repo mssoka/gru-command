@@ -12,6 +12,7 @@ import {
   type SupervisorRegistry,
 } from '../src/supervision/supervisor.js';
 import { DEFAULT_DECISIONS_CONFIG, type Role } from '../src/config.js';
+import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import type { DecisionService } from '../src/decisions/types.js';
 import { deterministicOutcome } from '../src/decisions/service.js';
 import type {
@@ -25,6 +26,13 @@ import type {
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
+import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
+import { DispatchService } from '../src/dispatch/service.js';
+import { routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { makeFixtureRepo } from './helpers/fixture-repo.js';
+import type { WorktreePort } from '../src/dispatch/worktree-port.js';
 
 /**
  * Supervisor tests (EPICS E7 story 4): a controllable registry + handles
@@ -87,7 +95,10 @@ class FakeHandle implements AgentHandle {
   async prompt(text = '', options?: PromptOptions): Promise<void> {
     this.promptCount += 1;
     this.promptCalls.push({ text, owner: options?.owner ?? null });
+    if (this.promptHook !== null) await this.promptHook(text, options);
   }
+  /** Scripted per-delivery transport outcome (tests drive failures). */
+  promptHook: ((text: string, options?: PromptOptions) => Promise<void> | void) | null = null;
   async steer(): Promise<void> {}
   async followUp(): Promise<void> {}
   /** E7 live-work probe: a fake scheduler can declare a live child process. */
@@ -203,7 +214,16 @@ interface Harness {
   dispose(): void;
 }
 
-function boot(decisions?: DecisionService, opts: { wallNow?: () => number } = {}): Harness {
+function boot(
+  decisions?: DecisionService,
+  opts: {
+    wallNow?: () => number;
+    rateLimitBackoff?: RateLimitBackoffPolicy | null;
+    workerGate?: PacingGate;
+    sleep?: (ms: number) => Promise<void>;
+    jitter?: (capMs: number) => number;
+  } = {},
+): Harness {
   const dir = tmpDir();
   const db = new LedgerDb(dir);
   const bus = new EventBus();
@@ -244,6 +264,10 @@ function boot(decisions?: DecisionService, opts: { wallNow?: () => number } = {}
     notifications: center,
     ...(decisions !== undefined ? { decisions } : {}),
     ...(opts.wallNow !== undefined ? { wallNow: opts.wallNow } : {}),
+    ...(opts.rateLimitBackoff !== undefined ? { rateLimitBackoff: opts.rateLimitBackoff } : {}),
+    ...(opts.sleep !== undefined ? { sleep: opts.sleep } : {}),
+    ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
+    ...(opts.jitter !== undefined ? { jitter: opts.jitter } : {}),
     tickMs: 5,
     now: () => harness.nowMs,
   });
@@ -253,6 +277,43 @@ function boot(decisions?: DecisionService, opts: { wallNow?: () => number } = {}
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Deterministic microtask drain: a wall-clock-free wait beat for the pacing
+ * coroutines that hop only through promises unless they sleep on the
+ * injected seam. A fixed hop count proves "nothing late is pending" without
+ * a fixed wall-clock sleep that flakes under load. */
+const flushMicrotasks = async (): Promise<void> => {
+  for (let i = 0; i < 16; i += 1) await Promise.resolve();
+};
+
+/** Deterministic backoff clock: records every sleep request and releases
+ * waits on demand so retry timing/bounds assert exactly. */
+class ManualSleeper {
+  readonly delays: number[] = [];
+  private readonly waiters: (() => void)[] = [];
+  readonly sleep = (ms: number): Promise<void> => {
+    this.delays.push(ms);
+    return new Promise<void>((resolve) => {
+      this.waiters.push(resolve);
+    });
+  };
+  /** Release the oldest pending backoff and flush the delivery coroutine. */
+  async release(): Promise<void> {
+    const next = this.waiters.shift();
+    if (next === undefined) throw new Error('no pending backoff sleep to release');
+    next();
+    for (let i = 0; i < 8; i += 1) await Promise.resolve();
+  }
+}
+
+function rateLimitPolicy(overrides: Partial<RateLimitBackoffPolicy> = {}): RateLimitBackoffPolicy {
+  return { baseMs: 100, maxMs: 1_000, maxRetries: 3, patterns: [], ...overrides };
+}
+
+/** Emit an adapter-style in-band failure event for the handle. */
+function emitFailure(handle: FakeHandle, text: string): void {
+  handle.emit({ type: 'error', error: text, fatal: false });
+}
 
 /** Hang a handle: open a turn, go streaming, then let silence accrue. */
 function hang(handle: FakeHandle): void {
@@ -1817,6 +1878,866 @@ describe('supervisor — #137 rollback: no proactive compaction gate', () => {
       await sleep(0);
       expect(handle.compactCalls).toBe(0);
       expect(compactionEvents()).toHaveLength(0);
+    } finally {
+      h.dispose();
+    }
+  });
+});
+
+describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, scope-trimmed)', () => {
+  it('off by default: a rate-limit failure keeps the existing stop + owner-ACK ladder', async () => {
+    const h = boot();
+    const handle = new FakeHandle('minion', 'minion-429-off', null);
+    handle.pendingTurnSnapshot = { text: 'keep going', owner: 'dispatch:job-429-off' };
+    h.registry.adopt(handle);
+    emitFailure(handle, '429: {"code":"1302","message":"slow down"}');
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
+    expect(h.notificationsOfKind('supervision.provider-wall.minion-429-off.quota_wall')).toHaveLength(1);
+    expect(handle.promptCalls).toHaveLength(0);
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind.startsWith('pacing.'))).toBe(false);
+    h.dispose();
+  });
+
+  it('retries with exponential backoff, records every attempt, and exhausts into the ladder', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-429-bounded', null);
+    handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-bounded' };
+    h.registry.adopt(handle);
+    // Every delivery fails in-band (pi-style: the failure event arrives
+    // during the prompt, which itself still resolves).
+    handle.promptHook = () => {
+      emitFailure(handle, '429 too many requests');
+    };
+    emitFailure(handle, '429 too many requests');
+    expect(sleeper.delays).toEqual([100]);
+    await sleeper.release(); // attempt 1 fails -> attempt 2 at 200ms
+    expect(sleeper.delays).toEqual([100, 200]);
+    await sleeper.release(); // attempt 2 fails -> attempt 3 at 400ms
+    expect(sleeper.delays).toEqual([100, 200, 400]);
+    await sleeper.release(); // attempt 3 fails -> budget spent -> stop
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
+    const retries = h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'pacing.auto-retry');
+    expect(retries).toHaveLength(3);
+    // listEvents is newest-first; the ladder shape is what matters.
+    expect(retries.map((event) => (event.payload as Record<string, unknown>)['attempt']).sort((a, b) => Number(a) - Number(b))).toEqual([1, 2, 3]);
+    expect(retries.map((event) => (event.payload as Record<string, unknown>)['delay_ms']).sort((a, b) => Number(a) - Number(b))).toEqual([100, 200, 400]);
+    expect(
+      h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'pacing.auto-retry-exhausted'),
+    ).toHaveLength(1);
+    expect(handle.promptCalls.map((call) => call.text)).toEqual([
+      'finish the lane', 'finish the lane', 'finish the lane',
+    ]);
+    expect(handle.promptCalls.map((call) => call.owner)).toEqual([
+      'dispatch:job-bounded', 'dispatch:job-bounded', 'dispatch:job-bounded',
+    ]);
+    expect(h.notificationsOfKind('supervision.provider-wall.minion-429-bounded.quota_wall')).toHaveLength(1);
+    h.dispose();
+  });
+
+  it('a clean retry recovers the turn, and a later failure starts a fresh budget', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-429-recover', null);
+    handle.pendingTurnSnapshot = { text: 'resume work', owner: 'dispatch:job-recover' };
+    h.registry.adopt(handle);
+    emitFailure(handle, 'HTTP 429');
+    await sleeper.release();
+    await vi.waitFor(() =>
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered')).toBe(true),
+    );
+    expect(handle.disposed).toBe(false);
+    expect(handle.promptCalls).toEqual([{ text: 'resume work', owner: 'dispatch:job-recover' }]);
+    expect(h.supervisor.viewFor(handle.id)?.state).toBe('watching');
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind.startsWith('supervision.provider-wall'))).toBe(false);
+    // A later incident owns a fresh budget: attempt 1 backoff again.
+    emitFailure(handle, 'HTTP 429');
+    expect(sleeper.delays).toEqual([100, 100]);
+    h.dispose();
+  });
+
+  it('duplicate failure signals of one failure never double-count the attempt', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-429-dup', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-dup' };
+    h.registry.adopt(handle);
+    emitFailure(handle, '429 too many requests');
+    emitFailure(handle, '429 too many requests'); // second frame of the same failure
+    handle.setState('error', '429 too many requests'); // sticky state echo
+    expect(sleeper.delays).toEqual([100]);
+    expect(h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'pacing.auto-retry')).toHaveLength(1);
+    h.dispose();
+  });
+
+  it('quota exhaustion without a rate-limit signature stops instead of retrying', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-balance-wall', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-balance' };
+    h.registry.adopt(handle);
+    emitFailure(handle, 'insufficient balance');
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(handle.promptCalls).toHaveLength(0);
+    expect(sleeper.delays).toEqual([]);
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind.startsWith('pacing.'))).toBe(false);
+    expect(h.notificationsOfKind('supervision.provider-wall.minion-balance-wall.quota_wall')).toHaveLength(1);
+    h.dispose();
+  });
+
+  it('non-rate-limit in-band failures keep the adapter contract: no retry, no restart', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-other-error', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-other' };
+    h.registry.adopt(handle);
+    emitFailure(handle, 'HTTP 500 internal server error');
+    await flushMicrotasks();
+    expect(handle.disposed).toBe(false);
+    expect(handle.promptCalls).toHaveLength(0);
+    expect(sleeper.delays).toEqual([]);
+    expect(h.registry.spawnCalls).toHaveLength(0);
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind.startsWith('pacing.'))).toBe(false);
+    h.dispose();
+  });
+
+  it('a rate-limit failure with no capturable turn does not park on an undeliverable retry', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-no-capture', null);
+    h.registry.adopt(handle); // no pendingTurnSnapshot, no open turn
+    emitFailure(handle, '429 too many requests');
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    expect(sleeper.delays).toEqual([]);
+    expect(handle.promptCalls).toHaveLength(0);
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind.startsWith('pacing.'))).toBe(false);
+    h.dispose();
+  });
+
+  it('the waiting retry suppresses hang detection until its delivery runs', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy({ baseMs: 100, maxMs: 1_000, maxRetries: 2 }),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-watch-suppress', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-watch' };
+    h.registry.adopt(handle);
+    hang(handle); // open turn; silence past the watchdog window would restart
+    emitFailure(handle, '429 too many requests');
+    h.advance(60); // past turn_silence_ms (50): the pending retry owns recovery
+    await vi.waitFor(() => expect(sleeper.delays).toEqual([100]));
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(0);
+    // The delivery itself still runs and recovers.
+    await sleeper.release();
+    await vi.waitFor(() => expect(handle.promptCalls).toHaveLength(1));
+    h.dispose();
+  });
+
+  it('delegates eligible isolated rate-limit retries to the workflow without disposal or supervisor delivery', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('perkins', 'isolated-review-429', null, true);
+    // A capturable turn exists: without the isolation guard this failure
+    // would schedule an automatic retry and re-deliver the prompt in place.
+    handle.pendingTurnSnapshot = { text: 'review the diff', owner: 'perkins-whole:lead' };
+    h.registry.adopt(handle);
+    h.api.registerAgent({ id: handle.id, role: 'perkins' });
+    hang(handle);
+    emitFailure(handle, '429 too many requests');
+    await flushMicrotasks();
+    expect(handle.disposed).toBe(false);
+    // The workflow owns the bounded backoff. Supervisor never schedules or
+    // disposes the isolated transport under that retry.
+    expect(sleeper.delays).toEqual([]);
+    expect(handle.promptCalls).toHaveLength(0);
+    expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind.startsWith('pacing.'))).toBe(false);
+    expect(h.api.listEvents({ limit: 100 }).some((event) =>
+      event.kind === 'supervision.review-attempt-aborted' && event.agentId === handle.id,
+    )).toBe(false);
+    // Supervision writes no failure state either: the workflow owns the
+    // retry, so the attempt must not look aborted to the board.
+    expect(h.api.getAgent(handle.id)?.state).not.toBe('error');
+    h.dispose();
+  });
+  it('a stale retry settlement never clears the newer rung’s flag or fakes recovery (r4 race)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-429-stale', null);
+    handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-stale' };
+    h.registry.adopt(handle);
+    const deferred = (): { promise: Promise<void>; resolve: () => void } => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((res) => {
+        resolve = res;
+      });
+      return { promise, resolve };
+    };
+    const first = deferred();
+    const second = deferred();
+    let calls = 0;
+    handle.promptHook = () => {
+      calls += 1;
+      if (calls === 1) return first.promise;
+      if (calls === 2) return second.promise;
+      emitFailure(handle, '429 too many requests');
+      return undefined;
+    };
+    const flush = async (): Promise<void> => {
+      for (let i = 0; i < 12; i += 1) await Promise.resolve();
+    };
+    emitFailure(handle, '429 too many requests'); // incident -> rung 1
+    expect(sleeper.delays).toEqual([100]);
+    await sleeper.release(); // rung 1 delivery starts and will settle LATE
+    emitFailure(handle, '429 too many requests'); // rung 1 failed -> rung 2
+    expect(sleeper.delays).toEqual([100, 200]);
+    await sleeper.release(); // rung 2 delivery in flight
+    first.resolve(); // stale settlement of rung 1 — must not touch rung 2
+    await flush();
+    emitFailure(handle, '429 too many requests'); // rung 2's failure — must not be swallowed
+    expect(sleeper.delays).toEqual([100, 200, 400]);
+    await flush();
+    second.resolve(); // now rung 2 settles; its failure was already consumed
+    await flush();
+    expect(
+      h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered'),
+    ).toBe(false);
+    await sleeper.release(); // rung 3 fails in-band -> budget spent -> ladder
+    await vi.waitFor(() => expect(handle.disposed).toBe(true));
+    const retries = h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'pacing.auto-retry');
+    expect(retries).toHaveLength(3);
+    expect(
+      h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'pacing.auto-retry-exhausted'),
+    ).toHaveLength(1);
+    h.dispose();
+  });
+
+  it('classifies a bare prompt rejection: rate-limit retries, other errors ladder (r4 coverage)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-reject-429', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-reject' };
+    h.registry.adopt(handle);
+    let calls = 0;
+    handle.promptHook = () => {
+      calls += 1;
+      if (calls === 1) throw new Error('429 too many requests');
+    };
+    emitFailure(handle, '429 too many requests');
+    await sleeper.release(); // rung 1 rejects with the class -> rung 2
+    expect(sleeper.delays).toEqual([100, 200]);
+    await sleeper.release(); // rung 2 resolves cleanly -> recovered
+    await vi.waitFor(() =>
+      expect(
+        h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered'),
+      ).toBe(true),
+    );
+    h.dispose();
+  });
+
+  it('a non-rate-limit prompt rejection stops to the ladder without another rung (r4 coverage)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-reject-500', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-500' };
+    h.registry.adopt(handle);
+    handle.promptHook = () => {
+      throw new Error('HTTP 500 internal server error');
+    };
+    emitFailure(handle, '429 too many requests');
+    const settled = h.supervisor.awaitRetrySettlement(handle.id);
+    await sleeper.release();
+    // The settlement gate replaces the wall-clock beat: the incident is
+    // concluded ('exhausted' — the non-rate-limit rejection stops to the
+    // ladder), so every assertion below is stable to read.
+    await expect(settled).resolves.toBe('exhausted');
+    expect(sleeper.delays).toEqual([100]);
+    expect(
+      h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'pacing.auto-retry'),
+    ).toHaveLength(1);
+    expect(
+      h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered'),
+    ).toBe(false);
+    h.dispose();
+  });
+
+  it('a typed disposal rejection clears the incident as superseded with no retry and no ladder (r4 coverage/#11)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-reject-disposed', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-gone' };
+    h.registry.adopt(handle);
+    handle.promptHook = () => {
+      throw new WorkerDisposalInProgressError();
+    };
+    emitFailure(handle, '429 too many requests');
+    const settled = h.supervisor.awaitRetrySettlement(handle.id);
+    await sleeper.release();
+    await expect(settled).resolves.toBe('superseded');
+    expect(sleeper.delays).toEqual([100]);
+    expect(
+      h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'pacing.auto-retry'),
+    ).toHaveLength(1);
+    expect(
+      h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered'),
+    ).toBe(false);
+    h.dispose();
+  });
+
+  it('untyped text merely containing “disposed” is NOT superseded: the failure ladders (r4 adversarial#11)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-text-disposed', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-text' };
+    h.registry.adopt(handle);
+    handle.promptHook = () => {
+      throw new Error('stream disposed before flush');
+    };
+    emitFailure(handle, '429 too many requests');
+    const settled = h.supervisor.awaitRetrySettlement(handle.id);
+    await sleeper.release();
+    // Not 'superseded' on a text sniff: the incident exhausts and the
+    // existing ladder owns the failure (no silent stop).
+    await expect(settled).resolves.toBe('exhausted');
+    expect(sleeper.delays).toEqual([100]);
+    h.dispose();
+  });
+
+  it('retries on a configured provider signature and misses without it (r4 verification#0)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy({ patterns: [/pacing code \d+/i] }),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-pattern', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-pattern' };
+    h.registry.adopt(handle);
+    let calls = 0;
+    handle.promptHook = () => {
+      calls += 1;
+      if (calls === 1) throw new Error('pacing code 1302 from the provider');
+    };
+    // The configured signature (outside the generic 429 family) reaches the
+    // consumer: retry scheduled, then a clean retry recovers.
+    emitFailure(handle, 'pacing code 1302 from the provider');
+    expect(sleeper.delays).toEqual([100]);
+    await sleeper.release();
+    expect(sleeper.delays).toEqual([100, 200]);
+    await sleeper.release();
+    await vi.waitFor(() =>
+      expect(
+        h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered'),
+      ).toBe(true),
+    );
+    h.dispose();
+  });
+
+  it('emits the canonical pacing payload with job attribution on supervisor retries (r4 adversarial#9)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-attributed', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-attributed' };
+    h.registry.adopt(handle);
+    // The FK-enforcing ledger needs the owned Job row this retry event is
+    // attributed to; the jobId assertion below is the attribution oracle.
+    h.api.addJob({ id: 'job-attributed', repo: 'gru-command', title: 'attributed lane' });
+    h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-attributed' });
+    emitFailure(handle, '429 too many requests');
+    const retry = h.api.listEvents({ limit: 100 }).find((event) => event.kind === 'pacing.auto-retry');
+    // Same canonical keys as the workflow producer, and the job is findable
+    // by job-scoped queries (envelope, not payload).
+    expect(retry?.jobId).toBe('job-attributed');
+    expect(Object.keys(retry?.payload as Record<string, unknown>).sort()).toEqual([
+      'attempt',
+      'delay_ms',
+      'error',
+      'max_auto_retries',
+    ]);
+    h.dispose();
+  });
+
+  it('a hung retry delivery stays under the watchdog (a running delivery is not a pause) (r4 coverage)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-hung-retry', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-hung' };
+    h.registry.adopt(handle);
+    handle.promptHook = () => new Promise<void>(() => {}); // delivery never settles
+    hang(handle); // open streaming turn accruing silence
+    emitFailure(handle, '429 too many requests');
+    h.advance(60); // waiting phase: suppressed (the pending retry owns recovery)
+    await flushMicrotasks();
+    expect(handle.disposed).toBe(false);
+    await sleeper.release(); // delivery starts and hangs
+    h.advance(60); // a running delivery is NOT a pause — the watchdog keeps counting
+    await vi.waitFor(() => {
+      expect(handle.disposed).toBe(true);
+      expect(h.registry.spawnCalls.length).toBeGreaterThan(0);
+    }, { timeout: 5_000 });
+    h.dispose();
+  });
+
+  it('a superseded incident never delivers after its sleeper releases (r4 coverage)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, {
+      rateLimitBackoff: rateLimitPolicy(),
+      sleep: sleeper.sleep,
+      jitter: () => 0,
+    });
+    const handle = new FakeHandle('minion', 'minion-supersede', null);
+    handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-super' };
+    h.registry.adopt(handle);
+    emitFailure(handle, '429 too many requests');
+    expect(sleeper.delays).toEqual([100]);
+    await handle.dispose(); // the disposed envelope clears the incident
+    await sleeper.release();
+    expect(handle.promptCalls).toHaveLength(0);
+    expect(
+      h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered'),
+    ).toBe(false);
+    h.dispose();
+  });
+});
+
+
+describe('supervisor pacing admission and workflow boundary', () => {
+  it('a worker automatic retry queues behind running work and releases its lease', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    try {
+      const handle = new FakeHandle('minion', 'retry-queued', null);
+      handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch' };
+      h.registry.adopt(handle); hang(handle); emitFailure(handle, '429 too many requests');
+      await sleeper.release();
+      expect(handle.promptCalls).toHaveLength(0);
+      expect(gate.view().worker.queued.map((entry) => entry.id)).toEqual([handle.id]);
+      holder.release();
+      await vi.waitFor(() => expect(handle.promptCalls).toHaveLength(1));
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally { h.dispose(); }
+  });
+
+  it('a worker automatic retry acquire carries the agent jobId on its gate events (r12 blind#5)', async () => {
+    const sleeper = new ManualSleeper();
+    const events: Array<{ kind: string; jobId?: string | null }> = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 1,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => events.push({ kind: event.kind, jobId: event.jobId }),
+    });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    try {
+      const handle = new FakeHandle('minion', 'retry-attributed', null);
+      handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch' };
+      h.api.addJob({ id: 'job-retry-attr', repo: 'fixture', title: 'retry attribution', briefing: 'brief' });
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-retry-attr' });
+      h.registry.adopt(handle); hang(handle); emitFailure(handle, '429 too many requests');
+      await sleeper.release();
+      await vi.waitFor(() => expect(handle.promptCalls).toHaveLength(1));
+      const admitted = events.filter((event) => event.kind === 'pacing.admitted');
+      expect(admitted.length).toBeGreaterThanOrEqual(1);
+      for (const event of admitted) expect(event.jobId).toBe('job-retry-attr');
+    } finally { h.dispose(); }
+  });
+
+  it('non-rate-limit isolated failures still abort even when backoff is enabled', async () => {
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy() });
+    try {
+      const handle = new FakeHandle('perkins', 'non-rate-review', null, true);
+      h.registry.adopt(handle); hang(handle); emitFailure(handle, '401 unauthorized');
+      await vi.waitFor(() => expect(handle.disposed).toBe(true));
+      expect(h.registry.spawnCalls).toHaveLength(0);
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry')).toBe(false);
+    } finally { h.dispose(); }
+  });
+});
+
+describe('worker delivery settlement under automatic rate-limit retry', () => {
+  it('an initial dispatch keeps its delivery pending until an in-band 429 retry recovers', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    const repo = makeFixtureRepo('pacing-dispatch-retry');
+    cleanupDirs.push(repo.path);
+    const root = tmpDir();
+    try {
+      const handle = new FakeHandle('minion', 'minion-dispatch-retry', null);
+      handle.pendingTurnSnapshot = { text: 'retry me', owner: 'dispatch:job-dispatch-retry' };
+      let failed = false;
+      handle.promptHook = () => {
+        if (failed) return;
+        failed = true;
+        handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+      };
+      h.registry.adopt(handle);
+      const service = new DispatchService({
+        ledger: h.api,
+        worktrees: new InMemoryWorktreePort(root),
+        spawner: async () => handle,
+        workerGate: gate,
+        retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
+      });
+      const outcome = await service.dispatch({
+        jobId: 'job-dispatch-retry', repoPath: repo.path, title: 'retry', briefing: 'brief',
+      });
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]));
+      // No premature settlement: not delivered, not disposed, and the slot
+      // is back with the gate so the retry can reacquire it.
+      expect(h.api.getJob('job-dispatch-retry')?.status).toBe('working');
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'job.delivered')).toBe(false);
+      expect(handle.disposed).toBe(false);
+      expect(gate.view().worker.running).toBe(0);
+      await sleeper.release();
+      const settled = await outcome.settled;
+      expect(settled).toEqual({ ok: true });
+      expect(handle.promptCalls).toEqual([
+        { text: expect.stringContaining('BRIEFING:'), owner: 'dispatch:job-dispatch-retry' },
+        { text: 'retry me', owner: 'dispatch:job-dispatch-retry' },
+      ]);
+      expect(h.api.getJob('job-dispatch-retry')?.status).toBe('delivered');
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'job.delivered')).toBe(true);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally { h.dispose(); }
+  });
+
+  it('a fresh-minion directive waits out an in-band 429 before it is disposed or reported delivered', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    const lanePath = tmpDir();
+    try {
+      h.api.addJob({ id: 'job-fresh-directive', repo: 'fixture', title: 'fresh directive', briefing: 'brief' });
+      let spawned: FakeHandle | null = null;
+      h.registry.spawnImpl = async (role, options) => {
+        const handle = new FakeHandle(role, 'minion-fresh-directive', options?.resumeFile ?? null);
+        let failed = false;
+        handle.promptHook = (text) => {
+          if (failed) return;
+          failed = true;
+          handle.pendingTurnSnapshot = { text, owner: 'fix-directive' };
+          handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+        };
+        spawned = handle;
+        return handle;
+      };
+      const routing = routeFixDirectiveToMinion({
+        registry: h.registry,
+        ledger: h.api,
+        worktrees: { listWorktrees: () => [{ kind: 'job', status: 'active', path: lanePath }] } as unknown as WorktreePort,
+        workerGate: gate,
+        retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
+        jobId: 'job-fresh-directive',
+        directive: 'fix the thing',
+        signal: new AbortController().signal,
+      });
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]));
+      const handle = spawned as FakeHandle | null;
+      expect(handle).not.toBeNull();
+      expect(handle!.disposed).toBe(false);
+      expect(handle!.promptCalls).toHaveLength(1);
+      await sleeper.release();
+      await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-fresh-directive' });
+      expect(handle!.promptCalls).toEqual([
+        { text: `fix the thing\n\n${PR_CREATION_RULE}`, owner: 'fix-directive' },
+        { text: `fix the thing\n\n${PR_CREATION_RULE}`, owner: 'fix-directive' },
+      ]);
+      expect(handle!.disposed).toBe(true);
+    } finally { h.dispose(); }
+  });
+
+  it('restart recovery waits for a worker slot: cap one keeps a single active minion turn', async () => {
+    const gateEvents: Array<{ kind: string; jobId?: string | null }> = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 1,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => gateEvents.push({ kind: event.kind, jobId: event.jobId }),
+    });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    let holderReleased = false;
+    const releaseHolder = (): void => { if (!holderReleased) { holderReleased = true; holder.release(); } };
+    const h = boot(undefined, { workerGate: gate });
+    try {
+      const handle = new FakeHandle('minion', 'minion-restart-cap', null);
+      h.api.addJob({ id: 'job-cap', repo: 'fixture', title: 'restart recovery admission' });
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-cap' });
+      h.registry.adopt(handle);
+      hang(handle);
+      handle.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:job-cap' };
+      let releasePrompt!: () => void;
+      const openPrompt = new Promise<void>((resolve) => { releasePrompt = resolve; });
+      h.registry.spawnImpl = async (role, options) => {
+        const resumed = new FakeHandle(role, 'minion-cap-resumed', options?.resumeFile ?? null);
+        // Hold the resumed turn open so the assertion sees the admitted slot.
+        resumed.promptHook = async () => { await openPrompt; };
+        return resumed;
+      };
+      h.advance(60);
+      await vi.waitFor(() => expect(h.registry.spawnCalls).toHaveLength(1), { timeout: 5_000 });
+      const resumed = [...h.registry.handlesById.values()].find((candidate) => candidate.id !== handle.id);
+      expect(resumed).toBeDefined();
+      // The gate is full: the recovery delivery queues instead of running a
+      // second minion turn beside the holder.
+      await vi.waitFor(() => expect(gate.view().worker.queued.map((entry) => entry.id)).toContain('minion-restart-cap'), { timeout: 5_000 });
+      // The recovery acquire is attributed too: its queued event carries the
+      // lane agent's job id, not null (r12 blind#5).
+      expect(gateEvents.filter((event) => event.kind === 'pacing.queued').map((event) => event.jobId)).toEqual(['job-cap']);
+      expect(resumed?.promptCalls).toHaveLength(0);
+      expect(gate.view().worker.running).toBe(1);
+      releaseHolder();
+      await vi.waitFor(() => expect(resumed?.promptCalls).toHaveLength(1), { timeout: 5_000 });
+      expect(resumed?.promptCalls[0]).toEqual({ text: 'finish the briefing', owner: 'dispatch:job-cap' });
+      releasePrompt();
+      await vi.waitFor(() => expect(gate.view().worker).toMatchObject({ running: 0, queued: [] }), { timeout: 5_000 });
+    } finally {
+      releaseHolder();
+      h.dispose();
+    }
+  });
+});
+
+describe('pacing settlement across rejection, recovery, and slot retirement', () => {
+  it('a rejected live-minion directive waits out its automatic retry before reporting', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    try {
+      const handle = new FakeHandle('minion', 'minion-live-reject', null);
+      h.registry.adopt(handle);
+      h.api.addJob({ id: 'job-live-reject', repo: 'fixture', title: 'live reject', briefing: 'brief' });
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-live-reject' });
+      let failed = false;
+      handle.promptHook = (text) => {
+        if (failed) return;
+        failed = true;
+        handle.pendingTurnSnapshot = { text, owner: 'fix-directive' };
+        handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+        throw new Error('429 too many requests');
+      };
+      const routing = routeFixDirectiveToMinion({
+        registry: h.registry,
+        ledger: h.api,
+        worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
+        workerGate: gate,
+        retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
+        jobId: 'job-live-reject',
+        directive: 'fix it',
+        signal: new AbortController().signal,
+      });
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]), { timeout: 5_000 });
+      // The rejection is not the verdict: the retry still owns the delivery.
+      await sleeper.release();
+      await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-live-reject' });
+      expect(handle.promptCalls).toHaveLength(2);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a rejected fresh-minion directive is not disposed while its automatic retry can still deliver', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    const lanePath = tmpDir();
+    try {
+      h.api.addJob({ id: 'job-fresh-reject', repo: 'fixture', title: 'fresh reject', briefing: 'brief' });
+      let spawned: FakeHandle | null = null;
+      h.registry.spawnImpl = async (role, options) => {
+        const handle = new FakeHandle(role, 'minion-fresh-reject', options?.resumeFile ?? null);
+        let failed = false;
+        handle.promptHook = (text) => {
+          if (failed) return;
+          failed = true;
+          handle.pendingTurnSnapshot = { text, owner: 'fix-directive' };
+          handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+          throw new Error('429 too many requests');
+        };
+        spawned = handle;
+        return handle;
+      };
+      const routing = routeFixDirectiveToMinion({
+        registry: h.registry,
+        ledger: h.api,
+        worktrees: { listWorktrees: () => [{ kind: 'job', status: 'active', path: lanePath }] } as unknown as WorktreePort,
+        workerGate: gate,
+        retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
+        jobId: 'job-fresh-reject',
+        directive: 'fix it',
+        signal: new AbortController().signal,
+      });
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]), { timeout: 5_000 });
+      const handle = spawned as FakeHandle | null;
+      expect(handle).not.toBeNull();
+      // The rejection must not dispose the session out from under its retry.
+      expect(handle!.disposed).toBe(false);
+      await sleeper.release();
+      await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-fresh-reject' });
+      expect(handle!.promptCalls).toHaveLength(2);
+      expect(handle!.disposed).toBe(true);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a restart-recovered turn that 429-rejects resumes through its automatic retry instead of escalating', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const handle = new FakeHandle('minion', 'minion-recovery-retry', null);
+      h.registry.adopt(handle);
+      hang(handle);
+      handle.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:job-rec' };
+      let promptCalls = 0;
+      h.registry.spawnImpl = async (role, options) => {
+        const resumed = new FakeHandle(role, 'minion-recovery-retry-resumed', options?.resumeFile ?? null);
+        resumed.promptHook = (text, promptOptions) => {
+          promptCalls += 1;
+          if (promptCalls > 1) return;
+          resumed.pendingTurnSnapshot = { text, owner: promptOptions?.owner ?? null };
+          resumed.emit({ type: 'error', error: '429 too many requests', fatal: false });
+          throw new Error('429 too many requests');
+        };
+        return resumed;
+      };
+      h.advance(60);
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]), { timeout: 5_000 });
+      await sleeper.release();
+      await vi.waitFor(() => {
+        const events = h.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.turn-recovery');
+        expect(events.some((event) => (event.payload as { disposition?: string }).disposition === 'resumed')).toBe(true);
+      }, { timeout: 5_000 });
+      expect(h.notificationsOfKind('supervision.turn-orphaned.minion-recovery-retry')).toHaveLength(0);
+      expect(promptCalls).toBe(2);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('retiring a slot record concludes its pending rate-limit settlement instead of leaving it hanging', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-retire-settle',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options),
+      });
+      const handle = (await slot.ensure({})) as FakeHandle;
+      handle.pendingTurnSnapshot = { text: 'stale turn', owner: null };
+      emitFailure(handle, '429 too many requests');
+      expect(sleeper.delays).toEqual([100]);
+      const settled = h.supervisor.awaitRetrySettlement(handle.id);
+      slot.release();
+      await expect(settled).resolves.toBe('superseded');
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('adopting an intentional replacement concludes the replaced record’s pending rate-limit settlement', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-adopt-settle',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options),
+      });
+      const handle = (await slot.ensure({})) as FakeHandle;
+      handle.pendingTurnSnapshot = { text: 'replaced turn', owner: null };
+      emitFailure(handle, '429 too many requests');
+      expect(sleeper.delays).toEqual([100]);
+      const settled = h.supervisor.awaitRetrySettlement(handle.id);
+      const fresh = new FakeHandle('gru', 'fresh-adopt-settle', null);
+      h.registry.adopt(fresh);
+      await slot.adoptReplacement(fresh);
+      await expect(settled).resolves.toBe('superseded');
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('retiring a stale slot record after an owner teardown concludes its pending rate-limit settlement', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-stale-settle',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options),
+      });
+      const first = (await slot.ensure({})) as FakeHandle;
+      first.pendingTurnSnapshot = { text: 'dead turn', owner: null };
+      emitFailure(first, '429 too many requests');
+      expect(sleeper.delays).toEqual([100]);
+      const settled = h.supervisor.awaitRetrySettlement(first.id);
+      await h.registry.disposeHandle(first);
+      await slot.ensure({});
+      await expect(settled).resolves.toBe('superseded');
     } finally {
       h.dispose();
     }

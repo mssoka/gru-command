@@ -254,3 +254,55 @@ describe('board server-frame validator', () => {
     expect(agentStateTone('error')).toContain('alert');
   });
 });
+
+describe('provider pacing mirror (server parity)', () => {
+  /** A valid snapshot carrying the mirrored pacing gate block. */
+  function pacingSnapshot(): Record<string, unknown> {
+    return {
+      ...snapshot(),
+      pacing: {
+        enabled: true,
+        worker: {
+          limit: 3,
+          running: 1,
+          queued: [
+            {
+              id: 'job-2',
+              kind: 'worker',
+              label: 'Job 2',
+              queuedAt: '2026-01-01T00:00:01.000Z',
+              reason: 'queued: 1/3 minion turns running (pacing.max_concurrent_minions)',
+            },
+          ],
+        },
+        review: { limit: 0, running: 0, queued: [] },
+      },
+    };
+  }
+
+  it('accepts a valid pacing gate block (queued lanes and honest reasons survive the mirror)', () => {
+    const valid = pacingSnapshot();
+    expect(isValidSnapshot(valid)).toBe(true);
+    expect(parseBoardServerFrame({ type: 'board', snapshot: valid })).not.toBeNull();
+  });
+
+  it('rejects a malformed pacing block like every other v4 health read', () => {
+    const badKind = pacingSnapshot();
+    const kindEntry = (badKind.pacing as { worker: { queued: Record<string, unknown>[] } }).worker.queued[0]!;
+    kindEntry.kind = 'nope';
+    expect(isValidSnapshot(badKind)).toBe(false);
+
+    const badReason = pacingSnapshot();
+    const reasonEntry = (badReason.pacing as { worker: { queued: Record<string, unknown>[] } }).worker.queued[0]!;
+    reasonEntry.reason = 42;
+    expect(isValidSnapshot(badReason)).toBe(false);
+
+    const badLimit = pacingSnapshot();
+    (badLimit.pacing as { review: { limit: number } }).review.limit = -1;
+    expect(isValidSnapshot(badLimit)).toBe(false);
+
+    const badQueued = pacingSnapshot();
+    (badQueued.pacing as { worker: { queued: unknown } }).worker.queued = 'nope';
+    expect(isValidSnapshot(badQueued)).toBe(false);
+  });
+});

@@ -205,6 +205,106 @@ describe('board bands — deterministic bucketing', () => {
   });
 });
 
+describe('board bands — concluded jobs ignore stale review history (owner ruling 2026-09-26)', () => {
+  const errorLens = { lens: 'blind', state: 'error', agentId: null, note: 'provider cap hit', verdict: null };
+  /** Generic #73/#74-shaped record: an old aborted round r1 full of error
+   * lenses, then a newer aborted round r2 with a null (INCOMPLETE)
+   * verdict — the exact live pattern that used to promote merged work. */
+  const abortedHistory = [
+    round({ id: 'r1', seq: 1, status: 'aborted', verdict: null, lenses: [errorLens] }),
+    round({ id: 'r2', seq: 2, status: 'aborted', verdict: null, targetRef: 'a'.repeat(40) }),
+  ];
+  const failedLensRound = round({
+    id: 'r1',
+    seq: 1,
+    status: 'pending',
+    verdict: null,
+    lenses: [errorLens],
+  });
+
+  it('merged/done jobs with aborted newest rounds earn NO historical review reasons', () => {
+    const mergedToday = job({
+      status: 'merged',
+      prState: 'merged',
+      prUrl: 'https://example.invalid/pr/1',
+      updatedAt: ISO(-600_000),
+      rounds: abortedHistory,
+    });
+    expect(needsYouReasons(mergedToday, 0)).toEqual([]); // not ['round aborted']
+    expect(bandForJob(mergedToday, { now: NOW })).toBe('settled'); // merged today
+
+    const mergedOld = job({ status: 'merged', prState: 'merged', updatedAt: ISO(-48 * 3_600_000), rounds: abortedHistory });
+    expect(bandForJob(mergedOld, { now: NOW })).toBe('cold'); // merged before today
+
+    const done = job({ status: 'done', rounds: abortedHistory });
+    expect(needsYouReasons(done, 0)).toEqual([]);
+    expect(bandForJob(done, { now: NOW })).toBe('cold');
+  });
+
+  it('concluded jobs with failed-lens (never-verdicted) newest rounds also stay out of NEEDS YOU', () => {
+    const merged = job({ status: 'merged', prState: 'merged', updatedAt: ISO(-600_000), rounds: [failedLensRound] });
+    expect(needsYouReasons(merged, 0)).toEqual([]); // not ['lens failed']
+    expect(bandForJob(merged, { now: NOW })).toBe('settled');
+    expect(bandForJob(job({ status: 'done', rounds: [failedLensRound] }), { now: NOW })).toBe('cold');
+  });
+
+  it('a separate unacked action-required notification still promotes a concluded job', () => {
+    const merged = job({ status: 'merged', prState: 'merged', updatedAt: ISO(-600_000), rounds: abortedHistory });
+    expect(needsYouReasons(merged, 2)).toEqual(['action-required']);
+    expect(bandForJob(merged, { now: NOW, unackedByJob: new Map([['job-1', 2]]) })).toBe('needs-you');
+    expect(bandForJob(job({ status: 'done', rounds: abortedHistory }), { now: NOW, unackedByJob: new Map([['job-1', 1]]) })).toBe('needs-you');
+  });
+
+  it('a conflicting PR keeps promoting even a concluded job (current state, not history)', () => {
+    const merged = job({
+      status: 'merged',
+      prState: 'conflicting',
+      prUrl: 'https://example.invalid/pr/1',
+      updatedAt: ISO(-600_000),
+      rounds: abortedHistory,
+    });
+    expect(needsYouReasons(merged, 0)).toEqual(['PR conflicting']);
+    expect(bandForJob(merged, { now: NOW })).toBe('needs-you');
+  });
+
+  it('delivered/parked jobs keep their existing aborted-round promotion (retained behavior)', () => {
+    expect(bandForJob(job({ status: 'delivered', rounds: abortedHistory }), { now: NOW })).toBe('needs-you');
+    expect(bandForJob(job({ status: 'parked', rounds: abortedHistory }), { now: NOW })).toBe('needs-you');
+    expect(needsYouReasons(job({ status: 'delivered', rounds: abortedHistory }), 0)).toContain('round aborted');
+  });
+
+  it('active work keeps legitimate NEEDS YOU attention — including a job reopened after a prior merge', () => {
+    // A current implementation is not finished just because its previous
+    // linked PR merged: status is in-review again, PR state still merged.
+    const reopened = job({
+      status: 'in-review',
+      prState: 'merged',
+      prUrl: 'https://example.invalid/pr/1',
+      updatedAt: ISO(-600_000),
+      rounds: abortedHistory,
+    });
+    expect(bandForJob(reopened, { now: NOW })).toBe('needs-you');
+    expect(bandForJob(job({ status: 'working', rounds: abortedHistory }), { now: NOW })).toBe('needs-you');
+    expect(bandForJob(job({ status: 'blocked', rounds: abortedHistory }), { now: NOW })).toBe('needs-you');
+    expect(bandForJob(job({ status: 'error', rounds: abortedHistory }), { now: NOW })).toBe('needs-you');
+  });
+
+  it('concluded jobs with no rounds at all bucket by day as before', () => {
+    expect(bandForJob(job({ status: 'merged', prState: 'merged', updatedAt: ISO(-600_000), rounds: [] }), { now: NOW })).toBe('settled');
+    expect(bandForJob(job({ status: 'merged', prState: 'merged', updatedAt: ISO(-48 * 3_600_000), rounds: [] }), { now: NOW })).toBe('cold');
+    expect(bandForJob(job({ status: 'done', rounds: [] }), { now: NOW })).toBe('cold');
+  });
+
+  it('bucketing never rewrites the review record — rounds ride along untouched', () => {
+    const merged = job({ status: 'merged', prState: 'merged', updatedAt: ISO(-600_000), rounds: abortedHistory });
+    const [settled] = bucketJobs([merged], { now: NOW });
+    expect(settled?.band).toBe('settled');
+    expect(settled?.jobs[0]?.job.rounds).toHaveLength(2);
+    expect(settled?.jobs[0]?.job.rounds.at(-1)?.status).toBe('aborted');
+    expect(settled?.jobs[0]?.job.rounds.at(-1)?.verdict).toBeNull(); // INCOMPLETE stays INCOMPLETE
+  });
+});
+
 describe('board bands — settled rolling window (v5)', () => {
   /** Recency-sorted settled band, newest first (bucketJobs order). */
   function settledBand(count: number) {
