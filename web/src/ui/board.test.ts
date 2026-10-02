@@ -817,6 +817,45 @@ describe('board lens chips — unused lenses are neutral, never a pass', () => {
     expect(errored.classList.contains('pp-chip--alert')).toBe(true);
     expect(errored.textContent).toContain('✕');
   });
+
+  it('raw unknown unused state keeps the defensive ? + park face and honest counts', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({
+      jobs: [baseJob({
+        status: 'in-review',
+        rounds: [baseRound({
+          status: 'verdict-posted',
+          verdict: 'changes-requested',
+          lensAttempts: [],
+          lenses: [
+            { lens: 'blind', state: 'done', agentId: null, note: 'clean — nothing found', verdict: 'clean' },
+            { lens: 'edge', state: 'unused', agentId: null, note: null, verdict: null },
+            { lens: 'tests', state: 'unused', agentId: null, note: 'not used — prose', verdict: null },
+            notUsed('acceptance'),
+            { lens: 'security', state: 'pending', agentId: null, note: null, verdict: null },
+            { lens: 'architecture', state: 'pending', agentId: null, note: null, verdict: null },
+            { lens: 'codebase', state: 'pending', agentId: null, note: null, verdict: null },
+          ],
+        })],
+      })],
+    }));
+    const row = expandFirstRound();
+    // Seven pills stay visible; the two drift records show the frozen
+    // unknown face — never the derived unused class, marker or wording.
+    expect([...row.querySelectorAll<HTMLElement>('.board-lens')]).toHaveLength(7);
+    for (const lens of ['edge', 'tests']) {
+      const node = chip(row, lens);
+      expect(node.classList.contains('pp-chip--park')).toBe(true);
+      expect(node.classList.contains('pp-chip--unused')).toBe(false);
+      expect(node.textContent).toContain('?');
+      expect(node.textContent).not.toContain('not used');
+      expect(node.textContent).not.toContain('—');
+    }
+    // Only the canonical record is unused; used/ran stay non-negative
+    // (pre-fix the drift records drove ran to 0 and stole the unused slot).
+    expect(row.querySelectorAll('.board-lens.pp-chip--unused')).toHaveLength(1);
+    expect(row.querySelector('.board-round__lens-progress')?.textContent).toBe('1/7 lenses ran · 1 not used');
+  });
 });
 
 describe('board v6 — bands', () => {

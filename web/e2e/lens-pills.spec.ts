@@ -1,6 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
+import {
+  isValidSnapshot,
+  parseBoardServerFrame,
+  type BoardSnapshot,
+  type JobView,
+  type LensChipView,
+  type RoundView,
+} from '../src/lib/board-protocol.js';
 
 /**
  * Lens-pill proof (ops-readiness-repair 2026-10-02, original scope only).
@@ -8,9 +16,13 @@ import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
  * Synthetic board snapshots are pushed into the page over an intercepted
  * `/board/ws` socket — the same `{ type: 'board', snapshot }` frame the
  * dev-only mock sends. No product, mock, style, or fixture code is
- * changed; the pairing flow still runs against the real dev mock. All
- * scenario data is generic (no real project names), mirroring the committed
- * DOM regression contract in src/ui/board.test.ts.
+ * changed; the pairing flow still runs against the real dev mock. The
+ * fixture is a COMPLETE canonical BoardSnapshot (the production
+ * `isValidSnapshot` validator requires agents/notifications/decisions —
+ * a repos-only object is invalid and would prove nothing) and every test
+ * gates on the production validator + frame parser before rendering.
+ * All scenario data is generic (no real project names), mirroring the
+ * committed DOM regression contract in src/ui/board.test.ts.
  *
  * Captures land in the ignored evidence root
  * `_bmad-output/ops-readiness-repair-20261002/captures/` for a genuine
@@ -32,66 +44,23 @@ const CAPTURE_DIR = path.join(
 
 const NOT_USED_NOTE = 'not used — lead-owned whole-PR review';
 
-interface LensRecord {
-  lens: string;
-  state: string;
-  agentId: string | null;
-  note: string | null;
-  verdict: string | null;
-}
-interface LensAttempt {
-  lens: string;
-  attempts: number;
-}
-interface RoundRecord {
-  id: string;
-  seq: number;
-  status: string;
-  verdict: string | null;
-  targetRef: string;
-  createdAt: string;
-  updatedAt: string;
-  lensAttempts: LensAttempt[];
-  blockers: number;
-  lenses: LensRecord[];
-}
-interface JobRecord {
-  id: string;
-  repo: string;
-  title: string;
-  status: string;
-  updatedAt: string;
-  prUrl: null;
-  prState: null;
-  baseBranch: string;
-  note: string | null;
-  rounds: RoundRecord[];
-  lane: {
-    branch: string;
-    sha: string;
-    status: string;
-    createdAt: string;
-  };
-  lastAgentActivity: string | null;
-}
-
 const T0 = '2026-10-02T00:00:00.000Z';
 
-const notUsed = (lens: string): LensRecord => ({
+const notUsed = (lens: string): LensChipView => ({
   lens,
   state: 'done',
   agentId: null,
   note: NOT_USED_NOTE,
   verdict: 'clean',
 });
-const cleanDone = (lens: string): LensRecord => ({
+const cleanDone = (lens: string): LensChipView => ({
   lens,
   state: 'done',
   agentId: null,
   note: 'clean — nothing found',
   verdict: 'clean',
 });
-const errored = (lens: string, note: string): LensRecord => ({
+const errored = (lens: string, note: string): LensChipView => ({
   lens,
   state: 'error',
   agentId: null,
@@ -104,10 +73,10 @@ function roundOf(
   seq: number,
   status: string,
   verdict: string | null,
-  lenses: LensRecord[],
-  lensAttempts: LensAttempt[],
+  lenses: LensChipView[],
+  lensAttempts: RoundView['lensAttempts'],
   blockers: number,
-): RoundRecord {
+): RoundView {
   return {
     id,
     seq,
@@ -122,7 +91,7 @@ function roundOf(
   };
 }
 
-function jobOf(id: string, title: string, rounds: RoundRecord[]): JobRecord {
+function jobOf(id: string, title: string, rounds: RoundView[]): JobView {
   return {
     id,
     repo: 'lens-proof',
@@ -139,8 +108,30 @@ function jobOf(id: string, title: string, rounds: RoundRecord[]): JobRecord {
   };
 }
 
-function snapshotOf(jobs: JobRecord[]): unknown {
-  return { repos: [{ name: 'lens-proof', jobs }] };
+/** COMPLETE canonical snapshot: the validator requires repos + agents +
+ * notifications + a valid decisions block and the unacked/wakes counters;
+ * the optional v4 blocks are legitimately absent (tolerated pre-v4). */
+function snapshotOf(jobs: JobView[]): BoardSnapshot {
+  return {
+    repos: [{ name: 'lens-proof', jobs }],
+    agents: [],
+    notifications: [],
+    decisions: {
+      enabled: false,
+      status: 'disabled',
+      reason: 'disabled',
+      model: '~typesafe/jev-latest',
+      endpoint: 'https://openrouter.ai/api/alpha/decisions',
+      credentialPresent: false,
+      credentialSource: 'none',
+      checkedAt: null,
+      incarnation: 'lens-proof-incarnation',
+      generation: 0,
+    },
+    unackedActionRequired: 0,
+    unackedNeedsOwner: 0,
+    wakes: { count: 0, lastAt: null },
+  };
 }
 
 /** Screenshot round: three executed clean + four canonical unused. */
@@ -191,7 +182,15 @@ const MIXED = jobOf('lens-proof-mixed', 'Mixed state proof — every honest stat
   ], [], 1),
 ]);
 
-async function seedBoardSocket(page: Page, snapshot: unknown): Promise<void> {
+async function seedBoardSocket(page: Page, snapshot: BoardSnapshot): Promise<Error[]> {
+  // Authored fixture gates: the synthetic snapshot must satisfy the
+  // production validator and parse as a real board frame — a fixture the
+  // app would silently reject proves nothing.
+  if (!isValidSnapshot(snapshot)) throw new Error('fixture snapshot fails the production isValidSnapshot validator');
+  const frame = parseBoardServerFrame({ type: 'board', snapshot });
+  if (frame === null || frame.type !== 'board') throw new Error('fixture board frame fails the production parser');
+  const pageErrors: Error[] = [];
+  page.on('pageerror', (error) => pageErrors.push(error));
   let seeded = false;
   await page.routeWebSocket(/\/board\/ws$/, (ws: WebSocketRoute) => {
     ws.onMessage(() => {
@@ -201,6 +200,7 @@ async function seedBoardSocket(page: Page, snapshot: unknown): Promise<void> {
       ws.send(JSON.stringify({ type: 'board', snapshot }));
     });
   });
+  return pageErrors;
 }
 
 async function pairAndOpenBoard(page: Page): Promise<void> {
@@ -240,10 +240,10 @@ async function capture(page: Page, name: string): Promise<void> {
 
 test.describe('lens pills — unused is neutral, never a pass (synthetic fixture)', () => {
   test('seven pills: four unused gray without a tick, three clean green; light/dark, phone/desktop', async ({ page }) => {
-    test.setTimeout(60_000);
-    await seedBoardSocket(page, snapshotOf([FOUR_UNUSED]));
+    const pageErrors = await seedBoardSocket(page, snapshotOf([FOUR_UNUSED]));
     await pairAndOpenBoard(page);
     await expandProofRound(page, FOUR_UNUSED.title);
+    expect(pageErrors).toEqual([]);
 
     const job = page.locator('.board-job', { hasText: FOUR_UNUSED.title });
     await expect(job.locator('.board-lens.pp-chip--unused')).toHaveCount(4);
@@ -289,9 +289,10 @@ test.describe('lens pills — unused is neutral, never a pass (synthetic fixture
   });
 
   test('four unused + three genuine timeout errors: neutral stays neutral, failures stay alert with attempts', async ({ page }) => {
-    await seedBoardSocket(page, snapshotOf([FOUR_UNUSED_THREE_ERRORS]));
+    const pageErrors = await seedBoardSocket(page, snapshotOf([FOUR_UNUSED_THREE_ERRORS]));
     await pairAndOpenBoard(page);
     await expandProofRound(page, FOUR_UNUSED_THREE_ERRORS.title);
+    expect(pageErrors).toEqual([]);
 
     const job = page.locator('.board-job', { hasText: FOUR_UNUSED_THREE_ERRORS.title });
     await expect(job.locator('.board-lens.pp-chip--unused')).toHaveCount(4);
@@ -318,12 +319,35 @@ test.describe('lens pills — unused is neutral, never a pass (synthetic fixture
     await expect(page.locator('html')).toHaveClass(/dark/);
     await expect(job.locator('.board-lens.pp-chip--alert')).toHaveCount(3);
     await capture(page, 'four-unused-three-errors-desktop-dark');
+
+    // Phone viewport, both themes: the same seven pills, honest wrap and
+    // error-attempt truth at 390px — failures stay alert with attempts.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(job.locator('.board-lens')).toHaveCount(7);
+    await expect(job.locator('.board-lens.pp-chip--unused')).toHaveCount(4);
+    await expect(job.locator('.board-lens.pp-chip--alert')).toHaveCount(3);
+    await expect(job.locator('.board-lens', { hasText: 'edge' })).toContainText('×2');
+    await assertNoHorizontalOverflow(page);
+    for (const lens of ['edge', 'codebase', 'tests']) {
+      const box = await job.locator('.board-lens', { hasText: lens }).boundingBox();
+      expect(box).not.toBeNull();
+      expect(box?.x ?? -1).toBeGreaterThanOrEqual(0);
+      expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(390);
+    }
+    await capture(page, 'four-unused-three-errors-phone-dark');
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).not.toHaveClass(/dark/);
+    await expect(job.locator('.board-lens.pp-chip--unused')).toHaveCount(4);
+    await expect(job.locator('.board-lens.pp-chip--alert')).toHaveCount(3);
+    await assertNoHorizontalOverflow(page);
+    await capture(page, 'four-unused-three-errors-phone-light');
   });
 
   test('mixed round: unused, clean, legacy null-note, live, pending, blocker, error all distinct', async ({ page }) => {
-    await seedBoardSocket(page, snapshotOf([MIXED]));
+    const pageErrors = await seedBoardSocket(page, snapshotOf([MIXED]));
     await pairAndOpenBoard(page);
     await expandProofRound(page, MIXED.title);
+    expect(pageErrors).toEqual([]);
 
     const job = page.locator('.board-job', { hasText: MIXED.title });
     const blocker = job.locator('.board-lens', { hasText: 'blind' });

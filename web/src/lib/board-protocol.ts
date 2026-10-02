@@ -521,11 +521,13 @@ export function agentViewOf(agent: AgentView): { id: string; role: string; state
  * `unused` — settled, never a pass. Only that canonical record downgrades,
  * and it downgrades to neutral, not to success. `lensChipTone`, the chip
  * icon/wording and `roundSummary` all read this result so they cannot
- * disagree; any unknown state passes through unchanged (defensive against
- * schema drift). */
+ * disagree; unknown states pass through so the defensive `?` + park
+ * rendering still applies — except a raw `unused` state string, which is
+ * renamed aside (`unrecognized`) so schema drift can never collide with
+ * the derived value, steal the `—` marker, or distort used/ran counts. */
 export function lensChipState(lens: Pick<LensChipView, 'state' | 'note'>): string {
   if (lens.state === 'done' && lens.note !== null && lens.note.startsWith('not used')) return 'unused';
-  return lens.state;
+  return lens.state === 'unused' ? 'unrecognized' : lens.state;
 }
 
 export function lensChipTone(state: string): string {
