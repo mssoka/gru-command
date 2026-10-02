@@ -266,6 +266,66 @@ export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   escalateAt: 4,
 };
 
+/** Provider-recovery sensor policy (owner-approved 2026-09-28,
+ * owner-approval.json). The sensor watches EXPLICIT temporary provider
+ * waits on supported routes and resumes approved work through Silas once
+ * the provider returns — no owner polling or ACKs for those waits.
+ * Owner activation is manual: disabled by default. */
+export interface ProviderRecoveryConfig {
+  /** Master switch. False (the default) = no waits recorded, no probes,
+   * no wakes — the feature is inert until the owner enables it. */
+  readonly enabled: boolean;
+  /** Sensor tick: how often routes are re-examined. The check cadence
+   * itself is bounded below by cadenceMinMs. */
+  readonly tickIntervalMs: number;
+  /** Minimum spacing between checks on one route (approval pin: 300 s;
+   * config may only raise it). */
+  readonly cadenceMinMs: number;
+  /** Maximum probe attempts per rolling hour per route (approval pin:
+   * 12; config may only lower it). */
+  readonly maxAttemptsPerHour: number;
+  /** Backoff base between failed probes (transport/tool failures);
+   * doubles per consecutive failure up to probeBackoffMaxMs. */
+  readonly probeBackoffBaseMs: number;
+  /** Backoff cap between failed probes. */
+  readonly probeBackoffMaxMs: number;
+  /** Consecutive false recoveries (recovery observed, continuation
+   * re-hit the wall) before escalating to Gru and suspending the route. */
+  readonly falseRecoveryEscalateAt: number;
+  /** Route probe suspension after a false-recovery escalation. */
+  readonly suspensionMs: number;
+  /** Upper bound honored for a trustworthy provider Retry-After hint
+   * (longer hints clamp to the cadence policy, never extend past this). */
+  readonly retryAfterMaxMs: number;
+  /** Bounded finite timeout for one probe I/O (generation or metadata
+   * read); also bounds the pre-I/O reservation expiry. */
+  readonly probeTimeoutMs: number;
+  /** GLM bounded generation fallback (≤64 output tokens, no history/tools,
+   * no hidden retries). The owner overlay keeps it DISABLED in production:
+   * false (the default) means GLM waits never run a generation probe —
+   * checks fail closed until a documented readiness endpoint exists. */
+  readonly glmGenerationFallback: boolean;
+}
+
+export const DEFAULT_PROVIDER_RECOVERY_CONFIG: ProviderRecoveryConfig = {
+  enabled: false,
+  tickIntervalMs: 30_000,
+  cadenceMinMs: 300_000,
+  maxAttemptsPerHour: 12,
+  probeBackoffBaseMs: 60_000,
+  probeBackoffMaxMs: 1_800_000,
+  falseRecoveryEscalateAt: 3,
+  suspensionMs: 21_600_000,
+  retryAfterMaxMs: 3_600_000,
+  probeTimeoutMs: 30_000,
+  glmGenerationFallback: false,
+};
+
+/** Hard floors from the owner approval — config may tighten, never
+ * loosen, the probe policy pins. */
+export const PROVIDER_RECOVERY_CADENCE_FLOOR_MS = 300_000;
+export const PROVIDER_RECOVERY_MAX_ATTEMPTS_PER_HOUR_CAP = 12;
+
 /** Verification scheduler policy (contention fix 2026-09-22): lanes request
  * verification runs through the service (POST /api/verify); the scheduler owns
  * the machine's GLOBAL test budget so co-tenant lanes cannot oversubscribe it.
@@ -370,6 +430,7 @@ export interface GruCommandConfig {
   readonly dispatch: DispatchConfig;
   readonly lessons: LessonsConfig;
   readonly silas: SilasConfig;
+  readonly providerRecovery: ProviderRecoveryConfig;
   readonly roll: RollConfig;
   readonly concurrency: ConcurrencyConfig;
   readonly review: ReviewConfig;
@@ -494,6 +555,7 @@ const TOP_LEVEL_KEYS = [
   'dispatch',
   'lessons',
   'silas',
+  'provider_recovery',
   'roll',
   'concurrency',
   'review',
@@ -733,6 +795,7 @@ export function loadConfig(
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
   let lessons: LessonsConfig = DEFAULT_LESSONS_CONFIG;
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
+  let providerRecovery: ProviderRecoveryConfig = DEFAULT_PROVIDER_RECOVERY_CONFIG;
   let roll: RollConfig = DEFAULT_ROLL_CONFIG;
   let concurrency: ConcurrencyConfig = DEFAULT_CONCURRENCY_CONFIG;
   let review: ReviewConfig = { enabled: true, maxConcurrentChildren: DEFAULT_REVIEW_CHILDREN };
@@ -1115,6 +1178,69 @@ export function loadConfig(
         escalateAt,
       };
     }
+    if (raw['provider_recovery'] !== undefined) {
+      const table = requireTable(raw['provider_recovery'], file, 'provider_recovery');
+      const VALID = [
+        'enabled',
+        'tick_interval_ms',
+        'cadence_min_ms',
+        'max_attempts_per_hour',
+        'probe_backoff_base_ms',
+        'probe_backoff_max_ms',
+        'false_recovery_escalate_at',
+        'suspension_ms',
+        'retry_after_max_ms',
+        'probe_timeout_ms',
+        'glm_generation_fallback',
+      ];
+      for (const key of Object.keys(table)) {
+        if (!VALID.includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [provider_recovery] (valid keys: ${VALID.join(', ')})`,
+            file,
+            `provider_recovery.${key}`,
+          );
+        }
+      }
+      const cadenceMinMs =
+        table['cadence_min_ms'] !== undefined
+          ? requirePositiveInt(table['cadence_min_ms'], file, 'provider_recovery.cadence_min_ms')
+          : providerRecovery.cadenceMinMs;
+      if (cadenceMinMs < PROVIDER_RECOVERY_CADENCE_FLOOR_MS) {
+        throw new ConfigError(
+          `provider_recovery.cadence_min_ms (${cadenceMinMs}) is below the approved floor ${PROVIDER_RECOVERY_CADENCE_FLOOR_MS} — the owner approval pins shared route checks to at least 300 s`,
+          file,
+          'provider_recovery.cadence_min_ms',
+        );
+      }
+      const maxAttemptsPerHour =
+        table['max_attempts_per_hour'] !== undefined
+          ? requirePositiveInt(table['max_attempts_per_hour'], file, 'provider_recovery.max_attempts_per_hour')
+          : providerRecovery.maxAttemptsPerHour;
+      if (maxAttemptsPerHour > PROVIDER_RECOVERY_MAX_ATTEMPTS_PER_HOUR_CAP) {
+        throw new ConfigError(
+          `provider_recovery.max_attempts_per_hour (${maxAttemptsPerHour}) exceeds the approved cap ${PROVIDER_RECOVERY_MAX_ATTEMPTS_PER_HOUR_CAP} — the owner approval pins at most 12 attempts/hour/route`,
+          file,
+          'provider_recovery.max_attempts_per_hour',
+        );
+      }
+      providerRecovery = {
+        enabled: table['enabled'] !== undefined ? requireBool(table['enabled'], file, 'provider_recovery.enabled') : providerRecovery.enabled,
+        tickIntervalMs: table['tick_interval_ms'] !== undefined ? requirePositiveInt(table['tick_interval_ms'], file, 'provider_recovery.tick_interval_ms') : providerRecovery.tickIntervalMs,
+        cadenceMinMs,
+        maxAttemptsPerHour,
+        probeBackoffBaseMs: table['probe_backoff_base_ms'] !== undefined ? requirePositiveInt(table['probe_backoff_base_ms'], file, 'provider_recovery.probe_backoff_base_ms') : providerRecovery.probeBackoffBaseMs,
+        probeBackoffMaxMs: table['probe_backoff_max_ms'] !== undefined ? requirePositiveInt(table['probe_backoff_max_ms'], file, 'provider_recovery.probe_backoff_max_ms') : providerRecovery.probeBackoffMaxMs,
+        falseRecoveryEscalateAt: table['false_recovery_escalate_at'] !== undefined ? requirePositiveInt(table['false_recovery_escalate_at'], file, 'provider_recovery.false_recovery_escalate_at') : providerRecovery.falseRecoveryEscalateAt,
+        suspensionMs: table['suspension_ms'] !== undefined ? requirePositiveInt(table['suspension_ms'], file, 'provider_recovery.suspension_ms') : providerRecovery.suspensionMs,
+        retryAfterMaxMs: table['retry_after_max_ms'] !== undefined ? requirePositiveInt(table['retry_after_max_ms'], file, 'provider_recovery.retry_after_max_ms') : providerRecovery.retryAfterMaxMs,
+        probeTimeoutMs: table['probe_timeout_ms'] !== undefined ? requirePositiveInt(table['probe_timeout_ms'], file, 'provider_recovery.probe_timeout_ms') : providerRecovery.probeTimeoutMs,
+        glmGenerationFallback:
+          table['glm_generation_fallback'] !== undefined
+            ? requireBool(table['glm_generation_fallback'], file, 'provider_recovery.glm_generation_fallback')
+            : providerRecovery.glmGenerationFallback,
+      };
+    }
     if (raw['roll'] !== undefined) {
       const table = requireTable(raw['roll'], file, 'roll');
       for (const key of Object.keys(table)) {
@@ -1269,6 +1395,7 @@ export function loadConfig(
     dispatch,
     lessons,
     silas,
+    providerRecovery,
     roll,
     concurrency,
     review,
