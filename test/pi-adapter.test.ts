@@ -1901,3 +1901,49 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
     expect(fx.runtime.health().state).toBe('ok');
   });
 });
+
+describe('typed provider-response provenance (r1 #13) — pure parsers', () => {
+  // The adapter is the ONLY place typed provenance is minted: an SDK error
+  // object with a numeric status, or a provider terminal message whose
+  // machine-composed line parses strictly. Arbitrary exceptions stay
+  // anonymous, so the recovery sensor can never misread them.
+  it('sdk errors: numeric status/statusCode is the gate; headers carry Retry-After', async () => {
+    const { typedFromSdkError } = await import('../src/runtime/pi-adapter.js');
+    expect(typedFromSdkError(new Error('arbitrary exception'))).toBeNull();
+    expect(typedFromSdkError({ message: 'no numeric status' })).toBeNull();
+    expect(typedFromSdkError({ status: 429 })).toEqual({ origin: 'sdk-error', status: 429 });
+    expect(typedFromSdkError({ statusCode: 503 })).toEqual({ origin: 'sdk-error', status: 503 });
+    const withHeaders = {
+      status: 429,
+      error: { error: { code: '1302' } },
+      headers: { get: (name: string) => (name === 'retry-after-ms' ? '2500' : null) },
+    };
+    expect(typedFromSdkError(withHeaders)).toEqual({ origin: 'sdk-error', status: 429, bodyCode: '1302', retryAfterMs: 2500 });
+    const seconds = { status: 429, headers: { get: (name: string) => (name === 'retry-after' ? '7' : null) } };
+    expect(typedFromSdkError(seconds)).toEqual({ origin: 'sdk-error', status: 429, retryAfterMs: 7000 });
+    expect(typedFromSdkError({ status: 429, error: { code: 1308 } })).toEqual({
+      origin: 'sdk-error',
+      status: 429,
+      bodyCode: '1308',
+    });
+  });
+
+  it('provider messages: only the strict machine-composed line yields typed provenance', async () => {
+    const { typedFromProviderMessageLine } = await import('../src/runtime/pi-adapter.js');
+    expect(typedFromProviderMessageLine('something exploded', 'zai-coding-cn', 'glm-5.3')).toBeNull();
+    expect(typedFromProviderMessageLine('quota issues mentioned in prose', 'zai-coding-cn', 'glm-5.3')).toBeNull();
+    expect(
+      typedFromProviderMessageLine('429: {"error":{"code":"1302","message":"usage window limit"}}', 'zai-coding-cn', 'glm-5.3'),
+    ).toEqual({ origin: 'provider-message', status: 429, bodyCode: '1302' });
+    expect(typedFromProviderMessageLine('401: {"error":{"code":"1002"}}', 'zai-coding-cn', 'glm-5.3')).toEqual({
+      origin: 'provider-message',
+      status: 401,
+      bodyCode: '1002',
+    });
+    // A bare status without a body still parses; malformed JSON never invents one.
+    expect(typedFromProviderMessageLine('429: not-json', 'zai-coding-cn', 'glm-5.3')).toEqual({
+      origin: 'provider-message',
+      status: 429,
+    });
+  });
+});

@@ -74,6 +74,7 @@ describe('config-generate CLI', () => {
       'dispatch',
       'lessons',
       'silas',
+      'provider_recovery',
       'roll',
       'concurrency',
       'review',

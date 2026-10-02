@@ -28,6 +28,20 @@ native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest 
 # (test/test-budgets.test.ts) pins these names to the heavy classification.
 ten-timeout-cases = "npx vitest run --config vitest.heavy.config.ts -t \"by=silas on the pr/review|second run fast-forwards|refuses a non-fast-forward|restarts only an owned|terminalizes a workflow schema|newest completed predecessor|does not record a reconciled delivery|non-PR origin/topic target FREEZES|rejects an empty/missing verdict|answers rejects secrets\" test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/perkins-whole-review.test.ts test/wizard.test.ts"
 
+# Provider-recovery sensor lane scopes (r4 fix round; invoked only via
+# the authenticated /api/verify scheduler at unchanged budgets/thresholds —
+# plain vitest invocations, no worker/timeout flags, never the npm chain).
+provider-recovery = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-metadata.test.ts test/provider-recovery-composition.test.ts test/provider-recovery-classify.test.ts test/provider-recovery-admission.test.ts test/provider-recovery-seam.test.ts test/suite-shape.test.ts"
+
+# Fails-before comparison for the r4 fix round. Baseline A = the pre-fix
+# lane head; baseline B = the parent of the blocked-settle fix 1073216.
+# Both overlay the CURRENT committed test sources onto a git archive of the
+# pinned pre-fix commits (node_modules bound by symlink, same RPC patch
+# prerequisite) and are EXPECTED RED: the new regressions fail before the
+# fixes. The vitest exit codes are echoed intact so the scheduler captures
+# both as evidence — never masked into a PASS. Snapshot dirs are preserved.
+provider-recovery-r4-baseline = 'root="$PWD"; dA=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-provider-recovery-r4a.XXXXXX"); git archive 8a68970ac56ee05632ca9ab86f54edf6058a19fc | tar -x -C "$dA" || { echo "baseline-A archive failed"; exit 3; }; cp test/provider-recovery-sensor.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-metadata.test.ts test/provider-recovery-seam.test.ts "$dA/test/"; ln -s "$root/node_modules" "$dA/node_modules"; ( cd "$dA" && node tools/patch-vitest-rpc-timeout.mjs >/dev/null 2>&1; npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-metadata.test.ts test/provider-recovery-seam.test.ts ); a=$?; echo "baseline-A pre-fix 8a68970 + current tests exit=$a EXPECTED-NONZERO"; dB=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-provider-recovery-blocker.XXXXXX"); git archive 7bbc25de0dc8aa088369cb32fed69e21c78df44b | tar -x -C "$dB" || { echo "baseline-B archive failed"; exit 3; }; cp test/provider-recovery-sensor.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts "$dB/test/"; ln -s "$root/node_modules" "$dB/node_modules"; ( cd "$dB" && node tools/patch-vitest-rpc-timeout.mjs >/dev/null 2>&1; npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts ); b=$?; echo "baseline-B pre-fix 7bbc25d + blocker tests exit=$b EXPECTED-NONZERO"; echo "baseline snapshots preserved: A=$dA B=$dB"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline passed unexpectedly"; fi; exit 1'
+
 # Baseline comparison for the lane: identical final test files (git show
 # from the pinned head) run against an isolated baseline snapshot (git
 # archive of the pinned base) using the unchanged baseline Vitest
@@ -41,3 +55,30 @@ ten-timeout-cases = "npx vitest run --config vitest.heavy.config.ts -t \"by=sila
 # _bmad-output/gate-prep/native-compaction-wait-baseline.last-snapshot.txt
 # records the latest snapshot location, preserved for inspection.
 native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f02c9ede86; headrev=ab11bb327c4ba1ab3e3e3a9cc9e6b3bcaf4a22b3; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-native-compaction-wait.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/supervisor.test.ts > "$d/test/supervisor.test.ts"; git show "$headrev":test/suite-shape.test.ts > "$d/test/suite-shape.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/native-compaction-wait-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts'
+
+# PR134 verification readiness (2026-10-02): this lane's focused regression
+# and its isolated pre-fix baseline, declared for the authenticated
+# scheduler only — explicit existing installed Vitest CLI invocations
+# (vitest is hoisted at the lane root; web/node_modules has none) under
+# the existing web Vitest config/budgets, approved RPC patch prerequisite,
+# exits never masked.
+board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts"
+
+# T4 diagnosis (2026-10-02): the shared perkins-builtin-wave T4 case sits on
+# the 30s default ceiling under full-suite co-tenant load and has timed out
+# in FULL at multiple heads across lanes (shared fixture cost; the cost
+# repair is owned by the separate review-rebrief-interlock lane, unmerged —
+# never copied here). This scope isolates that single case at the unchanged
+# default ceiling so a FULL timeout can be classified (isolation pass vs
+# deterministic fail); it changes no test, timeout, assertion or gate.
+t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
+
+# Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
+# final behavioral tests from the scheduled head, dependencies linked (no
+# download/install), same web config/runner/budgets and RPC prerequisite.
+# Main059c lacks the concluded-history fix, so assertion RED is expected;
+# compilation/import/setup/harness failure is not RED evidence. The vitest
+# exit is left intact, never masked. The snapshot directory and the ignored
+# pointer file are preserved for inspection; nothing is deleted or checked
+# out, and no branch/worktree holds the sha.
+board-merged-attention-baseline = 'set -e; base=059c076290145d4aae6e0b47c7b3f87156862c43; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-merged-attention.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board-merged-attention.test.ts > "$d/web/src/ui/board-merged-attention.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-merged-attention-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-merged-attention-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts'
