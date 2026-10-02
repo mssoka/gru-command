@@ -78,6 +78,16 @@ wizard-bmad-retry = "npm run build && node tools/patch-vitest-rpc-timeout.mjs &&
 # retained snapshot location (older snapshots are kept for inspection).
 wizard-bmad-retry-baseline = 'set -e; base=cee0ecbe53229d05c13f909dd11d4b31e886db72; headrev=5f61593a87c5fab3fc2e03f2769af03b21e95788; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-wizard-bmad-retry.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts; do git show "$headrev:$f" > "$d/$f"; done; { printf "base=%s head=%s snapshot=%s\n" "$base" "$headrev" "$d"; (cd "$d" && shasum -a 256 test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts); } > "$prep/wizard-bmad-retry-baseline.last-snapshot.txt"; ln -s "$root/node_modules" "$d/node_modules"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts'
 
+# Browser-consumer acceptance for the gh-32 lane (owner mandate j-861:
+# scoped/full/browser tests honestly captured through /api/verify at the
+# applicable final head). No web source is touched by this lane; this is
+# the consumer-side gate a backend-only FULL failure would otherwise leave
+# unexecuted: the shipped web shell's compile + unit suite, then both
+# Playwright projects (dev mock and the test-managed real service) against
+# the built merged source. Budgets/thresholds unchanged; approved RPC
+# patch prerequisite first, same as the other witnessed scopes.
+wizard-bmad-browser-consumer = "node tools/patch-vitest-rpc-timeout.mjs && npm run test:web && npm run e2e"
+
 lens-unused-neutral = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-signals.test.ts src/lib/board-protocol.test.ts"
 lens-unused-neutral-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=43e437a2e61b0c25351ed6147639aefbac4ccd77; root="$PWD"; prep=_bmad-output/ops-readiness-repair-20261002; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-lens-unused-neutral.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; git show "$headrev":web/src/lib/board-signals.test.ts > "$d/web/src/lib/board-signals.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/lens-unused-neutral-baseline.last-snapshot.txt"; cd "$d" && node tools/patch-vitest-rpc-timeout.mjs && cd "$d/web" && node "$root/node_modules/vitest/vitest.mjs" run src/ui/board.test.ts src/lib/board-signals.test.ts'
 lens-unused-neutral-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=lens-pills"
