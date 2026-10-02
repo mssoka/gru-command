@@ -184,6 +184,17 @@ four tests, all `Test timed out in 30000ms` with zero assertion failures:
 - Independence: the lane's product diff (`rebrief-recovery.ts`, the `/api/silas/rebrief`
   handler, `ledger/api.ts`, the boot counter) is on none of the four paths; the failing
   test bodies are unchanged from main and pass/fail with host load across heads.
+- Focused verification at the repaired head `2e42d61` (declared scope
+  `runtime-capability-decoupling`, committed): `/api/verify` run
+  `69c36574-23aa-4f45-be79-a36c8142662e` **PASS**, exit 0, not timed out, clean tracked
+  tree; 123/123 tests across `runtime-probe` (including the new decoupling oracle),
+  `claude-adapter`, `wizard`, `suite-shape`. Receipt + sinks: verify-capture
+  `runtime-capability-decoupling-2e42d619a433-20261002T203135Z.*` (raw 13307B sha256
+  `713f5006…`, decoded 6821B sha256 `43931e44…`). Measured effect: the wizard
+  `--answers rejects secrets…` case is now 4045ms over four CLI invocations (36509ms in
+  the preserved FULL; 7.7-11.5s per invocation pre-repair). Readiness reconciliation:
+  the original queued run is terminal (39524/39547); the two pending rebrief rows are
+  this session's own live dispatch pair, recorded in the receipt.
 - Remaining dependency (not a lane repair): active GC
   `gc-test-harness-budgets-20261002` (workload-aware 30s/120s budgets, two-worker heavy
   isolation); it must not be transplanted here. Next trigger: GC landing on `main` →
