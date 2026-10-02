@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 import {
   FAST_TEST_TIMEOUT_MS,
   FAST_WORKER_CAP,
@@ -32,7 +32,10 @@ process.stdout.write(`${budgetBanner('fast', effectiveWorkers)}\n`);
 export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
-    exclude: heavyTestPaths(),
+    // Compose with Vitest's defaults (a user-supplied exclude REPLACES them
+    // wholesale): the classified heavy files leave the fast phase, the
+    // node_modules/dist/dot-dir/config-file defaults stay in force.
+    exclude: [...configDefaults.exclude, ...heavyTestPaths()],
     setupFiles: ['test/helpers/env-setup.ts', 'test/helpers/timeout-diagnostics.ts'],
     testTimeout: FAST_TEST_TIMEOUT_MS,
     hookTimeout: FAST_TEST_TIMEOUT_MS,

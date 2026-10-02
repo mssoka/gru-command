@@ -1,5 +1,8 @@
+import { spawnSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parse as parseToml } from 'smol-toml';
 import { describe, expect, it } from 'vitest';
 import {
   FAST_TEST_TIMEOUT_MS,
@@ -123,6 +126,13 @@ describe('workload-aware test budgets', () => {
       VITEST_MAX_FORKS: '2',
       VITEST_MIN_FORKS: '2',
     });
+
+    // Every pinned knob counts, not just the max ones, and pins are parsed
+    // strictly (no prefix parsing, empty assignments are absent).
+    expect(resolveWorkerBudget({ VITEST_MAX_THREADS: '4', VITEST_MIN_THREADS: '2' }, FAST_WORKER_CAP)).toBe(2);
+    expect(resolveWorkerBudget({ VITEST_MAX_FORKS: '3', VITEST_MIN_FORKS: '1' }, FAST_WORKER_CAP)).toBe(1);
+    expect(resolveWorkerBudget({ VITEST_MAX_THREADS: '3abc' }, FAST_WORKER_CAP)).toBe(4);
+    expect(resolveWorkerBudget({ VITEST_MAX_THREADS: '' }, FAST_WORKER_CAP)).toBe(4);
   });
 
   it('emits one greppable budget banner per phase with runner context', () => {
@@ -143,8 +153,88 @@ describe('workload-aware test budgets', () => {
       expect(source).toContain('applyWorkerBudget(process.env');
     }
     expect(fast).toContain('FAST_TEST_TIMEOUT_MS');
-    expect(fast).toContain('exclude: heavyTestPaths()');
+    expect(fast).toContain('exclude: [...configDefaults.exclude, ...heavyTestPaths()]');
     expect(heavy).toContain('HEAVY_TEST_TIMEOUT_MS');
     expect(heavy).toContain('include: heavyTestPaths()');
+  });
+
+  it('routes every declared scope segment that names a heavy file through the heavy config', () => {
+    const manifest = parseToml(
+      readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8'),
+    ) as { verify?: Record<string, string> };
+    const scopes = manifest.verify ?? {};
+    expect(Object.keys(scopes).length).toBeGreaterThan(0);
+    for (const [scope, command] of Object.entries(scopes)) {
+      for (const segment of command.split('&&').map((part) => part.trim())) {
+        const namesHeavy = heavyTestPaths().some((path) => segment.includes(path));
+        if (!namesHeavy) continue;
+        expect(
+          segment,
+          `${scope} names a classified heavy file without --config vitest.heavy.config.ts: ${segment}`,
+        ).toContain('--config vitest.heavy.config.ts');
+      }
+    }
+  });
+
+  it('selects every on-disk test file exactly once across the two phases at runtime', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const vitestBin = join(repoRoot, 'node_modules', 'vitest', 'vitest.mjs');
+    const childEnv = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !key.startsWith('VITEST')),
+    );
+    const listConfig = (config: string): string[] => {
+      const result = spawnSync(
+        process.execPath,
+        [vitestBin, 'list', '--config', config, '--filesOnly', '--json'],
+        { cwd: repoRoot, encoding: 'utf-8', timeout: 120_000, env: { ...childEnv, CI: 'true' } },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      // The phase config prints its budget banner first; take the JSON body.
+      const jsonStart = result.stdout.indexOf('\n[');
+      expect(jsonStart, result.stdout.slice(0, 400)).toBeGreaterThanOrEqual(0);
+      const entries = JSON.parse(result.stdout.slice(jsonStart).trim()) as Array<{ file: string }>;
+      return entries
+        .map((entry) => {
+          const path = entry.file.startsWith('file://') ? fileURLToPath(entry.file) : entry.file;
+          return relative(repoRoot, path).split('\\').join('/');
+        })
+        .sort();
+    };
+    const fast = listConfig('vitest.config.ts');
+    const heavy = listConfig('vitest.heavy.config.ts');
+    const onDisk = readdirSync(join(repoRoot, 'test'), { recursive: true })
+      .map((name) => String(name).split('\\').join('/'))
+      .filter((name) => name.endsWith('.test.ts'))
+      .map((name) => `test/${name}`)
+      .sort();
+    expect(fast.length).toBeGreaterThan(0);
+    expect(heavy.length).toBeGreaterThan(0);
+    expect(fast.filter((file) => heavy.includes(file)), 'a file runs in both phases').toEqual([]);
+    expect([...fast, ...heavy].sort(), 'the phase union must equal the on-disk test files').toEqual(onDisk);
+
+    // The full chain really chains both phases (and the web suite).
+    const scripts = (
+      JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8')) as {
+        scripts: Record<string, string>;
+      }
+    ).scripts;
+    expect(scripts['test']).toContain('test:backend');
+    expect(scripts['test']).toContain('test:backend:heavy');
+    expect(scripts['test']).toContain('test:web');
+  });
+
+  it('keeps the ten-timeout-cases -t pattern matching every observed case', () => {
+    const manifest = parseToml(
+      readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8'),
+    ) as { verify?: Record<string, string> };
+    const command = (manifest.verify ?? {})['ten-timeout-cases'];
+    expect(command, 'ten-timeout-cases scope is declared').toBeDefined();
+    expect(command).toContain('--config vitest.heavy.config.ts');
+    const match = /-t\s+"([^"]+)"/.exec(command ?? '');
+    expect(match, `no -t pattern in: ${command ?? '<missing>'}`).not.toBeNull();
+    const pattern = new RegExp(match![1]!);
+    for (const { file, name } of OBSERVED_TIMEOUTS) {
+      expect(pattern.test(name), `${file}: -t pattern misses "${name}"`).toBe(true);
+    }
   });
 });

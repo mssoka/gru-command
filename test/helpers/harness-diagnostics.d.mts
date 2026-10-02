@@ -19,7 +19,7 @@ export interface TrackedProcess {
   signal: NodeJS.Signals | null;
   spawnError: string | null;
   output: { stdout: string; stderr: string };
-  outputTruncated: boolean;
+  outputTruncated: { stdout: boolean; stderr: boolean };
 }
 
 export interface DiagnosticsScope {
@@ -29,6 +29,7 @@ export interface DiagnosticsScope {
   readonly clock: () => number;
   readonly steps: FixtureStep[];
   readonly processes: TrackedProcess[];
+  readonly parent: DiagnosticsScope | null;
 }
 
 export declare class FixtureStepTimeoutError extends Error {
@@ -41,6 +42,7 @@ export declare function createTestScope(input: {
   file: string;
   name: string;
   now?: () => number;
+  parent?: DiagnosticsScope | null;
 }): DiagnosticsScope;
 
 /** Returns the displaced scope (if one was active). */
@@ -66,7 +68,7 @@ export declare function renderFailureDiagnostics(
 
 export declare function disposeScopeProcesses(
   scope: DiagnosticsScope | null,
-  options?: { graceMs?: number; killGraceMs?: number },
+  options?: { graceMs?: number; killGraceMs?: number; totalMs?: number },
 ): Promise<Array<{ label: string; pid: number | null; disposition: string }>>;
 
 export declare function runBoundedFixtureStep<T>(

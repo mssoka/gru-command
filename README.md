@@ -223,6 +223,7 @@ console, forensics and backups:
 ```bash
 npm install
 npm test        # full gate: lint + typecheck + build + fast + heavy + web
+npm run build   # prerequisite for the standalone phase commands below (dist-dependent suites)
 npm run test:backend        # fast suites (30s test/hook budget, up to 4 workers)
 npm run test:backend:heavy  # process-heavy integration suites (120s budget, up to 2 workers)
 npm run test:backend:heavy -- test/perkins-whole-review.test.ts  # debug one heavy file
@@ -236,7 +237,9 @@ listed with per-file reasons in `test/helpers/test-budgets.ts`, run at a 120s
 ceiling, and are capped at two workers. Both phases run sequentially inside
 `npm test`, so the aggregate worker count never exceeds the verification
 scheduler's single global budget. `npx vitest run` alone runs the fast phase;
-use `npm run test:backend:heavy` for the classified files.
+use `npm run test:backend:heavy` for the classified files. Both standalone
+phases assume `npm run build` has run first — several suites boot `dist/`
+artifacts — while `npm test` builds before either phase.
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is the authoritative full gate — it runs `npm test` on every pull request and push to `main`; dispatch lanes verify only their narrow suites locally.
 

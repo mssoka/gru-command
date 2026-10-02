@@ -60,6 +60,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'HTTP ops surface over real git fixture repositories',
   },
   { file: 'fix-directive.test.ts', workload: 'dispatch/fix flow over real git fixtures' },
+  {
+    file: 'harness-diagnostics.test.ts',
+    workload: 'spawns a real Vitest child over a temp fixture to prove the timeout/failure wiring',
+  },
   { file: 'install-one-line.test.ts', workload: 'install.sh clone/build/service pipelines' },
   { file: 'install.test.ts', workload: 'install.sh CLI contracts through real subprocesses' },
   { file: 'lan-phone-raw-client.test.ts', workload: 'real service over sockets with the raw client' },
@@ -106,12 +110,18 @@ export function heavyTestPaths(): string[] {
  * The documented worker clamp: the phase cap bounded by every pinned pool
  * knob in the environment (the verification scheduler pins all four to
  * the one cross-lane budget). A smaller pin always wins; the result is
- * never below one worker.
+ * never below one worker. Values are parsed strictly — a non-integer
+ * pin (or an empty assignment) is ignored rather than prefix-parsed.
  */
 export function resolveWorkerBudget(env: NodeJS.ProcessEnv, cap: number): number {
-  const pinned = [env['VITEST_MAX_THREADS'], env['VITEST_MAX_FORKS']]
-    .map((value) => (value === undefined ? Number.NaN : Number.parseInt(value, 10)))
-    .filter((value) => Number.isFinite(value));
+  const pinned = [
+    env['VITEST_MAX_THREADS'],
+    env['VITEST_MIN_THREADS'],
+    env['VITEST_MAX_FORKS'],
+    env['VITEST_MIN_FORKS'],
+  ]
+    .map((value) => (value === undefined || value.trim() === '' ? Number.NaN : Number(value)))
+    .filter((value) => Number.isInteger(value));
   return pinned.length > 0 ? Math.max(1, Math.min(...pinned, cap)) : cap;
 }
 

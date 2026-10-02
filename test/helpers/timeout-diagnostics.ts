@@ -1,30 +1,40 @@
 /**
- * Vitest setup file: one diagnostics scope per test, failure reporting,
- * and bounded teardown for fixture-owned children.
+ * Vitest setup file: a file-scoped diagnostics context (for children
+ * started in `beforeAll`), one scope per test, automatic failure
+ * reporting, and bounded teardown for fixture-owned children.
  *
- * Registration order (setup files load before the test file) means this
- * afterEach runs LAST in the default hook order, after the test's own
- * cleanup hooks, so it observes the state they leave behind. Vitest
- * invokes afterEach even when the test (or a beforeEach hook) timed out,
- * which is what makes timeout diagnostics automatic. A beforeAll failure
- * marks its tests skipped and runs no per-test hooks; harness setup
- * helpers that can fail that way use runBoundedFixtureStep, which emits
- * the same diagnostics at throw time.
+ * Registration order (setup files load before the test file) means the
+ * `beforeAll`/`afterAll` hooks here run before/after the test file's own,
+ * so a service booted in the file's `beforeAll` is tracked. Per-test
+ * scopes nest inside the file scope: their diagnostics render the
+ * file-scope children too, but disposal at test end touches only the
+ * test's own children; the file scope is disposed in `afterAll`.
+ *
+ * Reporting and disposal are registered through `context.onTestFinished`
+ * from `beforeEach`. Vitest invokes those callbacks after the afterEach
+ * chain and its failure handling, so a test whose own `afterEach` throws
+ * or times out still gets diagnostics and bounded cleanup — a setup
+ * `afterEach` would be skipped when the hook chain aborts. A `beforeAll`
+ * failure runs no per-test hooks; the file `afterAll` reports and disposes
+ * the file scope, and harness setup helpers that can fail that way also
+ * use runBoundedFixtureStep, which emits the same diagnostics at throw
+ * time.
  */
-import { afterEach, beforeEach } from 'vitest';
+import { afterAll, beforeAll, beforeEach } from 'vitest';
 import {
   activateTestScope,
   createTestScope,
-  currentTestScope,
   deactivateTestScope,
   disposeScopeProcesses,
   renderFailureDiagnostics,
+  type DiagnosticsScope,
 } from './harness-diagnostics.mjs';
 
 interface TaskLike {
   readonly name?: string | undefined;
   readonly suite?: TaskLike | undefined;
   readonly file?: { readonly name?: string | undefined } | undefined;
+  readonly result?: { readonly errors?: readonly unknown[] } | undefined;
 }
 
 function fullName(task: TaskLike): string {
@@ -38,28 +48,65 @@ function fullName(task: TaskLike): string {
   return names.join(' > ');
 }
 
-beforeEach((context) => {
-  const task = context.task as TaskLike;
-  const stale = activateTestScope(
-    createTestScope({ file: task.file?.name ?? '<unknown file>', name: fullName(task) }),
-  );
-  if (stale !== null) {
-    // A previous scope that never reached its afterEach: reap its owned
-    // children in the background rather than leaking them into this test.
-    void disposeScopeProcesses(stale, { graceMs: 500 }).catch(() => undefined);
-  }
+let fileScope: DiagnosticsScope | null = null;
+
+beforeAll((suite) => {
+  const file = suite.file ?? suite;
+  fileScope = createTestScope({
+    file: file.name ?? '<unknown file>',
+    name: '<file scope>',
+  });
+  activateTestScope(fileScope);
 });
 
-afterEach(async (context) => {
-  const scope = currentTestScope();
+beforeEach((context) => {
+  const task = context.task as TaskLike;
+  const scope = createTestScope({
+    file: task.file?.name ?? '<unknown file>',
+    name: fullName(task),
+    parent: fileScope,
+  });
+  const stale = activateTestScope(scope);
+  if (stale !== null && stale !== fileScope) {
+    // A previous test scope that never reached its onTestFinished: reap its
+    // owned children in the background rather than leaking them into this test.
+    void disposeScopeProcesses(stale, { graceMs: 500 }).catch(() => undefined);
+  }
+  context.onTestFinished(async () => {
+    try {
+      const errors = (context.task as TaskLike).result?.errors ?? [];
+      for (const error of errors) {
+        process.stderr.write(`${renderFailureDiagnostics(scope, error)}\n`);
+      }
+    } catch {
+      // Diagnostics must never turn a passing test red.
+    }
+    try {
+      deactivateTestScope(scope);
+      await disposeScopeProcesses(scope, { graceMs: 2_000 });
+    } catch {
+      // Bounded teardown failures are reported by the next scope's reaper.
+    }
+  });
+});
+
+afterAll(async (suite) => {
+  const scope = fileScope;
+  fileScope = null;
   if (scope === null) return;
   try {
-    const errors = (context.task.result?.errors ?? []) as readonly unknown[];
+    const errors = suite.result?.errors ?? [];
     for (const error of errors) {
       process.stderr.write(`${renderFailureDiagnostics(scope, error)}\n`);
     }
-  } finally {
+  } catch {
+    // Diagnostics must never turn a passing file red.
+  }
+  try {
     deactivateTestScope(scope);
-    await disposeScopeProcesses(scope, { graceMs: 2_000 }).catch(() => undefined);
+    await disposeScopeProcesses(scope, { graceMs: 2_000 });
+  } catch {
+    // The file's own afterAll hooks have already run; leftovers are bounded
+    // by the verification scheduler's process-group teardown at lane end.
   }
 });

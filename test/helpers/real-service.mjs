@@ -211,6 +211,13 @@ export async function startRealService({
   // Fixture-owned child: the diagnostics scope (when a test is active)
   // records pid/exit state and a bounded stderr tail for timeouts.
   trackChildProcess(child, { label: 'gru-command service (dist/main.js)' });
+  // Keep the spawn failure observable to the boot loops below; tracking
+  // attaches its own error listener, so without this a failed spawn would
+  // surface only as a 20s "never answered /health" deadline.
+  let spawnError = null;
+  child.once('error', (error) => {
+    spawnError = error instanceof Error ? error : new Error(String(error));
+  });
   let stderrTail = '';
   child.stdout.on('data', () => {}); // drain: the service log must never wedge the pipe
   child.stderr.on('data', (chunk) => {
@@ -226,6 +233,10 @@ export async function startRealService({
     while (discovered === null) {
       discovered = parseListeningPort(stderrTail);
       if (discovered !== null) break;
+      if (spawnError !== null) {
+        cleanup();
+        failLoud(`service failed to spawn: ${spawnError.message}`);
+      }
       if (child.exitCode !== null) {
         cleanup();
         failLoud(`service exited before listening (code ${child.exitCode})\n${stderrTail}`);
@@ -242,6 +253,10 @@ export async function startRealService({
 
   const baseUrl = `http://127.0.0.1:${port}`;
   for (;;) {
+    if (spawnError !== null) {
+      cleanup();
+      failLoud(`service failed to spawn: ${spawnError.message}`);
+    }
     if (child.exitCode !== null) {
       cleanup();
       failLoud(`service exited during boot (code ${child.exitCode})\n${stderrTail}`);

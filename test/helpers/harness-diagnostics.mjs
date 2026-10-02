@@ -40,7 +40,7 @@ export class FixtureStepTimeoutError extends Error {
   }
 }
 
-export function createTestScope({ file, name, now = Date.now }) {
+export function createTestScope({ file, name, now = Date.now, parent = null }) {
   return {
     file: String(file ?? '<unknown file>'),
     name: String(name ?? '<unknown test>'),
@@ -48,6 +48,7 @@ export function createTestScope({ file, name, now = Date.now }) {
     clock: now,
     steps: [],
     processes: [],
+    parent: parent ?? null,
   };
 }
 
@@ -63,7 +64,18 @@ export function currentTestScope() {
 }
 
 export function deactivateTestScope(scope) {
-  if (activeScope === scope) activeScope = null;
+  // Nested scopes restore their parent (a file-level scope around
+  // beforeAll owns file-scoped children); a root scope restores null.
+  if (activeScope === scope) activeScope = scope.parent ?? null;
+}
+
+/** Innermost-first chain of scopes (test scope, then its parents). */
+function scopeLineage(scope) {
+  const chain = [];
+  for (let cursor = scope; cursor !== null && cursor !== undefined; cursor = cursor.parent ?? null) {
+    chain.push(cursor);
+  }
+  return chain;
 }
 
 function scopeOf(scope) {
@@ -83,7 +95,7 @@ function appendTail(tracked, streamName, chunk) {
   const current = tracked.output[streamName];
   const next = current + text;
   const bounded = next.length > OUTPUT_TAIL_LIMIT ? next.slice(-OUTPUT_TAIL_LIMIT) : next;
-  if (next.length > OUTPUT_TAIL_LIMIT) tracked.outputTruncated = true;
+  if (next.length > OUTPUT_TAIL_LIMIT) tracked.outputTruncated[streamName] = true;
   tracked.output[streamName] = bounded;
 }
 
@@ -105,7 +117,7 @@ export function trackChildProcess(child, { label, captureOutput = true, scope } 
     signal: child.signalCode ?? null,
     spawnError: null,
     output: { stdout: '', stderr: '' },
-    outputTruncated: false,
+    outputTruncated: { stdout: false, stderr: false },
   };
   if (tracked.exitCode !== null || tracked.signal !== null) tracked.exitedAt = tracked.startedAt;
   target.processes.push(tracked);
@@ -130,15 +142,20 @@ export function trackChildProcess(child, { label, captureOutput = true, scope } 
   return tracked;
 }
 
-const SECRET_LABEL = /(["']?(?:token|api[_-]?key|secret|password|passwd|authorization|bearer|credential)s?["']?\s*[:=]\s*)(["']?)([^\s"',;}\]]{4,})/gi;
-const SECRET_VALUE = /\b(?:sk|gho|ghp|ghs|ghr|xox[baprs])-[A-Za-z0-9_-]{8,}\b/g;
+const SECRET_LABEL =
+  /(["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?["']?\s*[:=]\s*)(?:"([^"\n]{4,})"|'([^'\n]{4,})'|(?:(?:Bearer|Basic)\s+)?([^\s"',;}\]]{4,}))/gi;
+const BEARER_TOKEN = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}\b/gi;
+const SECRET_VALUE = /\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b/g;
+const JWT = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b/g;
 const AWS_KEY = /\bAKIA[0-9A-Z]{16}\b/g;
 
 /** Redact credential-shaped values; safe for bounded child output tails. */
 export function redactDiagnosticText(text) {
   return String(text)
-    .replace(SECRET_LABEL, '$1$2[REDACTED]')
+    .replace(SECRET_LABEL, '$1[REDACTED]')
+    .replace(BEARER_TOKEN, 'Bearer [REDACTED]')
     .replace(SECRET_VALUE, '[REDACTED]')
+    .replace(JWT, '[REDACTED]')
     .replace(AWS_KEY, '[REDACTED]');
 }
 
@@ -164,8 +181,14 @@ function errorText(error) {
 /** Vitest per-test/per-hook timeouts and the harness's own step deadline. */
 export function isTimeoutError(error) {
   if (error instanceof FixtureStepTimeoutError) return true;
+  // Vitest serializes result errors into null-prototype clones (processError
+  // → serializeValue), so the class identity is gone but `name` survives.
+  if (error !== null && typeof error === 'object' && error.name === 'FixtureStepTimeoutError') return true;
   const message = errorText(error);
-  return /\b(?:test|hook|fixture step)\b[^.\n]*timed out in \d+ms/i.test(message);
+  return (
+    /\b(?:test|hook|fixture step)\b[^.\n]*timed out in \d+ms/i.test(message) ||
+    /\bfixture step\b[^.\n]*exceeded its \d+ms deadline/i.test(message)
+  );
 }
 
 function formatMs(ms) {
@@ -212,24 +235,33 @@ export function renderFailureDiagnostics(scope, error, { timedOut } = {}) {
     `  elapsed: ${formatMs(elapsed)} (${timeout ? 'timeout' : 'failure'}${hookPhase ? ', hook/setup phase' : ''})`,
   );
   lines.push(`  error: ${firstLine(message)}`);
-  const lastStep = target.steps.at(-1);
+  const lineage = scopeLineage(target);
+  // File-scope children (started in beforeAll) render first; the test's own
+  // children last, so the newest evidence survives the per-process cap.
+  const allProcesses = [...lineage].reverse().flatMap((scope) => scope.processes);
+  const lastStep = lineage
+    .flatMap((scope) => scope.steps)
+    .reduce(
+      (latest, step) => (latest === undefined || step.completedAt >= latest.completedAt ? step : latest),
+      undefined,
+    );
   if (lastStep === undefined) {
     lines.push('  last completed fixture step: none recorded');
   } else {
     lines.push(
-      `  last completed fixture step: "${lastStep.label}" at +${formatMs(lastStep.completedAt - target.startedAt)} ` +
+      `  last completed fixture step: "${lastStep.label}" at +${formatMs(Math.max(0, lastStep.completedAt - target.startedAt))} ` +
         `(${formatMs(now - lastStep.completedAt)} before this report)`,
     );
   }
-  if (target.processes.length === 0) {
+  if (allProcesses.length === 0) {
     lines.push('  owned children tracked: none');
   } else {
-    lines.push(`  owned children tracked: ${target.processes.length}`);
+    lines.push(`  owned children tracked: ${allProcesses.length}`);
     // Every tracked child stays disposable at teardown; only the render is
     // capped, naming the overflow explicitly.
-    const shown = target.processes.slice(-PROCESS_LIMIT);
-    if (target.processes.length > shown.length) {
-      lines.push(`    ... ${target.processes.length - shown.length} earlier owned children not listed`);
+    const shown = allProcesses.slice(-PROCESS_LIMIT);
+    if (allProcesses.length > shown.length) {
+      lines.push(`    ... ${allProcesses.length - shown.length} earlier owned children not listed`);
     }
     for (const tracked of shown) {
       const state =
@@ -242,14 +274,20 @@ export function renderFailureDiagnostics(scope, error, { timedOut } = {}) {
       for (const streamName of ['stdout', 'stderr']) {
         const tail = tracked.output[streamName];
         if (tail !== '') {
-          const suffix = tracked.outputTruncated ? ' [truncated to last bytes]' : '';
+          const suffix = tracked.outputTruncated[streamName] ? ' [truncated to last bytes]' : '';
           lines.push(`      ${streamName} tail${suffix}: ${tailExcerpt(tail)}`);
         }
       }
     }
   }
   const rendered = redactDiagnosticText(lines.join('\n'));
-  return rendered.length > RENDER_LIMIT ? `${rendered.slice(0, RENDER_LIMIT)}\n...[diagnostics truncated]` : rendered;
+  if (rendered.length <= RENDER_LIMIT) return rendered;
+  // Keep the head (identity, elapsed, last step) AND the tail (the freshest
+  // owned-child evidence): elide the middle instead of the ending.
+  const marker = '\n...[diagnostics truncated]...\n';
+  const keep = RENDER_LIMIT - marker.length;
+  const head = Math.floor(keep / 2);
+  return `${rendered.slice(0, head)}${marker}${rendered.slice(rendered.length - (keep - head))}`;
 }
 
 function waitForExit(child, ms) {
@@ -266,11 +304,18 @@ function waitForExit(child, ms) {
 /**
  * Bounded teardown for fixture-owned children only: SIGTERM, wait
  * `graceMs`, then SIGKILL, wait `killGraceMs`. Untracked/foreign
- * processes are never touched.
+ * processes are never touched. The whole disposal shares one
+ * `totalMs` deadline, so a test that leaked many stuck children cannot
+ * push the teardown hook past its own budget; every child still gets a
+ * SIGTERM and a SIGKILL attempt, and an unreaped one is reported.
  */
-export async function disposeScopeProcesses(scope, { graceMs = 2_000, killGraceMs = 1_000 } = {}) {
+export async function disposeScopeProcesses(
+  scope,
+  { graceMs = 2_000, killGraceMs = 1_000, totalMs = 15_000 } = {},
+) {
   const target = scopeOf(scope);
   if (target === null) return [];
+  const deadline = Date.now() + totalMs;
   const results = [];
   for (const tracked of target.processes) {
     const { child, label, pid } = tracked;
@@ -283,14 +328,16 @@ export async function disposeScopeProcesses(scope, { graceMs = 2_000, killGraceM
     } catch {
       /* already gone */
     }
-    let exited = await waitForExit(child, graceMs);
+    const remaining = deadline - Date.now();
+    let exited = remaining > 0 ? await waitForExit(child, Math.min(graceMs, remaining)) : false;
     if (!exited) {
       try {
         child.kill('SIGKILL');
       } catch {
         /* already gone */
       }
-      exited = await waitForExit(child, killGraceMs);
+      const remainingAfterKill = deadline - Date.now();
+      exited = remainingAfterKill > 0 ? await waitForExit(child, Math.min(killGraceMs, remainingAfterKill)) : false;
     }
     results.push({ label, pid, disposition: exited ? 'reaped' : 'unreaped' });
   }
