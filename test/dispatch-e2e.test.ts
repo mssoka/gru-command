@@ -197,6 +197,9 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     expect(minion?.prompts[0]?.text).toContain('Dispatch briefing — job widget-polish');
     expect(minion?.prompts[0]?.text).toContain('Acceptance: tests pass.');
     expect(minion?.prompts[0]?.text).toContain(outcome.worktree.branch!);
+    // The dispatched contract carries the current non-draft PR rule.
+    expect(minion?.prompts[0]?.text).toContain('ordinary, non-draft PR');
+    expect(minion?.prompts[0]?.text).toContain('gh pr create without --draft/-d');
 
     // The lane: branch-for-jobs, registered through the port.
     expect(outcome.worktree.branch).toBe('gru/widget-polish');

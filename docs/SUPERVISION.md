@@ -40,6 +40,34 @@ silence threshold and resets the clock rather than killing the process
 growth, and no live tool is still hung and climbs the ladder; a probe
 error reads as live.
 
+**An open native compaction is waited for, never silence-restarted.**
+Provider compaction (`compaction_start` … `compaction_end`) can run
+silent far longer than a normal turn, so while it is open the silence
+threshold does not climb the restart ladder: at the threshold the
+supervisor makes at most ONE factual FYI attempt per episode
+(`supervision.native-compaction-wait` — "compaction has not reported
+completion; continuing to wait", `fyi`/info — no owner bell, and no
+machine wake under the default action-required wake policy; an explicit
+`notify_wake=all` configuration routes every notification kind, this FYI
+included) and keeps waiting. The attempt is best-effort at-most-one: the
+episode latch is set before the synchronous post, so a post that throws
+— before the row persists or after it — is never retried, and repeated
+ticks cannot duplicate the FYI. Repeated ticks and duplicate start
+signals never warn twice within one episode;
+`compaction_end` (success or failure) clears the latch and the warning
+state through the existing ownership path, so the next genuine episode
+may warn once again. Waiting is indefinite by design — a truly stalled
+provider is out-waited, and the owner's manual stop/reset remains the way
+to end one; there is no second automatic deadline. This exclusion is
+silence-only: a genuine fatal error, an explicit owner control, or a
+known provider-error control still lands during open compaction, and an
+independently authorized review-isolation deadline still aborts an
+isolated review attempt with an open compaction (no ordinary replacement
+spawns). A silence
+classification already in flight when compaction starts is discarded as
+stale, so old silence evidence can never kill a handle that entered
+compaction.
+
 **Sleep/wake is not a hang.** A watchdog tick separated from the
 previous one by a wall-clock gap beyond the tick cadence means the
 machine was suspended; every open turn gets a fresh silence window, a
@@ -81,25 +109,6 @@ reset failure.
 the adapter contract already recovers on the next turn. Only hangs and
 fatal errors climb.
 
-**Proactive compaction, provider-gated.** Large sessions must not have
-pi's threshold compaction fire mid-turn into a provider outage: the
-summary call itself is a model call, and a hung summary used to march a
-session up the restart ladder and drop the owner chat. When a supervised
-session is IDLE at a turn boundary and runtime-reported context usage
-crosses `proactive_compact_percent` (default 70), the supervisor calls
-the runtime's `compact()` explicitly. While a provider-wall or
-stream-error condition holds for that session (an error not yet cleared
-by a clean turn), attempts are deferred: one durable
-`supervision.compaction-deferred` ledger event records the deferral, and
-the retry waits for a clean turn to prove recovery. A failed attempt
-marks the session degraded (its supervision view reports
-`compactionDegraded`, the ledger carries `supervision.compaction-degraded`
-or `supervision.compaction-deferred`) and never climbs the restart
-ladder — the session stays connected through the outage. Pi's own
-threshold compaction stays enabled as the backstop, and explicit and
-pi-initiated compactions are both bounded by an adapter deadline (5 min)
-that aborts a silent summary call instead of wedging the session.
-
 **Crash-loop breaker.** ≥ `max_restarts` (default 3) restarts within a
 rolling `restart_window_ms` (default 10 min) trips the breaker: the agent
 is **stopped** (no further restarts), a **needs-owner** notification
@@ -119,7 +128,6 @@ agent across a service restart.
 | `restart_window_ms` | `600000` | rolling breaker window |
 | `max_restarts` | `3` | restarts allowed per window before the breaker trips |
 | `restart_backoff_ms` | `2000` | base backoff between failed rungs (doubling, 60 s cap) |
-| `proactive_compact_percent` | `70` | idle session at this context-usage percent compacts proactively (1-100) |
 
 `/health` carries the full supervision state under `supervision`:
 per-agent state (`watching`/`restarting`/`stopped`), restart counts, breaker
@@ -213,6 +221,16 @@ owns un-hanging the turn itself; `timeoutMs` is caller-side relief.
 agent climbs the ladder and is restored (resumed from its session file);
 three fast failures trip the breaker exactly once with a needs-owner
 notification; an ack re-arms; in-band errors never restart. The same
+suite pins the compaction wait policy: an open silent compaction holding
+a real pending-turn snapshot warns at most once per episode and is never
+restarted (same handle retained, no pending-turn take or re-delivery, no
+breaker, no fake progress — lastEventAt stays at the real start),
+duplicate start signals warn once per episode, `compaction_end` re-arms
+the warning for the next episode, a stale silence decision returning
+after compaction started is discarded, a synchronous warning-post
+failure (before persistence or after a durable row) neither duplicates
+the FYI nor restarts the handle, and a fatal error or an
+isolated-review deadline still lands during open compaction. The same
 suite pins the hung-turn follow-ups: a live open tool never trips the
 watchdog, heartbeats keep a quiet run alive, an interrupted turn is
 re-delivered on the resumed session, an unresumable turn posts its
@@ -224,11 +242,3 @@ heartbeats end to end and answers the live-process probe.
 (post → show → ack → events + board snapshot fields). OS units are
 covered by `install.sh --print` rendering tests (path escaping,
 placeholder substitution).
-
-The compaction gate has its own pinned coverage: the idle-boundary
-percent trigger (fires at the threshold, once per idle window), provider
-deferral with exactly one deferred-retry ledger event and
-retry-after-clean-turn, and zero restart-ladder events on compaction
-failure. The pi adapter suite bounds both an explicit compaction and a
-silent pi-auto compaction at their deadline and proves the session stays
-usable.
