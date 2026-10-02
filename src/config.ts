@@ -1392,7 +1392,12 @@ function readPacingConfig(
   let providers = defaults.providers;
   if (table['providers'] !== undefined) {
     const providersTable = requireTable(table['providers'], file, `${section}.providers`);
-    const parsed: Record<string, PacingProviderOverride> = {};
+    // Null-prototype map: a provider id like "__proto__" must land as an
+    // own entry, never mutate the map's prototype or vanish silently.
+    const parsed: Record<string, PacingProviderOverride> = Object.create(null) as Record<
+      string,
+      PacingProviderOverride
+    >;
     for (const [providerId, entry] of Object.entries(providersTable)) {
       if (providerId.trim() === '') {
         throw new ConfigError(

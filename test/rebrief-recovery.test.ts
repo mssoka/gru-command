@@ -358,6 +358,36 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
   });
 
+  it('a shutdown-cancelled settlement keeps the markers pending for the next boot', async () => {
+    const h = makeHarness();
+    const jobId = 'shutdown-settlement-job';
+    await seedPendingRebrief({ h, jobId });
+    const controller = new AbortController();
+    let hookEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { hookEntered = resolve; });
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: h.ledger,
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+        stopSignal: controller.signal,
+        retrySettlement: () => { hookEntered(); return new Promise<'recovered'>(() => {}); },
+        stopping: () => true,
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    await entered;
+    controller.abort();
+    await report.settled;
+    // Markers clear ONLY when the events land: a shutdown-cancelled
+    // settlement leaves both for the next boot and posts no incident.
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.listNotifications().some((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`)).toBe(false);
+  });
+
   it('records only the lost delivery when silas.rebrief already landed', async () => {
     const h = makeHarness();
     const jobId = 'delivery-only-job';

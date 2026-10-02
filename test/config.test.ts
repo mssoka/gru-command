@@ -888,6 +888,18 @@ describe('pacing config (FIFO admission caps + rate-limit backoff; owner heist 2
     });
   });
 
+  it('keeps a __proto__ provider id as an own entry instead of dropping it silently', () => {
+    const home = tmpHome();
+    writeConfig(
+      home,
+      ['[pacing]', '[pacing.providers."__proto__"]', 'rate_limit_patterns = ["429"]', ''].join('\n'),
+    );
+    const parsed = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').pacing.providers;
+    expect(Object.prototype.hasOwnProperty.call(parsed, '__proto__')).toBe(true);
+    expect(parsed['__proto__']).toEqual({ rateLimitPatterns: ['429'] });
+    expect(Object.getPrototypeOf(parsed)).toBeNull();
+  });
+
   it('keeps resident concurrency and turn pacing independent when both sections are present', () => {
     const home = tmpHome();
     writeConfig(home, '[concurrency]\nmax_workers = 4\n[pacing]\nmax_concurrent_minions = 2\nmax_concurrent_review_turns = 1\n');

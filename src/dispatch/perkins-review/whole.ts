@@ -778,9 +778,12 @@ export class PerkinsWholeReview {
         ...(this.pacingOptions.pacingSleep !== undefined ? { sleep: this.pacingOptions.pacingSleep } : {}),
         ...(this.pacingOptions.pacingJitter !== undefined ? { jitter: this.pacingOptions.pacingJitter } : {}),
         record: (event) => {
-          const payload = { ...event.payload, round_id: input.roundId, label, agent_id: handle.id };
-          writeReviewArtifact(review, `pacing/${randomUUID()}.json`, { kind: event.kind, ...payload });
-          this.pacingOptions.recordPacing?.({ kind: event.kind, agentId: handle.id, payload });
+          // Ledger payloads stay canonical across both producers (the
+          // supervisor and this workflow loop): per-producer context rides
+          // the event envelope, never the payload (pacing.ts contract).
+          // The round artifact keeps the fuller context for local evidence.
+          writeReviewArtifact(review, `pacing/${randomUUID()}.json`, { kind: event.kind, ...event.payload, round_id: input.roundId, label, agent_id: handle.id });
+          this.pacingOptions.recordPacing?.({ kind: event.kind, agentId: handle.id, payload: event.payload });
         },
       });
     };
@@ -1260,7 +1263,10 @@ export class PerkinsWholeReview {
           // WITHOUT a review slot (the combined cap would be exceeded).
           for (const result of childResults) undeliveredRuns.add(result.resultId);
           commitResults();
-          void lead?.dispose();
+          // Fire-and-forget disposal must not surface as an unhandled
+          // rejection (main exits 1 on one); the wave's own error is the
+          // outcome that matters and it is thrown below.
+          void lead?.dispose().catch(() => {});
           throw acquireError instanceof Error ? acquireError : new Error(String(acquireError));
         }
         commitResults();
@@ -1619,7 +1625,7 @@ export class PerkinsWholeReview {
       unsubscribe = lead.subscribe((event) => {
         if (event.type === 'turn_end') {
           turns += 1;
-          if (turns > MAX_LEAD_TURNS) void lead?.dispose();
+          if (turns > MAX_LEAD_TURNS) void lead?.dispose().catch(() => {});
         }
       });
       await retryPrompt(lead, initialPrompt, LEAD_TOTAL_TIMEOUT_MS, 'lead', [input.signal],

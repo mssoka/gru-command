@@ -401,4 +401,32 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     holder.release();
     expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
   });
+
+  it('a post-prompt abort on the re-brief path rejects before any delivery is recorded', async () => {
+    const controller = new AbortController();
+    const prompted: string[] = [];
+    const handle = {
+      id: 'minion-rebrief-cancel', sessionFile: '/sessions/rebrief-cancel.jsonl',
+      prompt: async (text: string) => { prompted.push(text); },
+      dispose: async () => {},
+    };
+    const routing = rebriefFreshMinion({
+      registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      note: 'resume',
+      briefing: 'original contract',
+      signal: controller.signal,
+      retrySettlement: () => new Promise<'recovered'>(() => {}),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(prompted).toHaveLength(1);
+    controller.abort();
+    await expect(routing).rejects.toThrow(/cancelled before its automatic retries settled/);
+  });
 });

@@ -517,4 +517,68 @@ describe('worker delivery settlement through the dispatcher', () => {
       expect(api.listJobEvents('job-rejected').some((event) => event.kind === 'job.delivered')).toBe(true);
     } finally { close(); }
   });
+
+  it('a settlement cancelled by shutdown blocks the lane and never records delivery', async () => {
+    const repo = makeFixtureRepo('pacing-dispatch-cancelled');
+    repos.push(repo);
+    const root = mkdtempSync(join(tmpdir(), 'pacing-dispatch-cancelled-lanes-'));
+    dirs.push(root);
+    const { api, close } = ledgerIn();
+    const controller = new AbortController();
+    try {
+      const minion = makeFakeMinion('minion-cancelled');
+      let hookEntered!: () => void;
+      const entered = new Promise<void>((resolve) => { hookEntered = resolve; });
+      const service = new DispatchService({
+        ledger: api,
+        worktrees: new InMemoryWorktreePort(root),
+        spawner: async () => minion.handle,
+        stopSignal: controller.signal,
+        retrySettlement: () => { hookEntered(); return new Promise<'recovered'>(() => {}); },
+      });
+      const outcome = await service.dispatch({
+        jobId: 'job-cancelled', repoPath: repo.path, title: 'cancelled', briefing: 'brief',
+      });
+      minion.settle();
+      await entered;
+      controller.abort();
+      await expect(outcome.settled).resolves.toMatchObject({
+        ok: false,
+        error: 'dispatch stopped before the automatic retries settled',
+      });
+      expect(api.getJob('job-cancelled')?.status).toBe('blocked');
+      expect(api.getJob('job-cancelled')?.note).toContain('pacing: dispatch stopped before the automatic retries settled');
+      expect(api.listJobEvents('job-cancelled').some((event) => event.kind === 'job.minion-error')).toBe(true);
+      expect(api.listJobEvents('job-cancelled').some((event) => event.kind === 'job.delivered')).toBe(false);
+    } finally { close(); }
+  });
+
+  it('a settlement-hook fault blocks the lane with the internal error instead of narrating retries', async () => {
+    const repo = makeFixtureRepo('pacing-dispatch-fault');
+    repos.push(repo);
+    const root = mkdtempSync(join(tmpdir(), 'pacing-dispatch-fault-lanes-'));
+    dirs.push(root);
+    const { api, close } = ledgerIn();
+    try {
+      const minion = makeFakeMinion('minion-fault');
+      const service = new DispatchService({
+        ledger: api,
+        worktrees: new InMemoryWorktreePort(root),
+        spawner: async () => minion.handle,
+        retrySettlement: () => { throw new Error('wiring fault'); },
+      });
+      const outcome = await service.dispatch({
+        jobId: 'job-fault', repoPath: repo.path, title: 'fault', briefing: 'brief',
+      });
+      minion.settle();
+      await expect(outcome.settled).resolves.toMatchObject({
+        ok: false,
+        error: expect.stringContaining('retry settlement unavailable'),
+      });
+      expect(api.getJob('job-fault')?.status).toBe('blocked');
+      expect(api.getJob('job-fault')?.note).toContain('pacing settlement unavailable — internal error');
+      expect(api.listJobEvents('job-fault').some((event) => event.kind === 'job.minion-error')).toBe(true);
+      expect(api.listJobEvents('job-fault').some((event) => event.kind === 'job.delivered')).toBe(false);
+    } finally { close(); }
+  });
 });

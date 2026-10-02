@@ -2645,4 +2645,49 @@ describe('pacing settlement across rejection, recovery, and slot retirement', ()
       h.dispose();
     }
   });
+
+  it('adopting an intentional replacement concludes the replaced record’s pending rate-limit settlement', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-adopt-settle',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options),
+      });
+      const handle = (await slot.ensure({})) as FakeHandle;
+      handle.pendingTurnSnapshot = { text: 'replaced turn', owner: null };
+      emitFailure(handle, '429 too many requests');
+      expect(sleeper.delays).toEqual([100]);
+      const settled = h.supervisor.awaitRetrySettlement(handle.id);
+      const fresh = new FakeHandle('gru', 'fresh-adopt-settle', null);
+      h.registry.adopt(fresh);
+      await slot.adoptReplacement(fresh);
+      await expect(settled).resolves.toBe('superseded');
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('retiring a stale slot record after an owner teardown concludes its pending rate-limit settlement', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-stale-settle',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options),
+      });
+      const first = (await slot.ensure({})) as FakeHandle;
+      first.pendingTurnSnapshot = { text: 'dead turn', owner: null };
+      emitFailure(first, '429 too many requests');
+      expect(sleeper.delays).toEqual([100]);
+      const settled = h.supervisor.awaitRetrySettlement(first.id);
+      await h.registry.disposeHandle(first);
+      await slot.ensure({});
+      await expect(settled).resolves.toBe('superseded');
+    } finally {
+      h.dispose();
+    }
+  });
 });

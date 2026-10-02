@@ -3798,7 +3798,17 @@ describe('provider pacing through WaveRunner', () => {
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
       const event = ledger.latestRoundEvent(result.round.id, 'pacing.auto-retry');
       expect(event?.jobId).toBe('pacing-wave');
-      expect(event?.payload).toMatchObject({ attempt: 1, max_auto_retries: 1, delay_ms: 1, label: 'lead' });
+      // Canonical payload across both producers; per-producer context rides
+      // the event envelope (roundId/agentId), never the payload.
+      expect(Object.keys(event?.payload as Record<string, unknown>).sort()).toEqual([
+        'attempt',
+        'delay_ms',
+        'error',
+        'max_auto_retries',
+      ]);
+      expect(event?.payload).toMatchObject({ attempt: 1, max_auto_retries: 1, delay_ms: 1 });
+      expect(event?.roundId).toBe(result.round.id);
+      expect(event?.agentId).toBeTruthy();
       expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
     } finally {
       await wave.shutdown();
