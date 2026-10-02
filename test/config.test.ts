@@ -199,7 +199,19 @@ describe('config fail-loud validation', () => {
   it('rejects unknown top-level keys', () => {
     const home = tmpHome();
     writeConfig(home, 'worskapce_root = "~/code"');
-    expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/unknown top-level key `worskapce_root`/);
+    try {
+      loadConfig({ GRU_COMMAND_HOME: home });
+      expect.unreachable('expected ConfigError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      const message = (error as ConfigError).message;
+      expect(message).toContain('unknown top-level key `worskapce_root`');
+      // The valid-key list must name each section exactly once (a duplicated
+      // entry both misreads the config and misleads the user debugging it).
+      const validKeys = /valid keys: (.+)\)/u.exec(message)?.[1]?.split(', ') ?? [];
+      expect(validKeys.length).toBeGreaterThan(0);
+      expect(new Set(validKeys).size).toBe(validKeys.length);
+    }
   });
 
   it('rejects wrong types', () => {
@@ -824,6 +836,127 @@ describe('verify config (contention fix 2026-09-22)', () => {
       '[verify]\nworker_budget = -1\n',
       '[verify]\nlock_wait_timeout_ms = 0\n',
       '[verify]\nrun_timeout_ms = -5\n',
+    ];
+    for (const text of bad) {
+      const h2 = tmpHome();
+      writeFileSync(join(h2, 'config.toml'), text, 'utf-8');
+      expect(() => loadConfig({ GRU_COMMAND_HOME: h2 }, '/home/tester'), text).toThrow(ConfigError);
+    }
+  });
+});
+
+describe('pacing config (FIFO admission caps + rate-limit backoff; owner heist 2026-09-29)', () => {
+  it('absent section ships enabled with unlimited admission caps', () => {
+    const home = tmpHome();
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.pacing).toEqual({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
+      backoffBaseMs: 1_000,
+      backoffMaxMs: 60_000,
+      maxAutoRetries: 5,
+      providers: {},
+    });
+  });
+
+  it('parses the brief-shaped [pacing] surface: enabled, caps, backoff, provider signatures', () => {
+    const home = tmpHome();
+    writeConfig(
+      home,
+      [
+        '[pacing]',
+        'enabled = true',
+        'max_concurrent_minions = 3',
+        'max_concurrent_review_turns = 3',
+        'backoff_base_ms = 250',
+        'backoff_max_ms = 5000',
+        'max_auto_retries = 3',
+        '[pacing.providers."provider-x"]',
+        'rate_limit_patterns = ["pacing code \\\\d+"]',
+        '',
+      ].join('\n'),
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').pacing).toEqual({
+      enabled: true,
+      maxConcurrentMinions: 3,
+      maxConcurrentReviewTurns: 3,
+      backoffBaseMs: 250,
+      backoffMaxMs: 5_000,
+      maxAutoRetries: 3,
+      providers: { 'provider-x': { rateLimitPatterns: ['pacing code \\d+'] } },
+    });
+  });
+
+  it('keeps a __proto__ provider id as an own entry instead of dropping it silently', () => {
+    const home = tmpHome();
+    writeConfig(
+      home,
+      ['[pacing]', '[pacing.providers."__proto__"]', 'rate_limit_patterns = ["429"]', ''].join('\n'),
+    );
+    const parsed = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').pacing.providers;
+    expect(Object.prototype.hasOwnProperty.call(parsed, '__proto__')).toBe(true);
+    expect(parsed['__proto__']).toEqual({ rateLimitPatterns: ['429'] });
+    expect(Object.getPrototypeOf(parsed)).toBeNull();
+  });
+
+  it('keeps resident concurrency and turn pacing independent when both sections are present', () => {
+    const home = tmpHome();
+    writeConfig(home, '[concurrency]\nmax_workers = 4\n[pacing]\nmax_concurrent_minions = 2\nmax_concurrent_review_turns = 1\n');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    expect(config.concurrency.maxWorkers).toBe(4);
+    expect(config.pacing).toMatchObject({ enabled: true, maxConcurrentMinions: 2, maxConcurrentReviewTurns: 1 });
+  });
+
+  it('a present section with absent keys takes the documented defaults (unlimited caps)', () => {
+    const home = tmpHome();
+    writeConfig(home, '[pacing]\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').pacing).toEqual({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
+      backoffBaseMs: 1_000,
+      backoffMaxMs: 60_000,
+      maxAutoRetries: 5,
+      providers: {},
+    });
+  });
+
+  it('enabled = false keeps the section parsed but the feature off', () => {
+    const home = tmpHome();
+    writeConfig(home, '[pacing]\nenabled = false\nmax_concurrent_minions = 3\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').pacing).toEqual({
+      enabled: false,
+      maxConcurrentMinions: 3,
+      maxConcurrentReviewTurns: 0,
+      backoffBaseMs: 1_000,
+      backoffMaxMs: 60_000,
+      maxAutoRetries: 5,
+      providers: {},
+    });
+  });
+
+  it('refuses garbage loudly (unknown keys, bad types, inverted ladder, bad patterns, aliases, both sections)', () => {
+    const bad: readonly string[] = [
+      '[pacing]\nunknown = 1\n',
+      '[pacing]\nenabled = "yes"\n',
+      '[pacing]\nmax_concurrent_minions = -1\n',
+      '[pacing]\nmax_concurrent_minions = 1.5\n',
+      '[pacing]\nmax_concurrent_review_turns = -1\n',
+      '[pacing]\nmax_auto_retries = -1\n',
+      '[pacing]\nmax_auto_retries = 1.5\n',
+      '[pacing]\nbackoff_base_ms = 0\n',
+      '[pacing]\nbackoff_max_ms = -5\n',
+      '[pacing]\nbackoff_base_ms = 2000\nbackoff_max_ms = 1000\n',
+      '[pacing]\nproviders = "nope"\n',
+      '[pacing.providers.""]\nrate_limit_patterns = ["x"]\n',
+      '[pacing.providers."provider-x"]\n',
+      '[pacing.providers."provider-x"]\nrate_limit_patterns = "x"\n',
+      '[pacing.providers."provider-x"]\nrate_limit_patterns = ["(unclosed"]\n',
+      '[pacing.providers."provider-x"]\nrate_limit_patterns = ["ok"]\nother = true\n',
+      '[pacing]\nmax_concurrent_minions = 3\nmax_workers = 3\n',
+      '[pacing]\nmax_concurrent_review_turns = 3\nmax_review_turns = 3\n',
+      '[concurrency]\nmax_concurrent_minions = 3\nmax_workers = 3\n',
     ];
     for (const text of bad) {
       const h2 = tmpHome();

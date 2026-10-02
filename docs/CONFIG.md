@@ -196,6 +196,33 @@ max_restarts = 3
 # Backoff base between failed restart rungs (doubles, capped at 60s).
 restart_backoff_ms = 2000
 
+# [pacing]
+# Provider pacing: FIFO admission caps for minion and Perkins review
+# turns (queued waits are carried in the board snapshot data; live turns are never preempted),
+# plus bounded automatic retry for the rate-limit error class
+# (HTTP 429, "rate limit", "too many requests", throttling). Every
+# automatic retry is recorded as a pacing.auto-retry ledger event.
+# Full ledger vocabulary: pacing.queued, pacing.admitted,
+# pacing.wait-cancelled, pacing.queued-rollback, pacing.auto-retry,
+# pacing.auto-retry-recovered, pacing.auto-retry-exhausted.
+# Enabled by default with unlimited admission caps. Suggested starting
+# point: cap minion and review turns at 3; 1s backoff, capped at 60s,
+# 5 retries.
+# max_auto_retries = 0 disables automatic retry (admission caps stay active).
+# Caps count MINION and Perkins review turns only: silas/bob/distiller/
+# chat core turns are outside this pool (the board view is not a
+# provider-wide count).
+# max_concurrent_minions = 3
+# max_concurrent_review_turns = 3   # 0 = unlimited
+# backoff_base_ms = 1000
+# backoff_max_ms = 60000
+# max_auto_retries = 5
+# enabled = true
+# Optional provider-keyed extra signatures (global text signatures):
+# [pacing.providers."<provider-id>"]
+# rate_limit_patterns = ["pacing code \\d+"]
+# [concurrency] controls resident sessions separately from these turn caps.
+
 [logging]
 # service.log size-based rotation.
 max_bytes = 10485760
@@ -275,6 +302,41 @@ stall_threshold_ms = 1800000
 directive_at = 2
 rebrief_at = 3
 escalate_at = 4
+
+[provider_recovery]
+# Provider-recovery sensor (owner-approved 2026-09-28): watches EXPLICIT
+# temporary provider waits on supported routes (v1: the zai-coding-cn
+# GLM coding route), probes each exact provider/model/credential binding
+# on a shared bounded cadence (a tiny no-history/no-tools generation,
+# ≤64 output tokens, no hidden retries), and on completed producer
+# evidence wakes Silas once to claim guarded continuations — no owner
+# ACK for eligible waits. DISABLED BY DEFAULT: owner activation is
+# manual. Auth/billing/ambiguous failures and unsupported providers
+# always stay owner-controlled.
+enabled = false
+# Sensor tick (how often routes are re-examined). The check cadence
+# itself cannot go below the approved 300 s floor.
+tick_interval_ms = 30000
+cadence_min_ms = 300000
+# Rolling probe budget per route (approval cap: 12/hour; config may
+# only lower it). Trustworthy provider Retry-After hints reschedule
+# within [cadence_min_ms, retry_after_max_ms].
+max_attempts_per_hour = 12
+probe_backoff_base_ms = 60000
+probe_backoff_max_ms = 1800000
+# Bounded false-recovery ladder: after this many recovered-
+# then-re-hit continuations the route escalates to Gru (action-
+# required) and probing suspends for suspension_ms.
+false_recovery_escalate_at = 3
+suspension_ms = 21600000
+retry_after_max_ms = 3600000
+# Finite timeout for one probe I/O (generation or metadata read); also
+# bounds the durable pre-I/O reservation expiry.
+probe_timeout_ms = 30000
+# GLM bounded generation fallback (<=64 output tokens, no history/tools,
+# no hidden retries). The owner overlay keeps it DISABLED in production:
+# false means GLM checks fail closed (no readiness endpoint exists yet).
+glm_generation_fallback = false
 
 [roll]
 # Graceful self-roll drain policy: how long the service waits for

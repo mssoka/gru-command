@@ -5,7 +5,7 @@ import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   assertFrozenPromptBounds,
   freezeReviewInputs,
@@ -18,10 +18,11 @@ import {
 } from '../src/dispatch/perkins-review/artifacts.js';
 import { loadPerkinsPolicy, PERKINS_LENSES, PERKINS_POLICY_SHA256 } from '../src/dispatch/perkins-review/policy.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../src/config.js';
-import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult } from '../src/dispatch/perkins-review/whole.js';
+import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult, type PerkinsWholeReviewOptions } from '../src/dispatch/perkins-review/whole.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { PacingGate, type PacingAcquireInput, type PacingLease } from '../src/runtime/pacing.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall, type WholeSubmission } from './helpers/perkins-whole-double.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
 
@@ -61,7 +62,14 @@ interface WholeHarness {
 
 function wholeHarness(
   brain: WholeLeadOptions,
-  options?: { noSpec?: boolean; spec?: string; priorConsolidatedFile?: string; beforeFreeze?: (repo: FixtureRepo) => void },
+  options?: {
+    noSpec?: boolean;
+    spec?: string;
+    priorConsolidatedFile?: string;
+    beforeFreeze?: (repo: FixtureRepo) => void;
+    reviewGate?: PacingGate;
+    pacing?: Pick<PerkinsWholeReviewOptions, 'rateLimitBackoff' | 'recordPacing' | 'pacingSleep' | 'pacingJitter' | 'pacingNow'>;
+  },
 ): WholeHarness {
   const fixture = makeReviewRepo();
   repos.push(fixture.repo);
@@ -81,7 +89,12 @@ function wholeHarness(
       : { spec: options?.spec ?? 'return 43' }),
   });
   const fake = fakeWholeSpawner(temp('perkins-whole-sessions-'), brain);
-  const engine = new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+  const engine = new PerkinsWholeReview({
+    spawner: fake.spawner,
+    policy: loadPerkinsPolicy(),
+    ...(options?.reviewGate !== undefined ? { reviewGate: options.reviewGate } : {}),
+    ...(options?.pacing ?? {}),
+  });
   return {
     ...fixture,
     base,
@@ -1755,4 +1768,281 @@ describe('wave refusals never consume lens or round budget (H1)', () => {
     const refusals = h.fake.toolErrors.filter((entry) => entry.error.includes('admitted wave'));
     expect(refusals.length).toBeGreaterThanOrEqual(3); // the stubborn re-issues happened
   }, 120_000);
+});
+
+describe('provider pacing: combined review-turn gate (owner heist 2026-09-29)', () => {
+  it('a lead waiting on its lens wave yields its slot: the round cannot wedge and the cap still holds (r5 liveness)', async () => {
+    const events: string[] = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 2,
+      record: (event) => events.push(event.kind),
+    });
+    // A concurrent round's lead holds one of the two combined slots for the
+    // whole window — the shape that wedged every concurrent round before the
+    // lead-yield fix (holders: concurrent lead + this lead = 2/2, and the
+    // wave's child could never be admitted).
+    const concurrentLead = await gate.acquireReviewTurn({ id: 'other-round', label: 'other lead' });
+    let peak = 0;
+    try {
+      const h = wholeHarness(
+        {
+          childAnswer: () => {
+            peak = Math.max(peak, gate.view().review.running);
+            return '[]';
+          },
+          specialists: ['blind', 'edge'],
+        },
+        { reviewGate: gate },
+      );
+      const running = h.run();
+      // Liveness probe, scoped to the one thing under test: with the lead
+      // yielding, the wave's first child spawns as soon as the pool runs.
+      // Without the yield it can NEVER spawn (both slots held), so this
+      // waits out and fails — no wall-clock bound on the rest of the round.
+      await vi.waitFor(() => expect(h.childCalls.length).toBeGreaterThan(0), { timeout: 20_000 });
+      const result = await running;
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      expect(h.childCalls).toHaveLength(2);
+      // The wave's second lens waited FIFO for the first to release —
+      // throttled, never failed, never wedged; the combined cap never broke.
+      expect(events).toContain('pacing.queued');
+      expect(events).toContain('pacing.admitted');
+      expect(peak).toBe(2);
+      // Only the concurrent lead's slot remains: the round's own lead
+      // re-acquired after the wave and released on disposal.
+      expect(gate.view().review.running).toBe(1);
+      expect(gate.view().review.queued).toHaveLength(0);
+    } finally {
+      concurrentLead.release();
+    }
+    expect(gate.view().review.running).toBe(0);
+  });
+
+  it('runs an unlimited review gate without any queue events (behavior-preserving default)', async () => {
+    const events: string[] = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => events.push(event.kind),
+    });
+    const h = wholeHarness(
+      { childAnswer: () => '[]', specialists: ['blind', 'edge'] },
+      { reviewGate: gate },
+    );
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(events).toEqual([]);
+  });
+
+  it('a failed lead-slot re-acquire keeps the settled lens runs committed (T13/R17)', async () => {
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 2,
+      record: (event) => {
+        if (event.kind === 'pacing.queued' && (event.payload as { id?: string } | undefined)?.id === 'lead') {
+          throw new Error('pacing recorder unavailable');
+        }
+      },
+    });
+    // One slot is held for the whole round, so when the wave ends the freed
+    // slot goes to the external FIFO waiter below and the lead's re-acquire
+    // has to queue — where the recorder then fails it.
+    const holder = await gate.acquireReviewTurn({ id: 'holder', label: 'holder' });
+    let releaseChild!: () => void;
+    const childGate = new Promise<void>((resolve) => { releaseChild = resolve; });
+    try {
+      const h = wholeHarness(
+        {
+          childAnswer: async () => {
+            await childGate;
+            return '[]';
+          },
+          specialists: ['blind', 'edge'],
+        },
+        { reviewGate: gate },
+      );
+      const running = h.run();
+      await vi.waitFor(() => expect(gate.view().review.queued).toHaveLength(1), { timeout: 20_000 });
+      const external = gate.acquireReviewTurn({ id: 'external', label: 'external' });
+      await vi.waitFor(() => expect(gate.view().review.queued).toHaveLength(2), { timeout: 20_000 });
+      releaseChild();
+      // The failed re-acquire ends the round (the lead is disposed), so the
+      // host rejects instead of returning a result — but the settled lens
+      // wave stays committed: both children really ran once each and their
+      // complete run records survive under the round's artifact directory
+      // (never erased or re-executed by the failed re-acquire).
+      await expect(running).rejects.toThrow(/lead session disposed/);
+      expect(h.toolErrors.some((entry) =>
+        entry.tool === 'perkins_run_specialists' && /pacing recorder unavailable/.test(entry.error),
+      )).toBe(true);
+      expect(h.leadCalls).toHaveLength(1);
+      expect(h.leadCalls[0]?.disposed).toBe(true);
+      expect(h.childCalls).toHaveLength(2);
+      const childRecords = readdirSync(join(h.frozen.directory, 'children'))
+        .filter((name) => name.endsWith('.json'))
+        .map((name) => JSON.parse(readFileSync(join(h.frozen.directory, 'children', name), 'utf8')) as { lens: string; status: string });
+      expect(childRecords.map((record) => record.lens).sort()).toEqual(['blind', 'edge']);
+      expect(childRecords.every((record) => record.status === 'valid')).toBe(true);
+      (await external).release();
+    } finally {
+      holder.release();
+    }
+  });
+});
+
+
+
+describe('provider pacing: workflow rate-limit retry and cleanup', () => {
+  it('lead and lens in-band rate limits retry automatically, release slots during backoff, and record evidence', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 1 });
+    const failures = new Set<string>();
+    const events: string[] = [];
+    const delays: number[] = [];
+    const h = wholeHarness({ childAnswer: () => '[]', specialists: ['edge'],
+      promptError: (call) => {
+        if (failures.has(call.agentId)) return null;
+        failures.add(call.agentId);
+        return '429 too many requests';
+      },
+    }, { reviewGate: gate, pacing: {
+      rateLimitBackoff: { baseMs: 100, maxMs: 300, maxRetries: 2, patterns: [] },
+      recordPacing: (event) => events.push(event.kind), pacingJitter: () => 0,
+      pacingSleep: async (ms) => { delays.push(ms); expect(gate.view().review.running).toBe(0); },
+    } });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(delays).toEqual([100, 100]);
+    // The lead's retry prompt runs the lens wave, so the lens retry and its
+    // recovery land inside the lead's turn: retry(lead), retry(lens),
+    // recovered(lens), recovered(lead).
+    expect(events).toEqual([
+      'pacing.auto-retry', 'pacing.auto-retry',
+      'pacing.auto-retry-recovered', 'pacing.auto-retry-recovered',
+    ]);
+    expect(h.leadCalls).toHaveLength(1);
+    expect(h.childCalls).toHaveLength(1); // transport retries do not burn policy lens attempts
+    expect(result.specialistRuns).toMatchObject([{ attempt: 1, status: 'valid' }]);
+    expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
+    expect(readdirSync(join(result.artifactDirectory, 'pacing'))).toHaveLength(4);
+  });
+
+  it('lead rate-limit retries exhaust at the configured bound and retain the original failure', async () => {
+    let calls = 0;
+    const events: string[] = [];
+    const delays: number[] = [];
+    const h = wholeHarness({ childAnswer: () => '[]', specialists: [], onLeadStart: () => { calls += 1; throw new Error('429 rate limit'); } }, {
+      pacing: { rateLimitBackoff: { baseMs: 100, maxMs: 150, maxRetries: 2, patterns: [] },
+        recordPacing: (event) => events.push(event.kind), pacingJitter: () => 0,
+        pacingSleep: async (ms) => { delays.push(ms); } },
+    });
+    await expect(h.run()).rejects.toThrow('429 rate limit');
+    expect(calls).toBe(3);
+    expect(delays).toEqual([100, 150]);
+    expect(events).toEqual(['pacing.auto-retry', 'pacing.auto-retry', 'pacing.auto-retry-exhausted']);
+    expect(h.leadCalls[0]?.disposed).toBe(true);
+  });
+
+  it('non-rate-limit lead errors are not retried', async () => {
+    const sleep = vi.fn();
+    const h = wholeHarness({ childAnswer: () => '[]', specialists: [], onLeadStart: () => { throw new Error('401 unauthorized'); } }, {
+      pacing: { rateLimitBackoff: { baseMs: 100, maxMs: 150, maxRetries: 2, patterns: [] }, pacingSleep: sleep },
+    });
+    await expect(h.run()).rejects.toThrow('401 unauthorized');
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('rejecting lead disposal still returns every pacing lease', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 1 });
+    const h = wholeHarness({ childAnswer: () => '[]', specialists: [], disposeRejects: (call) => call.options.reviewLead !== undefined }, { reviewGate: gate });
+    await expect(h.run()).rejects.toThrow('simulated session dispose failure');
+    expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
+  });
+
+  it('disabled pacing keeps the normal lens fan-out even with configured caps', async () => {
+    const gate = new PacingGate({ enabled: false, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 1 });
+    let firstWave = 0;
+    let starts = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const h = wholeHarness({ specialists: ['blind', 'edge'], childAnswer: async () => {
+      if (++starts === 2) { firstWave = gate.view().review.running; release(); }
+      await barrier;
+      return '[]';
+    } }, { reviewGate: gate });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(firstWave).toBe(2);
+    expect(gate.view().review).toMatchObject({ limit: 0, running: 0, queued: [] });
+  });
+  it('a failed lead re-acquire ends the round instead of running later turns ungated (r5 edge#0)', async () => {
+    class FailingReacquireGate extends PacingGate {
+      calls = 0;
+      override acquireReviewTurn(input: PacingAcquireInput): Promise<PacingLease> {
+        this.calls += 1;
+        if (this.calls === 3) return Promise.reject(new Error('review slot re-acquire unavailable'));
+        return super.acquireReviewTurn(input);
+      }
+    }
+    const gate = new FailingReacquireGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 2 });
+    const h = wholeHarness({ childAnswer: () => '[]', specialists: ['blind'] }, { reviewGate: gate });
+    // The wave completed, but the lead could not re-acquire its slot: the
+    // tool call fails AND the round ends (the lead is disposed), so no later
+    // lead turn can run outside the combined cap.
+    await expect(h.run()).rejects.toThrow(/lead session disposed/);
+    expect(h.toolErrors.some((entry) => entry.error.includes('re-acquire unavailable'))).toBe(true);
+    expect(gate.calls).toBeGreaterThanOrEqual(3);
+    expect(h.leadCalls).toHaveLength(1);
+    expect(h.leadCalls[0]?.disposed).toBe(true);
+    expect(h.childCalls).toHaveLength(1);
+    expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
+  });
+
+  it('shares one turn budget across retries: an elapsed retry never invokes the model (r4 verification#1)', async () => {
+    let clock = 1_000_000_000;
+    let firstChild: string | null = null;
+    const promptsByChild = new Map<string, number>();
+    const h = wholeHarness(
+      {
+        specialists: ['blind'],
+        childAnswer: (_prompt, call) => {
+          if (firstChild === null) firstChild = call.agentId;
+          promptsByChild.set(call.agentId, (promptsByChild.get(call.agentId) ?? 0) + 1);
+          if (call.agentId === firstChild) {
+            // Consume 400000 ms of the 600000 ms (10-minute) child turn
+            // budget on each model call and stay in the rate-limit class so
+            // the bounded retry runs: after call 1 the retry still has room,
+            // after call 2 the elapsed third iteration is stopped BEFORE the
+            // model runs.
+            clock += 400_000;
+            throw new Error('429 too many requests');
+          }
+          return '[]';
+        },
+      },
+      {
+        pacing: {
+          rateLimitBackoff: { baseMs: 100, maxMs: 1_000, maxRetries: 3, patterns: [] },
+          pacingNow: () => clock,
+          pacingSleep: async (ms) => {
+            clock += ms;
+          },
+          pacingJitter: () => 0,
+        },
+      },
+    );
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    // First attempt: exactly TWO model invocations — the shared budget guard
+    // stopped the third BEFORE the model ran. The lead's attempt-2 child
+    // then succeeds (one more invocation), so the round still completes.
+    const firstChildId = [...promptsByChild.keys()][0]!;
+    expect(promptsByChild.get(firstChildId)).toBe(2);
+    expect([...promptsByChild.values()].reduce((sum, count) => sum + count, 0)).toBe(3);
+    const envelope = result.lensEnvelopes.find((entry) => entry.lens === 'blind' && entry.attempt === 1);
+    expect(envelope?.failureKind).toBe('timeout');
+  });
 });
