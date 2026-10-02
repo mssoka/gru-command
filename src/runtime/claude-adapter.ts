@@ -54,21 +54,14 @@ import type {
   SpawnOptions,
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
+import { CLAUDE_CODE_CAPABILITIES } from './capabilities.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
-/** claude-code adapter capabilities, hoisted for the runtime probe (E3 story 3). */
-export const CLAUDE_CODE_CAPABILITIES: AgentCapabilities = {
-  streaming: true,
-  // The -p surface has no mid-turn channel (that lives in the SDK control
-  // protocol, out of scope per SPEC ruling 4) — the interface layer queues.
-  steer: 'queued',
-  resume: 'file',
-  images: true,
-  thinking: true,
-  thinkingLevelControl: true, // via --effort
-  followUp: false,
-};
+// The declaration now lives in the dependency-light `capabilities.js` so the
+// runtime probe can report it without loading this adapter's SDK graph; the
+// re-export keeps every existing import surface (and object identity) intact.
+export { CLAUDE_CODE_CAPABILITIES };
 
 /** Thinking levels the claude CLI accepts via --effort (fail-loud on others). */
 const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'] as const;

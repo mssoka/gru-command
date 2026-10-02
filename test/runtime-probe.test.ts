@@ -1,7 +1,7 @@
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { CLAUDE_CODE_CAPABILITIES } from '../src/runtime/claude-adapter.js';
 import { PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
 import { probeRuntimes, whichBinary } from '../src/runtime/probe.js';
@@ -112,5 +112,36 @@ describe('probeRuntimes on fixture PATHs', () => {
     expect(whichBinary('claude', dir)).toBeNull();
     const later = fixturePath({ claude: `${SH}echo "1.0.0"\n` });
     expect(whichBinary('claude', `${dir}:${later}`)).toBe(join(later, 'claude'));
+  });
+
+  it('reports the real capability constants WITHOUT loading the adapter modules (probe stays SDK-light)', async () => {
+    // Decoupling pin (2026-10-02 continuation): the probe used to import
+    // both adapters just for two static literals, dragging their agent-SDK
+    // graphs into every wizard process (measured ~7s per invocation, which
+    // made even a documented `--answers` refusal wait on SDK loading). The
+    // mocks below stand in for the adapters: if the probe (re)loads them,
+    // the sentinel values reach the report and these assertions fail.
+    vi.resetModules();
+    const sentinel = {
+      streaming: false,
+      steer: 'sentinel',
+      resume: 'none',
+      images: false,
+      thinking: false,
+      thinkingLevelControl: false,
+      followUp: false,
+    };
+    vi.doMock('../src/runtime/claude-adapter.js', () => ({ CLAUDE_CODE_CAPABILITIES: sentinel }));
+    vi.doMock('../src/runtime/pi-adapter.js', () => ({ PI_CAPABILITIES: sentinel }));
+    try {
+      const fresh = await import('../src/runtime/probe.js');
+      const report = fresh.probeRuntimes({ path: '' });
+      expect(report.find((entry) => entry.id === 'pi')?.capabilities).toEqual(PI_CAPABILITIES);
+      expect(report.find((entry) => entry.id === 'claude-code')?.capabilities).toEqual(CLAUDE_CODE_CAPABILITIES);
+    } finally {
+      vi.doUnmock('../src/runtime/claude-adapter.js');
+      vi.doUnmock('../src/runtime/pi-adapter.js');
+      vi.resetModules();
+    }
   });
 });
