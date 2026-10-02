@@ -132,6 +132,15 @@ only on provider proof:
   60 s margin tolerates provider clock skew, and older rounds' identical
   bytes outside it are never credited.
 
+The same constraints govern the **second** lookup of a failed attempt:
+when the failure path reconciles the same POST again (the review wave's
+failure seam), a definitively refused attempt (HTTP 4xx) fails closed with
+no lookup at all — no publication can be credited for a refused POST —
+and an ambiguous attempt stays bound to its attempt window: only reviews
+the provider provably submitted earlier than that window are excluded,
+while reviews whose submission time the provider does not state remain
+governed by the recovery rules below.
+
 Absence is certified only by full coverage: the walk visits every page up
 to the largest `rel="last"` page number any response reported — a list
 that grows mid-walk stays unresolved only while the grown list is not
@@ -139,7 +148,11 @@ covered within the lookup bound — or, when no Link header is present at
 all, it reaches a short final page (fewer than 100 reviews — GitHub's own
 end-of-list signal). A Link header that carries no usable `rel="last"` is
 not an end-of-list signal: the walk continues bounded and stays unresolved
-rather than certifying absence from a rewritten header. A foreign author
+rather than certifying absence from a rewritten header. A header whose
+`rel="last"` entries are malformed or contradict each other is worse than
+unusable: it poisons the walk's completeness evidence, so absence is never
+certified from that walk — not even from an earlier valid bound — though
+an independently proved exact match is still credited. A foreign author
 with the same bytes is never credited; a malformed list, a failed request,
 an exhausted page bound, or a predicate-complete review that cannot form a
 receipt id is never treated as absence — the delivery stays explicitly

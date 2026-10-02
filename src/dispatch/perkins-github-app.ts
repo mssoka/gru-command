@@ -128,8 +128,11 @@ export function parsePerkinsAppConfig(text: string, sourceLabel: string): Perkin
     // misspelling, and silently ignoring it would take effect as a partial
     // config. Name the line instead.
     if (key !== 'app_id' && key !== 'key_path' && !key.startsWith('installation_id_')) {
+      // Config-derived bytes are never echoed raw: KEY_PATTERN happily
+      // admits credential-shaped unknown keys (a pasted ghs_ token). The
+      // line number stays for actionable provisioning repair.
       throw new PerkinsAppError(
-        `${sourceLabel}: line ${index + 1} has an unrecognized key "${key}" — the bundle accepts app_id, key_path and installation_id_<owner> entries only`,
+        `${sourceLabel}: line ${index + 1} has an unrecognized key (${sanitize(key.slice(0, 24))}) — the bundle accepts app_id, key_path and installation_id_<owner> entries only`,
       );
     }
     const prior = seen.get(key);
@@ -152,7 +155,7 @@ export function parsePerkinsAppConfig(text: string, sourceLabel: string): Perkin
       const priorOwner = installationIds.get(owner);
       if (priorOwner !== undefined && priorOwner !== value) {
         throw new PerkinsAppError(
-          `${sourceLabel}: installation owner "${owner}" is configured twice with different values — resolve the bundle to one id per owner`,
+          `${sourceLabel}: installation owner "${sanitize(owner)}" is configured twice with different values — resolve the bundle to one id per owner`,
         );
       }
       installationIds.set(owner, value);
@@ -177,10 +180,10 @@ export function parsePerkinsAppConfig(text: string, sourceLabel: string): Perkin
   }
   for (const [owner, id] of installationIds) {
     if (!/^[1-9][0-9]*$/u.test(id)) {
-      throw new PerkinsAppError(`${sourceLabel}: installation id for owner "${owner}" is not a positive integer`);
+      throw new PerkinsAppError(`${sourceLabel}: installation id for owner "${sanitize(owner)}" is not a positive integer`);
     }
     if (!Number.isSafeInteger(Number(id))) {
-      throw new PerkinsAppError(`${sourceLabel}: installation id for owner "${owner}" is outside the safe integer range — refusing an id that would lose precision or aim a different installation`);
+      throw new PerkinsAppError(`${sourceLabel}: installation id for owner "${sanitize(owner)}" is outside the safe integer range — refusing an id that would lose precision or aim a different installation`);
     }
   }
   return {
@@ -540,6 +543,15 @@ function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, tar
   return Number.isFinite(submittedAt) && submittedAt >= notBeforeMs;
 }
 
+/** True only when the provider states a parsable submitted_at strictly
+ * older than the bound. A review with no parsable time is never "provably
+ * stale" — those stay governed by the recovery seam's own adjudication
+ * (proved bytes and head). */
+function provablySubmittedBefore(review: ProviderReview, notBeforeMs: number): boolean {
+  const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
+  return Number.isFinite(submittedAt) && submittedAt < notBeforeMs;
+}
+
 /** Provider-proved evidence that OUR App bot published exactly this review
  * during this round: every delivery predicate plus a usable provider id
  * (a receipt can only be certified with one). */
@@ -609,6 +621,17 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   private readonly postTimeoutMs: number;
   private readonly maxReconciliationPages: number;
   private readonly maxProviderBodyBytes: number;
+  /** The instance's most recent publication attempt — ONE bounded slot,
+   * never a receipt store. It exists so the SECOND reconciliation of the
+   * same attempt (the failure seam: WaveRunner calls VerdictPoster.reconcile
+   * after a failed post()) preserves that attempt's recency and refusal
+   * constraints: a stale identical review from an older round can never be
+   * credited, and a definitively refused attempt stays refused. Cleared
+   * when the attempt settles (proved receipt, proved absence, definitive
+   * refusal) or overwritten by the next attempt. */
+  private lastAttempt:
+    | { readonly targetSha: string; readonly bodySha256: string; readonly startedMs: number; readonly refused: boolean }
+    | null = null;
 
   constructor(private readonly options: PerkinsAppPosterOptions) {
     // The exported class is a public boundary: a direct construction with
@@ -657,6 +680,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
     const { grant, botLogin, owner, repo, prNumber, headSha, baseSha } = await this.prepare(input);
     const postStartMs = this.now();
+    // Record the attempt BEFORE the POST: the bounded second lookup (the
+    // WaveRunner failure seam reconciles after a failed post()) needs this
+    // attempt's start time and refusal state to stay constrained.
+    this.lastAttempt = { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), startedMs: postStartMs, refused: false };
     let review: unknown;
     try {
       review = (await this.callApi('POST review delivery', `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
@@ -674,6 +701,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       // match credits the delivery, anything else stays an explicit
       // failure. Never a second POST.
       if (error instanceof PerkinsAppHttpError && error.status >= 400 && error.status < 500) {
+        // Definitive refusal: the provider created no review for this
+        // attempt. A later reconcile of it fails closed — it can never
+        // credit an identical publication as this round's delivery.
+        this.lastAttempt = { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), startedMs: postStartMs, refused: true };
         if ((error.status === 403 || error.status === 429) && providerIndicatesRateLimit(error)) {
           throw new PerkinsAppError(
             `review POST refused with HTTP ${error.status} — GitHub rate limiting (${error.providerMessage}); the provider created no review; wait for the window to reset before the next round — no retry was attempted`,
@@ -684,10 +715,14 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, baseSha, error, postStartMs);
     }
     try {
-      return verifyPostedReceipt(
+      const receipt = verifyPostedReceipt(
         this.receiptFromReview(review, botLogin, input.targetSha, headSha, baseSha, input.body),
         { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
       );
+      // The attempt settled as a proved publication: the record is no
+      // longer needed (a later reconcile of this input is plain recovery).
+      this.lastAttempt = null;
+      return receipt;
     } catch (error) {
       if (error instanceof PerkinsAppError) {
         // A 2xx whose receipt cannot be proved (foreign author, enacted
@@ -708,8 +743,30 @@ export class PerkinsAppPrPoster implements VerdictPoster {
    * proof of absence. */
   async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
     const { grant, botLogin, owner, repo, prNumber, baseSha } = await this.prepare(input);
-    const { matched, provablyAbsent, matchedButUnreceiptable } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, null);
+    // A reconcile of THIS instance's own recent attempt (the failure seam:
+    // WaveRunner calls this after a failed post()) stays bound to that
+    // attempt: a definitively refused attempt fails closed with no lookup
+    // at all, and an ambiguous attempt is looked up under its recency
+    // constraint — excluding only reviews the provider PROVABLY submitted
+    // before this round's window. Time-unverifiable bytes stay governed by
+    // the recovery seam's own prior adjudication (proved bytes and head).
+    const attempt = this.lastAttempt;
+    const attemptConstrained = attempt !== null
+      && attempt.targetSha === input.targetSha
+      && attempt.bodySha256 === receiptDigest(input.body);
+    if (attempt !== null && attemptConstrained && attempt.refused) {
+      this.lastAttempt = null;
+      throw new PerkinsAppError(
+        'review reconciliation of a definitively refused POST (HTTP 4xx): the provider created no review for that attempt, so no lookup may credit one — verify the pull request manually before any retry, never assume absence',
+      );
+    }
+    const { matched, provablyAbsent, matchedButUnreceiptable } = await this.lookupMatchingReview(
+      grant, owner, repo, prNumber, botLogin, input.targetSha, input.body,
+      attempt !== null && attemptConstrained ? attempt.startedMs - 60_000 : null,
+      attemptConstrained ? 'provably-stale-only' : 'window',
+    );
     if (matched !== null) {
+      this.lastAttempt = null;
       return verifyPostedReceipt(
         this.receiptFromReview(matched, botLogin, input.targetSha, input.targetSha, baseSha, input.body),
         { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
@@ -720,7 +777,14 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         'review reconciliation found a review matching every delivery predicate except its provider id or its submission time — delivery stays unresolved; verify that review manually before any retry, never assume absence',
       );
     }
-    if (provablyAbsent) return null;
+    if (provablyAbsent) {
+      // The attempt settled as provably absent: the record is no longer
+      // needed (a later reconcile of this input is plain recovery).
+      this.lastAttempt = null;
+      return null;
+    }
+    // Unresolved: keep the attempt record so any further lookup of the
+    // same attempt stays constrained to it.
     throw new PerkinsAppError(
       `review reconciliation exceeded its ${this.maxReconciliationPages}-page lookup bound without exhausting the review list; delivery stays unresolved — verify manually before any retry, never assume absence`,
     );
@@ -1025,26 +1089,31 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   }
 
   /** Parse the last page number out of a GitHub Link header, if present.
-   * Only a sane integer >= 1 counts, and a header whose rel="last" entries
-   * are malformed or CONFLICT with each other yields null: a page count an
-   * intermediary could have rewritten — or that disagrees with itself — must
-   * never become the basis of a completeness certificate. Picking one of two
-   * disagreeing numbers (e.g. their maximum) would still trust a number the
-   * header itself shows to be unreliable. */
-  private parseLastPage(linkHeader: string | null): number | null {
-    if (linkHeader === null) return null;
+   * Three states, never collapsed: ABSENT (no header, or no rel="last" at
+   * all — no pagination evidence either way), LAST (one sane integer >= 1
+   * every rel="last" entry agrees on), and CONTRADICTORY (rel="last"
+   * entries exist but are malformed or disagree with each other). Only
+   * LAST may inform a completeness certificate: a page count an
+   * intermediary could have rewritten — or that disagrees with itself —
+   * must never become the basis of one, and a contradictory header must
+   * poison the walk's evidence even where an earlier bound looked valid.
+   * Picking one of two disagreeing numbers (e.g. their maximum) would
+   * still trust a number the header itself shows to be unreliable. */
+  private parseLastPage(linkHeader: string | null):
+    { readonly kind: 'absent' } | { readonly kind: 'contradictory' } | { readonly kind: 'last'; readonly page: number } {
+    if (linkHeader === null) return { kind: 'absent' };
     const entries = [...linkHeader.matchAll(/<([^>]+)>;\s*rel="last"/gu)];
-    if (entries.length === 0) return null;
+    if (entries.length === 0) return { kind: 'absent' };
     const pages: number[] = [];
     for (const entry of entries) {
       const page = /[?&]page=(\d+)/u.exec(entry[1]!);
-      if (page === null) return null;
+      if (page === null) return { kind: 'contradictory' };
       const parsed = Number(page[1]);
-      if (!Number.isSafeInteger(parsed) || parsed < 1) return null;
+      if (!Number.isSafeInteger(parsed) || parsed < 1) return { kind: 'contradictory' };
       pages.push(parsed);
     }
     const first = pages[0]!;
-    return pages.every((candidate) => candidate === first) ? first : null;
+    return pages.every((candidate) => candidate === first) ? { kind: 'last', page: first } : { kind: 'contradictory' };
   }
 
   /** Bounded ambiguous-POST reconciliation (the delivery path): a bounded
@@ -1125,9 +1194,20 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     targetSha: string,
     body: string,
     notBeforeMs: number | null,
+    /** 'window' (default): the strict round-window predicates.
+     * 'provably-stale-only': byte-proven matches are creditable unless the
+     * provider PROVABLY submitted them before the round window — used by
+     * the attempt-constrained second lookup, which must never credit an
+     * older round's identical publication but leaves the prior recovery
+     * adjudication for time-unverifiable bytes untouched. */
+    staleHandling: 'window' | 'provably-stale-only' = 'window',
   ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean }> {
     const visited = new Set<number>();
     let lastPage: number | null = null;
+    // Set when a response's rel="last" evidence is malformed or
+    // self-contradictory: the walk may keep looking, but it can never
+    // certify absence — not even from an earlier valid bound.
+    let contradictoryLastPage = false;
     let page = 1;
     let sequentialEnd = false;
     let matchedButUnreceiptable = false;
@@ -1141,7 +1221,15 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       const list = result.body;
       const linkHeader = result.header('link');
       const seenLast = this.parseLastPage(linkHeader);
-      if (seenLast !== null) lastPage = lastPage === null ? seenLast : Math.max(lastPage, seenLast);
+      if (seenLast.kind === 'contradictory') {
+        // The provider's own pagination evidence disagrees with itself or
+        // is malformed: no completeness certificate may rest on this walk,
+        // even where an earlier bound looked valid. Independently proved
+        // exact matches remain creditable; absence never is.
+        contradictoryLastPage = true;
+      } else if (seenLast.kind === 'last') {
+        lastPage = lastPage === null ? seenLast.page : Math.max(lastPage, seenLast.page);
+      }
       if (!Array.isArray(list)) {
         // Never report "searched and not found" when no usable list was read.
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
@@ -1152,7 +1240,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
       const reviews = list as readonly ProviderReview[];
-      const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, notBeforeMs));
+      const match = reviews.find((review) => staleHandling === 'provably-stale-only'
+        ? isMatchingAppReview(review, botLogin, targetSha, body, null) && !provablySubmittedBefore(review, notBeforeMs!)
+        : isMatchingAppReview(review, botLogin, targetSha, body, notBeforeMs));
       if (match !== undefined) {
         return { matched: match, provablyAbsent: false, matchedButUnreceiptable: false };
       }
@@ -1193,7 +1283,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       if (next < 1 || visited.has(next)) break;
       page = next;
     }
-    const provablyAbsent = lastPage !== null ? visited.size >= lastPage : sequentialEnd;
+    const provablyAbsent = !contradictoryLastPage && (lastPage !== null ? visited.size >= lastPage : sequentialEnd);
     return { matched: null, provablyAbsent, matchedButUnreceiptable };
   }
 }
