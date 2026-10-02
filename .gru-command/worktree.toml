@@ -51,3 +51,8 @@ pacing-current18 = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run te
 # focused scope covers the touched seams' runtime regressions and keeps the
 # approved j-463 RPC patch first, same as the other witnessed scopes.
 pr135-ci-type-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/rebrief-recovery.test.ts test/fix-directive.test.ts test/rate-limit-retry.test.ts test/supervisor.test.ts test/pacing.test.ts"
+
+# PR135 runtime CI three-repair (silas-ops-pr135-runtime-ci-three-repair-20261001T014506Z):
+# the job-attribution FK fixture, the T13/R17 settled-wave contract and the
+# shared child-turn budget oracle, plus the pin file; approved RPC patch first.
+pr135-runtime-ci-three-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/perkins-whole-review.test.ts test/suite-shape.test.ts"
