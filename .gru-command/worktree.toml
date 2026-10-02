@@ -37,9 +37,11 @@ native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f0
 
 # PR134 verification readiness (2026-10-02): this lane's focused regression
 # and its isolated pre-fix baseline, declared for the authenticated
-# scheduler only — plain invocations under the existing web Vitest
-# config/budgets, approved RPC patch prerequisite, exits never masked.
-board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && npx vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts"
+# scheduler only — explicit existing installed Vitest CLI invocations
+# (vitest is hoisted at the lane root; web/node_modules has none) under
+# the existing web Vitest config/budgets, approved RPC patch prerequisite,
+# exits never masked.
+board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts"
 
 # Isolated pre-fix baseline: current-main 6a00f4e5 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
@@ -49,4 +51,4 @@ board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && n
 # exit is left intact, never masked. The snapshot directory and the ignored
 # pointer file are preserved for inspection; nothing is deleted or checked
 # out, and no branch/worktree holds the sha.
-board-merged-attention-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-merged-attention.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board-merged-attention.test.ts > "$d/web/src/ui/board-merged-attention.test.ts"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-merged-attention-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-merged-attention-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && npx vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts'
+board-merged-attention-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-merged-attention.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board-merged-attention.test.ts > "$d/web/src/ui/board-merged-attention.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-merged-attention-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-merged-attention-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts'
