@@ -459,4 +459,24 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE pending_rebriefs ADD COLUMN phase_id TEXT;
     `,
   },
+  {
+    // Bounded reconcile cursors (PR136 r4 repair, blocker 3): one tiny
+    // durable round-robin pointer per reconcile scope. The phase-handoff
+    // sweep reads only actionable rows and must still make fair progress
+    // across bounded passes — without a persisted cursor a fresh pass
+    // re-examines the same prefix and a later owed row never lands.
+    // LANDING COLLISION (same convention as migrations 10/11): id 12 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 12,
+    name: 'reconcile-cursors',
+    sql: `
+      CREATE TABLE reconcile_cursors (
+        scope      TEXT PRIMARY KEY,
+        cursor     INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
 ];

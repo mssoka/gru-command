@@ -52,6 +52,10 @@ export interface HandBackResult {
   /** true when this call created the hand-back; false when a replay of
    * the same delivered event found it already recorded. */
   readonly created: boolean;
+  /** true when THIS call posted the stable-kind card; false when the
+   * logical card already existed (any state) or the obligation already
+   * carried it. */
+  readonly posted: boolean;
 }
 
 /**
@@ -61,8 +65,8 @@ export interface HandBackResult {
  * fine) records one phase-completion obligation and ONE action-required
  * Gru hand-back on the existing wake path. Replays of the same delivered
  * event coalesce (the obligation identity carries the event seq; the
- * notification dedupes until acked). A delivery on a lane that is not
- * blocked is the normal review flow — nothing is recorded here.
+ * stable-kind card is never re-posted in any state). A delivery on a lane
+ * that is not blocked is the normal review flow — nothing is recorded.
  *
  * Returns null when the event is not a follow-up delivery or the lane
  * needs no hand-back.
@@ -73,6 +77,30 @@ export function observeFollowUpDelivery(
 ): HandBackResult | null {
   if (event.kind !== 'job.delivered' || event.jobId === null) return null;
   const payload = (event.payload ?? {}) as Record<string, unknown>;
+  const target = unmarkedHandbackTarget(deps, event.jobId, event.seq, payload);
+  if (target === null) return null;
+  return recordUnmarkedHandback(deps, target);
+}
+
+interface UnmarkedHandbackTarget {
+  readonly jobId: string;
+  readonly seq: number;
+  readonly source: string;
+  readonly sha: string | null;
+}
+
+/**
+ * The durable target of one unmarked hand-back, resolved from ACTUAL
+ * durable state — never the caller's claim. The lane must still be blocked
+ * at recovery time: a lane that moved on already has its own follow-through
+ * (the original blocked fact is what mints this debt).
+ */
+function unmarkedHandbackTarget(
+  deps: FollowThroughDeps,
+  jobId: string,
+  seq: number,
+  payload: Record<string, unknown>,
+): UnmarkedHandbackTarget | null {
   const source = typeof payload['source'] === 'string' ? payload['source'] : null;
   if (source === null || !FOLLOW_UP_SOURCES.has(source)) return null;
   // An explicitly marked phase owns its own hand-back path
@@ -80,54 +108,163 @@ export function observeFollowUpDelivery(
   // double-publish the event-sequence card for the same delivery.
   const phaseId = typeof payload['phase_id'] === 'string' && payload['phase_id'] !== '' ? payload['phase_id'] : null;
   if (phaseId !== null && deps.ledger.getPhaseHandoff(phaseId) !== null) return null;
-  const job = deps.ledger.getJob(event.jobId);
-  if (job === null) return null;
-  if (job.status !== 'blocked') return null; // normal flow — review/digest owns it
-
+  const job = deps.ledger.getJob(jobId);
+  if (job === null || job.status !== 'blocked') return null; // normal flow — review/digest owns it
   const sha = typeof payload['sha'] === 'string' && payload['sha'] !== '' ? payload['sha'] : null;
+  return { jobId, seq, source, sha };
+}
+
+/**
+ * The ONE record-and-publish routine every unmarked hand-back rides
+ * (live observer and boot backstop), so the crash windows cannot drift
+ * from the live path. The debt upsert is idempotent by event identity;
+ * the card is the one stable-kind row per delivery event and is never
+ * re-posted once any incarnation exists.
+ */
+function recordUnmarkedHandback(deps: FollowThroughDeps, target: UnmarkedHandbackTarget): HandBackResult {
   // Identity carries the delivered event seq: a distinct phase completion
   // is a distinct hand-back; a replay of the same event coalesces onto
-  // the same obligation and the same notification (dedupe 'unacked').
-  const incidentKey = `phase-handback@${event.seq}`;
+  // the same obligation and the same notification.
+  const incidentKey = `phase-handback@${target.seq}`;
   const before = deps.ledger
-    .listObligations({ jobId: event.jobId })
+    .listObligations({ jobId: target.jobId })
     .find((row) => row.incidentKey === incidentKey && row.state !== 'settled' && row.state !== 'closed');
-  const obligation = deps.ledger.recordBlockedObservation(event.jobId, {
+  const obligation = before ?? deps.ledger.recordBlockedObservation(target.jobId, {
     logicalStep: 'operation',
     category: { kind: 'known', category: 'phase-completion' },
     incidentKey,
-    observedAtSeq: event.seq,
+    observedAtSeq: target.seq,
     description:
-      `bounded ${source} phase completed while the lane remains blocked ` +
-      `(delivered event ${event.seq}${sha === null ? '' : `, head ${sha}`})`,
+      `bounded ${target.source} phase completed while the lane remains blocked ` +
+      `(delivered event ${target.seq}${target.sha === null ? '' : `, head ${target.sha}`})`,
     dueAt: null,
   });
-  const notificationKind = `silas.phase-handback.${event.jobId}@${event.seq}`;
+  const posted = publishUnmarkedHandbackCard(deps, target, obligation.id);
+  deps.log?.('info', 'follow-through hand-back recorded', {
+    job: target.jobId,
+    obligation: obligation.id,
+    notification_kind: `silas.phase-handback.${target.jobId}@${target.seq}`,
+    delivered_seq: target.seq,
+  });
+  return {
+    jobId: target.jobId,
+    obligationId: obligation.id,
+    notificationKind: `silas.phase-handback.${target.jobId}@${target.seq}`,
+    created: before === undefined,
+    posted,
+  };
+}
+
+/** The ONE stable-kind card per delivery event. A row of this kind that
+ * already exists — unacked, acked or resolved — IS the logical card and
+ * is never re-posted (no fresh alert ids to bypass wake dedupe). Returns
+ * true only when this call actually posted it. */
+function publishUnmarkedHandbackCard(
+  deps: FollowThroughDeps,
+  target: UnmarkedHandbackTarget,
+  obligationId: string,
+): boolean {
+  const notificationKind = `silas.phase-handback.${target.jobId}@${target.seq}`;
+  if (deps.ledger.findNotificationByKind(notificationKind, 'any') !== null) return false;
   deps.notifications.postIncident({
     kind: notificationKind,
     routing: 'action-required',
     severity: 'info',
-    title: `Phase completed on blocked job ${event.jobId} — ruling requested`,
+    title: `Phase completed on blocked job ${target.jobId} — ruling requested`,
     detail:
-      `A bounded ${source} phase settled` +
-      `${sha === null ? '' : ` (head ${sha})`}` +
-      ` but the lane is still blocked. The obligation ${obligation.id} durably owes the next Gru ` +
+      `A bounded ${target.source} phase settled` +
+      `${target.sha === null ? '' : ` (head ${target.sha})`}` +
+      ` but the lane is still blocked. The obligation ${obligationId} durably owes the next Gru ` +
       'ruling (same head is evidence, not approval). No owner prompting is required; this row is ' +
       'the machine hand-back.',
     dedupe: 'unacked',
   });
-  deps.log?.('info', 'follow-through hand-back recorded', {
-    job: event.jobId,
-    obligation: obligation.id,
-    notification_kind: notificationKind,
-    delivered_seq: event.seq,
-  });
-  return {
-    jobId: event.jobId,
-    obligationId: obligation.id,
-    notificationKind,
-    created: before === undefined,
-  };
+  return true;
+}
+
+export interface UnmarkedReconcileReport {
+  /** Window-A candidates examined (delivery committed, observer never ran). */
+  readonly deliveries: number;
+  /** Hand-back obligations recorded by this pass. */
+  readonly recovered: number;
+  /** Stable-kind cards newly posted by this pass (either window). */
+  readonly published: number;
+}
+
+/**
+ * Boot backstop for UNMARKED blocked-phase hand-backs (PR136 r4 blocker
+ * 2). The live observer runs only after the delivery commit publishes on
+ * the bus; two crash windows can lose the hand-back entirely:
+ *
+ * (a) the `job.delivered` event committed but the observer never ran —
+ *     recovered from the delivery candidate set (no obligation yet);
+ * (b) the obligation committed but its action-required card never posted —
+ *     recovered from the live-obligation candidate set.
+ *
+ * Both windows ride the SAME record/publish routine as the live observer
+ * and both candidate sets drop rows as they are processed, so bounded
+ * passes make progress and re-running a pass is a no-op. Nothing
+ * re-dispatches a worker, rings the owner or mints a fresh alert id: the
+ * one card is machine action-required, deduped by its stable kind.
+ */
+export function reconcileUnmarkedHandbacks(
+  deps: FollowThroughDeps,
+  opts: { limit?: number } = {},
+): UnmarkedReconcileReport {
+  const limit = Math.min(Math.max(1, opts.limit ?? 200), 1000);
+  let deliveries = 0;
+  let recovered = 0;
+  let published = 0;
+  for (const event of deps.ledger.listUnmarkedHandbackDeliveries(limit)) {
+    if (event.jobId === null) continue;
+    deliveries += 1;
+    const payload = (event.payload ?? {}) as Record<string, unknown>;
+    const target = unmarkedHandbackTarget(deps, event.jobId, event.seq, payload);
+    if (target === null) continue;
+    try {
+      const result = recordUnmarkedHandback(deps, target);
+      if (result.created) recovered += 1;
+      if (result.posted) published += 1;
+    } catch (error) {
+      // One malformed/conflicting row stays visible and never takes the
+      // boot pass down: the next boot retries it from durable state.
+      deps.log?.('error', 'unmarked hand-back recovery failed', {
+        job: event.jobId,
+        seq: event.seq,
+        error: String(error),
+      });
+    }
+  }
+  for (const obligation of deps.ledger.listHandbacksMissingCards(limit)) {
+    const seq = Number(obligation.incidentKey.slice('phase-handback@'.length));
+    if (!Number.isSafeInteger(seq) || seq <= 0) continue;
+    // The delivery event is the source of the card's detail; a missing
+    // event still publishes the same stable-kind card (the obligation is
+    // the durable debt — the card must not be lost to a lookup).
+    const event = deps.ledger.getEvent(seq);
+    const payload = (event?.payload ?? {}) as Record<string, unknown>;
+    const source = typeof payload['source'] === 'string' && FOLLOW_UP_SOURCES.has(payload['source'])
+      ? payload['source']
+      : 'follow-up';
+    const sha = typeof payload['sha'] === 'string' && payload['sha'] !== '' ? payload['sha'] : null;
+    try {
+      if (publishUnmarkedHandbackCard(deps, { jobId: obligation.jobId, seq, source, sha }, obligation.id)) {
+        published += 1;
+        deps.log?.('info', 'unmarked hand-back card reconciled after a crash window', {
+          job: obligation.jobId,
+          obligation: obligation.id,
+          delivered_seq: seq,
+        });
+      }
+    } catch (error) {
+      deps.log?.('error', 'unmarked hand-back card recovery failed', {
+        job: obligation.jobId,
+        seq,
+        error: String(error),
+      });
+    }
+  }
+  return { deliveries, recovered, published };
 }
 
 export interface AdoptionReport {
@@ -424,6 +561,9 @@ export interface PhaseReconcileReport {
   readonly closed: number;
 }
 
+/** The durable round-robin cursor scope the phase sweep persists under. */
+const PHASE_RECONCILE_SCOPE = 'phase-handoffs';
+
 /**
  * Bounded boot/sweep reconciliation for phase handoffs — the crash-window
  * backstop, riding the existing recovery coordinator (no timer, no new
@@ -444,14 +584,28 @@ export function reconcilePhaseHandoffs(
   let completed = 0;
   let published = 0;
   let closed = 0;
-  let cursor: number | undefined;
+  // Durable round-robin cursor (PR136 r4 blocker 3). A pass reads only
+  // ACTIONABLE rows — awaiting intents and completed rows missing their
+  // obligation/card — so satisfied publication history never consumes its
+  // budget. When a pass exhausts its page budget it persists the last
+  // examined rowid, so the next pass continues past that prefix instead of
+  // re-reading it; a pass that reaches the end resets to the first row.
+  // Every actionable row is therefore examined within a bounded number of
+  // passes, however many published rows precede it.
+  let cursor = deps.ledger.readReconcileCursor(PHASE_RECONCILE_SCOPE) ?? 0;
+  if (!Number.isSafeInteger(cursor) || cursor < 0) cursor = 0;
+  let lastRowid: number | null = null;
+  let reachedEnd = false;
   for (let page = 0; page < maxPages; page += 1) {
     const rows = deps.ledger.listPhaseHandoffs({
-      states: ['awaiting', 'completed'],
+      needsAction: true,
       limit: pageSize,
-      ...(cursor !== undefined ? { cursor } : {}),
+      ...(cursor > 0 ? { cursor } : {}),
     });
-    if (rows.length === 0) break;
+    if (rows.length === 0) {
+      reachedEnd = true;
+      break;
+    }
     for (const listed of rows) {
       examined += 1;
       try {
@@ -470,8 +624,25 @@ export function reconcilePhaseHandoffs(
       }
     }
     const last = rows[rows.length - 1];
-    cursor = last === undefined ? undefined : (deps.ledger.phaseHandoffRowid(last.phaseId) ?? undefined);
-    if (rows.length < pageSize) break;
+    lastRowid = last === undefined ? null : (deps.ledger.phaseHandoffRowid(last.phaseId) ?? null);
+    if (rows.length < pageSize) {
+      reachedEnd = true; // the factual tail — the next pass starts over
+      break;
+    }
+    if (lastRowid === null) {
+      // A row that cannot produce its rowid is a durable inconsistency:
+      // stop the pass loudly, keep the previous cursor (no silent loop).
+      deps.log?.('error', 'phase handoff cursor could not advance — pass stopped', {
+        phase: last?.phaseId ?? null,
+      });
+      break;
+    }
+    cursor = lastRowid;
+  }
+  if (reachedEnd) {
+    if (cursor !== 0) deps.ledger.writeReconcileCursor({ scope: PHASE_RECONCILE_SCOPE, cursor: 0 });
+  } else if (lastRowid !== null) {
+    deps.ledger.writeReconcileCursor({ scope: PHASE_RECONCILE_SCOPE, cursor: lastRowid });
   }
   return { examined, completed, published, closed };
 }

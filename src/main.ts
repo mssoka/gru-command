@@ -25,7 +25,7 @@ import { SilasDriver } from './dispatch/silas-driver.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { reconcilePendingRebriefs, reconcilePendingDirectives } from './dispatch/rebrief-recovery.js';
-import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs } from './dispatch/obligations.js';
+import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
@@ -888,6 +888,23 @@ async function main(): Promise<number> {
       completed: phaseRecovery.completed,
       published: phaseRecovery.published,
       closed: phaseRecovery.closed,
+    });
+  }
+  // Unmarked blocked-phase hand-backs (the legacy event-sequence identity):
+  // the boot backstop for the two windows the live observer cannot cover —
+  // a delivery that committed before the observer ran, and an obligation
+  // that committed before its card posted. One stable-kind machine card is
+  // the recovery; nothing re-dispatches, nothing rings the owner.
+  const unmarkedRecovery = reconcileUnmarkedHandbacks({
+    ledger,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  if (unmarkedRecovery.deliveries > 0 || unmarkedRecovery.published > 0) {
+    logger.info('unmarked follow-through reconciliation', {
+      deliveries: unmarkedRecovery.deliveries,
+      recovered: unmarkedRecovery.recovered,
+      published: unmarkedRecovery.published,
     });
   }
   // Conservative migration of pre-existing blocked lanes: triage owed to

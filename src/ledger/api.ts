@@ -1744,6 +1744,69 @@ export class LedgerApi {
     });
   }
 
+  /** Window-A backstop candidates (PR136 r4 blocker 2): follow-up
+   * `job.delivered` events on still-blocked lanes whose hand-back
+   * obligation was never recorded (crash between the delivery commit and
+   * the observer). Already-tracked deliveries (and deliveries owned by an
+   * existing marked phase row) are excluded BY the query, so bounded
+   * passes always reach the tail. */
+  listUnmarkedHandbackDeliveries(limit: number): readonly EventRecord[] {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error(`listUnmarkedHandbackDeliveries requires a positive integer limit, got ${String(limit)}`);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT e.* FROM events e
+           JOIN jobs j ON j.id = e.job_id
+          WHERE e.kind = 'job.delivered'
+            AND j.status = 'blocked'
+            AND json_valid(e.payload)
+            AND json_extract(e.payload, '$.source') IN ('silas-directive', 'silas-rebrief')
+            AND (
+              json_extract(e.payload, '$.phase_id') IS NULL
+              OR NOT EXISTS (
+                SELECT 1 FROM phase_handoffs p WHERE p.phase_id = json_extract(e.payload, '$.phase_id')
+              )
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM job_obligations o
+               WHERE o.job_id = e.job_id
+                 AND o.logical_step = 'operation'
+                 AND o.incident_key = 'phase-handback@' || e.seq
+            )
+          ORDER BY e.seq ASC
+          LIMIT ?`,
+      )
+      .all(limit) as Row[];
+    return rows.map((row) => this.eventFromRow(row));
+  }
+
+  /** Window-B backstop candidates (PR136 r4 blocker 2): unmarked
+   * phase-handback obligations that are still live but whose stable-kind
+   * action-required card was never published (crash between the obligation
+   * write and the notification). A published card — even a resolved/acked
+   * one — removes the row from the candidate set. */
+  listHandbacksMissingCards(limit: number): readonly ObligationRecord[] {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error(`listHandbacksMissingCards requires a positive integer limit, got ${String(limit)}`);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT o.* FROM job_obligations o
+          WHERE o.logical_step = 'operation'
+            AND o.incident_key LIKE 'phase-handback@%'
+            AND o.state IN ('open', 'waiting')
+            AND NOT EXISTS (
+              SELECT 1 FROM notifications n
+               WHERE n.kind = 'silas.phase-handback.' || o.job_id || '@' || substr(o.incident_key, 16)
+            )
+          ORDER BY o.rowid ASC
+          LIMIT ?`,
+      )
+      .all(limit) as Row[];
+    return rows.map((row) => this.obligationFromRow(row));
+  }
+
   getObligation(id: string): ObligationRecord | null {
     const row = this.db.prepare('SELECT * FROM job_obligations WHERE id = ?').get(id) as Row | undefined;
     return row === undefined ? null : this.obligationFromRow(row);
@@ -2758,7 +2821,11 @@ export class LedgerApi {
   }
 
   /** Bounded listing for reconciliation/adoption. `cursor` is the rowid
-   * of the previous page's last row (append-only-safe paging). */
+   * of the previous page's last row (append-only-safe paging).
+   * `needsAction` narrows to rows a reconcile pass can still move —
+   * `awaiting` intents plus `completed` rows missing their obligation or
+   * card — so already-published history never consumes a bounded pass's
+   * budget and the tail keeps fair progress (PR136 r4 blocker 3). */
   listPhaseHandoffs(
     opts: {
       jobId?: string;
@@ -2766,6 +2833,7 @@ export class LedgerApi {
       states?: readonly PhaseHandoffState[];
       limit?: number;
       cursor?: number;
+      needsAction?: boolean;
     } = {},
   ): readonly PhaseHandoffRecord[] {
     const limit = Math.min(Math.max(1, opts.limit ?? 200), 1000);
@@ -2790,6 +2858,14 @@ export class LedgerApi {
       where.push(`state IN (${opts.states.map(() => '?').join(', ')})`);
       params.push(...opts.states);
     }
+    if (opts.needsAction === true) {
+      // Satisfied history (completed + obligation + card) is not actionable:
+      // excluding it here is what keeps a bounded pass from re-reading the
+      // same published prefix forever.
+      where.push(
+        "(state = 'awaiting' OR (state = 'completed' AND (obligation_id IS NULL OR notification_id IS NULL)))",
+      );
+    }
     if (opts.cursor !== undefined) {
       where.push('rowid > ?');
       params.push(opts.cursor);
@@ -2806,6 +2882,32 @@ export class LedgerApi {
       | Row
       | undefined;
     return row === undefined ? null : Number(row._rowid);
+  }
+
+  /** Durable round-robin cursor for one bounded reconcile scope (PR136 r4
+   * blocker 3): successive bounded passes continue where the previous pass
+   * stopped, so no fixed prefix — however much satisfied history it holds —
+   * can starve the actionable rows behind it. */
+  readReconcileCursor(scope: string): number | null {
+    if (scope.trim() === '') throw new Error('reconcile cursor scope must be non-empty');
+    const row = this.db.prepare('SELECT cursor FROM reconcile_cursors WHERE scope = ?').get(scope) as Row | undefined;
+    return row === undefined ? null : Number(row.cursor);
+  }
+
+  /** Advance one reconcile scope's cursor (idempotent upsert). */
+  writeReconcileCursor(input: { scope: string; cursor: number }): void {
+    if (input.scope.trim() === '') throw new Error('reconcile cursor scope must be non-empty');
+    if (!Number.isSafeInteger(input.cursor) || input.cursor < 0) {
+      throw new Error('reconcile cursor must be a safe non-negative rowid');
+    }
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO reconcile_cursors (scope, cursor, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(scope) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at`,
+        )
+        .run(input.scope, input.cursor, nowIso());
+    });
   }
 
   /** The newest phase row a directive request authorized, if any. */
