@@ -78,6 +78,7 @@ interface Harness {
   readonly ledger: LedgerApi;
   readonly worktrees: InMemoryWorktreePort;
   readonly wave: WaveRunner;
+  readonly bus: EventBus;
   readonly artifactRoot: string;
   close(): Promise<void>;
 }
@@ -145,6 +146,7 @@ async function boot(opts: { onReviewLane?: () => void; onPreflight?: () => void 
     ledger,
     worktrees: basePort,
     wave,
+    bus,
     artifactRoot,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
@@ -212,25 +214,44 @@ function pendingMarker(
   };
 }
 
-/** Deterministic completion join for the handoff replay: bounded
- * setImmediate sweeps until the EXPECTED ledger event lands, so the
- * assertion target is the join itself — a future extra await anywhere in
- * the replay chain can no longer outpace a fixed tick count. No sleeps,
- * no wall clock; a missing event fails loud with a named error. */
-async function awaitLedgerEvent(
-  ledger: { latestJobEvent(jobId: string, kind: string): EventRecord | null },
-  jobId: string,
-  kind: string,
-  maxSweeps = 1000,
-): Promise<EventRecord> {
-  for (let sweep = 0; sweep < maxSweeps; sweep += 1) {
-    const event = ledger.latestJobEvent(jobId, kind);
-    if (event !== null) return event;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-  throw new Error(
-    `expected a ${kind} event on ${jobId} after ${maxSweeps} deterministic sweeps — the replay never settled`,
-  );
+/** Fixture-local completion join on the harness's EXISTING EventBus (the
+ * same bus the LedgerApi and WaveRunner already share): a promise armed
+ * BEFORE the replay runs that resolves on THIS job's expected event. A
+ * fresh subscription only sees emissions made after it attaches, so stale
+ * history can never satisfy the join, and the jobId+kind filter
+ * distinguishes the expected request from any other traffic. Bounded by
+ * the SAME deterministic 100-sweep drain the former fixed flush used —
+ * no larger iteration count, no sleep, no wall-clock timeout. The
+ * listener is released on resolution and on bound exhaustion; the bus is
+ * fixture-local, so nothing outlives the test either way. An event that
+ * never lands rejects with a named error — absence is never success. */
+function joinJobEvent(h: Harness, jobId: string, kind: string): Promise<EventRecord> {
+  return new Promise<EventRecord>((resolve, reject) => {
+    let settled = false;
+    const unsubscribe = h.bus.subscribe((event) => {
+      if (settled || event.kind !== kind || event.jobId !== jobId) return;
+      settled = true;
+      unsubscribe();
+      resolve(event);
+    });
+    let sweeps = 0;
+    const drain = (): void => {
+      setImmediate(() => {
+        if (settled) return;
+        if (sweeps >= 100) {
+          settled = true;
+          unsubscribe();
+          reject(
+            new Error(`expected a ${kind} event on ${jobId} — the replay emitted none within the original 100-sweep bound`),
+          );
+          return;
+        }
+        sweeps += 1;
+        drain();
+      });
+    };
+    drain();
+  });
 }
 
 function eventRecord(seq: number, kind: string, payload: unknown = {}): EventRecord {
@@ -592,15 +613,21 @@ describe('branch-idle guard', () => {
       // replay must not start an obsolete review.
       h.ledger.setJobStatus('rebrief-handoff', 'delivered');
       const markers = h.ledger.beginPendingRebrief({ jobId: 'rebrief-handoff', note: 'n', briefing: 'b' });
+      // Arm the join BEFORE the replay: the subscription sees only events
+      // emitted by THIS reconciliation, never stale history.
+      const requeuedPromise = joinJobEvent(h, 'rebrief-handoff', 'job.review-handoff-requeued');
       h.wave.reconcilePendingHandoffs();
-      await awaitLedgerEvent(h.ledger, 'rebrief-handoff', 'job.review-handoff-requeued');
+      const requeued = await requeuedPromise;
+      expect(requeued.jobId).toBe('rebrief-handoff');
       expect(h.ledger.listRounds('rebrief-handoff')).toHaveLength(0);
       expect(preflights).toBe(0);
 
       // Genuine settlement releases the target; the queued replay arms.
       h.ledger.clearPendingRebriefs(markers.map((marker) => marker.id));
+      const startedPromise = joinJobEvent(h, 'rebrief-handoff', 'job.review-handoff-started');
       h.wave.reconcilePendingHandoffs();
-      await awaitLedgerEvent(h.ledger, 'rebrief-handoff', 'job.review-handoff-started');
+      const started = await startedPromise;
+      expect(started.jobId).toBe('rebrief-handoff');
       expect(h.ledger.listRounds('rebrief-handoff')).toHaveLength(1);
       expect(preflights).toBe(1);
     } finally {
