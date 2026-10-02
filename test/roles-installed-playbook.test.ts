@@ -192,8 +192,12 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('select by what the project really has installed for the task');
     expect(flat).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
     expect(flat).toContain('You own the selected workflow end to end');
-    expect(flat).toContain('fresh, context-free reviewer sessions');
-    expect(flat).toContain('`pi -p` / `claude -p`');
+    expect(flat).toContain("fresh, context-free tracked review jobs you commission through the service's dispatch surface");
+    expect(flat).toContain('each reviewer is a separate tracked job with its own session and worktree');
+    // j-810/j-811: the retired untracked headless-launcher wording must never return.
+    expect(flat).not.toContain('pi -p');
+    expect(flat).not.toContain('claude -p');
+    expect(flat).not.toContain('headless print mode');
     expect(flat).toContain('never a second Gru');
     expect(flat).toContain('an inline self-review is not a substitute');
     expect(flat).toContain('report that exact capability gap loudly');

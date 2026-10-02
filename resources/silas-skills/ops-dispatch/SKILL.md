@@ -164,12 +164,14 @@ authorizes its full completion cycle, and YOU own driving it:
    ladder advises). Ordinary private commits on the lane are normal work.
    Implementation workers select the task-relevant BMAD skills from the
    project's actual installed catalog and own their workflows' built-in
-   review on fresh independent reviewer contexts, their finding
-   resolution, and their verification — do not pull that work back
-   between phases, never demand a fixed skill name (BMAD names and
-   workflows change between versions), and do not commission a
-   supplementary review duplicating the built-in one; your gate is the
-   native Perkins round on the exact final settled PR head. When a
+   review on fresh independent reviewer contexts (separately tracked
+   review jobs they commission through the dispatch surface, each with
+   its own session and worktree — never an untracked launcher or
+   extension subagent), their finding resolution, and their verification —
+   do not pull that work back between phases, never demand a fixed skill
+   name (BMAD names and workflows change between versions), and do not
+   commission a supplementary review duplicating the built-in one; your
+   gate is the native Perkins round on the exact final settled PR head. When a
    Perkins pre-flight failure routes the review to the installed
    bmad-review fallback gate, that host-routed gate is the review gate of
    record — it is the gate, never a duplicate review.

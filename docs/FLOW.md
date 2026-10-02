@@ -266,7 +266,10 @@ the task-relevant BMAD skills from the PROJECT's actual installed skill
 catalog/metadata and follows their current workflows — names and workflow
 structure change between BMAD versions, so brief by the task, never by a
 fixed skill name. The selected workflow's built-in review runs on fresh,
-context-free reviewer contexts the minion spawns itself; the minion owns
+context-free reviewer contexts the minion commissions as separately
+tracked review jobs — each with its own session and worktree, a read-only
+brief, and the immutable diff head; never an untracked launcher, an
+extension subagent, or a model-native child session. The minion owns
 finding resolution, verification, and the authorized ordinary PR, and the
 ops layer does not pull the work back between phases or commission a
 supplementary review duplicating the built-in one. Expensive suites

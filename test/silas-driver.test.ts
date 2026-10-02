@@ -621,6 +621,10 @@ describe('silas skills and wake prompt', () => {
     // The ops skill carries the minion-owned BMAD workflow completion cycle.
     expect(ops).toContain("select the task-relevant BMAD skills from the project's actual installed catalog");
     expect(ops).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
+    expect(ops).toContain('separately tracked review jobs');
+    // j-810/j-811: the retired untracked headless-launcher wording must never return.
+    expect(ops).not.toContain('pi -p');
+    expect(ops).not.toContain('headless print mode');
     expect(ops).toContain('never demand a fixed skill name');
     expect(ops).toContain('do not commission a supplementary review duplicating');
     expect(ops).toContain('it is the gate, never a duplicate review');

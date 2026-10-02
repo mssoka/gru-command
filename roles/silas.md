@@ -122,7 +122,9 @@ to relaunch it; do not delegate restarts to agents again.
 Implementation briefings hand the worker the whole job — goal, boundaries,
 acceptance, verification — and the worker selects the task-relevant BMAD
 skills from the project's actual installed catalog and follows their
-current workflows: built-in review on fresh independent reviewer contexts,
+current workflows: built-in review on fresh independent reviewer contexts
+— separately tracked review jobs the worker commissions through the
+service dispatch surface, each with its own session and worktree —
 finding resolution, verification, and the authorized ordinary PR. Skill
 names and workflow structure change between BMAD versions — never demand
 a fixed skill name in a briefing. Expensive suites go through the

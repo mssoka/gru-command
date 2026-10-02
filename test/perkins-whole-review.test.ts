@@ -1348,11 +1348,14 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedMinion).toContain("the PROJECT's actual installed skill catalog and metadata");
     expect(stagedMinion).toContain('select by what the project really has installed for the task');
     expect(stagedMinion).toContain('You own the selected workflow end to end');
-    expect(stagedMinion).toContain('fresh, context-free reviewer sessions');
+    expect(stagedMinion).toContain('fresh, context-free tracked review jobs');
+    expect(stagedMinion).not.toContain('pi -p');
+    expect(stagedMinion).not.toContain('headless print mode');
     expect(stagedMinion).toContain('an inline self-review is not a substitute');
     expect(stagedMinion).not.toMatch(/bmad-[a-z][a-z-]*/u);
     const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
+    expect(stagedOps).toContain('separately tracked review jobs');
     expect(stagedOps).toContain('never demand a fixed skill name');
     expect(stagedOps).toContain('do not commission a supplementary review duplicating');
     expect(stagedOps).toContain('native Perkins round on the exact final settled PR head');
@@ -1376,7 +1379,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       const silasPrompt = flatten(ROLE_DEFINITIONS.silas.systemPrompt);
       const gruPrompt = flatten(ROLE_DEFINITIONS.gru.systemPrompt);
       if (!minionPrompt.includes("the PROJECT's actual installed skill catalog and metadata") ||
-          !minionPrompt.includes('fresh, context-free reviewer sessions') ||
+          !minionPrompt.includes('fresh, context-free tracked review jobs') ||
           /bmad-[a-z][a-z-]*/.test(minionPrompt)) {
         throw new Error('staged minion prompt lacks the BMAD workflow playbook');
       }
