@@ -1332,6 +1332,11 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     execFileSync('tar', ['-xzf', join(tarRoot, packed[0]!.filename), '-C', extractRoot]);
     const stage = join(extractRoot, 'package');
     expect(existsSync(join(stage, 'src'))).toBe(false);
+    // A real install resolves the shipped dist's bare imports through the
+    // dependency tree npm puts beside the package (the tarball itself never
+    // carries node_modules) — mirror that here so the smoke's
+    // `import('./dist/roles.js')` leg exercises the installed loading path.
+    symlinkSync(join(productRoot, 'node_modules'), join(stage, 'node_modules'), 'dir');
     // The shipped artifact carries the minion-owned bmad-build playbook in
     // the packaged personas (owner ruling 2026-10-02): the STAGED minion
     // prompt — read from the tarball extract, not the developer checkout —
