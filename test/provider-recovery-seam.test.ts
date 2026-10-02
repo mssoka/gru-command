@@ -1,12 +1,12 @@
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
-import { Supervisor, type SupervisorRegistry } from '../src/supervision/supervisor.js';
+import { Supervisor, type SupervisorOptions, type SupervisorRegistry } from '../src/supervision/supervisor.js';
 import { buildHealthPayload } from '../src/server.js';
 import type { GruCommandConfig } from '../src/config.js';
 import type { Role } from '../src/config.js';
@@ -170,7 +170,7 @@ class SeamHarness {
   supervisor: Supervisor;
   sensor: ProviderRecoverySensor;
 
-  constructor() {
+  constructor(pacing: Pick<SupervisorOptions, 'rateLimitBackoff' | 'sleep' | 'jitter'> = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-pr-seam-'));
     cleanupDirs.push(dir);
     const db = new LedgerDb(dir);
@@ -246,6 +246,7 @@ class SeamHarness {
       },
       tickMs: 5_000,
       now: () => Date.parse('2026-09-28T10:00:00Z'),
+      ...pacing,
     });
     this.supervisor.start();
   }
@@ -382,6 +383,64 @@ describe('supervisor ⇄ sensor seam', () => {
     expect(waits[0]?.incidentId).toBe(incident?.id);
     // The stop itself is unchanged: the handle is disposed.
     expect(handle.disposed).toBe(true);
+  });
+
+  it('exhausted pacing retries hand the latest typed provider evidence to the recovery sensor', async () => {
+    let releaseBackoff!: () => void;
+    const backoff = new Promise<void>((resolve) => { releaseBackoff = resolve; });
+    const sleep = vi.fn(() => backoff);
+    const h = new SeamHarness({
+      rateLimitBackoff: { baseMs: 100, maxMs: 100, maxRetries: 1, patterns: [] },
+      sleep,
+      jitter: () => 0,
+    });
+    try {
+      const handle = await h.runMinionIntoQuotaWall('job-pacing-exhausted');
+      expect(sleep).toHaveBeenCalledExactlyOnceWith(100);
+      expect(h.ownershipChecks).toHaveLength(0);
+      expect(h.ledger.listProviderWaits()).toHaveLength(0);
+      expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toHaveLength(0);
+      expect(handle.disposed).toBe(false);
+
+      const retryError = {
+        type: 'error',
+        error: '429: {"error":{"code":"1302","message":"usage window still limited"}}',
+        fatal: false,
+        provider: 'zai-coding-cn',
+        model: 'glm-5.3',
+        typed: { origin: 'provider-message', status: 429, bodyCode: '1302', retryAfterMs: 300_000 },
+      } as const;
+      handle.promptHook = () => {
+        handle.emit({ type: 'turn_start' });
+        handle.emit(retryError);
+      };
+      const settled = h.supervisor.awaitRetrySettlement(handle.id);
+      releaseBackoff();
+      expect(await settled).toBe('exhausted');
+      expect(handle.prompts).toEqual([{ text: 'the interrupted briefing turn', owner: 'minion-brief' }]);
+      expect(h.ownershipChecks).toHaveLength(1);
+      expect(h.ownershipChecks[0]?.source).toEqual({
+        provider: retryError.provider,
+        model: retryError.model,
+        error: retryError.error,
+        typed: retryError.typed,
+      });
+      await vi.waitFor(() => {
+        const notice = h.ledger.listNotifications({ routing: 'action-required' })
+          .find((n) => n.kind.startsWith('supervision.provider-wall.'));
+        expect(notice).toBeDefined();
+        const waits = h.ledger.listProviderWaits({ status: 'waiting' });
+        expect(waits).toHaveLength(1);
+        expect(waits[0]).toMatchObject({ agentId: handle.id, incidentId: notice?.id });
+      });
+      expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toHaveLength(0);
+      expect(h.ledger.listEvents({ limit: 50 }).filter((e) => e.kind === 'pacing.auto-retry')).toHaveLength(1);
+      expect(h.ledger.listEvents({ limit: 50 }).filter((e) => e.kind === 'pacing.auto-retry-exhausted')).toHaveLength(1);
+      expect(handle.disposed).toBe(true);
+      expect(h.registry.spawns).toBe(0);
+    } finally {
+      h.supervisor.dispose();
+    }
   });
 
   it('an auth wall keeps the conservative owner stop and never becomes a wait', async () => {

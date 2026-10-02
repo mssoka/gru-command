@@ -62,6 +62,14 @@ beforeEach(() => {
   context.id = 'chat-context-controls';
   const contextStatus = document.createElement('span');
   contextStatus.id = 'chat-context-status';
+  const contextStatusLabel = document.createElement('span');
+  contextStatusLabel.id = 'chat-context-status-label';
+  contextStatusLabel.textContent = 'Context unavailable';
+  const contextFlavor = document.createElement('span');
+  contextFlavor.id = 'chat-context-status-flavor';
+  contextFlavor.setAttribute('aria-hidden', 'true');
+  contextFlavor.hidden = true;
+  contextStatus.append(contextStatusLabel, contextFlavor);
   const contextAnnouncement = document.createElement('span');
   contextAnnouncement.id = 'chat-context-announcement';
   const compact = document.createElement('button');

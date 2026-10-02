@@ -20,6 +20,7 @@ typecheck = "npm run typecheck"
 # scope masks an exit code or bypasses the declared policy).
 residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-resident-registry.test.ts test/fix-directive.test.ts test/silas-deterministic-seam.test.ts"
 handoff-wave = "npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts && npx vitest run test/config.test.ts"
+working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 # The ten externally observed 30s timeouts (failed host run on 78724dc)
@@ -55,6 +56,44 @@ provider-recovery-r4-baseline = 'root="$PWD"; dA=$(mktemp -d "${TMPDIR:-/tmp}/gr
 # _bmad-output/gate-prep/native-compaction-wait-baseline.last-snapshot.txt
 # records the latest snapshot location, preserved for inspection.
 native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f02c9ede86; headrev=ab11bb327c4ba1ab3e3e3a9cc9e6b3bcaf4a22b3; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-native-compaction-wait.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/supervisor.test.ts > "$d/test/supervisor.test.ts"; git show "$headrev":test/suite-shape.test.ts > "$d/test/suite-shape.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/native-compaction-wait-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts'
+lens-unused-neutral = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-signals.test.ts src/lib/board-protocol.test.ts"
+lens-unused-neutral-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=43e437a2e61b0c25351ed6147639aefbac4ccd77; root="$PWD"; prep=_bmad-output/ops-readiness-repair-20261002; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-lens-unused-neutral.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; git show "$headrev":web/src/lib/board-signals.test.ts > "$d/web/src/lib/board-signals.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/lens-unused-neutral-baseline.last-snapshot.txt"; cd "$d" && node tools/patch-vitest-rpc-timeout.mjs && cd "$d/web" && node "$root/node_modules/vitest/vitest.mjs" run src/ui/board.test.ts src/lib/board-signals.test.ts'
+lens-unused-neutral-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=lens-pills"
+
+# Provider pacing regression scopes use the same scheduler budget as full.
+pacing-unit = "npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/config.test.ts test/config-generate.test.ts test/supervisor.test.ts test/patch-vitest-rpc-timeout.test.ts test/suite-shape.test.ts"
+pacing-review = "npx vitest run test/perkins-whole-review.test.ts -t 'provider pacing'"
+# The witnessed settlement/fixture regressions run the approved j-463 RPC
+# patch first (pretest equivalent); still no worker/timeout flags or npm chain.
+pacing-settlement-regressions = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/dispatch-server.test.ts test/supervisor.test.ts test/suite-shape.test.ts"
+
+# PR135 current18 raw-triage regressions (source-only fix pass; runs the
+# approved j-463 RPC patch first, same as the other witnessed scope).
+pacing-current18 = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/supervisor.test.ts test/fix-directive.test.ts test/dispatch-server.test.ts test/patch-vitest-rpc-timeout.test.ts test/suite-shape.test.ts"
+
+# PR135 CI typecheck repair (silas-ops-pr135-ci-type-repair-20261001T014506Z):
+# the compiler diagnostics are covered by the [verify] typecheck scope; this
+# focused scope covers the touched seams' runtime regressions and keeps the
+# approved j-463 RPC patch first, same as the other witnessed scopes.
+pr135-ci-type-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/rebrief-recovery.test.ts test/fix-directive.test.ts test/rate-limit-retry.test.ts test/supervisor.test.ts test/pacing.test.ts"
+
+# PR135 runtime CI three-repair (silas-ops-pr135-runtime-ci-three-repair-20261001T014506Z):
+# the job-attribution FK fixture, the T13/R17 settled-wave contract and the
+# shared child-turn budget oracle, plus the pin file; approved RPC patch first.
+pr135-runtime-ci-three-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/perkins-whole-review.test.ts test/suite-shape.test.ts"
+
+# PR135 r12 fresh-review repairs (BMAD built-in review 2026-10-02): the
+# null-prototype provider map, fire-and-forget dispose safety, canonical
+# retry payloads and the consumer-level settlement tests the verification
+# gap layer identified; approved RPC patch first.
+r12-review-repairs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing-admission.test.ts test/fix-directive.test.ts test/supervisor.test.ts test/config.test.ts test/perkins-builtin-wave.test.ts test/rebrief-recovery.test.ts test/suite-shape.test.ts"
+
+# PR135 r13 fresh-review repairs (BMAD blind-hunter on b541e44, 2026-10-02):
+# classifier context for the 429 family, capped-rung jitter spread, settlement
+# precedence over an already-aborted signal, the shared payload error bound,
+# gate job-attribution, the dual-root patch-tool guards and the
+# deterministic-wait conversions; approved RPC patch first.
+r13-review-repairs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/patch-vitest-rpc-timeout.test.ts test/supervisor.test.ts test/fix-directive.test.ts test/dispatch-server.test.ts test/perkins-builtin-wave.test.ts test/config.test.ts test/config-generate.test.ts test/suite-shape.test.ts"
 
 # PR134 verification readiness (2026-10-02): this lane's focused regression
 # and its isolated pre-fix baseline, declared for the authenticated

@@ -62,6 +62,7 @@ export const CONFIG_SECTION_HEADERS: readonly string[] = [
   '[runtimes.claude-code]',
   '[runtimes.claude-code.roles]',
   '[supervision]',
+  '[pacing]',
   '[logging]',
   '[chat]',
   '[worktrees]',
@@ -346,6 +347,71 @@ export function renderReferenceConfig(
     `max_restarts = ${supervision.maxRestarts}`,
     `# Backoff base between failed restart rungs (doubles, capped at 60s).`,
     `restart_backoff_ms = ${supervision.restartBackoffMs}`,
+  );
+  // Preserve explicit pacing policy independently of residency settings.
+  const pacing = preserved?.pacing;
+  if (pacing !== undefined) {
+    lines.push(
+      '',
+      '[pacing]',
+      '# Provider pacing: FIFO admission caps for minion turns and Perkins',
+      '# review turns, plus bounded automatic retry for the provider',
+      '# rate-limit error class (HTTP 429 and plain-language throttling).',
+      '# Queued waits are carried in the board snapshot data with the honest',
+      '# reason; every automatic retry is recorded as a pacing.auto-retry',
+      '# ledger event. Ledger vocabulary: pacing.queued, pacing.admitted,',
+      '# pacing.wait-cancelled, pacing.queued-rollback, pacing.auto-retry,',
+      '# pacing.auto-retry-recovered, pacing.auto-retry-exhausted.',
+      '# max_auto_retries = 0 disables automatic retry (admission caps stay active).',
+      '# Enabled with unlimited caps by default; set enabled = false to disable.',
+      `enabled = ${pacing.enabled}`,
+      `max_concurrent_minions = ${pacing.maxConcurrentMinions}`,
+      `max_concurrent_review_turns = ${pacing.maxConcurrentReviewTurns}`,
+      `backoff_base_ms = ${pacing.backoffBaseMs}`,
+      `backoff_max_ms = ${pacing.backoffMaxMs}`,
+      `max_auto_retries = ${pacing.maxAutoRetries}`,
+    );
+    for (const [providerId, override] of Object.entries(pacing.providers)) {
+      lines.push(
+        '',
+        `[pacing.providers.${tomlString(providerId)}]`,
+        '# Extra rate-limit signatures (regex bodies matched against error text',
+        '# only — global text signatures, never a brand baked into code).',
+        `rate_limit_patterns = [${override.rateLimitPatterns.map((pattern) => tomlString(pattern)).join(', ')}]`,
+      );
+    }
+  } else {
+    lines.push(
+      '',
+      '# [pacing]',
+      '# Provider pacing: FIFO admission caps for minion and Perkins review',
+      '# turns (queued waits are carried in the board snapshot data; live turns are never preempted),',
+      '# plus bounded automatic retry for the rate-limit error class',
+      '# (HTTP 429, "rate limit", "too many requests", throttling). Every',
+      '# automatic retry is recorded as a pacing.auto-retry ledger event.',
+      '# Full ledger vocabulary: pacing.queued, pacing.admitted,',
+      '# pacing.wait-cancelled, pacing.queued-rollback, pacing.auto-retry,',
+      '# pacing.auto-retry-recovered, pacing.auto-retry-exhausted.',
+      '# Enabled by default with unlimited admission caps. Suggested starting',
+      '# point: cap minion and review turns at 3; 1s backoff, capped at 60s,',
+      '# 5 retries.',
+      '# max_auto_retries = 0 disables automatic retry (admission caps stay active).',
+      '# Caps count MINION and Perkins review turns only: silas/bob/distiller/',
+      '# chat core turns are outside this pool (the board view is not a',
+      '# provider-wide count).',
+      '# max_concurrent_minions = 3',
+      '# max_concurrent_review_turns = 3   # 0 = unlimited',
+      '# backoff_base_ms = 1000',
+      '# backoff_max_ms = 60000',
+      '# max_auto_retries = 5',
+      '# enabled = true',
+      '# Optional provider-keyed extra signatures (global text signatures):',
+      '# [pacing.providers."<provider-id>"]',
+      '# rate_limit_patterns = ["pacing code \\\\d+"]',
+      '# [concurrency] controls resident sessions separately from these turn caps.',
+    );
+  }
+  lines.push(
     '',
     '[logging]',
     '# service.log size-based rotation.',
