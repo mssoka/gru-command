@@ -69,6 +69,20 @@ describe('ledger db + migration runner', () => {
     expect(() => new LedgerDb(dir)).toThrow(/unknown to this build/u);
   });
 
+  it('an applied migration whose recorded name differs from code fails loud (rename/reuse)', () => {
+    const dir = tmpDir();
+    // A database that applied the pre-integration ordering: id 9 is the
+    // never-deployed old name of the display-name migration (the 2026-10-02
+    // renumber moved it to id 10 under main's accepted worktree-base-source).
+    const preRename = [
+      ...MIGRATIONS.slice(0, 8),
+      { id: 9, name: 'job-display-name', sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;' },
+    ];
+    const old = new LedgerDb(dir, { migrations: preRename });
+    old.close();
+    expect(() => new LedgerDb(dir)).toThrow(/renamed migration/u);
+  });
+
   it('a numbering gap in the migration list fails loud before applying anything', () => {
     const dir = tmpDir();
     const gapped = [
