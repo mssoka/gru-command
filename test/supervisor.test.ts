@@ -204,7 +204,10 @@ interface Harness {
   dispose(): void;
 }
 
-function boot(decisions?: DecisionService, opts: { wallNow?: () => number } = {}): Harness {
+function boot(
+  decisions?: DecisionService,
+  opts: { wallNow?: () => number; log?: (level: string, msg: string, fields?: Record<string, unknown>) => void } = {},
+): Harness {
   const dir = tmpDir();
   const db = new LedgerDb(dir);
   const bus = new EventBus();
@@ -245,6 +248,7 @@ function boot(decisions?: DecisionService, opts: { wallNow?: () => number } = {}
     notifications: center,
     ...(decisions !== undefined ? { decisions } : {}),
     ...(opts.wallNow !== undefined ? { wallNow: opts.wallNow } : {}),
+    ...(opts.log !== undefined ? { log: opts.log } : {}),
     tickMs: 5,
     now: () => harness.nowMs,
   });
@@ -763,7 +767,8 @@ describe('supervisor — durable restart association', () => {
   });
 
   it('disposes a replacement whose known binding cannot be recorded before recovering its prompt', async () => {
-    const rig = boot();
+    const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+    const rig = boot(undefined, { log: (level, msg, fields) => logs.push({ level, msg, fields }) });
     const engine = new BoardEngine({ ledger: rig.api, bus: new EventBus() });
     const unsubscribe = rig.registry.onAgentEvent((event) => engine.onRuntimeEvent(event));
     const replacements: FakeHandle[] = [];
@@ -775,6 +780,15 @@ describe('supervisor — durable restart association', () => {
       original.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:binding-retry' };
       rig.registry.spawnImpl = async (role) => {
         const handle = new FakeHandle(role, `binding-replacement-${replacements.length + 1}`, null);
+        if (replacements.length === 0) {
+          // The failed replacement's disposal also rejects: the original
+          // binding error must survive, never the dispose error.
+          const dispose = handle.dispose.bind(handle);
+          handle.dispose = async () => {
+            await dispose();
+            throw new Error('dispose after binding failure exploded');
+          };
+        }
         replacements.push(handle);
         return handle;
       };
@@ -787,6 +801,13 @@ describe('supervisor — durable restart association', () => {
       await vi.waitFor(() => expect(rig.supervisor.viewFor('binding-replacement-2')?.restarts).toBe(2));
       expect(replacements[0]?.disposed).toBe(true);
       expect(replacements[0]?.promptCalls).toEqual([]);
+      // The rung reports the actionable binding failure; the dispose
+      // rejection is logged separately and never masks it.
+      const rungErrors = logs
+        .filter((entry) => entry.msg === 'restart rung threw — settling')
+        .map((entry) => String(entry.fields?.error));
+      expect(rungErrors).toEqual(['Error: restart binding write failed']);
+      expect(logs.some((entry) => entry.msg.includes('binding error is preserved'))).toBe(true);
       expect(rig.api.getAgent('binding-replacement-2')?.jobId).toBe('binding-retry');
       expect(replacements[1]?.promptCalls).toEqual([{ text: 'finish the briefing', owner: 'dispatch:binding-retry' }]);
     } finally {

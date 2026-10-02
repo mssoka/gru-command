@@ -1252,7 +1252,14 @@ export class Supervisor {
           } catch (error) {
             // Never recover a prompt on a replacement whose known ownership
             // could not be recorded; the existing ladder reports/retries it.
-            await this.registry.disposeHandle(spawned);
+            // A dispose hiccup is reported but must not mask the actionable
+            // binding error (mirrors the stale-result path above).
+            await this.registry.disposeHandle(spawned).catch((disposeError: unknown) => {
+              this.log('warn', 'dispose of the unbound replacement failed — the binding error is preserved', {
+                agent_id: spawned.id,
+                error: String(disposeError),
+              });
+            });
             throw error;
           }
         }
