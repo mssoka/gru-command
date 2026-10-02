@@ -73,7 +73,8 @@ describe('ledger db + migration runner', () => {
     const dir = tmpDir();
     // A database that applied the pre-integration ordering: id 9 is the
     // never-deployed old name of the display-name migration (the 2026-10-02
-    // renumber moved it to id 10 under main's accepted worktree-base-source).
+    // renumbers moved it to id 11 under main's accepted worktree-base-source
+    // id 9 and provider-recovery-waits id 10).
     const preRename = [
       ...MIGRATIONS.slice(0, 8),
       { id: 9, name: 'job-display-name', sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;' },

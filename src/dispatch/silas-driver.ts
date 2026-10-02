@@ -7,6 +7,7 @@ import type { AgentRecord, EventRecord, JobRecord, LedgerApi, RoundRecord } from
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { GitHubPollTickResult } from './github-poll.js';
+import { pendingRecoveryRows } from '../provider-recovery/sensor.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -133,9 +134,12 @@ export interface DigestLedger {
   listJobEvents(jobId: string, opts?: { limit?: number }): readonly EventRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
+  listAgents(): readonly AgentRecord[];
   /** Implementer minions only (Gru ruling 2026-09-29): review-only
    * sessions never win a digest pick. */
   listImplementerMinions(jobId: string): readonly AgentRecord[];
+  listProviderWaits?(opts?: { status?: string }): readonly unknown[];
+  listPendingProviderRecoveries?(): readonly unknown[];
 }
 
 /** Blockers of one round, with an explicit loud note instead of a silent
@@ -235,6 +239,18 @@ export interface MinionErrorRow {
   readonly at: string | null;
 }
 
+/** A provider-recovered lane awaiting its guarded continuation claim
+ * (provider-recovery sensor): Silas drives these through the recovery
+ * claim endpoint — one continuation per claim, fan-out after actual model
+ * progress. */
+export interface ProviderRecoveryPendingRow {
+  readonly waitId: string;
+  readonly jobId: string | null;
+  readonly slotId: string | null;
+  readonly route: string;
+  readonly recoveredAt: string;
+}
+
 export interface SilasOpsDigest {
   readonly computedAt: string;
   readonly trigger: string;
@@ -243,6 +259,7 @@ export interface SilasOpsDigest {
   readonly verdictsAwaitingDirective: readonly VerdictAwaitingDirectiveRow[];
   readonly stalledWorking: readonly StalledWorkingRow[];
   readonly minionErrors: readonly MinionErrorRow[];
+  readonly providerRecoveryPending: readonly ProviderRecoveryPendingRow[];
 }
 
 /** Count of actionable rows (event triggers wake even at zero; sweeps do not). */
@@ -252,7 +269,8 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.prWithoutReview.length +
     digest.verdictsAwaitingDirective.length +
     digest.stalledWorking.length +
-    digest.minionErrors.length
+    digest.minionErrors.length +
+    digest.providerRecoveryPending.length
   );
 }
 
@@ -355,6 +373,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     verdictsAwaitingDirective: VerdictAwaitingDirectiveRow[];
     stalledWorking: StalledWorkingRow[];
     minionErrors: MinionErrorRow[];
+    providerRecoveryPending: ProviderRecoveryPendingRow[];
   } = {
     computedAt: new Date(now()).toISOString(),
     trigger: input.trigger,
@@ -363,6 +382,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     verdictsAwaitingDirective: [],
     stalledWorking: [],
     minionErrors: [],
+    providerRecoveryPending: [],
   };
   for (const job of input.ledger.listJobs()) {
     if (job.status === 'merged' || job.status === 'done') continue;
@@ -510,6 +530,18 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       });
     }
   }
+  // Provider-recovery lanes awaiting a guarded continuation claim: the
+  // durable pending-delivery rows ARE the restart-safe handoff — every
+  // sweep re-arms this row until each wait is claimed or retired, so a
+  // lost wake can never strand recovered work.
+  if (
+    input.ledger.listProviderWaits !== undefined &&
+    input.ledger.listPendingProviderRecoveries !== undefined
+  ) {
+    digest.providerRecoveryPending = [
+      ...pendingRecoveryRows(input.ledger as Parameters<typeof pendingRecoveryRows>[0]),
+    ];
+  }
   return digest;
 }
 
@@ -565,7 +597,7 @@ export interface SilasSlot {
   ensure(options?: SpawnOptions): Promise<AgentHandle>;
 }
 
-export type SilasTriggerKind = 'job.delivered' | 'job.minion-error' | 'round.verdict' | 'round.perkins-incomplete' | 'sweep';
+export type SilasTriggerKind = 'job.delivered' | 'job.minion-error' | 'round.verdict' | 'round.perkins-incomplete' | 'provider.restored' | 'sweep';
 
 export interface SilasTrigger {
   readonly kind: SilasTriggerKind;
@@ -602,7 +634,7 @@ export interface SilasDriverOptions {
   readonly now?: () => number;
 }
 
-const SILAS_WAKE_EVENTS: readonly string[] = ['job.delivered', 'job.minion-error', 'round.verdict', 'round.perkins-incomplete'];
+const SILAS_WAKE_EVENTS: readonly string[] = ['job.delivered', 'job.minion-error', 'round.verdict', 'round.perkins-incomplete', 'provider.restored'];
 
 export class SilasDriver {
   private readonly opts: SilasDriverOptions;
@@ -857,6 +889,19 @@ export function buildWakePrompt(input: {
     'blocker (same fingerprint) recurs across consecutive verdict rounds,',
     'follow the advice named per blocker: directive → re-brief a fresh',
     'minion → escalate. Escalation always beats an endless loop.',
+    '',
+    '## Provider recovery (guarded continuation claims)',
+    '',
+    'Digest rows under providerRecoveryPending name lanes whose provider',
+    'limit recovered — the sensor already verified fresh completed producer',
+    'evidence on the exact route. Claim ONE continuation per wait through',
+    'the ops surface (POST /api/silas/provider-recovery/claim with',
+    '{"wait_id":"...","by":"silas"}); the service rechecks approval,',
+    'incident currency, blockers, actor cessation, and lane state, then',
+    'resumes the interrupted session. Fan out to further waits only after',
+    'the first continuation shows actual model progress. Never ack or',
+    'dispose provider-wall notifications on the owner’s behalf — those',
+    'stay owner-held.',
     '',
     'Reply with a short completion note: what you did per lane, or why you',
     'left it untouched.',

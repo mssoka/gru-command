@@ -198,7 +198,7 @@ FYI (owner incident 2026-09-23: lanes branched up to hours stale,
 silently). On REVIEW lanes `origin` covers any freshly fetched origin
 branch named by the target — not only the default branch.
 
-### E9: short heist names (migration 10)
+### E9: short heist names (migration 11)
 
 `jobs.display_name` is the optional short name the crew rail shows on
 minion cards (nullable: legacy rows read as NULL and fall back to a

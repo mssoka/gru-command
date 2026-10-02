@@ -335,11 +335,89 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
-    // Short heist names (owner-approved display, 2026-09-24): optional
-    // authored job label. Renumbered 9 -> 10 on integration with main's
-    // accepted worktree-base-source (id 9); never applied anywhere before
-    // this integration, so the renumber is safe and history-free.
+    // Provider-recovery sensor (owner-approved 2026-09-28): durable
+    // provider-wait state, per-route probe cadence/budget, and the
+    // restart-safe pending recovery delivery marker. Explicit waits only —
+    // never inferred from generic blocked status or backlog membership.
     id: 10,
+    name: 'provider-recovery-waits',
+    sql: `
+      CREATE TABLE provider_waits (
+        id                      TEXT PRIMARY KEY,
+        route_key               TEXT NOT NULL,
+        provider                TEXT NOT NULL,
+        model                   TEXT NOT NULL,
+        endpoint                TEXT NOT NULL,
+        credential_fingerprint  TEXT NOT NULL,
+        waiter_kind             TEXT NOT NULL CHECK (waiter_kind IN ('job-minion','silas-slot')),
+        job_id                  TEXT REFERENCES jobs(id),
+        agent_id                TEXT,
+        slot_id                 TEXT,
+        session_file            TEXT,
+        continuation            TEXT,
+        job_status_at_establishment TEXT,
+        lineage_key             TEXT,
+        recovery_batch_id       TEXT,
+        incident_id             TEXT NOT NULL,
+        incident_generation     INTEGER NOT NULL,
+        status                  TEXT NOT NULL CHECK (status IN ('waiting','recovered-pending','claimed','cancelled','superseded')),
+        reason_class            TEXT NOT NULL,
+        created_at              TEXT NOT NULL,
+        updated_at              TEXT NOT NULL
+      );
+      CREATE INDEX idx_provider_waits_route ON provider_waits(route_key, status);
+      CREATE INDEX idx_provider_waits_job ON provider_waits(job_id);
+      CREATE INDEX idx_provider_waits_agent ON provider_waits(agent_id);
+
+      CREATE TABLE provider_routes (
+        route_key                  TEXT PRIMARY KEY,
+        provider                   TEXT NOT NULL,
+        model                      TEXT NOT NULL,
+        endpoint                   TEXT NOT NULL,
+        credential_fingerprint     TEXT NOT NULL,
+        incident_seq               INTEGER NOT NULL,
+        window_start               TEXT NOT NULL,
+        attempts_in_window         INTEGER NOT NULL,
+        next_check_at              TEXT NOT NULL,
+        last_attempt_at            TEXT,
+        last_result                TEXT,
+        consecutive_probe_failures INTEGER NOT NULL,
+        false_recovery_count       INTEGER NOT NULL,
+        suspended_until            TEXT,
+        updated_at                 TEXT NOT NULL
+      );
+
+      CREATE TABLE pending_provider_recovery (
+        id                   TEXT PRIMARY KEY,
+        route_key            TEXT NOT NULL,
+        incident_generation  INTEGER NOT NULL,
+        evidence             TEXT NOT NULL,
+        created_at           TEXT NOT NULL,
+        updated_at           TEXT NOT NULL,
+        UNIQUE (route_key, incident_generation)
+      );
+      CREATE INDEX idx_pending_provider_recovery_route ON pending_provider_recovery(route_key);
+
+      -- Durable PRE-I/O probe reservation (r1 #5): a row exists while a
+      -- check is in flight or was interrupted mid-flight; its presence
+      -- means the attempt was CHARGED (budget + cadence advanced BEFORE
+      -- the network I/O), so a crash can never refund it or issue an
+      -- immediate duplicate.
+      CREATE TABLE provider_probe_reservations (
+        route_key    TEXT PRIMARY KEY,
+        reserved_at  TEXT NOT NULL,
+        expires_at   TEXT NOT NULL,
+        outcome      TEXT NOT NULL CHECK (outcome IN ('reserved','spent-unknown'))
+      );
+    `,
+  },
+  {
+    // Short heist names (owner-approved display, 2026-09-24): optional
+    // authored job label. Renumbered 9 -> 10 -> 11 across the two main integrations
+    // (worktree-base-source id 9; provider-recovery-waits id 10); never
+    // applied anywhere before this integration, so the renumber is safe
+    // and history-free.
+    id: 11,
     name: 'job-display-name',
     sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;',
   },
