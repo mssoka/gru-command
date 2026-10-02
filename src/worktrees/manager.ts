@@ -13,8 +13,9 @@ import {
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import type { LogLevel } from '../logger.js';
-import type { LedgerApi, WorktreeRecord } from '../ledger/api.js';
+import type { LedgerApi, WorktreeBaseSource, WorktreeRecord } from '../ledger/api.js';
 import { applyWorktreeManifest, loadWorktreeManifest } from './manifest.js';
+import { redactedText } from '../decisions/questions.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -25,7 +26,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * (a) Bootstrap manifest — `<repo>/.gru-command/worktree.toml`, applied
  *     automatically at creation (see manifest.ts).
  * (b) Registry — the LEDGER is the authoritative map job → worktree →
- *     branch; creation happens at a freshly-resolved sha; sweeps match
+ *     branch; creation happens at a freshly-FETCHED origin sha (the base
+ *     SOURCE is recorded — 'origin' vs 'local-head-fallback', never a
+ *     silent stale base; owner incident 2026-09-23); sweeps match
  *     registry paths only — never id-proximity, never labels.
  * (c) Preserve-first ordered sweep — untracked deliverables preserved
  *     FIRST, processes rooted in the tree enumerated BEFORE removal; any
@@ -221,6 +224,23 @@ export interface WorktreeManagerOptions {
   readonly setupTimeoutMs: number;
   /** Grace between the acknowledged SIGTERM and the SIGKILL (ms). */
   readonly killGraceMs?: number;
+  /** Fetch budget for origin base resolution (default 30 s) — a network
+   * op degrades to the declared local fallback, it never hangs the lane. */
+  readonly fetchTimeoutMs?: number;
+  /** FYI sink when a lane could not fetch origin and fell back to local
+   * HEAD (the degraded path is also recorded in the registry row; owner
+   * incident 2026-09-23 — staleness is visible, never silent). Wired to
+   * the notification center in main.ts. A sink failure never fails the
+   * lane: the registry row is the durable record. */
+  readonly onBaseFallback?: (input: {
+    readonly worktreeId: string;
+    readonly jobId: string;
+    readonly repoPath: string;
+    readonly repoName: string;
+    readonly defaultBranch: string | null;
+    readonly sha: string;
+    readonly detail: string;
+  }) => void;
   /** Escalation when a sweep pauses on live processes (fail-loud ask). */
   readonly onSweepPaused?: (input: {
     readonly worktree: WorktreeRecord;
@@ -230,11 +250,20 @@ export interface WorktreeManagerOptions {
   readonly log?: Log;
 }
 
-function runGit(repoPath: string, args: readonly string[]): string {
-  const { status, stdout, stderr } = spawnGit(repoPath, args);
+interface SpawnGitOptions {
+  /** Kill the git process after this budget (a service degrades, never hangs). */
+  readonly timeoutMs?: number;
+  /** Suppress interactive credential prompts (same reason). */
+  readonly noPrompt?: boolean;
+}
+
+function runGit(repoPath: string, args: readonly string[], opts: SpawnGitOptions = {}): string {
+  const { status, stdout, stderr, error } = spawnGit(repoPath, args, opts);
   if (status !== 0) {
     throw new Error(
-      `git ${args.join(' ')} failed (exit ${status}) in ${repoPath}: ${stderr.trim() || stdout.trim()}`,
+      `git ${args.join(' ')} failed (exit ${status}) in ${repoPath}: ${
+        stderr.trim() || error || stdout.trim()
+      }`,
     );
   }
   return stdout.trim();
@@ -243,19 +272,54 @@ function runGit(repoPath: string, args: readonly string[]): string {
 function spawnGit(
   repoPath: string,
   args: readonly string[],
-): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync('git', args, { cwd: repoPath, encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024 });
+  opts: SpawnGitOptions = {},
+): { status: number | null; stdout: string; stderr: string; error: string | null } {
+  const result = spawnSync('git', args, {
+    cwd: repoPath,
+    encoding: 'utf-8',
+    maxBuffer: 16 * 1024 * 1024,
+    ...(opts.timeoutMs !== undefined ? { timeout: opts.timeoutMs } : {}),
+    ...(opts.noPrompt === true ? { env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } } : {}),
+  });
   return {
     status: result.status,
     stdout: result.stdout ?? '',
     stderr: result.stderr ?? '',
+    error: result.error !== undefined ? String(result.error) : null,
   };
+}
+
+/** A lane base resolved to a concrete commit, with its provenance. */
+interface ResolvedBase {
+  readonly sha: string;
+  readonly baseSource: WorktreeBaseSource;
+  readonly defaultBranch: string | null;
+  /** Why the degraded path was taken (null when `baseSource` is 'origin'). */
+  readonly fallbackDetail: string | null;
+}
+
+/** True when a ref's SPELLING names an EXACT origin remote branch — the
+ * origin prefix stripped, the remainder is a syntactically plausible
+ * branch name. Origin-prefixed REVISION EXPRESSIONS (origin/main~1,
+ * origin/main^, origin/main@{u}) are NOT branch spellings: a real branch
+ * name cannot contain their operators, and routing one to the fetch would
+ * fetch a literal branch named "main~1" instead of resolving the named
+ * ancestor. Such spellings keep pin semantics (resolved exactly as
+ * named, refusing loudly when unresolvable). */
+export function isExactOriginBranchSpelling(ref: string): boolean {
+  const stripped = ref.replace(/^(?:refs\/)?remotes\/origin\/|^origin\//u, '');
+  if (stripped === '' || stripped === ref) return false; // no origin prefix
+  // Revision-expression operators and git's forbidden ref-name sequences.
+  // A misclassification here can only land on a loud refusal (a fetch of a
+  // name the remote rejects), never on wrong bytes.
+  return !/[~^:@\s]|\.\./u.test(stripped) && !stripped.startsWith('-');
 }
 
 export class WorktreeManager {
   private readonly opts: WorktreeManagerOptions;
   private readonly log: Log;
   private readonly enumerate: ProcessEnumerator;
+  private readonly fetchTimeoutMs: number;
   /** Same-repo serialization (ruling 18e): one creation at a time. */
   private readonly repoLocks = new Map<string, Promise<unknown>>();
   /** Set by finishSweep's tail guard; drained by recordSweepEvent. */
@@ -265,6 +329,7 @@ export class WorktreeManager {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
     this.enumerate = opts.enumerateProcesses ?? psEnumerator;
+    this.fetchTimeoutMs = opts.fetchTimeoutMs ?? 30_000;
   }
 
   /** Serialize per-repo mutations (worktree add/remove, branch deletes). */
@@ -280,9 +345,315 @@ export class WorktreeManager {
     return next;
   }
 
-  /** Freshly-resolved HEAD sha — always at creation/release time, never held. */
+  /**
+   * The base-resolution contract (owner incident 2026-09-23): a lane
+   * branches from the FETCHED origin default-branch tip — never from the
+   * worktree-host clone's local checkout, which can be hours stale. The
+   * degraded path is DECLARED: a fetch failure falls back to local HEAD
+   * with baseSource 'local-head-fallback' (recorded in the registry row,
+   * surfaced by an FYI) — staleness is visible, never silent.
+   */
+  private resolveBase(repoPath: string): ResolvedBase {
+    const resolved = this.resolveDefaultBranch(repoPath);
+    const defaultBranch = resolved.branch;
+    const localHead = (): string => runGit(repoPath, ['rev-parse', 'HEAD']);
+    if (defaultBranch === null) {
+      const detail = resolved.authoritativeAbsence
+        ? `origin default branch is unresolvable — the reachable remote's HEAD names no branch ` +
+          `(${resolved.liveDetail ?? 'no symref'}); cached origin/HEAD deliberately not trusted`
+        : `origin default branch is unresolvable — live probe: ${
+            resolved.liveDetail ?? 'named no branch'
+          }, no cached origin/HEAD`;
+      this.log('warn', 'base resolution degraded to the local checkout', { repo: repoPath, detail });
+      return { sha: localHead(), baseSource: 'local-head-fallback', defaultBranch: null, fallbackDetail: detail };
+    }
+    const fetched = this.fetchOriginTip(repoPath, defaultBranch);
+    // A cache-guessed default (the live probe FAILED — offline or
+    // transient) is NEVER verified freshness, even when the fetch
+    // succeeds (Perkins r6 B1): the fetch proves the branch exists, not
+    // that the remote still calls it default. Only a LIVE-probed default
+    // may record 'origin'; the cache-guessed path takes the APPROVED
+    // declared local-HEAD fallback with a visible FYI — no fail-closed
+    // redesign, no new provenance label.
+    if (!resolved.verified) {
+      const detail = fetched.ok
+        ? `origin default UNVERIFIED — live probe failed (${resolved.liveDetail ?? 'unreachable'}); ` +
+          `origin/${defaultBranch} fetched at ${fetched.sha} proves the branch exists, not that it is the default — ` +
+          'degraded to local HEAD'
+        : fetched.detail;
+      this.log('warn', 'base resolution degraded to the local checkout (default unverified)', {
+        repo: repoPath,
+        branch: defaultBranch,
+        detail,
+      });
+      return {
+        sha: localHead(),
+        baseSource: 'local-head-fallback',
+        defaultBranch,
+        fallbackDetail: detail,
+      };
+    }
+    if (fetched.ok) {
+      return { sha: fetched.sha, baseSource: 'origin', defaultBranch, fallbackDetail: null };
+    }
+    this.log('warn', 'base resolution degraded to the local checkout (origin fetch failed)', {
+      repo: repoPath,
+      branch: defaultBranch,
+      detail: fetched.detail,
+    });
+    return {
+      sha: localHead(),
+      baseSource: 'local-head-fallback',
+      defaultBranch,
+      fallbackDetail: fetched.detail,
+    };
+  }
+
+  /** The remote's own HEAD symref, asked live — the AUTHORITY for the
+   * default branch. The cached `refs/remotes/origin/HEAD` can name a
+   * branch the remote has since demoted (Perkins blocker: default
+   * renamed main→trunk while main stayed fetchable — lanes branched
+   * from the stale main recorded as 'origin'); only the live answer
+   * proves what the remote calls default TODAY. */
+  private liveDefaultBranch(
+    repoPath: string,
+  ): {
+    readonly branch: string | null;
+    readonly detail: string | null;
+    /** True when the probe SUCCEEDED and authoritatively found no default
+     * (exit 0, no symref line): the reachable remote names no branch, so
+     * no cached value may speak for it (Perkins R5 — consulting the
+     * cache here selected a demoted-but-fetchable branch and recorded it
+     * as 'origin'). False when the probe failed/unreachable — the cache
+     * remains the declared offline guess. */
+    readonly authoritativeAbsence: boolean;
+  } {
+    const live = spawnGit(repoPath, ['ls-remote', '--symref', 'origin', 'HEAD'], {
+      timeoutMs: this.fetchTimeoutMs,
+      noPrompt: true,
+    });
+    if (live.status === 0) {
+      const match = /^ref:\s+refs\/heads\/([^\s]+)\s+HEAD$/mu.exec(live.stdout);
+      if (match !== null && match[1] !== undefined && match[1] !== '') {
+        return { branch: match[1], detail: null, authoritativeAbsence: false };
+      }
+      // Exit 0 but no symref line: the reachable remote names no default
+      // HEAD — an AUTHORITATIVE absence, never a cache consultation.
+      return { branch: null, detail: 'remote HEAD carries no branch symref', authoritativeAbsence: true };
+    }
+    const detail = live.stderr.trim() || live.error || live.stdout.trim();
+    return {
+      branch: null,
+      // Redacted at the source (Perkins r6 W3): raw git stderr can carry
+      // credential-bearing remote URLs into logs and persisted FYIs.
+      detail: redactedText(detail === '' ? `ls-remote exited ${String(live.status)}` : detail, 500),
+      authoritativeAbsence: false,
+    };
+  }
+
+  /**
+   * The origin default branch, resolved PER-REPO — never a hardcoded
+   * 'main': (1) the remote's LIVE HEAD symref (the authority — a cached
+   * value can go stale exactly when the remote renames its default),
+   * else (2) offline, the cached remote HEAD (`refs/remotes/origin/HEAD`)
+   * as a declared guess that the fetch must still validate. The repo's
+   * checked-out branch is deliberately NOT consulted — a host clone on
+   * a lane branch must never be taken to name the default (Perkins
+   * blocker). Null = nothing names a default; the caller declares the
+   * degraded fallback.
+   */
+  private resolveDefaultBranch(repoPath: string): {
+    readonly branch: string | null;
+    readonly liveDetail: string | null;
+    readonly authoritativeAbsence: boolean;
+    /** True ONLY when the LIVE probe named the branch — a cache-guessed
+     * default is never verified freshness (Perkins r6 B1). */
+    readonly verified: boolean;
+  } {
+    const live = this.liveDefaultBranch(repoPath);
+    if (live.branch !== null) {
+      return { branch: live.branch, liveDetail: null, authoritativeAbsence: false, verified: true };
+    }
+    // A SUCCESSFUL probe that names no branch is authoritative (Perkins
+    // R5): the reachable remote has no default HEAD, so the cached
+    // origin/HEAD must NOT speak for it — a stale cache naming a
+    // demoted-but-fetchable branch would base the lane on a non-default
+    // and record it as 'origin'. The cache is a fallback ONLY when the
+    // probe failed (offline), where the fetch still validates the guess.
+    if (live.authoritativeAbsence) {
+      return { branch: null, liveDetail: live.detail, authoritativeAbsence: true, verified: false };
+    }
+    const cached = spawnGit(repoPath, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+    if (cached.status === 0) {
+      const name = cached.stdout.trim();
+      const prefix = 'origin/';
+      if (name.startsWith(prefix) && name.length > prefix.length) {
+        return {
+          branch: name.slice(prefix.length),
+          liveDetail: live.detail,
+          authoritativeAbsence: false,
+          verified: false,
+        };
+      }
+    }
+    return {
+      branch: null,
+      liveDetail: live.detail,
+      authoritativeAbsence: live.authoritativeAbsence,
+      verified: false,
+    };
+  }
+
+  /** `git fetch origin <branch>` with an explicit refspec so the
+   * remote-tracking ref updates deterministically, then resolve its tip
+   * commit. Never throws: the caller owns the declared fallback. */
+  private fetchOriginTip(
+    repoPath: string,
+    branch: string,
+  ): { ok: true; sha: string } | { ok: false; detail: string } {
+    const refspec = `+refs/heads/${branch}:refs/remotes/origin/${branch}`;
+    const fetched = spawnGit(repoPath, ['fetch', '--no-tags', 'origin', refspec], {
+      timeoutMs: this.fetchTimeoutMs,
+      noPrompt: true,
+    });
+    if (fetched.status !== 0) {
+      const detail = fetched.stderr.trim() || fetched.error || fetched.stdout.trim();
+      return {
+        ok: false,
+        detail: redactedText(detail === '' ? `git fetch exited ${String(fetched.status)}` : detail, 500),
+      };
+    }
+    const tip = spawnGit(repoPath, ['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`]);
+    const sha = tip.stdout.trim();
+    if (tip.status !== 0 || sha === '') {
+      const detail = tip.stderr.trim() || tip.error || 'empty revision';
+      return { ok: false, detail: `origin/${branch} did not resolve after the fetch: ${detail}`.slice(0, 500) };
+    }
+    return { ok: true, sha };
+  }
+
+  /** Freshly-resolved base sha — the fetched origin tip; local HEAD only in
+   * the declared degraded path. Always at creation/release time, never
+   * held. */
   private freshHead(repoPath: string): string {
-    return runGit(repoPath, ['rev-parse', 'HEAD']);
+    return this.resolveBase(repoPath).sha;
+  }
+
+  /** The degraded-path FYI (owner incident 2026-09-23): the registry row
+   * records baseSource; this sink surfaces it to the operator. A sink
+   * failure never fails the lane. */
+  private announceBaseFallback(repoName: string, jobId: string, repoPath: string, base: ResolvedBase): void {
+    try {
+      this.opts.onBaseFallback?.({
+        worktreeId: jobId,
+        jobId,
+        repoPath,
+        repoName,
+        defaultBranch: base.defaultBranch,
+        sha: base.sha,
+        detail: base.fallbackDetail ?? 'origin base unavailable',
+      });
+    } catch (error) {
+      this.log('error', 'base-fallback FYI sink failed (registry row still records base_source)', {
+        repo: repoPath,
+        job: jobId,
+        error: String(error),
+      });
+    }
+  }
+
+  /**
+   * Detached review ref resolution (ruling 18d). A ref that names a
+   * tracking ref of the origin remote is FETCHED fresh first — the same
+   * fetch discipline as job lanes: a review must never check out a stale
+   * origin tip, and an unfetchable origin ref REFUSES rather than degrade
+   * (a stale review is a wrong review, not an offline one). Explicit
+   * commits and local refs are pinned exactly as before — the merged
+   * PR-head freeze resolves its target to a fetched sha upstream and that
+   * sha resolves unchanged here.
+   */
+  private resolveReviewRef(
+    repoPath: string,
+    ref: string,
+  ): { sha: string; baseSource: WorktreeBaseSource | null } {
+    const prefix = 'refs/remotes/origin/';
+    const strip = /^(?:refs\/)?remotes\/origin\/|^origin\//u;
+    /** The fetch discipline one origin-branch spelling always gets. */
+    const fetchedOriginBranch = (branch: string | null, namedAs: string, unverifiedDetail: string | null = null): {
+      sha: string;
+      baseSource: WorktreeBaseSource | null;
+    } => {
+      if (branch === null) {
+        throw new Error(
+          `review ref ${namedAs} names origin/HEAD but the origin default branch is unresolvable — ` +
+            'refusing to check out a possibly stale origin tip',
+        );
+      }
+      if (unverifiedDetail !== null) {
+        // A cache-guessed default is never verified freshness (Perkins r6
+        // B1): reviewing a possibly-non-default tip is a wrong review.
+        throw new Error(
+          `review ref ${namedAs} names origin/HEAD but the default could not be verified live (${unverifiedDetail}) — ` +
+            'refusing to check out a possibly non-default origin tip; verify the remote and retry',
+        );
+      }
+      const fetched = this.fetchOriginTip(repoPath, branch);
+      if (!fetched.ok) {
+        throw new Error(
+          `review ref ${namedAs} names origin/${branch} but fetching it fresh failed: ${fetched.detail} — ` +
+            'refusing to check out a possibly stale origin tip; verify the remote and retry',
+        );
+      }
+      return { sha: fetched.sha, baseSource: 'origin' };
+    };
+    // (1) An EXACT origin-branch spelling classifies FIRST (Perkins R5):
+    // git's ambiguous DWIM lets a local refs/heads/origin/topic or
+    // refs/tags/origin/topic SHADOW refs/remotes/origin/topic — the
+    // spelling would resolve to LOCAL bytes posing as the remote and pin
+    // them without a fetch. The spelling means the REMOTE branch: fetch
+    // it fresh, fail closed (origin/HEAD resolves through the default
+    // branch; origin-prefixed revision expressions like origin/main~1
+    // are NOT exact spellings and never take this path — Perkins R4).
+    if (isExactOriginBranchSpelling(ref)) {
+      const stripped = ref.replace(strip, '');
+      if (stripped === 'HEAD') {
+        const resolvedDefault = this.resolveDefaultBranch(repoPath);
+        return fetchedOriginBranch(
+          resolvedDefault.branch,
+          ref,
+          resolvedDefault.branch === null || resolvedDefault.verified ? null : (resolvedDefault.liveDetail ?? 'unreachable'),
+        );
+      }
+      return fetchedOriginBranch(stripped, ref);
+    }
+    // (2) Everything else resolves locally — DWIM symbolic lookup first
+    // (a local branch, tag, or another remote's tracking ref), else the
+    // exact pin (SHAs, tags, revision expressions). Exact origin
+    // spellings never reach here; should a pathological spelling still
+    // DWIM-resolve onto an origin tracking ref, it gets the same fetch
+    // discipline — never a possibly-stale local pin.
+    const symbolic = spawnGit(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', ref]);
+    const fullName = symbolic.status === 0 ? symbolic.stdout.trim() : '';
+    if (fullName.startsWith(prefix) && fullName.length > prefix.length) {
+      const suffix = fullName.slice(prefix.length);
+      const branch = suffix === 'HEAD' ? this.resolveDefaultBranch(repoPath).branch : suffix;
+      return fetchedOriginBranch(branch, ref);
+    }
+    return { sha: runGit(repoPath, ['rev-parse', '--verify', `${ref}^{commit}`]), baseSource: null };
+  }
+
+  /** Resolve a review target exactly as `createReviewWorktree` does —
+   * same resolver, no worktree: origin tracking refs are FETCHED fresh
+   * (refusing when unfetchable), everything else pins exactly. The
+   * Perkins freeze path resolves its non-PR targets here so the frozen
+   * round identity and the checked-out bytes share ONE fetch-aware
+   * resolution (Perkins blocker: pre-resolving locally froze stale
+   * bytes the manager could never fetch). */
+  async resolveReviewTarget(input: {
+    repoPath: string;
+    ref: string;
+  }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null }> {
+    return this.withRepoLock(input.repoPath, async () => this.resolveReviewRef(input.repoPath, input.ref));
   }
 
   private assertRepo(repoPath: string): { repoPath: string; repoName: string } {
@@ -298,9 +669,9 @@ export class WorktreeManager {
 
   /**
    * Branch-for-jobs (ruling 18d): one worktree per job, on its own
-   * branch `gru/<jobId>`, created at the CURRENT head of the repo —
+   * branch `gru/<jobId>`, created at the FETCHED origin head —
    * sequential per repo (ruling 18e), manifest auto-applied (18a),
-   * registry row written (18b).
+   * registry row written (18b) with the base's provenance (18b).
    */
   async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeRecord> {
     if (input.jobId === '') throw new Error('job id must be non-empty');
@@ -315,7 +686,11 @@ export class WorktreeManager {
       if (existsSync(path)) {
         throw new Error(`worktree path already exists: ${path}`);
       }
-      const sha = this.freshHead(repo.repoPath);
+      // The base is resolved ONCE, and the SAME sha is branched from and
+      // recorded: the registry row can never name a commit the lane did
+      // not actually branch from (the 'freshHead lie' of 2026-09-23).
+      const base = this.resolveBase(repo.repoPath);
+      const sha = base.sha;
       runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, sha]);
       // Perkins lane-B r1 B1: the guard covers BOOTSTRAP *AND REGISTRATION*
       // — a registration failure (missing owner row, DB error) used to
@@ -333,13 +708,23 @@ export class WorktreeManager {
           path,
           branch,
           sha,
+          baseSource: base.baseSource,
           jobId: input.jobId,
         });
       } catch (error) {
         this.rollbackPartialLane(repo.repoPath, path, branch, error);
         throw error;
       }
-      this.log('info', 'job worktree created', { job: input.jobId, path, branch, sha });
+      this.log('info', 'job worktree created', {
+        job: input.jobId,
+        path,
+        branch,
+        sha,
+        base_source: base.baseSource,
+      });
+      if (base.baseSource === 'local-head-fallback') {
+        this.announceBaseFallback(repo.repoName, input.jobId, repo.repoPath, base);
+      }
       return record;
     });
   }
@@ -347,7 +732,9 @@ export class WorktreeManager {
   /**
    * Detached-for-reviews (ruling 18d): review rounds check out a
    * DETACHED worktree at the ref under review — reviews never grow
-   * branch debris.
+   * branch debris. Origin tracking refs are fetched fresh first (the
+   * same discipline as job lanes); an unfetchable origin ref REFUSES,
+   * never a silent stale checkout.
    */
   async createReviewWorktree(input: {
     repoPath: string;
@@ -367,7 +754,8 @@ export class WorktreeManager {
       if (existsSync(path)) {
         throw new Error(`worktree path already exists: ${path}`);
       }
-      runGit(repo.repoPath, ['worktree', 'add', '--detach', path, input.ref]);
+      const resolved = this.resolveReviewRef(repo.repoPath, input.ref);
+      runGit(repo.repoPath, ['worktree', 'add', '--detach', path, resolved.sha]);
       // Same guard as job lanes (Perkins lane-B r1 B1): registration
       // failures roll the detached tree back — no unregistered debris.
       let record;
@@ -376,21 +764,27 @@ export class WorktreeManager {
         // Job bootstrap links/setup outputs are intentionally not applied.
         const sha = runGit(path, ['rev-parse', 'HEAD']);
         record = this.opts.ledger.registerWorktree({
-        id: input.roundId,
-        kind: 'review',
-        repoPath: repo.repoPath,
-        repoName: repo.repoName,
-        path,
-        branch: null,
-        sha,
-        roundId: input.roundId,
+          id: input.roundId,
+          kind: 'review',
+          repoPath: repo.repoPath,
+          repoName: repo.repoName,
+          path,
+          branch: null,
+          sha,
+          baseSource: resolved.baseSource,
+          roundId: input.roundId,
           ...(input.jobId !== undefined ? { jobId: input.jobId } : {}),
         });
       } catch (error) {
         this.rollbackPartialLane(repo.repoPath, path, null, error);
         throw error;
       }
-      this.log('info', 'review worktree created (detached)', { round: input.roundId, path, ref: input.ref });
+      this.log('info', 'review worktree created (detached)', {
+        round: input.roundId,
+        path,
+        ref: input.ref,
+        sha: resolved.sha,
+      });
       return record;
     });
   }
@@ -464,7 +858,13 @@ export class WorktreeManager {
             `refs/heads/${row.branch}`,
           ]);
           if (present.status === 0) {
-            branchOutcome = this.disposeLaneBranch(row, input.baseBranch);
+            // Fresh remote state BEFORE the retry disposal (Perkins r8):
+            // the old tracking refs must not witness containment.
+            branchOutcome = this.disposeLaneBranch(
+              row,
+              input.baseBranch,
+              this.safeFreshRemoteBranch(row.repoPath),
+            );
           }
         }
         return {
@@ -839,14 +1239,26 @@ export class WorktreeManager {
     let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
     let freshHead = '';
     try {
+      // Release re-resolves the FRESH head FIRST (ruling 18e; Perkins
+      // r7/r8): the fetch makes the CURRENT remote state known BEFORE the
+      // branch decision, and ONLY a successfully-fetched, verified default
+      // yields a remote witness for the disposal — a fetch failure or an
+      // unverified default means stale tracking refs witness nothing.
+      // (A freshHead failure here skips the disposition — fail-safe: the
+      // branch is retained.)
+      const base = this.resolveBase(row.repoPath);
+      freshHead = base.sha;
       // Containment-verified branch delete — job lanes only; a branch
-      // is deleted only when its commits are provably contained in an
-      // existing ref; otherwise it is RETAINED and noted.
+      // is deleted only when its tip is provably contained in a durable
+      // local ref or the freshly verified remote default; otherwise it
+      // is RETAINED, noted, and the reason reported.
       if (row.kind === 'job' && row.branch !== null) {
-        branchOutcome = this.deleteBranchContained(row, baseBranch);
+        branchOutcome = this.deleteBranchContained(
+          row,
+          baseBranch,
+          base.baseSource === 'origin' ? base.defaultBranch : null,
+        );
       }
-      // Release re-resolves the FRESH head (ruling 18e).
-      freshHead = this.freshHead(row.repoPath);
     } catch (error) {
       this.log('error', 'sweep tail failed after removal — row still flips swept', {
         id: row.id,
@@ -889,7 +1301,13 @@ export class WorktreeManager {
     // DISPOSE FIRST, flip second (Perkins lane-B r4: mirror finishSweep —
     // flipping first re-opened the r3 wedge silently: a crash between the
     // flip and the disposal left every retry early-returning 'none').
-    const branchOutcome = this.disposeLaneBranch(row, baseBranch);
+    // The disposal resolves FRESH remote state first (Perkins r8): a
+    // retry must never delete on the witness of stale tracking refs.
+    const branchOutcome = this.disposeLaneBranch(
+      row,
+      baseBranch,
+      this.safeFreshRemoteBranch(row.repoPath),
+    );
     try {
       this.opts.ledger.setWorktreeStatus(row.id, 'swept');
       this.opts.ledger.appendCustomEvent({
@@ -914,10 +1332,11 @@ export class WorktreeManager {
   private disposeLaneBranch(
     row: WorktreeRecord,
     baseBranch: string | undefined,
+    freshRemoteBranch: string | null,
   ): 'deleted' | 'retained' | 'none' {
     if (row.kind !== 'job' || row.branch === null) return 'none';
     try {
-      return this.deleteBranchContained(row, baseBranch);
+      return this.deleteBranchContained(row, baseBranch, freshRemoteBranch);
     } catch (error) {
       this.log('error', 'lane branch disposal failed — recorded for retry', {
         id: row.id,
@@ -945,6 +1364,20 @@ export class WorktreeManager {
       return this.freshHead(repoPath);
     } catch {
       return '';
+    }
+  }
+
+  /** The remote default branch FRESHLY VERIFIED for a disposal decision
+   * (Perkins r8): resolveBase with a successful, verified fetch names the
+   * one remote ref this decision may trust as a containment witness; a
+   * fetch failure, an unverified default, or any resolution error yields
+   * null — stale tracking refs then witness nothing. Never throws. */
+  private safeFreshRemoteBranch(repoPath: string): string | null {
+    try {
+      const base = this.resolveBase(repoPath);
+      return base.baseSource === 'origin' ? base.defaultBranch : null;
+    } catch {
+      return null;
     }
   }
 
@@ -987,52 +1420,93 @@ export class WorktreeManager {
     }
   }
 
-  /**
-   * Containment-verified delete: `git branch -d` proves merge-containment
-   * itself; when it refuses (unmerged into HEAD), check containment
-   * against the job's base branch before any force; otherwise retain.
-   */
+  /** Containment-verified delete: prove the tip survives in a durable
+   * local ref or the freshly verified origin default before deleting.
+   * Never use `git branch -d`: it can trust a stale lane upstream. */
   private deleteBranchContained(
     row: WorktreeRecord,
     baseBranch: string | undefined,
+    freshRemoteBranch: string | null,
   ): 'deleted' | 'retained' {
     const branch = row.branch as string;
     // Already gone (a healed retry, a prior disposal): disposal is
     // idempotent — never a misleading 'retained' for a missing branch.
     const present = spawnGit(row.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
     if (present.status !== 0) return 'deleted';
-    const soft = spawnGit(row.repoPath, ['branch', '-d', branch]);
-    if (soft.status === 0) return 'deleted';
-    let base: string;
-    if (baseBranch !== undefined) {
-      base = baseBranch;
-    } else {
-      try {
-        base = runGit(row.repoPath, ['symbolic-ref', '--short', 'HEAD']);
-      } catch {
-        // No explicit base and the main checkout is detached: containment
-        // is UNPROVABLE — retain loudly, never throw (Perkins lane-B r1).
-        this.opts.ledger.appendCustomEvent({
-          kind: 'worktree.branch-retained',
-          jobId: row.jobId,
-          payload: { id: row.id, branch, reason: 'base branch unresolvable (detached HEAD, none given)' },
-        });
-        this.opts.ledger.noteWorktree(row.id, `branch ${branch} retained: base branch unresolvable`);
-        return 'retained';
-      }
-    }
-    const contained = spawnGit(row.repoPath, ['merge-base', '--is-ancestor', branch, base]);
-    if (contained.status === 0) {
+    const laneRef = `refs/heads/${branch}`;
+    const freshRemoteRef = freshRemoteBranch === null ? null : `refs/remotes/origin/${freshRemoteBranch}`;
+    const baseRef = spawnGit(row.repoPath, baseBranch === undefined
+      ? ['symbolic-ref', '--quiet', 'HEAD']
+      : ['rev-parse', '--symbolic-full-name', '--verify', baseBranch]);
+    const base = baseRef.status === 0 ? baseRef.stdout.trim() : '';
+    // An explicit base must obey the SAME witness rule, never bypass it
+    // with a stale tracking ref, a bare SHA, or the lane itself.
+    const durableBase = base !== laneRef && base !== '' && (
+      base.startsWith('refs/heads/') || base.startsWith('refs/tags/') || base === freshRemoteRef
+    );
+    if (durableBase && spawnGit(row.repoPath, ['merge-base', '--is-ancestor', laneRef, base]).status === 0) {
       runGit(row.repoPath, ['branch', '-D', branch]);
       return 'deleted';
+    }
+    // Detached HEAD or an unresolvable base is not proof of containment;
+    // the remaining durable refs can still witness the tip below.
+    // The lane's tip must survive in a DURABLE ref — never a stale
+    // remote-tracking ref (Perkins r7/r8): after a remote force-push the
+    // old tracking ref still names the tip, but it is transient — the
+    // next successful fetch of that branch overwrites it, orphaning the
+    // tip if the lane branch was deleted on its witness. Durable
+    // witnesses: another LOCAL branch or tag (they never move under a
+    // fetch), plus the ONE remote ref freshly verified for THIS
+    // decision — the default branch this release actually fetched
+    // (freshRemoteBranch; null when the fetch failed or the default was
+    // unverified). A stale/unverified tracking ref witnesses nothing.
+    const branchTip = spawnGit(row.repoPath, ['rev-parse', `refs/heads/${branch}^{commit}`]);
+    if (branchTip.status === 0 && branchTip.stdout.trim() !== '') {
+      const tip = branchTip.stdout.trim();
+      const durableLocal = spawnGit(row.repoPath, [
+        'for-each-ref',
+        `--contains=${tip}`,
+        '--format=%(refname)',
+        'refs/heads',
+        'refs/tags',
+      ]);
+      if (durableLocal.status === 0) {
+        const others = durableLocal.stdout
+          .split('\n')
+          .map((name) => name.trim())
+          .filter((name) => name !== '' && name !== `refs/heads/${branch}`);
+        const freshRemoteWitness =
+          freshRemoteBranch !== null &&
+          spawnGit(row.repoPath, [
+            'merge-base',
+            '--is-ancestor',
+            tip,
+            `refs/remotes/origin/${freshRemoteBranch}`,
+          ]).status === 0;
+        if (others.length > 0 || freshRemoteWitness) {
+          runGit(row.repoPath, ['branch', '-D', branch]);
+          return 'deleted';
+        }
+      }
     }
     this.opts.ledger.appendCustomEvent({
       kind: 'worktree.branch-retained',
       jobId: row.jobId,
-      payload: { id: row.id, branch, reason: `commits not contained in ${base}` },
+      payload: {
+        id: row.id,
+        branch,
+        reason:
+          'tip not contained in any durable local or freshly verified remote ref (remote force-pushed?); retained to preserve the commits',
+      },
     });
-    this.opts.ledger.noteWorktree(row.id, `branch ${branch} retained: not contained in ${base}`);
-    this.log('warn', 'worktree branch retained (uncontained commits)', { id: row.id, branch, base });
+    this.opts.ledger.noteWorktree(
+      row.id,
+      `branch ${branch} retained: no durable local or freshly verified remote ref contains the tip`,
+    );
+    this.log('warn', 'worktree branch retained (no surviving ref for the tip)', {
+      id: row.id,
+      branch,
+    });
     return 'retained';
   }
 }
