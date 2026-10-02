@@ -172,18 +172,20 @@ four tests, all `Test timed out in 30000ms` with zero assertion failures:
 
 | Test | Path traced | Disposition |
 |---|---|---|
-| `dispatch-server.test.ts:548` by=silas | `/api/dispatch/review` → `requestReview` → `setupRound` → `resolveFreezeTarget` (fixture probe/fetch) → review worktree + freeze diff | Aborted mid-review-POST (stray-probe evidence); ≥1 assertion ran; load-marginal, no lane-diff line on path. Remedy: GC workload budgets. |
-| `install-one-line.test.ts:604` owned/foreign service | Four synchronous `install.sh` runs (setup clone/build + refusal + print + owned restart) | Body completed; all assertions passed; the timeout is the post-hoc elapsed marker. Remedy: GC budgets; sibling PR141 `f2a7271` carries the cost relief (not copied). |
-| `perkins-builtin-wave.test.ts:3385` N5 | `wave.runRound` real round (freeze, worktree, diff, fake lead/lens, prior selection, sweep) | Aborted mid-round, zero assertions ran; body and helpers identical to main. Remedy: GC budgets. |
+| `dispatch-server.test.ts:548` by=silas | `/api/dispatch/review` → `requestReview` → `setupRound` → `resolveFreezeTarget` (fixture probe/fetch) → review worktree + freeze diff | Aborted mid-review-POST (stray-probe evidence); ≥1 assertion ran. Open: inherited test unchanged from main; the genuine repair is being authored in the `review-rebrief-interlock` native-NEEDS-CHANGES correction (reviewed head `271540a7954e`, base `b900837`) — coordinate that ownership, no private copy. |
+| `install-one-line.test.ts:604` owned/foreign service | Four synchronous `install.sh` runs (setup clone/build + refusal + print + owned restart) | Body completed; all assertions passed; the timeout is the post-hoc elapsed marker. Open: the genuine cost repair is PR141 `f2a7271` (drops the redundant setup cycle) — coordinate, no private copy. |
+| `perkins-builtin-wave.test.ts:3385` N5 | `wave.runRound` real round (freeze, worktree, diff, fake lead/lens, prior selection, sweep) | Aborted mid-round, zero assertions ran. Open: no sibling repair exists; the next genuine step is this lane's one controlled full verification at a real paced capacity checkpoint, and if still red, an in-lane cause determination (instrumentation), never a budget claim. |
 | `wizard.test.ts:462` `--answers` refusals | Four synchronous `node dist/wizard/main.js` children | **Repaired in-lane (`ce62304`):** every wizard process imported `runtime/probe.ts` → both adapters → the agent-SDK graphs for two static literals (~7s/invocation measured). Capability declarations moved to `src/runtime/capabilities.ts`; adapters re-export; probe consumes it; deterministic decoupling oracle added (sentinel adapter mocks; fails before, passes after); suite-shape pin 7→8. |
 
 - The stray `fatal: cannot change to '…/fixture-silas-by'` was traced (not assumed):
   `execFileSync` forwards child stderr by default; the call site is
   `test/helpers/pr-head-probe.ts:14`, reached by the orphaned in-flight review request
   after the test timeout and fixture cleanup. Harness capture finding, no product fault.
-- Independence: the lane's product diff (`rebrief-recovery.ts`, the `/api/silas/rebrief`
-  handler, `ledger/api.ts`, the boot counter) is on none of the four paths; the failing
-  test bodies are unchanged from main and pass/fail with host load across heads.
+- Independence from the lane diff (context, never a dismissal): the product diff
+  (`rebrief-recovery.ts`, the `/api/silas/rebrief` handler, `ledger/api.ts`, the boot
+  counter) is on none of the four paths, and the failing test bodies are unchanged from
+  main — but these remain OPEN requirements until a controlled full verification at this
+  head succeeds. A same-body pass/fail history is a lead to time-box, not a cause.
 - Focused verification at the repaired head `2e42d61` (declared scope
   `runtime-capability-decoupling`, committed): `/api/verify` run
   `69c36574-23aa-4f45-be79-a36c8142662e` **PASS**, exit 0, not timed out, clean tracked
@@ -195,9 +197,18 @@ four tests, all `Test timed out in 30000ms` with zero assertion failures:
   the preserved FULL; 7.7-11.5s per invocation pre-repair). Readiness reconciliation:
   the original queued run is terminal (39524/39547); the two pending rebrief rows are
   this session's own live dispatch pair, recorded in the receipt.
-- Remaining dependency (not a lane repair): active GC
-  `gc-test-harness-budgets-20261002` (workload-aware 30s/120s budgets, two-worker heavy
-  isolation); it must not be transplanted here. Next trigger: GC landing on `main` →
-  history-preserving integration → FULL at the then-final head → prescribed independent
-  reviews → non-force publish → exact-head CI → native Perkins handoff. No outstanding
-  verify request is held by this lane at handback.
+- Open dispositions and dependencies (corrected 2026-10-02, j861/j869/j870 continuation):
+  j829 `gc-test-harness-budgets-20261002` is a **separate owner-held harness job**; its
+  landing is NOT a prerequisite for this lane's completion, and its unlanded
+  budgets/skip/timeout changes are never transplanted. The three open host-load timeouts
+  are driven as: (a) dispatcher `dispatch-server.test.ts:548` — genuine repair owned by
+  the `review-rebrief-interlock` native-NEEDS-CHANGES correction (actor: that lane's
+  producer; repair: the reviewed blockers + inherited dispatcher/T4 failures; why
+  indispensable: it authors the concrete dispatcher repair; re-reconcile at each main
+  move and immediately before publish); (b) `install-one-line.test.ts:604` — genuine
+  repair owned by PR141 `f2a7271` (crew-heist-labels head `3398b43`; same reconciliation);
+  (c) N5 — no sibling owner: the next genuine step is this lane's one controlled FULL at
+  a real paced capacity checkpoint, then an in-lane cause determination if still red.
+  Prescribed independent read-only reviews are dispatched as separate tracked jobs from
+  the frozen actual-head packet; publish → exact-head CI → one native Perkins handoff
+  follow the controlled full verification.
