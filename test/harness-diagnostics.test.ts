@@ -104,6 +104,7 @@ function writeDiagnosticsFixtureProject(): string {
     ].join('\n'),
   );
   const helpers = join(REPO_ROOT, 'test', 'helpers', 'harness-diagnostics.mjs');
+  const ownedScript = 'process.stderr.write("owned-ready\\n");setInterval(() => {}, 1000);';
   writeFileSync(
     join(dir, 'fixture.test.ts'),
     [
@@ -116,7 +117,7 @@ function writeDiagnosticsFixtureProject(): string {
       '});',
       '',
       "test('stalled with an owned child', async () => {",
-      "  const child = spawn(process.execPath, ['-e', 'process.stderr.write(\\"owned-ready\\\\n\\");setInterval(() => {}, 1000);']);",
+      `  const child = spawn(process.execPath, ['-e', ${JSON.stringify(ownedScript)}]);`,
       "  trackChildProcess(child, { label: 'fixture owned child' });",
       "  markFixtureStep('stalled fixture step');",
       '  await new Promise(() => {});',
