@@ -137,6 +137,15 @@ board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && .
 # deterministic fail); it changes no test, timeout, assertion or gate.
 t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
 
+# r2 repair-generation diagnosis (native perkins-github-app-publisher-r2
+# blocker 2): the three FULL timeouts of run 878b2f8a classified case by
+# case at the unchanged runner/budgets. Each leg is exactly one failing
+# case selected with -t; every exit is echoed intact and composed into a
+# single evidence exit (never masked into a PASS), and this scope changes
+# no test, timeout, assertion, pool or gate. The full gate remains the
+# final head's FULL run.
+r2-timeout-isolation = 'node tools/patch-vitest-rpc-timeout.mjs || exit 3; echo "r2-timeout-isolation leg 1 dispatch-server: by=silas"; npx vitest run test/dispatch-server.test.ts -t "by=silas on the pr/review endpoints"; a=$?; echo "r2-timeout-isolation leg 2 install-one-line: restarts only an owned service"; npx vitest run test/install-one-line.test.ts -t "restarts only an owned service"; b=$?; echo "r2-timeout-isolation leg 3 wave: T4 reconciled delivery"; npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"; c=$?; echo "r2-timeout-isolation exits: dispatch-server=$a install-one-line=$b wave-t4=$c"; if [ "$a" -ne 0 ] || [ "$b" -ne 0 ] || [ "$c" -ne 0 ]; then exit 1; fi'
+
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
 # download/install), same web config/runner/budgets and RPC prerequisite.
