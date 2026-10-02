@@ -274,9 +274,10 @@ export function parseBoardServerFrame(raw: unknown): BoardServerFrame | null {
 
 /** True when the value carries at least one visible character: zero-width
  * and format controls (Unicode Cf), controls (Cc), and combining marks
- * (M) do not count — mirror of the ledger's authored-name rule, so a
+ * (M) do not count — mirror of the ledger's visibility rule, so a
  * server that somehow persisted an invisible-only name is rejected here
- * instead of rendering an empty card. */
+ * instead of rendering an empty card. (The ledger's 100-code-unit length
+ * ceiling is not mirrored; the rail shortens for display anyway.) */
 function hasVisibleCharacters(value: string): boolean {
   return value.replace(/[\p{Cf}\p{Cc}\p{M}\s]/gu, '') !== '';
 }

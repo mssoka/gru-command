@@ -41,7 +41,8 @@ export const DEFAULT_LENSES = [
 
 /** Upper bound for an authored job display name (Gru ruling G2,
  * 2026-09-29): a short card label, bounded at every write boundary —
- * four times the 24-grapheme rail bound the board renders. */
+ * 100 UTF-16 code units, comfortably above the 24-grapheme rail bound
+ * the board renders. */
 export const JOB_DISPLAY_NAME_MAX_LENGTH = 100;
 
 /** True when the value carries at least one visible character: zero-width
