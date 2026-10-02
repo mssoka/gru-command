@@ -33,7 +33,9 @@ describe('gru role definition', () => {
     expect(prompt).toContain('UNTRUSTED DATA');
     expect(prompt).toContain('POST /api/notifications/needs-owner');
     expect(prompt).toContain('Perkins must be READY on the exact final head');
-    expect(prompt).toContain('Elsewhere the owner decides');
+    expect(prompt).toContain('Everywhere the owner decides');
+    // The superseded Gru-merges-gru-command rule must never return.
+    expect(prompt).not.toContain('Merges in this repository are yours');
   });
 
   it('the role config maps the permission set (tools + workspace cwd)', () => {

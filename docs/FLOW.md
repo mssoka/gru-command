@@ -172,9 +172,9 @@ fallback session is a full-capability minion by design — it must load the
 ambient BMAD skill — and is instructed never to gate, approve, merge, or
 modify implementation code; every gate decision is the host's. The fallback
 never records a Perkins verdict and never moves merge authority: only an
-exact-head Perkins READY can authorize a merge; Gru merges this repository
-only after that gate, while the owner holds merges elsewhere
-everywhere. A failed pre-flight is never a silent downgrade — the failed
+exact-head Perkins READY can authorize a merge; the owner holds ALL merges
+— this repository included — and a merge is presented to the owner only
+after that gate. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (install BMAD via
 onboarding / restore Perkins) are escalated and recorded on the job as
 `job.fallback-review` events. GitLab merge requests get the same SHA-bound
@@ -460,8 +460,9 @@ IDs remain pending for rate-limited retry.
 **Mandate — act (tier-2).** A wake is machine attention meant to be acted
 on in-turn: Gru diagnoses the incident and takes one substantive step per
 incident (a fix lane, a re-arm, a disposition) within budget, staging the
-rest; novel failures and judgment calls stay with Gru. Gru holds merge
-authority for this repository; the owner retains it elsewhere. The owner
+rest; novel failures and judgment calls stay with Gru. Merge authority is
+owner-held everywhere — this repository included; Gru presents a merge to
+the owner only after the exact-final-head READY Perkins gate. The owner
 is reached only through `needs-owner` — and sparingly; an empty FOR YOU
 band is the healthy state.
 
@@ -472,7 +473,7 @@ next user-directed context block:
 | routing | meaning | surface |
 |---|---|---|
 | `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue; wakes Gru; never rings the owner bell |
-| `needs-owner` | owner-only decisions (merges outside this repo, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
+| `needs-owner` | owner-only decisions (merges everywhere, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
 | `fyi` | standing feed | board feed only |
 
 **Unresolved follow-up.** A successful prompt is delivery, not resolution.

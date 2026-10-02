@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 /**
  * Installed-layout playbook regression (owner ruling 2026-10-02, j-745):
@@ -70,7 +70,10 @@ function stageInstalledLayout(withRoles: boolean): string {
 }
 
 /** Run `probe.mjs` inside the staged install under an EMPTY home, so the
- *  load cannot lean on the developer checkout, journal, or user config. */
+ *  load cannot lean on the developer checkout's source, the journal, or
+ *  user config. Module resolution goes through the node_modules tree every
+ *  real install carries (symlinked to this checkout's dependency tree —
+ *  the dependencies themselves, not this repo's source). */
 function runProbe(installedRoot: string): StagedPrompt | StagedFailure {
   const emptyHome = temp('gru-command-installed-home-');
   mkdirSync(join(emptyHome, '.pi', 'agent'), { recursive: true });
@@ -100,10 +103,23 @@ function runProbe(installedRoot: string): StagedPrompt | StagedFailure {
       PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent'),
     },
   });
-  return JSON.parse(stdout) as StagedPrompt | StagedFailure;
+  const parsed = JSON.parse(stdout) as StagedPrompt | StagedFailure;
+  if (typeof parsed.minion !== 'string' && typeof parsed.loadError !== 'string') {
+    throw new Error(`unexpected probe output: ${stdout.slice(0, 200)}`);
+  }
+  return parsed;
 }
 
 describe('installed-layout playbook loading (shipped artifact, clean install)', () => {
+  // One staged install + one probe run shared by the prompt-content tests;
+  // the broken-install case stages its own (loading must fail loud there).
+  let staged: StagedPrompt;
+  beforeAll(() => {
+    const probe = runProbe(stageInstalledLayout(true));
+    if (probe.loadError !== undefined) throw new Error(`staged install failed to load: ${probe.loadError}`);
+    staged = probe as StagedPrompt;
+  });
+
   it('the package manifest ships the persona and ops-skill trees', () => {
     const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8')) as {
       files?: string[];
@@ -112,10 +128,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
   });
 
   it('the installed worker prompt carries the bmad-build playbook', () => {
-    const staged = runProbe(stageInstalledLayout(true));
-    expect(staged.loadError).toBeUndefined();
-    const { minion } = staged as StagedPrompt;
-    const flat = minion.replace(/\s+/gu, ' ');
+    const flat = staged.minion.replace(/\s+/gu, ' ');
     expect(flat).toContain("runs the PROJECT's installed `bmad-build` skill");
     expect(flat).toContain('you own its cycle end to end');
     expect(flat).toContain('fresh, context-free reviewer sessions');
@@ -128,9 +141,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
   });
 
   it('the installed ops prompt carries the minion-owned build cycle', () => {
-    const staged = runProbe(stageInstalledLayout(true));
-    const { silas } = staged as StagedPrompt;
-    const flat = silas.replace(/\s+/gu, ' ');
+    const flat = staged.silas.replace(/\s+/gu, ' ');
     expect(flat).toContain('Minion-owned build cycle');
     expect(flat).toContain('goal, boundaries, acceptance, verification');
     expect(flat).toContain('verification scheduler');
@@ -140,9 +151,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
   });
 
   it('installed prompts load from their own tree: no checkout paths, fail loud without roles/', () => {
-    const staged = runProbe(stageInstalledLayout(true));
-    const { minion, silas, gru } = staged as StagedPrompt;
-    for (const prompt of [minion, silas, gru]) {
+    for (const prompt of [staged.minion, staged.silas, staged.gru]) {
       // The text must have come from the staged tree, not from this
       // developer checkout or any personal location.
       expect(prompt).not.toContain(repoRoot);

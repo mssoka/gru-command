@@ -1346,7 +1346,8 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedOps).toContain('own its built-in review on fresh independent reviewer contexts');
     expect(stagedOps).toContain('do not commission a supplementary review duplicating');
-    expect(stagedOps).toContain('native Perkins round on the');
+    expect(stagedOps).toContain('native Perkins round on the exact final settled PR head');
+    expect(stagedOps).toContain('it is the gate, never a duplicate review');
     expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },

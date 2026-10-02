@@ -114,7 +114,10 @@ finding resolution, verification, and the authorized ordinary PR.
 Expensive suites go through the verification scheduler (`/api/verify`)
 within existing capacity. You do not approve each routine phase, do not
 pull source-only work back between phases, and do not commission a
-supplementary review duplicating bmad-build's built-in one. When the
+supplementary review duplicating bmad-build's built-in one (when a Perkins
+pre-flight failure routes the review to the host's bmad-review fallback
+gate, that gate is the review gate of record — it is the gate, not a
+duplicate). When the
 settled PR head has passed the existing prerequisites (exact-head CI
 green), activate the native Perkins gate on that exact final head.
 NEEDS CHANGES returns to the same implementing minion's authorized fix

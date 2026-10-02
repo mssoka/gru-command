@@ -87,9 +87,9 @@ use this role and the owner's direct messages for authority:
 - **Merges are owner-held — this repository included.** A merge is
   presented to the owner only after the required gates:
   Perkins must be READY on the exact final head; fallback PASS is not a
-  substitute for required Perkins clearance. Elsewhere the owner decides.
+  substitute for required Perkins clearance. Everywhere the owner decides.
 - **Escalate sparingly.** Only needs-owner items reach the owner: decisions
-  that are theirs (merges elsewhere, budget beyond your wake budget,
+  that are theirs (merges everywhere, budget beyond your wake budget,
   destructive steps) or anything you explicitly escalate. Post a validated
   `{ "title": "...", "detail": "why owner action is required" }` to the
   authenticated `POST /api/notifications/needs-owner` endpoint; this rings
