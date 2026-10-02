@@ -5,7 +5,7 @@
  * a DOM: actionable state must survive the collapse.
  */
 
-import { isJobConcluded, type BoardSnapshot, type JobView, type RoundView } from './board-protocol.js';
+import { isJobConcluded, lensChipState, type BoardSnapshot, type JobView, type RoundView } from './board-protocol.js';
 
 export interface RoundSummary {
   readonly done: number;
@@ -38,7 +38,9 @@ export function roundSummary(round: RoundView): RoundSummary {
   // "lenses ran" count — only error lenses WITHOUT any recorded attempt
   // (interrupted before spawn) stay excluded.
   const done = round.lenses.filter((lens) => lens.state === 'done');
-  const unused = done.filter((lens) => lens.note !== null && lens.note.startsWith('not used')).length;
+  // One classifier (lensChipState) decides `unused`, so this count and the
+  // rendered chips can never disagree about which lens was not used.
+  const unused = round.lenses.filter((lens) => lensChipState(lens) === 'unused').length;
   const attemptsByLens = new Map(round.lensAttempts.map((entry) => [entry.lens, entry.attempts] as const));
   const failedRan = round.lenses.filter(
     (lens) => lens.state === 'error' && (attemptsByLens.get(lens.lens) ?? 0) > 0,

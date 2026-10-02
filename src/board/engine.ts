@@ -7,6 +7,7 @@ import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
 import type { DeployDriftView } from './deploy-drift.js';
 import type { VerificationQueueView } from '../verify/scheduler.js';
+import type { PacingGateView } from '../runtime/pacing.js';
 import { ownerReadyPr, readBranchEvidence, type OwnerPrView } from './owner-actions.js';
 import {
   DEFAULT_LENSES,
@@ -159,6 +160,9 @@ export interface BoardSnapshot {
   readonly silas: SilasView;
   /** Verification scheduler queue (null until its API is wired). */
   readonly verify: VerificationQueueView | null;
+  /** Provider pacing gate (limits, running, queued with reasons). Null when
+   * the pacing feature is off — the pre-pacing snapshot shape. */
+  readonly pacing: PacingGateView | null;
   /** Self-healing session stats (null until its producer exists). */
   readonly selfHeal: SelfHealView | null;
   /** FOR YOU (owner approval 2026-09-28): PRs with exact-head evidence
@@ -242,6 +246,8 @@ export interface BoardEngineOptions {
   readonly buildDrift?: () => DeployDriftView | null;
   /** Board UX v4: verification queue view (late-bound scheduler). */
   readonly verifyQueue?: () => VerificationQueueView | null;
+  /** Provider pacing: gate view (late-bound; null when the feature is off). */
+  readonly pacing?: () => PacingGateView | null;
   /** Board UX v4: self-heal stats (no producer yet; null renders n/a). */
   readonly selfHeal?: () => SelfHealView | null;
   /** Clock seam for the day-boundary health derivations. */
@@ -274,6 +280,7 @@ export class BoardEngine {
     }));
     this.buildDrift = opts.buildDrift ?? (() => null);
     this.verifyQueue = opts.verifyQueue ?? (() => null);
+    this.pacing = opts.pacing ?? (() => null);
     this.selfHeal = opts.selfHeal ?? (() => null);
     this.now = opts.now ?? Date.now;
     this.bus.subscribe(() => this.notifyChanged());
@@ -283,6 +290,7 @@ export class BoardEngine {
   private readonly decisionsStatus: () => DecisionRuntimeStatus;
   private readonly buildDrift: () => DeployDriftView | null;
   private readonly verifyQueue: () => VerificationQueueView | null;
+  private readonly pacing: () => PacingGateView | null;
   private readonly selfHeal: () => SelfHealView | null;
   private readonly now: () => number;
 
@@ -450,6 +458,7 @@ export class BoardEngine {
       build: this.buildDrift(),
       silas: this.silasView(),
       verify: this.verifyQueue(),
+      pacing: this.pacing(),
       selfHeal: this.selfHeal(),
       ownerPrs: this.ownerPrs(repos),
     };

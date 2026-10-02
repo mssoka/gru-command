@@ -332,9 +332,18 @@ describe('notification center — durable log + receipts + acks', () => {
     }
     const reused = center.postIncident({ kind: legacyKinds[0]!, routing: 'needs-owner', severity: 'error', title: 'Same stop', dedupe: 'active' });
     expect(reused).toMatchObject({ id: 'legacy-0', ackedBy: 'operator' });
-    for (const kind of ['port-squat', 'roll-port-squat', 'supervision.provider-wall.a.quota_wall']) {
+    for (const kind of ['port-squat', 'roll-port-squat']) {
       expect(center.post({ kind, routing: 'action-required', severity: 'error', title: 'Owner remedy' }).routing).toBe('needs-owner');
     }
+    // Machine-ownership amendment (2026-09-29): the supervisor's explicit
+    // provider-wall routing is honored — action-required for eligible
+    // machine-owned stops, needs-owner for the conservative fallback.
+    expect(
+      center.post({ kind: 'supervision.provider-wall.a.quota_wall', routing: 'action-required', severity: 'error', title: 'Machine-owned' }).routing,
+    ).toBe('action-required');
+    expect(
+      center.post({ kind: 'supervision.provider-wall.a.authentication_wall', routing: 'needs-owner', severity: 'error', title: 'Owner fallback' }).routing,
+    ).toBe('needs-owner');
     new NotificationCenter({ ledger: api, bus }); // repeat boot cannot promote old rows
     expect(api.countPendingNeedsOwner()).toBe(3);
     expect(api.listEventsAfter(0, { kinds: ['notification.triaged'] })).toHaveLength(0);

@@ -3,6 +3,7 @@ import {
   agentStateTone,
   isValidSnapshot,
   jobChipTone,
+  lensChipState,
   lensChipTone,
   parseBoardServerFrame,
   type BoardSnapshot,
@@ -262,9 +263,42 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(unknown)).toBe(false);
   });
 
+  it('classifies only done+canonical-notused records as unused — no prose downgrade', () => {
+    // The canonical record: done + the lead's not-used note.
+    expect(lensChipState({ state: 'done', note: 'not used — lead-owned whole-PR review' })).toBe('unused');
+    expect(lensChipState({ state: 'done', note: 'not used' })).toBe('unused');
+    // Backward compatibility: a done record without the canonical note is a pass.
+    expect(lensChipState({ state: 'done', note: null })).toBe('done');
+    expect(lensChipState({ state: 'done', note: 'clean — nothing found' })).toBe('done');
+    // Words that merely appear in prose are not authority.
+    expect(lensChipState({ state: 'done', note: 'clean — lead said not used' })).toBe('done');
+    expect(lensChipState({ state: 'pending', note: 'not used — lead-owned whole-PR review' })).toBe('pending');
+    expect(lensChipState({ state: 'live', note: 'not used' })).toBe('live');
+    expect(lensChipState({ state: 'error', note: 'not used — provider cap' })).toBe('error');
+    // Unknown state drift passes through so the defensive rendering still applies.
+    expect(lensChipState({ state: 'mystery', note: null })).toBe('mystery');
+  });
+
+  it('raw unused state strings never collide with the derived unused classification', () => {
+    // Schema drift: a raw record carrying the state string 'unused' is not
+    // canonical — only done + the canonical note classifies as unused.
+    expect(lensChipState({ state: 'unused', note: null })).toBe('unrecognized');
+    expect(lensChipState({ state: 'unused', note: 'not used — prose' })).toBe('unrecognized');
+    // Both drift variants keep the old defensive unknown face: '?' label
+    // slot (unrecognized is not in LENS_STATE_LABEL) and the park tone —
+    // never the derived unused class or the '—' marker.
+    expect(lensChipTone(lensChipState({ state: 'unused', note: null }))).toBe('pp-chip--park');
+    expect(lensChipTone(lensChipState({ state: 'unused', note: 'not used — prose' }))).toBe('pp-chip--park');
+    expect(lensChipTone(lensChipState({ state: 'unused', note: null }))).not.toBe('pp-chip--unused');
+    // Other unknown states still pass through untouched (existing behavior).
+    expect(lensChipState({ state: 'mystery', note: 'not used' })).toBe('mystery');
+  });
+
   it('tone mapping covers every chip state with a design-token class', () => {
     expect(lensChipTone('live')).toContain('work');
     expect(lensChipTone('done')).toContain('done');
+    expect(lensChipTone('unused')).toBe('pp-chip--unused');
+    expect(lensChipTone('unused')).not.toContain('done');
     expect(lensChipTone('error')).toContain('alert');
     expect(lensChipTone('pending')).toContain('park');
     expect(lensChipTone('anything-else')).toContain('park');
@@ -276,5 +310,57 @@ describe('board server-frame validator', () => {
     expect(jobChipTone('parked')).toContain('park');
     expect(agentStateTone('streaming')).toContain('work');
     expect(agentStateTone('error')).toContain('alert');
+  });
+});
+
+describe('provider pacing mirror (server parity)', () => {
+  /** A valid snapshot carrying the mirrored pacing gate block. */
+  function pacingSnapshot(): Record<string, unknown> {
+    return {
+      ...snapshot(),
+      pacing: {
+        enabled: true,
+        worker: {
+          limit: 3,
+          running: 1,
+          queued: [
+            {
+              id: 'job-2',
+              kind: 'worker',
+              label: 'Job 2',
+              queuedAt: '2026-01-01T00:00:01.000Z',
+              reason: 'queued: 1/3 minion turns running (pacing.max_concurrent_minions)',
+            },
+          ],
+        },
+        review: { limit: 0, running: 0, queued: [] },
+      },
+    };
+  }
+
+  it('accepts a valid pacing gate block (queued lanes and honest reasons survive the mirror)', () => {
+    const valid = pacingSnapshot();
+    expect(isValidSnapshot(valid)).toBe(true);
+    expect(parseBoardServerFrame({ type: 'board', snapshot: valid })).not.toBeNull();
+  });
+
+  it('rejects a malformed pacing block like every other v4 health read', () => {
+    const badKind = pacingSnapshot();
+    const kindEntry = (badKind.pacing as { worker: { queued: Record<string, unknown>[] } }).worker.queued[0]!;
+    kindEntry.kind = 'nope';
+    expect(isValidSnapshot(badKind)).toBe(false);
+
+    const badReason = pacingSnapshot();
+    const reasonEntry = (badReason.pacing as { worker: { queued: Record<string, unknown>[] } }).worker.queued[0]!;
+    reasonEntry.reason = 42;
+    expect(isValidSnapshot(badReason)).toBe(false);
+
+    const badLimit = pacingSnapshot();
+    (badLimit.pacing as { review: { limit: number } }).review.limit = -1;
+    expect(isValidSnapshot(badLimit)).toBe(false);
+
+    const badQueued = pacingSnapshot();
+    (badQueued.pacing as { worker: { queued: unknown } }).worker.queued = 'nope';
+    expect(isValidSnapshot(badQueued)).toBe(false);
   });
 });

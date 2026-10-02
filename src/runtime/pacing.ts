@@ -1,0 +1,576 @@
+import { ConfigError, type PacingConfig } from '../config.js';
+
+/**
+ * Provider pacing (owner heist 2026-09-29): config-driven FIFO admission
+ * caps for minion turns and Perkins review turns, plus bounded automatic
+ * retry for the provider rate-limit error class — replacing per-429 owner
+ * ACKs.
+ *
+ * Provider-agnostic by ruling: no provider name, model, or limit is
+ * hardcoded. Limits and the master switch come from the [pacing] config
+ * section; provider-keyed
+ * error signatures match ERROR TEXT only — a CLI or adapter brand is never
+ * provider identity (bible: align-preflight-with-runtime-resolution). The
+ * signatures are global text signatures; the provider keys are
+ * organizational labels, never a match scope.
+ */
+
+/** Generic, provider-agnostic rate-limit signatures: the 429 family plus
+ * plain-language rate-limit phrasing any provider may emit. A bare numeric
+ * token is NOT enough — otherwise "TypeError at line 429" or "only 429
+ * bytes read" would schedule automatic retries. The code must look like a
+ * status (HTTP/status/error/code context, or the leading status-code shape
+ * a provider formatter emits), or sit next to rate-limit words. Deliberately
+ * narrower than the supervisor's quota-wall class: subscription/billing
+ * exhaustion ("quota exceeded", "insufficient balance") must never be
+ * retried into a silent loop. */
+const GENERIC_RATE_LIMIT_PATTERN =
+  /^429\b|\b(?:http(?:\/ ?\d+(?:\.\d+)*)?|status(?:[_\s]?code)?|error(?:[_\s]?code)?|code)\b\s*[:=,_-]?\s*429\b|\b429\b[^\p{L}\p{N}]{0,8}(?:too many requests|rate[- ]?limit)|\btoo many requests\b|\bthrottl(?:e|ed|ing)\b|\brate[- ]?limit(?:ed|ing)?\b/iu;
+
+/** True when the error text matches the generic 429 family or one of the
+ * configured signatures. Never matches on provider identity. */
+export function isRateLimitErrorText(
+  errorText: string,
+  extraPatterns: readonly RegExp[] = [],
+): boolean {
+  if (GENERIC_RATE_LIMIT_PATTERN.test(errorText)) return true;
+  return extraPatterns.some((pattern) => pattern.test(errorText));
+}
+
+/** Compile the configured rate-limit signatures. Pattern validity is
+ * already enforced at config load; this re-check fails loud rather than
+ * trusting a hand-built config object. */
+export function compileRateLimitPatterns(config: PacingConfig): readonly RegExp[] {
+  const compiled: RegExp[] = [];
+  for (const [providerId, override] of Object.entries(config.providers)) {
+    for (const pattern of override.rateLimitPatterns) {
+      try {
+        compiled.push(new RegExp(pattern, 'i'));
+      } catch (error) {
+        throw new ConfigError(
+          `pacing.providers."${providerId}".rate_limit_patterns contains an invalid regex: ${(error as Error).message}`,
+          '<pacing>',
+          `pacing.providers."${providerId}"`,
+        );
+      }
+    }
+  }
+  return compiled;
+}
+
+/** Fully-resolved rate-limit retry policy for one service process (config +
+ * compiled signatures). `null` means the feature is off — pure pre-pacing
+ * behavior is the exact contract the supervisor falls back to. */
+export interface RateLimitBackoffPolicy {
+  /** Backoff base; doubles per retry. */
+  readonly baseMs: number;
+  /** Hard bound on any single retry delay (jitter included). */
+  readonly maxMs: number;
+  /** Automatic retries per rate-limit incident. */
+  readonly maxRetries: number;
+  /** Compiled extra signatures beyond the generic 429 family. */
+  readonly patterns: readonly RegExp[];
+}
+
+/** Resolve the runtime backoff policy from config. The section being absent
+ * (or an explicit zero retry budget) is the off switch: no retry machinery
+ * runs. */
+export function resolveRateLimitBackoff(config: PacingConfig): RateLimitBackoffPolicy | null {
+  if (!config.enabled || config.maxAutoRetries <= 0) return null;
+  return {
+    baseMs: config.backoffBaseMs,
+    maxMs: config.backoffMaxMs,
+    maxRetries: config.maxAutoRetries,
+    patterns: compileRateLimitPatterns(config),
+  };
+}
+
+/**
+ * Delay for retry n (1-based): base * 2^(n-1), capped at maxMs, plus
+ * additive jitter up to half the (pre-jitter) exponential while the
+ * exponential is under the bound. Once the exponential reaches the cap,
+ * an additive draw would always clamp back to the same value — every
+ * fully capped retry would be synchronized — so the same draw instead
+ * spreads the delay DOWN from the bound (the bound stays a hard ceiling,
+ * and the default zero jitter keeps the pure ladder exactly: the capped
+ * rung remains maxMs). Exported for deterministic tests of the ladder
+ * shape; production callers use the service's jitter seam.
+ */
+export function backoffDelayMs(
+  retry: number,
+  baseMs: number,
+  maxMs: number,
+  jitter: (capMs: number) => number = () => 0,
+): number {
+  const exponential = Math.min(baseMs * 2 ** Math.max(0, retry - 1), maxMs);
+  if (exponential >= maxMs) return maxMs - jitter(maxMs / 2);
+  return Math.min(exponential + jitter(exponential / 2), maxMs);
+}
+
+/** Canonical pacing.auto-retry* payloads shared by BOTH producers — the
+ * supervisor's minion-turn retries and the workflow-owned retry loop used by
+ * Perkins lead/lens turns — so job/round-scoped ledger consumers never have
+ * to special-case two schemas. Context that varies per producer (jobId,
+ * roundId, agentId) rides the event ENVELOPE, never the payload. The error
+ * text is bounded here so both producers record the same bound. */
+export const MAX_PACING_ERROR_CHARS = 500;
+
+function boundedPacingError(error: string): string {
+  return error.length > MAX_PACING_ERROR_CHARS ? error.slice(0, MAX_PACING_ERROR_CHARS) : error;
+}
+
+export interface PacingRetryPayload {
+  readonly attempt: number;
+  readonly max_auto_retries: number;
+  readonly delay_ms: number;
+  readonly error: string;
+}
+
+export interface PacingExhaustedPayload {
+  readonly attempts: number;
+  readonly max_auto_retries: number;
+  readonly error: string;
+}
+
+export interface PacingRecoveredPayload {
+  readonly attempts: number;
+  readonly max_auto_retries: number;
+}
+
+export function pacingRetryPayload(
+  attempt: number,
+  maxAutoRetries: number,
+  delayMs: number,
+  error: string,
+): PacingRetryPayload {
+  return { attempt, max_auto_retries: maxAutoRetries, delay_ms: delayMs, error: boundedPacingError(error) };
+}
+
+export function pacingExhaustedPayload(
+  attempts: number,
+  maxAutoRetries: number,
+  error: string,
+): PacingExhaustedPayload {
+  return { attempts, max_auto_retries: maxAutoRetries, error: boundedPacingError(error) };
+}
+
+export function pacingRecoveredPayload(attempts: number, maxAutoRetries: number): PacingRecoveredPayload {
+  return { attempts, max_auto_retries: maxAutoRetries };
+}
+
+/** How a worker delivery's automatic rate-limit retry phase concluded.
+ * `none` = no retry was pending when the delivery settled; `recovered` =
+ * the retried turn delivered; `exhausted` = the bounded budget ran out (or
+ * a retry failed in a non-rate-limit class) without delivering the turn;
+ * `superseded` = a restart, replacement, or shutdown took the turn over. */
+export type RetrySettlement = 'none' | 'recovered' | 'exhausted' | 'superseded';
+
+/** A settlement hook fault, distinct from a spent retry budget: the retry
+ * machinery could not report a disposition (supervisor bug, unknown agent,
+ * wiring fault). Call sites surface this as an internal error — never as
+ * 'automatic rate-limit retry exhausted', which would narrate a retry that
+ * never ran and mask the real defect. */
+export class RetrySettlementUnavailableError extends Error {
+  constructor(
+    readonly agentId: string,
+    override readonly cause: unknown,
+  ) {
+    super(`retry settlement unavailable for agent ${agentId}: ${String(cause)}`);
+    this.name = 'RetrySettlementUnavailableError';
+  }
+}
+
+/** Await a delivered turn's bounded retry settlement, optionally raced
+ * against a cancellation signal (shutdown must never hang a delivery).
+ * A missing hook means no retry machinery is wired ('none'). A hook fault
+ * throws a named RetrySettlementUnavailableError: a system fault is never
+ * reported as a spent retry budget. */
+export async function settleRetries(
+  hook: ((agentId: string) => Promise<RetrySettlement>) | undefined,
+  agentId: string,
+  signal?: AbortSignal,
+): Promise<RetrySettlement | 'cancelled'> {
+  if (hook === undefined) return 'none';
+  let settle: Promise<RetrySettlement>;
+  try {
+    settle = hook(agentId);
+  } catch (cause) {
+    throw new RetrySettlementUnavailableError(agentId, cause);
+  }
+  const surfaced = settle.catch((cause: unknown) => {
+    throw new RetrySettlementUnavailableError(agentId, cause);
+  });
+  if (signal === undefined) return surfaced;
+  if (signal.aborted === true) {
+    // Shutdown already landed, but the hook may have had nothing to wait
+    // for: an already-available disposition ('none' — no incident was
+    // pending) must win over the cancellation, otherwise a shutdown
+    // between a resolved prompt and this call would block a lane that had
+    // no pending settlement. A genuinely pending settlement yields to the
+    // cancellation on the next microtask instead of hanging the caller:
+    // the race consults the hook first, and a promise that is already
+    // settled beats the already-resolved cancellation. A hook fault still
+    // surfaces as a named RetrySettlementUnavailableError.
+    const winner = await Promise.race([settle, Promise.resolve<'cancelled'>('cancelled')]).catch(
+      (cause: unknown) => {
+        throw new RetrySettlementUnavailableError(agentId, cause);
+      },
+    );
+    return winner;
+  }
+  let listener: (() => void) | null = null;
+  try {
+    return await Promise.race([
+      surfaced,
+      new Promise<'cancelled'>((resolve) => {
+        listener = () => resolve('cancelled');
+        signal.addEventListener('abort', listener, { once: true });
+      }),
+    ]);
+  } finally {
+    if (listener !== null) signal.removeEventListener('abort', listener);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Admission gate (FIFO, no starvation, no rejection, never preempt)
+// ---------------------------------------------------------------------------
+
+/** What pool a lease belongs to (worker = minion turns; review = Perkins
+ * lead + lens turns). */
+export type PacingPool = 'worker' | 'review';
+
+export interface PacingQueueEntryView {
+  /** Caller-chosen identity (job id, round id, lens label…). */
+  readonly id: string;
+  readonly kind: PacingPool;
+  /** Human-readable label carried with the queue entry in the board
+   * snapshot data. */
+  readonly label: string;
+  readonly queuedAt: string;
+  /** Why this entry is waiting — always the honest limit, never a guess. */
+  readonly reason: string;
+}
+
+export interface PacingPoolView {
+  /** Configured limit; 0 = unlimited. */
+  readonly limit: number;
+  readonly running: number;
+  readonly queued: readonly PacingQueueEntryView[];
+}
+
+/** Honest board-snapshot view: enabled flag, both pools, running counts,
+ * and every queued entry with its queue time and reason. */
+export interface PacingGateView {
+  readonly enabled: boolean;
+  readonly worker: PacingPoolView;
+  readonly review: PacingPoolView;
+}
+
+/** Durable-record hook (the ledger in production) so queuing and admission
+ * land on the record for observability. A throw fails the affected acquire
+ * loudly without consuming a slot. */
+export type PacingEventRecorder = (event: {
+  readonly kind: string;
+  readonly jobId?: string | null;
+  readonly agentId?: string | null;
+  readonly payload?: unknown;
+}) => void;
+
+export interface PacingAcquireInput {
+  /** Caller-chosen identity (job id, round id, lens label…). */
+  readonly id: string;
+  /** Human-readable label carried with the queue entry in the board
+   * snapshot data. */
+  readonly label: string;
+  readonly jobId?: string | null;
+  readonly agentId?: string | null;
+  /** Cancels a QUEUED wait (live turns are never preempted). A wait that
+   * was already admitted resolves with its lease instead. */
+  readonly signal?: AbortSignal;
+  /** Called synchronously when this acquire had to queue (never when it was
+   * admitted immediately), so the caller can land the honest reason on its
+   * own record. */
+  readonly queued?: (info: { readonly position: number; readonly limit: number; readonly reason: string }) => void;
+}
+
+/** A held slot. Release hands the slot straight to the head waiter. */
+export interface PacingLease {
+  /** Hand the slot back and admit the next queued waiter (FIFO). Releasing
+   * twice is a caller bug and throws. */
+  release(): void;
+  /** Time spent queued before admission; 0 when admitted immediately. */
+  readonly waitedMs: number;
+}
+
+export interface PacingGateOptions {
+  readonly enabled: boolean;
+  readonly maxConcurrentMinions: number;
+  readonly maxConcurrentReviewTurns: number;
+  readonly record?: PacingEventRecorder;
+  /** Clock seam (default Date.now). */
+  readonly now?: () => number;
+}
+
+interface PacingWaiter {
+  readonly id: string;
+  readonly kind: PacingPool;
+  readonly label: string;
+  readonly jobId: string | null;
+  readonly agentId: string | null;
+  readonly queuedAt: string;
+  readonly enqueueMs: number;
+  readonly signal: AbortSignal | undefined;
+  resolve: (lease: PacingLease) => void;
+  reject: (error: Error) => void;
+  onAbort: (() => void) | null;
+}
+
+/**
+ * FIFO admission gate for model turns (owner ruling: queue, never reject,
+ * never starve, never preempt). Two independent pools — worker MINION turns
+ * (the bound is named max_concurrent_minions; silas/bob/distiller/chat core
+ * turns are outside this pool by design, and residency stays with the
+ * worker-residency-budget undertaking) and Perkins review turns — each
+ * bounded by its configured limit; a limit of 0 (or a disabled feature)
+ * admits everyone immediately, which is the shipped default and preserves
+ * pre-pacing behavior exactly.
+ *
+ * Releases hand the slot straight to the head waiter, so a new arrival can
+ * never jump an existing queue (no starvation). Every wait is visible via
+ * {@link view} — the board snapshot carries every queued entry with its
+ * honest reason (rendering belongs to the board consumers).
+ */
+export class PacingGate {
+  private readonly enabled: boolean;
+  private readonly limits: Readonly<Record<PacingPool, number>>;
+  private readonly record: PacingEventRecorder | null;
+  private readonly now: () => number;
+  private readonly running: Record<PacingPool, number> = { worker: 0, review: 0 };
+  private readonly queues: Record<PacingPool, PacingWaiter[]> = { worker: [], review: [] };
+  private readonly released = new WeakSet<object>();
+
+  constructor(opts: PacingGateOptions) {
+    this.enabled = opts.enabled;
+    // Fail loud on a non-finite cap at this boundary: Math.floor(NaN) is NaN,
+    // and a NaN limit silently wedges every acquire while the board view
+    // carries NaN (which the web frame validator rejects). A wiring mistake
+    // must never read as a full pool.
+    if (!Number.isFinite(opts.maxConcurrentMinions)) {
+      throw new Error(`PacingGate: maxConcurrentMinions must be a finite number, got ${String(opts.maxConcurrentMinions)}`);
+    }
+    if (!Number.isFinite(opts.maxConcurrentReviewTurns)) {
+      throw new Error(`PacingGate: maxConcurrentReviewTurns must be a finite number, got ${String(opts.maxConcurrentReviewTurns)}`);
+    }
+    this.limits = {
+      worker: Math.max(0, Math.floor(opts.maxConcurrentMinions)),
+      review: Math.max(0, Math.floor(opts.maxConcurrentReviewTurns)),
+    };
+    this.record = opts.record ?? null;
+    this.now = opts.now ?? Date.now;
+  }
+
+  /** Acquire a worker (minion turn) slot; queues FIFO while at the limit. */
+  acquireWorkerTurn(input: PacingAcquireInput): Promise<PacingLease> {
+    return this.acquire('worker', input);
+  }
+
+  /** Acquire a review turn slot (Perkins lead or lens); queues FIFO. */
+  acquireReviewTurn(input: PacingAcquireInput): Promise<PacingLease> {
+    return this.acquire('review', input);
+  }
+
+  /** Honest snapshot for the board: limits, running counts, and every
+   * queued entry with its queue time and reason. */
+  view(): PacingGateView {
+    return {
+      enabled: this.enabled,
+      worker: this.poolView('worker'),
+      review: this.poolView('review'),
+    };
+  }
+
+  private poolView(kind: PacingPool): PacingPoolView {
+    return {
+      limit: this.limitFor(kind),
+      running: this.running[kind],
+      queued: this.queues[kind].map((waiter) => ({
+        id: waiter.id,
+        kind: waiter.kind,
+        label: waiter.label,
+        queuedAt: waiter.queuedAt,
+        reason: this.queueReason(kind),
+      })),
+    };
+  }
+
+  private queueReason(kind: PacingPool): string {
+    return kind === 'worker'
+      ? `queued: ${this.running.worker}/${this.limits.worker} minion turns running (pacing.max_concurrent_minions)`
+      : `queued: ${this.running.review}/${this.limits.review} review turns running (pacing.max_concurrent_review_turns)`;
+  }
+
+  private limitFor(kind: PacingPool): number {
+    return this.enabled ? this.limits[kind] : 0;
+  }
+
+  private acquire(kind: PacingPool, input: PacingAcquireInput): Promise<PacingLease> {
+    if (input.signal?.aborted === true) return Promise.reject(new Error('pacing wait aborted'));
+    const limit = this.limitFor(kind);
+    if (limit === 0 || this.running[kind] < limit) {
+      this.running[kind] += 1;
+      if (limit > 0) {
+        // A capped pool's admission history is part of the observability
+        // contract: record the immediate admit too (waited_ms: 0). An
+        // unlimited/disabled pool stays silent — the pre-pacing default
+        // must never inflate the ledger with an event per turn.
+        try {
+          this.recordEvent('pacing.admitted', input, { pool: kind, waited_ms: 0 });
+        } catch (error) {
+          this.running[kind] = Math.max(0, this.running[kind] - 1);
+          return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      }
+      return Promise.resolve(this.mintLease(kind, 0));
+    }
+    return new Promise<PacingLease>((resolve, reject) => {
+      const waiter: PacingWaiter = {
+        id: input.id,
+        kind,
+        label: input.label,
+        jobId: input.jobId ?? null,
+        agentId: input.agentId ?? null,
+        queuedAt: new Date(this.now()).toISOString(),
+        enqueueMs: this.now(),
+        signal: input.signal,
+        resolve: () => {},
+        reject: () => {},
+        onAbort: null,
+      };
+      waiter.resolve = (lease) => {
+        if (waiter.onAbort !== null && waiter.signal !== undefined) {
+          waiter.signal.removeEventListener('abort', waiter.onAbort);
+          waiter.onAbort = null;
+        }
+        resolve(lease);
+      };
+      waiter.reject = (error) => {
+        if (waiter.onAbort !== null && waiter.signal !== undefined) {
+          waiter.signal.removeEventListener('abort', waiter.onAbort);
+          waiter.onAbort = null;
+        }
+        reject(error);
+      };
+      this.queues[kind].push(waiter);
+      let queuedRecorded = false;
+      try {
+        this.recordEvent('pacing.queued', waiter, {
+          pool: kind, position: this.queues[kind].length, limit,
+        });
+        queuedRecorded = true;
+        input.queued?.({
+          position: this.queues[kind].length, limit, reason: this.queueReason(kind),
+        });
+      } catch (error) {
+        this.queues[kind].splice(this.queues[kind].indexOf(waiter), 1);
+        if (queuedRecorded) {
+          // The public record must never show a queue entry that never
+          // existed: compensate best-effort (a recorder failure here must
+          // not mask the caller's original error).
+          try {
+            this.recordEvent('pacing.queued-rollback', waiter, { pool: kind });
+          } catch {
+            // best-effort only — the caller's error is the loud one
+          }
+        }
+        waiter.reject(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      if (input.signal !== undefined) {
+        waiter.onAbort = () => {
+          const index = this.queues[kind].indexOf(waiter);
+          if (index < 0) return; // already admitted; the lease holder releases
+          this.queues[kind].splice(index, 1);
+          try {
+            this.recordEvent('pacing.wait-cancelled', waiter, { pool: kind });
+            waiter.reject(new Error('pacing wait aborted'));
+          } catch (error) {
+            waiter.reject(error instanceof Error ? error : new Error(String(error)));
+          }
+        };
+        if (input.signal.aborted) {
+          waiter.onAbort();
+        } else {
+          input.signal.addEventListener('abort', waiter.onAbort, { once: true });
+        }
+      }
+    });
+  }
+
+  private mintLease(kind: PacingPool, waitedMs: number): PacingLease {
+    const lease: PacingLease = {
+      waitedMs,
+      release: () => {
+        if (this.released.has(lease)) {
+          throw new Error(`pacing ${kind} lease released twice — caller bookkeeping bug`);
+        }
+        this.released.add(lease);
+        this.running[kind] = Math.max(0, this.running[kind] - 1);
+        // A recorder failure rejects THAT waiter loudly, not an orphaned
+        // lease. Continue draining so healthy queued callers cannot starve.
+        for (;;) {
+          const next = this.queues[kind].shift();
+          if (next === undefined) return;
+          const waited = Math.max(0, this.now() - next.enqueueMs);
+          try {
+            this.recordEvent('pacing.admitted', next, { pool: kind, waited_ms: waited });
+          } catch (error) {
+            next.reject(error instanceof Error ? error : new Error(String(error)));
+            continue;
+          }
+          this.running[kind] += 1;
+          next.resolve(this.mintLease(kind, waited));
+          return;
+        }
+      },
+    };
+    return lease;
+  }
+
+  private recordEvent(
+    kind: string,
+    waiter: { readonly id: string; readonly label: string; readonly jobId?: string | null; readonly agentId?: string | null },
+    payload: Record<string, unknown>,
+  ): void {
+    this.record?.({
+      kind,
+      jobId: waiter.jobId,
+      agentId: waiter.agentId,
+      payload: { id: waiter.id, label: waiter.label, ...payload },
+    });
+  }
+}
+
+/** Fully-resolved pacing policy for one service process: the optional
+ * rate-limit backoff policy plus the admission gate (always present; a
+ * disabled gate admits everyone immediately). */
+export interface ResolvedPacingPolicy {
+  readonly backoff: RateLimitBackoffPolicy | null;
+  readonly gate: PacingGate;
+}
+
+export function resolvePacingPolicy(
+  config: PacingConfig,
+  opts: { readonly record?: PacingEventRecorder; readonly now?: () => number } = {},
+): ResolvedPacingPolicy {
+  return {
+    backoff: resolveRateLimitBackoff(config),
+    gate: new PacingGate({
+      enabled: config.enabled,
+      maxConcurrentMinions: config.maxConcurrentMinions,
+      maxConcurrentReviewTurns: config.maxConcurrentReviewTurns,
+      ...(opts.record !== undefined ? { record: opts.record } : {}),
+      ...(opts.now !== undefined ? { now: opts.now } : {}),
+    }),
+  };
+}

@@ -45,6 +45,12 @@ let replayFloorSeq = 0;
 let controlState: ContextControlState = 'idle';
 let failNextCompact = false;
 let failNextNewChat = false;
+/** One-shot turn hold (tests only): the next scripted reply parks at the end
+ * of its token stream and stays `busy` until POST /__turn-release (or the
+ * socket closes), so the working-flavor rotation is observable in a real
+ * browser without racing a short stream. Cleared by /__reset. */
+let holdNextTurn = false;
+let releaseHeldTurn: (() => void) | null = null;
 let compactGeneration = 0;
 let newChatGeneration = 0;
 /** Reflow stress controls (owner heist 2026-09-29, tests only): the next
@@ -133,7 +139,7 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
   let settled = false;
   const timer = setInterval(() => {
     if (socket.readyState !== socket.OPEN) {
-      finishAborted();
+      finish();
       return;
     }
     if (index === 2 && !toolEnded) {
@@ -143,34 +149,34 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     }
     const chunk = tokens[index];
     if (chunk === undefined) {
-      settled = true;
-      clearInterval(timer);
-      socket.off('close', finishAborted);
-      emit({ type: 'turn', state: 'end', seq: nextSeq() });
-      controlState = 'idle';
-      broadcastContext();
-      drainDeferredUsers();
+      if (holdNextTurn) {
+        holdNextTurn = false;
+        releaseHeldTurn = finish;
+        return;
+      }
+      finish();
       return;
     }
     emit({ type: 'delta', text: chunk, seq: nextSeq() });
     index += 1;
   }, DELTA_INTERVAL_MS);
 
-  socket.once('close', finishAborted);
+  socket.once('close', finish);
 
-  // A dropped socket must not leave an unterminated turn in the log:
-  // closing frames are recorded (not sent) so replays see a settled turn.
-  function finishAborted(): void {
+  // One exit for every ending — normal, released, or dropped socket: the
+  // closing frames are recorded (and broadcast to survivors) so replays
+  // always see a settled turn.
+  function finish(): void {
     if (settled) return;
     settled = true;
     clearInterval(timer);
+    releaseHeldTurn = null;
+    socket.off('close', finish);
     if (!toolEnded) {
       toolEnded = true;
-      const toolEnd = record({ type: 'tool', name: toolName, state: 'end', seq: nextSeq() });
-      broadcastFrame(toolEnd);
+      emit({ type: 'tool', name: toolName, state: 'end', seq: nextSeq() });
     }
-    const turnEnd = record({ type: 'turn', state: 'end', seq: nextSeq() });
-    broadcastFrame(turnEnd);
+    emit({ type: 'turn', state: 'end', seq: nextSeq() });
     controlState = 'idle';
     broadcastContext();
     drainDeferredUsers();
@@ -755,8 +761,10 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   // Dev control plane (tests): POST /__reset clears the frame log;
   // POST /__drop terminates every connected socket; POST /__stress fits
   // the next scripted reply with a long tool name / error line (reflow
-  // evidence); the failure endpoints fail the next matching context
-  // control after its visible progress state.
+  // evidence); POST /__turn-hold parks the next settled reply in `busy`
+  // until POST /__turn-release (working-flavor evidence); the failure
+  // endpoints fail the next matching context control after its visible
+  // progress state.
   if (req.method === 'POST' && req.url === '/__compact-fail') {
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' });
@@ -775,6 +783,30 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
       return;
     }
     failNextNewChat = true;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}\n');
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/__turn-hold') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    holdNextTurn = true;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}\n');
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/__turn-release') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    const release = releaseHeldTurn;
+    releaseHeldTurn = null;
+    if (release !== null) release();
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}\n');
     return;
@@ -856,6 +888,8 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     controlState = 'idle';
     failNextCompact = false;
     failNextNewChat = false;
+    holdNextTurn = false;
+    releaseHeldTurn = null;
     stressTool = null;
     stressError = null;
     boardMode = 'default';

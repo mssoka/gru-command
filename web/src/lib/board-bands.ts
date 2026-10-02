@@ -3,7 +3,9 @@
  * TO DO NEXT, not what happened last. Bands, in order:
  *
  *   1 NEEDS GRU  — unacked action-required, blocked/error, PR conflicting,
- *                  aborted review, failed lenses in the newest round
+ *                  aborted review, failed lenses in the newest round —
+ *                  review-history causes apply only to work that is
+ *                  still open (concluded merged/done never revives)
  *   2 IN FLIGHT  — dispatched, fresh working, in-review
  *   3 SETTLED    — delivered, merged today
  *   4 COLD       — stalled working (30 min, Silas's default threshold),
@@ -124,7 +126,13 @@ export function isStalledWorking(job: JobView, opts: BucketOptions = {}): boolea
   return (opts.now ?? Date.now()) - then > threshold;
 }
 
-/** Every reason a job earns Band 1 (exported for focused tests). */
+/** Every reason a job earns Band 1 (exported for focused tests). A
+ * terminal job (merged/done) is a closed receipt: neither stale review
+ * history nor leftover current-state rows may promote it back into NEEDS
+ * GRU (section-truth ruling 2026-09-29; the earlier 2026-09-26 guard
+ * suppressed only review history and still let current-state causes
+ * promote a concluded lane). Terminal-bound machine rows are attributed
+ * as receipts upstream (unackedByJob), so no live cause remains. */
 export function needsYouReasons(job: JobView, unacked: number): readonly string[] {
   if (isJobConcluded(job.status)) return [];
   const reasons: string[] = [];

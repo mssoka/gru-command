@@ -139,6 +139,39 @@ describe('roundSummary', () => {
     );
     expect(interrupted.ran).toBe(1);
   });
+
+  it('classifies unused lenses through the shared classifier: prose alone never downgrades a count', () => {
+    const summary = roundSummary(
+      round({
+        lenses: [
+          { lens: 'blind', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+          { lens: 'edge', state: 'done', agentId: null, note: 'clean — lead said not used', verdict: 'clean' },
+          { lens: 'tests', state: 'done', agentId: null, note: null, verdict: null },
+          { lens: 'security', state: 'pending', agentId: null, note: 'not used — prose', verdict: null },
+        ],
+      }),
+    );
+    // Only the canonical done+notused record is unused; prose on a pending
+    // record and a legacy null note keep their normal accounting.
+    expect(summary).toEqual({ done: 3, used: 2, unused: 1, ran: 2, total: 4, blockers: 0, failures: 0 });
+  });
+
+  it('raw unknown unused records count nowhere: accounting stays non-negative', () => {
+    const summary = roundSummary(
+      round({
+        lenses: [
+          { lens: 'blind', state: 'done', agentId: null, note: 'clean — nothing found', verdict: 'clean' },
+          { lens: 'edge', state: 'unused', agentId: null, note: null, verdict: null },
+          { lens: 'tests', state: 'unused', agentId: null, note: 'not used — prose', verdict: null },
+          { lens: 'security', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+        ],
+      }),
+    );
+    // Only the canonical done record is unused. The two raw drift records
+    // count nowhere — pre-fix they inflated `unused` past `done`, driving
+    // `used`/`ran` negative.
+    expect(summary).toEqual({ done: 2, used: 1, unused: 1, ran: 1, total: 4, blockers: 0, failures: 0 });
+  });
 });
 
 describe('unackedByJob', () => {

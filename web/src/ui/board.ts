@@ -24,6 +24,7 @@ import {
   isJobConcluded,
   jobChipTone,
   jobStatusTone,
+  lensChipState,
   lensChipTone,
   type AgentView,
   type BoardSnapshot,
@@ -92,6 +93,7 @@ const LENS_STATE_LABEL: Readonly<Record<string, string>> = {
   live: '◉',
   done: '✓',
   error: '✕',
+  unused: '—',
 };
 
 export interface TranscriptOpenRequest {
@@ -803,13 +805,16 @@ export class BoardView {
     const attempts = new Map(round.lensAttempts.map((entry) => [entry.lens, entry.attempts]));
     for (const chip of round.lenses) {
       const attemptCount = attempts.get(chip.lens) ?? 0;
+      const state = lensChipState(chip);
+      const unused = state === 'unused';
       const node = el(
         'span',
-        `pp-chip board-lens ${lensChipTone(chip.state)}${chip.verdict === 'blocker' ? ' board-lens--blocker' : ''}`,
-        `${LENS_STATE_LABEL[chip.state] ?? '?'} ${chip.lens}${attemptCount > 1 ? ` ×${attemptCount}` : ''}`,
+        `pp-chip board-lens ${lensChipTone(state)}${chip.verdict === 'blocker' ? ' board-lens--blocker' : ''}`,
+        `${LENS_STATE_LABEL[state] ?? '?'} ${chip.lens}${attemptCount > 1 ? ` ×${attemptCount}` : ''}${unused ? ' · not used' : ''}`,
       );
       if (chip.verdict === 'blocker') node.title = chip.note ?? 'lens recorded a blocker';
-      else if (chip.state === 'error') node.title = chip.note ?? 'lens errored';
+      else if (state === 'error') node.title = chip.note ?? 'lens errored';
+      else if (unused) node.title = chip.note ?? 'not used';
       else if (attemptCount > 1) node.title = `${attemptCount} attempts`;
       chips.append(node);
     }
