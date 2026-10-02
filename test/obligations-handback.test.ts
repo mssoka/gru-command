@@ -309,7 +309,11 @@ describe('unmarked blocked-phase hand-back crash-window recovery (r4 blocker 2)'
       },
     };
     expect(() => observeFollowUpDelivery({ ledger: h.ledger, notifications: crashing }, delivered)).toThrow(/died/);
-    expect(h.ledger.listObligations({ jobId: 'job-uwc2' })).toHaveLength(1); // the debt survived
+    // The hand-back debt survived; the card did not. (Other debt — e.g. the
+    // initial blocked-transition obligation — may coexist on the lane.)
+    expect(
+      h.ledger.listObligations({ jobId: 'job-uwc2' }).filter((row) => row.incidentKey === `phase-handback@${delivered.seq}`),
+    ).toHaveLength(1);
     const kind = `silas.phase-handback.job-uwc2@${delivered.seq}`;
     expect(h.ledger.findNotificationByKind(kind, 'any')).toBeNull(); // the card did not
     const report = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });

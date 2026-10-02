@@ -818,7 +818,11 @@ describe('dispatch server (E8)', () => {
       expect(readback?.state).toBe('admitted');
       expect(readback?.deliverySeq).toBeNull();
       expect(readback?.failReason).toContain('in-band runtime error');
-      expect(h.ledger.latestJobEvent('inband-dir', 'job.delivered')).toBeNull();
+      // The creation dispatch legitimately recorded its own delivery; the
+      // failed directive turn must not add a REQUEST-sourced delivery.
+      expect(h.ledger.listJobEvents('inband-dir').some((event) =>
+        event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-directive',
+      )).toBe(false);
       expect(h.ledger.latestJobEvent('inband-dir', 'job.minion-error')).not.toBeNull();
       // The marked phase stays awaiting — never completed, never published.
       const phase = h.ledger.listPhaseHandoffs({ jobId: 'inband-dir' })[0];
@@ -860,8 +864,14 @@ describe('dispatch server (E8)', () => {
         job_id: 'dir-settle',
         directive: 'Fix the retry settlement path.',
       }, TOKEN);
-      expect(res.status).toBe(502);
-      expect(field<string>(res.json, 'error')).toBe('undelivered');
+      // Accepted ≠ admitted (PR136 durable-intent contract): the response
+      // is the durable acceptance; the exhausted retry is a durable
+      // no-delivery failure readable on the request record.
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      const terminal = await awaitDirectiveTerminal(h, requestId);
+      expect(terminal.state).toBe('failed');
+      expect(terminal.failReason).toContain('automatic rate-limit retry exhausted');
       expect(h.ledger.listJobEvents('dir-settle').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
       // The creation dispatch legitimately recorded its own delivery; the
       // request must not add a REQUEST-sourced delivery on top of it.
@@ -1290,8 +1300,17 @@ describe('provider pacing worker-gate pass-through on the silas routes (r4 verif
       expect(h.ledger.listJobEvents('gate-dir').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
       holder.release();
       const res = await pending;
-      expect(res.status).toBe(200);
+      // Accepted ≠ admitted (PR136 durable-intent contract): the 202 is the
+      // durable acceptance; the queued turn is admitted on release and its
+      // correlated events land on the request record / lane.
+      expect(res.status).toBe(202);
       expect(field<string>(res.json, 'job_id')).toBe('gate-dir');
+      const gateRequestId = field<string>(res.json, 'request_id');
+      const admitDeadline = Date.now() + 10_000;
+      while (h.ledger.getDirective(gateRequestId)?.state !== 'settled' && Date.now() < admitDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(h.ledger.getDirective(gateRequestId)?.state).toBe('settled');
       expect(h.ledger.listJobEvents('gate-dir').some((event) => event.kind === 'silas.directive-sent')).toBe(true);
       expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
     } finally {
