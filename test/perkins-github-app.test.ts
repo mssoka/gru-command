@@ -17,7 +17,7 @@ import {
   type AppFetch,
   type AppFetchInit,
 } from '../src/dispatch/perkins-github-app.js';
-import { AutoVerdictPoster, GhPrPoster, GitLabMrPoster, type VerdictPoster } from '../src/dispatch/perkins.js';
+import { AutoVerdictPoster, GhPrPoster, GitLabMrPoster, type VerdictPoster, type VerdictPosterInput } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 // ---------------------------------------------------------------------------
@@ -1512,7 +1512,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
         },
       },
     ]);
-    const pr8 = { ...PR_INPUT, prUrl: 'https://github.com/acme/widget/pull/8', repoPath: repoPathOf(fixture) } as typeof PR_INPUT;
+    const pr8: VerdictPosterInput = { ...PR_INPUT, prUrl: 'https://github.com/acme/widget/pull/8', repoPath: repoPathOf(fixture) };
     // A starts first and blocks inside its publication POST; the explicit
     // entered gate proves the positive order — A is held BEFORE B starts.
     // No sleeps and no arbitrary drain; a failed assertion before the
@@ -1579,7 +1579,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
         },
       },
     ]);
-    const pr8 = { ...PR_INPUT, prUrl: 'https://github.com/acme/widget/pull/8', repoPath: repoPathOf(fixture) } as typeof PR_INPUT;
+    const pr8: VerdictPosterInput = { ...PR_INPUT, prUrl: 'https://github.com/acme/widget/pull/8', repoPath: repoPathOf(fixture) };
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/NOT re-posted/u);
     expect(trace).toEqual(['A:post-failed', 'A:strict-window-lookup']);
     // B publishes successfully through the same poster afterwards, with
