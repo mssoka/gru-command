@@ -138,6 +138,7 @@ interface CancellationObservation {
   readonly turn: string;
   readonly queued: string;
   readonly errorEvents: number;
+  readonly errorMessages: readonly string[];
   readonly stateErrors: number;
   readonly assistantErrors: number;
   readonly abortedEnds: number;
@@ -328,6 +329,9 @@ async function observeCompactionCancellation(
       turn: turnOutcome,
       queued: queuedOutcome,
       errorEvents: events.filter((event) => event.type === 'error').length,
+      errorMessages: events
+        .filter((event): event is Extract<RuntimeEvent, { type: 'error' }> => event.type === 'error')
+        .map((event) => event.error),
       stateErrors: events.filter((event) => event.type === 'state' && event.state === 'error').length,
       assistantErrors: internal.session.agent.state.messages.filter(
         (message) => message.role === 'assistant' && message.stopReason === 'error',
@@ -989,6 +993,10 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.cancellations).toBe(1);
       expect(observation.turn).toBe('resolved');
       expect(observation.errorEvents).toBe(1);
+      // The surfaced error is the SDK abort message, not an anonymous failure:
+      // the test title's claim is pinned to the actual text.
+      expect(observation.errorMessages).toHaveLength(1);
+      expect(observation.errorMessages[0]).toContain('aborted');
       expect(observation.stateErrors).toBe(1);
       expect(observation.assistantErrors).toBe(1);
       expect(observation.continuationReachedModel).toBe(false);
@@ -1039,6 +1047,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.cancellations).toBe(1);
       expect(observation.turn).toBe('resolved');
       expect(observation.errorEvents).toBe(1);
+      expect(observation.errorMessages).toHaveLength(1);
+      expect(observation.errorMessages[0]).toContain('aborted');
       expect(observation.assistantErrors).toBe(1);
       expect(observation.continuationReachedModel).toBe(false);
       expect(observation.summarySettledByAbort).toBe(false);
@@ -1169,6 +1179,12 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         expect(ends[0]!.error).toBe('native compaction state did not settle after its terminal event');
         // The bound was actually awaited, not bypassed.
         expect(Date.now() - started).toBeGreaterThanOrEqual(5_000);
+        // ...and the upper edge is pinned too: the reconcile poll runs every
+        // 10ms, so a widened constant would push publication past this
+        // ceiling (recorded arrivals sit at ~5.15-5.22s; the ~1.8s margin
+        // keeps co-tenant scheduling slack while still failing any widening
+        // beyond ~7s).
+        expect(Date.now() - started).toBeLessThan(7_000);
         // The reconcile path disposes instead of wedging on the stuck gate.
         await waitFor(() => handle.health().state === 'disposed', 'reconciled disposal');
         expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(false);
