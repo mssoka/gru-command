@@ -100,6 +100,9 @@ interface SupervisedAgent {
   state: SupervisionState;
   openTurn: boolean;
   openControl: boolean;
+  /** One FYI warning per open native-compaction episode (cleared with the
+   * latch by compaction_end / disposal). */
+  compactionWarned: boolean;
   /** callId → tool name for tool calls currently executing. */
   openToolCalls: Map<string, string>;
   /** An interrupted turn awaiting resume on the next live handle. Survives
@@ -134,6 +137,7 @@ interface SupervisedAgent {
     handle: AgentHandle | null;
     activityGeneration: number;
     openTurn: boolean;
+    openControl: boolean;
   } | null;
 }
 
@@ -511,6 +515,7 @@ export class Supervisor {
         agent.handle = null;
         agent.openTurn = false;
         agent.openControl = false;
+        agent.compactionWarned = false;
         // A breaker-STOPPED agent keeps its record: the escalation names
         // it and the ack must find it to re-arm (deleting here would strand
         // the stopped agent — same reasoning as inRestart stickiness).
@@ -550,6 +555,7 @@ export class Supervisor {
           break;
         case 'compaction_end':
           agent.openControl = false;
+          agent.compactionWarned = false;
           break;
         case 'tool_start':
           agent.openToolCalls.set(event.callId, event.tool);
@@ -561,6 +567,7 @@ export class Supervisor {
           if (event.state === 'disposed') {
             agent.openTurn = false;
             agent.openControl = false;
+            agent.compactionWarned = false;
             agent.openToolCalls.clear();
           }
           break;
@@ -639,6 +646,7 @@ export class Supervisor {
       state: 'watching',
       openTurn: false,
       openControl: false,
+      compactionWarned: false,
       openToolCalls: new Map(),
       pendingRecovery: null,
       lastEventAt: this.now(),
@@ -686,6 +694,13 @@ export class Supervisor {
           this.abortIsolatedReviewAttempt(agent, 'turn hang');
           continue;
         }
+        if (agent.openControl) {
+          // Native compaction is open: silence is NOT hang evidence. Warn
+          // once, keep waiting — no dispose, no restart, no pending-turn
+          // take, no clock reset (no fake progress).
+          this.warnCompactionWait(agent, silence);
+          continue;
+        }
         if (this.hasLiveProcess(agent.handle)) {
           // An open tool call backed by a live process is ACTIVITY, never
           // silence. Reset the clock and fail toward NOT killing the work.
@@ -698,7 +713,10 @@ export class Supervisor {
           });
           continue;
         }
-        const reason = agent.openControl ? 'compaction hang' : 'turn hang';
+        // Native compaction never reaches this line (the wait branch above
+        // continues first): silence past the threshold here is a genuine
+        // non-compacting turn hang.
+        const reason = 'turn hang';
         this.log('warn', `${reason} detected — climbing restart ladder`, {
           agent_id: agent.agentId,
           silence_ms: silence,
@@ -706,6 +724,41 @@ export class Supervisor {
         });
         void this.evaluateRecovery(agent, reason);
       }
+    }
+  }
+
+  /**
+   * Open native compaction past the silence threshold: post ONE factual
+   * FYI per episode and keep waiting (owner ruling: a stalled provider is
+   * rare, and while compaction is in progress we wait for it — manual
+   * owner controls remain the way to end a truly stalled episode). No
+   * second deadline exists on top of this warning, and the silence clock
+   * is not reset; compaction_end (success or failure) clears the latch
+   * and re-arms the warning for the next episode.
+   */
+  private warnCompactionWait(agent: SupervisedAgent, silenceMs: number): void {
+    if (agent.compactionWarned) return;
+    agent.compactionWarned = true;
+    this.log('info', 'native compaction still open past the silence threshold — waiting', {
+      agent_id: agent.agentId,
+      silence_ms: silenceMs,
+      threshold_ms: this.cfg.turnSilenceMs,
+    });
+    try {
+      this.notifications.post({
+        kind: 'supervision.native-compaction-wait',
+        routing: 'fyi',
+        severity: 'info',
+        title: `Agent ${agent.agentId}: compaction has not reported completion — continuing to wait`,
+        detail:
+          `Native compaction has been silent for ${Math.round(silenceMs / 1000)}s ` +
+          `(threshold ${Math.round(this.cfg.turnSilenceMs / 1000)}s). ` +
+          'Silence during an open compaction is not hang evidence; no restart is scheduled. ' +
+          'Manual stop/reset remains available.',
+        agentId: agent.agentId,
+      });
+    } catch (error) {
+      this.log('warn', 'compaction-wait FYI could not be posted', { error: String(error) });
     }
   }
 
@@ -915,6 +968,7 @@ export class Supervisor {
         handle: agent.handle,
         activityGeneration: agent.activityGeneration,
         openTurn: agent.openTurn,
+        openControl: agent.openControl,
       };
       if (runtimeError) agent.failureTerminalPending = true;
       return;
@@ -925,6 +979,7 @@ export class Supervisor {
     const expectedHandle = agent.handle;
     const expectedActivityGeneration = agent.activityGeneration;
     const expectedOpenTurn = agent.openTurn;
+    const expectedOpenControl = agent.openControl;
     const request = supervisionDecisionRequest({
       reason,
       agentId: agent.agentId,
@@ -935,13 +990,18 @@ export class Supervisor {
     try {
       const outcome = await this.decisions.decide(request);
       // The entity may have been stopped/disposed/replaced while Jev was
-      // answering. A stale answer never starts a restart.
+      // answering. A stale answer never starts a restart. A SILENCE
+      // decision is additionally voided once native compaction opened:
+      // its silence evidence predates the compaction and must never kill
+      // it (compaction_start also bumps the activity generation; the
+      // openControl check states the contract explicitly).
       if (
         this.disposed ||
         this.agents.get(agent.agentId) !== agent ||
         agent.handle !== expectedHandle ||
         agent.activityGeneration !== expectedActivityGeneration ||
         (!runtimeError && agent.openTurn !== expectedOpenTurn) ||
+        (!runtimeError && agent.openControl !== expectedOpenControl) ||
         agent.breakerOpen
       ) return;
       const classAnswer = outcome.routes.failure_class.path === 'fallback'
@@ -1007,6 +1067,7 @@ export class Supervisor {
         agent.handle === expectedHandle &&
         agent.activityGeneration === expectedActivityGeneration &&
         (runtimeError || agent.openTurn === expectedOpenTurn) &&
+        (runtimeError || agent.openControl === expectedOpenControl) &&
         !agent.breakerOpen
       ) {
         if (deterministicWall) this.stopForGuidance(agent, deterministicClass);
@@ -1017,7 +1078,9 @@ export class Supervisor {
       agent.failureTerminalPending = false;
       const queued = agent.queuedRecovery;
       agent.queuedRecovery = null;
-      const queuedTurnStillMatches = queued?.runtimeError === true || queued?.openTurn === agent.openTurn;
+      const queuedTurnStillMatches =
+        queued?.runtimeError === true ||
+        (queued?.openTurn === agent.openTurn && queued?.openControl === agent.openControl);
       if (
         queued !== null &&
         !this.disposed &&
