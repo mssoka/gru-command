@@ -7,8 +7,27 @@ import type { LedgerApi } from '../ledger/api.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DecisionService } from '../decisions/types.js';
 import { deterministicFailureClass, supervisionDecisionRequest } from '../decisions/questions.js';
+import {
+  backoffDelayMs,
+  isRateLimitErrorText,
+  pacingExhaustedPayload,
+  pacingRecoveredPayload,
+  pacingRetryPayload,
+  type PacingExhaustedPayload,
+  type PacingGate, type PacingLease, type PacingRecoveredPayload, type PacingRetryPayload,
+  type RateLimitBackoffPolicy, type RetrySettlement,
+} from '../runtime/pacing.js';
+import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+/** Default backoff sleep: a real, unref'd timer (tests inject a fake). */
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
 
 /**
  * The registry surface supervision consumes (structural — the real
@@ -104,6 +123,11 @@ interface SupervisedAgent {
   /** An interrupted turn awaiting resume on the next live handle. Survives
    * failed rungs and breaker re-arms — the lane must never be forgotten. */
   pendingRecovery: InterruptedTurn | null;
+  /** Provider pacing: the abort handle for a restart-recovery delivery
+   * waiting on (or running under) a worker admission slot. Aborted when
+   * the recovery attempt is superseded, disposed, or a new failure lands;
+   * the waiting coroutine then exits without consuming a turn. */
+  recoveryAdmission: AbortController | null;
   lastEventAt: number;
   lastFileBytes: number | null;
   /** Restart timestamps (epoch ms) — the breaker ring. */
@@ -128,11 +152,47 @@ interface SupervisedAgent {
     reason: string;
     allowRestart: boolean;
     runtimeError: boolean;
+    source: ProviderErrorSource | null;  // carries .typed (r1 #13)
     handle: AgentHandle | null;
     activityGeneration: number;
     openTurn: boolean;
     openControl: boolean;
   } | null;
+  /** Active automatic rate-limit retry incident (null when none). While set
+   * it owns recovery for this agent; the watchdog skips hang detection
+   * until its next delivery attempt is actually running. */
+  rateLimitRetry: RateLimitRetryIncident | null;
+}
+
+/** One active automatic rate-limit retry incident: the failed turn's prompt
+ * is re-delivered on the SAME live session after each bounded backoff, and
+ * every failure inside the incident spends one retry from the resolved
+ * budget. Cleared by recovery, replacement, or a clean delivery. */
+interface RateLimitRetryIncident {
+  readonly admissionAbort: AbortController;
+  /** Retries scheduled so far (attempt numbers are 1-based at schedule). */
+  attempts: number;
+  readonly maxRetries: number;
+  /** The failed turn's prompt, captured synchronously at error time —
+   * before the adapter clears its live-turn snapshot. */
+  readonly pending: PendingTurn;
+  /** A delivery attempt is in flight right now. */
+  awaitingDelivery: boolean;
+  /** Monotonic per-delivery token; only the owning delivery may clear
+   * awaitingDelivery or act on its own settlement. */
+  deliveryToken: number;
+  /** Token of the delivery currently in flight (null when none). */
+  activeDelivery: number | null;
+  /** Failure signals observed in this incident: a delivery failed iff this
+   * counter moved across (i.e. during) that delivery. */
+  failureSeq: number;
+  lastError: string;
+  /** Resolved exactly once as the incident concludes, so a delivery call
+   * site can keep its own lifecycle pending until the bounded recovery
+   * succeeded or exhausted (instead of settling/disposing the handle out
+   * from under the retry). */
+  readonly settled: Promise<Exclude<RetrySettlement, 'none'>>;
+  resolveSettled: (disposition: Exclude<RetrySettlement, 'none'>) => void;
 }
 
 /** What a restart rung must know to recover a killed open turn. */
@@ -145,6 +205,57 @@ interface InterruptedTurn {
    * fresh-mint restart may retire the record's current id, but the job /
    * branch / phase context lives under this one. */
   readonly originAgentId: string;
+}
+
+/** Structured provider identity from a runtime error, when the runtime
+ * carried one (the provider-recovery sensor's evidence input; never
+ * guessed from prose). */
+export interface ProviderErrorSource {
+  readonly provider: string | null;
+  readonly model: string | null;
+  readonly error: string;
+  /** Typed provider-response provenance (r1 #13) — absent for arbitrary
+   * turn exceptions; the sensor requires it to establish a wait. */
+  readonly typed: {
+    readonly origin: 'sdk-error' | 'provider-message';
+    readonly status?: number;
+    readonly bodyCode?: string;
+    readonly retryAfterMs?: number;
+  } | null;
+}
+
+/** The provider-recovery observation sink (the sensor's recorder): the
+ * supervisor reports every wall stop with its structured evidence; the
+ * sink alone decides eligibility (owner control is preserved for
+ * auth/billing/ambiguous/unsupported). */
+export interface ProviderWallSink {
+  /** Machine-ownership classification BEFORE any owner stop is created
+   * (phase3 r1 #2): true only when the sink has ALREADY durably persisted
+   * an eligible machine-owned provider wait for this stop. false/absent/
+   * throwing keeps the conservative human-controlled needs-owner stop. */
+  ownsProviderWall?(input: {
+    readonly agentId: string;
+    readonly role: Role;
+    readonly slotId: string | null;
+    readonly jobId: string | null;
+    readonly sessionFile: string | null;
+    readonly failureClass: string;
+    readonly source: ProviderErrorSource | null;
+    readonly continuation: { readonly promptText: string | null; readonly promptOwner: string | null; readonly hadOpenTurn: boolean } | null;
+  }): Promise<boolean>;
+  /** Link the machine-owned stop notice onto the persisted wait (lifecycle). */
+  linkProviderWaitIncident?(waitLink: { readonly agentId: string; readonly incidentId: string }): void;
+  onProviderWall(input: {
+    readonly agentId: string;
+    readonly role: Role;
+    readonly slotId: string | null;
+    readonly jobId: string | null;
+    readonly sessionFile: string | null;
+    readonly failureClass: string;
+    readonly source: ProviderErrorSource | null;
+    readonly incidentId: string | null;
+    readonly continuation: { readonly promptText: string | null; readonly promptOwner: string | null; readonly hadOpenTurn: boolean } | null;
+  }): void;
 }
 
 /** A declared supervision slot — a stable identity that outlives handles
@@ -185,6 +296,10 @@ export interface SupervisorOptions {
    * restart-versus-escalate guidance. Counters, ceilings, stop/cancel state,
    * and re-arm remain deterministic here regardless of this service. */
   readonly decisions?: DecisionService;
+  /** Optional provider-recovery observation sink: wall stops are reported
+   * with their structured evidence; the sink alone decides wait
+   * eligibility. Absent = pure observer (no sensor). */
+  readonly providerWalls?: ProviderWallSink;
   readonly log?: Log;
   /** Test seam: tick interval override (default: min(silence/4, 5 s)). */
   readonly tickMs?: number;
@@ -193,6 +308,16 @@ export interface SupervisorOptions {
   /** Test seam: wall clock used only for sleep/wake gap detection
    * (default Date.now; the `now` seam is free to be a fake clock). */
   readonly wallNow?: () => number;
+  /** Resolved rate-limit automatic retry policy (owner heist 2026-09-29);
+   * null/omitted = feature off — the failure keeps its current ladder
+   * behavior (stop for provider walls, nothing for other in-band errors). */
+  readonly rateLimitBackoff?: RateLimitBackoffPolicy | null;
+  readonly workerGate?: PacingGate;
+  /** Test seam: backoff sleep (default a real unref'd timer). */
+  readonly sleep?: (ms: number) => Promise<void>;
+  /** Test seam: jitter over [0, capMs) added to each backoff delay (default
+   * uniform random). Tests pin it for deterministic ladder-shape asserts. */
+  readonly jitter?: (capMs: number) => number;
 }
 
 export class Supervisor {
@@ -201,9 +326,14 @@ export class Supervisor {
   private readonly ledger: LedgerApi;
   private readonly notifications: NotificationCenter;
   private readonly decisions: DecisionService | null;
+  private readonly providerWalls: ProviderWallSink | null;
   private readonly log: Log;
   private readonly now: () => number;
   private readonly wallNow: () => number;
+  private readonly rateLimitBackoff: RateLimitBackoffPolicy | null;
+  private readonly workerGate: PacingGate | undefined;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly jitter: (capMs: number) => number;
   private readonly agents = new Map<string, SupervisedAgent>();
   private readonly slots = new Map<string, SupervisedSlotInternal>();
   private readonly unsubscribeTap: () => void;
@@ -219,9 +349,14 @@ export class Supervisor {
     this.ledger = opts.ledger;
     this.notifications = opts.notifications;
     this.decisions = opts.decisions ?? null;
+    this.providerWalls = opts.providerWalls ?? null;
     this.log = opts.log ?? (() => {});
     this.now = opts.now ?? Date.now;
     this.wallNow = opts.wallNow ?? Date.now;
+    this.rateLimitBackoff = opts.rateLimitBackoff ?? null;
+    this.workerGate = opts.workerGate;
+    this.sleep = opts.sleep ?? defaultSleep;
+    this.jitter = opts.jitter ?? ((capMs: number) => Math.random() * capMs);
     // Cadence: a quarter of the silence window, capped at 5 s so a tight
     // window still ticks promptly.
     this.tickMs = opts.tickMs ?? Math.min(this.cfg.turnSilenceMs / 4, 5_000);
@@ -282,6 +417,11 @@ export class Supervisor {
         for (const agent of this.agents.values()) {
           if (agent.slot === internal) {
             if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
+            // Retiring the record must conclude its pacing state exactly as
+            // the disposed/shutdown funnels do, or a delivery already
+            // awaiting `settled` is left hanging.
+            this.clearRateLimitRetry(agent, 'superseded');
+            this.clearRecoveryAdmission(agent);
             this.agents.delete(agent.agentId);
           }
         }
@@ -405,7 +545,10 @@ export class Supervisor {
       if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
       // Intentional session replacement invalidates stale work by generation;
       // it does not erase restart history or acknowledge a human-facing
-      // breaker notification. Both follow the stable supervised slot.
+      // breaker notification. Both follow the stable supervised slot. The
+      // pacing state is concluded like every other retirement funnel.
+      this.clearRateLimitRetry(agent, 'superseded');
+      this.clearRecoveryAdmission(agent);
       this.agents.delete(agent.agentId);
       const old = agent.handle;
       agent.handle = null;
@@ -460,6 +603,8 @@ export class Supervisor {
         }
       }
       if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
+      this.clearRateLimitRetry(agent, 'superseded');
+      this.clearRecoveryAdmission(agent);
       this.agents.delete(agent.agentId);
       this.log('info', 'retired stale slot-bound supervision record', {
         agent_id: agent.agentId,
@@ -502,6 +647,11 @@ export class Supervisor {
       if (envelope.phase === 'disposed') {
         const agent = this.agents.get(envelope.agentId);
         if (agent === undefined) return;
+        // A disposed handle can never deliver a pending retry: conclude
+        // the incident with it (the delivery continuation self-cancels
+        // too) and supersede any restart-recovery admission wait.
+        this.clearRateLimitRetry(agent, 'superseded');
+        this.clearRecoveryAdmission(agent);
         agent.handle = null;
         agent.openTurn = false;
         agent.openControl = false;
@@ -576,12 +726,26 @@ export class Supervisor {
               agent_id: agent.agentId,
               error: event.error,
             });
-            void this.evaluateRecovery(agent, `fatal error: ${event.error}`, true, true);
+            void this.evaluateRecovery(agent, `fatal error: ${event.error}`, true, true, {
+              provider: event.provider ?? null,
+              model: event.model ?? null,
+              error: event.error,
+              typed: event.typed ?? null,
+            });
           } else {
             // Preserve the adapter contract: in-band failures never restart.
-            // They still enter provider-wall classification so known auth or
-            // quota failures produce durable stop/re-arm guidance.
-            void this.evaluateRecovery(agent, `runtime error: ${event.error}`, false, true);
+            // Rate-limit-class failures first spend the bounded automatic
+            // retry budget; everything else enters provider-wall
+            // classification so known auth or quota failures produce durable
+            // stop/re-arm guidance.
+            if (!this.absorbRateLimitFailure(agent, event.error)) {
+              void this.evaluateRecovery(agent, `runtime error: ${event.error}`, false, true, {
+                provider: event.provider ?? null,
+                model: event.model ?? null,
+                error: event.error,
+                typed: event.typed ?? null,
+              });
+            }
           }
           break;
         default:
@@ -651,6 +815,8 @@ export class Supervisor {
       decisionPending: false,
       failureTerminalPending: false,
       queuedRecovery: null,
+      rateLimitRetry: null,
+      recoveryAdmission: null,
     });
     this.log('info', 'supervising agent', { agent_id: agentId, role, slot: slot?.id ?? null });
     return true;
@@ -666,6 +832,11 @@ export class Supervisor {
     this.detectWake(now);
     for (const agent of this.agents.values()) {
       if (agent.handle === null || agent.state !== 'watching' || agent.breakerOpen) continue;
+      // An automatic rate-limit retry waiting out its backoff owns recovery:
+      // the failed turn's residual silence must not read as a hang. A
+      // delivery that is actually running stays under the watchdog — a hung
+      // retry attempt is still a hang.
+      if (agent.rateLimitRetry !== null && !agent.rateLimitRetry.awaitingDelivery) continue;
       const busy = this.handleBusy(agent.handle);
       if (!busy && !agent.openTurn && !agent.openControl) continue;
       // Liveness = events OR bytes: session-file growth also resets the clock.
@@ -861,6 +1032,259 @@ export class Supervisor {
   }
 
   // ------------------------------------------------------------------
+  // Automatic rate-limit retry (owner heist 2026-09-29)
+  // ------------------------------------------------------------------
+
+  /** Consumption gate for worker delivery call sites: after a prompt
+   * resolves, await the bounded outcome of any automatic rate-limit retry
+   * that covers the just-ended turn. The adapter tap is synchronous, so an
+   * in-band error has already become an incident by the time the prompt
+   * promise resolves. Callers MUST release their own worker admission
+   * before awaiting — the retry reacquires the slot per attempt — and may
+   * then record delivery only for `none`/`recovered`. */
+  async awaitRetrySettlement(agentId: string): Promise<RetrySettlement> {
+    const incident = this.agents.get(agentId)?.rateLimitRetry ?? null;
+    if (incident === null) return 'none';
+    return incident.settled;
+  }
+
+  /** Conclude the active incident (if any) with a disposition and clear it.
+   * Every clear site funnels here so a delivery call site awaiting
+   * `settled` is never left hanging. */
+  private clearRateLimitRetry(
+    agent: SupervisedAgent,
+    disposition: Exclude<RetrySettlement, 'none'>,
+  ): void {
+    const incident = agent.rateLimitRetry;
+    if (incident === null) return;
+    incident.admissionAbort.abort();
+    agent.rateLimitRetry = null;
+    incident.resolveSettled(disposition);
+  }
+
+  /** Supersede a restart-recovery admission wait or in-flight delivery:
+   * the waiting coroutine exits without consuming a turn. */
+  private clearRecoveryAdmission(agent: SupervisedAgent): void {
+    const controller = agent.recoveryAdmission;
+    if (controller === null) return;
+    agent.recoveryAdmission = null;
+    controller.abort();
+  }
+
+  /** Consume a non-fatal runtime error through the automatic retry path.
+   * True = absorbed (a retry was scheduled, or this duplicates the attempt
+   * already being retried); false = hand the failure to the existing
+   * recovery ladder. Never intercepts when the policy is off. */
+  private absorbRateLimitFailure(agent: SupervisedAgent, errorText: string): boolean {
+    const policy = this.rateLimitBackoff;
+    if (policy === null) return false;
+    if (agent.handle?.reviewIsolation === true) {
+      // The isolated workflow owns bounded rate-limit backoff and admission;
+      // supervisor disposal would race its next prompt. Other errors still
+      // enter the isolated-attempt abort contract.
+      return isRateLimitErrorText(errorText, policy.patterns);
+    }
+    if (!isRateLimitErrorText(errorText, policy.patterns)) return false;
+    const incident = agent.rateLimitRetry;
+    if (incident !== null) {
+      if (incident.awaitingDelivery) {
+        // The delivery we were waiting on failed; its error event is the
+        // one failure signal for this attempt. The delivery token is
+        // consumed here — a stale delivery that settles late must never
+        // clear the next rung's flag (per-delivery ownership).
+        incident.awaitingDelivery = false;
+        incident.activeDelivery = null;
+        incident.failureSeq += 1;
+        incident.lastError = errorText;
+        return this.scheduleRateLimitRetry(agent, incident);
+      }
+      // Adapters duplicate failure signals (error + sticky state:error, or
+      // a second error frame for one failure): never double-count an
+      // attempt, and never schedule two rungs for one failure.
+      return true;
+    }
+    const captured = this.captureInterruptedTurn(agent.handle, agent);
+    if (captured === null || captured.pending === null) {
+      // Nothing re-deliverable was captured: the failure keeps its existing
+      // ladder behavior rather than parking the lane on an undeliverable
+      // retry.
+      return false;
+    }
+    let resolveSettled!: (disposition: Exclude<RetrySettlement, 'none'>) => void;
+    const settled = new Promise<Exclude<RetrySettlement, 'none'>>((resolve) => {
+      resolveSettled = resolve;
+    });
+    const fresh: RateLimitRetryIncident = {
+      attempts: 0,
+      admissionAbort: new AbortController(),
+      maxRetries: policy.maxRetries,
+      pending: captured.pending,
+      awaitingDelivery: false,
+      deliveryToken: 0,
+      activeDelivery: null,
+      failureSeq: 1,
+      lastError: errorText,
+      settled,
+      resolveSettled,
+    };
+    agent.rateLimitRetry = fresh;
+    return this.scheduleRateLimitRetry(agent, fresh);
+  }
+
+  /** Schedule the next retry rung, or give up (false) when the budget is
+   * spent. One ledger event per scheduled retry is the observability
+   * contract; exhaustion is recorded before the ladder takes over. */
+  private scheduleRateLimitRetry(
+    agent: SupervisedAgent,
+    incident: RateLimitRetryIncident,
+  ): boolean {
+    const policy = this.rateLimitBackoff;
+    if (policy === null) {
+      this.clearRateLimitRetry(agent, 'superseded');
+      return false;
+    }
+    if (incident.attempts >= incident.maxRetries) {
+      this.recordEvent('pacing.auto-retry-exhausted', agent.agentId, pacingExhaustedPayload(
+        incident.attempts, incident.maxRetries, incident.lastError,
+      ));
+      this.clearRateLimitRetry(agent, 'exhausted');
+      return false;
+    }
+    incident.attempts += 1;
+    const delayMs = backoffDelayMs(incident.attempts, policy.baseMs, policy.maxMs, this.jitter);
+    this.recordEvent('pacing.auto-retry', agent.agentId, pacingRetryPayload(
+      incident.attempts, incident.maxRetries, delayMs, incident.lastError,
+    ));
+    this.log('warn', 'rate-limit failure — automatic retry scheduled', {
+      agent_id: agent.agentId,
+      attempt: incident.attempts,
+      max_auto_retries: incident.maxRetries,
+      delay_ms: delayMs,
+    });
+    void this.deliverRateLimitRetry(agent, incident, delayMs);
+    return true;
+  }
+
+  /** Wait out the backoff, then re-deliver the captured prompt on the SAME
+   * live session. Adapters report model failures in-band (the prompt may
+   * resolve while the turn errored), so an attempt's outcome is read from
+   * the failure counter, not from the promise alone; a rejection with no
+   * event signal is classified directly. */
+  private async deliverRateLimitRetry(
+    agent: SupervisedAgent,
+    incident: RateLimitRetryIncident,
+    delayMs: number,
+  ): Promise<void> {
+    let retryLease: PacingLease | null = null;
+    try {
+      await this.sleep(delayMs);
+      // The incident may have been superseded (recovery, replacement,
+      // shutdown) while we waited — the identity check is the cancellation.
+      if (this.disposed || agent.rateLimitRetry !== incident) return;
+      if (this.agents.get(agent.agentId) !== agent) return;
+      const handle = agent.handle;
+      if (handle === null || agent.breakerOpen) {
+        this.clearRateLimitRetry(agent, 'superseded');
+        return;
+      }
+      if (agent.role === 'minion' && this.workerGate !== undefined) {
+        retryLease = await this.workerGate.acquireWorkerTurn({
+          id: agent.agentId, label: `rate-limit retry → ${agent.agentId}`, agentId: agent.agentId,
+          jobId: this.ledger.getAgent(agent.agentId)?.jobId ?? null,
+          signal: incident.admissionAbort.signal,
+        });
+        if (this.disposed || agent.rateLimitRetry !== incident || this.agents.get(agent.agentId) !== agent) return;
+      }
+      // Defensive: a scheduled rung must never start while another delivery
+      // is still in flight. Its settlement owns the next transition.
+      if (incident.awaitingDelivery) {
+        this.log('error', 'rate-limit retry rung refused: a delivery is still in flight', {
+          agent_id: agent.agentId,
+          attempt: incident.attempts,
+        });
+        return;
+      }
+      incident.deliveryToken += 1;
+      const deliveryToken = incident.deliveryToken;
+      incident.activeDelivery = deliveryToken;
+      incident.awaitingDelivery = true;
+      const failureSeqAtDelivery = incident.failureSeq;
+      this.log('info', 'delivering automatic rate-limit retry', {
+        agent_id: agent.agentId,
+        attempt: incident.attempts,
+        owner: incident.pending.owner,
+      });
+      let rejection: unknown = null;
+      try {
+        await handle.prompt(incident.pending.text, {
+          ...(incident.pending.owner !== null ? { owner: incident.pending.owner } : {}),
+          ...(incident.pending.images !== undefined ? { images: incident.pending.images } : {}),
+        });
+      } catch (error) {
+        rejection = error;
+      }
+      if (agent.rateLimitRetry !== incident) return; // superseded mid-flight
+      if (incident.activeDelivery !== deliveryToken) {
+        // A newer rung owns the incident now; this stale settlement must
+        // not clear its flag, swallow its failure, or claim recovery.
+        this.log('warn', 'stale rate-limit retry delivery settled after a newer rung started', {
+          agent_id: agent.agentId,
+          attempt: incident.attempts,
+        });
+        return;
+      }
+      incident.awaitingDelivery = false;
+      incident.activeDelivery = null;
+      if (incident.failureSeq !== failureSeqAtDelivery) {
+        // The attempt failed; its error event already scheduled the next
+        // rung — or spent the budget and handed off to the ladder.
+        return;
+      }
+      if (rejection === null) {
+        this.recordEvent('pacing.auto-retry-recovered', agent.agentId, pacingRecoveredPayload(
+          incident.attempts, incident.maxRetries,
+        ));
+        this.clearRateLimitRetry(agent, 'recovered');
+        this.log('info', 'automatic rate-limit retry recovered the turn', {
+          agent_id: agent.agentId,
+          attempts: incident.attempts,
+        });
+        return;
+      }
+      const text = String(rejection);
+      const policy = this.rateLimitBackoff;
+      if (policy !== null && isRateLimitErrorText(text, policy.patterns)) {
+        incident.failureSeq += 1;
+        incident.lastError = text;
+        if (this.scheduleRateLimitRetry(agent, incident)) return;
+      } else if (rejection instanceof WorkerDisposalInProgressError || handle.health().state === 'disposed') {
+        // The session went away under the retry (typed disposal handshake or
+        // a persisted disposed state): no failure to ladder, no retry to
+        // continue. Arbitrary text containing 'disposed' must NOT land here —
+        // a genuine non-rate-limit failure keeps its stop/escalation path.
+        this.clearRateLimitRetry(agent, 'superseded');
+        this.log('warn', 'rate-limit retry delivery ended on a disposed session', {
+          agent_id: agent.agentId,
+          attempt: incident.attempts,
+        });
+        return;
+      } else {
+        this.clearRateLimitRetry(agent, 'exhausted');
+      }
+      // No adapter event surfaced this failure (or the budget is spent):
+      // the existing recovery ladder still owns it.
+      void this.evaluateRecovery(agent, `runtime error: ${text}`, false, true);
+    } catch (error) {
+      if (agent.rateLimitRetry !== incident || this.disposed) return;
+      this.clearRateLimitRetry(agent, 'exhausted');
+      this.log('error', 'rate-limit retry delivery failed internally', { agent_id: agent.agentId, error: String(error) });
+      void this.evaluateRecovery(agent, `rate-limit retry failed: ${String(error)}`, false, true);
+    } finally {
+      retryLease?.release();
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Decision-backed recovery guidance + restart ladder
   // ------------------------------------------------------------------
 
@@ -926,7 +1350,15 @@ export class Supervisor {
     reason: string,
     allowRestart = true,
     runtimeError = false,
+    source: ProviderErrorSource | null = null,
   ): Promise<void> {
+    // Any recovery entry (hang, fatal, non-rate-limit error) supersedes an
+    // in-flight automatic retry: the failure it was retrying is no longer
+    // the failure being handled. The delivery continuation self-cancels on
+    // the cleared incident identity; a pending restart-recovery admission
+    // wait is superseded too.
+    this.clearRateLimitRetry(agent, 'superseded');
+    this.clearRecoveryAdmission(agent);
     // Perkins review attempts are owned by the bounded review workflow. A
     // supervisor resume would drop that attempt's cwd/isolation contract and
     // race the workflow's one permitted retry, so abort the handle only; the
@@ -939,7 +1371,7 @@ export class Supervisor {
     const deterministicWall = deterministicClass === 'authentication_wall' || deterministicClass === 'quota_wall';
     if (this.decisions === null) {
       if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
-        this.stopForGuidance(agent, deterministicClass);
+        this.stopForGuidance(agent, deterministicClass, source);
       } else if (allowRestart) {
         await this.restartRung(agent, reason);
       }
@@ -953,6 +1385,7 @@ export class Supervisor {
         reason,
         allowRestart,
         runtimeError,
+        source,
         handle: agent.handle,
         activityGeneration: agent.activityGeneration,
         openTurn: agent.openTurn,
@@ -1022,7 +1455,7 @@ export class Supervisor {
       if (classifiedWall) {
         // A wall already evident in the runtime error stops unconditionally:
         // model advice never burns rungs on it.
-        this.stopForGuidance(agent, failureClass);
+        this.stopForGuidance(agent, failureClass, source);
         return;
       }
       if (restartAuthorized) {
@@ -1043,6 +1476,7 @@ export class Supervisor {
       this.stopForGuidance(
         agent,
         restartAdvised ? 'restart_confirmation_required' : failureClass,
+        source,
       );
     } catch (error) {
       this.log('error', 'recovery classification failed; using deterministic restart guards', {
@@ -1058,7 +1492,7 @@ export class Supervisor {
         (runtimeError || agent.openControl === expectedOpenControl) &&
         !agent.breakerOpen
       ) {
-        if (deterministicWall) this.stopForGuidance(agent, deterministicClass);
+        if (deterministicWall) this.stopForGuidance(agent, deterministicClass, source);
         else if (allowRestart) await this.restartRung(agent, reason);
       }
     } finally {
@@ -1079,20 +1513,21 @@ export class Supervisor {
         agent.activityGeneration === queued.activityGeneration &&
         queuedTurnStillMatches
       ) {
-        void this.evaluateRecovery(agent, queued.reason, queued.allowRestart, queued.runtimeError);
+        void this.evaluateRecovery(agent, queued.reason, queued.allowRestart, queued.runtimeError, queued.source);
       }
     }
   }
 
   /** Known futile retry walls stop once and require the existing human ack
-   * re-arm path; they never burn the restart ring blindly. */
-  private stopForGuidance(agent: SupervisedAgent, failureClass: string): void {
+   * re-arm path; they never burn the restart ring blindly. Wall stops are
+   * ALSO reported to the provider-recovery sink (when wired): the sink
+   * alone decides whether the stop is an eligible temporary provider wait
+   * — the supervisor's stop semantics are identical either way. */
+  private stopForGuidance(agent: SupervisedAgent, failureClass: string, source: ProviderErrorSource | null = null): void {
     if (agent.breakerOpen) return;
     agent.breakerOpen = true;
     agent.state = 'stopped';
     const handle = agent.handle;
-    // Snapshot the open turn before the stop disposes it: the ack re-arm
-    // resumes it, or the lane is documented rather than silently dead.
     const captured = this.captureInterruptedTurn(handle, agent);
     if (captured !== null) agent.pendingRecovery = captured;
     agent.openTurn = false;
@@ -1104,19 +1539,64 @@ export class Supervisor {
       agentId: agent.agentId,
       payload: { class: failureClass, restarts: agent.restartRing.length },
     });
-    const notification = this.notifications.postIncident({
-      kind: `supervision.provider-wall.${agent.agentId}.${failureClass}`,
-      // Re-arm is an ACK with side effects (supervisor.onNotificationAcked),
-      // so this stop must stay human-facing: FOR YOU + bell. The machine
-      // queue never self-arms a walled provider condition.
-      routing: 'needs-owner',
-      severity: 'error',
-      title: `Agent ${agent.agentId} stopped: ${failureClass.replaceAll('_', ' ')}`,
-      detail: 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.',
+    const ledgerAgent = this.ledger.getAgent(agent.agentId);
+    const observation = {
       agentId: agent.agentId,
-      dedupe: 'unacked',
-    });
-    agent.breakerNotificationId = notification.id;
+      role: agent.role,
+      slotId: agent.slot?.id ?? null,
+      jobId: ledgerAgent?.jobId ?? null,
+      sessionFile: agent.sessionFile,
+      failureClass,
+      source,
+      continuation: captured === null
+        ? null
+        : {
+            promptText: captured.pending?.text ?? null,
+            promptOwner: captured.pending?.owner ?? null,
+            hadOpenTurn: captured.hadOpenTurn,
+          },
+    } as const;
+    // r1 #2 (phase3): decide MACHINE ownership BEFORE creating any owner
+    // stop. The sink persists the eligible wait first; only a FAILED or
+    // ineligible classification falls back to the conservative needs-owner
+    // stop. Machine-owned stops post MACHINE attention (action-required),
+    // never a needs-owner chime.
+    const postStopNotice = (routing: 'needs-owner' | 'action-required') => {
+      const notification = this.notifications.postIncident({
+        kind: `supervision.provider-wall.${agent.agentId}.${failureClass}`,
+        routing,
+        severity: 'error',
+        title: `Agent ${agent.agentId} stopped: ${failureClass.replaceAll('_', ' ')}`,
+        detail:
+          routing === 'needs-owner'
+            ? 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.'
+            : 'Machine-owned temporary provider limit: the recovery sensor owns this stop (no owner ACK required).',
+        agentId: agent.agentId,
+        dedupe: 'unacked',
+      });
+      agent.breakerNotificationId = notification.id;
+      if (routing === 'action-required') {
+        this.providerWalls?.linkProviderWaitIncident?.({ agentId: agent.agentId, incidentId: notification.id });
+      }
+      return notification;
+    };
+    const sink = this.providerWalls;
+    if (sink?.ownsProviderWall !== undefined) {
+      void sink
+        .ownsProviderWall({ ...observation })
+        .then((machineOwned) => {
+          postStopNotice(machineOwned ? 'action-required' : 'needs-owner');
+          this.onProviderWallObserved(observation, machineOwned);
+        })
+        .catch(() => {
+          // Classification failure: conservative human-controlled stop.
+          postStopNotice('needs-owner');
+          this.onProviderWallObserved(observation, false);
+        });
+    } else {
+      postStopNotice('needs-owner');
+      this.onProviderWallObserved(observation, false);
+    }
     if (handle !== null) {
       void this.registry.disposeHandle(handle).catch((error: unknown) => {
         this.log('warn', 'dispose after provider-wall escalation failed', {
@@ -1124,6 +1604,32 @@ export class Supervisor {
           error: String(error),
         });
       });
+    }
+  }
+
+  /** The observation report to the sensor sink (fire-and-forget observer). */
+  private onProviderWallObserved(
+    observation: {
+      readonly agentId: string;
+      readonly role: Role;
+      readonly slotId: string | null;
+      readonly jobId: string | null;
+      readonly sessionFile: string | null;
+      readonly failureClass: string;
+      readonly source: ProviderErrorSource | null;
+      readonly continuation: { readonly promptText: string | null; readonly promptOwner: string | null; readonly hadOpenTurn: boolean } | null;
+    },
+    machineOwned: boolean,
+  ): void {
+    if (this.providerWalls === null) return;
+    try {
+      if (machineOwned) return; // wait already persisted by ownsProviderWall
+      this.providerWalls.onProviderWall({
+        ...observation,
+        incidentId: null,
+      });
+    } catch (error) {
+      this.log('error', 'provider-wall sink failed', { agent_id: observation.agentId, error: String(error) });
     }
   }
 
@@ -1198,6 +1704,7 @@ export class Supervisor {
       // open turn FIRST: a killed turn must be resumed or visibly orphaned,
       // never silently dead (E7 false-positive follow-up).
       const old = agent.handle;
+      this.clearRecoveryAdmission(agent);
       const captured = this.captureInterruptedTurn(old, agent);
       if (captured !== null) agent.pendingRecovery = captured;
       agent.handle = null;
@@ -1359,34 +1866,7 @@ export class Supervisor {
         reason,
         owner: pending.owner,
       });
-      try {
-        void handle
-          .prompt(pending.text, {
-            ...(pending.owner !== null ? { owner: pending.owner } : {}),
-            ...(pending.images !== undefined ? { images: pending.images } : {}),
-          })
-          .then(() => {
-            this.recordEvent('supervision.turn-recovery', laneAgentId, {
-              disposition: 'resumed',
-              reason,
-            });
-            this.log('info', 'interrupted turn resumed on the restarted session', {
-              agent_id: laneAgentId,
-              reason,
-            });
-          })
-          .catch((error: unknown) => {
-            this.log('error', 'interrupted turn could not be resumed — posting recoverable-lane note', {
-              agent_id: laneAgentId,
-              reason,
-              error: String(error),
-            });
-            this.postOrphanedTurn(laneAgentId, reason, String(error));
-          });
-      } catch (error) {
-        // A synchronous throw still never orphans: fall through to the note.
-        this.postOrphanedTurn(laneAgentId, reason, String(error));
-      }
+      void this.deliverRecoveredTurn(agent, handle, laneAgentId, pending, reason);
       return;
     }
     this.postOrphanedTurn(
@@ -1396,6 +1876,112 @@ export class Supervisor {
         ? 'the runtime did not expose the pending prompt'
         : 'the pending prompt was empty',
     );
+  }
+
+  /**
+   * Deliver one interrupted turn on a restarted session under the same
+   * worker admission cap as every other minion turn. With the cap occupied
+   * the delivery waits FIFO and is cancelled cleanly when the attempt is
+   * superseded; the lease is released unconditionally, including on
+   * synchronous prompt faults. A rate-limited delivery keeps its lifecycle
+   * pending until the bounded retry recovery concludes.
+   */
+  private async deliverRecoveredTurn(
+    agent: SupervisedAgent,
+    handle: AgentHandle,
+    laneAgentId: string,
+    pending: PendingTurn,
+    reason: string,
+  ): Promise<void> {
+    let lease: PacingLease | null = null;
+    const controller = new AbortController();
+    this.clearRecoveryAdmission(agent); // supersede any older recovery wait
+    agent.recoveryAdmission = controller;
+    const stillCurrent = (): boolean =>
+      !this.disposed &&
+      !controller.signal.aborted &&
+      this.agents.get(agent.agentId) === agent &&
+      agent.handle === handle;
+    try {
+      if (agent.role === 'minion' && this.workerGate !== undefined) {
+        lease = await this.workerGate.acquireWorkerTurn({
+          id: laneAgentId,
+          label: `restart recovery → ${laneAgentId}`,
+          agentId: laneAgentId,
+          jobId: this.ledger.getAgent(laneAgentId)?.jobId ?? null,
+          signal: controller.signal,
+        });
+        if (!stillCurrent()) return;
+      }
+      await handle.prompt(pending.text, {
+        ...(pending.owner !== null ? { owner: pending.owner } : {}),
+        ...(pending.images !== undefined ? { images: pending.images } : {}),
+      });
+      if (!stillCurrent()) return;
+      // Release the slot before waiting on a bounded rate-limit retry so
+      // the retry can reacquire admission for its next attempt.
+      lease?.release();
+      lease = null;
+      const disposition = await this.awaitRetrySettlement(agent.agentId);
+      if (disposition === 'exhausted' || disposition === 'superseded') {
+        this.log('warn', 'interrupted turn did not resume under its automatic retries', {
+          agent_id: laneAgentId,
+          reason,
+          disposition,
+        });
+        return;
+      }
+      this.recordEvent('supervision.turn-recovery', laneAgentId, {
+        disposition: 'resumed',
+        reason,
+      });
+      this.log('info', 'interrupted turn resumed on the restarted session', {
+        agent_id: laneAgentId,
+        reason,
+      });
+    } catch (error) {
+      // Cancellation is not an orphan: the attempt was superseded.
+      if (!stillCurrent()) return;
+      // Release the slot before consulting the settlement: the retry
+      // reacquires admission per attempt, exactly like the resolve path.
+      lease?.release();
+      lease = null;
+      // The rejection may itself have opened a rate-limit incident whose
+      // bounded retry is still carrying this turn: consult its settlement
+      // before classifying. A recovered retry is recorded as resumed — never
+      // escalated to the owner as a failed resume; a spent budget keeps the
+      // same ladder truth as the resolve path.
+      const disposition = await this.awaitRetrySettlement(agent.agentId);
+      if (!stillCurrent()) return;
+      if (disposition === 'recovered') {
+        this.recordEvent('supervision.turn-recovery', laneAgentId, {
+          disposition: 'resumed',
+          reason,
+        });
+        this.log('info', 'interrupted turn resumed on the restarted session', {
+          agent_id: laneAgentId,
+          reason,
+        });
+        return;
+      }
+      if (disposition === 'exhausted' || disposition === 'superseded') {
+        this.log('warn', 'interrupted turn did not resume under its automatic retries', {
+          agent_id: laneAgentId,
+          reason,
+          disposition,
+        });
+        return;
+      }
+      this.log('error', 'interrupted turn could not be resumed — posting recoverable-lane note', {
+        agent_id: laneAgentId,
+        reason,
+        error: String(error),
+      });
+      this.postOrphanedTurn(laneAgentId, reason, String(error));
+    } finally {
+      if (agent.recoveryAdmission === controller) agent.recoveryAdmission = null;
+      lease?.release();
+    }
   }
 
   private postOrphanedTurn(laneAgentId: string, reason: string, detail: string): void {
@@ -1425,10 +2011,21 @@ export class Supervisor {
     }
   }
 
-  /** Durable ledger event that never breaks the watchdog on a ledger fault. */
-  private recordEvent(kind: string, agentId: string | null, payload: Record<string, unknown>): void {
+  /** Durable ledger event that never breaks the watchdog on a ledger fault.
+   * The canonical pacing payloads are typed without an index signature and
+   * are part of the accepted event shapes here. */
+  private recordEvent(
+    kind: string,
+    agentId: string | null,
+    payload: Record<string, unknown> | PacingRetryPayload | PacingExhaustedPayload | PacingRecoveredPayload,
+  ): void {
     try {
-      this.ledger.appendCustomEvent({ kind, agentId, payload });
+      // Job attribution rides the envelope: a supervisor-owned worker retry
+      // must be findable by job-scoped queries, exactly like the workflow
+      // producer's events. Resolved per event (bounded: retry events are
+      // rare) and best-effort (a missing row simply omits the job).
+      const jobId = agentId === null ? null : (this.ledger.getAgent(agentId)?.jobId ?? null);
+      this.ledger.appendCustomEvent({ kind, agentId, jobId, payload });
     } catch (error) {
       this.log('warn', 'supervision ledger event could not be recorded', {
         kind,
@@ -1518,6 +2115,50 @@ export class Supervisor {
     }
   }
 
+  /**
+   * Guarded OWNED re-arm for a provider-recovered agent (the provider-recovery
+   * sensor's dedicated eligible-state transition — NOT notification-ACK
+   * automation): re-arms the open breaker of the exact agent a durable
+   * provider wait names, only while that wait is still open and the agent's
+   * breaker is genuinely the provider stop. Everything else keeps requiring
+   * the human ack path. Returns whether the re-arm happened.
+   */
+  ownedProviderReArm(agentId: string, waitId: string): boolean {
+    if (this.disposed || !this.cfg.enabled) return false;
+    const agent = this.agents.get(agentId);
+    if (agent === undefined || !agent.breakerOpen || agent.handle !== null) return false;
+    // The durable wait must still be open for THIS agent: the ledger, not
+    // memory, is the record (restart-safe).
+    let open = false;
+    try {
+      const wait = this.ledger.openProviderWaitForAgent(agentId);
+      open = wait !== null && wait.id === waitId;
+    } catch (error) {
+      this.log('error', 'owned re-arm could not verify the durable wait', {
+        agent_id: agentId,
+        error: String(error),
+      });
+      return false;
+    }
+    if (!open) return false;
+    agent.breakerOpen = false;
+    agent.breakerNotificationId = null;
+    agent.restartRing = [];
+    agent.consecutiveFailures = 0;
+    agent.state = 'watching';
+    this.log('info', 'breaker re-armed by owned provider recovery', {
+      agent_id: agentId,
+      wait_id: waitId,
+    });
+    this.ledger.appendCustomEvent({
+      kind: 'supervision.rearmed',
+      agentId,
+      payload: { by: 'provider-recovery', wait_id: waitId },
+    });
+    void this.restartRung(agent, 'provider recovery re-arm');
+    return true;
+  }
+
   // ------------------------------------------------------------------
   // Status + lifecycle
   // ------------------------------------------------------------------
@@ -1574,6 +2215,8 @@ export class Supervisor {
     }
     this.unsubscribeTap();
     for (const agent of this.agents.values()) {
+      this.clearRateLimitRetry(agent, 'superseded');
+      this.clearRecoveryAdmission(agent);
       if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
     }
     this.agents.clear();
