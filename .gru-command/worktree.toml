@@ -31,6 +31,20 @@ publisher-timeout-discriminator = "node tools/patch-vitest-rpc-timeout.mjs && np
 # the file it pins). Declared alongside real repairs, never standalone.
 app-contract-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/suite-shape.test.ts"
 
+# App-contract before-proof: the FINAL committed App contract test file
+# runs against an isolated git-archive of the immutable pre-repair
+# integration fe6a774 (contains main151; precedes every App repair),
+# with the existing node_modules symlinked, the approved RPC-patch
+# prerequisite, and the snapshot retained for inspection. Expected
+# result is RED (the baseline lacks the repaired behavior); the vitest
+# exit status is the scope's own and is never masked into a PASS. The
+# helper's registration guard uses the pin guard's own regex; the global
+# suite-shape pin map is deliberately not selected (final pins cannot
+# match baseline files whose counts changed for reasons outside this
+# repair). A separate Wave before-proof is not selectable from this
+# baseline without overlaying main's later worktree-freeze sources.
+app-contract-baseline = "sh tools/app-contract-baseline.sh"
+
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
 # Baseline comparison for the lane: identical final test files (git show
