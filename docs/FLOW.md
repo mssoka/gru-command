@@ -63,13 +63,17 @@ working/pushing the target branch (`dispatched`/`working` with no settled
 delivery for its current attempt), the API answers `409 branch_busy` with
 `blockers: [{job_id, status, branch}]` and the same check re-runs
 immediately before the freeze, so a lane re-opened mid-setup is refused
-the same way. The arm passes once the lane delivers. A lane with an
-unresolved re-brief request counts busy the same way: the durable pending
-markers written before a re-brief worker spawns (cleared only when the
-request genuinely settles, via finalization or boot recovery) fence the
-target regardless of an older delivery or a status flip, and the Silas
-digest does not offer the target for review while they stand. `force: true`
-is the human override; a forced round is tagged in its frozen manifest
+the same way. The arm passes only when the target work is genuinely
+settled AND no re-brief request is unresolved — a delivery alone does not
+release a fenced lane. A lane with an unresolved re-brief request counts
+busy the same way: the durable pending markers written before a re-brief
+worker spawns (cleared only when the request genuinely settles, via
+finalization or boot recovery) fence the target regardless of an older
+delivery or a status flip — the fence can coexist with a delivered or
+in-review status — and the Silas digest does not offer the target for
+review while they stand. `force: true` is the owner's explicit override —
+never an automatic operations action; a forced round is tagged in its
+frozen manifest
 (`branchIdle`) and the event log (`branch-idle.forced`), refusals land as
 `branch-idle.refused`, and a Silas auto-arm deferral lands as
 `silas.review-deferred` (retry on the next sweep). For a job

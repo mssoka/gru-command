@@ -103,7 +103,9 @@ The API owns this guard — your arm path needs NO special logic. An
 unresolved re-brief also answers `branch_busy` for that job: its durable
 pending markers (written before the re-brief worker spawns) stay until the
 request genuinely settles, and the digest does not list the job for review
-while they stand — wait for the re-brief's own delivery instead of
+while they stand. The fence is independent of lane status — a delivered or
+in-review lane stays fenced while a request stands, and a delivery alone
+cannot clear it. Wait for the re-brief's own settlement instead of
 retrying. When the answer is `409` with
 `{"error":"branch_busy","blockers":[...]}`:
 
@@ -116,12 +118,16 @@ retrying. When the answer is `409` with
 - **Never arm with `"force":true` on your own.** Force is the human
   escape hatch for a deliberate judgment call; a forced round freezes a
   branch that may still be moving and carries the override tag in its
-  manifest for exactly that reason. If a lane looks wedged, escalate — do
+  manifest (`branchIdle`) plus `branch-idle.forced` events for exactly
+  that reason. Force is an explicit, audited human decision — never an
+  automatic operations action — and forcing a round does not settle the
+  pending re-brief request itself. If a lane looks wedged, escalate — do
   not force the gate.
 - The blockers name each busy lane (`job_id`, `status`, `branch`); a
   blocker on the reviewed job itself means its fix loop has not delivered
-  yet. Wait for that delivery — that delivery is what re-arms the
-  re-review.
+  yet, or an unresolved re-brief request still fences it. Release needs
+  BOTH settled target work AND no pending re-brief markers — a delivery
+  alone cannot lift the marker fence.
 
 3. **NEEDS CHANGES verdict awaiting follow-through.** The digest lists the
    round's blockers with `consecutive_rounds` and the advised rung:

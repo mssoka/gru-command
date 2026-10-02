@@ -24,6 +24,11 @@ handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-wh
 t4-oracle = 'npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"'
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 uploads-boot = "npx vitest run test/uploads-dir.test.ts"
+# Narrow review-rebrief-interlock scope (phase pr144-independent-feedback-20261002):
+# the RPC patch prerequisite, then the fence's own suites — unchanged
+# configs/budgets, plain vitest; scheduled only via /api/verify by ops
+# after the source settles (never executed directly by the lane writer).
+review-rebrief-interlock = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/branch-idle-guard.test.ts test/silas-driver.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
 # Baseline comparison for the lane: identical final test files (git show
