@@ -28,8 +28,8 @@ to a lane that has none, and existing drafts are left untouched.
 
 ## Mechanical reactions vs judgment (owner mandate split 2026-09-23)
 
-The chief keeps the judgments: rulings, merges, and novel failures. The
-mechanical reactions are YOURS — execute them without asking:
+The chief keeps the judgments: rulings, merge escalations, and novel
+failures. The mechanical reactions are YOURS — execute them without asking:
 
 - **Re-arm proven clean aborts.** The digest marks only an aborted round with
   `round.perkins-incomplete.reason = service_restart` or
@@ -54,8 +54,8 @@ mechanical reactions are YOURS — execute them without asking:
   push) to settle, then arm. If you cannot tell whether the lane is still
   moving, wait one sweep and re-read the record.
 - **Novel failures are not yours to improvise around.** Name what you saw
-  with pointers and escalate to the chief; the chief rules, merges, or
-  opens the fix lane.
+  with pointers and escalate to the chief; the chief rules, opens the fix
+  lane, or presents the merge to the owner.
 
 ## The follow-through loop (no human ping required)
 
@@ -182,9 +182,10 @@ authorizes its full completion cycle, and YOU own driving it:
    Repeat while each cycle makes genuine progress. Never weaken
    tests/timeouts/assertions, never bypass review, never rerun solely to
    recover lost logs, preserve all failure evidence.
-5. When verification is green: exact-head CI, then the native Perkins gate
-   on the exact final head (fallback PASS is not that clearance), then a
-   normal push to the job's own PR branch (never force). Merge, deploy,
+5. When verification is green: push the job's own PR branch normally
+   (never force), let exact-head CI land, then run the native Perkins gate
+   on that exact final settled PR head (fallback PASS is not that
+   clearance — and never move the head after the gate). Merge, deploy,
    credentials and service restarts stay owner-held — the owner merges
    gru-command too, after the exact-final-head READY Perkins gate.
 6. Escalate to Gru ONLY: genuine design/intent decisions outside the spec,

@@ -163,8 +163,9 @@ default to **reuse unchanged**; per-repo skip is always available.
 The pinned set carries `bmad-review` out of the box, and it is a gate:
 0 blockers means clear to merge, while blockers route back to the
 implementing minion as fix directives—never inform-only. Perkins
-(GitHub/GitLab) remains the stronger gate with exact-head verdicts and
-autonomous-merge authority.
+(GitHub/GitLab) remains the stronger gate with exact-head verdicts; an
+exact-final-head READY is required before the owner merges (all merges
+are owner-held).
 
 Successful setup records exact versions in
 `.gru-command/bmad-install.json`, adds an idempotent owned bootstrap

@@ -532,7 +532,7 @@ actual resolutions and job events must be counted separately.
 **Silas mandate split** (same lane). Mechanical reactions move to Silas's
 ops driver — re-arm review rounds after clean aborts, pattern respins for
 known failure classes, sweep acks under recorded rules. Gru keeps the
-judgments: rulings, merges, and novel failures. One standing rule from the
+judgments: rulings, merge escalations, and novel failures. One standing rule from the
 2026-09-23 freeze: never auto-arm a review round on a branch while a
 rebase/force-push lane is active on the same target (the round races the
 push and dies obsolete); arm after the lane delivery settles. Service

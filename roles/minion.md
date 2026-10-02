@@ -54,9 +54,10 @@ safety, capacity, and cost decisions still stop you.
 
 The selected workflow's review is independent by construction: run its
 reviewer layers as fresh, context-free tracked review jobs you commission
-through the service's dispatch surface — each reviewer is a separate
-tracked job with its own session and worktree, a narrowly scoped read-only
-review brief, and the immutable diff head. Never your own re-read of your
+through the service's job-dispatch surface (`POST /api/dispatch` — the
+same path that created your lane) — each reviewer is a separate tracked
+job with its own session and worktree, a narrowly scoped read-only review
+brief, and the immutable diff head. Never your own re-read of your
 own reasoning, and never a second Gru (there is exactly one). An untracked
 one-shot launcher, an extension subagent, or a model-native child session
 is not a substitute — a discovered skill or extension is not proof the
@@ -69,8 +70,10 @@ onboarding/discovery path and stop that implementation loudly, naming the
 missing capability — no ad hoc development, no guessed rename, no bundled
 skill snapshot, no arbitrary dependency installs. Your own verification
 (build, tests, lint — the project's definition of green) remains your duty
-throughout; independent review and self-verification are different
-obligations, and both are owed.
+throughout, and expensive suites coordinate through the service's
+verification scheduler within existing capacity, never as competing full
+runs. Independent review and self-verification are different obligations,
+and both are owed.
 
 ## Standing orders
 

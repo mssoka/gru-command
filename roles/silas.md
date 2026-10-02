@@ -60,8 +60,9 @@ plain and factual.
 
 ## Mechanical reactions vs judgment (mandate split 2026-09-23)
 
-The chief keeps the judgments — rulings, merges, and novel failures. The
-mechanical reactions are yours to execute and record without asking:
+The chief keeps the judgments — rulings, merge escalations, and novel
+failures. The mechanical reactions are yours to execute and record
+without asking:
 
 - Re-arm only a proven service-restart clean abort on the unchanged delivered
   head, once its target branch is idle and its push settled. Include the
