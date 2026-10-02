@@ -266,6 +266,110 @@ export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   escalateAt: 4,
 };
 
+/** Provider pacing is independent of resident-session [concurrency].
+ * Admission caps ship enabled and unlimited; explicit enabled=false disables
+ * both admission and automatic rate-limit retry. Provider-keyed signatures
+ * match error text only, not the CLI or adapter brand. */
+export interface PacingProviderOverride {
+  /** Extra case-insensitive regex bodies classified as rate-limit class,
+   * matched against the runtime error text alongside the generic 429-family
+   * signatures. Signatures are global text signatures, not scoped per
+   * provider. */
+  readonly rateLimitPatterns: readonly string[];
+}
+
+export interface PacingConfig {
+  /** Master switch (enabled by default). Off = no automatic retry and no caps (current
+   * behavior). */
+  readonly enabled: boolean;
+  /** FIFO cap on concurrent minion turns; 0 = unlimited (the shipped
+   * default — behavior-preserving). */
+  readonly maxConcurrentMinions: number;
+  /** FIFO cap on combined Perkins review turns (lead + lenses); 0 =
+   * unlimited (the shipped default). */
+  readonly maxConcurrentReviewTurns: number;
+  /** Backoff base between automatic retries; doubles per attempt, with
+   * additive jitter, clamped by backoffMaxMs. */
+  readonly backoffBaseMs: number;
+  /** Upper bound on any single automatic-retry delay. */
+  readonly backoffMaxMs: number;
+  /** Automatic retries per rate-limit incident before the failure stops to
+   * the existing supervisor ladder + owner ACK. 0 = no automatic retry. */
+  readonly maxAutoRetries: number;
+  /** Provider-keyed extra rate-limit signatures (global text signatures). */
+  readonly providers: Readonly<Record<string, PacingProviderOverride>>;
+}
+
+export const DEFAULT_PACING_CONFIG: PacingConfig = {
+  enabled: true,
+  maxConcurrentMinions: 0,
+  maxConcurrentReviewTurns: 0,
+  backoffBaseMs: 1_000,
+  backoffMaxMs: 60_000,
+  maxAutoRetries: 5,
+  providers: {},
+};
+
+/** Provider-recovery sensor policy (owner-approved 2026-09-28,
+ * owner-approval.json). The sensor watches EXPLICIT temporary provider
+ * waits on supported routes and resumes approved work through Silas once
+ * the provider returns — no owner polling or ACKs for those waits.
+ * Owner activation is manual: disabled by default. */
+export interface ProviderRecoveryConfig {
+  /** Master switch. False (the default) = no waits recorded, no probes,
+   * no wakes — the feature is inert until the owner enables it. */
+  readonly enabled: boolean;
+  /** Sensor tick: how often routes are re-examined. The check cadence
+   * itself is bounded below by cadenceMinMs. */
+  readonly tickIntervalMs: number;
+  /** Minimum spacing between checks on one route (approval pin: 300 s;
+   * config may only raise it). */
+  readonly cadenceMinMs: number;
+  /** Maximum probe attempts per rolling hour per route (approval pin:
+   * 12; config may only lower it). */
+  readonly maxAttemptsPerHour: number;
+  /** Backoff base between failed probes (transport/tool failures);
+   * doubles per consecutive failure up to probeBackoffMaxMs. */
+  readonly probeBackoffBaseMs: number;
+  /** Backoff cap between failed probes. */
+  readonly probeBackoffMaxMs: number;
+  /** Consecutive false recoveries (recovery observed, continuation
+   * re-hit the wall) before escalating to Gru and suspending the route. */
+  readonly falseRecoveryEscalateAt: number;
+  /** Route probe suspension after a false-recovery escalation. */
+  readonly suspensionMs: number;
+  /** Upper bound honored for a trustworthy provider Retry-After hint
+   * (longer hints clamp to the cadence policy, never extend past this). */
+  readonly retryAfterMaxMs: number;
+  /** Bounded finite timeout for one probe I/O (generation or metadata
+   * read); also bounds the pre-I/O reservation expiry. */
+  readonly probeTimeoutMs: number;
+  /** GLM bounded generation fallback (≤64 output tokens, no history/tools,
+   * no hidden retries). The owner overlay keeps it DISABLED in production:
+   * false (the default) means GLM waits never run a generation probe —
+   * checks fail closed until a documented readiness endpoint exists. */
+  readonly glmGenerationFallback: boolean;
+}
+
+export const DEFAULT_PROVIDER_RECOVERY_CONFIG: ProviderRecoveryConfig = {
+  enabled: false,
+  tickIntervalMs: 30_000,
+  cadenceMinMs: 300_000,
+  maxAttemptsPerHour: 12,
+  probeBackoffBaseMs: 60_000,
+  probeBackoffMaxMs: 1_800_000,
+  falseRecoveryEscalateAt: 3,
+  suspensionMs: 21_600_000,
+  retryAfterMaxMs: 3_600_000,
+  probeTimeoutMs: 30_000,
+  glmGenerationFallback: false,
+};
+
+/** Hard floors from the owner approval — config may tighten, never
+ * loosen, the probe policy pins. */
+export const PROVIDER_RECOVERY_CADENCE_FLOOR_MS = 300_000;
+export const PROVIDER_RECOVERY_MAX_ATTEMPTS_PER_HOUR_CAP = 12;
+
 /** Verification scheduler policy (contention fix 2026-09-22): lanes request
  * verification runs through the service (POST /api/verify); the scheduler owns
  * the machine's GLOBAL test budget so co-tenant lanes cannot oversubscribe it.
@@ -370,10 +474,12 @@ export interface GruCommandConfig {
   readonly dispatch: DispatchConfig;
   readonly lessons: LessonsConfig;
   readonly silas: SilasConfig;
+  readonly providerRecovery: ProviderRecoveryConfig;
   readonly roll: RollConfig;
   readonly concurrency: ConcurrencyConfig;
   readonly review: ReviewConfig;
   readonly verify: VerifyConfig;
+  readonly pacing: PacingConfig;
   readonly decisions: DecisionsConfig;
   /** Absolute path the config was loaded from; null when running on pure defaults. */
   readonly sourceFile: string | null;
@@ -494,10 +600,12 @@ const TOP_LEVEL_KEYS = [
   'dispatch',
   'lessons',
   'silas',
+  'provider_recovery',
   'roll',
   'concurrency',
   'review',
   'verify',
+  'pacing',
   'decisions',
 ] as const;
 
@@ -733,10 +841,12 @@ export function loadConfig(
   let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
   let lessons: LessonsConfig = DEFAULT_LESSONS_CONFIG;
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
+  let providerRecovery: ProviderRecoveryConfig = DEFAULT_PROVIDER_RECOVERY_CONFIG;
   let roll: RollConfig = DEFAULT_ROLL_CONFIG;
   let concurrency: ConcurrencyConfig = DEFAULT_CONCURRENCY_CONFIG;
   let review: ReviewConfig = { enabled: true, maxConcurrentChildren: DEFAULT_REVIEW_CHILDREN };
   let verify: VerifyConfig = DEFAULT_VERIFY_CONFIG;
+  let pacing: PacingConfig = DEFAULT_PACING_CONFIG;
   let decisions: DecisionsConfig = DEFAULT_DECISIONS_CONFIG;
   let sourceFile: string | null = null;
 
@@ -1115,6 +1225,69 @@ export function loadConfig(
         escalateAt,
       };
     }
+    if (raw['provider_recovery'] !== undefined) {
+      const table = requireTable(raw['provider_recovery'], file, 'provider_recovery');
+      const VALID = [
+        'enabled',
+        'tick_interval_ms',
+        'cadence_min_ms',
+        'max_attempts_per_hour',
+        'probe_backoff_base_ms',
+        'probe_backoff_max_ms',
+        'false_recovery_escalate_at',
+        'suspension_ms',
+        'retry_after_max_ms',
+        'probe_timeout_ms',
+        'glm_generation_fallback',
+      ];
+      for (const key of Object.keys(table)) {
+        if (!VALID.includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [provider_recovery] (valid keys: ${VALID.join(', ')})`,
+            file,
+            `provider_recovery.${key}`,
+          );
+        }
+      }
+      const cadenceMinMs =
+        table['cadence_min_ms'] !== undefined
+          ? requirePositiveInt(table['cadence_min_ms'], file, 'provider_recovery.cadence_min_ms')
+          : providerRecovery.cadenceMinMs;
+      if (cadenceMinMs < PROVIDER_RECOVERY_CADENCE_FLOOR_MS) {
+        throw new ConfigError(
+          `provider_recovery.cadence_min_ms (${cadenceMinMs}) is below the approved floor ${PROVIDER_RECOVERY_CADENCE_FLOOR_MS} — the owner approval pins shared route checks to at least 300 s`,
+          file,
+          'provider_recovery.cadence_min_ms',
+        );
+      }
+      const maxAttemptsPerHour =
+        table['max_attempts_per_hour'] !== undefined
+          ? requirePositiveInt(table['max_attempts_per_hour'], file, 'provider_recovery.max_attempts_per_hour')
+          : providerRecovery.maxAttemptsPerHour;
+      if (maxAttemptsPerHour > PROVIDER_RECOVERY_MAX_ATTEMPTS_PER_HOUR_CAP) {
+        throw new ConfigError(
+          `provider_recovery.max_attempts_per_hour (${maxAttemptsPerHour}) exceeds the approved cap ${PROVIDER_RECOVERY_MAX_ATTEMPTS_PER_HOUR_CAP} — the owner approval pins at most 12 attempts/hour/route`,
+          file,
+          'provider_recovery.max_attempts_per_hour',
+        );
+      }
+      providerRecovery = {
+        enabled: table['enabled'] !== undefined ? requireBool(table['enabled'], file, 'provider_recovery.enabled') : providerRecovery.enabled,
+        tickIntervalMs: table['tick_interval_ms'] !== undefined ? requirePositiveInt(table['tick_interval_ms'], file, 'provider_recovery.tick_interval_ms') : providerRecovery.tickIntervalMs,
+        cadenceMinMs,
+        maxAttemptsPerHour,
+        probeBackoffBaseMs: table['probe_backoff_base_ms'] !== undefined ? requirePositiveInt(table['probe_backoff_base_ms'], file, 'provider_recovery.probe_backoff_base_ms') : providerRecovery.probeBackoffBaseMs,
+        probeBackoffMaxMs: table['probe_backoff_max_ms'] !== undefined ? requirePositiveInt(table['probe_backoff_max_ms'], file, 'provider_recovery.probe_backoff_max_ms') : providerRecovery.probeBackoffMaxMs,
+        falseRecoveryEscalateAt: table['false_recovery_escalate_at'] !== undefined ? requirePositiveInt(table['false_recovery_escalate_at'], file, 'provider_recovery.false_recovery_escalate_at') : providerRecovery.falseRecoveryEscalateAt,
+        suspensionMs: table['suspension_ms'] !== undefined ? requirePositiveInt(table['suspension_ms'], file, 'provider_recovery.suspension_ms') : providerRecovery.suspensionMs,
+        retryAfterMaxMs: table['retry_after_max_ms'] !== undefined ? requirePositiveInt(table['retry_after_max_ms'], file, 'provider_recovery.retry_after_max_ms') : providerRecovery.retryAfterMaxMs,
+        probeTimeoutMs: table['probe_timeout_ms'] !== undefined ? requirePositiveInt(table['probe_timeout_ms'], file, 'provider_recovery.probe_timeout_ms') : providerRecovery.probeTimeoutMs,
+        glmGenerationFallback:
+          table['glm_generation_fallback'] !== undefined
+            ? requireBool(table['glm_generation_fallback'], file, 'provider_recovery.glm_generation_fallback')
+            : providerRecovery.glmGenerationFallback,
+      };
+    }
     if (raw['roll'] !== undefined) {
       const table = requireTable(raw['roll'], file, 'roll');
       for (const key of Object.keys(table)) {
@@ -1198,6 +1371,9 @@ export function loadConfig(
             : verify.runTimeoutMs,
       };
     }
+    if (raw['pacing'] !== undefined) {
+      pacing = readPacingConfig(raw['pacing'], file, 'pacing', pacing);
+    }
     if (raw['decisions'] !== undefined) {
       decisions = readDecisionsConfig(raw['decisions'], file, decisions);
     }
@@ -1269,13 +1445,151 @@ export function loadConfig(
     dispatch,
     lessons,
     silas,
+    providerRecovery,
     roll,
     concurrency,
     review,
     verify,
+    pacing,
     decisions,
     sourceFile,
     instanceDir,
+  };
+}
+
+const PACING_KEYS = [
+  'enabled',
+  'max_concurrent_minions',
+  'max_concurrent_review_turns',
+  'backoff_base_ms',
+  'backoff_max_ms',
+  'max_auto_retries',
+  'providers',
+] as const;
+
+/** Parse a [pacing] table. Fail loud on unknown
+ * keys, wrong types, non-compiling patterns, and an inverted backoff
+ * ladder — a pacing misconfiguration must never silently disable or
+ * distort the bounds. The section being present is the feature switch
+ * unless an explicit `enabled = false` turns it off; this function only
+ * ever runs when a section is present, so the default is `enabled: true`. */
+function readPacingConfig(
+  value: unknown,
+  file: string,
+  section: 'pacing',
+  defaults: PacingConfig,
+): PacingConfig {
+  const table = requireTable(value, file, section);
+  for (const key of Object.keys(table)) {
+    if (!(PACING_KEYS as readonly string[]).includes(key)) {
+      throw new ConfigError(
+        `unknown key \`${key}\` in [${section}] (valid keys: ${PACING_KEYS.join(', ')})`,
+        file,
+        `${section}.${key}`,
+      );
+    }
+  }
+  // One canonical spelling per limit key (max_concurrent_minions,
+  // max_concurrent_review_turns); unknown spellings fail loud above rather
+  // than being silently accepted or aliased. A file that sets both is
+  // therefore impossible to write.
+  const enabled =
+    table['enabled'] !== undefined ? requireBool(table['enabled'], file, `${section}.enabled`) : defaults.enabled;
+  const maxConcurrentMinions = table['max_concurrent_minions'] !== undefined
+    ? requireNonNegativeInt(table['max_concurrent_minions'], file, `${section}.max_concurrent_minions`)
+    : defaults.maxConcurrentMinions;
+  const maxConcurrentReviewTurns = table['max_concurrent_review_turns'] !== undefined
+    ? requireNonNegativeInt(table['max_concurrent_review_turns'], file, `${section}.max_concurrent_review_turns`)
+    : defaults.maxConcurrentReviewTurns;
+  const backoffBaseMs =
+    table['backoff_base_ms'] !== undefined
+      ? requirePositiveInt(table['backoff_base_ms'], file, `${section}.backoff_base_ms`)
+      : defaults.backoffBaseMs;
+  const backoffMaxMs =
+    table['backoff_max_ms'] !== undefined
+      ? requirePositiveInt(table['backoff_max_ms'], file, `${section}.backoff_max_ms`)
+      : defaults.backoffMaxMs;
+  if (backoffBaseMs > backoffMaxMs) {
+    throw new ConfigError(
+      `${section}.backoff_base_ms (${backoffBaseMs}) must not exceed ${section}.backoff_max_ms (${backoffMaxMs})`,
+      file,
+      `${section}.backoff_base_ms`,
+    );
+  }
+  let providers = defaults.providers;
+  if (table['providers'] !== undefined) {
+    const providersTable = requireTable(table['providers'], file, `${section}.providers`);
+    // Null-prototype map: a provider id like "__proto__" must land as an
+    // own entry, never mutate the map's prototype or vanish silently.
+    const parsed: Record<string, PacingProviderOverride> = Object.create(null) as Record<
+      string,
+      PacingProviderOverride
+    >;
+    for (const [providerId, entry] of Object.entries(providersTable)) {
+      if (providerId.trim() === '') {
+        throw new ConfigError(
+          `${section}.providers keys must be non-empty provider ids`,
+          file,
+          `${section}.providers`,
+        );
+      }
+      const entryTable = requireTable(entry, file, `${section}.providers."${providerId}"`);
+      for (const key of Object.keys(entryTable)) {
+        if (key !== 'rate_limit_patterns') {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [${section}.providers."${providerId}"] (valid keys: rate_limit_patterns)`,
+            file,
+            `${section}.providers."${providerId}".${key}`,
+          );
+        }
+      }
+      const rawPatterns = entryTable['rate_limit_patterns'];
+      if (rawPatterns === undefined) {
+        throw new ConfigError(
+          `[${section}.providers."${providerId}"] must set rate_limit_patterns`,
+          file,
+          `${section}.providers."${providerId}"`,
+        );
+      }
+      if (!Array.isArray(rawPatterns)) {
+        throw new ConfigError(
+          `${section}.providers."${providerId}".rate_limit_patterns must be an array of strings`,
+          file,
+          `${section}.providers."${providerId}".rate_limit_patterns`,
+        );
+      }
+      const patterns = rawPatterns.map((pattern, index) => {
+        const text = requireString(
+          pattern,
+          file,
+          `${section}.providers."${providerId}".rate_limit_patterns[${index}]`,
+        );
+        try {
+          new RegExp(text, 'i');
+        } catch (error) {
+          throw new ConfigError(
+            `${section}.providers."${providerId}".rate_limit_patterns[${index}] is not a valid regex: ${(error as Error).message}`,
+            file,
+            `${section}.providers."${providerId}".rate_limit_patterns[${index}]`,
+          );
+        }
+        return text;
+      });
+      parsed[providerId] = { rateLimitPatterns: patterns };
+    }
+    providers = parsed;
+  }
+  return {
+    enabled,
+    maxConcurrentMinions,
+    maxConcurrentReviewTurns,
+    backoffBaseMs,
+    backoffMaxMs,
+    maxAutoRetries:
+      table['max_auto_retries'] !== undefined
+        ? requireNonNegativeInt(table['max_auto_retries'], file, `${section}.max_auto_retries`)
+        : defaults.maxAutoRetries,
+    providers,
   };
 }
 

@@ -1,3 +1,4 @@
+import type { AgentHandle } from '../runtime/types.js';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -17,6 +18,7 @@ import {
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
 import type { ResidentReviewRound } from '../runtime/registry.js';
+import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
@@ -993,6 +995,16 @@ export interface WaveRunnerOptions {
   readonly maxConcurrentChildren?: number;
   /** Ledger bus used to admit a worker's durable handoff after its turn delivers. */
   readonly bus?: EventBus;
+  /** Provider pacing: combined lead+lens review-turn gate for Perkins
+   * rounds. Absent = off; an unlimited or disabled gate admits at once. */
+  readonly reviewGate?: PacingGate;
+  readonly workerGate?: PacingGate;
+  readonly rateLimitBackoff?: RateLimitBackoffPolicy | null;
+  /** Provider pacing: the bounded settlement of an automatic rate-limit
+   * retry covering a fallback-review minion turn. The review records the
+   * turn as delivered only for 'none'/'recovered'; the worker lease is
+   * released before the wait so the retry can reacquire admission. */
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   readonly poster?: VerdictPoster;
   readonly escalate?: (title: string, detail: string) => void;
   /** Stable service-owned root. Required for every production review. */
@@ -1932,8 +1944,12 @@ export class WaveRunner {
   }
 
   private async defaultFallbackReview(input: FallbackReviewRunInput): Promise<readonly FallbackFinding[]> {
-    const handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
+    let lease: PacingLease | null = this.opts.workerGate === undefined ? null : await this.opts.workerGate.acquireWorkerTurn({
+      id: input.jobId, label: `fallback review → ${input.jobId}`, jobId: input.jobId, signal: input.signal,
+    });
+    let handle: AgentHandle | null = null;
     try {
+      handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
       const prompt = [
         `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
         'This session runs ONE review pass inside a release gate. The host performs triage and every gate decision afterwards: do NOT approve, merge, or gate anything yourself, and do not modify implementation code.',
@@ -1946,17 +1962,35 @@ export class WaveRunner {
       ].join('\n');
       if (input.signal.aborted) throw new Error('review operation aborted');
       let reviewTimer: ReturnType<typeof setTimeout> | null = null;
-      await Promise.race([
-        handle.prompt(prompt, { owner: 'bmad-review-gate' }),
-        new Promise<never>((_resolve, reject) => {
-          input.signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
-          reviewTimer = setTimeout(() => reject(new Error(`fallback review timed out after ${FALLBACK_REVIEW_TIMEOUT_MS}ms`)), FALLBACK_REVIEW_TIMEOUT_MS);
-          reviewTimer.unref?.();
-        }),
-      ]);
-      if (reviewTimer !== null) clearTimeout(reviewTimer);
+      let promptError: unknown = null;
+      try {
+        await Promise.race([
+          handle.prompt(prompt, { owner: 'bmad-review-gate' }),
+          new Promise<never>((_resolve, reject) => {
+            input.signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
+            reviewTimer = setTimeout(() => reject(new Error(`fallback review timed out after ${FALLBACK_REVIEW_TIMEOUT_MS}ms`)), FALLBACK_REVIEW_TIMEOUT_MS);
+            reviewTimer.unref?.();
+          }),
+        ]);
+      } catch (error) {
+        promptError = error;
+      } finally {
+        if (reviewTimer !== null) clearTimeout(reviewTimer);
+        // Release before the settlement wait: the retry reacquires the slot.
+        lease?.release();
+        lease = null;
+      }
+      const disposition = await settleRetries(this.opts.retrySettlement, handle.id, input.signal);
+      if (disposition === 'cancelled') throw new Error('review operation aborted');
+      if (disposition === 'exhausted' || disposition === 'superseded') {
+        throw new Error(`automatic rate-limit retry ${disposition} before the fallback review delivered`);
+      }
+      // A rejection whose automatic retry recovered IS the delivery: the
+      // report file the retried turn wrote is parsed below; only a
+      // rejection with no recovered retry keeps the fail-loud throw.
+      if (promptError !== null && disposition !== 'recovered') throw promptError;
     } finally {
-      await handle.dispose();
+      try { await handle?.dispose(); } finally { lease?.release(); }
     }
     return parseFallbackFindingsReport(input.reportFile);
   }
@@ -2387,6 +2421,11 @@ export class WaveRunner {
       spawner: spawnWithOptions,
       ...(reservation !== undefined ? { beginChildren: () => reservation.beginChildren(this.opts.maxConcurrentChildren ?? DEFAULT_REVIEW_CHILDREN) } : {}),
       ...(this.opts.maxConcurrentChildren !== undefined ? { maxConcurrentChildren: this.opts.maxConcurrentChildren } : {}),
+      ...(this.opts.reviewGate !== undefined ? { reviewGate: this.opts.reviewGate } : {}),
+      rateLimitBackoff: this.opts.rateLimitBackoff ?? null,
+      recordPacing: (event) => this.opts.ledger.appendCustomEvent({
+        kind: event.kind, jobId: job.id, roundId: round.id, agentId: event.agentId ?? null, payload: event.payload,
+      }),
       policy,
       onAgent: ({ phase, lens, attempt, handle }) => {
         this.opts.ledger.registerAgent({
