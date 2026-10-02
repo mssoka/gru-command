@@ -203,9 +203,11 @@ async function observeCompactionCancellation(
   const handle = await fx.runtime.spawn('gru');
   const events = collect(handle);
   const rawSdkEvents: string[] = [];
-  (handle as unknown as {
+  const sdkSession = (handle as unknown as {
     session: { subscribe?: (listener: (event: unknown) => void) => () => void };
-  }).session.subscribe?.((event) => rawSdkEvents.push(String((event as { type?: unknown }).type)));
+  }).session;
+  if (sdkSession.subscribe === undefined) throw new Error('SDK session is missing subscribe()');
+  sdkSession.subscribe((event) => rawSdkEvents.push(String((event as { type?: unknown }).type)));
   const internal = handle as unknown as {
     session: {
       abort?: () => Promise<void>;
@@ -944,6 +946,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.abortedEnds).toBe(0);
       expect(observation.successEnds).toBe(1);
       expect(observation.queuedDelivered).toBe(1);
+      expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
     });
 
@@ -977,6 +980,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.successEnds).toBe(1);
       expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
       expect(observation.queuedDelivered).toBe(1);
+      expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
     });
 

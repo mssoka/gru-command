@@ -79,7 +79,7 @@ function countedUsage(totalTokens: number) {
     output: 1,
     cacheRead: 0,
     cacheWrite: 0,
-    totalTokens,
+    totalTokens: totalTokens + 1,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
 }
@@ -248,16 +248,33 @@ export async function makeStubModelRuntime(
       if (turn.hold !== undefined) {
         if (turn.honorAbort === true && signal !== undefined) {
           // Faithful transport: the held stream settles when the request
-          // signal aborts, ending with an aborted assistant message.
+          // signal aborts, ending with an aborted assistant message. The
+          // listener is detached when the hold wins, so a settled stream can
+          // never read a later abort as its own.
+          let abortedBySignal = false;
           await new Promise<void>((resolve) => {
             if (signal.aborted) {
+              abortedBySignal = true;
               resolve();
               return;
             }
-            signal.addEventListener('abort', () => resolve(), { once: true });
-            void turn.hold!.then(() => resolve(), () => resolve());
+            const onAbort = () => {
+              abortedBySignal = true;
+              resolve();
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+            void turn.hold!.then(
+              () => {
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+              },
+              () => {
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+              },
+            );
           });
-          if (signal.aborted) {
+          if (abortedBySignal) {
             call.aborted = true;
             const aborted = {
               ...final,
