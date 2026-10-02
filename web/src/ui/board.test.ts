@@ -168,6 +168,7 @@ describe('minion heist identity in the crew rail', () => {
       agent('worker-5678dec9', { role: 'minion', label: null, jobId: 'wake', state: 'error' }),
       agent('worker-9999dec9', { role: 'minion', label: null, jobId: 'wake', state: 'disposed' }),
       agent('worker-00009b2b', { role: 'minion', label: null, jobId: 'model', state: 'streaming' }),
+      agent('worker-7777cafe', { role: 'minion', label: null, jobId: 'wake', state: 'idle' }),
       agent('unlinked-1111', { role: 'minion', label: null, jobId: null }),
       agent('orphaned-1111', { role: 'minion', label: null, jobId: 'missing-job' }),
       agent('lead-1234', { role: 'perkins', label: 'blind:001', jobId: 'wake' }),
@@ -189,6 +190,9 @@ describe('minion heist identity in the crew rail', () => {
     expect(new Set(originalSuffixes).size).toBe(3);
     expect(originalSuffixes.every((suffix) => suffix?.length === 5)).toBe(true);
     expect(byId('worker-00009b2b').querySelector('.board-agent__name')?.textContent).toBe('model repair with full');
+    // A non-colliding peer on the same heist keeps its normal four
+    // characters; only the colliding trio extends.
+    expect(byId('worker-7777cafe').querySelector('.board-agent__hash')?.textContent).toBe('cafe');
     expect(byId('unlinked-1111').querySelector('.board-agent__name')?.textContent).toBe('unassigned');
     expect(byId('orphaned-1111').querySelector('.board-agent__name')?.textContent).toBe('unassigned');
     expect(byId('unlinked-1111').querySelector('.board-agent__hash')?.textContent).not.toBe(byId('orphaned-1111').querySelector('.board-agent__hash')?.textContent);
@@ -200,7 +204,7 @@ describe('minion heist identity in the crew rail', () => {
     view.render({ ...board, agents: [...agents].reverse() });
     const reordered = [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')];
     expect(collisions.map((id) => reordered.find((row) => row.title.includes(id))?.querySelector('.board-agent__hash')?.textContent)).toEqual(originalSuffixes);
-    expect(document.querySelectorAll('.board-agent__hash')).toHaveLength(7);
+    expect(document.querySelectorAll('.board-agent__hash')).toHaveLength(8);
   });
 
   it('ignores invisible-only graphemes before shortening, keeping readable letters and ZWJ emoji', () => {
@@ -231,6 +235,17 @@ describe('minion heist identity in the crew rail', () => {
     expect(byId('worker-9999fade').querySelector('.board-agent__name')?.textContent).toBe('unassigned');
   });
 
+  it('bounds a single over-long word at 24 graphemes (no word boundary exists to cut on)', () => {
+    const view = new BoardView(() => {});
+    const jobs = [baseJob({ id: 'long', title: 'Long single word', displayName: 'x'.repeat(32) })];
+    const agents = [agent('worker-1234beef', { role: 'minion', label: null, jobId: 'long' })];
+    view.render(snapshot({ jobs, agents }));
+    const row = document.querySelector<HTMLElement>('#board-agents .board-agent');
+    expect(row?.querySelector('.board-agent__name')?.textContent).toBe('x'.repeat(24));
+    // Full title stays reachable in the tooltip.
+    expect(row?.title).toContain('Long single word');
+  });
+
   it('opens transcripts under the rail name while the full-ID file drives the selection', () => {
     const opened = vi.fn();
     const view = new BoardView(opened);
@@ -242,7 +257,7 @@ describe('minion heist identity in the crew rail', () => {
     view.render(snapshot({ jobs, agents }));
     const byId = (id: string) => [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')].find((row) => row.title.includes(id))!;
     byId('worker-5678dec9').click();
-    expect(opened).toHaveBeenCalledWith({ file: '/sessions/worker-5678dec9.jsonl', label: 'wake alerts' });
+    expect(opened).toHaveBeenCalledWith({ file: '/sessions/worker-5678dec9.jsonl', label: 'wake alerts · dec9' });
     byId('lead-1234').click();
     expect(opened).toHaveBeenLastCalledWith({ file: '/sessions/lead-1234.jsonl', label: 'blind:001' });
   });

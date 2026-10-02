@@ -845,8 +845,11 @@ export class BoardView {
     row.addEventListener('click', () => {
       if (agent.sessionFile !== null) {
         // G6: minion tabs read under the heist rail name; the session file
-        // (never the label) drives the actual transcript selection.
-        this.onOpenTranscript({ file: agent.sessionFile, label: name });
+        // (never the label) drives the actual transcript selection. The
+        // suffix joins the title so several workers on one heist stay
+        // distinguishable, exactly as the rail row shows them.
+        const label = agent.role === 'minion' ? `${name} · ${railSuffix(suffixes, agent.id)}` : name;
+        this.onOpenTranscript({ file: agent.sessionFile, label });
       }
     });
     const body = el('span', 'board-agent__body');
