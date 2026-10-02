@@ -484,7 +484,10 @@ class DispatchSeamHarness {
     this.repoPath = mkdtempSync(join(tmpdir(), 'pr-dispatch-seam-repo-'));
     cleanupDirs.push(this.repoPath);
     this.sensor = new ProviderRecoverySensor({
-      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true },
+      // The GLM generation fallback is an explicit activation guard (default
+      // OFF). This harness ticks the shared check, so it opts in — the
+      // provider transport stays the deterministic SensorProbe fake above.
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, glmGenerationFallback: true },
       ledger: this.ledger,
       probe: this.probe,
       notifications: this.notifications,

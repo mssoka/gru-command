@@ -982,8 +982,9 @@ describe('r4 — async settlement preserves the charge and mid-check updates (fi
     await h.establishMinionWait({ jobId: 'job-w2' });
     h.probe.queueCompleted();
     // A concurrent establishment/escalation lands MID-CHECK: the route's
-    // incident sequence, false-recovery ladder, and suspension advance
-    // while the probe is in flight.
+    // incident sequence and false-recovery ladder advance while the probe
+    // is in flight (a PAST suspension proves the field is preserved too
+    // without legitimately holding the waiter).
     h.probe.onProbeStart = () => {
       const current = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
       if (current !== null) {
@@ -991,7 +992,7 @@ describe('r4 — async settlement preserves the charge and mid-check updates (fi
           ...current,
           incidentSeq: 7,
           falseRecoveryCount: 2,
-          suspendedUntil: '2026-09-28T11:00:00Z',
+          suspendedUntil: '2026-09-27T00:00:00Z',
         });
       }
     };
@@ -1004,7 +1005,7 @@ describe('r4 — async settlement preserves the charge and mid-check updates (fi
     // ... and the mid-check updates survive the recovery settle.
     expect(route?.incidentSeq).toBe(7);
     expect(route?.falseRecoveryCount).toBe(2);
-    expect(route?.suspendedUntil).toBe('2026-09-28T11:00:00Z');
+    expect(route?.suspendedUntil).toBe('2026-09-27T00:00:00Z');
     expect(route?.lastResult).toBe('recovered');
     // The recovery itself still landed.
     expect(h.ledger.listProviderWaits({ status: 'recovered-pending' })).toHaveLength(1);
