@@ -274,6 +274,24 @@ function sampleSnapshot(): unknown {
             lastAgentActivity: new Date(Date.now() - 300_000).toISOString(),
           },
           {
+            // Long/Unicode/special-character authored name: the rail must
+            // escape it, shorten it to the 24-grapheme bound and keep the
+            // full title + id in the tooltip/accessible name.
+            id: 'demo-api-unicode-names',
+            repo: 'demo-api',
+            title: 'Přepiš šablony a ověř 名前の長い表示 — <script> & "café" v názvu',
+            displayName: 'Přepiš <script> & "café" — 名前がとても長い表示確認',
+            status: 'working',
+            updatedAt: new Date(Date.now() - 240_000).toISOString(),
+            prUrl: null,
+            prState: null,
+            baseBranch: 'main',
+            note: 'long authored name — the rail shortens it for the card',
+            rounds: [],
+            lane: null,
+            lastAgentActivity: new Date(Date.now() - 60_000).toISOString(),
+          },
+          {
             id: 'demo-api-stalled-lane',
             repo: 'demo-api',
             title: 'Backfill the audit log',
@@ -350,6 +368,7 @@ function sampleSnapshot(): unknown {
       { id: 'mock-lens-blind', role: 'perkins', label: 'blind:001', state: 'idle', lastActivity: new Date(Date.now() - 300_000).toISOString(), sessionFile: null, jobId: null, roundId: 'demo-api-payment-fix-r2', supervision: null },
       { id: 'mock-minion', role: 'minion', label: 'demo-api-payment-fix', state: 'idle', lastActivity: null, sessionFile: null, jobId: 'demo-api-payment-fix', roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true } },
       { id: 'mock-minion-docs', role: 'minion', label: null, state: 'idle', lastActivity: null, sessionFile: null, jobId: 'demo-api-docs-pass', roundId: null, supervision: null },
+      { id: 'mock-minion-unicode', role: 'minion', label: null, state: 'idle', lastActivity: null, sessionFile: null, jobId: 'demo-api-unicode-names', roundId: null, supervision: null },
       { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: null, supervision: null },
       { id: 'mock-gru-old', role: 'gru', label: 'gru · chat (retired)', state: 'disposed', lastActivity: new Date(Date.now() - 7_200_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
     ],

@@ -59,6 +59,15 @@ export default defineConfig({
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
+      // Crew-rail acceptance surface (isolated mock fixture): short
+      // authored names, long/Unicode names and bounded rendering captured
+      // for desktop/phone in light/dark. A dedicated project, like
+      // lens-pills, so the capture run is a complete declared surface.
+      name: 'crew-rail',
+      testMatch: 'crew-rail.spec.ts',
+      use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
+    },
+    {
       name: 'real',
       testMatch: 'real-server.spec.ts',
       use: { baseURL: `http://localhost:${REAL_PORT}` },
