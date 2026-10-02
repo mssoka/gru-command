@@ -1369,9 +1369,12 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       import { loadPerkinsPolicy } from './dist/dispatch/perkins-review/policy.js';
       import { ReviewMcpBridge } from './dist/runtime/review-mcp-bridge.js';
       const { ROLE_DEFINITIONS } = await import('./dist/roles.js');
-      const minionPrompt = ROLE_DEFINITIONS.minion.systemPrompt;
-      const silasPrompt = ROLE_DEFINITIONS.silas.systemPrompt;
-      const gruPrompt = ROLE_DEFINITIONS.gru.systemPrompt;
+      // The shipped prompts are markdown: phrases may wrap across lines,
+      // so flatten before substring checks (the vitest pins do the same).
+      const flatten = (text) => text.replace(/\s+/g, ' ');
+      const minionPrompt = flatten(ROLE_DEFINITIONS.minion.systemPrompt);
+      const silasPrompt = flatten(ROLE_DEFINITIONS.silas.systemPrompt);
+      const gruPrompt = flatten(ROLE_DEFINITIONS.gru.systemPrompt);
       if (!minionPrompt.includes("the PROJECT's actual installed skill catalog and metadata") ||
           !minionPrompt.includes('fresh, context-free reviewer sessions') ||
           /bmad-[a-z][a-z-]*/.test(minionPrompt)) {
