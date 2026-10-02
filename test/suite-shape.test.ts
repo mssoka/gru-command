@@ -33,7 +33,7 @@ const PINS: Record<string, number> = {
   'directive-markers.test.ts': 14,
   'dispatch-e2e.test.ts': 5,
   'dispatch-joins.test.ts': 2,
-  'dispatch-server.test.ts': 22,
+  'dispatch-server.test.ts': 24,
   'fix-directive.test.ts': 8,
   'github-poll.test.ts': 24,
   'health.test.ts': 19,
@@ -56,7 +56,7 @@ const PINS: Record<string, number> = {
   'logger.test.ts': 3,
   'native-tools-parity.test.ts': 2,
   'notifications.test.ts': 19,
-  'obligations-handback.test.ts': 5,
+  'obligations-handback.test.ts': 8,
   // Final-branch registration counts: owner-actions keeps this branch's
   // expanded registration set (28); supervisor keeps main's post-rollback
   // count (45). Verified against the merged tree, not ours/theirs copy.
@@ -66,10 +66,10 @@ const PINS: Record<string, number> = {
   'perkins-freeze-freshhead.test.ts': 24,
   'perkins-lead-schema-compat.test.ts': 6,
   'perkins-whole-review.test.ts': 67,
-  'phase-handoffs.test.ts': 11,
+  'phase-handoffs.test.ts': 13,
   'pi-adapter.test.ts': 63,
   'pr-creation-policy.test.ts': 5,
-  'rebrief-recovery.test.ts': 8,
+  'rebrief-recovery.test.ts': 9,
   'rehearsal.test.ts': 4,
   'resident-budget.test.ts': 7,
   'resident-saturation.test.ts': 2,

@@ -57,7 +57,11 @@ function seedJob(ledger: LedgerApi, jobId: string, status: 'working' | 'blocked'
   if (status === 'blocked') ledger.setJobStatus(jobId, 'blocked');
 }
 
-function fakeMinion(id: string, prompt: () => Promise<void>): AgentHandle {
+function fakeMinion(
+  id: string,
+  prompt: () => Promise<void>,
+  healthState: 'idle' | 'error' = 'idle',
+): AgentHandle {
   return {
     role: 'minion',
     id,
@@ -70,7 +74,9 @@ function fakeMinion(id: string, prompt: () => Promise<void>): AgentHandle {
       return () => {};
     },
     health() {
-      return { state: 'idle', lastActivity: null, sessionFile: null };
+      return healthState === 'error'
+        ? { state: 'error', lastActivity: null, sessionFile: null, error: 'runtime settled the turn with an in-band error' }
+        : { state: 'idle', lastActivity: null, sessionFile: null };
     },
     async dispose() {},
   };
@@ -293,6 +299,49 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
     expect(
       h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.includes('phase-handback')),
     ).toHaveLength(0);
+  });
+
+  it('a fulfilled-but-error dispatch turn never publishes a completed marked phase (r4 blocker 1)', async () => {
+    const h = makeHarness();
+    const repoPath = tmpDir();
+    const worktrees = new InMemoryWorktreePort(join(tmpDir(), 'wt'));
+    const service = new DispatchService({
+      ledger: h.ledger,
+      worktrees,
+      spawner: async () => fakeMinion('minion-ph-inband', async () => {}, 'error'),
+    });
+    h.bus.subscribe((event) => {
+      observePhaseCompletion({ ledger: h.ledger, notifications: h.notifications }, event);
+    });
+    const outcome = await service.dispatch({
+      jobId: 'job-ph-inband',
+      repoPath,
+      title: 'error-only audit',
+      briefing: 'audit only',
+      completionHandoff: { kind: 'gru-decision', decision: 'never owed by a failed turn' },
+    });
+    // The prompt RESOLVED — but the runtime's terminal evidence says the
+    // turn errored. Resolution alone must not stamp a delivery.
+    expect((await outcome.settled).ok).toBe(false);
+    expect(h.ledger.getJob('job-ph-inband')?.status).toBe('blocked');
+    const phase = h.ledger.listPhaseHandoffs({ jobId: 'job-ph-inband' })[0];
+    expect(phase?.state).toBe('closed');
+    expect(phase?.completionSeq).toBeNull();
+    const errorEvent = h.ledger.latestJobEvent('job-ph-inband', 'job.minion-error');
+    expect(errorEvent).not.toBeNull();
+    expect(payloadOf(errorEvent!)['error']).toContain('in-band error');
+    expect(
+      h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.includes('phase-handback')),
+    ).toHaveLength(0);
+    expect(
+      h.ledger
+        .listObligations({ jobId: 'job-ph-inband' })
+        .filter((row) => row.category.kind === 'known' && row.category.category === 'phase-completion'),
+    ).toHaveLength(0);
+    // The boot pass cannot fabricate a completion from a failed turn.
+    const replay = reconcilePhaseHandoffs({ ledger: h.ledger, notifications: h.notifications });
+    expect(replay.completed).toBe(0);
+    expect(replay.published).toBe(0);
   });
 });
 
@@ -586,5 +635,72 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
     const b = h.ledger.listPhaseHandoffs({ jobId: 'job-ph-page', states: ['awaiting'] });
     expect(b).toHaveLength(1);
     expect(b[0]?.decision).toBe('b');
+  });
+
+  it('a bounded pass makes fair progress past a published prefix and across successive passes (r4 blocker 3)', () => {
+    const h = makeHarness();
+    seedJob(h.ledger, 'job-ph-fair', 'working');
+    const jobId = 'job-ph-fair';
+    const ts = '2026-10-02T00:00:00.000Z';
+    // 4,000 already-published completed rows — the old oldest-first pass
+    // spent its whole 200x20 budget re-reading this prefix and never
+    // reached the tail. They must consume no pass budget now.
+    const insert = h.db.handle.prepare(
+      `INSERT INTO phase_handoffs
+         (phase_id, job_id, source, request_id, generation, decision, state, intent_seq, minion_id,
+          completion_seq, obligation_id, notification_id, close_reason, created_at, updated_at)
+       VALUES (?, ?, 'dispatch', NULL, ?, 'd', 'completed', 1, NULL, 2, 'ob', 'card', NULL, ?, ?)`,
+    );
+    h.db.handle.exec('BEGIN');
+    for (let i = 0; i < 4000; i += 1) {
+      insert.run(`phase-handoff:${jobId}:dispatch:published-${i}`, jobId, 1000 + i, ts, ts);
+    }
+    h.db.handle.exec('COMMIT');
+
+    // First wave behind the prefix: two completed-but-unpublished rows.
+    for (let i = 0; i < 2; i += 1) {
+      h.ledger.beginPhaseHandoff({ jobId, source: 'dispatch', intent: { kind: 'gru-decision', decision: `c${i}` } });
+      const row = h.ledger.listPhaseHandoffs({ jobId, states: ['awaiting'] }).at(-1)!;
+      h.ledger.completePhaseHandoff({ phaseId: row.phaseId, completionSeq: row.intentSeq + 1 });
+    }
+    const first = reconcilePhaseHandoffs(
+      { ledger: h.ledger, notifications: h.notifications },
+      { pageSize: 50, maxPages: 1 },
+    );
+    // The published 4,000 are filtered out entirely: the pass examines only
+    // the two owed rows and publishes both.
+    expect(first.examined).toBe(2);
+    expect(first.published).toBe(2);
+
+    // Second wave: three awaiting intents with no evidence, then two
+    // completed-but-unpublished rows. A pass with a SMALL EXHAUSTED budget
+    // (one row) must continue where the previous pass stopped — each pass
+    // examines the next actionable row, never the same prefix again, and
+    // the owed cards eventually publish.
+    for (let i = 0; i < 3; i += 1) {
+      h.ledger.beginPhaseHandoff({ jobId, source: 'dispatch', intent: { kind: 'gru-decision', decision: `a${i}` } });
+    }
+    for (let i = 0; i < 2; i += 1) {
+      h.ledger.beginPhaseHandoff({ jobId, source: 'dispatch', intent: { kind: 'gru-decision', decision: `late${i}` } });
+      const row = h.ledger.listPhaseHandoffs({ jobId, states: ['awaiting'] }).at(-1)!;
+      h.ledger.completePhaseHandoff({ phaseId: row.phaseId, completionSeq: row.intentSeq + 1 });
+    }
+    const passes = [0, 1, 2, 3, 4].map(() =>
+      reconcilePhaseHandoffs({ ledger: h.ledger, notifications: h.notifications }, { pageSize: 1, maxPages: 1 }),
+    );
+    expect(passes.map((report) => report.examined)).toEqual([1, 1, 1, 1, 1]);
+    expect(passes.map((report) => report.published)).toEqual([0, 0, 0, 1, 1]);
+    // Both waves settled exactly once; nothing is left owed and a fresh
+    // pass has no actionable work (it reads from the start again).
+    expect(h.ledger.listHandbacksMissingCards(500)).toHaveLength(0);
+    expect(
+      h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.startsWith('silas.phase-handback.')),
+    ).toHaveLength(4);
+    const sixth = reconcilePhaseHandoffs(
+      { ledger: h.ledger, notifications: h.notifications },
+      { pageSize: 1, maxPages: 1 },
+    );
+    expect(sixth.examined).toBe(0);
+    expect(sixth.published).toBe(0);
   });
 });

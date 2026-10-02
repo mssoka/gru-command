@@ -6,7 +6,9 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
-import { adoptBlockedLanes, observeFollowUpDelivery } from '../src/dispatch/obligations.js';
+import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcileUnmarkedHandbacks } from '../src/dispatch/obligations.js';
+import { finalizeRebriefRequest } from '../src/dispatch/rebrief-recovery.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { selectDueObligations } from '../src/ledger/obligations.js';
 
 /**
@@ -257,5 +259,104 @@ describe('attention disposition is not settlement; delegated work keeps its debt
         eventSeq: correlated.seq,
       }).state,
     ).toBe('open');
+  });
+});
+
+describe('unmarked blocked-phase hand-back crash-window recovery (r4 blocker 2)', () => {
+  it('recovers a delivery whose observer never ran, exactly once and without a worker turn', () => {
+    const h = makeHarness();
+    seedJob(h.ledger, 'job-uwc1', 'blocked');
+    // The delivery committed; the process died before the bus observer ran.
+    const delivered = h.ledger.appendCustomEvent({
+      kind: 'job.delivered',
+      jobId: 'job-uwc1',
+      payload: { source: 'silas-directive', sha: 'abc123', agentId: 'minion-9' },
+    });
+    const report = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });
+    expect(report.recovered).toBe(1);
+    expect(report.published).toBe(1);
+    const obligation = h.ledger
+      .listObligations({ jobId: 'job-uwc1' })
+      .find((row) => row.incidentKey === `phase-handback@${delivered.seq}`);
+    expect(obligation?.state).toBe('open');
+    const kind = `silas.phase-handback.job-uwc1@${delivered.seq}`;
+    const card = h.ledger.findNotificationByKind(kind, 'any');
+    expect(card?.routing).toBe('action-required'); // machine wake — never the owner bell
+    expect(card?.detail).toContain('abc123');
+    // Recovery is not a worker turn: nothing was spawned and no dispatch
+    // event was written — only the durable debt and the one card.
+    expect(h.ledger.listAgents().filter((agent) => agent.jobId === 'job-uwc1')).toHaveLength(0);
+    // Exactly once: a second pass changes nothing.
+    const second = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });
+    expect(second.recovered).toBe(0);
+    expect(second.published).toBe(0);
+    expect(h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind === kind)).toHaveLength(1);
+  });
+
+  it('recovers the card when the crash landed between the obligation write and its notification', () => {
+    const h = makeHarness();
+    seedJob(h.ledger, 'job-uwc2', 'blocked');
+    const delivered = h.ledger.appendCustomEvent({
+      kind: 'job.delivered',
+      jobId: 'job-uwc2',
+      payload: { source: 'silas-rebrief', sha: 'def456' },
+    });
+    // Simulate the crash: the observer records the obligation, then the post
+    // dies before the card commits.
+    const crashing = {
+      postIncident(): never {
+        throw new Error('process died before the card committed');
+      },
+    };
+    expect(() => observeFollowUpDelivery({ ledger: h.ledger, notifications: crashing }, delivered)).toThrow(/died/);
+    expect(h.ledger.listObligations({ jobId: 'job-uwc2' })).toHaveLength(1); // the debt survived
+    const kind = `silas.phase-handback.job-uwc2@${delivered.seq}`;
+    expect(h.ledger.findNotificationByKind(kind, 'any')).toBeNull(); // the card did not
+    const report = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });
+    expect(report.recovered).toBe(0); // the obligation already existed — only the card was lost
+    expect(report.published).toBe(1);
+    const card = h.ledger.findNotificationByKind(kind, 'any');
+    expect(card?.routing).toBe('action-required');
+    expect(card?.detail).toContain('def456');
+    const second = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });
+    expect(second.published).toBe(0);
+    expect(h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind === kind)).toHaveLength(1);
+  });
+
+  it('leaves marked deliveries and unblocked lanes to their own owners', () => {
+    const h = makeHarness();
+    const worktrees = new InMemoryWorktreePort(join(tmpDir(), 'wt'));
+    // A marked phase on a blocked lane: the phase path owns it; the unmarked
+    // backstop must not double-publish the event-sequence card.
+    seedJob(h.ledger, 'job-uwc3', 'blocked');
+    h.ledger.beginPendingRebrief({
+      jobId: 'job-uwc3',
+      note: 'n',
+      briefing: 'b',
+      handoff: { kind: 'gru-decision', decision: 'marked' },
+    });
+    finalizeRebriefRequest({ ledger: h.ledger, worktrees, jobId: 'job-uwc3', minionId: 'm1', lanePath: null, note: 'n' });
+    const markedPass = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });
+    expect(markedPass.deliveries).toBe(0);
+    expect(markedPass.published).toBe(0);
+    expect(
+      h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.startsWith('silas.phase-handback.')),
+    ).toHaveLength(0);
+    // The marked path still completes and publishes exactly ONE card.
+    const delivery = h.ledger.latestJobEvent('job-uwc3', 'job.delivered');
+    expect(delivery).not.toBeNull();
+    expect(observePhaseCompletion({ ledger: h.ledger, notifications: h.notifications }, delivery!)?.created).toBe(true);
+    expect(
+      h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.startsWith('silas.phase-handback.')),
+    ).toHaveLength(1);
+    // An unblocked lane is the normal review flow: nothing to recover.
+    seedJob(h.ledger, 'job-uwc4', 'working');
+    h.ledger.appendCustomEvent({
+      kind: 'job.delivered',
+      jobId: 'job-uwc4',
+      payload: { source: 'silas-directive', sha: 'x' },
+    });
+    const healthyPass = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });
+    expect(healthyPass.deliveries).toBe(0);
   });
 });

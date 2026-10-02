@@ -68,6 +68,9 @@ async function boot(opts: {
   silasOps?: boolean;
   /** Gate selected minion turns before they settle (in-flight assertions). */
   minionPromptGate?: (text: string) => Promise<void> | undefined;
+  /** The health a minion handle reports AFTER its prompt settles — the
+   * fulfilled-but-error outcome both real adapters can produce. */
+  minionTurnHealth?: (text: string) => 'idle' | 'error';
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -93,6 +96,7 @@ async function boot(opts: {
     spawns.push({ role, options: options ?? {} });
     if (role === 'perkins') return hybrid.spawner(role, options);
     const id = `agent-${spawns.length}`;
+    let turnHealth: 'idle' | 'error' = 'idle';
     return {
       role,
       id,
@@ -117,6 +121,7 @@ async function boot(opts: {
           const branch = execFileSync('git', ['-C', options.cwd, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf-8' }).trim();
           execFileSync('git', ['-C', options.cwd, 'push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`], { stdio: 'ignore' });
         }
+        turnHealth = opts.minionTurnHealth?.(text) ?? 'idle';
       },
       async steer() {},
       async followUp() {},
@@ -124,7 +129,9 @@ async function boot(opts: {
         return () => {};
       },
       health() {
-        return { state: 'idle', lastActivity: null, sessionFile: null };
+        return turnHealth === 'error'
+          ? { state: 'error' as const, lastActivity: null, sessionFile: null, error: 'runtime settled the turn with an in-band error' }
+          : { state: 'idle' as const, lastActivity: null, sessionFile: null };
       },
       async dispose() {
         // The directive route disposes a freshly spawned fallback minion
@@ -763,6 +770,61 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('/api/silas/directive records admission but NO delivery or phase completion when the turn settles with an in-band error', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-inband-directive');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'inband-dir', repo_path: repo.path, title: 'error lane', briefing: 'b',
+      }, TOKEN);
+      const minionId = `agent-${h.spawns.length}`;
+      h.ledger.registerAgent({ id: minionId, role: 'minion', jobId: 'inband-dir' });
+      h.liveHandles.set(minionId, {
+        role: 'minion',
+        id: minionId,
+        sessionFile: null,
+        capabilities: FAKE_CAPABILITIES,
+        prompt: async () => {}, // resolves — the failure is in-band health
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'error' as const, lastActivity: null, sessionFile: null, error: 'assistant stopReason error' }),
+        async dispose() {},
+      });
+      h.ledger.setJobStatus('inband-dir', 'in-review');
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'inband-dir',
+        directive: 'fix it',
+        completion_handoff: { kind: 'gru-decision', decision: 'never owed by a failed turn' },
+      }, TOKEN);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      // The turn settled with an error: the request is admitted with a
+      // durable reconcile note and NEVER records a delivery.
+      const deadline = Date.now() + 10_000;
+      while ((h.ledger.getDirective(requestId)?.failReason ?? '').indexOf('in-band runtime error') === -1 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const readback = h.ledger.getDirective(requestId);
+      expect(readback?.state).toBe('admitted');
+      expect(readback?.deliverySeq).toBeNull();
+      expect(readback?.failReason).toContain('in-band runtime error');
+      expect(h.ledger.latestJobEvent('inband-dir', 'job.delivered')).toBeNull();
+      expect(h.ledger.latestJobEvent('inband-dir', 'job.minion-error')).not.toBeNull();
+      // The marked phase stays awaiting — never completed, never published.
+      const phase = h.ledger.listPhaseHandoffs({ jobId: 'inband-dir' })[0];
+      expect(phase?.state).toBe('awaiting');
+      expect(phase?.completionSeq).toBeNull();
+      expect(h.ledger.getJob('inband-dir')?.status).toBe('in-review'); // no false working flip
+      expect(
+        h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.includes('phase-handback')),
+      ).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('/api/silas/rebrief retires the live minion and re-briefs a FRESH one on the same lane', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-rebrief');
@@ -821,6 +883,46 @@ describe('dispatch server (E8)', () => {
       });
       expect(head).not.toBe(lane?.sha);
       expect(field<string>(res.json, 'delivered_sha')).toBe(head);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief keeps the markers and records NO delivery or phase completion when the turn settles with an in-band error', async () => {
+    const h = await boot({ minionTurnHealth: (text) => (text.startsWith('Re-brief —') ? 'error' : 'idle') });
+    const repo = makeFixtureRepo('fixture-silas-inband-rebrief');
+    cleanupRepos.push(repo);
+    try {
+      const dispatch = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'inband-rebrief', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
+      }, TOKEN);
+      expect(dispatch.status).toBe(202);
+      // Let the initial (healthy) briefing turn settle first.
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('inband-rebrief', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'inband-rebrief',
+        note: 'same blocker; try differently',
+        completion_handoff: { kind: 'gru-decision', decision: 'never owed by a failed turn' },
+      }, TOKEN);
+      expect(res.status, JSON.stringify(res.json)).toBe(202);
+      expect(field<string>(res.json, 'state')).toBe('turn-error');
+      // No guarded events landed: the marker pair stays pending for the
+      // boot recovery ladder, and the marked phase stays awaiting.
+      expect(h.ledger.listPendingRebriefs({ jobId: 'inband-rebrief' })).toHaveLength(2);
+      expect(h.ledger.latestJobEvent('inband-rebrief', 'silas.rebrief')).toBeNull();
+      expect(
+        h.ledger.listJobEvents('inband-rebrief').filter((event) => event.kind === 'job.delivered'),
+      ).toHaveLength(1); // the initial dispatch delivery only — no failed-turn delivery
+      expect(h.ledger.latestJobEvent('inband-rebrief', 'job.minion-error')).not.toBeNull();
+      const phase = h.ledger.listPhaseHandoffs({ jobId: 'inband-rebrief' })[0];
+      expect(phase?.state).toBe('awaiting');
+      expect(phase?.completionSeq).toBeNull();
+      expect(
+        h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.includes('phase-handback')),
+      ).toHaveLength(0);
     } finally {
       await h.close();
     }
