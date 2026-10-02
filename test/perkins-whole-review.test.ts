@@ -1870,16 +1870,23 @@ describe('provider pacing: combined review-turn gate (owner heist 2026-09-29)', 
       const external = gate.acquireReviewTurn({ id: 'external', label: 'external' });
       await vi.waitFor(() => expect(gate.view().review.queued).toHaveLength(2), { timeout: 20_000 });
       releaseChild();
-      const result = await running;
+      // The failed re-acquire ends the round (the lead is disposed), so the
+      // host rejects instead of returning a result — but the settled lens
+      // wave stays committed: both children really ran once each and their
+      // complete run records survive under the round's artifact directory
+      // (never erased or re-executed by the failed re-acquire).
+      await expect(running).rejects.toThrow(/lead session disposed/);
       expect(h.toolErrors.some((entry) =>
         entry.tool === 'perkins_run_specialists' && /pacing recorder unavailable/.test(entry.error),
       )).toBe(true);
-      // The lens runs really executed once each and stayed committed as
-      // undelivered findings — never erased and re-executed by the retry.
+      expect(h.leadCalls).toHaveLength(1);
+      expect(h.leadCalls[0]?.disposed).toBe(true);
       expect(h.childCalls).toHaveLength(2);
-      const runs = result.specialistRuns.filter((run) => run.status === 'valid');
-      expect(runs.map((run) => run.lens).sort()).toEqual(['blind', 'edge']);
-      expect(runs.every((run) => run.findingsDelivered === false)).toBe(true);
+      const childRecords = readdirSync(join(h.frozen.directory, 'children'))
+        .filter((name) => name.endsWith('.json'))
+        .map((name) => JSON.parse(readFileSync(join(h.frozen.directory, 'children', name), 'utf8')) as { lens: string; status: string });
+      expect(childRecords.map((record) => record.lens).sort()).toEqual(['blind', 'edge']);
+      expect(childRecords.every((record) => record.status === 'valid')).toBe(true);
       (await external).release();
     } finally {
       holder.release();
@@ -2005,9 +2012,12 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
           if (firstChild === null) firstChild = call.agentId;
           promptsByChild.set(call.agentId, (promptsByChild.get(call.agentId) ?? 0) + 1);
           if (call.agentId === firstChild) {
-            // Consume most of the 10-minute child budget on each model call
-            // and stay in the rate-limit class so the bounded retry runs.
-            clock += 9_400_000;
+            // Consume 400000 ms of the 600000 ms (10-minute) child turn
+            // budget on each model call and stay in the rate-limit class so
+            // the bounded retry runs: after call 1 the retry still has room,
+            // after call 2 the elapsed third iteration is stopped BEFORE the
+            // model runs.
+            clock += 400_000;
             throw new Error('429 too many requests');
           }
           return '[]';

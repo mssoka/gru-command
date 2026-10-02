@@ -2279,6 +2279,9 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     const handle = new FakeHandle('minion', 'minion-attributed', null);
     handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-attributed' };
     h.registry.adopt(handle);
+    // The FK-enforcing ledger needs the owned Job row this retry event is
+    // attributed to; the jobId assertion below is the attribution oracle.
+    h.api.addJob({ id: 'job-attributed', repo: 'gru-command', title: 'attributed lane' });
     h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-attributed' });
     emitFailure(handle, '429 too many requests');
     const retry = h.api.listEvents({ limit: 100 }).find((event) => event.kind === 'pacing.auto-retry');
