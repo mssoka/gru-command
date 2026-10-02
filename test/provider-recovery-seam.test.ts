@@ -115,6 +115,10 @@ class FakeRegistry implements SupervisorRegistry {
     return this.handles.get(agentId) ?? null;
   }
   spawns = 0;
+  /** Test hook: observe EVERY spawned handle, whichever path spawns it
+   * (the DispatchService spawner and the claim/re-brief registry path both
+   * funnel here — a dispatch-local observer would miss claim spawns). */
+  onSpawn: ((handle: FakeHandle) => void) | null = null;
   async spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle> {
     this.next += 1;
     this.spawns += 1;
@@ -122,6 +126,7 @@ class FakeRegistry implements SupervisorRegistry {
     this.handles.set(handle.id, handle);
     this.emit({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
     this.wireTap(handle, role);
+    this.onSpawn?.(handle);
     return handle;
   }
   /** Mirror the real registry: handle events flow through the tap. */
@@ -549,28 +554,29 @@ class DispatchSeamHarness {
       now: () => Date.parse('2026-09-28T10:00:00Z'),
     });
     this.supervisor.start();
+    // Observe EVERY minion spawn (dispatch and claim/re-brief alike): the
+    // first briefing turn is the wall; any later minion is the continuation
+    // and admits its turn so the separate admission record can be proven.
+    this.registry.onSpawn = (handle) => {
+      if (handle.role !== 'minion') return;
+      this.minionSpawns += 1;
+      this.minionHandles.push(handle);
+      if (this.minionSpawns === 1) {
+        // The wall turn: the minion prompt rejects. The dispatch settle
+        // lands from that rejection BEFORE the runtime error event is
+        // delivered to the supervisor below (the r4 race order).
+        handle.promptHook = async () => {
+          throw new Error('429: {"error":{"code":"1302","message":"usage window limit reached"}}');
+        };
+      } else {
+        // The continuation admits its turn (the separate admission record).
+        handle.promptHook = async () => handle.emit({ type: 'turn_start' });
+      }
+    };
     this.dispatch = new DispatchService({
       ledger: this.ledger,
       worktrees: this.worktrees,
-      spawner: async (role, options) => {
-        const handle = (await this.registry.spawn(role, options)) as FakeHandle;
-        if (role === 'minion') {
-          this.minionSpawns += 1;
-          this.minionHandles.push(handle);
-          if (this.minionSpawns === 1) {
-            // The wall turn: the minion prompt rejects. The dispatch settle
-            // lands from that rejection BEFORE the runtime error event is
-            // delivered to the supervisor below (the r4 race order).
-            handle.promptHook = async () => {
-              throw new Error('429: {"error":{"code":"1302","message":"usage window limit reached"}}');
-            };
-          } else {
-            // The continuation admits its turn (the separate admission record).
-            handle.promptHook = async () => handle.emit({ type: 'turn_start' });
-          }
-        }
-        return handle;
-      },
+      spawner: async (role, options) => this.registry.spawn(role, options),
     });
   }
 
