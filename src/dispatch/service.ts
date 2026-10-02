@@ -9,7 +9,7 @@ import { renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
-import { recordFollowUpDelivery } from './fix-directive.js';
+import { recordFollowUpDelivery, promptTerminalVerdict } from './fix-directive.js';
 import { PR_CREATION_RULE } from './pr-creation.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -208,6 +208,22 @@ export class DispatchService {
         )
         .then(
           async () => {
+            // Transport resolution is not success: both adapters resolve a
+            // fulfilled prompt even when the turn ended in an in-band error
+            // (Claude result.isError; Pi assistant stopReason 'error'). The
+            // handle's health at settle time is the runtime's terminal
+            // evidence — without this correlation an error-only audit would
+            // record a phase-tagged delivery and publish a completed phase.
+            const verdict = promptTerminalVerdict(handle);
+            if (!verdict.ok) {
+              return this.recordTurnFailure(
+                job.id,
+                handle.id,
+                handoffPhaseId,
+                deliveredRecorded,
+                verdict.error ?? 'runtime settled the briefing turn with an in-band error',
+              );
+            }
             const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
               worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch',
               ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}) });
@@ -220,26 +236,8 @@ export class DispatchService {
             this.log('info', 'minion briefing turn completed', { job: job.id, agent: handle.id });
             return { ok: true as const };
           },
-          (error: unknown) => {
-            this.opts.ledger.appendCustomEvent({
-              kind: 'job.minion-error',
-              jobId: job.id,
-              payload: { agentId: handle.id, error: String(error) },
-            });
-            this.recordSettleOutcome(job.id, 'blocked');
-            // A failed attempt must never masquerade as a completed marked
-            // phase: close the guard row only when no delivery was recorded
-            // (delivered phases are finished by the completion reconcile).
-            if (!deliveredRecorded) {
-              this.closeHandoffQuietly(handoffPhaseId, `dispatch turn failed: ${String(error)}`);
-            }
-            this.log('error', 'minion briefing turn failed', {
-              job: job.id,
-              agent: handle.id,
-              error: String(error),
-            });
-            return { ok: false as const, error: String(error) };
-          },
+          (error: unknown) =>
+            this.recordTurnFailure(job.id, handle.id, handoffPhaseId, deliveredRecorded, String(error)),
         );
 
       return { job: working, worktree, agentId: handle.id, settled };
@@ -249,6 +247,31 @@ export class DispatchService {
       this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${String(error)}`);
       throw error;
     }
+  }
+
+  /** One failure path for a rejected prompt AND a fulfilled-but-error
+   * turn: durable error event, blocked lane, and the marked guard row
+   * closed only when no delivery was recorded (a recorded delivery means
+   * the completion reconcile owns the phase). A failed attempt can never
+   * masquerade as a completed marked phase. */
+  private recordTurnFailure(
+    jobId: string,
+    agentId: string,
+    phaseId: string | null,
+    deliveredRecorded: boolean,
+    error: string,
+  ): { ok: false; error: string } {
+    this.opts.ledger.appendCustomEvent({
+      kind: 'job.minion-error',
+      jobId,
+      payload: { agentId, error },
+    });
+    this.recordSettleOutcome(jobId, 'blocked');
+    if (!deliveredRecorded) {
+      this.closeHandoffQuietly(phaseId, `dispatch turn failed: ${error}`);
+    }
+    this.log('error', 'minion briefing turn failed', { job: jobId, agent: agentId, error });
+    return { ok: false as const, error };
   }
 
   /** Close an awaiting marked-phase guard row after a positive failure.

@@ -33,6 +33,37 @@ export interface DirectiveRoutingDeps {
   readonly lessons?: LessonsReferencePort;
 }
 
+/** The terminal verdict of a prompt that RESOLVED. Both adapters settle a
+ * fulfilled prompt even when the turn ended in an in-band error (Claude
+ * `result.isError` resolves with error state; Pi surfaces assistant
+ * `stopReason: 'error'` and still resolves). Resolution is transport
+ * completion, NOT a successful phase: every marked completion path must
+ * correlate this verdict or a failed turn masquerades as a completed
+ * phase. The handle's own health at settle time is the runtime's terminal
+ * evidence; an unreadable health is unproven and never becomes success. */
+export interface PromptTerminalVerdict {
+  readonly ok: boolean;
+  readonly error: string | null;
+}
+
+export function promptTerminalVerdict(handle: Pick<AgentHandle, 'health'>): PromptTerminalVerdict {
+  try {
+    const health = handle.health();
+    if (health.state === 'error') {
+      return { ok: false, error: health.error ?? 'runtime settled the turn with an in-band error' };
+    }
+    return { ok: true, error: null };
+  } catch (error) {
+    return { ok: false, error: `runtime terminal health unreadable: ${String(error)}` };
+  }
+}
+
+function verdictFields(verdict: PromptTerminalVerdict): { readonly outcome: 'completed' | 'error'; readonly error?: string } {
+  return verdict.ok
+    ? { outcome: 'completed' }
+    : { outcome: 'error', error: verdict.error ?? 'runtime settled the turn with an in-band error' };
+}
+
 /** Route a directive to the implementing minion: the live job minion
  * first; otherwise a fresh minion on the job lane. */
 export async function routeFixDirectiveToMinion(
@@ -43,7 +74,16 @@ export async function routeFixDirectiveToMinion(
     /** Prompt owner tag (audit); defaults to the shared routing owner. */
     owner?: string;
   },
-): Promise<{ delivered: boolean; minionId?: string; note?: string }> {
+): Promise<{
+  delivered: boolean;
+  minionId?: string;
+  note?: string;
+  /** 'error' = the prompt settled with an in-band runtime error: it WAS
+   * admitted, but it is not a successful completion and must never
+   * complete a marked phase or record a phase-tagged delivery. */
+  outcome?: 'completed' | 'error';
+  error?: string;
+}> {
   const owner = input.owner ?? 'fix-directive';
   // Follow-up turns carry the CURRENT creation rule too: a legacy briefing
   // that permitted drafts must not outrank it on the live/resumed paths.
@@ -62,7 +102,7 @@ export async function routeFixDirectiveToMinion(
     if (handle !== null) {
       try {
         await racedPrompt(handle, directive, input.signal, owner);
-        return { delivered: true, minionId: minion.id };
+        return { delivered: true, minionId: minion.id, ...verdictFields(promptTerminalVerdict(handle)) };
       } catch (error) {
         // A resident-budget reclaim may be disposing this handle under us
         // (typed handshake): fall through to the resume/re-brief path —
@@ -102,13 +142,17 @@ export async function routeFixDirectiveToMinion(
     handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal });
     prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
   }
+  let verdict: PromptTerminalVerdict = { ok: true, error: null };
   try {
     input.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: input.jobId, sessionFile: handle.sessionFile });
     await racedPrompt(handle, prompt, input.signal, owner);
+    // Read the terminal verdict BEFORE dispose(): a disposed handle cannot
+    // attest the turn it just ran.
+    verdict = promptTerminalVerdict(handle);
   } finally {
     await handle.dispose();
   }
-  return { delivered: true, minionId: handle.id };
+  return { delivered: true, minionId: handle.id, ...verdictFields(verdict) };
 }
 
 /** Race a prompt against cancellation so shutdown cannot stall on an
@@ -240,7 +284,17 @@ export async function rebriefFreshMinion(
      * crash mid-turn leaves a resumable pointer behind. */
     onSpawned?: (worker: { readonly id: string; readonly sessionFile: string | null }) => void;
   },
-): Promise<{ minionId: string; lanePath: string; prompt: string; sessionFile: string | null }> {
+): Promise<{
+  minionId: string;
+  lanePath: string;
+  prompt: string;
+  sessionFile: string | null;
+  /** 'error' = the prompt settled with an in-band runtime error (resolved
+   * but failed): the caller must keep the request markers pending and
+   * record NO delivery and NO phase completion. */
+  outcome: 'completed' | 'error';
+  error?: string;
+}> {
   const jobMinions = input.ledger
     .listAgents()
     .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
@@ -279,10 +333,18 @@ export async function rebriefFreshMinion(
       ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
       : {}),
   });
+  let verdict: PromptTerminalVerdict = { ok: true, error: null };
   try {
     await handle.prompt(prompt, { owner: `silas-rebrief:${input.jobId}` });
+    verdict = promptTerminalVerdict(handle);
   } catch (error) {
     throw new Error(`re-brief turn failed on ${handle.id}: ${String(error)}`);
   }
-  return { minionId: handle.id, lanePath: lane.path, prompt, sessionFile: handle.sessionFile };
+  return {
+    minionId: handle.id,
+    lanePath: lane.path,
+    prompt,
+    sessionFile: handle.sessionFile,
+    ...verdictFields(verdict),
+  };
 }

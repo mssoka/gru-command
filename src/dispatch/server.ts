@@ -484,6 +484,32 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           minionId: delivery.minionId,
           eventSeq: sent.seq,
         });
+        // In-band runtime error (resolved-but-failed: Claude result.isError,
+        // Pi stopReason 'error'): the prompt WAS admitted, so the admission
+        // evidence stands — but there is no successful delivery and NO
+        // phase completion. The request stays admitted with a durable
+        // reconcile note (the boot pass escalates it for a Gru
+        // reconciliation); the recovery decision is preserved without
+        // claiming phase evidence and without auto-retry.
+        if (delivery.outcome === 'error') {
+          options.ledger.appendCustomEvent({
+            kind: 'job.minion-error',
+            jobId,
+            payload: { agentId: delivery.minionId, error: delivery.error ?? 'runtime error' },
+          });
+          options.ledger.recordDirectiveReconcile({
+            requestId: intent.requestId,
+            note:
+              'admitted turn settled with an in-band runtime error' +
+              `${delivery.error === undefined ? '' : `: ${delivery.error}`} — no delivery recorded; reconcile before recording completion`,
+          });
+          log('warn', 'silas directive turn settled with an in-band error — no delivery/completion recorded', {
+            job: jobId,
+            request: intent.requestId,
+            error: delivery.error ?? null,
+          });
+          return;
+        }
         flipJobToWorking(options.ledger, jobId);
         // The follow-up delivery signal: the directive turn settled, so record
         // the delivery (with the lane head it produced) that re-arms review —
@@ -593,7 +619,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const rebriefPhaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
       const controller = new AbortController();
       directiveControllers.add(controller);
-      let result: { minionId: string; lanePath: string; prompt: string; sessionFile: string | null };
+      let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
       try {
         result = await rebriefFreshMinion({
           registry: ops.registry,
@@ -613,6 +639,33 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         });
       } finally {
         directiveControllers.delete(controller);
+      }
+      if (result.outcome === 'error') {
+        // In-band runtime error: the re-brief turn resolved but failed. No
+        // delivery, no `silas.rebrief`, no phase completion — the durable
+        // markers stay pending for the boot recovery ladder, and the error
+        // is on the record honestly. The request was NOT a successful
+        // completion and must never complete a marked phase.
+        options.ledger.appendCustomEvent({
+          kind: 'job.minion-error',
+          jobId,
+          payload: { agentId: result.minionId, error: result.error ?? 'runtime error' },
+        });
+        log('warn', 're-brief turn settled with an in-band error — markers kept, no delivery recorded', {
+          job: jobId,
+          minion: result.minionId,
+          error: result.error ?? null,
+        });
+        json(res, 202, {
+          job_id: jobId,
+          minion_id: result.minionId,
+          state: 'turn-error',
+          error: result.error ?? null,
+          note:
+            'the re-brief turn settled with an in-band runtime error; no delivery or phase completion ' +
+            'was recorded and the request markers stay pending for restart reconciliation',
+        });
+        return true;
       }
       // The follow-up delivery signal: the fresh minion's re-brief turn
       // settled; record the delivery that re-arms the re-review. Both

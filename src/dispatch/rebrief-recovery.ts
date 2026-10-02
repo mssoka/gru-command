@@ -341,6 +341,7 @@ async function redispatchGroup(
         group,
         ...(resumeFile !== null ? { resumeFile } : {}),
       });
+      throwIfTurnInBandError(result);
       path = resumeFile !== null ? 'resumed' : 'redispatched';
     } catch (error) {
       if (resumeFile === null) throw error;
@@ -350,6 +351,7 @@ async function redispatchGroup(
         error: String(error),
       });
       result = await runRebriefTurn(deps, { jobId, note, briefing: job.briefing, group });
+      throwIfTurnInBandError(result);
     }
     const finalized = finalizeRebriefRequest({
       ledger: deps.ledger,
@@ -429,6 +431,16 @@ function runRebriefTurn(
       });
     },
   });
+}
+
+/** A recovery turn that RESOLVED with an in-band runtime error is a
+ * failed turn, not a delivery: it must take the same failure ladder as a
+ * rejected prompt (resume retry, then a bounded escalation) and never
+ * record guarded events or complete a marked phase. */
+function throwIfTurnInBandError(result: Awaited<ReturnType<typeof rebriefFreshMinion>>): void {
+  if (result.outcome === 'error') {
+    throw new Error(`re-brief turn settled with an in-band runtime error: ${result.error ?? 'unknown'}`);
+  }
 }
 
 /** The interrupted worker's session, when one exists on disk: the marker's

@@ -272,7 +272,7 @@ describe('the non-draft PR rule on follow-up directives', () => {
       directive: 'open the PR for the finished fix',
       signal: new AbortController().signal,
     });
-    expect(outcome).toEqual({ delivered: true, minionId: 'minion-live' });
+    expect(outcome).toEqual({ delivered: true, minionId: 'minion-live', outcome: 'completed' });
     expect(prompted).toHaveLength(1);
     expect(prompted[0]).toContain('open the PR for the finished fix');
     expect(prompted[0]).toContain('ordinary, non-draft PR');
