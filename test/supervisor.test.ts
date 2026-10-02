@@ -2324,8 +2324,10 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     expect(handle.disposed).toBe(false);
     await sleeper.release(); // delivery starts and hangs
     h.advance(60); // a running delivery is NOT a pause — the watchdog keeps counting
-    await vi.waitFor(() => expect(handle.disposed).toBe(true), { timeout: 5_000 });
-    expect(h.registry.spawnCalls.length).toBeGreaterThan(0);
+    await vi.waitFor(() => {
+      expect(handle.disposed).toBe(true);
+      expect(h.registry.spawnCalls.length).toBeGreaterThan(0);
+    }, { timeout: 5_000 });
     h.dispose();
   });
 
@@ -2514,6 +2516,7 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
     const h = boot(undefined, { workerGate: gate });
     try {
       const handle = new FakeHandle('minion', 'minion-restart-cap', null);
+      h.api.addJob({ id: 'job-cap', repo: 'fixture', title: 'restart recovery admission' });
       h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-cap' });
       h.registry.adopt(handle);
       hang(handle);

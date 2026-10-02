@@ -31,6 +31,14 @@ export interface SilasOpsSurface {
   readonly registry: DirectiveRegistry;
   readonly worktrees: WorktreePort;
   readonly notifications: NotificationCenter;
+  /** Provider-recovery claim surface (the guarded continuation
+   * transition): absent = the claim endpoint answers 503 (sensor not
+   * wired). */
+  readonly providerRecovery?: {
+    claim(waitId: string, by: string): Promise<unknown>;
+  };
+  /** The supervisor's guarded owned re-arm for the silas slot. */
+  readonly slotReArm?: { ownedProviderReArm(agentId: string, waitId: string): boolean };
 }
 
 export interface DispatchServerOptions {
@@ -480,6 +488,27 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         payload: { title, notification_id: notification.id },
       });
       json(res, 200, { notification_id: notification.id });
+      return true;
+    }
+    if (req.method === 'POST' && path === '/api/silas/provider-recovery/claim') {
+      if (!authed(req, res)) return true;
+      const ops = silasOpsOr503(res);
+      if (ops === null) return true;
+      if (ops.providerRecovery === undefined) {
+        json(res, 503, {
+          error: 'provider_recovery_not_hosted',
+          detail: 'the provider-recovery sensor is not wired on this service',
+        });
+        return true;
+      }
+      const body = await readBody(req);
+      const waitId = strField(body, 'wait_id');
+      const by = strField(body, 'by');
+      if (by !== 'silas') {
+        throw new Error('provider-recovery claims are recorded as silas actions; pass by: "silas"');
+      }
+      const result = await ops.providerRecovery.claim(waitId, by);
+      json(res, 200, result as Record<string, unknown>);
       return true;
     }
     return false;

@@ -25,7 +25,7 @@ import { ConfigError, type PacingConfig } from '../config.js';
  * exhaustion ("quota exceeded", "insufficient balance") must never be
  * retried into a silent loop. */
 const GENERIC_RATE_LIMIT_PATTERN =
-  /^429\b|\b(?:http(?:\/ ?\d+(?:\.\d+)*)?|status(?:[_\s]?code)?|error(?:[_\s]?code)?|code)\b\s*[:=,_-]?\s*429\b|\b429\b[^\p{L}\p{N}]{0,8}(?:too many requests|rate[- ]?limit)|\btoo many requests\b|\bthrottl(?:e|ed|ing)\b|\brate[- ]?limit(?:ed|ing)?\b/i;
+  /^429\b|\b(?:http(?:\/ ?\d+(?:\.\d+)*)?|status(?:[_\s]?code)?|error(?:[_\s]?code)?|code)\b\s*[:=,_-]?\s*429\b|\b429\b[^\p{L}\p{N}]{0,8}(?:too many requests|rate[- ]?limit)|\btoo many requests\b|\bthrottl(?:e|ed|ing)\b|\brate[- ]?limit(?:ed|ing)?\b/iu;
 
 /** True when the error text matches the generic 429 family or one of the
  * configured signatures. Never matches on provider identity. */

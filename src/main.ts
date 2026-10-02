@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
@@ -23,6 +23,14 @@ import { createWorktreeServer } from './worktrees/server.js';
 import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver } from './dispatch/silas-driver.js';
+import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
+import { ModelRuntimeProbe } from './provider-recovery/probe.js';
+import {
+  composeMetadataReaders,
+  type NativeCommandPort,
+  type NativeContextPort,
+} from './provider-recovery/composition.js';
+import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
@@ -154,6 +162,24 @@ import { BOARD_WS_PATH } from './board/frames.js';
 import { GruSessionPointer } from './chat/session-state.js';
 import { createStaticRoot, defaultStaticRoot } from './static.js';
 import { SERVICE_NAME, VERSION } from './version.js';
+
+/** Non-secret override flags from the Claude settings file (presence
+ * booleans only; values never read into memory beyond the check). A
+ * missing/unreadable file counts as NO override — the env overrides and
+ * the keychain item itself remain the binding proofs. */
+function claudeSettingsOverridesPresent(): boolean {
+  try {
+    const raw = readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8');
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof parsed['apiKeyHelper'] === 'string' && parsed['apiKeyHelper'] !== '') return true;
+    const env = parsed['env'];
+    if (typeof env !== 'object' || env === null) return false;
+    const keys = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN'];
+    return keys.some((key) => (env as Record<string, unknown>)[key] !== undefined);
+  } catch {
+    return false;
+  }
+}
 
 async function main(): Promise<number> {
   const bootHr = process.hrtime.bigint();
@@ -300,6 +326,7 @@ async function main(): Promise<number> {
     bob?: BobScheduler;
     dream?: DreamScheduler;
     silas?: SilasDriver;
+    providerRecovery?: ProviderRecoverySensor;
     wave?: WaveRunner;
     verify?: ReturnType<typeof createVerificationServer>;
     deployDrift?: DeployDriftTracker;
@@ -388,6 +415,13 @@ async function main(): Promise<number> {
             state.silas.stop();
           } catch (error) {
             logger.error('silas driver stop failed', { error: String(error) });
+          }
+        }
+        if (state.providerRecovery !== undefined) {
+          try {
+            state.providerRecovery.stop();
+          } catch (error) {
+            logger.error('provider-recovery sensor stop failed', { error: String(error) });
           }
         }
         if (state.wave !== undefined) {
@@ -611,6 +645,111 @@ async function main(): Promise<number> {
     decisionRuntime,
     () => decisionRuntime.status().status === 'ready',
   );
+  // Provider-recovery sensor (owner-approved 2026-09-28): constructed
+  // BEFORE the supervisor so its recorder can observe wall stops, with
+  // late-bound wake (SilasDriver lands below) and guarded re-arm ports.
+  // Disabled by config = fully inert (no waits, no probes, no wakes).
+  const silasWakePort: {
+    trigger: (input: { kind: 'provider.restored'; routeKey: string }) => Promise<void>;
+  } = {
+    trigger: async (input) => {
+      const driver = state.silas;
+      if (driver === undefined) {
+        logger.log('warn', 'provider-restored wake dropped — silas driver not yet started (the sweep retries)', {
+          route: input.routeKey,
+        });
+        return;
+      }
+      await driver.trigger({ kind: 'provider.restored' });
+    },
+  };
+  const slotReArmPort = {
+    ownedProviderReArm: (agentId: string, waitId: string): boolean =>
+      supervisorLive.ownedProviderReArm(agentId, waitId),
+  };
+  // Non-generation metadata readers (owner-approved overlay), composed
+  // from read-only installed source interfaces: codex rides a nonmutating
+  // one-off auth.json read (readStoredCredential — no store run, no
+  // refresh); claude composes against the typed native snapshot port whose
+  // platform proof is the keychain item itself (never a hardcoded brand
+  // flag). ZERO generation on these paths, and their failures never fall
+  // back to generation.
+  const providerRecoverySensor = new ProviderRecoverySensor({
+    config: config.providerRecovery,
+    ledger,
+    probe: new ModelRuntimeProbe({
+      runtime: () => registry.piModelRuntime(),
+      // The documented conservative finite bound governs the generation
+      // probe too — not only the metadata readers/reservation expiry.
+      timeoutMs: config.providerRecovery.probeTimeoutMs,
+    }),
+    metadataReaders: composeMetadataReaders({
+      config: config.providerRecovery,
+      codexAuthPath: undefined, // readStoredCredential resolves the installed auth.json itself
+      fetch: {
+        get: async ({ url, authorization, accept, timeoutMs, extraHeaders }) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          timer.unref?.();
+          try {
+            const response = await fetch(url, {
+              headers: { authorization, accept, ...(extraHeaders ?? {}) },
+              signal: controller.signal,
+              redirect: 'manual',
+            });
+            return { status: response.status, body: await response.text() };
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+      },
+      claude: {
+        // Traced native protocol: one bounded `security find-generic-password`
+        // against the ACTUAL selected store/account. Never invoked while the
+        // sensor is disabled; activation runs it under a ruled checkpoint.
+        // Output stays in-process — never logged.
+        command: {
+          findGenericPassword: async ({ service, account }) => {
+            const { execFile } = await import('node:child_process');
+            return await new Promise((resolve) => {
+              execFile(
+                'security',
+                ['find-generic-password', '-s', service, '-a', account, '-w'],
+                { timeout: 10_000 },
+                (error, stdout) => {
+                  if (error !== null) resolve(null);
+                  else resolve({ exitCode: 0, stdout: String(stdout) });
+                },
+              );
+            });
+          },
+        } satisfies NativeCommandPort as NativeCommandPort,
+        // OBSERVED context only (phase3 ruling: never assert a selected
+        // platform): env overrides plus non-secret flags from the Claude
+        // settings file. Presence booleans only — values never logged.
+        context: (): NativeContextPort => ({
+          overridesPresent:
+            process.env['ANTHROPIC_API_KEY'] !== undefined ||
+            process.env['ANTHROPIC_AUTH_TOKEN'] !== undefined ||
+            process.env['ANTHROPIC_BASE_URL'] !== undefined ||
+            process.env['CLAUDE_CODE_OAUTH_TOKEN'] !== undefined ||
+            process.env['CLAUDE_CODE_USE_BEDROCK'] !== undefined ||
+            process.env['CLAUDE_CODE_USE_VERTEX'] !== undefined ||
+            process.env['CLAUDE_CODE_USE_FOUNDRY'] !== undefined ||
+            process.env['CLAUDE_CONFIG_DIR'] !== undefined ||
+            claudeSettingsOverridesPresent(),
+        }),
+        account: () => process.env['USER'] ?? '',
+      },
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    }),
+    notifications,
+    wake: silasWakePort,
+    slotReArm: slotReArmPort,
+    silasHosted: () => config.silas.enabled,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  state.providerRecovery = providerRecoverySensor;
   const supervisorLive = new Supervisor({
     config: config.supervision,
     registry,
@@ -619,6 +758,63 @@ async function main(): Promise<number> {
     decisions: decisionRuntime,
     rateLimitBackoff: pacing.backoff,
     workerGate: pacing.gate,
+    providerWalls: {
+      // Machine-vs-owner classification BEFORE any owner stop (phase3 r1
+      // #2): the sink persists an eligible machine-owned wait FIRST and
+      // answers true; false/throw keeps the conservative needs-owner stop.
+      ownsProviderWall: async (input) => {
+        const wait = await establishProviderWait(providerRecoverySensor, {
+          agentId: input.agentId,
+          role: input.role,
+          slotId: input.slotId,
+          jobId: input.jobId,
+          sessionFile: input.sessionFile,
+          failureClass: input.failureClass,
+          provider: input.source?.provider ?? null,
+          model: input.source?.model ?? null,
+          errorMessage: input.source?.error ?? '',
+          typed: input.source?.typed ?? null,
+          incidentId: null,
+          continuation: input.continuation,
+        }).catch((error: unknown) => {
+          logger.log('error', 'provider wait establishment failed (conservative owner stop kept)', {
+            agent_id: input.agentId,
+            error: String(error),
+          });
+          return null;
+        });
+        return wait !== null;
+      },
+      // Link the machine-owned action-required notice onto the persisted
+      // wait: the incident resolves with the wait's own terminal lifecycle.
+      linkProviderWaitIncident: ({ agentId, incidentId }) => {
+        const wait = ledger.openProviderWaitForAgent(agentId);
+        if (wait !== null) ledger.setProviderWaitIncident(wait.id, incidentId);
+      },
+      // The observation report for NON-machine-owned stops (incidentId
+      // null): the sink re-classifies; ineligible classes stay owner-held.
+      onProviderWall: (observation) => {
+        void establishProviderWait(providerRecoverySensor, {
+          agentId: observation.agentId,
+          role: observation.role,
+          slotId: observation.slotId,
+          jobId: observation.jobId,
+          sessionFile: observation.sessionFile,
+          failureClass: observation.failureClass,
+          provider: observation.source?.provider ?? null,
+          model: observation.source?.model ?? null,
+          errorMessage: observation.source?.error ?? '',
+          typed: observation.source?.typed ?? null,
+          incidentId: observation.incidentId,
+          continuation: observation.continuation,
+        }).catch((error: unknown) => {
+          logger.log('error', 'provider wait establishment failed', {
+            agent_id: observation.agentId,
+            error: String(error),
+          });
+        });
+      },
+    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   supervisor = supervisorLive;
@@ -904,7 +1100,28 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     ...(config.silas.enabled && silasSlot !== null
-      ? { silasOps: { registry, worktrees: worktreeManager, notifications } }
+      ? {
+          silasOps: {
+            registry,
+            worktrees: worktreeManager,
+            notifications,
+            slotReArm: slotReArmPort,
+            providerRecovery: {
+              claim: (waitId: string, by: string) =>
+                claimProviderRecoveryContinuation(
+                  {
+                    registry,
+                    ledger,
+                    worktrees: worktreeManager,
+                    slotReArm: slotReArmPort,
+                    log: (level, msg, fields) => logger.log(level, msg, fields),
+                  },
+                  waitId,
+                  by,
+                ),
+            },
+          },
+        }
       : {}),
     ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
@@ -987,6 +1204,7 @@ async function main(): Promise<number> {
       staticRoot: createStaticRoot(defaultStaticRoot(import.meta.url)),
       supervisionStatus: () => supervisorLive.status(),
       decisionsStatus: () => decisionRuntime.status(),
+      providerRecoveryView: () => providerRecoverySensor.waitingView(),
       buildInfo: () => buildInfo,
       requestHook: (req, res, path) =>
         lessonsServer.requestHook(req, res, path) ||
@@ -1085,6 +1303,19 @@ async function main(): Promise<number> {
     });
     state.silas = silas;
     silas.start();
+  }
+  // The provider-recovery sensor runs in the service, independent of
+  // Silas's model availability: its timer starts after listen (same
+  // pattern as the drivers) and its boot reconciliation re-wakes any
+  // recovery whose delivery was lost across a restart — never silently
+  // re-baselined away.
+  if (config.providerRecovery.enabled) {
+    providerRecoverySensor.start();
+    void providerRecoverySensor.reconcileAtBoot().catch((error: unknown) => {
+      logger.error('provider-recovery boot reconciliation failed', { error: String(error) });
+    });
+  } else {
+    logger.info('provider-recovery sensor disabled — owner activation stays manual', {});
   }
 
   logger.info('listening', { host: handle.host, port: handle.port });

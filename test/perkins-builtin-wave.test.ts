@@ -3789,6 +3789,9 @@ describe('provider pacing through WaveRunner', () => {
     const wave = new WaveRunner({ ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts, reviewGate: gate,
       poster, prHeadProbe: localHeadProbe('feature/pacing-wave'),
       rateLimitBackoff: { baseMs: 1, maxMs: 1, maxRetries: 1, patterns: [] } });
+    // Pin the draw: capped backoff now spreads downward instead of always
+    // clamping to maxMs. The ledger assertion still checks an exact delay.
+    const jitter = vi.spyOn(Math, 'random').mockReturnValue(0);
     try {
       const running = wave.runRound({ jobId: 'pacing-wave' });
       await vi.waitFor(() => expect(gate.view().review.queued).toHaveLength(1));
@@ -3811,6 +3814,7 @@ describe('provider pacing through WaveRunner', () => {
       expect(event?.agentId).toBeTruthy();
       expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
     } finally {
+      jitter.mockRestore();
       await wave.shutdown();
       for (const dir of [root, artifacts, sessions]) rmSync(dir, { recursive: true, force: true });
     }
