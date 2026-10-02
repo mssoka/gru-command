@@ -83,12 +83,25 @@ class DeferredReviewPort implements WorktreePort {
 
 /** Attach a fetchable bare origin inside the test's port root and push the
  * reviewed branch: the fresh-head freeze reads THIS tip, never the local
- * ref left behind by the fixture. */
-function attachOrigin(repo: FixtureRepo, branch: string, root: string): void {
+ * ref left behind by the fixture. `opts.batched` (T4 only) replaces
+ * `init --bare` + `push` with ONE `clone --bare` of the repo at the same
+ * commit: the bare carries refs/heads/<branch> at the identical sha (plus
+ * inert extra state nothing in the flow reads — the bare's HEAD, its own
+ * config, and a stale refs/heads/main copy; the head probe reads the LOCAL
+ * ref, review worktrees are created from the job repo, and the reconcile
+ * git-ops are local), and the job repo's `origin` remote is added exactly
+ * as before. Callers that omit the flag keep the historical three-process
+ * shape byte-for-byte (phase pr142-t4-source-repair-20261002). */
+function attachOrigin(repo: FixtureRepo, branch: string, root: string, opts?: { readonly batched?: boolean }): void {
   const origin = join(root, 'origin.git');
-  execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
-  repo.git(['remote', 'add', 'origin', origin]);
-  repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+  if (opts?.batched === true) {
+    execFileSync('git', ['clone', '--bare', '--quiet', repo.path, origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', origin]);
+  } else {
+    execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', origin]);
+    repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+  }
 }
 
 /** Probe double for PR rounds: report the reviewed branch's local tip (the
@@ -115,6 +128,17 @@ function makeSpawner(
   order: string[],
   onLeadStart?: () => void,
   answerOverride?: (prompt: string) => string | undefined,
+  /** Canonical security-blocker evidence the scripted lead cites on its
+   * second attempt. Defaults to the historical `return 43;` snippet the
+   * pre-existing fixtures commit; T4's fixture commits `return 44;`, so it
+   * passes the snippet its frozen diff actually contains — the locatable-
+   * evidence contract (whole.ts evidenceAtCitedLocation) then accepts the
+   * canonical attempt instead of rejecting it (which also pays a frozen
+   * path-diff git process per round). The malformed first attempt and the
+   * two-run attempt coverage are unchanged, and every caller that omits
+   * this behaves byte-for-byte as before
+   * (phase pr142-t4-source-repair-20261002). */
+  securityEvidence?: string,
 ): AgentSpawner {
   let securityAttempts = 0;
   const brain: WholeLeadOptions = {
@@ -130,7 +154,7 @@ function makeSpawner(
         : source === 'security'
           ? JSON.stringify([{
               source: 'security', severity: 'blocker', category: 'auth', title: 'Verified security defect',
-              location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line demonstrates the security defect.',
+              location: 'src/main.ts:2', evidence: securityEvidence ?? '  return 43;', detail: 'The changed line demonstrates the security defect.',
               recommended_fix: 'Correct the implementation and add a regression test.',
             }])
           : '[]');
@@ -1703,10 +1727,24 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
 
   it('does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)', async () => {
     const prepare = async (name: string, branch: string) => {
-      const repo = makeFixtureRepo(name);
+      const repo = makeFixtureRepo(name, { batchedInitialCommit: true });
       repos.push(repo);
       repo.git(['checkout', '-b', branch]);
-      const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+      const target = (() => {
+        // Batched equivalent of commitFile's add+commit (phase
+        // pr142-t4-source-repair-20261002): one `git commit --include` stages
+        // and commits the file, with the identical Fixture Tests identity,
+        // default message, parent and resulting tree/HEAD, and the same loud
+        // non-zero failure propagation on any git error.
+        const file = join(repo.path, 'src/main.ts');
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, 'export function answer(): number {\n  return 44;\n}\n');
+        repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit', '--include', 'src/main.ts', '-m', 'fixture: update src/main.ts',
+        ]);
+        return repo.git(['rev-parse', 'HEAD']);
+      })();
       const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
       const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
       const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
@@ -1720,7 +1758,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       ledger.setJobStatus(job.id, 'working');
       settleLane(ledger, job.id);
       ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
-      attachOrigin(repo, branch, root);
+      attachOrigin(repo, branch, root, { batched: true });
       return { repo, ledger, port, artifacts, sessions, target, job, root };
     };
     // (a) The movement ref advances while the reconciliation lookup is
@@ -1745,7 +1783,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     });
     const escalations: string[] = [];
     const movedWave = new WaveRunner({
-      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, []),
+      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, [], undefined, undefined, '  return 44;'),
       poster: { post, reconcile }, reviewArtifactRoot: moved.artifacts,
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
       prHeadProbe: localHeadProbe('feature/t4-moved'),
@@ -1773,7 +1811,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     });
     const abortEscalations: string[] = [];
     const abortedWave = new WaveRunner({
-      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, []),
+      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, [], undefined, undefined, '  return 44;'),
       poster: { post: abortPost, reconcile: abortReconcile }, reviewArtifactRoot: aborted.artifacts,
       escalate: (title, detail) => abortEscalations.push(`${title}: ${detail}`),
       prHeadProbe: localHeadProbe('feature/t4-aborted'),

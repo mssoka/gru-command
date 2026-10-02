@@ -20,6 +20,12 @@ residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-re
 handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 terminal-rebrief = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/rebrief-recovery.test.ts test/ledger-api.test.ts test/dispatch-server.test.ts test/suite-shape.test.ts test/shutdown.test.ts"
+# T4 moved-ref/abort oracle only (phase pr142-t4-source-repair-20261002):
+# the narrow T4 discriminator declaration, kept behind the guarded j-463
+# worker-to-host RPC prerequisite like every other declared command. It is a
+# diagnostic selector (name filter only; no timeout/worker/pool/reporter
+# flag) and never a FULL substitute.
+t4-oracle = 'node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"'
 claude-adapter-cleanup = "npx vitest run test/claude-adapter.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
