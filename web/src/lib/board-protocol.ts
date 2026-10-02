@@ -141,6 +141,30 @@ export interface VerifyQueueView {
   readonly workersPerRun: number;
 }
 
+/** Provider pacing gate (server mirror; board protocol parity). A capped
+ * pool's honest state: the configured limit, how many turns run, and every
+ * queued entry with its queue time and reason. */
+export interface PacingQueueEntryView {
+  readonly id: string;
+  readonly kind: 'worker' | 'review';
+  readonly label: string;
+  readonly queuedAt: string;
+  readonly reason: string;
+}
+
+export interface PacingPoolView {
+  /** Configured limit; 0 = unlimited. */
+  readonly limit: number;
+  readonly running: number;
+  readonly queued: readonly PacingQueueEntryView[];
+}
+
+export interface PacingGateView {
+  readonly enabled: boolean;
+  readonly worker: PacingPoolView;
+  readonly review: PacingPoolView;
+}
+
 /** Self-healing session stats (board UX v4; null until a producer exists). */
 export interface SelfHealView {
   readonly sessionsResumed: number;
@@ -181,6 +205,8 @@ export interface BoardSnapshot {
   readonly build?: BuildView | null;
   readonly silas?: SilasView | null;
   readonly verify?: VerifyQueueView | null;
+  /** Provider pacing gate (server mirror; absent on pre-pacing servers). */
+  readonly pacing?: PacingGateView | null;
   readonly selfHeal?: SelfHealView | null;
   /** FOR YOU PR rows (owner approval 2026-09-28); absent on pre-upgrade
   * servers (validator tolerates; the band renders ack rows only). */
@@ -373,6 +399,36 @@ function isVerifyQueueView(value: unknown): value is VerifyQueueView {
   );
 }
 
+function isPacingQueueEntryView(value: unknown): value is PacingQueueEntryView {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    (value.kind === 'worker' || value.kind === 'review') &&
+    typeof value.label === 'string' &&
+    typeof value.queuedAt === 'string' &&
+    typeof value.reason === 'string'
+  );
+}
+
+function isPacingPoolView(value: unknown): value is PacingPoolView {
+  return (
+    isRecord(value) &&
+    (typeof value.limit === 'number' && Number.isSafeInteger(value.limit) && value.limit >= 0) &&
+    (typeof value.running === 'number' && Number.isSafeInteger(value.running) && value.running >= 0) &&
+    Array.isArray(value.queued) &&
+    value.queued.every(isPacingQueueEntryView)
+  );
+}
+
+function isPacingGateView(value: unknown): value is PacingGateView {
+  return (
+    isRecord(value) &&
+    typeof value.enabled === 'boolean' &&
+    isPacingPoolView(value.worker) &&
+    isPacingPoolView(value.review)
+  );
+}
+
 function isSelfHealView(value: unknown): value is SelfHealView {
   return (
     isRecord(value) &&
@@ -437,6 +493,7 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (value.build !== undefined && value.build !== null && !isBuildView(value.build)) return false;
   if (value.silas !== undefined && value.silas !== null && !isSilasView(value.silas)) return false;
   if (value.verify !== undefined && value.verify !== null && !isVerifyQueueView(value.verify)) return false;
+  if (value.pacing !== undefined && value.pacing !== null && !isPacingGateView(value.pacing)) return false;
   if (value.selfHeal !== undefined && value.selfHeal !== null && !isSelfHealView(value.selfHeal)) return false;
   // FOR YOU PR rows: absent on pre-upgrade servers (tolerated), but a
   // present block must match its shape — readiness is server authority.

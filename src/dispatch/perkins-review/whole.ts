@@ -4,6 +4,8 @@ import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool } from '../../runtime/types.js';
+import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
+import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
 import { assertFrozenPromptBounds, refMovedSinceFreeze, writeReviewArtifact, type FrozenReview } from './artifacts.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -129,6 +131,16 @@ export interface PerkinsWholeReviewOptions {
   /** Effective specialist ceiling for this round; bounded by the host's
    * per-call input bound below. */
   readonly maxConcurrentChildren?: number;
+  /** Provider pacing: FIFO combined lead+lens review-turn gate. Absent =
+   * off; an unlimited or disabled gate admits immediately. */
+  readonly reviewGate?: PacingGate;
+  readonly rateLimitBackoff?: RateLimitBackoffPolicy | null;
+  readonly recordPacing?: PacingEventRecorder;
+  readonly pacingSleep?: RateLimitRetryOptions['sleep'];
+  readonly pacingJitter?: RateLimitRetryOptions['jitter'];
+  /** Clock seam for the shared per-turn retry budget (tests pin
+   * remaining/elapsed deterministically; default Date.now). */
+  readonly pacingNow?: () => number;
   readonly onProgress?: (progress: ReviewProgress) => void;
   readonly onAgent?: (input: {
     readonly phase: 'lead' | 'specialist';
@@ -543,6 +555,12 @@ async function boundedPrompt(
   timeoutMs: number,
   signals: readonly (AbortSignal | undefined)[] = [],
 ): Promise<void> {
+  let failure: string | null = null;
+  const unsubscribe = handle.subscribe((event) => {
+    if (event.type === 'error' || (event.type === 'state' && event.state === 'error')) {
+      failure = event.error ?? 'review model turn failed';
+    }
+  });
   let timer: ReturnType<typeof setTimeout> | null = null;
   let rejectAbort: ((error: Error) => void) | null = null;
   const listeners: Array<{ signal: AbortSignal; listener: () => void }> = [];
@@ -568,8 +586,10 @@ async function boundedPrompt(
       }),
       abort,
     ]);
+    if (failure !== null) throw new Error(failure);
   } finally {
     rejectAbort = null;
+    unsubscribe();
     if (timer !== null) clearTimeout(timer);
     for (const { signal, listener } of listeners) signal.removeEventListener('abort', listener);
   }
@@ -649,16 +669,46 @@ export class PerkinsWholeReview {
   private readonly policy: PerkinsPolicy;
   private readonly beginChildren: NonNullable<PerkinsWholeReviewOptions['beginChildren']>;
   private readonly maxConcurrentChildren: number;
+  private readonly reviewGate: PacingGate | null;
+  private readonly pacingOptions: PerkinsWholeReviewOptions;
   private readonly onProgress: (progress: ReviewProgress) => void;
   private readonly onAgent: NonNullable<PerkinsWholeReviewOptions['onAgent']>;
 
   constructor(options: PerkinsWholeReviewOptions) {
+    this.pacingOptions = options;
     this.spawner = options.spawner;
     this.policy = options.policy;
     this.maxConcurrentChildren = options.maxConcurrentChildren ?? STANDALONE_SPECIALIST_CONCURRENCY;
     this.beginChildren = options.beginChildren ?? (() => ({ concurrency: this.maxConcurrentChildren, finish: () => {} }));
+    this.reviewGate = options.reviewGate ?? null;
     this.onProgress = options.onProgress ?? (() => {});
     this.onAgent = options.onAgent ?? (() => {});
+  }
+
+  /** Provider pacing (review-turn gate): claim one combined review slot
+   * BEFORE the spawn — a queued FIFO wait never consumes the spawn or turn
+   * timeouts. The caller releases the lease in its own finally, beside the
+   * child disposal. Null when the gate is absent. */
+  private async acquireReviewTurnSlot(
+    label: string,
+    signal: AbortSignal | undefined,
+  ): Promise<PacingLease | null> {
+    const gate = this.reviewGate;
+    if (gate === null) return null;
+    return gate.acquireReviewTurn({
+      id: label,
+      label,
+      ...(signal !== undefined ? { signal } : {}),
+    });
+  }
+
+  /** Provider pacing: the wave's own fan-out width. When a review-turn cap
+   * is configured, a wave never starts more lens tasks than the global cap;
+   * the shared FIFO gate still enforces the combined lead+lens limit across
+   * rounds (extra tasks simply wait their turn). */
+  private specialistWaveWidth(): number {
+    const limit = this.reviewGate?.view().review.limit ?? 0;
+    return limit > 0 ? Math.max(1, Math.min(this.maxConcurrentChildren, limit)) : this.maxConcurrentChildren;
   }
 
   async run(input: RunWholeReviewInput): Promise<PerkinsWholeResult> {
@@ -701,6 +751,43 @@ export class PerkinsWholeReview {
       sessionFiles.add(sessionFile);
     };
 
+    const retryPrompt = async (
+      handle: AgentHandle, prompt: string, budgetMs: number, label: string,
+      signals: readonly (AbortSignal | undefined)[], acquire: () => Promise<void>, release: () => void,
+      hasSubmission: () => boolean,
+    ): Promise<void> => {
+      const now = this.pacingOptions.pacingNow ?? Date.now;
+      let remaining = budgetMs;
+      await withRateLimitRetries(async () => {
+        await acquire();
+        const start = now();
+        try {
+          if (remaining <= 0) throw new ReviewTurnTimeoutError(budgetMs);
+          await boundedPrompt(handle, prompt, remaining, signals);
+        } catch (error) {
+          // A terminal native submission outranks later transport noise.
+          if (hasSubmission()) return;
+          release();
+          throw error;
+        } finally {
+          remaining -= Math.max(0, now() - start);
+        }
+      }, {
+        policy: this.pacingOptions.rateLimitBackoff ?? null,
+        signals,
+        ...(this.pacingOptions.pacingSleep !== undefined ? { sleep: this.pacingOptions.pacingSleep } : {}),
+        ...(this.pacingOptions.pacingJitter !== undefined ? { jitter: this.pacingOptions.pacingJitter } : {}),
+        record: (event) => {
+          // Ledger payloads stay canonical across both producers (the
+          // supervisor and this workflow loop): per-producer context rides
+          // the event envelope, never the payload (pacing.ts contract).
+          // The round artifact keeps the fuller context for local evidence.
+          writeReviewArtifact(review, `pacing/${randomUUID()}.json`, { kind: event.kind, ...event.payload, round_id: input.roundId, label, agent_id: handle.id });
+          this.pacingOptions.recordPacing?.({ kind: event.kind, agentId: handle.id, payload: event.payload });
+        },
+      });
+    };
+
     const runSpecialist = async (
       lens: PerkinsLens,
       attempt: 1 | 2,
@@ -709,6 +796,7 @@ export class PerkinsWholeReview {
     ): Promise<SpecialistResult> => {
       this.onProgress({ lens, state: 'running' });
       let handle: AgentHandle | null = null;
+      let reviewLease: PacingLease | null = null;
       let settled: SpecialistResult | null = null;
       let disposeArtifactError: unknown | null = null;
       let raw: string | null = null;
@@ -760,6 +848,7 @@ export class PerkinsWholeReview {
         },
       };
       try {
+        reviewLease = await this.acquireReviewTurnSlot(`lens:${lens}#${attempt}`, signal);
         handle = await boundedSpawn(() => this.spawner('perkins', {
           // The blind child is rooted OUTSIDE the repository: even a future
           // tool leak would find no repo to read. Other children read the
@@ -777,14 +866,17 @@ export class PerkinsWholeReview {
         // native-tool child is tool-only, a text child (non-pi runtimes)
         // keeps the tolerant text path. The request alone proves nothing.
         nativeSubmit = handle.reviewTools?.includes(FINDINGS_TOOL_NAME) === true;
-        await boundedPrompt(
+        await retryPrompt(
           handle,
           renderSpecialistPrompt(
             this.policy, review, lens, nativeSubmit ? 'nativeTool' : 'text',
             attempt > 1 && previous !== undefined ? { attempt, previous } : undefined,
           ),
-          CHILD_TURN_TIMEOUT_MS,
+          CHILD_TURN_TIMEOUT_MS, `lens:${lens}#${attempt}`,
           [signal, input.signal],
+          async () => { reviewLease ??= await this.acquireReviewTurnSlot(`lens:${lens}#${attempt}`, signal ?? input.signal); },
+          () => { const lease = reviewLease; reviewLease = null; lease?.release(); },
+          () => capturedSubmission() !== null,
         );
         promptResolved = true;
       } catch (error) {
@@ -938,6 +1030,8 @@ export class PerkinsWholeReview {
             }
           }
         }
+        reviewLease?.release();
+        reviewLease = null;
       }
       if (disposeArtifactError !== null && settled !== null) {
         settled = {
@@ -1018,27 +1112,67 @@ export class PerkinsWholeReview {
         // consume lens attempts or the round's specialist budget — only
         // real starts do. The lead still sees a named error and retries
         // within its existing safeguards (no unlimited retries added).
-        let batch: { concurrency: number; finish(): void };
-        try {
-          batch = this.beginChildren();
-          if (scheduled.length > batch.concurrency) {
-            batch.finish();
-            throw new Error(
-              `perkins_run_specialists: ${scheduled.length} runs exceed this round's admitted wave of ${batch.concurrency}; split them across multiple calls`,
-            );
+        //
+        // Provider pacing liveness (r5): a lead waiting on its lens wave is
+        // not generating a turn, so it YIELDS its review slot for the whole
+        // wave — the children (and concurrent rounds) can then be admitted
+        // up to the combined cap. The slot is re-acquired before the result
+        // returns to the model, so the next lead turn is gated again.
+        const yieldedLeadSlot = reviewLease !== null;
+        const runWave = async (): Promise<{
+          readonly outcome: PoolOutcome<SpecialistResult | undefined>;
+          readonly acquireError: unknown | null;
+        }> => {
+          if (yieldedLeadSlot) {
+            reviewLease!.release();
+            reviewLease = null;
           }
-        } catch (error) {
-          restoreAttempts(scheduled);
-          specialistsStarted -= scheduled.length;
-          throw error;
-        }
-        let poolOutcome: PoolOutcome<SpecialistResult | undefined>;
-        try {
-          poolOutcome = await pool(scheduled, batch.concurrency, (run) =>
-            runSpecialist(run.lens, run.attempt, run.previous, signal));
-        } finally {
-          batch.finish();
-        }
+          let outcome: PoolOutcome<SpecialistResult | undefined> | null = null;
+          let acquireError: unknown = null;
+          try {
+            let batch: { concurrency: number; finish(): void };
+            try {
+              batch = this.beginChildren();
+              if (scheduled.length > batch.concurrency) {
+                batch.finish();
+                throw new Error(
+                  `perkins_run_specialists: ${scheduled.length} runs exceed this round's admitted wave of ${batch.concurrency}; split them across multiple calls`,
+                );
+              }
+            } catch (error) {
+              restoreAttempts(scheduled);
+              specialistsStarted -= scheduled.length;
+              throw error;
+            }
+            try {
+              // The resident wave admission (beginChildren) and the provider
+              // pacing cap both bound the fan-out: run the narrower of the
+              // two. Pacing never refuses a wave, it only throttles width.
+              const waveWidth = Math.max(1, Math.min(batch.concurrency, this.specialistWaveWidth()));
+              outcome = await pool(scheduled, waveWidth, (run) =>
+                runSpecialist(run.lens, run.attempt, run.previous, signal));
+            } finally {
+              batch.finish();
+            }
+          } finally {
+            if (yieldedLeadSlot) {
+              // A failed re-acquire must not erase the settled pool outcome:
+              // carry the error back so the caller commits the children
+              // before it surfaces (T13/R17).
+              try {
+                reviewLease = await this.acquireReviewTurnSlot('lead', input.signal);
+              } catch (error) {
+                acquireError = error;
+              }
+            }
+          }
+          if (outcome === null) {
+            // Unreachable: a thrown body propagates before this point.
+            throw new Error('perkins_run_specialists: the wave settled without an outcome');
+          }
+          return { outcome, acquireError };
+        };
+        const { outcome: poolOutcome, acquireError } = await runWave();
         // Every settled child is REAL work (T13): commit its result before
         // any error handling, so executed runs are never restored to
         // "not used" or hidden from the durable record.
@@ -1119,6 +1253,21 @@ export class PerkinsWholeReview {
           for (const result of childResults) undeliveredRuns.add(result.resultId);
           commitResults();
           throw new Error(`${(error instanceof Error ? error.message : String(error))}; the completed runs are recorded but their findings were not delivered to you`);
+        }
+        if (acquireError !== null) {
+          // The wave completed, but the lead could not re-acquire its review
+          // slot before this result would return to it. The tool call fails,
+          // so no finding reaches the lead: commit the real runs as
+          // undelivered instead of erasing them (T13/R17). End the round as
+          // well — error results must not let the lead run later turns
+          // WITHOUT a review slot (the combined cap would be exceeded).
+          for (const result of childResults) undeliveredRuns.add(result.resultId);
+          commitResults();
+          // Fire-and-forget disposal must not surface as an unhandled
+          // rejection (main exits 1 on one); the wave's own error is the
+          // outcome that matters and it is thrown below.
+          void lead?.dispose().catch(() => {});
+          throw acquireError instanceof Error ? acquireError : new Error(String(acquireError));
         }
         commitResults();
         return {
@@ -1458,9 +1607,11 @@ export class PerkinsWholeReview {
     ].join('\n');
     const initialPrompt = this.leadPrompt(review, prior, priorReview.targetSha);
     let lead: AgentHandle | null = null;
+    let reviewLease: PacingLease | null = null;
     let unsubscribe = (): void => {};
     let turns = 0;
     try {
+      reviewLease = await this.acquireReviewTurnSlot('lead', input.signal);
       lead = await boundedSpawn(() => this.spawner('perkins', {
         cwd: review.manifest.repoPath,
         reviewLead: {
@@ -1474,10 +1625,14 @@ export class PerkinsWholeReview {
       unsubscribe = lead.subscribe((event) => {
         if (event.type === 'turn_end') {
           turns += 1;
-          if (turns > MAX_LEAD_TURNS) void lead?.dispose();
+          if (turns > MAX_LEAD_TURNS) void lead?.dispose().catch(() => {});
         }
       });
-      await boundedPrompt(lead, initialPrompt, LEAD_TOTAL_TIMEOUT_MS, [input.signal]);
+      await retryPrompt(lead, initialPrompt, LEAD_TOTAL_TIMEOUT_MS, 'lead', [input.signal],
+        async () => { reviewLease ??= await this.acquireReviewTurnSlot('lead', input.signal); },
+        () => { const lease = reviewLease; reviewLease = null; lease?.release(); },
+        () => accepted !== null,
+      );
       if (input.signal?.aborted === true) throw new Error('review operation aborted');
       if (turns > MAX_LEAD_TURNS) throw new Error(`Perkins lead exceeded ${MAX_LEAD_TURNS} turns`);
       if (accepted === null) throw new Error('Perkins lead exited without an accepted terminal submission');
@@ -1492,8 +1647,12 @@ export class PerkinsWholeReview {
       });
       return accepted;
     } finally {
-      unsubscribe();
-      await lead?.dispose();
+      try {
+        unsubscribe();
+        await lead?.dispose();
+      } finally {
+        reviewLease?.release();
+      }
     }
   }
 
