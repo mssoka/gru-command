@@ -257,6 +257,25 @@ freezing until that minion's delivery event; a queued round then appears in
 the ledger as `round.residency-queued` until its lead/child pair is admitted.
 Queued waits consume no reviewer turn or spawn timeout.
 
+## 4e. Minion-owned build cycle (owner ruling 2026-10-02)
+
+Implementation briefings hand the worker the whole job. The minion selects
+the task-relevant BMAD skills from the PROJECT's actual installed skill
+catalog/metadata and follows their current workflows — names and workflow
+structure change between BMAD versions, so brief by the task, never by a
+fixed skill name. The selected workflow's built-in review runs on fresh,
+context-free reviewer contexts the minion spawns itself; the minion owns
+finding resolution, verification, and the authorized ordinary PR, and the
+ops layer does not pull the work back between phases or commission a
+supplementary review duplicating the built-in one. Expensive suites
+coordinate through the verification scheduler (§4c) within existing
+capacity; when the settled PR head has passed its prerequisites
+(exact-head CI green), the native Perkins gate runs on that exact final
+head, NEEDS CHANGES routes back to the same implementing minion's fix
+cycle, and the owner merges. When a Perkins pre-flight failure routes the
+review to the installed bmad-review fallback gate (§4b), that host-routed
+gate is the review gate of record — it is the gate, never a duplicate.
+
 ## 5. Release (the sweep)
 
 `POST /api/dispatch/release` `{job_id, confirm_kill?, base_branch?}` —

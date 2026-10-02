@@ -87,8 +87,8 @@ describe('role definitions (E8)', () => {
     expect(minion).toContain('no guessed rename');
     // Owner clarification j-761: the shipped policy selects by capability
     // from the project's actual catalog; a fixed skill name is never the
-    // normative entry point.
-    expect(minion).not.toContain('bmad-build');
+    // normative entry point — not just the retired `bmad-build` literal.
+    expect(minion).not.toMatch(/bmad-[a-z][a-z-]*/u);
   });
 
   it('pins the minion-owned build cycle on the ops prompt', () => {

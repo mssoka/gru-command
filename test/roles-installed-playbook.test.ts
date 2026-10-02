@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { readBuildInfo } from '../src/build-info.js';
 
 /**
  * Installed-layout playbook regression (owner ruling 2026-10-02, j-745;
@@ -56,6 +57,7 @@ function stageInstalledLayout(withRoles: boolean): string {
         'imports the SHIPPED compiled artifact, never the TypeScript source',
     );
   }
+  assertDistCurrent();
   const root = temp('gru-command-installed-');
   const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8')) as {
     name: string;
@@ -70,6 +72,29 @@ function stageInstalledLayout(withRoles: boolean): string {
   if (withRoles) cpSync(join(repoRoot, 'roles'), join(root, 'roles'), { recursive: true });
   symlinkSync(join(repoRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
   return root;
+}
+
+/** The compiled `dist/` this regression imports must be the CURRENT
+ *  candidate's build: a stale dist from an older revision would let the
+ *  gate green over code that is not the head under test. The full
+ *  verification chain (`npm test`) rebuilds before vitest; a focused scope
+ *  must not run on an older build. Tarball / non-git trees (the baseline
+ *  snapshot) have no HEAD to compare and keep the existence check only. */
+function assertDistCurrent(): void {
+  let head: string | null = null;
+  try {
+    head = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+  } catch {
+    head = null;
+  }
+  if (head === null) return;
+  const built = readBuildInfo(repoRoot).rev;
+  if (built !== head) {
+    throw new Error(
+      `dist/ is stale for this gate: built rev ${built ?? 'unknown'}, HEAD ${head}. ` +
+        'Run the full verification gate (it rebuilds) before this focused scope.',
+    );
+  }
 }
 
 /** Run `probe.mjs` inside the staged install under an EMPTY home, so the
@@ -116,27 +141,32 @@ function runProbe(installedRoot: string): StagedPrompt | StagedFailure {
 /** A representative RENAMED/REPLACEMENT project skill catalog (owner
  *  clarification j-761): BMAD versions may rename or replace their skills,
  *  so the shipped policy selects by the project's ACTUAL installed catalog
- *  and metadata — never by a name remembered from this release. The
- *  fixture mirrors a real install's runtime skill folder
+ *  and metadata — never by a name remembered from this release. Each
+ *  fixture entry mirrors a real install's runtime skill folder
  *  (`.agents/skills/<name>/SKILL.md` with `name`/`description` front
- *  matter) carrying the implementation capability under a different name. */
-function stageRenamedSkillCatalog(projectRoot: string, name: string): void {
+ *  matter). */
+function stageSkillCatalogEntry(projectRoot: string, name: string, description: string): void {
   const skillDir = join(projectRoot, '.agents', 'skills', name);
   mkdirSync(skillDir, { recursive: true });
   writeFileSync(
     join(skillDir, 'SKILL.md'),
-    [
-      '---',
-      `name: ${name}`,
-      "description: 'Turns implementation work into working code, reviewed and verified — the renamed replacement entry for that capability.'",
-      '---',
-      '',
-      `# ${name}`,
-      '',
-      'Follow the workflow this skill points to for implementation work.',
-      '',
-    ].join('\n'),
+    ['---', `name: ${name}`, `description: '${description}'`, '---', '', `# ${name}`, '', 'Follow the workflow this skill points to.', ''].join('\n'),
   );
+}
+
+/** Deterministic reading of the selection contract over a staged catalog:
+ *  the installed skill folders' `SKILL.md` front-matter metadata is the
+ *  matrix; the task-relevant entry is the one whose description covers
+ *  implementation work — never one remembered by name. */
+function selectImplementationSkills(projectRoot: string): string[] {
+  const skillsRoot = join(projectRoot, '.agents', 'skills');
+  return readdirSync(skillsRoot)
+    .filter((name) => {
+      const entry = readFileSync(join(skillsRoot, name, 'SKILL.md'), 'utf-8');
+      const front = /^---\nname: .+\ndescription: '([^']*)'\n---\n/u.exec(entry);
+      return front !== null && front[1]!.includes('implementation work');
+    })
+    .sort();
 }
 
 describe('installed-layout playbook loading (shipped artifact, clean install)', () => {
@@ -169,8 +199,9 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('report that exact capability gap loudly');
     expect(flat).toContain('supported official BMAD onboarding/discovery path');
     expect(flat).toContain('no guessed rename');
-    // Owner clarification j-761: never a fixed skill-name dependency.
-    expect(flat).not.toContain('bmad-build');
+    // Owner clarification j-761: never a fixed skill-name dependency —
+    // not just the retired `bmad-build` literal.
+    expect(staged.minion).not.toMatch(/bmad-[a-z][a-z-]*/u);
   });
 
   it('the installed ops prompt carries the minion-owned build cycle', () => {
@@ -189,21 +220,32 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
   it('a renamed/replacement project catalog still satisfies the worker contract (no fixed skill name)', () => {
     // BMAD may rename or replace its implementation skill; selection keys
     // on the project's actual catalog and the task, not a remembered name.
-    // Stage that rename and prove the shipped contract does not depend on
-    // the old name.
+    // Stage that rename with an unrelated sibling entry and consume the
+    // catalog as the contract describes. A fixed dependency on ANY
+    // installed catalog name — the retired `bmad-build` or the renamed
+    // entry — fails this test.
     const project = temp('gru-command-renamed-catalog-');
-    const renamed = 'bmad-delivery-cycle';
-    stageRenamedSkillCatalog(project, renamed);
+    stageSkillCatalogEntry(project, 'bmad-architecture', 'Work out and record architecture decisions in a short architecture document.');
+    stageSkillCatalogEntry(
+      project,
+      'bmad-delivery-cycle',
+      'Turns implementation work into working code, reviewed and verified — the renamed replacement entry for that capability.',
+    );
+    // Capability-based selection over the actual installed catalog: the
+    // task-relevant entry is found by its description metadata, and the
+    // unrelated sibling is not selected.
+    expect(selectImplementationSkills(project)).toEqual(['bmad-delivery-cycle']);
+    // The shipped worker contract is satisfied without the old name: no
+    // catalog name (and no bmad-* skill token at all) is pinned in the
+    // prompt, so a rename cannot strand the playbook.
     const flat = staged.minion.replace(/\s+/gu, ' ');
     expect(flat).toContain("the PROJECT's actual installed skill catalog and metadata");
     expect(flat).toContain('select by what the project really has installed for the task');
     expect(flat).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
-    // The fixture is a real catalog entry by shape (front-matter metadata)
-    // carrying the implementation capability under a DIFFERENT name:
-    const entry = readFileSync(join(project, '.agents', 'skills', renamed, 'SKILL.md'), 'utf-8');
-    expect(entry).toMatch(
-      new RegExp(`^---\\nname: ${renamed}\\ndescription: '.*implementation work.*'\\n---\\n`, 'u'),
-    );
+    const installedNames = readdirSync(join(project, '.agents', 'skills')).sort();
+    expect(installedNames).toEqual(['bmad-architecture', 'bmad-delivery-cycle']);
+    for (const name of installedNames) expect(staged.minion).not.toContain(name);
+    expect(staged.minion).not.toMatch(/bmad-[a-z][a-z-]*/u);
     expect(existsSync(join(project, '.agents', 'skills', 'bmad-build', 'SKILL.md'))).toBe(false);
   });
 

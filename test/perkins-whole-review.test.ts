@@ -1350,7 +1350,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedMinion).toContain('You own the selected workflow end to end');
     expect(stagedMinion).toContain('fresh, context-free reviewer sessions');
     expect(stagedMinion).toContain('an inline self-review is not a substitute');
-    expect(stagedMinion).not.toContain('bmad-build');
+    expect(stagedMinion).not.toMatch(/bmad-[a-z][a-z-]*/u);
     const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
     expect(stagedOps).toContain('never demand a fixed skill name');
@@ -1370,10 +1370,19 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       import { ReviewMcpBridge } from './dist/runtime/review-mcp-bridge.js';
       const { ROLE_DEFINITIONS } = await import('./dist/roles.js');
       const minionPrompt = ROLE_DEFINITIONS.minion.systemPrompt;
+      const silasPrompt = ROLE_DEFINITIONS.silas.systemPrompt;
+      const gruPrompt = ROLE_DEFINITIONS.gru.systemPrompt;
       if (!minionPrompt.includes("the PROJECT's actual installed skill catalog and metadata") ||
           !minionPrompt.includes('fresh, context-free reviewer sessions') ||
-          minionPrompt.includes('bmad-build')) {
+          /bmad-[a-z][a-z-]*/.test(minionPrompt)) {
         throw new Error('staged minion prompt lacks the BMAD workflow playbook');
+      }
+      if (!silasPrompt.includes("selects the task-relevant BMAD skills from the project's actual installed catalog") ||
+          silasPrompt.includes('bmad-build')) {
+        throw new Error('staged silas prompt lacks the minion-owned build cycle');
+      }
+      if (!gruPrompt.includes('Hand workers the whole build')) {
+        throw new Error('staged gru prompt lacks the whole-build handoff');
       }
       const bridge = await ReviewMcpBridge.start([{
         name: 'perkins_probe', description: 'staged probe', inputSchema: { type: 'object' },
