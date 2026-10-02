@@ -446,7 +446,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     const routing = routeFixDirectiveToMinion({
       registry: { getHandle: () => handle as never, spawn: async () => handle as never, disposeHandle: async () => {} },
       ledger: {
-        listAgents: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
+        listImplementerMinions: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
       },
@@ -483,7 +483,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         disposeHandle: async () => {},
       },
       ledger: {
-        listAgents: () => [],
+        listImplementerMinions: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
       },
@@ -509,7 +509,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         disposeHandle: async () => {},
       },
       ledger: {
-        listAgents: () => [],
+        listImplementerMinions: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
       },
@@ -538,7 +538,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     const routing = rebriefFreshMinion({
       registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
       ledger: {
-        listAgents: () => [],
+        listImplementerMinions: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
       },
