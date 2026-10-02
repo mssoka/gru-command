@@ -194,13 +194,17 @@ restart_backoff_ms = 2000
 
 # [pacing]
 # Provider pacing: FIFO admission caps for minion and Perkins review
-# turns (queued lanes render honestly; live turns are never preempted),
+# turns (queued waits are carried in the board snapshot data; live turns are never preempted),
 # plus bounded automatic retry for the rate-limit error class
 # (HTTP 429, "rate limit", "too many requests", throttling). Every
 # automatic retry is recorded as a pacing.auto-retry ledger event.
+# Full ledger vocabulary: pacing.queued, pacing.admitted,
+# pacing.wait-cancelled, pacing.queued-rollback, pacing.auto-retry,
+# pacing.auto-retry-recovered, pacing.auto-retry-exhausted.
 # Enabled by default with unlimited admission caps. Suggested starting
 # point: cap minion and review turns at 3; 1s backoff, capped at 60s,
 # 5 retries.
+# max_auto_retries = 0 disables automatic retry (admission caps stay active).
 # Caps count MINION and Perkins review turns only: silas/bob/distiller/
 # chat core turns are outside this pool (the board view is not a
 # provider-wide count).

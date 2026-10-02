@@ -1077,7 +1077,7 @@ export class Supervisor {
     }
     if (incident.attempts >= incident.maxRetries) {
       this.recordEvent('pacing.auto-retry-exhausted', agent.agentId, pacingExhaustedPayload(
-        incident.attempts, incident.maxRetries, incident.lastError.slice(0, 500),
+        incident.attempts, incident.maxRetries, incident.lastError,
       ));
       this.clearRateLimitRetry(agent, 'exhausted');
       return false;
@@ -1085,7 +1085,7 @@ export class Supervisor {
     incident.attempts += 1;
     const delayMs = backoffDelayMs(incident.attempts, policy.baseMs, policy.maxMs, this.jitter);
     this.recordEvent('pacing.auto-retry', agent.agentId, pacingRetryPayload(
-      incident.attempts, incident.maxRetries, delayMs, incident.lastError.slice(0, 500),
+      incident.attempts, incident.maxRetries, delayMs, incident.lastError,
     ));
     this.log('warn', 'rate-limit failure — automatic retry scheduled', {
       agent_id: agent.agentId,
@@ -1122,6 +1122,7 @@ export class Supervisor {
       if (agent.role === 'minion' && this.workerGate !== undefined) {
         retryLease = await this.workerGate.acquireWorkerTurn({
           id: agent.agentId, label: `rate-limit retry → ${agent.agentId}`, agentId: agent.agentId,
+          jobId: this.ledger.getAgent(agent.agentId)?.jobId ?? null,
           signal: incident.admissionAbort.signal,
         });
         if (this.disposed || agent.rateLimitRetry !== incident || this.agents.get(agent.agentId) !== agent) return;
@@ -1764,6 +1765,7 @@ export class Supervisor {
           id: laneAgentId,
           label: `restart recovery → ${laneAgentId}`,
           agentId: laneAgentId,
+          jobId: this.ledger.getAgent(laneAgentId)?.jobId ?? null,
           signal: controller.signal,
         });
         if (!stillCurrent()) return;

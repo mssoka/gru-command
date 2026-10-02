@@ -8,7 +8,7 @@ import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import { appendPrCreationRule, PR_CREATION_RULE } from './pr-creation.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import type { WorktreePort } from './worktree-port.js';
-import { settleRetries, type PacingGate, type PacingLease } from '../runtime/pacing.js';
+import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 
 /**
  * Fix-directive routing (E8 follow-through; owner ruling 2026-09-21): the
@@ -38,7 +38,7 @@ export interface DirectiveRoutingDeps {
    * retry covering the delivered turn. The directive reports delivered
    * only for 'none'/'recovered'; the worker lease is released before the
    * wait so the retry can reacquire admission. Absent = no interlock. */
-  readonly retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
 }
 
 /** Route a directive to the implementing minion: the live job minion

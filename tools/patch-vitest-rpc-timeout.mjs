@@ -52,34 +52,39 @@ const OPEN = [
 // by each test's timeout and by the verification scheduler's run budget).
 const PATCHED = `${OPEN}\n\t\ttimeout: -1,`;
 
-function rpcChunks() {
-  const files = [];
-  for (const root of DIST_ROOTS) {
-    const dir = join(root, 'vitest', 'dist', 'chunks');
-    if (!existsSync(dir)) {
-      if (existsSync(join(root, 'vitest', 'package.json'))) {
-        throw new Error('vitest-rpc-timeout: installed vitest has no dist/chunks — update tools/patch-vitest-rpc-timeout.mjs before testing');
-      }
-      continue;
-    }
-    distDirs.push(dir);
-    for (const entry of readdirSync(dir)) {
-      if (/^rpc\..+\.js$/.test(entry)) files.push(join(dir, entry));
-    }
-  }
-  return files;
-}
-
 /** vitest/dist/chunks directories that exist — distinguishes "vitest is not
  * installed" (skip cleanly) from "vitest is installed but its shape no longer
- * matches the pinned patch" (fail LOUD, never silently disable the fix). */
+ * matches the pinned patch" (fail LOUD, never silently disable the fix).
+ * Both roots are gathered BEFORE any failure decision: a package.json-only
+ * vitest under one root must not abort the run while the other root still
+ * holds a patchable dist. */
 const distDirs = [];
-const chunks = rpcChunks();
+const missingDistRoots = [];
+const chunks = [];
+for (const root of DIST_ROOTS) {
+  const dir = join(root, 'vitest', 'dist', 'chunks');
+  if (existsSync(dir)) {
+    distDirs.push(dir);
+    for (const entry of readdirSync(dir)) {
+      if (/^rpc\..+\.js$/.test(entry)) chunks.push(join(dir, entry));
+    }
+    continue;
+  }
+  if (existsSync(join(root, 'vitest', 'package.json'))) missingDistRoots.push(root);
+}
 if (chunks.length === 0) {
   if (distDirs.length > 0) {
+    const alsoMissing =
+      missingDistRoots.length > 0 ? `; also no dist/chunks under ${missingDistRoots.join(', ')}` : '';
     throw new Error(
-      `vitest-rpc-timeout: vitest dist present but no rpc chunk found (${distDirs.join(', ')}) — ` +
+      `vitest-rpc-timeout: vitest dist present but no rpc chunk found (${distDirs.join(', ')})${alsoMissing} — ` +
         'the installed vitest layout changed; update tools/patch-vitest-rpc-timeout.mjs before testing',
+    );
+  }
+  if (missingDistRoots.length > 0) {
+    throw new Error(
+      `vitest-rpc-timeout: installed vitest has no dist/chunks (${missingDistRoots.join(', ')}) — ` +
+        'update tools/patch-vitest-rpc-timeout.mjs before testing',
     );
   }
   note('vitest-rpc-timeout: no installed vitest dist found — skipped (production install?)');
@@ -101,7 +106,7 @@ for (const file of chunks) {
   if (patchedSites === 1) {
     if (openSites !== 1) {
       throw new Error(
-        `vitest-rpc-timeout: unexpected ${file} shape (${patchedSites} patched + ${openSites} createBirpc sites) — ` +
+        `vitest-rpc-timeout: unexpected ${file} shape (${patchedSites} patched + ${openSites - patchedSites} unpatched createBirpc sites) — ` +
           'the pinned vitest dist changed; update tools/patch-vitest-rpc-timeout.mjs before testing',
       );
     }
@@ -110,7 +115,7 @@ for (const file of chunks) {
   }
   if (patchedSites !== 0 || openSites !== 1) {
     throw new Error(
-      `vitest-rpc-timeout: unexpected ${file} shape (${patchedSites} patched + ${openSites} createBirpc sites) — ` +
+      `vitest-rpc-timeout: unexpected ${file} shape (${patchedSites} patched + ${openSites - patchedSites} unpatched createBirpc sites) — ` +
         'the pinned vitest dist changed; update tools/patch-vitest-rpc-timeout.mjs before testing',
     );
   }

@@ -13,7 +13,10 @@ describe('workflow-owned rate-limit retry', () => {
       sleep: async (ms) => { delays.push(ms); },
     })).rejects.toThrow('HTTP 429');
     expect(attempts).toBe(4);
-    expect(delays).toEqual([150, 250, 250]);
+    // 100 + 50 = 150; 200 + 100 clamps to 250; the third rung is fully
+    // capped, so its draw now spreads DOWN from the bound (250 - 125) instead
+    // of clamping flat at 250 for every draw (r12 blind#3).
+    expect(delays).toEqual([150, 250, 125]);
     expect(events.map((event) => event.kind)).toEqual(['pacing.auto-retry', 'pacing.auto-retry', 'pacing.auto-retry', 'pacing.auto-retry-exhausted']);
     // Canonical payload schema shared with the supervisor's producer.
     expect(Object.keys(events[0]!.payload).sort()).toEqual(['attempt', 'delay_ms', 'error', 'max_auto_retries']);

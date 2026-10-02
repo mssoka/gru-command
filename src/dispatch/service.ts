@@ -9,7 +9,7 @@ import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 import { recordFollowUpDelivery } from './fix-directive.js';
-import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease } from '../runtime/pacing.js';
+import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import { PR_CREATION_RULE } from './pr-creation.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -51,7 +51,7 @@ export interface DispatchServiceOptions {
    * production). The delivery records success only for 'none'/'recovered'
    * and releases its worker lease before waiting so the retry can
    * reacquire admission. Absent = no interlock. */
-  readonly retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   /** Service-stopping signal: aborts a QUEUED admission wait and lets the
    * settlement wait below observe shutdown instead of hanging. Absent =
    * settlement is hook-owned and the queue wait is uncancellable. */

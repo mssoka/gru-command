@@ -89,7 +89,6 @@ describe('worker admission through dispatch (FIFO queue, honest queue note, rele
     const { api, close } = ledgerIn();
     try {
       const worktrees = new InMemoryWorktreePort(laneRoot);
-      const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
       const events: string[] = [];
       const recordingGate = new PacingGate({
         enabled: true,
@@ -149,8 +148,6 @@ describe('worker admission through dispatch (FIFO queue, honest queue note, rele
 
       spawned[1]!.settle();
       await vi.waitFor(() => expect(recordingGate.view().worker.running).toBe(0));
-      // The plain gate was never used; construct-clean check only.
-      expect(gate.view().worker.running).toBe(0);
     } finally {
       close();
     }

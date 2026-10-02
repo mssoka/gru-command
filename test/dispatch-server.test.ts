@@ -15,7 +15,7 @@ import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
-import { PacingGate } from '../src/runtime/pacing.js';
+import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -71,7 +71,7 @@ async function boot(opts: {
   minionPromptGate?: (text: string) => Promise<void> | undefined;
   /** Provider pacing: the bounded retry settlement to report for a
    * delivered directive/re-brief turn. Absent = no interlock. */
-  retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
+  retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   /** Provider pacing: worker gate forwarded to the silas routes. */
   workerGate?: PacingGate;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {

@@ -47,12 +47,17 @@ Never: hardcode provider names, add dependencies, alter live config or credentia
 ## Tasks & Acceptance
 
 - [x] Replay on main and preserve published ancestry with ordinary merges.
-- [ ] Separate config sections and correct enabled/unlimited default and templates.
-- [ ] Make gate callback failure and worker/lead lease cleanup safe; cover regressions.
-- [ ] Gate fallback minion review and directive paths.
-- [ ] Implement workflow-owned bounded review backoff with durable retry events and deterministic tests.
-- [ ] Cover plumbing and board view seams; reconcile suite-shape pins.
-- [ ] Commit, capture scheduler full verification, push without rewriting remote history, and request fresh native review and exact-head CI.
+- [x] Separate config sections and correct enabled/unlimited default and templates.
+- [x] Make gate callback failure and worker/lead lease cleanup safe; cover regressions.
+- [x] Gate fallback minion review and directive paths.
+- [x] Implement workflow-owned bounded review backoff with durable retry events and deterministic tests.
+- [x] Cover plumbing and board view seams; reconcile suite-shape pins.
+- [ ] Remaining head gates on the current head: scheduled FULL via `POST /api/verify` with complete capture and nested `outcome.exitCode = 0`, exact-head CI, fresh independent review round, native Perkins READY. Scheduler captures for every repair round are recorded under `provider-pacing/` (failed captures preserved).
+
+The five delivery items above landed across r5–r12; the r12 fresh-review findings are closed on this head (r13 repairs). All rounds are recorded in the Review Triage Log
+sections of this file, the `provider-pacing/r12-review-triage.md` log, and the lane's
+`provider-pacing/` evidence directory. This checklist previously still read as unchecked; it now
+matches the landed state.
 
 Acceptance: given saturated gates, release admits FIFO without exceeding the cap; given rate-limit errors, retries obey configured delay/budget and are recorded; given other errors, no automatic retry occurs; given default config, admission remains unlimited; given merged residency and pacing config, generation boots and preserves both.
 
@@ -144,5 +149,5 @@ untouched. Suite-shape pins were recomputed from the raw `it(`/`it.skipIf(` coun
 test files with added tests (plus the strengthened config assertion and the pin file itself); no
 timeout, cap, budget or scheduler semantics changed and no existing assertion was weakened. New-head gates (focused, scheduled FULL with `outcome.exitCode = 0`,
 exact-head CI, fresh independent review and native Perkins readiness) are owed before any
-done/native-ready claim. PR #135 stays a draft; the owner holds merge, deployment, config and
-restart.
+done/native-ready claim. PR #135 is published non-draft per the current PR rule; the owner holds
+merge, deployment, config and restart.

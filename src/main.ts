@@ -521,8 +521,8 @@ async function main(): Promise<number> {
   // Provider pacing (owner heist 2026-09-29): one resolved policy for the
   // process — the optional rate-limit backoff plus the FIFO admission gate
   // shared by worker dispatches, directive deliveries, and Perkins rounds.
-  // Every queue/admission lands on the ledger; the board reads the live
-  // gate view. Default admission is enabled and unlimited; operators set
+  // Every queue/admission lands on the ledger; the board snapshot carries
+  // the live gate view. Default admission is enabled and unlimited; operators set
   // turn caps independently of the resident-session budget.
   const pacing = resolvePacingPolicy(config.pacing, {
     record: (event) => {

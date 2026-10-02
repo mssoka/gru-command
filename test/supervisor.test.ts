@@ -278,6 +278,14 @@ function boot(
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Deterministic microtask drain: a wall-clock-free wait beat for the pacing
+ * coroutines that hop only through promises unless they sleep on the
+ * injected seam. A fixed hop count proves "nothing late is pending" without
+ * a fixed wall-clock sleep that flakes under load. */
+const flushMicrotasks = async (): Promise<void> => {
+  for (let i = 0; i < 16; i += 1) await Promise.resolve();
+};
+
 /** Deterministic backoff clock: records every sleep request and releases
  * waits on demand so retry timing/bounds assert exactly. */
 class ManualSleeper {
@@ -1999,7 +2007,7 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch:job-other' };
     h.registry.adopt(handle);
     emitFailure(handle, 'HTTP 500 internal server error');
-    await sleep(20);
+    await flushMicrotasks();
     expect(handle.disposed).toBe(false);
     expect(handle.promptCalls).toHaveLength(0);
     expect(sleeper.delays).toEqual([]);
@@ -2038,10 +2046,9 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     hang(handle); // open turn; silence past the watchdog window would restart
     emitFailure(handle, '429 too many requests');
     h.advance(60); // past turn_silence_ms (50): the pending retry owns recovery
-    await sleep(20);
+    await vi.waitFor(() => expect(sleeper.delays).toEqual([100]));
     expect(handle.disposed).toBe(false);
     expect(h.registry.spawnCalls).toHaveLength(0);
-    expect(sleeper.delays).toEqual([100]);
     // The delivery itself still runs and recovers.
     await sleeper.release();
     await vi.waitFor(() => expect(handle.promptCalls).toHaveLength(1));
@@ -2063,7 +2070,7 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     h.api.registerAgent({ id: handle.id, role: 'perkins' });
     hang(handle);
     emitFailure(handle, '429 too many requests');
-    await sleep(20);
+    await flushMicrotasks();
     expect(handle.disposed).toBe(false);
     // The workflow owns the bounded backoff. Supervisor never schedules or
     // disposes the isolated transport under that retry.
@@ -2175,8 +2182,12 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
       throw new Error('HTTP 500 internal server error');
     };
     emitFailure(handle, '429 too many requests');
+    const settled = h.supervisor.awaitRetrySettlement(handle.id);
     await sleeper.release();
-    await sleep(20);
+    // The settlement gate replaces the wall-clock beat: the incident is
+    // concluded ('exhausted' — the non-rate-limit rejection stops to the
+    // ladder), so every assertion below is stable to read.
+    await expect(settled).resolves.toBe('exhausted');
     expect(sleeper.delays).toEqual([100]);
     expect(
       h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'pacing.auto-retry'),
@@ -2204,7 +2215,6 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     const settled = h.supervisor.awaitRetrySettlement(handle.id);
     await sleeper.release();
     await expect(settled).resolves.toBe('superseded');
-    await sleep(20);
     expect(sleeper.delays).toEqual([100]);
     expect(
       h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'pacing.auto-retry'),
@@ -2234,7 +2244,6 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     // Not 'superseded' on a text sniff: the incident exhausts and the
     // existing ladder owns the failure (no silent stop).
     await expect(settled).resolves.toBe('exhausted');
-    await sleep(20);
     expect(sleeper.delays).toEqual([100]);
     h.dispose();
   });
@@ -2311,12 +2320,11 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     hang(handle); // open streaming turn accruing silence
     emitFailure(handle, '429 too many requests');
     h.advance(60); // waiting phase: suppressed (the pending retry owns recovery)
-    await sleep(20);
+    await flushMicrotasks();
     expect(handle.disposed).toBe(false);
     await sleeper.release(); // delivery starts and hangs
     h.advance(60); // a running delivery is NOT a pause — the watchdog keeps counting
-    await sleep(60);
-    expect(handle.disposed).toBe(true);
+    await vi.waitFor(() => expect(handle.disposed).toBe(true), { timeout: 5_000 });
     expect(h.registry.spawnCalls.length).toBeGreaterThan(0);
     h.dispose();
   });
@@ -2360,6 +2368,30 @@ describe('supervisor pacing admission and workflow boundary', () => {
       holder.release();
       await vi.waitFor(() => expect(handle.promptCalls).toHaveLength(1));
       expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally { h.dispose(); }
+  });
+
+  it('a worker automatic retry acquire carries the agent jobId on its gate events (r12 blind#5)', async () => {
+    const sleeper = new ManualSleeper();
+    const events: Array<{ kind: string; jobId?: string | null }> = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 1,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => events.push({ kind: event.kind, jobId: event.jobId }),
+    });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    try {
+      const handle = new FakeHandle('minion', 'retry-attributed', null);
+      handle.pendingTurnSnapshot = { text: 'work', owner: 'dispatch' };
+      h.api.addJob({ id: 'job-retry-attr', repo: 'fixture', title: 'retry attribution', briefing: 'brief' });
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-retry-attr' });
+      h.registry.adopt(handle); hang(handle); emitFailure(handle, '429 too many requests');
+      await sleeper.release();
+      await vi.waitFor(() => expect(handle.promptCalls).toHaveLength(1));
+      const admitted = events.filter((event) => event.kind === 'pacing.admitted');
+      expect(admitted.length).toBeGreaterThanOrEqual(1);
+      for (const event of admitted) expect(event.jobId).toBe('job-retry-attr');
     } finally { h.dispose(); }
   });
 
@@ -2469,13 +2501,20 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
   });
 
   it('restart recovery waits for a worker slot: cap one keeps a single active minion turn', async () => {
-    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const gateEvents: Array<{ kind: string; jobId?: string | null }> = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 1,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => gateEvents.push({ kind: event.kind, jobId: event.jobId }),
+    });
     const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
     let holderReleased = false;
     const releaseHolder = (): void => { if (!holderReleased) { holderReleased = true; holder.release(); } };
     const h = boot(undefined, { workerGate: gate });
     try {
       const handle = new FakeHandle('minion', 'minion-restart-cap', null);
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-cap' });
       h.registry.adopt(handle);
       hang(handle);
       handle.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:job-cap' };
@@ -2494,6 +2533,9 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
       // The gate is full: the recovery delivery queues instead of running a
       // second minion turn beside the holder.
       await vi.waitFor(() => expect(gate.view().worker.queued.map((entry) => entry.id)).toContain('minion-restart-cap'), { timeout: 5_000 });
+      // The recovery acquire is attributed too: its queued event carries the
+      // lane agent's job id, not null (r12 blind#5).
+      expect(gateEvents.filter((event) => event.kind === 'pacing.queued').map((event) => event.jobId)).toEqual(['job-cap']);
       expect(resumed?.promptCalls).toHaveLength(0);
       expect(gate.view().worker.running).toBe(1);
       releaseHolder();

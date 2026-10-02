@@ -16,12 +16,16 @@ import { ConfigError, type PacingConfig } from '../config.js';
  */
 
 /** Generic, provider-agnostic rate-limit signatures: the 429 family plus
- * plain-language rate-limit phrasing any provider may emit. Deliberately
+ * plain-language rate-limit phrasing any provider may emit. A bare numeric
+ * token is NOT enough — otherwise "TypeError at line 429" or "only 429
+ * bytes read" would schedule automatic retries. The code must look like a
+ * status (HTTP/status/error/code context, or the leading status-code shape
+ * a provider formatter emits), or sit next to rate-limit words. Deliberately
  * narrower than the supervisor's quota-wall class: subscription/billing
  * exhaustion ("quota exceeded", "insufficient balance") must never be
  * retried into a silent loop. */
 const GENERIC_RATE_LIMIT_PATTERN =
-  /\b429\b|too many requests|\bthrottl(?:e|ed|ing)\b|\brate[- ]?limit(?:ed|ing)?\b/i;
+  /^429\b|\b(?:http(?:\/ ?\d+(?:\.\d+)*)?|status(?:[_\s]?code)?|error(?:[_\s]?code)?|code)\b\s*[:=,_-]?\s*429\b|\b429\b[^\p{L}\p{N}]{0,8}(?:too many requests|rate[- ]?limit)|\btoo many requests\b|\bthrottl(?:e|ed|ing)\b|\brate[- ]?limit(?:ed|ing)?\b/i;
 
 /** True when the error text matches the generic 429 family or one of the
  * configured signatures. Never matches on provider identity. */
@@ -83,11 +87,14 @@ export function resolveRateLimitBackoff(config: PacingConfig): RateLimitBackoffP
 
 /**
  * Delay for retry n (1-based): base * 2^(n-1), capped at maxMs, plus
- * additive jitter up to half the (pre-jitter) exponential — and the sum is
- * clamped to maxMs so no single delay can ever exceed the configured bound.
- * The pure exponential is therefore the floor of every delay. Exported for
- * deterministic tests of the ladder shape; production callers use the
- * service's jitter seam.
+ * additive jitter up to half the (pre-jitter) exponential while the
+ * exponential is under the bound. Once the exponential reaches the cap,
+ * an additive draw would always clamp back to the same value — every
+ * fully capped retry would be synchronized — so the same draw instead
+ * spreads the delay DOWN from the bound (the bound stays a hard ceiling,
+ * and the default zero jitter keeps the pure ladder exactly: the capped
+ * rung remains maxMs). Exported for deterministic tests of the ladder
+ * shape; production callers use the service's jitter seam.
  */
 export function backoffDelayMs(
   retry: number,
@@ -96,15 +103,22 @@ export function backoffDelayMs(
   jitter: (capMs: number) => number = () => 0,
 ): number {
   const exponential = Math.min(baseMs * 2 ** Math.max(0, retry - 1), maxMs);
-  const jittered = exponential + jitter(exponential / 2);
-  return Math.min(jittered, maxMs);
+  if (exponential >= maxMs) return maxMs - jitter(maxMs / 2);
+  return Math.min(exponential + jitter(exponential / 2), maxMs);
 }
 
 /** Canonical pacing.auto-retry* payloads shared by BOTH producers — the
  * supervisor's minion-turn retries and the workflow-owned retry loop used by
  * Perkins lead/lens turns — so job/round-scoped ledger consumers never have
  * to special-case two schemas. Context that varies per producer (jobId,
- * roundId, agentId) rides the event ENVELOPE, never the payload. */
+ * roundId, agentId) rides the event ENVELOPE, never the payload. The error
+ * text is bounded here so both producers record the same bound. */
+export const MAX_PACING_ERROR_CHARS = 500;
+
+function boundedPacingError(error: string): string {
+  return error.length > MAX_PACING_ERROR_CHARS ? error.slice(0, MAX_PACING_ERROR_CHARS) : error;
+}
+
 export interface PacingRetryPayload {
   readonly attempt: number;
   readonly max_auto_retries: number;
@@ -129,7 +143,7 @@ export function pacingRetryPayload(
   delayMs: number,
   error: string,
 ): PacingRetryPayload {
-  return { attempt, max_auto_retries: maxAutoRetries, delay_ms: delayMs, error };
+  return { attempt, max_auto_retries: maxAutoRetries, delay_ms: delayMs, error: boundedPacingError(error) };
 }
 
 export function pacingExhaustedPayload(
@@ -137,7 +151,7 @@ export function pacingExhaustedPayload(
   maxAutoRetries: number,
   error: string,
 ): PacingExhaustedPayload {
-  return { attempts, max_auto_retries: maxAutoRetries, error };
+  return { attempts, max_auto_retries: maxAutoRetries, error: boundedPacingError(error) };
 }
 
 export function pacingRecoveredPayload(attempts: number, maxAutoRetries: number): PacingRecoveredPayload {
@@ -177,7 +191,6 @@ export async function settleRetries(
   signal?: AbortSignal,
 ): Promise<RetrySettlement | 'cancelled'> {
   if (hook === undefined) return 'none';
-  if (signal?.aborted === true) return 'cancelled';
   let settle: Promise<RetrySettlement>;
   try {
     settle = hook(agentId);
@@ -188,6 +201,23 @@ export async function settleRetries(
     throw new RetrySettlementUnavailableError(agentId, cause);
   });
   if (signal === undefined) return surfaced;
+  if (signal.aborted === true) {
+    // Shutdown already landed, but the hook may have had nothing to wait
+    // for: an already-available disposition ('none' — no incident was
+    // pending) must win over the cancellation, otherwise a shutdown
+    // between a resolved prompt and this call would block a lane that had
+    // no pending settlement. A genuinely pending settlement yields to the
+    // cancellation on the next microtask instead of hanging the caller:
+    // the race consults the hook first, and a promise that is already
+    // settled beats the already-resolved cancellation. A hook fault still
+    // surfaces as a named RetrySettlementUnavailableError.
+    const winner = await Promise.race([settle, Promise.resolve<'cancelled'>('cancelled')]).catch(
+      (cause: unknown) => {
+        throw new RetrySettlementUnavailableError(agentId, cause);
+      },
+    );
+    return winner;
+  }
   let listener: (() => void) | null = null;
   try {
     return await Promise.race([
@@ -214,7 +244,8 @@ export interface PacingQueueEntryView {
   /** Caller-chosen identity (job id, round id, lens label…). */
   readonly id: string;
   readonly kind: PacingPool;
-  /** Human-readable label rendered with the queue (board snapshot data). */
+  /** Human-readable label carried with the queue entry in the board
+   * snapshot data. */
   readonly label: string;
   readonly queuedAt: string;
   /** Why this entry is waiting — always the honest limit, never a guess. */
@@ -249,7 +280,8 @@ export type PacingEventRecorder = (event: {
 export interface PacingAcquireInput {
   /** Caller-chosen identity (job id, round id, lens label…). */
   readonly id: string;
-  /** Human-readable label rendered with the queue (board snapshot data). */
+  /** Human-readable label carried with the queue entry in the board
+   * snapshot data. */
   readonly label: string;
   readonly jobId?: string | null;
   readonly agentId?: string | null;
@@ -306,7 +338,8 @@ interface PacingWaiter {
  *
  * Releases hand the slot straight to the head waiter, so a new arrival can
  * never jump an existing queue (no starvation). Every wait is visible via
- * {@link view} — the board renders queued lanes honestly.
+ * {@link view} — the board snapshot carries every queued entry with its
+ * honest reason (rendering belongs to the board consumers).
  */
 export class PacingGate {
   private readonly enabled: boolean;
@@ -319,6 +352,16 @@ export class PacingGate {
 
   constructor(opts: PacingGateOptions) {
     this.enabled = opts.enabled;
+    // Fail loud on a non-finite cap at this boundary: Math.floor(NaN) is NaN,
+    // and a NaN limit silently wedges every acquire while the board view
+    // carries NaN (which the web frame validator rejects). A wiring mistake
+    // must never read as a full pool.
+    if (!Number.isFinite(opts.maxConcurrentMinions)) {
+      throw new Error(`PacingGate: maxConcurrentMinions must be a finite number, got ${String(opts.maxConcurrentMinions)}`);
+    }
+    if (!Number.isFinite(opts.maxConcurrentReviewTurns)) {
+      throw new Error(`PacingGate: maxConcurrentReviewTurns must be a finite number, got ${String(opts.maxConcurrentReviewTurns)}`);
+    }
     this.limits = {
       worker: Math.max(0, Math.floor(opts.maxConcurrentMinions)),
       review: Math.max(0, Math.floor(opts.maxConcurrentReviewTurns)),

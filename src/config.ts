@@ -1367,7 +1367,7 @@ function readPacingConfig(
   // than being silently accepted or aliased. A file that sets both is
   // therefore impossible to write.
   const enabled =
-    table['enabled'] !== undefined ? requireBool(table['enabled'], file, `${section}.enabled`) : true;
+    table['enabled'] !== undefined ? requireBool(table['enabled'], file, `${section}.enabled`) : defaults.enabled;
   const maxConcurrentMinions = table['max_concurrent_minions'] !== undefined
     ? requireNonNegativeInt(table['max_concurrent_minions'], file, `${section}.max_concurrent_minions`)
     : defaults.maxConcurrentMinions;

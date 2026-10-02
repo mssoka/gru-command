@@ -103,13 +103,32 @@ describe('vitest rpc-timeout patch tool', () => {
     expect(result.stdout).toContain('skipped (production install?)');
   });
 
-  it('fails loud when vitest is installed but dist/chunks was relocated', () => {
+  it('fails LOUD when vitest is installed but dist/chunks was relocated', () => {
     const cwd = fixtureDir();
     mkdirSync(join(cwd, 'node_modules', 'vitest'), { recursive: true });
     writeFileSync(join(cwd, 'node_modules', 'vitest', 'package.json'), '{}');
     const result = runTool(cwd);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('installed vitest has no dist/chunks');
+    expect(result.stderr).toContain('node_modules');
+  });
+
+  it('keeps a valid dist usable when the OTHER root has a package.json-only vitest (r12 blind#10)', () => {
+    const cwd = fixtureDir();
+    // Root 1 looks installed but carries no dist/chunks (partial install).
+    mkdirSync(join(cwd, 'node_modules', 'vitest'), { recursive: true });
+    writeFileSync(join(cwd, 'node_modules', 'vitest', 'package.json'), '{}');
+    // Root 2 holds the patchable dist: the run must proceed there instead of
+    // aborting on root 1 before root 2 is ever inspected.
+    const dir = join(cwd, 'web', 'node_modules', 'vitest', 'dist', 'chunks');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'rpc.testchunk.js');
+    writeFileSync(file, `${OPEN}\n}));\n`);
+
+    const result = runTool(cwd);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('applied upstream fix');
+    expect(readFileSync(file, 'utf-8')).toContain('timeout: -1,');
   });
 
   it('applies the upstream fix and is idempotent on a second run', () => {
@@ -161,7 +180,7 @@ describe('vitest rpc-timeout patch tool', () => {
 
     const result = runTool(cwd);
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain('2 createBirpc sites');
+    expect(result.stderr).toContain('0 patched + 2 unpatched createBirpc sites');
   });
 
   it('fails LOUD when the patch marker is present but a second site is still unpatched (r4 adversarial#10)', () => {
@@ -171,8 +190,10 @@ describe('vitest rpc-timeout patch tool', () => {
     const result = runTool(cwd);
     expect(result.status).not.toBe(0);
     // The marker alone must never read as "already patched": the shape guard
-    // still runs and names both sides.
-    expect(result.stderr).toMatch(/1 patched \+ 2 createBirpc sites/);
+    // still runs and names both sides truthfully — one patched site plus the
+    // one still-unpatched site (not the old overcount that included the
+    // patched site's embedded OPEN prefix).
+    expect(result.stderr).toMatch(/1 patched \+ 1 unpatched createBirpc sites/);
     expect(result.stderr).toContain('update tools/patch-vitest-rpc-timeout.mjs');
   });
 

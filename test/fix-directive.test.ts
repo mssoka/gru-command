@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -334,8 +334,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         return settleCalls === 1 ? Promise.resolve('none' as const) : new Promise<'recovered'>(() => {});
       },
     });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(prompted).toHaveLength(1);
+    await vi.waitFor(() => expect(prompted).toHaveLength(1));
     controller.abort();
     await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted' });
     expect(settleCalls).toBe(2);
@@ -366,8 +365,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
       signal: controller.signal,
       retrySettlement: () => new Promise<'recovered'>(() => {}),
     });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(prompted).toHaveLength(1);
+    await vi.waitFor(() => expect(prompted).toHaveLength(1));
     controller.abort();
     await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted' });
   });
@@ -394,8 +392,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
       signal: controller.signal,
       workerGate: gate,
     });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(gate.view().worker.queued).toHaveLength(1);
+    await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
     controller.abort();
     await expect(routing).rejects.toThrow(/aborted/);
     holder.release();
@@ -424,8 +421,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
       signal: controller.signal,
       retrySettlement: () => new Promise<'recovered'>(() => {}),
     });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(prompted).toHaveLength(1);
+    await vi.waitFor(() => expect(prompted).toHaveLength(1));
     controller.abort();
     await expect(routing).rejects.toThrow(/cancelled before its automatic retries settled/);
   });

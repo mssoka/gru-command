@@ -64,6 +64,31 @@ describe('rate-limit error class (provider-agnostic)', () => {
     }
   });
 
+  it('never classifies stray numeric tokens: a bare 429 needs status context or rate-limit words (r12 blind#2)', () => {
+    const rateLimited = [
+      '429: {"error":"slow down"}',
+      'HTTP/1.1 429 Too Many Requests',
+      'statusCode: 429',
+      'error_code=429',
+      'Request failed with status code 429',
+      '429 rate limit exceeded',
+    ];
+    for (const text of rateLimited) {
+      expect(isRateLimitErrorText(text), text).toBe(true);
+    }
+    const notRateLimited = [
+      'TypeError at line 429',
+      'agent-429 failed',
+      'only 429 bytes read',
+      'waited 429 ms for the flush',
+      'processed item 429 of 1000',
+      'status 404, body follows',
+    ];
+    for (const text of notRateLimited) {
+      expect(isRateLimitErrorText(text), text).toBe(false);
+    }
+  });
+
   it('matches configured per-provider signatures without any provider name in code', () => {
     expect(isRateLimitErrorText('pacing code 1302 from the provider', [])).toBe(false);
     expect(
@@ -143,6 +168,33 @@ describe('bounded exponential backoff + jitter', () => {
     expect(caps).toEqual([200]);
     for (let retry = 1; retry <= 30; retry += 1) {
       const delay = backoffDelayMs(retry, 100, 1_000, maximal);
+      expect(delay).toBeGreaterThanOrEqual(100);
+      expect(delay).toBeLessThanOrEqual(1_000);
+    }
+  });
+
+  it('keeps spreading fully capped rungs: the draw trims below the bound instead of clamping flat (r12 blind#3)', () => {
+    // retry 5: 100 * 2^4 = 1600 -> exponential is at the 1000 cap, so an
+    // additive draw would clamp to 1000 for every draw and synchronize the
+    // herd. The draw instead spreads the delay down from the bound.
+    expect(backoffDelayMs(5, 100, 1_000, () => 0)).toBe(1_000);
+    expect(backoffDelayMs(5, 100, 1_000, (capMs) => capMs)).toBe(500);
+    expect(backoffDelayMs(20, 100, 1_000, (capMs) => capMs)).toBe(500);
+    expect(backoffDelayMs(5, 100, 1_000, () => 250)).toBe(750);
+    // Two different draws at the cap produce two different delays.
+    expect(backoffDelayMs(5, 100, 1_000, () => 100)).not.toBe(
+      backoffDelayMs(5, 100, 1_000, () => 300),
+    );
+    // The seam receives half the capped exponential, as before.
+    const caps: number[] = [];
+    backoffDelayMs(5, 100, 1_000, (capMs) => {
+      caps.push(capMs);
+      return 0;
+    });
+    expect(caps).toEqual([500]);
+    // The bound stays a hard ceiling for every retry and draw share.
+    for (let retry = 1; retry <= 30; retry += 1) {
+      const delay = backoffDelayMs(retry, 100, 1_000, (capMs) => capMs);
       expect(delay).toBeGreaterThanOrEqual(100);
       expect(delay).toBeLessThanOrEqual(1_000);
     }
@@ -330,25 +382,43 @@ describe('retry settlement consumption gate', () => {
     expect(await settleRetries(async () => 'superseded', 'agent-a')).toBe('superseded');
   });
 
-  it('a pre-aborted or mid-wait abort settles cancelled without invoking the hook', async () => {
+  it('consults the hook before a pre-aborted cancellation; a pending settlement still yields to it', async () => {
     const preAborted = new AbortController();
     preAborted.abort();
+    // Nothing was pending: the synchronously available disposition must win
+    // over the already-landed cancellation (r12 blind#8), otherwise a
+    // shutdown between a resolved prompt and the settlement call would block
+    // a lane that had no pending settlement.
     let called = false;
     expect(
       await settleRetries(async () => { called = true; return 'recovered'; }, 'agent-a', preAborted.signal),
-    ).toBe('cancelled');
-    expect(called).toBe(false);
+    ).toBe('recovered');
+    expect(called).toBe(true);
+    expect(await settleRetries(async () => 'none', 'agent-b', preAborted.signal)).toBe('none');
 
-    const controller = new AbortController();
+    // A genuinely pending settlement yields to the already-landed
+    // cancellation instead of hanging the caller.
     let release!: (value: 'recovered') => void;
     const pending = settleRetries(
       () => new Promise<'recovered'>((resolve) => { release = resolve; }),
-      'agent-a',
+      'agent-c',
+      preAborted.signal,
+    );
+    await expect(pending).resolves.toBe('cancelled');
+    release('recovered');
+
+    // A mid-wait abort (the signal fires while the race is live) is
+    // unchanged.
+    const controller = new AbortController();
+    let releaseLate!: (value: 'recovered') => void;
+    const pendingLate = settleRetries(
+      () => new Promise<'recovered'>((resolve) => { releaseLate = resolve; }),
+      'agent-d',
       controller.signal,
     );
     controller.abort();
-    await expect(pending).resolves.toBe('cancelled');
-    release('recovered');
+    await expect(pendingLate).resolves.toBe('cancelled');
+    releaseLate('recovered');
   });
 });
 
@@ -446,5 +516,24 @@ describe('pacing ledger honesty (r4 triage rows A3/A4/A9)', () => {
       error: '429',
     });
     expect(pacingRecoveredPayload(2, 5)).toEqual({ attempts: 2, max_auto_retries: 5 });
+  });
+
+  it('bounds the error text in the shared payload builders so both producers record the same bound (r12 blind#4)', () => {
+    const verbose = 'x'.repeat(5_000);
+    const retry = pacingRetryPayload(1, 3, 100, verbose);
+    const exhausted = pacingExhaustedPayload(3, 3, verbose);
+    expect(retry.error.length).toBe(500);
+    expect(exhausted.error.length).toBe(500);
+    // Short text passes through untouched.
+    expect(pacingRetryPayload(1, 3, 100, 'HTTP 429').error).toBe('HTTP 429');
+  });
+
+  it('fails loud at the gate boundary on a non-finite cap instead of wedging the pool (r12 blind#6)', () => {
+    expect(
+      () => new PacingGate({ enabled: true, maxConcurrentMinions: Number.NaN, maxConcurrentReviewTurns: 0 }),
+    ).toThrow(/maxConcurrentMinions must be a finite number/);
+    expect(
+      () => new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: Number.POSITIVE_INFINITY }),
+    ).toThrow(/maxConcurrentReviewTurns must be a finite number/);
   });
 });

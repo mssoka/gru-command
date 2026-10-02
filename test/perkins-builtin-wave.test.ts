@@ -1,4 +1,4 @@
-import { PacingGate } from '../src/runtime/pacing.js';
+import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -2391,7 +2391,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     workerGate?: PacingGate;
     /** Provider pacing: the bounded retry settlement to report for a
      * delivered fallback-review turn. Absent = no interlock. */
-    retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
+    retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
     /** Make the fallback turn reject after writing its report (a transport
      * rejection whose automatic retry may still recover the delivery). */
     failPrompt?: boolean;
