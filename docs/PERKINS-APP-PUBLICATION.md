@@ -132,14 +132,16 @@ only on provider proof:
   60 s margin tolerates provider clock skew, and older rounds' identical
   bytes outside it are never credited.
 
-The same constraints govern the **second** lookup of a failed attempt:
-when the failure path reconciles the same POST again (the review wave's
-failure seam), a definitively refused attempt (HTTP 4xx) fails closed with
-no lookup at all — no publication can be credited for a refused POST —
-and an ambiguous attempt stays bound to its attempt window: only reviews
-the provider provably submitted earlier than that window are excluded,
-while reviews whose submission time the provider does not state remain
-governed by the recovery rules below.
+The **second** lookup of a failed attempt is fail-closed: when the review
+wave's failure seam reconciles the same publication attempt again (an
+explicit post-failure caller context on `VerdictPoster.reconcile`, reaching
+this publisher through `AutoVerdictPoster`), it throws an honest unresolved
+error before any provider read — `post()` already owns the one bounded
+strict-window reconciliation, and a failed post is never upgraded into a
+receipt or an absence certificate by a second recovery lookup. Ordinary
+standalone/recovery reconciliation (no context) keeps its distinct prior
+rules: any provider-proved exact head/body match is credited, including a
+publication whose submission time the provider does not state.
 
 Absence is certified only by full coverage: the walk visits every page up
 to the largest `rel="last"` page number any response reported — a list

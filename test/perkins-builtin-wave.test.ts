@@ -1494,7 +1494,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // must leave the provider's stale identical review uncredited, so the
     // round stays honestly unposted (no round.posted event, no recorded
     // verdict, no approval completion).
-    const { privateKeyPem } = generateKeyPairSync('rsa', {
+    const { privateKey } = generateKeyPairSync('rsa', {
       modulusLength: 2048,
       privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
       publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -1503,7 +1503,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     dirs.push(home);
     mkdirSync(join(home, 'perkins'), { recursive: true });
     chmodSync(join(home, 'perkins'), 0o700);
-    writeFileSync(join(home, 'perkins', 'app-key.pem'), privateKeyPem, 'utf8');
+    writeFileSync(join(home, 'perkins', 'app-key.pem'), privateKey, 'utf8');
     chmodSync(join(home, 'perkins', 'app-key.pem'), 0o600);
     const configPath = join(home, 'perkins', 'config');
     writeFileSync(configPath, 'app_id=424242\nkey_path="app-key.pem"\ninstallation_id_acme=164552969\n', 'utf8');
@@ -1564,7 +1564,11 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       }
       return json(404, { message: `no test route for ${method} ${url}` });
     };
-    const poster = new PerkinsAppPrPoster({ instanceDir: home, fetchImpl, now: () => NOW });
+    // The REAL production path: AutoVerdictPoster selecting the real App
+    // publisher — so the post-failure caller context must travel through
+    // AutoVerdictPoster.reconcile to the same selected backend, not just
+    // to a directly injected double.
+    const poster = new AutoVerdictPoster(new PerkinsAppPrPoster({ instanceDir: home, fetchImpl, now: () => NOW }));
 
     const root = mkdtempSync(join(tmpdir(), 'perkins-app-seam-port-'));
     const artifacts = mkdtempSync(join(tmpdir(), 'perkins-app-seam-artifacts-'));
@@ -1586,9 +1590,13 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       prHeadProbe: localHeadProbe('feature/app-seam') as ReturnType<typeof localHeadProbe>,
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
-    // Exactly one POST (never a duplicate) and the bounded lookup ran.
+    // Exactly one POST (never a duplicate) and exactly ONE reviews lookup:
+    // post()'s own bounded strict-window reconciliation. A second lookup
+    // would prove the post-failure context never reached the selected App
+    // (ordinary recovery would then also CREDIT the stale review and
+    // record round.posted).
     expect(postCount).toBe(1);
-    expect(lookupCount).toBeGreaterThanOrEqual(1);
+    expect(lookupCount).toBe(1);
     // The stale identical review is NOT credited: honestly unposted.
     expect(outcome.posted).toBe(false);
     expect(outcome.round.status).not.toBe('verdict-posted');
