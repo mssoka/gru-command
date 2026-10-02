@@ -14,7 +14,8 @@ import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { NotificationCenter } from '../src/notifications/center.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
+import { originHeadProbe } from './helpers/pr-head-probe.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 import type { WorktreeBaseSource } from '../src/ledger/api.js';
 import { BRANCH_BUSY_HINT, findBusyLanes, laneIsBusy, normalizeBranch } from '../src/dispatch/branch-idle.js';
@@ -132,6 +133,10 @@ async function boot(opts: {
     spawner,
     reviewArtifactRoot: artifactRoot,
     bus,
+    // PR-linked rounds verify the live head through the fixture's own bare
+    // origin (the same double the dispatch-server suite uses); rounds
+    // without a registered PR never consult it.
+    prHeadProbe: originHeadProbe(),
     fallbackGate: {
       skillPath: fallbackSkill,
       runFallbackReview: async () => {
@@ -632,6 +637,10 @@ describe('branch-idle guard', () => {
     const h = await boot({ onPreflight: () => { preflights += 1; } });
     try {
       const lane = await createLaneJob(h, repo, { jobId: 'rebrief-finalize', status: 'delivered' });
+      // A registered PR routes the freeze through the live PR head; the
+      // fixture's bare origin carries the pushed lane branch for that check.
+      attachBareOrigin(repo);
+      repo.git(['push', '--quiet', 'origin', 'gru/rebrief-finalize:refs/heads/gru/rebrief-finalize']);
       h.ledger.setJobPr('rebrief-finalize', 'https://git.example.invalid/acme/fixture/pull/9');
       h.ledger.beginPendingRebrief({ jobId: 'rebrief-finalize', note: 'same blocker', briefing: 'b' });
 
