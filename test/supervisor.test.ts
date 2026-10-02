@@ -804,7 +804,7 @@ describe('supervisor — durable restart association', () => {
       // The rung reports the actionable binding failure; the dispose
       // rejection is logged separately and never masks it.
       const rungErrors = logs
-        .filter((entry) => entry.msg === 'restart rung threw — settling')
+        .filter((entry) => entry.msg === 'restart rung failed')
         .map((entry) => String(entry.fields?.error));
       expect(rungErrors).toEqual(['Error: restart binding write failed']);
       expect(logs.some((entry) => entry.msg.includes('binding error is preserved'))).toBe(true);
