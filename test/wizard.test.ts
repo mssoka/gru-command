@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { afterAll, describe, expect, it } from 'vitest';
+import { markFixtureStep } from './helpers/harness-diagnostics.mjs';
 import { loadConfig, configPathFor } from '../src/config.js';
 import { probeRuntimes } from '../src/runtime/probe.js';
 import { formatHostForUrl, runFirstBootSmoke } from '../src/wizard/main.js';
@@ -469,10 +470,13 @@ describe('wizard CLI surface', () => {
           stdio: ['ignore', 'pipe', 'pipe'],
           env: { ...process.env, GRU_COMMAND_HOME: tempDir('gru-command-wizard-answers-') },
         });
+        markFixtureStep('wizard --answers <json> → exit 0');
         return { status: 0, stderr: out };
       } catch (error) {
         const err = error as { status?: number; stderr?: string | Buffer };
-        return { status: err.status ?? 1, stderr: String(err.stderr ?? '') };
+        const status = err.status ?? 1;
+        markFixtureStep(`wizard --answers <json> → exit ${status}`);
+        return { status, stderr: String(err.stderr ?? '') };
       }
     };
     // Secrets are forbidden on the command line (documented contract).

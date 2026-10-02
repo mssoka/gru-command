@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { markFixtureStep, trackChildProcess } from './harness-diagnostics.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..');
@@ -207,6 +208,9 @@ export async function startRealService({
     stdio: ['ignore', 'pipe', 'pipe'],
     env: childEnv,
   });
+  // Fixture-owned child: the diagnostics scope (when a test is active)
+  // records pid/exit state and a bounded stderr tail for timeouts.
+  trackChildProcess(child, { label: 'gru-command service (dist/main.js)' });
   let stderrTail = '';
   child.stdout.on('data', () => {}); // drain: the service log must never wedge the pipe
   child.stderr.on('data', (chunk) => {
@@ -250,6 +254,7 @@ export async function startRealService({
     }
     await delay(100);
   }
+  markFixtureStep(`real service answered /health on port ${port}`);
 
   function cleanup() {
     // keepHome = "this boot's dirs survive stop()" (the e2e restart flow

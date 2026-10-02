@@ -1,5 +1,14 @@
 import { defineConfig } from 'vitest/config';
+import {
+  FAST_TEST_TIMEOUT_MS,
+  FAST_WORKER_CAP,
+  applyWorkerBudget,
+  budgetBanner,
+  heavyTestPaths,
+} from './test/helpers/test-budgets.js';
 
+// Fast phase (workload-aware test budgets, owner-approved journal j-829).
+//
 // Co-tenant headroom on a shared host. The verify scheduler pins
 // VITEST_MAX/MIN_THREADS/FORKS in the run environment (one cross-lane
 // budget, cores - 2), but dispatched job lanes and service housekeeping
@@ -12,22 +21,20 @@ import { defineConfig } from 'vitest/config';
 // stay exactly as authored. The scheduler's pin (if present) still acts
 // as the upper bound; the config module executes before resolveConfig
 // applies the environment, so clamping here composes with it.
-const SUITE_WORKER_CAP = 4;
-const pinnedPools = [process.env.VITEST_MAX_THREADS, process.env.VITEST_MAX_FORKS]
-  .map((value) => (value === undefined ? Number.NaN : Number.parseInt(value, 10)))
-  .filter((value) => Number.isFinite(value));
-const effectiveCap =
-  pinnedPools.length > 0 ? Math.min(...pinnedPools, SUITE_WORKER_CAP) : SUITE_WORKER_CAP;
-process.env.VITEST_MAX_THREADS = String(effectiveCap);
-process.env.VITEST_MIN_THREADS = String(effectiveCap);
-process.env.VITEST_MAX_FORKS = String(effectiveCap);
-process.env.VITEST_MIN_FORKS = String(effectiveCap);
+//
+// Process-heavy integration files are classified in
+// test/helpers/test-budgets.ts and run as a SEPARATE phase
+// (vitest.heavy.config.ts, 120s budgets, at most two workers) after this
+// one, so aggregate workers never exceed the same global budget.
+const effectiveWorkers = applyWorkerBudget(process.env, FAST_WORKER_CAP);
+process.stdout.write(`${budgetBanner('fast', effectiveWorkers)}\n`);
 
 export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
-    setupFiles: ['test/helpers/env-setup.ts'],
-    testTimeout: 30_000,
-    hookTimeout: 30_000,
+    exclude: heavyTestPaths(),
+    setupFiles: ['test/helpers/env-setup.ts', 'test/helpers/timeout-diagnostics.ts'],
+    testTimeout: FAST_TEST_TIMEOUT_MS,
+    hookTimeout: FAST_TEST_TIMEOUT_MS,
   },
 });

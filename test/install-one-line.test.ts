@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpat
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { markFixtureStep } from './helpers/harness-diagnostics.mjs';
 
 /**
  * install.sh setup mode (E9): the one-line-install pipeline exercised
@@ -28,6 +29,14 @@ function tempDir(prefix: string): string {
 
 let lastStderr = '';
 
+/** Flags only — never echo answer values or fixture paths into diagnostics. */
+function commandLabel(args: readonly string[]): string {
+  return args
+    .map((arg) => (arg.startsWith('--') ? (arg.split('=')[0] ?? arg) : '<arg>'))
+    .slice(0, 6)
+    .join(' ');
+}
+
 function run(
   script: string,
   args: string[],
@@ -42,11 +51,14 @@ function run(
       timeout: 120_000,
     });
     lastStderr = '';
+    markFixtureStep(`install.sh ${commandLabel(args)} → exit 0`);
     return { stdout, stderr: '', status: 0 };
   } catch (error) {
     const err = error as { stdout?: string; stderr?: string; status?: number };
     lastStderr = err.stderr ?? '';
-    return { stdout: err.stdout ?? '', stderr: err.stderr ?? '', status: err.status ?? 1 };
+    const status = err.status ?? 1;
+    markFixtureStep(`install.sh ${commandLabel(args)} → exit ${status}`);
+    return { stdout: err.stdout ?? '', stderr: err.stderr ?? '', status };
   }
 }
 
