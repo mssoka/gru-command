@@ -322,6 +322,9 @@ export const MIGRATIONS: readonly Migration[] = [
     sql: `
       ALTER TABLE worktrees ADD COLUMN base_source TEXT
         CHECK (base_source IN ('origin','local-head-fallback'));
+    `,
+  },
+  {
     // Durable follow-through obligations (blocked-heist follow-through,
     // phase 2 — ledger foundation only; no scheduling/execution).
     //
@@ -330,7 +333,7 @@ export const MIGRATIONS: readonly Migration[] = [
     // never-applied migrations sat unshipped on this branch. They were
     // renumbered 9->10 and 10->11 at integration — renumbering ONLY
     // never-applied migrations, no hole, no imported schema — and the
-    // final head must be reverifiied/reviewed after integration. Once applied on any
+    // final head must be reverified/reviewed after integration. Once applied on any
     // database, this build refuses unknown/gapped versions — roll-forward
     // is the only compatible direction (no old-binary compatibility
     // claim, no live schema action).
@@ -425,7 +428,7 @@ export const MIGRATIONS: readonly Migration[] = [
     // events watermark at acceptance: a completion at/before it can never
     // answer this phase (an older receipt cannot complete a newer phase).
     //
-    // LANDING COLLISION (same convention as migration 9): id 10 is a
+    // LANDING COLLISION (same convention as migration 10): id 11 is a
     // branch-local next-contiguous number for an UNSHIPPED feature; if
     // another lane's migration lands first, integrate owner-merged main and
     // re-number ONLY this never-applied migration (never a hole).

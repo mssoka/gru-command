@@ -12,11 +12,12 @@ not a claim about the chief's render or any other lane's work).
 - Re-brief `PR136-CHIEF-HANDOFF-20261001` (owner-approved, ruling `j-501`):
   continue ONLY this job/branch/draft PR; bounded delta on top of the
   existing approved `durable-blocked-followthrough` undertaking.
-- Chief scope observation `j-499` + proposed scope:
-  `/Users/moses/.gru-command/briefings/chief-decision-handoff-heist-20261001/proposed-scope.md`.
+- Chief scope observation `j-499` + proposed scope: lane-private pointer
+  (outside this repo) `briefings/chief-decision-handoff-heist-20261001/proposed-scope.md`.
 - Historical lane records (read as evidence, preserved unmodified):
   `_bmad-output/implementation-artifacts/spec-durable-blocked-followthrough.md`,
-  `/Users/moses/.gru-command/briefings/durable-blocked-followthrough-approved-20260928/plan/`
+  lane-private pointer (outside this repo)
+  `briefings/durable-blocked-followthrough-approved-20260928/plan/`
   (`ready-for-development-spec.md`, `acceptance-tests.md`, `overlap-and-sequencing.md`),
   `_bmad-output/implementation-artifacts/durable-followthrough-rebase-20260930/receipt.md`,
   `_bmad-output/implementation-artifacts/durable-followthrough-ci-repair-20260930/`.
