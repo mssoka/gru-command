@@ -56,7 +56,6 @@ const PINS: Record<string, number> = {
   'logger.test.ts': 3,
   'native-tools-parity.test.ts': 2,
   'notifications.test.ts': 19,
-  'owner-actions.test.ts': 8,
   'pacing-admission.test.ts': 14,
   'pacing.test.ts': 28,
   'patch-vitest-rpc-timeout.test.ts': 11,
