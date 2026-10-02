@@ -728,6 +728,28 @@ describe('dispatch server (E8)', () => {
         async dispose() {},
       });
       const freshBefore = h.spawns.filter((spawn) => spawn.role === 'minion').length;
+      // A round-bound review-only minion is not an implementer: the
+      // retirement pass must never touch its live handle (G1 exclusion).
+      const reviewRound = h.ledger.addRound({ jobId: 'rebrief-job', lenses: ['blind'] });
+      h.ledger.registerAgent({
+        id: 'review-only-minion',
+        role: 'minion',
+        jobId: 'rebrief-job',
+        roundId: reviewRound.id,
+        sessionFile: '/review-only.jsonl',
+      });
+      h.liveHandles.set('review-only-minion', {
+        role: 'minion',
+        id: 'review-only-minion',
+        sessionFile: '/review-only.jsonl',
+        capabilities: FAKE_CAPABILITIES,
+        prompt: async () => {},
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: '/review-only.jsonl' }),
+        async dispose() {},
+      });
       const res = await call(h.port, 'POST', '/api/silas/rebrief', {
         job_id: 'rebrief-job',
         note: 'same blocker three rounds; try a different approach',
@@ -742,8 +764,10 @@ describe('dispatch server (E8)', () => {
       const event = h.ledger.listJobEvents('rebrief-job').find((candidate) => candidate.kind === 'silas.rebrief');
       expect(event).not.toBeNull();
       expect((event?.payload as { note?: string }).note).toContain('same blocker');
-      // The prior live session was retired, not leaked.
+      // The prior live session was retired, not leaked — and the live
+      // review-only session was left alone.
       expect(h.disposedHandles).toContain(priorMinion);
+      expect(h.disposedHandles).not.toContain('review-only-minion');
       // The re-brief prompt carries the original briefing (still the
       // contract) AND the note — a cwd-only check proved neither.
       const rebriefText = h.minionTurnTexts.find((text) => text.startsWith('Re-brief — job rebrief-job'));

@@ -224,6 +224,11 @@ describe('ledger api — the record of state', () => {
   });
 
   it('listImplementerMinions: newest-first role-minion rows, review-only sessions excluded (G1)', () => {
+    // Self-seeding: earlier sections share this db, but a focused run must
+    // not depend on their rows (agents.job_id is FK-enforced).
+    if (api.getJob('fix-login-flow') === null) {
+      api.addJob({ id: 'fix-login-flow', repo: 'billing-api', title: 'Fix the login flow regression' });
+    }
     api.addJob({ id: 'unrelated', repo: 'fixture', title: 'other heist' });
     api.registerAgent({ id: 'crew', role: 'gru' });
     api.registerAgent({ id: 'impl', role: 'minion', jobId: 'fix-login-flow', sessionFile: '/impl.jsonl' });
