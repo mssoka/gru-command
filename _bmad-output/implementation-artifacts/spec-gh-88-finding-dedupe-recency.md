@@ -178,3 +178,32 @@ intent and stands as the Checkpoint-1 approval.
 - `node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-findings-dedupe.test.ts` — red first (fails on unfixed `types.ts`, preserved receipt), then green after the fix.
 - `node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-findings-dedupe.test.ts test/suite-shape.test.ts` — lane focused scope.
 - `npm test` — full backend gate (lint, typecheck, build + resource verifier, vitest); web e2e/CI/Perkins gates via the scheduler.
+
+- 2026-10-02 (owner-authorized full-completion continuation after the DeepSeek resume): integrated main `059c0762`
+  (PR #151 + #69) was already merged at `da9d32ad` by the interrupted session; this continuation re-verified the
+  lane focused scope through the authenticated scheduler at that exact head (run `d0905484…`, exit 0, 13/13),
+  pushed `ba6f043..da9d32a`, and got green CI run `37001175976` (backend 1510 passed, web 368 passed). FULL
+  scheduler attempts: `949d1413…` failed with loaded-host-only timeouts (heavy fixture suites; CI passes the identical
+  head in 99s — ~19× local contention inflation), `0e5872be…` lock-wait-timeout; a calm-window retry is in progress.
+  Failed runs stay failed; evidence preserved under `_bmad-output/verification/da9d32a/`. Native Perkins handoff on
+  the exact final head follows the green FULL. No product/policy/test changes in this phase.
+
+- 2026-10-02 continuation reconciliation (owner-authorized resume; every terminal run left as-is, no replay of any
+  terminal outcome): ledger-reconciled dispositions — `b8d3abdd…` started 09:57:25Z, never completed (service
+  shutdown; `full.interrupted.json`, never green); `0e5872be…` (11:00:35Z) and `9214feaf…` (12:46:52Z) are typed
+  never-started `lock_wait_timeout`s (retryable under existing scheduler policy); `949d1413…` completed 10:39:17Z
+  `ok:false` on `tracked_dirty:false` (loaded-host class, 23 failures / 22×30s timeouts; preserved in
+  `full-after-restart.ndjson`); the calm-window retry `7e076fe3…` completed 12:49:43Z `ok:false` with
+  `tracked_dirty:true` (this spec note was the WIP), so it cannot serve as clean-head evidence — its frames were
+  collided into `full-run4.ndjson` and extracted to `full-run4.7e076fe3.ndjson`; with no terminal frame in the
+  capture, its disposition comes from the ledger record (`output_bytes` 103105, `output_sha256` `8a44009c…`).
+  Watcher/capture remnants (`watch-and-fire-full-run4.sh`, `full-run4.watcher.log`, `full-run4.watcher.pid`,
+  `extract-run4.py`, `full-run4*.ndjson`) are preserved untouched; no new watcher was created, no process
+  signalled. CI run 37001175976 remains green at `da9d32a`. Next: commit this reconciliation to restore a clean
+  tracked head, then one calm-window FULL through /api/verify at the resulting head with a unique sink and
+  decoded-output receipt.
+
+- 2026-10-02 FULL retry at this reconciliation head: scheduled through /api/verify with unique raw-NDJSON and
+  decoded-output sinks under `_bmad-output/verification/`; the captured terminal frame and the ledger
+  `verification.completed` record are the evidence — not this note. No tracked paths change after this point
+  unless a genuine verification failure forces a repair cycle (which would rebind every gate to the new head).
