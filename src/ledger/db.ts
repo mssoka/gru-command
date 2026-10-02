@@ -311,15 +311,26 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
+    // Worktree base provenance (owner incident 2026-09-23): a lane's base
+    // sha is only trustworthy when its SOURCE is recorded. 'origin' = the
+    // freshly-fetched origin default-branch tip; 'local-head-fallback' =
+    // the declared degraded path (the fetch failed, the lane may be stale,
+    // and the FYI must be visible). Rows written before this migration
+    // keep NULL — a legacy lane's provenance is genuinely unknown.
+    id: 9,
+    name: 'worktree-base-source',
+    sql: `
+      ALTER TABLE worktrees ADD COLUMN base_source TEXT
+        CHECK (base_source IN ('origin','local-head-fallback'));
     // Durable follow-through obligations (blocked-heist follow-through,
     // phase 2 — ledger foundation only; no scheduling/execution).
     //
-    // LANDING COLLISION (chief ruling 2026-09-28): this id 9 is a
-    // branch-local next-contiguous number for an UNSHIPPED feature. PR132
-    // privately also uses 9. Whichever lane lands second must first
-    // integrate owner-merged main and re-number ONLY its never-applied
-    // migration (never a hole, never importing the other lane's unaccepted
-    // schema), then reverify at the exact final head. Once applied on any
+    // LANDING COLLISION RESOLVED (chief ruling 2026-09-28 protocol): main
+    // landed migration 9 (worktree-base-source, PR #69) while these
+    // never-applied migrations sat unshipped on this branch. They were
+    // renumbered 9->10 and 10->11 at integration — renumbering ONLY
+    // never-applied migrations, no hole, no imported schema — and the
+    // final head must be reverifiied/reviewed after integration. Once applied on any
     // database, this build refuses unknown/gapped versions — roll-forward
     // is the only compatible direction (no old-binary compatibility
     // claim, no live schema action).
@@ -342,7 +353,7 @@ export const MIGRATIONS: readonly Migration[] = [
     // binds an armed receipt expectation to the delegated phase's actual
     // identity, so a later unrelated event of the same kind cannot
     // satisfy an older expectation.
-    id: 9,
+    id: 10,
     name: 'job-obligations-and-directive-requests',
     sql: `
       CREATE TABLE job_obligations (
@@ -418,7 +429,7 @@ export const MIGRATIONS: readonly Migration[] = [
     // branch-local next-contiguous number for an UNSHIPPED feature; if
     // another lane's migration lands first, integrate owner-merged main and
     // re-number ONLY this never-applied migration (never a hole).
-    id: 10,
+    id: 11,
     name: 'phase-handoffs',
     sql: `
       CREATE TABLE phase_handoffs (

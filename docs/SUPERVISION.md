@@ -40,6 +40,34 @@ silence threshold and resets the clock rather than killing the process
 growth, and no live tool is still hung and climbs the ladder; a probe
 error reads as live.
 
+**An open native compaction is waited for, never silence-restarted.**
+Provider compaction (`compaction_start` … `compaction_end`) can run
+silent far longer than a normal turn, so while it is open the silence
+threshold does not climb the restart ladder: at the threshold the
+supervisor makes at most ONE factual FYI attempt per episode
+(`supervision.native-compaction-wait` — "compaction has not reported
+completion; continuing to wait", `fyi`/info — no owner bell, and no
+machine wake under the default action-required wake policy; an explicit
+`notify_wake=all` configuration routes every notification kind, this FYI
+included) and keeps waiting. The attempt is best-effort at-most-one: the
+episode latch is set before the synchronous post, so a post that throws
+— before the row persists or after it — is never retried, and repeated
+ticks cannot duplicate the FYI. Repeated ticks and duplicate start
+signals never warn twice within one episode;
+`compaction_end` (success or failure) clears the latch and the warning
+state through the existing ownership path, so the next genuine episode
+may warn once again. Waiting is indefinite by design — a truly stalled
+provider is out-waited, and the owner's manual stop/reset remains the way
+to end one; there is no second automatic deadline. This exclusion is
+silence-only: a genuine fatal error, an explicit owner control, or a
+known provider-error control still lands during open compaction, and an
+independently authorized review-isolation deadline still aborts an
+isolated review attempt with an open compaction (no ordinary replacement
+spawns). A silence
+classification already in flight when compaction starts is discarded as
+stale, so old silence evidence can never kill a handle that entered
+compaction.
+
 **Sleep/wake is not a hang.** A watchdog tick separated from the
 previous one by a wall-clock gap beyond the tick cadence means the
 machine was suspended; every open turn gets a fresh silence window, a
@@ -193,6 +221,16 @@ owns un-hanging the turn itself; `timeoutMs` is caller-side relief.
 agent climbs the ladder and is restored (resumed from its session file);
 three fast failures trip the breaker exactly once with a needs-owner
 notification; an ack re-arms; in-band errors never restart. The same
+suite pins the compaction wait policy: an open silent compaction holding
+a real pending-turn snapshot warns at most once per episode and is never
+restarted (same handle retained, no pending-turn take or re-delivery, no
+breaker, no fake progress — lastEventAt stays at the real start),
+duplicate start signals warn once per episode, `compaction_end` re-arms
+the warning for the next episode, a stale silence decision returning
+after compaction started is discarded, a synchronous warning-post
+failure (before persistence or after a durable row) neither duplicates
+the FYI nor restarts the handle, and a fatal error or an
+isolated-review deadline still lands during open compaction. The same
 suite pins the hung-turn follow-ups: a live open tool never trips the
 watchdog, heartbeats keep a quiet run alive, an interrupted turn is
 re-delivered on the resumed session, an unresumable turn posts its

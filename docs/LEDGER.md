@@ -181,7 +181,23 @@ worker keeps its permit; `resident.open-control-unknown` records (once
 per affected handle) that supervision lacked openControl evidence, which
 makes the handle non-reclaimable rather than presumed idle.
 
-### E9: durable follow-through obligations and directive requests (migration 9)
+### E8: worktree base provenance (migration 9)
+
+`worktrees.base_source` records HOW a lane's registered `sha` was
+resolved: `origin` = the freshly-fetched, LIVE-VERIFIED origin
+default-branch tip (a cache-guessed default whose live probe failed is
+NEVER `origin`, even when its fetch succeeds — the fetch proves the
+branch exists, not that it is the default); `local-head-fallback` = the
+declared degraded path. Rows written before this migration keep NULL —
+a legacy lane's provenance is genuinely unknown, never guessed — as do
+REVIEW rows pinned to an exact commit or fully-qualified ref: their
+`sha` is their provenance. On JOB lanes the manager declares the source
+on every row it creates, the `worktree.created` event carries it, and a
+`local-head-fallback` creation also posts a `worktree-base-fallback`
+FYI (owner incident 2026-09-23: lanes branched up to hours stale,
+silently). On REVIEW lanes `origin` covers any freshly fetched origin
+branch named by the target — not only the default branch.
+### E10: durable follow-through obligations and directive requests (migration 10)
 
 Two tables carry the blocked-heist follow-through contract. Neither
 executes work, schedules anything or wakes anyone by itself: they make
@@ -247,7 +263,7 @@ both query the LIVE states directly, and the boot pass pages by
 `request_id` cursor — terminal history can never crowd a live request
 out of examination.
 
-### Explicit phase-completion handoffs (migration 10, pr136-chief-handoff)
+### Explicit phase-completion handoffs (migration 11, pr136-chief-handoff)
 
 The durable-follow-through contract above started with blocked lanes. A
 bounded phase can also complete on a lane that is NOT blocked and whose
@@ -317,5 +333,5 @@ blocked hand-back is never double-published.
 **Limits.** This slice adds no runtime attestation interface, no
 provider recovery and no timer/scheduler: a crash mid-dispatch with no
 admission evidence leaves the phase `awaiting` (never a fabricated
-success). Migration 10 is additive; nothing here changes owner stops,
+success). Migration 11 is additive; nothing here changes owner stops,
 merge/deploy/restart policy or any callers' notification semantics.

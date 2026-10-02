@@ -7,7 +7,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
 import { commandReferencesTree, psEnumerator, WorktreeManager, type TreeProcess } from '../src/worktrees/manager.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { runWorktreePortContract } from './helpers/worktree-port-contract.js';
 
 /**
@@ -17,11 +17,22 @@ import { runWorktreePortContract } from './helpers/worktree-port-contract.js';
  * registry-only sweeps.
  */
 
+interface BaseFallbackNotice {
+  worktreeId: string;
+  jobId: string;
+  repoPath: string;
+  repoName: string;
+  defaultBranch: string | null;
+  sha: string;
+  detail: string;
+}
+
 interface Harness {
   repos: FixtureRepo[];
   manager: WorktreeManager;
   ledger: LedgerApi;
   escalations: { title: string; detail: string }[];
+  baseFallbacks: BaseFallbackNotice[];
   enumerator: ReturnType<typeof vi.fn>;
   make: (name?: string) => FixtureRepo;
   dispose: () => Promise<void>;
@@ -30,6 +41,7 @@ interface Harness {
 function makeHarness(useDefaultEnumerator = false): Harness {
   const repos: FixtureRepo[] = [];
   const escalations: { title: string; detail: string }[] = [];
+  const baseFallbacks: BaseFallbackNotice[] = [];
   const ledgerDb = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-command-wtdata-')));
   const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
   const enumerator = vi.fn<(treePath: string) => readonly TreeProcess[]>(() => []);
@@ -45,6 +57,7 @@ function makeHarness(useDefaultEnumerator = false): Harness {
         detail: processes.map((p) => p.pid).join(','),
       });
     },
+    onBaseFallback: (input) => baseFallbacks.push({ ...input }),
     ...(useDefaultEnumerator ? {} : { enumerateProcesses: (treePath: string) => enumerator(treePath) }),
   });
   return {
@@ -52,6 +65,7 @@ function makeHarness(useDefaultEnumerator = false): Harness {
     manager,
     ledger,
     escalations,
+    baseFallbacks,
     enumerator,
     make(name?: string): FixtureRepo {
       const repo = makeFixtureRepo(name ?? 'fixture-wt');
@@ -226,6 +240,634 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
     await expect(
       h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-dup' }),
     ).rejects.toThrowError(/already exists/);
+  });
+});
+
+const GIT_IDENTITY = ['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid'];
+
+/** A fixture with a real bare origin whose HEAD points at the pushed
+ * default branch — the cached shape a host clone actually has. */
+function originBacked(h: Harness, name: string, branch = 'main'): { repo: FixtureRepo; origin: string } {
+  const repo = h.make(name);
+  const origin = attachBareOrigin(repo);
+  repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+  execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', `refs/heads/${branch}`], { stdio: 'ignore' });
+  repo.git(['remote', 'set-head', 'origin', branch]);
+  return { repo, origin };
+}
+
+/** Advance `branch` on the bare origin from an isolated clone, leaving the
+ * host clone's local checkout AND its origin/<branch> ref behind — the
+ * exact "lane branched from a stale base" incident shape. Returns the live
+ * origin tip. */
+function advanceOrigin(origin: string, branch: string, rel: string, content: string): string {
+  const clone = mkdtempSync(join(tmpdir(), 'gru-wt-origin-clone-'));
+  try {
+    execFileSync('git', ['clone', '--quiet', '--branch', branch, origin, clone], { stdio: 'ignore' });
+    writeFileSync(join(clone, rel), content, 'utf-8');
+    execFileSync('git', ['-C', clone, 'add', rel], { stdio: 'ignore' });
+    execFileSync('git', ['-C', clone, ...GIT_IDENTITY, 'commit', '-m', 'advance origin head'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', clone, 'push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`], { stdio: 'ignore' });
+    return execFileSync('git', ['-C', clone, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+  } finally {
+    rmSync(clone, { recursive: true, force: true });
+  }
+}
+
+describe('base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone', () => {
+  it('freshHead fetches origin, then the created lane branches from the fetched sha', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-origin-fresh');
+    ledgerJob(h, 'job-fetched', repo);
+    const staleLocal = repo.head();
+    const tip = advanceOrigin(origin, 'main', 'src/advanced.ts', 'export const advanced = 1;\n');
+    expect(tip).not.toBe(staleLocal); // the host clone really is behind
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fetched' });
+    expect(row.sha).toBe(tip);
+    expect(row.baseSource).toBe('origin');
+    // The ACTUAL branched-from commit is the fetched sha (on disk too).
+    expect(repo.git(['rev-parse', 'HEAD'], row.path)).toBe(tip);
+    // The fetch updated the tracking ref (the refs are FETCHED, not stale).
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/main'])).toBe(tip);
+    expect(h.baseFallbacks).toEqual([]);
+  });
+
+  it('resolves the repo default branch (remote HEAD) — never a hardcoded main', async () => {
+    const h = harness();
+    const repo = h.make('fixture-origin-trunk');
+    repo.git(['branch', '-m', 'main', 'trunk']);
+    const origin = attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/trunk']);
+    execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/trunk'], { stdio: 'ignore' });
+    repo.git(['remote', 'set-head', 'origin', 'trunk']);
+    ledgerJob(h, 'job-trunk', repo);
+    const tip = advanceOrigin(origin, 'trunk', 'src/trunk.ts', 'export const trunk = 1;\n');
+    expect(repo.git(['branch', '--list', 'main'])).toBe(''); // no main anywhere
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-trunk' });
+    expect(row.sha).toBe(tip);
+    expect(row.baseSource).toBe('origin');
+  });
+
+  it('fetch failure falls back to local HEAD with the degrade VISIBLE (registry + event + FYI sink)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-origin-down');
+    repo.git(['remote', 'add', 'origin', join(repo.path, '..', 'no-such-origin.git')]);
+    ledgerJob(h, 'job-offline', repo);
+    const local = repo.commitFile('src/local-work.ts', 'export const local = 1;\n');
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-offline' });
+    expect(row.sha).toBe(local);
+    expect(row.baseSource).toBe('local-head-fallback');
+    expect(repo.git(['rev-parse', 'HEAD'], row.path)).toBe(local);
+    // Staleness becomes durable and visible — never silent.
+    expect(h.ledger.getWorktree('job-offline')?.baseSource).toBe('local-head-fallback');
+    const created = h.ledger.listEvents({ limit: 100 }).find((event) => event.kind === 'worktree.created');
+    expect(created?.payload).toMatchObject({ baseSource: 'local-head-fallback', sha: local });
+    expect(h.baseFallbacks).toHaveLength(1);
+    expect(h.baseFallbacks[0]).toMatchObject({
+      worktreeId: 'job-offline',
+      jobId: 'job-offline',
+      repoName: 'fixture-origin-down',
+      sha: local,
+    });
+    expect(h.baseFallbacks[0]?.detail).toMatch(/no-such-origin|fetch/i);
+  });
+
+  it('review lanes never check out a stale origin tip: the tracking ref is fetched first', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-review-origin');
+    ledgerJob(h, 'job-review-origin', repo);
+    h.ledger.addRound({ jobId: 'job-review-origin', targetRef: 'HEAD' });
+    const stale = repo.git(['rev-parse', 'refs/remotes/origin/main']);
+    const tip = advanceOrigin(origin, 'main', 'src/review.ts', 'export const review = 1;\n');
+    expect(tip).not.toBe(stale);
+
+    const review = await h.manager.createReviewWorktree({
+      repoPath: repo.path,
+      roundId: 'job-review-origin-r1',
+      ref: 'origin/main',
+    });
+    expect(review.sha).toBe(tip);
+    expect(review.baseSource).toBe('origin');
+    expect(repo.git(['rev-parse', 'HEAD'], review.path)).toBe(tip);
+  });
+
+  it('a review ref that names origin REFUSES to degrade silently when the fetch fails', async () => {
+    const h = harness();
+    const repo = h.make('fixture-review-down');
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['remote', 'set-url', 'origin', join(repo.path, '..', 'missing-origin.git')]);
+    ledgerJob(h, 'job-review-down', repo);
+    h.ledger.addRound({ jobId: 'job-review-down', targetRef: 'HEAD' });
+
+    await expect(
+      h.manager.createReviewWorktree({ repoPath: repo.path, roundId: 'job-review-down-r1', ref: 'origin/main' }),
+    ).rejects.toThrowError(/origin\/main.*fetch|refusing to check out a possibly stale/);
+    // No half-created lane: nothing registered, no review debris.
+    expect(h.manager.getWorktree('job-review-down-r1')).toBeNull();
+  });
+
+  it('a review ref naming origin/HEAD resolves through the fetched default branch', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-review-head');
+    ledgerJob(h, 'job-review-head', repo);
+    h.ledger.addRound({ jobId: 'job-review-head', targetRef: 'HEAD' });
+    const tip = advanceOrigin(origin, 'main', 'src/head-ref.ts', 'export const headRef = 1;\n');
+
+    const review = await h.manager.createReviewWorktree({
+      repoPath: repo.path,
+      roundId: 'job-review-head-r1',
+      ref: 'refs/remotes/origin/HEAD',
+    });
+    expect(review.sha).toBe(tip);
+    expect(review.baseSource).toBe('origin');
+    expect(repo.git(['rev-parse', 'HEAD'], review.path)).toBe(tip);
+  });
+
+  it('release re-resolves the FETCHED origin head — follow-on work starts from the fetched tip', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-release-fresh');
+    ledgerJob(h, 'job-release-fresh', repo);
+    await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-release-fresh' });
+    const tip = advanceOrigin(origin, 'main', 'src/after-lane.ts', 'export const afterLane = 1;\n');
+
+    const result = await h.manager.release({ worktreeId: 'job-release-fresh' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') {
+      expect(result.freshHead).toBe(tip);
+    }
+  });
+
+  it('a remote default RENAME wins over the stale cached origin/HEAD (Perkins blocker)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-default-rename'); // origin HEAD=main, cached origin/HEAD -> main
+    // The remote grows trunk FROM main, advances it, and renames its
+    // default to trunk — while old main stays fetchable at its old tip.
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main:refs/heads/trunk']);
+    const staleMainTip = repo.git(['rev-parse', 'refs/remotes/origin/main']);
+    const tip = advanceOrigin(origin, 'trunk', 'src/renamed-default.ts', 'export const renamedDefault = 1;\n');
+    execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/trunk'], { stdio: 'ignore' });
+    // The host clone's cache still names the DEMOTED branch (stale).
+    expect(repo.git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])).toBe('origin/main');
+    expect(tip).not.toBe(staleMainTip);
+    ledgerJob(h, 'job-renamed-default', repo);
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-renamed-default' });
+    // The lane bases on the LIVE default (trunk), never the cached main.
+    expect(row.sha).toBe(tip);
+    expect(row.sha).not.toBe(staleMainTip);
+    expect(row.baseSource).toBe('origin');
+    expect(repo.git(['rev-parse', 'HEAD'], row.path)).toBe(tip);
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/trunk'])).toBe(tip);
+    expect(h.baseFallbacks).toEqual([]);
+  });
+
+  it('a checked-out FEATURE branch is never taken for the default (no cached origin/HEAD, origin unreachable)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-feature-checkout');
+    repo.git(['checkout', '--quiet', '-b', 'gru/feature-x']);
+    repo.git(['remote', 'add', 'origin', join(repo.path, '..', 'no-such-origin.git')]);
+    ledgerJob(h, 'job-feature-offline', repo);
+    const local = repo.head();
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-feature-offline' });
+    expect(row.sha).toBe(local);
+    expect(row.baseSource).toBe('local-head-fallback');
+    // The degrade is declared WITHOUT presenting the feature branch as a default.
+    expect(h.baseFallbacks).toHaveLength(1);
+    expect(h.baseFallbacks[0]?.defaultBranch).toBeNull();
+    expect(h.baseFallbacks[0]?.detail).not.toContain('gru/feature-x');
+  });
+
+  it('a SUCCESSFUL probe without a HEAD symref is authoritative — the stale cached default is never fetched or labeled origin (Perkins R5)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-nosymref'); // bare HEAD=main, cached origin/HEAD -> main
+    const local = repo.head();
+    // The cached branch stays FETCHABLE on the remote but is not the default.
+    const wrongTip = advanceOrigin(origin, 'main', 'src/wrong-default.ts', 'export const wrongDefault = 1;\n');
+    expect(wrongTip).not.toBe(local);
+    // The remote's HEAD names NO branch at all: the live probe succeeds
+    // (exit 0) and carries no symref line.
+    execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/never-created'], { stdio: 'ignore' });
+    const probe = execFileSync('git', ['-C', repo.path, 'ls-remote', '--symref', 'origin', 'HEAD'], {
+      encoding: 'utf-8',
+    });
+    expect(probe).not.toMatch(/^ref:/mu); // authoritative absence, proven at setup
+    expect(repo.git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])).toBe('origin/main'); // cache still names main
+    ledgerJob(h, 'job-nosymref', repo);
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-nosymref' });
+    // The cached branch is NOT selected and NOT labeled origin: the lane
+    // takes the DECLARED local-head fallback with null defaultBranch.
+    expect(row.sha).toBe(local);
+    expect(row.sha).not.toBe(wrongTip);
+    expect(row.baseSource).toBe('local-head-fallback');
+    expect(h.baseFallbacks).toHaveLength(1);
+    expect(h.baseFallbacks[0]?.defaultBranch).toBeNull();
+    expect(h.baseFallbacks[0]?.detail).toMatch(/names no branch|no branch symref/u);
+    // main was never fetched for the base: the stale tracking ref stands.
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/main'])).not.toBe(wrongTip);
+  });
+
+  it('a FAILED live probe with a FETCHABLE cached default is declared fallback — never mislabeled origin (Perkins r6 B1)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-unverified-default'); // bare HEAD=main, cached origin/HEAD -> main
+    const local = repo.head();
+    // The remote renames its default to trunk; main stays FETCHABLE.
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main:refs/heads/trunk']);
+    execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/trunk'], { stdio: 'ignore' });
+    const wrongTip = advanceOrigin(origin, 'main', 'src/demoted.ts', 'export const demoted = 1;\n');
+    expect(wrongTip).not.toBe(local);
+    expect(repo.git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])).toBe('origin/main'); // stale cache
+    // Simulate the transient probe failure: every ls-remote fails, all
+    // other git calls pass through to the real binary.
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf-8' }).trim();
+    const shimDir = mkdtempSync(join(tmpdir(), 'gru-wt-lsremote-shim-'));
+    const shim = join(shimDir, 'git');
+    writeFileSync(
+      shim,
+      '#!/bin/sh\n' +
+        'if [ "$1" = \'ls-remote\' ]; then echo \'ls-remote unreachable (simulated)\' >&2; exit 1; fi\n' +
+        'exec ' + JSON.stringify(realGit) + ' "$@"\n',
+      'utf-8',
+    );
+    chmodSync(shim, 0o755);
+    const priorPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${priorPath ?? ''}`;
+    let row: Awaited<ReturnType<WorktreeManager['createJobWorktree']>>;
+    try {
+      ledgerJob(h, 'job-unverified', repo);
+      row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-unverified' });
+    } finally {
+      process.env.PATH = priorPath;
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+    // A successful fetch of the demoted cached branch proves EXISTENCE,
+    // not defaultness: the lane takes the DECLARED fallback, visibly.
+    expect(row.sha).toBe(local);
+    expect(row.sha).not.toBe(wrongTip);
+    expect(row.baseSource).toBe('local-head-fallback');
+    expect(h.baseFallbacks).toHaveLength(1);
+    expect(h.baseFallbacks[0]?.defaultBranch).toBe('main');
+    expect(h.baseFallbacks[0]?.detail).toMatch(/UNVERIFIED/u);
+    expect(h.baseFallbacks[0]?.detail).toMatch(/proves the branch exists/u);
+  });
+
+  it('an UNTOUCHED lane based ahead of the host releases with its branch DELETED (Perkins r6 W1)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-release-ahead');
+    const staleHost = repo.head();
+    // Origin advances BEFORE lane creation: the lane bases on the fetched
+    // tip, which the host checkout does not contain.
+    const fetchedTip = advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    expect(fetchedTip).not.toBe(staleHost);
+    ledgerJob(h, 'job-release-ahead', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-release-ahead' });
+    expect(row.sha).toBe(fetchedTip); // the lane really is ahead of the host
+
+    const result = await h.manager.release({ worktreeId: 'job-release-ahead' });
+    expect(result.status).toBe('swept');
+    // The untouched branch is contained in its REGISTERED base — no
+    // leftover debris blocking job-id reuse.
+    expect(() => repo.git(['rev-parse', '--verify', '--quiet', 'refs/heads/gru/job-release-ahead'])).toThrow();
+  });
+
+  it('a credential-bearing fetch failure is REDACTED in the fallback FYI (Perkins r6 W3)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-redact-fallback');
+    repo.git(['remote', 'add', 'origin', 'https://user:hunter2@invalid.example/repo.git']);
+    ledgerJob(h, 'job-redact', repo);
+    const local = repo.head();
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-redact' });
+    expect(row.baseSource).toBe('local-head-fallback');
+    expect(row.sha).toBe(local);
+    expect(h.baseFallbacks).toHaveLength(1);
+    // Raw git stderr (carrying the credential-bearing URL) is redacted
+    // before it reaches logs or the persisted notification.
+    expect(h.baseFallbacks[0]?.detail).not.toContain('hunter2');
+    expect(h.baseFallbacks[0]?.detail).toMatch(/redacted|invalid\.example/u);
+  });
+
+  it('a review ref naming origin/HEAD REFUSES an UNVERIFIED cache-guessed default (the r6 B1 review arm, pinned)', async () => {
+    const h = harness();
+    const { repo } = originBacked(h, 'fixture-review-head-unverified'); // cached origin/HEAD -> main
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf-8' }).trim();
+    const shimDir = mkdtempSync(join(tmpdir(), 'gru-wt-lsremote-shim2-'));
+    const shim = join(shimDir, 'git');
+    writeFileSync(
+      shim,
+      '#!/bin/sh\n' +
+        'if [ "$1" = \'ls-remote\' ]; then echo \'ls-remote unreachable (simulated)\' >&2; exit 1; fi\n' +
+        'exec ' + JSON.stringify(realGit) + ' "$@"\n',
+      'utf-8',
+    );
+    chmodSync(shim, 0o755);
+    const priorPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${priorPath ?? ''}`;
+    try {
+      ledgerJob(h, 'job-review-head-unverified', repo);
+      h.ledger.addRound({ jobId: 'job-review-head-unverified', targetRef: 'HEAD' });
+      await expect(
+        h.manager.createReviewWorktree({
+          repoPath: repo.path,
+          roundId: 'job-review-head-unverified-r1',
+          ref: 'origin/HEAD',
+        }),
+      ).rejects.toThrowError(/origin\/HEAD.*could not be verified live|possibly non-default/u);
+      expect(h.manager.getWorktree('job-review-head-unverified-r1')).toBeNull();
+    } finally {
+      process.env.PATH = priorPath;
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a review ref naming origin/HEAD REFUSES when the default is unresolvable (the refusal arm, pinned)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-review-head-down');
+    repo.git(['remote', 'add', 'origin', join(repo.path, '..', 'no-such-origin.git')]);
+    ledgerJob(h, 'job-review-head-down', repo);
+    h.ledger.addRound({ jobId: 'job-review-head-down', targetRef: 'HEAD' });
+
+    await expect(
+      h.manager.createReviewWorktree({ repoPath: repo.path, roundId: 'job-review-head-down-r1', ref: 'origin/HEAD' }),
+    ).rejects.toThrowError(/origin\/HEAD.*unresolvable|refusing to check out/u);
+    expect(h.manager.getWorktree('job-review-head-down-r1')).toBeNull();
+  });
+
+  it('a force-pushed remote orphans the lane base — the branch is RETAINED and the old tip stays reachable (Perkins R7)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-forcepush');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-forcepush', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-forcepush' });
+    const laneTip = row.sha; // the fetched origin tip the lane branched from
+    // The remote FORCE-PUSHES main to rewritten history after creation:
+    // the lane's base tip no longer survives anywhere on the remote.
+    const clone = mkdtempSync(join(tmpdir(), 'gru-wt-forcepush-clone-'));
+    try {
+      execFileSync('git', ['clone', '--quiet', '--branch', 'main', origin, clone], { stdio: 'ignore' });
+      execFileSync(
+        'git',
+        ['-C', clone, ...GIT_IDENTITY, 'commit', '--allow-empty', '--amend', '-m', 'force-pushed history'],
+        { stdio: 'ignore' },
+      );
+      execFileSync('git', ['-C', clone, 'push', '--quiet', '--force', 'origin', 'HEAD:refs/heads/main'], {
+        stdio: 'ignore',
+      });
+    } finally {
+      rmSync(clone, { recursive: true, force: true });
+    }
+    // Proven at setup: the rewritten remote main does NOT contain the tip.
+    const rewrittenTip = execFileSync('git', ['-C', origin, 'rev-parse', 'refs/heads/main'], {
+      encoding: 'utf-8',
+    }).trim();
+    expect(rewrittenTip).not.toBe(laneTip);
+
+    const result = await h.manager.release({ worktreeId: 'job-forcepush' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') {
+      // Containment could not be proven in a CURRENT ref: the branch is
+      // RETAINED and the release reports why — the lane's only copy of
+      // the orphaned tip survives (the release fetch already overwrote
+      // the tracking ref, so the branch is all that is left).
+      expect(result.branch).toBe('retained');
+    }
+    expect(repo.git(['rev-parse', 'refs/heads/gru/job-forcepush'])).toBe(laneTip);
+    const retainedEvent = h.ledger
+      .listEvents({ limit: 100 })
+      .find((event) => event.kind === 'worktree.branch-retained');
+    expect(retainedEvent?.payload).toMatchObject({ branch: 'gru/job-forcepush' });
+    expect(String((retainedEvent?.payload as Record<string, unknown>)?.reason ?? '')).toMatch(
+      /current ref|force-pushed/u,
+    );
+  });
+
+  /** The R8 loss shapes: a STALE remote-tracking ref (the tip's last
+   * apparent witness) must never justify deleting the lane branch — only
+   * a durable LOCAL ref or the remote default FRESHLY fetched for this
+   * decision may witness. Each case leaves the old tip reachable. */
+  const forcePushOrigin = (origin: string): string => {
+    const clone = mkdtempSync(join(tmpdir(), 'gru-wt-r8-clone-'));
+    try {
+      execFileSync('git', ['clone', '--quiet', '--branch', 'main', origin, clone], { stdio: 'ignore' });
+      execFileSync(
+        'git',
+        ['-C', clone, ...GIT_IDENTITY, 'commit', '--allow-empty', '--amend', '-m', 'force-pushed history'],
+        { stdio: 'ignore' },
+      );
+      execFileSync('git', ['-C', clone, 'push', '--quiet', '--force', 'origin', 'HEAD:refs/heads/main'], {
+        stdio: 'ignore',
+      });
+      return execFileSync('git', ['-C', clone, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    } finally {
+      rmSync(clone, { recursive: true, force: true });
+    }
+  };
+
+  it('an OFFLINE force-push release retains — the stale tracking ref witnesses nothing (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-offline');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-offline', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-offline' });
+    const laneTip = row.sha;
+    forcePushOrigin(origin);
+    // Origin becomes unreachable: the release fetch FALLS BACK, and the
+    // stale refs/remotes/origin/main (still naming the tip) is the false
+    // witness the old code deleted on.
+    repo.git(['remote', 'set-url', 'origin', join(repo.path, '..', 'missing-origin.git')]);
+
+    const result = await h.manager.release({ worktreeId: 'job-r8-offline' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') expect(result.branch).toBe('retained');
+    expect(repo.git(['rev-parse', 'refs/heads/gru/job-r8-offline'])).toBe(laneTip);
+  });
+
+  it('a DELETED remote default on release retains — the stale tracking ref witnesses nothing (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-default-gone');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-defaultgone', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-defaultgone' });
+    const laneTip = row.sha;
+    // The remote deletes its default entirely; the local tracking ref
+    // lingers, stale — and the live probe authoritatively finds no HEAD.
+    execFileSync('git', ['-C', origin, 'update-ref', '-d', 'refs/heads/main'], { stdio: 'ignore' });
+
+    const result = await h.manager.release({ worktreeId: 'job-r8-defaultgone' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') expect(result.branch).toBe('retained');
+    expect(repo.git(['rev-parse', 'refs/heads/gru/job-r8-defaultgone'])).toBe(laneTip);
+  });
+
+  it('a force-push through the SWEPT-ROW retry retains — fresh remote state is resolved before disposal (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-swept');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-swept', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-swept' });
+    const laneTip = row.sha;
+    forcePushOrigin(origin);
+    // The crash window: row flipped swept, tree gone, disposal skipped.
+    repo.git(['worktree', 'remove', '--force', row.path]);
+    h.ledger.setWorktreeStatus('job-r8-swept', 'swept');
+
+    const healed = await h.manager.release({ worktreeId: 'job-r8-swept' });
+    expect(healed.status).toBe('swept');
+    if (healed.status === 'swept') expect(healed.branch).toBe('retained');
+    expect(repo.git(['rev-parse', 'refs/heads/gru/job-r8-swept'])).toBe(laneTip);
+  });
+
+  it('a force-push through MISSING-TREE reconciliation retains — fresh remote state is resolved before disposal (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-reconcile');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-reconcile', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-reconcile' });
+    const laneTip = row.sha;
+    forcePushOrigin(origin);
+    // Crash window: tree gone, row never flipped.
+    repo.git(['worktree', 'remove', '--force', row.path]);
+
+    const reconciled = await h.manager.release({ worktreeId: 'job-r8-reconcile' });
+    expect(reconciled.status).toBe('swept');
+    if (reconciled.status === 'swept') expect(reconciled.branch).toBe('retained');
+    expect(repo.git(['rev-parse', 'refs/heads/gru/job-r8-reconcile'])).toBe(laneTip);
+  });
+
+  it('a RENAMED default never lets the stale old default witness release (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-renamed');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-renamed', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-renamed' });
+    const rewrittenTip = forcePushOrigin(origin);
+    execFileSync('git', ['-C', origin, 'update-ref', 'refs/heads/trunk', rewrittenTip]);
+    execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/trunk']);
+    // Release fetches trunk only; the stale origin/main still names the
+    // lane's tip, but must not be mistaken for a freshly verified ref.
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/main'])).toBe(row.sha);
+
+    const result = await h.manager.release({ worktreeId: row.id });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') expect(result.branch).toBe('retained');
+    expect(repo.git(['rev-parse', `refs/heads/${row.branch}`])).toBe(row.sha);
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/trunk'])).toBe(rewrittenTip);
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/main'])).toBe(row.sha);
+  });
+
+  it('a STALE lane upstream cannot bypass containment via git branch -d (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-upstream');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-upstream', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-upstream' });
+    repo.git(['push', '--quiet', '--set-upstream', 'origin', `${row.branch}:${row.branch}`]);
+    forcePushOrigin(origin);
+    execFileSync('git', ['-C', origin, 'update-ref', '-d', `refs/heads/${row.branch}`]);
+    // A normal worker push configured an upstream; its tracking ref
+    // lingers after the remote deletes the lane. branch -d trusts that
+    // stale upstream even though HEAD does not contain the tip.
+    expect(repo.git(['rev-parse', `refs/remotes/origin/${row.branch}`])).toBe(row.sha);
+
+    const result = await h.manager.release({ worktreeId: row.id });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') expect(result.branch).toBe('retained');
+    expect(repo.git(['rev-parse', `refs/heads/${row.branch}`])).toBe(row.sha);
+  });
+
+  it('an explicit STALE remote base cannot bypass containment during an offline release (Perkins R8)', async () => {
+    const h = harness();
+    const { repo, origin } = originBacked(h, 'fixture-r8-explicit-base');
+    advanceOrigin(origin, 'main', 'src/ahead.ts', 'export const ahead = 1;\n');
+    ledgerJob(h, 'job-r8-explicit-base', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-r8-explicit-base' });
+    forcePushOrigin(origin);
+    repo.git(['remote', 'set-url', 'origin', join(repo.path, '..', 'missing-origin.git')]);
+
+    const result = await h.manager.release({ worktreeId: row.id, baseBranch: 'origin/main' });
+    expect(result.status).toBe('swept');
+    if (result.status === 'swept') expect(result.branch).toBe('retained');
+    expect(repo.git(['rev-parse', `refs/heads/${row.branch}`])).toBe(row.sha);
+  });
+
+  it('an UNREACHABLE origin still consults the cached origin/HEAD as its declared offline guess (retained)', async () => {
+    const h = harness();
+    const { repo } = originBacked(h, 'fixture-offline-cache'); // cached origin/HEAD -> main
+    const local = repo.head();
+    repo.git(['remote', 'set-url', 'origin', join(repo.path, '..', 'missing-origin.git')]);
+    ledgerJob(h, 'job-offline-cache', repo);
+
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-offline-cache' });
+    expect(row.sha).toBe(local);
+    expect(row.baseSource).toBe('local-head-fallback');
+    // The cache WAS consulted offline: the FYI names the cached branch as
+    // the fetch guess that failed — the declared, never-silent degrade.
+    expect(h.baseFallbacks).toHaveLength(1);
+    expect(h.baseFallbacks[0]?.defaultBranch).toBe('main');
+    expect(h.baseFallbacks[0]?.detail).toMatch(/missing-origin|fetch/iu);
+  });
+
+  it('a LOCAL BRANCH named origin/topic cannot shadow the remote — the fetched tip is frozen (Perkins R5)', async () => {
+    const h = harness();
+    const { repo } = originBacked(h, 'fixture-branch-shadow');
+    const remoteTip = repo.head();
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main:refs/heads/topic']);
+    const shadow = repo.commitFile('src/shadow-branch.ts', 'export const shadowBranch = 1;\n');
+    expect(shadow).not.toBe(remoteTip);
+    // No local tracking ref: the shadow wins DWIM cleanly — the exact
+    // exploitable shape (a tracking ref would make the lookup ambiguous).
+    repo.git(['update-ref', '-d', 'refs/remotes/origin/topic']);
+    repo.git(['branch', 'origin/topic', shadow]);
+    expect(repo.git(['rev-parse', '--symbolic-full-name', '--verify', 'origin/topic'])).toBe(
+      'refs/heads/origin/topic',
+    );
+    ledgerJob(h, 'job-branch-shadow', repo);
+    h.ledger.addRound({ jobId: 'job-branch-shadow', targetRef: 'HEAD' });
+
+    const review = await h.manager.createReviewWorktree({
+      repoPath: repo.path,
+      roundId: 'job-branch-shadow-r1',
+      ref: 'origin/topic',
+    });
+    // The FETCHED remote tip freezes — never the shadowing local bytes.
+    expect(review.sha).toBe(remoteTip);
+    expect(review.sha).not.toBe(shadow);
+    expect(review.baseSource).toBe('origin');
+    expect(repo.git(['rev-parse', 'HEAD'], review.path)).toBe(remoteTip);
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/topic'])).toBe(remoteTip);
+  });
+
+  it('a TAG named origin/topic cannot shadow the remote — the fetched tip is frozen (Perkins R5)', async () => {
+    const h = harness();
+    const { repo } = originBacked(h, 'fixture-tag-shadow');
+    const remoteTip = repo.head();
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main:refs/heads/topic']);
+    const shadow = repo.commitFile('src/shadow-tag.ts', 'export const shadowTag = 1;\n');
+    expect(shadow).not.toBe(remoteTip);
+    // Tags beat branches in DWIM order and no tracking ref competes:
+    // the shadow wins cleanly.
+    repo.git(['update-ref', '-d', 'refs/remotes/origin/topic']);
+    repo.git(['tag', 'origin/topic', shadow]);
+    expect(repo.git(['rev-parse', '--symbolic-full-name', '--verify', 'origin/topic'])).toBe(
+      'refs/tags/origin/topic',
+    );
+    ledgerJob(h, 'job-tag-shadow', repo);
+    h.ledger.addRound({ jobId: 'job-tag-shadow', targetRef: 'HEAD' });
+
+    const review = await h.manager.createReviewWorktree({
+      repoPath: repo.path,
+      roundId: 'job-tag-shadow-r1',
+      ref: 'origin/topic',
+    });
+    expect(review.sha).toBe(remoteTip);
+    expect(review.sha).not.toBe(shadow);
+    expect(review.baseSource).toBe('origin');
+    expect(repo.git(['rev-parse', 'HEAD'], review.path)).toBe(remoteTip);
   });
 });
 

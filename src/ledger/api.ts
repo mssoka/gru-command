@@ -316,6 +316,17 @@ export function isWorktreeStatus(value: string): value is WorktreeStatus {
   return (WORKTREE_STATUSES as readonly string[]).includes(value);
 }
 
+/** How a lane's base sha was resolved (owner incident 2026-09-23):
+ * 'origin' = the freshly-fetched origin default-branch tip;
+ * 'local-head-fallback' = the declared degraded path (fetch failed — the
+ * lane may be stale and that fact is recorded, never silent). */
+export const WORKTREE_BASE_SOURCES = ['origin', 'local-head-fallback'] as const;
+export type WorktreeBaseSource = (typeof WORKTREE_BASE_SOURCES)[number];
+
+export function isWorktreeBaseSource(value: string): value is WorktreeBaseSource {
+  return (WORKTREE_BASE_SOURCES as readonly string[]).includes(value);
+}
+
 export interface WorktreeRecord {
   /** The owning job id (kind 'job') or round id (kind 'review'). */
   readonly id: string;
@@ -325,6 +336,12 @@ export interface WorktreeRecord {
   readonly path: string;
   readonly branch: string | null;
   readonly sha: string;
+  /** How `sha` was resolved — 'origin' (fetched origin tip) or
+   * 'local-head-fallback' (degraded path; the lane may be stale).
+   * NULL for rows written before the provenance migration and for
+   * review rows pinned to an exact commit (their sha IS their
+   * provenance). */
+  readonly baseSource: WorktreeBaseSource | null;
   readonly jobId: string | null;
   readonly roundId: string | null;
   readonly status: WorktreeStatus;
@@ -754,11 +771,23 @@ export class LedgerApi {
     path: string;
     branch?: string | null;
     sha: string;
+    /** Base provenance (the manager always declares it for lanes it
+     * creates; omitted = unknown, e.g. legacy callers). */
+    baseSource?: WorktreeBaseSource | null;
     jobId?: string | null;
     roundId?: string | null;
   }): WorktreeRecord {
     if (input.id === '' || input.path === '' || input.repoPath === '' || input.sha === '') {
       throw new Error('worktree id, path, repo path, and sha must be non-empty');
+    }
+    if (
+      input.baseSource !== undefined &&
+      input.baseSource !== null &&
+      !isWorktreeBaseSource(input.baseSource)
+    ) {
+      throw new Error(
+        `unknown worktree base source "${input.baseSource}" (valid: ${WORKTREE_BASE_SOURCES.join(', ')})`,
+      );
     }
     if (!isWorktreeKind(input.kind)) {
       throw new Error(`unknown worktree kind "${input.kind}" (valid: ${WORKTREE_KINDS.join(', ')})`);
@@ -782,8 +811,8 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, job_id, round_id, status, note, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)`,
+          `INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, base_source, job_id, round_id, status, note, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)`,
         )
         .run(
           input.id,
@@ -793,6 +822,7 @@ export class LedgerApi {
           input.path,
           input.branch ?? null,
           input.sha,
+          input.baseSource ?? null,
           input.jobId ?? null,
           input.roundId ?? null,
           ts,
@@ -802,7 +832,14 @@ export class LedgerApi {
         kind: 'worktree.created',
         jobId: input.jobId ?? null,
         roundId: input.roundId ?? null,
-        payload: { id: input.id, kind: input.kind, path: input.path, branch: input.branch ?? null, sha: input.sha },
+        payload: {
+          id: input.id,
+          kind: input.kind,
+          path: input.path,
+          branch: input.branch ?? null,
+          sha: input.sha,
+          baseSource: input.baseSource ?? null,
+        },
       });
       return this.getWorktree(input.id) as WorktreeRecord;
     });
@@ -1652,6 +1689,7 @@ export class LedgerApi {
       path: str(row.path),
       branch: nstr(row.branch),
       sha: str(row.sha),
+      baseSource: this.worktreeBaseSourceFromRow(row),
       jobId: nstr(row.job_id),
       roundId: nstr(row.round_id),
       status: str(row.status) as WorktreeStatus,
@@ -1659,6 +1697,17 @@ export class LedgerApi {
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
     };
+  }
+
+  /** A stored base source must be one of the known labels — an unknown
+   * value means a migration/code mismatch and is never coerced. */
+  private worktreeBaseSourceFromRow(row: Row): WorktreeBaseSource | null {
+    const value = nstr(row.base_source);
+    if (value === null) return null;
+    if (!isWorktreeBaseSource(value)) {
+      throw new Error(`worktrees row ${str(row.id)} has unknown base_source "${value}"`);
+    }
+    return value;
   }
 
   private agentFromRow(row: Row): AgentRecord {
