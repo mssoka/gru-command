@@ -17,6 +17,7 @@ import {
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
 import type { ResidentReviewRound } from '../runtime/registry.js';
+import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
@@ -270,6 +271,14 @@ export interface VerdictPoster {
  * page past the first hundred; an exhausted bound is an UNRESOLVED error,
  * never proof of absence or permission for a second POST. */
 const MAX_RECONCILE_PAGES = 10;
+
+/** A ref whose SPELLING names an origin remote branch (origin/<branch>,
+ * refs/remotes/origin/<branch>, remotes/origin/<branch>). Such a ref is
+ * NEVER an explicit pin (Perkins R3): even when nothing local resolves
+ * it — a remote-only branch — the manager fetches that spelling, and a
+ * linked-PR review must verify the live PR head instead of freezing
+ * whatever the ref fetches to. */
+const ORIGIN_REF_SPELLING = /^(?:(?:refs\/)?remotes\/origin\/|origin\/)/u;
 
 function receiptDigest(body: string): string {
   return createHash('sha256').update(body, 'utf8').digest('hex');
@@ -2150,6 +2159,34 @@ export class WaveRunner {
    * the request aborts before a round row, a review worktree, or any lens
    * exists. Non-PR rounds and explicit commit pins keep the local
    * resolution. */
+  /** The full ref name a candidate resolves to LOCALLY (shared ref store),
+   * or null when nothing resolves (an unresolved spelling or an ambiguous
+   * lookup — both stay on the remote route, where the fetch is the safe
+   * arm). Used to distinguish an intentional local pin such as
+   * refs/tags/origin/v1 from an unresolved origin/<branch> spelling
+   * (Perkins R5). */
+  private resolvedLocalRefName(repoPath: string, ref: string): string | null {
+    const result = spawnSync('git', ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref], {
+      encoding: 'utf-8',
+      timeout: 30_000,
+    });
+    const name = result.status === 0 ? (result.stdout ?? '').trim() : '';
+    return name === '' ? null : name;
+  }
+
+  /** True when origin currently advertises a branch by that name — the
+   * SHORT-spelling collision bit (Perkins r6 B2). Read-only, bounded; a
+   * failed probe reports a collision (the remote route — PR-head
+   * verification or the manager's fetch — is the safe arm either way). */
+  private originHasBranch(repoPath: string, branch: string): boolean {
+    const result = spawnSync('git', ['-C', repoPath, 'ls-remote', '--refs', 'origin', `refs/heads/${branch}`], {
+      encoding: 'utf-8',
+      timeout: 30_000,
+    });
+    if (result.status !== 0) return true;
+    return (result.stdout ?? '').trim() !== '';
+  }
+
   private async resolveFreezeTarget(input: {
     job: { readonly id: string; readonly prUrl: string | null };
     jobWorktree: { readonly path: string; readonly repoPath: string };
@@ -2160,12 +2197,68 @@ export class WaveRunner {
     const candidateBranch = input.job.prUrl === null
       ? null
       : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
-    // An explicit commit pin (a SHA, a tag, a revision expression) stays a
-    // pin even for a PR round. Everything else on a PR-linked job resolves
-    // from the PR's live head branch — never from a lane name synthesized
-    // from the job id.
-    const explicitPin = input.explicitTarget && candidateBranch === null;
+    // An EXACT origin branch spelling is NEVER an explicit pin (Perkins
+    // R3/R5): a remote-only origin/topic is invisible to prBranchCandidate
+    // (nothing local resolves), but it still names a REMOTE BRANCH, and
+    // the manager fetches that spelling — letting it through as a "pin"
+    // would bypass PR-head verification and freeze unrelated bytes for a
+    // linked PR. Origin-prefixed REVISION EXPRESSIONS (origin/main~1) are
+    // the opposite case (Perkins R4): they ARE pins — a real branch name
+    // cannot carry their operators — and must resolve to the NAMED
+    // ancestor, never the live PR tip nor a literal branch named "main~1".
+    // True explicit pins — SHAs, tags, revision expressions like HEAD~1 —
+    // stay pins even for a PR round; everything else on a PR-linked job
+    // resolves from the PR's live head branch.
+    const namesOriginRef = isExactOriginBranchSpelling(input.candidateRef);
+    // A locally RESOLVED origin-prefixed ref that is neither a branch nor
+    // an origin tracking ref — a tag like refs/tags/origin/v1 — is an
+    // INTENTIONAL pin when the caller was FULLY QUALIFIED (refs/tags/…)
+    // or when the remote has NO branch by that name (Perkins R5/r6 B2):
+    // a SHORT spelling (origin/topic) whose name COLLIDES with a real
+    // remote branch means the REMOTE branch — pinning the local tag
+    // there would bypass PR-head verification and freeze unrelated
+    // bytes. A tracking-ref resolution is NOT a pin (the stale-local
+    // shape the fetch exists to defeat), and only an UNRESOLVED origin
+    // spelling follows the live remote branch. (Ambiguous lookups and
+    // collision-probe failures both stay on the remote route — the
+    // fetch/PR verification is the safe arm.)
+    const resolvedName = namesOriginRef
+      ? this.resolvedLocalRefName(input.jobWorktree.repoPath, input.candidateRef)
+      : null;
+    const resolvedNonBranchRef =
+      resolvedName !== null &&
+      !resolvedName.startsWith('refs/remotes/origin/') &&
+      !resolvedName.startsWith('refs/heads/');
+    const fullyQualifiedPin = input.candidateRef.startsWith('refs/');
+    const shortSpellingCollides =
+      namesOriginRef &&
+      !fullyQualifiedPin &&
+      this.originHasBranch(input.jobWorktree.repoPath, input.candidateRef.replace(ORIGIN_REF_SPELLING, ''));
+    const resolvedOriginPin = resolvedNonBranchRef && !shortSpellingCollides;
+    const explicitPin =
+      input.explicitTarget && candidateBranch === null && (!namesOriginRef || resolvedOriginPin);
     if (input.job.prUrl === null || explicitPin) {
+      // UNRESOLVED origin-branch spellings resolve through the manager's
+      // fetch-before-freeze discipline (Perkins R3 lineage): FETCHED
+      // fresh — never the stale local tracking sha — and an unfetchable
+      // one refuses BEFORE any round row, review lane, or freeze exists.
+      // Tracking refs live in the SHARED ref store, so resolving from
+      // the host repo is equivalent to the lane. Locally resolved pins —
+      // tags, shas, revision expressions, lane branches — resolve from
+      // the ACTIVE JOB LANE (Perkins R3): worktree-relative refs like
+      // HEAD are PER-WORKTREE and must never resolve against the host
+      // checkout; branches, tags, and shas are shared and resolve
+      // identically from the lane.
+      if (namesOriginRef && !resolvedOriginPin) {
+        const resolved = await this.opts.worktrees.resolveReviewTarget({
+          repoPath: input.jobWorktree.repoPath,
+          ref: input.candidateRef,
+        });
+        return {
+          targetSha: resolved.sha,
+          movementRef: input.candidateRef,
+        };
+      }
       return {
         targetSha: resolveGitCommit(input.jobWorktree.path, input.candidateRef),
         movementRef: input.candidateRef,
@@ -2175,7 +2268,11 @@ export class WaveRunner {
       const fresh = await resolveFreshPrHead({
         repoPath: input.jobWorktree.repoPath,
         prUrl: input.job.prUrl,
-        branchRef: candidateBranch ?? '',
+        // A remote-only origin ref carries its branch name in the spelling
+        // — recover the hint prBranchCandidate could not see locally.
+        branchRef:
+          candidateBranch ??
+          (namesOriginRef ? input.candidateRef.replace(ORIGIN_REF_SPELLING, '') : ''),
         ...(this.opts.prHeadProbe !== undefined ? { probe: this.opts.prHeadProbe } : {}),
       });
       this.log('info', 'freeze target refreshed from the live PR head', {

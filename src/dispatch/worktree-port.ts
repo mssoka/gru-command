@@ -65,8 +65,22 @@ export interface WorktreeSweepSwept {
 
 export type WorktreeSweepResult = WorktreeSweepPaused | WorktreeSweepSwept;
 
+import type { WorktreeBaseSource } from '../ledger/api.js';
+
 /** The worktree subsystem the dispatch flow rides on. */
 export interface WorktreePort {
+  /** Resolve a review target exactly as `createReviewWorktree` would:
+   * an origin tracking ref is FETCHED fresh first and REFUSES when the
+   * fetch fails (a stale review is a wrong review); every other ref —
+   * explicit commit pins, tags, lane branches — pins exactly. The
+   * freeze path resolves through this so a round's frozen identity and
+   * its checked-out bytes come from ONE fetch-aware resolution
+   * (Perkins blocker: non-PR origin refs were frozen from the stale
+   * local tracking sha before the manager could fetch). */
+  resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
+    readonly sha: string;
+    readonly baseSource: WorktreeBaseSource | null;
+  }>;
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane>;
   createReviewWorktree(input: {
     repoPath: string;
@@ -91,6 +105,9 @@ export const WORKTREE_PORT_UNAVAILABLE =
  * registry") instead of naming the missing subsystem.
  */
 export class UnavailableWorktreePort implements WorktreePort {
+  async resolveReviewTarget(): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null }> {
+    throw new Error(WORKTREE_PORT_UNAVAILABLE);
+  }
   async createJobWorktree(): Promise<WorktreeLane> {
     throw new Error(WORKTREE_PORT_UNAVAILABLE);
   }

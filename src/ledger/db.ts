@@ -311,7 +311,25 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
+    // Worktree base provenance (owner incident 2026-09-23): a lane's base
+    // sha is only trustworthy when its SOURCE is recorded. 'origin' = the
+    // freshly-fetched origin default-branch tip; 'local-head-fallback' =
+    // the declared degraded path (the fetch failed, the lane may be stale,
+    // and the FYI must be visible). Rows written before this migration
+    // keep NULL — a legacy lane's provenance is genuinely unknown.
     id: 9,
+    name: 'worktree-base-source',
+    sql: `
+      ALTER TABLE worktrees ADD COLUMN base_source TEXT
+        CHECK (base_source IN ('origin','local-head-fallback'));
+    `,
+  },
+  {
+    // Short heist names (owner-approved display, 2026-09-24): optional
+    // authored job label. Renumbered 9 -> 10 on integration with main's
+    // accepted worktree-base-source (id 9); never applied anywhere before
+    // this integration, so the renumber is safe and history-free.
+    id: 10,
     name: 'job-display-name',
     sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;',
   },

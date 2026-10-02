@@ -16,6 +16,7 @@ import { createDispatchServer } from '../src/dispatch/server.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
+import type { WorktreeBaseSource } from '../src/ledger/api.js';
 import { BRANCH_BUSY_HINT, findBusyLanes, laneIsBusy, normalizeBranch } from '../src/dispatch/branch-idle.js';
 
 /**
@@ -47,6 +48,13 @@ class HookedWorktreePort implements WorktreePort {
 
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
     return this.delegate.createJobWorktree(input);
+  }
+
+  async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
+    readonly sha: string;
+    readonly baseSource: WorktreeBaseSource | null;
+  }> {
+    return this.delegate.resolveReviewTarget(input);
   }
 
   async createReviewWorktree(input: {
