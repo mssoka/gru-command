@@ -32,7 +32,7 @@ review-rebrief-interlock = "node tools/patch-vitest-rpc-timeout.mjs && npx vites
 # regression (deterministic settled-lane wait), the digest fence and the
 # recomputed pins — unchanged configs/budgets, the approved RPC patch first,
 # plain vitest; scheduled only via /api/verify.
-review-rebrief-r1-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/branch-idle-guard.test.ts test/dispatch-server.test.ts test/silas-driver.test.ts test/suite-shape.test.ts"
+review-rebrief-r1-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/branch-idle-guard.test.ts test/dispatch-server.test.ts test/worktree-port.test.ts test/silas-driver.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
 # Provider-recovery sensor lane scopes (r4 fix round; invoked only via
