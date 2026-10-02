@@ -132,4 +132,19 @@ describe('workload-aware test budgets', () => {
     expect(heavy).toContain(`testTimeout=${HEAVY_TEST_TIMEOUT_MS}ms`);
     expect(heavy).toContain(`heavyFiles=${HEAVY_TEST_FILES.length}`);
   });
+
+  it('keeps both phase configs derived from this module', () => {
+    const root = join(import.meta.dirname, '..');
+    const fast = readFileSync(join(root, 'vitest.config.ts'), 'utf-8');
+    const heavy = readFileSync(join(root, 'vitest.heavy.config.ts'), 'utf-8');
+    for (const source of [fast, heavy]) {
+      expect(source).toContain("'./test/helpers/test-budgets.js'");
+      expect(source).toContain('heavyTestPaths()');
+      expect(source).toContain('applyWorkerBudget(process.env');
+    }
+    expect(fast).toContain('FAST_TEST_TIMEOUT_MS');
+    expect(fast).toContain('exclude: heavyTestPaths()');
+    expect(heavy).toContain('HEAVY_TEST_TIMEOUT_MS');
+    expect(heavy).toContain('include: heavyTestPaths()');
+  });
 });
