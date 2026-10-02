@@ -71,6 +71,29 @@ describe('role definitions (E8)', () => {
     expect(silas).toContain('existing drafts are left untouched');
   });
 
+  it('pins the minion-owned bmad-build playbook on the worker prompt', () => {
+    const minion = ROLE_DEFINITIONS['minion'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(minion).toContain("runs the PROJECT's installed `bmad-build` skill");
+    expect(minion).toContain('you own its cycle end to end');
+    expect(minion).toContain('fresh, context-free reviewer sessions');
+    expect(minion).toContain('`pi -p` / `claude -p`');
+    expect(minion).toContain('never a second Gru');
+    expect(minion).toContain('an inline self-review is not a substitute');
+    expect(minion).toContain('report that exact capability gap loudly');
+    expect(minion).toContain('official BMAD onboarding/install path');
+    expect(minion).toContain('no ad hoc development, no bundled skill snapshots');
+  });
+
+  it('pins the minion-owned build cycle on the ops prompt', () => {
+    const silas = ROLE_DEFINITIONS['silas'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(silas).toContain('Minion-owned build cycle');
+    expect(silas).toContain('goal, boundaries, acceptance, verification');
+    expect(silas).toContain('verification scheduler');
+    expect(silas).toContain('do not commission a supplementary review duplicating');
+    expect(silas).toContain('activate the native Perkins gate on that exact final head');
+    expect(silas).toContain('NEEDS CHANGES returns to the same implementing minion');
+  });
+
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {
     expect(ROLE_DEFINITIONS['gru'].cwd).toBe('workspace_root');
     expect(ROLE_DEFINITIONS['silas'].cwd).toBe('workspace_root');

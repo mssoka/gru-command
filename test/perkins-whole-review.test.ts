@@ -1311,11 +1311,15 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       'dist/runtime/review-mcp-bridge.js',
       'dist/runtime/review-mcp-server.mjs',
       'resources/perkins-code-review/policy.json',
+      'resources/silas-skills/ops-dispatch/SKILL.md',
       'tools/verify-perkins-resource.mjs',
       'install.sh',
       'install/launchd/com.gru-command.service.plist.template',
       'install/systemd/gru-command.service.template',
       'roles/perkins.md',
+      'roles/minion.md',
+      'roles/silas.md',
+      'roles/gru.md',
       'web/dist/index.html',
     ]));
     const excludedMarker = ['j', 'ev'].join('');
@@ -1328,6 +1332,21 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     execFileSync('tar', ['-xzf', join(tarRoot, packed[0]!.filename), '-C', extractRoot]);
     const stage = join(extractRoot, 'package');
     expect(existsSync(join(stage, 'src'))).toBe(false);
+    // The shipped artifact carries the minion-owned bmad-build playbook in
+    // the packaged personas (owner ruling 2026-10-02): the STAGED minion
+    // prompt — read from the tarball extract, not the developer checkout —
+    // must select the project's installed bmad-build skill and its
+    // fresh-reviewer cycle, and the staged ops skill must not commission a
+    // duplicate review.
+    const stagedMinion = readFileSync(join(stage, 'roles', 'minion.md'), 'utf-8').replace(/\s+/gu, ' ');
+    expect(stagedMinion).toContain("runs the PROJECT's installed `bmad-build` skill");
+    expect(stagedMinion).toContain('you own its cycle end to end');
+    expect(stagedMinion).toContain('fresh, context-free reviewer sessions');
+    expect(stagedMinion).toContain('an inline self-review is not a substitute');
+    const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
+    expect(stagedOps).toContain('own its built-in review on fresh independent reviewer contexts');
+    expect(stagedOps).toContain('do not commission a supplementary review duplicating');
+    expect(stagedOps).toContain('native Perkins round on the');
     expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
@@ -1339,6 +1358,12 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       import { spawn } from 'node:child_process';
       import { loadPerkinsPolicy } from './dist/dispatch/perkins-review/policy.js';
       import { ReviewMcpBridge } from './dist/runtime/review-mcp-bridge.js';
+      const { ROLE_DEFINITIONS } = await import('./dist/roles.js');
+      const minionPrompt = ROLE_DEFINITIONS.minion.systemPrompt;
+      if (!minionPrompt.includes("runs the PROJECT's installed \`bmad-build\` skill") ||
+          !minionPrompt.includes('fresh, context-free reviewer sessions')) {
+        throw new Error('staged minion prompt lacks the bmad-build playbook');
+      }
       const bridge = await ReviewMcpBridge.start([{
         name: 'perkins_probe', description: 'staged probe', inputSchema: { type: 'object' },
         execute: async () => ({ text: 'stage-ok' }),

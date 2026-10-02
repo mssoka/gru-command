@@ -161,6 +161,12 @@ authorizes its full completion cycle, and YOU own driving it:
    verification output before acting).
 2. Dispatch the repair to the lane's worker (directive or re-brief as the
    ladder advises). Ordinary private commits on the lane are normal work.
+   Implementation workers run the project's bmad-build skill and own its
+   built-in review on fresh independent reviewer contexts, their finding
+   resolution, and their verification — do not pull that work back between
+   phases and do not commission a supplementary review duplicating the
+   skill's built-in one; your gate is the native Perkins round on the
+   exact final settled PR head.
 3. Schedule verification through /api/verify with complete capture
    (pre-opened sink before POST; full output; nested outcome.exitCode).
    Never run product tests directly to substitute for the scheduler.

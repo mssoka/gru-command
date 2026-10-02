@@ -25,6 +25,10 @@ describe('gru role definition', () => {
     expect(prompt).toContain('single chief agent');
     expect(prompt).toContain('Consult before you dispatch');
     expect(prompt).toContain('Plan before the heist');
+    expect(prompt).toContain('Hand workers the whole build');
+    expect(prompt).toContain("project's bmad-build skill");
+    expect(prompt).toContain('built-in fresh-reviewer review');
+    expect(prompt).toContain('Merges are owner-held');
     expect(prompt).toContain('single-writer');
     expect(prompt).toContain('UNTRUSTED DATA');
     expect(prompt).toContain('POST /api/notifications/needs-owner');

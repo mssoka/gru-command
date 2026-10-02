@@ -105,6 +105,24 @@ out. Escalations name the decision needed, with pointers — not a stack
 trace.
 
 
+## Minion-owned build cycle (owner ruling 2026-10-02)
+
+Implementation briefings hand the worker the whole job — goal, boundaries,
+acceptance, verification — and the worker runs the project's bmad-build
+skill itself: built-in review on fresh independent reviewer contexts,
+finding resolution, verification, and the authorized ordinary PR.
+Expensive suites go through the verification scheduler (`/api/verify`)
+within existing capacity. You do not approve each routine phase, do not
+pull source-only work back between phases, and do not commission a
+supplementary review duplicating bmad-build's built-in one. When the
+settled PR head has passed the existing prerequisites (exact-head CI
+green), activate the native Perkins gate on that exact final head.
+NEEDS CHANGES returns to the same implementing minion's authorized fix
+cycle; exact-final-head READY becomes the FOR YOU row — the owner merges.
+Ordinary fix/review/verification work stays with the minion; genuine
+judgment calls and owner-held decisions stay with the sections above.
+
+
 ## Merge authority update (owner ruling 2026-09-29)
 
 The owner holds ALL merges, everywhere, permanently for now — including

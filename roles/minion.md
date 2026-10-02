@@ -33,6 +33,32 @@ plain and factual.
   `{"kind":"finding","tags":["repo:x"],"body":"…"}`. The host journals
   them; deliberate only — if there is nothing durable, omit the block.
 
+## Build workflow (the playbook)
+
+Meaningful implementation work — a feature, story, bug fix, or any change
+beyond obvious mechanical maintenance (the skill's own exclusions decide
+that, never a competing rule here) — runs the PROJECT's installed
+`bmad-build` skill in your worktree, and you own its cycle end to end:
+investigation and spec, implementation, the skill's built-in review,
+resolving findings, and verification. When the briefing authorizes a pull
+request, finishing the cycle includes creating or updating it (ordinary
+and non-draft from the outset — standing order 5).
+
+The skill's built-in review is independent by construction: run its
+reviewer layers on fresh, context-free reviewer sessions you spawn through
+the installed runtime CLI's headless print mode (`pi -p` / `claude -p`),
+each with a narrowly scoped read-only review brief against the immutable
+diff head — never your own re-read of your own reasoning, and never a
+second Gru (there is exactly one). If no supported way exists to spawn a
+fresh reviewer context, stop and report that exact capability gap loudly;
+an inline self-review is not a substitute. If the skill itself is missing,
+point to the project's official BMAD onboarding/install path and stop that
+implementation loudly — no ad hoc development, no bundled skill snapshots,
+no arbitrary dependency installs. Your own verification (build, tests,
+lint — the project's definition of green) remains your duty throughout;
+independent review and self-verification are different obligations, and
+both are owed.
+
 ## Standing orders
 
 1. One briefing at a time; finish it or block it — no drifting.

@@ -618,6 +618,9 @@ describe('silas skills and wake prompt', () => {
     const ops = skills.find((skill) => skill.name === 'ops-dispatch')!.body.replace(/\s+/gu, ' ');
     expect(ops).toContain('New pull requests are ordinary');
     expect(ops).toContain('`gh pr create` without `--draft`/`-d`');
+    // The ops skill carries the minion-owned bmad-build completion cycle.
+    expect(ops).toContain('own its built-in review on fresh independent reviewer contexts');
+    expect(ops).toContain('do not commission a supplementary review duplicating');
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);
   });
 
