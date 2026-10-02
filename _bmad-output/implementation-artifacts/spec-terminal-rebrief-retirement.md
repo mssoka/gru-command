@@ -158,3 +158,35 @@ Raw candidate outputs are preserved by ops at `silas-ops-sweep-20260930T202418Z/
 - **Not claimed:** the specific trigger of the `b4b7d760` overruns is not isolable from static evidence, and host contention is not a proven root cause. No timeout/worker/pool flag is changed; the T4 180s override stays removed (j-470). The only executable discriminator for “does this recur at the frozen head” is a FULL re-run under unchanged runner/flags/budgets; a focused subset cannot decide it. If the overruns recur, a source-level repair of these three inherited tests is blocked by the standing no-timeout-change constraint — that is an owner/policy decision, not a lane invention.
 
 **Manual checks:** keep the pre-change red transcript and post-change green transcript in the completion report; confirm no live-ledger run.
+
+## Continuation 2026-10-02 — preserved-FULL diagnosis and the runtime-capability repair
+
+Authority: continuous-completion continuation of this undertaking (re-brief; same
+job/worktree/branch/PR142). Full trace, measured evidence and hashes live in the lane
+evidence directory `_bmad-output/implementation-artifacts/pr142-full-red-continuation-20261002/diagnosis.md`
+(git-ignored lane evidence, like the captured FULLs).
+
+The preserved FULL at `b923c98` (runId `721efa02-f895-464e-b12e-f5ab428ed024`, ledger
+39524; raw 141261B sha256 `384010ff…`, decoded 121526B sha256 `0c0f9ff8…`) failed exactly
+four tests, all `Test timed out in 30000ms` with zero assertion failures:
+
+| Test | Path traced | Disposition |
+|---|---|---|
+| `dispatch-server.test.ts:548` by=silas | `/api/dispatch/review` → `requestReview` → `setupRound` → `resolveFreezeTarget` (fixture probe/fetch) → review worktree + freeze diff | Aborted mid-review-POST (stray-probe evidence); ≥1 assertion ran; load-marginal, no lane-diff line on path. Remedy: GC workload budgets. |
+| `install-one-line.test.ts:604` owned/foreign service | Four synchronous `install.sh` runs (setup clone/build + refusal + print + owned restart) | Body completed; all assertions passed; the timeout is the post-hoc elapsed marker. Remedy: GC budgets; sibling PR141 `f2a7271` carries the cost relief (not copied). |
+| `perkins-builtin-wave.test.ts:3385` N5 | `wave.runRound` real round (freeze, worktree, diff, fake lead/lens, prior selection, sweep) | Aborted mid-round, zero assertions ran; body and helpers identical to main. Remedy: GC budgets. |
+| `wizard.test.ts:462` `--answers` refusals | Four synchronous `node dist/wizard/main.js` children | **Repaired in-lane (`ce62304`):** every wizard process imported `runtime/probe.ts` → both adapters → the agent-SDK graphs for two static literals (~7s/invocation measured). Capability declarations moved to `src/runtime/capabilities.ts`; adapters re-export; probe consumes it; deterministic decoupling oracle added (sentinel adapter mocks; fails before, passes after); suite-shape pin 7→8. |
+
+- The stray `fatal: cannot change to '…/fixture-silas-by'` was traced (not assumed):
+  `execFileSync` forwards child stderr by default; the call site is
+  `test/helpers/pr-head-probe.ts:14`, reached by the orphaned in-flight review request
+  after the test timeout and fixture cleanup. Harness capture finding, no product fault.
+- Independence: the lane's product diff (`rebrief-recovery.ts`, the `/api/silas/rebrief`
+  handler, `ledger/api.ts`, the boot counter) is on none of the four paths; the failing
+  test bodies are unchanged from main and pass/fail with host load across heads.
+- Remaining dependency (not a lane repair): active GC
+  `gc-test-harness-budgets-20261002` (workload-aware 30s/120s budgets, two-worker heavy
+  isolation); it must not be transplanted here. Next trigger: GC landing on `main` →
+  history-preserving integration → FULL at the then-final head → prescribed independent
+  reviews → non-force publish → exact-head CI → native Perkins handoff. No outstanding
+  verify request is held by this lane at handback.
