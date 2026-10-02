@@ -109,7 +109,6 @@ export function trackChildProcess(child, { label, captureOutput = true, scope } 
   };
   if (tracked.exitCode !== null || tracked.signal !== null) tracked.exitedAt = tracked.startedAt;
   target.processes.push(tracked);
-  if (target.processes.length > PROCESS_LIMIT) target.processes.shift();
   if (captureOutput) {
     for (const streamName of ['stdout', 'stderr']) {
       const stream = child[streamName];
@@ -226,7 +225,13 @@ export function renderFailureDiagnostics(scope, error, { timedOut } = {}) {
     lines.push('  owned children tracked: none');
   } else {
     lines.push(`  owned children tracked: ${target.processes.length}`);
-    for (const tracked of target.processes) {
+    // Every tracked child stays disposable at teardown; only the render is
+    // capped, naming the overflow explicitly.
+    const shown = target.processes.slice(-PROCESS_LIMIT);
+    if (target.processes.length > shown.length) {
+      lines.push(`    ... ${target.processes.length - shown.length} earlier owned children not listed`);
+    }
+    for (const tracked of shown) {
       const state =
         tracked.exitCode === null && tracked.signal === null
           ? `running (started +${formatMs(tracked.startedAt - target.startedAt)})`
