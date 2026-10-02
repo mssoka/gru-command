@@ -378,7 +378,7 @@ test('mock controls reject missing/wrong tokens without state changes and valid 
   await pair(page);
   await sendAndWaitReply(page, 'control-state-survives');
 
-  for (const route of ['__pulse', '__drop', '__reset', '__stress', '__compact-fail', '__new-chat-fail']) {
+  for (const route of ['__pulse', '__drop', '__reset', '__stress', '__compact-fail', '__new-chat-fail', '__board-mode']) {
     const missing = await page.request.post(`http://localhost:8788/${route}`);
     expect(missing.status(), `${route} missing token`).toBe(401);
     const wrong = await page.request.post(`http://localhost:8788/${route}`, {
@@ -607,6 +607,12 @@ test.describe('board (E6, mock feed)', () => {
       if (theme === 'light') await expect(page.locator('html')).not.toHaveClass(/dark/);
       else await expect(page.locator('html')).toHaveClass(/dark/);
 
+      // The settled band is a rolling window: the receipt can sit behind
+      // the "+K older settled" expander depending on its recency rank.
+      // Expand once so the assertion never depends on fixture ordering.
+      const more = page.locator('.board-band--settled .board-band__more');
+      if ((await more.count()) > 0) await more.click();
+
       // The merged lane with a leftover unacked escalation row is a closed
       // receipt: SETTLED, no signal chip, never a NEEDS GRU queue entry.
       const receipt = page.locator('.board-band--settled .board-job', { hasText: 'Rotate the staging tokens' });
@@ -650,6 +656,44 @@ test.describe('board (E6, mock feed)', () => {
       ).toHaveCount(0);
       await page.screenshot({ path: testInfo.outputPath(`board-truth-${theme}-bell.png`), fullPage: true });
       await page.locator('#notification-bell').click();
+    }
+  });
+
+  test('section truth: the empty NEEDS GRU clear state holds in light and dark', async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1440, height: 1200 });
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+
+    // The clear variant removes every live machine row and needs-you cause,
+    // so the calm green empty state (not absence) is what renders.
+    try {
+      const mode = await page.request.post('http://localhost:8788/__board-mode', {
+        headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+        data: { mode: 'clear-needs-you' },
+      });
+      expect(mode.ok()).toBe(true);
+      await page.reload();
+      await expect(page.locator('#board-view')).toBeVisible();
+
+      for (const theme of ['light', 'dark']) {
+        if (theme === 'dark') await page.locator('#theme-toggle').click();
+        if (theme === 'light') await expect(page.locator('html')).not.toHaveClass(/dark/);
+        else await expect(page.locator('html')).toHaveClass(/dark/);
+
+        const clear = page.locator('.board-band--needs-you .board-band__clear');
+        await expect(clear).toBeVisible();
+        await expect(clear.locator('.board-band__clear-text')).toHaveText('nothing needs Gru');
+        await expect(clear.locator('.board-band__clear-hint')).toHaveText('the crew is on it');
+        await expect(page.locator('#board-unacked')).toBeHidden();
+        await page.screenshot({ path: testInfo.outputPath(`board-truth-empty-${theme}.png`), fullPage: true });
+      }
+    } finally {
+      // The mock server is shared across specs: restore the default board
+      // so later tests never inherit the clear variant.
+      await page.request.post('http://localhost:8788/__board-mode', {
+        headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+        data: { mode: 'default' },
+      });
     }
   });
 

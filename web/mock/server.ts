@@ -191,16 +191,62 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
  */
 const LENSES = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'] as const;
 
+/** Board fixture mode (tests only): the default sample board, or a variant
+ * with no live machine rows and no needs-you job causes so the empty
+ * NEEDS GRU clear state is assertable in both themes. /__reset restores. */
+type BoardMode = 'default' | 'clear-needs-you';
+let boardMode: BoardMode = 'default';
+
 /** A stamp 20 minutes ago, clamped to stay inside the current LOCAL day:
  * the merged-receipt fixture must keep bucketing SETTLED even when the
  * mock boots just after midnight (the rolling-window pins depend on it). */
 function mergedReceiptStamp(): string {
   const startOfToday = new Date();
   startOfToday.setHours(0, 0, 0, 0);
-  return new Date(Math.max(Date.now() - 20 * 60_000, startOfToday.getTime() + 60_000)).toISOString();
+  // Never in the future: just after local midnight the 20-minute lookback
+  // crosses yesterday, so the clamp to today+60s would run ahead of
+  // Date.now() and skew recency ordering. Cap at now.
+  return new Date(
+    Math.min(Date.now(), Math.max(Date.now() - 20 * 60_000, startOfToday.getTime() + 60_000)),
+  ).toISOString();
 }
 
 function sampleSnapshot(): unknown {
+  const snapshot = defaultSampleSnapshot();
+  return boardMode === 'clear-needs-you' ? clearNeedsYouVariant(snapshot) : snapshot;
+}
+
+/** The clear variant: drop the live machine row, settle the needs-you
+ * causes of the two remaining fixture jobs (a failed lens and a conflicting
+ * PR), and zero the queue count — the board then renders the calm green
+ * "nothing needs Gru" state. Everything else is unchanged. */
+function clearNeedsYouVariant(snapshot: unknown): unknown {
+  const snap = snapshot as {
+    repos: Array<{ jobs: Array<Record<string, unknown>> }>;
+    notifications: Array<Record<string, unknown>>;
+    unackedActionRequired: number;
+  };
+  snap.notifications = snap.notifications.filter((row) => row.id !== 'mock-n5');
+  snap.unackedActionRequired = 0;
+  for (const repo of snap.repos) {
+    for (const job of repo.jobs) {
+      if (job.id === 'demo-api-payment-fix' && Array.isArray(job.rounds)) {
+        for (const round of job.rounds as Array<{ lenses?: Array<Record<string, unknown>> }>) {
+          for (const lens of round.lenses ?? []) {
+            if (lens.state === 'error') {
+              lens.state = 'done';
+              lens.note = null;
+            }
+          }
+        }
+      }
+      if (job.id === 'demo-api-conflict-probe') job.prState = 'open';
+    }
+  }
+  return snap;
+}
+
+function defaultSampleSnapshot(): unknown {
   return {
     repos: [
       {
@@ -744,6 +790,30 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     res.end('{"ok":true}\n');
     return;
   }
+  if (req.method === 'POST' && req.url === '/__board-mode') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    let body = '';
+    req.on('data', (chunk: Buffer) => {
+      body += chunk.toString('utf-8');
+    });
+    req.on('end', () => {
+      try {
+        const parsed = JSON.parse(body) as { mode?: string };
+        if (parsed.mode !== 'default' && parsed.mode !== 'clear-needs-you') throw new Error('bad mode');
+        boardMode = parsed.mode;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}\n');
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end('{"error":"mode must be default|clear-needs-you"}\n');
+      }
+    });
+    return;
+  }
   if (req.method === 'POST' && req.url === '/__stress') {
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' });
@@ -788,6 +858,7 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     failNextNewChat = false;
     stressTool = null;
     stressError = null;
+    boardMode = 'default';
     compactGeneration += 1;
     newChatGeneration += 1;
     deferredUsers.length = 0;

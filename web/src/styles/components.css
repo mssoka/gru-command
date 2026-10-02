@@ -2370,6 +2370,14 @@ body {
   color: var(--on-state);
 }
 
+/* A closed receipt is record-only history, never live work: keep it
+ * readable but de-emphasized beside live machine rows (no colors of its
+ * own — it dims whatever severity surface it keeps). */
+.board-notification--receipt {
+  opacity: 0.7;
+  border-style: dashed;
+}
+
 .board-notification__title {
   font-weight: 800;
 }
