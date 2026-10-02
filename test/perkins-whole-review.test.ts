@@ -1371,7 +1371,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       const { ROLE_DEFINITIONS } = await import('./dist/roles.js');
       // The shipped prompts are markdown: phrases may wrap across lines,
       // so flatten before substring checks (the vitest pins do the same).
-      const flatten = (text) => text.replace(/\s+/g, ' ');
+      const flatten = (text) => text.replace(/\\s+/g, ' ');
       const minionPrompt = flatten(ROLE_DEFINITIONS.minion.systemPrompt);
       const silasPrompt = flatten(ROLE_DEFINITIONS.silas.systemPrompt);
       const gruPrompt = flatten(ROLE_DEFINITIONS.gru.systemPrompt);
