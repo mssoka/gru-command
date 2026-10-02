@@ -145,7 +145,12 @@ interface CancellationObservation {
   readonly rawSdkCompactionEnds: number;
   readonly summarySettledByAbort: boolean;
   readonly continuationReachedModel: boolean;
+  readonly queuedPendingDuringStall: boolean;
+  readonly queuedModelCallsDuringStall: number;
+  readonly guardRejections: number;
   readonly queuedDelivered: number;
+  readonly afterSettle: string;
+  readonly afterSettleDelivered: number;
   readonly disposed: boolean;
   readonly idle: boolean;
 }
@@ -162,10 +167,14 @@ interface CancellationObservation {
  *
  * The first cycle is measured alone before any follow-up starts: the adapter
  * keeps one pending terminal slot, and a second adjacent cycle would race the
- * publication poll, so the follow-up is queued only after the first terminal
- * is published. Only the FIRST summary stalls; later cycles summarize
- * normally so the follow-up's exactly-once delivery is not conflated with an
- * open-ended provider stall.
+ * publication poll. Other-owner work is admitted while the measured turn is
+ * live and BEFORE native compaction opens, so its pending-to-delivered
+ * transition is proven through the stall and the cancellation instead of
+ * being submitted after settlement; one post-settlement request is kept as a
+ * separate usability check. While the summary is held, fresh prompt/steer/
+ * followUp requests must be refused by the compacting admission guard. Only
+ * the FIRST summary stalls; later cycles summarize normally so exactly-once
+ * delivery is not conflated with an open-ended provider stall.
  *
  * `abort-settles`: a faithful transport — the held summary stream ends when
  * its request signal aborts. `late-terminal`: the signal is ignored and the
@@ -222,10 +231,43 @@ async function observeCompactionCancellation(
       () => 'resolved',
       (error: Error) => `rejected:${error.message}`,
     );
+    // Admit other-owner work while the turn is live and before native
+    // compaction opens: single-writer must hold it pending, and it must
+    // deliver exactly once after genuine settlement.
+    const queued = handle.prompt('queued work', { owner: 'other' }).then(
+      () => 'resolved',
+      (error: Error) => `rejected:${error.message}`,
+    );
+    let queuedSettled = false;
+    void queued.then(() => {
+      queuedSettled = true;
+    });
     await waitFor(
       () => events.some((event) => event.type === 'compaction_start'),
       'compaction_start',
     );
+    // Pending through the held summary: the queued item must not reach the
+    // model while compaction is in progress, and fresh execution requests
+    // against the compacting session must be refused by the admission guard.
+    const queuedPendingDuringStall = !queuedSettled;
+    const queuedModelCallsDuringStall = fx.script.calls.filter(
+      (call) => call.prompt === 'queued work',
+    ).length;
+    const guardOutcomes = await Promise.all([
+      handle.prompt('during compaction', { owner: 'other' }).then(
+        () => 'resolved',
+        (error: Error) => error.message,
+      ),
+      handle.steer('during compaction', { owner: 'other' }).then(
+        () => 'resolved',
+        (error: Error) => error.message,
+      ),
+      handle.followUp('during compaction', { owner: 'other' }).then(
+        () => 'resolved',
+        (error: Error) => error.message,
+      ),
+    ]);
+    const guardRejections = guardOutcomes.filter((outcome) => /compacting/.test(outcome)).length;
     // The cancellation seam under test: exactly one call, summary-only or broad.
     let cancellations = 0;
     if (variant === 'broad') {
@@ -255,18 +297,25 @@ async function observeCompactionCancellation(
       'compaction_end',
       8_000,
     );
-    // Follow-up on the settled session: exactly-once delivery, no duplicates.
-    const queued = handle.prompt('queued work', { owner: 'other' }).then(
-      () => 'resolved',
-      (error: Error) => `rejected:${error.message}`,
-    );
+    const turnOutcome = await turn;
+    const queuedOutcome = await queued;
     await waitFor(
       () => fx.script.calls.some((call) => call.prompt === 'queued work'),
       'queued delivery',
       8_000,
     );
-    const turnOutcome = await turn;
-    const queuedOutcome = await queued;
+    // Separate post-settlement usability check: fresh work on the settled
+    // session delivers exactly once, on its own.
+    const afterSettle = handle.prompt('after settle', { owner: 'other' }).then(
+      () => 'resolved',
+      (error: Error) => `rejected:${error.message}`,
+    );
+    const afterSettleOutcome = await afterSettle;
+    await waitFor(
+      () => fx.script.calls.some((call) => call.prompt === 'after settle'),
+      'post-settlement delivery',
+      8_000,
+    );
     await waitFor(() => internal.session.isIdle || handle.health().state === 'disposed', 'session settle');
     const compactionEnds = events.filter(
       (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
@@ -294,7 +343,12 @@ async function observeCompactionCancellation(
       continuationReachedModel: fx.script.calls.some(
         (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
       ),
+      queuedPendingDuringStall,
+      queuedModelCallsDuringStall,
+      guardRejections,
       queuedDelivered: fx.script.calls.filter((call) => call.prompt === 'queued work').length,
+      afterSettle: afterSettleOutcome,
+      afterSettleDelivered: fx.script.calls.filter((call) => call.prompt === 'after settle').length,
       disposed: handle.health().state === 'disposed',
       idle: internal.session.isIdle,
     };
@@ -946,6 +1000,12 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.abortedEnds).toBe(0);
       expect(observation.successEnds).toBe(1);
       expect(observation.queuedDelivered).toBe(1);
+      expect(observation.queued).toBe('resolved');
+      expect(observation.queuedPendingDuringStall).toBe(true);
+      expect(observation.queuedModelCallsDuringStall).toBe(0);
+      expect(observation.guardRejections).toBe(3);
+      expect(observation.afterSettle).toBe('resolved');
+      expect(observation.afterSettleDelivered).toBe(1);
       expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
     });
@@ -964,6 +1024,12 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.abortedEnds).toBe(1);
       expect(observation.successEnds).toBe(0);
       expect(observation.queuedDelivered).toBe(1);
+      expect(observation.queued).toBe('resolved');
+      expect(observation.queuedPendingDuringStall).toBe(true);
+      expect(observation.queuedModelCallsDuringStall).toBe(0);
+      expect(observation.guardRejections).toBe(3);
+      expect(observation.afterSettle).toBe('resolved');
+      expect(observation.afterSettleDelivered).toBe(1);
       expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
     });
@@ -980,6 +1046,12 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.successEnds).toBe(1);
       expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
       expect(observation.queuedDelivered).toBe(1);
+      expect(observation.queued).toBe('resolved');
+      expect(observation.queuedPendingDuringStall).toBe(true);
+      expect(observation.queuedModelCallsDuringStall).toBe(0);
+      expect(observation.guardRejections).toBe(3);
+      expect(observation.afterSettle).toBe('resolved');
+      expect(observation.afterSettleDelivered).toBe(1);
       expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
     });
@@ -996,16 +1068,27 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.successEnds).toBe(0);
       expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
       expect(observation.queuedDelivered).toBe(1);
+      expect(observation.queued).toBe('resolved');
+      expect(observation.queuedPendingDuringStall).toBe(true);
+      expect(observation.queuedModelCallsDuringStall).toBe(0);
+      expect(observation.guardRejections).toBe(3);
+      expect(observation.afterSettle).toBe('resolved');
+      expect(observation.afterSettleDelivered).toBe(1);
       expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
     });
 
-    it('explicit stop context: dispose during a live turn rejects queued work and releases the session', async () => {
+    it('explicit stop context: dispose aborts the live stream, rejects queued work, and releases the session', async () => {
       let release!: () => void;
       const hold = new Promise<void>((resolve) => {
         release = resolve;
       });
-      const fx = await fixture([{ deltas: ['live'], hold }, { deltas: ['never'] }]);
+      // The live stream honors the request signal: disposal must settle it by
+      // abort instead of waiting on a hold only the test can release.
+      const fx = await fixture([
+        { deltas: ['live'], hold, honorAbort: true },
+        { deltas: ['never'] },
+      ]);
       const handle = await fx.runtime.spawn('gru');
       const sessionFile = handle.sessionFile!;
       const live = handle.prompt('live turn').then(
@@ -1022,15 +1105,135 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
           'live turn admitted',
         );
         await handle.dispose();
+        // Disposal settled the live stream by abort — never left it held.
+        await waitFor(
+          () => fx.script.calls[0]?.aborted === true,
+          'live stream abort settlement',
+        );
+        expect(fx.script.calls[0]?.aborted).toBe(true);
         expect(await queued).toMatch(
           /rejected:agent session disposed before queued message was delivered/,
         );
         expect(handle.health().state).toBe('disposed');
         expect(existsSync(`${sessionFile}.lock`)).toBe(false);
-        expect(fx.script.calls.map((call) => call.prompt)).not.toContain('never');
+        // The queued request never reached the model; only the live one did.
+        const prompts = fx.script.calls.map((call) => call.prompt);
+        expect(prompts).not.toContain('queued behind live');
+        expect(prompts).toEqual(['live turn']);
+        // The aborted live turn settles (no wedged run); its stream-abort
+        // settlement is pinned above, and disposal owns the terminal state.
+        await live;
       } finally {
         release();
         await live.catch(() => {});
+        await handle.dispose();
+      }
+    });
+
+    it('a stuck native gate after its terminal reconciles at the 5s bound: one failed terminal, then disposal', async () => {
+      const fx = await fixture([{ deltas: ['prime'] }]);
+      const handle = await fx.runtime.spawn('gru');
+      const events = collect(handle);
+      const internal = handle as unknown as {
+        session: { isCompacting: boolean };
+        onPiEvent(event: unknown): void;
+      };
+      const nativeSession = internal.session;
+      try {
+        await handle.prompt('prime');
+        // Pi dispatches compaction_end before the session clears isCompacting;
+        // hold that gate closed to pin the adapter's bounded reconciliation.
+        internal.session = new Proxy(nativeSession, {
+          get(target, key) {
+            if (key === 'isCompacting') return true;
+            return Reflect.get(target, key, target);
+          },
+        });
+        vi.useFakeTimers();
+        internal.onPiEvent({ type: 'compaction_start' });
+        internal.onPiEvent({ type: 'compaction_end', aborted: true });
+        await vi.advanceTimersByTimeAsync(4_999);
+        expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
+        await vi.advanceTimersByTimeAsync(2);
+        const ends = events.filter(
+          (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
+            event.type === 'compaction_end',
+        );
+        expect(ends).toHaveLength(1);
+        expect(ends[0]!.success).toBe(false);
+        expect(ends[0]!.error).toBe('native compaction state did not settle after its terminal event');
+        vi.useRealTimers();
+        // The reconcile path disposes instead of wedging on the stuck gate.
+        await waitFor(() => handle.health().state === 'disposed', 'reconciled disposal');
+        expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        internal.session = nativeSession;
+        await handle.dispose();
+      }
+    });
+
+    it('a signal-ignoring summary keeps compaction open until disposal: one failed terminal, no duplicates', async () => {
+      let releaseSummary: () => void = () => {};
+      const summaryHold = new Promise<void>((resolve) => {
+        releaseSummary = resolve;
+      });
+      const fx = await fixture((prompt, index) => {
+        if (prompt.startsWith('<conversation>')) return { deltas: [], hold: summaryHold };
+        if (index === 0) return { deltas: ['history '.repeat(12_000)] };
+        if (index === 1) {
+          return {
+            deltas: [],
+            toolCall: { id: 'call-1', name: 'read', args: { path: 'missing.txt' } },
+            usageTokens: 90_000,
+          };
+        }
+        return { deltas: [`answer-${index}`] };
+      });
+      const handle = await fx.runtime.spawn('gru');
+      const events = collect(handle);
+      const internal = handle as unknown as {
+        session: { abortCompaction?: () => void };
+      };
+      try {
+        await handle.prompt('start');
+        const turn = handle.prompt('do the work').then(
+          () => 'resolved',
+          (error: Error) => `rejected:${error.message}`,
+        );
+        await waitFor(
+          () => events.some((event) => event.type === 'compaction_start'),
+          'compaction_start',
+        );
+        if (internal.session.abortCompaction === undefined) {
+          throw new Error('SDK session is missing abortCompaction()');
+        }
+        internal.session.abortCompaction();
+        // The transport ignores the cancellation: no terminal is fabricated
+        // while the summary stays open.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
+        // Disposal is the way out of a truly stuck provider summary: exactly
+        // one failed terminal, and the lock is released.
+        await handle.dispose();
+        const ends = events.filter(
+          (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
+            event.type === 'compaction_end',
+        );
+        expect(ends).toHaveLength(1);
+        expect(ends[0]!.success).toBe(false);
+        expect(ends[0]!.error).toBe('agent session disposed during native compaction');
+        expect(handle.health().state).toBe('disposed');
+        expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(false);
+        // A late transport settlement adds no second terminal.
+        releaseSummary();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(
+          events.filter((event) => event.type === 'compaction_end'),
+        ).toHaveLength(1);
+        await turn.catch(() => {});
+      } finally {
+        releaseSummary();
         await handle.dispose();
       }
     });
