@@ -13,12 +13,13 @@ import {
 /**
  * Lens-pill proof (ops-readiness-repair 2026-10-02, original scope only).
  *
- * Synthetic board snapshots are pushed into the page over an intercepted
- * `/board/ws` socket — the same `{ type: 'board', snapshot }` frame the
- * dev-only mock sends. No product, mock, style, or fixture code is
- * changed; the pairing flow still runs against the real dev mock. The
- * fixture is a COMPLETE canonical BoardSnapshot (the production
- * `isValidSnapshot` validator requires agents/notifications/decisions —
+ * Synthetic board snapshots are served on BOTH of the board client's
+ * channels: the intercepted `/board/ws` push (the same
+ * `{ type: 'board', snapshot }` frame the dev-only mock sends) and the
+ * `GET /api/board` refetch (connect/reconnect/wake). No product, mock,
+ * style, or fixture code is changed; the pairing flow still runs against
+ * the real dev mock. The fixture is a COMPLETE canonical BoardSnapshot
+ * (the production `isValidSnapshot` validator requires agents/notifications/decisions —
  * a repos-only object is invalid and would prove nothing) and every test
  * gates on the production validator + frame parser before rendering.
  * All scenario data is generic (no real project names), mirroring the
@@ -191,8 +192,16 @@ async function seedBoardSocket(page: Page, snapshot: BoardSnapshot): Promise<Err
   if (frame === null || frame.type !== 'board') throw new Error('fixture board frame fails the production parser');
   const pageErrors: Error[] = [];
   page.on('pageerror', (error) => pageErrors.push(error));
-  let seeded = false;
+  // The board client loads through BOTH channels: an HTTP `GET /api/board`
+  // refetch on connect/reconnect/wake, and the `/board/ws` push. Seeding
+  // only the socket let a later HTTP refetch (served by the dev mock)
+  // replace the synthetic board mid-test — a harness race, not a product
+  // behaviour. Both channels are fulfilled from the same validated fixture
+  // so whichever arrives last renders the same board.
+  await page.route('**/api/board', (route) => route.fulfill({ json: snapshot }));
   await page.routeWebSocket(/\/board\/ws$/, (ws: WebSocketRoute) => {
+    // Per-connection seeding: a reconnect must be re-seeded, not starved.
+    let seeded = false;
     ws.onMessage(() => {
       if (seeded) return;
       seeded = true;
