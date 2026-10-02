@@ -11,6 +11,7 @@ import {
   isLensState,
   isRoundStatus,
   isRoundVerdict,
+  TERMINAL_JOB_STATUSES,
   type JobStatus,
   type LensState,
   type RoundStatus,
@@ -1239,10 +1240,12 @@ export class LedgerApi {
   }
 
   /** Count action-required notifications still awaiting a machine
-   * disposition — the NEEDS GRU queue (self-clearing; the human bell is
-   * not rung by these). Read straight from the TABLE — not the bounded
-   * feed window — so the tracker stays true. */
-  countPendingActionRequired(): number {
+   * disposition, INCLUDING terminal-bound closed receipts. Read straight
+   * from the TABLE — not the bounded feed window. Receipts belong to the
+   * record and the bell; the live NEEDS GRU queue is
+   * `countLivePendingActionRequired` — prefer that one for anything the
+   * board renders as live work. */
+  countPendingActionRequiredIncludingReceipts(): number {
     const row = this.db
       .prepare(
         "SELECT COUNT(*) AS n FROM notifications WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL",
@@ -1257,18 +1260,21 @@ export class LedgerApi {
    * (nothing is acked or resolved here), but it is not live Gru work, so
    * the queue count does not count it. Rows with no agent binding stay
    * global (no job → cannot be terminal). Same table-read discipline as
-   * `countPendingActionRequired` — never the feed window. */
+   * `countPendingActionRequiredIncludingReceipts` — never the feed window.
+   * The terminal statuses derive from `TERMINAL_JOB_STATUSES` so this SQL
+   * can never drift from `isJobTerminal`. */
   countLivePendingActionRequired(): number {
+    const terminalPlaceholders = TERMINAL_JOB_STATUSES.map(() => '?').join(', ');
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS n FROM notifications
          WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL
            AND (agent_id IS NULL OR agent_id NOT IN (
              SELECT agents.id FROM agents JOIN jobs ON agents.job_id = jobs.id
-             WHERE jobs.status IN ('merged', 'done')
+             WHERE jobs.status IN (${terminalPlaceholders})
            ))`,
       )
-      .get() as Row;
+      .get(...TERMINAL_JOB_STATUSES) as Row;
     return Number(row.n);
   }
 

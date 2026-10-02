@@ -218,10 +218,10 @@ describe('board server — HTTP API', () => {
     for (const body of [{}, { title: '  ', detail: 'x' }, { title: 'x', detail: '\n' }, { title: 'x'.repeat(501), detail: 'y' }]) {
       expect((await postJson(port, path, 'board-test-token', body)).status).toBe(400);
     }
-    const before = api.countPendingActionRequired();
+    const before = api.countPendingActionRequiredIncludingReceipts();
     const created = await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge' });
     expect(created).toMatchObject({ status: 201, body: { kind: 'gru.owner-escalation', routing: 'needs-owner', title: 'Owner call', ackedAt: null } });
-    expect(api.countPendingActionRequired()).toBe(before); // never loops into Gru's machine queue
+    expect(api.countPendingActionRequiredIncludingReceipts()).toBe(before); // never loops into Gru's machine queue
     const row = created.body as { id: string };
     expect(api.getNotification(row.id)).toMatchObject({ detail: 'Approve external merge', shownAt: null });
     expect((await getJson(port, '/api/board', 'board-test-token')).body).toMatchObject({ unackedNeedsOwner: expect.any(Number) });
@@ -506,7 +506,7 @@ describe('board server — empty token config locks every door', () => {
       const illegal = await postJson(port, `/api/notifications/${machine.id}/ack`, 'ack-token', { by: 'web' });
       expect(illegal.status).toBe(400);
       expect(api.getNotification(machine.id)).toMatchObject({ ackedAt: null, resolvedAt: null });
-      expect(api.countPendingActionRequired()).toBeGreaterThan(0);
+      expect(api.countPendingActionRequiredIncludingReceipts()).toBeGreaterThan(0);
       // Owner Ack fires the hook exactly once, idempotently.
       const ack1 = await postJson(port, `/api/notifications/${row.id}/ack`, 'ack-token', { by: 'web' });
       expect(ack1.status).toBe(200);

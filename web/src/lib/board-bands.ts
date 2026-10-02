@@ -13,7 +13,7 @@
  * every status × freshness × PR-state combination is unit-testable.
  */
 
-import type { AgentView, BoardSnapshot, JobView } from './board-protocol.js';
+import { isJobConcluded, type AgentView, type BoardSnapshot, type JobView } from './board-protocol.js';
 import { derivedPrState } from './board-kpi.js';
 import { isSameLocalDay } from './board-time.js';
 
@@ -76,18 +76,30 @@ export interface WorkerStopView {
  * Review agents (role `perkins`) are bound to the job too, but their
  * stops are workflow-owned (e.g. an aborted isolated attempt with the
  * breaker closed): they belong to the round lifecycle and must never
- * make a working lane read as waiting. */
+ * make a working lane read as waiting.
+ *
+ * The lane's CURRENT worker decides: a live (non-stopped, non-breaker)
+ * minion bound to the job clears any older stopped record. A stopped
+ * record survives its own disposal (the human Ack must find it to
+ * re-arm), so a re-dispatched lane would otherwise read "waiting" from
+ * its previous worker while the fresh one runs. Only when no live worker
+ * remains does the first recorded stop mark the lane. */
 export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
-  const byJob = new Map<string, WorkerStopView>();
+  const stopped = new Map<string, WorkerStopView>();
+  const liveJobs = new Set<string>();
   for (const agent of agents) {
     if (agent.jobId === null || agent.role !== 'minion') continue;
     const supervision = agent.supervision;
     if (supervision === null || supervision === undefined) continue;
-    if (supervision.state !== 'stopped' && supervision.breakerOpen !== true) continue;
-    if (byJob.has(agent.jobId)) continue;
-    byJob.set(agent.jobId, { reason: supervision.stopReason ?? null, restarts: supervision.restarts });
+    if (supervision.state !== 'stopped' && supervision.breakerOpen !== true) {
+      liveJobs.add(agent.jobId);
+      continue;
+    }
+    if (stopped.has(agent.jobId)) continue;
+    stopped.set(agent.jobId, { reason: supervision.stopReason ?? null, restarts: supervision.restarts });
   }
-  return byJob;
+  for (const jobId of liveJobs) stopped.delete(jobId);
+  return stopped;
 }
 
 /** The status-chip label for a stopped lane: an explicit waiting state
@@ -110,14 +122,6 @@ export function isStalledWorking(job: JobView, opts: BucketOptions = {}): boolea
   const then = Date.parse(stamp);
   if (Number.isNaN(then)) return false;
   return (opts.now ?? Date.now()) - then > threshold;
-}
-
-/** A terminal job (merged/done) is a closed receipt: it can never be
- * live Gru work, so no signal — leftover unacked escalation rows, an
- * aborted historical round, stale lens noise — may promote it back into
- * NEEDS YOU. The bell keeps the durable rows; the board moves on. */
-export function isJobConcluded(status: string): boolean {
-  return status === 'merged' || status === 'done';
 }
 
 /** Every reason a job earns Band 1 (exported for focused tests). */

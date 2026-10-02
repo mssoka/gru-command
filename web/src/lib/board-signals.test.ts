@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentView, BoardSnapshot, JobView, NotificationView, RoundView } from './board-protocol.js';
-import { isJobConcluded } from './board-bands.js';
+import { isJobConcluded } from './board-protocol.js';
 import { jobSignal, pluralCount, roundSummary, terminalBoundNotificationIds, unackedByJob } from './board-signals.js';
 
 function round(overrides: Partial<RoundView> = {}): RoundView {

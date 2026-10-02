@@ -321,7 +321,7 @@ describe('notification center — durable log + receipts + acks', () => {
     api.recordNotification({ id: 'true-machine', kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Machine' });
     const center = new NotificationCenter({ ledger: api, bus });
     expect(api.countPendingNeedsOwner()).toBe(0);
-    expect(api.countPendingActionRequired()).toBe(legacyKinds.length - 1);
+    expect(api.countPendingActionRequiredIncludingReceipts()).toBe(legacyKinds.length - 1);
     const ownerSnapshot = new BoardEngine({ ledger: api, bus }).snapshot();
     expect(ownerSnapshot.unackedNeedsOwner).toBe(0);
     expect(ownerSnapshot.notifications.filter((row) => row.routing === 'needs-owner')).toHaveLength(0);
@@ -384,7 +384,7 @@ describe('notification center — durable log + receipts + acks', () => {
     expect(() => api.ackNotification('legacy-provider-wall', 'operator')).toThrow(
       'action-required notifications require a Gru disposition',
     );
-    expect(api.countPendingActionRequired()).toBe(1);
+    expect(api.countPendingActionRequiredIncludingReceipts()).toBe(1);
     // Deterministic dedupe around the split state: while the fresh owner row
     // is unacked it dedupes same-routing posts; once acked, the only unacked
     // row is the legacy machine one, so a NEW trip again honors the request

@@ -21,6 +21,7 @@
 
 import {
   agentStateTone,
+  isJobConcluded,
   jobChipTone,
   jobStatusTone,
   lensChipTone,
@@ -35,7 +36,6 @@ import {
   BAND_LABELS,
   BAND_ORDER,
   bucketSnapshot,
-  isJobConcluded,
   settledWindow,
   stoppedWorkersByJob,
   workerStopLabel,

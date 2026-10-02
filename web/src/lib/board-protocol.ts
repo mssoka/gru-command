@@ -581,4 +581,13 @@ export function agentStateTone(state: string): string {
   }
 }
 
+/** A terminal job (merged/done) is a closed receipt: it can never be live
+ * Gru work, so no leftover unacked escalation row, aborted historical
+ * round, or stale lens noise may promote it back into NEEDS YOU. Shared
+ * by the banding and signal derivations — the web twin of the ledger's
+ * `isJobTerminal` (separate builds; keep the two in step). */
+export function isJobConcluded(status: string): boolean {
+  return status === 'merged' || status === 'done';
+}
+
 export { str as boardStr, nstr as boardNstr };

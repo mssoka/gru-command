@@ -369,4 +369,40 @@ describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
     expect(map.get('job-2')).toEqual({ reason: 'quota_wall', restarts: 2 });
     expect(map.size).toBe(1);
   });
+
+  it('a live re-dispatched worker clears the previous stopped record — the lane is not waiting', () => {
+    const map = stoppedWorkersByJob([
+      // The previous worker stopped; its record survives disposal (the Ack
+      // must find it to re-arm) and stays stopped while the lane is
+      // re-briefed with a fresh worker.
+      agentView('old', {
+        jobId: 'job-1',
+        state: 'idle',
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      // The fresh worker is running: the lane's CURRENT worker decides.
+      agentView('fresh', {
+        jobId: 'job-1',
+        state: 'streaming',
+        supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null },
+      }),
+    ]);
+    expect(map.has('job-1')).toBe(false);
+  });
+
+  it('stopped records still mark the lane when every bound worker is stopped', () => {
+    const map = stoppedWorkersByJob([
+      agentView('old', {
+        jobId: 'job-1',
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      agentView('newer', {
+        jobId: 'job-1',
+        supervision: { state: 'stopped', restarts: 4, breakerOpen: true, stopReason: 'crash loop' },
+      }),
+    ]);
+    // No live worker remains: the lane waits, deterministically reporting
+    // the first recorded stop in snapshot order.
+    expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 1 });
+  });
 });

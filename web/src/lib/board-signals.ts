@@ -5,8 +5,7 @@
  * a DOM: actionable state must survive the collapse.
  */
 
-import type { BoardSnapshot, JobView, RoundView } from './board-protocol.js';
-import { isJobConcluded } from './board-bands.js';
+import { isJobConcluded, type BoardSnapshot, type JobView, type RoundView } from './board-protocol.js';
 
 export interface RoundSummary {
   readonly done: number;
