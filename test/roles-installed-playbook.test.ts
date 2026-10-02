@@ -81,13 +81,19 @@ function stageInstalledLayout(withRoles: boolean): string {
  *  must not run on an older build. Tarball / non-git trees (the baseline
  *  snapshot) have no HEAD to compare and keep the existence check only. */
 function assertDistCurrent(): void {
-  let head: string | null = null;
+  // Tarball / baseline snapshots carry no checkout: keep the existence
+  // check only there. A real checkout that cannot resolve HEAD is a broken
+  // guard, not an excuse to skip the staleness check — fail loud.
+  if (!existsSync(join(repoRoot, '.git'))) return;
+  let head: string;
   try {
     head = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
-  } catch {
-    head = null;
+  } catch (error) {
+    throw new Error(
+      `cannot resolve HEAD for the stale-dist guard in ${repoRoot}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
   }
-  if (head === null) return;
   const built = readBuildInfo(repoRoot).rev;
   if (built !== head) {
     throw new Error(
@@ -192,7 +198,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('select by what the project really has installed for the task');
     expect(flat).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
     expect(flat).toContain('You own the selected workflow end to end');
-    expect(flat).toContain("fresh, context-free tracked review jobs you commission through the service's dispatch surface");
+    expect(flat).toContain("fresh, context-free tracked review jobs you commission through the service's job-dispatch surface");
     expect(flat).toContain('each reviewer is a separate tracked job with its own session and worktree');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(flat).not.toContain('pi -p');

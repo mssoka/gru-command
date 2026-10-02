@@ -1333,6 +1333,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       'roles/minion.md',
       'roles/silas.md',
       'roles/gru.md',
+      'roles/bob.md',
       'web/dist/index.html',
     ]));
     const excludedMarker = ['j', 'ev'].join('');
@@ -1369,6 +1370,8 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
     expect(stagedOps).toContain('separately tracked review jobs');
+    expect(stagedOps).toContain('The owner holds ALL merges');
+    expect(stagedOps).not.toContain('The chief holds merge authority');
     expect(stagedOps).toContain('never demand a fixed skill name');
     expect(stagedOps).toContain('do not commission a supplementary review duplicating');
     expect(stagedOps).toContain('native Perkins round on the exact final settled PR head');

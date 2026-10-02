@@ -78,12 +78,16 @@ describe('role definitions (E8)', () => {
     expect(minion).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
     expect(minion).toContain('You own the selected workflow end to end');
     expect(minion).toContain('no self-imposed call, turn, or time ceiling');
-    expect(minion).toContain("fresh, context-free tracked review jobs you commission through the service's dispatch surface");
+    expect(minion).toContain("fresh, context-free tracked review jobs you commission through the service's job-dispatch surface");
+    expect(minion).toContain('`POST /api/dispatch` — the same path that created your lane');
     expect(minion).toContain('each reviewer is a separate tracked job with its own session and worktree');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(minion).not.toContain('pi -p');
     expect(minion).not.toContain('claude -p');
     expect(minion).not.toContain('headless print mode');
+    // The verification scheduler is the one global budget; the worker
+    // prompt must not read as licence for competing full runs.
+    expect(minion).toContain("coordinate through the service's verification scheduler");
     expect(minion).toContain('never a second Gru');
     expect(minion).toContain('an inline self-review is not a substitute');
     expect(minion).toContain('report that exact capability gap loudly');

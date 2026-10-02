@@ -625,6 +625,12 @@ describe('silas skills and wake prompt', () => {
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(ops).not.toContain('pi -p');
     expect(ops).not.toContain('headless print mode');
+    // The owner-held merge rule must live on the loaded skill body itself
+    // (loop-1 adoption), not only in the composed wake prompt header.
+    expect(ops).toContain('The owner holds ALL merges');
+    expect(ops).toContain('the owner merges gru-command too');
+    expect(ops).not.toContain('The chief holds merge authority');
+    expect(ops).not.toContain('Gru merges gru-command only');
     expect(ops).toContain('never demand a fixed skill name');
     expect(ops).toContain('do not commission a supplementary review duplicating');
     expect(ops).toContain('it is the gate, never a duplicate review');
