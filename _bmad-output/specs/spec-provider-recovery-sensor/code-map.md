@@ -49,7 +49,7 @@ this lane; remote default verified `main`).
 3. **main.ts** — construct/start the scheduler after SilasDriver (service
    timer, `unref`), stop it in shutdown alongside silas. No new port, no new
    process.
-4. **ledger** — migration 9 (`provider_waits` + `pending_provider_recovery`);
+4. **ledger** — migration 10 (`provider_waits` + `pending_provider_recovery`);
    API additions scoped to the sensor module; events ride the existing
    append-only events table.
 5. **config.ts / config-reference.ts / docs** — new `[provider_recovery]`
@@ -86,7 +86,7 @@ r1 Perkins rework and the owner-approved multi-provider extension is:
 | Sensor | `src/provider-recovery/sensor.ts` | Explicit typed establishment; eligibility with durable establishment-status vs churn; ≥300 s floor on every outcome; reserve-and-charge before I/O (crash → spent-unknown); post-I/O reload/revalidation; atomic shared recovery batch; single durable delivery path (`provider.restored`); lineage-based renewal ladder; deterministic in-service timer. |
 | Resume/claim | `src/provider-recovery/resume.ts` | Atomic claim-before-spawn; full recheck set; one continuation; admission recorded separately; silas-slot guarded re-arm with tolerant concurrent settle. |
 | Admission ports | `src/provider-recovery/admission-observations.ts` | Typed admission/progress observations + all-binding fan-out gate. SOURCE-ONLY consumer: the cap-owned runtime emitter is NOT grounded on this branch (returned as the precise interface; no cap files touched). |
-| Ledger | `src/ledger/db.ts` migration 9 (unshipped, edited in place), `src/ledger/api.ts` | `provider_waits` (+endpoint/job-status-at-establishment/lineage/batch), `provider_routes`, `pending_provider_recovery`, `provider_probe_reservations`; atomic batch + CAS claim APIs. |
+| Ledger | `src/ledger/db.ts` migration 10 (renumbered from never-applied 9 after integrating main's shipped 9), `src/ledger/api.ts` | `provider_waits` (+endpoint/job-status-at-establishment/lineage/batch), `provider_routes`, `pending_provider_recovery`, `provider_probe_reservations`; atomic batch + CAS claim APIs. |
 | Supervisor seam | `src/supervision/supervisor.ts` | `ownsProviderWall` (machine ownership BEFORE any owner stop) + `linkProviderWaitIncident`; typed evidence threading; guarded `ownedProviderReArm`; stop/ack semantics otherwise unchanged. |
 | Notification seam | `src/notifications/center.ts`, `src/ledger/api.ts` | `supervision.provider-wall.*` no longer force-held: the supervisor's explicit routing governs (action-required = machine-owned; needs-owner = conservative fallback). Other owner-held kinds unchanged. |
 | Runtime seam | `src/runtime/{types,pi-adapter}.ts` | `typed` provenance on error events — sdk-error (numeric status + headers) or provider-message (strict machine-composed line) only. |

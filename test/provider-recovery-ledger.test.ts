@@ -6,7 +6,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 
 /**
- * Provider-recovery durable state (migration 9): waits, routes, and the
+ * Provider-recovery durable state (migration 10): waits, routes, and the
  * deduplicated pending-recovery marker — the restart-safe delivery
  * handoff. State machine: terminal rows never return to waiting.
  */
@@ -46,7 +46,7 @@ function waitInput(overrides: Partial<Parameters<LedgerApi['recordProviderWait']
   };
 }
 
-describe('provider waits (migration 9)', () => {
+describe('provider waits (migration 10)', () => {
   it('records an explicit wait with its full route binding and continuation', () => {
     const ledger = makeLedger();
     const wait = ledger.recordProviderWait(waitInput());
