@@ -1,0 +1,24 @@
+{
+  "recordedAt": "2026-09-28T10:01:15.685363+00:00",
+  "source": "direct owner messages",
+  "ownerMessages": [
+    "go ahead.",
+    "go ahead."
+  ],
+  "interpretation": "Repeated confirmation of one undertaking, not two dispatches. Approves implementing the consulted provider-recovery plan, the explicit eligible-wait definition, and bounded same-route real-generation fallback.",
+  "plan": "<intake-briefing-dir>/plan-v3.md",
+  "planSha256": "051194c8067abf7fcda6a805dafca84bd18c80aeea6897b5450132c074d1490e",
+  "policy": {
+    "automaticRecovery": "new explicitly eligible temporary-provider waits only",
+    "probeCadenceSecondsMinimum": 300,
+    "sharedBy": "exact provider/endpoint/model/credential binding with eligible waiting steps",
+    "maximumOutputTokens": 64,
+    "history": false,
+    "tools": false,
+    "hiddenRetries": false,
+    "providerV1": "actual zai-coding-cn GLM coding route",
+    "credentialsOrAccountChanges": false,
+    "historicalOwnerAckBypass": false
+  },
+  "scope": "one separate implementation lane; existing cap->pipeline order unchanged; owner retains merge/deployment/restart; no live provider probe or configuration change during development"
+}
