@@ -309,7 +309,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(existsSync(join(repoA, '.gru-command', 'bmad-install.json'))).toBe(true);
   }, 120_000);
 
-  it('already-onboarded deleted runtime binding is skip-only deterministic; retry is never offered (gh-32 r1)', () => {
+  it('already-onboarded deleted runtime binding is skip-only deterministic; a typed retry is refused and only skip completes (gh-32 r1)', () => {
     const workspace = tempDir('gru-command-pty-unbind-ws-');
     const repoA = join(workspace, 'repo-a');
     mkdirSync(join(repoA, '.git'), { recursive: true });
@@ -370,7 +370,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
         { expect: TOKEN_PROMPT, send: '' },
         { expect: REGISTER_PROMPT, send: 'n' },
         { expect: SMOKE_PROMPT, send: 'n' },
-        { expect: 'Skip this repo? [skip]:', send: '' }, // Enter = skip
+        { expect: 'Skip this repo? [skip]:', send: 'retry' }, // deliberate typed retry attempt
+        { expect: 'Skip this repo? [skip]:', send: '' }, // skip-only loop re-prompts; Enter = skip
       ],
       { GRU_COMMAND_HOME: reuseHome, PATH: `${bin}:${process.env.PATH ?? ''}` },
     );
@@ -378,6 +379,18 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(second.output).toContain('deterministic — retrying cannot fix it');
     expect(second.output).toContain('BMAD recorded skill binding is missing');
     expect(second.output).toContain('npx bmad-method install');
+    // The typed retry is REFUSED, not executed: the skip-only loop answers
+    // with its correction line and re-prompts WITHOUT a second onboarding
+    // attempt. The observation proving no retry ran: the failure banner and
+    // its missing-binding message appear EXACTLY once in the whole
+    // transcript — a real retry would re-invoke onboarding and print both
+    // again. (The older missing-module typed-retry leg is a different class
+    // and does not cover this deleted-binding path; this case does.)
+    expect(second.output).toContain('retry cannot fix it; enter skip');
+    const bannerCount = second.output.split('deterministic — retrying cannot fix it').length - 1;
+    expect(bannerCount, 'typed retry must not initiate another setup attempt').toBe(1);
+    const missingCount = second.output.split('BMAD recorded skill binding is missing').length - 1;
+    expect(missingCount).toBe(1);
     expect(second.output).not.toContain('Retry or skip this repo?');
     expect(second.output).toContain('BMAD not ready in repo-a: skipped by explicit per-repo choice');
     // The collected answers survived the failure loop: setup completes with

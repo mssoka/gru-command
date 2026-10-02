@@ -979,8 +979,8 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(driftResult.message).toContain('version drift for tea');
   });
 
-  it('already-onboarded degradation keeps the installer hint, control-file read failures stay transient, and disposable preflight output stays retryable (gh-32 r1)', () => {
-    // (1) Successful onboarding, then a DECLARED MODULE directory goes
+  it('already-onboarded missing declared module directory keeps the installer hint before any fingerprint refusal (gh-32 r1)', () => {
+    // Successful onboarding FIRST, then a DECLARED MODULE directory goes
     // missing: the module-directory check must classify BEFORE the
     // fingerprint refusal (which would also fire) so the official-installer
     // repair hint is retained. Fingerprint validation itself is not
@@ -1004,10 +1004,12 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(missingAfter.message).not.toContain('source payload changed');
     expect(missingAfter.repairHint).toContain('npx bmad-method install');
     expect(bmadSnapshot(missingModule.repo)).toBe(missingBefore);
+  });
 
-    // (2) Same shape with a SYMLINKED declared module (the payload
-    // fingerprint changes too): still the deterministic module-directory
-    // class with the installer hint, not a symlink-payload refusal.
+  it('already-onboarded symlinked declared module directory keeps the installer hint (gh-32 r1)', () => {
+    // Same shape with a SYMLINKED declared module (the payload fingerprint
+    // changes too): still the deterministic module-directory class with the
+    // installer hint, not a symlink-payload refusal.
     const linkedModule = fixtureRepo('onboarded-symlinked-module');
     const installedLinked = onboardBmadRepo(linkedModule.name, 'install', {
       workspaceRoot: linkedModule.workspace,
@@ -1026,10 +1028,12 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(linkedAfter.deterministic).toBe(true);
     expect(linkedAfter.message).toContain('missing or unsafe module directory');
     expect(linkedAfter.repairHint).toContain('npx bmad-method install');
+  });
 
-    // (3) Successful onboarding, then a RECORDED runtime binding is
-    // deleted: the native ENOENT must become the deterministic class with
-    // installer guidance — never a futile retry offer.
+  it('already-onboarded deleted recorded runtime binding is deterministic with installer guidance, never a futile retry (gh-32 r1)', () => {
+    // Successful onboarding, then a RECORDED runtime binding is deleted:
+    // the native ENOENT must become the deterministic class with installer
+    // guidance — never a futile retry offer.
     const deletedBinding = fixtureRepo('onboarded-deleted-binding');
     const installedBinding = onboardBmadRepo(deletedBinding.name, 'install', {
       workspaceRoot: deletedBinding.workspace,
@@ -1046,11 +1050,14 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(deletedAfter.deterministic).toBe(true);
     expect(deletedAfter.message).toContain('BMAD recorded skill binding is missing');
     expect(deletedAfter.repairHint).toContain('npx bmad-method install');
+  });
 
-    // (4) A VALID but UNREADABLE control file is not "malformed": the read
+  it('valid-but-unreadable BMAD control files stay transient and recover on the SAME collected answers (gh-32 r1)', () => {
+    // A VALID but UNREADABLE control file is not "malformed": the read
     // failure stays transient, and the identical call succeeds once access
-    // recovers — retry preserves the collected answers (the same answers
-    // object drives every attempt).
+    // recovers — retry preserves the collected answers (ONE captured
+    // answers object drives EVERY attempt below). Permission restoration
+    // lives in finally so a RED run still leaves the fixture writable.
     const unreadable = fixtureRepo('control-read-recovery');
     const installedRead = onboardBmadRepo(unreadable.name, 'install', {
       workspaceRoot: unreadable.workspace,
@@ -1060,35 +1067,45 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(installedRead.ready, installedRead.message).toBe(true);
     const recordFile = join(unreadable.repo, '.gru-command', 'bmad-install.json');
     const manifestFile = join(unreadable.repo, '.gru-command', 'worktree.toml');
+    const sharedAnswers = answers(unreadable.workspace, unreadable.name, 'reuse');
     const reuseUnreadable = () => onboardBmadRepo(unreadable.name, 'reuse', {
       workspaceRoot: unreadable.workspace,
-      answers: answers(unreadable.workspace, unreadable.name, 'reuse'),
+      answers: sharedAnswers,
     });
     chmodSync(recordFile, 0o000);
-    const recordDenied = reuseUnreadable();
-    expect(recordDenied.ready).toBe(false);
-    expect(recordDenied.deterministic).toBeUndefined();
-    expect(recordDenied.message).not.toContain('malformed');
-    expect(recordDenied.message).toMatch(/EACCES|permission denied/i);
-    chmodSync(recordFile, 0o644);
+    try {
+      const recordDenied = reuseUnreadable();
+      expect(recordDenied.ready).toBe(false);
+      expect(recordDenied.deterministic).toBeUndefined();
+      expect(recordDenied.message).not.toContain('malformed');
+      expect(recordDenied.message).toMatch(/EACCES|permission denied/i);
+    } finally {
+      chmodSync(recordFile, 0o644);
+    }
     const recordRecovered = reuseUnreadable();
     expect(recordRecovered.ready, recordRecovered.message).toBe(true);
 
     chmodSync(manifestFile, 0o000);
-    const manifestDenied = reuseUnreadable();
-    expect(manifestDenied.ready).toBe(false);
-    expect(manifestDenied.deterministic).toBeUndefined();
-    expect(manifestDenied.message).not.toContain('malformed');
-    expect(manifestDenied.message).toMatch(/EACCES|permission denied/i);
-    chmodSync(manifestFile, 0o644);
+    try {
+      const manifestDenied = reuseUnreadable();
+      expect(manifestDenied.ready).toBe(false);
+      expect(manifestDenied.deterministic).toBeUndefined();
+      expect(manifestDenied.message).not.toContain('malformed');
+      expect(manifestDenied.message).toMatch(/EACCES|permission denied/i);
+    } finally {
+      chmodSync(manifestFile, 0o644);
+    }
     const manifestRecovered = reuseUnreadable();
     expect(manifestRecovered.ready, manifestRecovered.message).toBe(true);
+  });
 
-    // (5) Disposable PREFLIGHT output that fails safety validation is still
+  it('disposable BMAD preflight output failing safety validation stays transient and the next attempt completes (gh-32 r1)', () => {
+    // Disposable PREFLIGHT output that fails safety validation is still
     // refused, but stays TRANSIENT: the stage is deleted and the repo is
     // untouched, so the next attempt can complete (stateful synthetic
     // installer — no real installer execution). Existing-repo unsafe
-    // bindings keep their deterministic classification above.
+    // bindings keep their deterministic classification elsewhere in this
+    // suite (unsafe-runtime-root, control-symlink).
     const preflight = fixtureRepo('preflight-transient');
     mkdirSync(join(preflight.workspace, 'outside-preflight'), { recursive: true });
     let installerCalls = 0;
