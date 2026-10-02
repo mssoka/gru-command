@@ -44,10 +44,17 @@ import type { ProbeOutcome, ProbeRoute } from './probe.js';
  * - Credential exceptions log SAFE CATEGORIES only (never raw error text,
  *   which could carry token material).
  * - GLM fallback stays a config activation guard (default off).
+ *
+ * DORMANT (r4 finding 5): the native-claude reader below is composed but
+ * cannot fire in production yet — the claude-code runtime does not emit
+ * provider/model/typed provenance and `anthropic-claude-native` has no pi
+ * catalog route. The overlay path is marked unshipped/dormant in the spec
+ * and gate matrix; grounding it needs a runtime provenance + route-
+ * resolution contract, not a relaxed fence.
  */
 
-export const CODEX_METADATA_ENDPOINT = 'https://chatgpt.com/backend-api/wham/usage';
-export const CLAUDE_METADATA_ENDPOINT = 'https://api.anthropic.com/api/oauth/usage';
+import { CLAUDE_METADATA_ENDPOINT, CODEX_METADATA_ENDPOINT } from './metadata.js';
+export { CLAUDE_METADATA_ENDPOINT, CODEX_METADATA_ENDPOINT };
 
 /** Safe error categories for credential-path logging (no raw text). */
 export type CredentialIssueCategory =
@@ -325,6 +332,7 @@ export function composeMetadataReaders(input: {
             fetch: input.fetch,
             resolveCredential: () => Promise.resolve(credential),
             timeoutMs: input.config.probeTimeoutMs,
+            model: route.model,
           }).read(),
         input.log,
       ).read(route),

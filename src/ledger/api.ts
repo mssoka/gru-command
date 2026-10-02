@@ -1313,9 +1313,15 @@ export class LedgerApi {
       const ts = nowIso();
       const existing = this.db.prepare('SELECT id FROM provider_waits WHERE incident_id = ?').get(input.incidentId) as Row | undefined;
       if (existing !== undefined) {
+        // Idempotent replay for a LIVE wait. A terminal row (claimed /
+        // cancelled / superseded) is NEVER revived to 'waiting' (r4 note:
+        // the old unconditional UPDATE broke the terminality invariant); it
+        // is returned unchanged so a stale replay cannot resurrect it.
+        const current = this.getProviderWait(str(existing.id)) as ProviderWaitRecord;
+        if (current.status !== 'waiting') return current;
         this.db
           .prepare(
-            `UPDATE provider_waits SET status = 'waiting', session_file = ?, continuation = ?, updated_at = ? WHERE id = ?`,
+            `UPDATE provider_waits SET session_file = ?, continuation = ?, updated_at = ? WHERE id = ? AND status = 'waiting'`,
           )
           .run(input.sessionFile, JSON.stringify(input.continuation ?? {}), ts, str(existing.id));
         return this.getProviderWait(str(existing.id)) as ProviderWaitRecord;
@@ -1416,6 +1422,15 @@ export class LedgerApi {
         agentId: wait?.agentId ?? null,
         payload: { id, ...(payload ?? {}) },
       });
+      // r4 finding 3: the claim is a terminal transition too — resolve the
+      // wait's OWN linked machine-routed incident under the same guard the
+      // status path uses (never needs-owner; never another wait's stop).
+      if (wait !== null && wait.incidentId !== null) {
+        const incident = this.getNotification(wait.incidentId);
+        if (incident !== null && incident.routing === 'action-required' && incident.resolvedAt === null) {
+          this.resolveNotificationById(incident.id, 'provider-recovery-sensor');
+        }
+      }
       return true;
     });
   }

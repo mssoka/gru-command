@@ -106,6 +106,75 @@ describe('provider waits (migration 10)', () => {
     const requeued = ledger.setProviderWaitStatus('w1', 'waiting');
     expect(requeued.status).toBe('waiting');
   });
+
+  it('a same-incident replay on a TERMINAL wait returns it unchanged (r4: never revived)', () => {
+    const ledger = makeLedger();
+    ledger.recordProviderWait(waitInput());
+    ledger.setProviderWaitStatus('w1', 'cancelled', { why: 'owner hold' });
+    const replayed = ledger.recordProviderWait(waitInput({ sessionFile: '/tmp/stale-replay.jsonl' }));
+    expect(replayed.id).toBe('w1');
+    expect(replayed.status).toBe('cancelled');
+    // The terminal row was not rewritten with stale replay material.
+    expect(replayed.sessionFile).toBe('/tmp/session.jsonl');
+    expect(ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(0);
+  });
+});
+
+describe('r4 — atomic claim resolves the linked machine incident (finding 3)', () => {
+  function recoveredWait(ledger: LedgerApi, incidentId: string): void {
+    ledger.recordProviderWait(waitInput({ incidentId }));
+    ledger.commitProviderRecoveryBatch({
+      id: 'p1',
+      routeKey: 'zai-coding-cn/glm-5.3@fp1',
+      incidentGenerations: [1],
+      evidence: {},
+      waiters: [{ id: 'w1', jobId: null }],
+    });
+  }
+
+  it('claimProviderWaitAtomic resolves its own action-required incident — lifecycle, never an ACK', () => {
+    const ledger = makeLedger();
+    ledger.recordNotification({
+      id: 'incident-1',
+      kind: 'supervision.provider-wall.agent-1.quota_wall',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'machine-owned stop',
+    });
+    recoveredWait(ledger, 'incident-1');
+    expect(ledger.claimProviderWaitAtomic('w1', { by: 'silas' })).toBe(true);
+    const incident = ledger.getNotification('incident-1');
+    expect(incident?.resolvedAt).not.toBeNull();
+    expect(incident?.ackedAt).toBeNull(); // resolved by lifecycle, never owner-ACKed
+  });
+
+  it('claim never resolves a needs-owner incident (owner control preserved)', () => {
+    const ledger = makeLedger();
+    ledger.recordNotification({
+      id: 'incident-owner',
+      kind: 'supervision.provider-wall.agent-1.quota_wall',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'owner stop',
+    });
+    recoveredWait(ledger, 'incident-owner');
+    expect(ledger.claimProviderWaitAtomic('w1', { by: 'silas' })).toBe(true);
+    expect(ledger.getNotification('incident-owner')?.resolvedAt).toBeNull();
+  });
+
+  it('a lost CAS (already claimed) resolves nothing further', () => {
+    const ledger = makeLedger();
+    ledger.recordNotification({
+      id: 'incident-2',
+      kind: 'supervision.provider-wall.agent-1.quota_wall',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'machine-owned stop',
+    });
+    recoveredWait(ledger, 'incident-2');
+    expect(ledger.claimProviderWaitAtomic('w1', { by: 'first' })).toBe(true);
+    expect(ledger.claimProviderWaitAtomic('w1', { by: 'second' })).toBe(false);
+  });
 });
 
 describe('provider routes (durable cadence/budget)', () => {

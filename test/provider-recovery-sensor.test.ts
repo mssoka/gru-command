@@ -974,3 +974,107 @@ describe('phase2 — machine-owned incidents resolve with their wait lifecycle (
     expect(incident?.resolvedAt).toBeNull(); // owner control preserved
   });
 });
+
+describe('r4 — async settlement preserves the charge and mid-check updates (finding 4)', () => {
+  it('a completed recovery keeps the pre-I/O charge and never reverts mid-check route updates', async () => {
+    const h = new Harness();
+    h.makeJob('job-w2');
+    await h.establishMinionWait({ jobId: 'job-w2' });
+    h.probe.queueCompleted();
+    // A concurrent establishment/escalation lands MID-CHECK: the route's
+    // incident sequence, false-recovery ladder, and suspension advance
+    // while the probe is in flight.
+    h.probe.onProbeStart = () => {
+      const current = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
+      if (current !== null) {
+        h.ledger.upsertProviderRoute({
+          ...current,
+          incidentSeq: 7,
+          falseRecoveryCount: 2,
+          suspendedUntil: '2026-09-28T11:00:00Z',
+        });
+      }
+    };
+    await h.sensor.tick();
+    const route = h.ledger.getProviderRoute(`zai-coding-cn/glm-5.3@${h.probe.fingerprint}`);
+    // The check was CHARGED before the I/O: the recovery write must not
+    // refund the attempt (the 12/hour pin would undercount) ...
+    expect(route?.attemptsInWindow).toBe(1);
+    expect(route?.lastAttemptAt).not.toBeNull();
+    // ... and the mid-check updates survive the recovery settle.
+    expect(route?.incidentSeq).toBe(7);
+    expect(route?.falseRecoveryCount).toBe(2);
+    expect(route?.suspendedUntil).toBe('2026-09-28T11:00:00Z');
+    expect(route?.lastResult).toBe('recovered');
+    // The recovery itself still landed.
+    expect(h.ledger.listProviderWaits({ status: 'recovered-pending' })).toHaveLength(1);
+  });
+});
+
+describe('r4 — endpoint rotation re-binds the route and retires stale waits (finding 8)', () => {
+  it('a catalog endpoint change re-binds the route and supersedes waits bound to the old endpoint', async () => {
+    const h = new Harness();
+    h.makeJob('job-e1');
+    const first = await h.establishMinionWait({ jobId: 'job-e1' });
+    expect(first?.endpoint).toBe(h.probe.endpoint);
+    // The catalog moves the endpoint for the SAME provider/model/credential
+    // binding (routeKey unchanged): the old endpoint can never be probed.
+    h.probe.endpoint = 'https://open.bigmodel.cn/api/coding/paas/v4-v2';
+    h.makeJob('job-e2');
+    const second = await h.establishMinionWait({
+      agentId: 'agent-minion-2',
+      jobId: 'job-e2',
+      sessionFile: '/tmp/minion-2.jsonl',
+      incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall',
+    });
+    // The stale wait is retired with a recorded reason; the new wait holds
+    // the new binding; the route row is re-bound.
+    const stale = h.ledger.getProviderWait(first!.id);
+    expect(stale?.status).toBe('superseded');
+    expect(second?.endpoint).toBe('https://open.bigmodel.cn/api/coding/paas/v4-v2');
+    const route = h.ledger.getProviderRoute(first!.routeKey);
+    expect(route?.endpoint).toBe('https://open.bigmodel.cn/api/coding/paas/v4-v2');
+    // The next shared check probes the RE-BOUND endpoint — never held forever.
+    await h.sensor.tick();
+    expect(h.probe.calls).toHaveLength(1);
+    expect(h.probe.calls[0]?.endpoint).toBe('https://open.bigmodel.cn/api/coding/paas/v4-v2');
+  });
+});
+
+describe('r4 — the notifications port uses the dedupe-capable incident path (finding 7)', () => {
+  it('two establishments on one route keep exactly ONE waiting row (not one per event)', async () => {
+    const h = new Harness();
+    h.makeJob('job-d1');
+    h.makeJob('job-d2');
+    await h.establishMinionWait({ jobId: 'job-d1' });
+    await h.establishMinionWait({
+      agentId: 'agent-minion-2',
+      jobId: 'job-d2',
+      sessionFile: '/tmp/minion-d2.jsonl',
+      incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall',
+    });
+    const waitingRows = h.ledger
+      .listNotifications()
+      .filter((notification) => notification.kind.startsWith('provider.waiting.'));
+    expect(waitingRows).toHaveLength(1);
+    expect(waitingRows[0]?.routing).toBe('fyi');
+  });
+
+  it('repeated false-recovery escalations reuse ONE durable machine row', async () => {
+    const h = new Harness({ falseRecoveryEscalateAt: 1, suspensionMs: 1_000 });
+    h.makeJob('job-d3');
+    await h.establishMinionWait({ jobId: 'job-d3' });
+    h.probe.queueCompleted();
+    await h.sensor.tick();
+    const recovered = h.ledger.listProviderWaits({ status: 'recovered-pending' })[0]!;
+    h.ledger.setProviderWaitStatus(recovered.id, 'claimed');
+    // Two separate renewals each climb the ladder to the escalation.
+    await h.establishMinionWait({ jobId: 'job-d3', incidentId: 'incident-d3-2' });
+    await h.establishMinionWait({ jobId: 'job-d3', incidentId: 'incident-d3-3' });
+    const rows = h.ledger
+      .listNotifications()
+      .filter((notification) => notification.kind.startsWith('provider.false-recovery.'));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.routing).toBe('action-required');
+  });
+});

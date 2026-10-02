@@ -15,11 +15,15 @@ import type {
   AgentHandle,
   AgentState,
   PendingTurn,
+  PromptOptions,
   RuntimeEvent,
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import { establishProviderWait, ProviderRecoverySensor } from '../src/provider-recovery/sensor.js';
+import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resume.js';
+import { DispatchService } from '../src/dispatch/service.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import type { ProviderProbePort, ProbeOutcome, ProbeRoute } from '../src/provider-recovery/probe.js';
 import { DEFAULT_PROVIDER_RECOVERY_CONFIG } from '../src/config.js';
 
@@ -61,7 +65,13 @@ class FakeHandle implements AgentHandle {
   emit(event: RuntimeEvent): void {
     for (const listener of this.listeners) listener(event);
   }
-  async prompt(): Promise<void> {}
+  async prompt(text: string, options?: PromptOptions): Promise<void> {
+    this.prompts.push({ text, owner: options?.owner });
+    if (this.promptHook !== null) await this.promptHook();
+  }
+  /** Test hook: per-handle prompt behavior (default settles immediately). */
+  promptHook: (() => Promise<void> | void) | null = null;
+  readonly prompts: { text: string; owner: string | undefined }[] = [];
   async steer(): Promise<void> {}
   async followUp(): Promise<void> {}
   readonly pendingTurn = (): PendingTurn | null => ({
@@ -438,5 +448,216 @@ describe('supervisor ⇄ sensor seam', () => {
     await h.settle();
     // The respawn happened through the normal ladder.
     expect(h.registry.spawns).toBeGreaterThanOrEqual(1);
+  });
+});
+
+/**
+ * The REAL DispatchService ⇄ supervisor ⇄ sensor seam (issue #154 blocker
+ * checklist): a dispatched minion's briefing turn is rejected by a
+ * structured GLM quota wall, the dispatch settle writes `blocked` BEFORE
+ * the supervisor observes the runtime error, the wait survives that race,
+ * the shared check recovers it, and ONE guarded continuation runs through
+ * the normal re-brief surface — no owner ACK anywhere.
+ */
+class DispatchSeamHarness {
+  readonly ledger: LedgerApi;
+  readonly notifications: NotificationCenter;
+  readonly registry = new FakeRegistry();
+  readonly probe = new SensorProbe();
+  readonly worktrees: InMemoryWorktreePort;
+  readonly repoPath: string;
+  readonly sensor: ProviderRecoverySensor;
+  readonly supervisor: Supervisor;
+  readonly dispatch: DispatchService;
+  readonly minionHandles: FakeHandle[] = [];
+  private minionSpawns = 0;
+
+  constructor() {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-pr-dispatch-seam-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    this.ledger = new LedgerApi(db.handle, { bus });
+    this.notifications = new NotificationCenter({ ledger: this.ledger, bus });
+    this.worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'pr-dispatch-seam-wt-')));
+    cleanupDirs.push(this.worktrees.root);
+    this.repoPath = mkdtempSync(join(tmpdir(), 'pr-dispatch-seam-repo-'));
+    cleanupDirs.push(this.repoPath);
+    this.sensor = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true },
+      ledger: this.ledger,
+      probe: this.probe,
+      notifications: this.notifications,
+      wake: { trigger: async () => {} },
+      silasHosted: () => true,
+    });
+    const sensor = this.sensor;
+    this.supervisor = new Supervisor({
+      config: {
+        enabled: true,
+        turnSilenceMs: 60_000,
+        restartWindowMs: 600_000,
+        maxRestarts: 3,
+        restartBackoffMs: 1_000,
+      },
+      registry: this.registry,
+      ledger: this.ledger,
+      notifications: this.notifications,
+      providerWalls: {
+        ownsProviderWall: async (input) => {
+          const wait = await establishProviderWait(sensor, {
+            agentId: input.agentId,
+            role: input.role,
+            slotId: input.slotId,
+            jobId: input.jobId,
+            sessionFile: input.sessionFile,
+            failureClass: input.failureClass,
+            provider: input.source?.provider ?? null,
+            model: input.source?.model ?? null,
+            errorMessage: input.source?.error ?? '',
+            typed: input.source?.typed ?? null,
+            incidentId: null,
+            continuation: input.continuation,
+          }).catch(() => null);
+          return wait !== null;
+        },
+        linkProviderWaitIncident: ({ agentId, incidentId }) => {
+          const wait = this.ledger.openProviderWaitForAgent(agentId);
+          if (wait !== null) this.ledger.setProviderWaitIncident(wait.id, incidentId);
+        },
+        onProviderWall: (observation) => {
+          void establishProviderWait(sensor, {
+            agentId: observation.agentId,
+            role: observation.role,
+            slotId: observation.slotId,
+            jobId: observation.jobId,
+            sessionFile: observation.sessionFile,
+            failureClass: observation.failureClass,
+            provider: observation.source?.provider ?? null,
+            model: observation.source?.model ?? null,
+            errorMessage: observation.source?.error ?? '',
+            typed: observation.source?.typed ?? null,
+            incidentId: observation.incidentId,
+            continuation: observation.continuation,
+          }).catch(() => {});
+        },
+      },
+      tickMs: 5_000,
+      now: () => Date.parse('2026-09-28T10:00:00Z'),
+    });
+    this.supervisor.start();
+    this.dispatch = new DispatchService({
+      ledger: this.ledger,
+      worktrees: this.worktrees,
+      spawner: async (role, options) => {
+        const handle = (await this.registry.spawn(role, options)) as FakeHandle;
+        if (role === 'minion') {
+          this.minionSpawns += 1;
+          this.minionHandles.push(handle);
+          if (this.minionSpawns === 1) {
+            // The wall turn: the minion prompt rejects. The dispatch settle
+            // lands from that rejection BEFORE the runtime error event is
+            // delivered to the supervisor below (the r4 race order).
+            handle.promptHook = async () => {
+              throw new Error('429: {"error":{"code":"1302","message":"usage window limit reached"}}');
+            };
+          } else {
+            // The continuation admits its turn (the separate admission record).
+            handle.promptHook = async () => handle.emit({ type: 'turn_start' });
+          }
+        }
+        return handle;
+      },
+    });
+  }
+
+  settle(): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, 30));
+  }
+}
+
+describe('real DispatchService ⇄ supervisor ⇄ sensor seam (issue #154)', () => {
+  it('a wall-settled dispatch block still resumes: settle → wait → recovery → one continuation', async () => {
+    const h = new DispatchSeamHarness();
+    const outcome = await h.dispatch.dispatch({
+      jobId: 'job-dispatch-wall',
+      repoPath: h.repoPath,
+      title: 'wall under dispatch',
+      briefing: 'do the approved work',
+    });
+    const settled = await outcome.settled;
+    expect(settled.ok).toBe(false);
+    // The dispatch settle is on the record and the job is `blocked` BEFORE
+    // the supervisor ever sees the provider error.
+    expect(h.ledger.getJob('job-dispatch-wall')?.status).toBe('blocked');
+    expect(
+      h.ledger.listJobEvents('job-dispatch-wall', { limit: 20 }).some((event) => event.kind === 'job.minion-error'),
+    ).toBe(true);
+
+    // Now the runtime error reaches the supervisor (typed provenance).
+    const first = h.minionHandles[0]!;
+    first.emit({
+      type: 'error',
+      error: '429: {"error":{"code":"1302","message":"usage window limit reached"}}',
+      fatal: false,
+      provider: 'zai-coding-cn',
+      model: 'glm-5.3',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
+    });
+    await h.settle();
+
+    // The wait survived the very settle it raced: established while blocked
+    // and still eligible; machine-owned (zero owner chimes).
+    const waits = h.ledger.listProviderWaits({ status: 'waiting' });
+    expect(waits).toHaveLength(1);
+    const wait = waits[0]!;
+    expect(wait.jobId).toBe('job-dispatch-wall');
+    expect(wait.jobStatusAtEstablishment).toBe('blocked');
+    expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toHaveLength(0);
+    const incident = h.ledger
+      .listNotifications({ unackedOnly: true })
+      .find((n) => n.kind.startsWith('supervision.provider-wall.'));
+    expect(incident?.routing).toBe('action-required');
+
+    // The shared check recovers on completed producer evidence.
+    h.probe.outcome = {
+      kind: 'completed',
+      evidence: {
+        provider: 'zai-coding-cn',
+        model: 'glm-5.3',
+        stopReason: 'stop',
+        outputTokens: 1,
+        totalTokens: 4,
+        responseId: 'resp-seam-1',
+        responseModel: 'glm-5.3',
+        completedAt: '2026-09-28T10:05:00Z',
+      },
+    };
+    await h.sensor.tick();
+    expect(h.ledger.getProviderWait(wait.id)?.status).toBe('recovered-pending');
+
+    // ONE guarded continuation through the real claim surface (no owner ACK).
+    const result = await claimProviderRecoveryContinuation(
+      { registry: h.registry, ledger: h.ledger, worktrees: h.worktrees },
+      wait.id,
+      'silas',
+    );
+    expect(result).toMatchObject({ outcome: 'continued' });
+    expect(h.ledger.getProviderWait(wait.id)?.status).toBe('claimed');
+    // The lane re-opened blocked→working and the continuation actually ran.
+    expect(h.ledger.getJob('job-dispatch-wall')?.status).toBe('working');
+    expect(h.minionHandles).toHaveLength(2);
+    const continuation = h.minionHandles[1]!;
+    expect(continuation.prompts).toHaveLength(1);
+    expect(continuation.prompts[0]?.text).toContain('the interrupted briefing turn');
+    expect(continuation.prompts[0]?.owner).toBe('silas-rebrief:job-dispatch-wall');
+    // Admission is recorded separately from delivery/claim.
+    expect(
+      h.ledger
+        .listJobEvents('job-dispatch-wall', { limit: 30 })
+        .some((event) => event.kind === 'provider.continuation-admitted'),
+    ).toBe(true);
+    // The machine incident resolved with the claim (never an owner ACK).
+    expect(incident === undefined ? null : h.ledger.getNotification(incident.id)?.resolvedAt).not.toBeNull();
   });
 });

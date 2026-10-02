@@ -19,8 +19,11 @@ import {
  * fetch port is an in-memory function), per the phase ruling that real
  * listeners count as service-using verification even inside a test process.
  *
- * NOTE (phase1): this file is WRITTEN SOURCE ONLY under the bounded repair
- * ruling — execution is deferred to an authorized phase.
+ * NOTE: these suites execute under the authenticated lane verification
+ * scheduler and use fake transports/credentials only. No HTTP listener is
+ * created anywhere (the fake fetch port is an in-memory function), per the
+ * phase ruling that real listeners count as service-using verification
+ * even inside a test process.
  */
 
 const CODEX_CREDENTIAL: MetadataCredential = {
@@ -150,6 +153,67 @@ describe('claude oauth/usage schema validation (strict, fail closed)', () => {
   });
 });
 
+describe('r4 — optional model buckets and scoped limits only ADD exhaustion', () => {
+  const openRequired = (extra: Record<string, unknown>): string =>
+    JSON.stringify({
+      windows: {
+        five_hour: { utilization: 0.2, resetsAtUtc: '2026-09-28T16:00:00Z' },
+        seven_day: { utilization: 0.1, resetsAtUtc: '2026-09-29T19:00:00Z' },
+        ...extra,
+      },
+    });
+
+  it('an exhausted opus bucket holds a route whose model is opus, with its own reset hint', () => {
+    const body = validateClaudeUsageBody(
+      openRequired({ seven_day_opus: { utilization: 1.0, resetsAtUtc: '2026-09-28T15:40:00Z' } }),
+    )!;
+    const outcome = claudeUsageOutcome(body, () => new Date('2026-09-28T15:20:00Z'), 'claude-opus-4-1');
+    expect(outcome.kind).toBe('exhausted');
+    if (outcome.kind === 'exhausted') expect(outcome.retryAfterMs).toBe(20 * 60 * 1000);
+  });
+
+  it('an exhausted opus bucket never holds a clearly non-opus route model — but UNKNOWN coverage never reads available', () => {
+    const body = validateClaudeUsageBody(
+      openRequired({ seven_day_opus: { utilization: 1.0, resetsAtUtc: '2026-09-28T15:40:00Z' } }),
+    )!;
+    // The traced family excludes a sonnet route: the bucket is ignored...
+    expect(claudeUsageOutcome(body, () => new Date('2026-09-28T15:20:00Z'), 'claude-sonnet-4-5').kind).toBe('available');
+    // ...but with no route model, coverage is unknown — hold, never available.
+    expect(claudeUsageOutcome(body, () => new Date('2026-09-28T15:20:00Z')).kind).toBe('exhausted');
+  });
+
+  it('an exhausted scoped limit with no model identity holds (never available)', () => {
+    const body = validateClaudeUsageBody(
+      JSON.stringify({
+        windows: {
+          five_hour: { utilization: 0.2, resetsAtUtc: '2026-09-28T16:00:00Z' },
+          seven_day: { utilization: 0.1, resetsAtUtc: '2026-09-29T19:00:00Z' },
+        },
+        scopedLimits: [{ percent: 1, resetsAtUtc: '2026-09-28T15:40:00Z' }],
+      }),
+    )!;
+    const outcome = claudeUsageOutcome(body, () => new Date('2026-09-28T15:20:00Z'), 'claude-sonnet-4-5');
+    expect(outcome.kind).toBe('exhausted');
+  });
+
+  it('a partial/invalid optional bucket fails the whole read closed (never a silent drop)', () => {
+    expect(validateClaudeUsageBody(openRequired({ seven_day_sonnet: { utilization: 0.5 } }))).toBeNull();
+  });
+
+  it('codex: the traced null/empty optional buckets stay accepted; any present unknown bucket fails closed', () => {
+    const traced = JSON.parse(CODEX_BODY) as Record<string, unknown>;
+    // The traced live shape (null + empty) is supported...
+    expect(
+      validateCodexUsageBody(JSON.stringify({ ...traced, codeReviewRateLimit: null, additionalRateLimits: [] })),
+    ).not.toBeNull();
+    // ...but a present model/feature bucket whose coverage contract is not
+    // established never reads as available.
+    expect(validateCodexUsageBody(JSON.stringify({ ...traced, codeReviewRateLimit: { used_percent: 0 } }))).toBeNull();
+    expect(validateCodexUsageBody(JSON.stringify({ ...traced, additionalRateLimits: [{ some: 'limit' }] }))).toBeNull();
+    expect(validateCodexUsageBody(JSON.stringify({ ...traced, additionalRateLimits: {} }))).toBeNull();
+  });
+});
+
 describe('adapters — one bounded read, zero generation, no fallback', () => {
   it('codex: exactly ONE GET, 200+valid → available; the token never leaks into outcomes', async () => {
     const fetch = new FakeFetch();
@@ -219,8 +283,9 @@ describe('adapters — one bounded read, zero generation, no fallback', () => {
 
 
 // ---------------------------------------------------------------------------
-// PHASE2 sources: binding/route/rotation/stale exclusions, no-waiter zero
-// I/O, and explicit zero-generation proofs (overlay test matrix). NOT executed.
+// PHASE2 sources (executed under the authenticated verify scheduler):
+// binding/route/rotation/stale exclusions, no-waiter zero I/O, and
+// explicit zero-generation proofs (overlay test matrix).
 // ---------------------------------------------------------------------------
 
 describe('phase2 — binding and route exclusions (fake transports only)', () => {

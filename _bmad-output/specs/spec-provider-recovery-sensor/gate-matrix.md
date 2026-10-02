@@ -1,22 +1,22 @@
 # Gate matrix — provider recovery sensor
 
-> **Current integration epoch (2026-09-30): not ready.** Main/base is
-> `c54bfbf89727bacfd27a27db65a9fab681c19c3e`; exact final head and gate
-> receipts live in the approved delivery record. The coverage table below
-> names existing tests, not execution evidence at the moved head. R4
-> changes-requested at `c2036c34a5ef00b9b9c31a445595d752fe7ba6aa` remains
-> outstanding; the preserved r4 fix addresses blocked-settle attribution,
-> not every warning/note. Inherited full run
-> `e2eebb45-1601-4914-a9dc-072b3be4c8ed` at
-> `5cd62b19809d334c30f595d72ce60cfed63d1eb5` settled `ok=false`, nested
-> `exitCode=null`, `signal=SIGKILL`, `timedOut=false`, during lint. Complete
-> output/hash preserved; cause unknown. Bounded ruling and real Silas
-> checkpoint requested; no worker retry, timeout/pool weakening or waiver.
-> Exact-final-head CI, independent BMAD review, native Perkins and local
-> verification are distinct gates. Historical results below do not inherit.
-> G11's fan-out gate is still source-only in production; native Claude
-> runtime establishment and optional metadata exhaustion issues remain
-> open, as identified by r4. Owner activation remains manual.
+> **Current integration epoch (2026-10-02): not ready.** The r4 fix round
+> is complete in code — all nine r4 findings are dispositioned with
+> deterministic coverage (two blockers: the wall-settled dispatch block
+> keeps its wait and the claim resumes; four warnings: fresh-route async
+> settlement, atomic-claim incident lifecycle, optional metadata bucket
+> exhaustion, and the DORMANT native-Claude overlay marking; three notes:
+> terminal-replay guard, dedupe-capable incident posts, endpoint-rotation
+> re-bind). Exact head/base, verification receipts and review identities
+> live in the approved delivery record. The coverage table below names
+> existing tests; it is not execution evidence at the final head.
+> **Native Claude overlay: DORMANT/UNSHIPPED** — the composed reader
+> cannot fire (no runtime provider provenance; no resolvable pi catalog
+> route), so no capability claim attaches to it. G11's fan-out gate is
+> still source-only in production (cap-owned emitter ungrounded). Owner
+> activation remains manual; no owner choice is reopened. Exact-final-head
+> CI, fresh independent review, native Perkins and local `/api/verify`
+> receipts are distinct gates; historical results do not inherit.
 
 Deterministic (fake clock / deferred / mock provider; no live calls, no
 ambient credentials, no service spawn): these run under the normal backend
@@ -83,7 +83,26 @@ suites = 198, plus supervisor, awareness, notifications, ledger-api,
 ledger-db, silas-driver, pi-adapter, fix-directive, rebrief-recovery, health,
 config, config-generate, suite-shape).
 
-Remaining gates (not self-served): exact-head CI (running on `3692718`),
-`/api/verify` full scope after a media-safe Silas checkpoint, fresh
-independent BMAD final-diff review, required native Perkins review, owner
+## r4 warning/note dispositions (2026-10-02)
+
+| Finding | Scenario | Deterministic coverage |
+| --- | --- | --- |
+| w-dispatch-race | Real `DispatchService` + supervisor + sensor: the failed briefing turn settles `blocked` BEFORE the supervisor observes the typed provider error; the wait stays eligible, the shared check recovers it, and ONE guarded continuation runs (lane re-opened; admission recorded separately; machine incident resolved). | `provider-recovery-seam.test.ts` (real-seam) |
+| w-async-settle | A completed recovery keeps the pre-I/O charged attempt and never reverts `incident_seq` / `false_recovery_count` / `suspended_until` updated mid-check. | `provider-recovery-sensor.test.ts` |
+| w-incident-lifecycle | `claimProviderWaitAtomic` resolves the wait's OWN action-required incident (never an ACK; needs-owner rows stay open; lost CAS resolves nothing). | `provider-recovery-ledger.test.ts` |
+| w-metadata-buckets | Exhausted optional model buckets hold only when they may cover the route model (unknown coverage fails closed); exhausted scoped limits hold; Codex null/empty optional buckets accepted while present unknown buckets fail closed; partial optional buckets fail the read closed. | `provider-recovery-metadata.test.ts` |
+| w-scope-coverage | Native Claude overlay path marked DORMANT/UNSHIPPED in SPEC + gate matrix (no runtime provenance; no resolvable route). | this document + `SPEC.md`; `composition.ts` notice |
+| n-terminal-replay | A same-incident replay on a terminal wait returns it unchanged (never revives). | `provider-recovery-ledger.test.ts` |
+| n-dedupe | The notifications port uses the dedupe-capable incident post: repeated establishments keep one waiting row; repeated false-recovery escalations reuse one machine row. | `provider-recovery-sensor.test.ts` |
+| n-endpoint-rotation | A catalog endpoint change re-binds the route row and retires stale waiting rows with a recorded reason; the next check probes the re-bound endpoint. | `provider-recovery-sensor.test.ts` |
+| config-wiring | `probe_timeout_ms` reaches the GLM generation probe (the documented finite bound now governs it too; the probe port applies it to both the request option and the abort signal). | `src/main.ts` wiring; `test/provider-recovery-classify.test.ts` pins `PROBE_MAX_OUTPUT_TOKENS`/`PROBE_TIMEOUT_MS` bounds |
+
+Fails-before evidence: the declared `provider-recovery-r4-baseline` scope
+runs the current test sources against `git archive` snapshots of the
+pre-fix commits with the vitest exit left intact (EXPECTED RED, never
+masked); see the delivery record for the run ids and complete output.
+
+Remaining gates (not self-served): exact-head CI, `/api/verify` receipts
+(focused/typecheck/full) at the final head, fresh independent BMAD
+final-diff review, required native Perkins review, owner
 merge/deploy/activation.

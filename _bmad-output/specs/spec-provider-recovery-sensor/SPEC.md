@@ -105,16 +105,33 @@ Metadata helpers are zero-generation; GLM generation runs only when
 `glm_generation_fallback` is explicitly enabled. Activation stays
 owner-manual; no live provider probing was performed.
 
-### Current integration status (2026-09-30)
+### Current integration status (2026-10-02)
 
-PR #132 is reconciled with main
-`c54bfbf89727bacfd27a27db65a9fab681c19c3e`, retaining the r4 blocked-settle
-fix and all approved policy bounds. The approved capabilities above remain
-the contract, not a claim of completed acceptance: progress-gated fan-out
-still has no production consumer, and native Claude runtime provider
-provenance/route establishment is ungrounded (metadata helpers alone do not
-ship that path). Other r4 warnings/notes remain for the routine fix loop.
-The interrupted local verification attempt is preserved and escalated for
-a bounded ruling; no moved-head CI/review result is inherited. See the
-current code-map and gate-matrix notices, the focused integration spec,
-and the approved delivery record. No owner approval choice is reopened.
+PR #132 carries the r4 fix round in code. The blocked-settle attribution
+fix lets a wait survive the dispatch settle it raced (selection stays
+eligible; the claim resumes and re-opens the lane), and the warning/note
+dispositions are in the fix loop: async settlements reload the fresh route
+row (the charged attempt and mid-check updates survive), the atomic claim
+resolves the wait's own machine-routed incident, metadata readers map
+exhausted optional model/feature buckets to hold (never "available") and
+fail closed on unestablished bucket contracts, a same-incident replay can
+never revive a terminal wait, an endpoint rotation re-binds the route and
+retires stale waits, and the notifications port uses the center's
+dedupe-capable incident post. Deterministic regressions cover each,
+including the real DispatchService ⇄ supervisor ⇄ sensor seam.
+
+The approved capabilities above remain the contract, not a claim of
+completed acceptance:
+
+- **Native Claude overlay path — DORMANT/UNSHIPPED.** The metadata reader
+  is composed but cannot fire in production: the claude-code runtime
+  emits no provider identity or typed provenance for it, and
+  `anthropic-claude-native` has no resolvable pi catalog route. Grounding
+  it needs a runtime provenance + route-resolution contract (see the gate
+  matrix); the overlay privilege is retained for a later follow-up.
+- Progress-gated fan-out still has no production consumer (the cap-owned
+  runtime emitter is ungrounded).
+
+Local/CI verification, fresh independent review, native Perkins and owner
+activation are tracked by the delivery record and gate matrix; nothing
+here asserts them. No owner approval choice is reopened.

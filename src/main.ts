@@ -655,7 +655,12 @@ async function main(): Promise<number> {
   const providerRecoverySensor = new ProviderRecoverySensor({
     config: config.providerRecovery,
     ledger,
-    probe: new ModelRuntimeProbe({ runtime: () => registry.piModelRuntime() }),
+    probe: new ModelRuntimeProbe({
+      runtime: () => registry.piModelRuntime(),
+      // The documented conservative finite bound governs the generation
+      // probe too — not only the metadata readers/reservation expiry.
+      timeoutMs: config.providerRecovery.probeTimeoutMs,
+    }),
     metadataReaders: composeMetadataReaders({
       config: config.providerRecovery,
       codexAuthPath: undefined, // readStoredCredential resolves the installed auth.json itself

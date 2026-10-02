@@ -47,15 +47,19 @@ export function providerRouteKey(provider: string, model: string, fingerprint: s
   return `${provider}/${model}@${fingerprint}`;
 }
 
-/** The notifications surface the sensor needs (NotificationCenter fits). */
+/** The notifications surface the sensor needs (NotificationCenter fits).
+ * r4 note: this port DECLARES postIncident, not post — the real center's
+ * `post` carries no dedupe, so a `dedupe` field there was silently
+ * ignored and every establishment/escalation stacked a new row. The
+ * incident post is the center's durable dedupe-capable write path. */
 export interface SensorNotifications {
-  post(input: {
+  postIncident(input: {
     kind: string;
     routing: 'fyi' | 'action-required';
     severity: 'info' | 'error';
     title: string;
     detail?: string | null;
-    dedupe?: 'unacked' | 'active' | 'all';
+    dedupe: 'unacked' | 'active' | 'all';
   }): { id: string };
   resolveIncidents(kindPrefix: string, by: string): unknown;
 }
@@ -470,6 +474,21 @@ export class ProviderRecoverySensor {
     }
   }
 
+  /** r4 finding 2: settle an ASYNC check on the FRESH route row. Writing
+   * the pre-charge snapshot back would refund the charged attempt and
+   * revert incident_seq / false_recovery_count / suspended_until that a
+   * concurrent establishment or escalation updated mid-check. */
+  private settleRoute(
+    routeKey: string,
+    changes: Partial<ProviderRouteRecord>,
+    nowIso: string,
+    event?: { kind: string; payload?: Record<string, unknown> },
+  ): void {
+    const fresh = this.ledger.getProviderRoute(routeKey);
+    if (fresh === null) return; // row gone mid-check — nothing to settle
+    this.ledger.upsertProviderRoute({ ...fresh, ...changes, updatedAt: nowIso }, event);
+  }
+
   /** The shared non-overlapping check for one route. */
   private async checkRoute(
     routeKey: string,
@@ -554,11 +573,11 @@ export class ProviderRecoverySensor {
       }
       if (revalidated.length === 0) {
         // Valid evidence but every waiter settled mid-check: nothing to
-        // deliver — record the outcome on the route, commit nothing.
-        this.ledger.upsertProviderRoute(
-          { ...base, lastResult: 'recovered-no-eligible-waiters', updatedAt: nowIso },
-          { kind: 'provider.probe-result', payload: { route: routeKey, result: 'recovered-no-eligible-waiters' } },
-        );
+        // deliver — record the outcome on the fresh route, commit nothing.
+        this.settleRoute(routeKey, { lastResult: 'recovered-no-eligible-waiters' }, nowIso, {
+          kind: 'provider.probe-result',
+          payload: { route: routeKey, result: 'recovered-no-eligible-waiters' },
+        });
         return;
       }
       await this.recoverRoute(route, revalidated, outcome.evidence as unknown as Record<string, unknown>, nowMs);
@@ -566,8 +585,10 @@ export class ProviderRecoverySensor {
     }
     if (outcome.kind === 'still-limited') {
       const cadence = this.nextCheckDelay(outcome.retryAfterMs);
-      this.ledger.upsertProviderRoute(
-        { ...base, lastResult: 'still-limited', nextCheckAt: new Date(nowMs + cadence).toISOString() },
+      this.settleRoute(
+        routeKey,
+        { lastResult: 'still-limited', nextCheckAt: new Date(nowMs + cadence).toISOString() },
+        nowIso,
         {
           kind: 'provider.probe-result',
           payload: {
@@ -591,13 +612,14 @@ export class ProviderRecoverySensor {
       this.cfg.cadenceMinMs,
       Math.min(this.cfg.probeBackoffBaseMs * 2 ** (failures - 1), this.cfg.probeBackoffMaxMs),
     );
-    this.ledger.upsertProviderRoute(
+    this.settleRoute(
+      routeKey,
       {
-        ...base,
         lastResult: 'probe-failed',
         consecutiveProbeFailures: failures,
         nextCheckAt: new Date(nowMs + backoff).toISOString(),
       },
+      nowIso,
       {
         kind: 'provider.probe-result',
         payload: { route: routeKey, result: 'probe-failed', reason: outcome.reason, retry_in_ms: backoff },
@@ -663,8 +685,13 @@ export class ProviderRecoverySensor {
     nowMs: number,
   ): Promise<void> {
     const nowIso = new Date(nowMs).toISOString();
-    this.ledger.upsertProviderRoute(
-      { ...route, lastResult: 'recovered', nextCheckAt: new Date(nowMs + this.cfg.cadenceMinMs).toISOString(), updatedAt: nowIso },
+    // r4 finding 2: settle on the FRESH route row — never write the
+    // pre-charge snapshot back (it would refund the charged attempt and
+    // revert mid-check incident/escalation updates).
+    this.settleRoute(
+      route.routeKey,
+      { lastResult: 'recovered', nextCheckAt: new Date(nowMs + this.cfg.cadenceMinMs).toISOString() },
+      nowIso,
       {
         kind: 'provider.probe-result',
         payload: { route: route.routeKey, result: 'recovered', evidence },
@@ -772,7 +799,30 @@ export class ProviderRecoverySensor {
       // A NEW incident on this route: the sequence advances so the next
       // recovery delivers exactly once for this incident.
       generation = route.incidentSeq + 1;
-      route = this.ledger.upsertProviderRoute({ ...route, incidentSeq: generation, updatedAt: nowIso });
+      // r4 note: if the catalog endpoint for this exact provider/model/
+      // credential binding changed, re-bind the route row and retire any
+      // waiting rows still bound to the old endpoint (they can never be
+      // probed again) with a recorded reason — a new wait must not deadlock
+      // the route on `route.endpoint !== wait.endpoint` forever.
+      if (route.endpoint !== endpoint) {
+        for (const stale of this.ledger.listProviderWaits({ status: 'waiting', routeKey })) {
+          if (stale.endpoint !== endpoint) {
+            this.ledger.setProviderWaitStatus(stale.id, 'superseded', {
+              why: 'endpoint-rotated',
+              from: stale.endpoint,
+              to: endpoint,
+            });
+          }
+        }
+        route = this.ledger.upsertProviderRoute({
+          ...route,
+          endpoint,
+          incidentSeq: generation,
+          updatedAt: nowIso,
+        });
+      } else {
+        route = this.ledger.upsertProviderRoute({ ...route, incidentSeq: generation, updatedAt: nowIso });
+      }
     }
     // Renewed quota after a recovered continuation: a prior claimed or
     // still-pending wait for the same agent+route means the recovery was
@@ -828,8 +878,10 @@ export class ProviderRecoverySensor {
       incidentGeneration: generation,
       reasonClass: `temporary-recoverable:${evidence.status ?? evidence.bodyCode ?? 'limit'}`,
     });
-    // Concise attention surface (fyi; routine polling never chimes):
-    this.notifications.post({
+    // Concise attention surface (fyi; routine polling never chimes). The
+    // incident post is deduped 'active': one row per route until the
+    // recovery resolves it, never one row per establishment event.
+    this.notifications.postIncident({
       kind: `provider.waiting.${routeKey}`,
       routing: 'fyi',
       severity: 'info',
@@ -857,7 +909,7 @@ export class ProviderRecoverySensor {
         payload: { route: route.routeKey, suspended_until: until, agent_id: observation.agentId },
       },
     );
-    this.notifications.post({
+    this.notifications.postIncident({
       kind: `provider.false-recovery.${route.routeKey}`,
       routing: 'action-required',
       severity: 'error',

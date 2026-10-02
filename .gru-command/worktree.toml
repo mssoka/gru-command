@@ -21,6 +21,20 @@ handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-wh
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
+# Provider-recovery sensor lane scopes (r4 fix round; invoked only via
+# the authenticated /api/verify scheduler at unchanged budgets/thresholds —
+# plain vitest invocations, no worker/timeout flags, never the npm chain).
+provider-recovery = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-metadata.test.ts test/provider-recovery-composition.test.ts test/provider-recovery-classify.test.ts test/provider-recovery-admission.test.ts test/provider-recovery-seam.test.ts test/suite-shape.test.ts"
+
+# Fails-before comparison for the r4 fix round. Baseline A = the pre-fix
+# lane head; baseline B = the parent of the blocked-settle fix 1073216.
+# Both overlay the CURRENT committed test sources onto a git archive of the
+# pinned pre-fix commits (node_modules bound by symlink, same RPC patch
+# prerequisite) and are EXPECTED RED: the new regressions fail before the
+# fixes. The vitest exit codes are echoed intact so the scheduler captures
+# both as evidence — never masked into a PASS. Snapshot dirs are preserved.
+provider-recovery-r4-baseline = 'root="$PWD"; dA=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-provider-recovery-r4a.XXXXXX"); git archive 8a68970ac56ee05632ca9ab86f54edf6058a19fc | tar -x -C "$dA" || { echo "baseline-A archive failed"; exit 3; }; cp test/provider-recovery-sensor.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-metadata.test.ts test/provider-recovery-seam.test.ts "$dA/test/"; ln -s "$root/node_modules" "$dA/node_modules"; ( cd "$dA" && node tools/patch-vitest-rpc-timeout.mjs >/dev/null 2>&1; npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-metadata.test.ts test/provider-recovery-seam.test.ts ); a=$?; echo "baseline-A pre-fix 8a68970 + current tests exit=$a EXPECTED-NONZERO"; dB=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-provider-recovery-blocker.XXXXXX"); git archive 7bbc25de0dc8aa088369cb32fed69e21c78df44b | tar -x -C "$dB" || { echo "baseline-B archive failed"; exit 3; }; cp test/provider-recovery-sensor.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts "$dB/test/"; ln -s "$root/node_modules" "$dB/node_modules"; ( cd "$dB" && node tools/patch-vitest-rpc-timeout.mjs >/dev/null 2>&1; npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts ); b=$?; echo "baseline-B pre-fix 7bbc25d + blocker tests exit=$b EXPECTED-NONZERO"; echo "baseline snapshots preserved: A=$dA B=$dB"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline passed unexpectedly"; fi; exit 1'
+
 # Baseline comparison for the lane: identical final test files (git show
 # from the pinned head) run against an isolated baseline snapshot (git
 # archive of the pinned base) using the unchanged baseline Vitest

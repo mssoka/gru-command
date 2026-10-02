@@ -64,6 +64,11 @@ export interface MetadataRouteBinding {
   readonly credentialFingerprint: string;
 }
 
+/** Fixed non-generation metadata endpoints (single source for the
+ * adapters and the composition wiring). */
+export const CODEX_METADATA_ENDPOINT = 'https://chatgpt.com/backend-api/wham/usage';
+export const CLAUDE_METADATA_ENDPOINT = 'https://api.anthropic.com/api/oauth/usage';
+
 /** Conservative finite read timeout (well under the tick cadence). */
 export const METADATA_READ_TIMEOUT_MS = 15_000;
 
@@ -93,11 +98,15 @@ interface CodexUsageBody {
     readonly primary_window: CodexWindow | null;
     readonly secondary_window?: CodexWindow | null;
   };
-  readonly codeReviewRateLimit?: unknown;
-  readonly additionalRateLimits?: readonly unknown[];
 }
 
-/** Validate the codex body STRICTLY. Returns null for any deviation. */
+/** Validate the codex body STRICTLY. Returns null for any deviation.
+ *
+ * Optional buckets (`codeReviewRateLimit`, non-empty `additionalRateLimits`)
+ * carry model/feature coverage we cannot establish from the traced
+ * contract, so a NON-EMPTY/NON-NULL value fails the read closed (r4
+ * finding 5: unknown optional data must never read as 'available'). The
+ * traced live response carries both as null/empty. */
 export function validateCodexUsageBody(raw: string): CodexUsageBody | null {
   let parsed: unknown;
   try {
@@ -129,6 +138,21 @@ export function validateCodexUsageBody(raw: string): CodexUsageBody | null {
     // No windows at all: unknown, not unlimited.
     return null;
   }
+  const codeReview = root['codeReviewRateLimit'];
+  if (codeReview !== undefined && codeReview !== null) {
+    // A code-review bucket exists; its coverage of normal route models is
+    // not established — unsupported, fail closed.
+    return null;
+  }
+  const additional = root['additionalRateLimits'];
+  if (additional !== undefined && additional !== null) {
+    if (!Array.isArray(additional)) return null;
+    if (additional.length > 0) {
+      // Additional (model-specific) limits are present but their element
+      // contract is not established from the traced source — fail closed.
+      return null;
+    }
+  }
   return {
     rateLimit: {
       allowed: rl['allowed'],
@@ -136,10 +160,6 @@ export function validateCodexUsageBody(raw: string): CodexUsageBody | null {
       primary_window: primary === null ? null : (validateCodexWindow(primary) as CodexWindow),
       secondary_window: secondary === undefined ? null : (secondary === null ? null : validateCodexWindow(secondary)),
     },
-    ...(root['codeReviewRateLimit'] !== undefined ? { codeReviewRateLimit: root['codeReviewRateLimit'] } : {}),
-    ...(Array.isArray(root['additionalRateLimits'])
-      ? { additionalRateLimits: root['additionalRateLimits'] as readonly unknown[] }
-      : {}),
   };
 }
 
@@ -200,17 +220,29 @@ interface ClaudeUsageBody {
   readonly windows: {
     readonly five_hour: ClaudeWindow;
     readonly seven_day: ClaudeWindow;
-    readonly seven_day_oauth_apps?: ClaudeWindow | null;
-    readonly seven_day_opus?: ClaudeWindow | null;
-    readonly seven_day_sonnet?: ClaudeWindow | null;
-    readonly seven_day_cowork?: ClaudeWindow | null;
+    readonly seven_day_oauth_apps: ClaudeWindow | null;
+    readonly seven_day_opus: ClaudeWindow | null;
+    readonly seven_day_sonnet: ClaudeWindow | null;
+    readonly seven_day_cowork: ClaudeWindow | null;
+    readonly iguana_necktie: ClaudeWindow | null;
   };
   readonly scopedLimits?: readonly { readonly percent: number; readonly resetsAtUtc: string }[];
 }
 
+/** The optional model-bucket keys the traced oauth/usage contract may carry. */
+const CLAUDE_OPTIONAL_WINDOWS = [
+  'seven_day_oauth_apps',
+  'seven_day_opus',
+  'seven_day_sonnet',
+  'seven_day_cowork',
+  'iguana_necktie',
+] as const;
+
 /** Strict validation of the traced oauth/usage shape. Null windows for
  * OPTIONAL model buckets stay unknown (never "unlimited"); five_hour and
- * seven_day are REQUIRED by the traced contract. */
+ * seven_day are REQUIRED by the traced contract. Optional windows are
+ * VALIDATED when present (r4 finding 5): a partial/invalid optional bucket
+ * fails the whole read closed. */
 export function validateClaudeUsageBody(raw: string): ClaudeUsageBody | null {
   let parsed: unknown;
   try {
@@ -226,10 +258,25 @@ export function validateClaudeUsageBody(raw: string): ClaudeUsageBody | null {
   const five = validateClaudeWindow(w['five_hour']);
   const seven = validateClaudeWindow(w['seven_day']);
   if (five === null || seven === null) return null;
+  const optional: Record<(typeof CLAUDE_OPTIONAL_WINDOWS)[number], ClaudeWindow | null> = {
+    seven_day_oauth_apps: null,
+    seven_day_opus: null,
+    seven_day_sonnet: null,
+    seven_day_cowork: null,
+    iguana_necktie: null,
+  };
+  for (const key of CLAUDE_OPTIONAL_WINDOWS) {
+    const value = w[key];
+    if (value === undefined || value === null) continue;
+    const window = validateClaudeWindow(value);
+    if (window === null) return null;
+    optional[key] = window;
+  }
   return {
     windows: {
       five_hour: five,
       seven_day: seven,
+      ...optional,
     },
     ...(Array.isArray(root['scopedLimits'])
       ? {
@@ -253,10 +300,17 @@ function validateClaudeWindow(value: unknown): ClaudeWindow | null {
   return { utilization: w['utilization'], resetsAtUtc: w['resetsAtUtc'] };
 }
 
-/** Map a validated claude body: any REQUIRED window at 1.0 = exhausted
- * (reset hint from that window); optional model windows only ADD exhaustion
- * (they never prove availability). */
-export function claudeUsageOutcome(body: ClaudeUsageBody, now: () => Date = () => new Date()): MetadataReadOutcome {
+/** Map a validated claude body. Any REQUIRED window at 1.0 = exhausted.
+ * Optional model buckets and scoped limits ONLY ADD exhaustion (r4 finding
+ * 5): an exhausted bucket whose family clearly does not cover the route's
+ * model is ignored; a covering bucket — or one whose coverage is unknown
+ * (including when no route model was supplied) — maps to 'exhausted'.
+ * They never prove availability. */
+export function claudeUsageOutcome(
+  body: ClaudeUsageBody,
+  now: () => Date = () => new Date(),
+  routeModel?: string,
+): MetadataReadOutcome {
   const required: readonly ClaudeWindow[] = [body.windows.five_hour, body.windows.seven_day];
   const exhausted = required.find((window) => window.utilization >= 1);
   if (exhausted !== undefined) {
@@ -266,6 +320,32 @@ export function claudeUsageOutcome(body: ClaudeUsageBody, now: () => Date = () =
       detail: 'claude usage window exhausted',
     };
   }
+  const optional: readonly (readonly [string, ClaudeWindow | null])[] = [
+    ['seven_day_oauth_apps', body.windows.seven_day_oauth_apps],
+    ['seven_day_opus', body.windows.seven_day_opus],
+    ['seven_day_sonnet', body.windows.seven_day_sonnet],
+    ['seven_day_cowork', body.windows.seven_day_cowork],
+    ['iguana_necktie', body.windows.iguana_necktie],
+  ];
+  for (const [name, window] of optional) {
+    if (window === null || window.utilization < 1) continue;
+    if (!optionalBucketMayCoverModel(name, routeModel)) continue;
+    return {
+      kind: 'exhausted',
+      retryAfterMs: Math.max(0, Date.parse(window.resetsAtUtc) - now().getTime()),
+      detail: `${name} model bucket exhausted`,
+    };
+  }
+  const scoped = body.scopedLimits?.find((limit) => limit.percent >= 1);
+  if (scoped !== undefined) {
+    // Scoped limits carry no model identity in the established view: an
+    // exhausted scoped limit might cover the route — hold, never available.
+    return {
+      kind: 'exhausted',
+      retryAfterMs: Math.max(0, Date.parse(scoped.resetsAtUtc) - now().getTime()),
+      detail: 'claude scoped limit exhausted',
+    };
+  }
   return {
     kind: 'available',
     retryAfterMs: null,
@@ -273,9 +353,21 @@ export function claudeUsageOutcome(body: ClaudeUsageBody, now: () => Date = () =
       adapter: 'claude-oauth-usage',
       five_hour_utilization: body.windows.five_hour.utilization,
       seven_day_utilization: body.windows.seven_day.utilization,
+      optional_window_count: optional.filter(([, window]) => window !== null).length,
       scoped_limit_count: body.scopedLimits?.length ?? 0,
     },
   };
+}
+
+/** Model-family coverage for an exhausted optional bucket. `false` only
+ * when the bucket's traced family clearly excludes the route model; every
+ * unknown case returns true (fail closed). */
+function optionalBucketMayCoverModel(bucket: string, model: string | undefined): boolean {
+  if (model === undefined || model === '') return true;
+  if (bucket === 'seven_day_opus') return /opus/i.test(model);
+  if (bucket === 'seven_day_sonnet') return /sonnet/i.test(model);
+  if (bucket === 'seven_day_cowork') return /cowork/i.test(model);
+  return true;
 }
 
 function earliestResetSeconds(windows: readonly (CodexWindow | null | undefined)[]): number | null {
@@ -311,6 +403,9 @@ export interface MetadataAdapterOptions {
   readonly resolveCredential: () => Promise<MetadataCredential | null>;
   readonly timeoutMs?: number;
   readonly now?: () => Date;
+  /** The EXACT route model being checked — used by the claude adapter for
+   * model-family coverage of its optional exhausted buckets (r4 #5). */
+  readonly model?: string;
   readonly log?: Log;
 }
 
@@ -322,7 +417,7 @@ export class CodexUsageAdapter {
   async read(): Promise<MetadataReadOutcome> {
     return readUsage({
       opts: this.opts,
-      url: 'https://chatgpt.com/backend-api/wham/usage',
+      url: CODEX_METADATA_ENDPOINT,
       accept: 'application/json',
       validate: validateCodexUsageBody,
       toOutcome: (body) => codexUsageOutcome(body),
@@ -342,10 +437,10 @@ export class ClaudeUsageAdapter {
   async read(): Promise<MetadataReadOutcome> {
     return readUsage({
       opts: this.opts,
-      url: 'https://api.anthropic.com/api/oauth/usage',
+      url: CLAUDE_METADATA_ENDPOINT,
       accept: 'application/json',
       validate: validateClaudeUsageBody,
-      toOutcome: (body) => claudeUsageOutcome(body, this.opts.now ?? (() => new Date())),
+      toOutcome: (body) => claudeUsageOutcome(body, this.opts.now ?? (() => new Date()), this.opts.model),
       adapterName: 'claude',
     });
   }
