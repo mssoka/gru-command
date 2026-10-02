@@ -108,7 +108,20 @@ board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && .
 # never copied here). This scope isolates that single case at the unchanged
 # default ceiling so a FULL timeout can be classified (isolation pass vs
 # deterministic fail); it changes no test, timeout, assertion or gate.
-t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
+t4-oracle = 'node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"'
+
+# PR138 deadline repairs (2026-10-03): the five inherited 30s-default cases
+# that overran under co-tenant load at 92698f2 are repaired in-lane — the
+# wizard fails an invalid --answers payload before any probe work and loads
+# the probe dynamically; the dispatcher attribution case, the two T4 legs
+# and the verdict-shape matrix are one scenario per case; T4's origin is a
+# single batched bare clone and its scripted security evidence is locatable
+# in the fixture's own frozen diff; the installer ownership case drops its
+# redundant setup cycle. This scope re-runs the whole wizard file plus
+# exactly the repaired cases in the other four files, approved j-463 RPC
+# patch first, no timeout/worker/assertion flag — a repair check, never a
+# FULL substitute.
+deadline-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/wizard.test.ts && npx vitest run test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts -t "by=silas on the pr/review|without by, the pr/review|restarts only an owned service|does not record a reconciled delivery|rejects a submission with an empty/missing verdict|rejects an empty report|rejects a report omitting"'
 
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
