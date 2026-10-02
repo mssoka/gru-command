@@ -14,6 +14,14 @@ function installChatDom(): void {
   context.id = 'chat-context-controls';
   const contextStatus = document.createElement('span');
   contextStatus.id = 'chat-context-status';
+  const contextStatusLabel = document.createElement('span');
+  contextStatusLabel.id = 'chat-context-status-label';
+  contextStatusLabel.textContent = 'Context unavailable';
+  const contextFlavor = document.createElement('span');
+  contextFlavor.id = 'chat-context-status-flavor';
+  contextFlavor.setAttribute('aria-hidden', 'true');
+  contextFlavor.hidden = true;
+  contextStatus.append(contextStatusLabel, contextFlavor);
   contextStatus.setAttribute('role', 'status');
   contextStatus.setAttribute('aria-live', 'polite');
   const announcement = document.createElement('span');
