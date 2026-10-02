@@ -117,3 +117,29 @@ r5 returned NEEDS CHANGES at `71935f8acc034f224ad909f80d67defd06937aa6` (base `c
 - **install-one-line owned-service case (`test/install-one-line.test.ts:604`):** the case spent a full extra installer cycle on setup+wizard before exercising service ownership. It now provisions the instance config directly — the retained-config pattern its neighbouring update test already uses — and still proves clone-when-absent → build → foreign refusal, then the owned restart. Assertions unchanged; no timeout changed.
 - **Five `onTaskUpdate` RPC errors (failed run):** root cause is vitest 3.2.7's hardcoded 60 s worker→host birpc timeout (`DEFAULT_TIMEOUT = 6e4`, no configuration surface). A worker blocked in long synchronous test operations past 60 s raises the unhandled error while its tests still pass; the run exits 1. Upstream removed the timer (`vitest-dev/vitest#8297`, `timeout: -1`); the fix is pending on PR #135 as a `pretest` hook + `tools/patch-vitest-rpc-timeout.mjs` (cherry-picked on #134/#139) and is not on `main` or this lane. It is declared in the handoff matrix as a cross-lane gate dependency, not duplicated here.
 - **Next gates:** scheduler-backed `full` at the new clean head (fresh ownership/media/free-space checkpoint; complete NDJSON capture + nested exit), exact-head Linux CI, then native Perkins re-review. Owner alone merges, deploys or restarts. The handoff matrix is `_bmad-output/implementation-artifacts/r5-followthrough-verification-matrix.md` (local, ignored).
+
+### Main integration — 2026-10-02 (owner-cleared resume)
+
+- Integrated current `origin/main` `059c076290145d4aae6e0b47c7b3f87156862c43`
+  (PR #69 worktree-fresh-base + PR #151 native-compaction-wait) with an
+  ordinary history-preserving merge; conflicts were limited to
+  `docs/LEDGER.md`, `src/ledger/db.ts` and `test/suite-shape.test.ts`.
+  Pre-integration head `364638f2dbf3388a63a1696204aff5f23a695f34` is
+  preserved in history and as a local bundle under the resume briefing.
+  No reset/discard/stash/force; no sibling lane touched.
+- Genuine accepted-main collision: main's accepted id 9 is now
+  `worktree-base-source`, so the never-applied `job-display-name`
+  migration renumbers 9 -> 10 (no deployed DB had ever applied it;
+  `docs/LEDGER.md` updated). The v8-upgrade test still exercises the
+  full slice and passes structurally unchanged.
+- `test/suite-shape.test.ts`: `supervisor.test.ts` pin recounted from the
+  merged source (56); the whole pin map was revalidated against the guard
+  regex — 98/98 files pinned, zero mismatches.
+- R5 follow-through repairs (invisible-grapheme shortening guard and its
+  three deterministic regressions, LAN-phone replay wait, Perkins R2
+  fixture sharing, install-one-line direct provisioning) are all present
+  and were not modified by the integration.
+- Next gates (this head, no source change after): scheduler-backed `full`
+  via `/api/verify`, exact-head Linux CI, fresh native Perkins review of
+  the exact published head.
+
