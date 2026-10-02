@@ -578,6 +578,28 @@ function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogi
   return !Number.isFinite(submittedAt);
 }
 
+/** Whether a review-list entry is a decidable review record that an
+ * absence proof may rest on: a plain record (never an array), carrying the
+ * provider's numeric review id, and — when present — the fields the
+ * delivery predicates read, in their provider types. Anything else —
+ * `[[]]`, `[{}]`, `[{user: …}]`, `[42]` — is a broken list, not a review
+ * that happens to differ: its non-match proves nothing, so a walk over it
+ * must stay unresolved rather than certify absence. */
+function isDecidableReviewEntry(entry: unknown): entry is ProviderReview {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const record = entry as Record<string, unknown>;
+  const id = record['id'];
+  if (typeof id !== 'number' || !Number.isFinite(id)) return false;
+  if (!('user' in record)) return false;
+  const user = record['user'];
+  if (!(user === null || (typeof user === 'object' && !Array.isArray(user)))) return false;
+  for (const field of ['state', 'commit_id', 'body', 'submitted_at'] as const) {
+    const value = record[field];
+    if (!(value === null || value === undefined || typeof value === 'string')) return false;
+  }
+  return true;
+}
+
 /** GitHub error bodies/markers that mean rate limiting, not permission. */
 function providerIndicatesRateLimit(error: PerkinsAppHttpError): boolean {
   const documentationUrl = error.documentationUrl;
@@ -1209,9 +1231,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         // Never report "searched and not found" when no usable list was read.
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
-      if (list.some((entry) => entry === null || typeof entry !== 'object')) {
-        // A null or primitive entry is a broken list, not absence: a lookup
-        // we cannot trust must never become a certificate.
+      if (list.some((entry) => !isDecidableReviewEntry(entry))) {
+        // A null, primitive, array-valued or otherwise undecidable entry is
+        // a broken list, not absence: a lookup we cannot trust must never
+        // become a certificate.
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
       const reviews = list as readonly ProviderReview[];

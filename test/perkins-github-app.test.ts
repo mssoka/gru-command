@@ -1394,6 +1394,22 @@ describe('bounded ambiguous-POST reconciliation', () => {
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
+  it('treats array-valued and record-less entries as a malformed body on an ambiguous POST — unproven, never did-not-land, no second POST', async () => {
+    for (const body of [[[]], [{}], [{ user: { login: 'perkins-review[bot]', type: 'Bot' } }]]) {
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      // A broken entry can never certify that the POST did not land; the
+      // outcome stays explicitly unproven and no second POST is made.
+      expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+      expect(error?.message ?? '').not.toMatch(/did not land/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    }
+  });
+
   it('never credits an older round\u2019s identical bytes: stale submitted_at is not a match', async () => {
     const fixture = bundleFixture();
     const stale = { ...MATCHING_REVIEW, id: 111222, submitted_at: new Date(NOW - 3_600_000).toISOString() };
@@ -1864,6 +1880,21 @@ describe('idempotent recovery reconciliation', () => {
       prUrl: 'https://ghe.corp.example/acme/widget/pull/7', host: 'ghe.corp.example',
     })).rejects.toThrow(/not github\.com/u);
     expect(calls).toHaveLength(0);
+  });
+
+  it('keeps standalone reconciliation unresolved when a review entry is not a decidable record', async () => {
+    for (const body of [[[]], [{}]]) {
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body }) },
+      ]);
+      // A malformed entry is never read as provable absence: a null return
+      // here would re-authorize publication against this very head.
+      await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+        .rejects.toThrow(/malformed list body/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+      expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(1);
+    }
   });
 });
 

@@ -155,8 +155,10 @@ rather than certifying absence from a rewritten header. A header whose
 unusable: it poisons the walk's completeness evidence, so absence is never
 certified from that walk — not even from an earlier valid bound — though
 an independently proved exact match is still credited. A foreign author
-with the same bytes is never credited; a malformed list, a failed request,
-an exhausted page bound, or a predicate-complete review that cannot form a
+with the same bytes is never credited; a malformed list — one with an
+entry that is not a decidable review record (an array, a primitive, or a
+record without the provider's numeric review id) — a failed request, an
+exhausted page bound, or a predicate-complete review that cannot form a
 receipt id is never treated as absence — the delivery stays explicitly
 unproven and the review is never blindly re-posted.
 
