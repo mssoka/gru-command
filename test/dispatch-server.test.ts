@@ -894,11 +894,51 @@ describe('dispatch server (E8)', () => {
       // The incomplete disposition is in-band and the markers survive for
       // the next pass; nothing claims a recovery or a retirement.
       expect(res.json).toMatchObject({ retirement: { refused: null, skipped_ids: ['stale-generation'] } });
+      // The wire must not conflate the disposition with a retirement: on
+      // the all-skip path `retired` is absent (examined-vs-retired truth).
+      expect(field(res.json, 'retired')).toBeUndefined();
       expect(h.ledger.latestJobEvent('incomplete-rebrief-job', 'silas.rebrief-retired')).toBeNull();
       expect(h.ledger.latestJobEvent('incomplete-rebrief-job', 'silas.rebrief-recovered')).toBeNull();
       expect(h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' })).toHaveLength(2);
     } finally {
       releasePrompt();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief refuses at the admission boundary when the job merges before the marker write', async () => {
+    const h = await boot({
+      wrapLedger: (ledger) => {
+        const view = Object.create(ledger) as LedgerApi;
+        Object.defineProperty(view, 'beginPendingRebrief', {
+          value: (input: Parameters<LedgerApi['beginPendingRebrief']>[0]) => {
+            // The owner merges the lane between the HTTP guard and the
+            // marker write: the in-transaction admission boundary must
+            // refuse — never write a marker for a terminal lane.
+            ledger.setJobStatus(input.jobId, 'in-review');
+            ledger.setJobStatus(input.jobId, 'merged');
+            return ledger.beginPendingRebrief(input);
+          },
+        });
+        return view;
+      },
+    });
+    try {
+      h.ledger.addJob({ id: 'admission-race-job', repo: 'nowhere', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('admission-race-job', 'working');
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'admission-race-job', note: 'n',
+      }, TOKEN);
+      // The named in-transaction refusal maps to the caller-visible 400 the
+      // spec's admission-race edge row promises.
+      expect(res.status, JSON.stringify(res.json)).toBe(400);
+      expect(field<string>(res.json, 'error')).toBe('bad_request');
+      expect(field<string>(res.json, 'detail')).toMatch(/terminal lanes are never re-briefed/u);
+      // No marker row was written and no worker was spawned.
+      expect(h.ledger.listPendingRebriefs({ jobId: 'admission-race-job' })).toHaveLength(0);
+      expect(h.spawns.filter((spawn) => spawn.role === 'minion')).toHaveLength(0);
+      expect(h.ledger.getJob('admission-race-job')?.status).toBe('merged');
+    } finally {
       await h.close();
     }
   });

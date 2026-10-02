@@ -41,7 +41,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * reached terminal (`merged`/`done`) is the exception: the request can
  * never be honored, so boot retires it administratively — one
  * `silas.rebrief-retired` audit committed with the marker deletion —
- * instead of re-dispatching or escalating forever.
+ * instead of re-dispatching or escalating forever. Spent markers (both
+ * guarded events already landed) are not retired: they clear as the
+ * completion they are, with no retirement audit.
  *
  * This module owns the recording half of the flow (events + marker
  * clearing); the HTTP endpoint and the boot reconciler both ride it, so
@@ -92,10 +94,12 @@ export interface PendingRebriefFinalize {
    * drift that skips every candidate, retires nothing and reports false,
    * carrying the disposition in `retirement`. */
   readonly retired: boolean;
-  /** Set when the terminal branch examined the request but retired nothing:
-   * the caller must not report the request as recovered; markers stay for
-   * the next pass. Null when no terminal retirement was attempted or when
-   * it actually retired the request. */
+  /** Set when the terminal branch examined the request: either it retired
+   * nothing (a refused boundary or an identity drift — the caller must not
+   * report the request as recovered; markers stay for the next pass), or
+   * it retired partially and this carries the skipped ids (refused null).
+   * Null when no terminal retirement was attempted or when it retired the
+   * request completely. */
   readonly retirement: PendingRebriefRetirementDetail | null;
 }
 
@@ -187,7 +191,12 @@ export function finalizeRebriefRequest(input: {
       rebriefRecorded: false,
       deliveryRecorded: false,
       retired: true,
-      retirement: null,
+      // A partial retirement must still trace what was deliberately left
+      // behind (the spec edge row promises "caller logs skipped ids"); a
+      // complete retirement carries no disposition.
+      retirement: retirement.skippedIds.length > 0
+        ? { refused: retirement.refused, skippedIds: retirement.skippedIds }
+        : null,
     };
   }
   const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief') ?? null;
@@ -289,6 +298,7 @@ export async function reconcilePendingRebriefs(
           job: jobId,
           status: job.status,
           markers: retirement.retired.map((marker) => `${marker.kind}:${marker.id}`).join(', '),
+          ...(retirement.skippedIds.length > 0 ? { skipped: retirement.skippedIds } : {}),
         });
       } else {
         // Defensive boundary: a refusal or identity drift leaves the markers

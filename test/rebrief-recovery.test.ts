@@ -799,4 +799,94 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
     expect(logs).toContain('warn:re-brief recovery closed without retirement: markers kept');
   });
+
+  it('one pass retires multiple terminal jobs: per-job audits, statuses, and an untouched working lane', async () => {
+    const h = makeHarness();
+    const mergedJobId = 'multi-terminal-merged';
+    const doneJobId = 'multi-terminal-done';
+    const workingJobId = 'multi-terminal-working';
+    await seedPendingRebrief({ h, jobId: mergedJobId });
+    await seedPendingRebrief({ h, jobId: doneJobId });
+    await seedPendingRebrief({ h, jobId: workingJobId });
+    merge(h, mergedJobId);
+    h.ledger.setJobStatus(doneJobId, 'done');
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    expect(report.examined).toBe(6);
+    expect(report.retired).toBe(2);
+    expect(report.completed).toBe(0);
+    expect(report.redispatched).toBe(1);
+    await report.settled;
+    // The loop carried BOTH terminal groups: one audit per job, each with
+    // its own terminal status, and no terminal lane spawned a worker.
+    expect(h.registry.workers).toHaveLength(1);
+    expect(h.registry.workers[0]?.prompts[0] ?? '').toContain(`Re-brief — job ${workingJobId}`);
+    for (const [jobId, status] of [[mergedJobId, 'merged'], [doneJobId, 'done']] as const) {
+      const audits = h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired');
+      expect(audits).toHaveLength(1);
+      expect((audits[0]!.payload as { job_status?: string }).job_status).toBe(status);
+      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    }
+    // The working lane walked the honest recovery path.
+    expect(h.ledger.latestJobEvent(workingJobId, 'silas.rebrief')).not.toBeNull();
+  });
+
+  it('a partial retirement traces its skipped ids through every caller surface', async () => {
+    const h = makeHarness();
+    const jobId = 'partial-retirement-boot';
+    await seedPendingRebrief({ h, jobId });
+    merge(h, jobId);
+    // Drift ONE candidate's identity after the pass examined the rows: the
+    // real transaction retires the matching marker and skips the drifted
+    // one — the partial composition, deterministically.
+    const driftedId = h.ledger.listPendingRebriefs({ jobId })[0]!.id;
+    const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: ledgerWith(h, {
+          retirePendingRebriefs: (input) => h.ledger.retirePendingRebriefs({
+            ...input,
+            candidates: input.candidates.map((candidate) =>
+              candidate.id === driftedId ? { ...candidate, payloadHash: 'drifted-hash' } : candidate),
+          }),
+        }),
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+        log: (level, msg, fields) => { logs.push({ level, msg, fields }); },
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    expect(report.retired).toBe(1);
+    await report.settled;
+    // The boot log carries the drifted ids beside the retired markers.
+    const retired = logs.find((line) => line.msg === 're-brief request retired: job is terminal');
+    expect(retired?.fields?.['skipped']).toEqual([driftedId]);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(1);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).not.toBeNull();
+
+    // The same partial composition on the finalize path: retired:true plus
+    // the disposition — never a bare success over a kept marker.
+    const finalizeJobId = 'partial-retirement-finalize';
+    await seedPendingRebrief({ h, jobId: finalizeJobId });
+    merge(h, finalizeJobId);
+    const driftedFinalizeId = h.ledger.listPendingRebriefs({ jobId: finalizeJobId })[0]!.id;
+    const result = finalizeRebriefRequest({
+      ledger: ledgerWith(h, {
+        retirePendingRebriefs: (input) => h.ledger.retirePendingRebriefs({
+          ...input,
+          candidates: input.candidates.map((candidate) =>
+            candidate.id === driftedFinalizeId ? { ...candidate, payloadHash: 'drifted-hash' } : candidate),
+        }),
+      }),
+      worktrees: h.worktrees,
+      jobId: finalizeJobId,
+      minionId: 'worker-9',
+      lanePath: h.lanePath,
+      note: 'n',
+    });
+    expect(result.retired).toBe(true);
+    expect(result.retirement).toEqual({ refused: null, skippedIds: [driftedFinalizeId] });
+    expect(h.ledger.listPendingRebriefs({ jobId: finalizeJobId })).toHaveLength(1);
+  });
 });

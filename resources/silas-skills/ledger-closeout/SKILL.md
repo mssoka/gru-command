@@ -28,8 +28,10 @@ close-out: a ledger-visible end state a stranger can audit.
    follow-up delivery lands and the re-review fires. If the same canonical
    blocker then recurs, the ladder continues (directive → re-brief →
    escalate); if blockers evolve, keep looping — no cap. A re-brief whose
-   job reached terminal (`merged`/`done`) before the turn settled is
-   closed administratively instead: the pending markers are retired with
+   job reached terminal (`merged`/`done`) before the request was honored
+   is closed administratively instead — whether the stale markers surface
+   at boot with no live turn at all, or a settling turn or re-dispatch
+   boundary meets the terminal job: the pending markers are retired with
    a `silas.rebrief-retired` event and no delivery is expected — do not
    re-treat that lane as unclosed.
 3. **Escalations.** An escalation is closed by a human ack, not by you.

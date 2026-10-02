@@ -444,6 +444,34 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     expect(missing.refused).toBe('job-missing');
   });
 
+  it('a mixed candidate list retires only the matching identity and traces the drifted id', () => {
+    const jobId = 'retire-mixed';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'mixed candidates' });
+    api.setJobStatus(jobId, 'working');
+    const superseded = api.beginPendingRebrief({ jobId, note: 'old', briefing: 'b' });
+    const fresh = api.beginPendingRebrief({ jobId, note: 'fresh', briefing: 'b' });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    // One candidate still matches the live row; its stale-generation twin
+    // (same kind, superseded id/hash/watermark) must be skipped, never
+    // deleted — and the drift must be traceable in the single audit.
+    const matching = candidatesOf(fresh)[0]!;
+    const drifted = candidatesOf(superseded).find((candidate) => candidate.kind === matching.kind)!;
+    const result = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates: [matching, drifted] });
+    expect(result.recorded).toBe(true);
+    expect(result.refused).toBeNull();
+    expect(result.retired.map((marker) => marker.id)).toEqual([matching.id]);
+    expect(result.skippedIds).toEqual([drifted.id]);
+    // Exactly one row deleted; the newer generation of the other kind survives.
+    expect(api.listPendingRebriefs({ jobId }).map((marker) => marker.id))
+      .toEqual([fresh.find((marker) => marker.kind !== matching.kind)!.id]);
+    const audits = api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired');
+    expect(audits).toHaveLength(1);
+    const payload = audits[0]!.payload as { retired: readonly { id: string }[]; skipped_ids: readonly string[] };
+    expect(payload.retired.map((marker) => marker.id)).toEqual([matching.id]);
+    expect(payload.skipped_ids).toEqual([drifted.id]);
+  });
+
   it('the retirement audit recomputes guarded_event_landed from the ledger, not the caller', () => {
     const jobId = 'retire-landed-flag';
     api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'landed-flag truth' });

@@ -165,6 +165,13 @@ action-required when recovery fails. A leftover whose job has since
 reached `merged`/`done` is instead retired administratively: the
 identity-checked marker deletion and a single `silas.rebrief-retired`
 audit commit in one transaction, with no spawn and no escalation.
+Retirement fires wherever the terminal state is met — the boot scan, a
+settling turn, or the re-dispatch boundary — not only at boot. Spent
+markers (both guarded events already landed) are the exception: they
+clear as the completed request they are, with no retirement audit. The
+boot summary's units are mixed by design: `examined` counts markers
+while `completed`/`redispatched`/`retired` count jobs, so one retired
+marker pair reads `examined: 2 … retired: 1` — not a partial failure.
 
 ### Residency admission + durable review handoffs (custom events)
 
