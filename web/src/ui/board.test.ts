@@ -273,6 +273,36 @@ describe('minion heist identity in the crew rail', () => {
     expect([...document.querySelectorAll('.board-agent__hash')].map((node) => node.textContent)).toEqual(['x😀bcde', 'y😀bcde']);
   });
 
+  it('resolves large groups with tail buckets: lone tails keep four, collisions extend deterministically', () => {
+    const jobs = new Map([['swarm', baseJob({ id: 'swarm', title: 'Swarm review' })]]);
+    const bulk = Array.from({ length: 1500 }, (_, index) =>
+      agent(`bulk-${String(index).padStart(8, '0')}`, { role: 'minion', label: null, jobId: 'swarm' }));
+    const collisions = [
+      agent('worker-1234dec9', { role: 'minion', label: null, jobId: 'swarm' }),
+      agent('worker-5678dec9', { role: 'minion', label: null, jobId: 'swarm' }),
+      agent('worker-9999dec9', { role: 'minion', label: null, jobId: 'swarm' }),
+      agent('worker-12dec9', { role: 'minion', label: null, jobId: 'swarm' }),
+      agent('worker-22dec9', { role: 'minion', label: null, jobId: 'swarm' }),
+      agent('ab', { role: 'minion', label: null, jobId: 'swarm' }),
+    ];
+    const agents = [...bulk, ...collisions];
+    const suffixes = minionSuffixes(agents, jobs);
+    // Lone tails never scan peers and keep the normal four characters.
+    expect(suffixes.get('bulk-00000000')).toBe('0000');
+    expect(suffixes.get('bulk-00001499')).toBe('1499');
+    // A shared four-tail extends only as far as the collision requires.
+    expect(suffixes.get('worker-1234dec9')).toBe('4dec9');
+    expect(suffixes.get('worker-5678dec9')).toBe('8dec9');
+    expect(suffixes.get('worker-9999dec9')).toBe('9dec9');
+    expect(suffixes.get('worker-12dec9')).toBe('12dec9');
+    expect(suffixes.get('worker-22dec9')).toBe('22dec9');
+    // Shorter than four graphemes: the whole id, never a padded tail.
+    expect(suffixes.get('ab')).toBe('ab');
+    // Row order never changes an answer.
+    const reversed = minionSuffixes([...agents].reverse(), jobs);
+    for (const item of agents) expect(reversed.get(item.id)).toBe(suffixes.get(item.id));
+  });
+
   it('renders exactly the suffixes the rail authority computes and fails loud on a miss', () => {
     const view = new BoardView(() => {});
     const jobs = [baseJob({ id: 'wake', title: 'Full wake alert contract', displayName: 'Wake Alerts' })];

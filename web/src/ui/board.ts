@@ -1124,7 +1124,13 @@ function heistName(source: string | undefined): string {
 
 /** The normally four-character ID suffix; identical suffixes extend on
  * grapheme boundaries (never halving an astral character) until the
- * peers diverge, independent of row order (G11). */
+ * peers diverge, independent of row order (G11).
+ *
+ * A peer can only collide at a length >= 4 when both IDs share the same
+ * four trailing graphemes, so long IDs are bucketed by that tail: a
+ * one-member bucket keeps four characters with no peer scan at all, and
+ * only a genuinely colliding bucket extends. IDs shorter than four
+ * graphemes cannot extend and are returned whole (unchanged semantics). */
 export function minionSuffixes(agents: readonly AgentView[], jobs: ReadonlyMap<string, JobView>): ReadonlyMap<string, string> {
   const groups = new Map<string, string[]>();
   for (const agent of agents) {
@@ -1132,22 +1138,43 @@ export function minionSuffixes(agents: readonly AgentView[], jobs: ReadonlyMap<s
     // Missing jobs share the neutral label with null bindings; distinguish
     // their IDs against every other unassigned worker in that one group.
     const key = agent.jobId !== null && jobs.has(agent.jobId) ? agent.jobId : '';
-    groups.set(key, [...(groups.get(key) ?? []), agent.id]);
+    const bucket = groups.get(key);
+    if (bucket === undefined) groups.set(key, [agent.id]);
+    else bucket.push(agent.id);
   }
   const suffixes = new Map<string, string>();
+  const cut = (source: readonly string[], length: number): string =>
+    source.slice(source.length - length).join('');
   for (const ids of groups.values()) {
     const parts = new Map(ids.map((id) => [id, graphemes(id)] as const));
-    const cut = (source: readonly string[], length: number): string =>
-      source.slice(source.length - length).join('');
+    const tails = new Map<string, string[]>();
     for (const [id, own] of parts) {
-      // For each ID find the shortest suffix which distinguishes it from
-      // every peer's suffix at that length, independent of row ordering.
-      let length = Math.min(4, own.length);
-      while (
-        length < own.length &&
-        ids.some((peer) => peer !== id && cut(parts.get(peer) ?? [], length) === cut(own, length))
-      ) length++;
-      suffixes.set(id, cut(own, length));
+      if (own.length < 4) {
+        suffixes.set(id, own.join(''));
+        continue;
+      }
+      const tail = cut(own, 4);
+      const bucket = tails.get(tail);
+      if (bucket === undefined) tails.set(tail, [id]);
+      else bucket.push(id);
+    }
+    for (const bucket of tails.values()) {
+      if (bucket.length === 1) {
+        const only = bucket[0]!;
+        suffixes.set(only, cut(parts.get(only) ?? [], 4));
+        continue;
+      }
+      for (const id of bucket) {
+        const own = parts.get(id) ?? [];
+        // For each ID find the shortest suffix which distinguishes it from
+        // every colliding peer at that length, independent of row order.
+        let length = 4;
+        while (
+          length < own.length &&
+          bucket.some((peer) => peer !== id && cut(parts.get(peer) ?? [], length) === cut(own, length))
+        ) length++;
+        suffixes.set(id, cut(own, length));
+      }
     }
   }
   return suffixes;
