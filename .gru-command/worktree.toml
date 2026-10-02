@@ -62,3 +62,10 @@ pr135-runtime-ci-three-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx 
 # retry payloads and the consumer-level settlement tests the verification
 # gap layer identified; approved RPC patch first.
 r12-review-repairs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing-admission.test.ts test/fix-directive.test.ts test/supervisor.test.ts test/config.test.ts test/perkins-builtin-wave.test.ts test/rebrief-recovery.test.ts test/suite-shape.test.ts"
+
+# PR135 r13 fresh-review repairs (BMAD blind-hunter on b541e44, 2026-10-02):
+# classifier context for the 429 family, capped-rung jitter spread, settlement
+# precedence over an already-aborted signal, the shared payload error bound,
+# gate job-attribution, the dual-root patch-tool guards and the
+# deterministic-wait conversions; approved RPC patch first.
+r13-review-repairs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/patch-vitest-rpc-timeout.test.ts test/supervisor.test.ts test/fix-directive.test.ts test/dispatch-server.test.ts test/perkins-builtin-wave.test.ts test/config.test.ts test/config-generate.test.ts test/suite-shape.test.ts"
