@@ -122,6 +122,186 @@ async function rejection(promise: Promise<unknown>): Promise<Error> {
   throw new Error('expected the promise to reject');
 }
 
+/** Poll a condition until it holds; throws with the label on timeout. */
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 4_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+interface CancellationObservation {
+  readonly variant: 'broad' | 'narrow';
+  readonly summaryMode: 'abort-settles' | 'late-terminal';
+  readonly cancellations: number;
+  readonly turn: string;
+  readonly queued: string;
+  readonly errorEvents: number;
+  readonly stateErrors: number;
+  readonly assistantErrors: number;
+  readonly abortedEnds: number;
+  readonly successEnds: number;
+  readonly rawSdkCompactionEnds: number;
+  readonly summarySettledByAbort: boolean;
+  readonly continuationReachedModel: boolean;
+  readonly queuedDelivered: number;
+  readonly disposed: boolean;
+  readonly idle: boolean;
+}
+
+/**
+ * Drive one real mid-run threshold compaction into a stall, then apply the
+ * cancellation a bound would apply — broad `session.abort()` or summary-only
+ * `session.abortCompaction()` — through the public SDK session and measure the
+ * outcome. No product code is patched and no adapter deadline is armed: the
+ * seam under test is the cancellation boundary itself, so this contract holds
+ * for any future (or owner-controlled) bound that needs it. The adapter's
+ * former #137 deadline is gone (rollback of PR #137), which is exactly why the
+ * boundary is pinned here instead of at the deleted call site.
+ *
+ * The first cycle is measured alone before any follow-up starts: the adapter
+ * keeps one pending terminal slot, and a second adjacent cycle would race the
+ * publication poll, so the follow-up is queued only after the first terminal
+ * is published. Only the FIRST summary stalls; later cycles summarize
+ * normally so the follow-up's exactly-once delivery is not conflated with an
+ * open-ended provider stall.
+ *
+ * `abort-settles`: a faithful transport — the held summary stream ends when
+ * its request signal aborts. `late-terminal`: the signal is ignored and the
+ * transport settles only when the test releases it (after the cancellation).
+ */
+async function observeCompactionCancellation(
+  variant: 'broad' | 'narrow',
+  summaryMode: 'abort-settles' | 'late-terminal',
+): Promise<CancellationObservation> {
+  const history = 'history '.repeat(12_000); // ~24k estimated tokens: forces a discarding cut point
+  let releaseSummary: () => void = () => {};
+  const summaryHold = new Promise<void>((resolve) => {
+    releaseSummary = resolve;
+  });
+  let summaryCalls = 0;
+  const fx = await fixture((prompt, index) => {
+    if (prompt.startsWith('<conversation>')) {
+      summaryCalls += 1;
+      return summaryCalls === 1
+        ? { deltas: [], hold: summaryHold, honorAbort: summaryMode === 'abort-settles' }
+        : { deltas: ['summary'] };
+    }
+    if (index === 0) return { deltas: [history] };
+    if (index === 1) {
+      // The tool call keeps the run live through prepareNextTurnWithContext,
+      // where pi runs native threshold compaction mid-run.
+      return {
+        deltas: [],
+        toolCall: { id: 'call-1', name: 'read', args: { path: 'missing.txt' } },
+        usageTokens: 90_000,
+      };
+    }
+    return { deltas: [`answer-${index}`] };
+  });
+  const handle = await fx.runtime.spawn('gru');
+  const events = collect(handle);
+  const rawSdkEvents: string[] = [];
+  (handle as unknown as {
+    session: { subscribe?: (listener: (event: unknown) => void) => () => void };
+  }).session.subscribe?.((event) => rawSdkEvents.push(String((event as { type?: unknown }).type)));
+  const internal = handle as unknown as {
+    session: {
+      abort?: () => Promise<void>;
+      abortCompaction?: () => void;
+      isIdle: boolean;
+      agent: { state: { messages: Array<{ role: string; stopReason?: string }> } };
+    };
+  };
+  try {
+    await handle.prompt('start');
+    const turn = handle.prompt('do the work').then(
+      () => 'resolved',
+      (error: Error) => `rejected:${error.message}`,
+    );
+    await waitFor(
+      () => events.some((event) => event.type === 'compaction_start'),
+      'compaction_start',
+    );
+    // The cancellation seam under test: exactly one call, summary-only or broad.
+    let cancellations = 0;
+    if (variant === 'broad') {
+      const abort = internal.session.abort;
+      if (abort === undefined) throw new Error('SDK session is missing abort()');
+      cancellations += 1;
+      void abort.call(internal.session);
+    } else {
+      const abortCompaction = internal.session.abortCompaction;
+      if (abortCompaction === undefined) throw new Error('SDK session is missing abortCompaction()');
+      cancellations += 1;
+      abortCompaction.call(internal.session);
+    }
+    if (summaryMode === 'late-terminal') {
+      // The transport ignores the request signal: give the SDK abort path a
+      // bounded probe window for its own terminal, then settle the transport
+      // late. The probe never gates a pin — it only orders the release after
+      // the cancellation to define this mode.
+      const until = Date.now() + 2_000;
+      while (Date.now() < until && !rawSdkEvents.includes('compaction_end')) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+    releaseSummary(); // no-op for an already-aborted stream; settles a late one
+    await waitFor(
+      () => events.some((event) => event.type === 'compaction_end'),
+      'compaction_end',
+      8_000,
+    );
+    // Follow-up on the settled session: exactly-once delivery, no duplicates.
+    const queued = handle.prompt('queued work', { owner: 'other' }).then(
+      () => 'resolved',
+      (error: Error) => `rejected:${error.message}`,
+    );
+    await waitFor(
+      () => fx.script.calls.some((call) => call.prompt === 'queued work'),
+      'queued delivery',
+      8_000,
+    );
+    const turnOutcome = await turn;
+    const queuedOutcome = await queued;
+    await waitFor(() => internal.session.isIdle || handle.health().state === 'disposed', 'session settle');
+    const compactionEnds = events.filter(
+      (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
+        event.type === 'compaction_end',
+    );
+    return {
+      variant,
+      summaryMode,
+      cancellations,
+      turn: turnOutcome,
+      queued: queuedOutcome,
+      errorEvents: events.filter((event) => event.type === 'error').length,
+      stateErrors: events.filter((event) => event.type === 'state' && event.state === 'error').length,
+      assistantErrors: internal.session.agent.state.messages.filter(
+        (message) => message.role === 'assistant' && message.stopReason === 'error',
+      ).length,
+      abortedEnds: compactionEnds.filter(
+        (event) => !event.success && event.error === 'compaction aborted',
+      ).length,
+      successEnds: compactionEnds.filter((event) => event.success).length,
+      rawSdkCompactionEnds: rawSdkEvents.filter((type) => type === 'compaction_end').length,
+      summarySettledByAbort: fx.script.calls.some(
+        (call) => call.prompt.startsWith('<conversation>') && call.aborted,
+      ),
+      continuationReachedModel: fx.script.calls.some(
+        (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
+      ),
+      queuedDelivered: fx.script.calls.filter((call) => call.prompt === 'queued work').length,
+      disposed: handle.health().state === 'disposed',
+      idle: internal.session.isIdle,
+    };
+  } finally {
+    releaseSummary();
+    await handle.dispose();
+  }
+}
+
 describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
   it('spawns a session persisted under the instance sessions dir', async () => {
     const fx = await fixture();
@@ -745,6 +925,111 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       internal.session = nativeSession;
       await handle.dispose();
     }
+  });
+
+  describe('compaction cancellation boundary: summary-only vs broad (test-only seam, no product change)', () => {
+    it('broad cancellation: the live pending turn is cancelled and surfaces the SDK abort error', async () => {
+      const observation = await observeCompactionCancellation('broad', 'abort-settles');
+      expect(observation.cancellations).toBe(1);
+      expect(observation.turn).toBe('resolved');
+      expect(observation.errorEvents).toBe(1);
+      expect(observation.stateErrors).toBe(1);
+      expect(observation.assistantErrors).toBe(1);
+      expect(observation.continuationReachedModel).toBe(false);
+      expect(observation.summarySettledByAbort).toBe(true);
+      // The aborted first cycle is superseded by the SDK's immediate
+      // prepareNextTurn retry, which completes before the adapter's single
+      // pending-terminal slot has an idle gate to publish: consumers see the
+      // eventual success exactly once, never a duplicate or a wedged slot.
+      expect(observation.abortedEnds).toBe(0);
+      expect(observation.successEnds).toBe(1);
+      expect(observation.queuedDelivered).toBe(1);
+      expect(observation.disposed).toBe(false);
+    });
+
+    it('narrow cancellation: the pending turn answers, no error events, follow-up work exactly once', async () => {
+      const observation = await observeCompactionCancellation('narrow', 'abort-settles');
+      expect(observation.cancellations).toBe(1);
+      expect(observation.turn).toBe('resolved');
+      expect(observation.errorEvents).toBe(0);
+      expect(observation.stateErrors).toBe(0);
+      expect(observation.assistantErrors).toBe(0);
+      expect(observation.continuationReachedModel).toBe(true);
+      expect(observation.summarySettledByAbort).toBe(true);
+      // The SDK reports the summary-only cancellation as an aborted
+      // compaction; the adapter publishes that failure terminal exactly once.
+      expect(observation.abortedEnds).toBe(1);
+      expect(observation.successEnds).toBe(0);
+      expect(observation.queuedDelivered).toBe(1);
+      expect(observation.idle).toBe(true);
+      expect(observation.disposed).toBe(false);
+    });
+
+    it('late terminal under broad cancellation: the cancelled run stays cancelled; one terminal publishes', async () => {
+      const observation = await observeCompactionCancellation('broad', 'late-terminal');
+      expect(observation.cancellations).toBe(1);
+      expect(observation.turn).toBe('resolved');
+      expect(observation.errorEvents).toBe(1);
+      expect(observation.assistantErrors).toBe(1);
+      expect(observation.continuationReachedModel).toBe(false);
+      expect(observation.summarySettledByAbort).toBe(false);
+      expect(observation.abortedEnds).toBe(0);
+      expect(observation.successEnds).toBe(1);
+      expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
+      expect(observation.queuedDelivered).toBe(1);
+      expect(observation.disposed).toBe(false);
+    });
+
+    it('late terminal under narrow cancellation: the run recovers and no terminal duplicates publish', async () => {
+      const observation = await observeCompactionCancellation('narrow', 'late-terminal');
+      expect(observation.cancellations).toBe(1);
+      expect(observation.turn).toBe('resolved');
+      expect(observation.errorEvents).toBe(0);
+      expect(observation.assistantErrors).toBe(0);
+      expect(observation.continuationReachedModel).toBe(true);
+      expect(observation.summarySettledByAbort).toBe(false);
+      expect(observation.abortedEnds).toBe(1);
+      expect(observation.successEnds).toBe(0);
+      expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
+      expect(observation.queuedDelivered).toBe(1);
+      expect(observation.idle).toBe(true);
+      expect(observation.disposed).toBe(false);
+    });
+
+    it('explicit stop context: dispose during a live turn rejects queued work and releases the session', async () => {
+      let release!: () => void;
+      const hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const fx = await fixture([{ deltas: ['live'], hold }, { deltas: ['never'] }]);
+      const handle = await fx.runtime.spawn('gru');
+      const sessionFile = handle.sessionFile!;
+      const live = handle.prompt('live turn').then(
+        () => 'resolved',
+        (error: Error) => `rejected:${error.message}`,
+      );
+      const queued = handle.prompt('queued behind live', { owner: 'other' }).then(
+        () => 'resolved',
+        (error: Error) => `rejected:${error.message}`,
+      );
+      try {
+        await waitFor(
+          () => fx.script.calls.some((call) => call.prompt === 'live turn'),
+          'live turn admitted',
+        );
+        await handle.dispose();
+        expect(await queued).toMatch(
+          /rejected:agent session disposed before queued message was delivered/,
+        );
+        expect(handle.health().state).toBe('disposed');
+        expect(existsSync(`${sessionFile}.lock`)).toBe(false);
+        expect(fx.script.calls.map((call) => call.prompt)).not.toContain('never');
+      } finally {
+        release();
+        await live.catch(() => {});
+        await handle.dispose();
+      }
+    });
   });
 
   it('emits thinking deltas before text when the model reasons', async () => {

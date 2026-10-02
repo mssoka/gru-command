@@ -43,6 +43,8 @@ export interface StubCall {
   readonly prompt: string;
   readonly imageCount: number;
   readonly images: readonly StubImage[];
+  /** True when a held stream settled because its request signal aborted. */
+  aborted: boolean;
 }
 
 function makeStubModel(input: readonly ('text' | 'image')[] = ['text']): Model<Api> {
@@ -162,7 +164,7 @@ export class StubScript {
   }
 
   next(prompt: string, images: StubImage[] = []): StubTurn {
-    this.calls.push({ prompt, imageCount: images.length, images });
+    this.calls.push({ prompt, imageCount: images.length, images, aborted: false });
     return this.responder?.(prompt, this.calls.length - 1) ?? this.turns.shift() ?? { deltas: ['stub: ', 'ok'] };
   }
 }
@@ -201,6 +203,7 @@ export async function makeStubModelRuntime(
   const model = makeStubModel(options.input);
   const streamTurn = (prompt: string, images: StubImage[], signal?: AbortSignal): AssistantMessageEventStream => {
     const turn = script.next(prompt, images);
+    const call = script.calls[script.calls.length - 1]!;
     const stream = new AssistantMessageEventStream();
     const text = turn.deltas.join('');
     void (async () => {
@@ -255,6 +258,7 @@ export async function makeStubModelRuntime(
             void turn.hold!.then(() => resolve(), () => resolve());
           });
           if (signal.aborted) {
+            call.aborted = true;
             const aborted = {
               ...final,
               stopReason: 'aborted',
