@@ -75,6 +75,31 @@ restart_window_ms = 600000
 max_restarts = 3
 restart_backoff_ms = 2000
 
+# [pacing]                          # provider pacing — admission caps + rate-limit retry (optional)
+# FIFO admission caps for minion and Perkins review turns (queued waits are
+# carried in the board snapshot data; live turns are never preempted) plus
+# bounded automatic retry for the provider rate-limit error class (HTTP 429,
+# "rate limit"/"too many requests"/throttling). Every automatic retry is
+# recorded as a pacing.auto-retry ledger event; non-rate-limit failures and an
+# exhausted budget still stop to the supervisor ladder + owner ACK. Ledger
+# vocabulary: pacing.queued, pacing.admitted, pacing.wait-cancelled,
+# pacing.queued-rollback, pacing.auto-retry, pacing.auto-retry-recovered,
+# pacing.auto-retry-exhausted. max_auto_retries = 0 disables automatic retry
+# (admission caps stay active). Enabled by default with unlimited admission
+# caps. Provider-agnostic: signatures match error text, never a provider brand
+# baked into code.
+# Caps count MINION and Perkins review turns only: silas/bob/distiller/chat
+# core turns are outside this pool (the board view is not a provider-wide count).
+# max_concurrent_minions = 3
+# max_concurrent_review_turns = 3      # 0 = unlimited
+# backoff_base_ms = 1000
+# backoff_max_ms = 60000
+# max_auto_retries = 5
+# enabled = true
+# [pacing.providers."<provider-id>"]  # extra signatures (global text signatures)
+# rate_limit_patterns = ["pacing code \\d+"]
+# [concurrency] controls resident sessions separately from these turn caps.
+
 [logging]
 max_bytes = 10485760
 keep = 5

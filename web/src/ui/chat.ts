@@ -29,6 +29,7 @@ import { imageKindFor, type BrowseResult, type UploadedFile } from '../lib/attac
 import { COCKPIT_MIN_WIDTH } from '../lib/console-layout.js';
 import { MAX_ATTACHMENTS_PER_MESSAGE } from '../lib/protocol.js';
 import { renderMarkdown } from '../lib/markdown.js';
+import { WORKING_FLAVOR_INTERVAL_MS, WorkingFlavorDeck } from '../lib/working-flavor.js';
 import { el, mustGet } from './dom.js';
 
 /** The chat overlay takes over below the cockpit width (v6). */
@@ -50,6 +51,12 @@ const STICK_THRESHOLD_PX = 40;
 export interface AttachSurface {
   browse(path: string): Promise<BrowseResult>;
   upload(file: File): Promise<UploadedFile>;
+}
+
+/** Optional seams for the view's local presentation. Tests inject a seeded
+ * `random` so the working-flavor shuffle is exact and deterministic. */
+export interface ChatViewOptions {
+  readonly random?: () => number;
 }
 
 /** The composer's send seam returns false when the message was NOT
@@ -93,6 +100,8 @@ export class ChatView {
   private readonly attachButton = mustGet<HTMLButtonElement>('chat-attach');
   private readonly fileInput = mustGet<HTMLInputElement>('chat-attach-file');
   private readonly contextStatus = mustGet<HTMLElement>('chat-context-status');
+  private readonly contextStatusLabel = mustGet<HTMLElement>('chat-context-status-label');
+  private readonly contextFlavor = mustGet<HTMLElement>('chat-context-status-flavor');
   private readonly contextAnnouncement = mustGet<HTMLElement>('chat-context-announcement');
   private readonly compactButton = mustGet<HTMLButtonElement>('chat-compact');
   private readonly newChatButton = mustGet<HTMLButtonElement>('chat-new');
@@ -140,6 +149,12 @@ export class ChatView {
   /** Absolute workspace root from the current browse (chip paths). */
   private browseRoot = '';
   private context: ContextFrame | null = null;
+  /** ONE deck per mounted view: bags survive working episodes (no reset). */
+  private readonly flavorDeck: WorkingFlavorDeck;
+  /** At most one rotation timer per view; null whenever rotation is off. */
+  private flavorTimer: ReturnType<typeof setInterval> | null = null;
+  /** Phrase currently shown in the busy chip (null outside busy). */
+  private flavorPhrase: string | null = null;
   private pendingResetView: PendingResetView | null = null;
   private controlsConnected = false;
   private requestControl: ((action: ControlAction) => boolean) | null = null;
@@ -149,7 +164,9 @@ export class ChatView {
       text: string,
       attachments?: readonly AttachmentChip[],
     ) => boolean,
+    options: ChatViewOptions = {},
   ) {
+    this.flavorDeck = new WorkingFlavorDeck(options.random);
     // Multi-line composer (textarea): Enter sends, Shift+Enter inserts a
     // newline — DESKTOP/fine-pointer only. Coarse-pointer (touch) devices
     // take the standard mobile pattern: the return key inserts a newline
@@ -417,31 +434,36 @@ export class ChatView {
     const snapshot = this.context;
     const connected = this.controlsConnected;
     const busy = snapshot?.state !== 'idle';
+    // The ROTATION predicate is deliberately narrower than `busy` above:
+    // only the authoritative connected busy state rotates the flavor chip.
+    const working = connected && snapshot !== null && snapshot.state === 'busy';
+    if (working) this.ensureWorkingFlavor();
+    else this.stopWorkingFlavor();
     this.contextStatus.classList.toggle('chat-context__status--busy', connected && busy);
     this.contextStatus.toggleAttribute('aria-busy', connected && busy);
     if (!connected || snapshot === null) {
-      this.contextStatus.textContent = 'Context unavailable';
+      this.setContextStatus('Context unavailable');
       this.contextStatus.title = 'No current runtime context measurement';
       this.contextStatus.setAttribute('aria-label', 'Context unavailable');
     } else if (snapshot.state === 'busy') {
-      this.contextStatus.textContent = 'Gru is working…';
+      this.renderWorkingFlavor();
       this.contextStatus.title = 'Context controls are available again after the current turn';
       this.contextStatus.setAttribute('aria-label', 'Gru is working; context controls are busy');
     } else if (snapshot.state === 'compacting') {
-      this.contextStatus.textContent = 'Compacting context…';
+      this.setContextStatus('Compacting context…');
       this.contextStatus.title = 'Native compaction is in progress';
       this.contextStatus.setAttribute('aria-label', 'Compacting context');
     } else if (snapshot.state === 'resetting') {
-      this.contextStatus.textContent = 'Starting new chat…';
+      this.setContextStatus('Starting new chat…');
       this.contextStatus.title = 'A fresh native session is being activated';
       this.contextStatus.setAttribute('aria-label', 'Starting a new chat');
     } else if (snapshot.usage === null) {
-      this.contextStatus.textContent = 'Context unavailable';
+      this.setContextStatus('Context unavailable');
       this.contextStatus.title = 'The runtime did not provide current context usage';
       this.contextStatus.setAttribute('aria-label', 'Context usage unavailable');
     } else {
       const percent = Math.round(Math.max(0, Math.min(100, snapshot.usage.percent)));
-      this.contextStatus.textContent = `${percent}% context`;
+      this.setContextStatus(`${percent}% context`);
       this.contextStatus.title =
         `${Math.round(snapshot.usage.tokens).toLocaleString()} of ` +
         `${Math.round(snapshot.usage.context_window).toLocaleString()} tokens`;
@@ -464,6 +486,58 @@ export class ChatView {
       snapshot !== null && !snapshot.writer
         ? 'Read-only tab: another client holds the pen'
         : 'Start a truly fresh native conversation';
+  }
+
+  // -----------------------------------------------------------------------
+  // Working flavor: approved phrases rotating while Gru is busy
+  // -----------------------------------------------------------------------
+
+  /** Set the factual status text and clear the decorative phrase slot. */
+  private setContextStatus(text: string): void {
+    if (this.contextStatusLabel.textContent !== text) this.contextStatusLabel.textContent = text;
+    if (this.contextFlavor.textContent !== '') this.contextFlavor.textContent = '';
+    this.contextFlavor.hidden = true;
+  }
+
+  /** Busy chip: stable factual label (visually hidden while busy) plus the
+   * visible decorative phrase — the phrase is aria-hidden, so rotations
+   * never turn into a live-region announcement every four seconds. */
+  private renderWorkingFlavor(): void {
+    if (this.contextStatusLabel.textContent !== 'Gru is working…') {
+      this.contextStatusLabel.textContent = 'Gru is working…';
+    }
+    const phrase = this.flavorPhrase === null ? '' : `${this.flavorPhrase}…`;
+    if (this.contextFlavor.textContent !== phrase) this.contextFlavor.textContent = phrase;
+    this.contextFlavor.hidden = false;
+  }
+
+  /** Show a phrase immediately on the first authoritative busy render and
+   * start the ONE 4 s rotation timer; repeated renders are no-ops, so
+   * snapshots/tools/deltas/reparenting can never restart or resample. */
+  private ensureWorkingFlavor(): void {
+    if (this.flavorTimer !== null) return;
+    this.flavorPhrase = this.flavorDeck.next();
+    this.flavorTimer = setInterval(() => this.rotateWorkingFlavor(), WORKING_FLAVOR_INTERVAL_MS);
+  }
+
+  /** One timer tick: only a still-authoritative busy state rotates, so a
+   * stale callback can never overwrite a later factual status. */
+  private rotateWorkingFlavor(): void {
+    if (this.flavorTimer === null) return;
+    if (!this.controlsConnected || this.context === null || this.context.state !== 'busy') return;
+    this.flavorPhrase = this.flavorDeck.next();
+    this.renderWorkingFlavor();
+  }
+
+  /** Leaving connected busy clears the single timer immediately and the
+   * factual branch repaints the chip. The deck keeps its bag across
+   * working episodes for this mounted view. */
+  private stopWorkingFlavor(): void {
+    if (this.flavorTimer !== null) {
+      clearInterval(this.flavorTimer);
+      this.flavorTimer = null;
+    }
+    this.flavorPhrase = null;
   }
 
   // -----------------------------------------------------------------------

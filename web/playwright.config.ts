@@ -55,7 +55,14 @@ export default defineConfig({
   projects: [
     {
       name: 'mock',
-      testMatch: 'smoke.spec.ts',
+      testMatch: ['smoke.spec.ts', 'working-flavor.spec.ts'],
+      use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
+    },
+    {
+      // Lens-pill proof (ops-readiness-repair 2026-10-02): synthetic
+      // WebSocket-seeded board snapshots only — no product/mock edits.
+      name: 'lens-pills',
+      testMatch: 'lens-pills.spec.ts',
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {

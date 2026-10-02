@@ -1,9 +1,9 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
@@ -12,6 +12,8 @@ import type { AgentHandle } from '../src/runtime/types.js';
 import type { WorktreeLane, WorktreePort } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { PacingGate } from '../src/runtime/pacing.js';
+import type { AgentRecord } from '../src/ledger/api.js';
 
 /**
  * The follow-up delivery signal (R2 review B3): a settled directive or
@@ -156,6 +158,22 @@ describe('fresh fix worker association', () => {
     }
   });
 });
+/** A complete AgentRecord row for ledger-port doubles (the port returns full
+ * rows, never partial fixtures). */
+function minionRecord(id: string, jobId: string | null, sessionFile: string | null): AgentRecord {
+  return {
+    id,
+    role: 'minion',
+    label: null,
+    jobId,
+    roundId: null,
+    state: 'idle',
+    lastActivity: null,
+    sessionFile,
+    createdAt: '2026-09-21T00:00:00.000Z',
+    updatedAt: '2026-09-21T00:00:00.000Z',
+  };
+}
 
 describe('recordFollowUpDelivery (the loop-closing signal)', () => {
   it('records job.delivered with the lane head the settled turn produced', async () => {
@@ -406,5 +424,133 @@ describe('the non-draft PR rule on follow-up directives', () => {
     expect(prompted[0]).toContain('open the PR for the finished fix');
     expect(prompted[0]).toContain('ordinary, non-draft PR');
     expect(prompted[0]).toContain('gh pr create without --draft/-d');
+  });
+});
+
+describe('cancelled retry settlement on directive consumers (r4 verification#3)', () => {
+  const CAPS = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
+  const lane = {
+    id: 'job-cancel', kind: 'job' as const, repoPath: '/tmp/lane', repoName: 'fixture', path: '/tmp/lane',
+    branch: 'gru/job-cancel', sha: 'sha', jobId: 'job-cancel', roundId: null, status: 'active' as const,
+  };
+
+  it('a mid-wait abort on the live path reports undelivered and never lands a delivery', async () => {
+    const controller = new AbortController();
+    const prompted: string[] = [];
+    const handle = {
+      id: 'minion-live', role: 'minion' as const, sessionFile: '/sessions/live.jsonl', capabilities: CAPS,
+      prompt: async (text: string) => { prompted.push(text); },
+      subscribe: () => () => {}, dispose: async () => {},
+    };
+    let settleCalls = 0;
+    const routing = routeFixDirectiveToMinion({
+      registry: { getHandle: () => handle as never, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listAgents: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      directive: 'fix the blocker',
+      signal: controller.signal,
+      retrySettlement: () => {
+        settleCalls += 1;
+        // Pre-prompt interlock resolves immediately; the POST-prompt
+        // settlement waits — that pending wait is what cancellation must
+        // observe instead of reporting a delivery.
+        return settleCalls === 1 ? Promise.resolve('none' as const) : new Promise<'recovered'>(() => {});
+      },
+    });
+    await vi.waitFor(() => expect(prompted).toHaveLength(1));
+    controller.abort();
+    await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted' });
+    expect(settleCalls).toBe(2);
+  });
+
+  it('a mid-wait abort on the fresh-minion path reports undelivered too', async () => {
+    const controller = new AbortController();
+    const prompted: string[] = [];
+    const handle = {
+      id: 'minion-fresh', sessionFile: '/sessions/fresh.jsonl',
+      prompt: async (text: string) => { prompted.push(text); },
+      dispose: async () => {},
+    };
+    const routing = routeFixDirectiveToMinion({
+      registry: {
+        getHandle: () => null,
+        spawn: async () => handle as never,
+        disposeHandle: async () => {},
+      },
+      ledger: {
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      directive: 'fix the blocker',
+      signal: controller.signal,
+      retrySettlement: () => new Promise<'recovered'>(() => {}),
+    });
+    await vi.waitFor(() => expect(prompted).toHaveLength(1));
+    controller.abort();
+    await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted' });
+  });
+
+  it('a queued re-brief admission aborts on the service-stopping signal (r4 adversarial#5)', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    const controller = new AbortController();
+    const routing = rebriefFreshMinion({
+      registry: {
+        getHandle: () => null,
+        spawn: async () => { throw new Error('a queued re-brief must not spawn before admission'); },
+        disposeHandle: async () => {},
+      },
+      ledger: {
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      note: 'resume',
+      briefing: 'original contract',
+      signal: controller.signal,
+      workerGate: gate,
+    });
+    await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+    controller.abort();
+    await expect(routing).rejects.toThrow(/aborted/);
+    holder.release();
+    expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+  });
+
+  it('a post-prompt abort on the re-brief path rejects before any delivery is recorded', async () => {
+    const controller = new AbortController();
+    const prompted: string[] = [];
+    const handle = {
+      id: 'minion-rebrief-cancel', sessionFile: '/sessions/rebrief-cancel.jsonl',
+      prompt: async (text: string) => { prompted.push(text); },
+      dispose: async () => {},
+    };
+    const routing = rebriefFreshMinion({
+      registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      note: 'resume',
+      briefing: 'original contract',
+      signal: controller.signal,
+      retrySettlement: () => new Promise<'recovered'>(() => {}),
+    });
+    await vi.waitFor(() => expect(prompted).toHaveLength(1));
+    controller.abort();
+    await expect(routing).rejects.toThrow(/cancelled before its automatic retries settled/);
   });
 });

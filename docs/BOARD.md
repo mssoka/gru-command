@@ -132,7 +132,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   jobs render their last round quiescent — no stale blocker pills). Click
   a row to disclose lane + rounds (v3 collapse, persisted per job).
   Round rows carry per-lens chips (`○ pending` gray · `◉ live` yellow ·
-  `✓ done` green · `✕ error` red) behind a click.
+  `✓ done` green · `✕ error` red · `— not used` neutral gray, no pass mark)
+  behind a click.
 - **Crew rail:** CREW (n) / TRANSCRIPTS tabs above dense rows — a
   status dot + name + short hash (minion rows lead with the heist's
   short name: the authored `display_name` when present, otherwise a
