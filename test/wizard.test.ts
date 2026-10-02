@@ -490,6 +490,68 @@ describe('wizard CLI surface', () => {
     expect(exists.stderr).not.toContain('npx bmad-method install');
   }, 120_000);
 
+  it('noninteractive deleted recorded binding after successful onboard fails loud skip-only with the installer hint (gh-32 r1)', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-unbind-ws-');
+    const repoA = join(workspace, 'repo-a');
+    mkdirSync(join(repoA, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoA });
+    const bin = tempDir('gru-command-wizard-unbind-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    // Synthetic pinned installer (no real installer execution): the fake
+    // npx materializes the exact pinned fresh install into its --directory
+    // target (== its cwd, as the wizard invokes it).
+    writeFileSync(
+      join(bin, 'npx'),
+      [
+        '#!/usr/bin/env node',
+        "const { mkdirSync, writeFileSync } = require('node:fs');",
+        "const { join } = require('node:path');",
+        "if (process.argv.includes('--version')) { console.log('10.0.0'); process.exit(0); }",
+        "const root = process.cwd();",
+        "const manifest = ['installation:', '  version: 6.12.0', 'modules:', '  - name: core', '    version: 6.12.0', '  - name: bmm', '    version: 6.12.0', '  - name: cis', '    version: v0.3.2', '  - name: tea', '    version: v1.27.2', '  - name: gds', '    version: v0.7.2', 'ides:', '  - pi', ''].join('\\n');",
+        "for (const module of ['core','bmm','cis','tea','gds']) { mkdirSync(join(root, '_bmad', module), { recursive: true }); writeFileSync(join(root, '_bmad', module, 'marker.txt'), module + '\\n'); }",
+        "mkdirSync(join(root, '_bmad', '_config'), { recursive: true }); writeFileSync(join(root, '_bmad', '_config', 'manifest.yaml'), manifest);",
+        "for (const skill of ['bmad-build','bmad-help','gds-quick-dev']) { const dir=join(root,'.agents','skills',skill); mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,'SKILL.md'),'# skill\\n'); writeFileSync(join(dir,'workflow.md'),'{{.implementation_artifacts}}\\n'); }",
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const baseEnv = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` };
+    const answersFor = (action: 'install' | 'reuse' | 'skip') =>
+      JSON.stringify({
+        workspace_root: workspace,
+        repos: ['repo-a'],
+        bmad: { 'repo-a': action },
+        runtime: 'pi',
+        port: 0,
+        smoke: false,
+      });
+    const runWizard = (answersJson: string, home: string) =>
+      spawnSync(
+        process.execPath,
+        [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson],
+        { env: { ...baseEnv, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 60_000 },
+      );
+    // First run: a successful install records the runtime bindings.
+    const installed = runWizard(answersFor('install'), tempDir('gru-command-wizard-unbind-install-home-'));
+    expect(installed.status, installed.stderr + installed.stdout).toBe(0);
+    expect(installed.stdout).toContain('BMAD ready in repo-a');
+    expect(existsSync(join(repoA, '.gru-command', 'bmad-install.json'))).toBe(true);
+    // The recorded binding then disappears from disk — unchanged state for
+    // every later retry, so the reuse run must be skip-only deterministic.
+    rmSync(join(repoA, '.agents', 'skills', 'bmad-help'), { recursive: true, force: true });
+    const reuseHome = tempDir('gru-command-wizard-unbind-reuse-home-');
+    const failed = runWizard(answersFor('reuse'), reuseHome);
+    expect(failed.status, failed.stderr).toBe(1);
+    expect(failed.stderr).toContain('deterministic failure — retrying cannot fix it');
+    expect(failed.stderr).toContain('BMAD recorded skill binding is missing');
+    expect(failed.stderr).toContain('npx bmad-method install');
+    expect(failed.stderr).toContain('answers.bmad.repo-a="skip"');
+    expect(failed.stderr).not.toContain('Retry after fixing it');
+    expect(existsSync(join(reuseHome, 'config.toml'))).toBe(false);
+  }, 120_000);
+
   it('host validation accepts every VALID IPv6 form (Perkins r2 note)', () => {
     for (const good of ['::', '::1', 'fe80::1', 'fe80::1%en0', '1:2:3:4:5:6:7:8', '::ffff:127.0.0.1']) {
       expect(parseAnswers(JSON.stringify({ host: good })).host, good).toBe(good);

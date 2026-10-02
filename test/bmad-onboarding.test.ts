@@ -979,6 +979,151 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(driftResult.message).toContain('version drift for tea');
   });
 
+  it('already-onboarded degradation keeps the installer hint, control-file read failures stay transient, and disposable preflight output stays retryable (gh-32 r1)', () => {
+    // (1) Successful onboarding, then a DECLARED MODULE directory goes
+    // missing: the module-directory check must classify BEFORE the
+    // fingerprint refusal (which would also fire) so the official-installer
+    // repair hint is retained. Fingerprint validation itself is not
+    // weakened — it runs unchanged, after the directory check.
+    const missingModule = fixtureRepo('onboarded-missing-module');
+    const installedMissing = onboardBmadRepo(missingModule.name, 'install', {
+      workspaceRoot: missingModule.workspace,
+      answers: answers(missingModule.workspace, missingModule.name, 'install'),
+      run: successfulInstaller(missingModule.repo, []),
+    });
+    expect(installedMissing.ready, installedMissing.message).toBe(true);
+    rmSync(join(missingModule.repo, '_bmad', 'tea'), { recursive: true, force: true });
+    const missingBefore = bmadSnapshot(missingModule.repo);
+    const missingAfter = onboardBmadRepo(missingModule.name, 'reuse', {
+      workspaceRoot: missingModule.workspace,
+      answers: answers(missingModule.workspace, missingModule.name, 'reuse'),
+    });
+    expect(missingAfter.ready).toBe(false);
+    expect(missingAfter.deterministic).toBe(true);
+    expect(missingAfter.message).toContain('missing or unsafe module directory');
+    expect(missingAfter.message).not.toContain('source payload changed');
+    expect(missingAfter.repairHint).toContain('npx bmad-method install');
+    expect(bmadSnapshot(missingModule.repo)).toBe(missingBefore);
+
+    // (2) Same shape with a SYMLINKED declared module (the payload
+    // fingerprint changes too): still the deterministic module-directory
+    // class with the installer hint, not a symlink-payload refusal.
+    const linkedModule = fixtureRepo('onboarded-symlinked-module');
+    const installedLinked = onboardBmadRepo(linkedModule.name, 'install', {
+      workspaceRoot: linkedModule.workspace,
+      answers: answers(linkedModule.workspace, linkedModule.name, 'install'),
+      run: successfulInstaller(linkedModule.repo, []),
+    });
+    expect(installedLinked.ready, installedLinked.message).toBe(true);
+    const outsideModule = tempDir('gru-command-bmad-outside-module-');
+    rmSync(join(linkedModule.repo, '_bmad', 'gds'), { recursive: true, force: true });
+    symlinkSync(outsideModule, join(linkedModule.repo, '_bmad', 'gds'));
+    const linkedAfter = onboardBmadRepo(linkedModule.name, 'reuse', {
+      workspaceRoot: linkedModule.workspace,
+      answers: answers(linkedModule.workspace, linkedModule.name, 'reuse'),
+    });
+    expect(linkedAfter.ready).toBe(false);
+    expect(linkedAfter.deterministic).toBe(true);
+    expect(linkedAfter.message).toContain('missing or unsafe module directory');
+    expect(linkedAfter.repairHint).toContain('npx bmad-method install');
+
+    // (3) Successful onboarding, then a RECORDED runtime binding is
+    // deleted: the native ENOENT must become the deterministic class with
+    // installer guidance — never a futile retry offer.
+    const deletedBinding = fixtureRepo('onboarded-deleted-binding');
+    const installedBinding = onboardBmadRepo(deletedBinding.name, 'install', {
+      workspaceRoot: deletedBinding.workspace,
+      answers: answers(deletedBinding.workspace, deletedBinding.name, 'install'),
+      run: successfulInstaller(deletedBinding.repo, []),
+    });
+    expect(installedBinding.ready, installedBinding.message).toBe(true);
+    rmSync(join(deletedBinding.repo, '.agents', 'skills', 'bmad-help'), { recursive: true, force: true });
+    const deletedAfter = onboardBmadRepo(deletedBinding.name, 'reuse', {
+      workspaceRoot: deletedBinding.workspace,
+      answers: answers(deletedBinding.workspace, deletedBinding.name, 'reuse'),
+    });
+    expect(deletedAfter.ready).toBe(false);
+    expect(deletedAfter.deterministic).toBe(true);
+    expect(deletedAfter.message).toContain('BMAD recorded skill binding is missing');
+    expect(deletedAfter.repairHint).toContain('npx bmad-method install');
+
+    // (4) A VALID but UNREADABLE control file is not "malformed": the read
+    // failure stays transient, and the identical call succeeds once access
+    // recovers — retry preserves the collected answers (the same answers
+    // object drives every attempt).
+    const unreadable = fixtureRepo('control-read-recovery');
+    const installedRead = onboardBmadRepo(unreadable.name, 'install', {
+      workspaceRoot: unreadable.workspace,
+      answers: answers(unreadable.workspace, unreadable.name, 'install'),
+      run: successfulInstaller(unreadable.repo, []),
+    });
+    expect(installedRead.ready, installedRead.message).toBe(true);
+    const recordFile = join(unreadable.repo, '.gru-command', 'bmad-install.json');
+    const manifestFile = join(unreadable.repo, '.gru-command', 'worktree.toml');
+    const reuseUnreadable = () => onboardBmadRepo(unreadable.name, 'reuse', {
+      workspaceRoot: unreadable.workspace,
+      answers: answers(unreadable.workspace, unreadable.name, 'reuse'),
+    });
+    chmodSync(recordFile, 0o000);
+    const recordDenied = reuseUnreadable();
+    expect(recordDenied.ready).toBe(false);
+    expect(recordDenied.deterministic).toBeUndefined();
+    expect(recordDenied.message).not.toContain('malformed');
+    expect(recordDenied.message).toMatch(/EACCES|permission denied/i);
+    chmodSync(recordFile, 0o644);
+    const recordRecovered = reuseUnreadable();
+    expect(recordRecovered.ready, recordRecovered.message).toBe(true);
+
+    chmodSync(manifestFile, 0o000);
+    const manifestDenied = reuseUnreadable();
+    expect(manifestDenied.ready).toBe(false);
+    expect(manifestDenied.deterministic).toBeUndefined();
+    expect(manifestDenied.message).not.toContain('malformed');
+    expect(manifestDenied.message).toMatch(/EACCES|permission denied/i);
+    chmodSync(manifestFile, 0o644);
+    const manifestRecovered = reuseUnreadable();
+    expect(manifestRecovered.ready, manifestRecovered.message).toBe(true);
+
+    // (5) Disposable PREFLIGHT output that fails safety validation is still
+    // refused, but stays TRANSIENT: the stage is deleted and the repo is
+    // untouched, so the next attempt can complete (stateful synthetic
+    // installer — no real installer execution). Existing-repo unsafe
+    // bindings keep their deterministic classification above.
+    const preflight = fixtureRepo('preflight-transient');
+    mkdirSync(join(preflight.workspace, 'outside-preflight'), { recursive: true });
+    let installerCalls = 0;
+    const flaky = ((_command: string, args: string[]) => {
+      installerCalls += 1;
+      const directoryAt = args.indexOf('--directory');
+      const directory = args[directoryAt + 1] ?? preflight.repo;
+      materializeOfficialInstall(directory, '', ['pi']);
+      if (installerCalls === 1) {
+        symlinkSync(
+          join(preflight.workspace, 'outside-preflight'),
+          join(directory, '.agents', 'skills', 'evil-binding'),
+        );
+      }
+      return { status: 0, signal: null, stdout: '', stderr: '', pid: 1, output: [] };
+    }) as unknown as typeof spawnSync;
+    const refused = onboardBmadRepo(preflight.name, 'install', {
+      workspaceRoot: preflight.workspace,
+      answers: answers(preflight.workspace, preflight.name, 'install'),
+      run: flaky,
+    });
+    expect(refused.ready).toBe(false);
+    expect(refused.deterministic).toBeUndefined();
+    expect(refused.message).toContain('skill binding is a symlink');
+    expect(existsSync(join(preflight.repo, '_bmad'))).toBe(false);
+    const retried = onboardBmadRepo(preflight.name, 'install', {
+      workspaceRoot: preflight.workspace,
+      answers: answers(preflight.workspace, preflight.name, 'install'),
+      run: flaky,
+    });
+    expect(retried.ready, retried.message).toBe(true);
+    // Refused attempt: preflight stage only. Retried attempt: stage + repo.
+    expect(installerCalls).toBe(3);
+  });
+
   it('bootstraps isolated copies into a real fresh worktree and fails when a required source module disappears', async () => {
     const fixture = fixtureRepo('worktree-proof');
     const customSkill = join(fixture.repo, '.agents', 'skills', 'user-custom');

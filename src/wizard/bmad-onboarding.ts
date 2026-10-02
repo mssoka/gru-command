@@ -473,6 +473,24 @@ function runOfficialInstaller(
   }
 }
 
+/**
+ * Validate DISPOSABLE preflight output (gh-32 r1): the stage directory is
+ * deleted in `finally` and the repo is untouched, so an unsafe GENERATED
+ * binding is a transient installer-output failure — a new attempt can
+ * produce valid output — even though the safety refusal itself stands.
+ * Existing-repo validation keeps its deterministic classification.
+ */
+function preflightSkillNames(stage: string, tool: string): string[] {
+  try {
+    return runtimeSkillNames(stage, tool);
+  } catch (error) {
+    if (error instanceof BmadDeterministicSetupError) {
+      throw new Error(`official BMAD preflight produced an unsafe skill binding: ${(error as Error).message}`);
+    }
+    throw error;
+  }
+}
+
 function installFresh(
   repoPath: string,
   tools: readonly string[],
@@ -493,7 +511,7 @@ function installFresh(
     if (staged === null) throw new Error('official BMAD preflight wrote no manifest');
     expectedFreshModules(staged.summary);
     for (const tool of tools) {
-      const generated = runtimeSkillNames(stage, tool);
+      const generated = preflightSkillNames(stage, tool);
       const collisions = generated.filter((name) => beforeSkills[tool]?.includes(name));
       if (collisions.length > 0) {
         throw new Error(
@@ -603,9 +621,28 @@ function validatedSkillPath(repoPath: string, tool: string, skill: string): stri
   const root = runtimeSkillsRoot(repoPath, tool);
   const path = join(root, skill);
   assertNoSymlinkComponents(repoPath, relative(repoPath, path));
-  const realRepo = realpathSync(repoPath);
-  const realRoot = realpathSync(root);
-  const realSkill = realpathSync(path);
+  let realRepo: string;
+  let realRoot: string;
+  let realSkill: string;
+  try {
+    realRepo = realpathSync(repoPath);
+    realRoot = realpathSync(root);
+    realSkill = realpathSync(path);
+  } catch (error) {
+    // A MISSING recorded binding/root (ENOENT/ENOTDIR) is unchanged
+    // on-disk state (gh-32 r1): a retry re-runs the identical check and
+    // fails identically, so it is deterministic with the installer repair
+    // path. Other I/O failures (EACCES, …) stay plain errors — permissions
+    // can recover between attempts, so retry stays available.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' ||
+        (error as NodeJS.ErrnoException).code === 'ENOTDIR') {
+      throw new BmadDeterministicSetupError(
+        `BMAD recorded skill binding is missing: ${path}`,
+        INSTALLER_REPAIR_HINT,
+      );
+    }
+    throw error;
+  }
   if (!insideOrEqual(realRepo, realRoot) || !insideOrEqual(realRoot, realSkill) ||
       !lstatSync(path).isDirectory()) {
     throw new BmadDeterministicSetupError(`unsafe BMAD recorded skill path: ${path}`);
@@ -904,9 +941,13 @@ function assertControlFilesSafe(repoPath: string): void {
   }
   const recordPath = join(repoPath, RECORD_PATH);
   if (existsSync(recordPath)) {
+    // Read OUTSIDE the parse catch (gh-32 r1): a read/IO failure is
+    // recoverable (permissions can change between attempts) and stays a
+    // plain transient error; only UNPARSEABLE content is deterministic.
+    const recordText = readFileSync(recordPath, 'utf-8');
     let managedBy: unknown;
     try {
-      managedBy = (JSON.parse(readFileSync(recordPath, 'utf-8')) as { managed_by?: unknown }).managed_by;
+      managedBy = (JSON.parse(recordText) as { managed_by?: unknown }).managed_by;
     } catch {
       throw new BmadDeterministicSetupError(`existing BMAD record is malformed: ${recordPath}`);
     }
@@ -920,8 +961,11 @@ function assertControlFilesSafe(repoPath: string): void {
   }
   const manifestPath = join(repoPath, WORKTREE_MANIFEST_PATH);
   if (existsSync(manifestPath)) {
+    // Same split as the record above (gh-32 r1): read outside the parse
+    // catch so a denied read stays transient, never "malformed".
+    const manifestText = readFileSync(manifestPath, 'utf-8');
     try {
-      parse(readFileSync(manifestPath, 'utf-8'));
+      parse(manifestText);
     } catch (error) {
       throw new BmadDeterministicSetupError(
         `existing worktree manifest is malformed: ${manifestPath}: ${String(error)}`,
@@ -1025,6 +1069,13 @@ export function onboardBmadRepo(
         assertNoPartialInstall(repoPath);
         throw new BmadDeterministicSetupError('reuse requested but no existing BMAD manifest was found');
       }
+      // Validate the declared module directories BEFORE any record or
+      // fingerprint work (gh-32 r1): an already-onboarded repo whose
+      // declared module directory went missing/symlinked/escaping must be
+      // classified with the official-installer repair hint even when the
+      // payload fingerprint would also mismatch. Fingerprint validation is
+      // NOT weakened — it runs unchanged, just after the directory check.
+      verifyModuleDirectories(repoPath, existing.summary);
       let recordedSkills: RuntimeSkillMap | undefined;
       const priorRecord = join(repoPath, RECORD_PATH);
       if (existsSync(priorRecord)) {
@@ -1062,7 +1113,8 @@ export function onboardBmadRepo(
       }
       const runtimeSkills = recordedSkills ?? observedBmadSkills(repoPath, existing.summary.tools);
       installed = { ...existing, runtimeSkills };
-      verifyModuleDirectories(repoPath, installed.summary);
+      // Module directories were already validated above, before the
+      // fingerprint refusal; installed.summary === existing.summary here.
       verifySkills(repoPath, installed.summary.tools);
       verifyNoAmbiguousSkillConfig(
         repoPath,

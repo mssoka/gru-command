@@ -309,6 +309,84 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(existsSync(join(repoA, '.gru-command', 'bmad-install.json'))).toBe(true);
   }, 120_000);
 
+  it('already-onboarded deleted runtime binding is skip-only deterministic; retry is never offered (gh-32 r1)', () => {
+    const workspace = tempDir('gru-command-pty-unbind-ws-');
+    const repoA = join(workspace, 'repo-a');
+    mkdirSync(join(repoA, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoA });
+    const bin = tempDir('gru-command-pty-unbind-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    // Synthetic pinned installer (no real installer execution).
+    writeFileSync(
+      join(bin, 'npx'),
+      [
+        '#!/usr/bin/env node',
+        "const { mkdirSync, writeFileSync } = require('node:fs');",
+        "const { join } = require('node:path');",
+        "if (process.argv.includes('--version')) { console.log('10.0.0'); process.exit(0); }",
+        "const root = process.cwd();",
+        "const manifest = ['installation:', '  version: 6.12.0', 'modules:', '  - name: core', '    version: 6.12.0', '  - name: bmm', '    version: 6.12.0', '  - name: cis', '    version: v0.3.2', '  - name: tea', '    version: v1.27.2', '  - name: gds', '    version: v0.7.2', 'ides:', '  - pi', ''].join('\\n');",
+        "for (const module of ['core','bmm','cis','tea','gds']) { mkdirSync(join(root, '_bmad', module), { recursive: true }); writeFileSync(join(root, '_bmad', module, 'marker.txt'), module + '\\n'); }",
+        "mkdirSync(join(root, '_bmad', '_config'), { recursive: true }); writeFileSync(join(root, '_bmad', '_config', 'manifest.yaml'), manifest);",
+        "for (const skill of ['bmad-build','bmad-help','gds-quick-dev']) { const dir=join(root,'.agents','skills',skill); mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,'SKILL.md'),'# skill\\n'); writeFileSync(join(dir,'workflow.md'),'{{.implementation_artifacts}}\\n'); }",
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const ptyEnv = { GRU_COMMAND_HOME: tempDir('gru-command-pty-unbind-home-'), PATH: `${bin}:${process.env.PATH ?? ''}` };
+    // First run: a successful install records the runtime bindings.
+    const first = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '1' },
+        { expect: BMAD_A_PROMPT, send: '' }, // default = install (fresh repo)
+        { expect: RUNTIME_PROMPT, send: 'pi' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: '' },
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+      ],
+      ptyEnv,
+    );
+    expect(first.status, first.output).toBe(0);
+    expect(first.output).toContain('BMAD ready in repo-a');
+    expect(existsSync(join(repoA, '.gru-command', 'bmad-install.json'))).toBe(true);
+    // The recorded binding then disappears — unchanged on-disk state.
+    rmSync(join(repoA, '.agents', 'skills', 'bmad-help'), { recursive: true, force: true });
+    const reuseHome = tempDir('gru-command-pty-unbind-home2-');
+    const second = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '1' },
+        { expect: BMAD_A_PROMPT, send: 'reuse' },
+        { expect: RUNTIME_PROMPT, send: 'pi' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: '' },
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+        { expect: 'Skip this repo? [skip]:', send: '' }, // Enter = skip
+      ],
+      { GRU_COMMAND_HOME: reuseHome, PATH: `${bin}:${process.env.PATH ?? ''}` },
+    );
+    expect(second.status, second.output).toBe(0);
+    expect(second.output).toContain('deterministic — retrying cannot fix it');
+    expect(second.output).toContain('BMAD recorded skill binding is missing');
+    expect(second.output).toContain('npx bmad-method install');
+    expect(second.output).not.toContain('Retry or skip this repo?');
+    expect(second.output).toContain('BMAD not ready in repo-a: skipped by explicit per-repo choice');
+    // The collected answers survived the failure loop: setup completes with
+    // the same workspace answer and writes the fresh instance's config.
+    expect(second.output).toContain('Setup complete');
+    const config = readFileSync(join(reuseHome, 'config.toml'), 'utf-8');
+    expect(config).toContain(`workspace_root = "${workspace}"`);
+  }, 120_000);
+
   it('every prompt loop retries on invalid input, then accepts the valid answer', () => {
     const workspace = fixtureWorkspace();
     const instance = tempDir('gru-command-pty-home2-');
