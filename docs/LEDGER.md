@@ -249,16 +249,18 @@ turn stays owned and tracked by the existing dispatch server instance
 (no detached helper, no second chief); late errors surface durably.
 `GET /api/silas/directives/{request_id}` is the authenticated readback
 of the same request. Same id + same canonical payload replays to the
-SAME row; same id + different payload is a 409 conflict; a caller
-without an id fails closed (409 `ambiguous_repeat`) while another
-request for the job is live. Boot reconciliation
+SAME row; same id + different payload is a 409 conflict. The lane is
+single-writer: while ANY live request exists for the job, ANY different
+request id — identified or not — fails closed (409 `ambiguous_repeat`)
+with the live request NAMED; only a replay of that same id proceeds, so
+a fresh id can never start a second concurrent turn. Boot reconciliation
 (`reconcilePendingDirectives` in the existing recovery coordinator)
 completes a request from its own correlated evidence when it exists —
 admission first, then the terminal receipt — and otherwise posts ONE
 bounded, stable-kind action-required escalation naming the request: no
 automatic retry, no fabricated delivery, no fresh alert ids to bypass
 dedupe. A settled/failed request id never re-runs; recovered capacity is
-not permission. The identity-less duplicate guard and the boot pass
+not permission. The live-request duplicate guard and the boot pass
 both query the LIVE states directly, and the boot pass pages by
 `request_id` cursor — terminal history can never crowd a live request
 out of examination.

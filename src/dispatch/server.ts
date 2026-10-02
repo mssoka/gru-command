@@ -349,8 +349,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // Durable intent BEFORE any prompt/spawn side effect (the PR133
       // timeout window: the old flow awaited the whole model turn before
       // recording anything). A retry of the same request id replays to the
-      // same row; without an id, a repeat while another request for the
-      // job is live fails CLOSED — never a silent duplicate turn.
+      // same row; any different request id while one is live fails CLOSED
+      // with the live request named — never a second concurrent turn.
       let begun;
       try {
         begun = options.ledger.beginDirectiveIntent({

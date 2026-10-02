@@ -23,9 +23,11 @@
  *
  * Idempotency identity is the caller's stable `request_id`: the same id
  * with the same canonical payload replays to the SAME row; the same id
- * with a different payload is a CONFLICT, not a new request. Callers
- * that cannot supply an id fail CLOSED on an ambiguous repeat while
- * another request for the job is live — they never silently duplicate.
+ * with a different payload is a CONFLICT, not a new request. The lane is
+ * single-writer: while ANY live request exists for the job, ANY different
+ * request id (identified or not) fails CLOSED with the live request named
+ * — only a replay of that same id proceeds, so a fresh id never starts a
+ * second concurrent turn.
  */
 
 export const DIRECTIVE_STATES = ['dispatching', 'admitted', 'settled', 'failed'] as const;

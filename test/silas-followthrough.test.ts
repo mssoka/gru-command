@@ -78,10 +78,24 @@ function silasActsViaHttp(input: {
   }) => void;
 }) {
   return async (prompt: string): Promise<void> => {
-    const jsonStart = prompt.indexOf('```json');
-    const jsonEnd = prompt.indexOf('```', jsonStart + 7);
-    if (jsonStart < 0 || jsonEnd < 0) throw new Error('wake prompt carries no digest');
-    const digest = JSON.parse(prompt.slice(jsonStart + 7, jsonEnd)) as DigestView;
+    // The digest is the JSON block under the '## Digest' heading. The wake
+    // prompt may carry OTHER ```json fences (e.g. the ops skill's
+    // completion_handoff example), so locate the digest by its heading
+    // first — then take the next fenced block — and require the expected
+    // digest keys; never assume the digest is the prompt's first fence.
+    const heading = prompt.indexOf('## Digest');
+    const jsonStart = heading < 0 ? -1 : prompt.indexOf('```json', heading);
+    const jsonEnd = jsonStart < 0 ? -1 : prompt.indexOf('```', jsonStart + 7);
+    if (jsonStart < 0 || jsonEnd < 0) throw new Error('wake prompt carries no digest block');
+    const parsed = JSON.parse(prompt.slice(jsonStart + 7, jsonEnd)) as unknown;
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      !Array.isArray((parsed as { deliveredWithoutPr?: unknown }).deliveredWithoutPr)
+    ) {
+      throw new Error('wake prompt digest block is not the actionable digest');
+    }
+    const digest = parsed as DigestView;
     const base = `http://127.0.0.1:${input.port()}`;
     const auth = { authorization: `Bearer ${input.token}`, 'content-type': 'application/json' };
     const post = async (

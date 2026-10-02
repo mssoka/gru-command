@@ -149,9 +149,10 @@ answer is `409` with `{"error":"branch_busy","blockers":[...]}`:
      The call answers **202** with the stable `request_id` once the durable
      intent is accepted — accepted is not admitted; read the durable state
      back with `GET /api/silas/directives/{request_id}`. Retry only with the
-     SAME `request_id`; an identity-less repeat fails closed while another
-     request for the job is live, and a request that is still
-     `dispatching`/`admitted` must never get a second turn.
+     SAME `request_id`: while ANY request for the job is live, a different
+     request id (or an identity-less repeat) is refused with the live
+     request named, and a request that is still `dispatching`/`admitted`
+     must never get a second turn.
      A NEW blocker gets this rung too — it is the first fix directive, and
      without it the lane can never re-open. The service routes the
      directive to the live minion (or a fresh one on the lane), flips the

@@ -113,22 +113,32 @@ describe('directive requests — durable ledger contract', () => {
     ).toThrow(/terminal lanes/u);
   });
 
-  it('fails CLOSED for identity-less callers while another request for the job is live', () => {
+  it('fails CLOSED while a live request exists — identity-less AND a fresh different id (named)', () => {
     const api = new LedgerApi(new LedgerDb(tmpDir()).handle, { bus: new EventBus() });
     api.addJob({ id: 'job-d2', repo: 'r', title: 'Job D2' });
     api.setJobStatus('job-d2', 'working');
     const first = api.beginDirectiveIntent({ jobId: 'job-d2', directive: 'first', holder: 'silas-ops' }).record;
     expect(first.requestId).toBeTruthy(); // minted identity for a one-off caller
+    // Identity-less repeat: refused.
     expect(() =>
       api.beginDirectiveIntent({ jobId: 'job-d2', directive: 'first', holder: 'silas-ops' }),
     ).toThrow(AmbiguousDirectiveError);
+    // A FRESH, never-seen request id: also refused, naming the live request
+    // — a new id must never start a second concurrent turn on the lane.
+    expect(() =>
+      api.beginDirectiveIntent({ jobId: 'job-d2', directive: 'fresh attempt', holder: 'silas-ops', requestId: 'req-fresh-1' }),
+    ).toThrow(new RegExp(`${first.requestId}.*dispatching`, 'su'));
+    // A replay of the LIVE id itself still proceeds (it is the same request).
+    expect(
+      api.beginDirectiveIntent({ jobId: 'job-d2', directive: 'first', holder: 'silas-ops', requestId: first.requestId }).created,
+    ).toBe(false);
     // A DIFFERENT job is not ambiguous.
     api.addJob({ id: 'job-d2b', repo: 'r', title: 'Job D2b' });
     api.setJobStatus('job-d2b', 'working');
     expect(() => api.beginDirectiveIntent({ jobId: 'job-d2b', directive: 'other', holder: 'silas-ops' })).not.toThrow();
   });
 
-  it('the identity-less guard sees a live request sorting past a long settled history (B1)', () => {
+  it('the live-request guard sees a live request sorting past a long settled history (B1)', () => {
     const api = new LedgerApi(new LedgerDb(tmpDir()).handle, { bus: new EventBus() });
     api.addJob({ id: 'job-d5', repo: 'r', title: 'Job D5' });
     api.setJobStatus('job-d5', 'working');
@@ -139,11 +149,15 @@ describe('directive requests — durable ledger contract', () => {
     }
     const live = api.beginDirectiveIntent({ jobId: 'job-d5', directive: 'live work', holder: 'silas-ops', requestId: 'req-zzzz-live' }).record;
     expect(live.state).toBe('dispatching');
-    // The live request is past the old page, but the repeat must still fail
-    // closed — a second live request would mean a second implementing turn.
+    // The live request is past the old page, but a repeat — identified or
+    // not — must still fail closed: a second live request would mean a
+    // second implementing turn.
     expect(() => api.beginDirectiveIntent({ jobId: 'job-d5', directive: 'repeat', holder: 'silas-ops' })).toThrow(
       AmbiguousDirectiveError,
     );
+    expect(() =>
+      api.beginDirectiveIntent({ jobId: 'job-d5', directive: 'repeat', holder: 'silas-ops', requestId: 'req-zzzz-fresh' }),
+    ).toThrow(/req-zzzz-live/u);
   });
 
   it('admission binds only to a correlated REAL event; delivery requires admitted + correlated + post-admission', () => {
@@ -322,11 +336,14 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
     const dir = tmpDir();
     {
       const { ledger } = boot(dir);
-      ledger.addJob({ id: 'job-b1p', repo: 'r', title: 'Job B1p' });
-      ledger.setJobStatus('job-b1p', 'working');
+      // 201 live requests across 201 jobs (the single-writer guard forbids
+      // many live requests on ONE lane; the pager must still walk the whole
+      // live set by request_id cursor, never a fixed first page).
       for (let i = 0; i < 201; i += 1) {
+        ledger.addJob({ id: `job-b1p-${String(i).padStart(4, '0')}`, repo: 'r', title: `Job B1p ${i}` });
+        ledger.setJobStatus(`job-b1p-${String(i).padStart(4, '0')}`, 'working');
         ledger.beginDirectiveIntent({
-          jobId: 'job-b1p',
+          jobId: `job-b1p-${String(i).padStart(4, '0')}`,
           directive: `live ${i}`,
           holder: 'silas-ops',
           requestId: `req-live-${String(i).padStart(4, '0')}`,
@@ -536,7 +553,7 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     }
   });
 
-  it('fails CLOSED (409) for an identity-less repeat while a live request exists', async () => {
+  it('fails CLOSED (409) for any repeat while a live request exists — identity-less or fresh id, live request named', async () => {
     const h = await bootServer();
     try {
       let release!: () => void;
@@ -545,13 +562,23 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
       });
       const first = await post(h.port, { job_id: 'job-h1', directive: 'audit' });
       expect(first.status).toBe(202);
-      expect(typeof first.body['request_id']).toBe('string');
+      const firstId = first.body['request_id'] as string;
+      expect(typeof firstId).toBe('string');
       const repeat = await post(h.port, { job_id: 'job-h1', directive: 'audit' });
       expect(repeat.status).toBe(409);
       expect(repeat.body['error']).toBe('ambiguous_repeat');
+      // A fresh request id is equally refused, naming the live request: no
+      // second concurrent turn on the lane, ever.
+      const fresh = await post(h.port, { job_id: 'job-h1', directive: 'audit again', request_id: 'req-http-fresh' });
+      expect(fresh.status).toBe(409);
+      expect(fresh.body['error']).toBe('ambiguous_repeat');
+      expect(String(fresh.body['detail'])).toContain(firstId);
       expect(h.registry.prompts).toHaveLength(1);
       release();
-      await until(() => (h.ledger.getDirective(first.body['request_id'] as string)?.state === 'settled' ? true : null));
+      await until(() => (h.ledger.getDirective(firstId)?.state === 'settled' ? true : null));
+      // Once settled, a NEW directive for the job proceeds (fresh id).
+      const afterSettled = await post(h.port, { job_id: 'job-h1', directive: 'next phase', request_id: 'req-http-next' });
+      expect(afterSettled.status).toBe(202);
     } finally {
       await h.close();
     }

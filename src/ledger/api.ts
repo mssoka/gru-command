@@ -234,9 +234,10 @@ export class DirectiveConflictError extends Error {
   }
 }
 
-/** A caller without an idempotency identity repeated a directive while
- * another request for the job is live. Fail closed — the caller must
- * identify its retries, not duplicate the turn. */
+/** A directive repeat arrived while another request for the job is live.
+ * The lane is single-writer: ANY different request id (identified or not)
+ * fails closed with the live request named — only a replay of that same id
+ * proceeds, so a fresh id never starts a second concurrent turn. */
 export class AmbiguousDirectiveError extends Error {
   constructor(message: string) {
     super(message);
@@ -1826,8 +1827,10 @@ export class LedgerApi {
    *
    * - No authority ⇒ non-executable (attention-only).
    * - `accepted-operation` ⇒ the named directive request must exist,
-   *   belong to this job and generation, and be actually admitted or
-   *   settled — accepted, not merely typed.
+   *   belong to this job, and be actually admitted or settled — accepted,
+   *   not merely typed. The authority's `version` field is caller-supplied
+   *   provenance TEXT and is not independently validated here; only the
+   *   durable directive request grounds executability.
    * - `chief-ruling`/`owner-ruling` ⇒ a `ruling.recorded` event with the
    *   exact ref and version must exist on this job; prose or a path is
    *   never proof. */
@@ -1849,7 +1852,12 @@ export class LedgerApi {
       if (directive.state !== 'admitted' && directive.state !== 'settled') {
         return { executable: false, reason: `accepted operation "${authority.operationId}" is ${directive.state} — accepted admission required` };
       }
-      return { executable: true, reason: `operation ${authority.operationId} v${authority.version} is durably admitted` };
+      return {
+        executable: true,
+        reason:
+          `operation ${authority.operationId} is durably admitted; the authority's version field ` +
+          `"${authority.version}" is caller-supplied provenance, not independently validated`,
+      };
     }
     // A ruling is valid while SOME durably recorded ruling event carries
     // its exact ref+version — later unrelated rulings must not shadow an
@@ -2997,9 +3005,10 @@ export class LedgerApi {
    * durable REPLAY of an existing request: the caller must NOT start
    * another turn — only the creating call ever owns side effects. Same
    * request id + same canonical payload replays to the SAME row; same id
-   * + different payload is a conflict. A caller without an identity
-   * (`requestId` omitted) that repeats while another request for the job
-   * is live fails CLOSED — never a silent duplicate turn. When the
+   * + different payload is a conflict. While ANY live request exists for
+   * the job, ANY different request id (identified or not) fails CLOSED
+   * with the live request named — the lane is single-writer, so a fresh
+   * id never starts a second concurrent turn. When the
    * request carries an explicit completion intent (`handoff`), the
    * phase-handoff guard row is persisted in the SAME transaction — before
    * any side effect — and a live REPLAY may attach the intent to the
@@ -3051,20 +3060,25 @@ export class LedgerApi {
           return { record: existing, created: false }; // durable replay — the accepted request, unchanged
         }
       }
-      // Fail CLOSED for identity-less callers while ANY live request for
-      // the job exists. Query the LIVE states directly (a bounded page
-      // ordered by request_id cannot be the live set: the table is
-      // append-only, so terminal rows would crowd live ones past the
-      // page forever).
+      // Fail CLOSED while ANY live request for the job exists: the lane is
+      // single-writer, so a DIFFERENT request id must never start a second
+      // concurrent turn (never reopen the PR133 window with a fresh id).
+      // A replay of the live request itself already returned above; the
+      // refusal always NAMES the live request so the caller can retry with
+      // the same id, wait, or reconcile. Query the LIVE states directly
+      // (a bounded page ordered by request_id cannot be the live set: the
+      // table is append-only, so terminal rows would crowd live ones past
+      // the page forever).
       const live = this.listPendingDirectives({
         jobId: input.jobId,
         states: LIVE_DIRECTIVE_STATES,
         limit: 1,
       })[0];
-      if (live !== undefined && input.requestId === undefined) {
+      if (live !== undefined) {
         throw new AmbiguousDirectiveError(
-          `a directive for job "${input.jobId}" is already live (request ${live.requestId}, state ${live.state}) ` +
-            'and this caller supplied no request id — identify retries with a stable request_id or reconcile the live request first',
+          `a directive for job "${input.jobId}" is already live (request ${live.requestId}, state ${live.state}) — ` +
+            'retry with that SAME request_id, wait for it to settle, or reconcile it first; ' +
+            'a different request id never starts a second concurrent turn on the lane',
         );
       }
       const requestId = input.requestId ?? randomUUID();
