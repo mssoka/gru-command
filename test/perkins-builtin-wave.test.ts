@@ -39,6 +39,7 @@ function settleLane(ledger: LedgerApi, jobId: string): void {
 
 
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
+import type { WorktreeBaseSource } from '../src/ledger/api.js';
 import type { AgentSpawner } from '../src/dispatch/service.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import { EventBus } from '../src/events/bus.js';
@@ -59,6 +60,13 @@ class DeferredReviewPort implements WorktreePort {
 
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
     return this.delegate.createJobWorktree(input);
+  }
+
+  async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
+    readonly sha: string;
+    readonly baseSource: WorktreeBaseSource | null;
+  }> {
+    return this.delegate.resolveReviewTarget(input);
   }
 
   async createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): Promise<WorktreeLane> {
@@ -1617,6 +1625,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // recovery through the same port interface.
     const crashTimePort: WorktreePort = {
       createJobWorktree: (input) => port.createJobWorktree(input),
+      resolveReviewTarget: (input) => port.resolveReviewTarget(input),
       createReviewWorktree: (input) => port.createReviewWorktree(input),
       getWorktree: (id) => port.getWorktree(id),
       listWorktrees: (listOpts) => port.listWorktrees(listOpts).map((lane) =>
