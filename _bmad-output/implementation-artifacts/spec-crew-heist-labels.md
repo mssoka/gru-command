@@ -193,3 +193,56 @@ Severities below are assigned by triage, not by the reviewing layers.
 Repairs landed as source/test commits on this branch; the scheduler `full`
 gate, exact-head CI and the fresh native Perkins round below run at the
 repaired head.
+
+## r6 INCOMPLETE and evidence repair — 2026-10-02
+
+r6 (target `3398b43c14ca695c58291cbb612495c31adf594b`) returned INCOMPLETE:
+the confined lead could read neither the owner's reference upload nor the
+vision-skill route (both outside its immutable review directory), the frozen
+specification carried only an older head's Linux CI receipt, and the edge and
+acceptance specialists exceeded their 600000 ms turn budgets. Every failed
+attempt and finding remains preserved under the host review artifact root; no
+timed-out specialist is counted as coverage and no finding was erased.
+
+This round repaired the evidence path against the two modalities the confined
+review actually has — the frozen specification (ledger-backed scheduler
+receipts appended at arm time) and the frozen worktree (tracked files read by
+the run's image-capable read tool):
+
+- **Visual evidence now rides the frozen tree.** The isolated mock fixture
+  gained one working lane whose authored name is longer than the 24-grapheme
+  bound and mixes Unicode with `<script>`/quote characters; the new
+  `crew-rail` Playwright project asserts the short authored row, the bounded
+  Unicode row, retained role/state subtext and pill, the full title/id in the
+  tooltip and accessible name, no primary `minion` prefix and no horizontal
+  overflow, then captures desktop/phone light/dark. Pixel reads of every
+  capture come from the explicit vision route (`zai-coding-cn/glm-5.3-flash`
+  via headless pi); captures, vision reports, hashes, commands and
+  limitations are committed under
+  `_bmad-output/implementation-artifacts/crew-heist-labels-evidence/`.
+- **The owner's private reference upload is not published.** It stays
+  host-side (owner material); the frozen briefing already carries its
+  description and the evidence README records the limitation. The
+  acceptance comparison is against the current render, which the pack
+  supplies as pixels.
+- **Linux CI receipts are committed with their exact relationship stated.**
+  A receipt cannot be a file of the commit it describes (writing it moves the
+  head), so the evidence pack carries the run receipt for the reviewed code
+  commit plus the explicit evidence-only delta map to the frozen head, and
+  the frozen head's own merge-result run is recorded on the PR. The
+  scheduler `full` run at the frozen head is appended to the specification by
+  the host because it is bound to that exact SHA.
+- **The r6 architecture note was fixed proportionately.**
+  `web/src/ui/board.ts:minionSuffixes` now buckets long IDs by their
+  four-grapheme tail and scans only genuinely colliding buckets; values,
+  row-order independence and short-ID behavior are unchanged, and a
+  large-history regression pins lone tails, the 4→5→6 collision ladder,
+  short IDs and reversal stability. No unrelated refactor rode along.
+- **Second main integration.** `origin/main` `a2315ae` (PR #132
+  provider-recovery sensor, PR #134 board-merged-attention) merged with an
+  ordinary history-preserving merge; conflicts (silas-driver interface,
+  migration numbering, suite-shape pins) resolved semantically with both
+  sides kept. The never-applied `job-display-name` migration renumbers
+  10 → 11 (`docs/LEDGER.md`, spec and test comments updated); the
+  registered source checkout and sibling lanes were not touched.
+
