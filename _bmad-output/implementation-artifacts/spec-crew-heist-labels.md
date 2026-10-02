@@ -3,7 +3,7 @@ title: 'Short heist names on minion cards'
 type: 'feature'
 created: '2026-09-24'
 status: 'in-review'
-baseline_commit: 'c54bfbf89727bacfd27a27db65a9fab681c19c3e'
+baseline_commit: '059c076290145d4aae6e0b47c7b3f87156862c43'
 route: 'dispatch'
 review_loop_iteration: 1
 context: []
@@ -143,3 +143,53 @@ r5 returned NEEDS CHANGES at `71935f8acc034f224ad909f80d67defd06937aa6` (base `c
   via `/api/verify`, exact-head Linux CI, fresh native Perkins review of
   the exact published head.
 
+## Review Triage Log — fresh bmad-build layers, 2026-10-02
+
+Fresh independent reviewer contexts (isolated one-shot `pi -p` sessions,
+model `deepseek/deepseek-flash` matching the implementer route, cwd = this
+lane; raw findings and full session transcripts preserved under
+`_bmad-output/implementation-artifacts/reviewers-1437840/`). Content under
+review: the unified diff `origin/main 059c076 → 1437840`, staged as
+`review-crew-heist-labels-finaldiff-1437840.patch` (122069 bytes, sha256
+`5339187d908d982e50c4c7ade99a3b6324345b619c57d0660e2efd40be81fce4`).
+`baseline_commit` was corrected to `059c076` (the PR's current merge base)
+because the previous value predated the 2026-10-02 main integrations.
+Severities below are assigned by triage, not by the reviewing layers.
+
+| Layer | Session id | Findings |
+| --- | --- | --- |
+| Blind Hunter | `01a0fd0e-4f72-7130-8937-d77e48778bbf` | 18 |
+| Edge Case Hunter | `01a0fd0e-4fe7-77f7-a1c3-543827ce7609` | 4 |
+| Verification Gap Reviewer | `01a0fd0e-4eff-7260-845d-2b0dc27c54e8` | 1 |
+
+### Findings, verdicts, dispositions
+
+| # | Finding (layer) | Verdict | Evidence / disposition |
+| --- | --- | --- | --- |
+| 1 | `POST /api/jobs` ignores `display_name` (blind) | false | Authoring surface is the dispatch handoff per frozen intent; `/api/jobs` is documented as-is (`docs/BOARD.md`), dispatch authoring is documented (`docs/FLOW.md`, `docs/LEDGER.md`). No defect. |
+| 2 | No in-repo producer sends `display_name` (blind) | false | The optional field extends the dispatch API for the dispatcher's own handoff payload; intent required acceptance, not an in-repo sender. No defect. |
+| 3 | Protocol comment over-claims a full ledger-rule mirror (blind) | low | Fixed: comment now names the visibility rule and records the deliberate omission of the 100-unit length ceiling (adding the ceiling here would reject whole snapshots for one long name). Comment-only. |
+| 4 | One malformed `displayName` rejects the whole snapshot (blind) | false | Deliberate, documented, tested strict contract for malformed present blocks, consistent with the surrounding build/silas/verify blocks and the repo's fail-loud boundary style; unreachable from validated writers and from legacy rows (`display_name` exists only from migration 10). No defect. |
+| 5 | `JOB_DISPLAY_NAME_MAX_LENGTH` doc math/units wrong (blind) | low | Fixed: comment now states 100 UTF-16 code units; value unchanged (tests pin it; intent requires a bound, not a grapheme count). Comment-only. |
+| 6 | Raw authored name never surfaced (blind) | false | Lowercase display is the approved presentation; full title + id stay in tooltip/aria; normalization is documented in Design Notes. No defect. |
+| 7 | Unlinked minions lose their ledger `label` (blind; edge #4) | false | Frozen I/O matrix: unlinked → `unassigned` + suffix; deliberate and tested (`web/src/ui/board.test.ts`, label→unassigned case). No defect. |
+| 8 | Invisible-only `displayName` degrades to `unassigned` though a title exists (blind) | false | The ledger refuses the write and the protocol mirror rejects an invisible-only value before render; the renderer fallback is defense-in-depth for direct calls and is deliberate + tested. No defect. |
+| 9 | Invisible graphemes inside a word join letters (blind) | low | Rejected: zero-width separator characters are rare copy-paste casualties, the display stays readable, and normalizing them would add a behavior branch for no acceptance gain. |
+| 10 | Single over-long word is hard-cut, no test (blind) | low | Fixed-by-test: new DOM case pins the 24-grapheme grapheme-safe cut; multi-word names still cut at word boundaries (a single word has none). Test-only. |
+| 11 | Same-heist workers indistinguishable in transcript titles (blind) | low | Fixed: the opened transcript label now carries the rail suffix (`wake alerts · dec9`), matching the rail row's disambiguation; DOM test updated. |
+| 12 | E2E uses short ASCII names only; no overflow assertion (blind) | low | Deferred (deferred-work.md): recorded layout acceptance is the four human-inspected light/dark desktop+phone captures; the lane's only declared scheduler scope (`full` = `npm test`) does not run Playwright, so e2e assertions cannot be validated here. |
+| 13 | Mobile full identity only via `title` (touch ignores it) (blind) | low | Rejected: the tooltip is the approved surface, the aria-label carries the full identity, and a tap-popover is a new interaction beyond intent. |
+| 14 | Binding-failure dispose masks the original error (blind; edge #2) | low | Fixed: the dispose rejection is logged and the actionable binding error is rethrown (mirrors the stale-result path); test now makes dispose reject and asserts the rung reports the binding error. |
+| 15 | Migration guard compares ids only (blind; edge #1) | low | Fixed: a recorded name that differs from code now fails loud with the mismatch named, closing the renumber/reuse blind spot this integration's 9→10 renumber exposed; ledger-db test simulates the pre-renumber DB. |
+| 16 | Dispatch service forwards a blank `displayName` to the strict ledger (blind) | false | Ledger strictness (blank = error) and HTTP tolerance (blank = absent) are both the documented, intended layering; each boundary is pinned by tests. No defect. |
+| 17 | "Extend only colliding suffixes" untested with a mixed group (blind) | low | Fixed-by-test: the collision fixture now includes a non-colliding peer on the same heist and asserts it keeps exactly four characters. Test-only. |
+| 18 | `registerAgent` review-role protection is a hardcoded pair (blind) | false | The pair is the only review role the runtime can produce and is explicitly tested (`preserves the review-worker role…`); data-driven generality is speculative. No defect. |
+| 19 | Applied-migration rename/reuse hazard (edge #1) | low | Fixed with #15 (same root cause). |
+| 20 | Binding-failure dispose path (edge #2) | low | Fixed with #14 (same root cause). |
+| 21 | G1 test relies on earlier suite sections (FK on `agents.job_id`) (edge #3) | low | Fixed: the implementer-list test self-seeds its job so focused runs no longer depend on earlier sections. Test-only. |
+| 22 | Unlinked minion label no longer rendered (edge #4) | false | Duplicate of #7; same disposition. |
+| 23 | Re-brief reviewer exclusion not observed by any test (verification gap) | medium | Fixed: the rebrief test now registers a round-bound live review-only handle and asserts it is absent from `disposedHandles` while the prior implementer is retired. Test-only. |
+
+Repairs landed as source/test commits on this branch; the scheduler `full`
+gate, exact-head CI and the fresh native Perkins round below run at the
+repaired head.
