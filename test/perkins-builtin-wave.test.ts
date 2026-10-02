@@ -1,3 +1,4 @@
+import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -2387,6 +2388,13 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
   async function makeProductionGateHarness(options: {
     findingToWrite: readonly Record<string, string>[];
     skillContent?: string;
+    workerGate?: PacingGate;
+    /** Provider pacing: the bounded retry settlement to report for a
+     * delivered fallback-review turn. Absent = no interlock. */
+    retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+    /** Make the fallback turn reject after writing its report (a transport
+     * rejection whose automatic retry may still recover the delivery). */
+    failPrompt?: boolean;
   }): Promise<{
     wave: WaveRunner;
     job: { readonly id: string };
@@ -2439,6 +2447,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
           if (reportMatch !== null) {
             writeFileSync(reportMatch[1]!, JSON.stringify(options.findingToWrite), 'utf8');
           }
+          if (options.failPrompt === true) throw new Error('429 too many requests');
         },
         async steer() {},
         async followUp() {},
@@ -2452,6 +2461,8 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       worktrees: port,
       spawner,
       reviewArtifactRoot: artifacts,
+      ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+      ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
       reviewPreflight: async () => ({
         ok: false,
         failures: [preflightFailure('review-policy', 'the Perkins review gate is disabled')],
@@ -2483,6 +2494,72 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         .map((event) => (event.payload as { phase?: string }).phase)
         .reverse();
       expect(phases).toEqual(['started', 'triaged', 'pass']);
+    } finally {
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it('the production fallback review takes a worker pacing slot before it spawns', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    const h = await makeProductionGateHarness({ findingToWrite: [], workerGate: gate });
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+      expect(h.prompts).toHaveLength(0);
+      expect(h.spawnCwds).toHaveLength(0);
+      holder.release();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(true);
+      expect(h.prompts).toHaveLength(1);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally {
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it('a fallback rejection whose automatic retry recovers is parsed as delivered', async () => {
+    const h = await makeProductionGateHarness({
+      findingToWrite: [],
+      failPrompt: true,
+      retrySettlement: async () => 'recovered',
+    });
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(true);
+      expect(h.prompts).toHaveLength(1);
+      const phases = h.ledger.listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'job.fallback-review')
+        .map((event) => (event.payload as { phase?: string }).phase)
+        .reverse();
+      expect(phases).toEqual(['started', 'triaged', 'pass']);
+    } finally {
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it('a fallback resolution whose bounded retry exhausts is recorded blocked, never delivered', async () => {
+    const h = await makeProductionGateHarness({
+      findingToWrite: [],
+      retrySettlement: async () => 'exhausted',
+    });
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(h.escalations.some((entry) => entry.includes('BLOCKED'))).toBe(true);
+      const phases = h.ledger.listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'job.fallback-review')
+        .map((event) => (event.payload as { phase?: string }).phase);
+      expect(phases[0]).toBe('blocked'); // newest-first order
     } finally {
       rmSync(h.root, { recursive: true, force: true });
       rmSync(h.artifacts, { recursive: true, force: true });
@@ -3680,4 +3757,66 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     expect(spawner).not.toHaveBeenCalled();
     await wave.shutdown();
   }, 120_000);
+});
+
+
+describe('provider pacing through WaveRunner', () => {
+  it('passes review admission and retry policy to the native workflow with round-bound ledger events', async () => {
+    const repo = makeFixtureRepo('pacing-wave-port'); repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/pacing-wave']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number { return 43; }\n');
+    const root = mkdtempSync(join(tmpdir(), 'pacing-wave-root-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'pacing-wave-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'pacing-wave-sessions-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'pacing-wave-db-'))); dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/pacing-wave', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'pacing-wave' });
+    ledger.addJob({ id: 'pacing-wave', repo: 'fixture', title: 'pacing wave', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus('pacing-wave', 'working'); settleLane(ledger, 'pacing-wave');
+    ledger.setJobPr('pacing-wave', 'https://git.example.invalid/acme/fixture/pull/11');
+    attachOrigin(repo, 'feature/pacing-wave', root);
+    const poster = { post: vi.fn(async (input: { readonly prUrl: string; readonly body: string; readonly targetSha: string }) => ({
+      reviewId: '9101', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+      headSha: input.targetSha, baseSha: input.targetSha,
+      bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
+    })) };
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 1 });
+    const holder = await gate.acquireReviewTurn({ id: 'other', label: 'other' });
+    let failed = false;
+    const fake = fakeWholeSpawner(sessions, { childAnswer: () => '[]', specialists: [],
+      promptError: () => { if (failed) return null; failed = true; return '429 too many requests'; } });
+    const wave = new WaveRunner({ ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts, reviewGate: gate,
+      poster, prHeadProbe: localHeadProbe('feature/pacing-wave'),
+      rateLimitBackoff: { baseMs: 1, maxMs: 1, maxRetries: 1, patterns: [] } });
+    // Pin the draw: capped backoff now spreads downward instead of always
+    // clamping to maxMs. The ledger assertion still checks an exact delay.
+    const jitter = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
+      const running = wave.runRound({ jobId: 'pacing-wave' });
+      await vi.waitFor(() => expect(gate.view().review.queued).toHaveLength(1));
+      expect(fake.leadCalls).toHaveLength(0);
+      holder.release();
+      const result = asWave(await running);
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      const event = ledger.latestRoundEvent(result.round.id, 'pacing.auto-retry');
+      expect(event?.jobId).toBe('pacing-wave');
+      // Canonical payload across both producers; per-producer context rides
+      // the event envelope (roundId/agentId), never the payload.
+      expect(Object.keys(event?.payload as Record<string, unknown>).sort()).toEqual([
+        'attempt',
+        'delay_ms',
+        'error',
+        'max_auto_retries',
+      ]);
+      expect(event?.payload).toMatchObject({ attempt: 1, max_auto_retries: 1, delay_ms: 1 });
+      expect(event?.roundId).toBe(result.round.id);
+      expect(event?.agentId).toBeTruthy();
+      expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
+    } finally {
+      jitter.mockRestore();
+      await wave.shutdown();
+      for (const dir of [root, artifacts, sessions]) rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

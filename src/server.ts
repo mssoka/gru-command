@@ -52,6 +52,17 @@ export interface HealthPayload {
   readonly liveness: LivenessBlock;
   readonly supervision: SupervisionStatus | null;
   readonly decisions: DecisionRuntimeStatus | null;
+  /** Concise provider-recovery waiting view (existing attention surface;
+   * null when the sensor is not wired). */
+  readonly providerRecovery: readonly {
+    readonly route: string;
+    readonly provider: string;
+    readonly model: string;
+    readonly waiters: number;
+    readonly nextCheckAt: string;
+    readonly lastResult: string | null;
+    readonly lastAttemptAt: string | null;
+  }[] | null;
   readonly session: {
     readonly path: string;
     readonly declared: boolean;
@@ -161,6 +172,7 @@ export function buildHealthPayload(
   supervisionStatus: SupervisionStatus | null = null,
   decisionsStatus: DecisionRuntimeStatus | null = null,
   buildInfo: BuildInfo | null = null,
+  providerRecovery: HealthPayload['providerRecovery'] = null,
 ): HealthPayload {
   const liveness: LivenessBlock =
     runtimeStatus === null
@@ -216,6 +228,7 @@ export function buildHealthPayload(
     liveness,
     supervision: supervisionStatus,
     decisions: decisionsStatus,
+    providerRecovery,
     build: {
       rev: buildInfo?.rev ?? null,
       committed_at: buildInfo?.committedAt ?? null,
@@ -246,6 +259,8 @@ export interface ServiceOptions {
    * Null (or omitted) reports `supervision: null` — pre-E7 shape. */
   readonly supervisionStatus?: () => SupervisionStatus | null;
   readonly decisionsStatus?: () => DecisionRuntimeStatus | null;
+  /** Concise provider-recovery waiting view (token-gated /health block). */
+  readonly providerRecoveryView?: () => HealthPayload['providerRecovery'];
   /** Build stamp of the running dist (self-roll verification); null when
    * unknown. Full (token-gated) payload only — never the public shape. */
   readonly buildInfo?: () => BuildInfo | null;
@@ -315,6 +330,7 @@ export function createService(
             options.supervisionStatus !== undefined ? options.supervisionStatus() : null,
             options.decisionsStatus !== undefined ? options.decisionsStatus() : null,
             options.buildInfo !== undefined ? options.buildInfo() : null,
+            options.providerRecoveryView !== undefined ? options.providerRecoveryView() : null,
           );
           // W-C (E9 r3 carry): the pairing surface gets LIVENESS ONLY —
           // workspace_root / data_dir / install fingerprint / session
