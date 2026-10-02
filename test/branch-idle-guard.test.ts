@@ -212,10 +212,25 @@ function pendingMarker(
   };
 }
 
-/** Bounded deterministic flush: settle promise chains started by the
- * handoff replay without sleeps or wall-clock waits. */
-async function flushAsync(): Promise<void> {
-  for (let tick = 0; tick < 100; tick += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+/** Deterministic completion join for the handoff replay: bounded
+ * setImmediate sweeps until the EXPECTED ledger event lands, so the
+ * assertion target is the join itself — a future extra await anywhere in
+ * the replay chain can no longer outpace a fixed tick count. No sleeps,
+ * no wall clock; a missing event fails loud with a named error. */
+async function awaitLedgerEvent(
+  ledger: { latestJobEvent(jobId: string, kind: string): EventRecord | null },
+  jobId: string,
+  kind: string,
+  maxSweeps = 1000,
+): Promise<EventRecord> {
+  for (let sweep = 0; sweep < maxSweeps; sweep += 1) {
+    const event = ledger.latestJobEvent(jobId, kind);
+    if (event !== null) return event;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error(
+    `expected a ${kind} event on ${jobId} after ${maxSweeps} deterministic sweeps — the replay never settled`,
+  );
 }
 
 function eventRecord(seq: number, kind: string, payload: unknown = {}): EventRecord {
@@ -578,18 +593,51 @@ describe('branch-idle guard', () => {
       h.ledger.setJobStatus('rebrief-handoff', 'delivered');
       const markers = h.ledger.beginPendingRebrief({ jobId: 'rebrief-handoff', note: 'n', briefing: 'b' });
       h.wave.reconcilePendingHandoffs();
-      await flushAsync();
-      expect(h.ledger.latestJobEvent('rebrief-handoff', 'job.review-handoff-requeued')).not.toBeNull();
+      await awaitLedgerEvent(h.ledger, 'rebrief-handoff', 'job.review-handoff-requeued');
       expect(h.ledger.listRounds('rebrief-handoff')).toHaveLength(0);
       expect(preflights).toBe(0);
 
       // Genuine settlement releases the target; the queued replay arms.
       h.ledger.clearPendingRebriefs(markers.map((marker) => marker.id));
       h.wave.reconcilePendingHandoffs();
-      await flushAsync();
-      expect(h.ledger.latestJobEvent('rebrief-handoff', 'job.review-handoff-started')).not.toBeNull();
+      await awaitLedgerEvent(h.ledger, 'rebrief-handoff', 'job.review-handoff-started');
       expect(h.ledger.listRounds('rebrief-handoff')).toHaveLength(1);
       expect(preflights).toBe(1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('force=true remains the audited human escape hatch for a pending-marker fence (never an operations default)', async () => {
+    const repo = makeFixtureRepo('branch-idle-rebrief-force');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    try {
+      await createLaneJob(h, repo, { jobId: 'rebrief-force', status: 'delivered' });
+      h.ledger.beginPendingRebrief({ jobId: 'rebrief-force', note: 'n', briefing: 'b' });
+      // The lane is delivered, yet the unresolved request fences it: the
+      // marker fence — not a status — is what a human override must clear.
+      expect((await postReview(h, { job_id: 'rebrief-force' })).status).toBe(409);
+      const forced = await postReview(h, { job_id: 'rebrief-force', force: true });
+      expect(forced.status).toBe(202);
+      const roundId = forced.json['round_id'] as string;
+      const manifest = JSON.parse(readFileSync(join(h.artifactRoot, roundId, 'manifest.json'), 'utf8')) as {
+        branchIdle?: { forced: boolean; targetBranch: string; blockers: readonly unknown[] };
+      };
+      expect(manifest.branchIdle).toEqual({
+        forced: true,
+        targetBranch: 'gru/rebrief-force',
+        blockers: [{ jobId: 'rebrief-force', status: 'delivered', branch: 'gru/rebrief-force' }],
+      });
+      const forcedEvents = h.ledger
+        .listJobEvents('rebrief-force')
+        .filter((event) => event.kind === 'branch-idle.forced');
+      expect(forcedEvents.map((event) => (event.payload as { phase?: string }).phase).sort()).toEqual([
+        'arm',
+        'freeze',
+      ]);
+      expect((forcedEvents[0]?.payload as { forced?: boolean }).forced).toBe(true);
+      expect(h.ledger.listJobEvents('rebrief-force').some((event) => event.kind === 'branch-idle.refused')).toBe(true);
     } finally {
       await h.close();
     }
