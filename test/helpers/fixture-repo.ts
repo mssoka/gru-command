@@ -41,7 +41,6 @@ export type FixtureRepoStep = 'tempdir' | 'git-init' | 'seed-files' | 'initial-c
 export function makeFixtureRepo(
   name = 'fixture-app',
   onStep?: (step: FixtureRepoStep) => void,
-  opts?: { readonly batchedInitialCommit?: boolean },
 ): FixtureRepo {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-fixture-'));
   onStep?.('tempdir');
@@ -60,20 +59,12 @@ export function makeFixtureRepo(
   mkdirSync(join(path, 'src'), { recursive: true });
   writeFileSync(join(path, 'src', 'main.ts'), 'export function answer(): number {\n  return 42;\n}\n');
   onStep?.('seed-files');
-  if (opts?.batchedInitialCommit === true) {
-    // T4-only equivalent primitive (phase pr144-t4-second-cost-diagnosis-20261002):
-    // ONE `git commit --include .` stages the same untracked seed files the
-    // pathspec matches — exactly what `git add .` staged — and commits, with
-    // the identical resulting tree, root parent, Fixture Tests identity,
-    // message, and loud non-zero failure propagation, at one fewer git
-    // process in the load-amplified fixture window. Callers that omit the
-    // flag keep the historical two-process `git add .` + `git commit` shape
-    // byte-for-byte.
-    git([...GIT_IDENTITY, 'commit', '--include', '.', '-m', 'fixture: initial state']);
-  } else {
-    git([...GIT_IDENTITY, 'add', '.']);
-    git([...GIT_IDENTITY, 'commit', '-m', 'fixture: initial state']);
-  }
+  // Historical two-process shape (restored 2026-10-02): `git commit --include .`
+  // cannot stage untracked files on a fresh repository — it failed the 26e32a8
+  // FULL with "pathspec '.' did not match any file(s) known to git" — so the
+  // initial commit keeps `git add .` + `git commit` exactly as authored.
+  git([...GIT_IDENTITY, 'add', '.']);
+  git([...GIT_IDENTITY, 'commit', '-m', 'fixture: initial state']);
   onStep?.('initial-commit');
 
   const repo: FixtureRepo = {

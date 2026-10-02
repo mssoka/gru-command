@@ -119,3 +119,23 @@ These notes SUPERSEDE the timing/attribution prose in the earlier Implementation
 **Superseded 3 — "no cost cut was found" is bounded, not exhaustive.** The earlier "no cost cut that provably preserves oracle and production-path fidelity was found" statement is a claim about the static analysis actually performed on that date, not a proof that no lever exists. The levers it named (the production wave cost, the inherited 30000 ms bound itself) remain owner decisions exactly as stated there.
 
 **Superseded 4 — the comparison evidence.** The accepted repaired-head observation now exists: FULL run `9a70b120-b58e-41cc-a504-52296cc7d341` at head `8baa5e94ac120b2796cf1bcd0d5a276e1d535166` (accepted capture `pr144-full.accepted.json`; raw output `silas-sweep-20261001T231729Z/pr144-first-cost-full.output.txt`, sha256 `78375eec5fb43d728c7af3cc5561bc7d83bc30d4fdaead3f2f99098d7bd9a5be`, 1008 lines fully read): lint/typecheck/pinned build PASS; backend 1463 passed / 0 failed / 12 skipped; web 368 passed / 0 failed; T4 PASS — body 9155 ms (reported 9684 ms), outside cleanup 526 ms — under the inherited single 30000 ms bound with all T4 gates unchanged. What this does NOT establish: the failed ORIGINAL FULL at `8588b99` (body-end 30865 ms, cleanup 1341 ms) and this repaired pass are observations of CHANGED SOURCE under VARIED LOAD — a historical contrast, not a paired controlled causal-speedup proof. One accepted pass also does not prove a universal timing fix, rule out a host/load cause, or change any owner lever. The earlier failed runs and their claims remain preserved history; this correction creates no new perf gate, no mandatory rerun, and no automated product timing consumer.
+
+## Implementation Notes — completion-cycle repairs (2026-10-02, phase pr144-completion-cycle-20261002)
+
+- The FIRST FULL at `26e32a83` (run `122e42b9`, exit 1) exposed two real failures:
+  (1) the `ae9faa6` batched initial commit (`git commit --include .`) cannot
+  stage untracked files on a fresh repository — T4 died at fixture prep with
+  "pathspec '.' did not match any file(s) known to git"; (2) `test/lan-phone-raw-client`
+  asserted the replayed echo directly after the user frame, racing the later
+  replayed deltas (the identical signature recurred cross-lane: provider-pacing
+  2026-09-30).
+- Repairs: the initial commit is restored to the historical two-process shape;
+  a T4-only loose-ref fast path (value-identical to `git rev-parse` for the
+  loose refs these fixtures write, with an exact rev-parse fallback) removes two
+  more git spawns from the load-amplified window (target sha 1/leg, head probe
+  1/leg); the origin-attach batching (`clone --bare`) is retained; the phone
+  test waits for the replayed settled turn end before asserting — exactly the
+  rule its own reconnect case documents.
+- No timeout, assertion, oracle, discriminator, or budget changed; the
+  inherited 30,000 ms T4 bound stands, and the FULL gate at the repaired head
+  remains the deciding evidence (no earlier pass is transplanted).

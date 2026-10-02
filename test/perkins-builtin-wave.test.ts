@@ -105,12 +105,27 @@ function attachOrigin(repo: FixtureRepo, branch: string, root: string, opts?: { 
   }
 }
 
+/** Loose-ref fast path (phase pr144-completion-cycle-20261002): the git
+ * command that just ran wrote `.git/refs/heads/<branch>` as a loose ref,
+ * so reading it is value-identical to `git rev-parse refs/heads/<branch>`
+ * and saves one git spawn per call in the load-amplified T4 window. Any
+ * read failure (worktree gitdir files, packed refs, missing file) falls
+ * back to the real rev-parse, so non-loose layouts keep exact behavior.
+ * Dispatch only — the resolved value is never altered. */
+function looseRefOrRevParse(repoPath: string, ref: string): string {
+  try {
+    return readFileSync(join(repoPath, '.git', ref), 'utf-8').trim();
+  } catch {
+    return execFileSync('git', ['-C', repoPath, 'rev-parse', ref], { encoding: 'utf-8' }).trim();
+  }
+}
+
 /** Probe double for PR rounds: report the reviewed branch's local tip (the
  * same commit pushed to origin before the freeze). */
 function localHeadProbe(branch: string): PrHeadProbe {
   return async ({ repoPath }) => ({
     headRefName: branch,
-    headSha: execFileSync('git', ['-C', repoPath, 'rev-parse', `refs/heads/${branch}`], { encoding: 'utf-8' }).trim(),
+    headSha: looseRefOrRevParse(repoPath, `refs/heads/${branch}`),
   });
 }
 
@@ -1819,7 +1834,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     };
     t4Attr('suite', 'test-start', 'start', { note: 'single case, both discriminators, inherited 30000 ms bound unchanged; nested intervals are never summed' });
     const prepare = async (name: string, branch: string, leg: 'moved' | 'aborted') => {
-      const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' }), { batchedInitialCommit: true }));
+      const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' })));
       repos.push(repo);
       await t4Step(leg, 'fixture/branch-create', async () => { repo.git(['checkout', '-b', branch]); });
       const target = await t4Step(leg, 'fixture/target-commit', () => {
@@ -1836,7 +1851,10 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
           '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
           'commit', '--include', 'src/main.ts', '-m', 'fixture: update src/main.ts',
         ]);
-        return repo.git(['rev-parse', 'HEAD']);
+        // The branch ref was just written loose by the commit above; the
+        // loose read is value-identical to `git rev-parse HEAD` (HEAD is
+        // the branch here) with an exact rev-parse fallback.
+        return looseRefOrRevParse(repo.path, `refs/heads/${branch}`);
       });
       const temps = await t4Step(leg, 'fixture/tempdirs', () => {
         const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
