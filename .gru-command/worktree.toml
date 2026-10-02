@@ -68,10 +68,11 @@ board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && .
 # the 30s default ceiling under full-suite co-tenant load and has timed out
 # in FULL at multiple heads across lanes (shared fixture cost; the cost
 # repair is owned by the separate review-rebrief-interlock lane, unmerged —
-# never copied here). This scope isolates that single case at the unchanged
-# default ceiling so a FULL timeout can be classified (isolation pass vs
-# deterministic fail); it changes no test, timeout, assertion or gate.
-t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
+# never copied here). This scope isolates that single case under the
+# classified heavy budget (120s, min(2, pin) workers) so a FULL timeout
+# can be classified (isolation pass vs deterministic fail); it changes no
+# test, assertion or gate.
+t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
 
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
