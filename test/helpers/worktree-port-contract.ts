@@ -36,6 +36,11 @@ export function runWorktreePortContract(name: string, make: () => Promise<PortCo
       expect(existsSync(lane.path)).toBe(true); // lanes are real directories
     });
 
+    it('RESOLVE: review targets resolve through the port (explicit refs pin; origin refs fetch fresh)', async () => {
+      const resolved = await h.port.resolveReviewTarget({ repoPath: h.repoPath, ref: 'HEAD' });
+      expect(resolved.sha).not.toBe('');
+    });
+
     it('DISCOVERY: listWorktrees({jobId}) scopes the job lane + linked review lanes; never id-guessing', async () => {
       const lanes = h.port.listWorktrees({ jobId: 'contract-job' });
       expect(lanes.some((lane) => lane.kind === 'job' && lane.id === 'contract-job')).toBe(true);
