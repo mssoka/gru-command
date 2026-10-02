@@ -2,13 +2,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type EventRecord, type JobRecord, type JobStatus, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
-import { loadConfig } from '../src/config.js';
+import { DEFAULT_SILAS_CONFIG, loadConfig } from '../src/config.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
@@ -18,6 +18,8 @@ import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 import type { WorktreeBaseSource } from '../src/ledger/api.js';
 import { BRANCH_BUSY_HINT, findBusyLanes, laneIsBusy, normalizeBranch } from '../src/dispatch/branch-idle.js';
+import { finalizeRebriefRequest } from '../src/dispatch/rebrief-recovery.js';
+import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 
 /**
  * Branch-idle guard (proven 2026-09-23; cost: two wasted review rounds): a
@@ -88,10 +90,17 @@ interface Harness {
   readonly wave: WaveRunner;
   readonly bus: EventBus;
   readonly artifactRoot: string;
+  /** Fallback-gate passes that actually started a fallback reviewer. */
+  readonly fallbackRuns: number[];
   close(): Promise<void>;
 }
 
-async function boot(opts: { onReviewLane?: () => void; onPreflight?: () => void } = {}): Promise<Harness> {
+async function boot(opts: {
+  onReviewLane?: () => void;
+  onPreflight?: () => void | Promise<void>;
+  /** The pre-flight resolves as FAILED (routes to the fallback gate). */
+  preflightFails?: boolean;
+} = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-branch-idle-'));
   cleanupDirs.push(dir);
   writeFileSync(
@@ -113,17 +122,38 @@ async function boot(opts: { onReviewLane?: () => void; onPreflight?: () => void 
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
   const artifactRoot = join(dir, 'reviews');
+  const fallbackRuns: number[] = [];
+  const fallbackSkill = join(dir, 'skills', 'bmad-review', 'SKILL.md');
+  mkdirSync(dirname(fallbackSkill), { recursive: true });
+  writeFileSync(fallbackSkill, '---\nname: bmad-review\n---\ninstalled skill bytes\n', 'utf8');
   const wave = new WaveRunner({
     ledger,
     worktrees,
     spawner,
     reviewArtifactRoot: artifactRoot,
     bus,
-    ...(opts.onPreflight !== undefined
+    fallbackGate: {
+      skillPath: fallbackSkill,
+      runFallbackReview: async () => {
+        fallbackRuns.push(1);
+        return [];
+      },
+      fixDirectiveSink: async () => ({ delivered: true as const }),
+    },
+    ...(opts.onPreflight !== undefined || opts.preflightFails === true
       ? {
           reviewPreflight: async () => {
-            opts.onPreflight?.();
-            return { ok: true as const, failures: [] as const };
+            await opts.onPreflight?.();
+            return opts.preflightFails === true
+              ? {
+                  ok: false as const,
+                  failures: [{
+                    leg: 'review-policy' as const,
+                    detail: 'the Perkins review gate is disabled in config',
+                    remediation: 'Enable the Perkins review gate in config: set [review] enabled = true in the instance config.',
+                  }],
+                }
+              : { ok: true as const, failures: [] as const };
           },
         }
       : {}),
@@ -156,6 +186,7 @@ async function boot(opts: { onReviewLane?: () => void; onPreflight?: () => void 
     wave,
     bus,
     artifactRoot,
+    fallbackRuns,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
       await wave.shutdown();
@@ -201,6 +232,25 @@ async function postReview(
     body: JSON.stringify(body),
   });
   return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+}
+
+/** The Silas review-eligibility projection over the harness's real ledger. */
+function digestOf(h: Harness): ReturnType<typeof computeSilasDigest> {
+  return computeSilasDigest({
+    ledger: h.ledger,
+    blockersForRound: async () => ({ blockers: [], note: null }),
+    config: DEFAULT_SILAS_CONFIG,
+    trigger: 'sweep',
+  });
+}
+
+/** A manually released gate the test controls (no sleeps, deterministic). */
+function deferred(): { readonly promise: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
 }
 
 /** A full pending-re-brief marker fixture (the guard reads only jobId). */
@@ -438,7 +488,9 @@ describe('branch-idle guard', () => {
           (event) =>
             event.kind === 'branch-idle.refused' && (event.payload as { phase?: string }).phase === 'freeze',
         );
-      expect(refusal).not.toBeNull();
+      expect(refusal).toBeDefined();
+      expect(refusal?.roundId).toBe(rounds[0]?.id);
+      expect(refusal?.payload).toMatchObject({ phase: 'freeze' });
       // The aborted round's review lane was swept back out — no half state.
       const reviewLanes = h.worktrees.listWorktrees({ jobId: 'race-lane' }).filter((lane) => lane.kind === 'review');
       expect(reviewLanes).toHaveLength(1);
@@ -531,7 +583,7 @@ describe('branch-idle guard', () => {
     expect(busy('merged-pending')).toBe(false);
   });
 
-  it('a pending re-brief refuses the arm before preflight; a late delivery cannot clear it, and settlement releases it', async () => {
+  it('a pending re-brief refuses the arm before preflight; a late delivery and a partial marker set cannot clear it', async () => {
     const repo = makeFixtureRepo('branch-idle-rebrief-arm');
     cleanupRepos.push(repo);
     let preflights = 0;
@@ -562,13 +614,56 @@ describe('branch-idle guard', () => {
       h.ledger.clearPendingRebriefs([rebriefMarker.id]);
       expect((await postReview(h, { job_id: 'rebrief-arm' })).status).toBe(409);
       expect(preflights).toBe(0);
+      // No release is asserted here: direct marker deletion is not
+      // settlement proof, and on THIS late-delivery fixture the real
+      // finalizer's reused delivery still leaves the attempt busy
+      // (rebrief-recovery owns that lifecycle seam). The genuine
+      // finalizer-driven release is covered in its own case below.
+      expect(h.ledger.listPendingRebriefs({ jobId: 'rebrief-arm' })).toHaveLength(1);
+    } finally {
+      await h.close();
+    }
+  });
 
-      // Genuine settlement (both markers cleared) releases the target.
-      h.ledger.clearPendingRebriefs(markers.filter((marker) => marker.kind === 'job.delivered').map((marker) => marker.id));
-      const passed = await postReview(h, { job_id: 'rebrief-arm' });
+  it('genuine finalization with a fresh settled delivery releases the target for digest and admission', async () => {
+    const repo = makeFixtureRepo('branch-idle-rebrief-finalize');
+    cleanupRepos.push(repo);
+    let preflights = 0;
+    const h = await boot({ onPreflight: () => { preflights += 1; } });
+    try {
+      const lane = await createLaneJob(h, repo, { jobId: 'rebrief-finalize', status: 'delivered' });
+      h.ledger.setJobPr('rebrief-finalize', 'https://git.example.invalid/acme/fixture/pull/9');
+      h.ledger.beginPendingRebrief({ jobId: 'rebrief-finalize', note: 'same blocker', briefing: 'b' });
+
+      // While the request is unresolved: no digest offer and no admission.
+      expect((await digestOf(h)).prWithoutReview.map((row) => row.jobId)).toEqual([]);
+      expect((await postReview(h, { job_id: 'rebrief-finalize' })).status).toBe(409);
+      expect(preflights).toBe(0);
+
+      // The REAL finalizer (the same one the /api/silas/rebrief endpoint
+      // and boot recovery call) records both guarded events — including the
+      // settled turn's OWN fresh delivery — and clears the markers only then.
+      const finalized = finalizeRebriefRequest({
+        ledger: h.ledger,
+        worktrees: h.worktrees,
+        jobId: 'rebrief-finalize',
+        minionId: 'minion-fresh',
+        lanePath: lane.path,
+        note: 'same blocker',
+      });
+      expect(finalized).toMatchObject({ rebriefRecorded: true, deliveryRecorded: true });
+      expect(h.ledger.listPendingRebriefs({ jobId: 'rebrief-finalize' })).toHaveLength(0);
+      const delivered = h.ledger.latestJobEvent('rebrief-finalize', 'job.delivered');
+      expect(delivered).not.toBeNull();
+      expect((delivered?.payload as { sha?: string }).sha).toBeTruthy();
+
+      // Digest eligibility returns for exactly this target...
+      expect((await digestOf(h)).prWithoutReview.map((row) => row.jobId)).toEqual(['rebrief-finalize']);
+      // ...and normal admission passes every current gate with one preflight.
+      const passed = await postReview(h, { job_id: 'rebrief-finalize' });
       expect(passed.status).toBe(202);
       expect(preflights).toBe(1);
-      expect(h.ledger.listRounds('rebrief-arm')).toHaveLength(1);
+      expect(h.ledger.listRounds('rebrief-finalize')).toHaveLength(1);
     } finally {
       await h.close();
     }
@@ -595,7 +690,9 @@ describe('branch-idle guard', () => {
         (event) =>
           event.kind === 'branch-idle.refused' && (event.payload as { phase?: string }).phase === 'freeze',
       );
-      expect(refusal).not.toBeNull();
+      expect(refusal).toBeDefined();
+      expect(refusal?.roundId).toBe(rounds[0]?.id);
+      expect(refusal?.payload).toMatchObject({ phase: 'freeze' });
       // The aborted round's review lane was swept back out — no half state.
       const reviewLanes = h.worktrees.listWorktrees({ jobId: 'rebrief-freeze' }).filter((lane) => lane.kind === 'review');
       expect(reviewLanes).toHaveLength(1);
@@ -639,6 +736,89 @@ describe('branch-idle guard', () => {
       expect(h.ledger.listRounds('rebrief-handoff')).toHaveLength(1);
       expect(preflights).toBe(1);
     } finally {
+      await h.close();
+    }
+  });
+
+  it('a re-brief admitted during a failing pre-flight refuses the fallback arm (normal request)', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-normal');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const gate = deferred();
+    const h = await boot({
+      preflightFails: true,
+      onPreflight: async () => {
+        entered.release();
+        await gate.promise;
+      },
+    });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-normal', status: 'delivered' });
+      const pending = postReview(h, { job_id: 'fallback-normal' });
+      await entered.promise;
+      // The re-brief lands while the failing pre-flight is awaited: the
+      // fallback admission re-checks the SAME shared guard before any
+      // fallback reviewer starts.
+      h.ledger.beginPendingRebrief({ jobId: 'fallback-normal', note: 'n', briefing: 'b' });
+      gate.release();
+      const refused = await pending;
+      expect(refused.status).toBe(409);
+      expect(refused.json).toEqual({
+        error: 'branch_busy',
+        blockers: [{ job_id: 'fallback-normal', status: 'delivered', branch: 'gru/fallback-normal' }],
+        hint: BRANCH_BUSY_HINT,
+      });
+      // No fallback reviewer started and no fallback outcome was recorded.
+      expect(h.fallbackRuns).toHaveLength(0);
+      expect(h.ledger.listJobEvents('fallback-normal').some((event) => event.kind === 'job.fallback-review')).toBe(false);
+      expect(h.ledger.listRounds('fallback-normal')).toHaveLength(0);
+      const refusal = h.ledger
+        .listJobEvents('fallback-normal')
+        .find((event) => event.kind === 'branch-idle.refused' && (event.payload as { phase?: string }).phase === 'arm');
+      expect(refusal).toBeDefined();
+      expect(refusal?.payload).toMatchObject({ phase: 'arm', targetBranch: 'gru/fallback-normal' });
+    } finally {
+      gate.release();
+      await h.close();
+    }
+  });
+
+  it('a queued review replay refuses the fallback arm when the re-brief lands during its failing pre-flight', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-replay');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const gate = deferred();
+    const h = await boot({
+      preflightFails: true,
+      onPreflight: async () => {
+        entered.release();
+        await gate.promise;
+      },
+    });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-replay', status: 'working' });
+      const queued = await postReview(h, { job_id: 'fallback-replay', by: 'minion' });
+      expect(queued.status).toBe(202);
+      expect(queued.json).toMatchObject({ route: 'queued', job_id: 'fallback-replay' });
+
+      // The old attempt settles; the replay's failing pre-flight is awaited
+      // while a NEW re-brief is admitted — the replay must re-queue instead
+      // of routing the lane to a fallback reviewer.
+      h.ledger.setJobStatus('fallback-replay', 'delivered');
+      const requeuedPromise = joinJobEvent(h, 'fallback-replay', 'job.review-handoff-requeued');
+      h.wave.reconcilePendingHandoffs();
+      await entered.promise;
+      h.ledger.beginPendingRebrief({ jobId: 'fallback-replay', note: 'n', briefing: 'b' });
+      gate.release();
+      const requeued = await requeuedPromise;
+      expect(requeued.jobId).toBe('fallback-replay');
+
+      // No fallback reviewer started; nothing was admitted as a round.
+      expect(h.fallbackRuns).toHaveLength(0);
+      expect(h.ledger.listRounds('fallback-replay')).toHaveLength(0);
+      expect(h.ledger.listJobEvents('fallback-replay').some((event) => event.kind === 'job.fallback-review')).toBe(false);
+    } finally {
+      gate.release();
       await h.close();
     }
   });

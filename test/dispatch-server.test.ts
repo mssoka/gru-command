@@ -228,6 +228,18 @@ function field<T>(json: unknown, key: string): T {
   return (json as Record<string, unknown>)[key] as T;
 }
 
+/** The minion's briefing turn runs in the background; a review request must
+ * observe the SETTLED lane (the same wait the fallback-gate case below
+ * documents). Otherwise the branch-idle guard can refuse the arm with 409
+ * and the pushed origin tip may not exist yet for the freeze — a real race
+ * under co-tenant load, not a product behavior. */
+async function waitForDelivery(h: ServerHarness, jobId: string): Promise<void> {
+  await vi.waitFor(
+    () => expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull(),
+    { timeout: 10_000 },
+  );
+}
+
 describe('dispatch server (E8)', () => {
   it('rejects unauthenticated and unconfigured access like the board does', async () => {
     const h = await boot();
@@ -547,6 +559,7 @@ describe('dispatch server (E8)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-silas-job', repo_path: repo.path, title: 'attribution', briefing: 'b',
       }, TOKEN);
+      await waitForDelivery(h, 'by-silas-job');
       const pr = await call(h.port, 'POST', '/api/dispatch/pr', {
         job_id: 'by-silas-job', url: PR_URL, by: 'silas',
       }, TOKEN);
@@ -564,6 +577,7 @@ describe('dispatch server (E8)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-none-job', repo_path: repo.path, title: 'plain', briefing: 'b',
       }, TOKEN);
+      await waitForDelivery(h, 'by-none-job');
       await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'by-none-job', url: PR_URL }, TOKEN);
       await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'by-none-job' }, TOKEN);
       const plainKinds = h.ledger.listJobEvents('by-none-job').map((event) => event.kind);

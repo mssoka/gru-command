@@ -1494,7 +1494,17 @@ export class WaveRunner {
     const result: ReviewPreflightResult = preflight !== undefined && repoPath !== null
       ? await preflight({ repoPath })
       : { ok: true, failures: [] };
-    if (!result.ok) return this.beginFallbackGate(input, result.failures, repoPath);
+    if (!result.ok) {
+      // The fallback gate has no freeze leg of its own: the awaited
+      // pre-flight is an asynchronous admission window, and a re-brief (or
+      // lane re-open) admitted while it ran must fence fallback admission
+      // too. Re-prove branch idleness through the SAME shared guard the
+      // arm intake and the native freeze use — before any fallback reviewer
+      // starts. An explicit `force` keeps its audited escape hatch, and a
+      // BranchBusyError keeps its 409 refusal / same-job replay re-queue.
+      this.enforceBranchIdleForRequest(input);
+      return this.beginFallbackGate(input, result.failures, repoPath);
+    }
     // Post-await recheck (handoff replays only): permission is re-proven
     // after preflight/capacity waits, BEFORE freeze/admission effects.
     if (input.fromHandoff === true) {

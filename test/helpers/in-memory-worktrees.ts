@@ -16,10 +16,25 @@ import { resolveReviewTargetReal } from './git-review-port.js';
 export class InMemoryWorktreePort implements WorktreePort {
   readonly root: string;
   private readonly lanes = new Map<string, WorktreeLane>();
+  /** Probed once per repo path: a directory's git-ness does not change
+   * inside one harness, so repeated `rev-parse --is-inside-work-tree`
+   * spawns are pure overhead in the load-amplified suites. */
+  private readonly gitRepos = new Map<string, boolean>();
   private n = 0;
 
   constructor(root: string) {
     this.root = root;
+  }
+
+  private isGitRepo(repoPath: string): boolean {
+    const cached = this.gitRepos.get(repoPath);
+    if (cached !== undefined) return cached;
+    const probe = spawnSync('git', ['-C', repoPath, 'rev-parse', '--is-inside-work-tree'], {
+      stdio: 'ignore',
+    });
+    const result = probe.status === 0;
+    this.gitRepos.set(repoPath, result);
+    return result;
   }
 
   async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
@@ -29,10 +44,7 @@ export class InMemoryWorktreePort implements WorktreePort {
     // Git-backed fixtures resolve with the production discipline; the
     // non-git contract fixtures keep the fabricated identity this double
     // guarantees every other method (their lanes are plain directories).
-    const probe = spawnSync('git', ['-C', input.repoPath, 'rev-parse', '--is-inside-work-tree'], {
-      stdio: 'ignore',
-    });
-    if (probe.status === 0) return resolveReviewTargetReal(input.repoPath, input.ref);
+    if (this.isGitRepo(input.repoPath)) return resolveReviewTargetReal(input.repoPath, input.ref);
     return { sha: `sha-${input.ref}`, baseSource: null };
   }
 
@@ -75,8 +87,7 @@ export class InMemoryWorktreePort implements WorktreePort {
     let actualSha = sha;
     let isGitRepo = false;
     try {
-      execFileSync('git', ['-C', repoPath, 'rev-parse', '--is-inside-work-tree'], { stdio: 'ignore' });
-      isGitRepo = true;
+      isGitRepo = this.isGitRepo(repoPath);
     } catch {
       // Contract-only tests intentionally use non-git fixture directories.
     }

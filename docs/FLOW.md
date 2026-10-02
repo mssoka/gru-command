@@ -65,7 +65,11 @@ working/pushing the target branch (`dispatched`/`working` with no settled
 delivery for its current attempt), the API answers `409 branch_busy` with
 `blockers: [{job_id, status, branch}]` and the same check re-runs
 immediately before the freeze, so a lane re-opened mid-setup is refused
-the same way. The arm passes only when the target work is genuinely
+the same way. The same recheck runs after a failed pre-flight and before
+the bmad-review fallback gate admits — a re-brief or lane re-open landing
+during the awaited pre-flight refuses the fallback arm (409, or a queued
+replay re-queue) instead of starting a fallback reviewer. The arm passes
+only when the target work is genuinely
 settled AND no re-brief request is unresolved — a delivery alone does not
 release a fenced lane. A lane with an unresolved re-brief request counts
 busy the same way: the durable pending markers written before a re-brief
