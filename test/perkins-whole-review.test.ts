@@ -497,21 +497,48 @@ describe('Perkins whole-PR lead engine', () => {
     expect(preflight.errors.map((error) => error.rule)).toContain('submission-verdict');
   });
 
-  it('rejects an empty/missing verdict, an empty report, and a report omitting the verdict line or frozen identity', async () => {
-    const cases: ReadonlyArray<{ name: string; mutate: (submission: WholeSubmission) => Record<string, unknown>; pattern: RegExp }> = [
-      { name: 'missing verdict', mutate: (s) => ({ ...s, verdict: undefined }), pattern: /submission-verdict/ },
-      { name: 'empty report', mutate: (s) => ({ ...s, report_markdown: '' }), pattern: /report-shape/ },
-      { name: 'verdict line missing', mutate: (s) => ({ ...s, report_markdown: s.report_markdown.replace(/\*\*Verdict: READY TO MERGE\*\*/, '**Verdict: UNKNOWN**') }), pattern: /report-verdict/ },
-      { name: 'frozen identity missing', mutate: (s) => ({ ...s, report_markdown: s.report_markdown.replace(/^Frozen target: .+$/m, 'Frozen target: redacted') }), pattern: /report-identity/ },
-    ];
-    for (const testCase of cases) {
-      const h = wholeHarness({
-        ...ALL_CLEAN,
-        submitPayload: (_attempt, submission) => testCase.mutate(submission) as never,
-        submitRetries: 0,
-      });
-      await expect(h.run()).rejects.toThrow(testCase.pattern);
-    }
+  /** One verdict-shape rejection per case: the combined matrix ran four
+   * complete lead harnesses under one inherited 30s default and overran it
+   * under co-tenant load. Each case keeps the exact mutation and rejection
+   * pattern the matrix asserted, under its own default bound. */
+  async function expectWholeSubmissionRejected(
+    mutate: (submission: WholeSubmission) => Record<string, unknown>,
+    pattern: RegExp,
+  ): Promise<void> {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitPayload: (_attempt, submission) => mutate(submission) as never,
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(pattern);
+  }
+
+  it('rejects a submission with an empty/missing verdict', async () => {
+    await expectWholeSubmissionRejected(
+      (s) => ({ ...s, verdict: undefined }),
+      /submission-verdict/,
+    );
+  });
+
+  it('rejects an empty report', async () => {
+    await expectWholeSubmissionRejected(
+      (s) => ({ ...s, report_markdown: '' }),
+      /report-shape/,
+    );
+  });
+
+  it('rejects a report omitting the verdict line', async () => {
+    await expectWholeSubmissionRejected(
+      (s) => ({ ...s, report_markdown: s.report_markdown.replace(/\*\*Verdict: READY TO MERGE\*\*/, '**Verdict: UNKNOWN**') }),
+      /report-verdict/,
+    );
+  });
+
+  it('rejects a report omitting the frozen identity', async () => {
+    await expectWholeSubmissionRejected(
+      (s) => ({ ...s, report_markdown: s.report_markdown.replace(/^Frozen target: .+$/m, 'Frozen target: redacted') }),
+      /report-identity/,
+    );
   });
 
   it('preflight is free and exhaustive; a rejected submission is corrected and accepted within the real attempt bound', async () => {

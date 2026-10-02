@@ -626,7 +626,14 @@ describe('install.sh setup mode (one-line path)', () => {
       GRU_COMMAND_LAUNCHCTL: manager,
       GRU_COMMAND_SYSTEMCTL: manager,
     };
-    expect(run(join(bare, 'install.sh'), ['--answers', '{}'], env).status).toBe(0);
+    // Provision the retained instance directly (the pattern the neighbouring
+    // update cases use). The contract under test is service ownership on the
+    // update path; the bare first run below still exercises clone-when-absent
+    // and build before the restart decision, so the setup+wizard cycle this
+    // replaces only duplicated coverage the file already carries and pushed
+    // the case past its inherited 30s default under co-tenant load.
+    mkdirSync(instance, { recursive: true });
+    writeFileSync(join(instance, 'config.toml'), 'retained-user-config\n');
 
     mkdirSync(dirname(unit), { recursive: true });
     writeFileSync(unit, '/someone/else/dist/main.js\n/someone/else/.gru-command\n');

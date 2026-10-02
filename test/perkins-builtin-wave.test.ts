@@ -84,9 +84,23 @@ class DeferredReviewPort implements WorktreePort {
 
 /** Attach a fetchable bare origin inside the test's port root and push the
  * reviewed branch: the fresh-head freeze reads THIS tip, never the local
- * ref left behind by the fixture. */
-function attachOrigin(repo: FixtureRepo, branch: string, root: string): void {
+ * ref left behind by the fixture. `batched` (T4 only) replaces the
+ * `init --bare` + `push` pair with ONE `clone --bare` of the repo at the
+ * identical branch tips: the bare gains inert extra state nothing in the
+ * flow reads (its own HEAD/config and the other branch refs), while every
+ * caller that omits the flag keeps the historical three-process shape. */
+function attachOrigin(
+  repo: FixtureRepo,
+  branch: string,
+  root: string,
+  opts?: { readonly batched?: boolean },
+): void {
   const origin = join(root, 'origin.git');
+  if (opts?.batched === true) {
+    execFileSync('git', ['clone', '--bare', '--quiet', repo.path, origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', origin]);
+    return;
+  }
   execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
   repo.git(['remote', 'add', 'origin', origin]);
   repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
@@ -116,6 +130,14 @@ function makeSpawner(
   order: string[],
   onLeadStart?: () => void,
   answerOverride?: (prompt: string) => string | undefined,
+  /** Canonical security-blocker evidence the scripted specialist cites on
+   * its retry. Defaults to the historical `return 43;` snippet the shared
+   * fixtures commit; T4's fixture commits `return 44;`, so it passes the
+   * snippet its frozen diff actually contains — the locatable-evidence
+   * contract then accepts the canonical attempt instead of rejecting it
+   * (a rejection also pays an extra frozen path-diff git process). The
+   * malformed first attempt and the retry coverage are unchanged. */
+  securityEvidence?: string,
 ): AgentSpawner {
   let securityAttempts = 0;
   const brain: WholeLeadOptions = {
@@ -131,7 +153,7 @@ function makeSpawner(
         : source === 'security'
           ? JSON.stringify([{
               source: 'security', severity: 'blocker', category: 'auth', title: 'Verified security defect',
-              location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line demonstrates the security defect.',
+              location: 'src/main.ts:2', evidence: securityEvidence ?? '  return 43;', detail: 'The changed line demonstrates the security defect.',
               recommended_fix: 'Correct the implementation and add a regression test.',
             }])
           : '[]');
@@ -1702,31 +1724,38 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     }
   });
 
-  it('does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)', async () => {
-    const prepare = async (name: string, branch: string) => {
-      const repo = makeFixtureRepo(name);
-      repos.push(repo);
-      repo.git(['checkout', '-b', branch]);
-      const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
-      const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
-      const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
-      const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
-      dirs.push(root, artifacts, sessions);
-      const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
-      dbs.push(db);
-      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-      const port = new GitReviewPort(root, branch, target);
-      await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
-      const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
-      ledger.setJobStatus(job.id, 'working');
-      settleLane(ledger, job.id);
-      ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
-      attachOrigin(repo, branch, root);
-      return { repo, ledger, port, artifacts, sessions, target, job, root };
-    };
-    // (a) The movement ref advances while the reconciliation lookup is
+  // T4 legs share this preparation: a real repo + job lane, a fetchable
+  // bare origin whose tip is the reviewed branch, and the canonical
+  // security evidence the fixture's frozen diff actually contains. Each
+  // leg then runs a complete production round under its OWN inherited
+  // 30s default (the combined form ran both rounds under one default and
+  // overran it under co-tenant load).
+  const prepareT4 = async (name: string, branch: string) => {
+    const repo = makeFixtureRepo(name);
+    repos.push(repo);
+    repo.git(['checkout', '-b', branch]);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+    const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+    const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, branch, target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
+    const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
+    attachOrigin(repo, branch, root, { batched: true });
+    return { repo, ledger, port, artifacts, sessions, target, job, root };
+  };
+
+  it('does not record a reconciled delivery when the ref moved during the lookup (T4)', async () => {
+    // The movement ref advances while the reconciliation lookup is
     // outstanding: the receipt is preserved, never recorded as delivery.
-    const moved = await prepare('perkins-t4-moved', 'feature/t4-moved');
+    const moved = await prepareT4('perkins-t4-moved', 'feature/t4-moved');
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
       // The frozen BASE drifts while the lookup is outstanding — the
@@ -1746,7 +1775,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     });
     const escalations: string[] = [];
     const movedWave = new WaveRunner({
-      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, []),
+      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, [], undefined, undefined, '  return 44;'),
       poster: { post, reconcile }, reviewArtifactRoot: moved.artifacts,
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
       prHeadProbe: localHeadProbe('feature/t4-moved'),
@@ -1761,8 +1790,11 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(unrecorded.reason).toContain('moved while the reconciliation lookup was outstanding');
     expect(unrecorded.receipt?.reviewId).toBe('9200');
     expect(moved.ledger.latestRoundEvent(movedOutcome.round.id, 'round.posted')).toBeNull();
-    // (b) The run's abort signal fires while the lookup is outstanding.
-    const aborted = await prepare('perkins-t4-aborted', 'feature/t4-aborted');
+  });
+
+  it('does not record a reconciled delivery when the run aborted during the lookup (T4)', async () => {
+    // The run's abort signal fires while the lookup is outstanding.
+    const aborted = await prepareT4('perkins-t4-aborted', 'feature/t4-aborted');
     const abortPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const abortReconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
       for (const controller of (abortedWave as unknown as { activeControllers: Set<AbortController> }).activeControllers) controller.abort();
@@ -1774,7 +1806,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     });
     const abortEscalations: string[] = [];
     const abortedWave = new WaveRunner({
-      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, []),
+      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, [], undefined, undefined, '  return 44;'),
       poster: { post: abortPost, reconcile: abortReconcile }, reviewArtifactRoot: aborted.artifacts,
       escalate: (title, detail) => abortEscalations.push(`${title}: ${detail}`),
       prHeadProbe: localHeadProbe('feature/t4-aborted'),
