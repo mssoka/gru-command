@@ -56,3 +56,9 @@ pr135-ci-type-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest ru
 # the job-attribution FK fixture, the T13/R17 settled-wave contract and the
 # shared child-turn budget oracle, plus the pin file; approved RPC patch first.
 pr135-runtime-ci-three-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/perkins-whole-review.test.ts test/suite-shape.test.ts"
+
+# PR135 r12 fresh-review repairs (BMAD built-in review 2026-10-02): the
+# null-prototype provider map, fire-and-forget dispose safety, canonical
+# retry payloads and the consumer-level settlement tests the verification
+# gap layer identified; approved RPC patch first.
+r12-review-repairs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing-admission.test.ts test/fix-directive.test.ts test/supervisor.test.ts test/config.test.ts test/perkins-builtin-wave.test.ts test/rebrief-recovery.test.ts test/suite-shape.test.ts"
