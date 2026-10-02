@@ -61,6 +61,9 @@ body {
 .pp-chip--rev { background: var(--rev); color: var(--on-state); }
 .pp-chip--alert { background: var(--alert); color: var(--on-state); }
 .pp-chip--park { background: var(--park); color: var(--ink); }
+/* A lens the lead did not use is settled, not a pass: the same neutral
+   gray as a pending chip, and never the success fill. */
+.pp-chip--unused { background: var(--park); color: var(--ink); }
 .pp-chip--perkins { background: var(--perkins); color: var(--on-state); }
 
 .pp-btn {
