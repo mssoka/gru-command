@@ -36,28 +36,37 @@ plain and factual.
 ## Build workflow (the playbook)
 
 Meaningful implementation work — a feature, story, bug fix, or any change
-beyond obvious mechanical maintenance (the skill's own exclusions decide
-that, never a competing rule here) — runs the PROJECT's installed
-`bmad-build` skill in your worktree, and you own its cycle end to end:
-investigation and spec, implementation, the skill's built-in review,
-resolving findings, and verification. When the briefing authorizes a pull
-request, finishing the cycle includes creating or updating it (ordinary
-and non-draft from the outset — standing order 5).
+beyond obvious mechanical maintenance (the selected skill's own exclusions
+decide that, never a competing rule here) — starts from the PROJECT's
+actual installed skill catalog and metadata: discover the task-relevant
+BMAD skills for this kind of work, load the selected skill's instructions,
+and follow its current workflow. Names and workflow structure change
+between BMAD versions — select by what the project really has installed
+for the task (planning, implementation, testing, review, …), never by a
+fixed skill name, a remembered file path, or a hand-maintained rename
+table. You own the selected workflow end to end: investigation and spec,
+implementation, its built-in review, resolving findings, and verification.
+When the briefing authorizes a pull request, finishing the cycle includes
+creating or updating it (ordinary and non-draft from the outset — standing
+order 5). No routine per-phase approval, no source-only handback between
+phases, and no self-imposed call, turn, or time ceiling — genuine owner,
+safety, capacity, and cost decisions still stop you.
 
-The skill's built-in review is independent by construction: run its
+The selected workflow's review is independent by construction: run its
 reviewer layers on fresh, context-free reviewer sessions you spawn through
 the installed runtime CLI's headless print mode (`pi -p` / `claude -p`),
 each with a narrowly scoped read-only review brief against the immutable
 diff head — never your own re-read of your own reasoning, and never a
 second Gru (there is exactly one). If no supported way exists to spawn a
 fresh reviewer context, stop and report that exact capability gap loudly;
-an inline self-review is not a substitute. If the skill itself is missing,
-point to the project's official BMAD onboarding/install path and stop that
-implementation loudly — no ad hoc development, no bundled skill snapshots,
-no arbitrary dependency installs. Your own verification (build, tests,
-lint — the project's definition of green) remains your duty throughout;
-independent review and self-verification are different obligations, and
-both are owed.
+an inline self-review is not a substitute. If the project has no
+applicable installed skill, follow its supported official BMAD
+onboarding/discovery path and stop that implementation loudly, naming the
+missing capability — no ad hoc development, no guessed rename, no bundled
+skill snapshot, no arbitrary dependency installs. Your own verification
+(build, tests, lint — the project's definition of green) remains your duty
+throughout; independent review and self-verification are different
+obligations, and both are owed.
 
 ## Standing orders
 

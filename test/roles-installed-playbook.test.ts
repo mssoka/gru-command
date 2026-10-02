@@ -5,11 +5,14 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 /**
- * Installed-layout playbook regression (owner ruling 2026-10-02, j-745):
- * the minion-owned bmad-build playbook must reach a CLEAN INSTALLATION
- * through the SHIPPED artifact and its normal prompt-loading path — never
- * through this developer checkout, the local journal, home paths, or
- * global custom instructions. The test stages an installed-package layout
+ * Installed-layout playbook regression (owner ruling 2026-10-02, j-745;
+ * clarification j-761): the minion-owned build-workflow playbook must reach
+ * a CLEAN INSTALLATION through the SHIPPED artifact and its normal
+ * prompt-loading path — never through this developer checkout, the local
+ * journal, home paths, or global custom instructions. The policy selects
+ * the task-relevant BMAD skills from the PROJECT's actual installed skill
+ * catalog and metadata, so it survives a BMAD release that renames or
+ * replaces its skills. The test stages an installed-package layout
  * (compiled dist + the shipped roles/ and resources/ trees + the
  * dependency tree) in an isolated temp dir, then loads `dist/roles.js`
  * FROM THAT LAYOUT in a child node process whose HOME points at an empty
@@ -110,6 +113,32 @@ function runProbe(installedRoot: string): StagedPrompt | StagedFailure {
   return parsed;
 }
 
+/** A representative RENAMED/REPLACEMENT project skill catalog (owner
+ *  clarification j-761): BMAD versions may rename or replace their skills,
+ *  so the shipped policy selects by the project's ACTUAL installed catalog
+ *  and metadata — never by a name remembered from this release. The
+ *  fixture mirrors a real install's runtime skill folder
+ *  (`.agents/skills/<name>/SKILL.md` with `name`/`description` front
+ *  matter) carrying the implementation capability under a different name. */
+function stageRenamedSkillCatalog(projectRoot: string, name: string): void {
+  const skillDir = join(projectRoot, '.agents', 'skills', name);
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(
+    join(skillDir, 'SKILL.md'),
+    [
+      '---',
+      `name: ${name}`,
+      "description: 'Turns implementation work into working code, reviewed and verified — the renamed replacement entry for that capability.'",
+      '---',
+      '',
+      `# ${name}`,
+      '',
+      'Follow the workflow this skill points to for implementation work.',
+      '',
+    ].join('\n'),
+  );
+}
+
 describe('installed-layout playbook loading (shipped artifact, clean install)', () => {
   // One staged install + one probe run shared by the prompt-content tests;
   // the broken-install case stages its own (loading must fail loud there).
@@ -127,27 +156,55 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(pkg.files).toEqual(expect.arrayContaining(['roles/', 'resources/silas-skills/']));
   });
 
-  it('the installed worker prompt carries the bmad-build playbook', () => {
+  it('the installed worker prompt carries the BMAD workflow playbook', () => {
     const flat = staged.minion.replace(/\s+/gu, ' ');
-    expect(flat).toContain("runs the PROJECT's installed `bmad-build` skill");
-    expect(flat).toContain('you own its cycle end to end');
+    expect(flat).toContain("the PROJECT's actual installed skill catalog and metadata");
+    expect(flat).toContain('select by what the project really has installed for the task');
+    expect(flat).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
+    expect(flat).toContain('You own the selected workflow end to end');
     expect(flat).toContain('fresh, context-free reviewer sessions');
     expect(flat).toContain('`pi -p` / `claude -p`');
     expect(flat).toContain('never a second Gru');
     expect(flat).toContain('an inline self-review is not a substitute');
     expect(flat).toContain('report that exact capability gap loudly');
-    expect(flat).toContain('official BMAD onboarding/install path');
-    expect(flat).toContain('no ad hoc development, no bundled skill snapshots');
+    expect(flat).toContain('supported official BMAD onboarding/discovery path');
+    expect(flat).toContain('no guessed rename');
+    // Owner clarification j-761: never a fixed skill-name dependency.
+    expect(flat).not.toContain('bmad-build');
   });
 
   it('the installed ops prompt carries the minion-owned build cycle', () => {
     const flat = staged.silas.replace(/\s+/gu, ' ');
     expect(flat).toContain('Minion-owned build cycle');
     expect(flat).toContain('goal, boundaries, acceptance, verification');
+    expect(flat).toContain("selects the task-relevant BMAD skills from the project's actual installed catalog");
+    expect(flat).toContain('never demand a fixed skill name in a briefing');
     expect(flat).toContain('verification scheduler');
     expect(flat).toContain('do not commission a supplementary review duplicating');
     expect(flat).toContain('activate the native Perkins gate on that exact final head');
     expect(flat).toContain('NEEDS CHANGES returns to the same implementing minion');
+    expect(flat).not.toContain('bmad-build');
+  });
+
+  it('a renamed/replacement project catalog still satisfies the worker contract (no fixed skill name)', () => {
+    // BMAD may rename or replace its implementation skill; selection keys
+    // on the project's actual catalog and the task, not a remembered name.
+    // Stage that rename and prove the shipped contract does not depend on
+    // the old name.
+    const project = temp('gru-command-renamed-catalog-');
+    const renamed = 'bmad-delivery-cycle';
+    stageRenamedSkillCatalog(project, renamed);
+    const flat = staged.minion.replace(/\s+/gu, ' ');
+    expect(flat).toContain("the PROJECT's actual installed skill catalog and metadata");
+    expect(flat).toContain('select by what the project really has installed for the task');
+    expect(flat).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
+    // The fixture is a real catalog entry by shape (front-matter metadata)
+    // carrying the implementation capability under a DIFFERENT name:
+    const entry = readFileSync(join(project, '.agents', 'skills', renamed, 'SKILL.md'), 'utf-8');
+    expect(entry).toMatch(
+      new RegExp(`^---\\nname: ${renamed}\\ndescription: '.*implementation work.*'\\n---\\n`, 'u'),
+    );
+    expect(existsSync(join(project, '.agents', 'skills', 'bmad-build', 'SKILL.md'))).toBe(false);
   });
 
   it('installed prompts load from their own tree: no checkout paths, fail loud without roles/', () => {

@@ -71,23 +71,32 @@ describe('role definitions (E8)', () => {
     expect(silas).toContain('existing drafts are left untouched');
   });
 
-  it('pins the minion-owned bmad-build playbook on the worker prompt', () => {
+  it('pins the task-relevant BMAD workflow playbook on the worker prompt', () => {
     const minion = ROLE_DEFINITIONS['minion'].systemPrompt.replace(/\s+/gu, ' ');
-    expect(minion).toContain("runs the PROJECT's installed `bmad-build` skill");
-    expect(minion).toContain('you own its cycle end to end');
+    expect(minion).toContain("the PROJECT's actual installed skill catalog and metadata");
+    expect(minion).toContain('select by what the project really has installed for the task');
+    expect(minion).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
+    expect(minion).toContain('You own the selected workflow end to end');
+    expect(minion).toContain('no self-imposed call, turn, or time ceiling');
     expect(minion).toContain('fresh, context-free reviewer sessions');
     expect(minion).toContain('`pi -p` / `claude -p`');
     expect(minion).toContain('never a second Gru');
     expect(minion).toContain('an inline self-review is not a substitute');
     expect(minion).toContain('report that exact capability gap loudly');
-    expect(minion).toContain('official BMAD onboarding/install path');
-    expect(minion).toContain('no ad hoc development, no bundled skill snapshots');
+    expect(minion).toContain('supported official BMAD onboarding/discovery path');
+    expect(minion).toContain('no guessed rename');
+    // Owner clarification j-761: the shipped policy selects by capability
+    // from the project's actual catalog; a fixed skill name is never the
+    // normative entry point.
+    expect(minion).not.toContain('bmad-build');
   });
 
   it('pins the minion-owned build cycle on the ops prompt', () => {
     const silas = ROLE_DEFINITIONS['silas'].systemPrompt.replace(/\s+/gu, ' ');
     expect(silas).toContain('Minion-owned build cycle');
     expect(silas).toContain('goal, boundaries, acceptance, verification');
+    expect(silas).toContain("selects the task-relevant BMAD skills from the project's actual installed catalog");
+    expect(silas).toContain('never demand a fixed skill name in a briefing');
     expect(silas).toContain('verification scheduler');
     expect(silas).toContain('do not commission a supplementary review duplicating');
     expect(silas).toContain('activate the native Perkins gate on that exact final head');

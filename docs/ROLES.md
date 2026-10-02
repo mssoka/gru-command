@@ -10,7 +10,7 @@ fail-loud at boot); this page is the map.
 |------|-------------|-----------|--------|-------|
 | Gru | `roles/gru.md` | workspace root | chat only | judgment: consult, plan-before-heist, dispatch, verify |
 | Silas | `roles/silas.md` | workspace root | ledger/ops | operations: briefings are contracts, lanes, sweeps, close-outs; minion-owned build cycle — schedulable verification, exact-final-head Perkins. Hosted as the `silas-ops` slot with follow-through + recurrence duties (`docs/FLOW.md`) |
-| minion | `roles/minion.md` | **spawn-provided** (the job worktree) | code | one briefing per lane, verified work, honest commits; runs the project's bmad-build cycle — built-in fresh-reviewer review, finding resolution, PR |
+| minion | `roles/minion.md` | **spawn-provided** (the job worktree) | code | one briefing per lane, verified work, honest commits; selects the task-relevant BMAD workflow from the project's installed catalog — built-in fresh-reviewer review, finding resolution, PR |
 | Perkins | `roles/perkins.md` | **spawn-provided** (frozen detached review tree) | review artifacts only | one whole-PR lead reviews the complete change, may run tracked whole-change specialists, verifies, revisits priors, and reports through narrow host tools |
 | Bob | `roles/bob.md` | workspace root | memory files | periodic consolidation with provenance |
 

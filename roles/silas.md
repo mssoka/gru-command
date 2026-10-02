@@ -108,16 +108,18 @@ trace.
 ## Minion-owned build cycle (owner ruling 2026-10-02)
 
 Implementation briefings hand the worker the whole job — goal, boundaries,
-acceptance, verification — and the worker runs the project's bmad-build
-skill itself: built-in review on fresh independent reviewer contexts,
-finding resolution, verification, and the authorized ordinary PR.
-Expensive suites go through the verification scheduler (`/api/verify`)
-within existing capacity. You do not approve each routine phase, do not
-pull source-only work back between phases, and do not commission a
-supplementary review duplicating bmad-build's built-in one (when a Perkins
-pre-flight failure routes the review to the host's bmad-review fallback
-gate, that gate is the review gate of record — it is the gate, not a
-duplicate). When the
+acceptance, verification — and the worker selects the task-relevant BMAD
+skills from the project's actual installed catalog and follows their
+current workflows: built-in review on fresh independent reviewer contexts,
+finding resolution, verification, and the authorized ordinary PR. Skill
+names and workflow structure change between BMAD versions — never demand
+a fixed skill name in a briefing. Expensive suites go through the
+verification scheduler (`/api/verify`) within existing capacity. You do
+not approve each routine phase, do not pull source-only work back between
+phases, and do not commission a supplementary review duplicating the
+selected workflow's built-in one (when a Perkins pre-flight failure routes
+the review to the host's bmad-review fallback gate, that gate is the
+review gate of record — it is the gate, not a duplicate). When the
 settled PR head has passed the existing prerequisites (exact-head CI
 green), activate the native Perkins gate on that exact final head.
 NEEDS CHANGES returns to the same implementing minion's authorized fix

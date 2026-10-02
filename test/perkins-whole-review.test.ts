@@ -1337,19 +1337,23 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     // carries node_modules) — mirror that here so the smoke's
     // `import('./dist/roles.js')` leg exercises the installed loading path.
     symlinkSync(join(productRoot, 'node_modules'), join(stage, 'node_modules'), 'dir');
-    // The shipped artifact carries the minion-owned bmad-build playbook in
-    // the packaged personas (owner ruling 2026-10-02): the STAGED minion
-    // prompt — read from the tarball extract, not the developer checkout —
-    // must select the project's installed bmad-build skill and its
-    // fresh-reviewer cycle, and the staged ops skill must not commission a
-    // duplicate review.
+    // The shipped artifact carries the minion-owned BMAD workflow playbook
+    // in the packaged personas (owner ruling 2026-10-02; clarification
+    // j-761): the STAGED minion prompt — read from the tarball extract, not
+    // the developer checkout — must select the task-relevant installed BMAD
+    // skills from the project's actual catalog and its fresh-reviewer
+    // cycle, and the staged ops skill must not commission a duplicate
+    // review.
     const stagedMinion = readFileSync(join(stage, 'roles', 'minion.md'), 'utf-8').replace(/\s+/gu, ' ');
-    expect(stagedMinion).toContain("runs the PROJECT's installed `bmad-build` skill");
-    expect(stagedMinion).toContain('you own its cycle end to end');
+    expect(stagedMinion).toContain("the PROJECT's actual installed skill catalog and metadata");
+    expect(stagedMinion).toContain('select by what the project really has installed for the task');
+    expect(stagedMinion).toContain('You own the selected workflow end to end');
     expect(stagedMinion).toContain('fresh, context-free reviewer sessions');
     expect(stagedMinion).toContain('an inline self-review is not a substitute');
+    expect(stagedMinion).not.toContain('bmad-build');
     const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
-    expect(stagedOps).toContain('own its built-in review on fresh independent reviewer contexts');
+    expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
+    expect(stagedOps).toContain('never demand a fixed skill name');
     expect(stagedOps).toContain('do not commission a supplementary review duplicating');
     expect(stagedOps).toContain('native Perkins round on the exact final settled PR head');
     expect(stagedOps).toContain('it is the gate, never a duplicate review');
@@ -1366,9 +1370,10 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       import { ReviewMcpBridge } from './dist/runtime/review-mcp-bridge.js';
       const { ROLE_DEFINITIONS } = await import('./dist/roles.js');
       const minionPrompt = ROLE_DEFINITIONS.minion.systemPrompt;
-      if (!minionPrompt.includes("runs the PROJECT's installed \`bmad-build\` skill") ||
-          !minionPrompt.includes('fresh, context-free reviewer sessions')) {
-        throw new Error('staged minion prompt lacks the bmad-build playbook');
+      if (!minionPrompt.includes("the PROJECT's actual installed skill catalog and metadata") ||
+          !minionPrompt.includes('fresh, context-free reviewer sessions') ||
+          minionPrompt.includes('bmad-build')) {
+        throw new Error('staged minion prompt lacks the BMAD workflow playbook');
       }
       const bridge = await ReviewMcpBridge.start([{
         name: 'perkins_probe', description: 'staged probe', inputSchema: { type: 'object' },

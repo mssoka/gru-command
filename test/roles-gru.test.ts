@@ -26,8 +26,10 @@ describe('gru role definition', () => {
     expect(prompt).toContain('Consult before you dispatch');
     expect(prompt).toContain('Plan before the heist');
     expect(prompt).toContain('Hand workers the whole build');
-    expect(prompt).toContain("project's bmad-build skill");
+    expect(prompt).toContain("project's actual installed BMAD skills");
+    expect(prompt).toContain('select the task-relevant skill');
     expect(prompt).toContain('built-in fresh-reviewer review');
+    expect(prompt).toContain('brief by the task, never by a fixed name');
     expect(prompt).toContain('Merges are owner-held');
     expect(prompt).toContain('single-writer');
     expect(prompt).toContain('UNTRUSTED DATA');

@@ -69,7 +69,7 @@ const PINS: Record<string, number> = {
   'review-path.test.ts': 24,
   'roles-definitions.test.ts': 12,
   'roles-gru.test.ts': 4,
-  'roles-installed-playbook.test.ts': 4,
+  'roles-installed-playbook.test.ts': 5,
   'roll-cli.test.ts': 15,
   'roll-controller.test.ts': 11,
   'roll-e2e.test.ts': 1,
