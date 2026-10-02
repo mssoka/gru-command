@@ -18,6 +18,7 @@ typecheck = "npm run typecheck"
 # plain vitest invocations, no worker/timeout flags, never the npm chain).
 residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-resident-registry.test.ts test/fix-directive.test.ts test/silas-deterministic-seam.test.ts"
 handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"
+working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
