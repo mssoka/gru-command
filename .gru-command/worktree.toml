@@ -46,6 +46,12 @@ app-contract-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run
 # baseline without overlaying main's later worktree-freeze sources.
 app-contract-baseline = "sh tools/app-contract-baseline.sh"
 
+# Bounded diagnosis of the six failures in the previous FULL run at
+# 71481b8 (3608c3b7): the five 30 s timeout cases plus the decisions
+# hot-reload case, run together under the lane's approved RPC pretest.
+# Evidence only: the full gate remains the final head's FULL run.
+full-fail-diagnosis = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/decisions.test.ts test/dispatch-e2e.test.ts test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/wizard.test.ts"
+
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
 # Provider-recovery sensor lane scopes (r4 fix round; invoked only via
