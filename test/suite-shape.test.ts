@@ -58,7 +58,7 @@ const PINS: Record<string, number> = {
   'perkins-builtin-wave.test.ts': 88,
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
   'perkins-findings-dedupe.test.ts': 11,
-  'perkins-freeze-freshhead.test.ts': 13,
+  'perkins-freeze-freshhead.test.ts': 24,
   'perkins-lead-schema-compat.test.ts': 6,
   'perkins-whole-review.test.ts': 67,
   'pi-adapter.test.ts': 63,
@@ -104,7 +104,7 @@ const PINS: Record<string, number> = {
   'wizard-interactive.test.ts': 8,
   'wizard-register.test.ts': 2,
   'wizard.test.ts': 24,
-  'worktree-manager.test.ts': 40,
+  'worktree-manager.test.ts': 66,
   'worktree-manifest.test.ts': 8,
   'worktree-port.test.ts': 4,
   'worktrees-server.test.ts': 3,

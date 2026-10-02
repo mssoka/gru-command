@@ -1,7 +1,9 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import type { WorktreeBaseSource } from '../../src/ledger/api.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../../src/dispatch/worktree-port.js';
+import { resolveReviewTargetReal } from './git-review-port.js';
 
 /**
  * In-memory worktree port (test double for the E8 CORE suites — the real
@@ -18,6 +20,20 @@ export class InMemoryWorktreePort implements WorktreePort {
 
   constructor(root: string) {
     this.root = root;
+  }
+
+  async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
+    readonly sha: string;
+    readonly baseSource: WorktreeBaseSource | null;
+  }> {
+    // Git-backed fixtures resolve with the production discipline; the
+    // non-git contract fixtures keep the fabricated identity this double
+    // guarantees every other method (their lanes are plain directories).
+    const probe = spawnSync('git', ['-C', input.repoPath, 'rev-parse', '--is-inside-work-tree'], {
+      stdio: 'ignore',
+    });
+    if (probe.status === 0) return resolveReviewTargetReal(input.repoPath, input.ref);
+    return { sha: `sha-${input.ref}`, baseSource: null };
   }
 
   async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
