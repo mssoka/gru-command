@@ -8,6 +8,7 @@ import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import { appendPrCreationRule, PR_CREATION_RULE } from './pr-creation.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import type { WorktreePort } from './worktree-port.js';
+import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 
 /**
  * Fix-directive routing (E8 follow-through; owner ruling 2026-09-21): the
@@ -31,6 +32,13 @@ export interface DirectiveRoutingDeps {
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
+  /** Provider pacing: worker (minion turn) admission gate. Absent = off. */
+  readonly workerGate?: PacingGate;
+  /** Provider pacing: the bounded settlement of an automatic rate-limit
+   * retry covering the delivered turn. The directive reports delivered
+   * only for 'none'/'recovered'; the worker lease is released before the
+   * wait so the retry can reacquire admission. Absent = no interlock. */
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
 }
 
 /** The terminal verdict of a prompt that RESOLVED. Both adapters settle a
@@ -100,17 +108,64 @@ export async function routeFixDirectiveToMinion(
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
+      // Active-incident attribution (B1): if an automatic retry is already
+      // covering this handle, wait for its settlement BEFORE prompting.
+      // Otherwise the new directive and the retry would deliver overlapping
+      // prompts on one session, and this turn's failure could be settled by
+      // the other turn's outcome. Await before taking the worker slot — the
+      // retry re-acquires its own slot and must not be blocked by ours.
+      const pending = await settleRetries(input.retrySettlement, handle.id, input.signal);
+      if (pending === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+      let lease: PacingLease | null = null;
+      if (input.workerGate !== undefined) {
+        lease = await input.workerGate.acquireWorkerTurn({
+          id: input.jobId,
+          label: `directive → ${minion.id}`,
+          jobId: input.jobId,
+          signal: input.signal,
+        });
+      }
+      let promptError: unknown = null;
       try {
         await racedPrompt(handle, directive, input.signal, owner);
-        return { delivered: true, minionId: minion.id, ...verdictFields(promptTerminalVerdict(handle)) };
       } catch (error) {
-        // A resident-budget reclaim may be disposing this handle under us
-        // (typed handshake): fall through to the resume/re-brief path —
-        // remembering THIS handle's logical session — instead of dropping
-        // the directive with an opaque failure.
-        if (!(error instanceof WorkerDisposalInProgressError)) throw error;
-        evictedSessionFile = handle.sessionFile;
+        promptError = error;
+      } finally {
+        // Release before the settlement wait: the retry reacquires the slot.
+        lease?.release();
+        lease = null;
       }
+      if (promptError instanceof WorkerDisposalInProgressError) {
+        // A resident-budget reclaim may be disposing this handle under us
+        // (typed handshake): settle any automatic retry covering it BEFORE
+        // falling through, so the retry's own delivery and a resumed /
+        // session-file fallback can never overlap (two writers on one
+        // session) — and a 'recovered' disposition is reported as the
+        // delivery it is.
+        const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+        if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+        if (disposition === 'recovered') {
+          return { delivered: true, minionId: minion.id, ...verdictFields(promptTerminalVerdict(handle)) };
+        }
+        evictedSessionFile = handle.sessionFile;
+        continue;
+      }
+      // A rejected prompt keeps the same bounded settlement interlock as a
+      // resolved one: an in-band rate-limit incident may still be carrying
+      // the directive, so failure is reported only after the disposition is
+      // known (never duplicating a delivery the retry still owns).
+      const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+      if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+      if (disposition === 'exhausted' || disposition === 'superseded') {
+        return { delivered: false, note: `automatic rate-limit retry ${disposition} before delivery` };
+      }
+      if (promptError !== null && disposition !== 'recovered') throw promptError;
+      // Terminal/error correlation (r4 blocker 1): the settled handle's
+      // health is the runtime's own verdict for the turn that just settled
+      // — a resolved-but-errored turn reports outcome 'error' and must
+      // never complete a marked phase or record a phase-tagged delivery.
+      const verdict = promptTerminalVerdict(handle);
+      return { delivered: true, minionId: minion.id, ...verdictFields(verdict) };
     }
   }
   const lane = input.worktrees
@@ -119,40 +174,67 @@ export async function routeFixDirectiveToMinion(
   if (lane === undefined) {
     return { delivered: false, note: 'no implementing minion session and no job lane' };
   }
-  // Prefer the CURRENT failing logical session; only when the evicted
-  // handle exposed none fall back to the newest session-bearing record —
-  // never an arbitrary older disposed minion's session.
-  const fallback = evictedSessionFile === null
-    ? ([...minions].reverse().find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
-    : null;
-  const resumeFile = evictedSessionFile ?? fallback;
-  let handle: AgentHandle;
-  let prompt = directive;
-  try {
-    handle = await input.registry.spawn('minion', {
-      cwd: lane.path, signal: input.signal,
-      ...(resumeFile !== null ? { resumeFile } : {}),
+  let lease: PacingLease | null = null;
+  if (input.workerGate !== undefined) {
+    lease = await input.workerGate.acquireWorkerTurn({
+      id: input.jobId,
+      label: `directive (fresh minion) → ${input.jobId}`,
+      jobId: input.jobId,
+      signal: input.signal,
     });
-  } catch (error) {
-    if (resumeFile === null || input.signal.aborted) throw error;
-    const job = input.ledger.getJob(input.jobId);
-    if (job == null || job.briefing == null) {
-      throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
-    }
-    handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal });
-    prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
   }
-  let verdict: PromptTerminalVerdict = { ok: true, error: null };
+  let handle: AgentHandle | null = null;
   try {
-    input.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: input.jobId, sessionFile: handle.sessionFile });
-    await racedPrompt(handle, prompt, input.signal, owner);
-    // Read the terminal verdict BEFORE dispose(): a disposed handle cannot
-    // attest the turn it just ran.
-    verdict = promptTerminalVerdict(handle);
+    // Prefer the CURRENT failing logical session; only when the evicted
+    // handle exposed none fall back to the newest session-bearing record —
+    // never an arbitrary older disposed minion's session.
+    const fallback = evictedSessionFile === null
+      ? ([...minions].reverse().find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
+      : null;
+    const resumeFile = evictedSessionFile ?? fallback;
+    let prompt = directive;
+    try {
+      handle = await input.registry.spawn('minion', {
+        cwd: lane.path, signal: input.signal,
+        ...(resumeFile !== null ? { resumeFile } : {}),
+      });
+    } catch (error) {
+      if (resumeFile === null || input.signal.aborted) throw error;
+      const job = input.ledger.getJob(input.jobId);
+      if (job == null || job.briefing == null) {
+        throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
+      }
+      handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal });
+      prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
+    }
+    let promptError: unknown = null;
+    try {
+      input.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: input.jobId, sessionFile: handle.sessionFile });
+      await racedPrompt(handle, prompt, input.signal, owner);
+    } catch (error) {
+      promptError = error;
+    } finally {
+      // Release before the settlement wait: the retry reacquires the slot.
+      lease?.release();
+      lease = null;
+    }
+    const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+    if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+    if (disposition === 'exhausted' || disposition === 'superseded') {
+      return { delivered: false, note: `automatic rate-limit retry ${disposition} before delivery` };
+    }
+    if (promptError !== null && disposition !== 'recovered') throw promptError;
+    // Terminal/error correlation (r4 blocker 1): the handle's health at
+    // settlement is the runtime's own verdict for the turn that just
+    // settled — including a retry-recovered one. A resolved-but-errored
+    // turn reports outcome 'error' and must never complete a marked
+    // phase or record a phase-tagged delivery.
+    const verdict = promptTerminalVerdict(handle);
+    return { delivered: true, minionId: handle.id, ...verdictFields(verdict) };
   } finally {
-    await handle.dispose();
+    lease?.release();
+    if (handle !== null) await handle.dispose();
   }
-  return { delivered: true, minionId: handle.id, ...verdictFields(verdict) };
 }
 
 /** Race a prompt against cancellation so shutdown cannot stall on an
@@ -279,6 +361,10 @@ export async function rebriefFreshMinion(
     briefing: string | null;
     /** Resume this session file instead of minting fresh (boot recovery). */
     resumeFile?: string | null;
+    /** Service-stopping signal: aborts a QUEUED admission wait and lets the
+     * settlement race below observe cancellation instead of hanging
+     * shutdown. Absent = settlement remains hook-owned. */
+    signal?: AbortSignal;
     /** Called after the worker is registered and BEFORE its prompt is
      * delivered — the durable re-brief marker binds the worker here, so a
      * crash mid-turn leaves a resumable pointer behind. */
@@ -314,37 +400,68 @@ export async function rebriefFreshMinion(
     throw new Error(`job "${input.jobId}" has no active job lane — a re-brief needs its worktree`);
   }
   const cwd = requireSpawnCwd('minion', lane.path);
-  const handle = await input.registry.spawn('minion', {
-    cwd,
-    ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
-  });
-  input.ledger.registerAgent({
-    id: handle.id,
-    role: 'minion',
-    sessionFile: handle.sessionFile,
-    jobId: input.jobId,
-  });
-  input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
-  const prompt = renderRebriefPrompt({
-    jobId: input.jobId,
-    briefing: input.briefing,
-    note: input.note,
-    ...(input.lessons !== undefined
-      ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
-      : {}),
-  });
-  let verdict: PromptTerminalVerdict = { ok: true, error: null };
-  try {
-    await handle.prompt(prompt, { owner: `silas-rebrief:${input.jobId}` });
-    verdict = promptTerminalVerdict(handle);
-  } catch (error) {
-    throw new Error(`re-brief turn failed on ${handle.id}: ${String(error)}`);
+  let lease: PacingLease | null = null;
+  if (input.workerGate !== undefined) {
+    lease = await input.workerGate.acquireWorkerTurn({
+      id: input.jobId,
+      label: `re-brief → ${input.jobId}`,
+      jobId: input.jobId,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    });
   }
-  return {
-    minionId: handle.id,
-    lanePath: lane.path,
-    prompt,
-    sessionFile: handle.sessionFile,
-    ...verdictFields(verdict),
-  };
+  try {
+    const handle = await input.registry.spawn('minion', {
+      cwd,
+      ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
+    });
+    input.ledger.registerAgent({
+      id: handle.id,
+      role: 'minion',
+      sessionFile: handle.sessionFile,
+      jobId: input.jobId,
+    });
+    input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
+    const prompt = renderRebriefPrompt({
+      jobId: input.jobId,
+      briefing: input.briefing,
+      note: input.note,
+      ...(input.lessons !== undefined
+        ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
+        : {}),
+    });
+    let promptError: unknown = null;
+    try {
+      await handle.prompt(prompt, { owner: `silas-rebrief:${input.jobId}` });
+    } catch (error) {
+      promptError = error;
+    } finally {
+      // Release before the settlement wait: the retry reacquires the slot.
+      lease?.release();
+      lease = null;
+    }
+    // The re-brief delivery reports success only for 'none'/'recovered': a
+    // rate-limited turn whose bounded retry is still carrying the prompt
+    // must not land the re-brief/delivery markers early, and a rejection
+    // whose retry recovers is a delivery, not a failure.
+    const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+    if (disposition === 'cancelled') {
+      throw new Error(`re-brief turn on ${handle.id} was cancelled before its automatic retries settled`);
+    }
+    if (disposition === 'exhausted' || disposition === 'superseded') {
+      throw new Error(`re-brief turn failed on ${handle.id}: automatic rate-limit retry ${disposition} before delivery`);
+    }
+    if (promptError !== null && disposition !== 'recovered') {
+      throw new Error(`re-brief turn failed on ${handle.id}: ${String(promptError)}`);
+    }
+    const verdict = promptTerminalVerdict(handle);
+    return {
+      minionId: handle.id,
+      lanePath: lane.path,
+      prompt,
+      sessionFile: handle.sessionFile,
+      ...verdictFields(verdict),
+    };
+  } finally {
+    lease?.release();
+  }
 }

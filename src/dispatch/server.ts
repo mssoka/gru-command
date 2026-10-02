@@ -14,6 +14,7 @@ import type { LessonsReferencePort } from '../lessons/types.js';
 import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha } from './silas-driver.js';
 import type { WorktreePort } from './worktree-port.js';
+import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -32,6 +33,14 @@ export interface SilasOpsSurface {
   readonly registry: DirectiveRegistry;
   readonly worktrees: WorktreePort;
   readonly notifications: NotificationCenter;
+  /** Provider-recovery claim surface (the guarded continuation
+   * transition): absent = the claim endpoint answers 503 (sensor not
+   * wired). */
+  readonly providerRecovery?: {
+    claim(waitId: string, by: string): Promise<unknown>;
+  };
+  /** The supervisor's guarded owned re-arm for the silas slot. */
+  readonly slotReArm?: { ownedProviderReArm(agentId: string, waitId: string): boolean };
 }
 
 export interface DispatchServerOptions {
@@ -40,6 +49,13 @@ export interface DispatchServerOptions {
   readonly wave: WaveRunner;
   /** The record of record — silas.* attribution events land here. */
   readonly ledger: LedgerApi;
+  /** Provider pacing: worker (minion turn) admission gate for directive
+   * deliveries and re-briefs. Absent = off. */
+  readonly workerGate?: PacingGate;
+  /** Provider pacing: bounded settlement of an automatic rate-limit retry
+   * covering a just-delivered directive/re-brief turn (supervisor-backed
+   * in production). The route records delivered only for 'none'/'recovered'. */
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   /** Absent = /api/silas/* answers 503 (silas ops not hosted). */
   readonly silasOps?: SilasOpsSurface;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
@@ -407,7 +423,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const controller = new AbortController();
       directiveControllers.add(controller);
       const run = (async (): Promise<void> => {
-        let delivery: { delivered: boolean; minionId?: string; note?: string };
+        let delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>;
         try {
           delivery = await routeFixDirectiveToMinion({
             registry: ops.registry,
@@ -417,6 +433,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             directive,
             signal: controller.signal,
             owner: 'silas-ops',
+            ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+            ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
             ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
           });
         } catch (error) {
@@ -625,6 +643,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           registry: ops.registry,
           ledger: options.ledger,
           worktrees: ops.worktrees,
+          signal: controller.signal,
+          ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+          ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
           jobId,
           note,
           briefing: job.briefing,
@@ -721,6 +742,27 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         payload: { title, notification_id: notification.id },
       });
       json(res, 200, { notification_id: notification.id });
+      return true;
+    }
+    if (req.method === 'POST' && path === '/api/silas/provider-recovery/claim') {
+      if (!authed(req, res)) return true;
+      const ops = silasOpsOr503(res);
+      if (ops === null) return true;
+      if (ops.providerRecovery === undefined) {
+        json(res, 503, {
+          error: 'provider_recovery_not_hosted',
+          detail: 'the provider-recovery sensor is not wired on this service',
+        });
+        return true;
+      }
+      const body = await readBody(req);
+      const waitId = strField(body, 'wait_id');
+      const by = strField(body, 'by');
+      if (by !== 'silas') {
+        throw new Error('provider-recovery claims are recorded as silas actions; pass by: "silas"');
+      }
+      const result = await ops.providerRecovery.claim(waitId, by);
+      json(res, 200, result as Record<string, unknown>);
       return true;
     }
     return false;

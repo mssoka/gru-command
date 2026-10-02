@@ -10,6 +10,7 @@ import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 import { recordFollowUpDelivery, promptTerminalVerdict } from './fix-directive.js';
+import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import { PR_CREATION_RULE } from './pr-creation.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -43,6 +44,19 @@ export interface DispatchServiceOptions {
    * split: the manager implementation is its own lane. */
   readonly worktrees: WorktreePort;
   readonly spawner: AgentSpawner;
+  /** Provider pacing: FIFO worker (minion turn) admission gate. Absent =
+   * off; an unlimited or disabled gate admits immediately. */
+  readonly workerGate?: PacingGate;
+  /** Provider pacing: the bounded settlement of an automatic rate-limit
+   * retry covering a just-delivered worker turn (supervisor-backed in
+   * production). The delivery records success only for 'none'/'recovered'
+   * and releases its worker lease before waiting so the retry can
+   * reacquire admission. Absent = no interlock. */
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+  /** Service-stopping signal: aborts a QUEUED admission wait and lets the
+   * settlement wait below observe shutdown instead of hanging. Absent =
+   * settlement is hook-owned and the queue wait is uncancellable. */
+  readonly stopSignal?: AbortSignal;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
   /** Extracts a minion's opt-in lessons block at delivery settle. */
@@ -133,6 +147,12 @@ export class DispatchService {
     // later bookkeeping failure must not close a phase whose completion
     // evidence already exists (the boot reconciler finishes it instead).
     let deliveredRecorded = false;
+    let workerLease: PacingLease | null = null;
+    const releaseWorker = (): void => {
+      const lease = workerLease;
+      workerLease = null;
+      lease?.release();
+    };
     try {
       const working = this.opts.ledger.setJobStatus(job.id, 'working');
 
@@ -155,13 +175,41 @@ export class DispatchService {
 
       // (4) The minion: a fresh agent session rooted in the PROJECT
       // worktree (ruling 17: dispatch cwd = project root, all runtimes).
+      // Provider pacing: the minion turn waits FIFO for a worker slot when
+      // at the configured cap — the lane lands queued on the board with the
+      // honest reason and is admitted in order (never rejected, never
+      // preempted). Unlimited default admits immediately: zero change.
+      if (this.opts.workerGate !== undefined) {
+        let queuedReason: string | null = null;
+        const lease = await this.opts.workerGate.acquireWorkerTurn({
+          id: job.id,
+          label: input.title,
+          jobId: job.id,
+          ...(this.opts.stopSignal !== undefined ? { signal: this.opts.stopSignal } : {}),
+          queued: (info) => {
+            queuedReason = info.reason;
+            this.opts.ledger.noteJob(job.id, info.reason);
+          },
+        });
+        workerLease = lease;
+        if (queuedReason !== null) {
+          // The lane waited at the cap and is now admitted: replace the queue
+          // note so the durable note never keeps claiming a running lane is
+          // still queued (the live gate view carries the queue truth).
+          this.opts.ledger.noteJob(
+            job.id,
+            `pacing: admitted after ${lease.waitedMs} ms queue wait`,
+          );
+        }
+      }
       let handle: AgentHandle;
       try {
         const cwd = requireSpawnCwd('minion', worktree.path);
         handle = await this.opts.spawner('minion', { cwd });
       } catch (error) {
-        // The lane cannot start — sweep the fresh worktree (preserve
-        // first, per ruling 18c) and block the job.
+        // The lane cannot start — release the pacing slot, sweep the fresh
+        // worktree (preserve first, per ruling 18c) and block the job.
+        releaseWorker();
         await this.sweepQuietly(worktree.id);
         throw error;
       }
@@ -191,8 +239,130 @@ export class DispatchService {
       });
 
       // (5) Deliver the briefing. The turn runs in the background; the
-      // board shows the arc through ledger events, not this await.
+      // board shows the arc through ledger events, not this await. A
+      // rate-limited turn stays pending until its bounded automatic retry
+      // path concludes — never recorded as delivered while a retry could
+      // still carry it, never disposed out from under that retry.
       const lessons = this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
+      const settleTurn = async (failure: unknown | null): Promise<{ readonly ok: boolean; readonly error?: string }> => {
+        // Release the slot first: the retry reacquires admission per attempt.
+        releaseWorker();
+        const settlement = await settleRetries(this.opts.retrySettlement, handle.id, this.opts.stopSignal).then(
+          (value) => ({ ok: true as const, value }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        if (!settlement.ok) {
+          if (!(settlement.error instanceof RetrySettlementUnavailableError)) throw settlement.error;
+          // A settlement-system fault is not a rate-limit narrative: block
+          // the lane loudly with the internal error instead of narrating a
+          // retry that never ran.
+          const detail = String(settlement.error);
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.minion-error',
+            jobId: job.id,
+            payload: { agentId: handle.id, error: detail },
+          });
+          this.recordSettleOutcome(job.id, 'blocked');
+          this.opts.ledger.noteJob(job.id, `pacing settlement unavailable — internal error: ${detail.slice(0, 200)}`);
+          this.log('error', 'briefing turn settlement unavailable', {
+            job: job.id,
+            agent: handle.id,
+            error: detail,
+          });
+          // A failed attempt never masquerades as a completed marked phase:
+          // no delivery was recorded, so the guard row closes with reason.
+          this.closeHandoffQuietly(
+            handoffPhaseId,
+            `dispatch turn failed: pacing settlement unavailable — internal error: ${detail.slice(0, 200)}`,
+          );
+          return { ok: false as const, error: detail };
+        }
+        const disposition = settlement.value;
+        if (disposition === 'cancelled') {
+          // Service stopping: the turn's outcome is unknown. Never report it
+          // delivered, and leave a named note instead of claiming the lane is
+          // still queued.
+          const detail = 'dispatch stopped before the automatic retries settled';
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.minion-error',
+            jobId: job.id,
+            payload: { agentId: handle.id, error: detail },
+          });
+          this.recordSettleOutcome(job.id, 'blocked');
+          this.opts.ledger.noteJob(job.id, `pacing: ${detail}`);
+          this.log('warn', 'briefing turn settlement cancelled by shutdown', {
+            job: job.id,
+            agent: handle.id,
+          });
+          // The turn recorded no delivery, so the marked phase cannot have
+          // completed: close the guard row instead of leaving a stale intent.
+          this.closeHandoffQuietly(handoffPhaseId, 'dispatch turn failed: service stopped before the automatic retries settled');
+          return { ok: false as const, error: detail };
+        }
+        const retryFailed = disposition === 'exhausted' || disposition === 'superseded';
+        if (failure !== null && disposition !== 'recovered') {
+          const error = String(failure);
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.minion-error',
+            jobId: job.id,
+            payload: { agentId: handle.id, error },
+          });
+          this.recordSettleOutcome(job.id, 'blocked');
+          this.log('error', 'minion briefing turn failed', {
+            job: job.id,
+            agent: handle.id,
+            error,
+          });
+          if (!deliveredRecorded) {
+            this.closeHandoffQuietly(handoffPhaseId, `dispatch turn failed: ${error}`);
+          }
+          return { ok: false as const, error };
+        }
+        if (retryFailed) {
+          const error = `automatic rate-limit retry ${disposition} — the briefing turn did not deliver`;
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.minion-error',
+            jobId: job.id,
+            payload: { agentId: handle.id, error },
+          });
+          this.recordSettleOutcome(job.id, 'blocked');
+          this.log('error', 'minion briefing turn did not survive its automatic retries', {
+            job: job.id,
+            agent: handle.id,
+            disposition,
+          });
+          this.closeHandoffQuietly(handoffPhaseId, `dispatch turn failed: ${error}`);
+          return { ok: false as const, error };
+        }
+        // Terminal/error correlation (r4 blocker 1): a resolved prompt is
+        // not success — both adapters settle fulfilled prompts that ended in
+        // an in-band error (Claude result.isError; Pi stopReason 'error').
+        // The handle's health at settlement is the runtime's terminal
+        // evidence, including for a retry-recovered turn; a failed turn
+        // never records a phase-tagged delivery and never publishes a
+        // completed phase.
+        const verdict = promptTerminalVerdict(handle);
+        if (!verdict.ok) {
+          return this.recordTurnFailure(
+            job.id,
+            handle.id,
+            handoffPhaseId,
+            deliveredRecorded,
+            verdict.error ?? 'runtime settled the briefing turn with an in-band error',
+          );
+        }
+        const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
+          worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch',
+          ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}) });
+        deliveredRecorded = true;
+        if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
+          job: job.id, note: delivery.note, lane: delivery.lanePath,
+        });
+        this.recordSettleOutcome(job.id, 'delivered');
+        this.captureLessons(handle, job.id);
+        this.log('info', 'minion briefing turn completed', { job: job.id, agent: handle.id, disposition });
+        return { ok: true as const };
+      };
       const settled = handle
         .prompt(
           renderMinionBriefing({
@@ -207,41 +377,16 @@ export class DispatchService {
           { owner: `dispatch:${job.id}` },
         )
         .then(
-          async () => {
-            // Transport resolution is not success: both adapters resolve a
-            // fulfilled prompt even when the turn ended in an in-band error
-            // (Claude result.isError; Pi assistant stopReason 'error'). The
-            // handle's health at settle time is the runtime's terminal
-            // evidence — without this correlation an error-only audit would
-            // record a phase-tagged delivery and publish a completed phase.
-            const verdict = promptTerminalVerdict(handle);
-            if (!verdict.ok) {
-              return this.recordTurnFailure(
-                job.id,
-                handle.id,
-                handoffPhaseId,
-                deliveredRecorded,
-                verdict.error ?? 'runtime settled the briefing turn with an in-band error',
-              );
-            }
-            const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
-              worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch',
-              ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}) });
-            deliveredRecorded = true;
-            if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
-              job: job.id, note: delivery.note, lane: delivery.lanePath,
-            });
-            this.recordSettleOutcome(job.id, 'delivered');
-            this.captureLessons(handle, job.id);
-            this.log('info', 'minion briefing turn completed', { job: job.id, agent: handle.id });
-            return { ok: true as const };
-          },
-          (error: unknown) =>
-            this.recordTurnFailure(job.id, handle.id, handoffPhaseId, deliveredRecorded, String(error)),
-        );
+          () => settleTurn(null),
+          (error: unknown) => settleTurn(error),
+        )
+        .finally(() => {
+          releaseWorker();
+        });
 
       return { job: working, worktree, agentId: handle.id, settled };
     } catch (error) {
+      releaseWorker();
       this.opts.ledger.setJobStatus(job.id, 'blocked');
       this.opts.ledger.noteJob(job.id, `dispatch failed: ${String(error)}`);
       this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${String(error)}`);

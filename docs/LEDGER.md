@@ -197,7 +197,7 @@ on every row it creates, the `worktree.created` event carries it, and a
 FYI (owner incident 2026-09-23: lanes branched up to hours stale,
 silently). On REVIEW lanes `origin` covers any freshly fetched origin
 branch named by the target — not only the default branch.
-### E10: durable follow-through obligations and directive requests (migration 10)
+### E10: durable follow-through obligations and directive requests (migration 11)
 
 Two tables carry the blocked-heist follow-through contract. Neither
 executes work, schedules anything or wakes anyone by itself: they make
@@ -265,12 +265,12 @@ both query the LIVE states directly, and the boot pass pages by
 `request_id` cursor — terminal history can never crowd a live request
 out of examination.
 
-### Explicit phase-completion handoffs (migration 11, pr136-chief-handoff)
+### Explicit phase-completion handoffs (migration 12, pr136-chief-handoff)
 
 The durable-follow-through contract above started with blocked lanes. A
 bounded phase can also complete on a lane that is NOT blocked and whose
 HEAD never moves (the fresh artifact-only dispatch and the same-head
-re-brief are the observed shapes). Migration 10 closes that gap with an
+re-brief are the observed shapes). Migration 11 closes that gap with an
 EXPLICIT, durable intent — never inferred from a final message, an HTTP
 status, `job.delivered` alone, an idle board or an assistant claim.
 
@@ -337,7 +337,7 @@ published; a completed phase missing its obligation or card finishes
 them. It reads only ACTIONABLE rows (`awaiting` intents plus `completed`
 rows missing the obligation or card — already-published history is
 excluded, so no prefix can consume its budget) and persists a durable
-round-robin cursor (`reconcile_cursors`, migration 12): a pass that
+round-robin cursor (`reconcile_cursors`, migration 13): a pass that
 exhausts its page budget resumes from its last examined rowid on the next
 pass, and a pass that reaches the end wraps to the first row. Every
 actionable row is therefore examined within a bounded number of passes.
@@ -364,10 +364,10 @@ machine `action-required`.
 **Limits.** This slice adds no runtime attestation interface, no
 provider recovery and no timer/scheduler: a crash mid-dispatch with no
 admission evidence leaves the phase `awaiting` (never a fabricated
-success). Migration 11 is additive; nothing here changes owner stops,
+success). Migration 12 is additive; nothing here changes owner stops,
 merge/deploy/restart policy or any callers' notification semantics.
 
-### Bounded reconcile cursors (migration 12, PR136 r4 repair)
+### Bounded reconcile cursors (migration 13, PR136 r4 repair)
 
 One tiny durable table backs fair bounded reconciliation:
 
@@ -378,5 +378,5 @@ scope is used by `reconcilePhaseHandoffs`; the cursor rowid is the last
 row EXAMINED by a pass that hit its page budget, and `0` means “start
 from the first actionable row”. A cursor is operational state, never a
 write license: it only decides WHICH bounded slice of already-authorized
-reconciliation runs next. Migration 12 is additive and carries the same
+reconciliation runs next. Migration 13 is additive and carries the same
 landing-collision convention as migrations 10/11.

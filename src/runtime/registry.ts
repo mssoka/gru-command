@@ -1,6 +1,7 @@
 import { RUNTIME_IDS, resolveSpawnPolicy, type Role, type RuntimeId } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
+import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { PiRuntime } from './pi-adapter.js';
 import { ClaudeCodeRuntime } from './claude-adapter.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
@@ -662,6 +663,20 @@ export class RuntimeRegistry {
       if (handle.id === agentId) return handle;
     }
     return null;
+  }
+
+  /** The shared offline pi ModelRuntime for read-only consumers (the
+   * provider-recovery probe resolves routes/credentials through the SAME
+   * instance spawns use). Creates the pi adapter if needed — offline
+   * construction only, no network refresh. */
+  piModelRuntime(): Promise<ModelRuntime> {
+    const adapter = this.runtimeFor('pi');
+    const native = this.nativeAdapters.get('pi');
+    if (!(native instanceof PiRuntime)) {
+      throw new Error('pi runtime adapter unavailable — the provider-recovery probe requires it');
+    }
+    void adapter;
+    return native.runtimeHandle();
   }
 
   /** Snapshot of every live handle (roll drain probe: mid-turn sessions). */

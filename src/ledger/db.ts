@@ -325,15 +325,94 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
+    // Provider-recovery sensor (owner-approved 2026-09-28): durable
+    // provider-wait state, per-route probe cadence/budget, and the
+    // restart-safe pending recovery delivery marker. Explicit waits only —
+    // never inferred from generic blocked status or backlog membership.
+    id: 10,
+    name: 'provider-recovery-waits',
+    sql: `
+      CREATE TABLE provider_waits (
+        id                      TEXT PRIMARY KEY,
+        route_key               TEXT NOT NULL,
+        provider                TEXT NOT NULL,
+        model                   TEXT NOT NULL,
+        endpoint                TEXT NOT NULL,
+        credential_fingerprint  TEXT NOT NULL,
+        waiter_kind             TEXT NOT NULL CHECK (waiter_kind IN ('job-minion','silas-slot')),
+        job_id                  TEXT REFERENCES jobs(id),
+        agent_id                TEXT,
+        slot_id                 TEXT,
+        session_file            TEXT,
+        continuation            TEXT,
+        job_status_at_establishment TEXT,
+        lineage_key             TEXT,
+        recovery_batch_id       TEXT,
+        incident_id             TEXT NOT NULL,
+        incident_generation     INTEGER NOT NULL,
+        status                  TEXT NOT NULL CHECK (status IN ('waiting','recovered-pending','claimed','cancelled','superseded')),
+        reason_class            TEXT NOT NULL,
+        created_at              TEXT NOT NULL,
+        updated_at              TEXT NOT NULL
+      );
+      CREATE INDEX idx_provider_waits_route ON provider_waits(route_key, status);
+      CREATE INDEX idx_provider_waits_job ON provider_waits(job_id);
+      CREATE INDEX idx_provider_waits_agent ON provider_waits(agent_id);
+
+      CREATE TABLE provider_routes (
+        route_key                  TEXT PRIMARY KEY,
+        provider                   TEXT NOT NULL,
+        model                      TEXT NOT NULL,
+        endpoint                   TEXT NOT NULL,
+        credential_fingerprint     TEXT NOT NULL,
+        incident_seq               INTEGER NOT NULL,
+        window_start               TEXT NOT NULL,
+        attempts_in_window         INTEGER NOT NULL,
+        next_check_at              TEXT NOT NULL,
+        last_attempt_at            TEXT,
+        last_result                TEXT,
+        consecutive_probe_failures INTEGER NOT NULL,
+        false_recovery_count       INTEGER NOT NULL,
+        suspended_until            TEXT,
+        updated_at                 TEXT NOT NULL
+      );
+
+      CREATE TABLE pending_provider_recovery (
+        id                   TEXT PRIMARY KEY,
+        route_key            TEXT NOT NULL,
+        incident_generation  INTEGER NOT NULL,
+        evidence             TEXT NOT NULL,
+        created_at           TEXT NOT NULL,
+        updated_at           TEXT NOT NULL,
+        UNIQUE (route_key, incident_generation)
+      );
+      CREATE INDEX idx_pending_provider_recovery_route ON pending_provider_recovery(route_key);
+
+      -- Durable PRE-I/O probe reservation (r1 #5): a row exists while a
+      -- check is in flight or was interrupted mid-flight; its presence
+      -- means the attempt was CHARGED (budget + cadence advanced BEFORE
+      -- the network I/O), so a crash can never refund it or issue an
+      -- immediate duplicate.
+      CREATE TABLE provider_probe_reservations (
+        route_key    TEXT PRIMARY KEY,
+        reserved_at  TEXT NOT NULL,
+        expires_at   TEXT NOT NULL,
+        outcome      TEXT NOT NULL CHECK (outcome IN ('reserved','spent-unknown'))
+      );
+    `,
+  },
+  {
     // Durable follow-through obligations (blocked-heist follow-through,
     // phase 2 — ledger foundation only; no scheduling/execution).
     //
     // LANDING COLLISION RESOLVED (chief ruling 2026-09-28 protocol): main
     // landed migration 9 (worktree-base-source, PR #69) while these
     // never-applied migrations sat unshipped on this branch. They were
-    // renumbered 9->10 and 10->11 at integration — renumbering ONLY
-    // never-applied migrations, no hole, no imported schema — and the
-    // final head must be reverified/reviewed after integration. Once applied on any
+    // renumbered 9->10 and 10->11 there, then 10->11, 11->12, 12->13
+    // when owner-merged main landed provider-recovery-waits as id 10 —
+    // renumbering ONLY never-applied migrations, no hole, no imported
+    // schema — and the final head must be reverified/reviewed after
+    // integration. Once applied on any
     // database, this build refuses unknown/gapped versions — roll-forward
     // is the only compatible direction (no old-binary compatibility
     // claim, no live schema action).
@@ -356,7 +435,7 @@ export const MIGRATIONS: readonly Migration[] = [
     // binds an armed receipt expectation to the delegated phase's actual
     // identity, so a later unrelated event of the same kind cannot
     // satisfy an older expectation.
-    id: 10,
+    id: 11,
     name: 'job-obligations-and-directive-requests',
     sql: `
       CREATE TABLE job_obligations (
@@ -428,11 +507,11 @@ export const MIGRATIONS: readonly Migration[] = [
     // events watermark at acceptance: a completion at/before it can never
     // answer this phase (an older receipt cannot complete a newer phase).
     //
-    // LANDING COLLISION (same convention as migration 10): id 11 is a
+    // LANDING COLLISION (same convention as migration 10): id 12 is a
     // branch-local next-contiguous number for an UNSHIPPED feature; if
     // another lane's migration lands first, integrate owner-merged main and
     // re-number ONLY this never-applied migration (never a hole).
-    id: 11,
+    id: 12,
     name: 'phase-handoffs',
     sql: `
       CREATE TABLE phase_handoffs (
@@ -465,11 +544,11 @@ export const MIGRATIONS: readonly Migration[] = [
     // sweep reads only actionable rows and must still make fair progress
     // across bounded passes — without a persisted cursor a fresh pass
     // re-examines the same prefix and a later owed row never lands.
-    // LANDING COLLISION (same convention as migrations 10/11): id 12 is a
+    // LANDING COLLISION (same convention as migrations 10/11): id 13 is a
     // branch-local next-contiguous number for an UNSHIPPED feature; if
     // owner-merged main lands first, re-number ONLY this never-applied
     // migration (never a hole).
-    id: 12,
+    id: 13,
     name: 'reconcile-cursors',
     sql: `
       CREATE TABLE reconcile_cursors (

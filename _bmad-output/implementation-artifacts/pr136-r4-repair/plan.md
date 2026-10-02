@@ -84,9 +84,10 @@ later owed decision was never reached.
 - `src/ledger/api.ts` — `listPhaseHandoffs({ needsAction: true })` narrows
   to rows a pass can move: `awaiting`, or `completed` missing its obligation
   or card. Satisfied publication history is excluded BY the query.
-- `src/ledger/db.ts` — migration 12 `reconcile_cursors` (scope, cursor,
-  updated_at); `readReconcileCursor`/`writeReconcileCursor` are the only
-  accessors.
+- `src/ledger/db.ts` — migration `reconcile-cursors` (final merged id 13:
+  branch-local 12 renumbered when owner-merged main landed
+  provider-recovery-waits as 10); `readReconcileCursor` /
+  `writeReconcileCursor` are the only accessors.
 - `src/dispatch/obligations.ts` — `reconcilePhaseHandoffs` reads actionable
   rows only and persists a durable round-robin cursor: a pass that exhausts
   its page budget resumes at its last examined rowid; a pass that reaches
@@ -124,3 +125,24 @@ later owed decision was never reached.
 - Known residual (nonblocking, from prior 1): obligation `authority.version`
   is caller-supplied provenance; request existence/job/admitted-settled
   state are validated against ledger facts.
+
+## Integration (owner-merged main, history-preserving)
+
+- Repair head before integration: `32d2f40c4606c0fd1bd4110150c937af908caa4c`.
+- Owner-merged main integrated: `b9008373497709d2bd2f07fdbaf83634808955c1`
+  (PRs #132/#134/#135/#143/#150 wave; PR135 provider pacing landed the
+  rate-limit retry interlock on the same dispatch/directive/re-brief
+  seams).
+- Compose rule (r2 handoff's requested "clean turn outcome AND retry
+  finality"): the terminal verdict is read after the retry settlement at
+  every delivery return, so a resolved-but-errored turn (including a
+  retry-recovered one) reports `outcome: 'error'` and never completes a
+  marked phase. Known-failure dispatch branches close the marked guard
+  row; the cancelled-by-shutdown branch closes it as well (no delivery
+  was recorded, so completion is impossible).
+- Migrations renumbered on merge: main's `provider-recovery-waits`
+  keeps id 10; this lane's three never-applied migrations become
+  11 (job-obligations-and-directive-requests), 12 (phase-handoffs) and
+  13 (reconcile-cursors). No applied migration was edited.
+- `test/suite-shape.test.ts` pins reconciled to the merged tree (114
+  files, exact per-file counts; branch-local pins restored).

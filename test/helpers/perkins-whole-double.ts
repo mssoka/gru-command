@@ -77,6 +77,8 @@ export interface WholePreflightOptions {
 
 export interface WholeLeadOptions {
   childAnswer: (prompt: string, call: WholeSpawnCall) => string | Promise<string>;
+  /** In-band model failure whose prompt promise still resolves. */
+  readonly promptError?: (call: WholeSpawnCall) => string | null;
   /**
    * Simulate a native-tool specialist runtime (pi): the spawned handle
    * declares the requested perkins_submit_findings tool and, with 'tool',
@@ -230,6 +232,10 @@ export function fakeWholeSpawner(
     let waveLimit = 4;
     let stubbornLeft = options.stubbornBatches ?? 0;
     while (worklist.length > 0) {
+      // A session disposed MID-TURN (e.g. the host ending a round whose
+      // review slot could not be re-acquired) stops the scripted lead here:
+      // no later tool call may run without its slot.
+      if (call.disposed === true) throw new Error('lead session disposed');
       const batch = worklist.splice(0, waveLimit);
       let runs: readonly string[];
       if (first && options.badRuns !== undefined) {
@@ -419,6 +425,7 @@ export function fakeWholeSpawner(
     (isLead ? leadCalls : childCalls).push(call);
     const requestedNativeTools = spawnOptions.isolatedReview?.nativeTools ?? [];
     const declaresNativeTools = !isLead && options.childNativeTools !== undefined && requestedNativeTools.length > 0;
+    const listeners = new Set<RuntimeEventListener>();
     const handle: AgentHandle = {
       role: 'perkins',
       id: agentId,
@@ -428,6 +435,11 @@ export function fakeWholeSpawner(
       ...(declaresNativeTools ? { reviewTools: requestedNativeTools.map((tool) => tool.name) } : {}),
       async prompt(prompt) {
         call.prompt = prompt;
+        const error = options.promptError?.(call) ?? null;
+        if (error !== null) {
+          for (const listener of listeners) listener({ type: 'error', error, fatal: false });
+          return;
+        }
         const text = isLead
           ? await runLead(call, prompt, spawnOptions.reviewLead!.nativeTools)
           : await options.childAnswer(prompt, call);
@@ -461,7 +473,7 @@ export function fakeWholeSpawner(
       },
       async steer() {},
       async followUp() {},
-      subscribe(_listener: RuntimeEventListener) { return () => {}; },
+      subscribe(listener: RuntimeEventListener) { listeners.add(listener); return () => { listeners.delete(listener); }; },
       health() { return { state: 'idle', lastActivity: null, sessionFile: file }; },
       async dispose() {
         if (options.disposeRejects?.(call) === true) {
