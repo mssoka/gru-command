@@ -31,10 +31,7 @@ export function attachBareOrigin(repo: FixtureRepo): string {
   return origin;
 }
 
-export function makeFixtureRepo(
-  name = 'fixture-app',
-  opts?: { readonly batchedInitialCommit?: boolean },
-): FixtureRepo {
+export function makeFixtureRepo(name = 'fixture-app'): FixtureRepo {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-fixture-'));
   const path = join(dir, name);
   mkdirSync(path, { recursive: true });
@@ -49,20 +46,8 @@ export function makeFixtureRepo(
   writeFileSync(join(path, 'README.md'), `# ${name}\n\nFixture repository for dispatch-flow tests.\n`);
   mkdirSync(join(path, 'src'), { recursive: true });
   writeFileSync(join(path, 'src', 'main.ts'), 'export function answer(): number {\n  return 42;\n}\n');
-  if (opts?.batchedInitialCommit === true) {
-    // T4-only equivalent primitive (phase pr142-t4-source-repair-20261002):
-    // ONE `git commit --include .` stages the same untracked seed files the
-    // pathspec matches — exactly what `git add .` staged — and commits, with
-    // the identical resulting tree, root parent, Fixture Tests identity,
-    // message and loud non-zero failure propagation, at one fewer git process
-    // in the load-amplified fixture window. Callers that omit the flag keep
-    // the historical two-process `git add .` + `git commit` shape
-    // byte-for-byte.
-    git([...GIT_IDENTITY, 'commit', '--include', '.', '-m', 'fixture: initial state']);
-  } else {
-    git([...GIT_IDENTITY, 'add', '.']);
-    git([...GIT_IDENTITY, 'commit', '-m', 'fixture: initial state']);
-  }
+  git([...GIT_IDENTITY, 'add', '.']);
+  git([...GIT_IDENTITY, 'commit', '-m', 'fixture: initial state']);
 
   const repo: FixtureRepo = {
     path,

@@ -1727,15 +1727,17 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
 
   it('does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)', async () => {
     const prepare = async (name: string, branch: string) => {
-      const repo = makeFixtureRepo(name, { batchedInitialCommit: true });
+      const repo = makeFixtureRepo(name);
       repos.push(repo);
       repo.git(['checkout', '-b', branch]);
       const target = (() => {
-        // Batched equivalent of commitFile's add+commit (phase
-        // pr142-t4-source-repair-20261002): one `git commit --include` stages
-        // and commits the file, with the identical Fixture Tests identity,
-        // default message, parent and resulting tree/HEAD, and the same loud
-        // non-zero failure propagation on any git error.
+        // Batched equivalent of commitFile's add+commit for a TRACKED modified
+        // file (phase pr142-t4-source-repair-20261002): `git commit --include
+        // <path>` stages the modification and commits in one process, with the
+        // identical Fixture Tests identity, default message, parent and
+        // resulting tree/HEAD, and the same loud non-zero failure propagation.
+        // (Untracked NEW files cannot be batch-staged this way — the initial
+        // fixture commit keeps its add+commit form.)
         const file = join(repo.path, 'src/main.ts');
         mkdirSync(dirname(file), { recursive: true });
         writeFileSync(file, 'export function answer(): number {\n  return 44;\n}\n');
