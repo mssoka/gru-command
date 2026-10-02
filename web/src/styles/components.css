@@ -1073,6 +1073,18 @@ body {
   background: var(--card);
 }
 
+/* Working flavor geometry (owner 2026-10-01): the rotating phrase must
+   never push the controls onto a second line. Console/tablet widths pin
+   the strip to one line — a long phrase ellipsizes inside the shrinkable
+   status chip instead of wrapping the buttons (which also grew the strip
+   and shifted the row above). The phone sheet keeps the wrap so the
+   status takes its own row (max-width: 899px block below). */
+@media (min-width: 900px) {
+  .chat-context {
+    flex-wrap: nowrap;
+  }
+}
+
 .chat-context__status {
   margin-right: auto;
   max-width: 100%;

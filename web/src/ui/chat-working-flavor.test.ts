@@ -384,4 +384,15 @@ describe('working flavor stylesheet contract', () => {
     expect(busyLabel).toMatch(/position:\s*absolute/);
     expect(busyLabel).toMatch(/clip:\s*rect\(0, 0, 0, 0\)/);
   });
+
+  it('never wraps the status strip on console/tablet widths', () => {
+    // The rotating phrase must stay on ONE line: with the base wrap, the
+    // longest approved phrases pushed the controls to a second line and
+    // grew the strip (the geometry e2e sweep found 21 phrases doing it).
+    // Console/tablet widths pin the single line; the phone sheet keeps the
+    // wrap so the status takes its own row.
+    expect(COMPONENTS_CSS).toMatch(
+      /@media \(min-width: 900px\)\s*\{\s*\.chat-context\s*\{[^}]*flex-wrap:\s*nowrap/,
+    );
+  });
 });

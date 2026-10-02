@@ -661,6 +661,10 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
 
     const chip = page.locator('#chat-chips .attach-chip', { hasText: 'camera-roll.png' });
     await expect(chip).toBeVisible();
+    // The ready chip appears with the upload; the busy placeholder clears
+    // in the same settle. The composer refuses a send while an upload is
+    // in flight ("one moment…"), so wait for the hand-off before clicking.
+    await expect(page.locator('#chat-chips .attach-chip--busy')).toHaveCount(0);
 
     await page.locator('#chat-input').fill('what did I just shoot');
     await page.locator('#chat-send').click();
@@ -698,6 +702,9 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
     });
     const chip = page.locator('#chat-chips .attach-chip', { hasText: 'paste-shot.png' });
     await expect(chip).toBeVisible();
+    // Same hand-off wait as the device-picker leg: send is guarded while
+    // the upload is still in flight.
+    await expect(page.locator('#chat-chips .attach-chip--busy')).toHaveCount(0);
 
     // Attachment-only send: no typed words needed (empty text + chips).
     await page.locator('#chat-send').click();
