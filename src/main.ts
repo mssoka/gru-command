@@ -5,6 +5,7 @@ import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
 import { RuntimeRegistry } from './runtime/registry.js';
+import { resolvePacingPolicy } from './runtime/pacing.js';
 import { SessionStore } from './sessions/store.js';
 import { LedgerDb } from './ledger/db.js';
 import { LedgerApi, type NotificationRecord } from './ledger/api.js';
@@ -331,9 +332,13 @@ async function main(): Promise<number> {
     deployDrift?: DeployDriftTracker;
   } = {};
   let shuttingDown = false;
+  /** Service-stopping signal (pacing): aborts QUEUED admission waits and
+   * lets delivery settlement observe shutdown instead of hanging. */
+  const serviceStop = new AbortController();
   const shutdown = (signal: string, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    serviceStop.abort();
     logger.info('shutdown begin', { signal, exit_code: exitCode });
     const forceExit = setTimeout(() => {
       logger.error('shutdown timeout — forcing exit', { signal });
@@ -547,10 +552,27 @@ async function main(): Promise<number> {
   // Late-bound (the verification server lands below) — same pattern as
   // supervisionFor / decisionsStatus above.
   let verificationView: () => VerificationQueueView | null = () => null;
+  // Provider pacing (owner heist 2026-09-29): one resolved policy for the
+  // process — the optional rate-limit backoff plus the FIFO admission gate
+  // shared by worker dispatches, directive deliveries, and Perkins rounds.
+  // Every queue/admission lands on the ledger; the board snapshot carries
+  // the live gate view. Default admission is enabled and unlimited; operators set
+  // turn caps independently of the resident-session budget.
+  const pacing = resolvePacingPolicy(config.pacing, {
+    record: (event) => {
+      ledger.appendCustomEvent({
+        kind: event.kind,
+        agentId: event.agentId ?? null,
+        jobId: event.jobId ?? null,
+        payload: event.payload,
+      });
+    },
+  });
   const engine = new BoardEngine({
     ledger,
     bus,
     supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
+    pacing: () => (config.pacing.enabled ? pacing.gate.view() : null),
     decisionsStatus: () => decisions?.status() ?? {
       enabled: false,
       status: 'disabled',
@@ -734,6 +756,8 @@ async function main(): Promise<number> {
     ledger,
     notifications,
     decisions: decisionRuntime,
+    rateLimitBackoff: pacing.backoff,
+    workerGate: pacing.gate,
     providerWalls: {
       // Machine-vs-owner classification BEFORE any owner stop (phase3 r1
       // #2): the sink persists an eligible machine-owned wait FIRST and
@@ -961,6 +985,9 @@ async function main(): Promise<number> {
     ledger,
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
+    workerGate: pacing.gate,
+    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    stopSignal: serviceStop.signal,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -968,6 +995,10 @@ async function main(): Promise<number> {
     ledger,
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
+    reviewGate: pacing.gate,
+    workerGate: pacing.gate,
+    rateLimitBackoff: pacing.backoff,
+    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     poster: new AutoVerdictPoster(),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     maxConcurrentChildren: config.review.maxConcurrentChildren,
@@ -977,6 +1008,8 @@ async function main(): Promise<number> {
     fallbackGate: {
       skillPath: resolveBmadReviewSkillPath(),
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
+        workerGate: pacing.gate,
+        retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
         registry,
         ledger,
         worktrees: worktreeManager,
@@ -1006,6 +1039,9 @@ async function main(): Promise<number> {
     ledger,
     worktrees: worktreeManager,
     notifications,
+    workerGate: pacing.gate,
+    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    stopSignal: serviceStop.signal,
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,
   });
@@ -1061,6 +1097,8 @@ async function main(): Promise<number> {
     dispatch: dispatcher,
     wave,
     ledger,
+    workerGate: pacing.gate,
+    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     ...(config.silas.enabled && silasSlot !== null
       ? {
           silasOps: {

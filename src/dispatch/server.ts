@@ -12,6 +12,7 @@ import type { LessonsReferencePort } from '../lessons/types.js';
 import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha } from './silas-driver.js';
 import type { WorktreePort } from './worktree-port.js';
+import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -46,6 +47,13 @@ export interface DispatchServerOptions {
   readonly wave: WaveRunner;
   /** The record of record — silas.* attribution events land here. */
   readonly ledger: LedgerApi;
+  /** Provider pacing: worker (minion turn) admission gate for directive
+   * deliveries and re-briefs. Absent = off. */
+  readonly workerGate?: PacingGate;
+  /** Provider pacing: bounded settlement of an automatic rate-limit retry
+   * covering a just-delivered directive/re-brief turn (supervisor-backed
+   * in production). The route records delivered only for 'none'/'recovered'. */
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   /** Absent = /api/silas/* answers 503 (silas ops not hosted). */
   readonly silasOps?: SilasOpsSurface;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
@@ -351,6 +359,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           directive,
           signal: controller.signal,
           owner: 'silas-ops',
+          ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+          ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
           ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
         });
       } finally {
@@ -413,6 +423,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           registry: ops.registry,
           ledger: options.ledger,
           worktrees: ops.worktrees,
+          signal: controller.signal,
+          ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+          ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
           jobId,
           note,
           briefing: job.briefing,
