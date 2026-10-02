@@ -726,6 +726,13 @@ describe('supervisor — workflow-owned review attempts', () => {
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
+    // The abort records its cause on the stopped record the board reads:
+    // the lane renders this exact reason until a re-arm clears it.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({
+      state: 'stopped',
+      breakerOpen: false,
+      stopReason: 'review aborted',
+    });
     h.dispose();
   });
 
@@ -744,6 +751,7 @@ describe('supervisor — workflow-owned review attempts', () => {
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
     expect(h.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(0);
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'review aborted' });
     h.dispose();
   });
 });

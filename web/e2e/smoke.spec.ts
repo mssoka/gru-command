@@ -387,6 +387,21 @@ test('mock controls reject missing/wrong tokens without state changes and valid 
     expect(wrong.status(), `${route} wrong token`).toBe(401);
   }
 
+  // The board-mode control validates its body: only the two known modes
+  // pass, and a valid mode returns 200 without touching frame state.
+  for (const body of [{}, { mode: 'nope' }, { mode: 7 }]) {
+    const bad = await page.request.post('http://localhost:8788/__board-mode', {
+      headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+      data: body,
+    });
+    expect(bad.status(), `__board-mode invalid body ${JSON.stringify(body)}`).toBe(400);
+  }
+  const modeOk = await page.request.post('http://localhost:8788/__board-mode', {
+    headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+    data: { mode: 'default' },
+  });
+  expect(modeOk.ok()).toBe(true);
+
   // A denied drop did not touch the live socket, and a denied reset did not
   // clear durable mock history.
   await expect(page.locator('#banners .banner')).toBeHidden();
