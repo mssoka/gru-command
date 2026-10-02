@@ -38,3 +38,27 @@ native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f0
 # source's dist, then applies the repo-approved vitest RPC pretest patch
 # (tools/patch-vitest-rpc-timeout.mjs) that `npm test` also runs.
 wizard-bmad-retry = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts"
+
+# Feature-specific BASELINE for the gh-32 lane (scheduler-only; never part
+# of `npm test`): identical FINAL tests and suite pins (git show from the
+# pinned final-test commit, captured at admission — never uncommitted
+# bytes, never a circular hardcoded self-SHA) run against an isolated
+# RETAINED snapshot (git archive) of the PRE-REPAIR merge parent
+# cee0ecbe53229d05c13f909dd11d4b31e886db72 (2bf6bc7 + main 6a00f4e) — NOT
+# the unrelated native-compaction baseline. So each split r1 class case
+# (missing module, symlinked module, deleted recorded binding,
+# control-file read+recovery, disposable preflight) REDs independently and
+# attributably against pre-fix source. No worktree/branch mutation, no
+# snapshot deletion, no dependency install (existing node_modules bound by
+# symlink), no cherry-pick or other-lane patch. Baseline dist is BUILT
+# before the dist-driven CLI/pty legs, after the approved RPC-patch
+# prerequisite; no vitest flags — original pools/30s budgets/assertions
+# and the 14-worker scheduler contract are inherited unchanged. vitest has
+# no bail/short-circuit, so every independent case executes; the expected
+# RED is the feature's nonzero exit, left intact (never masked into PASS).
+# Baseline and final focused runs are separate scheduler requests. The
+# ignored pointer file
+# _bmad-output/gate-prep/wizard-bmad-retry-baseline.last-snapshot.txt
+# records base SHA, final-test SHA, per-file test hashes and the latest
+# retained snapshot location (older snapshots are kept for inspection).
+wizard-bmad-retry-baseline = 'set -e; base=cee0ecbe53229d05c13f909dd11d4b31e886db72; headrev=5f61593a87c5fab3fc2e03f2769af03b21e95788; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-wizard-bmad-retry.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts; do git show "$headrev:$f" > "$d/$f"; done; { printf "base=%s head=%s snapshot=%s\n" "$base" "$headrev" "$d"; (cd "$d" && shasum -a 256 test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts); } > "$prep/wizard-bmad-retry-baseline.last-snapshot.txt"; ln -s "$root/node_modules" "$d/node_modules"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts'
