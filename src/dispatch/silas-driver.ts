@@ -6,6 +6,7 @@ import type { EventBus } from '../events/bus.js';
 import type { AgentRecord, EventRecord, JobRecord, LedgerApi, RoundRecord } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -273,6 +274,10 @@ export interface ComputeDigestInput {
   readonly config: Pick<SilasConfig, 'stallThresholdMs' | 'directiveAt' | 'rebriefAt' | 'escalateAt'>;
   readonly trigger: string;
   readonly now?: () => number;
+  /** The supervisor's live per-agent views. A supervision-stopped worker is
+   * waiting on a human re-arm with a recorded cause — the board renders it
+   * as waiting, so the digest must not call the same lane stalled. */
+  readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
 }
 
 /** The head sha a delivery event recorded (`job.delivered.payload.sha`) —
@@ -488,8 +493,13 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         .filter((agent) => agent.jobId === job.id && agent.role === 'minion')
         .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
       if (minion !== undefined) {
+        // Same truth the board renders: a stopped/breaker-open worker is
+        // waiting on a human re-arm — silence from a stop is not a stall.
+        const supervision = input.supervisionFor?.(minion.id) ?? null;
+        const stopped =
+          supervision !== null && (supervision.state === 'stopped' || supervision.breakerOpen === true);
         const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);
-        if (Number.isFinite(lastMs) && now() - lastMs >= input.config.stallThresholdMs) {
+        if (!stopped && Number.isFinite(lastMs) && now() - lastMs >= input.config.stallThresholdMs) {
           digest.stalledWorking.push({
             jobId: job.id,
             repo: job.repo,
@@ -587,6 +597,9 @@ export interface SilasDriverOptions {
   /** The ops surface Silas acts through: base URL + where the pairing token lives. */
   readonly ops: { readonly baseUrl: string; readonly configPath: string };
   readonly bus?: EventBus;
+  /** The supervisor's live per-agent views — the digest reads the SAME stop
+   * truth the board renders so a stopped lane is never woken as stalled. */
+  readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
   /** The fast GitHub signal poll, ticked on `[silas] poll_interval_ms`. */
   readonly githubPoll?: GitHubPollPort;
   /** Operating skills injected into every wake prompt (default: shipped resources). */
@@ -766,6 +779,7 @@ export class SilasDriver {
         config: this.opts.config,
         trigger: trigger.kind,
         now: this.now,
+        ...(this.opts.supervisionFor !== undefined ? { supervisionFor: this.opts.supervisionFor } : {}),
       });
     } catch (error) {
       this.log('error', 'silas digest computation failed', { trigger: trigger.kind, error: String(error) });

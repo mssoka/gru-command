@@ -1032,6 +1032,9 @@ async function main(): Promise<number> {
         configPath: configPathFor(config.instanceDir),
       },
       bus,
+      // Same live stop truth the board renders: a supervision-stopped
+      // worker is waiting on a human re-arm, never a stalled lane.
+      supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
       // Chief phase-3 seam: every deterministic Silas pass (bus wake events
       // and sweep ticks) reconsidered pending review handoffs BEFORE any
       // LLM wake — bounded, no-overlap, fence-preserving.

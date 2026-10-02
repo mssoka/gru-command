@@ -26,6 +26,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
+import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
 import type { EventRecord, JobRecord, RoundRecord } from '../src/ledger/api.js';
 import type { Role } from '../src/config.js';
 
@@ -287,6 +288,55 @@ describe('silas digest (the four actionable states)', () => {
       expect(digest.stalledWorking).toHaveLength(1);
       expect(digest.stalledWorking[0]?.jobId).toBe('job-slow');
       expect(digest.stalledWorking[0]?.minionId).toBe('min-slow');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a supervision-stopped worker waits, never stalls — and a live worker still flags', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-walled', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-walled', 'working');
+      h.ledger.registerAgent({ id: 'min-walled', role: 'minion', jobId: 'job-walled' });
+      h.ledger.setAgentState('min-walled', 'idle');
+      const now = Date.now();
+      const base = {
+        agentId: 'min-walled',
+        role: 'minion' as const,
+        slotId: null,
+        restarts: 2,
+        openTurn: false,
+        openToolCalls: 0,
+        lastEventAt: null,
+        lastFileBytes: null,
+      };
+      let view: AgentSupervisionView | null = {
+        ...base,
+        state: 'stopped',
+        breakerOpen: true,
+        stopReason: 'quota_wall',
+      };
+      const digestOf = () =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+          now: () => now + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000,
+          supervisionFor: () => view,
+        });
+
+      // Stopped worker: waiting on a human re-arm with a recorded cause —
+      // the board says waiting, so the digest must not fire a stall wake.
+      expect((await digestOf()).stalledWorking).toHaveLength(0);
+      // Breaker-open alone is the same wait even before the state settles.
+      view = { ...base, state: 'watching', breakerOpen: true, stopReason: null };
+      expect((await digestOf()).stalledWorking).toHaveLength(0);
+      // No stop record: the genuine stall still flags (the exemption is not
+      // a blanket mute).
+      view = null;
+      expect((await digestOf()).stalledWorking).toHaveLength(1);
     } finally {
       h.cleanup();
     }
