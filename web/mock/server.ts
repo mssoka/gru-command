@@ -151,6 +151,9 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     if (chunk === undefined) {
       if (holdNextTurn) {
         holdNextTurn = false;
+        // Parked: STOP the ticks so the next one cannot fall through to
+        // finish(). The hold lasts until /__turn-release (or socket close).
+        clearInterval(timer);
         releaseHeldTurn = finish;
         return;
       }
@@ -748,6 +751,10 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
       res.end('{"error":"unauthorized"}\n');
       return;
     }
+    // A parked turn must not leak into the cleared log: settle it before
+    // the counters reset (the afterEach release is idempotent; this guards
+    // the crash path so no later spec replays a ghost turn).
+    releaseHeldTurn?.();
     // Counters may rewind only after every client is detached; otherwise a
     // live browser observes impossible seq/epoch regression.
     for (const socket of server.clients) socket.terminate();

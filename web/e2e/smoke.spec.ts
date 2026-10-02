@@ -911,6 +911,15 @@ test.describe('chat pane reflow (owner heist)', () => {
       `reflow-all ${LONG_TOKEN}\n\n\`\`\`\n${LONG_CODE}\n\`\`\`\n\n${LONG_TABLE}\n\ntail after table`,
       'reflow-all',
     );
+    // Clean-chat clause (owner 2026-09-23): tool lines sit in a collapsed
+    // service band — one tap reveals the machinery, exactly as the first
+    // smoke test does. Expand before the assertions AND the reflow sweep so
+    // the long unbroken tokens are measured in their real, expanded layout.
+    const toolBand = page.locator('.service-band', {
+      has: page.locator('.tool-line', { hasText: 'mcp__' }),
+    });
+    await expect(toolBand).toHaveCount(1);
+    await toolBand.locator('.service-band__head').click();
     await expect(page.locator('.tool-line', { hasText: 'mcp__' })).toBeVisible();
     await expect(page.locator('.tool-line', { hasText: 'failed:' })).toBeVisible();
   }
