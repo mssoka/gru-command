@@ -1,7 +1,9 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { WorktreeBaseSource } from '../../src/ledger/api.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../../src/dispatch/worktree-port.js';
+import { resolveReviewTargetReal } from './git-review-port.js';
 
 /**
  * File-backed review port (R19): lanes persist in a JSON registry under the
@@ -33,6 +35,13 @@ export class PersistedReviewPort implements WorktreePort {
 
   private write(lanes: Map<string, WorktreeLane>): void {
     writeFileSync(this.registryFile, `${JSON.stringify([...lanes.values()], null, 2)}\n`, 'utf8');
+  }
+
+  async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
+    readonly sha: string;
+    readonly baseSource: WorktreeBaseSource | null;
+  }> {
+    return resolveReviewTargetReal(input.repoPath, input.ref);
   }
 
   async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
