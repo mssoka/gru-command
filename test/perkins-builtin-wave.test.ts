@@ -1521,11 +1521,22 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     repos.push(repo);
     repo.git(['checkout', '-b', 'feature/app-seam']);
     const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
-    // The App publisher binds credentials to the PR URL's origin: a plain
-    // github.com origin satisfies the identity check; nothing ever
-    // contacts it (the delivery rides the mocked fetch, the head probe is
-    // the local double).
-    execFileSync('git', ['-C', repo.path, 'remote', 'add', 'origin', 'https://github.com/acme/widget.git'], { stdio: 'ignore' });
+    // The App publisher binds credentials to the PR URL's origin: an
+    // ssh-form github.com origin satisfies the identity check. The freeze
+    // and drift checks still FETCH that origin and cross-check the local
+    // head probe, so the fixture binds the ssh transport to a local bare
+    // repo via core.sshCommand — every production freshness check runs,
+    // with no network. The delivery itself rides the mocked fetch.
+    const originRoot = mkdtempSync(join(tmpdir(), 'perkins-app-seam-origin-'));
+    dirs.push(originRoot);
+    const origin = join(originRoot, 'origin.git');
+    execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', 'git@github.com:acme/widget.git']);
+    repo.git(['push', '--quiet', origin, 'refs/heads/feature/app-seam']);
+    const sshDouble = join(originRoot, 'ssh-double.sh');
+    writeFileSync(sshDouble, `#!/bin/sh\nexec git-upload-pack ${JSON.stringify(origin)}\n`, 'utf8');
+    chmodSync(sshDouble, 0o755);
+    repo.git(['config', 'core.sshCommand', sshDouble]);
 
     const NOW = 1_800_000_000_000;
     let postCount = 0;
@@ -1616,8 +1627,8 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // The stale identical review is NOT credited: honestly unposted.
     expect(outcome.posted).toBe(false);
     expect(outcome.round.status).not.toBe('verdict-posted');
-    expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeUndefined();
-    expect(ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')).toBeDefined();
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')).not.toBeNull();
     expect(outcome.verdict ?? null).toBeNull();
     expect(escalations.length).toBeGreaterThanOrEqual(1);
   });

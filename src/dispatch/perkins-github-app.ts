@@ -1067,18 +1067,30 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     if (entries.length === 0) return { kind: 'absent' };
     const pages: number[] = [];
     for (const entry of entries) {
-      // Strict UNAMBIGUOUS page-number validation: exactly one `page=`
-      // parameter may appear in the entry URL, and its value must be a
-      // strictly sane integer. Duplicates (`page=2&page=5`), a malformed
-      // value next to a valid one (`page=2junk&page=2` — first-match
-      // extraction would silently skip the malformed prefix and accept the
-      // later value), and numeric prefixes (`page=2junk`) are all
+      // Strict SEMANTIC page-evidence validation: the entry URL is parsed
+      // as a real URL and its query parameters are read by DECODED name,
+      // so a raw-regex blind spot can never supply a page the provider did
+      // not send. Exactly one `page` parameter must exist with a strictly
+      // sane integer value. A bare duplicate key (`?page=2&page`), a
+      // decoded duplicate (`?page=2&%70age=5`), a `page` only in the
+      // fragment (no query parameter at all), a malformed value next to a
+      // valid one (`page=2junk&page=2` — first-match extraction would
+      // silently skip the malformed prefix and accept the later value),
+      // numeric prefixes (`page=2junk`), and non-URL entries are all
       // contradictory evidence that must poison completeness, never
-      // combine with an earlier bound into a false certificate.
-      const pageMatches = [...entry[1]!.matchAll(/[?&]page=([^&]*)/gu)];
-      if (pageMatches.length !== 1) return { kind: 'contradictory' };
-      if (!/^\d+$/u.test(pageMatches[0]![1]!)) return { kind: 'contradictory' };
-      const parsed = Number(pageMatches[0]![1]);
+      // combine with an earlier bound into a false certificate. A
+      // genuinely proved positive match stays creditable regardless.
+      let entryUrl: URL;
+      try {
+        entryUrl = new URL(entry[1]!);
+      } catch {
+        return { kind: 'contradictory' };
+      }
+      const pageValues = entryUrl.searchParams.getAll('page');
+      if (pageValues.length !== 1) return { kind: 'contradictory' };
+      const value = pageValues[0]!;
+      if (!/^\d+$/u.test(value)) return { kind: 'contradictory' };
+      const parsed = Number(value);
       if (!Number.isSafeInteger(parsed) || parsed < 1) return { kind: 'contradictory' };
       pages.push(parsed);
     }
