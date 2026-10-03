@@ -20,7 +20,8 @@ import { TranscriptService } from './transcripts/service.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
-import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
+import { WaveRunner } from './dispatch/perkins.js';
+import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver } from './dispatch/silas-driver.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
@@ -1034,7 +1035,7 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     rateLimitBackoff: pacing.backoff,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
-    poster: new AutoVerdictPoster(),
+    poster: createStartupVerdictPoster(config),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     maxConcurrentChildren: config.review.maxConcurrentChildren,
     bus,

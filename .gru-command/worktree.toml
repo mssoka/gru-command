@@ -24,6 +24,38 @@ residency-runtime = "npx vitest run --config vitest.heavy.config.ts test/fix-dir
 handoff-wave = "npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts && npx vitest run test/config.test.ts"
 working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
+
+# One narrow FAILED-FULL discriminator at the frozen head (diagnostic,
+# not a gate): same runner/config and inherited 30 s budget. The RPC
+# patch is the repo's existing approved pretest hook — the one declared
+# scope that is not a bare vitest invocation.
+publisher-timeout-discriminator = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/dispatch-e2e.test.ts test/perkins-builtin-wave.test.ts test/wizard.test.ts"
+
+# Narrow scope for the final raw-advice triage repairs on the App
+# publisher (one focused vitest invocation; the suite pin travels with
+# the file it pins). Declared alongside real repairs, never standalone.
+app-contract-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/suite-shape.test.ts"
+
+# App-contract before-proof: the FINAL committed App contract test file
+# runs against an isolated git-archive of the immutable pre-repair
+# integration fe6a774 (contains main151; precedes every App repair),
+# with the existing node_modules symlinked, the approved RPC-patch
+# prerequisite, and the snapshot retained for inspection. Expected
+# result is RED (the baseline lacks the repaired behavior); the vitest
+# exit status is the scope's own and is never masked into a PASS. The
+# helper's registration guard uses the pin guard's own regex; the global
+# suite-shape pin map is deliberately not selected (final pins cannot
+# match baseline files whose counts changed for reasons outside this
+# repair). A separate Wave before-proof is not selectable from this
+# baseline without overlaying main's later worktree-freeze sources.
+app-contract-baseline = "sh tools/app-contract-baseline.sh"
+
+# Bounded diagnosis of the six failures in the previous FULL run at
+# 71481b8 (3608c3b7): the five 30 s timeout cases plus the decisions
+# hot-reload case, run together under the lane's approved RPC pretest.
+# Evidence only: the full gate remains the final head's FULL run.
+full-fail-diagnosis = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/decisions.test.ts test/dispatch-e2e.test.ts test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/wizard.test.ts"
+
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 # The ten externally observed 30s timeouts (failed host run on 78724dc)
 # exercised by exact test name through the heavy config first; the FULL
@@ -122,6 +154,15 @@ board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && .
 # test, assertion or gate.
 t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
 
+# r2 repair-generation diagnosis (native perkins-github-app-publisher-r2
+# blocker 2): the three FULL timeouts of run 878b2f8a classified case by
+# case at the unchanged runner/budgets. Each leg is exactly one failing
+# case selected with -t; every exit is echoed intact and composed into a
+# single evidence exit (never masked into a PASS), and this scope changes
+# no test, timeout, assertion, pool or gate. The full gate remains the
+# final head's FULL run.
+r2-timeout-isolation = 'node tools/patch-vitest-rpc-timeout.mjs || exit 3; echo "r2-timeout-isolation leg 1 dispatch-server: by=silas"; npx vitest run test/dispatch-server.test.ts -t "by=silas on the pr/review endpoints"; a=$?; echo "r2-timeout-isolation leg 2 install-one-line: restarts only an owned service"; npx vitest run test/install-one-line.test.ts -t "restarts only an owned service"; b=$?; echo "r2-timeout-isolation leg 3 wave: T4 reconciled delivery"; npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"; c=$?; echo "r2-timeout-isolation exits: dispatch-server=$a install-one-line=$b wave-t4=$c"; if [ "$a" -ne 0 ] || [ "$b" -ne 0 ] || [ "$c" -ne 0 ]; then exit 1; fi'
+
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
 # download/install), same web config/runner/budgets and RPC prerequisite.
@@ -132,3 +173,11 @@ t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config 
 # out, and no branch/worktree holds the sha.
 board-merged-attention-baseline = 'set -e; base=059c076290145d4aae6e0b47c7b3f87156862c43; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-merged-attention.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board-merged-attention.test.ts > "$d/web/src/ui/board-merged-attention.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-merged-attention-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-merged-attention-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts'
 finding-dedupe-recency = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-findings-dedupe.test.ts test/suite-shape.test.ts"
+
+# PR130 r3 native-repair regressions (silas-ops PR130 r3 follow-through):
+# malformed nested author fields, a failed 4xx body read staying a definitive
+# refusal, order-independent rel="last" parsing, and PKCS#8/truncated PEM
+# redaction — plus the suite pin that travels with the repaired test file.
+# One focused vitest invocation under the approved RPC-patch prerequisite;
+# never a standalone declaration.
+app-contract-r3-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/suite-shape.test.ts"

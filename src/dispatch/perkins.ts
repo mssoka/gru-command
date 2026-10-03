@@ -259,14 +259,25 @@ export interface VerdictPosterInput {
   readonly baseSha: string;
 }
 
+/** Optional caller context for VerdictPoster.reconcile (bounded shared
+ * hook, chief ruling j-642): 'post-failure' marks the live second lookup
+ * that immediately follows a FAILED post() within the same publication
+ * attempt — a backend may fail such a lookup closed (it must never
+ * upgrade a failed post into a receipt or an absence certificate).
+ * Omitted for ordinary standalone/recovery reconciliation, which keeps
+ * its prior provider-proved semantics; the unannotated call is fully
+ * backward-compatible. */
+export type VerdictReconcileContext = { readonly reason: 'post-failure' };
+
 export interface VerdictPoster {
   post(input: VerdictPosterInput): Promise<PostedReviewReceipt>;
   /** Idempotent reconciliation for an ambiguous post (e.g. a timeout after
    * the provider may have committed): find an already-published review for
    * this exact head whose body digest matches, or return null. Never
    * creates anything. Optional: a poster without provider lookup leaves an
-   * ambiguous failure honestly unposted. */
-  reconcile?(input: VerdictPosterInput): Promise<PostedReviewReceipt | null>;
+   * ambiguous failure honestly unposted. The optional context distinguishes
+   * a live post-failure second lookup from ordinary recovery. */
+  reconcile?(input: VerdictPosterInput, context?: VerdictReconcileContext): Promise<PostedReviewReceipt | null>;
 }
 
 /** Bounded pagination for ambiguous-delivery lookups (R4): both providers
@@ -868,12 +879,14 @@ export class AutoVerdictPoster implements VerdictPoster {
   /** Reconciliation reaches the SAME host-selected provider as posting —
    * an ambiguous post must be reconciled by the backend that created it,
    * never by a hand-picked alternate. */
-  async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
+  async reconcile(input: VerdictPosterInput, context?: VerdictReconcileContext): Promise<PostedReviewReceipt | null> {
     const poster = this.select(input);
     if (typeof poster.reconcile !== 'function') {
       throw new Error(`the selected ${new URL(input.prUrl.trim()).host} poster does not support reconciliation — delivery stays honestly unresolved`);
     }
-    return poster.reconcile(input);
+    // The caller context reaches the SAME host-selected backend that the
+    // post used — never a hand-picked alternate.
+    return poster.reconcile(input, context);
   }
 
   private select(input: VerdictPosterInput): VerdictPoster {
@@ -2667,6 +2680,9 @@ export class WaveRunner {
               if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) throw writeError;
               publicationFile = join(frozenReview.directory, 'perkins-report.publication.md');
             }
+            // Live post-failure second lookup: the explicit context lets
+            // the backend fail it closed (j-642) instead of re-reading the
+            // provider under recovery semantics after a failed post.
             const found = await poster.reconcile!({
               prUrl: job.prUrl!,
               host: prUrl.host,
@@ -2674,7 +2690,7 @@ export class WaveRunner {
               body: publicationBody,
               targetSha: review.targetSha,
               baseSha: frozenReview.manifest.baseRefSha,
-            });
+            }, { reason: 'post-failure' });
             reconciledDelivery = found === null
               ? null
               : verifyPostedReceipt(found, { targetSha: review.targetSha, bodySha256: publicationSha256 });

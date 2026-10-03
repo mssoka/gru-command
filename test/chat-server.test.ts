@@ -2614,6 +2614,11 @@ describe('chat context controls and durable new-chat boundaries', () => {
         ),
       ).toMatchObject({ ok: true, epoch: 2 });
       expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({ epoch: 2 });
+      // The retired handle's disposal is part of the deferred, best-effort
+      // post-commit finalize (chat/server.ts postCommit timer), so it may
+      // still be in flight when the control result arrives; wait for it like
+      // the first reset in this test already does.
+      await pollUntil(() => firstFresh.disposed, 'retired fresh handle disposal');
       expect(firstFresh.disposed).toBe(true);
       await reconnect.close();
       await client.close();
@@ -2770,6 +2775,11 @@ describe('chat context controls and durable new-chat boundaries', () => {
         (frame) => frame.type === 'control_result' && frame.request_id === 'adopt-fresh',
         'fresh adoption result',
       );
+      // Post-commit adoption is intentionally started on the next event-loop
+      // turn AFTER the control result is released (chat/server.ts postCommit
+      // timer), so waiting for the result alone still races the server's
+      // timer under load. Wait for the adoption itself before asserting.
+      await pollUntil(() => adopted !== null, 'fresh handle adoption');
       expect(adopted).toBe(h.freshHandles[0]);
       expect(new GruSessionPointer(h.chatDir).current()?.sessionFile).toBe(
         h.freshHandles[0]?.sessionFile,
