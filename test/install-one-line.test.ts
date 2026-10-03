@@ -26,6 +26,17 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
+// Cost repair (a6 FULL-red follow-through): each simulated installation fans
+// out into node/npm/child chains, and the heaviest leg (three full installer
+// runs) can cross the unchanged 30s body deadline on a loaded vitest worker.
+// A shared V8 compile cache plus quiet npm startup removes startup work only:
+// no installer behavior, artifact, or assertion changes.
+let compileCacheDir: string | null = null;
+function nodeCompileCacheDir(): string {
+  compileCacheDir ??= tempDir('gru-install-one-line-node-cache-');
+  return compileCacheDir;
+}
+
 let lastStderr = '';
 
 function run(
@@ -38,7 +49,14 @@ function run(
       encoding: 'utf-8',
       // Each simulated installation owns its config home even when the test
       // runner supplies an XDG_CONFIG_HOME outside the fixture's HOME.
-      env: { ...process.env, ...env, ...(env.HOME ? { XDG_CONFIG_HOME: join(env.HOME, '.config') } : {}) },
+      env: {
+        ...process.env,
+        ...env,
+        ...(env.HOME ? { XDG_CONFIG_HOME: join(env.HOME, '.config') } : {}),
+        NODE_COMPILE_CACHE: nodeCompileCacheDir(),
+        npm_config_update_notifier: 'false',
+        npm_config_progress: 'false',
+      },
       timeout: 120_000,
     });
     lastStderr = '';

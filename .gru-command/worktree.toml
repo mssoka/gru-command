@@ -103,6 +103,12 @@ native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f0
 # material; the ignored pointer file
 # _bmad-output/gate-prep/review-rebrief-interlock-baseline.last-snapshot.txt
 # records the latest snapshot location, preserved for inspection.
+# a6 FULL-red causal follow-through (phase pr144-a6-full-red-20261003):
+# the two files whose deadlined bodies crossed under worker load — the
+# chat-server post-commit retirement synchronization and the installer
+# fixture cost repair. Approved RPC patch first, plain vitest, no flags.
+pr144-full-red-followthrough = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/chat-server.test.ts test/install-one-line.test.ts"
+
 rebrief-interlock-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=ec2a490de91fd5e6ace2870e97a80e5a115007c0; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-review-rebrief-interlock.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/silas-driver.test.ts > "$d/test/silas-driver.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/review-rebrief-interlock-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/silas-driver.test.ts'
 
 lens-unused-neutral = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-signals.test.ts src/lib/board-protocol.test.ts"
