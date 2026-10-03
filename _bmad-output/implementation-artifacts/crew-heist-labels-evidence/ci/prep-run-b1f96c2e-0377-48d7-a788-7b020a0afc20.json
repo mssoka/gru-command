@@ -1,6 +1,5 @@
 {
   "command": "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-protocol.test.ts && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=crew-rail && cd .. && npx vitest run test/ledger-db.test.ts test/ledger-api.test.ts test/board-engine.test.ts test/dispatch-server.test.ts test/dispatch-e2e.test.ts test/fix-directive.test.ts test/rebrief-recovery.test.ts test/silas-driver.test.ts test/supervisor.test.ts test/perkins-builtin-wave.test.ts test/lessons-injection.test.ts test/suite-shape.test.ts",
-  "cwd": "/Users/moses/.gru-command/worktrees/gru-command/job-crew-heist-labels",
   "durationMs": 303814,
   "exitCode": 0,
   "jobId": "crew-heist-labels",

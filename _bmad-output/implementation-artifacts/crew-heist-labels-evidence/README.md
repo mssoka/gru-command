@@ -1,6 +1,6 @@
 # Crew-heist-labels evidence pack (r7)
 
-Assembled 2026-10-03T00:47:31Z. This directory exists so the acceptance evidence is
+Assembled 2026-10-03T00:59:05Z. This directory exists so the acceptance evidence is
 readable INSIDE the frozen review worktree: the confined review tools can
 only read files in the tree at the frozen commit, so the capture pixels,
 the vision-route reports and the CI receipt ride the commit itself.
@@ -31,7 +31,7 @@ prefix, and no horizontal overflow at desktop/phone in light/dark.
 - `vision/crew-light-desktop.txt` — sha256 `e7edbb62bac726f8a5cb3ed4845b66585e9af02273e54df707aa761d803a7354`, 2264 bytes
 - `vision/crew-light-phone.txt` — sha256 `fe7cc5500e6578252d840d19733ee2d9f662817ea3670a7cb9b173bd084fd0aa`, 1309 bytes
 - `ci/ci-run-37083150166-eeb62f091281.json` — sha256 `4125fa3deb814febf7a0c5f1c86e93b8488627875dfc2745421ad5650453707b`, 2805 bytes
-- `ci/prep-run-b1f96c2e-0377-48d7-a788-7b020a0afc20.json` — sha256 `c76ed73120ff33a0c666dfa3e6a696699bdd5fa3b2f9eaa94e3fedd0a4acf052`, 1223 bytes
+- `ci/prep-run-b1f96c2e-0377-48d7-a788-7b020a0afc20.json` — sha256 `c1bacdb0a6ef4a36fec104a4865ca2df844247fb713c0cbfe74fc2fcc73f48ce`, 1141 bytes
 
 ## Bound records
 
