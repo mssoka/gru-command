@@ -135,6 +135,7 @@ interface CancellationObservation {
   readonly variant: 'broad' | 'narrow';
   readonly summaryMode: 'abort-settles' | 'late-terminal';
   readonly cancellations: number;
+  readonly abortOutcome: string | null;
   readonly turn: string;
   readonly queued: string;
   readonly errorEvents: number;
@@ -146,10 +147,12 @@ interface CancellationObservation {
   readonly terminalEnds: readonly { readonly success: boolean; readonly error: string | null }[];
   readonly rawSdkCompactionEnds: number;
   readonly summarySettledByAbort: boolean;
+  readonly stalledSummaryCalls: number;
   readonly continuationReachedModel: boolean;
   readonly queuedPendingDuringStall: boolean;
   readonly queuedModelCallsDuringStall: number;
-  readonly guardRejections: number;
+  readonly guardMessages: readonly string[];
+  readonly guardModelCalls: number;
   readonly queuedDelivered: number;
   readonly afterSettle: string;
   readonly afterSettleDelivered: number;
@@ -161,11 +164,11 @@ interface CancellationObservation {
  * Drive one real mid-run threshold compaction into a stall, then apply the
  * cancellation a bound would apply — broad `session.abort()` or summary-only
  * `session.abortCompaction()` — through the public SDK session and measure the
- * outcome. No product code is patched and no adapter deadline is armed: the
- * seam under test is the cancellation boundary itself, so this contract holds
- * for any future (or owner-controlled) bound that needs it. The adapter's
- * former #137 deadline is gone (rollback of PR #137), which is exactly why the
- * boundary is pinned here instead of at the deleted call site.
+ * outcome. No product code is modified and no adapter deadline is armed: the
+ * cancellation is invoked through the public SDK session, so this contract
+ * holds for any future (or owner-controlled) bound that needs it. The
+ * adapter's former #137 deadline is gone (rollback of PR #137), which is
+ * exactly why the boundary is pinned here instead of at the deleted call site.
  *
  * The first cycle is measured alone before any follow-up starts: the adapter
  * keeps one pending terminal slot, and a second adjacent cycle would race the
@@ -269,14 +272,27 @@ async function observeCompactionCancellation(
         (error: Error) => error.message,
       ),
     ]);
-    const guardRejections = guardOutcomes.filter((outcome) => /compacting/.test(outcome)).length;
+    // Pin each guard's rejection text and prove none of them reached the
+    // model: a single regex count would let any wording containing
+    // "compacting" pass, and a guard that rejects after enqueueing would be
+    // invisible without the model-call check.
+    const guardMessages = guardOutcomes;
+    const guardModelCalls = fx.script.calls.filter((call) =>
+      call.prompt.includes('during compaction'),
+    ).length;
     // The cancellation seam under test: exactly one call, summary-only or broad.
     let cancellations = 0;
+    let abortSettled: Promise<string> | null = null;
     if (variant === 'broad') {
       const abort = internal.session.abort;
       if (abort === undefined) throw new Error('SDK session is missing abort()');
       cancellations += 1;
-      void abort.call(internal.session);
+      // Capture the SDK abort promise instead of discarding it: a rejection
+      // must fail at this seam, not surface as an unhandled rejection.
+      abortSettled = abort.call(internal.session).then(
+        () => 'resolved',
+        (error: Error) => `rejected:${error.message}`,
+      );
     } else {
       const abortCompaction = internal.session.abortCompaction;
       if (abortCompaction === undefined) throw new Error('SDK session is missing abortCompaction()');
@@ -319,6 +335,14 @@ async function observeCompactionCancellation(
       8_000,
     );
     await waitFor(() => internal.session.isIdle || handle.health().state === 'disposed', 'session settle');
+    // The broad abort promise must resolve (session reached idle), never
+    // reject; the summary-only path has no broad abort at all.
+    const abortOutcome = abortSettled === null ? null : await abortSettled;
+    // Anchor the abort-settlement marker to the FIRST summary call (the
+    // stalled one), not any later summary that the same signal could abort.
+    const firstSummary = fx.script.calls.find((call) =>
+      call.prompt.startsWith('<conversation>'),
+    );
     const compactionEnds = events.filter(
       (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
         event.type === 'compaction_end',
@@ -327,6 +351,7 @@ async function observeCompactionCancellation(
       variant,
       summaryMode,
       cancellations,
+      abortOutcome,
       turn: turnOutcome,
       queued: queuedOutcome,
       errorEvents: events.filter((event) => event.type === 'error').length,
@@ -346,15 +371,17 @@ async function observeCompactionCancellation(
         error: event.error ?? null,
       })),
       rawSdkCompactionEnds: rawSdkEvents.filter((type) => type === 'compaction_end').length,
-      summarySettledByAbort: fx.script.calls.some(
-        (call) => call.prompt.startsWith('<conversation>') && call.aborted,
-      ),
+      summarySettledByAbort: firstSummary?.aborted === true,
+      stalledSummaryCalls: fx.script.calls.filter((call) =>
+        call.prompt.startsWith('<conversation>'),
+      ).length,
       continuationReachedModel: fx.script.calls.some(
         (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
       ),
       queuedPendingDuringStall,
       queuedModelCallsDuringStall,
-      guardRejections,
+      guardMessages,
+      guardModelCalls,
       queuedDelivered: fx.script.calls.filter((call) => call.prompt === 'queued work').length,
       afterSettle: afterSettleOutcome,
       afterSettleDelivered: fx.script.calls.filter((call) => call.prompt === 'after settle').length,
@@ -369,7 +396,6 @@ async function observeCompactionCancellation(
 
 interface NativeQueueObservation {
   readonly summaryMode: 'abort-settles' | 'late-terminal';
-  readonly nativeAdmissions: number;
   readonly pendingAfterAdmission: number;
   readonly pendingDuringStall: number;
   readonly modelCallsDuringStall: number;
@@ -454,18 +480,6 @@ async function observeNativeFollowUpCancellation(
     if (count === undefined) throw new Error('SDK session lost pendingMessageCount');
     return count;
   };
-  let nativeAdmissions = 0;
-  (handle as unknown as { session: unknown }).session = new Proxy(sdkSession, {
-    get(target, key) {
-      if (key === 'followUp') {
-        return async (text: string, images?: unknown) => {
-          nativeAdmissions += 1;
-          return target.followUp!(text, images);
-        };
-      }
-      return Reflect.get(target, key, target);
-    },
-  });
   try {
     await handle.prompt('start');
     const turn = handle.prompt('do the work').then(
@@ -525,7 +539,6 @@ async function observeNativeFollowUpCancellation(
     );
     return {
       summaryMode,
-      nativeAdmissions,
       pendingAfterAdmission,
       pendingDuringStall,
       modelCallsDuringStall,
@@ -1182,6 +1195,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     it('broad cancellation: the live pending turn is cancelled and surfaces the SDK abort error', async () => {
       const observation = await observeCompactionCancellation('broad', 'abort-settles');
       expect(observation.cancellations).toBe(1);
+      expect(observation.abortOutcome).toBe('resolved');
       expect(observation.turn).toBe('resolved');
       expect(observation.errorEvents).toBe(1);
       // The surfaced error is the SDK abort message, not an anonymous failure:
@@ -1202,11 +1216,18 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       // and the one exact failure text — a differently-worded extra terminal
       // can no longer escape this oracle.
       expect(observation.terminalEnds).toEqual([{ success: true, error: null }]);
+      expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
       expect(observation.queuedDelivered).toBe(1);
       expect(observation.queued).toBe('resolved');
       expect(observation.queuedPendingDuringStall).toBe(true);
       expect(observation.queuedModelCallsDuringStall).toBe(0);
-      expect(observation.guardRejections).toBe(3);
+      expect(observation.guardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.guardModelCalls).toBe(0);
+      expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
       expect(observation.afterSettle).toBe('resolved');
       expect(observation.afterSettleDelivered).toBe(1);
       expect(observation.idle).toBe(true);
@@ -1216,6 +1237,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     it('narrow cancellation: the pending turn answers, no error events, follow-up work exactly once', async () => {
       const observation = await observeCompactionCancellation('narrow', 'abort-settles');
       expect(observation.cancellations).toBe(1);
+      expect(observation.abortOutcome).toBeNull();
       expect(observation.turn).toBe('resolved');
       expect(observation.errorEvents).toBe(0);
       expect(observation.stateErrors).toBe(0);
@@ -1227,11 +1249,18 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.abortedEnds).toBe(1);
       expect(observation.successEnds).toBe(0);
       expect(observation.terminalEnds).toEqual([{ success: false, error: 'compaction aborted' }]);
+      expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
       expect(observation.queuedDelivered).toBe(1);
       expect(observation.queued).toBe('resolved');
       expect(observation.queuedPendingDuringStall).toBe(true);
       expect(observation.queuedModelCallsDuringStall).toBe(0);
-      expect(observation.guardRejections).toBe(3);
+      expect(observation.guardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.guardModelCalls).toBe(0);
+      expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
       expect(observation.afterSettle).toBe('resolved');
       expect(observation.afterSettleDelivered).toBe(1);
       expect(observation.idle).toBe(true);
@@ -1241,6 +1270,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     it('late terminal under broad cancellation: the cancelled run stays cancelled; one terminal publishes', async () => {
       const observation = await observeCompactionCancellation('broad', 'late-terminal');
       expect(observation.cancellations).toBe(1);
+      expect(observation.abortOutcome).toBe('resolved');
       expect(observation.turn).toBe('resolved');
       expect(observation.errorEvents).toBe(1);
       expect(observation.errorMessages).toHaveLength(1);
@@ -1256,7 +1286,13 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.queued).toBe('resolved');
       expect(observation.queuedPendingDuringStall).toBe(true);
       expect(observation.queuedModelCallsDuringStall).toBe(0);
-      expect(observation.guardRejections).toBe(3);
+      expect(observation.guardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.guardModelCalls).toBe(0);
+      expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
       expect(observation.afterSettle).toBe('resolved');
       expect(observation.afterSettleDelivered).toBe(1);
       expect(observation.idle).toBe(true);
@@ -1266,6 +1302,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     it('late terminal under narrow cancellation: the run recovers and no terminal duplicates publish', async () => {
       const observation = await observeCompactionCancellation('narrow', 'late-terminal');
       expect(observation.cancellations).toBe(1);
+      expect(observation.abortOutcome).toBeNull();
       expect(observation.turn).toBe('resolved');
       expect(observation.errorEvents).toBe(0);
       expect(observation.assistantErrors).toBe(0);
@@ -1279,7 +1316,13 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.queued).toBe('resolved');
       expect(observation.queuedPendingDuringStall).toBe(true);
       expect(observation.queuedModelCallsDuringStall).toBe(0);
-      expect(observation.guardRejections).toBe(3);
+      expect(observation.guardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.guardModelCalls).toBe(0);
+      expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
       expect(observation.afterSettle).toBe('resolved');
       expect(observation.afterSettleDelivered).toBe(1);
       expect(observation.idle).toBe(true);
@@ -1298,6 +1341,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         { deltas: ['never'] },
       ]);
       const handle = await fx.runtime.spawn('gru');
+      expect(handle.sessionFile).not.toBeNull();
       const sessionFile = handle.sessionFile!;
       const live = handle.prompt('live turn').then(
         () => 'resolved',
@@ -1367,11 +1411,12 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
           internal.onPiEvent({ type: 'compaction_start' });
           internal.onPiEvent({ type: 'compaction_end', aborted: true });
           // Nothing publishes before the bound.
-          await vi.advanceTimersByTimeAsync(4_990);
+          await vi.advanceTimersByTimeAsync(4_999);
           expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
-          // Crossing the 5,000ms bound (plus one poll tick) publishes exactly
-          // one failed terminal.
-          await vi.advanceTimersByTimeAsync(20);
+          // Crossing the 5,000ms bound (with one second of fake-clock slack so
+          // a widened constant still fails while a poll-cadence change does
+          // not) publishes exactly one failed terminal.
+          await vi.advanceTimersByTimeAsync(1_000);
           const ends = events.filter(
             (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
               event.type === 'compaction_end',
@@ -1386,6 +1431,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         }
         // The reconcile path disposes instead of wedging on the stuck gate.
         await waitFor(() => handle.health().state === 'disposed', 'reconciled disposal');
+        expect(handle.sessionFile).not.toBeNull();
         expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(false);
       } finally {
         internal.session = nativeSession;
@@ -1458,6 +1504,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         await disposal;
         await turn.catch(() => {});
         expect(handle.health().state).toBe('disposed');
+        expect(handle.sessionFile).not.toBeNull();
         expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(false);
         // A late transport settlement adds no second terminal.
         await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1473,7 +1520,6 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
 
     it('native SDK follow-up: admitted before compaction, pending through the stall, delivered once (signal settles)', async () => {
       const observation = await observeNativeFollowUpCancellation('abort-settles');
-      expect(observation.nativeAdmissions).toBe(1);
       expect(observation.pendingAfterAdmission).toBe(1);
       expect(observation.pendingDuringStall).toBe(1);
       expect(observation.modelCallsDuringStall).toBe(0);
@@ -1491,7 +1537,6 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
 
     it('native SDK follow-up: late transport settlement still delivers the pending message exactly once', async () => {
       const observation = await observeNativeFollowUpCancellation('late-terminal');
-      expect(observation.nativeAdmissions).toBe(1);
       expect(observation.pendingAfterAdmission).toBe(1);
       expect(observation.pendingDuringStall).toBe(1);
       expect(observation.modelCallsDuringStall).toBe(0);

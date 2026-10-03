@@ -73,13 +73,14 @@ function zeroUsage() {
   };
 }
 
-function countedUsage(totalTokens: number) {
+/** Usage with internally consistent totals (input + the one output token). */
+function countedUsage(inputTokens: number) {
   return {
-    input: totalTokens,
+    input: inputTokens,
     output: 1,
     cacheRead: 0,
     cacheWrite: 0,
-    totalTokens: totalTokens + 1,
+    totalTokens: inputTokens + 1,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
 }
@@ -203,6 +204,12 @@ export async function makeStubModelRuntime(
   const model = makeStubModel(options.input);
   const streamTurn = (prompt: string, images: StubImage[], signal?: AbortSignal): AssistantMessageEventStream => {
     const turn = script.next(prompt, images);
+    // Fail loud on a dishonest fixture: honorAbort is meaningless without a
+    // hold to settle and a request signal to observe, and the silent
+    // fallbacks were how a wiring regression could go unnoticed.
+    if (turn.honorAbort === true && (turn.hold === undefined || signal === undefined)) {
+      throw new Error('stub honorAbort requires a hold and a request signal');
+    }
     const call = script.calls[script.calls.length - 1]!;
     const stream = new AssistantMessageEventStream();
     const text = turn.deltas.join('');

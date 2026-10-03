@@ -2628,6 +2628,47 @@ describe('chat context controls and durable new-chat boundaries', () => {
     }
   });
 
+  it('holds the reset barrier independent of the retired handle disposal on a committed reset', async () => {
+    let release!: () => void;
+    const retirementHold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const h = await makeHarness();
+    // Hold the retired handle's disposal: the committed reset must still
+    // release its control result and idle view instead of pinning the barrier
+    // behind the cleanup (finalizeCommittedNewChat is post-commit).
+    h.handle.disposeHold = retirementHold;
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      // The committed-retirement path needs an ACTIVE handle to retire.
+      client.send('establish before retirement', 'retirement-establish');
+      await client.waitFor(isTurnEndFrame, 'retirement setup');
+      client.control('new_chat', 'retirement-held');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'retirement-held',
+          'committed result while retirement is held',
+        ),
+      ).toMatchObject({ ok: true, epoch: 1 });
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'context' && frame.epoch === 1 && frame.state === 'idle',
+          'idle reset state while retirement is held',
+        ),
+      ).toBeDefined();
+      // The post-commit finalizer started retiring the old handle and is stuck
+      // on the test's hold: the result and idle view above arrived regardless.
+      await pollUntil(() => h.handle.disposalStarted, 'retired handle disposal started');
+      expect(h.handle.disposed).toBe(false);
+      release();
+      await pollUntil(() => h.handle.disposed, 'retired handle disposal settled');
+      await client.close();
+    } finally {
+      release();
+      await h.close();
+    }
+  });
+
   it('rejects stale old-epoch resends server-side and scopes dedup to epoch', async () => {
     const h = await makeHarness();
     try {

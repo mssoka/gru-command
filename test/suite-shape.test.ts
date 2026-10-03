@@ -23,7 +23,7 @@ const PINS: Record<string, number> = {
   'build-info.test.ts': 5,
   'chat-frame-log.test.ts': 20,
   'chat-frames.test.ts': 4,
-  'chat-server.test.ts': 83,
+  'chat-server.test.ts': 84,
   'chat-session-state.test.ts': 6,
   'claude-adapter.test.ts': 89,
   'config-generate.test.ts': 10,
