@@ -620,18 +620,20 @@ function managedBlock(
   return `${prefix}${prefix === '' ? '' : '\n'}${block}\n`;
 }
 
-function runtimeSkillNames(repoPath: string, tool: string): string[] {
+function runtimeSkillNames(repoPath: string, tool: string, repairHint?: string): string[] {
   const rootName = tool === 'claude-code' ? '.claude' : '.agents';
-  assertNoSymlinkComponents(repoPath, `${rootName}/skills`);
+  assertNoSymlinkComponents(repoPath, `${rootName}/skills`, repairHint);
   const root = runtimeSkillsRoot(repoPath, tool);
   if (!existsSync(root)) return [];
   if (!statSync(root).isDirectory()) {
-    throw new BmadDeterministicSetupError(`BMAD skill root is not a directory: ${root}`);
+    throw new BmadDeterministicSetupError(`BMAD skill root is not a directory: ${root}`, repairHint);
   }
   const names: string[] = [];
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const path = join(root, entry.name);
-    if (entry.isSymbolicLink()) throw new BmadDeterministicSetupError(`BMAD skill binding is a symlink: ${path}`);
+    if (entry.isSymbolicLink()) {
+      throw new BmadDeterministicSetupError(`BMAD skill binding is a symlink: ${path}`, repairHint);
+    }
     if (entry.isDirectory()) names.push(entry.name);
   }
   return names.sort();
@@ -641,7 +643,7 @@ function observedBmadSkills(repoPath: string, tools: readonly string[]): Runtime
   return Object.fromEntries(
     tools.map((tool) => [
       tool,
-      runtimeSkillNames(repoPath, tool).filter((name) => /^(?:bmad|gds|tea|cis)-/.test(name)),
+      runtimeSkillNames(repoPath, tool, INSTALLER_REPAIR_HINT).filter((name) => /^(?:bmad|gds|tea|cis)-/.test(name)),
     ]),
   );
 }
@@ -1106,8 +1108,8 @@ export function onboardBmadRepo(
   try {
     const repoPath = validateRepo(options.workspaceRoot, repoName, env);
     assertControlFilesSafe(repoPath);
-    assertNoSymlinkComponents(repoPath, '_bmad');
-    for (const tool of tools) runtimeSkillNames(repoPath, tool);
+    assertNoSymlinkComponents(repoPath, '_bmad', INSTALLER_REPAIR_HINT);
+    for (const tool of tools) runtimeSkillNames(repoPath, tool, INSTALLER_REPAIR_HINT);
     assertPrerequisites(tools, env, repoPath, options.prerequisiteCheck ?? commandAvailable);
     const existing = existingManifestFor(repoPath);
     let installed: InstalledBmad;
