@@ -281,3 +281,53 @@ typecheck) at `5a2a6fb`. The controlled FULL remains OWED:
   the GC capacity reconciliation (`gc-test-harness-budgets-20261002`) is the standing
   fleet capacity owner. Reconciliation is event-driven (queue drains), never an age-based
   loop or detached watcher.
+
+### Continuation 2026-10-03 — owner-approved main-to-feature integration (PR142)
+
+Authority: the owner directly replied **B** to the PR142 two-option authority question —
+one minion may integrate current published main INTO this existing branch and resolve its
+conflicts, preserving local/published history (authority record: the PR142 owner-B
+integration briefing in the ops briefings directory). It is not a merge into main and not a
+general merge exception.
+
+Starting state: lane head `4cbf7313ec9213d1399d25ae3a868b184a51829e` (tracked-clean),
+published head `c5b22268d03702b472f907452e4a747ad87208ad` (proven ancestor), 26 local
+commits beyond it. Main refreshed at admission: `9bb51b05af5d8f0a0cd389788d1d3f19607d5361`
+(the `#136 durable-blocked-followthrough` merge wave plus PR #149 — the shared seam this
+spec anticipated).
+
+Integration result (one normal history-preserving merge; no rebase/reset/stash/force):
+
+- Merge commit `aa55ea9` ("Merge origin/main (9bb51b05, durable follow-through + freshness
+  wave) into gru/terminal-rebrief-retirement"), followed by the suite-shape pin
+  reconciliation `35b1d99`. Both `4cbf7313` and `9bb51b05` are ancestors of the new head;
+  all 26 fine-grained local commits remain in history.
+- Conflict files and resolutions:
+
+| File | Resolution |
+|---|---|
+| `src/dispatch/rebrief-recovery.ts` | Kept BOTH the terminal-retirement branch (`retired`/`retirement`) and #136's phase-supersession fence (`superseded`): supersession returns first so an older turn never records against (or deletes) a newer request's markers; terminal retirement then closes the matching generation (audited, identity-checked). Boot, re-dispatch and HTTP surfaces carry every disposition. |
+| `src/dispatch/server.ts` | Retirement log/response (`retired`, `retirement`) plus the superseded warn line. |
+| `src/ledger/api.ts` (`beginPendingRebrief`) | The in-transaction terminal recheck precedes the phase-handoff guard row (a refused terminal admission never creates a handoff); the baseline watermark stays inside the same transaction. |
+| `test/dispatch-server.test.ts` | Kept the four lane retirement endpoint tests and upstream's renamed durable no-effect directive test (upstream body). |
+| `test/supervisor.test.ts` | Took upstream's deterministic fake-timer breaker test, which supersedes the local `vi.waitFor` repair of the same inherited real-time sampling race. |
+| `test/suite-shape.test.ts` | Pins recomputed from the combined files with the gate's own regex (never either side's stale values): dispatch-server 33, fix-directive 13, rebrief-recovery 27, runtime-resident-registry 22 (runtime-probe 8 retained). |
+
+- Preserved upstream semantics: #136 phase-supersession fence and the directive/phase
+  obligation reconciliation. Preserved lane semantics: audited terminal retirement, the
+  in-transaction terminal admission recheck, and boot/turn/boundary retirement with no
+  fabricated delivery, no reopen, and no new action-required alert.
+- Registry audit of the combined tree: 115 test files / 115 pins / 0 drift / 0 orphans
+  (source-regex reads only, no collected counts).
+
+Intermediate integration gate: the declared `terminal-rebrief` focused scope run through the
+authenticated scheduler at `35b1d99` — **PASS** (run `4b895ee0-e513-4050-bdc6-fe0f1d39c9a4`,
+exit 0, not timed out, sha exact, trackedDirty false; 5 files / 96 tests including every
+retirement and supersession case). Receipt and raw/decoded sinks are preserved in the
+lane's ignored verify-capture directory. A focused green is never FULL clearance.
+
+Final-head obligations after this record freezes the tracked content: that head's own
+focused/static/FULL gates, exact-head provider CI, whole-final-change independent review and
+native Perkins READY. No READY/PASS/merge claim is made here. Once source/control/push
+settles, Silas resumes the normal review/gate follow-through; no competing worker for this
+same approval.
