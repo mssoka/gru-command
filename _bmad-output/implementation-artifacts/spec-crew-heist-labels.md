@@ -246,3 +246,34 @@ the run's image-capable read tool):
   10 → 11 (`docs/LEDGER.md`, spec and test comments updated); the
   registered source checkout and sibling lanes were not touched.
 
+
+### r7 evidence-round verification — 2026-10-03
+
+- **Second main integration:** `eeb62f0` carries the merge of `b900837`
+  (PR #150 gru-working-flavor + PR #143 lens-unused-neutral); conflicts in
+  `fix-directive.ts`/`perkins.ts` resolved by keeping main's provider-pacing
+  interlock whole and re-applying this lane's implementer-only selection; main's
+  newer routing doubles gained `listImplementerMinions`; suite-shape pins
+  recounted (dispatch-server 25, fix-directive 15, supervisor 86,
+  rebrief-recovery 12).
+- **Scheduler prep (exact head `eeb62f0`, clean tree):** scope
+  `crew-heist-labels` run `b1f96c2e-0377-48d7-a788-7b020a0afc20`, exit 0 —
+  web board/protocol 74 passed, `crew-rail` acceptance pass, backend focused
+  12 files / 346 passed. Raw NDJSON host-side; record in the evidence pack.
+- **Linux CI (exact head `eeb62f0`):** run `37083150166` SUCCESS, all steps
+  including the full test suite; full job/step receipt committed in the
+  evidence pack (`ci/ci-run-37083150166-eeb62f091281.json`).
+- **Visual acceptance:** the four captures (`crew-{light,dark}-{desktop,phone}`)
+  and their verbatim `zai-coding-cn/glm-5.3-flash` vision reports are committed
+  under `_bmad-output/implementation-artifacts/crew-heist-labels-evidence/`
+  with SHA-256 hashes, the inspected presentation and the limitations
+  (including the model's `nion` OCR note and the owner-reference publication
+  constraint) in that directory's README.
+- **Prior failed attempt preserved:** the first prep run `a8e16b5e` exited 1
+  with three timeout-class failures under a loaded host; its complete raw
+  capture stays host-side and is not claimed as verification.
+- **Structural note:** a commit cannot contain the CI receipt of itself
+  (writing the receipt moves the head). The pack therefore binds the reviewed
+  code head's receipt and states the exact relationship; the host scheduler
+  `full` receipt at the frozen head is appended to this specification by the
+  host because it is bound to that SHA.
