@@ -67,19 +67,54 @@ interface DigestView {
 /** The hosted silas session stand-in: on every wake it parses the digest
  * out of the prompt (exactly what the model reads) and closes the loop
  * through the authenticated HTTP ops surface. */
-function silasActsViaHttp(input: { port: () => number; token: string; prFor: (jobId: string) => string }) {
+function silasActsViaHttp(input: {
+  port: () => number;
+  token: string;
+  prFor: (jobId: string) => string;
+  onDirectiveAccepted?: (receipt: {
+    readonly requestId: string;
+    readonly status: number;
+    readonly readbackState: string | null;
+  }) => void;
+}) {
   return async (prompt: string): Promise<void> => {
-    const jsonStart = prompt.indexOf('```json');
-    const jsonEnd = prompt.indexOf('```', jsonStart + 7);
-    if (jsonStart < 0 || jsonEnd < 0) throw new Error('wake prompt carries no digest');
-    const digest = JSON.parse(prompt.slice(jsonStart + 7, jsonEnd)) as DigestView;
+    // The digest is the JSON block under the '## Digest' heading. The wake
+    // prompt may carry OTHER ```json fences (e.g. the ops skill's
+    // completion_handoff example), so locate the digest by its heading
+    // first — then take the next fenced block — and require the expected
+    // digest keys; never assume the digest is the prompt's first fence.
+    const heading = prompt.indexOf('## Digest');
+    const jsonStart = heading < 0 ? -1 : prompt.indexOf('```json', heading);
+    const jsonEnd = jsonStart < 0 ? -1 : prompt.indexOf('```', jsonStart + 7);
+    if (jsonStart < 0 || jsonEnd < 0) throw new Error('wake prompt carries no digest block');
+    const parsed = JSON.parse(prompt.slice(jsonStart + 7, jsonEnd)) as unknown;
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      !Array.isArray((parsed as { deliveredWithoutPr?: unknown }).deliveredWithoutPr)
+    ) {
+      throw new Error('wake prompt digest block is not the actionable digest');
+    }
+    const digest = parsed as DigestView;
     const base = `http://127.0.0.1:${input.port()}`;
     const auth = { authorization: `Bearer ${input.token}`, 'content-type': 'application/json' };
-    const post = async (path: string, body: unknown, expected: number): Promise<void> => {
+    const post = async (
+      path: string,
+      body: unknown,
+      expected: number,
+    ): Promise<{ status: number; body: Record<string, unknown> }> => {
       const res = await fetch(`${base}${path}`, { method: 'POST', headers: auth, body: JSON.stringify(body) });
       if (res.status !== expected) {
         throw new Error(`${path} failed: ${res.status} ${await res.text()}`);
       }
+      return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+    };
+    const get = async (path: string): Promise<Record<string, unknown>> => {
+      const res = await fetch(`${base}${path}`, { headers: auth });
+      if (res.status !== 200) {
+        throw new Error(`${path} failed: ${res.status} ${await res.text()}`);
+      }
+      return (await res.json()) as Record<string, unknown>;
     };
     for (const row of digest.deliveredWithoutPr) {
       // discovery (transcript/gh) simulated by the fixture mapping…
@@ -99,15 +134,27 @@ function silasActsViaHttp(input: { port: () => number; token: string; prFor: (jo
       if (blocker.advice !== 'directive') {
         throw new Error(`unhandled ladder rung in the fixture: ${blocker.advice}`);
       }
-      await post(
+      const accepted = await post(
         '/api/silas/directive',
         {
           job_id: row.jobId,
           directive: `Fix "${blocker.title}" at ${blocker.location}, then re-run the suite.`,
           blocker_fingerprint: blocker.fingerprint,
         },
-        200,
+        202,
       );
+      const requestId = accepted.body['request_id'];
+      if (typeof requestId !== 'string' || requestId === '') {
+        throw new Error(`directive acceptance carried no durable request_id: ${JSON.stringify(accepted.body)}`);
+      }
+      // Accepted ≠ admitted: the readback is the durable contract, and a
+      // request that failed to route must surface here, not be swallowed.
+      const readback = await get(`/api/silas/directives/${encodeURIComponent(requestId)}`);
+      const readbackState = typeof readback['state'] === 'string' ? readback['state'] : null;
+      if (readback['request_id'] !== requestId || readbackState === null || readbackState === 'failed') {
+        throw new Error(`directive readback disagreed with acceptance: ${JSON.stringify(readback)}`);
+      }
+      input.onDirectiveAccepted?.({ requestId, status: accepted.status, readbackState });
     }
   };
 }
@@ -120,6 +167,7 @@ interface FollowThroughHarness {
   readonly spawns: { role: Role; options: SpawnOptions }[];
   readonly silasPrompts: Promise<void>[];
   readonly minionPrompts: string[];
+  readonly directiveReceipts: { requestId: string; status: number; readbackState: string | null }[];
   close(): Promise<void>;
 }
 
@@ -212,6 +260,7 @@ async function bootFollowThrough(input: {
     prHeadProbe: originHeadProbe(),
   });
   const silasPrompts: Promise<void>[] = [];
+  const directiveReceipts: { requestId: string; status: number; readbackState: string | null }[] = [];
   const silasHandle: AgentHandle = {
     role: 'silas',
     id: 'silas-hosted',
@@ -222,6 +271,9 @@ async function bootFollowThrough(input: {
         port: () => (http.address() as AddressInfo).port,
         token: TOKEN,
         prFor: (jobId) => (jobId === 'pr-651' ? PR_URL : `${PR_URL}-x`),
+        onDirectiveAccepted: (receipt) => {
+          directiveReceipts.push({ ...receipt });
+        },
       })(text);
       silasPrompts.push(run);
       return run;
@@ -281,6 +333,7 @@ async function bootFollowThrough(input: {
     spawns,
     silasPrompts,
     minionPrompts,
+    directiveReceipts,
     close: async () => {
       driver.stop();
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
@@ -389,6 +442,14 @@ describe('silas follow-through (no human input)', () => {
         { timeout: 45_000 },
       );
       await Promise.allSettled(h.silasPrompts);
+
+      // The client contract is asserted OUTSIDE the fake-session promise
+      // (its rejection is swallowed by Promise.allSettled): a fresh
+      // directive is 202 + stable id, and its readback is a durable state.
+      expect(h.directiveReceipts).toHaveLength(1);
+      expect(h.directiveReceipts[0]?.status).toBe(202);
+      expect(h.directiveReceipts[0]?.requestId).toBeTruthy();
+      expect(['dispatching', 'admitted', 'settled']).toContain(h.directiveReceipts[0]?.readbackState);
 
       const rounds = h.ledger.listRounds('pr-651');
       const events = h.ledger.listJobEvents('pr-651');

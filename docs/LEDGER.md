@@ -197,3 +197,186 @@ on every row it creates, the `worktree.created` event carries it, and a
 FYI (owner incident 2026-09-23: lanes branched up to hours stale,
 silently). On REVIEW lanes `origin` covers any freshly fetched origin
 branch named by the target — not only the default branch.
+### E10: durable follow-through obligations and directive requests (migration 11)
+
+Two tables carry the blocked-heist follow-through contract. Neither
+executes work, schedules anything or wakes anyone by itself: they make
+the NEXT obligation durable. This slice wires attention for the
+phase-completion hand-back only (`observeFollowUpDelivery` posts one
+action-required Gru row); obligations recorded by blocked transitions
+and boot adoption are durable triage debt that the digest / FOR YOU
+projection slices consume later — not yet surfaced by a notification.
+
+**`job_obligations`** — one row per (job, logical step, incident key)
+incarnation. A blocked transition records its obligation in the SAME
+transaction as the status write (`LedgerApi.setJobStatus`), with a typed
+blocker category (a closed list; anything else is `unknown` → Gru
+triage, never guessed into authority), the responsible role, the next
+action, optional typed authority, wake condition, bounded due/deadline
+state, optional human description (evidence for triage, never
+authority) and firing-rule provenance (issue #117). Identity survives
+duplicate observations (coalesce, no generation advance); distinct
+incidents coexist; a settled incident recurring mints a NEW incarnation
+(`id#n`) — the partial unique index enforces one active incarnation per
+tuple. `plan_revision` bumps when a duplicate observation CHANGES the
+plan (next action / authority / wake condition) and fences claims taken
+under the older plan. Receipts cite REAL ledger events (existence, kind,
+job, correlation) and never settle; evidence settlements and mechanical
+authority are validated against ledger facts (`verifyObligationAuthority`
+→ an unverifiable reference is a visible non-executable decision). Claim
+replacement across an expired lease requires positive reconciliation
+proof recorded with the full prior identity in `claim_log`. Parking
+suspends, terminal closes, `invalidateStaleContinuations` reclassifies
+stale continuations onto a LINKED successor — debt is never silently
+erased.
+
+**`pending_directives`** — one row per accepted Silas directive request,
+keyed by the caller's stable `request_id`. The atomic intent→dispatch
+claim is persisted BEFORE any prompt/spawn side effect, so a crash
+before the insert is provably side-effect-free while a crash after it
+is ADMISSION-UNKNOWN — never read as safe to retry. States:
+
+| state | meaning |
+|---|---|
+| `dispatching` | accepted; a claim was taken before any side effect; native admission not yet recorded (or unknown after a crash) |
+| `admitted` | a correlated `silas.directive-sent` event bound an actual awaited turn; terminal receipt pending |
+| `settled` | the correlated `job.delivered` terminal receipt was recorded |
+| `failed` | a durable positive no-effect failure was recorded; resubmit changed work under a NEW request id |
+
+`POST /api/silas/directive` returns **202** with the stable `request_id`
+once the durable intent is accepted — accepted ≠ admitted. The async
+turn stays owned and tracked by the existing dispatch server instance
+(no detached helper, no second chief); late errors surface durably.
+`GET /api/silas/directives/{request_id}` is the authenticated readback
+of the same request. Same id + same canonical payload replays to the
+SAME row; same id + different payload is a 409 conflict. The lane is
+single-writer: while ANY live request exists for the job, ANY different
+request id — identified or not — fails closed (409 `ambiguous_repeat`)
+with the live request NAMED; only a replay of that same id proceeds, so
+a fresh id can never start a second concurrent turn. Boot reconciliation
+(`reconcilePendingDirectives` in the existing recovery coordinator)
+completes a request from its own correlated evidence when it exists —
+admission first, then the terminal receipt — and otherwise posts ONE
+bounded, stable-kind action-required escalation naming the request: no
+automatic retry, no fabricated delivery, no fresh alert ids to bypass
+dedupe. A settled/failed request id never re-runs; recovered capacity is
+not permission. The live-request duplicate guard and the boot pass
+both query the LIVE states directly, and the boot pass pages by
+`request_id` cursor — terminal history can never crowd a live request
+out of examination.
+
+### Explicit phase-completion handoffs (migration 12, pr136-chief-handoff)
+
+The durable-follow-through contract above started with blocked lanes. A
+bounded phase can also complete on a lane that is NOT blocked and whose
+HEAD never moves (the fresh artifact-only dispatch and the same-head
+re-brief are the observed shapes). Migration 11 closes that gap with an
+EXPLICIT, durable intent — never inferred from a final message, an HTTP
+status, `job.delivered` alone, an idle board or an assistant claim.
+
+**The intent.** The phase-authorizing requests accept an optional typed
+field:
+
+```json
+"completion_handoff": { "kind": "gru-decision", "decision": "rule on the completed audit follow-through" }
+```
+
+on `POST /api/dispatch` (fresh artifact phase), `POST /api/silas/directive`
+(bounded fix/repair phase) and `POST /api/silas/rebrief` (fresh-worker
+phase). Omitting the field preserves the ordinary flow exactly. A
+malformed intent answers 400 BEFORE any job, marker or side effect. The
+decision text is a label for the owed obligation — never authority and
+never identity.
+
+**`phase_handoffs`** — one guard row per marked phase, written in the
+SAME transaction as the authorized request (before admission/side
+effects). Identity is host-owned:
+`phase-handoff:<job>:<source>:<generation>` (per-job monotonic
+generation). States:
+
+| state | meaning |
+|---|---|
+| `awaiting` | the intent is durable; the phase has not completed (the request's own reconcilers still own admission-unknown escalation) |
+| `completed` | a VALIDATED correlated terminal delivery landed; the obligation and its one card are reconciled from here |
+| `closed` | terminal without a hand-back (failed/cancelled/superseded/parked/terminal-job); closed never reopens |
+
+**Validated completion.** Only a `job.delivered` event carrying the
+phase's `phase_id` AND postdating its `intent_seq` AND passing the
+source's admission gate completes a phase: a directive request must be
+`admitted`/`settled` with the matching `request_id`; a re-brief must have
+recorded its `silas.rebrief` request event with the same phase id; a
+dispatch delivery must come from the phase's bound minion. A phase-tagged
+delivery is recorded ONLY when the prompt settled without an in-band
+runtime error: both adapters resolve a fulfilled prompt on an error turn
+(Claude `result.isError`; Pi assistant `stopReason: 'error'`), so every
+marked path correlates the handle's terminal health at settle
+(`promptTerminalVerdict`) before stamping a delivery. A failed turn
+records `job.minion-error` and NO delivery: the dispatch guard row
+closes, the directive request stays `admitted` with a reconcile note (the
+boot pass escalates it), and a re-brief keeps its marker pair for the
+recovery ladder — none can masquerade as completion. Disposed and
+admission-unknown attempts likewise record nothing. An older receipt
+cannot complete a newer phase (correlation, not sequence).
+
+**The hand-back.** On completion the service records ONE
+`phase-completion` obligation (`incidentKey phase-handoff@<phaseId>`,
+category `phase-completion`, firing rule
+`phase-completion-gru-decision`, no authority) and publishes ONE
+action-required row on the existing Gru wake path
+(`NotificationCenter.postIncident`, stable kind
+`silas.phase-handback.<phaseId>`, `dedupe: all`). No watcher, minion
+callback, model classification or second wake pipeline participates.
+Durable guards: a terminal job settles the debt `job-terminal`; a parked
+job SUSPENDS it — neither publishes a card, and neither is revived
+automatically. Shown/ACK/disposition is never settlement.
+
+**Reconciliation.** `reconcilePhaseHandoffs` rides the existing boot
+sequence (after the directive/re-brief reconcilers): an awaiting phase
+whose delivery committed before the observer ran is completed and
+published; a completed phase missing its obligation or card finishes
+them. It reads only ACTIONABLE rows (`awaiting` intents plus `completed`
+rows missing the obligation or card — already-published history is
+excluded, so no prefix can consume its budget) and persists a durable
+round-robin cursor (`reconcile_cursors`, migration 13): a pass that
+exhausts its page budget resumes from its last examined rowid on the next
+pass, and a pass that reaches the end wraps to the first row. Every
+actionable row is therefore examined within a bounded number of passes.
+Every step is idempotent, so duplicates, replays and restarts yield
+exactly one logical hand-back per phase — no re-dispatch, no duplicate
+Gru turn, no fresh alert ids. The legacy blocked-only observer skips any
+delivery naming an existing phase row, so a marked blocked hand-back is
+never double-published.
+
+**Unmarked hand-back crash windows.** The legacy event-sequence hand-back
+(`silas.phase-handback.<job>@<seq>` + obligation `phase-handback@<seq>`)
+is written by the live bus observer, which runs AFTER the delivery
+commits — a crash in that gap would lose it. `reconcileUnmarkedHandbacks`
+(boot, after the phase sweep) restores both windows from durable state:
+(a) follow-up `job.delivered` events on still-blocked lanes with no
+hand-back obligation yet, and (b) live `phase-handback@` obligations
+whose stable-kind card was never published. Both ride the SAME
+record/publish routine as the live observer; both candidate sets drop
+rows as they are processed, so bounded passes reach the tail and re-runs
+are no-ops. Recovery never spawns a worker, never rings the owner and
+never re-posts an existing card (even a resolved one); the one card is
+machine `action-required`.
+
+**Limits.** This slice adds no runtime attestation interface, no
+provider recovery and no timer/scheduler: a crash mid-dispatch with no
+admission evidence leaves the phase `awaiting` (never a fabricated
+success). Migration 12 is additive; nothing here changes owner stops,
+merge/deploy/restart policy or any callers' notification semantics.
+
+### Bounded reconcile cursors (migration 13, PR136 r4 repair)
+
+One tiny durable table backs fair bounded reconciliation:
+
+**`reconcile_cursors`** — `scope` (TEXT PRIMARY KEY), `cursor` (INTEGER
+rowid), `updated_at`. `LedgerApi.readReconcileCursor` /
+`writeReconcileCursor` are the only accessors. The `phase-handoffs`
+scope is used by `reconcilePhaseHandoffs`; the cursor rowid is the last
+row EXAMINED by a pass that hit its page budget, and `0` means “start
+from the first actionable row”. A cursor is operational state, never a
+write license: it only decides WHICH bounded slice of already-authorized
+reconciliation runs next. Migration 13 is additive and carries the same
+landing-collision convention as migrations 10/11.
