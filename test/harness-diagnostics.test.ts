@@ -436,6 +436,24 @@ describe('harness diagnostics', () => {
     const spawnRendered = renderFailureDiagnostics(scope, new Error('spawn check'));
     expect(spawnRendered).not.toContain('S'.repeat(50));
 
+    // Quoted values split at every boundary (Perkins r4): the continuation
+    // line is discarded fail-closed, so no fragment can leak — double- and
+    // single-quoted alike.
+    trackChildProcess(
+      fakeChild({ pid: 766_007, exitCode: 0, stderr: fakeStream('password="al', 'pha-', 'beta gamma', '"') }),
+      { label: 'quoted-split child', scope },
+    );
+    const quotedSplitRendered = renderFailureDiagnostics(scope, new Error('quoted split check'));
+    expect(quotedSplitRendered).not.toContain('pha-');
+    expect(quotedSplitRendered).not.toContain('gamma');
+    trackChildProcess(
+      fakeChild({ pid: 766_008, exitCode: 0, stderr: fakeStream("token='delta", 'eps', "lon'") }),
+      { label: 'single-quoted-split child', scope },
+    );
+    const singleQuotedRendered = renderFailureDiagnostics(scope, new Error('single quoted check'));
+    expect(singleQuotedRendered).not.toContain('eps');
+    expect(singleQuotedRendered).not.toContain('lon');
+
     // JSON-escaped credentials in log records.
     const jsonEscaped = String.raw`{\"token\":\"JSON-secret-123456\"}`;
     expect(redactDiagnosticText(jsonEscaped)).not.toContain('JSON-secret-123456');

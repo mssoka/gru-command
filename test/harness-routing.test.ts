@@ -64,9 +64,25 @@ describe('phase routing at runtime', () => {
         scripts: Record<string, string>;
       }
     ).scripts;
-    expect(scripts['test']).toContain('test:backend');
-    expect(scripts['test']).toContain('test:backend:heavy');
-    expect(scripts['test']).toContain('test:web');
+    const segments = (scripts['test'] ?? '').split('&&').map((part) => part.trim());
+    // Exact, ordered chain: a substring oracle would accept test:backend:heavy
+    // in place of test:backend and miss a dropped phase.
+    expect(segments).toEqual([
+      'npm run lint',
+      'npm run typecheck',
+      'npm run build',
+      'npm run test:backend',
+      'npm run test:backend:heavy',
+      'npm run test:web',
+    ]);
+    const runsRequired = (chain: readonly string[]): boolean =>
+      ['npm run test:backend', 'npm run test:backend:heavy', 'npm run test:web'].every((command) =>
+        chain.includes(command),
+      );
+    expect(runsRequired(segments)).toBe(true);
+    // Negative omission case: dropping either backend phase must fail.
+    expect(runsRequired(segments.filter((segment) => segment !== 'npm run test:backend'))).toBe(false);
+    expect(runsRequired(segments.filter((segment) => segment !== 'npm run test:backend:heavy'))).toBe(false);
   });
 
   it('bounds a stalled listing under its own deadline and reaps it (Perkins r1)', async () => {
