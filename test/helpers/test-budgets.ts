@@ -64,6 +64,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     file: 'harness-diagnostics.test.ts',
     workload: 'spawns a real Vitest child over a temp fixture to prove the timeout/failure wiring',
   },
+  {
+    file: 'harness-routing.test.ts',
+    workload: 'spawns two real Vitest collection children as the runtime phase-partition guard',
+  },
   { file: 'install-one-line.test.ts', workload: 'install.sh clone/build/service pipelines' },
   { file: 'install.test.ts', workload: 'install.sh CLI contracts through real subprocesses' },
   { file: 'lan-phone-raw-client.test.ts', workload: 'real service over sockets with the raw client' },

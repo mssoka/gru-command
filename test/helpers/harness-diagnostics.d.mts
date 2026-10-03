@@ -38,6 +38,13 @@ export declare class FixtureStepTimeoutError extends Error {
   diagnostics: string;
 }
 
+export declare class OwnedCommandTimeoutError extends Error {
+  readonly label: string;
+  readonly deadlineMs: number;
+  stdout: string;
+  stderr: string;
+}
+
 export declare function createTestScope(input: {
   file: string;
   name: string;
@@ -76,3 +83,25 @@ export declare function runBoundedFixtureStep<T>(
   fn: () => T | Promise<T>,
   options?: { deadlineMs?: number; scope?: DiagnosticsScope | null },
 ): Promise<T>;
+
+export declare function runOwnedCommand(
+  command: string,
+  args: readonly string[],
+  options?: {
+    label?: string;
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    input?: string;
+    deadlineMs?: number;
+    scope?: DiagnosticsScope | null;
+    killGraceMs?: number;
+  },
+): Promise<{
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  outputTruncated: boolean;
+  spawnError: string | null;
+  tracked: TrackedProcess | null;
+}>;

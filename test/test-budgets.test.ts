@@ -1,7 +1,5 @@
-import { spawnSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import { describe, expect, it } from 'vitest';
 import {
@@ -174,53 +172,6 @@ describe('workload-aware test budgets', () => {
         ).toContain('--config vitest.heavy.config.ts');
       }
     }
-  });
-
-  it('selects every on-disk test file exactly once across the two phases at runtime', () => {
-    const repoRoot = join(import.meta.dirname, '..');
-    const vitestBin = join(repoRoot, 'node_modules', 'vitest', 'vitest.mjs');
-    const childEnv = Object.fromEntries(
-      Object.entries(process.env).filter(([key]) => !key.startsWith('VITEST')),
-    );
-    const listConfig = (config: string): string[] => {
-      const result = spawnSync(
-        process.execPath,
-        [vitestBin, 'list', '--config', config, '--filesOnly', '--json'],
-        { cwd: repoRoot, encoding: 'utf-8', timeout: 120_000, env: { ...childEnv, CI: 'true' } },
-      );
-      expect(result.status, result.stderr).toBe(0);
-      // The phase config prints its budget banner first; take the JSON body.
-      const jsonStart = result.stdout.indexOf('\n[');
-      expect(jsonStart, result.stdout.slice(0, 400)).toBeGreaterThanOrEqual(0);
-      const entries = JSON.parse(result.stdout.slice(jsonStart).trim()) as Array<{ file: string }>;
-      return entries
-        .map((entry) => {
-          const path = entry.file.startsWith('file://') ? fileURLToPath(entry.file) : entry.file;
-          return relative(repoRoot, path).split('\\').join('/');
-        })
-        .sort();
-    };
-    const fast = listConfig('vitest.config.ts');
-    const heavy = listConfig('vitest.heavy.config.ts');
-    const onDisk = readdirSync(join(repoRoot, 'test'), { recursive: true })
-      .map((name) => String(name).split('\\').join('/'))
-      .filter((name) => name.endsWith('.test.ts'))
-      .map((name) => `test/${name}`)
-      .sort();
-    expect(fast.length).toBeGreaterThan(0);
-    expect(heavy.length).toBeGreaterThan(0);
-    expect(fast.filter((file) => heavy.includes(file)), 'a file runs in both phases').toEqual([]);
-    expect([...fast, ...heavy].sort(), 'the phase union must equal the on-disk test files').toEqual(onDisk);
-
-    // The full chain really chains both phases (and the web suite).
-    const scripts = (
-      JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8')) as {
-        scripts: Record<string, string>;
-      }
-    ).scripts;
-    expect(scripts['test']).toContain('test:backend');
-    expect(scripts['test']).toContain('test:backend:heavy');
-    expect(scripts['test']).toContain('test:web');
   });
 
   it('keeps the ten-timeout-cases -t pattern matching every observed case', () => {

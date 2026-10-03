@@ -22,6 +22,7 @@
  * outside Vitest) can import it; TS consumers use the adjacent .d.mts.
  */
 import { clearTimeout, setTimeout } from 'node:timers';
+import { spawn } from 'node:child_process';
 
 const OUTPUT_TAIL_LIMIT = 2_048; // chars kept per stream, per process
 const RENDER_LIMIT = 8_192; // chars of the rendered diagnostics block
@@ -92,10 +93,12 @@ export function markFixtureStep(label, scope) {
 
 function appendTail(tracked, streamName, chunk) {
   const text = String(chunk);
-  const current = tracked.output[streamName];
-  const next = current + text;
-  const bounded = next.length > OUTPUT_TAIL_LIMIT ? next.slice(-OUTPUT_TAIL_LIMIT) : next;
-  if (next.length > OUTPUT_TAIL_LIMIT) tracked.outputTruncated[streamName] = true;
+  const combined = tracked.output[streamName] + text;
+  // Redact BEFORE retaining: a credential label cut by the bounded window
+  // (or split across stream chunks) would otherwise let its value survive.
+  const redacted = redactDiagnosticText(combined);
+  const bounded = redacted.length > OUTPUT_TAIL_LIMIT ? redacted.slice(-OUTPUT_TAIL_LIMIT) : redacted;
+  if (combined.length > OUTPUT_TAIL_LIMIT) tracked.outputTruncated[streamName] = true;
   tracked.output[streamName] = bounded;
 }
 
@@ -143,7 +146,7 @@ export function trackChildProcess(child, { label, captureOutput = true, scope } 
 }
 
 const SECRET_LABEL =
-  /(["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?["']?\s*[:=]\s*)(?:"([^"\n]{4,})"|'([^'\n]{4,})'|(?:(?:Bearer|Basic)\s+)?([^\s"',;}\]]{4,}))/gi;
+  /(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:\\?"([^"\\\n]{4,})\\?"|'([^'\n]{4,})'|(?:(?:Bearer|Basic)\s+)?([^\s"',;}\\\]]{4,}))/gi;
 const BEARER_TOKEN = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}\b/gi;
 const SECRET_VALUE = /\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b/g;
 const JWT = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b/g;
@@ -348,8 +351,7 @@ export async function disposeScopeProcesses(
  * Run one fixture step under a hard step deadline. The step itself is
  * expected to use owned processes; on expiry the thrown error carries
  * the rendered diagnostics (last step, owned child state, output tails).
- */
-export async function runBoundedFixtureStep(label, fn, { deadlineMs = 5_000, scope } = {}) {
+ */export async function runBoundedFixtureStep(label, fn, { deadlineMs = 5_000, scope } = {}) {
   const target = scopeOf(scope);
   if (target === null) {
     throw new Error('runBoundedFixtureStep requires an active test scope');
@@ -371,4 +373,113 @@ export async function runBoundedFixtureStep(label, fn, { deadlineMs = 5_000, sco
   } finally {
     if (timer !== null) clearTimeout(timer);
   }
+}
+
+export class OwnedCommandTimeoutError extends Error {
+  constructor(label, deadlineMs) {
+    super(`${label} exceeded its ${deadlineMs}ms deadline`);
+    this.name = 'OwnedCommandTimeoutError';
+    this.label = label;
+    this.deadlineMs = deadlineMs;
+  }
+}
+
+const COMMAND_OUTPUT_LIMIT = 4 * 1024 * 1024;
+
+/**
+ * Run an owned child ASYNCHRONOUSLY under a bounded deadline. The child is
+ * registered with the active diagnostics scope (pid/state/output tails) and
+ * the returned stdout/stderr are captured for assertions. A deadline expiry
+ * SIGTERMs (then SIGKILLs after `killGraceMs`) the child before throwing an
+ * `OwnedCommandTimeoutError` whose `stdout`/`stderr` carry the partial
+ * output — so a stalled CLI can never block the worker past its classified
+ * test ceiling, and its evidence stays diagnosable. Foreign processes are
+ * never touched.
+ */
+export async function runOwnedCommand(
+  command,
+  args,
+  { label, cwd, env, input, deadlineMs = 120_000, scope, killGraceMs = 1_000 } = {},
+) {
+  const name = String(label ?? command);
+  const child = spawn(command, args, {
+    ...(cwd !== undefined ? { cwd } : {}),
+    ...(env !== undefined ? { env } : {}),
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const tracked = trackChildProcess(child, { label: name, scope });
+  let stdout = '';
+  let stderr = '';
+  let outputTruncated = false;
+  const collect = (current, chunk) => {
+    const next = current + String(chunk);
+    if (next.length > COMMAND_OUTPUT_LIMIT) outputTruncated = true;
+    return next.length > COMMAND_OUTPUT_LIMIT ? next.slice(-COMMAND_OUTPUT_LIMIT) : next;
+  };
+  child.stdout?.on('data', (chunk) => {
+    stdout = collect(stdout, chunk);
+  });
+  child.stderr?.on('data', (chunk) => {
+    stderr = collect(stderr, chunk);
+  });
+  let spawnError = null;
+  child.once('error', (error) => {
+    spawnError = error;
+  });
+  if (child.stdin !== null) {
+    if (input !== undefined) child.stdin.end(String(input));
+    else child.stdin.end();
+  }
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      /* already gone */
+    }
+    const escalate = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+    }, killGraceMs);
+    escalate.unref?.();
+  }, deadlineMs);
+  const closed = await new Promise((resolve) => {
+    let settled = false;
+    const settle = (code, signal) => {
+      if (!settled) {
+        settled = true;
+        resolve({ code, signal });
+      }
+    };
+    child.once('close', (code, signal) => settle(code, signal));
+    // A grandchild holding the stdio pipes open must not defeat the
+    // deadline: settle shortly after the direct child exits.
+    child.once('exit', (code, signal) => {
+      setTimeout(() => settle(code, signal), 100);
+    });
+    // A spawn failure may never produce 'close' on some platforms.
+    child.once('error', () => settle(null, null));
+  });
+  clearTimeout(timer);
+  if (timedOut) {
+    const error = new OwnedCommandTimeoutError(name, deadlineMs);
+    error.stdout = stdout;
+    error.stderr = stderr;
+    throw error;
+  }
+  return {
+    status: closed.code,
+    signal: closed.signal,
+    stdout,
+    stderr,
+    outputTruncated,
+    spawnError: spawnError === null ? null : String(spawnError.message ?? spawnError),
+    tracked,
+  };
 }

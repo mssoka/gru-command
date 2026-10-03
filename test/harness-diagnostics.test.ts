@@ -14,6 +14,7 @@ import {
   redactDiagnosticText,
   renderFailureDiagnostics,
   runBoundedFixtureStep,
+  runOwnedCommand,
   trackChildProcess,
 } from './helpers/harness-diagnostics.mjs';
 
@@ -65,11 +66,11 @@ function fakeChild(overrides: Record<string, unknown> = {}): ChildProcess {
   } as unknown as ChildProcess;
 }
 
-/** A fake readable stream that synchronously emits one chunk of text. */
-function fakeStream(text: string): { on: (event: string, cb: (chunk: string) => void) => void } {
+/** A fake readable stream that synchronously emits each chunk in order. */
+function fakeStream(...chunks: string[]): { on: (event: string, cb: (chunk: string) => void) => void } {
   return {
     on: (_event, cb) => {
-      cb(text);
+      for (const chunk of chunks) cb(chunk);
     },
   };
 }
@@ -378,5 +379,48 @@ describe('harness diagnostics', () => {
     expect(output).toContain('[harness-diagnostics] FAILURE');
     expect(output).toContain('failing fixture step');
     expect(output).toContain('teardown boom');
+  });
+
+  it('redacts credentials across truncation and JSON-escaped boundaries (Perkins r1)', () => {
+    const scope = currentTestScope()!;
+    const opaque = 'A'.repeat(32);
+    // The label sits 477 characters before the excerpt cut: redaction must
+    // happen before retention/excerpting, never after.
+    trackChildProcess(
+      fakeChild({ pid: 766_001, exitCode: 0, stderr: fakeStream(`token=${opaque} ${'x'.repeat(444)}`) }),
+      { label: 'boundary child', scope },
+    );
+    const rendered = renderFailureDiagnostics(scope, new Error('boundary check'));
+    expect(rendered).not.toContain(opaque);
+    expect(rendered).toContain('[REDACTED]');
+
+    // A pair split across stream chunks: the second chunk completes it.
+    const splitOpaque = 'B'.repeat(32);
+    trackChildProcess(
+      fakeChild({ pid: 766_002, exitCode: 0, stderr: fakeStream('token=', `${splitOpaque} ${'y'.repeat(400)}`) }),
+      { label: 'split child', scope },
+    );
+    const splitRendered = renderFailureDiagnostics(scope, new Error('split check'));
+    expect(splitRendered).not.toContain(splitOpaque);
+
+    // JSON-escaped credentials in log records.
+    const jsonEscaped = String.raw`{\"token\":\"JSON-secret-123456\"}`;
+    expect(redactDiagnosticText(jsonEscaped)).not.toContain('JSON-secret-123456');
+  });
+
+  it('bounds an owned command past its deadline and reaps it (Perkins r1)', async () => {
+    const scope = currentTestScope()!;
+    const started = Date.now();
+    await expect(
+      runOwnedCommand(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        label: 'stalled synthetic command',
+        deadlineMs: 300,
+        scope,
+      }),
+    ).rejects.toThrow(/stalled synthetic command exceeded its 300ms deadline/);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    const tracked = scope.processes.at(-1);
+    expect(tracked, 'the stalled command stays tracked').toBeDefined();
+    expect(tracked!.exitCode !== null || tracked!.signal !== null, 'reaped by the deadline').toBe(true);
   });
 });
