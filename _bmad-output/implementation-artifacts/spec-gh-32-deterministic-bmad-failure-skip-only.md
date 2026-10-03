@@ -172,6 +172,8 @@ re-asking — recorded here as the standing Checkpoint-1 approval.
 
 - Browser correction, third iteration (same cycle): with the strip geometry and the attach hand-off fixed, the geometry sweep passed on the desktop console and the tablet drawer for the first time, then the phone step timed out tapping `#gru-fab` — the tablet drawer stays open across the width change and the open sheet covers the FAB. The phone step now taps the FAB only when the sheet is closed, then asserts open + flavor visible + sweep as before. No assertion, tolerance, timeout or approved UX changed.
 
+- Browser correction, fourth iteration (same cycle): the fresh-main merged head's browser run (`d480d67e` at `7330e44`) came back RED with the two `themes` whole-page captures missing the owner band (mock: header only, rows absent; real: the band absent) while the failure-time accessibility snapshots show the band fully present, the web tree and snapshots are byte-identical to the green `1bac32d` run, and no web code changed between the two — the capture raced the band's first render/paint under host load, and the tests waited only for the chat reply, not the board. Both themes tests now synchronize on the band's authoritative content before the screenshot (mock: the two owner rows; real: the `nothing needs you` clear row). No oracle, tolerance, timeout, deadline or product behavior changed; the RED receipt and its captures are preserved.
+
 ## Spec Change Log
 
 ## Review Triage Log

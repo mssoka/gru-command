@@ -996,6 +996,15 @@ test.describe('themes', () => {
     await pair(page);
     await sendAndWaitReply(page, 'theme check');
 
+    // The whole-page capture must not race the board's owner band: the
+    // reply wait above covers the chat only (observed RED under load: the
+    // capture missed the band while the DOM already had it). Synchronize
+    // on the band's authoritative rows before the screenshot.
+    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(2);
+    await expect(
+      page.locator('#board-owner .board-owner__row', { hasText: 'Fix the payment retry loop' }),
+    ).toBeVisible();
+
     await expect(page.locator('html')).not.toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('chat-light.png', { maxDiffPixelRatio: 0.02 });
 

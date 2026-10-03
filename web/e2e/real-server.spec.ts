@@ -481,6 +481,12 @@ test.describe('themes', () => {
     await pair(page, `http://127.0.0.1:${themesPort}/`);
     await sendAndWaitReply(page, 'theme real check');
 
+    // The whole-page capture must not race the board's owner band (the
+    // chat wait above does not cover the board snapshot; observed as a RED
+    // capture with the band missing while the DOM already had it).
+    await expect(page.locator('#board-owner')).toBeVisible();
+    await expect(page.locator('#board-owner .board-owner__clear')).toBeVisible();
+
     await expect(page.locator('html')).not.toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('real-chat-light.png', { maxDiffPixelRatio: 0.02 });
 
