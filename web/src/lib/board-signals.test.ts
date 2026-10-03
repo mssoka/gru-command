@@ -242,13 +242,15 @@ describe('unackedByJob', () => {
     // this test reads the server's terminal declaration directly: every
     // status the ledger names terminal must be concluded here. A new
     // terminal status server-side fails THIS test until the web twin
-    // mirrors it (final independent review B0/Ar1/T0).
+    // mirrors it (final independent review B0/Ar1/T0). The pattern
+    // tolerates formatting/type-annotation changes so only a real status
+    // drift (or a removed declaration) fails.
     const statesSource = readFileSync(
       fileURLToPath(new URL('../../../src/ledger/states.ts', import.meta.url)),
       'utf-8',
     );
-    const declaration = /const JOB_TERMINAL: ReadonlySet<JobStatus> = new Set\(\[([^\]]*)\]\)/.exec(statesSource);
-    expect(declaration).not.toBeNull();
+    const declaration = /JOB_TERMINAL\s*:[^=]*=\s*new Set[^(]*\(\[([^\]]*)\]\)/.exec(statesSource);
+    expect(declaration, 'the ledger terminal declaration moved or changed shape').not.toBeNull();
     const terminal = [...declaration![1]!.matchAll(/'([^']+)'/g)].map((match) => match[1]!);
     expect(terminal.length).toBeGreaterThan(0);
     for (const status of terminal) {

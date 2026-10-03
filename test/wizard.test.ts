@@ -493,6 +493,24 @@ describe('wizard CLI surface', () => {
     }
   });
 
+  it('a valid --answers run still prints the runtime probe (fail-fast only skips invalid input)', () => {
+    // Final independent review T0: the fail-fast refactor is asserted
+    // negatively above; this pins the other half — valid runs still probe
+    // (and therefore still print the probe block).
+    const repoRoot = join(import.meta.dirname, '..');
+    const wizard = join(repoRoot, 'dist', 'wizard', 'main.js');
+    const result = spawnSync(
+      process.execPath,
+      [wizard, '--answers', JSON.stringify({ smoke: false, port: 0 })],
+      {
+        encoding: 'utf-8',
+        env: { ...process.env, GRU_COMMAND_HOME: tempDir('gru-command-wizard-valid-') },
+      },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('Runtime probe:');
+  });
+
   it('pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)', async () => {
     const repoRoot2 = join(import.meta.dirname, '..');
     const instance = tempDir('gru-command-pty-h2-');

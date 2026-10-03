@@ -512,37 +512,43 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         .filter((agent) => agent.jobId === job.id && agent.role === 'minion');
       // The SAME attribution the board renders (stoppedWorkersByJob): a
       // bound minion is live unless its supervision view says stopped or
-      // breaker-open (a null view is an unsupervised worker, not a stop).
+      // breaker-open, and a disposed unsupervised record is not a worker.
       // A lane with a stop record and NO live worker is WAITING on a human
-      // re-arm — silence from a stop is never a stall. The newest live
-      // worker speaks for the lane's silence; the board's COLD banding
-      // deliberately measures lane-level recency instead, and the two
-      // surfaces share this stop attribution so a waiting lane never
-      // contradicts itself.
+      // re-arm — silence from a stop is never a stall. Otherwise the
+      // newest non-stop-exempt worker speaks for the lane's silence; a
+      // lane whose only worker is a dead record still wakes (the board
+      // shows it COLD, and both surfaces agree it is not running). The
+      // board's COLD banding deliberately measures lane-level recency
+      // instead, and the two surfaces share this stop attribution so a
+      // waiting lane never contradicts itself.
+      const viewOf = (agent: (typeof boundMinions)[number]): AgentSupervisionView | null =>
+        input.supervisionFor?.(agent.id) ?? null;
+      const stopExempt = (agent: (typeof boundMinions)[number]): boolean => {
+        const supervision = viewOf(agent);
+        return supervision !== null && (supervision.state === 'stopped' || supervision.breakerOpen === true);
+      };
       const live = boundMinions.filter((agent) => {
-        const supervision = input.supervisionFor?.(agent.id) ?? null;
-        if (supervision === null) {
-          // Unsupervised: live only while it is not a disposed record — a
-          // dead row is not a worker and must not mute a current stop
-          // (same rule the board applies; round-3 finding).
-          return agent.state !== 'disposed';
-        }
-        return supervision.state !== 'stopped' && supervision.breakerOpen !== true;
+        if (stopExempt(agent)) return false;
+        return viewOf(agent) !== null || agent.state !== 'disposed';
       });
-      const minion = live.sort((a, b) =>
-        (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt),
-      )[0];
-      if (minion !== undefined) {
-        const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);
-        if (Number.isFinite(lastMs) && now() - lastMs >= input.config.stallThresholdMs) {
-          digest.stalledWorking.push({
-            jobId: job.id,
-            repo: job.repo,
-            minionId: minion.id,
-            minionState: minion.state,
-            lastActivity: minion.lastActivity,
-            idleMs: now() - lastMs,
-          });
+      const waiting = boundMinions.some(stopExempt) && live.length === 0;
+      if (!waiting) {
+        const pool = live.length > 0 ? live : boundMinions.filter((agent) => !stopExempt(agent));
+        const minion = pool.sort((a, b) =>
+          (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt),
+        )[0];
+        if (minion !== undefined) {
+          const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);
+          if (Number.isFinite(lastMs) && now() - lastMs > input.config.stallThresholdMs) {
+            digest.stalledWorking.push({
+              jobId: job.id,
+              repo: job.repo,
+              minionId: minion.id,
+              minionState: minion.state,
+              lastActivity: minion.lastActivity,
+              idleMs: now() - lastMs,
+            });
+          }
         }
       }
     }
@@ -634,6 +640,15 @@ export interface SilasTrigger {
 /** The GitHub signal poll's single entry point (`GitHubSignalPoll` satisfies it). */
 export interface GitHubPollPort {
   pollOnce(): Promise<GitHubPollTickResult>;
+}
+
+/** Bind the supervisor's live per-agent views to the digest's lookup. This
+ * is the one seam main.ts wires; it is a factory so the binding is testable
+ * without booting the service (final independent review T2). */
+export function supervisionLookup(
+  supervisor: { readonly viewFor: (agentId: string) => AgentSupervisionView | null } | null,
+): (agentId: string) => AgentSupervisionView | null {
+  return (agentId) => supervisor?.viewFor(agentId) ?? null;
 }
 
 export interface SilasDriverOptions {

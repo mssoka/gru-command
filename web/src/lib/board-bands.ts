@@ -88,12 +88,12 @@ export interface WorkerStopView {
  * stop — it counts as live, so a re-dispatched lane whose fresh worker
  * is unsupervised still never reads "waiting" from its previous
  * worker. A stopped record survives its own disposal (the human Ack
- * must find it to re-arm). Only when no live worker remains does the
- * first recorded stop mark the lane; the ledger lists agents
- * most-recently-updated first, so that first stop is the most recent
- * one. */
+ * must find it to re-arm). Only when no live worker remains does a stop
+ * mark the lane; when several workers are stopped, the NEWEST recorded
+ * stop (by lastActivity) speaks for the lane — a superseded worker's
+ * cause never masquerades as the current one. Ties keep snapshot order. */
 export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
-  const stopped = new Map<string, WorkerStopView>();
+  const stopped = new Map<string, { readonly view: WorkerStopView; readonly at: number }>();
   const liveJobs = new Set<string>();
   for (const agent of agents) {
     if (agent.jobId === null || agent.role !== 'minion') continue;
@@ -110,11 +110,17 @@ export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, W
       liveJobs.add(agent.jobId);
       continue;
     }
-    if (stopped.has(agent.jobId)) continue;
-    stopped.set(agent.jobId, { reason: supervision.stopReason ?? null, restarts: supervision.restarts });
+    const view: WorkerStopView = { reason: supervision.stopReason ?? null, restarts: supervision.restarts };
+    const at = agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+    const existing = stopped.get(agent.jobId);
+    if (existing === undefined || (Number.isFinite(at) && (!Number.isFinite(existing.at) || at > existing.at))) {
+      stopped.set(agent.jobId, { view, at });
+    }
   }
   for (const jobId of liveJobs) stopped.delete(jobId);
-  return stopped;
+  const result = new Map<string, WorkerStopView>();
+  for (const [jobId, entry] of stopped) result.set(jobId, entry.view);
+  return result;
 }
 
 /** The status-chip label for a stopped lane: an explicit waiting state

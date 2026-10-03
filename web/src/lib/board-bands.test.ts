@@ -500,16 +500,19 @@ describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
     const map = stoppedWorkersByJob([
       agentView('old', {
         jobId: 'job-1',
+        lastActivity: ISO(-2 * 3_600_000),
         supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
       }),
       agentView('newer', {
         jobId: 'job-1',
+        lastActivity: ISO(-1 * 3_600_000),
         supervision: { state: 'stopped', restarts: 4, breakerOpen: true, stopReason: 'crash loop' },
       }),
     ]);
-    // No live worker remains: the lane waits, deterministically reporting
-    // the first recorded stop in snapshot order.
-    expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 1 });
+    // No live worker remains: the lane waits on its CURRENT (newest) stop —
+    // a superseded worker's reason never masquerades as the live one
+    // (final independent review B1/C0).
+    expect(map.get('job-1')).toEqual({ reason: 'crash loop', restarts: 4 });
   });
 
   it('an unsupervised fresh worker still clears an older stopped record', () => {

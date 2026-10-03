@@ -355,7 +355,11 @@ function defaultSampleSnapshot(): unknown {
               status: 'active',
               createdAt: new Date(Date.now() - 40 * 60_000).toISOString(),
             },
-            lastAgentActivity: new Date(Date.now() - 10 * 60_000).toISOString(),
+            // Backdated past the 30-minute stall window so the e2e's 'not
+            // COLD' assertion actually exercises the stop exemption: the
+            // lane is IN FLIGHT only because its stopped worker is waiting
+            // on a re-arm, not because its stamp is fresh (review B4).
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
           },
           {
             id: 'demo-api-conflict-probe',

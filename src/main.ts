@@ -22,7 +22,7 @@ import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
 import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
-import { SilasDriver } from './dispatch/silas-driver.js';
+import { SilasDriver, supervisionLookup } from './dispatch/silas-driver.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -1290,7 +1290,7 @@ async function main(): Promise<number> {
       bus,
       // Same live stop truth the board renders: a supervision-stopped
       // worker is waiting on a human re-arm, never a stalled lane.
-      supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
+      supervisionFor: supervisionLookup(supervisor),
       // Chief phase-3 seam: every deterministic Silas pass (bus wake events
       // and sweep ticks) reconsidered pending review handoffs BEFORE any
       // LLM wake — bounded, no-overlap, fence-preserving.

@@ -15,6 +15,7 @@ import {
   followUpChangedTarget,
   loadSilasSkills,
   SilasDriver,
+  supervisionLookup,
   type DigestLedger,
   type GitHubPollPort,
   type RoundBlocker,
@@ -325,7 +326,9 @@ describe('silas digest (the four actionable states)', () => {
           trigger: 'sweep',
           now: () => now + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000,
           supervisionFor: (agentId) =>
-            (agentId === 'min-other-live' || agentId === 'min-disposed' ? null : view),
+            (agentId === 'min-other-live' || agentId === 'min-disposed' || agentId === 'min-only-dead'
+              ? null
+              : view),
         });
 
       // Stopped worker: waiting on a human re-arm with a recorded cause —
@@ -361,9 +364,34 @@ describe('silas digest (the four actionable states)', () => {
       h.ledger.setAgentState('min-disposed', 'disposed');
       const dead = await digestOf();
       expect(dead.stalledWorking.filter((row) => row.jobId === 'job-dead')).toHaveLength(0);
+      // A lane whose ONLY worker is a dead record has no stop to wait on:
+      // the board shows COLD and the digest still wakes — both surfaces
+      // agree the lane is not running (round-4 definition).
+      h.ledger.addJob({ id: 'job-only-dead', repo: 'fixture-app', title: 'dead-only', briefing: 'b' });
+      h.ledger.setJobStatus('job-only-dead', 'working');
+      h.ledger.registerAgent({ id: 'min-only-dead', role: 'minion', jobId: 'job-only-dead' });
+      h.ledger.setAgentState('min-only-dead', 'disposed');
+      const onlyDead = await digestOf();
+      expect(onlyDead.stalledWorking.filter((row) => row.jobId === 'job-only-dead')).toHaveLength(1);
     } finally {
       h.cleanup();
     }
+  });
+
+  it('supervisionLookup binds the supervisor views exactly as main.ts wires them', () => {
+    // Final independent review T2: the factory is the tested seam; a
+    // dropped or broken binding would silently re-enable stall wakes for
+    // stopped lanes.
+    const view: AgentSupervisionView = {
+      agentId: 'wired', role: 'minion', slotId: null, state: 'stopped', restarts: 2,
+      breakerOpen: true, stopReason: 'quota_wall', openTurn: false, openToolCalls: 0,
+      lastEventAt: null, lastFileBytes: null,
+    };
+    const lookup = supervisionLookup({ viewFor: (agentId) => (agentId === 'wired' ? view : null) });
+    expect(lookup('wired')).toBe(view);
+    expect(lookup('other')).toBeNull();
+    // A missing supervisor (not yet constructed at boot) reads as no view.
+    expect(supervisionLookup(null)('wired')).toBeNull();
   });
 
   it('a fresh delivery after a changes-requested verdict is re-review due, not directive-due', async () => {
