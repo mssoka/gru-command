@@ -309,6 +309,18 @@ checkout, home paths, journal, or global custom instructions).
   guard, overlaid test files, and expected-RED intent are unchanged; the
   prior exit-99 receipt and snapshot remain preserved as evidence.
 
+- 2026-10-03 native round 3 fix (trigger: Perkins round
+  `gc-packaged-build-playbook-20261002-r3` NEEDS CHANGES on 60cfbd8 — 1
+  carried canonical-briefing blocker + 1 new fallback-merge blocker).
+  Amended: the contract-review reconciliation is corrected — a fallback
+  gate PASS clears review/fix routing only and never substitutes for the
+  exact-final-head Perkins READY required before a merge is presented;
+  the missing Perkins gate is escalated instead. README, `docs/FLOW.md`,
+  the ops skill, and the loader/tarball pins aligned. The carried blocker
+  is an owner/operations disposition (canonical acceptance amendment via
+  a supported audited ingress) — held, not bypassed. KEEP: fallback
+  review/fix routing, owner-held merges, no agent merge, all gates.
+
 - 2026-10-03 owner contract addendum (autonomous follow-through; owner
   ruling 2026-10-02, j-869/j-878/j-879): approved heists advance without a
   continue prompt — every nonterminal job resolves to active owned work,
@@ -453,6 +465,8 @@ checkout, home paths, journal, or global custom instructions).
 | 55 | blind | low | README onboarding sentence named `bmad-build` unversioned while the playbook forbids fixed names → patch (version-scoped: the build-workflow skill this pinned release provides) |
 | 56 | edge | low | tilde-path (`~/`) home-relative paths not negative-pinned at the installed seam → patch (`not.toContain('~/')`) |
 | 57 | verif-gap | clean | No verification gaps found (whole diff read, receipt verified) |
+| 58 | native r3 | blocker (carried 0, owner/ops) | Frozen Acceptance 1 still names the retired literal while the shipped contract selects by capability; the runtime freezes `job.briefing`, not the committed amendment record (`src/dispatch/perkins.ts:2041`) → **owner/operations disposition**: freeze the approved j-761 amendment into the canonical acceptance through a supported audited ingress, then re-review. Not resolvable in-lane; no gate/spec weakening or DB repair |
+| 59 | native r3 | blocker (new) | The contract-review patch (row 43) over-reconciled the fallback gate: it permitted presenting a merge after a fallback PASS, contradicting Acceptance 4 (`roles/gru.md` READY rule + wake header). → patch: fallback PASS clears review/fix routing only; the missing Perkins gate is escalated, never substituted; README/FLOW/ops + loader and tarball pins aligned |
 
 ### Final-review cycle (2026-10-02, continuation)
 
