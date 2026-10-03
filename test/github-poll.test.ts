@@ -510,6 +510,7 @@ interface FakePost {
   readonly title: string;
   readonly detail?: string | null;
   readonly dedupe: string;
+  readonly agentId?: string | null;
 }
 
 class FakeNotifications implements GitHubPollNotifications {
