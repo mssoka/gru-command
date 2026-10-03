@@ -29,6 +29,29 @@ draft first, never a later draft-to-ready conversion. This corrects HOW
 an already-authorized PR is created; it grants no publication permission
 to a lane that has none, and existing drafts are left untouched.
 
+## Marking a phase that owes the chief a decision (pr136-chief-handoff)
+
+A bounded phase can complete with the lane unblocked and HEAD unmoved (an
+artifact-only audit; a same-head re-brief). When the authorizing request is
+EXPLICITLY marked, the SERVICE — not you, not a watcher — durably records
+the owed chief decision and publishes one action-required hand-back when
+that exact phase reaches validated completion. Add to the request:
+
+```json
+"completion_handoff": { "kind": "gru-decision", "decision": "<what the chief must rule on>" }
+```
+
+- `POST /api/dispatch` — the fresh artifact phase (omitted = ordinary
+  dispatch; the field is validated before any job exists).
+- `POST /api/silas/directive` — a bounded fix/repair phase.
+- `POST /api/silas/rebrief` — a fresh-worker phase.
+
+Mark only phases whose completion genuinely owes the chief a decision.
+An unmarked request keeps the ordinary flow. `job.delivered`, a 200, idle
+or a nonempty artifact is never completion by itself: the hand-back fires
+only for the marked phase's correlated, admitted terminal delivery. Never
+re-mark historical work; a changed decision needs a NEW request id.
+
 ## Mechanical reactions vs judgment (owner mandate split 2026-09-23)
 
 The chief keeps the judgments: rulings, merge escalations, and novel
@@ -126,7 +149,14 @@ answer is `409` with `{"error":"branch_busy","blockers":[...]}`:
    round's blockers with `consecutive_rounds` and the advised rung:
    - `directive`: send a fix directive naming each blocker with its
      evidence, via `POST /api/silas/directive`
-     `{"job_id":"<job>","directive":"...","blocker_fingerprint":"..."}`.
+     `{"job_id":"<job>","directive":"...","blocker_fingerprint":"...","request_id":"<stable-id>"}`.
+     The call answers **202** with the stable `request_id` once the durable
+     intent is accepted — accepted is not admitted; read the durable state
+     back with `GET /api/silas/directives/{request_id}`. Retry only with the
+     SAME `request_id`: while ANY request for the job is live, a different
+     request id (or an identity-less repeat) is refused with the live
+     request named, and a request that is still `dispatching`/`admitted`
+     must never get a second turn.
      A NEW blocker gets this rung too — it is the first fix directive, and
      without it the lane can never re-open. The service routes the
      directive to the live minion (or a fresh one on the lane), flips the

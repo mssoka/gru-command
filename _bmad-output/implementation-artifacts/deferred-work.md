@@ -16,3 +16,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-gc-packaged-build-playbook.md`
   summary: No staged `loadSilasSkills()` probe loads `resources/silas-skills/ops-dispatch/SKILL.md` through its compiled module-relative loader from an installed/tarball layout.
   evidence: The tarball's packed-files assertions and the staged ops-skill text read cover presence; `loadSilasSkills`'s `../../resources/silas-skills` resolution is covered from the checkout only. Pre-existing coverage refinement on an unchanged loader path, not caused by the j-810/j-811 correction. Final-review row 36 (blind), triaged defer 2026-10-02.
+- source_spec: `_bmad-output/implementation-artifacts/pr136-chief-handoff/plan.md`
+  summary: Dispatch-lane mid-turn crash after a marked phase intent has no recovery beyond leaving the phase `awaiting` (no fabricated completion, no phase-specific escalation)
+  evidence: The pr136-chief-handoff delta deliberately adds no runtime attestation interface or provider recovery; a crash between the persisted intent and any admission evidence leaves the guard row awaiting and the job's own state visible. Adding dispatch-lane provider recovery is a wider runtime change that returns to Gru.
+- source_spec: `_bmad-output/implementation-artifacts/pr136-chief-handoff/plan.md`
+  summary: `reconcilePendingRebriefs` delivery-only branch may append a `silas.rebrief-recovered` event for a marker group replaced by a newer request mid-boot
+  evidence: Markers are read as a boot snapshot; a newer re-brief request can replace them while recovery runs. The `expectedPhaseId` fence added by this delta prevents any phase completion from the stale group (and nothing is cleared), but the recovered-history event is still appended as noise.

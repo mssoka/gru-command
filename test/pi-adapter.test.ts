@@ -1657,6 +1657,32 @@ describe('Perkins r1 regressions', () => {
     }
   });
 
+  it('W7b: promptWithVerdict preserves an errored turn when a queued successor clears the state (r5 blocker 1)', async () => {
+    let release!: () => void;
+    const fx = await fixture([
+      { deltas: [], error: 'queued-race exploded', hold: new Promise<void>((resolve) => (release = resolve)) },
+      { deltas: ['successor'] },
+    ]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const first = handle.promptWithVerdict!('first', { owner: 'alice' });
+      await vi.waitFor(() => expect(fx.script.calls).toHaveLength(1));
+      // A successor is queued while the errored turn is still live.
+      const successor = handle.prompt('successor', { owner: 'alice' });
+      release();
+      const verdict = await first;
+      // The successor runs to completion and owns the live session state...
+      await successor;
+      expect(handle.health().state).toBe('idle');
+      // ...but the errored turn's own captured verdict is preserved.
+      expect(verdict.ok).toBe(false);
+      expect(verdict.error).toContain('queued-race exploded');
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+    }
+  });
+
   it('W10: registry status aggregates streaming while a turn is live', async () => {
     let release!: () => void;
     const fx = await fixture();
