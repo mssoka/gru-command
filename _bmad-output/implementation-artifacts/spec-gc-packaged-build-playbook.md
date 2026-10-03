@@ -466,6 +466,18 @@ bad_spec).
     patch, mktemp, archive/extract, overlay, link, head, pointer write,
     cd) with the distinct exit 3, so a setup failure can never read as the
     expected test RED.
+- Verification incident (2026-10-03T04:14-04:28): the 6c91ee0 baseline
+  request `0edde2bf-b757-4709-a61c-de2de2c46d3a` was submitted with
+  exclusive sinks, but the local client was killed by a bash-tool default
+  timeout 60 s later, leaving a 99-byte partial capture (one queued
+  frame). The request had been accepted; it was granted at 04:28:19 and
+  settled server-side in 22.2 s with `ok=false, exit_code=1`,
+  `output_bytes=70422`, `output_sha256=40eed742...`, and a tail showing
+  `Test Files 4 failed (4); Tests 8 failed | 46 passed (54)` — the same
+  genuine fail-before RED through the new guarded setup path. Disposition:
+  partial capture and ledger-complete outcome preserved; no blind replay
+  (a rerun solely to recover lost output is forbidden). Lesson applied:
+  scheduler client calls always carry a generous explicit timeout.
 
 ## Verification
 
