@@ -309,6 +309,144 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(existsSync(join(repoA, '.gru-command', 'bmad-install.json'))).toBe(true);
   }, 120_000);
 
+  it('EOF (Ctrl-D) at the deterministic skip-only prompt takes the skip path instead of wedging (whole-900 review A2)', () => {
+    const workspace = tempDir('gru-command-pty-eof-det-ws-');
+    const repoA = join(workspace, 'repo-a');
+    mkdirSync(join(repoA, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoA });
+    // Same broken existing install as the deterministic test: the prompt
+    // under test is the skip-only loop, and a closed stdin must reach the
+    // documented skip path (readline question() never settles on EOF).
+    mkdirSync(join(repoA, '_bmad', '_config'), { recursive: true });
+    writeFileSync(
+      join(repoA, '_bmad', '_config', 'manifest.yaml'),
+      'installation:\n  version: 6.12.0\nmodules:\n  - name: core\n    version: 6.12.0\nides:\n  - pi\n',
+    );
+    const instance = tempDir('gru-command-pty-eof-det-home-');
+    const bin = tempDir('gru-command-pty-eof-det-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    const { output, status } = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '1' },
+        { expect: BMAD_A_PROMPT, send: 'reuse' },
+        { expect: RUNTIME_PROMPT, send: 'pi' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: '' },
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+        { expect: 'Skip this repo? [skip]:', send: '\u0004' },
+      ],
+      { GRU_COMMAND_HOME: instance, PATH: `${bin}:${process.env.PATH ?? ''}` },
+    );
+    expect(status, output).toBe(0);
+    expect(output).toContain('input closed (EOF) — taking the skip path');
+    expect(output).toContain('deterministic — retrying cannot fix it');
+    expect(output).toContain('BMAD not ready in repo-a: skipped by explicit per-repo choice');
+    expect(output).toContain('Setup complete');
+  }, 120_000);
+
+  it('EOF (Ctrl-D) at the transient retry prompt takes the skip path instead of wedging (whole-900 review A2)', () => {
+    const workspace = tempDir('gru-command-pty-eof-retry-ws-');
+    const repoA = join(workspace, 'repo-a');
+    mkdirSync(join(repoA, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoA });
+    const instance = tempDir('gru-command-pty-eof-retry-home-');
+    const bin = tempDir('gru-command-pty-eof-retry-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    // Stateful fake npx (same shape as the transient retry test): the
+    // pinned installer fails on the first repo write, so the retry prompt
+    // is reached; Ctrl-D there must skip instead of hanging.
+    const counter = join(bin, 'npx-invocations');
+    const repoAReal = realpathSync(repoA);
+    const npxScript = [
+      '#!/usr/bin/env node',
+      "const { mkdirSync, writeFileSync, readFileSync } = require('node:fs');",
+      "const { join } = require('node:path');",
+      "if (process.argv.includes('--version')) { console.log('10.0.0'); process.exit(0); }",
+      "const dirAt = process.argv.indexOf('--directory');",
+      'const root = dirAt === -1 ? process.cwd() : process.argv[dirAt + 1];',
+      `const counter = ${JSON.stringify(counter)};`,
+      'let count = 0;',
+      "try { count = Number(readFileSync(counter, 'utf-8')); } catch {}",
+      'count += 1;',
+      "writeFileSync(counter, String(count));",
+      `if (root === ${JSON.stringify(repoAReal)} && count === 2) { process.stderr.write('fixture transient download failure\\n'); process.exit(1); }`,
+      "const manifest = ['installation:', '  version: 6.12.0', 'modules:', '  - name: core', '    version: 6.12.0', '  - name: bmm', '    version: 6.12.0', '  - name: cis', '    version: v0.3.2', '  - name: tea', '    version: v1.27.2', '  - name: gds', '    version: v0.7.2', 'ides:', '  - pi', ''].join('\\n');",
+      "for (const module of ['core','bmm','cis','tea','gds']) { mkdirSync(join(root, '_bmad', module), { recursive: true }); writeFileSync(join(root, '_bmad', module, 'marker.txt'), module + '\\n'); }",
+      "mkdirSync(join(root, '_bmad', '_config'), { recursive: true }); writeFileSync(join(root, '_bmad', '_config', 'manifest.yaml'), manifest);",
+      "for (const skill of ['bmad-build','bmad-help','gds-quick-dev']) { const dir=join(root,'.agents','skills',skill); mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,'SKILL.md'),'# skill\\n'); writeFileSync(join(dir,'workflow.md'),'{{.implementation_artifacts}}\\n'); }",
+      'process.exit(0);',
+      '',
+    ].join('\n');
+    writeFileSync(join(bin, 'npx'), npxScript, { mode: 0o755 });
+    const { output, status } = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '1' },
+        { expect: BMAD_A_PROMPT, send: '' },
+        { expect: RUNTIME_PROMPT, send: 'pi' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: '' },
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+        { expect: 'Retry or skip this repo? [retry/skip]:', send: '\u0004' },
+      ],
+      { GRU_COMMAND_HOME: instance, PATH: `${bin}:${process.env.PATH ?? ''}` },
+    );
+    expect(status, output).toBe(0);
+    expect(output).toContain('input closed (EOF) — taking the skip path');
+    expect(output).toContain('BMAD setup for repo-a failed:');
+    expect(output).toContain('BMAD not ready in repo-a: skipped by explicit per-repo choice');
+    expect(output).toContain('Setup complete');
+  }, 120_000);
+
+  it('interactive hint-less deterministic failures keep neutral guidance and refuse a typed retry (whole-900 review V2)', () => {
+    const workspace = tempDir('gru-command-pty-hintless-ws-');
+    const repoA = join(workspace, 'repo-a');
+    mkdirSync(join(repoA, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoA });
+    // A partial install (_bmad without a manifest) is deterministic with
+    // NO repairHint: the interactive banner must render the neutral
+    // fallback, never the literal 'undefined'.
+    mkdirSync(join(repoA, '_bmad', 'bmm'), { recursive: true });
+    const instance = tempDir('gru-command-pty-hintless-home-');
+    const bin = tempDir('gru-command-pty-hintless-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    const { output, status } = ptyWizard(
+      [
+        { expect: WS_PROMPT, send: workspace },
+        { expect: REPOS_PROMPT, send: '1' },
+        { expect: BMAD_A_PROMPT, send: 'reuse' },
+        { expect: RUNTIME_PROMPT, send: 'pi' },
+        { expect: MODEL_PROMPT, send: '' },
+        { expect: THINKING_PROMPT, send: '' },
+        { expect: HOST_PROMPT, send: '' },
+        { expect: PORT_PROMPT, send: '0' },
+        { expect: TOKEN_PROMPT, send: '' },
+        { expect: REGISTER_PROMPT, send: 'n' },
+        { expect: SMOKE_PROMPT, send: 'n' },
+        { expect: 'Skip this repo? [skip]:', send: 'retry' },
+        { expect: 'Skip this repo? [skip]:', send: 'skip' },
+      ],
+      { GRU_COMMAND_HOME: instance, PATH: `${bin}:${process.env.PATH ?? ''}` },
+    );
+    expect(status, output).toBe(0);
+    expect(output).toContain('partial BMAD installation detected');
+    expect(output).toContain('deterministic — retrying cannot fix it');
+    expect(output).toContain('Repair the reported condition deliberately, then re-run the wizard');
+    expect(output).not.toContain('undefined');
+    expect(output).toContain('retry cannot fix it; enter skip');
+    expect(output).toContain('BMAD not ready in repo-a: skipped by explicit per-repo choice');
+    expect(output).toContain('Setup complete');
+  }, 120_000);
+
   it('already-onboarded deleted runtime binding is skip-only deterministic; a typed retry is refused and only skip completes (gh-32 r1)', () => {
     const workspace = tempDir('gru-command-pty-unbind-ws-');
     const repoA = join(workspace, 'repo-a');

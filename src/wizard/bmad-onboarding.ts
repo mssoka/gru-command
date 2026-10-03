@@ -90,9 +90,21 @@ const INSTALLER_REPAIR_HINT =
 /**
  * "BMAD already exists" is preserved, not repaired: the deliberate path is a
  * fresh wizard run choosing reuse, because installer overwrite/upgrade is
- * exactly what the guard refuses.
+ * exactly what the guard refuses. Exported so the headless renderer can
+ * name the answers.bmad.<repo> value the noninteractive mode actually
+ * offers instead of pointing at an interactive prompt it does not have.
  */
-const REUSE_REPAIR_HINT = 'Re-run the wizard and choose reuse to preserve the existing install';
+export const REUSE_REPAIR_HINT =
+  'Re-run the wizard and choose reuse to preserve the existing install';
+/**
+ * A symlinked ENTRY under a runtime skills root is not necessarily an
+ * installer-managed binding: foreign user-owned entries get this neutral
+ * deliberate fix (remove or replace the entry), while the official-installer
+ * hint is reserved for proven managed module/binding causes — the installer
+ * would not remove a foreign symlink either.
+ */
+const FOREIGN_SKILL_ENTRY_HINT =
+  'Remove or replace the symlinked skill entry deliberately, then re-run the wizard';
 
 /**
  * A BMAD setup failure caused by unchanged on-disk repo state (a manifest
@@ -496,24 +508,62 @@ function asTransientInstallerOutput(error: unknown): never {
   throw error;
 }
 
+/** The staging path is deleted in finally and must never leak into
+ * user-facing text: only the sanitized cause text is carried out. */
+function withoutStagingPath(message: string, stage: string): string {
+  return message
+    .split(`${stage}/`)
+    .join('')
+    .split(stage)
+    .join('')
+    .trim();
+}
+
 function preflightSkillNames(stage: string, tool: string): string[] {
   try {
     return runtimeSkillNames(stage, tool);
   } catch (error) {
+    // EVERY thrown value passes through the staging-path hygiene, not only
+    // the refusal branch: a plain read/IO failure while inspecting the
+    // disposable stage must not name a path that no longer exists.
+    const detail = withoutStagingPath(
+      error instanceof Error ? error.message : String(error),
+      stage,
+    );
     if (error instanceof BmadDeterministicSetupError) {
-      // The staging path is deleted in finally and must never leak into
-      // user-facing text: keep the refusal, name the class, drop the path.
-      const detail = (error as Error).message
-        .split(`${stage}/`)
-        .join('')
-        .split(stage)
-        .join('')
-        .trim();
+      // Keep the refusal class: an unsafe staged binding is deterministic
+      // installer preflight output, never a retryable condition.
       throw new Error(
         `official BMAD preflight produced an unsafe skill binding${detail === '' ? '' : `: ${detail}`}; retry this repo or skip`,
       );
     }
-    throw error;
+    // Plain read/IO failures keep their transient class (the staging install
+    // can succeed on a re-run) with a message a stranger can act on.
+    throw new Error(
+      `official BMAD preflight failed${detail === '' ? '' : `: ${detail}`}; retry this repo or skip`,
+    );
+  }
+}
+
+/** Fresh-install runtime skill scan. These entries are INSTALLER OUTPUT
+ * (the official installer just ran over the repo): a refusal it produced is
+ * transient installer validation, never a deterministic user-state verdict
+ * — the same classification the post-install checks below keep. The repo's
+ * PRE-install entries were already scanned by the caller and keep theirs. */
+function freshRuntimeSkills(
+  repoPath: string,
+  tools: readonly string[],
+  beforeSkills: Record<string, string[]>,
+): Record<string, string[]> {
+  try {
+    return Object.fromEntries(
+      tools.map((tool) => {
+        const before = new Set(beforeSkills[tool] ?? []);
+        return [tool, runtimeSkillNames(repoPath, tool).filter((name) => !before.has(name))];
+      }),
+    ) as Record<string, string[]>;
+  } catch (error) {
+    asTransientInstallerOutput(error);
   }
 }
 
@@ -558,12 +608,7 @@ function installFresh(
   if (tools.some((tool) => !actualTools.has(tool))) {
     throw new Error(`official BMAD installer omitted requested tool binding(s): ${tools.join(',')}`);
   }
-  const runtimeSkills = Object.fromEntries(
-    tools.map((tool) => {
-      const before = new Set(beforeSkills[tool] ?? []);
-      return [tool, runtimeSkillNames(repoPath, tool).filter((name) => !before.has(name))];
-    }),
-  ) as Record<string, string[]>;
+  const runtimeSkills = freshRuntimeSkills(repoPath, tools, beforeSkills);
   for (const tool of tools) {
     if (!runtimeSkills[tool]?.includes('bmad-build')) {
       throw new Error(`official BMAD installer did not create an isolated bmad-build binding for ${tool}`);
@@ -632,7 +677,10 @@ function runtimeSkillNames(repoPath: string, tool: string, repairHint?: string):
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const path = join(root, entry.name);
     if (entry.isSymbolicLink()) {
-      throw new BmadDeterministicSetupError(`BMAD skill binding is a symlink: ${path}`, repairHint);
+      throw new BmadDeterministicSetupError(
+        `BMAD skill binding is a symlink: ${path}`,
+        FOREIGN_SKILL_ENTRY_HINT,
+      );
     }
     if (entry.isDirectory()) names.push(entry.name);
   }
@@ -1060,8 +1108,12 @@ function validateRepo(
   // A spawn failure, signal, timeout (status null + error set) or empty
   // output is tool availability, not repo state: installing/unblocking git
   // and retrying can succeed, so it keeps the retry/skip offer — the same
-  // availability class the prerequisite probe reports. Only a clean
-  // non-zero exit that reports a non-repo / non-root path is deterministic.
+  // availability class the prerequisite probe reports. A clean non-zero
+  // exit stays deterministic, but it must be diagnosed truthfully: git also
+  // refuses on ownership/config conditions whose deliberate fix is a
+  // Git-state change, not a different directory. The wizard never edits
+  // Git config, ownership, or credentials itself — the message names the
+  // deliberate fix and skip stays available.
   if (gitRoot.error !== undefined || gitRoot.signal !== null || gitRoot.status === null) {
     const detail = gitRoot.error !== undefined
       ? gitRoot.error.message
@@ -1071,6 +1123,18 @@ function validateRepo(
     );
   }
   if (gitRoot.status !== 0) {
+    const refusal =
+      `${String(gitRoot.stderr ?? '')} ${String(gitRoot.stdout ?? '')}`.toLowerCase();
+    if (
+      /dubious ownership|safe\.directory|unable to read config|bad config|config file .*permission/.test(
+        refusal,
+      )
+    ) {
+      throw new BmadDeterministicSetupError(
+        `git refused to resolve this repository (Git ownership/config condition): ${repoPath}; ` +
+          'repair the reported Git state deliberately (for example its ownership or safe.directory configuration), then re-run the wizard or choose skip',
+      );
+    }
     throw new BmadDeterministicSetupError(`selected directory is not a usable Git repo: ${repoPath}`);
   }
   if (gitRoot.stdout.trim() === '') {

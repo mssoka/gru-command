@@ -945,16 +945,23 @@ test.describe('chat pane reflow (owner heist)', () => {
     // ONE live drag: floor first, ceiling second, asserting mid-gesture.
     // The floor move stays INSIDE the viewport — a pointer moved off-screen
     // delivers no further pointermove events to the page.
+    // Resolve the drag target AT ACTION TIME (whole-900 browser red): the
+    // raw cached-box sequence could miss the 4px handle when the page
+    // settled between measuring and pressing. hover() scrolls the handle
+    // into view, waits for stability and verifies the point actually hits
+    // the element; the engagement gate then fails AT the gesture with a
+    // named cause instead of a muted 5s width-poll timeout.
     const handle = page.locator('#splitter-chat');
+    await handle.hover();
     const box = (await handle.boundingBox())!;
-    await page.mouse.move(box.x + 2, box.y + 120);
     await page.mouse.down();
-    await page.mouse.move(box.x + 2 - 400, box.y + 120, { steps: 8 });
+    await expect(page.locator('[data-pane-dragging]')).toHaveCount(1);
+    await page.mouse.move(box.x + box.width / 2 - 400, box.y + 120, { steps: 8 });
     await expect
       .poll(async () => (await page.locator('#chat-main-mount').boundingBox())!.width)
       .toBeLessThan(defaultWidth - 100);
     await assertChatReflows(page, 'live drag at the floor');
-    await page.mouse.move(box.x + 2 + 600, box.y + 120, { steps: 8 });
+    await page.mouse.move(box.x + box.width / 2 + 600, box.y + 120, { steps: 8 });
     await expect
       .poll(async () => (await page.locator('#chat-main-mount').boundingBox())!.width)
       .toBeGreaterThan(defaultWidth + 60);

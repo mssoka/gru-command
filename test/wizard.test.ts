@@ -487,6 +487,9 @@ describe('wizard CLI surface', () => {
     expect(exists.status, exists.stderr).toBe(1);
     expect(exists.stderr).toContain('BMAD already exists; choose reuse to preserve it');
     expect(exists.stderr).toContain('Re-run the wizard and choose reuse');
+    // Headless mode names the JSON value it actually offers (whole-900
+    // review A9); the interactive wording above stays truthful too.
+    expect(exists.stderr).toContain('answers.bmad.repo-a="reuse"');
     expect(exists.stderr).not.toContain('npx bmad-method install');
   }, 120_000);
 

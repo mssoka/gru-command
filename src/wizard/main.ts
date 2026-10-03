@@ -42,7 +42,7 @@ import {
   seedAnswersFromConfig,
   writeConfigText,
 } from './steps.js';
-import { onboardBmadRepo } from './bmad-onboarding.js';
+import { onboardBmadRepo, REUSE_REPAIR_HINT } from './bmad-onboarding.js';
 
 const WIZARD_USAGE =
   'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
@@ -111,6 +111,32 @@ function openWizardTerminal(repoRoot: string): WizardTerminal {
 
 async function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return (await rl.question(question)).trim();
+}
+
+/** Failure-prompt line where EOF (Ctrl-D / closed stdin) is a first-class
+ * outcome: readline/promises' question() never settles once the input
+ * stream ends (observed on Node 22), so race it against the interface's
+ * close event. A closed prompt must reach the documented skip path, never
+ * wedge the wizard. Default prompts keep `ask` and are never offered here. */
+async function askOrEof(
+  rl: ReturnType<typeof createInterface>,
+  question: string,
+): Promise<string | null> {
+  return new Promise<string | null>((resolve) => {
+    let settled = false;
+    const settle = (value: string | null): void => {
+      if (settled) return;
+      settled = true;
+      rl.off('close', onClose);
+      resolve(value);
+    };
+    const onClose = (): void => settle(null);
+    rl.once('close', onClose);
+    void rl.question(question).then(
+      (answer) => settle(answer.trim()),
+      () => settle(null),
+    );
+  });
 }
 
 function yn(value: string): boolean {
@@ -646,9 +672,15 @@ async function main(argv: readonly string[]): Promise<number> {
         const repairHint = result.repairHint ??
           'Repair the reported condition deliberately, then re-run the wizard';
         if (terminal === null) {
+          // Headless guidance names the JSON values this mode actually
+          // offers: a reuse-class refusal is unblocked by asking for reuse
+          // again, not by an interactive prompt the mode does not have.
+          const headlessEscape = result.repairHint === REUSE_REPAIR_HINT
+            ? ` Headless: set answers.bmad.${repo}="reuse" to preserve it, or "skip" to leave the repo managed.`
+            : `, or explicitly set answers.bmad.${repo}="skip".`;
           fail(
             `BMAD setup for ${repo} is not ready (deterministic failure — retrying cannot fix it): ${result.message}\n` +
-              `${repairHint}, or explicitly set answers.bmad.${repo}="skip".`,
+              `${repairHint}${headlessEscape}`,
           );
         }
         terminal.output.write(
@@ -657,8 +689,12 @@ async function main(argv: readonly string[]): Promise<number> {
         );
         for (;;) {
           const skipRl = createInterface({ input: terminal.input, output: terminal.output });
-          const choice = (await ask(skipRl, 'Skip this repo? [skip]: ')).toLowerCase();
+          const answer = await askOrEof(skipRl, 'Skip this repo? [skip]: ');
           skipRl.close();
+          if (answer === null) {
+            terminal.output.write('  input closed (EOF) — taking the skip path\n');
+          }
+          const choice = (answer ?? 'skip').toLowerCase();
           if (['', 'skip', 's', 'y', 'yes'].includes(choice)) {
             action = 'skip';
             break;
@@ -675,8 +711,12 @@ async function main(argv: readonly string[]): Promise<number> {
       }
       terminal.output.write(`BMAD setup for ${repo} failed: ${result.message}\n`);
       const retryRl = createInterface({ input: terminal.input, output: terminal.output });
-      const choice = (await ask(retryRl, 'Retry or skip this repo? [retry/skip]: ')).toLowerCase();
+      const answer = await askOrEof(retryRl, 'Retry or skip this repo? [retry/skip]: ');
       retryRl.close();
+      if (answer === null) {
+        terminal.output.write('  input closed (EOF) — taking the skip path\n');
+      }
+      const choice = (answer ?? 'skip').toLowerCase();
       action = choice === 'skip' ? 'skip' : action;
     }
   }

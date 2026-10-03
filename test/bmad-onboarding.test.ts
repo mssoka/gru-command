@@ -129,7 +129,9 @@ function materializeOfficialInstall(
  * Byte-level snapshot of the fixture's owned install surface (manifest,
  * module markers, skills, symlink targets, sentinel): any onboarding
  * mutation of a failed/skipped repo shows up as an inequality (gh-32
- * non-mutation oracle).
+ * non-mutation oracle). Covers every root a refusal could touch: the BMAD
+ * install, BOTH runtime skill trees, and the Gru control dir (whole-900
+ * review A3: the docstring's guarantee includes them).
  */
 function bmadSnapshot(repo: string): string {
   const parts: string[] = [];
@@ -145,7 +147,15 @@ function bmadSnapshot(repo: string): string {
       parts.push(`f\0${rel}\0${readFileSync(path, 'utf-8')}`);
     }
   };
-  visit(join(repo, '_bmad'));
+  for (const root of ['_bmad', '.agents', '.claude', '.gru-command']) {
+    const path = join(repo, root);
+    try {
+      lstatSync(path);
+    } catch {
+      continue;
+    }
+    visit(path);
+  }
   if (existsSync(join(repo, '_bmad-custom-byte'))) {
     parts.push(`s\0${readFileSync(join(repo, '_bmad-custom-byte'), 'utf-8')}`);
   }
@@ -759,6 +769,10 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(escapeResult.ready).toBe(false);
     expect(escapeResult.deterministic).toBe(true);
     expect(escapeResult.message).toContain('BMAD module directory escapes selected repo');
+    // The escaping class is one of the acceptance-named install-repair
+    // classes: its skip-only prompt must name the deliberate fix too
+    // (whole-900 review A8).
+    expect(escapeResult.repairHint).toContain('npx bmad-method install');
     expect(bmadSnapshot(escape.repo)).toBe(escapeBefore);
 
     // Selected-runtime binding mismatch (the issue's sibling class):
@@ -1377,6 +1391,112 @@ describe('per-selected-repo BMAD onboarding', () => {
       expect(second.ready, second.message).toBe(true);
     });
 
+    it('fresh-installer output with a symlinked skill entry stays transient (whole-900 review A0)', () => {
+      const fixture = fixtureRepo('fresh-symlinked-entry');
+      const outside = tempDir('gru-command-bmad-se-fresh-');
+      let calls = 0;
+      const installer = ((_command: string, args: string[]) => {
+        calls += 1;
+        const directoryAt = args.indexOf('--directory');
+        const directory = args[directoryAt + 1] ?? fixture.repo;
+        materializeOfficialInstall(directory, '', ['pi']);
+        // The REPO install (second call of the attempt) also emits a
+        // symlinked skill entry: installer output, so the refusal must be
+        // transient (retry re-runs the installer), never skip-only.
+        if (calls === 2) {
+          symlinkSync(outside, join(directory, '.agents', 'skills', 'evil-entry'));
+        }
+        return { status: 0, signal: null, stdout: '', stderr: '', pid: 1, output: [] };
+      }) as unknown as typeof spawnSync;
+      const result = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: installer,
+      });
+      expect(result.ready).toBe(false);
+      expect(result.deterministic).toBeUndefined();
+      expect(result.message).toContain('official BMAD installer output failed validation');
+      expect(result.message).toContain('BMAD skill binding is a symlink');
+      expect(result.message).toContain('retry this repo or skip');
+    });
+
+    it('fresh record payload hash hitting a symlink stays transient (whole-900 review A6/V0)', () => {
+      const fixture = fixtureRepo('fresh-record-hash');
+      const outside = tempDir('gru-command-bmad-hash-');
+      let calls = 0;
+      const installer = ((_command: string, args: string[]) => {
+        calls += 1;
+        const directoryAt = args.indexOf('--directory');
+        const directory = args[directoryAt + 1] ?? fixture.repo;
+        materializeOfficialInstall(directory, '', ['pi']);
+        // The REPO install also emits a symlink under a non-declared _bmad
+        // path: the declared-module and binding checks pass, so the only
+        // possible refusal is the fresh record payload hash in writeRecord.
+        if (calls === 2) {
+          symlinkSync(outside, join(directory, '_bmad', 'core', 'evil-link'));
+        }
+        return { status: 0, signal: null, stdout: '', stderr: '', pid: 1, output: [] };
+      }) as unknown as typeof spawnSync;
+      const result = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: installer,
+      });
+      expect(result.ready).toBe(false);
+      expect(result.deterministic).toBeUndefined();
+      expect(result.message).toContain('official BMAD installer output failed validation');
+      expect(result.message).toContain('owned payload contains symlink');
+      expect(result.message).toContain('retry this repo or skip');
+    });
+
+    it('preflight read failures stay transient and never leak the staging path (whole-900 review A1)', () => {
+      const fixture = fixtureRepo('preflight-io-hygiene');
+      const outside = tempDir('gru-command-bmad-preflight-io-');
+      materializeOfficialInstall(outside, '', ['pi']);
+      const outsideSkills = join(outside, '.agents', 'skills');
+      chmodSync(outsideSkills, 0o000);
+      let calls = 0;
+      const installer = ((_command: string, args: string[]) => {
+        calls += 1;
+        const directoryAt = args.indexOf('--directory');
+        const directory = args[directoryAt + 1] ?? fixture.repo;
+        if (calls === 1) {
+          // The staging call hands back a stage that IS a link to an
+          // install whose skills root denies reads: runtimeSkillNames
+          // fails with a plain IO error naming the stage path. The stage
+          // is a LINK, so the wizard's finally cleanup stays a plain
+          // unlink (the unreadable target is never recursed into).
+          rmSync(directory, { recursive: true, force: true });
+          symlinkSync(outside, directory);
+        } else {
+          materializeOfficialInstall(directory, '', ['pi']);
+        }
+        return { status: 0, signal: null, stdout: '', stderr: '', pid: 1, output: [] };
+      }) as unknown as typeof spawnSync;
+      try {
+        const result = onboardBmadRepo(fixture.name, 'install', {
+          workspaceRoot: fixture.workspace,
+          answers: answers(fixture.workspace, fixture.name, 'install'),
+          run: installer,
+        });
+        expect(result.ready).toBe(false);
+        expect(result.deterministic).toBeUndefined();
+        expect(result.message).toContain('official BMAD preflight failed');
+        expect(result.message).toContain('EACCES');
+        expect(result.message).not.toContain('gru-command-bmad-preflight-');
+        expect(result.message).toContain('retry this repo or skip');
+        // Only the disposable stage was touched: a healthy retry completes.
+        const retried = onboardBmadRepo(fixture.name, 'install', {
+          workspaceRoot: fixture.workspace,
+          answers: answers(fixture.workspace, fixture.name, 'install'),
+          run: installer,
+        });
+        expect(retried.ready, retried.message).toBe(true);
+      } finally {
+        chmodSync(outsideSkills, 0o755);
+      }
+    });
+
     it('missing skills root and ENOTDIR root report the root; EACCES stays transient', () => {
       const missingRoot = fixtureRepo('missing-skills-root');
       expect(
@@ -1500,7 +1620,7 @@ describe('per-selected-repo BMAD onboarding', () => {
       const fakeBin = tempDir('gru-command-fake-git-');
       writeFileSync(
         join(fakeBin, 'git'),
-        '#!/usr/bin/env bash\nif [[ "$*" == *"--show-toplevel"* ]]; then echo "$FAKE_GIT_TOPLEVEL"; exit 0; fi\nexit 1\n',
+        '#!/usr/bin/env bash\nif [[ "$*" == *"--show-toplevel"* ]]; then\n  if [[ -n "${FAKE_GIT_STDERR:-}" ]]; then echo "$FAKE_GIT_STDERR" >&2; fi\n  if [[ -n "${FAKE_GIT_EXIT:-}" ]]; then exit "$FAKE_GIT_EXIT"; fi\n  echo "$FAKE_GIT_TOPLEVEL"; exit 0\nfi\nexit 1\n',
         { mode: 0o755 },
       );
       const ghost = fixtureRepo('ghost-toplevel');
@@ -1527,6 +1647,43 @@ describe('per-selected-repo BMAD onboarding', () => {
       } finally {
         chmodSync(blockedParent, 0o755);
       }
+
+      // Exit 0 with empty stdout: a git wrapper/tooling quirk that can
+      // recover, so it stays transient with no repo/control writes
+      // (whole-900 review V1).
+      const emptyRoot = fixtureRepo('git-empty-root');
+      const emptyProbe = onboardBmadRepo(emptyRoot.name, 'reuse', {
+        workspaceRoot: emptyRoot.workspace,
+        answers: answers(emptyRoot.workspace, emptyRoot.name, 'reuse'),
+        env: { PATH: `${fakeBin}:${process.env.PATH ?? ''}`, FAKE_GIT_TOPLEVEL: '' },
+      });
+      expect(emptyProbe.ready).toBe(false);
+      expect(emptyProbe.deterministic).toBeUndefined();
+      expect(emptyProbe.message).toContain('git reported no repository root');
+      expect(emptyProbe.message).toContain('retry or skip this repo');
+      expect(existsSync(join(emptyRoot.repo, '.gru-command'))).toBe(false);
+
+      // A clean non-zero exit caused by Git ownership/config refusal is
+      // diagnosed as that condition (the deliberate fix is a Git-state
+      // change), still deterministic and never 'not a usable Git repo'
+      // (whole-900 review A7). No Git config/ownership is edited.
+      const ownership = fixtureRepo('git-ownership-refused');
+      const ownershipProbe = onboardBmadRepo(ownership.name, 'reuse', {
+        workspaceRoot: ownership.workspace,
+        answers: answers(ownership.workspace, ownership.name, 'reuse'),
+        env: {
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+          FAKE_GIT_STDERR: "fatal: detected dubious ownership in repository at '/somewhere'",
+          FAKE_GIT_EXIT: '128',
+        },
+      });
+      expect(ownershipProbe.ready).toBe(false);
+      expect(ownershipProbe.deterministic).toBe(true);
+      expect(ownershipProbe.message).toContain('Git ownership/config condition');
+      expect(ownershipProbe.message).toContain('safe.directory');
+      expect(ownershipProbe.message).not.toContain('not a usable Git repo');
+      expect(ownershipProbe.repairHint).toBeUndefined();
+      expect(existsSync(join(ownership.repo, '.gru-command'))).toBe(false);
     });
 
     it('reuse-path content validator classifications are pinned (final review)', () => {
@@ -1554,12 +1711,21 @@ describe('per-selected-repo BMAD onboarding', () => {
       const symlinkedEntry = fixtureRepo('symlinked-skill-entry');
       materializeOfficialInstall(symlinkedEntry.repo, '', ['pi']);
       symlinkSync(tempDir('gru-command-bmad-se-outside-'), join(symlinkedEntry.repo, '.agents', 'skills', 'evil'));
+      const symlinkedBefore = bmadSnapshot(symlinkedEntry.repo);
       const symlinkedResult = onboardBmadRepo(symlinkedEntry.name, 'reuse', {
         workspaceRoot: symlinkedEntry.workspace,
         answers: answers(symlinkedEntry.workspace, symlinkedEntry.name, 'reuse'),
       });
       expect(symlinkedResult.deterministic).toBe(true);
       expect(symlinkedResult.message).toContain('BMAD skill binding is a symlink');
+      // A foreign entry is not a proven installer-managed binding: the
+      // neutral deliberate fix renders, never the npx installer hint
+      // (whole-900 review E0). The extended no-mutation oracle also covers
+      // the runtime skill roots this refusal looked at.
+      expect(symlinkedResult.repairHint).toContain('Remove or replace the symlinked skill entry');
+      expect(symlinkedResult.repairHint).not.toContain('npx bmad-method install');
+      expect(symlinkedBefore).toContain('evil');
+      expect(bmadSnapshot(symlinkedEntry.repo)).toBe(symlinkedBefore);
 
       const payloadLink = fixtureRepo('owned-payload-symlink');
       const payloadInstalled = onboardBmadRepo(payloadLink.name, 'install', {
