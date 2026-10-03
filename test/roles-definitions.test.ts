@@ -98,6 +98,8 @@ describe('role definitions (E8)', () => {
     expect(minion).toContain('an inline self-review is not a substitute');
     expect(minion).toContain('report that exact capability gap loudly');
     expect(minion).toContain('supported official BMAD onboarding/discovery path');
+    // Native round 2 warning: name the concrete onboarding surface.
+    expect(minion).toContain('Project-local BMAD setup');
     expect(minion).toContain('no guessed rename');
     // Owner clarification j-761: the shipped policy selects by capability
     // from the project's actual catalog; a fixed skill name is never the

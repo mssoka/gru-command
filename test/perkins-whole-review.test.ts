@@ -1366,6 +1366,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedMinion).not.toContain('pi -p');
     expect(stagedMinion).not.toContain('headless print mode');
     expect(stagedMinion).toContain('an inline self-review is not a substitute');
+    expect(stagedMinion).toContain('Project-local BMAD setup');
     expect(stagedMinion).not.toMatch(/bmad-[a-z][a-z-]*/u);
     const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");

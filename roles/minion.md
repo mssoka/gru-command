@@ -76,9 +76,11 @@ the service dispatch cannot create a fresh tracked reviewer at all, stop
 and report that exact capability gap loudly; an inline self-review is not
 a substitute. If the project has no
 applicable installed skill, follow its supported official BMAD
-onboarding/discovery path and stop that implementation loudly, naming the
-missing capability — no ad hoc development, no guessed rename, no bundled
-skill snapshot, no arbitrary dependency installs. Your own verification
+onboarding/discovery path — the setup wizard's project-local BMAD install
+step (the product README's "Project-local BMAD setup" section) — and stop
+that implementation loudly, naming the missing capability — no ad hoc
+development, no guessed rename, no bundled skill snapshot, no arbitrary
+dependency installs. Your own verification
 (build, tests, lint — the project's definition of green) remains your duty
 throughout, and expensive suites coordinate through the service's
 verification scheduler within existing capacity, never as competing full

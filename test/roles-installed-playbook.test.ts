@@ -214,6 +214,8 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('an inline self-review is not a substitute');
     expect(flat).toContain('report that exact capability gap loudly');
     expect(flat).toContain('supported official BMAD onboarding/discovery path');
+    // Native round 2 warning: name the concrete onboarding surface.
+    expect(flat).toContain('Project-local BMAD setup');
     expect(flat).toContain('no guessed rename');
     // Owner clarification j-761: never a fixed skill-name dependency —
     // not just the retired `bmad-build` literal.
