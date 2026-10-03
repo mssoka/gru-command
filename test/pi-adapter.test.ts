@@ -152,6 +152,7 @@ interface CancellationObservation {
   readonly queuedPendingDuringStall: boolean;
   readonly queuedModelCallsDuringStall: number;
   readonly guardMessages: readonly string[];
+  readonly guardModelCallsDuringStall: number;
   readonly guardModelCalls: number;
   readonly queuedDelivered: number;
   readonly afterSettle: string;
@@ -275,9 +276,11 @@ async function observeCompactionCancellation(
     // Pin each guard's rejection text and prove none of them reached the
     // model: a single regex count would let any wording containing
     // "compacting" pass, and a guard that rejects after enqueueing would be
-    // invisible without the model-call check.
+    // invisible without the model-call check. The stall-time count is kept
+    // AND the final count is re-taken after all work settles (a rejected but
+    // enqueued request could deliver later without changing a cached zero).
     const guardMessages = guardOutcomes;
-    const guardModelCalls = fx.script.calls.filter((call) =>
+    const guardModelCallsDuringStall = fx.script.calls.filter((call) =>
       call.prompt.includes('during compaction'),
     ).length;
     // The cancellation seam under test: exactly one call, summary-only or broad.
@@ -338,6 +341,11 @@ async function observeCompactionCancellation(
     // The broad abort promise must resolve (session reached idle), never
     // reject; the summary-only path has no broad abort at all.
     const abortOutcome = abortSettled === null ? null : await abortSettled;
+    // Final guarded-prompt count AFTER the measured turn, queued work, and
+    // post-settlement request have all settled.
+    const guardModelCalls = fx.script.calls.filter((call) =>
+      call.prompt.includes('during compaction'),
+    ).length;
     // Anchor the abort-settlement marker to the FIRST summary call (the
     // stalled one), not any later summary that the same signal could abort.
     const firstSummary = fx.script.calls.find((call) =>
@@ -381,6 +389,7 @@ async function observeCompactionCancellation(
       queuedPendingDuringStall,
       queuedModelCallsDuringStall,
       guardMessages,
+      guardModelCallsDuringStall,
       guardModelCalls,
       queuedDelivered: fx.script.calls.filter((call) => call.prompt === 'queued work').length,
       afterSettle: afterSettleOutcome,
@@ -406,6 +415,7 @@ interface NativeQueueObservation {
   readonly pendingAfterSettlement: number;
   readonly abortedEnds: number;
   readonly successEnds: number;
+  readonly terminalEnds: readonly { readonly success: boolean; readonly error: string | null }[];
   readonly summarySettledByAbort: boolean;
   readonly idle: boolean;
   readonly disposed: boolean;
@@ -553,6 +563,10 @@ async function observeNativeFollowUpCancellation(
         (event) => !event.success && event.error === 'compaction aborted',
       ).length,
       successEnds: compactionEnds.filter((event) => event.success).length,
+      terminalEnds: compactionEnds.map((event) => ({
+        success: event.success,
+        error: event.error ?? null,
+      })),
       summarySettledByAbort: fx.script.calls.some(
         (call) => call.prompt.startsWith('<conversation>') && call.aborted,
       ),
@@ -1226,6 +1240,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         'agent session is compacting; steer requires an idle session',
         'agent session is compacting; follow-up requires an idle session',
       ]);
+      expect(observation.guardModelCallsDuringStall).toBe(0);
       expect(observation.guardModelCalls).toBe(0);
       expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
       expect(observation.afterSettle).toBe('resolved');
@@ -1259,6 +1274,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         'agent session is compacting; steer requires an idle session',
         'agent session is compacting; follow-up requires an idle session',
       ]);
+      expect(observation.guardModelCallsDuringStall).toBe(0);
       expect(observation.guardModelCalls).toBe(0);
       expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
       expect(observation.afterSettle).toBe('resolved');
@@ -1291,6 +1307,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         'agent session is compacting; steer requires an idle session',
         'agent session is compacting; follow-up requires an idle session',
       ]);
+      expect(observation.guardModelCallsDuringStall).toBe(0);
       expect(observation.guardModelCalls).toBe(0);
       expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
       expect(observation.afterSettle).toBe('resolved');
@@ -1321,6 +1338,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         'agent session is compacting; steer requires an idle session',
         'agent session is compacting; follow-up requires an idle session',
       ]);
+      expect(observation.guardModelCallsDuringStall).toBe(0);
       expect(observation.guardModelCalls).toBe(0);
       expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
       expect(observation.afterSettle).toBe('resolved');
@@ -1530,6 +1548,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.pendingAfterSettlement).toBe(0);
       expect(observation.abortedEnds).toBe(1);
       expect(observation.successEnds).toBe(0);
+      expect(observation.terminalEnds).toEqual([{ success: false, error: 'compaction aborted' }]);
       expect(observation.summarySettledByAbort).toBe(true);
       expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
@@ -1547,6 +1566,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.pendingAfterSettlement).toBe(0);
       expect(observation.abortedEnds).toBe(1);
       expect(observation.successEnds).toBe(0);
+      expect(observation.terminalEnds).toEqual([{ success: false, error: 'compaction aborted' }]);
       expect(observation.summarySettledByAbort).toBe(false);
       expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
