@@ -170,6 +170,11 @@ checkout, home paths, journal, or global custom instructions).
       subagent/extension bypass are forbidden, and the loud
       capability-gap stop stays. Tests negative-pin the retired wording
       at every loader surface.
+- [x] r1-verdict directed follow-through: `test/pacing-admission.test.ts`
+      (nested parent/reviewer admission at cap 1 and saturated default 4,
+      limits preserved), `test/suite-shape.test.ts` pin; j-761 verified
+      provenance recorded; failed FULL `c16457f6` fully inspected and
+      whole-graded.
 - [x] outcome-truth clarification (owner clarification 2026-10-02,
       consumed 2026-10-03): `roles/minion.md`, `roles/silas.md`,
       `roles/gru.md`, `resources/silas-skills/ops-dispatch/SKILL.md`,
@@ -328,6 +333,27 @@ checkout, home paths, journal, or global custom instructions).
   guard, overlaid test files, and expected-RED intent are unchanged; the
   prior exit-99 receipt and snapshot remain preserved as evidence.
 
+- 2026-10-03 r1-verdict-directed follow-through (directive
+  `gru-pr165-...` r1 bundle, consumed at the current head): (a) the
+  admission-cycle blocker gained deterministic nested parent/reviewer
+  regressions in `test/pacing-admission.test.ts` at the supported cap 1
+  (the reviewer queues until the parent's turn settles — a synchronous
+  wait would wait behind the parent's own lease, the condition the shipped
+  contract stops on loudly) and at the saturated default 4 (no admission
+  until a slot frees, then FIFO), with limits unchanged and no new
+  subsystem/receipt/lease redesign; (b) the j-761 owner amendment now
+  carries independently verified provenance (above) in this tracked
+  record; (c) failed FULL `c16457f6` (b3a204a) was inspected in full
+  (complete capture): lint/typecheck/build PASS, 3 genuine 30 s timeouts
+  in untouched subprocess-heavy tests (`dispatch-server` by=silas,
+  `install-one-line` foreign-unit, `perkins-builtin-wave` T4), web not
+  reached; real causes are per-test ceilings under shared-host suite load,
+  no in-lane repair is available without forbidden timeout/assertion
+  changes, and the RED stays preserved/whole-graded, never waived by CI or
+  host stories; (d) blocker 2 (canonical acceptance amendment) remains the
+  owner/operations disposition required by r4 — the tracked amendment
+  record is provided, and no fixed-name intent is restored.
+
 - 2026-10-03 base-conflict continuation completed
   (`gru-pr165-base-conflict-20261003-once`): integrated `9bb51b0`, repaired
   the integrated-review findings, pushed `ad98f1a` (CI green), requested
@@ -438,7 +464,11 @@ checkout, home paths, journal, or global custom instructions).
   the reviewer's admitted alternative).
 
 - 2026-10-02 clarification j-761 (trigger: owner correction superseding the
-  literal bmad-build dependency in the original briefing). Owner ruling,
+  literal bmad-build dependency in the original briefing). Provenance
+  independently re-verified 2026-10-03: journal seq 761, ts
+  2026-10-02T09:23:40.605Z, source gru; the verified ruling JSON is
+  preserved in the silas-sweep-20261003T013313Z investigation bundle
+  (`pr165-r1-verdict-repair/verified-owner-amendment-j761.json`). Owner ruling,
   verbatim: "GC must use relevant BMAD skills to achieve tasks, not
   hard-code bmad-build because BMAD renames skills. Supersedes literal
   skill-name requirements in j742/j745 and the active packaged-playbook
