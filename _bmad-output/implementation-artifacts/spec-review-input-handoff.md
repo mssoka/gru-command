@@ -182,7 +182,11 @@ bmad-build interactive checkpoint is not available in this confined worker.
   (expected degraded/credential_missing, observed disabled/disabled); not
   touched by this diff; did not recur in r9.
 - `dispatch-server` by=silas timeout (full r9): seam-adjacent file; failure is
-  a 30 s default-timeout wall, no assertion; isolation run scheduled.
+  a 30 s default-timeout wall, no assertion; PASSED in the r10 isolation run
+  (444/445; the sole red was `decisions.test.ts`).
+- `decisions` hot-reload (r8 + r10): reproducible in isolation without this
+  lane's suites; pre-existing fs-watch timing, outside the diff and outside
+  this lane's ownership; preserved for the review/owner disposition.
 ## Implementation Notes
 
 - 2026-10-03: lane workflow rendered via `bmad-build`; Checkpoint-1 approval
@@ -217,12 +221,19 @@ bmad-build interactive checkpoint is not available in this confined worker.
   `review-inputs-regression` (the seam suites plus the exact red files) to
   establish isolation at one head before the final FULL. No test assertion,
   timeout, budget or scope was weakened.
+- 2026-10-03: isolation run r10 (`review-inputs-regression`, run at 8e033f9)
+  reproduced the `decisions.test.ts` hot-reload failure WITHOUT any of this
+  lane's new suites in the scope (1 failed / 444 passed) — the failure is
+  pre-existing and independent of this diff. All other eight files passed,
+  including `dispatch-server.test.ts` and the seam suites. The final FULL is
+  the gate for the final head; its result is recorded in the completion report
+  and ledger (not rewritten into the head it proves).
 
 ## Verification
 
 **Commands:**
 - `npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/review-inputs-wave.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts` — scheduler scope `review-inputs`: PASS (run ee48afd8 at f3959f5, 94/94 tests, clean tree, whole-output sha256 b3675c9f2183c2d00c49fee7002379ebb2ac4e7381ace7c229a737528ac7b3b0).
-- `npx vitest run test/dispatch-server.test.ts test/attachments.test.ts test/claude-adapter.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/lan-phone-raw-client.test.ts test/chat-server.test.ts test/decisions.test.ts test/suite-shape.test.ts` — scheduler scope `review-inputs-regression`: isolation evidence at the final pre-gate head (result recorded in the completion report).
+- `npx vitest run test/dispatch-server.test.ts test/attachments.test.ts test/claude-adapter.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/lan-phone-raw-client.test.ts test/chat-server.test.ts test/decisions.test.ts test/suite-shape.test.ts` — scheduler scope `review-inputs-regression`: 444/445 passed at 8e033f9; sole red is the pre-existing `decisions` hot-reload timing test (reproduced without this lane's suites in scope).
 - `npm test` — scheduler scope `full`: final-head gate; earlier reds and their completions are preserved above and in the run captures.
 
 **Manual checks:**
