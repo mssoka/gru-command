@@ -75,7 +75,7 @@ describe('role definitions (E8)', () => {
     const minion = ROLE_DEFINITIONS['minion'].systemPrompt.replace(/\s+/gu, ' ');
     expect(minion).toContain("explicitly select the project's installed build-workflow skill");
     expect(minion).toContain("the PROJECT's actual installed skill catalog and metadata");
-    expect(minion).toContain('select by what the project really has installed for the task');
+    expect(minion).toContain('select by capability from what the project really has installed');
     expect(minion).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
     expect(minion).toContain('You own the selected workflow end to end');
     expect(minion).toContain('no self-imposed call, turn, or time ceiling');

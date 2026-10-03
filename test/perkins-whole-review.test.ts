@@ -1360,7 +1360,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     // review.
     const stagedMinion = readFileSync(join(stage, 'roles', 'minion.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedMinion).toContain("the PROJECT's actual installed skill catalog and metadata");
-    expect(stagedMinion).toContain('select by what the project really has installed for the task');
+    expect(stagedMinion).toContain('select by capability from what the project really has installed');
     expect(stagedMinion).toContain('You own the selected workflow end to end');
     expect(stagedMinion).toContain('fresh, context-free tracked review jobs');
     expect(stagedMinion).not.toContain('pi -p');

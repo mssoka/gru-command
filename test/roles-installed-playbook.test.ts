@@ -196,7 +196,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     const flat = staged.minion.replace(/\s+/gu, ' ');
     expect(flat).toContain("explicitly select the project's installed build-workflow skill");
     expect(flat).toContain("the PROJECT's actual installed skill catalog and metadata");
-    expect(flat).toContain('select by what the project really has installed for the task');
+    expect(flat).toContain('select by capability from what the project really has installed');
     expect(flat).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
     expect(flat).toContain('You own the selected workflow end to end');
     expect(flat).toContain("fresh, context-free tracked review jobs you commission through the service's job-dispatch surface");
@@ -256,7 +256,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     // prompt, so a rename cannot strand the playbook.
     const flat = staged.minion.replace(/\s+/gu, ' ');
     expect(flat).toContain("the PROJECT's actual installed skill catalog and metadata");
-    expect(flat).toContain('select by what the project really has installed for the task');
+    expect(flat).toContain('select by capability from what the project really has installed');
     expect(flat).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
     const installedNames = readdirSync(join(project, '.agents', 'skills')).sort();
     expect(installedNames).toEqual(['bmad-architecture', 'bmad-delivery-cycle']);
