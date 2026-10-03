@@ -579,3 +579,151 @@ describe('worker delivery settlement through the dispatcher', () => {
     } finally { close(); }
   });
 });
+
+describe('nested parent/reviewer admission (shipped playbook contract, j-810/j-811 + r1 blocker 1)', () => {
+  it('cap 1: a reviewer commissioned while the parent turn holds the only lease queues until the parent yields', async () => {
+    const repo = makeFixtureRepo('pacing-nested-cap1');
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'gru-pacing-nested-cap1-lanes-'));
+    dirs.push(laneRoot);
+    const { api, close } = ledgerIn();
+    try {
+      const worktrees = new InMemoryWorktreePort(laneRoot);
+      const events: string[] = [];
+      const gate = new PacingGate({
+        enabled: true,
+        maxConcurrentMinions: 1,
+        maxConcurrentReviewTurns: 0,
+        record: (event) => events.push(event.kind),
+      });
+      const spawned: FakeMinion[] = [];
+      const service = new DispatchService({
+        ledger: api,
+        worktrees,
+        spawner: async () => {
+          const minion = makeFakeMinion(`minion-${spawned.length + 1}`);
+          spawned.push(minion);
+          return minion.handle;
+        },
+        workerGate: gate,
+      });
+
+      const parent = await service.dispatch({
+        jobId: 'parent-lane',
+        repoPath: repo.path,
+        title: 'parent',
+        briefing: 'parent brief',
+      });
+      expect(parent.agentId).toBe('minion-1');
+      expect(spawned).toHaveLength(1);
+      expect(gate.view().worker).toMatchObject({ limit: 1, running: 1 });
+      expect(gate.view().worker.queued).toHaveLength(0);
+
+      // The parent commissions its fresh independent review jobs from inside
+      // its own open turn (roles/minion.md). While that turn holds the only
+      // lease the reviewer cannot be admitted, so a parent that waited for it
+      // synchronously would wait behind its own lease — the exact condition
+      // the shipped contract stops on loudly instead of blocking.
+      const reviewerPromise = service.dispatch({
+        jobId: 'parent-lane-review-blind',
+        repoPath: repo.path,
+        title: 'reviewer',
+        briefing: 'read-only review brief',
+      });
+      await flush();
+      expect(spawned).toHaveLength(1);
+      expect(gate.view().worker.queued.map((entry) => entry.id)).toEqual([
+        'parent-lane-review-blind',
+      ]);
+      expect(gate.view().worker.running).toBe(1);
+
+      // The supported flow: the parent's turn settles (the lane yields), the
+      // reviewer is admitted as a separate tracked job with its own session.
+      spawned[0]!.settle();
+      const reviewer = await reviewerPromise;
+      expect(reviewer.agentId).toBe('minion-2');
+      expect(spawned).toHaveLength(2);
+      expect(spawned[1]!.calls.map((call) => call.text).join('\n')).toContain('read-only review brief');
+      expect(gate.view().worker).toMatchObject({ limit: 1, running: 1 });
+      expect(gate.view().worker.queued).toHaveLength(0);
+      expect(events).toEqual(['pacing.admitted', 'pacing.queued', 'pacing.admitted']);
+      spawned[1]!.settle();
+      await vi.waitFor(() => expect(gate.view().worker.running).toBe(0));
+    } finally {
+      close();
+    }
+  });
+
+  it('default 4 saturated: a nested reviewer waits for a free slot and admits FIFO when any parent settles', async () => {
+    const repo = makeFixtureRepo('pacing-nested-cap4');
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'gru-pacing-nested-cap4-lanes-'));
+    dirs.push(laneRoot);
+    const { api, close } = ledgerIn();
+    try {
+      const worktrees = new InMemoryWorktreePort(laneRoot);
+      const events: string[] = [];
+      const gate = new PacingGate({
+        enabled: true,
+        maxConcurrentMinions: 4,
+        maxConcurrentReviewTurns: 0,
+        record: (event) => events.push(event.kind),
+      });
+      const spawned: FakeMinion[] = [];
+      const service = new DispatchService({
+        ledger: api,
+        worktrees,
+        spawner: async () => {
+          const minion = makeFakeMinion(`minion-${spawned.length + 1}`);
+          spawned.push(minion);
+          return minion.handle;
+        },
+        workerGate: gate,
+      });
+
+      for (const id of ['parent-a', 'parent-b', 'parent-c', 'parent-d']) {
+        const outcome = await service.dispatch({
+          jobId: id,
+          repoPath: repo.path,
+          title: id,
+          briefing: `brief ${id}`,
+        });
+        expect(outcome.agentId).not.toBeNull();
+      }
+      expect(spawned).toHaveLength(4);
+      expect(gate.view().worker).toMatchObject({ limit: 4, running: 4 });
+
+      // Saturated residency: the nested reviewer stays queued while all four
+      // parent leases are open; no admission, no spawn, limits unchanged.
+      const reviewerPromise = service.dispatch({
+        jobId: 'parent-a-review-verifgap',
+        repoPath: repo.path,
+        title: 'reviewer',
+        briefing: 'read-only review brief',
+      });
+      await flush();
+      await flush();
+      expect(spawned).toHaveLength(4);
+      expect(gate.view().worker.queued.map((entry) => entry.id)).toEqual([
+        'parent-a-review-verifgap',
+      ]);
+      expect(gate.view().worker.running).toBe(4);
+
+      // Any parent settling frees a slot; the reviewer admits into it.
+      spawned[1]!.settle();
+      const reviewer = await reviewerPromise;
+      expect(reviewer.agentId).not.toBeNull();
+      expect(spawned).toHaveLength(5);
+      expect(gate.view().worker.running).toBe(4);
+      expect(gate.view().worker.queued).toHaveLength(0);
+      expect(events.filter((kind) => kind === 'pacing.queued')).toHaveLength(1);
+
+      for (let index = 0; index < spawned.length; index += 1) {
+        if (index !== 1) spawned[index]!.settle();
+      }
+      await vi.waitFor(() => expect(gate.view().worker.running).toBe(0));
+    } finally {
+      close();
+    }
+  });
+});

@@ -59,7 +59,7 @@ const PINS: Record<string, number> = {
   'native-tools-parity.test.ts': 2,
   'notifications.test.ts': 19,
   'obligations-handback.test.ts': 9,
-  'pacing-admission.test.ts': 14,
+  'pacing-admission.test.ts': 16,
   'pacing.test.ts': 28,
   'patch-vitest-rpc-timeout.test.ts': 11,
   'perkins-builtin-wave.test.ts': 92,
