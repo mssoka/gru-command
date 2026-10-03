@@ -541,4 +541,22 @@ describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
     ]);
     expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 1 });
   });
+
+  it('a newer stop wins over an older live record', () => {
+    const map = stoppedWorkersByJob([
+      agentView('stale-live', {
+        jobId: 'job-1',
+        lastActivity: ISO(-2 * 3_600_000),
+        supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null },
+      }),
+      agentView('current-stop', {
+        jobId: 'job-1',
+        lastActivity: ISO(-1 * 3_600_000),
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+    ]);
+    // The stopped record is the lane's current worker: an older live
+    // record must not mask it (final independent review B1).
+    expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 1 });
+  });
 });

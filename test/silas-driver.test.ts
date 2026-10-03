@@ -378,6 +378,36 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
+  it('the stall boundary matches the board (>): exactly at the threshold is not stalled', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-edge', repo: 'fixture-app', title: 'edge', briefing: 'b' });
+      h.ledger.setJobStatus('job-edge', 'working');
+      h.ledger.registerAgent({ id: 'min-edge', role: 'minion', jobId: 'job-edge' });
+      h.ledger.setAgentState('min-edge', 'idle');
+      const activity = h.ledger.getAgent('min-edge')!.lastActivity!;
+      const at = Date.parse(activity);
+      const digestAt = (nowMs: number) =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+          now: () => nowMs,
+        });
+      // The board's isStalledWorking uses `>` ("past the window"); the
+      // digest must agree exactly at the boundary (round-5 finding).
+      expect(
+        (await digestAt(at + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking,
+      ).toHaveLength(0);
+      expect(
+        (await digestAt(at + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking,
+      ).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('supervisionLookup binds the supervisor views exactly as main.ts wires them', () => {
     // Final independent review T2: the factory is the tested seam; a
     // dropped or broken binding would silently re-enable stall wakes for

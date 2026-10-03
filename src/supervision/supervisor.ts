@@ -1819,10 +1819,10 @@ export class Supervisor {
     adopted.slotGeneration = old.slotGeneration;
     adopted.restartRing = old.restartRing;
     adopted.breakerOpen = old.breakerOpen;
-    // The cause travels with a carried breaker (final independent review
-    // C0): a carried-over stop must never lose its recorded reason. When
-    // the carried breaker is closed there is no stop to explain.
-    adopted.stopReason = old.breakerOpen ? old.stopReason : null;
+    // Note: restartRung returns before this path whenever the breaker is
+    // open, so the adopted record keeps its fresh null stopReason and no
+    // cause is lost here. A future caller that carries an OPEN breaker
+    // must copy stopReason the way adoptSlotReplacement does.
     adopted.breakerNotificationId = old.breakerNotificationId;
     // A turn interrupted by an earlier failed rung (or by the breaker
     // stop) still awaits resume on the next live handle.

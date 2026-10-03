@@ -125,14 +125,15 @@ t4-oracle = 'node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perk
 deadline-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/wizard.test.ts && npx vitest run test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts -t "by=silas on the pr/review|without by, the pr/review|restarts only an owned service|does not record a reconciled delivery|rejects a submission with an empty/missing verdict|rejects an empty report|rejects a report omitting"'
 
 # PR138 final-review repairs (2026-10-03): the four independent lens rounds
-# at 37f0e14/9a58d79/53add5f/6aa20d7 produced 50 findings, all triaged; the
-# actionable ones are repaired through b2064ae (stop-truth alignment across
-# supervisor/digest/board, disposed-record semantics, carried stopReason,
-# live-count SQL, cross-build drift alarm, wizard fail-fast positive pin,
-# mock fixture timing). This scope covers exactly the touched backend and
-# web suites plus lint/typecheck/build; approved j-463 RPC patch first, no
-# timeout/worker/assertion flag — a repair check, never a FULL substitute.
-final-review-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/silas-driver.test.ts test/supervisor.test.ts test/provider-recovery-seam.test.ts test/health.test.ts test/wizard.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/lib/board-signals.test.ts'
+# at 37f0e14/9a58d79/53add5f/6aa20d7 plus the fce17f0 confirmation round
+# produced 62 findings, all triaged; the actionable ones are repaired through
+# this head (stop-truth alignment across supervisor/digest/board, disposed
+# and recency semantics, live-count SQL, cross-build drift alarm, wizard
+# fail-fast positive pin, mock fixture timing). This scope covers the touched
+# backend suites plus the whole web unit suite, with lint/typecheck/build;
+# approved j-463 RPC patch first, no timeout/worker/assertion flag — a repair
+# check, never a FULL substitute.
+final-review-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/silas-driver.test.ts test/supervisor.test.ts test/provider-recovery-seam.test.ts test/health.test.ts test/wizard.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run'
 
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no

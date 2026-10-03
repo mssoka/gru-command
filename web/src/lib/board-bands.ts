@@ -88,38 +88,52 @@ export interface WorkerStopView {
  * stop — it counts as live, so a re-dispatched lane whose fresh worker
  * is unsupervised still never reads "waiting" from its previous
  * worker. A stopped record survives its own disposal (the human Ack
- * must find it to re-arm). Only when no live worker remains does a stop
- * mark the lane; when several workers are stopped, the NEWEST recorded
- * stop (by lastActivity) speaks for the lane — a superseded worker's
- * cause never masquerades as the current one. Ties keep snapshot order. */
+ * must find it to re-arm). A stopped worker marks the lane only when no
+ * live (non-stopped, non-breaker, non-disposed) worker is NEWER — or
+ * none exists; when several workers are stopped, the NEWEST recorded
+ * stop (by lastActivity) speaks for the lane. Unknown timestamps favor
+ * the live worker, so a re-dispatched lane never reads waiting from its
+ * previous worker. */
 export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
   const stopped = new Map<string, { readonly view: WorkerStopView; readonly at: number }>();
-  const liveJobs = new Set<string>();
+  const liveAt = new Map<string, number>();
+  const stamp = (agent: AgentView): number =>
+    agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+  const bumpLive = (jobId: string, at: number): void => {
+    const existing = liveAt.get(jobId);
+    if (existing === undefined || (Number.isFinite(at) && (!Number.isFinite(existing) || at > existing))) {
+      liveAt.set(jobId, at);
+    }
+  };
   for (const agent of agents) {
     if (agent.jobId === null || agent.role !== 'minion') continue;
     const supervision = agent.supervision;
+    const at = stamp(agent);
     if (supervision === null || supervision === undefined) {
       // Unsupervised worker: not a supervision stop. A DISPOSED record is
-      // not a live worker either — only a running unsupervised worker
-      // clears an older stopped record (final independent review E0).
+      // not a live worker either — only a running unsupervised worker can
+      // clear a stopped record (final independent review E0).
       if (agent.state === 'disposed') continue;
-      liveJobs.add(agent.jobId);
+      bumpLive(agent.jobId, at);
       continue;
     }
     if (supervision.state !== 'stopped' && supervision.breakerOpen !== true) {
-      liveJobs.add(agent.jobId);
+      bumpLive(agent.jobId, at);
       continue;
     }
     const view: WorkerStopView = { reason: supervision.stopReason ?? null, restarts: supervision.restarts };
-    const at = agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
     const existing = stopped.get(agent.jobId);
     if (existing === undefined || (Number.isFinite(at) && (!Number.isFinite(existing.at) || at > existing.at))) {
       stopped.set(agent.jobId, { view, at });
     }
   }
-  for (const jobId of liveJobs) stopped.delete(jobId);
   const result = new Map<string, WorkerStopView>();
-  for (const [jobId, entry] of stopped) result.set(jobId, entry.view);
+  for (const [jobId, entry] of stopped) {
+    const live = liveAt.get(jobId);
+    const waiting =
+      live === undefined || (Number.isFinite(entry.at) && (!Number.isFinite(live) || entry.at > live));
+    if (waiting) result.set(jobId, entry.view);
+  }
   return result;
 }
 
