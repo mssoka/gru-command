@@ -9,7 +9,9 @@ import { renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
-import { recordFollowUpDelivery, promptTerminalVerdict } from './fix-directive.js';
+import { recordFollowUpDelivery } from './fix-directive.js';
+import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
+import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import { PR_CREATION_RULE } from './pr-creation.js';
 
@@ -244,7 +246,10 @@ export class DispatchService {
       // path concludes — never recorded as delivered while a retry could
       // still carry it, never disposed out from under that retry.
       const lessons = this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
-      const settleTurn = async (failure: unknown | null): Promise<{ readonly ok: boolean; readonly error?: string }> => {
+      const settleTurn = async (
+        failure: unknown | null,
+        verdict: PromptTurnVerdict | null,
+      ): Promise<{ readonly ok: boolean; readonly error?: string }> => {
         // Release the slot first: the retry reacquires admission per attempt.
         releaseWorker();
         const settlement = await settleRetries(this.opts.retrySettlement, handle.id, this.opts.stopSignal).then(
@@ -337,18 +342,24 @@ export class DispatchService {
         // Terminal/error correlation (r4 blocker 1): a resolved prompt is
         // not success — both adapters settle fulfilled prompts that ended in
         // an in-band error (Claude result.isError; Pi stopReason 'error').
-        // The handle's health at settlement is the runtime's terminal
-        // evidence, including for a retry-recovered turn; a failed turn
-        // never records a phase-tagged delivery and never publishes a
-        // completed phase.
-        const verdict = promptTerminalVerdict(handle);
-        if (!verdict.ok) {
+        // Terminal/error correlation (r4/r5 blocker 1): the verdict was
+        // captured by the transport when THIS prompt settled — before any
+        // queued successor turn could start — and is held across the retry
+        // settlement above. A failed turn never records a phase-tagged
+        // delivery and never publishes a completed phase; a retry-recovered
+        // disposition is the retry's own clean turn (the supervisor
+        // supersedes itself on any further in-band error).
+        const evidence =
+          disposition === 'recovered'
+            ? ({ ok: true, error: null } as const)
+            : (verdict ?? promptVerdictFromHealth(handle));
+        if (!evidence.ok) {
           return this.recordTurnFailure(
             job.id,
             handle.id,
             handoffPhaseId,
             deliveredRecorded,
-            verdict.error ?? 'runtime settled the briefing turn with an in-band error',
+            evidence.error ?? 'runtime settled the briefing turn with an in-band error',
           );
         }
         const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
@@ -363,22 +374,22 @@ export class DispatchService {
         this.log('info', 'minion briefing turn completed', { job: job.id, agent: handle.id, disposition });
         return { ok: true as const };
       };
-      const settled = handle
-        .prompt(
-          renderMinionBriefing({
-            jobId: job.id,
-            repoName,
-            branch: worktree.branch ?? `gru/${job.id}`,
-            worktreePath: worktree.path,
-            sha: worktree.sha,
-            briefing: input.briefing,
-            ...(lessons.length > 0 ? { lessons } : {}),
-          }),
-          { owner: `dispatch:${job.id}` },
-        )
+      const settled = promptWithTerminalVerdict(
+        handle,
+        renderMinionBriefing({
+          jobId: job.id,
+          repoName,
+          branch: worktree.branch ?? `gru/${job.id}`,
+          worktreePath: worktree.path,
+          sha: worktree.sha,
+          briefing: input.briefing,
+          ...(lessons.length > 0 ? { lessons } : {}),
+        }),
+        { owner: `dispatch:${job.id}` },
+      )
         .then(
-          () => settleTurn(null),
-          (error: unknown) => settleTurn(error),
+          (verdict) => settleTurn(null, verdict),
+          (error: unknown) => settleTurn(error, null),
         )
         .finally(() => {
           releaseWorker();

@@ -239,6 +239,18 @@ export interface PendingTurn {
   readonly images?: PromptOptions['images'];
 }
 
+/** Terminal evidence for the turn a prompt call settled. Captured by the
+ * transport IN its settle path, before any queued successor turn can start
+ * (single-writer queues pump inside the settle path, ahead of the caller's
+ * continuation) — so the caller can never mistake a successor's health for
+ * this turn's outcome. `ok:false` = the turn ended in an in-band runtime
+ * error (Claude `result.isError`, Pi assistant `stopReason: 'error'`),
+ * which is NOT a successful delivery merely because the Promise resolved. */
+export interface PromptTurnVerdict {
+  readonly ok: boolean;
+  readonly error: string | null;
+}
+
 /** One live agent session hosted by a runtime. */
 export interface AgentHandle {
   /** Adapter-owned cessation evidence. 'ceased': the adapter observed the
@@ -272,6 +284,15 @@ export interface AgentHandle {
    * ruling 1) and resolves after it is eventually delivered.
    */
   prompt(text: string, options?: PromptOptions): Promise<void>;
+  /**
+   * Like prompt(), but resolves with the settled turn's captured terminal
+   * verdict, taken in the settle path before any queued successor starts.
+   * The value is safe to hold across awaits (retry settlement, successor
+   * turns). Runtimes that cannot attest per-turn omit it; callers then fall
+   * back to prompt() + settle-time health
+   * (`promptWithTerminalVerdict` encodes that fallback).
+   */
+  promptWithVerdict?(text: string, options?: PromptOptions): Promise<PromptTurnVerdict>;
   /**
    * Interrupt/redirect the live turn. Native on pi; runtimes declaring
    * steer 'queued' get the fallback wrapper's queue-until-idle behavior.

@@ -456,6 +456,26 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           directiveControllers.delete(controller);
         }
         if (!delivery.delivered) {
+          if (delivery.admission === 'unknown') {
+            // The router cannot prove non-admission: cancellation or a
+            // spent/superseded retry AFTER the prompt call. Marking the
+            // request failed would release the single-writer guard while a
+            // prior writer's recovery may still be live. Keep it live with
+            // a durable reconcile note — boot reconciliation escalates it
+            // for a Gru decision, never an automatic retry.
+            options.ledger.recordDirectiveReconcile({
+              requestId: intent.requestId,
+              note:
+                `turn interrupted with unknown admission: ${delivery.note ?? 'no proof of non-delivery'}` +
+                ' — no delivery recorded; reconcile settlement/cessation before releasing the request',
+            });
+            log('warn', 'silas directive turn interrupted — request left live for reconciliation', {
+              job: jobId,
+              request: intent.requestId,
+              note: delivery.note ?? null,
+            });
+            return;
+          }
           // Positive no-effect proof (no live minion and no job lane): a
           // durable failure is honest; the caller resubmits fresh work.
           const reason = delivery.note ?? 'no implementing minion session and no job lane';

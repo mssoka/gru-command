@@ -2286,11 +2286,17 @@ export class LedgerApi {
   }
 
   /** Window-A backstop candidates (PR136 r4 blocker 2): follow-up
-   * `job.delivered` events on still-blocked lanes whose hand-back
-   * obligation was never recorded (crash between the delivery commit and
-   * the observer). Already-tracked deliveries (and deliveries owned by an
-   * existing marked phase row) are excluded BY the query, so bounded
-   * passes always reach the tail. */
+   * `job.delivered` events whose delivery happened during a BLOCKED
+   * episode of the lane and whose hand-back obligation was never recorded
+   * (crash between the delivery commit and the observer). The lane's
+   * CURRENT blocked status is not enough — joining a historical healthy
+   * delivery to an unrelated later block would revive completed work
+   * (PR136 r5 blocker 3) — so the query reconstructs the status AT
+   * DELIVERY from the job's own status events: the latest `job.status`
+   * transition before the delivery must have entered `blocked`. A lane
+   * with no provable blocked episode is excluded. Already-tracked
+   * deliveries (and deliveries owned by an existing marked phase row) are
+   * excluded BY the query, so bounded passes always reach the tail. */
   listUnmarkedHandbackDeliveries(limit: number): readonly EventRecord[] {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listUnmarkedHandbackDeliveries requires a positive integer limit, got ${String(limit)}`);
@@ -2303,6 +2309,15 @@ export class LedgerApi {
             AND j.status = 'blocked'
             AND json_valid(e.payload)
             AND json_extract(e.payload, '$.source') IN ('silas-directive', 'silas-rebrief')
+            AND COALESCE((
+              SELECT json_extract(s.payload, '$.to')
+                FROM events s
+               WHERE s.job_id = e.job_id
+                 AND s.kind = 'job.status'
+                 AND s.seq < e.seq
+               ORDER BY s.seq DESC
+               LIMIT 1
+            ), '') = 'blocked'
             AND (
               json_extract(e.payload, '$.phase_id') IS NULL
               OR NOT EXISTS (

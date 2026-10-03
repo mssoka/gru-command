@@ -7,6 +7,8 @@ import { appendLessonPointers, renderLessonsSection } from '../lessons/reference
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import { appendPrCreationRule, PR_CREATION_RULE } from './pr-creation.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
+import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
+import type { PromptTurnVerdict } from '../runtime/types.js';
 import type { WorktreePort } from './worktree-port.js';
 import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 
@@ -41,39 +43,7 @@ export interface DirectiveRoutingDeps {
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
 }
 
-/** The terminal verdict of a prompt that RESOLVED. Both adapters settle a
- * fulfilled prompt even when the turn ended in an in-band error (Claude
- * `result.isError` resolves with error state; Pi surfaces assistant
- * `stopReason: 'error'` and still resolves). Resolution is transport
- * completion, NOT a successful phase: every marked completion path must
- * correlate this verdict or a failed turn masquerades as a completed
- * phase. The handle's own health at settle time is the runtime's terminal
- * evidence.
- *
- * A handle without the health surface (structural callers, test doubles)
- * cannot attest either way: it carries NO failure evidence, so the
- * caller's existing settlement decides (prompt resolution / retry
- * disposition) exactly as before this gate. A health read that THROWS is
- * a broken attestation and is unproven — it never becomes success. */
-export interface PromptTerminalVerdict {
-  readonly ok: boolean;
-  readonly error: string | null;
-}
-
-export function promptTerminalVerdict(handle: Pick<AgentHandle, 'health'>): PromptTerminalVerdict {
-  if (typeof handle.health !== 'function') return { ok: true, error: null };
-  try {
-    const health = handle.health();
-    if (health.state === 'error') {
-      return { ok: false, error: health.error ?? 'runtime settled the turn with an in-band error' };
-    }
-    return { ok: true, error: null };
-  } catch (error) {
-    return { ok: false, error: `runtime terminal health unreadable: ${String(error)}` };
-  }
-}
-
-function verdictFields(verdict: PromptTerminalVerdict): { readonly outcome: 'completed' | 'error'; readonly error?: string } {
+function verdictFields(verdict: PromptTurnVerdict): { readonly outcome: 'completed' | 'error'; readonly error?: string } {
   return verdict.ok
     ? { outcome: 'completed' }
     : { outcome: 'error', error: verdict.error ?? 'runtime settled the turn with an in-band error' };
@@ -98,6 +68,13 @@ export async function routeFixDirectiveToMinion(
    * complete a marked phase or record a phase-tagged delivery. */
   outcome?: 'completed' | 'error';
   error?: string;
+  /** Only on `delivered:false`: `'none'` = positive no-effect proof (the
+   * prompt was never handed to a worker or turn); `'unknown'` = the prompt
+   * may already have run (cancellation or a spent/superseded retry AFTER
+   * the prompt call) — the durable request must stay live for
+   * reconciliation and must never be marked failed or release its
+   * single-writer guard on this evidence alone. */
+  admission?: 'none' | 'unknown';
 }> {
   const owner = input.owner ?? 'fix-directive';
   // Follow-up turns carry the CURRENT creation rule too: a legacy briefing
@@ -122,7 +99,7 @@ export async function routeFixDirectiveToMinion(
       // the other turn's outcome. Await before taking the worker slot — the
       // retry re-acquires its own slot and must not be blocked by ours.
       const pending = await settleRetries(input.retrySettlement, handle.id, input.signal);
-      if (pending === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+      if (pending === 'cancelled') return { delivered: false, note: 'review operation aborted', admission: 'none' };
       let lease: PacingLease | null = null;
       if (input.workerGate !== undefined) {
         lease = await input.workerGate.acquireWorkerTurn({
@@ -133,8 +110,9 @@ export async function routeFixDirectiveToMinion(
         });
       }
       let promptError: unknown = null;
+      let verdict: PromptTurnVerdict | null = null;
       try {
-        await racedPrompt(handle, directive, input.signal, owner);
+        verdict = await racedPrompt(handle, directive, input.signal, owner);
       } catch (error) {
         promptError = error;
       } finally {
@@ -150,9 +128,9 @@ export async function routeFixDirectiveToMinion(
         // session) — and a 'recovered' disposition is reported as the
         // delivery it is.
         const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
-        if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+        if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted', admission: 'unknown' };
         if (disposition === 'recovered') {
-          return { delivered: true, minionId: minion.id, ...verdictFields(promptTerminalVerdict(handle)) };
+          return { delivered: true, minionId: minion.id, ...verdictFields({ ok: true, error: null }) };
         }
         evictedSessionFile = handle.sessionFile;
         continue;
@@ -162,24 +140,39 @@ export async function routeFixDirectiveToMinion(
       // the directive, so failure is reported only after the disposition is
       // known (never duplicating a delivery the retry still owns).
       const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
-      if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+      if (disposition === 'cancelled') {
+        // The prompt call already ran: admission is UNKNOWN, not a no-effect
+        // failure — the request stays live for reconciliation.
+        return { delivered: false, note: 'review operation aborted', admission: 'unknown' };
+      }
       if (disposition === 'exhausted' || disposition === 'superseded') {
-        return { delivered: false, note: `automatic rate-limit retry ${disposition} before delivery` };
+        return {
+          delivered: false,
+          note: `automatic rate-limit retry ${disposition} before delivery`,
+          admission: 'unknown',
+        };
       }
       if (promptError !== null && disposition !== 'recovered') throw promptError;
-      // Terminal/error correlation (r4 blocker 1): the settled handle's
-      // health is the runtime's own verdict for the turn that just settled
-      // — a resolved-but-errored turn reports outcome 'error' and must
-      // never complete a marked phase or record a phase-tagged delivery.
-      const verdict = promptTerminalVerdict(handle);
-      return { delivered: true, minionId: minion.id, ...verdictFields(verdict) };
+      // Terminal/error correlation (r4/r5 blocker 1): the verdict was
+      // captured by the transport when THIS prompt settled — before any
+      // queued successor turn could start — and is held across the retry
+      // settlement above. A resolved-but-errored turn reports outcome
+      // 'error' and must never complete a marked phase or record a
+      // phase-tagged delivery. A retry-recovered disposition is the
+      // retry's own clean turn (the supervisor supersedes itself on any
+      // further in-band error), so it is delivery evidence.
+      const evidence =
+        disposition === 'recovered'
+          ? ({ ok: true, error: null } as const)
+          : (verdict ?? promptVerdictFromHealth(handle));
+      return { delivered: true, minionId: minion.id, ...verdictFields(evidence) };
     }
   }
   const lane = input.worktrees
     .listWorktrees({ jobId: input.jobId })
     .find((candidate) => candidate.kind === 'job');
   if (lane === undefined) {
-    return { delivered: false, note: 'no implementing minion session and no job lane' };
+    return { delivered: false, note: 'no implementing minion session and no job lane', admission: 'none' };
   }
   let lease: PacingLease | null = null;
   if (input.workerGate !== undefined) {
@@ -215,9 +208,10 @@ export async function routeFixDirectiveToMinion(
       prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
     }
     let promptError: unknown = null;
+    let verdict: PromptTurnVerdict | null = null;
     try {
       input.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: input.jobId, sessionFile: handle.sessionFile });
-      await racedPrompt(handle, prompt, input.signal, owner);
+      verdict = await racedPrompt(handle, prompt, input.signal, owner);
     } catch (error) {
       promptError = error;
     } finally {
@@ -226,18 +220,29 @@ export async function routeFixDirectiveToMinion(
       lease = null;
     }
     const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
-    if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+    if (disposition === 'cancelled') {
+      // The prompt call already ran on the fresh minion: UNKNOWN admission.
+      return { delivered: false, note: 'review operation aborted', admission: 'unknown' };
+    }
     if (disposition === 'exhausted' || disposition === 'superseded') {
-      return { delivered: false, note: `automatic rate-limit retry ${disposition} before delivery` };
+      return {
+        delivered: false,
+        note: `automatic rate-limit retry ${disposition} before delivery`,
+        admission: 'unknown',
+      };
     }
     if (promptError !== null && disposition !== 'recovered') throw promptError;
-    // Terminal/error correlation (r4 blocker 1): the handle's health at
-    // settlement is the runtime's own verdict for the turn that just
-    // settled — including a retry-recovered one. A resolved-but-errored
-    // turn reports outcome 'error' and must never complete a marked
-    // phase or record a phase-tagged delivery.
-    const verdict = promptTerminalVerdict(handle);
-    return { delivered: true, minionId: handle.id, ...verdictFields(verdict) };
+    // Terminal/error correlation (r4/r5 blocker 1): the verdict was captured
+    // by the transport when THIS prompt settled (before any queued successor
+    // could start) and is held across the retry settlement. A
+    // resolved-but-errored turn must never complete a marked phase or record
+    // a phase-tagged delivery; a retry-recovered disposition is the retry's
+    // own clean turn.
+    const evidence =
+      disposition === 'recovered'
+        ? ({ ok: true, error: null } as const)
+        : (verdict ?? promptVerdictFromHealth(handle));
+    return { delivered: true, minionId: handle.id, ...verdictFields(evidence) };
   } finally {
     lease?.release();
     if (handle !== null) await handle.dispose();
@@ -245,11 +250,17 @@ export async function routeFixDirectiveToMinion(
 }
 
 /** Race a prompt against cancellation so shutdown cannot stall on an
- * in-flight fix-directive turn. */
-function racedPrompt(handle: { prompt(text: string, options?: { owner?: string }): Promise<void> }, text: string, signal: AbortSignal, owner: string): Promise<void> {
+ * in-flight fix-directive turn, carrying the settled turn's captured
+ * terminal verdict through the race. */
+function racedPrompt(
+  handle: Pick<AgentHandle, 'prompt' | 'health'> & Partial<Pick<AgentHandle, 'promptWithVerdict'>>,
+  text: string,
+  signal: AbortSignal,
+  owner: string,
+): Promise<PromptTurnVerdict> {
   if (signal.aborted) return Promise.reject(new Error('review operation aborted'));
   return Promise.race([
-    handle.prompt(text, { owner }),
+    promptWithTerminalVerdict(handle, text, { owner }),
     new Promise<never>((_resolve, reject) => {
       signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
     }),
@@ -437,8 +448,9 @@ export async function rebriefFreshMinion(
         : {}),
     });
     let promptError: unknown = null;
+    let verdict: PromptTurnVerdict | null = null;
     try {
-      await handle.prompt(prompt, { owner: `silas-rebrief:${input.jobId}` });
+      verdict = await promptWithTerminalVerdict(handle, prompt, { owner: `silas-rebrief:${input.jobId}` });
     } catch (error) {
       promptError = error;
     } finally {
@@ -460,13 +472,21 @@ export async function rebriefFreshMinion(
     if (promptError !== null && disposition !== 'recovered') {
       throw new Error(`re-brief turn failed on ${handle.id}: ${String(promptError)}`);
     }
-    const verdict = promptTerminalVerdict(handle);
+    // Terminal/error correlation (r4/r5 blocker 1): the transport captured
+    // the verdict when THIS prompt settled, before any queued successor
+    // could start, and it is held across the retry settlement. A
+    // resolved-but-errored turn is not a delivery; a retry-recovered
+    // disposition is the retry's own clean turn.
+    const evidence =
+      disposition === 'recovered'
+        ? ({ ok: true, error: null } as const)
+        : (verdict ?? promptVerdictFromHealth(handle));
     return {
       minionId: handle.id,
       lanePath: lane.path,
       prompt,
       sessionFile: handle.sessionFile,
-      ...verdictFields(verdict),
+      ...verdictFields(evidence),
     };
   } finally {
     lease?.release();

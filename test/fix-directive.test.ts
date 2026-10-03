@@ -4,6 +4,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { withFallbacks } from '../src/runtime/fallbacks.js';
+import type { AgentRuntime } from '../src/runtime/types.js';
 import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -336,7 +338,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     });
     await vi.waitFor(() => expect(prompted).toHaveLength(1));
     controller.abort();
-    await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted' });
+    await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted', admission: 'unknown' });
     expect(settleCalls).toBe(2);
   });
 
@@ -367,7 +369,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     });
     await vi.waitFor(() => expect(prompted).toHaveLength(1));
     controller.abort();
-    await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted' });
+    await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted', admission: 'unknown' });
   });
 
   it('a queued re-brief admission aborts on the service-stopping signal (r4 adversarial#5)', async () => {
@@ -424,5 +426,91 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     await vi.waitFor(() => expect(prompted).toHaveLength(1));
     controller.abort();
     await expect(routing).rejects.toThrow(/cancelled before its automatic retries settled/);
+  });
+});
+
+describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
+  const QUEUED_CAPS = {
+    streaming: true,
+    steer: 'queued' as const,
+    resume: 'file' as const,
+    images: false,
+    thinking: false,
+    thinkingLevelControl: false,
+    followUp: false,
+  };
+
+  it('a resolved-but-errored directive turn with a queued successor still reports outcome error', async () => {
+    // The REAL fallback wrapper (steer:'queued') pumps its queue in the
+    // settle path, before its caller resumes; the successor therefore owns
+    // the live session health by the time the router would read it. The
+    // verdict must have been captured before that pump.
+    let healthState: 'idle' | 'error' = 'idle';
+    let healthError: string | null = null;
+    const resolvers: Array<() => void> = [];
+    const inner = {
+      role: 'minion' as const,
+      id: 'inner-queued',
+      sessionFile: null,
+      capabilities: QUEUED_CAPS,
+      prompt: () => new Promise<void>((resolve) => resolvers.push(resolve)),
+      async steer() {},
+      async followUp() {},
+      subscribe() {
+        return () => {};
+      },
+      health() {
+        return {
+          state: healthState,
+          lastActivity: null,
+          sessionFile: null,
+          ...(healthError === null ? {} : { error: healthError }),
+        };
+      },
+      async dispose() {},
+    };
+    const runtime = withFallbacks({
+      id: 'queued-fake',
+      capabilities: QUEUED_CAPS,
+      spawn: async () => inner,
+      health: () => ({ state: 'ok' as const }),
+      dispose: async () => {},
+    } as unknown as AgentRuntime);
+    const handle = await runtime.spawn('minion');
+    try {
+      const routing = routeFixDirectiveToMinion({
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        ledger: {
+          listAgents: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
+          registerAgent: () => {},
+          getJob: () => null,
+        } as never,
+        worktrees: {} as never,
+        jobId: 'job-queued',
+        directive: 'fix the race',
+        signal: new AbortController().signal,
+      });
+      await vi.waitFor(() => expect(resolvers).toHaveLength(1));
+      // A successor is queued while the directive turn is live.
+      const successor = handle.prompt('queued successor', { owner: 'other' });
+      // The directive turn ends in an in-band error; the successor starts
+      // inside the settle path and clears the session health.
+      healthState = 'error';
+      healthError = 'assistant stopReason error';
+      resolvers[0]!();
+      await vi.waitFor(() => expect(resolvers).toHaveLength(2));
+      healthState = 'idle';
+      healthError = null;
+      resolvers[1]!();
+      await successor;
+      await expect(routing).resolves.toEqual({
+        delivered: true,
+        minionId: 'inner-queued',
+        outcome: 'error',
+        error: 'assistant stopReason error',
+      });
+    } finally {
+      await handle.dispose();
+    }
   });
 });

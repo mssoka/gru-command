@@ -837,8 +837,12 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-  it('/api/silas/directive answers undelivered (never a delivery) when the bounded retry exhausts', async () => {
-    const h = await boot({ retrySettlement: async () => 'exhausted' });
+  it('/api/silas/directive keeps a superseded post-prompt turn LIVE for reconciliation (never a no-effect failure)', async () => {
+    // The pre-prompt interlock is clean; the retry is superseded AFTER the
+    // prompt call — admission is UNKNOWN, not a no-effect failure (r5
+    // blocker 2).
+    let settleCalls = 0;
+    const h = await boot({ retrySettlement: async () => (++settleCalls === 1 ? 'none' : 'superseded') });
     const repo = makeFixtureRepo('fixture-silas-directive-settle');
     cleanupRepos.push(repo);
     try {
@@ -864,20 +868,75 @@ describe('dispatch server (E8)', () => {
         job_id: 'dir-settle',
         directive: 'Fix the retry settlement path.',
       }, TOKEN);
-      // Accepted ≠ admitted (PR136 durable-intent contract): the response
-      // is the durable acceptance; the exhausted retry is a durable
-      // no-delivery failure readable on the request record.
       expect(res.status).toBe(202);
       const requestId = field<string>(res.json, 'request_id');
-      const terminal = await awaitDirectiveTerminal(h, requestId);
-      expect(terminal.state).toBe('failed');
-      expect(terminal.failReason).toContain('automatic rate-limit retry exhausted');
+      // The reconcile note lands; the request stays dispatching (live).
+      const deadline = Date.now() + 10_000;
+      while (!(h.ledger.getDirective(requestId)?.failReason ?? '').includes('unknown admission') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const readback = h.ledger.getDirective(requestId);
+      expect(readback?.state).toBe('dispatching');
+      expect(readback?.failReason).toContain('unknown admission');
+      expect(readback?.failReason).toContain('superseded');
+      // The single-writer guard holds: a different request id is refused.
+      const blocked = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-settle', directive: 'different work', request_id: 'req-other',
+      }, TOKEN);
+      expect(blocked.status).toBe(409);
       expect(h.ledger.listJobEvents('dir-settle').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
       // The creation dispatch legitimately recorded its own delivery; the
       // request must not add a REQUEST-sourced delivery on top of it.
       expect(h.ledger.listJobEvents('dir-settle').some((event) =>
         event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-directive',
       )).toBe(false);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/directive keeps a post-prompt cancellation LIVE for reconciliation too', async () => {
+    let settleCalls = 0;
+    const h = await boot({ retrySettlement: async () => (++settleCalls === 1 ? 'none' : 'cancelled') });
+    const repo = makeFixtureRepo('fixture-silas-directive-cancel');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'dir-cancel', repo_path: repo.path, title: 'cancel lane', briefing: 'b',
+      }, TOKEN);
+      const minionId = `agent-${h.spawns.length}`;
+      h.ledger.registerAgent({ id: minionId, role: 'minion', jobId: 'dir-cancel' });
+      h.liveHandles.set(minionId, {
+        role: 'minion',
+        id: minionId,
+        sessionFile: null,
+        capabilities: FAKE_CAPABILITIES,
+        prompt: async () => {},
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
+        async dispose() {},
+      });
+      h.ledger.setJobStatus('dir-cancel', 'in-review');
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-cancel',
+        directive: 'Fix under cancellation.',
+      }, TOKEN);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      const deadline = Date.now() + 10_000;
+      while (!(h.ledger.getDirective(requestId)?.failReason ?? '').includes('unknown admission') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const readback = h.ledger.getDirective(requestId);
+      expect(readback?.state).toBe('dispatching');
+      expect(readback?.failReason).toContain('review operation aborted');
+      const blocked = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-cancel', directive: 'different work', request_id: 'req-other',
+      }, TOKEN);
+      expect(blocked.status).toBe(409);
+      expect(h.ledger.listJobEvents('dir-cancel').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
     } finally {
       await h.close();
     }

@@ -363,4 +363,28 @@ describe('unmarked blocked-phase hand-back crash-window recovery (r4 blocker 2)'
     const healthyPass = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });
     expect(healthyPass.deliveries).toBe(0);
   });
+
+  it('does not revive a healthy delivery when the lane blocks later (r5 blocker 3)', () => {
+    const h = makeHarness();
+    seedJob(h.ledger, 'job-uwc5', 'working');
+    // A bounded phase completed while the lane was HEALTHY; its delivery is
+    // the normal review flow, not a blocked-phase hand-back.
+    const delivered = h.ledger.appendCustomEvent({
+      kind: 'job.delivered',
+      jobId: 'job-uwc5',
+      payload: { source: 'silas-directive', sha: 'healthy-head' },
+    });
+    // An unrelated blocked episode starts later.
+    h.ledger.setJobStatus('job-uwc5', 'blocked');
+    const report = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });
+    expect(report.deliveries).toBe(0);
+    expect(report.recovered).toBe(0);
+    expect(report.published).toBe(0);
+    expect(
+      h.ledger
+        .listObligations({ jobId: 'job-uwc5' })
+        .filter((row) => row.incidentKey === `phase-handback@${delivered.seq}`),
+    ).toHaveLength(0);
+    expect(h.ledger.findNotificationByKind(`silas.phase-handback.job-uwc5@${delivered.seq}`, 'any')).toBeNull();
+  });
 });
