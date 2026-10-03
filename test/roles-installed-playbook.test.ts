@@ -240,7 +240,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     // reconciliation for dispatched reviewer jobs.
     expect(flat).toContain('the review is the gate, and the owner holds every merge');
     expect(flat).toContain('read-only brief that names the exact immutable head');
-    expect(flat).toContain('never echo it');
+    expect(flat).toContain('never echo or copy the token');
     expect(flat).toContain('reconcile it by job identity');
     // Outcome truth (owner clarification 2026-10-02).
     expect(flat).toContain('Report outcomes truthfully');

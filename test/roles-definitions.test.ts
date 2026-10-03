@@ -112,7 +112,7 @@ describe('role definitions (E8)', () => {
     // reconciliation for dispatched reviewer jobs.
     expect(minion).toContain('the review is the gate, and the owner holds every merge');
     expect(minion).toContain('read-only brief that names the exact immutable head');
-    expect(minion).toContain('never echo it');
+    expect(minion).toContain('never echo or copy the token');
     expect(minion).toContain('reconcile it by job identity');
     // Outcome truth (owner clarification 2026-10-02).
     expect(minion).toContain('Report outcomes truthfully');
