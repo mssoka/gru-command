@@ -454,6 +454,38 @@ describe('harness diagnostics', () => {
     expect(singleQuotedRendered).not.toContain('eps');
     expect(singleQuotedRendered).not.toContain('lon');
 
+    // Escaped-quote boundaries (Perkins r5): every split point of an escaped
+    // double- or single-quoted value must stay fail-closed — a chunk ending
+    // in an escaped quote may not leak the continuation.
+    const escapedDouble = String.raw`password="omega\"omega2 gamma"`;
+    for (let split = 1; split < escapedDouble.length; split += 1) {
+      trackChildProcess(
+        fakeChild({
+          pid: 771_000 + split,
+          exitCode: 0,
+          stderr: fakeStream(escapedDouble.slice(0, split), escapedDouble.slice(split)),
+        }),
+        { label: `escaped double split ${split}`, scope },
+      );
+      const splitRendered = renderFailureDiagnostics(scope, new Error('escaped double split check'));
+      expect(splitRendered, `escaped double split ${split}`).not.toContain('omega');
+      expect(splitRendered, `escaped double split ${split}`).not.toContain('gamma');
+    }
+    const escapedSingle = String.raw`token='al\'pha gamma'`;
+    for (let split = 1; split < escapedSingle.length; split += 1) {
+      trackChildProcess(
+        fakeChild({
+          pid: 772_000 + split,
+          exitCode: 0,
+          stderr: fakeStream(escapedSingle.slice(0, split), escapedSingle.slice(split)),
+        }),
+        { label: `escaped single split ${split}`, scope },
+      );
+      const splitRendered = renderFailureDiagnostics(scope, new Error('escaped single split check'));
+      expect(splitRendered, `escaped single split ${split}`).not.toContain('pha');
+      expect(splitRendered, `escaped single split ${split}`).not.toContain('gamma');
+    }
+
     // JSON-escaped credentials in log records.
     const jsonEscaped = String.raw`{\"token\":\"JSON-secret-123456\"}`;
     expect(redactDiagnosticText(jsonEscaped)).not.toContain('JSON-secret-123456');

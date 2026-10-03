@@ -184,7 +184,7 @@ const SECRET_OPEN =
 // text without a delimiter may continue in the next chunk; the rest of that
 // credential's line is then discarded rather than rendered naked.
 const UNTERMINATED_VALUE =
-  /(?:\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:\\?"[^"\n]*|\\?'[^'\n]*|[^\s"',;}\]]+)$|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+$|\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]+$|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$|\bAKIA[0-9A-Z]+$/i;
+  /(?:\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:\\?"(?:[^"\\\n]|\\.)*\\?$|\\?'(?:[^'\\\n]|\\.)*\\?$|[^\s"',;}\]]+)$|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+$|\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]+$|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$|\bAKIA[0-9A-Z]+$/i;
 const BEARER_TOKEN = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}\b/gi;
 const SECRET_VALUE = /\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b/g;
 const JWT = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b/g;
