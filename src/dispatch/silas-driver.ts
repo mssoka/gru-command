@@ -513,25 +513,31 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       // The SAME attribution the board renders (stoppedWorkersByJob): a
       // bound minion is live unless its supervision view says stopped or
       // breaker-open, and a disposed unsupervised record is not a worker.
-      // A lane with a stop record and NO live worker is WAITING on a human
-      // re-arm — silence from a stop is never a stall. Otherwise the
-      // newest non-stop-exempt worker speaks for the lane's silence; a
-      // lane whose only worker is a dead record still wakes (the board
-      // shows it COLD, and both surfaces agree it is not running). The
-      // board's COLD banding deliberately measures lane-level recency
-      // instead, and the two surfaces share this stop attribution so a
-      // waiting lane never contradicts itself.
+      // A stop marks the lane only when no live worker exists or the
+      // newest live worker's stamp is KNOWN and strictly older; an
+      // unknown live stamp (a fresh worker registered before its first
+      // activity) favors the live worker. A waiting lane's silence is a
+      // human re-arm — this STALL channel never wakes it (the distinct
+      // minion-error channel below keeps its genuine-failure wakes).
       const viewOf = (agent: (typeof boundMinions)[number]): AgentSupervisionView | null =>
         input.supervisionFor?.(agent.id) ?? null;
       const stopExempt = (agent: (typeof boundMinions)[number]): boolean => {
         const supervision = viewOf(agent);
         return supervision !== null && (supervision.state === 'stopped' || supervision.breakerOpen === true);
       };
+      const stampOf = (agent: (typeof boundMinions)[number]): number =>
+        agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
       const live = boundMinions.filter((agent) => {
         if (stopExempt(agent)) return false;
         return viewOf(agent) !== null || agent.state !== 'disposed';
       });
-      const waiting = boundMinions.some(stopExempt) && live.length === 0;
+      const newestKnown = (stamps: readonly number[]): number | null =>
+        stamps.filter(Number.isFinite).reduce<number | null>((best, at) => (best === null || at > best ? at : best), null);
+      const hasStop = boundMinions.some(stopExempt);
+      const stopAt = newestKnown(boundMinions.filter(stopExempt).map(stampOf));
+      const liveAt = newestKnown(live.map(stampOf));
+      const waiting =
+        hasStop && (live.length === 0 || (stopAt !== null && liveAt !== null && stopAt > liveAt));
       if (!waiting) {
         const pool = live.length > 0 ? live : boundMinions.filter((agent) => !stopExempt(agent));
         const minion = pool.sort((a, b) =>

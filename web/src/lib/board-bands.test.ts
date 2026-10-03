@@ -556,7 +556,31 @@ describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
       }),
     ]);
     // The stopped record is the lane's current worker: an older live
-    // record must not mask it (final independent review B1).
+    // record must not mask it. This is the SHARED cross-surface fixture:
+    // test/silas-driver.test.ts pins the same agents (same ids/stamps)
+    // and the digest must NOT stall this waiting lane (tracked-review
+    // A1/E0/V0).
     expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 1 });
+  });
+
+  it('a fresh worker with an unknown stamp never inherits the previous stop', () => {
+    const map = stoppedWorkersByJob([
+      // The superseded worker's stop carries a real stamp...
+      agentView('old-stop', {
+        jobId: 'job-1',
+        lastActivity: ISO(-1 * 3_600_000),
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      // ...but the fresh live worker was just registered: registerAgent
+      // inserts last_activity NULL, so its stamp is unknown. Unknown
+      // favors the live worker — the lane is running, not waiting
+      // (tracked-review A0/E1/V1; registration NULL pair).
+      agentView('fresh-null', {
+        jobId: 'job-1',
+        state: 'spawning',
+        supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null },
+      }),
+    ]);
+    expect(map.has('job-1')).toBe(false);
   });
 });

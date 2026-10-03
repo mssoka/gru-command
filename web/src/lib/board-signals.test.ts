@@ -256,6 +256,13 @@ describe('unackedByJob', () => {
     for (const status of terminal) {
       expect(isJobConcluded(status), status).toBe(true);
     }
+    // Bidirectional equivalence over the known job-status universe
+    // (tracked-review A6): the web twin must conclude EXACTLY the ledger's
+    // terminal set. A web-only addition would otherwise keep counting rows
+    // the web reclassifies as receipts while every test stayed green.
+    const knownStatuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done'];
+    const webConcluded = knownStatuses.filter((status) => isJobConcluded(status)).sort();
+    expect(webConcluded).toEqual([...terminal].sort());
   });
 
   it('terminalBoundNotificationIds names the closed receipts — terminal bindings only, never guessing', () => {
@@ -282,6 +289,31 @@ describe('unackedByJob', () => {
       }),
     );
     expect([...ids]).toEqual(['n-merged']);
+  });
+
+  it('a producer escalation row bound to a terminal lane is a closed receipt (A4 pairing)', () => {
+    const bound = (id: string, jobId: string): AgentView => ({
+      id, role: 'minion', label: null, state: 'idle', lastActivity: null, sessionFile: null, jobId, roundId: null, supervision: null,
+    });
+    const snap = snapshot({
+      repos: [
+        {
+          name: 'demo',
+          jobs: [job({ id: 'merged-1', status: 'merged' }), job({ id: 'live-1', status: 'working' })],
+        },
+      ],
+      agents: [bound('am', 'merged-1'), bound('al', 'live-1')],
+      notifications: [
+        notification('n-escal-merged', { kind: 'review-escalation', agentId: 'am' }),
+        notification('n-escal-live', { kind: 'review-escalation', agentId: 'al' }),
+      ],
+    });
+    // The producers bind lane rows through the existing agentId
+    // (tracked-review A4): the merged lane's escalation is a receipt and
+    // never attributes to the banded view; the live lane's stays live.
+    expect([...unackedByJob(snap).entries()]).toEqual([['live-1', 1]]);
+    expect(terminalBoundNotificationIds(snap).has('n-escal-merged')).toBe(true);
+    expect(terminalBoundNotificationIds(snap).has('n-escal-live')).toBe(false);
   });
 });
 

@@ -91,9 +91,11 @@ export interface WorkerStopView {
  * must find it to re-arm). A stopped worker marks the lane only when no
  * live (non-stopped, non-breaker, non-disposed) worker is NEWER — or
  * none exists; when several workers are stopped, the NEWEST recorded
- * stop (by lastActivity) speaks for the lane. Unknown timestamps favor
- * the live worker, so a re-dispatched lane never reads waiting from its
- * previous worker. */
+ * stop (by lastActivity) speaks for the lane. A KNOWN live stamp must be
+ * strictly older for the stop to win: an unknown live stamp (a fresh
+ * worker registered before its first activity — last_activity is NULL)
+ * favors the live worker, so a re-dispatched lane never reads waiting
+ * from its previous worker. */
 export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
   const stopped = new Map<string, { readonly view: WorkerStopView; readonly at: number }>();
   const liveAt = new Map<string, number>();
@@ -130,8 +132,13 @@ export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, W
   const result = new Map<string, WorkerStopView>();
   for (const [jobId, entry] of stopped) {
     const live = liveAt.get(jobId);
+    // The stop marks the lane only when no live worker exists, or the
+    // newest live worker has a KNOWN and strictly older stamp. An unknown
+    // live stamp favors the live worker (registerAgent inserts
+    // last_activity NULL), so the fresh-worker window never inherits the
+    // previous worker's stop (final tracked-review A0/A1/E1/V1).
     const waiting =
-      live === undefined || (Number.isFinite(entry.at) && (!Number.isFinite(live) || entry.at > live));
+      live === undefined || (Number.isFinite(entry.at) && Number.isFinite(live) && entry.at > live);
     if (waiting) result.set(jobId, entry.view);
   }
   return result;

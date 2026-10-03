@@ -94,7 +94,7 @@ const PINS: Record<string, number> = {
   'silas-deterministic-seam.test.ts': 1,
   'session-store.test.ts': 14,
   'shutdown.test.ts': 4,
-  'silas-driver.test.ts': 37,
+  'silas-driver.test.ts': 38,
   'silas-followthrough.test.ts': 2,
   'smoke-claude.test.ts': 1,
   'smoke-real-model.test.ts': 1,

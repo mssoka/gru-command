@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -341,18 +341,25 @@ describe('silas digest (the four actionable states)', () => {
       // a blanket mute).
       view = null;
       expect((await digestOf()).stalledWorking).toHaveLength(1);
-      // The same any-live rule the board renders: a stopped NEWEST worker
-      // must not mute the lane while an older live worker remains — the
-      // live worker's silence is the stall (final independent review B1).
+      // The SHARED cross-surface fixture (same ids/stamps/reason as the web
+      // test 'a newer stop wins over an older live record'): a stopped
+      // worker newer than the older live record marks the lane WAITING on
+      // the board, so this stall channel must NOT wake it (tracked-review
+      // A1/E0/V0).
       h.ledger.registerAgent({ id: 'min-other-live', role: 'minion', jobId: 'job-walled' });
       h.ledger.setAgentState('min-other-live', 'idle');
       view = { ...base, state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' };
-      // Make the stopped worker the newest record too: the old
-      // newest-only rule would have muted this lane.
+      // Make the stopped worker the newest record: the stop is the lane's
+      // current worker, and the board pins the same expectation.
       h.ledger.setAgentState('min-walled', 'idle');
       const mixed = await digestOf();
-      expect(mixed.stalledWorking).toHaveLength(1);
-      expect(mixed.stalledWorking[0]?.minionId).toBe('min-other-live');
+      expect(mixed.stalledWorking).toHaveLength(0);
+      // The mirrored direction: a stop OLDER than the live worker does not
+      // wait, and the live worker's silence stalls again.
+      h.ledger.setAgentState('min-other-live', 'idle');
+      const reDispatched = await digestOf();
+      expect(reDispatched.stalledWorking).toHaveLength(1);
+      expect(reDispatched.stalledWorking[0]?.minionId).toBe('min-other-live');
       // A DISPOSED unsupervised record is not a live worker: a lane with a
       // current stopped worker plus a dead record stays waiting and is
       // never woken as stalled (round-3 finding).
@@ -422,6 +429,17 @@ describe('silas digest (the four actionable states)', () => {
     expect(lookup('other')).toBeNull();
     // A missing supervisor (not yet constructed at boot) reads as no view.
     expect(supervisionLookup(null)('wired')).toBeNull();
+  });
+
+  it('the main assembly wires the supervisor stop truth into the driver (assembly alarm)', () => {
+    // Tracked-review V2: the behavior has unit coverage but no assembly
+    // pin — dropping `supervisionFor: supervisionLookup(supervisor)` in
+    // main.ts would silently re-enable stall wakes for stopped lanes and
+    // no behavioral test would fail. This is the repo's established
+    // source-drift alarm pattern.
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(/supervisionFor:\s*supervisionLookup\(\s*supervisor\s*\)/);
+    expect(mainSource).toMatch(/import\s*\{[^}]*\bsupervisionLookup\b[^}]*\}\s*from\s*'\.\/dispatch\/silas-driver\.js'/);
   });
 
   it('a fresh delivery after a changes-requested verdict is re-review due, not directive-due', async () => {

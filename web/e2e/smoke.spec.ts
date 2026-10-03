@@ -653,6 +653,15 @@ test.describe('board (E6, mock feed)', () => {
 
       // Chip and bands agree: only the live machine row (mock-n5) counts.
       await expect(page.locator('#board-unacked')).toContainText('1 needs Gru');
+      // Scoped acceptance clips (tracked-review A10): the full-page capture
+      // is taken under sticky chrome that can occlude the IN FLIGHT band,
+      // so the NEEDS GRU band and the waiting row get their own clips — the
+      // band shows the closed-receipt exclusion, the row shows the
+      // stopped-lane waiting state directly.
+      await page
+        .locator('.board-band--needs-you')
+        .screenshot({ path: testInfo.outputPath(`board-truth-needs-gru-${theme}.png`) });
+      await walled.screenshot({ path: testInfo.outputPath(`board-truth-waiting-${theme}.png`) });
       await page.screenshot({ path: testInfo.outputPath(`board-truth-${theme}.png`), fullPage: true });
 
       // The bell keeps the durable record: the merged lane's leftover row

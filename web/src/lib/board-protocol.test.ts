@@ -174,14 +174,15 @@ describe('board server-frame validator', () => {
     }
   });
 
-  it('validates a present supervision block at the parse boundary (stopReason null | string; junk rejects)', () => {
+  it('validates a present supervision block at the parse boundary (known state, boolean breaker, finite restarts; junk rejects)', () => {
     const withSupervision = (supervision: unknown): unknown => {
       const candidate = snapshot();
       (candidate.agents[0] as unknown as { supervision: unknown }).supervision = supervision;
       return candidate;
     };
     // Accept: a stopped lane with a recorded reason, a stop without one
-    // (pre-reason server), and the watching baseline with stopReason absent.
+    // (pre-reason server), the watching baseline with stopReason absent,
+    // and supervision absent/null (unsupervised).
     expect(
       isValidSnapshot(withSupervision({ state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' })),
     ).toBe(true);
@@ -189,6 +190,8 @@ describe('board server-frame validator', () => {
       isValidSnapshot(withSupervision({ state: 'stopped', restarts: 0, breakerOpen: true, stopReason: null })),
     ).toBe(true);
     expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: 0, breakerOpen: false }))).toBe(true);
+    expect(isValidSnapshot(withSupervision(null))).toBe(true);
+    expect(isValidSnapshot(withSupervision(undefined))).toBe(true);
     // Reject: a present-but-junk block is a server bug, never "no reason".
     expect(
       isValidSnapshot(withSupervision({ state: 'stopped', restarts: 0, breakerOpen: true, stopReason: 7 })),
@@ -197,6 +200,15 @@ describe('board server-frame validator', () => {
       isValidSnapshot(withSupervision({ state: 'stopped', restarts: 0, breakerOpen: true, stopReason: {} })),
     ).toBe(false);
     expect(isValidSnapshot(withSupervision('stopped'))).toBe(false);
+    // Reject malformed PRESENT fields (tracked-review A9): a truthy
+    // non-boolean breaker must never read as a false-live lane, an unknown
+    // state is not a state, and a non-finite/negative restart count is not
+    // a count.
+    expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: 0, breakerOpen: 1 }))).toBe(false);
+    expect(isValidSnapshot(withSupervision({ state: 'stopped', restarts: 'x', breakerOpen: true }))).toBe(false);
+    expect(isValidSnapshot(withSupervision({ state: 'flying', restarts: 0, breakerOpen: false }))).toBe(false);
+    expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: -1, breakerOpen: false }))).toBe(false);
+    expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: Number.NaN, breakerOpen: false }))).toBe(false);
   });
 
   it('FOR YOU ownerPrs: absent/null tolerated (pre-upgrade servers), well-formed accepted, malformed rejected', () => {

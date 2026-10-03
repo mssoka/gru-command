@@ -569,6 +569,10 @@ describe('github signal poll tick', () => {
     try {
       addTrackedJob(h.ledger, 'job-merge', 'https://github.com/acme/app/pull/10');
       addTrackedJob(h.ledger, 'job-conflict', 'https://github.com/acme/app/pull/11');
+      // The lane's worker is the existing agentId binding the escalation
+      // row carries (tracked-review A4): the job is already validated by
+      // the poll, so the row is bound without guessing.
+      h.ledger.registerAgent({ id: 'minion-conflict', role: 'minion', jobId: 'job-conflict' });
       const api = new FakeGhApi();
       api.pulls.set('acme/app', [
         pull({ number: 10, headRef: 'gru/job-merge', headSha: 'sha-10', merged: true, mergeCommitSha: 'mc-10', url: 'https://github.com/acme/app/pull/10' }),
@@ -604,6 +608,7 @@ describe('github signal poll tick', () => {
         routing: 'action-required',
         severity: 'error',
         dedupe: 'unacked',
+        agentId: 'minion-conflict',
       });
       expect(notifications.posts[0]?.detail).toContain('rebase');
 

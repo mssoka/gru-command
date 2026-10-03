@@ -389,6 +389,11 @@ function escalateRecoveryFailure(
   error: unknown,
 ): void {
   const kinds = group.map((marker) => marker.kind).join(', ');
+  // Bind the row to the recorded re-brief worker when one was spawned
+  // before the failure (existing agentId semantics) so the escalation is
+  // classified as a closed receipt once the lane goes terminal; a marker
+  // with no worker stays unbound and live (tracked-review A4).
+  const boundAgent = group.find((marker) => marker.agentId !== null)?.agentId ?? null;
   try {
     deps.notifications.postIncident({
       kind: `silas.rebrief-unreconciled.${jobId}`,
@@ -400,6 +405,7 @@ function escalateRecoveryFailure(
         `re-dispatch the worker: ${String(error)}. Pending markers (${kinds}) remain; the ` +
         'next boot retries — or re-brief the lane once the cause is cleared.',
       dedupe: 'unacked',
+      agentId: boundAgent,
     });
   } catch (notificationError) {
     deps.log?.('error', 're-brief recovery escalation could not be posted', {

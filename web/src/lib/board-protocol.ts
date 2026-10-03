@@ -302,6 +302,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+const SUPERVISION_STATES = ['watching', 'restarting', 'stopped'] as const;
+
+/** The E7 supervision block's known states: an unknown state is a server
+ * bug, never a silently tolerated value. */
+function isSupervisionState(value: unknown): value is (typeof SUPERVISION_STATES)[number] {
+  return typeof value === 'string' && (SUPERVISION_STATES as readonly string[]).includes(value);
+}
+
+/** A restart count must be a finite non-negative number. A malformed value
+ * must not reach the chip/stop predicate as a false-live read (tracked-
+ * review A9). */
+function isRestartCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
 /** Parse one OUTBOUND client frame (the auth frame clients send); null on
  * anything malformed. Lives here so server and web share the same rules
  * (parity-tested in test/board-frames.test.ts). */
@@ -509,10 +524,15 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       typeof agent.state === 'string' &&
       // supervision is optional (null when the agent is unsupervised);
       // stopReason is optional too (pre-reason servers) — present, it is
-      // a nullable string.
+      // a nullable string. The whole PRESENT block is typed strictly (A9):
+      // known state, boolean breakerOpen, finite non-negative restarts —
+      // a truthy non-boolean breaker must never read as a false-live lane.
       (agent.supervision === null ||
         agent.supervision === undefined ||
-        (isRecord(agent.supervision) && typeof agent.supervision.state === 'string' &&
+        (isRecord(agent.supervision) &&
+          isSupervisionState(agent.supervision.state) &&
+          typeof agent.supervision.breakerOpen === 'boolean' &&
+          isRestartCount(agent.supervision.restarts) &&
           (agent.supervision.stopReason === undefined ||
             agent.supervision.stopReason === null ||
             typeof agent.supervision.stopReason === 'string'))),

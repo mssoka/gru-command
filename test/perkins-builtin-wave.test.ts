@@ -1749,6 +1749,14 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     settleLane(ledger, job.id);
     ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
     attachOrigin(repo, branch, root, { batched: true });
+    // Equivalence pin (tracked-review A8): the batched bare clone must
+    // carry the reviewed branch at the SAME tip the historical init+push
+    // shape produced, so the T4 legs stay end-to-end equivalent and a
+    // future origin-topology reader cannot be masked here.
+    const originTip = execFileSync('git', ['-C', join(root, 'origin.git'), 'rev-parse', `refs/heads/${branch}`], {
+      encoding: 'utf-8',
+    }).trim();
+    expect(originTip).toBe(target);
     return { repo, ledger, port, artifacts, sessions, target, job, root };
   };
 

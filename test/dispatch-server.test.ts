@@ -1034,6 +1034,9 @@ describe('dispatch server (E8)', () => {
     const h = await boot();
     try {
       h.ledger.addJob({ id: 'esc-job', repo: 'r', title: 't', briefing: 'b' });
+      // The lane's bound minion is the existing agentId binding the row
+      // carries (tracked-review A4): validated job + actual identity.
+      h.ledger.registerAgent({ id: 'esc-minion', role: 'minion', jobId: 'esc-job' });
       const res = await call(h.port, 'POST', '/api/silas/escalate', {
         title: 'Same blocker recurred past the ladder',
         detail: 'job esc-job: fingerprint correctness::src/a.ts::null deref, 4 consecutive rounds',
@@ -1047,6 +1050,14 @@ describe('dispatch server (E8)', () => {
       const notification = h.ledger.listNotifications().find((row) => row.id === notificationId);
       expect(notification?.routing).toBe('action-required');
       expect(notification?.severity).toBe('error');
+      expect(notification?.agentId).toBe('esc-minion');
+      // A job-less escalation stays unbound (never guessed).
+      const noJob = await call(h.port, 'POST', '/api/silas/escalate', { title: 'no lane' }, TOKEN);
+      expect(noJob.status).toBe(200);
+      const noJobNotification = h.ledger
+        .listNotifications()
+        .find((row) => row.id === field<string>(noJob.json, 'notification_id'));
+      expect(noJobNotification?.agentId).toBeNull();
       // unknown job id fails loud; empty title fails loud
       const unknown = await call(h.port, 'POST', '/api/silas/escalate', { title: 'x', job_id: 'nope' }, TOKEN);
       expect(unknown.status).toBe(400);

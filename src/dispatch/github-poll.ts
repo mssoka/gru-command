@@ -640,6 +640,9 @@ export interface GitHubPollLedger {
   getJob(id: string): JobRecord | null;
   listWorktrees(opts?: { jobId?: string }): readonly WorktreeRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
+  /** The lane's bound agent rows — used to bind escalation rows to their
+   * lane's worker through the existing notification agentId field. */
+  listAgents(): readonly { readonly id: string; readonly jobId: string | null; readonly role: string }[];
   appendCustomEvent(fields: {
     kind: string;
     jobId?: string | null;
@@ -656,6 +659,7 @@ export interface GitHubPollNotifications {
     title: string;
     detail?: string | null;
     dedupe: 'unacked' | 'active' | 'all';
+    agentId?: string | null;
   }): unknown;
 }
 
@@ -1027,6 +1031,16 @@ export class GitHubSignalPoll {
       title: `PR ${prLabel} conflicts with its base (${repoFullName(signal.repo)})`,
       detail,
       dedupe: 'unacked',
+      // Bind the row to the lane's current worker (existing agentId
+      // semantics) so a merged/done lane's leftover row is classified as
+      // a closed receipt instead of live NEEDS GRU work. The job is
+      // already validated by the poll; no bound worker → unbound and
+      // live (unknown historical rows are never guessed; tracked-review
+      // A4).
+      agentId:
+        this.ledger
+          .listAgents()
+          .find((agent) => agent.jobId === signal.jobId && agent.role === 'minion')?.id ?? null,
     });
     this.log('info', 'github poll: PR conflict observed', {
       job: signal.jobId,

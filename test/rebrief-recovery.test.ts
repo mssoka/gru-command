@@ -335,7 +335,13 @@ describe('re-brief restart safety (durable markers)', () => {
   it('a failed re-dispatch escalates action-required and keeps the markers for the next boot', async () => {
     const h = makeHarness();
     const jobId = 'failed-job';
-    await seedPendingRebrief({ h, jobId });
+    await seedPendingRebrief({
+      h,
+      jobId,
+      // A worker was spawned before the restart: the recorded agent id is
+      // the existing agentId binding the escalation carries (A4).
+      bindWorker: { agentId: 'rebrief-worker', sessionFile: null },
+    });
     h.registry.failSpawn = new Error('provider unavailable');
     const report = await reconcilePendingRebriefs(
       {
@@ -351,6 +357,7 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(notification).toBeDefined();
     expect(notification?.routing).toBe('action-required');
     expect(notification?.severity).toBe('error');
+    expect(notification?.agentId).toBe('rebrief-worker');
     expect(notification?.detail).toContain('provider unavailable');
     // The invariant: markers clear ONLY when the events land — still pending.
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
