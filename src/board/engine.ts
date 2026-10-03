@@ -98,6 +98,9 @@ export interface AgentView {
   readonly label: string | null;
   readonly state: AgentState;
   readonly lastActivity: string | null;
+  /** Row registration stamp: the board's stall clock floor for a fresh
+   * worker that has not sent its first frame (twelve-followthrough A1/E1). */
+  readonly createdAt: string;
   readonly sessionFile: string | null;
   readonly jobId: string | null;
   readonly roundId: string | null;

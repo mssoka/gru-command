@@ -26,6 +26,10 @@ import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { createReviewEscalationNotifier } from '../src/dispatch/escalation-identity.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import {
+  isValidSnapshot,
+  type BoardSnapshot as WireBoardSnapshot,
+} from '../web/src/lib/board-protocol.js';
 import { terminalBoundNotificationIds } from '../web/src/lib/board-signals.js';
 
 /** These suites exercise the Perkins route (no pre-flight configured), so
@@ -701,8 +705,13 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobStatus(job.id, 'merged');
     expect(ledger.countLivePendingActionRequired()).toBe(liveBefore);
     expect(ledger.countPendingActionRequiredIncludingReceipts()).toBe(receiptsBefore + 1);
-    const receiptSnapshot = new BoardEngine({ ledger, bus: new EventBus() }).snapshot();
-    expect(terminalBoundNotificationIds(receiptSnapshot)).toContain(chainRow?.id);
+    // The engine's server-side snapshot and the web's wire type are
+    // separate namespaces: cross them the way the wire does — serialize,
+    // validate with the web parser, then classify. A shape drift fails the
+    // validator here instead of silently changing the board's truth.
+    const wireValue: unknown = JSON.parse(JSON.stringify(new BoardEngine({ ledger, bus: new EventBus() }).snapshot()));
+    expect(isValidSnapshot(wireValue)).toBe(true);
+    expect(terminalBoundNotificationIds(wireValue as WireBoardSnapshot)).toContain(chainRow?.id);
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
   });
