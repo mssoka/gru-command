@@ -126,10 +126,11 @@ board-pr-number-links = "node tools/patch-vitest-rpc-timeout.mjs && cd web && ..
 # tests overlaid on the pinned lane base (old generic-label board.ts) with
 # dependencies linked by symlink — no download/install, no branch mutation.
 # The baseline lacks the label change, so assertion RED is EXPECTED
-# (compilation/import/setup failure would not be RED evidence). The Vitest
-# exit is left intact, never masked; the ignored pointer file records the
-# snapshot, which is preserved for inspection.
-board-pr-number-links-baseline = 'set -e; base=5d56194a905262231bb0d183292b6d08c70810; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-pr-number-links.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-pr-number-links-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-pr-number-links-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/ui/board.test.ts'
+# (compilation/import/setup failure would not be RED evidence). The archive
+# step writes an explicit file so a bad base sha aborts loudly instead of
+# masking behind a tar pipe; the Vitest exit is left intact, never masked;
+# the ignored pointer file records the snapshot, preserved for inspection.
+board-pr-number-links-baseline = 'set -e; base=5d56194a905262231bb0d183292b6d08cbd70810; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-pr-number-links.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-pr-number-links-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-pr-number-links-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/ui/board.test.ts'
 
 # Browser evidence (j-982 acceptance C/D): typecheck + production web build
 # + the FULL existing mock Playwright project (no filters). The mock project
