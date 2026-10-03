@@ -1,4 +1,5 @@
 import type { Role } from '../config.js';
+import { promptWithTerminalVerdict } from './prompt-verdict.js';
 import type {
   AgentHandle,
   AgentRuntime,
@@ -6,6 +7,7 @@ import type {
   ContextUsage,
   PendingTurn,
   PromptOptions,
+  PromptTurnVerdict,
   RuntimeEvent,
   RuntimeEventListener,
   RuntimeHealth,
@@ -55,7 +57,7 @@ class FallbackRuntime implements AgentRuntime {
 interface QueuedTurn {
   text: string;
   options: PromptOptions;
-  resolve: () => void;
+  resolve: (verdict: PromptTurnVerdict) => void;
   reject: (error: Error) => void;
   /** Opt-in queued-wait cap (E7): rejects THIS caller when it fires. */
   timer: ReturnType<typeof setTimeout> | null;
@@ -217,17 +219,22 @@ class FallbackHandle implements AgentHandle {
 
   prompt(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
+    return this.request(text, options, 'single-writer').then(() => {});
+  }
+
+  promptWithVerdict(text: string, options: PromptOptions = {}): Promise<PromptTurnVerdict> {
+    this.assertLive();
     return this.request(text, options, 'single-writer');
   }
 
   steer(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
-    return this.request(text, options, 'steer-unable');
+    return this.request(text, options, 'steer-unable').then(() => {});
   }
 
   followUp(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
-    return this.request(text, options, 'single-writer');
+    return this.request(text, options, 'single-writer').then(() => {});
   }
 
   /**
@@ -239,11 +246,11 @@ class FallbackHandle implements AgentHandle {
     text: string,
     options: PromptOptions,
     reason: 'single-writer' | 'steer-unable',
-  ): Promise<void> {
+  ): Promise<PromptTurnVerdict> {
     if (this.busy || this.queue.length > 0) {
       const owner = options.owner ?? 'default';
       this.emit({ type: 'queued', reason, owner });
-      return new Promise<void>((resolve, reject) => {
+      return new Promise<PromptTurnVerdict>((resolve, reject) => {
         const item: QueuedTurn = {
           text,
           options,
@@ -274,14 +281,19 @@ class FallbackHandle implements AgentHandle {
     return this.deliver(text, options);
   }
 
-  private async deliver(text: string, options: PromptOptions): Promise<void> {
+  private async deliver(text: string, options: PromptOptions): Promise<PromptTurnVerdict> {
     this.inFlight = true;
+    let captured: PromptTurnVerdict = { ok: true, error: null };
     try {
-      await this.inner.prompt(text, options);
+      // Capture the settled turn's verdict BEFORE the finally pumps the
+      // queue: a synchronously started successor's state must never be
+      // read as this turn's outcome (r5 blocker 1).
+      captured = await promptWithTerminalVerdict(this.inner, text, options);
     } finally {
       this.inFlight = false;
       void this.pump();
     }
+    return captured;
   }
 
   private async pump(): Promise<void> {
@@ -292,8 +304,8 @@ class FallbackHandle implements AgentHandle {
         const next = this.queue.shift()!;
         if (next.timer !== null) clearTimeout(next.timer);
         try {
-          await this.deliver(next.text, next.options);
-          next.resolve();
+          const verdict = await this.deliver(next.text, next.options);
+          next.resolve(verdict);
         } catch (error) {
           next.reject(error instanceof Error ? error : new Error(String(error)));
         }

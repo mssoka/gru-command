@@ -561,10 +561,15 @@ export class RuntimeRegistry {
           );
           return disposing;
         };
-        if (['prompt', 'steer', 'followUp', 'compact'].includes(String(property))) {
+        if (['prompt', 'steer', 'followUp', 'promptWithVerdict', 'compact'].includes(String(property))) {
           if (wrappers.has(String(property))) return wrappers.get(String(property));
+          const tracked = String(property);
           const method = Reflect.get(target, property) as ((...args: unknown[]) => Promise<unknown>) | undefined;
           if (method === undefined) {
+            // Per-turn evidence is an OPTIONAL capability (r6 architecture):
+            // absence means "no attestation", not an adapter defect — callers
+            // check for it. Required methods still fail loud.
+            if (tracked === 'promptWithVerdict') return undefined;
             throw new Error(
               `resident handle was asked for "${String(property)}" but its runtime adapter does not implement it`,
             );
@@ -580,11 +585,11 @@ export class RuntimeRegistry {
               const operation = method.apply(target, args);
               return Promise.resolve(operation).finally(() => {
                 pending -= 1;
-                // Only a real prompt delivers the briefing: steer/followUp
-                // alone must never mark an un-briefed session reclaim-
-                // eligible (docs/FLOW.md §4d "as-yet-undelivered first
-                // prompt").
-                if (property === 'prompt') completedPrompt = true;
+                // Only a real prompt delivers the briefing — plain or
+                // verdict-carrying: steer/followUp alone must never mark an
+                // un-briefed session reclaim-eligible (docs/FLOW.md §4d
+                // "as-yet-undelivered first prompt").
+                if (tracked === 'prompt' || tracked === 'promptWithVerdict') completedPrompt = true;
                 budget.changed();
               });
             } catch (error) {
@@ -593,7 +598,7 @@ export class RuntimeRegistry {
               return Promise.reject(error);
             }
           };
-          wrappers.set(String(property), wrapper);
+          wrappers.set(tracked, wrapper);
           return wrapper;
         }
         const value: unknown = Reflect.get(target, property);
