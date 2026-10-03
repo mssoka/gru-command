@@ -29,13 +29,8 @@ function tempDir(prefix: string): string {
 // Cost repair (a6 FULL-red follow-through): each simulated installation fans
 // out into node/npm/child chains, and the heaviest leg (three full installer
 // runs) can cross the unchanged 30s body deadline on a loaded vitest worker.
-// A shared V8 compile cache plus quiet npm startup removes startup work only:
-// no installer behavior, artifact, or assertion changes.
-let compileCacheDir: string | null = null;
-function nodeCompileCacheDir(): string {
-  compileCacheDir ??= tempDir('gru-install-one-line-node-cache-');
-  return compileCacheDir;
-}
+// Quiet npm startup removes the update-notifier child and progress work from
+// every spawned installation; no installer behavior or assertion changes.
 
 let lastStderr = '';
 
@@ -53,7 +48,6 @@ function run(
         ...process.env,
         ...env,
         ...(env.HOME ? { XDG_CONFIG_HOME: join(env.HOME, '.config') } : {}),
-        NODE_COMPILE_CACHE: nodeCompileCacheDir(),
         npm_config_update_notifier: 'false',
         npm_config_progress: 'false',
       },
@@ -648,7 +642,13 @@ describe('install.sh setup mode (one-line path)', () => {
 
     mkdirSync(dirname(unit), { recursive: true });
     writeFileSync(unit, '/someone/else/dist/main.js\n/someone/else/.gru-command\n');
-    const foreign = run(join(bare, 'install.sh'), [], env);
+    // The update legs invoke the checkout's own installer: the one-line
+    // wrapper's fresh-clone dance stays covered by the initial leg here and
+    // its clone-reuse/pull dance by the fast-forward legs' tests, while
+    // these two runs keep the exact update path (pull -> build -> service
+    // identity) under test. This drops one wrapper layer per leg from the
+    // heaviest body in the file without moving any service-identity oracle.
+    const foreign = run(join(target, 'install.sh'), [], env);
     expect(foreign.status).toBe(1);
     expect(foreign.stderr).toContain('refusing to restart unrelated service unit');
     expect(readFileSync(unit, 'utf-8')).toContain('/someone/else');
@@ -656,7 +656,7 @@ describe('install.sh setup mode (one-line path)', () => {
     const renderedOwned = run(join(target, 'install.sh'), ['--print'], env);
     expect(renderedOwned.status, renderedOwned.stderr).toBe(0);
     writeFileSync(unit, renderedOwned.stdout);
-    const owned = run(join(bare, 'install.sh'), [], env);
+    const owned = run(join(target, 'install.sh'), [], env);
     expect(owned.status, `${owned.stdout}\n${owned.stderr}`).toBe(0);
     expect(owned.stdout).toContain('restarting owned Gru Command service');
     const managerCalls = readFileSync(managerLog, 'utf-8');
