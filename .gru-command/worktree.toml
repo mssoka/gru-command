@@ -33,6 +33,12 @@ review-rebrief-interlock = "node tools/patch-vitest-rpc-timeout.mjs && npx vites
 # recomputed pins — unchanged configs/budgets, the approved RPC patch first,
 # plain vitest; scheduled only via /api/verify.
 review-rebrief-r1-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/branch-idle-guard.test.ts test/dispatch-server.test.ts test/worktree-port.test.ts test/silas-driver.test.ts test/suite-shape.test.ts"
+
+# Integrated-head report-shape scope (phase pr144-r1-main-integration-20261003):
+# the perkins-whole-review report-validation cases split one-per-case after the
+# integrated FULL timed out the inherited four-case block at the unchanged 30s
+# bound; filtered run of exactly those cases, approved RPC patch first.
+whole-review-report-shape = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-whole-review.test.ts -t \"report rejection\""
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
 # Provider-recovery sensor lane scopes (r4 fix round; invoked only via
