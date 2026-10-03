@@ -92,7 +92,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 
 | Kind | Payload (essentials) |
 |---|---|
-| `job.created` | repo, title |
+| `job.created` | repo, title, display_name |
 | `job.status` / `job.note` / `job.pr` / `job.target` | from→to / note / url / ref |
 | `round.created` / `round.status` / `round.verdict` / `round.target` | seq, lenses / from→to / verdict / ref |
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
@@ -197,3 +197,17 @@ on every row it creates, the `worktree.created` event carries it, and a
 FYI (owner incident 2026-09-23: lanes branched up to hours stale,
 silently). On REVIEW lanes `origin` covers any freshly fetched origin
 branch named by the target — not only the default branch.
+
+### E9: short heist names (migration 11)
+
+`jobs.display_name` is the optional short name the crew rail shows on
+minion cards (nullable: legacy rows read as NULL and fall back to a
+display-only, grapheme-bounded shortening of the title). `addJob` trims
+an authored value, rejects blank or visible-character-free names, and
+caps it at `JOB_DISPLAY_NAME_MAX_LENGTH` (100 characters); the dispatch
+API accepts the same value as `display_name`, maps a missing, blank or
+mistyped field to "no authored name" rather than an error, answers a
+too-long name with 400, and `job.created` payloads carry the stored
+value. Reads: `JobView.displayName` on `GET /api/board`; the full title
+and the full agent id stay on the job and in each row's tooltip, so
+nothing is lost when a name is shortened for display.

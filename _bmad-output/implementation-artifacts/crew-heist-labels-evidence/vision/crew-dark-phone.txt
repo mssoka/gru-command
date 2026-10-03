@@ -1,0 +1,22 @@
+1. **Theme/viewport:** Dark theme; phone width (narrow single-column rail, ~343px).
+
+2. **Rows (name | ID badge | subtext | pill):**
+   - `gru · chat` | `MOCK-GRU` | `GRU · IDLE` | `idle`
+   - `silas · ops` | `MOCK-SIL` | `SILAS · STREAMING 14S QUIET` | `streaming`
+   - `blind:001` | `MOCK-LEN` | `PERKINS · IDLE` | `idle`
+   - `fix the payment retry` | `NION` (visibly clipped — leading characters cut off, reads only "NION") | `MINION · IDLE` with a red ⛔ `STOPPED` label on the same line | `idle`
+   - `api docs pass` | `DOCS` | `MINION · IDLE` | `idle`
+   - `prepıs <script> & "café"` | `CODE` | `MINION · IDLE` | `idle`
+   - `bob · memory` | `MOCK-BOB` | `BOB · IDLE` | `idle`
+   - Footer line below the cards: `+1 disposed`
+
+3. **Any primary name starting with literal "minion":** no.
+
+4. **Clipping/overflow/overlap:** Not none. Row 4 (`fix the payment retry`): the ID badge is clipped/overlapped by the long name — only `NION` is visible where a longer badge label appears to start. Additionally, the red `STOPPED` text sits crowded against `MINION · IDLE` on the subtext line, ending very close to the card's right edge. No other clipping observed.
+
+5. **Long/Unicode row:** rendered as `prepıs <script> & "café"` (contains a dotless-ı and é with curly quotes). Fully readable, no ellipsis.
+
+6. **Contradictions:**
+   - Row 4 badge text is clipped to `NION` (violates "no text clipped/overlapped").
+   - Row 4 shows both an `idle` pill and a red `STOPPED` label on the subtext line — redundant/conflicting state presentation not described in expectations.
+   - Most ID badges are 8 characters (`MOCK-GRU`, `MOCK-SIL`, `MOCK-LEN`, `MOCK-BOB`), not the expected ~4.

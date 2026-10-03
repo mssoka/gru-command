@@ -73,12 +73,22 @@ export class LedgerDb {
 
     // Guard 1: every applied version must still exist in code — an unknown
     // version means this binary is OLDER than the database; running on
-    // would risk writing rows a missing migration shaped.
-    for (const id of applied.keys()) {
-      if (!migrations.some((m) => m.id === id)) {
+    // would risk writing rows a missing migration shaped. A recorded NAME
+    // that differs from code means the id was renamed or reused AFTER it
+    // was applied: continuing would silently skip the renamed SQL (or die
+    // on a duplicate column), so refuse with the mismatch named.
+    for (const [id, name] of applied) {
+      const coded = migrations.find((m) => m.id === id);
+      if (coded === undefined) {
         throw new Error(
           `ledger schema version ${id} is applied but unknown to this build — ` +
             'refusing to run an older binary against a newer ledger',
+        );
+      }
+      if (coded.name !== name) {
+        throw new Error(
+          `ledger migration ${id} was applied as "${name}" but this build defines ` +
+            `"${coded.name}" — refusing to run with a renamed migration`,
         );
       }
     }
@@ -400,5 +410,15 @@ export const MIGRATIONS: readonly Migration[] = [
         outcome      TEXT NOT NULL CHECK (outcome IN ('reserved','spent-unknown'))
       );
     `,
+  },
+  {
+    // Short heist names (owner-approved display, 2026-09-24): optional
+    // authored job label. Renumbered 9 -> 10 -> 11 across the two main integrations
+    // (worktree-base-source id 9; provider-recovery-waits id 10); never
+    // applied anywhere before this integration, so the renumber is safe
+    // and history-free.
+    id: 11,
+    name: 'job-display-name',
+    sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;',
   },
 ];

@@ -1,0 +1,17 @@
+{
+  "command": "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-protocol.test.ts && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=crew-rail && cd .. && npx vitest run test/ledger-db.test.ts test/ledger-api.test.ts test/board-engine.test.ts test/dispatch-server.test.ts test/dispatch-e2e.test.ts test/fix-directive.test.ts test/rebrief-recovery.test.ts test/silas-driver.test.ts test/supervisor.test.ts test/perkins-builtin-wave.test.ts test/lessons-injection.test.ts test/suite-shape.test.ts",
+  "durationMs": 303814,
+  "exitCode": 0,
+  "jobId": "crew-heist-labels",
+  "ok": true,
+  "outputBytes": 23705,
+  "outputSha256": "7272370a1f4b9a6fc40875ce2fe1ceb3f3a27c37bc60b4e2d28278726630ef2a",
+  "queuedMs": 201983,
+  "runId": "b1f96c2e-0377-48d7-a788-7b020a0afc20",
+  "scope": "crew-heist-labels",
+  "sha": "eeb62f091281d10477ed6be7ba602c171f050173",
+  "signal": null,
+  "timedOut": false,
+  "trackedDirty": false,
+  "workers": 14
+}

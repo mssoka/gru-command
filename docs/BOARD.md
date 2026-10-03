@@ -135,7 +135,11 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `✓ done` green · `✕ error` red · `— not used` neutral gray, no pass mark)
   behind a click.
 - **Crew rail:** CREW (n) / TRANSCRIPTS tabs above dense rows — a
-  status dot + name + short hash, a `role · state` subline (with turn
+  status dot + name + short hash (minion rows lead with the heist's
+  short name: the authored `display_name` when present, otherwise a
+  display-only shortening of the title, plus a normally four-character
+  id suffix extended only on same-heist collisions; full title and id
+  stay in the row's tooltip), a `role · state` subline (with turn
   age and supervision marks), and a right-aligned state chip; error rows
   carry the alert accent; disposed rows collapse behind a dashed `+N
   disposed` footer. Clicking an agent with a session file opens its

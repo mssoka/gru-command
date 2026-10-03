@@ -364,8 +364,10 @@ function runRebriefTurn(
 }
 
 /** The interrupted worker's session, when one exists on disk: the marker's
- * bound session first, then the job's latest minion (a crash between spawn
- * and marker binding). No resumable session means a fresh worker. */
+ * bound session first, then the job's latest IMPLEMENTER minion (a crash
+ * between spawn and marker binding). Review-only sessions (Gru ruling
+ * 2026-09-29) are never resume candidates, no matter how new their rows
+ * are. No resumable session means a fresh worker. */
 function resolveResumeFile(
   deps: ReconcileRebriefDeps,
   jobId: string,
@@ -373,8 +375,8 @@ function resolveResumeFile(
 ): string | null {
   const markerSession = group.find((marker) => marker.sessionFile !== null)?.sessionFile ?? null;
   const latestMinion = deps.ledger
-    .listAgents()
-    .find((agent) => agent.jobId === jobId && agent.role === 'minion' && agent.sessionFile !== null);
+    .listImplementerMinions(jobId)
+    .find((agent) => agent.sessionFile !== null) ?? null;
   const candidates = [markerSession, latestMinion?.sessionFile ?? null];
   for (const candidate of candidates) {
     if (candidate !== null && candidate !== '' && existsSync(candidate)) return candidate;

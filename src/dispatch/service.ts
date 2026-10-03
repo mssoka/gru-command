@@ -114,6 +114,7 @@ export class DispatchService {
     jobId: string;
     repoPath: string;
     title: string;
+    displayName?: string;
     briefing: string;
   }): Promise<DispatchOutcome> {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
@@ -126,6 +127,7 @@ export class DispatchService {
       id: input.jobId,
       repo: repoName,
       title: input.title,
+      displayName: input.displayName,
       briefing: input.briefing,
     });
 

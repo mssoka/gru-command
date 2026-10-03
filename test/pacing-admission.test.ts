@@ -192,8 +192,8 @@ describe('worker admission through directive deliveries', () => {
         disposeHandle: async () => {},
       },
       ledger: {
-        listAgents: () => [
-          { id: 'minion-1', jobId: 'job-1', role: 'minion' } as unknown as ReturnType<LedgerApi['listAgents']>[number],
+        listImplementerMinions: () => [
+          { id: 'minion-1', jobId: 'job-1', role: 'minion' } as unknown as ReturnType<LedgerApi['listImplementerMinions']>[number],
         ],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (() => null) as unknown as LedgerApi['getJob'],
@@ -231,8 +231,8 @@ describe('worker admission through directive deliveries', () => {
         disposeHandle: async () => {},
       },
       ledger: {
-        listAgents: () => [
-          { id: 'minion-1', jobId: 'job-1', role: 'minion' } as unknown as ReturnType<LedgerApi['listAgents']>[number],
+        listImplementerMinions: () => [
+          { id: 'minion-1', jobId: 'job-1', role: 'minion' } as unknown as ReturnType<LedgerApi['listImplementerMinions']>[number],
         ],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (() => null) as unknown as LedgerApi['getJob'],
@@ -276,8 +276,8 @@ describe('worker admission through directive deliveries', () => {
         disposeHandle: async () => {},
       },
       ledger: {
-        listAgents: () => [
-          { id: 'minion-1', jobId: 'job-1', role: 'minion', sessionFile: '/tmp/minion-1.jsonl' } as unknown as ReturnType<LedgerApi['listAgents']>[number],
+        listImplementerMinions: () => [
+          { id: 'minion-1', jobId: 'job-1', role: 'minion', sessionFile: '/tmp/minion-1.jsonl' } as unknown as ReturnType<LedgerApi['listImplementerMinions']>[number],
         ],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (() => null) as unknown as LedgerApi['getJob'],
@@ -321,8 +321,8 @@ describe('worker admission through directive deliveries', () => {
         disposeHandle: async () => {},
       },
       ledger: {
-        listAgents: () => [
-          { id: 'minion-1', jobId: 'job-1', role: 'minion', sessionFile: '/tmp/minion-1.jsonl' } as unknown as ReturnType<LedgerApi['listAgents']>[number],
+        listImplementerMinions: () => [
+          { id: 'minion-1', jobId: 'job-1', role: 'minion', sessionFile: '/tmp/minion-1.jsonl' } as unknown as ReturnType<LedgerApi['listImplementerMinions']>[number],
         ],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (() => null) as unknown as LedgerApi['getJob'],
@@ -365,7 +365,7 @@ describe('worker admission through directive deliveries', () => {
         disposeHandle: async () => {},
       },
       ledger: {
-        listAgents: () => [],
+        listImplementerMinions: () => [],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (() => null) as unknown as LedgerApi['getJob'],
       },

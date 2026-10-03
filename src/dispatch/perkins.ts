@@ -1950,6 +1950,17 @@ export class WaveRunner {
     let handle: AgentHandle | null = null;
     try {
       handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
+      // The ledger role is the review-worker role on purpose (Gru ruling
+      // 2026-09-29): this session runs ONE review pass and is forbidden
+      // from implementation edits, so it must never win an implementer
+      // pick (re-brief resume, Silas digest, fix-directive routing).
+      this.opts.ledger.registerAgent({
+        id: handle.id,
+        role: 'perkins',
+        label: 'fallback-review',
+        sessionFile: handle.sessionFile,
+        jobId: input.jobId,
+      });
       const prompt = [
         `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
         'This session runs ONE review pass inside a release gate. The host performs triage and every gate decision afterwards: do NOT approve, merge, or gate anything yourself, and do not modify implementation code.',

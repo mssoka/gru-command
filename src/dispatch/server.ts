@@ -3,6 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi } from '../ledger/api.js';
+import { JOB_DISPLAY_NAME_MAX_LENGTH } from '../ledger/api.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
@@ -187,10 +188,18 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     if (req.method === 'POST' && path === '/api/dispatch') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
+      // Optional-field idiom (target_ref and friends): an absent, null, or
+      // blank display_name means "no authored name" — the job falls back
+      // to its title. A real name is bounded here AND at the ledger write.
+      const displayName = optStrField(body, 'display_name')?.trim();
+      if (displayName !== undefined && displayName.length > JOB_DISPLAY_NAME_MAX_LENGTH) {
+        throw new Error(`display_name exceeds ${JOB_DISPLAY_NAME_MAX_LENGTH} characters`);
+      }
       const outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
         title: strField(body, 'title'),
+        ...(displayName !== undefined ? { displayName } : {}),
         briefing: strField(body, 'briefing'),
       });
       // The minion's turn runs in the background; the board carries the

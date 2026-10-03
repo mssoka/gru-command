@@ -4,8 +4,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { EventBus } from '../src/events/bus.js';
 import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
-import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
+import type { AgentHandle } from '../src/runtime/types.js';
+import type { WorktreeLane, WorktreePort } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { PacingGate } from '../src/runtime/pacing.js';
@@ -66,6 +70,94 @@ function laneAt(path: string, status: WorktreeLane['status'] = 'active'): Worktr
   };
 }
 
+describe('fresh fix worker association', () => {
+  it('binds the owning job before a failed prompt and keeps it after disposal', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-binding-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'owner-lane', repo: 'fixture', title: 'Full owner title' });
+      let disposed = false;
+      const handle = {
+        id: 'worker-uuid-0001', role: 'minion', sessionFile: '/fixture/session',
+        async prompt() {
+          expect(ledger.getAgent('worker-uuid-0001')?.jobId).toBe('owner-lane');
+          throw new Error('prompt failed');
+        },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: '/fixture/session' }; },
+        async dispose() { disposed = true; },
+      } satisfies AgentHandle;
+      await expect(routeFixDirectiveToMinion({
+        jobId: 'owner-lane', directive: 'repair', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
+      })).rejects.toThrow('prompt failed');
+      expect(disposed).toBe(true);
+      expect(ledger.getAgent(handle.id)).toMatchObject({ role: 'minion', jobId: 'owner-lane', sessionFile: '/fixture/session' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('never routes a directive into a review-only session, however new (Gru ruling 2026-09-29)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-reviewer-safe-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'reviewer-safe', repo: 'fixture', title: 't', briefing: 'b' });
+      // An implementer with NO live handle, and a NEWEST review-only row
+      // (round-bound minion) whose handle IS live — the old newest-first
+      // live-handle loop prompted the reviewer; routing must spawn fresh
+      // instead.
+      ledger.registerAgent({ id: 'impl-minion', role: 'minion', jobId: 'reviewer-safe', sessionFile: '/fixture/impl.jsonl' });
+      const round = ledger.addRound({ jobId: 'reviewer-safe', lenses: ['blind'] });
+      ledger.registerAgent({ id: 'rev-reviewer', role: 'minion', roundId: round.id, jobId: 'reviewer-safe', sessionFile: '/fixture/rev.jsonl' });
+      const bump = db.handle.prepare('UPDATE agents SET updated_at = ? WHERE id = ?');
+      bump.run('2026-09-29T12:00:01.000Z', 'impl-minion');
+      bump.run('2026-09-29T12:00:02.000Z', 'rev-reviewer');
+      const prompted: string[] = [];
+      let spawned = 0;
+      const reviewerHandle = {
+        id: 'rev-reviewer', role: 'minion', sessionFile: '/fixture/rev.jsonl',
+        async prompt() { prompted.push('rev-reviewer'); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: '/fixture/rev.jsonl' }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const freshHandle = {
+        id: 'fresh-worker', role: 'minion', sessionFile: '/fixture/fresh.jsonl',
+        async prompt() { prompted.push('fresh-worker'); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: '/fixture/fresh.jsonl' }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const outcome = await routeFixDirectiveToMinion({
+        jobId: 'reviewer-safe', directive: 'repair the flake', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: (id: string) => (id === 'rev-reviewer' ? reviewerHandle : null),
+          spawn: async () => { spawned += 1; return freshHandle; },
+          disposeHandle: async () => {},
+        },
+      });
+      expect(prompted).toEqual(['fresh-worker']);
+      expect(spawned).toBe(1);
+      expect(outcome.delivered).toBe(true);
+      expect(outcome.minionId).toBe('fresh-worker');
+    } finally {
+      db.close();
+    }
+  });
+});
 /** A complete AgentRecord row for ledger-port doubles (the port returns full
  * rows, never partial fixtures). */
 function minionRecord(id: string, jobId: string | null, sessionFile: string | null): AgentRecord {
@@ -219,6 +311,42 @@ describe('eviction-safe fix directives (phase 3)', () => {
     return { registry, failing, controller, calls, prompted };
   }
 
+  it('uses newest spawn order for both live picks and session fallback after integration', async () => {
+    for (const live of [true, false]) {
+      const root = mkdtempSync(join(tmpdir(), 'fix-directive-order-'));
+      cleanupDirs.push(root);
+      const db = new LedgerDb(root);
+      try {
+        const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+        ledger.addJob({ id: 'ordered-heist', repo: 'fixture', title: 'T', briefing: 'original contract' });
+        for (const id of ['old', 'new']) {
+          ledger.registerAgent({ id, role: 'minion', jobId: 'ordered-heist', sessionFile: `/sessions/${id}.jsonl` });
+        }
+        const stamp = db.handle.prepare('UPDATE agents SET created_at = ?, updated_at = ? WHERE id = ?');
+        stamp.run('2026-09-29T12:00:01Z', '2026-09-29T12:00:03Z', 'old');
+        stamp.run('2026-09-29T12:00:02Z', '2026-09-29T12:00:02Z', 'new');
+        const { registry, controller, calls, failing } = stubRegistry(null);
+        const prompted: string[] = [];
+        await routeFixDirectiveToMinion({
+          registry: {
+            ...registry,
+            getHandle: (id: string) => live ? { ...failing, id, prompt: async () => { prompted.push(id); } } : null,
+          } as never,
+          ledger, worktrees: { listWorktrees: () => [laneAt(root)] } as unknown as WorktreePort,
+          jobId: 'ordered-heist', directive: 'repair', signal: controller.signal,
+        });
+        if (live) {
+          expect(prompted).toEqual(['new']);
+          expect(calls).toEqual([]);
+        } else {
+          expect(calls[0]?.options.resumeFile).toBe('/sessions/new.jsonl');
+        }
+      } finally {
+        db.close();
+      }
+    }
+  });
+
   it('falls through a typed eviction rejection and resumes the FAILING logical session', async () => {
     const { WorkerDisposalInProgressError } = await import('../src/runtime/registry.js');
     const { registry, controller, calls } = stubRegistry(new WorkerDisposalInProgressError());
@@ -229,7 +357,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-evict' });
     const ledgerEvents: Array<{ kind: string; payload: unknown }> = [];
     const ledger = {
-      listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-evict', sessionFile: '/sessions/failing.jsonl' }],
+      listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-evict', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: (fields: { id: string }) => { ledgerEvents.push({ kind: 'agent', payload: fields }); },
       getJob: () => ({ briefing: 'original contract' }),
     };
@@ -251,7 +379,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
     cleanupRepos.push(repo);
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-resume' });
     const ledger = {
-      listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
+      listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: () => {},
       getJob: () => ({ briefing: 'original contract' }),
     };
@@ -282,7 +410,7 @@ describe('the non-draft PR rule on follow-up directives', () => {
         disposeHandle: async () => {},
       },
       ledger: {
-        listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
+        listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
         registerAgent: () => {},
         getJob: () => ({ briefing: 'original contract' }),
       } as never,
@@ -318,7 +446,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     const routing = routeFixDirectiveToMinion({
       registry: { getHandle: () => handle as never, spawn: async () => handle as never, disposeHandle: async () => {} },
       ledger: {
-        listAgents: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
+        listImplementerMinions: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
       },
@@ -355,7 +483,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         disposeHandle: async () => {},
       },
       ledger: {
-        listAgents: () => [],
+        listImplementerMinions: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
       },
@@ -381,7 +509,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         disposeHandle: async () => {},
       },
       ledger: {
-        listAgents: () => [],
+        listImplementerMinions: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
       },
@@ -410,7 +538,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     const routing = rebriefFreshMinion({
       registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
       ledger: {
-        listAgents: () => [],
+        listImplementerMinions: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
       },

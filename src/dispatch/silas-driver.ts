@@ -135,6 +135,9 @@ export interface DigestLedger {
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
+  /** Implementer minions only (Gru ruling 2026-09-29): review-only
+   * sessions never win a digest pick. */
+  listImplementerMinions(jobId: string): readonly AgentRecord[];
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
 }
@@ -409,9 +412,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // (1) Delivered, no PR yet.
     if (delivered !== null && job.prUrl === null && rounds.length === 0) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
-      const minion = input.ledger
-        .listAgents()
-        .filter((agent) => agent.jobId === job.id && agent.role === 'minion')
+      const minion = [...input.ledger.listImplementerMinions(job.id)]
         .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
       digest.deliveredWithoutPr.push({
         jobId: job.id,
@@ -502,9 +503,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
 
     // (4) Stalled lane: working with no delivery, minion gone quiet.
     if (job.status === 'working' && delivered === null) {
-      const minion = input.ledger
-        .listAgents()
-        .filter((agent) => agent.jobId === job.id && agent.role === 'minion')
+      const minion = [...input.ledger.listImplementerMinions(job.id)]
         .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
       if (minion !== undefined) {
         const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
+import { BoardEngine } from '../src/board/engine.js';
 import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
@@ -218,6 +219,7 @@ function boot(
   decisions?: DecisionService,
   opts: {
     wallNow?: () => number;
+    log?: (level: string, msg: string, fields?: Record<string, unknown>) => void;
     rateLimitBackoff?: RateLimitBackoffPolicy | null;
     workerGate?: PacingGate;
     sleep?: (ms: number) => Promise<void>;
@@ -264,6 +266,7 @@ function boot(
     notifications: center,
     ...(decisions !== undefined ? { decisions } : {}),
     ...(opts.wallNow !== undefined ? { wallNow: opts.wallNow } : {}),
+    ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.rateLimitBackoff !== undefined ? { rateLimitBackoff: opts.rateLimitBackoff } : {}),
     ...(opts.sleep !== undefined ? { sleep: opts.sleep } : {}),
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
@@ -771,6 +774,122 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(handle.disposed).toBe(true);
     expect(h.notificationsOfKind('supervision.fatal').length).toBe(fatalsBefore + 1);
     expect(h.notificationsOfKind('supervision.native-compaction-wait').length).toBe(waitsBefore);
+  });
+});
+
+describe('supervisor — durable restart association', () => {
+  it('carries the known job binding through both fresh-id and same-id minion restarts', async () => {
+    for (const sameId of [false, true]) {
+      const rig = boot();
+      const engine = new BoardEngine({ ledger: rig.api, bus: new EventBus() });
+      const unsubscribe = rig.registry.onAgentEvent((event) => engine.onRuntimeEvent(event));
+      try {
+        rig.api.addJob({ id: 'restart-heist', repo: 'fixture', title: 'Full restart heist title', displayName: 'restart fix' });
+        const original = new FakeHandle('minion', 'original-full-uuid-0001', '/fixture/minion.jsonl');
+        rig.registry.adopt(original);
+        rig.api.registerAgent({ id: original.id, role: 'minion', jobId: 'restart-heist' });
+        const replacementId = sameId ? original.id : 'replacement-full-uuid-0002';
+        rig.registry.spawnImpl = async (role, options) => new FakeHandle(role, replacementId, options?.resumeFile ?? null);
+        original.emit({ type: 'error', error: 'session stream died', fatal: true });
+        await vi.waitFor(() => expect(rig.supervisor.viewFor(replacementId)?.restarts).toBe(1));
+        expect(original.disposed).toBe(true);
+        expect(rig.api.getAgent(replacementId)).toMatchObject({ id: replacementId, role: 'minion', jobId: 'restart-heist' });
+        expect(rig.api.listImplementerMinions('restart-heist').map((agent) => agent.id)).toContain(replacementId);
+        const snapshot = engine.snapshot();
+        expect(snapshot.agents.find((agent) => agent.id === replacementId)?.jobId).toBe('restart-heist');
+        expect(snapshot.repos.flatMap((repo) => repo.jobs).find((job) => job.id === 'restart-heist')).toMatchObject({ title: 'Full restart heist title', displayName: 'restart fix' });
+      } finally {
+        unsubscribe();
+        rig.dispose();
+      }
+    }
+  });
+
+  it('carries fallback-review metadata to a fresh restart without making it an implementer', async () => {
+    const rig = boot();
+    const engine = new BoardEngine({ ledger: rig.api, bus: new EventBus() });
+    const unsubscribe = rig.registry.onAgentEvent((event) => engine.onRuntimeEvent(event));
+    try {
+      rig.api.addJob({ id: 'review-heist', repo: 'fixture', title: 'Review title' });
+      const original = new FakeHandle('minion', 'fallback-old-id', null);
+      rig.registry.adopt(original);
+      rig.api.registerAgent({ id: original.id, role: 'perkins', label: 'fallback-review', jobId: 'review-heist' });
+      rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'fallback-new-id', null);
+      original.emit({ type: 'error', error: 'session stream died', fatal: true });
+      await vi.waitFor(() => expect(rig.supervisor.viewFor('fallback-new-id')?.restarts).toBe(1));
+      expect(rig.api.getAgent('fallback-new-id')).toMatchObject({ role: 'perkins', label: 'fallback-review', jobId: 'review-heist' });
+      expect(rig.api.listImplementerMinions('review-heist')).toEqual([]);
+    } finally {
+      unsubscribe();
+      rig.dispose();
+    }
+  });
+
+  it('disposes a replacement whose known binding cannot be recorded before recovering its prompt', async () => {
+    const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+    const rig = boot(undefined, { log: (level, msg, fields) => logs.push({ level, msg, fields }) });
+    const engine = new BoardEngine({ ledger: rig.api, bus: new EventBus() });
+    const unsubscribe = rig.registry.onAgentEvent((event) => engine.onRuntimeEvent(event));
+    const replacements: FakeHandle[] = [];
+    try {
+      rig.api.addJob({ id: 'binding-retry', repo: 'fixture', title: 'Retry title' });
+      const original = new FakeHandle('minion', 'retry-original', null);
+      rig.registry.adopt(original);
+      rig.api.registerAgent({ id: original.id, role: 'minion', jobId: 'binding-retry' });
+      original.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:binding-retry' };
+      rig.registry.spawnImpl = async (role) => {
+        const handle = new FakeHandle(role, `binding-replacement-${replacements.length + 1}`, null);
+        if (replacements.length === 0) {
+          // The failed replacement's disposal also rejects: the original
+          // binding error must survive, never the dispose error.
+          const dispose = handle.dispose.bind(handle);
+          handle.dispose = async () => {
+            await dispose();
+            throw new Error('dispose after binding failure exploded');
+          };
+        }
+        replacements.push(handle);
+        return handle;
+      };
+      const register = rig.api.registerAgent.bind(rig.api);
+      vi.spyOn(rig.api, 'registerAgent').mockImplementation((input) => {
+        if (input.id === 'binding-replacement-1') throw new Error('restart binding write failed');
+        return register(input);
+      });
+      original.emit({ type: 'error', error: 'session stream died', fatal: true });
+      await vi.waitFor(() => expect(rig.supervisor.viewFor('binding-replacement-2')?.restarts).toBe(2));
+      expect(replacements[0]?.disposed).toBe(true);
+      expect(replacements[0]?.promptCalls).toEqual([]);
+      // The rung reports the actionable binding failure; the dispose
+      // rejection is logged separately and never masks it.
+      const rungErrors = logs
+        .filter((entry) => entry.msg === 'restart rung failed')
+        .map((entry) => String(entry.fields?.error));
+      expect(rungErrors).toEqual(['Error: restart binding write failed']);
+      expect(logs.some((entry) => entry.msg.includes('binding error is preserved'))).toBe(true);
+      expect(rig.api.getAgent('binding-replacement-2')?.jobId).toBe('binding-retry');
+      expect(replacements[1]?.promptCalls).toEqual([{ text: 'finish the briefing', owner: 'dispatch:binding-retry' }]);
+    } finally {
+      unsubscribe();
+      rig.dispose();
+    }
+  });
+
+  it('keeps an unlinked legacy worker neutral after a fresh restart', async () => {
+    const rig = boot();
+    const engine = new BoardEngine({ ledger: rig.api, bus: new EventBus() });
+    const unsubscribe = rig.registry.onAgentEvent((event) => engine.onRuntimeEvent(event));
+    try {
+      const original = new FakeHandle('minion', 'unlinked-old-id', null);
+      rig.registry.adopt(original);
+      rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'unlinked-new-id', null);
+      original.emit({ type: 'error', error: 'session stream died', fatal: true });
+      await vi.waitFor(() => expect(rig.supervisor.viewFor('unlinked-new-id')?.restarts).toBe(1));
+      expect(rig.api.getAgent('unlinked-new-id')).toMatchObject({ role: 'minion', jobId: null });
+    } finally {
+      unsubscribe();
+      rig.dispose();
+    }
   });
 });
 
