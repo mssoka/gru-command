@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, PipelineConflictError } from '../src/ledger/api.js';
-import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 import {
   evaluatePipelineEntry,
   pipelineBlockingReason,
@@ -376,5 +376,27 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     });
     expect(evaluation.state).toBe('waiting');
     db.close();
+  });
+
+  it('applies migration 14 over an existing v13 ledger without touching old rows', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-upgrade-'));
+    cleanupDirs.push(dir);
+    // A ledger frozen at the pre-pipeline schema (the shape an existing
+    // installation boots with).
+    const db13 = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 13) });
+    const ledger13 = new LedgerApi(db13.handle, { bus: new EventBus({}) });
+    ledger13.addJob({ id: 'legacy-job', repo: 'demo', title: 'Legacy', briefing: 'old brief' });
+    db13.close();
+
+    // Reboot with the full migration set: 14 applies, old rows survive,
+    // and the queue is immediately usable.
+    const db14 = new LedgerDb(dir);
+    const ledger14 = new LedgerApi(db14.handle, { bus: new EventBus({}) });
+    expect(ledger14.getJob('legacy-job')?.briefing).toBe('old brief');
+    enqueue(ledger14, 'pipe-new');
+    expect(ledger14.listPipelineEntries().map((entry) => entry.id)).toEqual(['pipe-new']);
+    const applied = db14.handle.prepare('SELECT id FROM schema_migrations ORDER BY id').all() as { id: number }[];
+    expect(applied.map((row) => row.id)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
+    db14.close();
   });
 });

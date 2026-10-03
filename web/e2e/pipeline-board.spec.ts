@@ -305,8 +305,11 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
     await capture(page, 'tablet-768-light-cold-jump');
   });
 
-  test('phone 390 and 360: usable strip, no body overflow, disclosures still reachable', async ({ page }) => {
+  test('phone 390 and 360: usable strip, no body overflow, disclosures still reachable', async ({ browser }) => {
     for (const width of [390, 360]) {
+      // A fresh page per width: route seeding must not stack across
+      // iterations.
+      const page = await browser.newPage();
       await page.setViewportSize({ width, height: 844 });
       const seed = await seedBoard(page, proofSnapshot());
       await pairAndOpenBoard(page);
@@ -331,7 +334,10 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       await expect(page.locator('.board-band--in-flight .board-job')).toHaveCount(7);
       await expect.poll(() => bodyOverflow(page)).toBeLessThanOrEqual(0);
       await capture(page, `phone-${width}-light-expanded`);
+      await page.locator('.board-band--in-flight .board-band__more').click();
+      await expect(page.locator('.board-band--in-flight .board-job')).toHaveCount(5);
       await capture(page, `phone-${width}-light-collapsed`);
+      await page.close();
     }
   });
 
