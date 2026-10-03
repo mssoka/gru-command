@@ -1,5 +1,6 @@
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, JobRecord } from '../ledger/api.js';
+import type { CompletionHandoffIntent } from '../ledger/obligations.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
@@ -9,6 +10,8 @@ import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 import { recordFollowUpDelivery } from './fix-directive.js';
+import { isPromptTurnVerdict, promptVerdictFromHealth } from '../runtime/prompt-verdict.js';
+import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import { PR_CREATION_RULE } from './pr-creation.js';
 
@@ -115,6 +118,11 @@ export class DispatchService {
     repoPath: string;
     title: string;
     briefing: string;
+    /** Explicit completion intent: when present, the phase-handoff guard
+     * row is persisted BEFORE any side effect and this exact phase's
+     * validated completion owes the named decision durably. Omitted =
+     * ordinary Silas completion. */
+    completionHandoff?: CompletionHandoffIntent;
   }): Promise<DispatchOutcome> {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
       throw new Error('dispatch requires a non-empty job id, title, and briefing');
@@ -136,6 +144,11 @@ export class DispatchService {
       payload: { repo: repoName, repoPath: input.repoPath },
     });
 
+    let handoffPhaseId: string | null = null;
+    // Tracks whether THIS run committed the terminal delivery event: a
+    // later bookkeeping failure must not close a phase whose completion
+    // evidence already exists (the boot reconciler finishes it instead).
+    let deliveredRecorded = false;
     let workerLease: PacingLease | null = null;
     const releaseWorker = (): void => {
       const lease = workerLease;
@@ -144,6 +157,17 @@ export class DispatchService {
     };
     try {
       const working = this.opts.ledger.setJobStatus(job.id, 'working');
+
+      // (2b) Explicit completion intent BEFORE admission/side effects: the
+      // durable guard row exists before any worktree or spawn, so a crash
+      // mid-dispatch is provably not a completion and the intent survives.
+      if (input.completionHandoff !== undefined) {
+        handoffPhaseId = this.opts.ledger.beginPhaseHandoff({
+          jobId: job.id,
+          source: 'dispatch',
+          intent: input.completionHandoff,
+        }).record.phaseId;
+      }
 
       // (3) One worktree per job, fresh head, own branch (ruling 18).
       const worktree = await this.opts.worktrees.createJobWorktree({
@@ -200,6 +224,11 @@ export class DispatchService {
         sessionFile: handle.sessionFile,
         jobId: job.id,
       });
+      // Bind the admitted worker to the marked phase BEFORE its prompt runs:
+      // a delivery from any other worker can never complete this phase.
+      if (handoffPhaseId !== null) {
+        this.opts.ledger.bindPhaseHandoffMinion({ phaseId: handoffPhaseId, minionId: handle.id });
+      }
       this.opts.ledger.appendCustomEvent({
         kind: 'job.minion-spawned',
         jobId: job.id,
@@ -217,7 +246,10 @@ export class DispatchService {
       // path concludes — never recorded as delivered while a retry could
       // still carry it, never disposed out from under that retry.
       const lessons = this.opts.lessons?.referencesFor(`${input.title}\n${input.briefing}`) ?? [];
-      const settleTurn = async (failure: unknown | null): Promise<{ readonly ok: boolean; readonly error?: string }> => {
+      const settleTurn = async (
+        failure: unknown | null,
+        verdict: PromptTurnVerdict | null,
+      ): Promise<{ readonly ok: boolean; readonly error?: string }> => {
         // Release the slot first: the retry reacquires admission per attempt.
         releaseWorker();
         const settlement = await settleRetries(this.opts.retrySettlement, handle.id, this.opts.stopSignal).then(
@@ -242,6 +274,12 @@ export class DispatchService {
             agent: handle.id,
             error: detail,
           });
+          // A failed attempt never masquerades as a completed marked phase:
+          // no delivery was recorded, so the guard row closes with reason.
+          this.closeHandoffQuietly(
+            handoffPhaseId,
+            `dispatch turn failed: pacing settlement unavailable — internal error: ${detail.slice(0, 200)}`,
+          );
           return { ok: false as const, error: detail };
         }
         const disposition = settlement.value;
@@ -261,6 +299,9 @@ export class DispatchService {
             job: job.id,
             agent: handle.id,
           });
+          // The turn recorded no delivery, so the marked phase cannot have
+          // completed: close the guard row instead of leaving a stale intent.
+          this.closeHandoffQuietly(handoffPhaseId, 'dispatch turn failed: service stopped before the automatic retries settled');
           return { ok: false as const, error: detail };
         }
         const retryFailed = disposition === 'exhausted' || disposition === 'superseded';
@@ -277,6 +318,9 @@ export class DispatchService {
             agent: handle.id,
             error,
           });
+          if (!deliveredRecorded) {
+            this.closeHandoffQuietly(handoffPhaseId, `dispatch turn failed: ${error}`);
+          }
           return { ok: false as const, error };
         }
         if (retryFailed) {
@@ -292,10 +336,36 @@ export class DispatchService {
             agent: handle.id,
             disposition,
           });
+          this.closeHandoffQuietly(handoffPhaseId, `dispatch turn failed: ${error}`);
           return { ok: false as const, error };
         }
+        // Terminal/error correlation (r4 blocker 1): a resolved prompt is
+        // not success — both adapters settle fulfilled prompts that ended in
+        // an in-band error (Claude result.isError; Pi stopReason 'error').
+        // Terminal/error correlation (r4/r5 blocker 1): the verdict was
+        // captured by the transport when THIS prompt settled — before any
+        // queued successor turn could start — and is held across the retry
+        // settlement above. A failed turn never records a phase-tagged
+        // delivery and never publishes a completed phase; a retry-recovered
+        // disposition is the retry's own clean turn (the supervisor
+        // supersedes itself on any further in-band error).
+        const evidence =
+          disposition === 'recovered'
+            ? ({ ok: true, error: null } as const)
+            : (verdict ?? promptVerdictFromHealth(handle));
+        if (!evidence.ok) {
+          return this.recordTurnFailure(
+            job.id,
+            handle.id,
+            handoffPhaseId,
+            deliveredRecorded,
+            evidence.error ?? 'runtime settled the briefing turn with an in-band error',
+          );
+        }
         const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
-          worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch' });
+          worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch',
+          ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}) });
+        deliveredRecorded = true;
         if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
           job: job.id, note: delivery.note, lane: delivery.lanePath,
         });
@@ -304,22 +374,32 @@ export class DispatchService {
         this.log('info', 'minion briefing turn completed', { job: job.id, agent: handle.id, disposition });
         return { ok: true as const };
       };
-      const settled = handle
-        .prompt(
-          renderMinionBriefing({
-            jobId: job.id,
-            repoName,
-            branch: worktree.branch ?? `gru/${job.id}`,
-            worktreePath: worktree.path,
-            sha: worktree.sha,
-            briefing: input.briefing,
-            ...(lessons.length > 0 ? { lessons } : {}),
-          }),
-          { owner: `dispatch:${job.id}` },
-        )
+      // The prompt promise resolves with captured per-turn evidence when
+      // the handle attests (`promptWithVerdict`); the fallback handle keeps
+      // the legacy void. The verdict is derived INSIDE this first `.then`
+      // (never an extra helper hop): the worker-admission release below is
+      // settle-leaf ordered and must not gain a microtask.
+      const briefing = renderMinionBriefing({
+        jobId: job.id,
+        repoName,
+        branch: worktree.branch ?? `gru/${job.id}`,
+        worktreePath: worktree.path,
+        sha: worktree.sha,
+        briefing: input.briefing,
+        ...(lessons.length > 0 ? { lessons } : {}),
+      });
+      const promptRun: Promise<unknown> =
+        handle.promptWithVerdict !== undefined
+          ? handle.promptWithVerdict(briefing, { owner: `dispatch:${job.id}` })
+          : handle.prompt(briefing, { owner: `dispatch:${job.id}` });
+      const settled = promptRun
         .then(
-          () => settleTurn(null),
-          (error: unknown) => settleTurn(error),
+          (value) =>
+            settleTurn(
+              null,
+              isPromptTurnVerdict(value) ? value : promptVerdictFromHealth(handle),
+            ),
+          (error: unknown) => settleTurn(error, null),
         )
         .finally(() => {
           releaseWorker();
@@ -330,7 +410,49 @@ export class DispatchService {
       releaseWorker();
       this.opts.ledger.setJobStatus(job.id, 'blocked');
       this.opts.ledger.noteJob(job.id, `dispatch failed: ${String(error)}`);
+      this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${String(error)}`);
       throw error;
+    }
+  }
+
+  /** One failure path for a rejected prompt AND a fulfilled-but-error
+   * turn: durable error event, blocked lane, and the marked guard row
+   * closed only when no delivery was recorded (a recorded delivery means
+   * the completion reconcile owns the phase). A failed attempt can never
+   * masquerade as a completed marked phase. */
+  private recordTurnFailure(
+    jobId: string,
+    agentId: string,
+    phaseId: string | null,
+    deliveredRecorded: boolean,
+    error: string,
+  ): { ok: false; error: string } {
+    this.opts.ledger.appendCustomEvent({
+      kind: 'job.minion-error',
+      jobId,
+      payload: { agentId, error },
+    });
+    this.recordSettleOutcome(jobId, 'blocked');
+    if (!deliveredRecorded) {
+      this.closeHandoffQuietly(phaseId, `dispatch turn failed: ${error}`);
+    }
+    this.log('error', 'minion briefing turn failed', { job: jobId, agent: agentId, error });
+    return { ok: false as const, error };
+  }
+
+  /** Close an awaiting marked-phase guard row after a positive failure.
+   * Never closes a completed phase (a recorded delivery already owns it),
+   * and a close failure is logged — the row stays awaiting, which is
+   * honest, and no completion evidence exists to fabricate a hand-back. */
+  private closeHandoffQuietly(phaseId: string | null, reason: string): void {
+    if (phaseId === null) return;
+    try {
+      const phase = this.opts.ledger.getPhaseHandoff(phaseId);
+      if (phase !== null && phase.state === 'awaiting') {
+        this.opts.ledger.closePhaseHandoff({ phaseId, reason });
+      }
+    } catch (error) {
+      this.log('error', 'phase handoff close after failure also failed', { phase: phaseId, error: String(error) });
     }
   }
 

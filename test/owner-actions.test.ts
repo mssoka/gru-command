@@ -89,34 +89,91 @@ describe('owner-action projection — fail-closed readiness gate', () => {
     });
   });
 
-  const notReady: readonly (readonly [string, OwnerPrJob, BranchEvidence | null])[] = [
-    ['job is not in-review (hold)', job({ status: 'blocked' }), evidence()],
-    ['job has no recorded PR', job({ prUrl: null }), evidence()],
-    ['prUrl is not https', job({ prUrl: 'http://insecure.example/pr' }), evidence()],
-    ['no branch-state evidence at all', job(), null],
-    ['evidence describes a different PR', job(), evidence({ prUrl: 'https://github.com/example/demo/pull/9' })],
-    ['PR already merged', job(), evidence({ merged: true, prOpen: false })],
-    ['PR closed without merging', job(), evidence({ prOpen: false })],
-    ['PR open/closed status never observed (legacy event)', job(), evidence({ prOpen: null })],
-    ['head sha missing', job(), evidence({ sha: null })],
-    ['mergeable dirty (conflicts)', job(), evidence({ mergeableState: 'dirty' })],
-    ['mergeable blocked (required gate)', job(), evidence({ mergeableState: 'blocked' })],
-    ['mergeable unknown', job(), evidence({ mergeableState: null })],
-    ['mergeable unstable', job(), evidence({ mergeableState: 'unstable' })],
-    ['CI unobserved', job(), evidence({ ci: null })],
-    ['CI pending', job(), evidence({ ci: { sha: SHA, status: 'pending', signature: '', failures: [], checks: [] } })],
-    ['CI failed', job(), evidence({ ci: { sha: SHA, status: 'failed', signature: 'ci|lint', failures: [{ name: 'ci', conclusion: 'failure', url: null }], checks: [] } })],
-    ['CI green but at an older sha (head moved)', job(), evidence({ sha: OTHER_SHA, ci: greenCi(SHA) })],
-    ['no review rounds', job({ rounds: [] }), evidence()],
-    ['newest round not verdict-posted', job({ rounds: [{ status: 'live', verdict: null, targetRef: SHA }] }), evidence()],
-    ['newest round changes-requested', job({ rounds: [{ status: 'verdict-posted', verdict: 'changes-requested', targetRef: SHA }] }), evidence()],
-    ['approval bound to an older head', job({ rounds: [{ status: 'verdict-posted', verdict: 'approved', targetRef: OTHER_SHA }] }), evidence()],
-  ];
-  for (const [name, jobInput, ev] of notReady) {
-    it(`renders NO ready row when: ${name}`, () => {
-      expect(ownerReadyPr(jobInput, ev)).toBeNull();
-    });
-  }
+  // Register each case explicitly: the full-suite shape guard must pin all
+  // 28 cases, not just one registration site hidden inside a loop.
+  it('renders NO ready row when: job is not in-review (hold)', () => {
+    expect(ownerReadyPr(job({ status: 'blocked' }), evidence())).toBeNull();
+  });
+
+  it('renders NO ready row when: job has no recorded PR', () => {
+    expect(ownerReadyPr(job({ prUrl: null }), evidence())).toBeNull();
+  });
+
+  it('renders NO ready row when: prUrl is not https', () => {
+    expect(ownerReadyPr(job({ prUrl: 'http://insecure.example/pr' }), evidence())).toBeNull();
+  });
+
+  it('renders NO ready row when: no branch-state evidence at all', () => {
+    expect(ownerReadyPr(job(), null)).toBeNull();
+  });
+
+  it('renders NO ready row when: evidence describes a different PR', () => {
+    expect(ownerReadyPr(job(), evidence({ prUrl: 'https://github.com/example/demo/pull/9' }))).toBeNull();
+  });
+
+  it('renders NO ready row when: PR already merged', () => {
+    expect(ownerReadyPr(job(), evidence({ merged: true, prOpen: false }))).toBeNull();
+  });
+
+  it('renders NO ready row when: PR closed without merging', () => {
+    expect(ownerReadyPr(job(), evidence({ prOpen: false }))).toBeNull();
+  });
+
+  it('renders NO ready row when: PR open/closed status never observed (legacy event)', () => {
+    expect(ownerReadyPr(job(), evidence({ prOpen: null }))).toBeNull();
+  });
+
+  it('renders NO ready row when: head sha missing', () => {
+    expect(ownerReadyPr(job(), evidence({ sha: null }))).toBeNull();
+  });
+
+  it('renders NO ready row when: mergeable dirty (conflicts)', () => {
+    expect(ownerReadyPr(job(), evidence({ mergeableState: 'dirty' }))).toBeNull();
+  });
+
+  it('renders NO ready row when: mergeable blocked (required gate)', () => {
+    expect(ownerReadyPr(job(), evidence({ mergeableState: 'blocked' }))).toBeNull();
+  });
+
+  it('renders NO ready row when: mergeable unknown', () => {
+    expect(ownerReadyPr(job(), evidence({ mergeableState: null }))).toBeNull();
+  });
+
+  it('renders NO ready row when: mergeable unstable', () => {
+    expect(ownerReadyPr(job(), evidence({ mergeableState: 'unstable' }))).toBeNull();
+  });
+
+  it('renders NO ready row when: CI unobserved', () => {
+    expect(ownerReadyPr(job(), evidence({ ci: null }))).toBeNull();
+  });
+
+  it('renders NO ready row when: CI pending', () => {
+    expect(ownerReadyPr(job(), evidence({ ci: { sha: SHA, status: 'pending', signature: '', failures: [], checks: [] } }))).toBeNull();
+  });
+
+  it('renders NO ready row when: CI failed', () => {
+    expect(ownerReadyPr(job(), evidence({ ci: { sha: SHA, status: 'failed', signature: 'ci|lint', failures: [{ name: 'ci', conclusion: 'failure', url: null }], checks: [] } }))).toBeNull();
+  });
+
+  it('renders NO ready row when: CI green but at an older sha (head moved)', () => {
+    expect(ownerReadyPr(job(), evidence({ sha: OTHER_SHA, ci: greenCi(SHA) }))).toBeNull();
+  });
+
+  it('renders NO ready row when: no review rounds', () => {
+    expect(ownerReadyPr(job({ rounds: [] }), evidence())).toBeNull();
+  });
+
+  it('renders NO ready row when: newest round not verdict-posted', () => {
+    expect(ownerReadyPr(job({ rounds: [{ status: 'live', verdict: null, targetRef: SHA }] }), evidence())).toBeNull();
+  });
+
+  it('renders NO ready row when: newest round changes-requested', () => {
+    expect(ownerReadyPr(job({ rounds: [{ status: 'verdict-posted', verdict: 'changes-requested', targetRef: SHA }] }), evidence())).toBeNull();
+  });
+
+  it('renders NO ready row when: approval bound to an older head', () => {
+    expect(ownerReadyPr(job({ rounds: [{ status: 'verdict-posted', verdict: 'approved', targetRef: OTHER_SHA }] }), evidence())).toBeNull();
+  });
 
   it('an approved round followed by a newer aborted round fails closed (newest verdict must be the approval)', () => {
     const jobInput = job({

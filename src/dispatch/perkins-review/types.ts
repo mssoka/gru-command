@@ -343,27 +343,36 @@ function normalize(value: string): string {
 
 export function dedupeVerifiedFindings(findings: readonly VerifiedFinding[]): readonly VerifiedFinding[] {
   const severityRank: Record<FindingSeverity, number> = { blocker: 3, warning: 2, note: 1 };
-  const byKey = new Map<string, VerifiedFinding>();
+  // The retained same-key judgment carries the actual round it came from.
+  // The finding's own `roundOrigin` stays the oldest origin (`Math.min`) for
+  // display provenance, so it cannot double as the judgment's recency mark.
+  type RetainedFinding = { readonly finding: VerifiedFinding; readonly judgmentRound: number };
+  const byKey = new Map<string, RetainedFinding>();
   for (const finding of findings) {
     const key = `${normalize(finding.title)}\0${normalize(finding.location)}`;
     const prior = byKey.get(key);
     if (prior === undefined) {
-      byKey.set(key, finding);
+      byKey.set(key, { finding, judgmentRound: finding.roundOrigin });
       continue;
     }
-    // Within one round the higher severity wins; across rounds the FRESHER
-    // judgment wins — a current downgrade must not lose to a stale
-    // carried-up severity the reviewer explicitly moved away from.
-    const preferred = prior.roundOrigin === finding.roundOrigin
-      ? (severityRank[finding.severity] > severityRank[prior.severity] ? finding : prior)
-      : (finding.roundOrigin > prior.roundOrigin ? finding : prior);
+    // Within one actual round the higher severity wins; across rounds the
+    // FRESHER judgment wins — a current downgrade must not lose to a stale
+    // carried-up severity, and a same-round duplicate must not outrank the
+    // retained judgment through the oldest-origin display value.
+    const findingWins = prior.judgmentRound === finding.roundOrigin
+      ? severityRank[finding.severity] > severityRank[prior.finding.severity]
+      : finding.roundOrigin > prior.judgmentRound;
+    const preferred = findingWins ? finding : prior.finding;
     byKey.set(key, {
-      ...preferred,
-      sources: [...new Set([...prior.sources, ...finding.sources])].sort(),
-      roundOrigin: Math.min(prior.roundOrigin, finding.roundOrigin),
+      finding: {
+        ...preferred,
+        sources: [...new Set([...prior.finding.sources, ...finding.sources])].sort(),
+        roundOrigin: Math.min(prior.finding.roundOrigin, finding.roundOrigin),
+      },
+      judgmentRound: findingWins ? finding.roundOrigin : prior.judgmentRound,
     });
   }
-  return [...byKey.values()].sort((left, right) => {
+  return [...byKey.values()].map((entry) => entry.finding).sort((left, right) => {
     const severity = severityRank[right.severity] - severityRank[left.severity];
     return severity !== 0 ? severity : `${left.location}\0${left.title}`.localeCompare(`${right.location}\0${right.title}`);
   });
