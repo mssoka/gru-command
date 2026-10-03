@@ -3,7 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi } from '../ledger/api.js';
-import { AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError } from '../ledger/api.js';
+import { AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError, PipelineConflictError } from '../ledger/api.js';
 import { parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
 import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger/pipeline.js';
 import type { PipelineService } from './pipeline.js';
@@ -377,18 +377,27 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         throw new Error('priority must be a number');
       }
       const scopes = optStrArray(body, 'exclusive_scopes');
-      const receipt = pipeline.enqueue({
-        id: strField(body, 'id'),
-        ...(optStrField(body, 'request_id') !== undefined ? { requestId: optStrField(body, 'request_id') } : {}),
-        repoPath: strField(body, 'repo_path'),
-        title: strField(body, 'title'),
-        briefing: strField(body, 'briefing'),
-        ...(priorityField !== undefined ? { priority: priorityField as number } : {}),
-        ...(optPrerequisitesField(body) !== undefined ? { prerequisites: optPrerequisitesField(body) } : {}),
-        ...(scopes !== undefined ? { exclusiveScopes: scopes } : {}),
-        ...(optStrField(body, 'hold_reason') !== undefined ? { holdReason: optStrField(body, 'hold_reason') } : {}),
-        by: byField(body) ?? null,
-      });
+      let receipt: ReturnType<PipelineService['enqueue']>;
+      try {
+        receipt = pipeline.enqueue({
+          id: strField(body, 'id'),
+          ...(optStrField(body, 'request_id') !== undefined ? { requestId: optStrField(body, 'request_id') } : {}),
+          repoPath: strField(body, 'repo_path'),
+          title: strField(body, 'title'),
+          briefing: strField(body, 'briefing'),
+          ...(priorityField !== undefined ? { priority: priorityField as number } : {}),
+          ...(optPrerequisitesField(body) !== undefined ? { prerequisites: optPrerequisitesField(body) } : {}),
+          ...(scopes !== undefined ? { exclusiveScopes: scopes } : {}),
+          ...(optStrField(body, 'hold_reason') !== undefined ? { holdReason: optStrField(body, 'hold_reason') } : {}),
+          by: byField(body) ?? null,
+        });
+      } catch (error) {
+        if (error instanceof PipelineConflictError) {
+          json(res, 409, { error: 'conflict', detail: error.message });
+          return true;
+        }
+        throw error;
+      }
       json(res, receipt.duplicate ? 200 : 201, receipt);
       return true;
     }

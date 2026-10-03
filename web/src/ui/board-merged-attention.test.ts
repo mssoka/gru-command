@@ -159,6 +159,14 @@ function bandIds(band: string): string[] {
   );
 }
 
+/** FOR GRU is collapsed by default (owner approval j-1064); these tests
+ * assert CLASSIFICATION, so the machine queue is deliberately revealed
+ * first — an empty band keeps its calm clear state either way. */
+function expandForGru(): void {
+  const toggle = document.querySelector<HTMLButtonElement>('.board-band--needs-you .board-band__more');
+  if (toggle !== null && toggle.getAttribute('aria-expanded') === 'false') toggle.click();
+}
+
 describe('board rendered regression — concluded jobs and stale review history', () => {
   beforeEach(mountBoardDom);
 
@@ -215,6 +223,7 @@ describe('board rendered regression — concluded jobs and stale review history'
         notifications: [notification('n1', { agentId: 'perkins-1', title: 'Owner decision required' })],
       }),
     );
+    expandForGru();
     expect(bandIds('needs-you')).toEqual(['lane-merged-owed']);
   });
 
@@ -245,6 +254,7 @@ describe('board rendered regression — concluded jobs and stale review history'
         ],
       }),
     );
+    expandForGru();
     const expected = ['lane-blocked', 'lane-error', 'lane-conflict', 'lane-reopened', 'lane-delivered', 'lane-parked'];
     expect([...bandIds('needs-you')].sort()).toEqual([...expected].sort());
   });

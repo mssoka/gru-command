@@ -333,8 +333,10 @@ function describeUnmetMilestone(
   if (prerequisite.milestone === 'admitted') {
     return `waiting for ${prerequisite.id} to be admitted (now ${dependency.state})`;
   }
-  const status = jobStatusOf(dependency, ctx)?.toString() ?? 'not started';
-  return `waiting for ${prerequisite.id} to be ${prerequisite.milestone} (now ${status})`;
+  // No job yet: the dependency's own queue state is the honest position
+  // ("not started" would read as if no row existed).
+  const status = jobStatusOf(dependency, ctx)?.toString() ?? null;
+  return `waiting for ${prerequisite.id} to be ${prerequisite.milestone} (now ${status ?? dependency.state})`;
 }
 
 /** Scope names held by this entry right now: `admitting` until claimed

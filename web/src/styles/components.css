@@ -1948,10 +1948,15 @@ body {
 }
 
 .board-job__toggle:focus-visible,
-.board-round__toggle:focus-visible {
+.board-round__toggle:focus-visible,
+.board-band__more:focus-visible {
   outline: 3px solid var(--work);
   outline-offset: 2px;
   border-radius: 6px;
+}
+
+.board-band__more:focus-visible {
+  border-radius: 999px;
 }
 
 .board-job__chevron {

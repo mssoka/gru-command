@@ -149,3 +149,8 @@ pipeline-board-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && n
 # deliberately excluded). Exit left intact, never masked; snapshot dir +
 # ignored pointer preserved.
 pipeline-board-web-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-pipeline-board.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-protocol.test.ts > "$d/web/src/lib/board-protocol.test.ts"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "pipeline-board-web-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/pipeline-board-web-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-protocol.test.ts src/lib/board-bands.test.ts src/ui/board.test.ts'
+
+# Combined focused regression for the pipeline queue + compact board in ONE
+# scheduled run (one queue slot): backend suite first, then the web suite.
+# Same RPC prerequisite and budgets as the split scopes above.
+pipeline-check = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-pipeline.test.ts test/pipeline-service.test.ts test/pipeline-server.test.ts test/board-pipeline-view.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-sections.test.ts src/lib/board-protocol.test.ts src/lib/board-bands.test.ts src/ui/board.test.ts"

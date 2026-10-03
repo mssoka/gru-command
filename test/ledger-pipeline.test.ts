@@ -267,7 +267,11 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     const ready = (id: string): boolean =>
       ledger.pipelineBoardView(FULL_CAPACITY).entries.find((entry) => entry.id === id)?.reason === null;
     expect(ready('pipe-b')).toBe(false);
+    // The milestone is read from the ADMITTED prerequisite's job — not
+    // from a same-id row that no admission ever bound.
+    ledger.claimPipelineEntry({ id: 'pipe-a', holder: 'silas' });
     ledger.addJob({ id: 'pipe-a', repo: 'demo', title: 'Entry pipe-a', briefing: 'Briefing for pipe-a' });
+    ledger.markPipelineAdmitted({ id: 'pipe-a', jobId: 'pipe-a' });
     ledger.setJobStatus('pipe-a', 'working');
     ledger.setJobStatus('pipe-a', 'delivered');
     expect(ready('pipe-b')).toBe(true); // delivered milestone satisfied
@@ -286,10 +290,13 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     enqueue(ledger, 'pipe-b', { exclusiveScopes: ['repo:demo'] });
     enqueue(ledger, 'pipe-c');
     const view = (): ReturnType<LedgerApi['pipelineBoardView']> => ledger.pipelineBoardView(FULL_CAPACITY);
-    expect(view().entries.find((entry) => entry.id === 'pipe-b')?.reason).toContain('exclusive scope "repo:demo" held by pipe-a');
-    expect(view().entries.find((entry) => entry.id === 'pipe-c')?.reason).toBeNull();
+    // Waiting entries hold nothing; the CLAIM (and the live job after it)
+    // is what serializes the shared scope.
     ledger.claimPipelineEntry({ id: 'pipe-a', holder: 'silas' });
-    expect(view().entries.find((entry) => entry.id === 'pipe-b')?.reason).toContain('held by pipe-a');
+    expect(view().entries.find((entry) => entry.id === 'pipe-b')?.reason).toContain(
+      'exclusive scope "repo:demo" held by pipe-a',
+    );
+    expect(view().entries.find((entry) => entry.id === 'pipe-c')?.reason).toBeNull();
     ledger.addJob({ id: 'pipe-a', repo: 'demo', title: 'Entry pipe-a', briefing: 'Briefing for pipe-a' });
     ledger.markPipelineAdmitted({ id: 'pipe-a', jobId: 'pipe-a' });
     expect(view().entries.find((entry) => entry.id === 'pipe-b')?.reason).toContain('held by pipe-a');

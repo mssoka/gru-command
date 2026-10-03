@@ -167,6 +167,9 @@ describe('pipeline service — admission and ordering', () => {
       bus,
     });
     liveServices.push(service2);
+    // Boot reconciliation is the production trigger (main.ts) — without it
+    // a fresh service is dormant until an event arrives.
+    service2.reconcileAtBoot();
     await service2.whenIdle();
     expect(calls2).toEqual(['pipe-a', 'pipe-b']);
     db2.close();
@@ -292,6 +295,9 @@ describe('pipeline service — failure and crash reconciliation', () => {
     h.service.enqueue({ id: 'pipe-b', repoPath: '/tmp/demo', title: 'B', briefing: 'B' });
     await h.service.whenIdle();
     expect(h.calls).toHaveLength(2);
+    // Freeze capacity so the live service cannot race the hand-crafted
+    // crash claims below.
+    h.capacity = { capacity: 4, occupied: 4, queued: 0, available: 0 };
     // Simulate a crash: an admitting claim for a job that committed.
     h.ledger.enqueuePipelineEntry({ id: 'pipe-c', repoPath: '/tmp/demo', title: 'C', briefing: 'C' });
     h.ledger.claimPipelineEntry({ id: 'pipe-c', holder: 'silas-pipeline' });
@@ -304,6 +310,8 @@ describe('pipeline service — failure and crash reconciliation', () => {
     expect(report).toEqual({ examined: 2, adopted: 1, requeued: 1 });
     expect(h.service.entry('pipe-c')?.state).toBe('admitted');
     expect(h.service.entry('pipe-d')?.state).toBe('waiting');
+    h.capacity = { capacity: 4, occupied: 2, queued: 0, available: 2 };
+    h.service.schedule();
     await h.service.whenIdle();
     expect(h.calls.map((call) => call.jobId)).toEqual(['pipe-a', 'pipe-b', 'pipe-d']);
     expect(h.service.entry('pipe-d')?.state).toBe('admitted');
