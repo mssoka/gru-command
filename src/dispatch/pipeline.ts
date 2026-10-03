@@ -186,8 +186,11 @@ export class PipelineService {
       examined += 1;
       const job = this.opts.ledger.getJob(entry.id);
       if (job !== null && job.briefing === entry.briefing) {
-        this.opts.ledger.markPipelineAdmitted({ id: entry.id, jobId: entry.id });
-        adopted += 1;
+        if (this.finalizeAdmission(entry)) {
+          adopted += 1;
+        } else {
+          requeued += 1;
+        }
         continue;
       }
       this.opts.ledger.releasePipelineClaim({
@@ -303,7 +306,7 @@ export class PipelineService {
       if (job !== null && job.briefing === entry.briefing) {
         // Dispatch committed the job row before failing; its lifecycle
         // owns the failure (blocked + note). Adopt — never re-dispatch.
-        this.opts.ledger.markPipelineAdmitted({ id: entry.id, jobId: entry.id });
+        this.finalizeAdmission(entry);
         this.log('warn', 'pipeline entry adopted its pre-existing job after a dispatch failure', {
           entry: entry.id,
           error: detail,
@@ -324,7 +327,7 @@ export class PipelineService {
       }
       return;
     }
-    this.opts.ledger.markPipelineAdmitted({ id: entry.id, jobId: entry.id });
+    this.finalizeAdmission(entry);
     // The briefing turn runs in the background (dispatch owns it); when it
     // settles, capacity may have moved for a waiting follower. Rejections
     // are owned here so the settled promise never leaks unhandled.
@@ -333,6 +336,35 @@ export class PipelineService {
         /* the job lifecycle recorded the outcome; nothing to duplicate */
       })
       .finally(() => this.schedule());
+  }
+
+  /** Bookkeeping-safe admission: a ledger failure after the dispatch side
+   * effect must never leave a permanently admitting claim. It reconciles
+   * the row back to waiting; a retry ADOPTS the existing job (the dispatch
+   * throws on the duplicate id and the adopt path wins) instead of
+   * duplicating work. */
+  private finalizeAdmission(entry: PipelineEntryRecord): boolean {
+    try {
+      this.opts.ledger.markPipelineAdmitted({ id: entry.id, jobId: entry.id });
+      return true;
+    } catch (error) {
+      this.log('error', 'pipeline admission bookkeeping failed — reconciled for a safe retry', {
+        entry: entry.id,
+        error: String(error),
+      });
+      try {
+        this.opts.ledger.releasePipelineClaim({
+          id: entry.id,
+          reason: `admission bookkeeping failed: ${String(error).slice(0, 300)}`,
+          outcome: 'reconciled',
+          note: 'reconciled by the live pass; a retry adopts the existing job rather than duplicating it',
+        });
+        this.schedule();
+      } catch {
+        // The ledger itself is failing; boot reconciliation owns the claim.
+      }
+      return false;
+    }
   }
 
   private notifyAdmissionFailed(entry: PipelineEntryRecord, reason: string): void {

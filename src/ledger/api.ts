@@ -4443,6 +4443,9 @@ export class LedgerApi {
       if (row.state === 'admitting') {
         throw new Error(`pipeline entry "${input.id}" has a live admission claim — reconciliation owns it`);
       }
+      if (row.state === 'admitted') {
+        throw new Error(`pipeline entry "${input.id}" is admitted — its job lifecycle owns it now`);
+      }
       const ts = nowIso();
       this.db
         .prepare(

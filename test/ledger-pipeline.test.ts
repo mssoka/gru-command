@@ -204,6 +204,12 @@ describe('pipeline ledger — claims and admission', () => {
     expect(cancelled.failureReason).toBe('owner withdrew it');
     expect(cancelled.claim).toBeNull();
     expect(ledger.cancelPipelineEntry({ id: 'pipe-a', reason: 'again' }).state).toBe('cancelled');
+    // Admitted work is owned by its job lifecycle — no queue cancellation.
+    enqueue(ledger, 'pipe-b');
+    ledger.claimPipelineEntry({ id: 'pipe-b', holder: 'silas' });
+    ledger.addJob({ id: 'pipe-b', repo: 'demo', title: 'Entry pipe-b', briefing: 'Briefing for pipe-b' });
+    ledger.markPipelineAdmitted({ id: 'pipe-b', jobId: 'pipe-b' });
+    expect(() => ledger.cancelPipelineEntry({ id: 'pipe-b', reason: 'too late' })).toThrow(/admitted/);
     db.close();
   });
 });
