@@ -18,7 +18,13 @@ typecheck = "npm run typecheck"
 # plain vitest invocations, no worker/timeout flags, never the npm chain).
 residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-resident-registry.test.ts test/fix-directive.test.ts test/silas-deterministic-seam.test.ts"
 handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"
-working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
+# The web shard needs the approved j-463 RPC-patch prerequisite first (the
+# scheduler runs plain vitest, never the npm chain whose pretest applies it):
+# without it vitest 3.2.7's hardcoded 60s birpc timer can fail suite
+# collection under co-tenant load — run ebfb85f9 on 8f5662b collected only
+# 5/9 suites with `[vitest-worker]: Timeout calling "fetch"`. Same upstream
+# fix every other vitest scope here carries; no test/timeout/budget changes.
+working-flavor = "node tools/patch-vitest-rpc-timeout.mjs && cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
@@ -139,8 +145,11 @@ working-flavor-browser = "cd web && node ../node_modules/typescript/bin/tsc --no
 # counts, the updated whole-pool hash, the three-bag 200-boundary draws)
 # while the legacy-subset pin passes there by design. The vitest exit code is
 # echoed and the scope exits nonzero so the scheduler captures it as
-# evidence, never masked into a PASS. Snapshots are preserved; the ignored
+# evidence, never masked into a PASS. The approved j-463 RPC-patch
+# prerequisite runs first inside the snapshot (same as the sibling
+# baselines), so the EXPECTED RED is assertion-based, never a collection
+# timeout. Snapshots are preserved; the ignored
 # pointer file
 # _bmad-output/gate-prep/working-flavor-catalog-baseline.last-snapshot.txt
 # records the latest snapshot location.
-working-flavor-catalog-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-working-flavor-catalog.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/working-flavor.test.ts > "$d/web/src/lib/working-flavor.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/working-flavor-catalog-baseline.last-snapshot.txt"; cd "$d/web"; set +e; npx vitest run src/lib/working-flavor.test.ts; code=$?; set -e; echo "working-flavor-catalog-baseline vitest exit=$code (EXPECTED-NONZERO: new catalog assertions vs pre-change base)"; if [ "$code" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; fi; exit 1'
+working-flavor-catalog-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-working-flavor-catalog.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/working-flavor.test.ts > "$d/web/src/lib/working-flavor.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/working-flavor-catalog-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; cd web; set +e; npx vitest run src/lib/working-flavor.test.ts; code=$?; set -e; echo "working-flavor-catalog-baseline vitest exit=$code (EXPECTED-NONZERO: new catalog assertions vs pre-change base)"; if [ "$code" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; fi; exit 1'
