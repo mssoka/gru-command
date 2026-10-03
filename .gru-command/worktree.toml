@@ -124,6 +124,15 @@ board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && .
 # deterministic fail); it changes no test, timeout, assertion or gate.
 t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
 
+# Installer one-line classification (2026-10-03, review-input-handoff resume):
+# the FULL at 13b8734 hit the same 30s default ceiling on the installer
+# owned/foreign-service case (31.3s) that passed at 19.6s on the previous
+# green head (cea7bbf) — the test file and install.sh are byte-identical at
+# both heads. This scope isolates the whole file at the unchanged default
+# ceiling so the timeout can be classified (isolation pass vs deterministic
+# fail); it changes no test, timeout, assertion or gate.
+installer-isolation = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/install-one-line.test.ts"
+
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
 # download/install), same web config/runner/budgets and RPC prerequisite.
