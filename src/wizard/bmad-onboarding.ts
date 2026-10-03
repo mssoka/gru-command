@@ -285,14 +285,14 @@ function expectedFreshModules(summary: BmadManifestSummary): void {
   }
 }
 
-function assertNoSymlinkComponents(base: string, relativePath: string): void {
+function assertNoSymlinkComponents(base: string, relativePath: string, repairHint?: string): void {
   let current = base;
   for (const part of relativePath.split('/').filter(Boolean)) {
     current = join(current, part);
     if (!existsSync(current)) return;
     const info = lstatSync(current);
     if (info.isSymbolicLink()) {
-      throw new BmadDeterministicSetupError(`refusing BMAD path through symlink: ${current}`);
+      throw new BmadDeterministicSetupError(`refusing BMAD path through symlink: ${current}`, repairHint);
     }
   }
 }
@@ -358,7 +358,7 @@ function qualifyFreshSkillConfig(
 }
 
 function verifyModuleDirectories(repoPath: string, summary: BmadManifestSummary): void {
-  assertNoSymlinkComponents(repoPath, '_bmad');
+  assertNoSymlinkComponents(repoPath, '_bmad', INSTALLER_REPAIR_HINT);
   for (const module of summary.modules) {
     const path = join(repoPath, '_bmad', module.name);
     if (!existsSync(path) || lstatSync(path).isSymbolicLink() || !statSync(path).isDirectory()) {
@@ -379,7 +379,7 @@ function verifyModuleDirectories(repoPath: string, summary: BmadManifestSummary)
 function verifySkills(repoPath: string, tools: readonly string[]): void {
   for (const tool of tools) {
     const root = tool === 'claude-code' ? '.claude' : '.agents';
-    assertNoSymlinkComponents(repoPath, `${root}/skills/bmad-build`);
+    assertNoSymlinkComponents(repoPath, `${root}/skills/bmad-build`, INSTALLER_REPAIR_HINT);
     const skill = join(repoPath, root, 'skills', 'bmad-build', 'SKILL.md');
     if (!existsSync(skill) || lstatSync(skill).isSymbolicLink() || !statSync(skill).isFile()) {
       throw new BmadDeterministicSetupError(
@@ -480,12 +480,38 @@ function runOfficialInstaller(
  * produce valid output — even though the safety refusal itself stands.
  * Existing-repo validation keeps its deterministic classification.
  */
+/**
+ * Fresh-installer OUTPUT that fails validation is not unchanged user
+ * state: the official installer can produce different bytes on a re-run,
+ * so these failures stay transient — retry re-runs the installer (the
+ * spec's fresh-install output contract). Validation of unchanged bytes on
+ * the reuse path keeps its deterministic classification.
+ */
+function asTransientInstallerOutput(error: unknown): never {
+  if (error instanceof BmadDeterministicSetupError) {
+    throw new Error(
+      `official BMAD installer output failed validation: ${(error as Error).message}; retry this repo or skip`,
+    );
+  }
+  throw error;
+}
+
 function preflightSkillNames(stage: string, tool: string): string[] {
   try {
     return runtimeSkillNames(stage, tool);
   } catch (error) {
     if (error instanceof BmadDeterministicSetupError) {
-      throw new Error(`official BMAD preflight produced an unsafe skill binding: ${(error as Error).message}`);
+      // The staging path is deleted in finally and must never leak into
+      // user-facing text: keep the refusal, name the class, drop the path.
+      const detail = (error as Error).message
+        .split(`${stage}/`)
+        .join('')
+        .split(stage)
+        .join('')
+        .trim();
+      throw new Error(
+        `official BMAD preflight produced an unsafe skill binding${detail === '' ? '' : `: ${detail}`}; retry this repo or skip`,
+      );
     }
     throw error;
   }
@@ -544,9 +570,13 @@ function installFresh(
     }
   }
   qualifyFreshSkillConfig(repoPath, tools, runtimeSkills);
-  verifyModuleDirectories(repoPath, installed.summary);
-  verifySkills(repoPath, tools);
-  verifyNoAmbiguousSkillConfig(repoPath, tools, installed.summary, runtimeSkills);
+  try {
+    verifyModuleDirectories(repoPath, installed.summary);
+    verifySkills(repoPath, tools);
+    verifyNoAmbiguousSkillConfig(repoPath, tools, installed.summary, runtimeSkills);
+  } catch (error) {
+    asTransientInstallerOutput(error);
+  }
   return { ...installed, runtimeSkills };
 }
 
@@ -575,7 +605,12 @@ function managedBlock(
   const startAt = original.indexOf(start);
   const endAt = original.indexOf(end);
   if ((startAt === -1) !== (endAt === -1) || (startAt !== -1 && endAt < startAt)) {
-    throw new Error(`malformed managed block: expected paired ${start} / ${end}`);
+    // Unpaired/reversed managed markers are unchanged on-disk state: a
+    // retry re-reads the same bytes and fails identically, so this is a
+    // deterministic skip-only refusal (gh-32), not a retryable write.
+    throw new BmadDeterministicSetupError(
+      `malformed managed block: expected paired ${start} / ${end}`,
+    );
   }
   const block = `${start}\n${body.join('\n')}\n${end}`;
   if (startAt !== -1) {
@@ -620,29 +655,32 @@ function validatedSkillPath(repoPath: string, tool: string, skill: string): stri
   }
   const root = runtimeSkillsRoot(repoPath, tool);
   const path = join(root, skill);
-  assertNoSymlinkComponents(repoPath, relative(repoPath, path));
-  let realRepo: string;
-  let realRoot: string;
-  let realSkill: string;
-  try {
-    realRepo = realpathSync(repoPath);
-    realRoot = realpathSync(root);
-    realSkill = realpathSync(path);
-  } catch (error) {
-    // A MISSING recorded binding/root (ENOENT/ENOTDIR) is unchanged
-    // on-disk state (gh-32 r1): a retry re-runs the identical check and
-    // fails identically, so it is deterministic with the installer repair
-    // path. Other I/O failures (EACCES, …) stay plain errors — permissions
-    // can recover between attempts, so retry stays available.
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT' ||
-        (error as NodeJS.ErrnoException).code === 'ENOTDIR') {
-      throw new BmadDeterministicSetupError(
-        `BMAD recorded skill binding is missing: ${path}`,
-        INSTALLER_REPAIR_HINT,
-      );
+  assertNoSymlinkComponents(repoPath, relative(repoPath, path), INSTALLER_REPAIR_HINT);
+  // Resolve each operand in its own guarded step so a missing repository,
+  // skills root, or recorded binding is reported for the object that
+  // actually disappeared (all three are unchanged on-disk state).
+  const resolveReal = (target: string, missingMessage: string, hint?: string): string => {
+    try {
+      return realpathSync(target);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new BmadDeterministicSetupError(missingMessage, hint);
+      }
+      throw error;
     }
-    throw error;
-  }
+  };
+  const realRepo = resolveReal(repoPath, `BMAD repository directory is missing: ${repoPath}`);
+  const realRoot = resolveReal(
+    root,
+    `BMAD ${tool} skills root is missing: ${root}`,
+    INSTALLER_REPAIR_HINT,
+  );
+  const realSkill = resolveReal(
+    path,
+    `BMAD recorded skill binding is missing: ${path}`,
+    INSTALLER_REPAIR_HINT,
+  );
   if (!insideOrEqual(realRepo, realRoot) || !insideOrEqual(realRoot, realSkill) ||
       !lstatSync(path).isDirectory()) {
     throw new BmadDeterministicSetupError(`unsafe BMAD recorded skill path: ${path}`);
@@ -914,12 +952,27 @@ function writeRecord(
     tools,
     runtime_skills: runtimeSkills,
     official_manifest_sha256: createHash('sha256').update(manifestText).digest('hex'),
-    source_payload_sha256: hashOwnedPayload(repoPath, runtimeSkills),
+    source_payload_sha256: payloadSha256ForFreshOrReuse(repoPath, runtimeSkills, fresh),
     source_payload_format: 'without-derived-caches-v1',
     compatibility_patches: fresh ? ['qualify-bmm-gds-short-config-tokens-v1'] : [],
   };
   atomicWrite(path, `${JSON.stringify(record, null, 2)}\n`);
   return path;
+}
+
+/** Existing-state hashing keeps its deterministic classification; a FRESH
+ * record's payload is installer output, so its failures stay transient. */
+function payloadSha256ForFreshOrReuse(
+  repoPath: string,
+  runtimeSkills: RuntimeSkillMap,
+  fresh: boolean,
+): string {
+  try {
+    return hashOwnedPayload(repoPath, runtimeSkills);
+  } catch (error) {
+    if (fresh) asTransientInstallerOutput(error);
+    throw error;
+  }
 }
 
 function assertControlFilesSafe(repoPath: string): void {
@@ -1026,8 +1079,13 @@ function validateRepo(
   let actualRoot: string;
   try {
     actualRoot = realpathSync(gitRoot.stdout.trim());
-  } catch {
-    throw new BmadDeterministicSetupError(`selected Git repo reported an invalid top-level path: ${repoPath}`);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      throw new BmadDeterministicSetupError(`selected Git repo reported an invalid top-level path: ${repoPath}`);
+    }
+    // EACCES/EIO and friends can recover between attempts — stay transient.
+    throw error;
   }
   if (actualRoot !== repoPath) {
     throw new BmadDeterministicSetupError(`selected directory is not the Git repository root: ${repoPath}`);

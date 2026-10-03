@@ -490,6 +490,38 @@ describe('wizard CLI surface', () => {
     expect(exists.stderr).not.toContain('npx bmad-method install');
   }, 120_000);
 
+  it('noninteractive hint-less deterministic failures name the neutral deliberate repair (gh-32 final review)', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-fallback-ws-');
+    const repoA = join(workspace, 'repo-a');
+    mkdirSync(join(repoA, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoA });
+    // A partial install (_bmad without a manifest) is deterministic with
+    // NO installer hint, so the neutral deliberate-repair fallback renders.
+    mkdirSync(join(repoA, '_bmad', 'bmm'), { recursive: true });
+    const bin = tempDir('gru-command-wizard-fallback-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    const answersJson = JSON.stringify({
+      workspace_root: workspace,
+      repos: ['repo-a'],
+      bmad: { 'repo-a': 'reuse' },
+      runtime: 'pi',
+      port: 0,
+      smoke: false,
+    });
+    const instance = tempDir('gru-command-wizard-fallback-home-');
+    const failed = spawnSync(
+      process.execPath,
+      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson],
+      { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, GRU_COMMAND_HOME: instance }, encoding: 'utf-8', timeout: 60_000 },
+    );
+    expect(failed.status, failed.stderr).toBe(1);
+    expect(failed.stderr).toContain('partial BMAD installation detected');
+    expect(failed.stderr).toContain('Repair the reported condition deliberately, then re-run the wizard');
+    expect(failed.stderr).not.toContain('Retry after fixing it');
+    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
+  }, 120_000);
+
   it('noninteractive deleted recorded binding after successful onboard fails loud skip-only with the installer hint (gh-32 r1)', () => {
     const repoRoot = join(import.meta.dirname, '..');
     const workspace = tempDir('gru-command-wizard-unbind-ws-');

@@ -919,7 +919,12 @@ test.describe('chat pane reflow (owner heist)', () => {
       has: page.locator('.tool-line', { hasText: 'mcp__' }),
     });
     await expect(toolBand).toHaveCount(1);
-    await toolBand.locator('.service-band__head').click();
+    const bandHead = toolBand.locator('.service-band__head');
+    // Guard the toggle state so a future already-expanded default cannot
+    // silently collapse the band (and measure the wrong layout).
+    await expect(bandHead).toHaveAttribute('aria-expanded', 'false');
+    await bandHead.click();
+    await expect(bandHead).toHaveAttribute('aria-expanded', 'true');
     await expect(page.locator('.tool-line', { hasText: 'mcp__' })).toBeVisible();
     await expect(page.locator('.tool-line', { hasText: 'failed:' })).toBeVisible();
   }

@@ -3,7 +3,8 @@ import { readFileSync, readdirSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { WebSocket } from 'ws';
 
 const TOKEN = 'configured-mock-test-token';
 const cleanupDirs: string[] = [];
@@ -134,5 +135,64 @@ describe('dev mock upload endpoint hardening', () => {
 
     // Both rejected size requests and the rejected quota request leave no file.
     expect(readdirSync(dirname(first.path))).toHaveLength(2);
+  }, 30_000);
+});
+
+describe('dev mock turn-hold fixture contract', () => {
+  /** Frame log helper: the mock's chat channel streams JSON frames. */
+  type Frame = Record<string, unknown>;
+
+  async function chatSocket(baseUrl: string): Promise<{ ws: WebSocket; frames: Frame[] }> {
+    const ws = new WebSocket(`${baseUrl.replace('http', 'ws')}/ws`);
+    const frames: Frame[] = [];
+    ws.on('message', (data: Buffer) => frames.push(JSON.parse(String(data)) as Frame));
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => resolve());
+      ws.once('error', reject);
+    });
+    ws.send(JSON.stringify({ type: 'auth', token: TOKEN }));
+    await vi.waitFor(() => expect(frames.some((f) => f['type'] === 'auth_ok')).toBe(true));
+    return { ws, frames };
+  }
+
+  const control = async (baseUrl: string, path: string): Promise<void> => {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    expect(res.ok, path).toBe(true);
+  };
+
+  it('parks the scripted turn until release, and reset settles a parked turn without ghost frames', async () => {
+    const { baseUrl } = await startMock();
+    await control(baseUrl, '/__reset');
+    await control(baseUrl, '/__turn-hold');
+    const first = await chatSocket(baseUrl);
+    first.ws.send(JSON.stringify({ type: 'user', text: 'hold check', client_msg_id: 'hold-1', epoch: 0 }));
+    await vi.waitFor(() => expect(first.frames.some((f) => f['type'] === 'delta')).toBe(true));
+    // Well past the scripted stream duration: a parked turn must NOT end.
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(first.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(false);
+    await control(baseUrl, '/__turn-release');
+    await vi.waitFor(() => expect(first.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(true));
+    first.ws.close();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // Reset WHILE a turn is parked: the parked turn must settle before the
+    // log clears, so a fresh client replays no ghost turn/tool frames.
+    await control(baseUrl, '/__reset');
+    await control(baseUrl, '/__turn-hold');
+    const parked = await chatSocket(baseUrl);
+    parked.ws.send(JSON.stringify({ type: 'user', text: 'reset while parked', client_msg_id: 'hold-2', epoch: 0 }));
+    await vi.waitFor(() => expect(parked.frames.some((f) => f['type'] === 'delta')).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    await control(baseUrl, '/__reset');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const fresh = await chatSocket(baseUrl);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(fresh.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(false);
+    expect(fresh.frames.some((f) => f['type'] === 'tool')).toBe(false);
+    expect(fresh.frames.some((f) => f['type'] === 'delta')).toBe(false);
+    fresh.ws.close();
   }, 30_000);
 });
