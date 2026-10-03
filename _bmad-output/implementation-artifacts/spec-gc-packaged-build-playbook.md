@@ -2,7 +2,7 @@
 title: 'Ship the minion-owned BMAD build-workflow playbook in installed role prompts'
 type: 'feature'
 created: '2026-10-02'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 baseline_commit: 6a00f4e50e7ae970915a9a534c142c1f8a45b57d
 review_loop_iteration: 2
@@ -141,7 +141,7 @@ checkout, home paths, journal, or global custom instructions).
       or duplicate review) -- ops alignment.
 - [x] `roles/gru.md` -- resolve the merge-authority wake bullet to owner-held
       + exact-final-head READY, and note implementation briefings hand the
-      worker the full bmad-build cycle -- chief alignment.
+      worker the whole build cycle -- chief alignment.
 - [x] `test/roles-definitions.test.ts` -- pin the new minion/silas/gru
       clauses -- deterministic regression on the src-loaded surface.
 - [x] `test/roles-installed-playbook.test.ts` -- new installed-layout
@@ -332,6 +332,20 @@ checkout, home paths, journal, or global custom instructions).
   `prep="$root/_bmad-output/gate-prep"`. The snapshot pointer, build
   guard, overlaid test files, and expected-RED intent are unchanged; the
   prior exit-99 receipt and snapshot remain preserved as evidence.
+
+- 2026-10-03 final whole-diff review round (trigger: tracked review jobs
+  `gc-playbook-final-review-{blind,edge,verifgap}-718249d`; verifgap clean,
+  blind 14 + edge 3 findings triaged as rows 60-77). Patched:
+  admission detection before the wait (pacing-view pre-check) and the
+  loud stop; reviewer-brief head + diff base/range + read-only object
+  access; findings-consumption duty; `Authorization: Bearer` guidance;
+  cap-4 FIFO regression extended to two queued reviewers; baseline archive
+  materialized and snapshot history appended; timeout scope runs both
+  legs; targeted dirty-input guard in `assertDistCurrent`; canonical
+  fallback terminology ("review gate of record for routing and fixes —
+  never a Perkins READY"); README grammar and tarball pins;
+  completion-order pins; spec/deferred traceability. The standing
+  canonical-briefing disposition is unchanged.
 
 - 2026-10-03 r1-verdict-directed follow-through (directive
   `gru-pr165-...` r1 bundle, consumed at the current head): (a) the
@@ -559,6 +573,25 @@ checkout, home paths, journal, or global custom instructions).
 | 57 | verif-gap | clean | No verification gaps found (whole diff read, receipt verified) |
 | 58 | native r3 | blocker (carried 0, owner/ops) | Frozen Acceptance 1 still names the retired literal while the shipped contract selects by capability; the runtime freezes `job.briefing`, not the committed amendment record (`src/dispatch/perkins.ts:2041`) → **owner/operations disposition**: freeze the approved j-761 amendment into the canonical acceptance through a supported audited ingress, then re-review. Not resolvable in-lane; no gate/spec weakening or DB repair |
 | 59 | native r3 | blocker (new) | The contract-review patch (row 43) over-reconciled the fallback gate: it permitted presenting a merge after a fallback PASS, contradicting Acceptance 4 (`roles/gru.md` READY rule + wake header). → patch: fallback PASS clears review/fix routing only; the missing Perkins gate is escalated, never substituted; README/FLOW/ops + loader and tarball pins aligned |
+| 60 | blind | medium | Nested-admission rule not executable as written: no detection before waiting → patch: the worker prompt now names the service pacing view (board snapshot) as the pre-dispatch check and keeps the loud stop; the saturation view is asserted in the regressions |
+| 61 | blind | low | Cap-4 regression queued only one reviewer (FIFO unexercised) → patch: two reviewers queued; head-waiter order and second admission asserted |
+| 62 | blind | medium | Reviewer brief named only the head; no diff base/range or object-access instructions (dispatch branches from origin default) → patch: the brief must carry the head SHA plus the diff base/range (or a frozen diff) and read-only object access |
+| 63 | blind | medium | No return path for a commissioned review's findings → patch: a review is complete only when its delivered findings are collected (report/session) and resolved through the fix cycle; reconcile the terminal state before re-commissioning |
+| 64 | blind | low | Worker API guidance incomplete (no auth header/config surface) → patch: read the `[auth]` token from the instance config, send `Authorization: Bearer`, never echo or copy it |
+| 65 | blind | low | Renamed-catalog test claim overbroad (a non-`bmad-` hardcode would pass) → patch: claim narrowed to name-absence plus the metadata-selection clauses (prose, not a runtime selector) |
+| 66 | blind | low | `assertDistCurrent` ignored dirty staged inputs at the same HEAD → patch: targeted dirty check on `roles`/`resources`/`package.json` (supersedes the low dispositions in rows 35/51) |
+| 67 | blind | low | Baseline pointer overwrote each run vs the "never deleted" comment → patch: `packaged-playbook-baseline.snapshots.log` appends history; latest pointer preserved |
+| 68 | blind | low | `git archive | tar` could mask a failed archive leg → patch: archive materialized (`-o`) and extraction checked (completes row 49's guard) |
+| 69 | blind | low | Fallback terminology split across surfaces ("FULL GATE semantics" vs "routing of record") → patch: canonical "review gate of record for routing and fixes — never a Perkins READY" across ops/silas/FLOW/README |
+| 70 | blind | low | README grammar + no README/FLOW fallback pin → patch: "0 blockers clear..."; tarball README pins the corrected sentence and negative-pins the retired phrase |
+| 71 | blind | low | Corrected ops completion order unpinned → patch: "let exact-head CI land" / "never move the head after the gate" pins added |
+| 72 | blind | low, rejected | Worker `bmad-*` blanket negative vs ops review-token allowlist asymmetry: intentional (j-761 forbids the fixed build name on the worker; review tokens are ops-only). `claude -p` negative added to the tarball smoke |
+| 73 | blind | low, deferred | `clear_to_merge` wire-field name debt → deferred (rename is a wire break; semantics documented and the owner-held marker pinned) |
+| 74 | blind | low | Spec verification pointer/frontmatter/deferred traceability stale → patch: status in-review; deferred entries carry heads; receipt summary completed at close |
+| 75 | edge | low | Timeout scope skipped the second leg when the first failed → patch: both legs run and both rc values are reported |
+| 76 | edge | false, carried | Tasks text "full bmad-build cycle" vs name-free shipped prompts: the task wording is amended and the substance is the standing Acceptance-1 disposition (rows 58/previous) — owner/ops action |
+| 77 | edge | low | Owner-held positive pins pass pre-change → patch: fail-before provenance clarified in the test comment (the negative pins carry the fail-before evidence) |
+
 
 ### Final-review cycle (2026-10-02, continuation)
 
