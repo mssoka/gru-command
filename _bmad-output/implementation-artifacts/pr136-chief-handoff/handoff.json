@@ -1,0 +1,102 @@
+{
+  "phase_id": "pr136-chief-handoff-20261001",
+  "requires_chief_decision": true,
+  "status": "source-delivered",
+  "job": "durable-blocked-followthrough",
+  "branch": "gru/durable-blocked-followthrough",
+  "pr": 136,
+  "pr_state": {
+    "open": true,
+    "draft": true,
+    "note": "draft preserved; no flag change by this worker"
+  },
+  "source_head": "d0035aeb52137b29af423df2a857adb44069c8cd",
+  "source_commit": "d0035aeb52137b29af423df2a857adb44069c8cd",
+  "feature_commit": "66ac37782720a0378337821f0935be8cccb675fa",
+  "plan_checkpoint_commit": "e28bcfe8b63034bc66a06ff9bc55c33183242726",
+  "publication": {
+    "remote": "origin/gru/durable-blocked-followthrough",
+    "remote_head_at_push": "d57f0dd2c00c1f2ebf8e3e80aec7eac68d3273ee",
+    "pushed_at": "2026-10-01T01:48:02+01:00",
+    "pr_draft_preserved": true,
+    "note": "fast-forward push on top of the prior remote head 0bb5a03; no force, no rebase, no draft-flag change"
+  },
+  "source_base": "2aa836abe262759c651683deb40d05f02c9ede86",
+  "lane_base_before_session": "0bb5a03f80ac8f65da078420f29e86325214eccb",
+  "merge_commit_this_session": "5ccae7981e9ec379463793574100cc180b958278",
+  "artifact_paths": [
+    "_bmad-output/implementation-artifacts/pr136-chief-handoff/plan.md",
+    "_bmad-output/implementation-artifacts/pr136-chief-handoff/review.md",
+    "_bmad-output/implementation-artifacts/pr136-chief-handoff/handoff.json"
+  ],
+  "changed_files": [
+    "src/ledger/db.ts",
+    "src/ledger/obligations.ts",
+    "src/ledger/api.ts",
+    "src/dispatch/obligations.ts",
+    "src/dispatch/service.ts",
+    "src/dispatch/fix-directive.ts",
+    "src/dispatch/rebrief-recovery.ts",
+    "src/dispatch/server.ts",
+    "src/main.ts",
+    "docs/LEDGER.md",
+    "resources/silas-skills/ops-dispatch/SKILL.md",
+    "test/phase-handoffs.test.ts",
+    "test/dispatch-server.test.ts",
+    "test/suite-shape.test.ts",
+    "_bmad-output/implementation-artifacts/deferred-work.md",
+    "_bmad-output/implementation-artifacts/pr136-chief-handoff/plan.md",
+    "_bmad-output/implementation-artifacts/pr136-chief-handoff/review.md",
+    "_bmad-output/implementation-artifacts/pr136-chief-handoff/handoff.json"
+  ],
+  "actual_checks": {
+    "run": [],
+    "note": "SOURCE-only mandate on this worker: no tests/build/lint/typecheck/npm/npx/provider/browser probes were run, and no /api/verify was attempted. The deterministic tests were WRITTEN (test/phase-handoffs.test.ts: 11 cases; test/dispatch-server.test.ts +2; pins updated) and must fail before / pass after through the authenticated /api/verify path at a clean frozen head."
+  },
+  "remaining_gates": [
+    "Silas: producer/resource checks, clean-head freeze, authenticated /api/verify focused then FULL (>=36GiB free, real media-safe checkpoint, actual nested outcome.exitCode); fail-before/pass-after capture",
+    "exact-head GitHub CI on the published candidate",
+    "independent final-diff BMAD review and required native Perkins READY (separate; worker did not self-arm)",
+    "owner/ops: merge, deployment, restart, live migration (migration 10 is additive and unapplied outside tests/CI)"
+  ],
+  "decisions": [
+    {
+      "id": "intent-representation",
+      "decision": "explicit typed `completion_handoff` request field + small `phase_handoffs` guard table (migration 10), reusing job_obligations for the owed debt and pending_rebriefs for re-brief markers",
+      "why": "keeps blocked-obligation vocabulary/consumers clean; smallest additive durable marker; no new scheduler/inbox"
+    },
+    {
+      "id": "completion-evidence",
+      "decision": "correlated job.delivered (phase_id + intent watermark) PLUS per-source admission (directive admitted/settled + request_id; re-brief request event with the same phase id; dispatch bound minion); no fabricated completion for admission-unknown crashes",
+      "why": "re-brief: job.delivered/HTTP/idle/assistant-claim alone insufficient; reuse existing trustworthy evidence"
+    },
+    {
+      "id": "guard-policy",
+      "decision": "terminal/parked phases never publish: terminal settles the obligation job-terminal; parked suspends it; both close the phase without a wake; shown/ACK never settles",
+      "why": "preserve owner stops/terminal lanes; no revived terminal lane"
+    },
+    {
+      "id": "stale-fence",
+      "decision": "a newer re-brief request supersedes the older awaiting phase, and finalize reconciles only against the phase identity the turn started under",
+      "why": "an older receipt must never complete a newer phase (acceptance E); found and closed a marker-guard hole during self-review"
+    }
+  ],
+  "review": {
+    "record": "_bmad-output/implementation-artifacts/pr136-chief-handoff/review.md",
+    "independent_layers_run": false,
+    "note": "no subagent capability in this worker session; 7 self-review findings fixed, 4 checked-and-rejected, residuals deferred; external gates unchanged"
+  },
+  "evidence_pointers": [
+    "_bmad-output/implementation-artifacts/pr136-chief-handoff/plan.md",
+    "_bmad-output/implementation-artifacts/pr136-chief-handoff/review.md",
+    "lane-private (outside this repo): briefings/chief-decision-handoff-heist-20261001/proposed-scope.md",
+    "lane-private (outside this repo): briefings/chief-decision-handoff-heist-20261001/scope-observation-receipt.json",
+    "_bmad-output/implementation-artifacts/spec-durable-blocked-followthrough.md",
+    "_bmad-output/implementation-artifacts/durable-followthrough-rebase-20260930/receipt.md"
+  ],
+  "non_claims": [
+    "source delivered and committed on the existing draft PR only — the behavior is NOT live, verified, merged or deployed",
+    "no test/build/lint/npm/verify run in this session; no red/green receipts are claimed",
+    "no approval, merge, restart, deployment or live migration is requested or performed"
+  ]
+}
