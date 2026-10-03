@@ -328,6 +328,14 @@ checkout, home paths, journal, or global custom instructions).
   guard, overlaid test files, and expected-RED intent are unchanged; the
   prior exit-99 receipt and snapshot remain preserved as evidence.
 
+- 2026-10-03 base-conflict continuation completed
+  (`gru-pr165-base-conflict-20261003-once`): integrated `9bb51b0`, repaired
+  the integrated-review findings, pushed `ad98f1a` (CI green), requested
+  native r4 (prior fallback blocker fixed/accepted; only the carried
+  canonical-briefing disposition remains). Failed FULLs `51`/`55` and
+  earlier are preserved; the `ad98f1a` baseline attempts never started and
+  are preserved as such.
+
 - 2026-10-03 base-conflict continuation (amendment
   `gru-pr165-base-conflict-20261003-once`): origin/main advanced to
   `9bb51b0` (PR #136 durable-blocked-followthrough merged; PR #149
@@ -625,11 +633,25 @@ bad_spec).
     disposition; the briefing remains unamended as of the base-conflict
     continuation). Held, not bypassed; no r4 is requested until it lands.
 
-- Native r4 is held on the canonical-briefing disposition. The latest
-  verified fix (`8ed3bd6`) and the outcome-truth/contract changes are
-  covered by the post-integration independent review
-  (`gc-playbook-integrated-review-{blind,edge,verifgap}-810f471`) and the
-  head gates recorded in the completion handoff.
+- Round `gc-packaged-build-playbook-20261002-r4` frozen at target
+  `ad98f1a` (base `9bb51b0`), seven lenses; verdict **NEEDS CHANGES** —
+  **prior 0 fixed/accepted** (fallback PASS no longer bypasses the
+  READY merge-presentation gate; README/FLOW/ops/wake header agree and
+  the runtime reporting surfaces were aligned), **prior 1 carried only**:
+  the canonical briefing still supplies the original `bmad-build`
+  acceptance while the shipped contract selects by capability. The
+  reviewer's required action: "Owner/operations must freeze the actual
+  approved amendment into the canonical briefing/acceptance through an
+  audited ingress, then request review against the consistent contract.
+  A repository note alone does not resolve this blocker." No additional
+  findings; the tests specialist timed out and is not counted as
+  coverage.
+- The lane is therefore complete on all in-lane axes and blocked solely
+  on that owner/operations disposition; no r5 is requested while the
+  briefing remains unamended. The post-integration independent review
+  (`gc-playbook-integrated-review-{blind,edge,verifgap}-810f471`) findings
+  were repaired in `ad98f1a`; head gates and receipt identities are bound
+  in the completion handoff.
 
 ## Verification
 
