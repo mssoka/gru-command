@@ -6,6 +6,9 @@ status: 'in-progress'
 route: 'dispatch'
 baseline_commit: 6a00f4e50e7ae970915a9a534c142c1f8a45b57d
 review_loop_iteration: 2
+# Note (2026-10-03): native review rounds diff from current main
+# (5d56194 at r1/r2 time); baseline_commit below is the pre-playbook
+# comparison base, not the native review diff base.
 context:
   - '{project-root}/AGENTS.md'
 ---
@@ -70,6 +73,14 @@ checkout, home paths, journal, or global custom instructions).
   of existing tests, gates, pins, or owner-held merge/restart decisions.
 
 </frozen-after-approval>
+
+<!-- Amendment marker (2026-10-03): the frozen "Always" bullet that names
+     the runtime CLI headless print mode (`pi -p` / `claude -p`) as the
+     reviewer-spawning mechanism is superseded by the owner clarification
+     j-810/j-811 recorded in the Spec Change Log below: prescribed
+     independent reviewers run as separately tracked review jobs. The
+     frozen text is preserved unmodified; this marker records the
+     supersession inline for readers of the approval source. -->
 
 ## Code Map
 
@@ -309,9 +320,14 @@ checkout, home paths, journal, or global custom instructions).
   fences); verification is scheduler-owned one-shot with honest terminal
   states; progress is not a heartbeat/open turn/API 200/delivered
   prompt/old-head CI; artifact-only and investigation jobs complete by
-  verified artifact handback. Amended surfaces: `roles/minion.md`,
-  `roles/silas.md`, `roles/gru.md`,
-  `resources/silas-skills/ops-dispatch/SKILL.md`, `docs/FLOW.md`; pins at
+  verified artifact handback. Amended surfaces: `roles/minion.md`
+  (continuous-completion rule, artifact-vs-PR completion, no-caps,
+  accepted-action reconciliation for its own dispatched reviewers),
+  `roles/silas.md` + `resources/silas-skills/ops-dispatch/SKILL.md`
+  (the three-state reconciliation, bounded scan, restart-safe records,
+  one-shot verification, progress-vs-live), `roles/gru.md` (no continue
+  ceremony; precise owner questions only), `docs/FLOW.md` §4f (contract +
+  honest policy-vs-implemented pointers); pins at
   the loader, installed-layout, and staged-tarball seams. Known-bad state
   avoided: shipped instructions that stall approved work pending a
   "continue", chase a product PR for artifact jobs, treat liveness as
@@ -422,6 +438,21 @@ checkout, home paths, journal, or global custom instructions).
 | 40 | verif-gap | high (pre-verified) | ops-skill merge-authority rewrite had no pin: reverting the Authority bullet or step 5 left every suite green → patch (positive + negative pins at the loader and staged-tarball seams) |
 | 41 | verif-gap, edge | medium (pre-verified) | shipped ops skill still said "the chief rules, merges…" (:57) and kept merges in the chief's judgment list (:31; `roles/silas.md:63`; FLOW :535), three lines from its own owner-held bullet → patch (owner-held wording everywhere) |
 | 42 | verif-gap | medium (pre-verified) | `assertDistCurrent`'s bare catch treated any git failure as "no checkout", letting a broken guard read as pass → patch (fail loud when `.git` exists and HEAD cannot resolve) |
+| 43 | blind | medium | Fallback-gate merge wording read as contradictory across README/FLOW/ops ("clear to merge" vs "never authorizes a merge" vs "review gate of record") → patch (every surface now: routed-there fallback is the review of record, its PASS is never Perkins READY, the owner holds the merge) |
+| 44 | blind | medium | Worker prompt still said "merging belongs to the review verdict"; silas said "approved merges" — both implied verdict→merge → patch (review is the gate; the owner takes every merge decision) + positive/negative pins |
+| 45 | blind | low | Reviewer dispatch not reachable from the shipped worker surface (no auth/base guidance) → patch (authenticated local API; token from the service config; never echo it) |
+| 46 | blind | medium | An accepted dispatch can still admit after a reported nested-admission gap, and the worker had no reconciliation rule → duplicate-reviewer risk → patch (a submitted dispatch is an accepted action; reconcile by job identity before re-commissioning) |
+| 47 | blind | low | Reviewer briefs must bind the immutable head through the brief itself (dispatch branches from the origin default) → patch (the brief names the exact head SHA) |
+| 48 | blind, edge | low | Frozen spec block still prescribes the headless launcher with no inline supersession marker → patch (amendment marker placed outside the frozen block; frozen text untouched) |
+| 49 | blind, edge | medium | Baseline expected-RED was exit-code-only: a GREEN baseline would be recorded as scope success; the overlay claim was broader than the four overlaid files → patch (GREEN exits 4; overlay claim narrowed to the four files; the staged-tarball oracle is covered by the artifact scope + pre-change phrase-absence). The stricter JSON `numFailedTests>0` identity check was rejected (runner change; identity is read from the complete capture) |
+| 50 | blind | low | "Tracked as separate code work" had no pointers → patch (docs/FLOW §4f cites issues #160/#162/#163) |
+| 51 | blind | false, carried | renamed-catalog selector "not tied to a shipped path" — same class as row 34; no shipped selector exists, selection is prompt-level by design, and the intent forbids a new runtime → false (carried) |
+| 52 | blind | low | cross-surface wording drift (`substantive` vs `real repair`) → patch (aligned wording); no cross-surface meta-pin (redundant machinery) |
+| 53 | blind | low | "internal wait … its owner" overloaded owner with the human sense → patch ("its owning job or agent") |
+| 54 | blind | low | spec metadata stale for the native rounds → patch (frontmatter provenance note; baseline_commit/iteration fields preserved for the bmad workflow) |
+| 55 | blind | low | README onboarding sentence named `bmad-build` unversioned while the playbook forbids fixed names → patch (version-scoped: the build-workflow skill this pinned release provides) |
+| 56 | edge | low | tilde-path (`~/`) home-relative paths not negative-pinned at the installed seam → patch (`not.toContain('~/')`) |
+| 57 | verif-gap | clean | No verification gaps found (whole diff read, receipt verified) |
 
 ### Final-review cycle (2026-10-02, continuation)
 
@@ -520,7 +551,7 @@ bad_spec).
 lane's declared scopes; never run directly):**
 - `scope=packaged-playbook` (`node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/suite-shape.test.ts test/roles-installed-playbook.test.ts test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts test/install.test.ts`) -- expected: green (focused prompt/packaging regressions).
 - `scope=packaged-artifact` (`node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-whole-review.test.ts`) -- expected: green (staged npm-pack tarball + smoke on the shipped artifact).
-- `scope=packaged-playbook-baseline` -- expected RED: fail-before proof for the new oracles against the pinned pre-playbook tree (`6a00f4e`); setup failure exits 3 and build failure exits 99 (never confusable with the expected test RED), and the snapshot pointer records the lane head; exit status left intact as evidence.
+- `scope=packaged-playbook-baseline` -- expected RED: fail-before proof for the four overlaid oracles (`roles-installed-playbook`, `roles-definitions`, `roles-gru`, `silas-driver`) against the pinned pre-playbook tree (`6a00f4e`); setup failure exits 3 and build failure exits 99 (never confusable with the expected test RED), a green baseline exits 4 (the fail-before claim would be broken), and the snapshot pointer records the lane head; exit status left intact as evidence. The staged-tarball prompt oracles in `perkins-whole-review` are not overlaid here (pack cost); their pre-change absence is proven by the phrase-absence grep and their current pass by the artifact scope.
 - `scope=full` (`npm test`) -- expected: full green on the final head
   (lint, typecheck, build, vitest, web); coordinated, no competing suites.
 - `scope=typecheck` (`npm run typecheck`) -- available when a bounded
