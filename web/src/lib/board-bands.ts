@@ -89,7 +89,9 @@ export interface WorkerStopView {
  * is unsupervised still never reads "waiting" from its previous
  * worker. A stopped record survives its own disposal (the human Ack
  * must find it to re-arm). Only when no live worker remains does the
- * first recorded stop mark the lane. */
+ * first recorded stop mark the lane; the ledger lists agents
+ * most-recently-updated first, so that first stop is the most recent
+ * one. */
 export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
   const stopped = new Map<string, WorkerStopView>();
   const liveJobs = new Set<string>();

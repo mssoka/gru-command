@@ -521,9 +521,15 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       // contradicts itself.
       const live = boundMinions.filter((agent) => {
         const supervision = input.supervisionFor?.(agent.id) ?? null;
-        return supervision === null || (supervision.state !== 'stopped' && supervision.breakerOpen !== true);
+        if (supervision === null) {
+          // Unsupervised: live only while it is not a disposed record — a
+          // dead row is not a worker and must not mute a current stop
+          // (same rule the board applies; round-3 finding).
+          return agent.state !== 'disposed';
+        }
+        return supervision.state !== 'stopped' && supervision.breakerOpen !== true;
       });
-      const minion = [...live].sort((a, b) =>
+      const minion = live.sort((a, b) =>
         (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt),
       )[0];
       if (minion !== undefined) {

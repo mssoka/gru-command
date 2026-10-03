@@ -324,7 +324,8 @@ describe('silas digest (the four actionable states)', () => {
           config: DEFAULT_SILAS_CONFIG,
           trigger: 'sweep',
           now: () => now + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000,
-          supervisionFor: (agentId) => (agentId === 'min-other-live' ? null : view),
+          supervisionFor: (agentId) =>
+            (agentId === 'min-other-live' || agentId === 'min-disposed' ? null : view),
         });
 
       // Stopped worker: waiting on a human re-arm with a recorded cause —
@@ -349,6 +350,17 @@ describe('silas digest (the four actionable states)', () => {
       const mixed = await digestOf();
       expect(mixed.stalledWorking).toHaveLength(1);
       expect(mixed.stalledWorking[0]?.minionId).toBe('min-other-live');
+      // A DISPOSED unsupervised record is not a live worker: a lane with a
+      // current stopped worker plus a dead record stays waiting and is
+      // never woken as stalled (round-3 finding).
+      h.ledger.addJob({ id: 'job-dead', repo: 'fixture-app', title: 'dead', briefing: 'b' });
+      h.ledger.setJobStatus('job-dead', 'working');
+      h.ledger.registerAgent({ id: 'min-stopped-dead', role: 'minion', jobId: 'job-dead' });
+      h.ledger.setAgentState('min-stopped-dead', 'idle');
+      h.ledger.registerAgent({ id: 'min-disposed', role: 'minion', jobId: 'job-dead' });
+      h.ledger.setAgentState('min-disposed', 'disposed');
+      const dead = await digestOf();
+      expect(dead.stalledWorking.filter((row) => row.jobId === 'job-dead')).toHaveLength(0);
     } finally {
       h.cleanup();
     }
