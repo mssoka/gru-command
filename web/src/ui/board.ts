@@ -44,6 +44,7 @@ import {
   pipelineStateLabel,
   pipelineStateTone,
   pipelineWindow,
+  sectionNav,
   settledJobs,
   settledPreview,
   IN_FLIGHT_PREVIEW_SIZE,

@@ -283,8 +283,10 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
     await expect.poll(() => bodyOverflow(page)).toBeLessThanOrEqual(0);
     await capture(page, 'tablet-768-light-defaults');
 
-    // Sticky reachability after scrolling deep into the board.
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    // Sticky reachability after scrolling deep into the board (a mid-list
+    // position, not the absolute bottom where a sticky box may release at
+    // its container edge).
+    await page.locator('#board-section-settled').scrollIntoViewIfNeeded();
     const navBox = await page.locator('#board-nav').boundingBox();
     expect(navBox).not.toBeNull();
     expect(navBox!.y).toBeGreaterThanOrEqual(0);
