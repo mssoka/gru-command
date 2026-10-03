@@ -169,14 +169,15 @@ security, data loss, broken builds, and related crash/regression/
 vulnerability/injection/secret-leak tags — are BLOCKERS; the rest are
 notes); BLOCKERS > 0 routes a fix directive to the implementing MINION
 session, the lane's working diff is re-read, and the gate re-reviews after
-fixes (bounded rounds); 0 blockers = PASS reported as clear-to-merge. The
-fallback session is a full-capability minion by design — it must load the
-ambient BMAD skill — and is instructed never to gate, approve, merge, or
-modify implementation code; every gate decision is the host's. The fallback
-never records a Perkins verdict and never moves merge authority: only an
-exact-head Perkins READY can authorize a merge; Gru merges this repository
-only after that gate, while the owner holds merges elsewhere
-everywhere. A failed pre-flight is never a silent downgrade — the failed
+fixes (bounded rounds); 0 blockers = PASS clears the review/fix routing.
+The fallback session is a full-capability minion by design — it must load
+the ambient BMAD skill — and is instructed never to gate, approve, merge,
+or modify implementation code; every gate decision is the host's. The
+fallback never records a Perkins verdict and never authorizes an agent
+merge: a merge is presented to the owner only after the exact-head Perkins
+gate, and when a pre-flight failure routed the review here, the missing
+Perkins clearance is escalated rather than substituted. The owner always
+holds ALL merges — this repository included. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (install BMAD via
 onboarding / restore Perkins) are escalated and recorded on the job as
 `job.fallback-review` events. GitLab merge requests get the same SHA-bound
@@ -258,6 +259,104 @@ handoff receipt (202) immediately. The branch-idle guard still prevents
 freezing until that minion's delivery event; a queued round then appears in
 the ledger as `round.residency-queued` until its lead/child pair is admitted.
 Queued waits consume no reviewer turn or spawn timeout.
+
+## 4e. Minion-owned build cycle (owner ruling 2026-10-02)
+
+Implementation briefings hand the worker the whole job. The minion selects
+the task-relevant BMAD skills from the PROJECT's actual installed skill
+catalog/metadata and follows their current workflows — names and workflow
+structure change between BMAD versions, so brief by the task, never by a
+fixed skill name. The selected workflow's built-in review runs on fresh,
+context-free reviewer contexts the minion commissions as separately
+tracked review jobs — each with its own session and worktree, a read-only
+brief, and the immutable diff head; never an untracked launcher, an
+extension subagent, or a model-native child session. Those reviewer jobs
+share the worker budget with the lane that commissions them, so a
+nested-admission gap (a dispatch that cannot be admitted while its lane
+holds its slot) stops the lane loudly and is scheduled by ops under the
+configured limits — never a limit change or an untracked substitute. The
+minion owns
+finding resolution, verification, and the authorized ordinary PR, and the
+ops layer does not pull the work back between phases or commission a
+supplementary review duplicating the built-in one. Expensive suites
+coordinate through the verification scheduler (§4c) within existing
+capacity; when the settled PR head has passed its prerequisites
+(exact-head CI green), the native Perkins gate runs on that exact final
+head, NEEDS CHANGES routes back to the same implementing minion's fix
+cycle, and the owner merges. When a Perkins pre-flight failure routes the
+review to the installed bmad-review fallback gate (§4b), that host-routed
+gate is the review gate of record — it is the gate, never a duplicate.
+
+## 4f. Continuous completion (owner contract 2026-10-02)
+
+An approved heist advances without a new continue prompt. Every
+nonterminal job resolves to one of three durable states: active owned
+work (the exact source/control/verification/review identity, progress
+evidence, and expected next transition); an internal wait (the concrete
+dependency, its owning job or agent, and an automatic re-arm trigger or next
+reconciliation time); or a precise needs-owner question (the decision,
+the evidence, the choices, and the linked notification). Routine
+conflicts, test failures, review feedback, in-policy provider recovery,
+lost workers after a restart, capacity waits, PR registration, and gate
+handoffs are GC-owned continuations; only a genuine owner decision stops
+the work, and vague blocked/working/awaiting-review status is not one.
+
+Ops reconciliation is bounded and independent of long model/worker
+turns: Silas dispatches actionable work and re-enters reconciliation
+rather than holding the fleet behind one HTTP turn or a broad historical
+re-audit; an actively working long lane is neither duplicated nor
+interrupted, and no detached retry/capacity watcher is built. Each tick
+acts or records a justified dependency, with fairness across runnable
+jobs; re-observation is not progress. Accepted actions and requests are
+reconciled before resuming after a restart — recorded durably before
+their effects can be lost, with idempotency, head/generation binding,
+and single-writer fences. Verification stays scheduler-owned and
+one-shot (one owned accepted producer, exclusive pre-opened captures
+through EOF, honest terminal states); a queue timeout is not a test
+result, a captured failure stays a failure until real repair, and
+lost logs never justify a rerun. A heartbeat, an open turn, an HTTP 200,
+a delivered prompt, or old-head CI is not progress or readiness.
+Artifact-only and investigation jobs complete at their verified artifact
+handback; product-PR jobs complete through implement/integrate → verify
+→ repair → independent review/fix → normal publication → exact
+final-head CI/native Perkins → the owner-held merge. Limits, gates, and
+owner-held decisions are unchanged.
+
+**Outcome truth (owner clarification 2026-10-02).** A fulfilled async
+call, HTTP 200, tool return, model turn ending, or recorded receipt alone
+is not contract delivery. Success, failure, cancellation, and
+interruption are validated at the originating runtime/control boundary;
+a failed or unknown outcome keeps its error evidence and a GC-owned
+repair/retry obligation, and no success-delivery fact is emitted because
+control returned. Genuinely delivered, terminal, and deliberately parked
+jobs are never reopened merely because no worker is live or no product PR
+exists — artifact-only and investigation jobs complete at their verified
+artifact handback. Current phase and history stay distinct: a job
+legitimately returned to working by review feedback or authorized repair
+has a new active obligation, and the older `job.delivered` event is
+history, never proof that the new phase is done (events are not erased or
+rewritten). A failed attempt during an owned repair does not destroy the
+undertaking.
+
+**Policy vs implemented.** These obligations ship in the installed
+playbook, but the runtime does not yet enforce all of them. Still
+missing in code: the stalled/PR-overdue predicates do not carry
+deliverable-kind carve-outs for artifact-only jobs; and current-phase
+delivery is not distinct from historical `job.delivered` events
+(`stalledWorking` still keys on the absence of any historical delivery).
+Those gaps, plus board cadence/next-action truth, are tracked in
+mssoka/gru-command issues #160 (delivery truth), #162 (current-phase
+stalled detection), and #163 (bounded reconciliation while a model turn
+is open); artifact-job classification and board timing are named there as
+further separate concerns. The outcome/phase machinery itself is
+`durable-blocked-followthrough` (PR #136, **merged into main**): durable
+directive intent, request-id idempotency with single-writer refusal,
+marked phase handoffs with correlated completion, per-turn terminal
+outcome validation (`src/runtime/prompt-verdict.ts`), and boot
+reconciliation. That is the mechanism to extend — do not build a parallel
+outcome system. `/api/verify` admission/re-arm (#159) is still missing.
+Nothing in this section claims those remaining runtime guarantees exist
+today.
 
 ## 5. Release (the sweep)
 
@@ -462,8 +561,9 @@ IDs remain pending for rate-limited retry.
 **Mandate — act (tier-2).** A wake is machine attention meant to be acted
 on in-turn: Gru diagnoses the incident and takes one substantive step per
 incident (a fix lane, a re-arm, a disposition) within budget, staging the
-rest; novel failures and judgment calls stay with Gru. Gru holds merge
-authority for this repository; the owner retains it elsewhere. The owner
+rest; novel failures and judgment calls stay with Gru. Merge authority is
+owner-held everywhere — this repository included; Gru presents a merge to
+the owner only after the exact-final-head READY Perkins gate. The owner
 is reached only through `needs-owner` — and sparingly; an empty FOR YOU
 band is the healthy state.
 
@@ -474,7 +574,7 @@ next user-directed context block:
 | routing | meaning | surface |
 |---|---|---|
 | `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue; wakes Gru; never rings the owner bell |
-| `needs-owner` | owner-only decisions (merges outside this repo, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
+| `needs-owner` | owner-only decisions (merges everywhere, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
 | `fyi` | standing feed | board feed only |
 
 **Unresolved follow-up.** A successful prompt is delivery, not resolution.
@@ -509,7 +609,7 @@ actual resolutions and job events must be counted separately.
 **Silas mandate split** (same lane). Mechanical reactions move to Silas's
 ops driver — re-arm review rounds after clean aborts, pattern respins for
 known failure classes, sweep acks under recorded rules. Gru keeps the
-judgments: rulings, merges, and novel failures. One standing rule from the
+judgments: rulings, merge escalations, and novel failures. One standing rule from the
 2026-09-23 freeze: never auto-arm a review round on a branch while a
 rebase/force-push lane is active on the same target (the round races the
 push and dies obsolete); arm after the lane delivery settles. Service

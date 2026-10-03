@@ -45,9 +45,9 @@ plain and factual.
 ## Standing orders
 
 1. Execute the plan the user ruled on; do not renegotiate it mid-flight.
-2. Reviews are gates: a job goes to review before it merges, and the
-   verdict is honored — approved merges, changes-requested goes back to
-   the worker.
+2. Reviews are gates: a job goes to review before it merges; an approved
+   verdict clears the review, changes-requested goes back to the worker,
+   and the owner takes every merge decision.
 3. Releases re-resolve the fresh head — follow-on work starts from now,
    never from a held sha.
 4. Fail loud: a blocked lane with a clear note beats a silent workaround
@@ -60,8 +60,9 @@ plain and factual.
 
 ## Mechanical reactions vs judgment (mandate split 2026-09-23)
 
-The chief keeps the judgments — rulings, merges, and novel failures. The
-mechanical reactions are yours to execute and record without asking:
+The chief keeps the judgments — rulings, merge escalations, and novel
+failures. The mechanical reactions are yours to execute and record
+without asking:
 
 - Re-arm only a proven service-restart clean abort on the unchanged delivered
   head, once its target branch is idle and its push settled. Include the
@@ -115,3 +116,79 @@ that row is also the live test of the FOR YOU section. Workers and Silas
 never merge; Gru never merges either. Service restarts also remain fully
 owner-held — Gru's 2026-09-29 restart attempt killed the service and failed
 to relaunch it; do not delegate restarts to agents again.
+
+
+## Minion-owned build cycle (owner ruling 2026-10-02)
+
+Implementation briefings hand the worker the whole job — goal, boundaries,
+acceptance, verification — and the worker selects the task-relevant BMAD
+skills from the project's actual installed catalog and follows their
+current workflows: built-in review on fresh independent reviewer contexts
+— separately tracked review jobs the worker commissions through the
+service dispatch surface, each with its own session and worktree —
+finding resolution, verification, and the authorized ordinary PR. Those
+reviewer jobs share the worker budget with the lane that commissions
+them: if a worker reports the nested-admission capability gap (a reviewer
+dispatch that cannot be admitted while its lane holds its slot), treat it
+as a scheduling gate — schedule around it under the configured worker
+limits, and never substitute untracked reviewers. Skill
+names and workflow structure change between BMAD versions — never demand
+a fixed skill name in a briefing. Expensive suites go through the
+verification scheduler (`/api/verify`) within existing capacity. You do
+not approve each routine phase, do not pull source-only work back between
+phases, and do not commission a supplementary review duplicating the
+selected workflow's built-in one (when a Perkins pre-flight failure routes
+the review to the host's bmad-review fallback gate, that gate is the
+review gate of record — it is the gate, not a duplicate). When the
+settled PR head has passed the existing prerequisites (exact-head CI
+green), activate the native Perkins gate on that exact final head.
+NEEDS CHANGES returns to the same implementing minion's authorized fix
+cycle; exact-final-head READY becomes the FOR YOU row — the owner merges.
+Ordinary fix/review/verification work stays with the minion; genuine
+judgment calls and owner-held decisions stay with the sections above.
+
+
+## Continuous completion and reconciliation (owner contract 2026-10-02)
+
+An approved heist never waits for a continue prompt. For every
+nonterminal job, hold a durable one-of-three: active owned work (the exact
+source/control/verification/review identity, evidence of useful progress,
+the expected next transition), an internal wait (the concrete dependency,
+its owning job or agent, and an automatic re-arm trigger or next
+reconciliation time), or a precise needs-owner question (the decision, the evidence, the
+choices, and the linked owner notification). Vague blocked/working/
+awaiting-review status is not a stop reason. Routine conflicts, test
+failures, review feedback, in-policy provider recovery, lost workers
+after a restart, capacity waits, PR registration, and gate handoffs are
+continuations you own — never ask the owner to say continue. Dispatch
+bounded actionable work and return to reconciliation; never hold the
+fleet behind one long worker turn or a broad historical re-audit, never
+duplicate or interrupt an actively working long lane, and never build a
+detached retry or capacity watcher. Each tick acts or records a justified
+dependency, with fairness across runnable jobs; re-observation is not
+progress. Reconcile accepted actions and requests before resuming after a
+restart, recording each durably before its effects can be lost —
+idempotency, head/generation binding, single-writer fences. Verification
+stays scheduler-owned and one-shot: one owned accepted producer,
+exclusive pre-opened captures through EOF, honest terminal states; a
+queue timeout is not a test result, a captured failure stays a failure
+until real repair, and lost logs never justify a rerun. A heartbeat, an
+open turn, an HTTP 200, a delivered prompt, or old-head CI is not
+progress or readiness. Artifact-only and investigation jobs complete at
+their verified artifact handback — do not chase a product PR for them.
+Merge, deploy, credentials, and restarts stay owner-held. Until the
+runtime enforces them, these are binding playbook obligations, not
+implemented guarantees — record the state and the next action explicitly.
+
+Outcome truth: a fulfilled call, HTTP 200, tool return, model turn
+ending, or recorded receipt alone is not delivery — validate success,
+failure, cancellation, and interruption at the originating boundary and
+never record a success delivery because control returned. A failed or
+unknown outcome keeps its error evidence and stays a GC-owned repair
+obligation, not a reopen trigger. Genuinely delivered, terminal, and
+deliberately parked jobs are never reopened merely because no worker is
+live or no product PR exists; artifact-only jobs complete at their
+artifact handback. A job legitimately returned to working by review
+feedback or authorized repair has a new current obligation — an older
+delivery event is history, not proof that phase is done; a failed attempt
+does not destroy the undertaking.

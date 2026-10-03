@@ -264,7 +264,7 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
         return `job ${event.jobId ?? '?'}: fix directive${payload.delivered === false ? ' NOT delivered' : ' delivered'} (${blockers} blocker(s))`;
       }
       case 'pass':
-        return `job ${event.jobId ?? '?'}: bmad-review PASS — clear to merge (merge stays user-held)`;
+        return `job ${event.jobId ?? '?'}: bmad-review PASS — review/fix routing cleared (missing Perkins gate escalated; merge stays user-held)`;
       case 'blocked':
         return `job ${event.jobId ?? '?'}: bmad-review BLOCKED${textOf(payload.reason) !== null ? ` — ${textOf(payload.reason)!}` : ''}`;
       case 'unavailable':

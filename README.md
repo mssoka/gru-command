@@ -161,10 +161,13 @@ external pins `cis=v0.3.2`, `tea=v1.27.2`, `gds=v0.7.2`. Runtime bindings
 follow the selected `pi`/Claude tools. Existing/customized installs
 default to **reuse unchanged**; per-repo skip is always available.
 The pinned set carries `bmad-review` out of the box, and it is a gate:
-0 blockers means clear to merge, while blockers route back to the
+0 blockers clears the review/fix routing, while blockers route back to the
 implementing minion as fix directives—never inform-only. Perkins
-(GitHub/GitLab) remains the stronger gate with exact-head verdicts and
-autonomous-merge authority.
+(GitHub/GitLab) is the stronger gate with exact-head verdicts; an
+exact-final-head Perkins READY is required before a merge is presented to
+the owner, and all merges are owner-held. When a Perkins pre-flight
+failure routes the review to the bmad-review gate, its PASS is not a
+Perkins READY — the missing Perkins gate is escalated, never substituted.
 
 Successful setup records exact versions in
 `.gru-command/bmad-install.json`, adds an idempotent owned bootstrap
@@ -172,7 +175,8 @@ block to `.gru-command/worktree.toml`, and uses narrow Git-local excludes
 for generated paths. It does not blanket-ignore `.agents/`, `.claude/`,
 or `_bmad-output/`, and never untracks files. Commit the three
 `.gru-command/` bootstrap files so newly-created worktrees can copy an
-isolated project-local BMAD install and discover `bmad-build`; generated
+isolated project-local BMAD install and discover the build-workflow
+skill this pinned release provides (`bmad-build` in `bmad-method@6.12.0`); generated
 skills/output remain local. Network/prerequisite/partial failures name
 the repo and require retry or explicit skip—no false-ready state.
 

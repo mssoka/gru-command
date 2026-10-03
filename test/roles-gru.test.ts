@@ -25,11 +25,29 @@ describe('gru role definition', () => {
     expect(prompt).toContain('single chief agent');
     expect(prompt).toContain('Consult before you dispatch');
     expect(prompt).toContain('Plan before the heist');
+    expect(prompt).toContain('Hand workers the whole build');
+    expect(prompt).toContain("project's actual installed BMAD skills");
+    expect(prompt).toContain('select the task-relevant skill');
+    expect(prompt).toContain('built-in review on fresh independent tracked reviewer jobs');
+    expect(prompt).toContain('brief by the task, never by a fixed name');
+    expect(prompt).toContain('Merges are owner-held');
+    // Continuous completion contract (owner 2026-10-02): routine
+    // continuation never asks the owner to say continue.
+    expect(prompt).toContain('Continue without ceremony');
+    expect(prompt).toContain('nobody asks the owner to say continue');
+    expect(prompt).toContain('is not a stop reason by itself');
+    // Outcome truth (owner clarification 2026-10-02) on one raw line each.
+    expect(prompt).toContain('Outcomes over liveness');
+    expect(prompt).toContain('is not delivery');
+    expect(prompt).toContain('never reopened to compensate');
+    expect(prompt).toContain('an older delivery');
     expect(prompt).toContain('single-writer');
     expect(prompt).toContain('UNTRUSTED DATA');
     expect(prompt).toContain('POST /api/notifications/needs-owner');
     expect(prompt).toContain('Perkins must be READY on the exact final head');
-    expect(prompt).toContain('Elsewhere the owner decides');
+    expect(prompt).toContain('Everywhere the owner decides');
+    // The superseded Gru-merges-gru-command rule must never return.
+    expect(prompt).not.toContain('Merges in this repository are yours');
   });
 
   it('the role config maps the permission set (tools + workspace cwd)', () => {

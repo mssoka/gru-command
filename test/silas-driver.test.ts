@@ -618,6 +618,49 @@ describe('silas skills and wake prompt', () => {
     const ops = skills.find((skill) => skill.name === 'ops-dispatch')!.body.replace(/\s+/gu, ' ');
     expect(ops).toContain('New pull requests are ordinary');
     expect(ops).toContain('`gh pr create` without `--draft`/`-d`');
+    // The ops skill carries the minion-owned BMAD workflow completion cycle.
+    expect(ops).toContain("select the task-relevant BMAD skills from the project's actual installed catalog");
+    expect(ops).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
+    expect(ops).toContain('separately tracked review jobs');
+    expect(ops).toContain('nested-admission capability gap');
+    // j-810/j-811: the retired untracked headless-launcher wording must never return.
+    expect(ops).not.toContain('pi -p');
+    expect(ops).not.toContain('headless print mode');
+    // The owner-held merge rule must live on the loaded skill body itself
+    // (loop-1 adoption), not only in the composed wake prompt header.
+    expect(ops).toContain('The owner holds ALL merges');
+    expect(ops).toContain('the owner merges gru-command too');
+    expect(ops).not.toContain('The chief holds merge authority');
+    expect(ops).not.toContain('Gru merges gru-command only');
+    // Fixed build-skill names must not return on the ops surface either,
+    // while the legitimate review tokens stay allowed.
+    const opsTokens = [...ops.matchAll(/bmad-[a-z][a-z-]*/gu)].map((match) => match[0]);
+    expect(opsTokens.every((token) => token === 'bmad-review' || token === 'bmad-review-fallback')).toBe(true);
+    expect(ops).toContain('never demand a fixed skill name');
+    // Continuous completion contract (owner 2026-10-02) on the loaded skill.
+    expect(ops).toContain('Continuous completion (owner contract 2026-10-02)');
+    expect(ops).toContain('Active owned work');
+    expect(ops).toContain('Internal wait');
+    expect(ops).toContain('Needs owner');
+    expect(ops).toContain('never hold the fleet behind one long');
+    expect(ops).toContain('restart cannot lose or double an effect');
+    expect(ops).toContain('queue timeout is not a test result');
+    expect(ops).toContain('A heartbeat, an open turn, an API 200');
+    expect(ops).toContain('binding playbook obligations, not implemented guarantees');
+    // Fallback-gate merge wording reconciled to owner-held (final review),
+    // then re-aligned to Acceptance 4 by native r3: fallback PASS clears
+    // review/fix routing only; READY is still required to present a merge.
+    expect(ops).toContain('its PASS is not Perkins READY');
+    expect(ops).toContain('escalate the missing Perkins gate');
+    expect(ops).not.toContain("carrying that gate's");
+    expect(ops).not.toContain('the fallback gate never authorizes one');
+    // Outcome truth (owner clarification 2026-10-02).
+    expect(ops).toContain('Outcome truth (owner clarification 2026-10-02)');
+    expect(ops).toContain('never emit a success-delivery fact because control returned');
+    expect(ops).toContain('an older delivery event is evidence of an earlier phase');
+    expect(ops).toContain('never compensate by reopening delivered jobs or building');
+    expect(ops).toContain('do not commission a supplementary review duplicating');
+    expect(ops).toContain('it is the gate, never a duplicate review');
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);
   });
 
@@ -628,9 +671,11 @@ describe('silas skills and wake prompt', () => {
       verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [], providerRecoveryPending: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
-    expect(prompt).toContain('Gru may merge gru-command only');
+    expect(prompt).toContain('The owner holds ALL merges');
     expect(prompt).toContain('fallback PASS is not that clearance');
-    expect(prompt).toContain('owner holds merges elsewhere');
+    expect(prompt).toContain('a merge is presented to the owner only after the');
+    expect(prompt).not.toContain('Gru may merge gru-command only');
+    expect(prompt).not.toContain('owner holds merges elsewhere');
     expect(prompt).toContain('clean-abort-service-restart');
     expect(prompt).toContain('source_round_id');
     expect(prompt).not.toContain('human holds the merge);');

@@ -61,9 +61,10 @@ try {
   }
   // bmad-review gate ruling (fork-3 extension): the default pinned module set
   // must carry the project-local bmad-review skill so a default-onboarded user
-  // can gate on it — 0 blockers = clear to merge; blockers route back to the
-  // implementing minion as fix directives, never inform-only. Perkins stays the
-  // stronger exact-head gate with autonomous-merge authority.
+  // can gate on it — 0 blockers clears review/fix routing; blockers route back
+  // to the implementing minion as fix directives, never inform-only. Perkins
+  // stays the stronger exact-head gate — the owner merges after its exact-head
+  // READY (all merges are owner-held).
   const reviewSkill = join(worktree, '.agents', 'skills', 'bmad-review', 'SKILL.md');
   if (!existsSync(reviewSkill) || lstatSync(reviewSkill).isSymbolicLink() || !statSync(reviewSkill).isFile()) {
     throw new Error('fresh worktree lacks the project-local bmad-review gate skill');

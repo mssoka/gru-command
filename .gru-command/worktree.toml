@@ -121,3 +121,41 @@ t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perk
 # out, and no branch/worktree holds the sha.
 board-merged-attention-baseline = 'set -e; base=059c076290145d4aae6e0b47c7b3f87156862c43; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-merged-attention.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board-merged-attention.test.ts > "$d/web/src/ui/board-merged-attention.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-merged-attention-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-merged-attention-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts'
 finding-dedupe-recency = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-findings-dedupe.test.ts test/suite-shape.test.ts"
+
+# Packaged-playbook correction scopes (owner clarification j-761): focused
+# prompt/packaging regressions, the installed-tarball artifact suite, and
+# the fail-before baseline comparison. Plain vitest invocations through the
+# authenticated /api/verify scheduler only — no worker/timeout flags, never
+# `npm test`; the baseline creates its own snapshot and builds inside it. Each
+# scope applies the approved worker-RPC patch first
+# (the same prerequisite `npm test` runs via pretest). The baseline scope
+# overlays the four fast prompt/packaging oracles
+# (roles-installed-playbook, roles-definitions, roles-gru, silas-driver)
+# onto the pinned pre-playbook tree and expects RED (the baseline prompts
+# predate the shipped policy): the vitest exit status is left intact so the
+# scheduler records outcome.exitCode as evidence; it is never masked into a
+# PASS. A GREEN baseline exits 4 (the fail-before claim would be broken);
+# the staged-tarball oracles are covered by the packaged-artifact scope and
+# the pre-change phrase-absence proof, not by this overlay. Setup failures carry their own
+# exit (3) distinct from the expected test RED (1), and the build guard uses
+# exit 99 — never confusable with feature evidence. The snapshot location
+# (dir, base, and the lane head whose tests were overlaid) is recorded in
+# _bmad-output/gate-prep/packaged-playbook-baseline.last-snapshot.txt and
+# never deleted — preserved for inspection. `prep` is anchored at "$root"
+# because the build redirect runs AFTER the cd into the snapshot directory.
+packaged-playbook = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/suite-shape.test.ts test/roles-installed-playbook.test.ts test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts test/install.test.ts"
+packaged-artifact = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-whole-review.test.ts"
+packaged-playbook-baseline = 'set -e; setup_fail() { echo "baseline setup failed — NOT the expected test RED" >&2; exit 3; }; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; root="$PWD"; prep="$root/_bmad-output/gate-prep"; mkdir -p "$prep" || setup_fail; node tools/patch-vitest-rpc-timeout.mjs || setup_fail; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-packaged-playbook.XXXXXX") || setup_fail; git archive "$base" | tar -x -C "$d" || setup_fail; cp test/roles-installed-playbook.test.ts test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts "$d/test/" || setup_fail; [ -d "$root/node_modules" ] || setup_fail; ln -s "$root/node_modules" "$d/node_modules" || setup_fail; head=$(git rev-parse HEAD) || setup_fail; printf "%s base=%s head=%s\n" "$d" "$base" "$head" > "$prep/packaged-playbook-baseline.last-snapshot.txt" || setup_fail; cd "$d" || setup_fail; if ! npm run build > "$prep/packaged-playbook-baseline.build.log" 2>&1; then echo "baseline build failed — NOT the expected test RED" >&2; exit 99; fi; rc=0; npx vitest run test/roles-installed-playbook.test.ts test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts || rc=$?; if [ "$rc" -eq 0 ]; then echo "baseline unexpectedly GREEN — fail-before claim broken" >&2; exit 4; fi; exit "$rc"'
+
+
+# Timeout classification (declared during the final-review cycle at
+# b3a204a; the observed FULL-run timeout class was seen at c80ad0e): the two
+# FULL-run timeouts (dispatch-server by=silas attribution; wizard --answers) run in
+# isolation at the UNCHANGED 30s default ceiling. An isolation pass
+# classifies the FULL failures as co-tenant load effects on untouched
+# subprocess-heavy tests (vitest.config.ts documents that class); a
+# deterministic fail here is a real gate. No test, timeout, or assertion
+# changes. Sequential invocations so the two heavy files do not starve
+# each other.
+packaged-playbook-timeouts = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/wizard.test.ts && npx vitest run test/dispatch-server.test.ts"
+

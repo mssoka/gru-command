@@ -1324,11 +1324,16 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       'dist/runtime/review-mcp-bridge.js',
       'dist/runtime/review-mcp-server.mjs',
       'resources/perkins-code-review/policy.json',
+      'resources/silas-skills/ops-dispatch/SKILL.md',
       'tools/verify-perkins-resource.mjs',
       'install.sh',
       'install/launchd/com.gru-command.service.plist.template',
       'install/systemd/gru-command.service.template',
       'roles/perkins.md',
+      'roles/minion.md',
+      'roles/silas.md',
+      'roles/gru.md',
+      'roles/bob.md',
       'web/dist/index.html',
     ]));
     const excludedMarker = ['j', 'ev'].join('');
@@ -1341,6 +1346,60 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     execFileSync('tar', ['-xzf', join(tarRoot, packed[0]!.filename), '-C', extractRoot]);
     const stage = join(extractRoot, 'package');
     expect(existsSync(join(stage, 'src'))).toBe(false);
+    // A real install resolves the shipped dist's bare imports through the
+    // dependency tree npm puts beside the package (the tarball itself never
+    // carries node_modules) — mirror that here so the smoke's
+    // `import('./dist/roles.js')` leg exercises the installed loading path.
+    symlinkSync(join(productRoot, 'node_modules'), join(stage, 'node_modules'), 'dir');
+    // The shipped artifact carries the minion-owned BMAD workflow playbook
+    // in the packaged personas (owner ruling 2026-10-02; clarification
+    // j-761): the STAGED minion prompt — read from the tarball extract, not
+    // the developer checkout — must select the task-relevant installed BMAD
+    // skills from the project's actual catalog and its fresh-reviewer
+    // cycle, and the staged ops skill must not commission a duplicate
+    // review.
+    const stagedMinion = readFileSync(join(stage, 'roles', 'minion.md'), 'utf-8').replace(/\s+/gu, ' ');
+    expect(stagedMinion).toContain("the PROJECT's actual installed skill catalog and metadata");
+    expect(stagedMinion).toContain('select by capability from what the project really has installed');
+    expect(stagedMinion).toContain('You own the selected workflow end to end');
+    expect(stagedMinion).toContain('fresh, context-free tracked review jobs');
+    expect(stagedMinion).not.toContain('pi -p');
+    expect(stagedMinion).not.toContain('headless print mode');
+    expect(stagedMinion).toContain('an inline self-review is not a substitute');
+    expect(stagedMinion).toContain('Project-local BMAD setup');
+    expect(stagedMinion).toContain('Approved work runs to its end without a new go-ahead');
+    expect(stagedMinion).toContain('A failed attempt is not a destroyed undertaking');
+    expect(stagedMinion).toContain('binding playbook obligations, not runtime guarantees');
+    expect(stagedMinion).toContain('the review is the gate, and the owner holds every merge');
+    expect(stagedMinion).toContain('reconcile it by job identity');
+    expect(stagedMinion).toContain('Report outcomes truthfully');
+    expect(stagedMinion).toContain('an older delivery is history');
+    expect(stagedMinion).not.toMatch(/bmad-[a-z][a-z-]*/u);
+    const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
+    expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
+    expect(stagedOps).toContain('separately tracked review jobs');
+    expect(stagedOps).toContain('nested-admission capability gap');
+    expect(stagedOps).toContain('The owner holds ALL merges');
+    expect(stagedOps).not.toContain('The chief holds merge authority');
+    expect(stagedOps).toContain('never demand a fixed skill name');
+    expect(stagedOps).toContain('do not commission a supplementary review duplicating');
+    expect(stagedOps).toContain('native Perkins round on the exact final settled PR head');
+    expect(stagedOps).toContain('it is the gate, never a duplicate review');
+    expect(stagedOps).toContain('Continuous completion (owner contract 2026-10-02)');
+    expect(stagedOps).toContain('Active owned work');
+    expect(stagedOps).toContain('never hold the fleet behind one long');
+    expect(stagedOps).toContain('queue timeout is not a test result');
+    expect(stagedOps).toContain('binding playbook obligations, not implemented guarantees');
+    expect(stagedOps).toContain('its PASS is not Perkins READY');
+    expect(stagedOps).toContain('escalate the missing Perkins gate');
+    expect(stagedOps).toContain('Outcome truth (owner clarification 2026-10-02)');
+    expect(stagedOps).toContain('never emit a success-delivery fact because control returned');
+    expect(stagedOps).toContain('never compensate by reopening delivered jobs or building');
+    // The shipped worker prompt points at this README section: prove the
+    // heading travels in the installed package.
+    expect(readFileSync(join(stage, 'README.md'), 'utf-8')).toContain('### Project-local BMAD setup');
+    const stagedOpsTokens = [...stagedOps.matchAll(/bmad-[a-z][a-z-]*/gu)].map((match) => match[0]);
+    expect(stagedOpsTokens.every((token) => token === 'bmad-review' || token === 'bmad-review-fallback')).toBe(true);
     expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
@@ -1352,6 +1411,27 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       import { spawn } from 'node:child_process';
       import { loadPerkinsPolicy } from './dist/dispatch/perkins-review/policy.js';
       import { ReviewMcpBridge } from './dist/runtime/review-mcp-bridge.js';
+      const { ROLE_DEFINITIONS } = await import('./dist/roles.js');
+      // The shipped prompts are markdown: phrases may wrap across lines,
+      // so flatten before substring checks (the vitest pins do the same).
+      const flatten = (text) => text.replace(/\\s+/g, ' ');
+      const minionPrompt = flatten(ROLE_DEFINITIONS.minion.systemPrompt);
+      const silasPrompt = flatten(ROLE_DEFINITIONS.silas.systemPrompt);
+      const gruPrompt = flatten(ROLE_DEFINITIONS.gru.systemPrompt);
+      if (!minionPrompt.includes("the PROJECT's actual installed skill catalog and metadata") ||
+          !minionPrompt.includes('fresh, context-free tracked review jobs') ||
+          !minionPrompt.includes('Approved work runs to its end without a new go-ahead') ||
+          /bmad-[a-z][a-z-]*/.test(minionPrompt)) {
+        throw new Error('staged minion prompt lacks the BMAD workflow playbook');
+      }
+      if (!silasPrompt.includes("selects the task-relevant BMAD skills from the project's actual installed catalog") ||
+          !silasPrompt.includes('never ask the owner to say continue') ||
+          silasPrompt.includes('bmad-build')) {
+        throw new Error('staged silas prompt lacks the minion-owned build cycle');
+      }
+      if (!gruPrompt.includes('Hand workers the whole build')) {
+        throw new Error('staged gru prompt lacks the whole-build handoff');
+      }
       const bridge = await ReviewMcpBridge.start([{
         name: 'perkins_probe', description: 'staged probe', inputSchema: { type: 'object' },
         execute: async () => ({ text: 'stage-ok' }),

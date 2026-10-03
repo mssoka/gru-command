@@ -71,6 +71,91 @@ describe('role definitions (E8)', () => {
     expect(silas).toContain('existing drafts are left untouched');
   });
 
+  it('pins the task-relevant BMAD workflow playbook on the worker prompt', () => {
+    const minion = ROLE_DEFINITIONS['minion'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(minion).toContain("explicitly select the project's installed build-workflow skill");
+    expect(minion).toContain("the PROJECT's actual installed skill catalog and metadata");
+    expect(minion).toContain('select by capability from what the project really has installed');
+    expect(minion).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
+    expect(minion).toContain('You own the selected workflow end to end');
+    expect(minion).toContain('no self-imposed call, turn, or time ceiling');
+    expect(minion).toContain("fresh, context-free tracked review jobs you commission through the service's job-dispatch surface");
+    expect(minion).toContain('`POST /api/dispatch` — the same path that created your lane');
+    expect(minion).toContain('each reviewer is a separate tracked job with its own session and worktree');
+    // Native round 1 (admission-cycle blocker): a nested reviewer dispatch
+    // that cannot be admitted must stop loud, never deadlock or bypass caps.
+    expect(minion).toContain('nested-admission capability gap');
+    expect(minion).toContain('do not block waiting');
+    expect(minion).toContain('never raise or bypass the configured worker limits');
+    // j-810/j-811: the retired untracked headless-launcher wording must never return.
+    expect(minion).not.toContain('pi -p');
+    expect(minion).not.toContain('claude -p');
+    expect(minion).not.toContain('headless print mode');
+    // The verification scheduler is the one global budget; the worker
+    // prompt must not read as licence for competing full runs.
+    expect(minion).toContain("coordinate through the service's verification scheduler");
+    expect(minion).toContain('never a second Gru');
+    expect(minion).toContain('an inline self-review is not a substitute');
+    expect(minion).toContain('report that exact capability gap loudly');
+    expect(minion).toContain('supported official BMAD onboarding/discovery path');
+    // Native round 2 warning: name the concrete onboarding surface.
+    expect(minion).toContain('Project-local BMAD setup');
+    expect(minion).toContain('no guessed rename');
+    // Continuous completion contract (owner 2026-10-02): approved work runs
+    // to the end without a continue prompt; artifact jobs owe no PR; the
+    // obligations are policy, not implemented runtime guarantees.
+    expect(minion).toContain('Approved work runs to its end without a new go-ahead');
+    expect(minion).toContain('A failed attempt is not a destroyed undertaking');
+    expect(minion).toContain('no product PR is owed');
+    expect(minion).toContain('binding playbook obligations, not runtime guarantees');
+    // Owner-held merge adoption on the worker surface + accepted-action
+    // reconciliation for dispatched reviewer jobs.
+    expect(minion).toContain('the review is the gate, and the owner holds every merge');
+    expect(minion).toContain('read-only brief that names the exact immutable head');
+    expect(minion).toContain('never echo it');
+    expect(minion).toContain('reconcile it by job identity');
+    // Outcome truth (owner clarification 2026-10-02).
+    expect(minion).toContain('Report outcomes truthfully');
+    expect(minion).toContain('a fulfilled call, HTTP 200, tool return, turn ending, or receipt is not delivery');
+    expect(minion).toContain('never reopen a genuinely delivered or parked job to compensate');
+    expect(minion).toContain('an older delivery is history');
+    // Owner clarification j-761: the shipped policy selects by capability
+    // from the project's actual catalog; a fixed skill name is never the
+    // normative entry point — not just the retired `bmad-build` literal.
+    expect(minion).not.toMatch(/bmad-[a-z][a-z-]*/u);
+  });
+
+  it('pins the minion-owned build cycle on the ops prompt', () => {
+    const silas = ROLE_DEFINITIONS['silas'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(silas).toContain('Minion-owned build cycle');
+    expect(silas).toContain('goal, boundaries, acceptance, verification');
+    expect(silas).toContain("selects the task-relevant BMAD skills from the project's actual installed catalog");
+    expect(silas).toContain('never demand a fixed skill name in a briefing');
+    expect(silas).toContain('verification scheduler');
+    expect(silas).toContain('do not commission a supplementary review duplicating');
+    expect(silas).toContain('activate the native Perkins gate on that exact final head');
+    expect(silas).toContain('NEEDS CHANGES returns to the same implementing minion');
+    // Continuous completion + reconciliation contract (owner 2026-10-02).
+    expect(silas).toContain('Continuous completion and reconciliation');
+    expect(silas).toContain('never ask the owner to say continue');
+    expect(silas).toContain('awaiting-review status is not a stop reason');
+    expect(silas).toContain('never hold the fleet behind one long worker turn');
+    expect(silas).toContain('Reconcile accepted actions and requests before resuming');
+    expect(silas).toContain('restart, recording each durably before its effects can be lost');
+    expect(silas).toContain('a queue timeout is not a test result');
+    expect(silas).toContain('Artifact-only and investigation jobs complete at their verified artifact handback');
+    expect(silas).toContain('binding playbook obligations, not implemented guarantees');
+    // Outcome truth (owner clarification 2026-10-02).
+    expect(silas).toContain('Outcome truth: a fulfilled call');
+    expect(silas).toContain('never record a success delivery because control returned');
+    expect(silas).toContain('not a reopen trigger');
+    expect(silas).toContain('an older delivery event is history');
+    expect(silas).toContain('a failed attempt does not destroy the undertaking');
+    // Owner-held merge on the reviews-are-gates standing order.
+    expect(silas).toContain('an approved verdict clears the review');
+    expect(silas).not.toContain('approved merges, changes-requested goes back');
+  });
+
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {
     expect(ROLE_DEFINITIONS['gru'].cwd).toBe('workspace_root');
     expect(ROLE_DEFINITIONS['silas'].cwd).toBe('workspace_root');
