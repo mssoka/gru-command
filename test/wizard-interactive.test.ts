@@ -423,7 +423,10 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       [
         { expect: WS_PROMPT, send: workspace },
         { expect: REPOS_PROMPT, send: '1' },
-        { expect: BMAD_A_PROMPT, send: 'reuse' },
+        // No manifest exists, so the interactive prompt is the fresh-repo
+        // Y/n default (Enter = install): the install attempt then refuses
+        // the partial install — deterministic and hint-less.
+        { expect: BMAD_A_PROMPT, send: '' },
         { expect: RUNTIME_PROMPT, send: 'pi' },
         { expect: MODEL_PROMPT, send: '' },
         { expect: THINKING_PROMPT, send: '' },
