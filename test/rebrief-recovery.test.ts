@@ -54,6 +54,10 @@ class FakeAgents implements DirectiveRegistry {
   readonly disposed: string[] = [];
   failSpawn: Error | null = null;
   failPrompt: Error | null = null;
+  /** When set, every handle's health() reports an in-band runtime error —
+   * the fulfilled-but-failed outcome both real adapters can produce. */
+  healthState: 'idle' | 'error' = 'idle';
+  healthError: string | null = null;
   /** When set, every minion prompt waits on this gate before settling. */
   gate: Promise<void> | null = null;
   private readonly expectedSessionFile: string | null;
@@ -82,6 +86,8 @@ class FakeAgents implements DirectiveRegistry {
   private handleFor(record: { id: string; role: Role; options: SpawnOptions; prompts: string[] }): AgentHandle {
     const gate = (): Promise<void> | null => this.gate;
     const failPrompt = (): Error | null => this.failPrompt;
+    const healthState = (): 'idle' | 'error' => this.healthState;
+    const healthError = (): string | null => this.healthError;
     return {
       role: record.role,
       id: record.id,
@@ -99,8 +105,11 @@ class FakeAgents implements DirectiveRegistry {
       subscribe(): () => void {
         return () => {};
       },
-      health(): { state: 'idle'; lastActivity: null; sessionFile: null } {
-        return { state: 'idle', lastActivity: null, sessionFile: null };
+      health() {
+        const error = healthError();
+        return healthState() === 'error'
+          ? { state: 'error' as const, lastActivity: null, sessionFile: null, ...(error === null ? {} : { error }) }
+          : { state: 'idle' as const, lastActivity: null, sessionFile: null };
       },
       async dispose(): Promise<void> {},
     };
@@ -419,6 +428,36 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')?.payload).toMatchObject({ path: 'delivery-only' });
     expect(h.ledger.listPendingRebriefs()).toHaveLength(0);
+  });
+
+  it('a recovery turn that resolves with an in-band error records no guarded events and keeps the markers (r4 blocker 1)', async () => {
+    const h = makeHarness();
+    const jobId = 'inband-job';
+    await seedPendingRebrief({ h, jobId });
+    h.registry.healthState = 'error';
+    h.registry.healthError = 'assistant stopReason error';
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: h.ledger,
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    expect(report.redispatched).toBe(1);
+    await report.settled;
+    // A fulfilled-but-error turn is NOT a delivery: no request event, no
+    // delivery event, no phase completion — and the markers stay for the
+    // next boot's ladder (never a fabricated success).
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+    // The failure is visible, action-required — never silence.
+    const notification = h.ledger.listNotifications().find((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`);
+    expect(notification).toBeDefined();
+    expect(notification?.routing).toBe('action-required');
+    expect(notification?.detail).toContain('in-band runtime error');
   });
 
   it('does not reconcile markers younger than the boot', async () => {

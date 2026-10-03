@@ -9,6 +9,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { Supervisor } from '../src/supervision/supervisor.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import type { AgentHandle, AgentRuntime, RuntimeEvent, RuntimeEventListener, SpawnOptions } from '../src/runtime/types.js';
 import type { SessionStore } from '../src/sessions/store.js';
 
@@ -20,6 +21,8 @@ function harness(capacity: number, shouldFail?: (role: Role) => boolean, closeSe
   let next = 0;
   let live = 0;
   let peak = 0;
+  /** Optional hold for verdict-bearing prompts (pending-work assertions). */
+  let verdictHold: Promise<void> | null = null;
   const controllers = new Map<string, { active: boolean; disposed: boolean }>();
   const events = new Map<string, (event: RuntimeEvent) => void>();
   const made: Array<{ id: string; adapter: string; resumeFile?: string }> = [];
@@ -41,6 +44,10 @@ function harness(capacity: number, shouldFail?: (role: Role) => boolean, closeSe
         health: () => ({ state: activity.disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: `${dir}/${agentId}.jsonl` }),
         subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
         prompt: async () => {}, steer: async () => {}, followUp: async () => {},
+        promptWithVerdict: async () => {
+          if (verdictHold !== null) await verdictHold;
+          return { ok: true, error: null };
+        },
         hasLiveProcess: () => false, isCompacting: () => false,
         dispose: async () => {
           if (activity.disposed) return;
@@ -62,7 +69,7 @@ function harness(capacity: number, shouldFail?: (role: Role) => boolean, closeSe
     canReclaim: (id) => controllers.get(id)?.active === false,
     ...(closeSettleMs === undefined ? {} : { closeSettleMs }),
   });
-  return { registry, controllers, events, config, dir, made, get peak() { return peak; }, get live() { return live; }, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { registry, controllers, events, config, dir, made, setVerdictHold: (hold: Promise<void> | null) => { verdictHold = hold; }, get peak() { return peak; }, get live() { return live; }, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 async function tick() { await new Promise<void>((resolve) => setImmediate(resolve)); }
@@ -109,6 +116,38 @@ describe('registry resident boundary across adapters', () => {
       const admitted = await queued;
       expect(h.registry.getHandle(newMinion.id)).toBeNull();
       await admitted.dispose();
+    } finally { h.cleanup(); }
+  });
+
+  it('decorates promptWithVerdict with first-prompt reclaim and the disposal fence (r6 architecture)', async () => {
+    const h = harness(1);
+    try {
+      const newMinion = await h.registry.spawn('minion');
+      // The optional per-turn verdict surface is wrapped by the residency
+      // decorator: no bypass of pending/reclaim accounting.
+      expect(typeof newMinion.promptWithVerdict).toBe('function');
+      const queued = h.registry.spawn('minion');
+      await tick();
+      expect(h.registry.getHandle(newMinion.id)).toBe(newMinion);
+      expect(h.registry.residents.queued).toBe(1);
+      // Pending work: an IN-FLIGHT verdict prompt charges the resident and
+      // blocks reclaim until it settles.
+      let release!: () => void;
+      h.setVerdictHold(new Promise<void>((resolve) => { release = resolve; }));
+      const pending = newMinion.promptWithVerdict!('first turn');
+      for (let i = 0; i < 3; i += 1) await tick();
+      expect(h.registry.getHandle(newMinion.id)).toBe(newMinion);
+      expect(h.registry.residents.queued).toBe(1);
+      release();
+      h.setVerdictHold(null);
+      // A verdict-carrying prompt is a REAL first prompt: settling it makes
+      // the handle reclaimable exactly like prompt() does.
+      await expect(pending).resolves.toEqual({ ok: true, error: null });
+      const admitted = await queued;
+      expect(h.registry.getHandle(newMinion.id)).toBeNull();
+      // The same disposal fence guards late verdict prompts.
+      await admitted.dispose();
+      await expect(newMinion.promptWithVerdict!('late')).rejects.toThrow(WorkerDisposalInProgressError);
     } finally { h.cleanup(); }
   });
 

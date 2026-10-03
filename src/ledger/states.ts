@@ -68,6 +68,28 @@ const LENS_TRANSITIONS: Readonly<Record<LensState, readonly LensState[]>> = {
   error: [],
 };
 
+/** Durable follow-through obligation lifecycle (blocked-heist follow-
+ * through, phase 2). `open` owes its next action now; `waiting` has
+ * delegated/armed a phase and expects a typed receipt (deadline bounded);
+ * `suspended` is an explicit human hold (parking/owner hold) that only an
+ * explicit durable resume leaves; `settled` closed WITH accepted evidence
+ * (executed action or accepted gate); `closed` ended without a settlement
+ * claim (superseded/cancelled/job-terminal) — history is preserved either
+ * way. settled/closed are terminal: an obligation never resurrects; a new
+ * incident on the same lane is a NEW obligation. */
+export const OBLIGATION_STATES = ['open', 'waiting', 'settled', 'suspended', 'closed'] as const;
+export type ObligationState = (typeof OBLIGATION_STATES)[number];
+
+const OBLIGATION_TERMINAL: ReadonlySet<ObligationState> = new Set(['settled', 'closed']);
+
+const OBLIGATION_TRANSITIONS: Readonly<Record<ObligationState, readonly ObligationState[]>> = {
+  open: ['waiting', 'settled', 'suspended', 'closed'],
+  waiting: ['open', 'settled', 'suspended', 'closed'],
+  settled: [],
+  suspended: ['open', 'closed'],
+  closed: [],
+};
+
 function assertTransition<T extends string>(
   machine: string,
   from: T,
@@ -124,4 +146,16 @@ export function isRoundVerdict(value: string): value is RoundVerdict {
 
 export function isLensState(value: string): value is LensState {
   return (LENS_STATES as readonly string[]).includes(value);
+}
+
+export function isObligationState(value: string): value is ObligationState {
+  return (OBLIGATION_STATES as readonly string[]).includes(value);
+}
+
+export function isObligationTerminal(state: ObligationState): boolean {
+  return OBLIGATION_TERMINAL.has(state);
+}
+
+export function assertObligationTransition(from: ObligationState, to: ObligationState): void {
+  assertTransition('obligation', from, to, OBLIGATION_TRANSITIONS);
 }
