@@ -895,33 +895,26 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-  it('/api/silas/directive keeps a post-prompt cancellation LIVE for reconciliation too', async () => {
-    let settleCalls = 0;
-    const h = await boot({ retrySettlement: async () => (++settleCalls === 1 ? 'none' : 'cancelled') });
-    const repo = makeFixtureRepo('fixture-silas-directive-cancel');
+  it('/api/silas/directive keeps a FRESH-minion post-prompt supersession LIVE too', async () => {
+    // No live handle is registered: the route spawns a fresh minion, prompts
+    // it, and only then learns the retry was superseded. Admission is
+    // UNKNOWN — the request stays live on the fresh path as well.
+    const h = await boot({ retrySettlement: async () => 'superseded' });
+    const repo = makeFixtureRepo('fixture-silas-directive-fresh-settle');
     cleanupRepos.push(repo);
     try {
       await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'dir-cancel', repo_path: repo.path, title: 'cancel lane', briefing: 'b',
+        job_id: 'dir-fresh', repo_path: repo.path, title: 'fresh settle lane', briefing: 'b',
       }, TOKEN);
-      const minionId = `agent-${h.spawns.length}`;
-      h.ledger.registerAgent({ id: minionId, role: 'minion', jobId: 'dir-cancel' });
-      h.liveHandles.set(minionId, {
-        role: 'minion',
-        id: minionId,
-        sessionFile: null,
-        capabilities: FAKE_CAPABILITIES,
-        prompt: async () => {},
-        async steer() {},
-        async followUp() {},
-        subscribe: () => () => {},
-        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
-        async dispose() {},
-      });
-      h.ledger.setJobStatus('dir-cancel', 'in-review');
+      // Let the initial dispatch turn settle before the directive starts.
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('dir-fresh', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      h.ledger.setJobStatus('dir-fresh', 'in-review');
       const res = await call(h.port, 'POST', '/api/silas/directive', {
-        job_id: 'dir-cancel',
-        directive: 'Fix under cancellation.',
+        job_id: 'dir-fresh',
+        directive: 'Fix under fresh supersession.',
       }, TOKEN);
       expect(res.status).toBe(202);
       const requestId = field<string>(res.json, 'request_id');
@@ -931,12 +924,14 @@ describe('dispatch server (E8)', () => {
       }
       const readback = h.ledger.getDirective(requestId);
       expect(readback?.state).toBe('dispatching');
-      expect(readback?.failReason).toContain('review operation aborted');
+      expect(readback?.failReason).toContain('superseded');
       const blocked = await call(h.port, 'POST', '/api/silas/directive', {
-        job_id: 'dir-cancel', directive: 'different work', request_id: 'req-other',
+        job_id: 'dir-fresh', directive: 'different work', request_id: 'req-other',
       }, TOKEN);
       expect(blocked.status).toBe(409);
-      expect(h.ledger.listJobEvents('dir-cancel').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
+      expect(h.ledger.listJobEvents('dir-fresh').some((event) =>
+        event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-directive',
+      )).toBe(false);
     } finally {
       await h.close();
     }
