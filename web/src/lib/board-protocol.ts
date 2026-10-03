@@ -197,7 +197,8 @@ export interface BoardSnapshot {
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionStatusView;
-  /** NEEDS GRU: machine-attention rows awaiting a disposition. */
+  /** NEEDS GRU: LIVE machine-attention rows awaiting a disposition
+   * (terminal-bound rows are closed receipts and are not counted here). */
   readonly unackedActionRequired: number;
   /** FOR YOU: needs-owner rows awaiting a human ack (the bell class). */
   readonly unackedNeedsOwner: number;

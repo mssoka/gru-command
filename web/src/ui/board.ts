@@ -450,13 +450,14 @@ export class BoardView {
         : decisions.reason === null
           ? `Decision routing: ${decisions.status}.`
           : `Decision routing: ${decisions.status} (${decisions.reason}).`;
-    // NEEDS GRU is the machine queue: action-required rows awaiting a
-    // machine disposition. It never rings the owner bell — the FOR YOU
-    // band (bell + toasts) is the only human-facing surface.
+    // NEEDS GRU is the LIVE machine queue: action-required rows awaiting a
+    // machine disposition (terminal-bound rows are closed receipts below).
+    // It never rings the owner bell — the FOR YOU band (bell + toasts) is
+    // the only human-facing surface.
     const needsGru = snapshot.unackedActionRequired;
     this.unackedChip.hidden = needsGru === 0;
     this.unackedChip.textContent = `🛠 ${needsGru} needs Gru`;
-    this.unackedChip.title = `${needsGru} machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the machine queue clears itself; the owner bell is not rung.`;
+    this.unackedChip.title = `${needsGru} live machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the live queue clears itself; closed receipts stay in the record and the owner bell is not rung.`;
     // Wake tracker: every autonomous wake is a durable `gru.wake` event;
     // the count/last fire stamp makes the wake path visible on the board.
     const wakes = snapshot.wakes;
@@ -972,7 +973,7 @@ export class BoardView {
       }
     }
     list.append(forYou);
-    this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'machine queue is clear', receipts);
+    this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'live machine queue is clear', receipts);
     if (feed.length > 0) this.renderNotificationSection(list, 'FEED', feed, null, receipts);
   }
 

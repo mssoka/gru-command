@@ -1,5 +1,5 @@
 {
-  "note": "ONE fixture, TWO implementations: LedgerApi.countLivePendingActionRequired (SQL over the ledger) and the web live attribution (unackedByJob / terminalBoundNotificationIds) must classify these rows identically. Consumed by test/board-engine.test.ts and web/src/lib/board-signals.test.ts \u2014 do not fork the values. Note: agent->job FKs make an agent bound to a missing job unreachable through the ledger API, so the fixture covers bound-live / bound-terminal / unbound / fyi only.",
+  "note": "ONE fixture, TWO implementations: LedgerApi.countLivePendingActionRequired (SQL over the ledger) and the web live attribution (unackedByJob / terminalBoundNotificationIds) must classify these rows identically. Consumed by test/board-engine.test.ts and web/src/lib/board-signals.test.ts \u2014 do not fork the values. notifications.agent_id has NO foreign key, so the ghost-agent bound row (a-ghost exists nowhere) is representable and must stay live on both surfaces; an agent bound to a missing JOB remains unreachable through the ledger API (the agents.job_id FK), so that case is not representable here.",
   "jobs": [
     {
       "id": "job-live",
@@ -58,10 +58,16 @@
       "agentId": "a-merged",
       "kind": "fyi.merged",
       "routing": "fyi"
+    },
+    {
+      "id": "n-ghost-agent",
+      "agentId": "a-ghost",
+      "kind": "review-escalation",
+      "routing": "action-required"
     }
   ],
   "expected": {
-    "liveCount": 2,
+    "liveCount": 3,
     "liveByJob": {
       "job-live": 1
     },

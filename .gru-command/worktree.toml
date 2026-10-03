@@ -25,7 +25,7 @@ native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest 
 # Board acceptance evidence: mock browser services run under the scheduler,
 # not beside it. Keep each run's screenshots in a distinct artifact root.
 # This focused browser scope supplements FULL; it never replaces npm test.
-board-browser = "npm run build && npm run e2e -w web -- --project mock --grep 'board.*mock feed|cockpit layout' --output ../_bmad-output/implementation-artifacts/board-section-truth/browser-$(git rev-parse HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
+board-browser = "npm run build && npm run e2e -w web -- --project mock --grep 'board.*mock feed|cockpit layout|mock controls' --output ../_bmad-output/implementation-artifacts/board-section-truth/browser-$(git rev-parse HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
 
 # PR136 durable follow-through focused scope: every suite the delta can
 # move — the directive single-writer guard (ledger + HTTP), obligations

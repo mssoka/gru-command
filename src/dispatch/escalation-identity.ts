@@ -8,22 +8,35 @@ type EscalationIdentityLedger = Pick<LedgerApi, 'getAgent' | 'getRound' | 'listA
  * null when no CONSISTENT real actor/job binding can be established.
  *
  * The row is never attributed to another job: absent context, an unknown
- * actor, or contradictory job/round identity leaves it unbound and live
+ * round, a contradictory job/round pair, an unknown actor, or an actor not
+ * actually bound to the expected job all leave it unbound and live
  * (human-dispositioned). Context values are supplied by call sites that
- * already hold them; title/detail text is never parsed for identity.
- */
+ * already hold them; title/detail text is never parsed for identity. The
+ * concrete-actor-only case (no job/round expectation) stays explicit: the
+ * actor must exist, and the row's binding is whatever its own record says. */
 export function resolveEscalationAgent(
   ledger: EscalationIdentityLedger,
   context: EscalationContext | undefined,
 ): string | null {
   if (context === undefined) return null;
-  const roundJobId =
-    context.roundId !== undefined ? ledger.getRound(context.roundId)?.jobId ?? null : null;
+  let roundJobId: string | null = null;
+  if (context.roundId !== undefined) {
+    roundJobId = ledger.getRound(context.roundId)?.jobId ?? null;
+    // A supplied round is a claim of identity: an unknown round, or a round
+    // that contradicts a supplied job, fails closed BEFORE any selection.
+    if (roundJobId === null) return null;
+    if (context.jobId !== undefined && context.jobId !== roundJobId) return null;
+  }
   const jobId = context.jobId ?? roundJobId;
   if (context.agentId !== undefined) {
     const agent = ledger.getAgent(context.agentId);
     if (agent === null) return null;
-    if (jobId !== null && agent.jobId !== null && agent.jobId !== jobId) return null;
+    // The binding must be PROVED, not merely uncontradicted: when a job is
+    // expected, the actor must actually be bound to it (a null job_id does
+    // not pass). A known round with a matching job does not require the
+    // actor's own roundId — a legitimate lane actor can carry a null round
+    // while the context's round belongs to the same job (minion semantics).
+    if (jobId !== null && agent.jobId !== jobId) return null;
     if (context.roundId !== undefined && agent.roundId !== null && agent.roundId !== context.roundId) return null;
     return agent.id;
   }

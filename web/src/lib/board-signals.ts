@@ -155,7 +155,7 @@ export function jobSignal(job: JobView, unackedActionRequired: number): JobSigna
 
   if (unackedActionRequired > 0) {
     parts.push(`🛠 ${unackedActionRequired} needs Gru`);
-    details.push(`${pluralCount(unackedActionRequired, 'machine-attention notification')} awaiting Gru disposition`);
+    details.push(`${pluralCount(unackedActionRequired, 'live machine-attention notification')} awaiting Gru disposition`);
     attention = true;
   }
 

@@ -450,7 +450,7 @@ describe('jobSignal', () => {
     const signal = jobSignal(job({ rounds: [round({ seq: 2, status: 'live' })] }), 1);
     expect(signal?.label).toBe('🛠 1 needs Gru · ◉ round 2 · live · 0/0');
     expect(signal?.tone).toBe('alert');
-    expect(signal?.title).toContain('1 machine-attention notification awaiting Gru disposition');
+    expect(signal?.title).toContain('1 live machine-attention notification awaiting Gru disposition');
   });
 });
 

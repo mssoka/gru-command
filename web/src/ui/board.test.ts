@@ -204,7 +204,7 @@ describe('board view resolved-notification rendering', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ notifications: [notification('legacy-machine', { ackedAt: '2026-01-01T00:01:00.000Z' })] }));
     const sections = [...document.querySelectorAll<HTMLElement>('.board-notification-section')];
-    expect(sections[1]?.textContent).toContain('machine queue is clear');
+    expect(sections[1]?.textContent).toContain('live machine queue is clear');
     expect(sections[1]?.textContent).not.toContain('Notice legacy-machine');
     expect(sections[2]?.textContent).toContain('Notice legacy-machine');
     expect(sections[2]?.querySelector('.board-notification__ack')).toBeNull();
@@ -393,6 +393,9 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     const unacked = trackers?.querySelector<HTMLElement>('#board-unacked');
     expect(unacked?.hidden).toBe(false);
     expect(unacked?.textContent).toContain('2 needs Gru');
+    // The count is the LIVE machine queue: the copy says so (A4).
+    expect(unacked?.title).toContain('2 live machine-attention notifications awaiting a Gru disposition');
+    expect(unacked?.title).toContain('closed receipts stay in the record');
   });
 
   it('shows the NEEDS GRU machine-queue chip only when the table has pending rows', () => {

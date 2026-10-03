@@ -34,7 +34,7 @@ const PINS: Record<string, number> = {
   'deploy-drift.test.ts': 10,
   'directive-markers.test.ts': 14,
   'dispatch-e2e.test.ts': 5,
-  'escalation-identity.test.ts': 4,
+  'escalation-identity.test.ts': 6,
   'dispatch-joins.test.ts': 2,
   'dispatch-server.test.ts': 30,
   'fix-directive.test.ts': 13,

@@ -681,6 +681,10 @@ test.describe('board (E6, mock feed)', () => {
       await expect(
         needsGruSection.locator('.board-notification', { hasText: 'Leftover machine escalation on the merged lane' }),
       ).toHaveCount(0);
+      // The FEED receipt sits below the panel's scroll fold; bring it into
+      // the panel's own view with a natural scroll (no forced clicks) so the
+      // retained capture actually witnesses the closed-receipt claim (A6).
+      await closedRow.evaluate((node) => node.scrollIntoView({ block: 'center' }));
       await page.screenshot({ path: testInfo.outputPath(`board-truth-${theme}-bell.png`), fullPage: true });
       await page.locator('#notification-bell').click();
     }
