@@ -2614,7 +2614,13 @@ describe('chat context controls and durable new-chat boundaries', () => {
         ),
       ).toMatchObject({ ok: true, epoch: 2 });
       expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({ epoch: 2 });
-      expect(firstFresh.disposed).toBe(true);
+      // Post-commit retirement is deliberately best-effort: the reset barrier
+      // is never pinned behind retired-handle cleanup (see
+      // finalizeCommittedNewChat in src/chat/server.ts), so the disposal can
+      // legitimately land after the control result. Wait for the documented
+      // eventual disposal instead of asserting one scheduling instant; the
+      // same poll is used for the first reset above.
+      await pollUntil(() => firstFresh.disposed, 'retired epoch-1 handle disposal');
       await reconnect.close();
       await client.close();
     } finally {
