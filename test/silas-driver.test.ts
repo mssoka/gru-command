@@ -483,7 +483,7 @@ describe('silas digest (the four actionable states)', () => {
           supervisionFor: (agentId) => {
             const agent = supervisionById.get(agentId);
             if (agent === undefined) return null;
-            return {
+            const view: AgentSupervisionView = {
               agentId,
               role: 'minion',
               slotId: null,
@@ -492,7 +492,8 @@ describe('silas digest (the four actionable states)', () => {
               openToolCalls: 0,
               lastEventAt: null,
               lastFileBytes: null,
-            } as AgentSupervisionView;
+            };
+            return view;
           },
         });
         expect(
