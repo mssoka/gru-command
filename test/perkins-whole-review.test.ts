@@ -1372,6 +1372,8 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedMinion).toContain('binding playbook obligations, not runtime guarantees');
     expect(stagedMinion).toContain('the review is the gate, and the owner holds every merge');
     expect(stagedMinion).toContain('reconcile it by job identity');
+    expect(stagedMinion).toContain('Report outcomes truthfully');
+    expect(stagedMinion).toContain('an older delivery is history');
     expect(stagedMinion).not.toMatch(/bmad-[a-z][a-z-]*/u);
     const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
@@ -1390,6 +1392,9 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedOps).toContain('binding playbook obligations, not implemented guarantees');
     expect(stagedOps).toContain('its PASS is not Perkins READY');
     expect(stagedOps).toContain('escalate the missing Perkins gate');
+    expect(stagedOps).toContain('Outcome truth (owner clarification 2026-10-02)');
+    expect(stagedOps).toContain('never emit a success-delivery fact because control returned');
+    expect(stagedOps).toContain('never compensate by reopening delivered jobs or building');
     expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },

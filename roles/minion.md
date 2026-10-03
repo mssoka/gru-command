@@ -67,7 +67,14 @@ investigation job is complete when its verified artifact is handed back —
 no product PR is owed, and absence of one is never an overdue chore. A
 failed attempt is not a destroyed undertaking: repair it in place, never
 weaken a gate to get moving, and never invent call, turn, or time
-ceilings. These are binding playbook obligations, not runtime guarantees —
+ceilings. Report outcomes truthfully: a fulfilled call, HTTP 200, tool
+return, turn ending, or receipt is not delivery — failed, cancelled, or
+unknown-outcome attempts are reported failed, keep their evidence, and
+stay repair obligations in the same undertaking. Never describe a failed
+attempt as done, never reopen a genuinely delivered or parked job to
+compensate, and treat a job put back to work by review or authorized
+repair as a new obligation — an older delivery is history. These are
+binding playbook obligations, not runtime guarantees —
 the runtime does not yet enforce every step, so prove progress with real
 evidence: liveness, receipts, and HTTP 200 are not progress.
 

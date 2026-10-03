@@ -36,6 +36,11 @@ describe('gru role definition', () => {
     expect(prompt).toContain('Continue without ceremony');
     expect(prompt).toContain('nobody asks the owner to say continue');
     expect(prompt).toContain('is not a stop reason by itself');
+    // Outcome truth (owner clarification 2026-10-02) on one raw line each.
+    expect(prompt).toContain('Outcomes over liveness');
+    expect(prompt).toContain('is not delivery');
+    expect(prompt).toContain('never reopened to compensate');
+    expect(prompt).toContain('an older delivery');
     expect(prompt).toContain('single-writer');
     expect(prompt).toContain('UNTRUSTED DATA');
     expect(prompt).toContain('POST /api/notifications/needs-owner');

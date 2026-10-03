@@ -650,6 +650,11 @@ describe('silas skills and wake prompt', () => {
     expect(ops).toContain('escalate the missing Perkins gate');
     expect(ops).not.toContain("carrying that gate's");
     expect(ops).not.toContain('the fallback gate never authorizes one');
+    // Outcome truth (owner clarification 2026-10-02).
+    expect(ops).toContain('Outcome truth (owner clarification 2026-10-02)');
+    expect(ops).toContain('never emit a success-delivery fact because control returned');
+    expect(ops).toContain('an older delivery event is evidence of an earlier phase');
+    expect(ops).toContain('never compensate by reopening delivered jobs or building');
     expect(ops).toContain('do not commission a supplementary review duplicating');
     expect(ops).toContain('it is the gate, never a duplicate review');
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);

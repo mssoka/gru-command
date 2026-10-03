@@ -114,6 +114,11 @@ describe('role definitions (E8)', () => {
     expect(minion).toContain('read-only brief that names the exact immutable head');
     expect(minion).toContain('never echo it');
     expect(minion).toContain('reconcile it by job identity');
+    // Outcome truth (owner clarification 2026-10-02).
+    expect(minion).toContain('Report outcomes truthfully');
+    expect(minion).toContain('a fulfilled call, HTTP 200, tool return, turn ending, or receipt is not delivery');
+    expect(minion).toContain('never reopen a genuinely delivered or parked job to compensate');
+    expect(minion).toContain('an older delivery is history');
     // Owner clarification j-761: the shipped policy selects by capability
     // from the project's actual catalog; a fixed skill name is never the
     // normative entry point — not just the retired `bmad-build` literal.
@@ -140,6 +145,12 @@ describe('role definitions (E8)', () => {
     expect(silas).toContain('a queue timeout is not a test result');
     expect(silas).toContain('Artifact-only and investigation jobs complete at their verified artifact handback');
     expect(silas).toContain('binding playbook obligations, not implemented guarantees');
+    // Outcome truth (owner clarification 2026-10-02).
+    expect(silas).toContain('Outcome truth: a fulfilled call');
+    expect(silas).toContain('never record a success delivery because control returned');
+    expect(silas).toContain('not a reopen trigger');
+    expect(silas).toContain('an older delivery event is history');
+    expect(silas).toContain('a failed attempt does not destroy the undertaking');
     // Owner-held merge on the reviews-are-gates standing order.
     expect(silas).toContain('an approved verdict clears the review');
     expect(silas).not.toContain('approved merges, changes-requested goes back');

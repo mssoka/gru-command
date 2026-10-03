@@ -322,6 +322,22 @@ handback; product-PR jobs complete through implement/integrate → verify
 final-head CI/native Perkins → the owner-held merge. Limits, gates, and
 owner-held decisions are unchanged.
 
+**Outcome truth (owner clarification 2026-10-02).** A fulfilled async
+call, HTTP 200, tool return, model turn ending, or recorded receipt alone
+is not contract delivery. Success, failure, cancellation, and
+interruption are validated at the originating runtime/control boundary;
+a failed or unknown outcome keeps its error evidence and a GC-owned
+repair/retry obligation, and no success-delivery fact is emitted because
+control returned. Genuinely delivered, terminal, and deliberately parked
+jobs are never reopened merely because no worker is live or no product PR
+exists — artifact-only and investigation jobs complete at their verified
+artifact handback. Current phase and history stay distinct: a job
+legitimately returned to working by review feedback or authorized repair
+has a new active obligation, and the older `job.delivered` event is
+history, never proof that the new phase is done (events are not erased or
+rewritten). A failed attempt during an owned repair does not destroy the
+undertaking.
+
 **Policy vs implemented.** These obligations ship in the installed
 playbook, but the runtime does not yet enforce all of them. Still
 missing in code: accepted requests/actions are not a restart-durable
@@ -333,8 +349,16 @@ historical `job.delivered` events. Those gaps are tracked in
 mssoka/gru-command issues #160 (delivery truth), #162 (current-phase
 stalled detection), and #163 (bounded reconciliation while a model turn
 is open); artifact-job classification and board timing are named there as
-further separate concerns. They are not implemented by this document —
-nothing in this section claims those runtime guarantees exist today.
+further separate concerns. The outcome/phase machinery itself is the
+`durable-blocked-followthrough` work (PR #136): it covers durable
+directive intent, request idempotency, marked phase handoffs, and boot
+reconciliation, but its native r4 verdict is NEEDS CHANGES at the
+inspected head — resolve-but-error turns can still publish a completed
+phase, unmarked crash windows are not recovered, and the phase reconciler
+starves past its page budget. Reuse/fix that mechanism; do not build a
+parallel outcome system. `/api/verify` admission/re-arm (#159) is also
+missing. They are not implemented by this document — nothing in this
+section claims those runtime guarantees exist today.
 
 ## 5. Release (the sweep)
 

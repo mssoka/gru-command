@@ -250,6 +250,27 @@ raises or bypasses them. Until the runtime enforces the contract, these
 are binding playbook obligations, not implemented guarantees — record
 the state and next action explicitly.
 
+### Outcome truth (owner clarification 2026-10-02)
+
+A fulfilled async call, HTTP 200, tool return, model turn ending, or
+recorded receipt alone is NOT delivery. Validate success, failure,
+cancellation, and interruption at the originating runtime/control
+boundary; a failed or unknown outcome keeps its error evidence and stays
+a GC-owned repair/retry obligation — never emit a success-delivery fact
+because control returned. Never reopen a genuinely delivered, terminal,
+or deliberately parked job merely because it has no live worker or no
+product PR; artifact-only and investigation jobs complete at their
+verified artifact handback. Distinguish the current phase from history:
+a job legitimately returned to working by review feedback or an
+authorized repair has a new current obligation, and an older delivery
+event is evidence of an earlier phase, not proof the new one is done. A
+failed attempt during an owned repair does not destroy the undertaking —
+repair it in the same lane. These are binding playbook obligations; the
+runtime does not yet enforce every step (the outcome/phase machinery and
+detector corrections are tracked code work), so record the truth
+explicitly and never compensate by reopening delivered jobs or building
+a parallel outcome system.
+
 
 ## Merge authority update (owner ruling 2026-09-29)
 

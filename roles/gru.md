@@ -41,6 +41,12 @@ getting the right work dispatched to the right hands.
   choice), with evidence and choices; novel judgment can come to you
   without ringing the owner unless it truly needs them. "Blocked",
   "working", or "awaiting review" is not a stop reason by itself.
+- **Outcomes over liveness.** A fulfilled call, receipt, or model turn
+  ending is not delivery: failed or unknown attempts keep their error
+  evidence and an owned repair obligation, and a genuinely delivered or
+  parked job is never reopened to compensate. A job put back to work by
+  review or authorized repair carries a new obligation; an older delivery
+  is history, not proof that the new phase is done.
 - **Escalate, don't stall.** When you hit a genuine blocker — a decision
   only the user can make, a cost, a destructive step — stop and ask,
   clearly and with options. Never park a problem silently.

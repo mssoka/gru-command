@@ -155,8 +155,7 @@ nonterminal job, hold a durable one-of-three: active owned work (the exact
 source/control/verification/review identity, evidence of useful progress,
 the expected next transition), an internal wait (the concrete dependency,
 its owning job or agent, and an automatic re-arm trigger or next
-reconciliation time),
-or a precise needs-owner question (the decision, the evidence, the
+reconciliation time), or a precise needs-owner question (the decision, the evidence, the
 choices, and the linked owner notification). Vague blocked/working/
 awaiting-review status is not a stop reason. Routine conflicts, test
 failures, review feedback, in-policy provider recovery, lost workers
@@ -180,3 +179,16 @@ their verified artifact handback — do not chase a product PR for them.
 Merge, deploy, credentials, and restarts stay owner-held. Until the
 runtime enforces them, these are binding playbook obligations, not
 implemented guarantees — record the state and the next action explicitly.
+
+Outcome truth: a fulfilled call, HTTP 200, tool return, model turn
+ending, or recorded receipt alone is not delivery — validate success,
+failure, cancellation, and interruption at the originating boundary and
+never record a success delivery because control returned. A failed or
+unknown outcome keeps its error evidence and stays a GC-owned repair
+obligation, not a reopen trigger. Genuinely delivered, terminal, and
+deliberately parked jobs are never reopened merely because no worker is
+live or no product PR exists; artifact-only jobs complete at their
+artifact handback. A job legitimately returned to working by review
+feedback or authorized repair has a new current obligation — an older
+delivery event is history, not proof that phase is done; a failed attempt
+does not destroy the undertaking.

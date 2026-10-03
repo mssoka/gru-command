@@ -228,6 +228,11 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('read-only brief that names the exact immutable head');
     expect(flat).toContain('never echo it');
     expect(flat).toContain('reconcile it by job identity');
+    // Outcome truth (owner clarification 2026-10-02).
+    expect(flat).toContain('Report outcomes truthfully');
+    expect(flat).toContain('a fulfilled call, HTTP 200, tool return, turn ending, or receipt is not delivery');
+    expect(flat).toContain('never reopen a genuinely delivered or parked job to compensate');
+    expect(flat).toContain('an older delivery is history');
     // Owner clarification j-761: never a fixed skill-name dependency —
     // not just the retired `bmad-build` literal.
     expect(staged.minion).not.toMatch(/bmad-[a-z][a-z-]*/u);
@@ -251,6 +256,12 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('a queue timeout is not a test result');
     expect(flat).toContain('Artifact-only and investigation jobs complete at their verified artifact handback');
     expect(flat).toContain('binding playbook obligations, not implemented guarantees');
+    // Outcome truth (owner clarification 2026-10-02).
+    expect(flat).toContain('Outcome truth: a fulfilled call');
+    expect(flat).toContain('never record a success delivery because control returned');
+    expect(flat).toContain('not a reopen trigger');
+    expect(flat).toContain('an older delivery event is history');
+    expect(flat).toContain('a failed attempt does not destroy the undertaking');
     // Owner-held merge on the reviews-are-gates standing order.
     expect(flat).toContain('an approved verdict clears the review');
     expect(flat).not.toContain('approved merges, changes-requested goes back');
