@@ -38,7 +38,7 @@ const PINS: Record<string, number> = {
   'dispatch-server.test.ts': 29,
   'fix-directive.test.ts': 13,
   'github-poll.test.ts': 24,
-  'harness-diagnostics.test.ts': 15,
+  'harness-diagnostics.test.ts': 18,
   'harness-routing.test.ts': 3,
   'health.test.ts': 19,
   'identity.test.ts': 3,

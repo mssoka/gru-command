@@ -27,7 +27,8 @@ import {
 // (vitest.heavy.config.ts, 120s budgets, at most two workers) after this
 // one, so aggregate workers never exceed the same global budget.
 const effectiveWorkers = applyWorkerBudget(process.env, FAST_WORKER_CAP);
-process.stdout.write(`${budgetBanner('fast', effectiveWorkers)}\n`);
+// stderr: stdout stays clean for machine-readable output (`vitest list --json`).
+process.stderr.write(`${budgetBanner('fast', effectiveWorkers)}\n`);
 
 export default defineConfig({
   test: {

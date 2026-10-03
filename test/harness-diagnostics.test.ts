@@ -1,10 +1,11 @@
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   FixtureStepTimeoutError,
+  OwnedCommandTimeoutError,
   activateTestScope,
   createTestScope,
   currentTestScope,
@@ -14,6 +15,7 @@ import {
   markFixtureStep,
   redactDiagnosticText,
   renderFailureDiagnostics,
+  renderTeardownReport,
   runBoundedFixtureStep,
   runOwnedCommand,
   trackChildProcess,
@@ -23,8 +25,9 @@ import {
  * Diagnostics regression coverage: bounded, non-zero timeout evidence
  * (identity, elapsed, last completed fixture step, owned child pid/state
  * and captured output tail), secret redaction, and cleanup restricted to
- * demonstrably owned children. Uses short synthetic deadlines so no case
- * ever waits for the real 30s/120s budgets.
+ * demonstrably owned children. Uses short synthetic deadlines; the one
+ * real-Vitest case runs owned and asynchronous under a 90s deadline, below
+ * this file's 120s ceiling.
  */
 
 function waitForExit(child: ChildProcess, timeoutMs = 5_000): Promise<void> {
@@ -68,7 +71,9 @@ function fakeChild(overrides: Record<string, unknown> = {}): ChildProcess {
 }
 
 /** A fake readable stream that synchronously emits each chunk in order. */
-function fakeStream(...chunks: string[]): { on: (event: string, cb: (chunk: string) => void) => void } {
+function fakeStream(
+  ...chunks: Array<string | Buffer>
+): { on: (event: string, cb: (chunk: string | Buffer) => void) => void } {
   return {
     on: (_event, cb) => {
       for (const chunk of chunks) cb(chunk);
@@ -81,7 +86,11 @@ function fakeStream(...chunks: string[]): { on: (event: string, cb: (chunk: stri
  * setup file is this repo's timeout-diagnostics wiring. It stalls one test
  * with an owned child and fails another whose own afterEach throws; both
  * must emit the diagnostics block (the afterEach-abort case is red with the
- * old setup-afterEach wiring).
+ * old setup-afterEach wiring). A describe-level beforeAll fails too: its
+ * error lands on the nested suite, not the file. The owned child's pid is
+ * written to `owned.pid` so the caller can prove teardown reaped it; the
+ * child also exits by itself after 100s, so even a killed inner run cannot
+ * leak it indefinitely.
  */
 function writeDiagnosticsFixtureProject(): string {
   const dir = mkdtempSync(join(tmpdir(), 'gru-diagnostics-fixture-'));
@@ -108,12 +117,14 @@ function writeDiagnosticsFixtureProject(): string {
     ].join('\n'),
   );
   const helpers = join(REPO_ROOT, 'test', 'helpers', 'harness-diagnostics.mjs');
-  const ownedScript = 'process.stderr.write("owned-ready\\n");setInterval(() => {}, 1000);';
+  const ownedScript =
+    'process.stderr.write("owned-ready\\n");setInterval(() => {}, 1000);setTimeout(() => process.exit(0), 100000);';
   writeFileSync(
     join(dir, 'fixture.test.ts'),
     [
       "import { spawn } from 'node:child_process';",
-      "import { afterEach, expect, test } from 'vitest';",
+      "import { writeFileSync } from 'node:fs';",
+      "import { afterEach, beforeAll, describe, expect, test } from 'vitest';",
       `import { markFixtureStep, trackChildProcess } from ${JSON.stringify(helpers)};`,
       '',
       'afterEach(() => {',
@@ -122,6 +133,7 @@ function writeDiagnosticsFixtureProject(): string {
       '',
       "test('stalled with an owned child', async () => {",
       `  const child = spawn(process.execPath, ['-e', ${JSON.stringify(ownedScript)}]);`,
+      `  writeFileSync(${JSON.stringify(join(dir, 'owned.pid'))}, String(child.pid));`,
       "  trackChildProcess(child, { label: 'fixture owned child' });",
       "  markFixtureStep('stalled fixture step');",
       '  await new Promise(() => {});',
@@ -130,6 +142,14 @@ function writeDiagnosticsFixtureProject(): string {
       "test('fails after its own afterEach throws', () => {",
       "  markFixtureStep('failing fixture step');",
       "  expect('actual').toBe('expected');",
+      '});',
+      '',
+      "describe('nested boot', () => {",
+      '  beforeAll(() => {',
+      "    markFixtureStep('nested boot step');",
+      "    throw new Error('nested boot failed');",
+      '  });',
+      "  test('never runs', () => {});",
       '});',
       '',
     ].join('\n'),
@@ -286,6 +306,16 @@ describe('harness diagnostics', () => {
     expect(isTimeoutError({ message: 'Fixture step "probe" exceeded its 200ms deadline.' })).toBe(true);
     expect(renderFailureDiagnostics(currentTestScope(), serialized)).toContain('[harness-diagnostics] TIMEOUT');
     expect(isTimeoutError(new Error('fixture exploded'))).toBe(false);
+    // An owned command's deadline is a timeout too, live or serialized.
+    expect(isTimeoutError(new OwnedCommandTimeoutError('install.sh --no-interact', 100_000))).toBe(true);
+    expect(
+      isTimeoutError(
+        Object.assign(Object.create(null), {
+          name: 'OwnedCommandTimeoutError',
+          message: 'install.sh --no-interact exceeded its 100000ms deadline',
+        }),
+      ),
+    ).toBe(true);
   });
 
   it('marks only the truncated stream and keeps the freshest child evidence (review r1)', () => {
@@ -332,7 +362,17 @@ describe('harness diagnostics', () => {
     const results = await disposeScopeProcesses(scope, { graceMs: 100, killGraceMs: 100, totalMs: 250 });
     const elapsed = Date.now() - started;
     expect(elapsed).toBeLessThan(1_000);
-    expect(results.filter((entry) => entry.disposition === 'unreaped').length).toBeGreaterThan(0);
+    const unreaped = results.filter((entry) => entry.disposition === 'unreaped');
+    expect(unreaped.length).toBeGreaterThan(0);
+    // Every survivor is named, never silently dropped (review r7).
+    const report = renderTeardownReport(scope, results);
+    expect(report).toHaveLength(unreaped.length);
+    for (const entry of unreaped) {
+      expect(report).toContainEqual(
+        expect.stringMatching(new RegExp(`^\\[harness-diagnostics\\] UNREAPED .*: pid ${String(entry.pid)} "stuck child" survived`)),
+      );
+    }
+    expect(renderTeardownReport(scope, [{ label: 'gone', pid: 1, disposition: 'reaped' }])).toEqual([]);
     // No real processes exist; release the fakes so this scope's teardown is cheap.
     for (const child of stuck) {
       (child as { exitCode: number | null }).exitCode = 0;
@@ -357,15 +397,18 @@ describe('harness diagnostics', () => {
     expect(currentTestScope()).toBe(testScope);
   });
 
-  it('emits the diagnostics block through real Vitest for a timeout and for an afterEach abort (review r1)', () => {
+  it('emits the diagnostics block through real Vitest for a timeout and for an afterEach abort (review r1)', async () => {
     const dir = writeDiagnosticsFixtureProject();
     const childEnv = Object.fromEntries(
       Object.entries(process.env).filter(([key]) => !key.startsWith('VITEST')),
     );
-    const result = spawnSync(process.execPath, [VITEST_BIN, 'run', '--config', 'vitest.config.ts'], {
+    // Asynchronous and owned, under a deadline below this file's 120s
+    // ceiling: a stalled inner run is reaped and reported instead of
+    // blocking the worker's event loop (review r7).
+    const result = await runOwnedCommand(process.execPath, [VITEST_BIN, 'run', '--config', 'vitest.config.ts'], {
+      label: 'fixture vitest run',
       cwd: dir,
-      encoding: 'utf-8',
-      timeout: 120_000,
+      deadlineMs: 90_000,
       env: { ...childEnv, CI: 'true' },
     });
     const output = `${result.stdout}\n${result.stderr}`;
@@ -380,6 +423,80 @@ describe('harness diagnostics', () => {
     expect(output).toContain('[harness-diagnostics] FAILURE');
     expect(output).toContain('failing fixture step');
     expect(output).toContain('teardown boom');
+    // A describe-level beforeAll failure lands on the nested suite; the file
+    // afterAll still reports it against the file scope (review r7).
+    expect(output).toMatch(
+      /\[harness-diagnostics\] FAILURE [^\n]*> <file scope>\n[^\n]*\n\s+error: nested boot failed/,
+    );
+    expect(output).toContain('last completed fixture step: "nested boot step"');
+    // Teardown really reaped the owned child: rendered evidence alone would
+    // stay green with disposal removed (review r7).
+    const ownedPid = Number(readFileSync(join(dir, 'owned.pid'), 'utf-8'));
+    expect(Number.isInteger(ownedPid) && ownedPid > 0, `owned.pid: ${ownedPid}`).toBe(true);
+    let ownedAlive = true;
+    try {
+      process.kill(ownedPid, 0);
+    } catch (error) {
+      ownedAlive = (error as NodeJS.ErrnoException).code !== 'ESRCH';
+    }
+    expect(ownedAlive, `owned child ${ownedPid} survived the fixture run's teardown`).toBe(false);
+  });
+
+  it('keeps the repo-authored identity header readable while redacting the body (review r7)', () => {
+    // A real test name (pacing.test.ts) that the label shape used to mask.
+    const name = 'never classifies stray numeric tokens: a bare 429 needs status context';
+    const scope = createTestScope({ file: 'test/pacing.test.ts', name });
+    trackChildProcess(fakeChild({ pid: 777_001, exitCode: 0, stderr: fakeStream('token=planted-secret-value\n') }), {
+      label: 'identity child',
+      scope,
+    });
+    const rendered = renderFailureDiagnostics(scope, new Error('token="error-secret-value"'));
+    expect(rendered.split('\n')[0]).toBe(`[harness-diagnostics] FAILURE test/pacing.test.ts > ${name}`);
+    expect(rendered).not.toContain('planted-secret-value');
+    expect(rendered).not.toContain('error-secret-value');
+  });
+
+  it('marks a tail cut after redaction lengthened it (review r7)', () => {
+    const scope = createTestScope({ file: 'expansion.test.ts', name: 'expansion check' });
+    // 2000 raw characters, under the 2048 bound; redaction grows each
+    // "sk-a" to "[REDACTED]", so the retained tail is cut.
+    trackChildProcess(fakeChild({ pid: 777_002, exitCode: 0, stderr: fakeStream('sk-a '.repeat(400)) }), {
+      label: 'expanding child',
+      scope,
+    });
+    expect(scope.processes[0]!.output.stderr.length).toBe(2_048);
+    expect(renderFailureDiagnostics(scope, new Error('expansion'))).toContain('stderr tail [truncated to last bytes]');
+  });
+
+  it('decodes a multi-byte character split across chunks (review r7)', async () => {
+    const scope = createTestScope({ file: 'utf8.test.ts', name: 'utf8 check' });
+    const dash = Buffer.from('—', 'utf-8');
+    trackChildProcess(
+      fakeChild({
+        pid: 777_003,
+        exitCode: 0,
+        stderr: fakeStream(
+          Buffer.concat([Buffer.from('before '), dash.subarray(0, 1)]),
+          Buffer.concat([dash.subarray(1), Buffer.from(' after\n')]),
+        ),
+      }),
+      { label: 'split-utf8 child', scope },
+    );
+    const tail = renderFailureDiagnostics(scope, new Error('utf8')).split('\n').find((line) => line.includes('stderr tail'));
+    expect(tail?.trim()).toBe('stderr tail: before — after');
+
+    // A real owned command whose write is split mid-character keeps it whole.
+    const result = await runOwnedCommand(
+      process.execPath,
+      [
+        '-e',
+        'process.stdout.write(Buffer.from([0x61, 0xe2]));' +
+          'setTimeout(() => process.stdout.write(Buffer.from([0x80, 0x94, 0x62])), 50);',
+      ],
+      { label: 'split-utf8 command', deadlineMs: 10_000, scope },
+    );
+    expect(result.stdout).toBe('a—b');
+    expect(result.stdout).not.toContain('�');
   });
 
   it('redacts credentials across truncation, chunk-split and JSON-escaped boundaries (Perkins r1/r2)', () => {

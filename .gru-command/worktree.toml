@@ -28,8 +28,9 @@ native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest 
 # The ten externally observed 30s timeouts (failed host run on 78724dc)
 # exercised by exact test name through the heavy config first; the FULL
 # scope still runs every test exactly once. The policy guard
-# (test/test-budgets.test.ts) pins these names to the heavy classification.
-ten-timeout-cases = "npx vitest run --config vitest.heavy.config.ts -t \"by=silas on the pr/review|second run fast-forwards|refuses a non-fast-forward|restarts only an owned|terminalizes a workflow schema|newest completed predecessor|does not record a reconciled delivery|non-PR origin/topic target FREEZES|rejects an empty/missing verdict|answers rejects secrets\" test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/perkins-whole-review.test.ts test/wizard.test.ts"
+# (test/test-budgets.test.ts) pins these names to the heavy classification,
+# each case's file to this command, and the approved j-463 RPC patch first.
+ten-timeout-cases = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts -t \"by=silas on the pr/review|second run fast-forwards|refuses a non-fast-forward|restarts only an owned|terminalizes a workflow schema|newest completed predecessor|does not record a reconciled delivery|non-PR origin/topic target FREEZES|rejects an empty/missing verdict|answers rejects secrets\" test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/perkins-whole-review.test.ts test/wizard.test.ts"
 
 # PR136 durable follow-through focused scope: every suite the delta can
 # move — the directive single-writer guard (ledger + HTTP), obligations

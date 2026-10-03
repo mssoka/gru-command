@@ -37,6 +37,13 @@ function commandLabel(args: readonly string[]): string {
     .join(' ');
 }
 
+/**
+ * Below the 120s heavy ceiling every run() caller uses, so a stalled
+ * installer surfaces as its own deadline error (owned child reaped, partial
+ * output in the diagnostics) instead of a bare test-level timeout.
+ */
+const INSTALL_DEADLINE_MS = 100_000;
+
 async function run(
   script: string,
   args: string[],
@@ -46,7 +53,7 @@ async function run(
   try {
     const result = await runOwnedCommand('bash', [script, ...args], {
       label,
-      deadlineMs: 120_000,
+      deadlineMs: INSTALL_DEADLINE_MS,
       // Each simulated installation owns its config home even when the test
       // runner supplies an XDG_CONFIG_HOME outside the fixture's HOME.
       env: { ...process.env, ...env, ...(env.HOME ? { XDG_CONFIG_HOME: join(env.HOME, '.config') } : {}) },
@@ -56,12 +63,12 @@ async function run(
     markFixtureStep(`install.sh ${commandLabel(args)} → exit ${status}`);
     return { stdout: result.stdout, stderr: status === 0 ? '' : result.stderr, status };
   } catch (error) {
-    // Bounded deadline: the owned child was SIGTERMed/SIGKILLed by the
-    // helper; report the same shape execFileSync's timeout produced.
+    // A deadline overrun fails loud: mapping it to exit 1 would let a
+    // stalled installer pass as an expected refusal. The helper already
+    // SIGTERMed/SIGKILLed the owned child.
     if (error instanceof OwnedCommandTimeoutError) {
       lastStderr = error.stderr;
-      markFixtureStep(`install.sh ${commandLabel(args)} → exit 1`);
-      return { stdout: error.stdout, stderr: error.stderr, status: 1 };
+      markFixtureStep(`${label} → timeout`);
     }
     throw error;
   }

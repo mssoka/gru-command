@@ -68,7 +68,9 @@ const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string
 ];
 
 describe('workload-aware test budgets', () => {
-  it('partitions every test file exactly once between fast and heavy', () => {
+  // The exactly-once fast/heavy partition is proven at runtime against the
+  // npm phase scripts in test/harness-routing.test.ts; this pins the list.
+  it('classifies only existing, unique test files as heavy', () => {
     const files = readdirSync(import.meta.dirname)
       .filter((name) => name.endsWith('.test.ts'))
       .sort();
@@ -76,9 +78,6 @@ describe('workload-aware test budgets', () => {
     for (const file of HEAVY_TEST_FILES) {
       expect(files, `heavy classification names a missing file: ${file}`).toContain(file);
     }
-    const heavy = new Set(HEAVY_TEST_FILES);
-    const fast = files.filter((file) => !heavy.has(file));
-    expect([...fast, ...HEAVY_TEST_FILES].sort()).toEqual(files);
     expect(heavyTestPaths()).toEqual(HEAVY_TEST_FILES.map((file) => `test/${file}`));
   });
 
@@ -156,15 +155,24 @@ describe('workload-aware test budgets', () => {
     expect(heavy).toContain('include: heavyTestPaths()');
   });
 
-  it('routes every declared scope segment that names a heavy file through the heavy config', () => {
+  it('routes every declared scope segment that names a heavy file through the heavy config, and only heavy files', () => {
     const manifest = parseToml(
       readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8'),
     ) as { verify?: Record<string, string> };
     const scopes = manifest.verify ?? {};
     expect(Object.keys(scopes).length).toBeGreaterThan(0);
+    const heavyPaths = heavyTestPaths();
     for (const [scope, command] of Object.entries(scopes)) {
       for (const segment of command.split('&&').map((part) => part.trim())) {
-        const namesHeavy = heavyTestPaths().some((path) => segment.includes(path));
+        if (segment.includes('--config vitest.heavy.config.ts')) {
+          // The heavy include is an explicit list: a fast file named here is
+          // silently never run while the scope still exits 0.
+          for (const path of segment.match(/\btest\/[\w./-]+\.test\.ts\b/g) ?? []) {
+            expect(heavyPaths, `${scope} names a fast file in its heavy-config segment: ${path}`).toContain(path);
+          }
+          continue;
+        }
+        const namesHeavy = heavyPaths.some((path) => segment.includes(path));
         if (!namesHeavy) continue;
         expect(
           segment,
@@ -180,12 +188,16 @@ describe('workload-aware test budgets', () => {
     ) as { verify?: Record<string, string> };
     const command = (manifest.verify ?? {})['ten-timeout-cases'];
     expect(command, 'ten-timeout-cases scope is declared').toBeDefined();
+    // The approved j-463 RPC patch runs first, like the other witnessed scopes.
+    expect(command).toMatch(/^node tools\/patch-vitest-rpc-timeout\.mjs && /);
     expect(command).toContain('--config vitest.heavy.config.ts');
     const match = /-t\s+"([^"]+)"/.exec(command ?? '');
     expect(match, `no -t pattern in: ${command ?? '<missing>'}`).not.toBeNull();
     const pattern = new RegExp(match![1]!);
     for (const { file, name } of OBSERVED_TIMEOUTS) {
       expect(pattern.test(name), `${file}: -t pattern misses "${name}"`).toBe(true);
+      // The pattern alone is not enough: the case's file must be selected too.
+      expect(command, `ten-timeout-cases does not select test/${file}`).toContain(`test/${file}`);
     }
   });
 });

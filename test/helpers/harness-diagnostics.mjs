@@ -23,6 +23,7 @@
  */
 import { clearTimeout, setTimeout } from 'node:timers';
 import { spawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 
 const OUTPUT_TAIL_LIMIT = 2_048; // chars kept per stream, per process
 const RENDER_LIMIT = 8_192; // chars of the rendered diagnostics block
@@ -124,7 +125,9 @@ function appendTail(tracked, streamName, chunk) {
   // half arrives, and no trim can ever cut a label away from its value.
   const redacted = redactDiagnosticText(masked);
   const bounded = redacted.length > OUTPUT_TAIL_LIMIT ? redacted.slice(-OUTPUT_TAIL_LIMIT) : redacted;
-  if (combined.length > OUTPUT_TAIL_LIMIT) tracked.outputTruncated[streamName] = true;
+  // The marker follows the text actually cut: redaction can lengthen short
+  // values ("sk-a" → "[REDACTED]"), so the raw length is not the measure.
+  if (redacted.length > OUTPUT_TAIL_LIMIT) tracked.outputTruncated[streamName] = true;
   tracked.output[streamName] = bounded;
   tracked.openCredential[streamName] = stillOpen || open;
 }
@@ -161,7 +164,13 @@ export function trackChildProcess(child, { label, captureOutput = true, scope } 
     for (const streamName of ['stdout', 'stderr']) {
       const stream = child[streamName];
       if (stream !== null && stream !== undefined && typeof stream.on === 'function') {
-        stream.on('data', (chunk) => appendTail(tracked, streamName, chunk));
+        // Buffer chunks are decoded statefully: a multi-byte character split
+        // across chunks must not become U+FFFD. The caller's own listeners
+        // keep whatever encoding the caller chose.
+        const decoder = new StringDecoder('utf8');
+        stream.on('data', (chunk) =>
+          appendTail(tracked, streamName, typeof chunk === 'string' ? chunk : decoder.write(chunk)),
+        );
       }
     }
   }
@@ -234,12 +243,14 @@ function errorText(error) {
   }
 }
 
-/** Vitest per-test/per-hook timeouts and the harness's own step deadline. */
+const DEADLINE_ERROR_NAMES = new Set(['FixtureStepTimeoutError', 'OwnedCommandTimeoutError']);
+
+/** Vitest per-test/per-hook timeouts and the harness's own step/command deadlines. */
 export function isTimeoutError(error) {
-  if (error instanceof FixtureStepTimeoutError) return true;
+  if (error instanceof FixtureStepTimeoutError || error instanceof OwnedCommandTimeoutError) return true;
   // Vitest serializes result errors into null-prototype clones (processError
   // → serializeValue), so the class identity is gone but `name` survives.
-  if (error !== null && typeof error === 'object' && error.name === 'FixtureStepTimeoutError') return true;
+  if (error !== null && typeof error === 'object' && DEADLINE_ERROR_NAMES.has(error.name)) return true;
   const message = errorText(error);
   return (
     /\b(?:test|hook|fixture step)\b[^.\n]*timed out in \d+ms/i.test(message) ||
@@ -344,7 +355,11 @@ export function renderFailureDiagnostics(scope, error, { timedOut } = {}) {
       }
     }
   }
-  const rendered = redactDiagnosticText(lines.join('\n'));
+  // The identity header (the repo-authored file path and test name) is never
+  // a credential and must stay readable — a test named "…tokens: a bare
+  // 429…" is not a secret. Every line below it is redacted as a whole.
+  const [header, ...body] = lines;
+  const rendered = `${header}\n${redactDiagnosticText(body.join('\n'))}`;
   if (rendered.length <= RENDER_LIMIT) return rendered;
   // Keep the head (identity, elapsed, last step) AND the tail (the freshest
   // owned-child evidence): elide the middle instead of the ending.
@@ -409,6 +424,23 @@ export async function disposeScopeProcesses(
 }
 
 /**
+ * One line per owned child that survived the bounded teardown, so a leak
+ * is named instead of silently adding co-tenant load. Empty when every
+ * child was reaped or had already exited.
+ */
+export function renderTeardownReport(scope, results) {
+  const target = scopeOf(scope);
+  const identity = target === null ? '<no active test scope>' : `${target.file} > ${target.name}`;
+  return results
+    .filter((entry) => entry.disposition === 'unreaped')
+    .map(
+      (entry) =>
+        `[harness-diagnostics] UNREAPED ${identity}: pid ${String(entry.pid)} ` +
+        `"${redactDiagnosticText(entry.label)}" survived bounded teardown`,
+    );
+}
+
+/**
  * Run one fixture step under a hard step deadline. The step itself is
  * expected to use owned processes; on expiry the thrown error carries
  * the rendered diagnostics (last step, owned child state, output tails).
@@ -468,6 +500,10 @@ export async function runOwnedCommand(
     ...(env !== undefined ? { env } : {}),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  // Decode statefully before any listener attaches: per-chunk String(buffer)
+  // turns a multi-byte character split across chunks into U+FFFD.
+  child.stdout?.setEncoding('utf8');
+  child.stderr?.setEncoding('utf8');
   const tracked = trackChildProcess(child, { label: name, scope });
   let stdout = '';
   let stderr = '';

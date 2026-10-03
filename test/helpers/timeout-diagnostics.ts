@@ -15,10 +15,14 @@
  * chain and its failure handling, so a test whose own `afterEach` throws
  * or times out still gets diagnostics and bounded cleanup — a setup
  * `afterEach` would be skipped when the hook chain aborts. A `beforeAll`
- * failure runs no per-test hooks; the file `afterAll` reports and disposes
- * the file scope, and harness setup helpers that can fail that way also
- * use runBoundedFixtureStep, which emits the same diagnostics at throw
- * time.
+ * failure runs no per-test hooks; the file `afterAll` reports every file-
+ * and describe-level hook error (a nested `beforeAll` failure lands on its
+ * own suite, not the file) against the file scope, then disposes it.
+ * Children that survive the bounded teardown are named on stderr
+ * (`UNREAPED`) rather than leaking silently. If the test file's own
+ * `afterAll` throws, Vitest stops the serial afterAll chain before this
+ * one runs; file-scope leftovers are then bounded only by the verification
+ * scheduler's process-group teardown at lane end.
  */
 import { afterAll, beforeAll, beforeEach } from 'vitest';
 import {
@@ -27,7 +31,9 @@ import {
   deactivateTestScope,
   disposeScopeProcesses,
   renderFailureDiagnostics,
+  renderTeardownReport,
   type DiagnosticsScope,
+  type TeardownResult,
 } from './harness-diagnostics.mjs';
 
 interface TaskLike {
@@ -35,6 +41,12 @@ interface TaskLike {
   readonly suite?: TaskLike | undefined;
   readonly file?: { readonly name?: string | undefined } | undefined;
   readonly result?: { readonly errors?: readonly unknown[] } | undefined;
+}
+
+interface SuiteLike {
+  readonly type?: string | undefined;
+  readonly result?: { readonly errors?: readonly unknown[] } | undefined;
+  readonly tasks?: readonly SuiteLike[] | undefined;
 }
 
 function fullName(task: TaskLike): string {
@@ -46,6 +58,18 @@ function fullName(task: TaskLike): string {
   }
   names.push(task.name ?? '<unknown test>');
   return names.join(' > ');
+}
+
+/** Hook errors of a suite and every nested describe (test errors excluded). */
+function suiteErrors(suite: SuiteLike): unknown[] {
+  return [
+    ...(suite.result?.errors ?? []),
+    ...(suite.tasks ?? []).filter((task) => task.type === 'suite').flatMap((task) => suiteErrors(task)),
+  ];
+}
+
+function reportTeardown(scope: DiagnosticsScope, results: readonly TeardownResult[]): void {
+  for (const line of renderTeardownReport(scope, results)) process.stderr.write(`${line}\n`);
 }
 
 let fileScope: DiagnosticsScope | null = null;
@@ -70,7 +94,9 @@ beforeEach((context) => {
   if (stale !== null && stale !== fileScope) {
     // A previous test scope that never reached its onTestFinished: reap its
     // owned children in the background rather than leaking them into this test.
-    void disposeScopeProcesses(stale, { graceMs: 500 }).catch(() => undefined);
+    void disposeScopeProcesses(stale, { graceMs: 500 })
+      .then((results) => reportTeardown(stale, results))
+      .catch(() => undefined);
   }
   context.onTestFinished(async () => {
     try {
@@ -83,9 +109,10 @@ beforeEach((context) => {
     }
     try {
       deactivateTestScope(scope);
-      await disposeScopeProcesses(scope, { graceMs: 2_000 });
+      reportTeardown(scope, await disposeScopeProcesses(scope, { graceMs: 2_000 }));
     } catch {
-      // Bounded teardown failures are reported by the next scope's reaper.
+      // Disposal swallows per-child signal errors; this only keeps a
+      // reporting fault from turning a passing test red.
     }
   });
 });
@@ -95,8 +122,7 @@ afterAll(async (suite) => {
   fileScope = null;
   if (scope === null) return;
   try {
-    const errors = suite.result?.errors ?? [];
-    for (const error of errors) {
+    for (const error of suiteErrors(suite as SuiteLike)) {
       process.stderr.write(`${renderFailureDiagnostics(scope, error)}\n`);
     }
   } catch {
@@ -104,7 +130,7 @@ afterAll(async (suite) => {
   }
   try {
     deactivateTestScope(scope);
-    await disposeScopeProcesses(scope, { graceMs: 2_000 });
+    reportTeardown(scope, await disposeScopeProcesses(scope, { graceMs: 2_000 }));
   } catch {
     // The file's own afterAll hooks have already run; leftovers are bounded
     // by the verification scheduler's process-group teardown at lane end.

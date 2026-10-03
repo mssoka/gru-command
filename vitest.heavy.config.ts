@@ -17,7 +17,8 @@ import {
 // never overlap and the service's single global worker budget is never
 // exceeded. Existing explicit per-test allowances stay untouched.
 const effectiveWorkers = applyWorkerBudget(process.env, HEAVY_WORKER_CAP);
-process.stdout.write(`${budgetBanner('heavy', effectiveWorkers)}\n`);
+// stderr: stdout stays clean for machine-readable output (`vitest list --json`).
+process.stderr.write(`${budgetBanner('heavy', effectiveWorkers)}\n`);
 
 export default defineConfig({
   test: {

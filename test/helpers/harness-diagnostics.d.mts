@@ -40,6 +40,7 @@ export declare class FixtureStepTimeoutError extends Error {
 }
 
 export declare class OwnedCommandTimeoutError extends Error {
+  constructor(label: string, deadlineMs: number);
   readonly label: string;
   readonly deadlineMs: number;
   stdout: string;
@@ -74,10 +75,22 @@ export declare function renderFailureDiagnostics(
   options?: { timedOut?: boolean },
 ): string;
 
+export interface TeardownResult {
+  readonly label: string;
+  readonly pid: number | null;
+  readonly disposition: string;
+}
+
 export declare function disposeScopeProcesses(
   scope: DiagnosticsScope | null,
   options?: { graceMs?: number; killGraceMs?: number; totalMs?: number },
-): Promise<Array<{ label: string; pid: number | null; disposition: string }>>;
+): Promise<TeardownResult[]>;
+
+/** One "UNREAPED" line per owned child that survived the bounded teardown. */
+export declare function renderTeardownReport(
+  scope: DiagnosticsScope | null,
+  results: readonly TeardownResult[],
+): string[];
 
 export declare function runBoundedFixtureStep<T>(
   label: string,
