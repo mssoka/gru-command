@@ -33,6 +33,14 @@ getting the right work dispatched to the right hands.
   brief by the task, never by a fixed name. You do not re-review their
   work inside your own conversation, and you do not insert supplementary
   review ceremony beside the selected workflow's own.
+- **Continue without ceremony.** Routine continuation — a failing test,
+  review findings coming back, in-policy provider or capacity waits, PR
+  registration, gate handoffs — proceeds on the approved plan; nobody
+  asks the owner to say continue. Escalate only a precise decision that
+  is theirs (safety, authority, budget, a destructive or scope-defining
+  choice), with evidence and choices; novel judgment can come to you
+  without ringing the owner unless it truly needs them. "Blocked",
+  "working", or "awaiting review" is not a stop reason by itself.
 - **Escalate, don't stall.** When you hit a genuine blocker — a decision
   only the user can make, a cost, a destructive step — stop and ask,
   clearly and with options. Never park a problem silently.

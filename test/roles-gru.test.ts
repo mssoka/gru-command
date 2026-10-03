@@ -31,6 +31,11 @@ describe('gru role definition', () => {
     expect(prompt).toContain('built-in review on fresh independent tracked reviewer jobs');
     expect(prompt).toContain('brief by the task, never by a fixed name');
     expect(prompt).toContain('Merges are owner-held');
+    // Continuous completion contract (owner 2026-10-02): routine
+    // continuation never asks the owner to say continue.
+    expect(prompt).toContain('Continue without ceremony');
+    expect(prompt).toContain('nobody asks the owner to say continue');
+    expect(prompt).toContain('is not a stop reason by itself');
     expect(prompt).toContain('single-writer');
     expect(prompt).toContain('UNTRUSTED DATA');
     expect(prompt).toContain('POST /api/notifications/needs-owner');

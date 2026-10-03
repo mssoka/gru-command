@@ -286,6 +286,52 @@ cycle, and the owner merges. When a Perkins pre-flight failure routes the
 review to the installed bmad-review fallback gate (§4b), that host-routed
 gate is the review gate of record — it is the gate, never a duplicate.
 
+## 4f. Continuous completion (owner contract 2026-10-02)
+
+An approved heist advances without a new continue prompt. Every
+nonterminal job resolves to one of three durable states: active owned
+work (the exact source/control/verification/review identity, progress
+evidence, and expected next transition); an internal wait (the concrete
+dependency, its owner, and an automatic re-arm trigger or next
+reconciliation time); or a precise needs-owner question (the decision,
+the evidence, the choices, and the linked notification). Routine
+conflicts, test failures, review feedback, in-policy provider recovery,
+lost workers after a restart, capacity waits, PR registration, and gate
+handoffs are GC-owned continuations; only a genuine owner decision stops
+the work, and vague blocked/working/awaiting-review status is not one.
+
+Ops reconciliation is bounded and independent of long model/worker
+turns: Silas dispatches actionable work and re-enters reconciliation
+rather than holding the fleet behind one HTTP turn or a broad historical
+re-audit; an actively working long lane is neither duplicated nor
+interrupted, and no detached retry/capacity watcher is built. Each tick
+acts or records a justified dependency, with fairness across runnable
+jobs; re-observation is not progress. Accepted actions and requests are
+reconciled before resuming after a restart — recorded durably before
+their effects can be lost, with idempotency, head/generation binding,
+and single-writer fences. Verification stays scheduler-owned and
+one-shot (one owned accepted producer, exclusive pre-opened captures
+through EOF, honest terminal states); a queue timeout is not a test
+result, a captured failure stays a failure until substantive repair, and
+lost logs never justify a rerun. A heartbeat, an open turn, an HTTP 200,
+a delivered prompt, or old-head CI is not progress or readiness.
+Artifact-only and investigation jobs complete at their verified artifact
+handback; product-PR jobs complete through implement/integrate → verify
+→ repair → independent review/fix → normal publication → exact
+final-head CI/native Perkins → the owner-held merge. Limits, gates, and
+owner-held decisions are unchanged.
+
+**Policy vs implemented.** These obligations ship in the installed
+playbook, but the runtime does not yet enforce all of them. Still
+missing in code: accepted requests/actions are not a restart-durable
+store; the board does not carry per-job last-tick/last-completed-
+reconcile, open-turn age, last useful action, and next action; the
+stalled/PR-overdue predicates do not carry deliverable-kind carve-outs
+for artifact-only jobs; and current-phase delivery is not distinct from
+historical `job.delivered` events. Those gaps are tracked as separate
+code work and are not implemented by this document — nothing in this
+section claims those runtime guarantees exist today.
+
 ## 5. Release (the sweep)
 
 `POST /api/dispatch/release` `{job_id, confirm_kill?, base_branch?}` —

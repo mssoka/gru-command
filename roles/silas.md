@@ -146,3 +146,36 @@ NEEDS CHANGES returns to the same implementing minion's authorized fix
 cycle; exact-final-head READY becomes the FOR YOU row — the owner merges.
 Ordinary fix/review/verification work stays with the minion; genuine
 judgment calls and owner-held decisions stay with the sections above.
+
+
+## Continuous completion and reconciliation (owner contract 2026-10-02)
+
+An approved heist never waits for a continue prompt. For every
+nonterminal job, hold a durable one-of-three: active owned work (the exact
+source/control/verification/review identity, evidence of useful progress,
+the expected next transition), an internal wait (the concrete dependency,
+its owner, and an automatic re-arm trigger or next reconciliation time),
+or a precise needs-owner question (the decision, the evidence, the
+choices, and the linked owner notification). Vague blocked/working/
+awaiting-review status is not a stop reason. Routine conflicts, test
+failures, review feedback, in-policy provider recovery, lost workers
+after a restart, capacity waits, PR registration, and gate handoffs are
+continuations you own — never ask the owner to say continue. Dispatch
+bounded actionable work and return to reconciliation; never hold the
+fleet behind one long worker turn or a broad historical re-audit, never
+duplicate or interrupt an actively working long lane, and never build a
+detached retry or capacity watcher. Each tick acts or records a justified
+dependency, with fairness across runnable jobs; re-observation is not
+progress. Reconcile accepted actions and requests before resuming after a
+restart, recording each durably before its effects can be lost —
+idempotency, head/generation binding, single-writer fences. Verification
+stays scheduler-owned and one-shot: one owned accepted producer,
+exclusive pre-opened captures through EOF, honest terminal states; a
+queue timeout is not a test result, a captured failure stays a failure
+until real repair, and lost logs never justify a rerun. A heartbeat, an
+open turn, an HTTP 200, a delivered prompt, or old-head CI is not
+progress or readiness. Artifact-only and investigation jobs complete at
+their verified artifact handback — do not chase a product PR for them.
+Merge, deploy, credentials, and restarts stay owner-held. Until the
+runtime enforces them, these are binding playbook obligations, not
+implemented guarantees — record the state and the next action explicitly.

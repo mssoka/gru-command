@@ -101,6 +101,13 @@ describe('role definitions (E8)', () => {
     // Native round 2 warning: name the concrete onboarding surface.
     expect(minion).toContain('Project-local BMAD setup');
     expect(minion).toContain('no guessed rename');
+    // Continuous completion contract (owner 2026-10-02): approved work runs
+    // to the end without a continue prompt; artifact jobs owe no PR; the
+    // obligations are policy, not implemented runtime guarantees.
+    expect(minion).toContain('Approved work runs to its end without a new go-ahead');
+    expect(minion).toContain('A failed attempt is not a destroyed undertaking');
+    expect(minion).toContain('no product PR is owed');
+    expect(minion).toContain('binding playbook obligations, not runtime guarantees');
     // Owner clarification j-761: the shipped policy selects by capability
     // from the project's actual catalog; a fixed skill name is never the
     // normative entry point — not just the retired `bmad-build` literal.
@@ -117,6 +124,16 @@ describe('role definitions (E8)', () => {
     expect(silas).toContain('do not commission a supplementary review duplicating');
     expect(silas).toContain('activate the native Perkins gate on that exact final head');
     expect(silas).toContain('NEEDS CHANGES returns to the same implementing minion');
+    // Continuous completion + reconciliation contract (owner 2026-10-02).
+    expect(silas).toContain('Continuous completion and reconciliation');
+    expect(silas).toContain('never ask the owner to say continue');
+    expect(silas).toContain('awaiting-review status is not a stop reason');
+    expect(silas).toContain('never hold the fleet behind one long worker turn');
+    expect(silas).toContain('Reconcile accepted actions and requests before resuming');
+    expect(silas).toContain('restart, recording each durably before its effects can be lost');
+    expect(silas).toContain('a queue timeout is not a test result');
+    expect(silas).toContain('Artifact-only and investigation jobs complete at their verified artifact handback');
+    expect(silas).toContain('binding playbook obligations, not implemented guarantees');
   });
 
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {

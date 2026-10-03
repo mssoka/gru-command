@@ -1367,6 +1367,9 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedMinion).not.toContain('headless print mode');
     expect(stagedMinion).toContain('an inline self-review is not a substitute');
     expect(stagedMinion).toContain('Project-local BMAD setup');
+    expect(stagedMinion).toContain('Approved work runs to its end without a new go-ahead');
+    expect(stagedMinion).toContain('A failed attempt is not a destroyed undertaking');
+    expect(stagedMinion).toContain('binding playbook obligations, not runtime guarantees');
     expect(stagedMinion).not.toMatch(/bmad-[a-z][a-z-]*/u);
     const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
@@ -1378,6 +1381,11 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedOps).toContain('do not commission a supplementary review duplicating');
     expect(stagedOps).toContain('native Perkins round on the exact final settled PR head');
     expect(stagedOps).toContain('it is the gate, never a duplicate review');
+    expect(stagedOps).toContain('Continuous completion (owner contract 2026-10-02)');
+    expect(stagedOps).toContain('Active owned work');
+    expect(stagedOps).toContain('never hold the fleet behind one long');
+    expect(stagedOps).toContain('queue timeout is not a test result');
+    expect(stagedOps).toContain('binding playbook obligations, not implemented guarantees');
     expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
@@ -1398,10 +1406,12 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       const gruPrompt = flatten(ROLE_DEFINITIONS.gru.systemPrompt);
       if (!minionPrompt.includes("the PROJECT's actual installed skill catalog and metadata") ||
           !minionPrompt.includes('fresh, context-free tracked review jobs') ||
+          !minionPrompt.includes('Approved work runs to its end without a new go-ahead') ||
           /bmad-[a-z][a-z-]*/.test(minionPrompt)) {
         throw new Error('staged minion prompt lacks the BMAD workflow playbook');
       }
       if (!silasPrompt.includes("selects the task-relevant BMAD skills from the project's actual installed catalog") ||
+          !silasPrompt.includes('never ask the owner to say continue') ||
           silasPrompt.includes('bmad-build')) {
         throw new Error('staged silas prompt lacks the minion-owned build cycle');
       }

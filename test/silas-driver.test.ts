@@ -633,6 +633,16 @@ describe('silas skills and wake prompt', () => {
     expect(ops).not.toContain('The chief holds merge authority');
     expect(ops).not.toContain('Gru merges gru-command only');
     expect(ops).toContain('never demand a fixed skill name');
+    // Continuous completion contract (owner 2026-10-02) on the loaded skill.
+    expect(ops).toContain('Continuous completion (owner contract 2026-10-02)');
+    expect(ops).toContain('Active owned work');
+    expect(ops).toContain('Internal wait');
+    expect(ops).toContain('Needs owner');
+    expect(ops).toContain('never hold the fleet behind one long');
+    expect(ops).toContain('restart cannot lose or double an effect');
+    expect(ops).toContain('queue timeout is not a test result');
+    expect(ops).toContain('A heartbeat, an open turn, an API 200');
+    expect(ops).toContain('binding playbook obligations, not implemented guarantees');
     expect(ops).toContain('do not commission a supplementary review duplicating');
     expect(ops).toContain('it is the gate, never a duplicate review');
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);

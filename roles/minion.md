@@ -55,6 +55,21 @@ order 5). No routine per-phase approval, no source-only handback between
 phases, and no self-imposed call, turn, or time ceiling — genuine owner,
 safety, capacity, and cost decisions still stop you.
 
+Approved work runs to its end without a new go-ahead: integrate, verify,
+repair real failures in the same lane, take the review's findings through
+the fix cycle, publish normally, clear the exact final-head gates, and
+leave the settled result to the owner's merge decision. A failing test, a
+lost session, or a queued verification is continuation work, not a stop
+reason — only a genuine owner decision (safety, authority, budget,
+destructive step, scope) stops the lane. An artifact-only or
+investigation job is complete when its verified artifact is handed back —
+no product PR is owed, and absence of one is never an overdue chore. A
+failed attempt is not a destroyed undertaking: repair it in place, never
+weaken a gate to get moving, and never invent call, turn, or time
+ceilings. These are binding playbook obligations, not runtime guarantees —
+the runtime does not yet enforce every step, so prove progress with real
+evidence: liveness, receipts, and HTTP 200 are not progress.
+
 The selected workflow's review is independent by construction: run its
 reviewer layers as fresh, context-free tracked review jobs you commission
 through the service's job-dispatch surface (`POST /api/dispatch` — the

@@ -217,6 +217,11 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     // Native round 2 warning: name the concrete onboarding surface.
     expect(flat).toContain('Project-local BMAD setup');
     expect(flat).toContain('no guessed rename');
+    // Continuous completion contract (owner 2026-10-02).
+    expect(flat).toContain('Approved work runs to its end without a new go-ahead');
+    expect(flat).toContain('A failed attempt is not a destroyed undertaking');
+    expect(flat).toContain('no product PR is owed');
+    expect(flat).toContain('binding playbook obligations, not runtime guarantees');
     // Owner clarification j-761: never a fixed skill-name dependency —
     // not just the retired `bmad-build` literal.
     expect(staged.minion).not.toMatch(/bmad-[a-z][a-z-]*/u);
@@ -232,6 +237,14 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('do not commission a supplementary review duplicating');
     expect(flat).toContain('activate the native Perkins gate on that exact final head');
     expect(flat).toContain('NEEDS CHANGES returns to the same implementing minion');
+    // Continuous completion + reconciliation contract (owner 2026-10-02).
+    expect(flat).toContain('Continuous completion and reconciliation');
+    expect(flat).toContain('never ask the owner to say continue');
+    expect(flat).toContain('awaiting-review status is not a stop reason');
+    expect(flat).toContain('Reconcile accepted actions and requests before resuming');
+    expect(flat).toContain('a queue timeout is not a test result');
+    expect(flat).toContain('Artifact-only and investigation jobs complete at their verified artifact handback');
+    expect(flat).toContain('binding playbook obligations, not implemented guarantees');
     expect(flat).not.toContain('bmad-build');
   });
 

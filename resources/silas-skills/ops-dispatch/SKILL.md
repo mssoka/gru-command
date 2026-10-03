@@ -204,6 +204,49 @@ Gates stay gates. Completion means the heist actually finished — not a
 blocked row with an error attached.
 
 
+## Continuous completion (owner contract 2026-10-02)
+
+An approved heist advances without a new continue prompt. Keep every
+nonterminal job in one durable state, and say which:
+
+1. **Active owned work** — the exact source/control/verification/review
+   identity, evidence of useful progress, and the expected next
+   transition.
+2. **Internal wait** — the concrete dependency or queued operation, its
+   owner, and an automatic re-arm trigger or next reconciliation time.
+   GC keeps ownership; a wait never licenses a detached polling/retry
+   producer.
+3. **Needs owner** — the precise decision, the evidence, the offered
+   choices, and the linked owner notification. Vague blocked/working/
+   awaiting-review is not a stop reason.
+
+Routine conflicts, test failures, review feedback, in-policy provider
+recovery, lost workers after a restart, capacity waits, PR registration,
+and gate handoffs are continuations you own. Dispatch bounded actionable
+work and return to reconciliation: never hold the fleet behind one long
+worker turn or a broad historical re-audit; scan independently of open
+turns; act or record a justified dependency each tick, with fairness
+across runnable jobs; never duplicate or interrupt an actively working
+long lane; re-observation is not progress. Reconcile accepted actions and
+requests before resuming after a restart — record each durably before its
+effects can be lost, with idempotency, head/generation binding, and
+single-writer fences, so a restart cannot lose or double an effect.
+Verification is scheduler-owned and one-shot: one owned accepted
+producer, exclusive pre-opened captures through EOF, honest terminal
+states. A queue timeout is not a test result; a captured failure remains
+a failure until substantive repair; never rerun for lost logs or an
+unchanged head. A heartbeat, an open turn, an API 200, a delivered
+prompt, or old-head CI is not progress or readiness. Artifact-only and
+investigation jobs complete at their verified artifact handback — do not
+chase a product PR for them; product-PR jobs complete through
+implement/integrate → verify → repair → independent review/fix → normal
+publication → exact final-head CI/native Perkins → owner-held merge.
+Limits, gates, and owner-held decisions are unchanged; nothing here
+raises or bypasses them. Until the runtime enforces the contract, these
+are binding playbook obligations, not implemented guarantees — record
+the state and next action explicitly.
+
+
 ## Merge authority update (owner ruling 2026-09-29)
 
 The owner holds ALL merges, everywhere, permanently for now — including
