@@ -63,8 +63,9 @@ export function jobRecency(job: JobView): string {
 }
 
 /** The stop truth for one lane: the lane's bound minion worker is
- * supervision-stopped (or breaker-open) and the job still reads
- * "working". */
+ * supervision-stopped (or breaker-open). Callers decide whether the lane's
+ * status makes the waiting state applicable (the board gates on a working
+ * job). */
 export interface WorkerStopView {
   /** Failure class the supervisor recorded (e.g. `quota_wall`), null on
    * pre-reason snapshots — the stop renders without a cause. */
@@ -96,8 +97,10 @@ export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, W
     if (agent.jobId === null || agent.role !== 'minion') continue;
     const supervision = agent.supervision;
     if (supervision === null || supervision === undefined) {
-      // Unsupervised worker: not a supervision stop — counts as live so it
-      // clears any older stopped record for the job (doc above).
+      // Unsupervised worker: not a supervision stop. A DISPOSED record is
+      // not a live worker either — only a running unsupervised worker
+      // clears an older stopped record (final independent review E0).
+      if (agent.state === 'disposed') continue;
       liveJobs.add(agent.jobId);
       continue;
     }

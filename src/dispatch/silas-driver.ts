@@ -515,7 +515,10 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       // breaker-open (a null view is an unsupervised worker, not a stop).
       // A lane with a stop record and NO live worker is WAITING on a human
       // re-arm — silence from a stop is never a stall. The newest live
-      // worker speaks for the lane's silence.
+      // worker speaks for the lane's silence; the board's COLD banding
+      // deliberately measures lane-level recency instead, and the two
+      // surfaces share this stop attribution so a waiting lane never
+      // contradicts itself.
       const live = boundMinions.filter((agent) => {
         const supervision = input.supervisionFor?.(agent.id) ?? null;
         return supervision === null || (supervision.state !== 'stopped' && supervision.breakerOpen !== true);

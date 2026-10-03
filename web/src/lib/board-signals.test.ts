@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type { AgentView, BoardSnapshot, JobView, NotificationView, RoundView } from './board-protocol.js';
 import { isJobConcluded } from './board-protocol.js';
 import { jobSignal, pluralCount, roundSummary, terminalBoundNotificationIds, unackedByJob } from './board-signals.js';
@@ -227,12 +229,31 @@ describe('unackedByJob', () => {
     expect([...counts.entries()]).toEqual([['live-1', 1]]);
     // Pin the concluded set across EVERY job status the web can receive.
     // The backend and the web share no module, so a terminal status added
-    // on the ledger side must be mirrored here too; this enumeration is a
-    // CHECKLIST (not a drift alarm — it cannot compare against the
-    // ledger's TERMINAL_JOB_STATUSES from the web bundle).
+    // on the ledger side must be mirrored here too; the companion test
+    // below reads the ledger declaration and makes drift FAIL instead of
+    // relying on this checklist being remembered.
     const statuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done'];
     expect(statuses.filter((status) => isJobConcluded(status))).toEqual(['merged', 'done']);
     expect(isJobConcluded('working')).toBe(false);
+  });
+
+  it('the concluded set cannot drift from the ledger terminal statuses (cross-build alarm)', () => {
+    // The web bundle cannot import the ledger module (separate builds), so
+    // this test reads the server's terminal declaration directly: every
+    // status the ledger names terminal must be concluded here. A new
+    // terminal status server-side fails THIS test until the web twin
+    // mirrors it (final independent review B0/Ar1/T0).
+    const statesSource = readFileSync(
+      fileURLToPath(new URL('../../../src/ledger/states.ts', import.meta.url)),
+      'utf-8',
+    );
+    const declaration = /const JOB_TERMINAL: ReadonlySet<JobStatus> = new Set\(\[([^\]]*)\]\)/.exec(statesSource);
+    expect(declaration).not.toBeNull();
+    const terminal = [...declaration![1]!.matchAll(/'([^']+)'/g)].map((match) => match[1]!);
+    expect(terminal.length).toBeGreaterThan(0);
+    for (const status of terminal) {
+      expect(isJobConcluded(status), status).toBe(true);
+    }
   });
 
   it('terminalBoundNotificationIds names the closed receipts — terminal bindings only, never guessing', () => {

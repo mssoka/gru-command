@@ -525,4 +525,17 @@ describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
     ]);
     expect(map.has('job-1')).toBe(false);
   });
+
+  it('a disposed unsupervised record does not clear a current stop', () => {
+    const map = stoppedWorkersByJob([
+      agentView('current', {
+        jobId: 'job-1',
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      // A disposed record has no live worker behind it: it must not erase
+      // the current worker's stop (finding E0, final independent review).
+      agentView('dead', { jobId: 'job-1', state: 'disposed', supervision: null }),
+    ]);
+    expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 1 });
+  });
 });

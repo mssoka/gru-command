@@ -1785,7 +1785,9 @@ export class LedgerApi {
    * from the TABLE — not the bounded feed window. Receipts belong to the
    * record and the bell; the live NEEDS GRU queue is
    * `countLivePendingActionRequired` — prefer that one for anything the
-   * board renders as live work. */
+   * board renders as live work. This accessor is DIAGNOSTIC/TEST-ONLY
+   * (the durable receipt record); production paths should use the live
+   * count or `listNotifications` directly. */
   countPendingActionRequiredIncludingReceipts(): number {
     const row = this.db
       .prepare(
@@ -1810,10 +1812,10 @@ export class LedgerApi {
       .prepare(
         `SELECT COUNT(*) AS n FROM notifications
          WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL
-           AND (agent_id IS NULL OR agent_id NOT IN (
-             SELECT agents.id FROM agents JOIN jobs ON agents.job_id = jobs.id
-             WHERE jobs.status IN (${terminalPlaceholders})
-           ))`,
+           AND NOT EXISTS (
+             SELECT 1 FROM agents JOIN jobs ON agents.job_id = jobs.id
+             WHERE agents.id = notifications.agent_id AND jobs.status IN (${terminalPlaceholders})
+           )`,
       )
       .get(...TERMINAL_JOB_STATUSES) as Row;
     return Number(row.n);
