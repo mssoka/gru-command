@@ -25,6 +25,11 @@ import { clearTimeout, setTimeout } from 'node:timers';
 import { spawn } from 'node:child_process';
 
 const OUTPUT_TAIL_LIMIT = 2_048; // chars kept per stream, per process
+// Raw retention feeds render-time redaction: a credential label/value pair
+// split across stream chunks (or inside a quoted error) is only matchable
+// while both sides are still present. Lines are dropped whole where
+// possible so a retained window never starts mid-credential.
+const RAW_TAIL_LIMIT = 8 * OUTPUT_TAIL_LIMIT;
 const RENDER_LIMIT = 8_192; // chars of the rendered diagnostics block
 const STEP_LIMIT = 16;
 const PROCESS_LIMIT = 12;
@@ -92,14 +97,18 @@ export function markFixtureStep(label, scope) {
 }
 
 function appendTail(tracked, streamName, chunk) {
-  const text = String(chunk);
-  const combined = tracked.output[streamName] + text;
-  // Redact BEFORE retaining: a credential label cut by the bounded window
-  // (or split across stream chunks) would otherwise let its value survive.
-  const redacted = redactDiagnosticText(combined);
-  const bounded = redacted.length > OUTPUT_TAIL_LIMIT ? redacted.slice(-OUTPUT_TAIL_LIMIT) : redacted;
+  const combined = tracked.output[streamName] + String(chunk);
   if (combined.length > OUTPUT_TAIL_LIMIT) tracked.outputTruncated[streamName] = true;
-  tracked.output[streamName] = bounded;
+  tracked.output[streamName] = retainRawTail(combined);
+}
+
+/** Keep a bounded RAW tail; drop whole lines when the cut would split one. */
+function retainRawTail(text) {
+  if (text.length <= RAW_TAIL_LIMIT) return text;
+  const excess = text.length - RAW_TAIL_LIMIT;
+  const newline = text.indexOf('\n', excess);
+  const cut = newline !== -1 && newline - excess <= 256 ? newline + 1 : excess;
+  return text.slice(cut);
 }
 
 /**
@@ -223,13 +232,17 @@ function tailExcerpt(text) {
 export function renderFailureDiagnostics(scope, error, { timedOut } = {}) {
   const target = scopeOf(scope);
   const message = errorText(error);
+  // Sanitize the COMPLETE error string before any truncation: a quoted
+  // credential cut at the 240-char line bound would lose its closing quote
+  // and defeat the matcher.
+  const safeMessage = redactDiagnosticText(message);
   if (target === null) {
-    return `[harness-diagnostics] no active test scope; error: ${firstLine(message)}`;
+    return `[harness-diagnostics] no active test scope; error: ${firstLine(safeMessage)}`;
   }
   const now = target.clock();
   const elapsed = now - target.startedAt;
   const timeout = timedOut ?? isTimeoutError(error);
-  const hookPhase = /^hook\b/i.test(firstLine(message));
+  const hookPhase = /^hook\b/i.test(firstLine(safeMessage));
   const lines = [];
   lines.push(
     `[harness-diagnostics] ${timeout ? 'TIMEOUT' : 'FAILURE'} ${target.file} > ${target.name}`,
@@ -237,7 +250,7 @@ export function renderFailureDiagnostics(scope, error, { timedOut } = {}) {
   lines.push(
     `  elapsed: ${formatMs(elapsed)} (${timeout ? 'timeout' : 'failure'}${hookPhase ? ', hook/setup phase' : ''})`,
   );
-  lines.push(`  error: ${firstLine(message)}`);
+  lines.push(`  error: ${firstLine(safeMessage)}`);
   const lineage = scopeLineage(target);
   // File-scope children (started in beforeAll) render first; the test's own
   // children last, so the newest evidence survives the per-process cap.
@@ -273,12 +286,16 @@ export function renderFailureDiagnostics(scope, error, { timedOut } = {}) {
           : `exited code=${String(tracked.exitCode)} signal=${String(tracked.signal)} at ` +
             `+${formatMs((tracked.exitedAt ?? now) - target.startedAt)}`;
       lines.push(`    - pid ${String(tracked.pid)} "${tracked.label}": ${state}`);
-      if (tracked.spawnError !== null) lines.push(`      spawn error: ${firstLine(tracked.spawnError)}`);
+      if (tracked.spawnError !== null) {
+        lines.push(`      spawn error: ${firstLine(redactDiagnosticText(tracked.spawnError))}`);
+      }
       for (const streamName of ['stdout', 'stderr']) {
         const tail = tracked.output[streamName];
         if (tail !== '') {
           const suffix = tracked.outputTruncated[streamName] ? ' [truncated to last bytes]' : '';
-          lines.push(`      ${streamName} tail${suffix}: ${tailExcerpt(tail)}`);
+          // Redact the complete retained tail BEFORE excerpting, so a label
+          // is never cut away from its value by the 477-char bound.
+          lines.push(`      ${streamName} tail${suffix}: ${tailExcerpt(redactDiagnosticText(tail))}`);
         }
       }
     }

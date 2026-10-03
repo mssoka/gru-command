@@ -381,11 +381,11 @@ describe('harness diagnostics', () => {
     expect(output).toContain('teardown boom');
   });
 
-  it('redacts credentials across truncation and JSON-escaped boundaries (Perkins r1)', () => {
+  it('redacts credentials across truncation, chunk-split and JSON-escaped boundaries (Perkins r1/r2)', () => {
     const scope = currentTestScope()!;
     const opaque = 'A'.repeat(32);
     // The label sits 477 characters before the excerpt cut: redaction must
-    // happen before retention/excerpting, never after.
+    // happen before excerpting, never after.
     trackChildProcess(
       fakeChild({ pid: 766_001, exitCode: 0, stderr: fakeStream(`token=${opaque} ${'x'.repeat(444)}`) }),
       { label: 'boundary child', scope },
@@ -394,14 +394,47 @@ describe('harness diagnostics', () => {
     expect(rendered).not.toContain(opaque);
     expect(rendered).toContain('[REDACTED]');
 
-    // A pair split across stream chunks: the second chunk completes it.
-    const splitOpaque = 'B'.repeat(32);
+    // Split INSIDE the value: neither fragment may survive.
+    const splitValue = 'B'.repeat(32);
     trackChildProcess(
-      fakeChild({ pid: 766_002, exitCode: 0, stderr: fakeStream('token=', `${splitOpaque} ${'y'.repeat(400)}`) }),
-      { label: 'split child', scope },
+      fakeChild({ pid: 766_002, exitCode: 0, stderr: fakeStream('token=BBBB', `${splitValue.slice(4)} ${'y'.repeat(400)}`) }),
+      { label: 'split-value child', scope },
     );
-    const splitRendered = renderFailureDiagnostics(scope, new Error('split check'));
-    expect(splitRendered).not.toContain(splitOpaque);
+    const splitValueRendered = renderFailureDiagnostics(scope, new Error('split value check'));
+    expect(splitValueRendered).not.toContain(splitValue);
+    expect(splitValueRendered).not.toContain('BBBB');
+
+    // Split AFTER the Bearer scheme word: the whole pair still redacts.
+    const bearerValue = 'opaque-token-value-12345';
+    trackChildProcess(
+      fakeChild({ pid: 766_003, exitCode: 0, stderr: fakeStream('authorization: Bearer ', bearerValue) }),
+      { label: 'bearer-split child', scope },
+    );
+    const bearerRendered = renderFailureDiagnostics(scope, new Error('bearer split check'));
+    expect(bearerRendered).not.toContain(bearerValue);
+    expect(bearerRendered).not.toContain('opaque-token');
+
+    // A long quoted credential in an error: sanitized before the 240-char
+    // line bound can strip its closing quote.
+    const longSecret = 'Z'.repeat(300);
+    const longQuoted = renderFailureDiagnostics(scope, new Error(`token="${longSecret}"`));
+    expect(longQuoted).not.toContain('Z'.repeat(50));
+    expect(longQuoted).toContain('[REDACTED]');
+
+    // A long quoted credential in a spawn error follows the same path.
+    const spawnSecret = 'S'.repeat(300);
+    trackChildProcess(
+      fakeChild({
+        pid: 766_004,
+        exitCode: 0,
+        once: (event: string, callback: (argument: unknown) => void) => {
+          if (event === 'error') callback(new Error(`token="${spawnSecret}"`));
+        },
+      }),
+      { label: 'spawn-error child', scope },
+    );
+    const spawnRendered = renderFailureDiagnostics(scope, new Error('spawn check'));
+    expect(spawnRendered).not.toContain('S'.repeat(50));
 
     // JSON-escaped credentials in log records.
     const jsonEscaped = String.raw`{\"token\":\"JSON-secret-123456\"}`;
