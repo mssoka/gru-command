@@ -1,0 +1,146 @@
+{
+  "at": "2026-10-03T00:45:38.349117+00:00",
+  "by": "minion",
+  "job": "wizard-bmad-deterministic-retry-32",
+  "scope": "wizard-bmad-browser-consumer",
+  "head_expected": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+  "preflight": {
+    "at": "2026-10-03T00:45:34.289793+00:00",
+    "scope": "wizard-bmad-browser-consumer",
+    "head": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+    "expected_head": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+    "tracked_dirty": "",
+    "remote_head": "81d3f1081486a6cbb39f1d56876375709ebb087f",
+    "job_status": "working",
+    "live_rounds": [],
+    "live_minions": [
+      "01a0fdf5-dde4-7194-a9fd-496e9cb2f932"
+    ],
+    "pending_rebriefs": 0,
+    "blocking_rebriefs": [],
+    "recent_verifications": [
+      {
+        "seq": 40484,
+        "ts": "2026-10-03T00:44:51.639Z",
+        "kind": "verification.lock-timeout"
+      },
+      {
+        "seq": 40437,
+        "ts": "2026-10-03T00:29:19.510Z",
+        "kind": "verification.completed"
+      },
+      {
+        "seq": 40420,
+        "ts": "2026-10-03T00:24:13.484Z",
+        "kind": "verification.started"
+      },
+      {
+        "seq": 40352,
+        "ts": "2026-10-03T00:08:25.373Z",
+        "kind": "verification.completed"
+      }
+    ],
+    "verify_view": {
+      "lockInUse": true,
+      "activeRuns": 1,
+      "queuedRuns": 3,
+      "workerBudget": 14,
+      "workersPerRun": 14
+    },
+    "free_bytes": 63648202752
+  },
+  "starts": [
+    {
+      "type": "started",
+      "runId": "8473ecde-e10f-4c7c-b5c5-d8ea9c2a643a",
+      "workers": 14,
+      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+      "queuedMs": 752505
+    }
+  ],
+  "completed": {
+    "type": "completed",
+    "runId": "8473ecde-e10f-4c7c-b5c5-d8ea9c2a643a",
+    "outcome": {
+      "runId": "8473ecde-e10f-4c7c-b5c5-d8ea9c2a643a",
+      "jobId": "wizard-bmad-deterministic-retry-32",
+      "scope": "wizard-bmad-browser-consumer",
+      "command": "node tools/patch-vitest-rpc-timeout.mjs && npm run test:web && npm run e2e",
+      "cwd": "<LANE_WORKTREE>",
+      "ok": true,
+      "exitCode": 0,
+      "signal": null,
+      "timedOut": false,
+      "queuedMs": 752505,
+      "durationMs": 301351,
+      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+      "trackedDirty": false,
+      "workers": 14,
+      "outputBytes": 14834,
+      "outputSha256": "91ef95bff47efc596b45c15bbeba5afe9e02ade7065977a3588dc6650b8f56ae",
+      "outputTail": "ock] \u203a e2e/smoke.spec.ts:995:3 \u203a themes \u203a light default, dark toggle persists, both snapshotted (4.8s)\n  \u2713  27 [mock] \u203a e2e/smoke.spec.ts:1061:3 \u203a phone chrome \u203a nav fits the phone: zero horizontal overflow on chat and board, every control reachable (3.2s)\n  \u2713  28 [mock] \u203a e2e/smoke.spec.ts:1101:3 \u203a phone chrome \u203a 561px band: the single-row nav still fits without overflow or clipped controls (2.1s)\n  \u2713  29 [mock] \u203a e2e/working-flavor.spec.ts:109:1 \u203a busy phrases rotate with stable status/control geometry on every surface (8.0s)\n  \u2713  30 [lens-pills] \u203a e2e/lens-pills.spec.ts:251:3 \u203a lens pills \u2014 unused is neutral, never a pass (synthetic fixture) \u203a seven pills: four unused gray without a tick, three clean green; light/dark, phone/desktop (4.9s)\n  \u2713  31 [lens-pills] \u203a e2e/lens-pills.spec.ts:300:3 \u203a lens pills \u2014 unused is neutral, never a pass (synthetic fixture) \u203a four unused + three genuine timeout errors: neutral stays neutral, failures stay alert with attempts (4.3s)\n  \u2713  32 [lens-pills] \u203a e2e/lens-pills.spec.ts:355:3 \u203a lens pills \u2014 unused is neutral, never a pass (synthetic fixture) \u203a mixed round: unused, clean, legacy null-note, live, pending, blocker, error all distinct (3.1s)\n  \u2713  33 [real] \u203a e2e/real-server.spec.ts:122:1 \u203a pair with the real token, send, streamed echo reply (2.7s)\n  \u2713  34 [real] \u203a e2e/real-server.spec.ts:127:1 \u203a multi-line prompt rides the real socket intact (agent receives the newline) (2.5s)\n  \u2713  35 [real] \u203a e2e/real-server.spec.ts:151:1 \u203a real native compact preserves history and New chat starts unresumed behind a durable epoch (3.7s)\n  \u2713  36 [real] \u203a e2e/real-server.spec.ts:185:1 \u203a reload keeps history from the real frame log (no duplicates) (2.1s)\n  \u2713  37 [real] \u203a e2e/real-server.spec.ts:198:1 \u203a service restart drops the socket; reconnect keeps history and flushes the typed word (8.1s)\n  \u2713  38 [real] \u203a e2e/real-server.spec.ts:232:1 \u203a mobile viewport: board-first, corner bubble, sheet, unread badge over the real socket (2.7s)\n  \u2713  39 [real] \u203a e2e/real-server.spec.ts:265:1 \u203a wrong token: fatal inline error, stays on pairing across reload (1.3s)\n  \u2713  40 [real] \u203a e2e/real-server.spec.ts:281:3 \u203a board (E6) \u203a seeded jobs render repo-grouped with lens chips; live push updates (2.6s)\n  \u2713  41 [real] \u203a e2e/real-server.spec.ts:311:3 \u203a board (E6) \u203a agent rail lists the gru session; transcripts open, search, page (3.4s)\n  \u2713  42 [real] \u203a e2e/real-server.spec.ts:373:3 \u203a board (E6) \u203a notification round-trip (E7 + routing split): a blocked job lands in the feed, never the bell; ack clears it (2.6s)\n  \u2713  43 [real] \u203a e2e/real-server.spec.ts:418:3 \u203a board (E6) \u203a Gru can escalate a machine stop to FOR YOU through the authenticated route (2.7s)\n  \u2713  44 [real] \u203a e2e/real-server.spec.ts:448:3 \u203a board (E6) \u203a unauthenticated board API is a locked door (178ms)\n  \u2713  45 [real] \u203a e2e/real-server.spec.ts:480:3 \u203a themes \u203a light default, dark toggle persists, both snapshotted (3.4s)\n  \u2713  46 [real] \u203a e2e/real-server.spec.ts:496:1 \u203a Settings recheck shows real degraded \u2192 recovered Jev state and resolved incident semantics (2.8s)\n  \u2713  47 [real] \u203a e2e/real-server.spec.ts:531:1 \u203a missing-key enabled startup is durable degraded: a browser connected AFTER startup sees the actionable notice (5.8s)\n  \u2713  48 [real] \u203a e2e/real-server.spec.ts:577:3 \u203a attach flow (SPEC ruling 19) \u2014 full gesture \u203a on-disk pick: attach \u2192 browse \u2192 pick a real file \u2192 chip \u2192 send \u2192 agent receives the PATH; uploads dir stays EMPTY (no byte copy) (3.1s)\n  \u2713  49 [real] \u203a e2e/real-server.spec.ts:622:3 \u203a attach flow (SPEC ruling 19) \u2014 full gesture \u203a B2 fails-pre-fix discriminator \u2014 PHONE full gesture: attach \u2192 device button \u2192 chooser \u2192 chip \u2192 send \u2192 agent receives THAT path (3.6s)\n  \u2713  50 [real] \u203a e2e/real-server.spec.ts:689:3 \u203a attach flow (SPEC ruling 19) \u2014 full gesture \u203a clipboard paste (Mac-screenshot class): paste bytes into the composer \u2192 materialized \u2192 chip \u2192 send (2.6s)\n  \u2713  51 [real] \u203a e2e/real-server.spec.ts:719:3 \u203a attach flow (SPEC ruling 19) \u2014 full gesture \u203a chips replay with history after reload (the durable log carries them) (3.0s)\n\n  51 passed (3.5m)\n",
+      "error": null
+    }
+  },
+  "errors": [],
+  "frames": 105,
+  "transport_error": null,
+  "http_status": 200,
+  "queued": {
+    "type": "queued",
+    "runId": "8473ecde-e10f-4c7c-b5c5-d8ea9c2a643a",
+    "position": 4,
+    "active": 1,
+    "limit": 1
+  },
+  "captured_output_bytes": 14834,
+  "captured_output_sha256": "91ef95bff47efc596b45c15bbeba5afe9e02ade7065977a3588dc6650b8f56ae",
+  "raw_ndjson_bytes": 29863,
+  "raw_ndjson_sha256": "9effbbff0d848b38d584b57ac75b21631900057457f7f164d95c92cb553f724d",
+  "terminal_outcome": {
+    "runId": "8473ecde-e10f-4c7c-b5c5-d8ea9c2a643a",
+    "jobId": "wizard-bmad-deterministic-retry-32",
+    "scope": "wizard-bmad-browser-consumer",
+    "command": "node tools/patch-vitest-rpc-timeout.mjs && npm run test:web && npm run e2e",
+    "cwd": "<LANE_WORKTREE>",
+    "ok": true,
+    "exitCode": 0,
+    "signal": null,
+    "timedOut": false,
+    "queuedMs": 752505,
+    "durationMs": 301351,
+    "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+    "trackedDirty": false,
+    "workers": 14,
+    "outputBytes": 14834,
+    "outputSha256": "91ef95bff47efc596b45c15bbeba5afe9e02ade7065977a3588dc6650b8f56ae",
+    "error": null
+  },
+  "capture_matches": true,
+  "post_head": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+  "post_tracked_dirty": "",
+  "ledger_terminal": {
+    "seq": 40521,
+    "ts": "2026-10-03T01:03:12.370Z",
+    "payload": {
+      "run_id": "8473ecde-e10f-4c7c-b5c5-d8ea9c2a643a",
+      "scope": "wizard-bmad-browser-consumer",
+      "command": "node tools/patch-vitest-rpc-timeout.mjs && npm run test:web && npm run e2e",
+      "cwd": "<LANE_WORKTREE>",
+      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+      "tracked_dirty": false,
+      "ok": true,
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "queued_ms": 752505,
+      "duration_ms": 301351,
+      "workers": 14,
+      "output_bytes": 14834,
+      "output_sha256": "91ef95bff47efc596b45c15bbeba5afe9e02ade7065977a3588dc6650b8f56ae",
+      "output_tail": "ock] \u203a e2e/smoke.spec.ts:995:3 \u203a themes \u203a light default, dark toggle persists, both snapshotted (4.8s)\n  \u2713  27 [mock] \u203a e2e/smoke.spec.ts:1061:3 \u203a phone chrome \u203a nav fits the phone: zero horizontal overflow on chat and board, every control reachable (3.2s)\n  \u2713  28 [mock] \u203a e2e/smoke.spec.ts:1101:3 \u203a phone chrome \u203a 561px band: the single-row nav still fits without overflow or clipped controls (2.1s)\n  \u2713  29 [mock] \u203a e2e/working-flavor.spec.ts:109:1 \u203a busy phrases rotate with stable status/control geometry on every surface (8.0s)\n  \u2713  30 [lens-pills] \u203a e2e/lens-pills.spec.ts:251:3 \u203a lens pills \u2014 unused is neutral, never a pass (synthetic fixture) \u203a seven pills: four unused gray without a tick, three clean green; light/dark, phone/desktop (4.9s)\n  \u2713  31 [lens-pills] \u203a e2e/lens-pills.spec.ts:300:3 \u203a lens pills \u2014 unused is neutral, never a pass (synthetic fixture) \u203a four unused + three genuine timeout errors: neutral stays neutral, failures stay alert with attempts (4.3s)\n  \u2713  32 [lens-pills] \u203a e2e/lens-pills.spec.ts:355:3 \u203a lens pills \u2014 unused is neutral, never a pass (synthetic fixture) \u203a mixed round: unused, clean, legacy null-note, live, pending, blocker, error all distinct (3.1s)\n  \u2713  33 [real] \u203a e2e/real-server.spec.ts:122:1 \u203a pair with the real token, send, streamed echo reply (2.7s)\n  \u2713  34 [real] \u203a e2e/real-server.spec.ts:127:1 \u203a multi-line prompt rides the real socket intact (agent receives the newline) (2.5s)\n  \u2713  35 [real] \u203a e2e/real-server.spec.ts:151:1 \u203a real native compact preserves history and New chat starts unresumed behind a durable epoch (3.7s)\n  \u2713  36 [real] \u203a e2e/real-server.spec.ts:185:1 \u203a reload keeps history from the real frame log (no duplicates) (2.1s)\n  \u2713  37 [real] \u203a e2e/real-server.spec.ts:198:1 \u203a service restart drops the socket; reconnect keeps history and flushes the typed word (8.1s)\n  \u2713  38 [real] \u203a e2e/real-server.spec.ts:232:1 \u203a mobile viewport: board-first, corner bubble, sheet, unread badge over the real socket (2.7s)\n  \u2713  39 [real] \u203a e2e/real-server.spec.ts:265:1 \u203a wrong token: fatal inline error, stays on pairing across reload (1.3s)\n  \u2713  40 [real] \u203a e2e/real-server.spec.ts:281:3 \u203a board (E6) \u203a seeded jobs render repo-grouped with lens chips; live push updates (2.6s)\n  \u2713  41 [real] \u203a e2e/real-server.spec.ts:311:3 \u203a board (E6) \u203a agent rail lists the gru session; transcripts open, search, page (3.4s)\n  \u2713  42 [real] \u203a e2e/real-server.spec.ts:373:3 \u203a board (E6) \u203a notification round-trip (E7 + routing split): a blocked job lands in the feed, never the bell; ack clears it (2.6s)\n  \u2713  43 [real] \u203a e2e/real-server.spec.ts:418:3 \u203a board (E6) \u203a Gru can escalate a machine stop to FOR YOU through the authenticated route (2.7s)\n  \u2713  44 [real] \u203a e2e/real-server.spec.ts:448:3 \u203a board (E6) \u203a unauthenticated board API is a locked door (178ms)\n  \u2713  45 [real] \u203a e2e/real-server.spec.ts:480:3 \u203a themes \u203a light default, dark toggle persists, both snapshotted (3.4s)\n  \u2713  46 [real] \u203a e2e/real-server.spec.ts:496:1 \u203a Settings recheck shows real degraded \u2192 recovered Jev state and resolved incident semantics (2.8s)\n  \u2713  47 [real] \u203a e2e/real-server.spec.ts:531:1 \u203a missing-key enabled startup is durable degraded: a browser connected AFTER startup sees the actionable notice (5.8s)\n  \u2713  48 [real] \u203a e2e/real-server.spec.ts:577:3 \u203a attach flow (SPEC ruling 19) \u2014 full gesture \u203a on-disk pick: attach \u2192 browse \u2192 pick a real file \u2192 chip \u2192 send \u2192 agent receives the PATH; uploads dir stays EMPTY (no byte copy) (3.1s)\n  \u2713  49 [real] \u203a e2e/real-server.spec.ts:622:3 \u203a attach flow (SPEC ruling 19) \u2014 full gesture \u203a B2 fails-pre-fix discriminator \u2014 PHONE full gesture: attach \u2192 device button \u2192 chooser \u2192 chip \u2192 send \u2192 agent receives THAT path (3.6s)\n  \u2713  50 [real] \u203a e2e/real-server.spec.ts:689:3 \u203a attach flow (SPEC ruling 19) \u2014 full gesture \u203a clipboard paste (Mac-screenshot class): paste bytes into the composer \u2192 materialized \u2192 chip \u2192 send (2.6s)\n  \u2713  51 [real] \u203a e2e/real-server.spec.ts:719:3 \u203a attach flow (SPEC ruling 19) \u2014 full gesture \u203a chips replay with history after reload (the durable log carries them) (3.0s)\n\n  51 passed (3.5m)\n",
+      "error": null
+    }
+  },
+  "ledger_match": true
+}

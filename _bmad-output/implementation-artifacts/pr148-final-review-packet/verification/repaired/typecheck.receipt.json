@@ -1,0 +1,146 @@
+{
+  "at": "2026-10-03T08:11:34.727294+00:00",
+  "by": "minion",
+  "job": "wizard-bmad-deterministic-retry-32",
+  "scope": "typecheck",
+  "head_expected": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+  "preflight": {
+    "at": "2026-10-03T08:11:33.013605+00:00",
+    "scope": "typecheck",
+    "head": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+    "expected_head": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+    "tracked_dirty": "",
+    "remote_head": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+    "job_status": "working",
+    "live_rounds": [],
+    "live_minions": [
+      "01a0fdf5-dde4-7194-a9fd-496e9cb2f932"
+    ],
+    "pending_rebriefs": 0,
+    "blocking_rebriefs": [],
+    "recent_verifications": [
+      {
+        "seq": 41823,
+        "ts": "2026-10-03T08:11:06.613Z",
+        "kind": "verification.completed"
+      },
+      {
+        "seq": 41807,
+        "ts": "2026-10-03T08:09:25.058Z",
+        "kind": "verification.started"
+      },
+      {
+        "seq": 41788,
+        "ts": "2026-10-03T08:02:03.011Z",
+        "kind": "verification.lock-timeout"
+      },
+      {
+        "seq": 41721,
+        "ts": "2026-10-03T07:46:23.857Z",
+        "kind": "verification.completed"
+      }
+    ],
+    "verify_view": {
+      "lockInUse": true,
+      "activeRuns": 1,
+      "queuedRuns": 0,
+      "workerBudget": 14,
+      "workersPerRun": 14
+    },
+    "free_bytes": 56573906944
+  },
+  "starts": [
+    {
+      "type": "started",
+      "runId": "5e262d98-579a-4749-b989-7a2d4c8d5187",
+      "workers": 14,
+      "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+      "queuedMs": 63171
+    }
+  ],
+  "completed": {
+    "type": "completed",
+    "runId": "5e262d98-579a-4749-b989-7a2d4c8d5187",
+    "outcome": {
+      "runId": "5e262d98-579a-4749-b989-7a2d4c8d5187",
+      "jobId": "wizard-bmad-deterministic-retry-32",
+      "scope": "typecheck",
+      "command": "npm run typecheck",
+      "cwd": "<LANE_WORKTREE>",
+      "ok": true,
+      "exitCode": 0,
+      "signal": null,
+      "timedOut": false,
+      "queuedMs": 63171,
+      "durationMs": 21631,
+      "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+      "trackedDirty": false,
+      "workers": 14,
+      "outputBytes": 69,
+      "outputSha256": "94cfb58693ab95115e64b57bdc98dda5d552f13d3dc89a01fe3f67bb690bec5d",
+      "outputTail": "\n> gru-command@1.0.0 typecheck\n> tsc --noEmit -p tsconfig.test.json\n\n",
+      "error": null
+    }
+  },
+  "errors": [],
+  "frames": 4,
+  "transport_error": null,
+  "http_status": 200,
+  "queued": {
+    "type": "queued",
+    "runId": "5e262d98-579a-4749-b989-7a2d4c8d5187",
+    "position": 1,
+    "active": 1,
+    "limit": 1
+  },
+  "captured_output_bytes": 69,
+  "captured_output_sha256": "94cfb58693ab95115e64b57bdc98dda5d552f13d3dc89a01fe3f67bb690bec5d",
+  "raw_ndjson_bytes": 1101,
+  "raw_ndjson_sha256": "74e2f93b76206e22508f2dd4c4e648e21941359c48eaf2571331a2aaa943c777",
+  "terminal_outcome": {
+    "runId": "5e262d98-579a-4749-b989-7a2d4c8d5187",
+    "jobId": "wizard-bmad-deterministic-retry-32",
+    "scope": "typecheck",
+    "command": "npm run typecheck",
+    "cwd": "<LANE_WORKTREE>",
+    "ok": true,
+    "exitCode": 0,
+    "signal": null,
+    "timedOut": false,
+    "queuedMs": 63171,
+    "durationMs": 21631,
+    "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+    "trackedDirty": false,
+    "workers": 14,
+    "outputBytes": 69,
+    "outputSha256": "94cfb58693ab95115e64b57bdc98dda5d552f13d3dc89a01fe3f67bb690bec5d",
+    "error": null
+  },
+  "capture_matches": true,
+  "post_head": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+  "post_tracked_dirty": "",
+  "ledger_terminal": {
+    "seq": 41833,
+    "ts": "2026-10-03T08:12:59.563Z",
+    "payload": {
+      "run_id": "5e262d98-579a-4749-b989-7a2d4c8d5187",
+      "scope": "typecheck",
+      "command": "npm run typecheck",
+      "cwd": "<LANE_WORKTREE>",
+      "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+      "tracked_dirty": false,
+      "ok": true,
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "queued_ms": 63171,
+      "duration_ms": 21631,
+      "workers": 14,
+      "output_bytes": 69,
+      "output_sha256": "94cfb58693ab95115e64b57bdc98dda5d552f13d3dc89a01fe3f67bb690bec5d",
+      "output_tail": "\n> gru-command@1.0.0 typecheck\n> tsc --noEmit -p tsconfig.test.json\n\n",
+      "error": null
+    }
+  },
+  "ledger_match": true
+}

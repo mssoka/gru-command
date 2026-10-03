@@ -1,0 +1,22 @@
+[
+  {
+    "location": "src/wizard/bmad-onboarding.ts:538-549",
+    "trigger_condition": "claim: fresh-install output guards stay transient, keeping retry (plain Error)",
+    "guard_snippet": "post-install runtimeSkillNames/verifyModuleDirectories/verifySkills/verifyNoAmbiguousSkillConfig and writeRecord's fresh hashOwnedPayload throw BmadDeterministicSetupError -> deterministic: true",
+    "potential_consequence": "an installer-output flake silently loses retry and is routed to manual repair",
+    "kind": "claim",
+    "confidence": "high"
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:873",
+    "trigger_condition": "existing worktree.toml parses but carries unpaired managed-block markers",
+    "guard_snippet": "classify managedBlock's malformed-block throw as deterministic at this updateWorktreeBootstrap call site",
+    "potential_consequence": "retry re-runs the identical check and loops the user (gh-32 symptom)"
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:1029-1031",
+    "trigger_condition": "realpathSync of the git-reported toplevel fails with recoverable IO (EACCES/EIO)",
+    "guard_snippet": "discriminate errno as validatedSkillPath does: ENOENT/ENOTDIR deterministic, other errno rethrown transient",
+    "potential_consequence": "recoverable permission or IO failure becomes skip-only with no retry offered"
+  }
+]

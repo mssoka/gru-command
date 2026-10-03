@@ -1,0 +1,55 @@
+[
+  {
+    "location": "src/wizard/bmad-onboarding.ts:385,391 (verifySkills), :594,599 (runtimeSkillNames), :648 (validatedSkillPath unsafe-path branch), :662,671 (hashOwnedPayload)",
+    "trigger_condition": "The reuse-path content validators classify their failures as deterministic, but no test observes the classification for any of these sites, so the skip-only behavior for these classes is unpinned.",
+    "guard_snippet": "Add classification cases in test/bmad-onboarding.test.ts in the existing deterministic style (each with the bmadSnapshot no-mutation oracle): (a) an install without a Gru record whose `.agents/skills/bmad-build/SKILL.md` is removed -> expect(result.deterministic).toBe(true) and message contains 'binding is missing required bmad-build skill'; (b) a symlinked entry under `.agents/skills/` -> deterministic true and 'skill binding is a symlink'; (c) a symlink inside `_bmad` on a non-declared path with a record present -> deterministic true and 'owned payload contains symlink'; (d) a recorded skill name replaced by a regular file -> deterministic true ('unsafe BMAD recorded skill path').",
+    "potential_consequence": "If any of these conversions is lost (or reverted to a plain Error), the wizard offers 'Retry or skip' for unchanged install bytes again - the exact gh-32 futile-retry loop - and the whole suite still passes, because no assertion observes these classifications.",
+    "gap_shape": "regression-gap",
+    "consumer": "the wizard failure loop that maps the result to skip-only vs retry at src/wizard/main.ts:639 (reuse flow)",
+    "evidence": "Searched the whole test/ tree and the repo root for each message: 'missing required bmad-build skill', 'binding escapes selected repo', 'skill root is not a directory', 'owned payload contains symlink', 'owned payload contains unsupported entry', 'unsafe BMAD recorded skill path' - matches only in src/wizard/bmad-onboarding.ts (and the packet copy). The only 'skill binding is a symlink' hit, test/bmad-onboarding.test.ts:1132, asserts the opposite classification (transient, for the disposable-preflight wrapper at src/wizard/bmad-onboarding.ts:488), not this path. Covered siblings I checked for contrast: module dirs, symlink components, unsafe recorded name, and the ENOENT binding. test/bmad-onboarding.test.ts is the only test file that exercises onboardBmadRepo directly (grep for import/call sites in test/ and web/)."
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:417 (verifyNoAmbiguousSkillConfig)",
+    "trigger_condition": "A customized existing install whose workflow files still carry short config tokens is classified deterministic at :417, but no test observes it; the new classification fixture pre-qualifies those tokens specifically to avoid this branch.",
+    "guard_snippet": "Unit case in test/bmad-onboarding.test.ts: an install without a Gru record whose `.agents/skills/*/workflow.md` contains the raw '{{.implementation_artifacts}}' token -> expect(result.deterministic).toBe(true), message contains 'ambiguous BMM/GDS config token', repairHint contains 'npx bmad-method install'.",
+    "potential_consequence": "If the conversion is dropped, reuse of a customized install that carries short tokens loops the futile retry from gh-32; no test fails because no case reaches :417.",
+    "gap_shape": "regression-gap",
+    "consumer": "the wizard failure loop at src/wizard/main.ts:639 (reuse flow)",
+    "evidence": "No match anywhere in test/ for 'ambiguous BMM/GDS' or verifyNoAmbiguousSkillConfig. The fixture comment at test/bmad-onboarding.test.ts:766 and the pre-qualified workflow writes around :770 show the branch is deliberately bypassed so the binding check is reached instead."
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:938,952,955,970 (assertControlFilesSafe; duplicate defenses at :870 and :905)",
+    "trigger_condition": "Control-file state refusals - symlinked/non-file control file (:938), unparseable bmad-install.json (:952), record with foreign managed_by (:955), malformed worktree.toml (:970) - are classified deterministic but have no test; only the .gru-command directory symlink (:930) and the non-Gru bootstrap (:960) are covered.",
+    "guard_snippet": "Cases in test/bmad-onboarding.test.ts: `.gru-command/bmad-install.json` replaced by a symlink -> deterministic true + 'control write through unsafe path'; malformed record JSON -> deterministic true + 'record is malformed'; record with managed_by:'other' -> deterministic true + 'non-Gru BMAD record'; malformed `.gru-command/worktree.toml` -> deterministic true + 'worktree manifest is malformed' (no-write/message oracles per suite style).",
+    "potential_consequence": "Reverting any of these conversions returns the retry offer for unchanged control bytes; the suite is green either way, so the skip-only contract for damaged control files is not protected.",
+    "gap_shape": "regression-gap",
+    "consumer": "assertControlFilesSafe, which runs before every onboarding action, surfaced by the wizard failure loop at src/wizard/main.ts:639",
+    "evidence": "Searches for 'control write through unsafe path', 'record is malformed', 'refusing to overwrite non-Gru BMAD record', 'worktree manifest is malformed' return no test matches. Covered contrasts: the control-dir symlink leg of the new classification test (src/wizard/bmad-onboarding.ts:930) and the foreign-control bootstrap case (src/wizard/bmad-onboarding.ts:960 asserted in test/bmad-onboarding.test.ts)."
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:985 (repo no longer exists), :994 (escapes the workspace root / repo == workspace), :1030 (invalid git top-level path), :1033 (not the repository root)",
+    "trigger_condition": "validateRepo terminal refusals outside the two tested ones (non-Git dir :997, non-usable git :1019) are classified deterministic with no test, including the deleted-repo race the suite already simulates for .git removal.",
+    "guard_snippet": "Direct-seam race fixture mirroring the plain-dir case in test/bmad-onboarding.test.ts: capture answers while the repo is valid, rmdir the repo, call onboardBmadRepo -> expect deterministic true + 'no longer exists' + no writes; similarly a .git-bearing path whose git top-level resolves elsewhere -> deterministic true for :1033.",
+    "potential_consequence": "If a conversion is lost, a deleted/renamed repo (or a path that resolves outside the workspace) offers a retry that can only fail; no test would fail.",
+    "gap_shape": "regression-gap",
+    "consumer": "validateRepo at the head of every onboard, surfaced by the wizard failure loop at src/wizard/main.ts:639",
+    "evidence": "No test match for 'no longer exists', 'escapes the workspace root', 'invalid top-level path', 'not the Git repository root'. Covered contrasts: the plain-dir race case (for :997) and the broken-.git case (for :1019) in test/bmad-onboarding.test.ts."
+  },
+  {
+    "location": "src/wizard/main.ts:646-647 (neutral repairHint fallback; rendered at :651 and :655-656)",
+    "trigger_condition": "The fallback wording for deterministic failures whose class carries no repairHint is never observed by a test in either mode; every wizard-level deterministic test drives a class with a hint, and the bmad unit tests only assert repairHint === undefined.",
+    "guard_snippet": "Add one noninteractive leg (test/wizard.test.ts spawn style) and/or a pty leg for a hint-less deterministic class (e.g., partial install): assert the rendered guidance contains the fallback sentence 'Repair the reported condition deliberately, then re-run the wizard' (and not 'undefined'), plus the answers.bmad.<repo>=\"skip\" escape in noninteractive mode.",
+    "potential_consequence": "A regression in the fallback (dropped, empty, or leaking 'undefined') ships silently; hint-less deterministic classes would render broken guidance, and the deliberate-repair-hint contract is exactly what those classes rely on.",
+    "gap_shape": "regression-gap",
+    "consumer": "noninteractive fail() path and interactive banner for hint-less classes (e.g., partial install, reuse-without-manifest, non-Git dir) via the deterministic branch at src/wizard/main.ts:639",
+    "evidence": "Repo-root search: 'Repair the reported condition deliberately' appears only at src/wizard/main.ts:647. Wizard-level deterministic tests use only hint-bearing classes (missing module, binding mismatch, deleted binding, already-exists); test/bmad-onboarding.test.ts asserts repairHint undefined for reuse-without-manifest but never renders the wizard output for it."
+  },
+  {
+    "location": "README.md (Product diff paragraph and How-to-verify-packet step 3) vs manifest.json 'product_files_at_head'",
+    "trigger_condition": "The README states the manifest lists the git blob hash of every diff-touched file at the product head, but manifest.json 'product_files_at_head' is an empty array, so the frozen worktree's product files cannot be checked against the packet from the packet alone.",
+    "guard_snippet": "Populate product_files_at_head with the per-file blob hashes at the product head (or drop the README claim), so a reviewer can independently confirm the frozen source tree equals the reviewed tree.",
+    "potential_consequence": "Exact-head claims for the frozen source worktree rest on the dispatch narrative only; a substituted worktree file would not be detectable from the packet's own bindings.",
+    "gap_shape": "other",
+    "evidence": "manifest.json 'product_files_at_head': [] ; README statements promising the per-file blob-hash listing. Packet-file SHA-256 coverage itself was verified: all 59 packet files hashed before and after the reading window, zero mismatches."
+  }
+]

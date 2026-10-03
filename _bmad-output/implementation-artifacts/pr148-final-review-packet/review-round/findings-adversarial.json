@@ -1,0 +1,80 @@
+[
+  {
+    "location": "src/wizard/bmad-onboarding.ts:569-578 (managedBlock), reached via updateWorktreeBootstrap:863-885",
+    "trigger_condition": "An existing `.gru-command/worktree.toml` that parses as TOML but has an unpaired `# BEGIN GRU COMMAND BMAD BOOTSTRAP` / `# END GRU COMMAND BMAD BOOTSTRAP` pair (or END before BEGIN) makes managedBlock throw a plain Error, so BmadRepoResult.deterministic stays undefined and the wizard keeps offering 'Retry or skip this repo?' (headless: 'Retry after fixing it') even though a retry re-reads identical bytes and fails identically.",
+    "guard_snippet": "Throw BmadDeterministicSetupError for the malformed-block condition (wording that names the paired markers), keeping read/IO failures transient, and add a regression fixture: worktree.toml with BEGIN and no END -> deterministic true and no mutation; denied read stays retryable.",
+    "potential_consequence": "The exact gh-32 futile-retry loop survives for a control-file state defect that the sibling malformed-manifest/record paths now classify skip-only, so classification is inconsistent inside the same file family and users can be looped."
+  },
+  {
+    "location": "verification/post-merge/*.receipt.json (head_expected/sha = faa69d69264a293296fffa7d773b083b2fa17135) vs manifest.json product_head 5c0d1d343639c4c96c0e387030f8c3ef6fddd445 and packet commit 821ead3f8fd5989e3e05bf80568888d32c40ea44; verification/current-evidence.md:88 calls faa69d69 'Product head at capture'",
+    "trigger_condition": "An evidence consumer tries to bind the green post-merge focused/full/browser runs to the reviewed product bytes: no packet artifact (no tree digest, no git diff --stat fragment, no stated commit relationship) proves faa69d69's product tree equals 5c0d1d3's; the packet-dir-only delta claim exists only as README prose.",
+    "guard_snippet": "Ship a machine-checkable binding for the run head - e.g. the `git diff --stat 5c0d1d3..faa69d69` output or a digest of the diff-touched product paths at faa69d69 - and label faa69d69's role (renumbered packet commit/ancestor) explicitly in current-evidence.",
+    "potential_consequence": "The exact-head verification story rests on cross-document prose; product-byte drift between the run head and the frozen head would not be detectable from the packet alone."
+  },
+  {
+    "location": "manifest.json:348 (`\"product_files_at_head\": []`) vs README.md:17 and README.md:44-45",
+    "trigger_condition": "A reviewer follows packet verification step 3 ('the manifest lists the git blob hash of every diff-touched file at the product head') - the array is empty, so no product-file blob hash exists to compare against the frozen worktree or the sanitized source copies.",
+    "guard_snippet": "Populate product_files_at_head with {path, blob hash} for every file final.patch touches (computed at the frozen head), or amend the README steps to describe the evidence that actually exists (packet sha256 + frozen worktree path) so the check is not vacuous.",
+    "potential_consequence": "The frozen-tree claim cannot be mechanically verified from the packet; sanitized source copies are the only per-file artifact, and a copy/head mismatch would pass unnoticed."
+  },
+  {
+    "location": "manifest.json:366-390 (verification_runs: full exit 1 at sha 255ef07d... 'FULL pending re-run', browser 'pending at this head') next to manifest.json:392+ (post_merge_runs all exit 0 at faa69d69); verification/current-evidence.md qualifications never mention this packet-side RED or the renumbering",
+    "trigger_condition": "A consumer checks whether FULL is pending or green: two blocks describe runs at different head SHAs (255ef07d vs faa69d69) with no note of which supersedes which or what the renumber was.",
+    "guard_snippet": "Annotate the historical block as superseded (naming the head it belonged to and the renumber/sanitize event) or fold it into current-evidence's Qualifications with an explicit 255ef07d -> faa69d69 mapping.",
+    "potential_consequence": "Ambiguous verification status for the packet's own head; a superseded hygiene RED can be read as current, or the current green as not covering the renumbered head."
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:620-645 (single try over realpathSync(repoPath), realpathSync(root), realpathSync(path))",
+    "trigger_condition": "ENOENT/ENOTDIR from the repoPath or skills-root realpath (repo/root removed or replaced between validateRepo and this call) is reported as 'BMAD recorded skill binding is missing: <path>' with the `npx bmad-method install` hint, although the repo/root - not the recorded binding - is what disappeared.",
+    "guard_snippet": "Resolve each operand in its own guarded step and classify per object (repo-missing -> validateRepo wording, root-missing -> its own message, only the skill path -> the binding class), preserving the ENOENT/ENOTDIR vs other-errno split.",
+    "potential_consequence": "Misleading skip-only diagnosis and installer hint; the user inspects or repairs the wrong object."
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:483-491 (preflightSkillNames), surfaced from installFresh:511-521",
+    "trigger_condition": "Installer-generated preflight output fails safety validation -> the transient message embeds the mkdtemp staging path ('official BMAD preflight produced an unsafe skill binding: ... /tmp/gru-command-bmad-preflight-XXXX/...'), but the stage is deleted in finally, so the path no longer exists and no repo condition is named.",
+    "guard_snippet": "Reshape the wrapper message to the generated binding/skill identity only (mask/drop the temp path), e.g. 'the official installer generated an unsafe binding (<name>); retry this repo or skip'.",
+    "potential_consequence": "Confusing, non-actionable diagnostics (and stale temp paths) reach the user and logs; harder triage of a retryable installer-output failure."
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:288-296 (assertNoSymlinkComponents) reached from verifyModuleDirectories:362 and verifySkills:381",
+    "trigger_condition": "When the symlink is an ancestor (`_bmad` itself, or `.agents`/`.claude`) rather than the declared module directory/binding, the refusal throws without repairHint, so the wizard renders only the neutral fallback - while the r1-repaired module-level symlink of the same class keeps `npx bmad-method install`.",
+    "guard_snippet": "Attach the installer repairHint at ancestor-refusal sites for existing installs (or explicitly test/document that ancestor refusals are a distinct, hint-free class).",
+    "potential_consequence": "Inconsistent deliberate-repair text for the same 'missing or unsafe module directory' family; the documented expectation that the prompt names the deliberate-fix path is not uniformly met."
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:234-255 (existingManifestFor: readFileSync outside the parse catch) vs test/bmad-onboarding.test.ts 'valid-but-unreadable BMAD control files...' (covers .gru-command record and worktree.toml only)",
+    "trigger_condition": "Denying read access to `_bmad/_config/manifest.yaml` during reuse should keep the failure transient and recover after permissions return, but no deterministic regression exercises that arm; only the control-file reads are covered.",
+    "guard_snippet": "Add a reuse fixture that chmods the existing manifest to 000, asserts deterministic undefined and message not 'malformed', then restores permissions and succeeds on the SAME answers object.",
+    "potential_consequence": "The r1 read-vs-parse split guarantee is half-covered; a future edit folding the manifest read back into the parse catch would pass the suite."
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:620-645 (validatedSkillPath errno split rethrow)",
+    "trigger_condition": "Only the deleted-binding ENOENT path is exercised; the ENOTDIR variant (a path component replaced by a file) and the non-ENOENT/ENOTDIR rethrow arm (e.g. a denial that reaches this helper) have no fixture.",
+    "guard_snippet": "Add an ENOTDIR fixture (replace `.agents/skills` with a file) and a denial fixture that reaches this helper, asserting deterministic only for ENOENT/ENOTDIR and transient otherwise.",
+    "potential_consequence": "The 'rethrow every other errno as transient - no blanket catch' contract is asserted only by comments; broadened catches would not fail any test."
+  },
+  {
+    "location": "src/wizard/bmad-onboarding.ts:657-678 (hashOwnedPayload throws) called from writeRecord:905 on fresh installs",
+    "trigger_condition": "The official installer's own output contains a symlink/unsupported entry under `_bmad` or a generated skill; the fresh-path writeRecord hashing throws BmadDeterministicSetupError -> skip-only plus neutral fallback, although the spec's Implementation Notes classify fresh-install output guards as transient.",
+    "guard_snippet": "Split hash classification by call site: existing-state verification (reuse) deterministic; fresh-record hashing treated as installer output (transient) or explicitly documented and tested as deterministic with a fixture.",
+    "potential_consequence": "Installer-output failure is presented as an unretryable user-state verdict; declared error ownership and implementation disagree, so future readers and tests infer the wrong class."
+  },
+  {
+    "location": "web/e2e/smoke.spec.ts:918-922 (new band-expansion block; same idiom as :45-49)",
+    "trigger_condition": "The helper clicks `.service-band__head` unconditionally; if the band is already expanded (page-state reuse, a future default change, or the reply appending into an open band), the click collapses it and the following visibility assertion/sweep fail or measure collapsed content. The head exposes aria-expanded and the detail starts hidden (web/src/ui/chat.ts:958-966).",
+    "guard_snippet": "Assert aria-expanded=false (or click only when the detail is hidden) before expanding, then assert aria-expanded=true; keep the visibility assertions as the behavioral oracle.",
+    "potential_consequence": "State/order-dependent flakiness in the browser acceptance evidence that is expensive to diagnose remotely."
+  },
+  {
+    "location": "README.md:176-181 (diff) vs classes without repairHint in src/wizard/bmad-onboarding.ts (e.g. assertNoPartialInstall:262-273, unsafe control-path refusals:932-980, selected-repo state refusals:981-1045)",
+    "trigger_condition": "The README says deterministic state failures '-a broken or partial install, ...- offer skip-only with the deliberate repair path', but partial-install and unsafe-path classes carry no repairHint and render only the generic 'Repair the reported condition deliberately' wording; the official-installer path is named only for module/binding/mismatch/malformed-manifest classes.",
+    "guard_snippet": "Either attach the installer hint to the partial-install/unsafe-path classes where the official installer is the deliberate repair, or reword the README to 'skip-only with repair guidance; install-repair classes name the official installer'.",
+    "potential_consequence": "Documentation promises a named deliberate path where the prompt shows generic text; readers and auditors over-trust the doc and the acceptance wording is only loosely met for those classes."
+  },
+  {
+    "location": "web/mock/server.ts:152-158 (park clears the tick interval) and :751-757 (reset settles a parked turn); only exercised by web/e2e/working-flavor.spec.ts",
+    "trigger_condition": "The fixture-contract fix (park must stop the ticks; reset must settle a parked turn so it cannot leak into a cleared log) has no direct mock-server unit coverage; regressions surface only through the browser e2e.",
+    "guard_snippet": "Add a mock-server HTTP/unit test that holds a turn, asserts no finish frames while parked, releases, and asserts reset settles without ghost turns.",
+    "potential_consequence": "A fixture regression again manifests as a distant browser failure (the original RED needed a multi-run repair chain), slowing attribution."
+  }
+]

@@ -55,6 +55,68 @@ provider-recovery-r4-baseline = 'root="$PWD"; dA=$(mktemp -d "${TMPDIR:-/tmp}/gr
 # _bmad-output/gate-prep/native-compaction-wait-baseline.last-snapshot.txt
 # records the latest snapshot location, preserved for inspection.
 native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f02c9ede86; headrev=ab11bb327c4ba1ab3e3e3a9cc9e6b3bcaf4a22b3; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-native-compaction-wait.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/supervisor.test.ts > "$d/test/supervisor.test.ts"; git show "$headrev":test/suite-shape.test.ts > "$d/test/suite-shape.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/native-compaction-wait-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts'
+# wizard-bmad-retry builds first so its CLI/pty legs execute the reviewed
+# source's dist, then applies the repo-approved vitest RPC pretest patch
+# (tools/patch-vitest-rpc-timeout.mjs) that `npm test` also runs.
+wizard-bmad-retry = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts"
+
+# Feature-specific BASELINE for the gh-32 lane (scheduler-only; never part
+# of `npm test`): the FINAL test generation — the whole-900 review repair
+# round's test commit, pinned by headrev below — and its suite pins (git
+# show from that commit, captured at admission — never uncommitted bytes,
+# never a circular hardcoded self-SHA) run against an isolated RETAINED
+# snapshot (git archive) of the PRE-REPAIR merge parent
+# cee0ecbe53229d05c13f909dd11d4b31e886db72 (2bf6bc7 + main 6a00f4e) — NOT
+# the unrelated native-compaction baseline. So each split r1 class case
+# (missing module, symlinked module, deleted recorded binding,
+# control-file read+recovery, disposable preflight) REDs independently and
+# attributably against pre-fix source. No worktree/branch mutation, no
+# snapshot deletion, no dependency install (existing node_modules bound by
+# symlink), no cherry-pick or other-lane patch. Baseline dist is BUILT
+# before the dist-driven CLI/pty legs, after the approved RPC-patch
+# prerequisite; no vitest flags — original pools/30s budgets/assertions
+# and the 14-worker scheduler contract are inherited unchanged. vitest has
+# no bail/short-circuit, so every independent case executes; the expected
+# RED is the feature's nonzero exit, left intact (never masked into PASS).
+# Baseline and final focused runs are separate scheduler requests. The
+# ignored pointer file
+# _bmad-output/gate-prep/wizard-bmad-retry-baseline.last-snapshot.txt
+# records base SHA, final-test SHA, per-file test hashes and the latest
+# retained snapshot location (older snapshots are kept for inspection).
+# Repinned for the r3 cycle (whole-900 review A4): headrev moved from the
+# r1 proof-prep commit 5f61593a — an earlier test generation that predates
+# the r2/r3 regression cases and was never claimed to carry them — to the
+# r3 final-test commit ffea0476, so the overlay IS the current final test
+# generation and head-vs-test equality is real, not asserted. The earlier
+# r1 baseline receipts remain preserved as historical fail-before evidence.
+wizard-bmad-retry-baseline = 'set -e; base=cee0ecbe53229d05c13f909dd11d4b31e886db72; headrev=ffea04763cf02f194b81db5d4ab411054288d301; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-wizard-bmad-retry.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts; do git show "$headrev:$f" > "$d/$f"; done; { printf "base=%s head=%s snapshot=%s\n" "$base" "$headrev" "$d"; (cd "$d" && shasum -a 256 test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts); } > "$prep/wizard-bmad-retry-baseline.last-snapshot.txt"; ln -s "$root/node_modules" "$d/node_modules"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts'
+
+# Browser-consumer acceptance for the gh-32 lane (owner mandate j-861:
+# scoped/full/browser tests honestly captured through /api/verify at the
+# applicable final head). No web source is touched by this lane; this is
+# the consumer-side gate a backend-only FULL failure would otherwise leave
+# unexecuted: the shipped web shell's compile + unit suite, then both
+# Playwright projects (dev mock and the test-managed real service) against
+# the built merged source. Budgets/thresholds unchanged; approved RPC
+# patch prerequisite first, same as the other witnessed scopes.
+wizard-bmad-browser-consumer = "node tools/patch-vitest-rpc-timeout.mjs && npm run test:web && npm run e2e"
+
+# Browser snapshot repair (2026-10-02, PR148 browser-consumer correction):
+# regenerates the four darwin theme baselines (mock chat-light/dark + real
+# real-chat-light/dark) against the approved current-main UI (FOR YOU owner
+# band, owner chime, collapsed service band) after the fixture repairs.
+# Writes tracked PNGs DELIBERATELY (explicit --update-snapshots, only the
+# two `dark toggle persists` tests); the outputs are reviewed and committed,
+# then wizard-bmad-browser-consumer re-runs as the acceptance scope.
+# Scheduler-only; budgets/tolerances/timeouts unchanged.
+# REVIEW-ONLY REPAIR SCOPE (whole-900 review A5): it exists solely so a
+# human-armed repair window can regenerate deliberately-broken baselines;
+# it MUST NOT be invoked after a freeze or cited as acceptance evidence,
+# and never automatically. Acceptance re-runs use
+# wizard-bmad-browser-consumer; invoking this scope rewrites tracked PNGs
+# by design and invalidates exact-head captures.
+wizard-bmad-snapshot-update = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npm run build -w web && cd web && node ../node_modules/@playwright/test/cli.js test --update-snapshots=all --grep \"dark toggle persists\""
+
 lens-unused-neutral = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-signals.test.ts src/lib/board-protocol.test.ts"
 lens-unused-neutral-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=43e437a2e61b0c25351ed6147639aefbac4ccd77; root="$PWD"; prep=_bmad-output/ops-readiness-repair-20261002; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-lens-unused-neutral.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; git show "$headrev":web/src/lib/board-signals.test.ts > "$d/web/src/lib/board-signals.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/lens-unused-neutral-baseline.last-snapshot.txt"; cd "$d" && node tools/patch-vitest-rpc-timeout.mjs && cd "$d/web" && node "$root/node_modules/vitest/vitest.mjs" run src/ui/board.test.ts src/lib/board-signals.test.ts'
 lens-unused-neutral-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=lens-pills"
