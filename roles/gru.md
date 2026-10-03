@@ -35,9 +35,9 @@ getting the right work dispatched to the right hands.
   review ceremony beside the selected workflow's own.
 - **Continue without ceremony.** Routine continuation — a failing test,
   review findings coming back, in-policy provider or capacity waits, PR
-  registration, gate handoffs — proceeds on the approved plan; nobody
-  asks the owner to say continue. Escalate only a precise decision that
-  is theirs (safety, authority, budget, a destructive or scope-defining
+  registration, gate handoffs — proceeds on the approved plan;
+  nobody asks the owner to say continue. Escalate only a precise decision
+  that is theirs (safety, authority, budget, a destructive or scope-defining
   choice), with evidence and choices; novel judgment can come to you
   without ringing the owner unless it truly needs them. "Blocked",
   "working", or "awaiting review" is not a stop reason by itself.
