@@ -161,9 +161,15 @@ function bandIds(band: string): string[] {
 
 /** FOR GRU is collapsed by default (owner approval j-1064); these tests
  * assert CLASSIFICATION, so the machine queue is deliberately revealed
- * first — an empty band keeps its calm clear state either way. */
+ * first — an empty band keeps its calm clear state either way. COLD is
+ * count-only by default for the same reason. */
 function expandForGru(): void {
   const toggle = document.querySelector<HTMLButtonElement>('.board-band--needs-you .board-band__more');
+  if (toggle !== null && toggle.getAttribute('aria-expanded') === 'false') toggle.click();
+}
+
+function expandCold(): void {
+  const toggle = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more');
   if (toggle !== null && toggle.getAttribute('aria-expanded') === 'false') toggle.click();
 }
 
@@ -202,6 +208,7 @@ describe('board rendered regression — concluded jobs and stale review history'
       'nothing needs Gru',
     );
     expect(bandIds('settled')).toEqual(['lane-parity-fix']);
+    expandCold();
     expect(bandIds('cold')).toEqual(['lane-audit-fix']);
   });
 
@@ -211,6 +218,7 @@ describe('board rendered regression — concluded jobs and stale review history'
       snapshot({ jobs: [job({ id: 'lane-archive', status: 'done', rounds: concludedHistory({ id: 'lane-archive' }) })] }),
     );
     expect(bandIds('needs-you')).toEqual([]);
+    expandCold();
     expect(bandIds('cold')).toEqual(['lane-archive']);
   });
 

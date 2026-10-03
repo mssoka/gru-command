@@ -143,6 +143,17 @@ function snapshot(
   };
 }
 
+/** FOR GRU and COLD are collapsed/count-only by default (owner approval
+ * j-1064): classification-focused tests reveal the section they assert
+ * on, exactly as an operator would. */
+function expandForGru(): void {
+  document.querySelector<HTMLButtonElement>('.board-band--needs-you .board-band__more')?.click();
+}
+
+function expandCold(): void {
+  document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more')?.click();
+}
+
 function mountBoardDom(): void {
   document.body.innerHTML = `
     <div id="chip-rail" hidden>
@@ -467,6 +478,7 @@ describe('board v6 — dense job rows', () => {
         ],
       }),
     );
+    expandForGru();
     const failing = new Map(
       [...document.querySelectorAll<HTMLElement>('.board-job')].map((row) => [row.dataset.jobId, row.classList.contains('board-job--alert')]),
     );
@@ -551,6 +563,7 @@ describe('board v6 — dense job rows', () => {
         unackedActionRequired: 1,
       }),
     );
+    expandForGru();
     const signal = document.querySelector('.board-job__signal');
     expect(signal?.textContent).toContain('1 needs Gru');
     expect(signal?.textContent).toContain('1 blocker');
@@ -900,6 +913,8 @@ describe('board v6 — bands', () => {
     }
     expect(document.querySelector('.board-band--in-flight .board-job')?.getAttribute('data-job-id')).toBe('flight-1');
     expect(document.querySelector('.board-band--pipeline .board-pipeline__title')?.textContent).toBe('Queued one');
+    expect(document.querySelector('.board-band--needs-you .board-job')).toBeNull(); // FOR GRU starts collapsed
+    expandForGru();
     expect(document.querySelector('.board-band--needs-you .board-job')?.getAttribute('data-job-id')).toBe('needs-1');
     expect(document.querySelector('.board-band--settled .board-job')?.getAttribute('data-job-id')).toBe('settled-1');
     expect(document.querySelector('.board-band--cold .board-job')).toBeNull(); // count-only by default
@@ -977,6 +992,7 @@ describe('board v6 — bands', () => {
         unackedActionRequired: 1,
       }),
     );
+    expandForGru();
     const band = document.querySelector<HTMLElement>('.board-band--needs-you');
     expect(band?.querySelector('.board-band__label')?.textContent).toBe('FOR GRU');
     expect(band?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('quiet-job');
@@ -998,6 +1014,7 @@ describe('board v6 — bands', () => {
         ],
       }),
     );
+    expandForGru();
     const needsYou = document.querySelector<HTMLElement>('.board-band--needs-you');
     expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('FOR GRU');
     const needsRepos = [...(needsYou?.querySelectorAll('.board-job__repo') ?? [])].map((node) => node.textContent);
@@ -1083,6 +1100,7 @@ describe('board v4.1/v6 — stale review pills on concluded jobs', () => {
         ],
       }),
     );
+    expandCold();
     expect(document.querySelector('.board-job__signal')).toBeNull();
   });
 
@@ -1102,6 +1120,7 @@ describe('board v4.1/v6 — stale review pills on concluded jobs', () => {
         ],
       }),
     );
+    expandCold();
     document.querySelector<HTMLButtonElement>('.board-job__toggle')?.click();
     const body = document.querySelector('.board-job__body');
     expect(body).not.toBeNull();
