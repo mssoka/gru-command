@@ -161,13 +161,13 @@ external pins `cis=v0.3.2`, `tea=v1.27.2`, `gds=v0.7.2`. Runtime bindings
 follow the selected `pi`/Claude tools. Existing/customized installs
 default to **reuse unchanged**; per-repo skip is always available.
 The pinned set carries `bmad-review` out of the box, and it is a gate:
-0 blockers clears the review, while blockers route back to the
+0 blockers clears the review/fix routing, while blockers route back to the
 implementing minion as fix directives—never inform-only. Perkins
 (GitHub/GitLab) is the stronger gate with exact-head verdicts; an
-exact-final-head Perkins READY is what a merge presentation to the owner
-is built on, and all merges are owner-held. When a Perkins pre-flight
-failure routes the review to the bmad-review gate, that gate is the
-review of record — its PASS is not a Perkins READY and no agent merges.
+exact-final-head Perkins READY is required before a merge is presented to
+the owner, and all merges are owner-held. When a Perkins pre-flight
+failure routes the review to the bmad-review gate, its PASS is not a
+Perkins READY — the missing Perkins gate is escalated, never substituted.
 
 Successful setup records exact versions in
 `.gru-command/bmad-install.json`, adds an idempotent owned bootstrap

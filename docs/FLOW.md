@@ -169,15 +169,15 @@ security, data loss, broken builds, and related crash/regression/
 vulnerability/injection/secret-leak tags — are BLOCKERS; the rest are
 notes); BLOCKERS > 0 routes a fix directive to the implementing MINION
 session, the lane's working diff is re-read, and the gate re-reviews after
-fixes (bounded rounds); 0 blockers = PASS clears the review gate. The
-fallback session is a full-capability minion by design — it must load the
-ambient BMAD skill — and is instructed never to gate, approve, merge, or
-modify implementation code; every gate decision is the host's. The fallback
-never records a Perkins verdict and never authorizes an agent merge: a
-merge is presented to the owner only after the exact-head Perkins gate, or
-— when a pre-flight failure routed the review here — carrying this gate's
-PASS as the review of record. The owner always holds ALL merges — this
-repository included. A failed pre-flight is never a silent downgrade — the failed
+fixes (bounded rounds); 0 blockers = PASS clears the review/fix routing.
+The fallback session is a full-capability minion by design — it must load
+the ambient BMAD skill — and is instructed never to gate, approve, merge,
+or modify implementation code; every gate decision is the host's. The
+fallback never records a Perkins verdict and never authorizes an agent
+merge: a merge is presented to the owner only after the exact-head Perkins
+gate, and when a pre-flight failure routed the review here, the missing
+Perkins clearance is escalated rather than substituted. The owner always
+holds ALL merges — this repository included. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (install BMAD via
 onboarding / restore Perkins) are escalated and recorded on the job as
 `job.fallback-review` events. GitLab merge requests get the same SHA-bound

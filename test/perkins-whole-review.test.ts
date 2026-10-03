@@ -1388,7 +1388,8 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedOps).toContain('never hold the fleet behind one long');
     expect(stagedOps).toContain('queue timeout is not a test result');
     expect(stagedOps).toContain('binding playbook obligations, not implemented guarantees');
-    expect(stagedOps).toContain("carrying that gate's");
+    expect(stagedOps).toContain('its PASS is not Perkins READY');
+    expect(stagedOps).toContain('escalate the missing Perkins gate');
     expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
