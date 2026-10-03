@@ -155,6 +155,14 @@ checkout, home paths, journal, or global custom instructions).
       packaged-playbook baseline `prep` path is anchored at "$root" so
       the build-log redirect lands after the `cd` into the snapshot
       (prior run aborted exit 99 at the redirect, before any build).
+- [x] owner contract addendum (autonomous follow-through, 2026-10-02):
+      `roles/minion.md`, `roles/silas.md`, `roles/gru.md`,
+      `resources/silas-skills/ops-dispatch/SKILL.md`, `docs/FLOW.md` --
+      continuous autonomous completion, the three-state reconciliation,
+      bounded ops scan, restart-safe accepted actions, scheduler-owned
+      one-shot verification, artifact-vs-PR completion, and the honest
+      policy-vs-implemented statement; deterministic pins at the loader,
+      installed-layout, and staged-tarball seams.
 - [x] `.gru-command/worktree.toml` -- declare the lane's focused,
       installed-artifact, and fail-before baseline verification scopes (all
       via the authenticated `/api/verify` scheduler).
@@ -289,6 +297,33 @@ checkout, home paths, journal, or global custom instructions).
   `prep="$root/_bmad-output/gate-prep"`. The snapshot pointer, build
   guard, overlaid test files, and expected-RED intent are unchanged; the
   prior exit-99 receipt and snapshot remain preserved as evidence.
+
+- 2026-10-03 owner contract addendum (autonomous follow-through; owner
+  ruling 2026-10-02, j-869/j-878/j-879): approved heists advance without a
+  continue prompt — every nonterminal job resolves to active owned work,
+  an internal wait with a re-arm trigger, or a precise needs-owner
+  question; routine failures/review feedback/in-policy recovery/lost
+  workers/capacity waits/gate handoffs are GC-owned; ops reconciliation is
+  bounded and independent of long worker turns; accepted actions are
+  restart-reconciled (idempotency, head/generation binding, single-writer
+  fences); verification is scheduler-owned one-shot with honest terminal
+  states; progress is not a heartbeat/open turn/API 200/delivered
+  prompt/old-head CI; artifact-only and investigation jobs complete by
+  verified artifact handback. Amended surfaces: `roles/minion.md`,
+  `roles/silas.md`, `roles/gru.md`,
+  `resources/silas-skills/ops-dispatch/SKILL.md`, `docs/FLOW.md`; pins at
+  the loader, installed-layout, and staged-tarball seams. Known-bad state
+  avoided: shipped instructions that stall approved work pending a
+  "continue", chase a product PR for artifact jobs, treat liveness as
+  progress, or imply runtime enforcement exists. KEEP: no arbitrary
+  minion task-duration/tool-call caps; safety, single-writer, review,
+  owner-stop and exact-head gates; owner-held merge/restart; and the
+  original BMAD build instructions and workflow stages. Policy vs
+  implemented is stated honestly in `docs/FLOW.md` §4f:
+  restart-durable acceptance records, cadence/next-action board truth,
+  deliverable-kind carve-outs, and current-phase delivery are NOT
+  implemented runtime guarantees (tracked as separate code work; no
+  product runtime change was made here).
 
 - 2026-10-03 native round 1 fix cycle (trigger: Perkins round
   `gc-packaged-build-playbook-20261002-r1` NEEDS CHANGES — 2 blockers on
