@@ -1705,6 +1705,9 @@ describe('supervisor — Perkins r1 fixes', () => {
     const view = h.supervisor.viewFor('slot-recovered');
     expect(view?.state).toBe('watching');
     expect(view?.breakerOpen).toBe(false);
+    // A re-armed agent is running again — the stop cause clears with the
+    // breaker (final independent review T1).
+    expect(view?.stopReason).toBeNull();
     h.dispose();
   });
 });

@@ -486,10 +486,17 @@ describe('supervisor ⇄ sensor seam', () => {
     const handle = await h.runMinionIntoQuotaWall('job-seam-2');
     await h.settle();
     const wait = h.ledger.listProviderWaits({ status: 'waiting' })[0]!;
+    // The stop carries its cause while the breaker is open...
+    const stoppedView = h.supervisor.viewFor(handle.id);
+    expect(stoppedView?.state).toBe('stopped');
+    expect(stoppedView?.stopReason).not.toBeNull();
     // Recovery flips the wait and the service re-arms the same agent.
     h.ledger.setProviderWaitStatus(wait.id, 'recovered-pending');
     const rearmed = h.supervisor.ownedProviderReArm(handle.id, wait.id);
     expect(rearmed).toBe(true);
+    // ...and the re-arm clears it with the breaker: a watching agent must
+    // never carry a stale stopReason (final independent review A0/E0).
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false, stopReason: null });
     const events = h.ledger.listEvents({ limit: 20 }).filter((e) => e.kind === 'supervision.rearmed');
     expect(events.some((e) => e.payload !== null && typeof e.payload === 'object' && (e.payload as { by?: string }).by === 'provider-recovery')).toBe(true);
     // A wrong wait id (not this agent's open wait) is refused.

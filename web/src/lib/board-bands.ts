@@ -5,7 +5,8 @@
  *   1 NEEDS GRU  — unacked action-required, blocked/error, PR conflicting,
  *                  aborted review, failed lenses in the newest round —
  *                  review-history causes apply only to work that is
- *                  still open (concluded merged/done never revives)
+ *                  still open: a concluded merged/done job earns NO
+ *                  NEEDS GRU causes at all (closed receipt)
  *   2 IN FLIGHT  — dispatched, fresh working, in-review
  *   3 SETTLED    — delivered, merged today
  *   4 COLD       — stalled working (30 min, Silas's default threshold),
@@ -81,18 +82,25 @@ export interface WorkerStopView {
  * make a working lane read as waiting.
  *
  * The lane's CURRENT worker decides: a live (non-stopped, non-breaker)
- * minion bound to the job clears any older stopped record. A stopped
- * record survives its own disposal (the human Ack must find it to
- * re-arm), so a re-dispatched lane would otherwise read "waiting" from
- * its previous worker while the fresh one runs. Only when no live worker
- * remains does the first recorded stop mark the lane. */
+ * minion bound to the job clears any older stopped record. An
+ * unsupervised worker (null supervision view) is not a supervision
+ * stop — it counts as live, so a re-dispatched lane whose fresh worker
+ * is unsupervised still never reads "waiting" from its previous
+ * worker. A stopped record survives its own disposal (the human Ack
+ * must find it to re-arm). Only when no live worker remains does the
+ * first recorded stop mark the lane. */
 export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
   const stopped = new Map<string, WorkerStopView>();
   const liveJobs = new Set<string>();
   for (const agent of agents) {
     if (agent.jobId === null || agent.role !== 'minion') continue;
     const supervision = agent.supervision;
-    if (supervision === null || supervision === undefined) continue;
+    if (supervision === null || supervision === undefined) {
+      // Unsupervised worker: not a supervision stop — counts as live so it
+      // clears any older stopped record for the job (doc above).
+      liveJobs.add(agent.jobId);
+      continue;
+    }
     if (supervision.state !== 'stopped' && supervision.breakerOpen !== true) {
       liveJobs.add(agent.jobId);
       continue;

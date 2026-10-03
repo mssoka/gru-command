@@ -324,7 +324,7 @@ describe('silas digest (the four actionable states)', () => {
           config: DEFAULT_SILAS_CONFIG,
           trigger: 'sweep',
           now: () => now + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000,
-          supervisionFor: () => view,
+          supervisionFor: (agentId) => (agentId === 'min-other-live' ? null : view),
         });
 
       // Stopped worker: waiting on a human re-arm with a recorded cause —
@@ -337,6 +337,18 @@ describe('silas digest (the four actionable states)', () => {
       // a blanket mute).
       view = null;
       expect((await digestOf()).stalledWorking).toHaveLength(1);
+      // The same any-live rule the board renders: a stopped NEWEST worker
+      // must not mute the lane while an older live worker remains — the
+      // live worker's silence is the stall (final independent review B1).
+      h.ledger.registerAgent({ id: 'min-other-live', role: 'minion', jobId: 'job-walled' });
+      h.ledger.setAgentState('min-other-live', 'idle');
+      view = { ...base, state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' };
+      // Make the stopped worker the newest record too: the old
+      // newest-only rule would have muted this lane.
+      h.ledger.setAgentState('min-walled', 'idle');
+      const mixed = await digestOf();
+      expect(mixed.stalledWorking).toHaveLength(1);
+      expect(mixed.stalledWorking[0]?.minionId).toBe('min-other-live');
     } finally {
       h.cleanup();
     }
@@ -740,6 +752,10 @@ function makeDriver(opts: {
     setInterval: typeof setInterval;
     clearInterval: typeof clearInterval;
   };
+  /** The board's live stop truth, wired through to the digest the same way
+   * main.ts wires it (final independent review T0). */
+  supervisionFor?: (agentId: string) => AgentSupervisionView | null;
+  now?: () => number;
 } = {}): DriverHarness {
   const h = makeLedger();
   const prompts: { text: string; owner?: string }[] = [];
@@ -785,6 +801,8 @@ function makeDriver(opts: {
     ...(opts.githubPoll !== undefined ? { githubPoll: opts.githubPoll } : {}),
     ...(opts.skills !== undefined ? { skills: opts.skills } : {}),
     ...(opts.timers !== undefined ? { setInterval: opts.timers.setInterval, clearInterval: opts.timers.clearInterval } : {}),
+    ...(opts.supervisionFor !== undefined ? { supervisionFor: opts.supervisionFor } : {}),
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
     log: () => {},
   });
   return {
@@ -904,6 +922,47 @@ describe('silas driver wakes', () => {
       expect(h.prompts).toHaveLength(0);
       await h.driver.trigger({ kind: 'sweep' });
       expect(h.prompts).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the supervisionFor wiring reaches the digest: a stopped worker never wakes as stalled', async () => {
+    // main.ts injects the supervisor views into the DRIVER; a broken wiring
+    // would silently re-enable stall wakes for stopped lanes (final
+    // independent review T0). The stop truth travels the real path here.
+    const realNow = Date.now();
+    const future = (): number => realNow + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000;
+    const base = {
+      agentId: 'min-wired',
+      role: 'minion' as const,
+      slotId: null,
+      restarts: 1,
+      openTurn: false,
+      openToolCalls: 0,
+      lastEventAt: null,
+      lastFileBytes: null,
+    };
+    let view: AgentSupervisionView | null = {
+      ...base,
+      state: 'stopped',
+      breakerOpen: true,
+      stopReason: 'quota_wall',
+    };
+    const h = makeDriver({ now: future, supervisionFor: (agentId) => (agentId === 'min-wired' ? view : null) });
+    try {
+      h.ledger.addJob({ id: 'job-wired', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-wired', 'working');
+      h.ledger.registerAgent({ id: 'min-wired', role: 'minion', jobId: 'job-wired' });
+      h.ledger.setAgentState('min-wired', 'idle');
+      // A waiting lane: the sweep has nothing to wake Silas about.
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(0);
+      expect(h.ledger.listEvents({ limit: 50 }).filter((event) => event.kind === 'silas.wake')).toHaveLength(0);
+      // The same wiring with no stop record: the genuine stall wakes.
+      view = null;
+      await h.driver.trigger({ kind: 'sweep' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
     } finally {
       h.cleanup();
     }

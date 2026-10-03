@@ -507,18 +507,25 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
 
     // (4) Stalled lane: working with no delivery, minion gone quiet.
     if (job.status === 'working' && delivered === null) {
-      const minion = input.ledger
+      const boundMinions = input.ledger
         .listAgents()
-        .filter((agent) => agent.jobId === job.id && agent.role === 'minion')
-        .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
+        .filter((agent) => agent.jobId === job.id && agent.role === 'minion');
+      // The SAME attribution the board renders (stoppedWorkersByJob): a
+      // bound minion is live unless its supervision view says stopped or
+      // breaker-open (a null view is an unsupervised worker, not a stop).
+      // A lane with a stop record and NO live worker is WAITING on a human
+      // re-arm — silence from a stop is never a stall. The newest live
+      // worker speaks for the lane's silence.
+      const live = boundMinions.filter((agent) => {
+        const supervision = input.supervisionFor?.(agent.id) ?? null;
+        return supervision === null || (supervision.state !== 'stopped' && supervision.breakerOpen !== true);
+      });
+      const minion = [...live].sort((a, b) =>
+        (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt),
+      )[0];
       if (minion !== undefined) {
-        // Same truth the board renders: a stopped/breaker-open worker is
-        // waiting on a human re-arm — silence from a stop is not a stall.
-        const supervision = input.supervisionFor?.(minion.id) ?? null;
-        const stopped =
-          supervision !== null && (supervision.state === 'stopped' || supervision.breakerOpen === true);
         const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);
-        if (!stopped && Number.isFinite(lastMs) && now() - lastMs >= input.config.stallThresholdMs) {
+        if (Number.isFinite(lastMs) && now() - lastMs >= input.config.stallThresholdMs) {
           digest.stalledWorking.push({
             jobId: job.id,
             repo: job.repo,

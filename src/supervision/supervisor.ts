@@ -2157,6 +2157,10 @@ export class Supervisor {
     }
     if (!open) return false;
     agent.breakerOpen = false;
+    // The re-arm clears the stop cause with the breaker: a watching agent
+    // must never carry a stale stopReason (the invariant viewFor/health
+    // and the board rely on). Every other re-arm path clears it too.
+    agent.stopReason = null;
     agent.breakerNotificationId = null;
     agent.restartRing = [];
     agent.consecutiveFailures = 0;
