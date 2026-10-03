@@ -2003,8 +2003,11 @@ export class WaveRunner {
             }
             if (outcome === 'settled') break;
             waitedMs += FALLBACK_REVIEW_TIMEOUT_MS;
-            if (session.health().state === 'disposed') {
-              throw new Error('fallback review minion session was disposed while its review turn was still open');
+            const sessionState = session.health().state;
+            if (sessionState === 'disposed' || sessionState === 'error') {
+              throw new Error(
+                `fallback review minion session entered terminal state "${sessionState}" while its review turn was still open`,
+              );
             }
             this.log('info', 'fallback review still running at the transport wait — reattaching to the same session', {
               job: input.jobId, iteration: input.iteration, waited_ms: waitedMs,
