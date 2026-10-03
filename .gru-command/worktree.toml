@@ -55,6 +55,12 @@ runtime-capability-decoupling = "node tools/patch-vitest-rpc-timeout.mjs && npx 
 claude-adapter-cleanup = "npx vitest run test/claude-adapter.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
+# PR136 durable follow-through focused scope: every suite the delta can
+# move — the directive single-writer guard (ledger + HTTP), obligations
+# and hand-backs, the phase-handoff delta, the wake-digest/ops-skill
+# regression that broke exact-head CI on 24b51f6, the always-on hygiene
+# check and the suite-shape pins.
+durable-followthrough-focused = "npx vitest run test/directive-markers.test.ts test/ledger-obligations.test.ts test/obligations-handback.test.ts test/phase-handoffs.test.ts test/rebrief-recovery.test.ts test/fix-directive.test.ts test/dispatch-server.test.ts test/silas-followthrough.test.ts test/rehearsal.test.ts test/suite-shape.test.ts"
 # Provider-recovery sensor lane scopes (r4 fix round; invoked only via
 # the authenticated /api/verify scheduler at unchanged budgets/thresholds —
 # plain vitest invocations, no worker/timeout flags, never the npm chain).
@@ -138,3 +144,4 @@ board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && .
 # pointer file are preserved for inspection; nothing is deleted or checked
 # out, and no branch/worktree holds the sha.
 board-merged-attention-baseline = 'set -e; base=059c076290145d4aae6e0b47c7b3f87156862c43; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-merged-attention.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board-merged-attention.test.ts > "$d/web/src/ui/board-merged-attention.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-merged-attention-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-merged-attention-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts'
+finding-dedupe-recency = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-findings-dedupe.test.ts test/suite-shape.test.ts"

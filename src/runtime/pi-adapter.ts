@@ -34,6 +34,7 @@ import type {
   NativeAgentTool,
   PendingTurn,
   PromptOptions,
+  PromptTurnVerdict,
   RuntimeEvent,
   RuntimeEventListener,
   RuntimeHealth,
@@ -265,7 +266,7 @@ interface QueuedMessage {
   readonly text: string;
   readonly owner: string;
   readonly images?: PromptOptions['images'];
-  readonly resolve: () => void;
+  readonly resolve: (verdict: PromptTurnVerdict) => void;
   readonly reject: (error: Error) => void;
   /** Opt-in queued-wait cap (E7): rejects THIS caller when it fires. */
   timer: ReturnType<typeof setTimeout> | null;
@@ -897,6 +898,10 @@ export class PiAgentHandle implements AgentHandle {
   }
 
   async prompt(text: string, options: PromptOptions = {}): Promise<void> {
+    await this.promptWithVerdict(text, options);
+  }
+
+  async promptWithVerdict(text: string, options: PromptOptions = {}): Promise<PromptTurnVerdict> {
     this.assertLive();
     if (this.compacting || this.nativeCompactionOpen || this.session.isCompacting) {
       throw new Error('agent session is compacting; prompt requires an idle session');
@@ -905,7 +910,9 @@ export class PiAgentHandle implements AgentHandle {
     if (this.liveTurn !== null) {
       return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
     }
-    return this.runTurn(text, owner, options.images);
+    const turn = this.runTurn(text, owner, options.images);
+    await turn.done;
+    return turn.verdict();
   }
 
   async steer(text: string, options: PromptOptions = {}): Promise<void> {
@@ -919,9 +926,10 @@ export class PiAgentHandle implements AgentHandle {
       return;
     }
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      await this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      return;
     }
-    return this.runTurn(text, owner, options.images);
+    await this.runTurn(text, owner, options.images).done;
   }
 
   async followUp(text: string, options: PromptOptions = {}): Promise<void> {
@@ -935,9 +943,10 @@ export class PiAgentHandle implements AgentHandle {
       return;
     }
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      await this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      return;
     }
-    return this.runTurn(text, owner, options.images);
+    await this.runTurn(text, owner, options.images).done;
   }
 
   getContextUsage = (): ContextUsage | null => {
@@ -1141,14 +1150,14 @@ export class PiAgentHandle implements AgentHandle {
     reason: 'single-writer' | 'steer-unable',
     images?: PromptOptions['images'],
     timeoutMs?: number,
-  ): Promise<void> {
+  ): Promise<PromptTurnVerdict> {
     this.emit({ type: 'queued', reason, owner });
     this.log('info', 'message queued (single-writer)', {
       role: this.role,
       session: this.id,
       owner,
     });
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<PromptTurnVerdict>((resolve, reject) => {
       const item: QueuedMessage = {
         text,
         owner,
@@ -1174,13 +1183,18 @@ export class PiAgentHandle implements AgentHandle {
     });
   }
 
-  private runTurn(text: string, owner: string, images?: PromptOptions['images']): Promise<void> {
+  private runTurn(
+    text: string,
+    owner: string,
+    images?: PromptOptions['images'],
+  ): { readonly done: Promise<void>; readonly verdict: () => PromptTurnVerdict } {
     this.liveOwner = owner;
     this.livePromptText = text;
     this.livePromptImages = images;
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
     if (mapped !== undefined) promptOptions['images'] = mapped;
+    let captured: PromptTurnVerdict = { ok: true, error: null };
     const turn = this.session
       .prompt(text, promptOptions)
       .catch((error: unknown) => {
@@ -1207,6 +1221,13 @@ export class PiAgentHandle implements AgentHandle {
       })
       .finally(() => {
         if (this.liveTurn === turn) {
+          // Capture THIS turn's terminal evidence BEFORE `drain()` can start
+          // a queued successor: the successor's state must never be read as
+          // this turn's outcome (r5 blocker 1).
+          captured =
+            this.state === 'error'
+              ? { ok: false, error: this.stateError ?? 'runtime settled the turn with an in-band error' }
+              : { ok: true, error: null };
           this.liveTurn = null;
           this.liveOwner = null;
           this.livePromptText = null;
@@ -1216,7 +1237,7 @@ export class PiAgentHandle implements AgentHandle {
         }
       });
     this.liveTurn = turn;
-    return turn;
+    return { done: turn, verdict: () => captured };
   }
 
   private async drain(): Promise<void> {
@@ -1224,8 +1245,9 @@ export class PiAgentHandle implements AgentHandle {
       const next = this.queue.shift()!;
       if (next.timer !== null) clearTimeout(next.timer);
       try {
-        await this.runTurn(next.text, next.owner, next.images);
-        next.resolve();
+        const turn = this.runTurn(next.text, next.owner, next.images);
+        await turn.done;
+        next.resolve(turn.verdict());
       } catch (error) {
         next.reject(error instanceof Error ? error : new Error(String(error)));
       }

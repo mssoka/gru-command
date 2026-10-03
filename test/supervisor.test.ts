@@ -1430,43 +1430,55 @@ describe('supervisor — intentional slot generations', () => {
 
   it('intentional replacement fails closed after the breaker opens and leaves its alert unacknowledged', async () => {
     const h = boot();
-    const slot = h.supervisor.declareSlot({
-      id: 'gru-breaker-replacement',
-      role: 'gru',
-      spawn: (options) => h.registry.spawn('gru', options),
-    });
-    const first = (await slot.ensure({})) as FakeHandle;
-    h.registry.spawnImpl = async () => {
-      throw new Error('restart unavailable');
-    };
-    hang(first);
-    h.advance(60);
-    // The breaker trips only after the 1/2/4ms backoff rungs settle, and that
-    // settle is asynchronous to the fixed clock: a fixed real-time slice
-    // raced the rung chain under CI load (the alert was sampled before the
-    // trip). Wait for the condition itself — this file's vi.waitFor shape —
-    // then assert the same facts.
-    await vi.waitFor(() => {
-      expect(h.notificationsOfKind('supervision.breaker').length).toBeGreaterThan(0);
-    });
-    const alert = h.notificationsOfKind('supervision.breaker').find((item) => item.ackedAt === null);
-    expect(alert).toBeDefined();
-    expect(slot.canReplace()).toBe(false);
+    vi.useFakeTimers();
+    try {
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-breaker-replacement',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options),
+      });
+      const first = (await slot.ensure({})) as FakeHandle;
+      h.registry.spawnImpl = async () => {
+        throw new Error('restart unavailable');
+      };
+      hang(first);
+      h.advance(60);
+      // A wall-clock sleep can resolve between nested restart backoffs.
+      // Drain the first failed spawn's microtasks, then drive exactly the
+      // three scheduled backoffs (1, 2, 4 ms) to the breaker check. This
+      // harness does not start the periodic watchdog; no polling is needed.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.registry.spawnCalls).toHaveLength(2); // ensure + first failed rung
+      for (let step = 0; step < 3; step += 1) {
+        expect(vi.getTimerCount()).toBe(1);
+        await vi.advanceTimersToNextTimerAsync();
+      }
+      expect(h.registry.spawnCalls).toHaveLength(4); // ensure + three failed rungs
+      expect(vi.getTimerCount()).toBe(0);
+      const alert = h.notificationsOfKind('supervision.breaker').find((item) => item.ackedAt === null);
+      expect(alert).toBeDefined();
+      expect(alert?.routing).toBe('needs-owner');
+      expect(slot.canReplace()).toBe(false);
 
-    const fresh = new FakeHandle('gru', 'fresh-after-breaker', null);
-    h.registry.adopt(fresh);
-    await expect(slot.adoptReplacement(fresh)).rejects.toThrow(/breaker is open/);
-    expect(fresh.disposed).toBe(true);
-    expect(
-      h.api.listNotifications({ limit: 100 }).find((item) => item.id === alert!.id)?.ackedAt,
-    ).toBeNull();
-    expect(slot.current()).toBeNull();
-    expect(h.supervisor.viewFor(first.id)).toMatchObject({
-      breakerOpen: true,
-      state: 'stopped',
-      restarts: 3,
-    });
-    h.dispose();
+      const fresh = new FakeHandle('gru', 'fresh-after-breaker', null);
+      h.registry.adopt(fresh);
+      await expect(slot.adoptReplacement(fresh)).rejects.toThrow(/breaker is open/);
+      expect(fresh.disposed).toBe(true);
+      expect(
+        h.api.listNotifications({ limit: 100 }).find((item) => item.id === alert!.id)?.ackedAt,
+      ).toBeNull();
+      expect(slot.current()).toBeNull();
+      expect(h.supervisor.viewFor(first.id)).toMatchObject({
+        breakerOpen: true,
+        state: 'stopped',
+        restarts: 3,
+      });
+      expect(h.notificationsOfKind('supervision.breaker')).toHaveLength(1);
+      expect(h.registry.spawnCalls).toHaveLength(4);
+    } finally {
+      h.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it('releasing a slot invalidates and disposes an in-flight restart result', async () => {
