@@ -1410,6 +1410,28 @@ describe('bounded ambiguous-POST reconciliation', () => {
     }
   });
 
+  it('treats malformed nested author fields as a malformed body — unproven on an ambiguous POST, unresolved on reconcile, no second POST', async () => {
+    // A numeric-id review that is otherwise exact on commit/state/body but
+    // carries a malformed nested author (`login`/`type` not provider-typed
+    // strings) is undecidable author evidence: it may be this round's
+    // publication with mangled fields, so its non-match proves nothing.
+    for (const user of [{ login: [], type: 'Bot' }, { login: 'perkins-review[bot]', type: ['Bot'] }]) {
+      const fixture = bundleFixture();
+      const malformedAuthor = { ...MATCHING_REVIEW, id: 889977, user };
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [malformedAuthor] }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+      expect(error?.message ?? '').toMatch(/malformed list body/u);
+      expect(error?.message ?? '').not.toMatch(/did not land/u);
+      await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+        .rejects.toThrow(/malformed list body/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    }
+  });
+
   it('never credits an older round\u2019s identical bytes: stale submitted_at is not a match', async () => {
     const fixture = bundleFixture();
     const stale = { ...MATCHING_REVIEW, id: 111222, submitted_at: new Date(NOW - 3_600_000).toISOString() };
@@ -1962,6 +1984,28 @@ describe('credential hygiene on rejected URLs', () => {
     expect(userinfo?.message ?? '').not.toContain(secret);
     expect(calls).toHaveLength(0);
   });
+
+  it('redacts PKCS#8 and unterminated private-key blocks from diagnostics and serialized errors', async () => {
+    const fixture = bundleFixture();
+    const blocks = [
+      '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----',
+      `-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA${'A'.repeat(40)}`,
+      '-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBozAcBgkqhkiG9w0BBwGg\n-----END ENCRYPTED PRIVATE KEY-----',
+    ];
+    for (const block of blocks) {
+      const { poster } = posterWith(fixture, [
+        {
+          method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/,
+          handler: async () => ({ status: 403, body: { message: `refused. ${block}` } }),
+        },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error).toBeInstanceOf(PerkinsAppHttpError);
+      expect(error?.message ?? '').not.toContain('MIIE');
+      expect(error?.message ?? '').toContain('[REDACTED]');
+      expect(JSON.stringify(error)).not.toContain('MIIE');
+    }
+  });
 });
 
 describe('review id discipline', () => {
@@ -2102,6 +2146,31 @@ describe('review id discipline', () => {
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('keeps a 422 refusal definitive when its body stream fails — no lookup, no stale credit', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/reviews$/,
+        handler: async () => ({
+          status: 422,
+          stream: new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.error(new Error('refusal body stream reset'));
+            },
+          }),
+        }),
+      },
+      // A matching historical review sits in the list and would be credited
+      // by reconciliation: an unreadable refusal must never look ambiguous.
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW] }) },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error).toBeInstanceOf(PerkinsAppHttpError);
+    expect((error as PerkinsAppHttpError).status).toBe(422);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(0);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
@@ -2741,6 +2810,52 @@ describe('bounded lookup growth and link sanity', () => {
     await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/delivery stays unresolved/u);
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(2);
+  });
+
+  it('parses rel="last" independent of parameter order — a reordered later bound cannot mint a false absence', async () => {
+    const fixture = bundleFixture();
+    const page1Link = '<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=2>; rel="last"';
+    const reorderedLast = '<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=5>; title="tail"; rel="last"';
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => (/[?&]page=1$/u.test(call.url)
+            ? { status: 200, body: fullPage, headers: { link: page1Link } }
+            : { status: 200, body: fullPage, headers: { link: reorderedLast } }),
+      },
+    ], { maxReconciliationPages: 3 });
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+    expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+    expect(error?.message ?? '').not.toMatch(/did not land/u);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .rejects.toThrow(/delivery stays unresolved/u);
+    // The reordered page-5 bound was read and the walk extended toward it
+    // (pages 1 and 2 were already visited; page 5 is the new jump target).
+    const pages = calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))
+      .map((call) => /[?&]page=(\d+)/u.exec(call.url)?.[1]);
+    expect(pages).toEqual(['1', '2', '5']);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('still credits a proved match on a page whose reordered rel="last" bound extended the walk', async () => {
+    const fixture = bundleFixture();
+    const page1Link = '<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=2>; rel="last"';
+    const reorderedLast = '<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=5>; title="tail"; rel="last"';
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'GET', test: /\/reviews\?/,
+        handler: async (call) => (/[?&]page=1$/u.test(call.url)
+            ? { status: 200, body: fullPage, headers: { link: page1Link } }
+            : (/[?&]page=5$/u.test(call.url)
+                ? { status: 200, body: [MATCHING_REVIEW], headers: { link: reorderedLast } }
+                : { status: 200, body: fullPage, headers: { link: reorderedLast } })),
+      },
+    ], { maxReconciliationPages: 3 });
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+    const pages = calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))
+      .map((call) => /[?&]page=(\d+)/u.exec(call.url)?.[1]);
+    expect(pages).toEqual(['1', '2', '5']);
   });
 });
 

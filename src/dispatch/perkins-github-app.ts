@@ -29,7 +29,11 @@ export class PerkinsAppError extends Error {
  * brute-force oracle for low-entropy secrets. */
 function sanitize(text: string): string {
   return text
-    .replace(/-----BEGIN [^-\r\n]+ PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]+ PRIVATE KEY-----/gu, '[REDACTED]')
+    // The END marker may be absent (a display bound or a hostile truncation)
+    // and the subtype is optional (PKCS#8 emits `BEGIN PRIVATE KEY`): any
+    // private-key BEGIN marker is secret-bearing through END or EOF. Same
+    // handling as the questions redactor (src/decisions/questions.ts).
+    .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\r\n]*PRIVATE KEY-----|$)/gu, '[REDACTED]')
     // Token shapes are matched unanchored: a credential pasted without a
     // clean separator before its prefix must still be redacted.
     .replace(/gh[pousra]_[A-Za-z0-9_]{16,}/gu, '[REDACTED]')
@@ -592,7 +596,18 @@ function isDecidableReviewEntry(entry: unknown): entry is ProviderReview {
   if (typeof id !== 'number' || !Number.isFinite(id)) return false;
   if (!('user' in record)) return false;
   const user = record['user'];
-  if (!(user === null || (typeof user === 'object' && !Array.isArray(user)))) return false;
+  if (user !== null) {
+    if (typeof user !== 'object' || Array.isArray(user)) return false;
+    // The nested author fields are read by every delivery predicate: a
+    // record whose login/type are not provider-typed strings (an array, a
+    // number, a missing key) is malformed author evidence. Its non-match
+    // proves nothing — one such record must keep the whole walk from
+    // certifying absence.
+    const author = user as Record<string, unknown>;
+    for (const field of ['login', 'type'] as const) {
+      if (typeof author[field] !== 'string') return false;
+    }
+  }
   for (const field of ['state', 'commit_id', 'body', 'submitted_at'] as const) {
     const value = record[field];
     if (!(value === null || value === undefined || typeof value === 'string')) return false;
@@ -860,6 +875,15 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     try {
       ({ text, overflowed } = await readResponseBodyCapped(response, this.maxProviderBodyBytes));
     } catch (error) {
+      // The status line arrived even though the body did not: a 4xx is the
+      // provider's definitive refusal and keeps that classification no
+      // matter how its body read failed. An unreadable refusal must never
+      // degrade into an unknown outcome that a reconciliation could upgrade
+      // into a receipt for the refused attempt. The raw read-error text is
+      // discarded (it is never sanitized provider evidence).
+      if (response.status >= 400 && response.status < 500) {
+        throw new PerkinsAppHttpError(label, response.status, null, 'refusal body could not be read');
+      }
       if (seam.ambiguousOutcome === true) throw error;
       throw new PerkinsAppError(`${label} response could not be read: ${error instanceof Error ? sanitize(error.message) : 'unreadable body'}`);
     }
@@ -1085,10 +1109,20 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   private parseLastPage(linkHeader: string | null):
     { readonly kind: 'absent' } | { readonly kind: 'contradictory' } | { readonly kind: 'last'; readonly page: number } {
     if (linkHeader === null) return { kind: 'absent' };
-    const entries = [...linkHeader.matchAll(/<([^>]+)>;\s*rel="last"/gu)];
-    if (entries.length === 0) return { kind: 'absent' };
+    // Relation parameters are parsed independent of ORDER: GitHub emits
+    // `; rel="last"` right after the URL, but a provider or intermediary
+    // may emit other parameters first (`; title="tail"; rel="last"`), and
+    // an order-sensitive match would silently drop that page bound and let
+    // an earlier, smaller bound certify absence over pages never read.
     const pages: number[] = [];
-    for (const entry of entries) {
+    for (const entry of linkHeader.matchAll(/<([^>]+)>([^<]*)/gu)) {
+      const paramsText = entry[2]!;
+      let claimsLast = false;
+      for (const rel of paramsText.matchAll(/(?:^|[;\s,])rel\s*=\s*(?:"([^"]*)"|([^;,\s]+))/giu)) {
+        const value = (rel[1] ?? rel[2] ?? '').toLowerCase();
+        if (value === 'last') claimsLast = true;
+      }
+      if (!claimsLast) continue;
       // Strict SEMANTIC page-evidence validation: the entry URL is parsed
       // as a real URL and its query parameters are read by DECODED name,
       // so a raw-regex blind spot can never supply a page the provider did
@@ -1116,6 +1150,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       if (!Number.isSafeInteger(parsed) || parsed < 1) return { kind: 'contradictory' };
       pages.push(parsed);
     }
+    if (pages.length === 0) return { kind: 'absent' };
     const first = pages[0]!;
     return pages.every((candidate) => candidate === first) ? { kind: 'last', page: first } : { kind: 'contradictory' };
   }
