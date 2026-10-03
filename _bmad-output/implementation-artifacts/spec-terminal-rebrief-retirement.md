@@ -259,3 +259,25 @@ the same directory. Every claim was re-verified against the pinned code before a
 
 Review returns are advisory artifacts, never native clearance; repairs are verified by the
 `pr142-review-triage` focused scope and the controlled FULL.
+
+### Waiting checkpoint (2026-10-02 late, head `5a2a6fb` + this docs update)
+
+State: the three tracked independent reviews delivered and were triaged (14 accepted
+repairs, 2 rejected with recorded reasons) in `99d6e04`; `pr142-review-triage` focused
+scope **PASS** (98/98) at `99d6e04`; `pr142-static-preflight` **PASS** (lint + test-config
+typecheck) at `5a2a6fb`. The controlled FULL remains OWED:
+
+- attempt 1 (`99d6e04`) FAILED at lint: the packet's copied dispatch client inside the
+  git-ignored tree is still scanned by `eslint .`; fixed by the `.mjs.txt` rename and
+  bookkeeping commits. Failed receipt preserved (`full-99d6e04abb73-20261002T215841Z.*`).
+- attempt 2 (`5a2a6fb`) `LOCK_TIMEOUT_NOT_STARTED`: busy fleet queue (1 active, 3 queued);
+  the run never started. Unrun receipt preserved (`full-5a2a6fba4551-20261002T222900Z.*`).
+- Next safe transition: submit `full` at the then-current head through the lane's
+  pre-opened sink client the moment the verify scheduler shows a genuine free window
+  (`lockInUse=false`, or `queuedRuns=0` with a mature active run); read the whole output,
+  bind nested outcome/sha/bytes/hashes and the ledger terminal, then non-force publish →
+  exact-head CI → one native Perkins handoff.
+- Owner/dependency: fleet verify-scheduler capacity (all lanes in continuous completion);
+  the GC capacity reconciliation (`gc-test-harness-budgets-20261002`) is the standing
+  fleet capacity owner. Reconciliation is event-driven (queue drains), never an age-based
+  loop or detached watcher.
