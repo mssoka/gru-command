@@ -57,6 +57,9 @@ import {
   type PrHeadProbe,
 } from './perkins-review/fresh-head.js';
 
+/** Transport wait slice for one fallback-review turn: on expiry the live
+ * minion is reported still-running and the SAME session is re-attached — the
+ * worker's lifetime is never bounded by this value. */
 export const FALLBACK_REVIEW_TIMEOUT_MS = 15 * 60 * 1_000;
 
 /** The agent-rail label for one Perkins specialist child. First attempts
@@ -1961,21 +1964,66 @@ export class WaveRunner {
         input.diff,
       ].join('\n');
       if (input.signal.aborted) throw new Error('review operation aborted');
-      let reviewTimer: ReturnType<typeof setTimeout> | null = null;
+      const session = handle;
       let promptError: unknown = null;
       try {
-        await Promise.race([
-          handle.prompt(prompt, { owner: 'bmad-review-gate' }),
-          new Promise<never>((_resolve, reject) => {
-            input.signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
-            reviewTimer = setTimeout(() => reject(new Error(`fallback review timed out after ${FALLBACK_REVIEW_TIMEOUT_MS}ms`)), FALLBACK_REVIEW_TIMEOUT_MS);
-            reviewTimer.unref?.();
-          }),
-        ]);
+        // The transport wait is a still-running REPORT boundary, never a
+        // worker lifetime: a live review turn keeps running on its own
+        // session across any number of wait slices (host supervision owns
+        // genuine stalls), and each expired slice leaves a durable event so
+        // the long wait is observable instead of silent.
+        let waitedMs = 0;
+        let sliceTimer: ReturnType<typeof setTimeout> | null = null;
+        let abortListener: (() => void) | null = null;
+        try {
+          const settled = new Promise<'settled'>((resolve) => {
+            void session.prompt(prompt, { owner: 'bmad-review-gate' }).then(
+              () => resolve('settled'),
+              (error) => { promptError = error; resolve('settled'); },
+            );
+          });
+          const aborted = new Promise<never>((_resolve, reject) => {
+            abortListener = () => reject(new Error('review operation aborted'));
+            if (input.signal.aborted) abortListener();
+            else input.signal.addEventListener('abort', abortListener, { once: true });
+          });
+          for (;;) {
+            const slice = new Promise<'slice'>((resolve) => {
+              sliceTimer = setTimeout(() => resolve('slice'), FALLBACK_REVIEW_TIMEOUT_MS);
+              sliceTimer.unref?.();
+            });
+            let outcome: 'settled' | 'slice';
+            try {
+              outcome = await Promise.race([settled, aborted, slice]);
+            } finally {
+              if (sliceTimer !== null) {
+                clearTimeout(sliceTimer);
+                sliceTimer = null;
+              }
+            }
+            if (outcome === 'settled') break;
+            waitedMs += FALLBACK_REVIEW_TIMEOUT_MS;
+            const sessionState = session.health().state;
+            if (sessionState === 'disposed' || sessionState === 'error') {
+              throw new Error(
+                `fallback review minion session entered terminal state "${sessionState}" while its review turn was still open`,
+              );
+            }
+            this.log('info', 'fallback review still running at the transport wait — reattaching to the same session', {
+              job: input.jobId, iteration: input.iteration, waited_ms: waitedMs,
+            });
+            this.opts.ledger.appendCustomEvent({
+              kind: 'job.fallback-review',
+              jobId: input.jobId,
+              payload: { gate: true, phase: 'still-running', waited_ms: waitedMs, iteration: input.iteration },
+            });
+          }
+        } finally {
+          if (abortListener !== null) input.signal.removeEventListener('abort', abortListener);
+        }
       } catch (error) {
         promptError = error;
       } finally {
-        if (reviewTimer !== null) clearTimeout(reviewTimer);
         // Release before the settlement wait: the retry reacquires the slot.
         lease?.release();
         lease = null;

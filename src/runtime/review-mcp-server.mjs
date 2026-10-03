@@ -5,6 +5,10 @@ import { createConnection } from 'node:net';
 
 const MAX_MESSAGE_BYTES = 1024 * 1024;
 const CONNECT_TIMEOUT_MS = 5_000;
+/* The transport wait for one bridge response. Expiry is NOT a failure: a
+ * `tools/call` that has not answered yet gets a still-running result and the
+ * caller re-attaches by calling the same tool with the same arguments, so a
+ * live review operation is never cancelled or duplicated by this bound. */
 const RESPONSE_TIMEOUT_MS = 15 * 60 * 1_000;
 const SUPPORTED_PROTOCOL_VERSION = '2024-11-05';
 const socketPath = process.env['GRU_REVIEW_BRIDGE_SOCKET'];
@@ -12,13 +16,35 @@ if (socketPath === undefined || socketPath === '') {
   process.stderr.write('GRU_REVIEW_BRIDGE_SOCKET is required\n');
   process.exit(2);
 }
+/* Deterministic-test seam: production never sets this, and the default stays
+ * the 15-minute wait. A malformed value fails loud instead of guessing. */
+let responseWaitMs = RESPONSE_TIMEOUT_MS;
+const responseWaitOverride = process.env['GRU_REVIEW_RESPONSE_WAIT_MS'];
+if (responseWaitOverride !== undefined && responseWaitOverride !== '') {
+  const parsed = Number(responseWaitOverride);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    process.stderr.write(`GRU_REVIEW_RESPONSE_WAIT_MS must be a positive integer, got ${responseWaitOverride}\n`);
+    process.exit(2);
+  }
+  responseWaitMs = parsed;
+}
 const bridgeSocketPath = socketPath;
 
 function object(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-async function bridge(name, input) {
+function stillRunningResult(name) {
+  return {
+    text:
+      `The review tool "${name}" has not returned within the ${responseWaitMs} ms transport wait. ` +
+      'No work was cancelled; the operation may still be running. Call the same tool again with the same ' +
+      'arguments to attach to it and collect its result — do not start a duplicate operation.',
+    details: { stillRunning: true, tool: name, waitedMs: responseWaitMs },
+  };
+}
+
+async function bridge(name, input, replyOnWait) {
   const id = randomUUID();
   return await new Promise((resolve, reject) => {
     const socket = createConnection(bridgeSocketPath);
@@ -36,7 +62,10 @@ async function bridge(name, input) {
       else reject(error);
     };
     const connectTimer = setTimeout(() => finish(new Error('review bridge connection timed out')), CONNECT_TIMEOUT_MS);
-    const responseTimer = setTimeout(() => finish(new Error('review bridge response timed out')), RESPONSE_TIMEOUT_MS);
+    const responseTimer = setTimeout(() => {
+      if (replyOnWait) finish(null, stillRunningResult(name));
+      else finish(new Error('review bridge response timed out'));
+    }, responseWaitMs);
     connectTimer.unref?.();
     responseTimer.unref?.();
     socket.setEncoding('utf8');
@@ -118,7 +147,7 @@ function dispatch(raw) {
         return;
       }
       if (request.method === 'tools/list') {
-        const tools = await bridge('__list__', {});
+        const tools = await bridge('__list__', {}, false);
         if (!Array.isArray(tools)) throw new Error('native review tool list is invalid');
         respond(request.id, { tools });
         return;
@@ -129,7 +158,7 @@ function dispatch(raw) {
         if (params.arguments !== undefined && !object(params.arguments)) {
           throw new Error('tools/call arguments must be an object');
         }
-        const result = await bridge(params.name, params.arguments ?? {});
+        const result = await bridge(params.name, params.arguments ?? {}, true);
         if (typeof result.text !== 'string') throw new Error('native review tool returned invalid text');
         if (result.details !== undefined && !object(result.details)) {
           throw new Error('native review tool returned invalid structured details');
