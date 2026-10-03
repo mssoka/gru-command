@@ -36,6 +36,7 @@ import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { reconcilePendingRebriefs, reconcilePendingDirectives } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
+import { PipelineService } from './dispatch/pipeline.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
 import { createService, type ServiceHandle } from './server.js';
@@ -330,6 +331,7 @@ async function main(): Promise<number> {
     providerRecovery?: ProviderRecoverySensor;
     wave?: WaveRunner;
     verify?: ReturnType<typeof createVerificationServer>;
+    pipeline?: PipelineService;
     deployDrift?: DeployDriftTracker;
   } = {};
   let shuttingDown = false;
@@ -430,6 +432,13 @@ async function main(): Promise<number> {
             await state.wave.shutdown();
           } catch (error) {
             logger.error('Perkins review shutdown failed', { error: String(error) });
+          }
+        }
+        if (state.pipeline !== undefined) {
+          try {
+            state.pipeline.dispose();
+          } catch (error) {
+            logger.error('pipeline dispose failed', { error: String(error) });
           }
         }
         if (state.verify !== undefined) {
@@ -553,6 +562,10 @@ async function main(): Promise<number> {
   // Late-bound (the verification server lands below) — same pattern as
   // supervisionFor / decisionsStatus above.
   let verificationView: () => VerificationQueueView | null = () => null;
+  // Durable pipeline queue (owner approvals j-239/j-1064): late-bound too —
+  // the mechanical consumer is constructed after the dispatcher it feeds.
+  let pipelineView: () => import('./ledger/pipeline.js').PipelineBoardView | null = () => null;
+  let pipeline: PipelineService | null = null;
   // Provider pacing (owner heist 2026-09-29): one resolved policy for the
   // process — the optional rate-limit backoff plus the FIFO admission gate
   // shared by worker dispatches, directive deliveries, and Perkins rounds.
@@ -588,9 +601,13 @@ async function main(): Promise<number> {
     },
     buildDrift: () => deployDrift.view(),
     verifyQueue: () => verificationView(),
+    pipeline: () => pipelineView(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  registry.onAgentEvent((envelope) => engine.onRuntimeEvent(envelope));
+  registry.onAgentEvent((envelope) => {
+    engine.onRuntimeEvent(envelope);
+    pipeline?.noteRuntimeEvent(envelope);
+  });
   deployDrift.start();
   state.deployDrift = deployDrift;
 
@@ -1026,6 +1043,36 @@ async function main(): Promise<number> {
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // The durable queue's mechanical consumer: one shared-budget-aware
+  // reconsider pass over the ledger-backed pipeline, triggered by enqueue,
+  // bus transitions and runtime capacity events. No timer, no second
+  // scheduler; the shared resident budget remains the capacity authority.
+  pipeline = new PipelineService({
+    ledger,
+    dispatch: dispatcher,
+    capacity: () => {
+      const snapshot = registry.residencySnapshot();
+      return {
+        capacity: snapshot.capacity,
+        occupied: snapshot.occupied,
+        queued: snapshot.queued,
+        available: snapshot.capacity - snapshot.occupied,
+      };
+    },
+    bus,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  pipelineView = () => pipeline?.view() ?? null;
+  state.pipeline = pipeline;
+  const pipelineRecovery = pipeline.reconcileAtBoot();
+  if (pipelineRecovery.examined > 0) {
+    logger.info('pipeline admission reconciliation', {
+      examined: pipelineRecovery.examined,
+      adopted: pipelineRecovery.adopted,
+      requeued: pipelineRecovery.requeued,
+    });
+  }
   const wave = new WaveRunner({
     ledger,
     worktrees: worktreeManager,
@@ -1197,6 +1244,7 @@ async function main(): Promise<number> {
     ledger,
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    ...(pipeline !== null ? { pipeline } : {}),
     ...(config.silas.enabled && silasSlot !== null
       ? {
           silasOps: {

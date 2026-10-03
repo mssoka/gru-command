@@ -63,6 +63,25 @@ import {
   type DirectiveRequestRecord,
   type DirectiveState,
 } from './directives.js';
+import {
+  evaluatePipelineEntry,
+  isPipelineState,
+  parseExclusiveScopes,
+  parsePipelineClaim,
+  parsePipelinePrerequisites,
+  pipelineOrder,
+  PIPELINE_PRIORITY_DEFAULT,
+  validateExclusiveScopes,
+  validatePipelinePrerequisites,
+  validatePipelinePriority,
+  wouldCreatePipelineCycle,
+  type PipelineBoardView,
+  type PipelineEntryBoardView,
+  type PipelineEntryRecord,
+  type PipelineEvaluationContext,
+  type PipelinePrerequisite,
+  type PipelineState,
+} from './pipeline.js';
 
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 export type { DirectiveRequestRecord, DirectiveState } from './directives.js';
@@ -72,6 +91,14 @@ export type {
   PhaseHandoffSource,
   PhaseHandoffState,
 } from './obligations.js';
+export type {
+  PipelineBoardView,
+  PipelineEntryBoardView,
+  PipelineEntryRecord,
+  PipelineMilestone,
+  PipelinePrerequisite,
+  PipelineState,
+} from './pipeline.js';
 
 type Row = Record<string, unknown>;
 
@@ -259,6 +286,16 @@ export class PhaseHandoffConflictError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'PhaseHandoffConflictError';
+  }
+}
+
+/** An accepted pipeline request was replayed with changed content, or a
+ * stable id collides with existing work — the accepted brief is never
+ * silently overwritten. */
+export class PipelineConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PipelineConflictError';
   }
 }
 
@@ -4050,6 +4087,440 @@ export class LedgerApi {
         .run(`reconcile: ${input.note}`, nowIso(), input.requestId);
       return this.getDirective(input.requestId) as DirectiveRequestRecord;
     });
+  }
+
+  // ------------------------------------------------------------------
+  // Durable pipeline queue (owner approvals j-239/j-1064)
+  //
+  // A complete approved executable briefing persists here BEFORE any
+  // worker exists. Only this authenticated boundary writes entries; the
+  // state machine keeps every claim atomic (claim before side effect)
+  // and every crash reconcilable. The ledger never spawns anything —
+  // src/dispatch/pipeline.ts is the mechanical consumer.
+  // ------------------------------------------------------------------
+
+  /** Accept one approved executable briefing. A replay of the same
+   * request id with the identical canonical payload returns the SAME
+   * durable row (created:false); changed content, an occupied id, an
+   * occupied job id, or a dependency cycle fails CLOSED. */
+  enqueuePipelineEntry(input: {
+    id: string;
+    requestId?: string;
+    repoPath: string;
+    title: string;
+    briefing: string;
+    priority?: number;
+    prerequisites?: readonly PipelinePrerequisite[];
+    exclusiveScopes?: readonly string[];
+    holdReason?: string | null;
+    by?: string | null;
+  }): { readonly record: PipelineEntryRecord; readonly created: boolean } {
+    if (input.repoPath.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
+      throw new Error('pipeline enqueue requires a non-empty repo path, title, and briefing');
+    }
+    requireSafeRecordId(input.id, 'pipeline entry id');
+    const priority = input.priority === undefined ? PIPELINE_PRIORITY_DEFAULT : validatePipelinePriority(input.priority);
+    const prerequisites = input.prerequisites === undefined ? [] : validatePipelinePrerequisites(input.prerequisites);
+    if (prerequisites.some((prerequisite) => prerequisite.id === input.id)) {
+      throw new Error(`pipeline entry "${input.id}" cannot depend on itself`);
+    }
+    const exclusiveScopes = input.exclusiveScopes === undefined ? [] : validateExclusiveScopes(input.exclusiveScopes);
+    const holdReason =
+      input.holdReason === undefined || input.holdReason === null || input.holdReason.trim() === ''
+        ? null
+        : input.holdReason.trim().slice(0, 500);
+    const requestId = input.requestId === undefined || input.requestId.trim() === '' ? input.id : input.requestId;
+    const repo = input.repoPath.split('/').filter(Boolean).pop() ?? input.repoPath;
+    // Canonical accepted payload: the briefing is immutable; a changed
+    // replay of the same request is a conflict, never an overwrite.
+    const canonical = JSON.stringify({
+      id: input.id,
+      repo_path: input.repoPath,
+      repo,
+      title: input.title,
+      briefing: input.briefing,
+      priority,
+      prerequisites,
+      exclusive_scopes: exclusiveScopes,
+      hold_reason: holdReason,
+    });
+    const payloadHash = createHash('sha256').update(canonical).digest('hex');
+
+    return this.transaction(() => {
+      const existingByRequest = this.getPipelineEntryByRequestId(requestId);
+      if (existingByRequest !== null) {
+        if (existingByRequest.payloadHash !== payloadHash || existingByRequest.id !== input.id) {
+          throw new PipelineConflictError(
+            `pipeline request "${requestId}" was accepted with different content — ` +
+              'an accepted brief is immutable; submit changed work under a new request id',
+          );
+        }
+        return { record: existingByRequest, created: false };
+      }
+      if (this.getPipelineEntry(input.id) !== null) {
+        throw new PipelineConflictError(
+          `pipeline entry "${input.id}" already exists — a new request cannot reuse an accepted entry id`,
+        );
+      }
+      if (this.getJob(input.id) !== null) {
+        throw new PipelineConflictError(
+          `pipeline entry id "${input.id}" collides with an existing job — pick a fresh stable id`,
+        );
+      }
+      if (wouldCreatePipelineCycle(input.id, prerequisites, this.listPipelineEntries())) {
+        throw new PipelineConflictError(
+          `pipeline prerequisites for "${input.id}" would form a dependency cycle — fix the prerequisites or the entry order`,
+        );
+      }
+      const ts = nowIso();
+      const maxRow = this.db.prepare('SELECT COALESCE(MAX(enqueue_seq), 0) AS seq FROM pipeline_entries').get() as Row;
+      const enqueueSeq = Number(maxRow.seq) + 1;
+      this.db
+        .prepare(
+          `INSERT INTO pipeline_entries
+             (id, repo_path, repo, title, briefing, briefing_hash, priority, enqueue_seq, state,
+              hold_reason, prerequisites, exclusive_scopes, request_id, payload_hash, failure_count,
+              queued_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?, ?, ?, ?, 0, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.repoPath,
+          repo,
+          input.title,
+          input.briefing,
+          createHash('sha256').update(input.briefing).digest('hex'),
+          priority,
+          enqueueSeq,
+          holdReason,
+          JSON.stringify(prerequisites),
+          JSON.stringify(exclusiveScopes),
+          requestId,
+          payloadHash,
+          ts,
+          ts,
+        );
+      this.appendEvent({
+        kind: 'pipeline.enqueued',
+        payload: {
+          entry_id: input.id,
+          request_id: requestId,
+          priority,
+          enqueue_seq: enqueueSeq,
+          hold: holdReason !== null,
+          briefing_bytes: Buffer.byteLength(input.briefing, 'utf-8'),
+          by: input.by ?? null,
+        },
+      });
+      return { record: this.getPipelineEntry(input.id) as PipelineEntryRecord, created: true };
+    });
+  }
+
+  getPipelineEntry(id: string): PipelineEntryRecord | null {
+    const row = this.db.prepare('SELECT * FROM pipeline_entries WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : this.pipelineEntryFromRow(row);
+  }
+
+  private getPipelineEntryByRequestId(requestId: string): PipelineEntryRecord | null {
+    const row = this.db.prepare('SELECT * FROM pipeline_entries WHERE request_id = ?').get(requestId) as Row | undefined;
+    return row === undefined ? null : this.pipelineEntryFromRow(row);
+  }
+
+  /** Every entry in durable enqueue order, optionally state-narrowed. */
+  listPipelineEntries(opts: { states?: readonly PipelineState[] } = {}): readonly PipelineEntryRecord[] {
+    if (opts.states !== undefined && opts.states.length === 0) {
+      throw new Error('listPipelineEntries "states" filter must not be empty');
+    }
+    const where =
+      opts.states === undefined ? '' : ` WHERE state IN (${opts.states.map(() => '?').join(', ')})`;
+    const rows = this.db
+      .prepare(`SELECT * FROM pipeline_entries${where} ORDER BY enqueue_seq ASC`)
+      .all(...(opts.states ?? [])) as Row[];
+    return rows.map((row) => this.pipelineEntryFromRow(row));
+  }
+
+  /** Atomic admission claim: waiting|ready without a hold becomes
+   * `admitting` with the claim persisted BEFORE any side effect. A
+   * non-claimable row returns null (never a silent no-op throw); a
+   * concurrent claimer loses the race through the WHERE guard. */
+  claimPipelineEntry(input: { id: string; holder: string }): PipelineEntryRecord | null {
+    if (input.holder.trim() === '') throw new Error('pipeline claim requires a non-empty holder');
+    return this.transaction(() => {
+      const row = this.getPipelineEntry(input.id);
+      if (row === null) throw new RecordNotFound(`pipeline entry "${input.id}" not found`);
+      if ((row.state !== 'waiting' && row.state !== 'ready') || row.holdReason !== null) return null;
+      const ts = nowIso();
+      const info = this.db
+        .prepare(
+          `UPDATE pipeline_entries
+              SET state = 'admitting', claim = ?, claimed_at = ?, updated_at = ?
+            WHERE id = ? AND state IN ('waiting','ready') AND hold_reason IS NULL`,
+        )
+        .run(JSON.stringify({ holder: input.holder, since: ts }), ts, ts, input.id);
+      if (Number(info.changes) === 0) return null;
+      this.appendEvent({
+        kind: 'pipeline.claimed',
+        payload: { entry_id: input.id, holder: input.holder },
+      });
+      return this.getPipelineEntry(input.id) as PipelineEntryRecord;
+    });
+  }
+
+  /** Bind the claim to the actual job that owns the lifecycle from now
+   * on. The job must exist AND carry this entry's exact briefing —
+   * adoption of unrelated work is refused. */
+  markPipelineAdmitted(input: { id: string; jobId: string }): PipelineEntryRecord {
+    return this.transaction(() => {
+      const row = this.getPipelineEntry(input.id);
+      if (row === null) throw new RecordNotFound(`pipeline entry "${input.id}" not found`);
+      if (row.state === 'admitted' && row.jobId === input.jobId) return row; // idempotent replay
+      if (row.state !== 'admitting') {
+        throw new Error(`pipeline entry "${input.id}" is ${row.state} — admission requires an admitting claim`);
+      }
+      const job = this.getJob(input.jobId);
+      if (job === null) throw new Error(`pipeline admission for "${input.id}" requires job "${input.jobId}" to exist`);
+      if (job.briefing !== row.briefing) {
+        throw new Error(
+          `job "${input.jobId}" carries a different briefing than the accepted pipeline entry — refusing adoption`,
+        );
+      }
+      const ts = nowIso();
+      this.db
+        .prepare("UPDATE pipeline_entries SET state = 'admitted', job_id = ?, admitted_at = ?, updated_at = ? WHERE id = ?")
+        .run(input.jobId, ts, ts, input.id);
+      this.appendEvent({ kind: 'pipeline.admitted', payload: { entry_id: input.id, job_id: input.jobId } });
+      return this.getPipelineEntry(input.id) as PipelineEntryRecord;
+    });
+  }
+
+  /** Resolve an admitting claim without an admission. `requeue` counts a
+   * failed attempt (returns to waiting); `failed` is the bounded terminal
+   * outcome; `reconciled` is the crash path (no failure counted). */
+  releasePipelineClaim(input: {
+    id: string;
+    reason: string;
+    outcome: 'requeue' | 'failed' | 'reconciled';
+    note?: string | null;
+  }): PipelineEntryRecord {
+    if (input.reason.trim() === '') throw new Error('pipeline claim release requires a reason');
+    return this.transaction(() => {
+      const row = this.getPipelineEntry(input.id);
+      if (row === null) throw new RecordNotFound(`pipeline entry "${input.id}" not found`);
+      if (row.state !== 'admitting') {
+        // Idempotent replay of an already-resolved claim.
+        if (
+          (input.outcome === 'failed' && row.state === 'failed') ||
+          (input.outcome !== 'failed' && (row.state === 'waiting' || row.state === 'ready'))
+        ) {
+          return row;
+        }
+        throw new Error(`pipeline entry "${input.id}" is ${row.state} — no admitting claim to release`);
+      }
+      const ts = nowIso();
+      if (input.outcome === 'failed') {
+        this.db
+          .prepare(
+            `UPDATE pipeline_entries
+                SET state = 'failed', failure_reason = ?, failure_count = failure_count + 1,
+                    claim = NULL, updated_at = ?
+              WHERE id = ?`,
+          )
+          .run(input.reason, ts, input.id);
+      } else if (input.outcome === 'requeue') {
+        this.db
+          .prepare(
+            `UPDATE pipeline_entries
+                SET state = 'waiting', failure_reason = ?, failure_count = failure_count + 1,
+                    reconcile_note = ?, claim = NULL, updated_at = ?
+              WHERE id = ?`,
+          )
+          .run(input.reason, input.note ?? null, ts, input.id);
+      } else {
+        this.db
+          .prepare(
+            `UPDATE pipeline_entries
+                SET state = 'waiting', reconcile_note = ?, claim = NULL, updated_at = ?
+              WHERE id = ?`,
+          )
+          .run(input.note ?? input.reason, ts, input.id);
+      }
+      this.appendEvent({
+        kind:
+          input.outcome === 'failed'
+            ? 'pipeline.failed'
+            : input.outcome === 'requeue'
+              ? 'pipeline.requeued'
+              : 'pipeline.reconciled',
+        payload: { entry_id: input.id, reason: input.reason, ...(input.note != null ? { note: input.note } : {}) },
+      });
+      return this.getPipelineEntry(input.id) as PipelineEntryRecord;
+    });
+  }
+
+  /** Persist an eligibility-classified waiting|ready state (the
+   * mechanical consumer's normalization); terminal/claim states refuse. */
+  setPipelineEntryState(input: {
+    id: string;
+    state: 'waiting' | 'ready';
+    reason?: string | null;
+  }): PipelineEntryRecord {
+    return this.transaction(() => {
+      const row = this.getPipelineEntry(input.id);
+      if (row === null) throw new RecordNotFound(`pipeline entry "${input.id}" not found`);
+      if (row.state !== 'waiting' && row.state !== 'ready') {
+        throw new Error(`pipeline entry "${input.id}" is ${row.state} — only waiting/ready can be normalized`);
+      }
+      if (row.state === input.state) return row;
+      const ts = nowIso();
+      this.db.prepare('UPDATE pipeline_entries SET state = ?, updated_at = ? WHERE id = ?').run(input.state, ts, input.id);
+      this.appendEvent({
+        kind: 'pipeline.state',
+        payload: {
+          entry_id: input.id,
+          from: row.state,
+          to: input.state,
+          ...(input.reason != null ? { reason: input.reason } : {}),
+        },
+      });
+      return this.getPipelineEntry(input.id) as PipelineEntryRecord;
+    });
+  }
+
+  /** Explicit owner hold: the entry stays waiting with the reason; no
+   * reclaim path bypasses it (only `clearPipelineHold` leaves it, and
+   * that is a deliberate supported mutation, never an inferred ACK). */
+  holdPipelineEntry(input: { id: string; reason: string; by?: string | null }): PipelineEntryRecord {
+    if (input.reason.trim() === '') throw new Error('pipeline hold requires a reason');
+    return this.transaction(() => {
+      const row = this.getPipelineEntry(input.id);
+      if (row === null) throw new RecordNotFound(`pipeline entry "${input.id}" not found`);
+      if (row.state === 'admitting') {
+        throw new Error(`pipeline entry "${input.id}" has a live admission claim — a hold cannot race it`);
+      }
+      if (row.state === 'admitted' || row.state === 'failed' || row.state === 'cancelled') {
+        throw new Error(`pipeline entry "${input.id}" is ${row.state} — it can no longer be held`);
+      }
+      const reason = input.reason.trim().slice(0, 500);
+      const ts = nowIso();
+      this.db
+        .prepare("UPDATE pipeline_entries SET hold_reason = ?, state = 'waiting', updated_at = ? WHERE id = ?")
+        .run(reason, ts, input.id);
+      this.appendEvent({
+        kind: 'pipeline.held',
+        payload: { entry_id: input.id, reason, by: input.by ?? null },
+      });
+      return this.getPipelineEntry(input.id) as PipelineEntryRecord;
+    });
+  }
+
+  /** Deliberate release of an explicit hold (owner decision, not an ACK). */
+  clearPipelineHold(input: { id: string; reason?: string | null; by?: string | null }): PipelineEntryRecord {
+    return this.transaction(() => {
+      const row = this.getPipelineEntry(input.id);
+      if (row === null) throw new RecordNotFound(`pipeline entry "${input.id}" not found`);
+      if (row.state !== 'waiting' && row.state !== 'ready') {
+        throw new Error(`pipeline entry "${input.id}" is ${row.state} — only a waiting/ready hold can be cleared`);
+      }
+      if (row.holdReason === null) return row; // idempotent
+      const ts = nowIso();
+      this.db.prepare('UPDATE pipeline_entries SET hold_reason = NULL, updated_at = ? WHERE id = ?').run(ts, input.id);
+      this.appendEvent({
+        kind: 'pipeline.hold-cleared',
+        payload: { entry_id: input.id, reason: input.reason ?? null, by: input.by ?? null },
+      });
+      return this.getPipelineEntry(input.id) as PipelineEntryRecord;
+    });
+  }
+
+  /** Terminal cancellation before/without an admission claim. A live
+   * admission claim is never cancelled out from under its dispatch. */
+  cancelPipelineEntry(input: { id: string; reason: string; by?: string | null }): PipelineEntryRecord {
+    if (input.reason.trim() === '') throw new Error('pipeline cancellation requires a reason');
+    return this.transaction(() => {
+      const row = this.getPipelineEntry(input.id);
+      if (row === null) throw new RecordNotFound(`pipeline entry "${input.id}" not found`);
+      if (row.state === 'cancelled') return row; // idempotent
+      if (row.state === 'admitting') {
+        throw new Error(`pipeline entry "${input.id}" has a live admission claim — reconciliation owns it`);
+      }
+      const ts = nowIso();
+      this.db
+        .prepare(
+          "UPDATE pipeline_entries SET state = 'cancelled', hold_reason = NULL, failure_reason = ?, updated_at = ? WHERE id = ?",
+        )
+        .run(input.reason.trim().slice(0, 500), ts, input.id);
+      this.appendEvent({
+        kind: 'pipeline.cancelled',
+        payload: { entry_id: input.id, reason: input.reason, by: input.by ?? null },
+      });
+      return this.getPipelineEntry(input.id) as PipelineEntryRecord;
+    });
+  }
+
+  /** Board projection (server-computed, evidence-bound): every active
+   * entry (waiting/ready/admitting/failed), evaluated against the live
+   * job statuses + shared capacity, in the approved deterministic order.
+   * Admitted/cancelled entries are excluded — admitted work lives in the
+   * normal job lifecycle, cancelled work is terminal. No briefings. */
+  pipelineBoardView(capacity: PipelineEvaluationContext['capacity']): PipelineBoardView {
+    const entries = this.listPipelineEntries();
+    const ctx: PipelineEvaluationContext = {
+      entries,
+      jobStatusOf: (jobId) => this.getJob(jobId)?.status ?? null,
+      capacity,
+    };
+    const rows: PipelineEntryBoardView[] = entries
+      .filter((entry) => entry.state !== 'admitted' && entry.state !== 'cancelled')
+      .map((entry) => {
+        const evaluation = evaluatePipelineEntry(entry, ctx);
+        return {
+          id: entry.id,
+          repo: entry.repo,
+          title: entry.title,
+          priority: entry.priority,
+          enqueueSeq: entry.enqueueSeq,
+          state: evaluation.state,
+          reason: evaluation.reason,
+          queuedAt: entry.queuedAt,
+        };
+      })
+      .sort((left, right) =>
+        pipelineOrder(
+          { priority: left.priority, enqueueSeq: left.enqueueSeq, id: left.id },
+          { priority: right.priority, enqueueSeq: right.enqueueSeq, id: right.id },
+        ),
+      );
+    return { entries: rows, pending: rows.length };
+  }
+
+  private pipelineEntryFromRow(row: Row): PipelineEntryRecord {
+    const state = str(row.state);
+    if (!isPipelineState(state)) throw new Error(`pipeline_entries row "${str(row.id)}" has unknown state "${state}"`);
+    return {
+      id: str(row.id),
+      repoPath: str(row.repo_path),
+      repo: str(row.repo),
+      title: str(row.title),
+      briefing: str(row.briefing),
+      briefingHash: str(row.briefing_hash),
+      priority: Number(row.priority),
+      enqueueSeq: Number(row.enqueue_seq),
+      state,
+      holdReason: nstr(row.hold_reason),
+      prerequisites: parsePipelinePrerequisites(str(row.prerequisites)),
+      exclusiveScopes: parseExclusiveScopes(str(row.exclusive_scopes)),
+      requestId: str(row.request_id),
+      payloadHash: str(row.payload_hash),
+      jobId: nstr(row.job_id),
+      claim: parsePipelineClaim(nstr(row.claim)),
+      failureReason: nstr(row.failure_reason),
+      failureCount: Number(row.failure_count),
+      reconcileNote: nstr(row.reconcile_note),
+      queuedAt: str(row.queued_at),
+      claimedAt: nstr(row.claimed_at),
+      admittedAt: nstr(row.admitted_at),
+      updatedAt: str(row.updated_at),
+    };
   }
 
   private directiveFromRow(row: Row): DirectiveRequestRecord {

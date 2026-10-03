@@ -5,6 +5,8 @@ import type { LogLevel } from '../logger.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError } from '../ledger/api.js';
 import { parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
+import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger/pipeline.js';
+import type { PipelineService } from './pipeline.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
@@ -58,6 +60,9 @@ export interface DispatchServerOptions {
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   /** Absent = /api/silas/* answers 503 (silas ops not hosted). */
   readonly silasOps?: SilasOpsSurface;
+  /** Durable pipeline queue surface (approved j-239/j-1064); absent =
+   * /api/pipeline/* answers 503 (queue not hosted in this build). */
+  readonly pipeline?: PipelineService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
   readonly log?: Log;
@@ -110,6 +115,19 @@ function completionHandoffField(body: Record<string, unknown>): CompletionHandof
   const value = body['completion_handoff'];
   if (value === undefined) return undefined;
   return parseCompletionHandoffIntent(value);
+}
+
+/** Pipeline prerequisites arrive as a JSON array of `{id, milestone}`;
+ * validated by the SAME codec the ledger persists (fail loud on any
+ * typo'd milestone rather than silently treating it as unmet). */
+function optPrerequisitesField(body: Record<string, unknown>): readonly PipelinePrerequisite[] | undefined {
+  const value = body['prerequisites'];
+  if (value === undefined) return undefined;
+  try {
+    return parsePipelinePrerequisites(JSON.stringify(value));
+  } catch (error) {
+    throw new Error(`prerequisites: ${String(error instanceof Error ? error.message : error)}`);
+  }
 }
 
 export function createDispatchServer(options: DispatchServerOptions): DispatchServer {
@@ -192,6 +210,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       return null;
     }
     return options.silasOps;
+  }
+
+  /** The pipeline surface, or null with a 503 already written. */
+  function pipelineOr503(res: ServerResponse): PipelineService | null {
+    if (options.pipeline === undefined) {
+      json(res, 503, { error: 'pipeline_not_hosted', detail: 'the durable pipeline queue is not hosted on this service' });
+      return null;
+    }
+    return options.pipeline;
   }
 
   async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
@@ -338,6 +365,77 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         status: outcome.round.status,
         lenses: outcome.round.lenses.map((chip) => chip.lens),
       });
+      return true;
+    }
+    if (req.method === 'POST' && path === '/api/pipeline/enqueue') {
+      if (!authed(req, res)) return true;
+      const pipeline = pipelineOr503(res);
+      if (pipeline === null) return true;
+      const body = await readBody(req);
+      const priorityField = body['priority'];
+      if (priorityField !== undefined && typeof priorityField !== 'number') {
+        throw new Error('priority must be a number');
+      }
+      const scopes = optStrArray(body, 'exclusive_scopes');
+      const receipt = pipeline.enqueue({
+        id: strField(body, 'id'),
+        ...(optStrField(body, 'request_id') !== undefined ? { requestId: optStrField(body, 'request_id') } : {}),
+        repoPath: strField(body, 'repo_path'),
+        title: strField(body, 'title'),
+        briefing: strField(body, 'briefing'),
+        ...(priorityField !== undefined ? { priority: priorityField as number } : {}),
+        ...(optPrerequisitesField(body) !== undefined ? { prerequisites: optPrerequisitesField(body) } : {}),
+        ...(scopes !== undefined ? { exclusiveScopes: scopes } : {}),
+        ...(optStrField(body, 'hold_reason') !== undefined ? { holdReason: optStrField(body, 'hold_reason') } : {}),
+        by: byField(body) ?? null,
+      });
+      json(res, receipt.duplicate ? 200 : 201, receipt);
+      return true;
+    }
+    if (req.method === 'GET' && path === '/api/pipeline') {
+      if (!authed(req, res)) return true;
+      const pipeline = pipelineOr503(res);
+      if (pipeline === null) return true;
+      json(res, 200, pipeline.view());
+      return true;
+    }
+    const pipelineEntryMatch = /^\/api\/pipeline\/entries\/([^/]+)$/.exec(path);
+    if (req.method === 'GET' && pipelineEntryMatch !== null) {
+      if (!authed(req, res)) return true;
+      const pipeline = pipelineOr503(res);
+      if (pipeline === null) return true;
+      const id = decodeURIComponent(pipelineEntryMatch[1] ?? '');
+      const record = pipeline.entry(id);
+      if (record === null) {
+        json(res, 404, { error: 'not_found', detail: `no pipeline entry "${id}"` });
+        return true;
+      }
+      const live = pipeline.view().entries.find((row) => row.id === id) ?? null;
+      json(res, 200, {
+        entry: record,
+        live_state: live?.state ?? record.state,
+        live_reason: live?.reason ?? (record.state === 'failed' ? record.failureReason : null),
+      });
+      return true;
+    }
+    const pipelineHoldMatch = /^\/api\/pipeline\/entries\/([^/]+)\/(hold|clear-hold|cancel)$/.exec(path);
+    if (req.method === 'POST' && pipelineHoldMatch !== null) {
+      if (!authed(req, res)) return true;
+      const pipeline = pipelineOr503(res);
+      if (pipeline === null) return true;
+      const id = decodeURIComponent(pipelineHoldMatch[1] ?? '');
+      const action = pipelineHoldMatch[2];
+      const body = await readBody(req);
+      const by = byField(body) ?? null;
+      if (action === 'hold') {
+        json(res, 200, pipeline.hold(id, strField(body, 'reason'), { by }));
+        return true;
+      }
+      if (action === 'clear-hold') {
+        json(res, 200, pipeline.clearHold(id, optStrField(body, 'reason') ?? null, { by }));
+        return true;
+      }
+      json(res, 200, pipeline.cancel(id, strField(body, 'reason'), { by }));
       return true;
     }
     const worktreesMatch = /^\/api\/dispatch\/jobs\/([^/]+)\/worktrees$/.exec(path);
@@ -790,7 +888,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
 
   return {
     requestHook(req, res, path): boolean {
-      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas')) return false;
+      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline')) {
+        return false;
+      }
       const startedAt = Date.now();
       handleApi(req, res, path)
         .then((handled) => {
