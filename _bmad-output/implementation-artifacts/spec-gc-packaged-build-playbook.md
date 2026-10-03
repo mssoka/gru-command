@@ -74,13 +74,17 @@ checkout, home paths, journal, or global custom instructions).
 
 </frozen-after-approval>
 
-<!-- Amendment marker (2026-10-03): the frozen "Always" bullet that names
-     the runtime CLI headless print mode (`pi -p` / `claude -p`) as the
-     reviewer-spawning mechanism is superseded by the owner clarification
-     j-810/j-811 recorded in the Spec Change Log below: prescribed
-     independent reviewers run as separately tracked review jobs. The
-     frozen text is preserved unmodified; this marker records the
-     supersession inline for readers of the approval source. -->
+<!-- Amendment marker (2026-10-03): two frozen "Always" bullets are
+     superseded by later owner clarifications, both recorded in the Spec
+     Change Log below. (1) The bullet naming the runtime CLI headless
+     print mode (`pi -p` / `claude -p`) as the reviewer-spawning mechanism
+     is superseded by j-810/j-811: prescribed independent reviewers run as
+     separately tracked review jobs. (2) The bullet requiring the literal
+     project-installed `bmad-build` skill is superseded by j-761: the
+     shipped contract selects the project's installed build-workflow skill
+     by capability from the actual catalog/metadata. The frozen text is
+     preserved unmodified; this marker records the supersessions inline
+     for readers of the approval source. -->
 
 ## Code Map
 
@@ -119,7 +123,11 @@ checkout, home paths, journal, or global custom instructions).
   removed, and asserts no personal/home paths in the loaded prompts.
 - `scripts/hygiene-grep.sh` -- repo-wide personal-path gate; must stay green.
 - `README.md` (Project-local BMAD setup) -- the official onboarding path the
-  missing-skill rule points to; docs only, not shipped.
+  missing-skill rule points to. README IS shipped (package.json `files` and
+  npm's default README inclusion); its version-scoped mention of
+  `bmad-build` (`bmad-method@6.12.0`'s installed name) is deliberate and
+  documents the pinned installer, while the fixed-name negatives apply to
+  the persona/ops instruction surfaces.
 - `docs/ROLES.md` -- persona map; one-row coherence touch (not shipped).
 
 ## Tasks & Acceptance
@@ -250,7 +258,7 @@ checkout, home paths, journal, or global custom instructions).
   `_bmad-output/implementation-artifacts/review-loop2/`, loop-1 artifacts
   preserved beside them). All 13 findings triaged in the log above: one
   defer (pre-existing onboarding), one carried false (loop-1 row 4), one
-  false, and nine patches applied — the renamed-catalog fixture now
+  false, and ten patches applied — the renamed-catalog fixture now
   consumes a staged catalog and cross-checks installed names, the tarball
   smoke loads silas/gru through `ROLE_DEFINITIONS`, the baseline overlays
   the wake-prompt test and guards its build, and the focused scope checks
@@ -605,6 +613,24 @@ bad_spec).
   (a rerun solely to recover lost output is forbidden). Lesson applied:
   scheduler client calls always carry a generous explicit timeout.
 
+- Round `gc-packaged-build-playbook-20261002-r3` frozen at target
+  `60cfbd8` (base `5d56194`), seven lenses; verdict **NEEDS CHANGES** —
+  prior findings 1 and 2 fixed, one new blocker plus one carried:
+  - New: the contract-review fallback reconciliation let a fallback PASS
+    stand in for the READY merge-presentation gate. Fixed in `8ed3bd6`:
+    fallback PASS clears review/fix routing only; its PASS is not Perkins
+    READY and the missing Perkins gate is escalated, never substituted
+    (README/FLOW/ops/pins aligned; row 59).
+  - Carried: the canonical-briefing acceptance amendment (owner/ops
+    disposition; the briefing remains unamended as of the base-conflict
+    continuation). Held, not bypassed; no r4 is requested until it lands.
+
+- Native r4 is held on the canonical-briefing disposition. The latest
+  verified fix (`8ed3bd6`) and the outcome-truth/contract changes are
+  covered by the post-integration independent review
+  (`gc-playbook-integrated-review-{blind,edge,verifgap}-810f471`) and the
+  head gates recorded in the completion handoff.
+
 ## Verification
 
 **Commands (all through the authenticated `/api/verify` scheduler — the
@@ -616,3 +642,12 @@ lane's declared scopes; never run directly):**
   (lint, typecheck, build, vitest, web); coordinated, no competing suites.
 - `scope=typecheck` (`npm run typecheck`) -- available when a bounded
   typecheck check is wanted without the full chain.
+- `scope=packaged-playbook-timeouts` (`node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/wizard.test.ts && npx vitest run test/dispatch-server.test.ts`) -- the declared timeout-classification diagnostic (isolation of the two FULL-run timeout tests at the unchanged 30 s ceiling). Recorded outcome: the attempts at `7a7702a` (`50`/`50b`) both never started (typed lock timeouts 900048/902625 ms, preserved); the a5a2 failure mechanism therefore remains unproved-by-isolation and is reported as such — never converted to a waiver.
+- Final-head receipts live under `_bmad-output/gate-prep/` (labels 01+);
+  the canonical final SHA and its receipt identities are bound in the
+  ignored completion handoff
+  (`_bmad-output/implementation-artifacts/completion-handoff.md`). The
+  first integrated-head full (`51-full-810f471`, base `9bb51b0`) FAILED
+  genuinely — a single 30 s `install-one-line` timeout with the complete
+  capture retained — and is never erased by later heads or CI; post-repair
+  heads take their own receipts as recorded in the handoff.
