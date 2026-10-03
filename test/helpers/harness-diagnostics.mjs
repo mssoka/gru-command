@@ -25,11 +25,6 @@ import { clearTimeout, setTimeout } from 'node:timers';
 import { spawn } from 'node:child_process';
 
 const OUTPUT_TAIL_LIMIT = 2_048; // chars kept per stream, per process
-// Raw retention feeds render-time redaction: a credential label/value pair
-// split across stream chunks (or inside a quoted error) is only matchable
-// while both sides are still present. Lines are dropped whole where
-// possible so a retained window never starts mid-credential.
-const RAW_TAIL_LIMIT = 8 * OUTPUT_TAIL_LIMIT;
 const RENDER_LIMIT = 8_192; // chars of the rendered diagnostics block
 const STEP_LIMIT = 16;
 const PROCESS_LIMIT = 12;
@@ -97,18 +92,38 @@ export function markFixtureStep(label, scope) {
 }
 
 function appendTail(tracked, streamName, chunk) {
-  const combined = tracked.output[streamName] + String(chunk);
+  let text = String(chunk);
+  const wasOpen = tracked.openCredential[streamName] === true;
+  let stillOpen = false;
+  if (wasOpen) {
+    // The previous chunk ended inside a credential value; drop this chunk's
+    // continuation run fail-closed instead of rendering it naked. If the
+    // whole chunk was that run, the value may still continue.
+    const run = VALUE_CHAR_RUN.exec(text);
+    if (run !== null) {
+      text = text.slice(run[0].length);
+      stillOpen = text.length === 0;
+    }
+    tracked.openCredential[streamName] = false;
+  }
+  const combined = tracked.output[streamName] + text;
+  // Redact BEFORE trimming: the retained tail is always sanitized text, so
+  // a credential pair split across chunks is redacted the moment its second
+  // half arrives, and no trim can ever cut a label away from its value.
+  const redacted = redactDiagnosticText(combined);
+  const bounded = redacted.length > OUTPUT_TAIL_LIMIT ? redacted.slice(-OUTPUT_TAIL_LIMIT) : redacted;
   if (combined.length > OUTPUT_TAIL_LIMIT) tracked.outputTruncated[streamName] = true;
-  tracked.output[streamName] = retainRawTail(combined);
+  tracked.output[streamName] = bounded;
+  tracked.openCredential[streamName] = wasOpen
+    ? stillOpen
+    : endsWithUnterminatedValue(combined);
 }
 
-/** Keep a bounded RAW tail; drop whole lines when the cut would split one. */
-function retainRawTail(text) {
-  if (text.length <= RAW_TAIL_LIMIT) return text;
-  const excess = text.length - RAW_TAIL_LIMIT;
-  const newline = text.indexOf('\n', excess);
-  const cut = newline !== -1 && newline - excess <= 256 ? newline + 1 : excess;
-  return text.slice(cut);
+function endsWithUnterminatedValue(text) {
+  // `$` also matches before a single trailing newline, and a newline IS a
+  // terminator; probe without it so completed values do not stay "open".
+  const probe = text.endsWith('\n') ? text.slice(0, -1) : text;
+  return UNTERMINATED_VALUE.test(probe);
 }
 
 /**
@@ -130,6 +145,7 @@ export function trackChildProcess(child, { label, captureOutput = true, scope } 
     spawnError: null,
     output: { stdout: '', stderr: '' },
     outputTruncated: { stdout: false, stderr: false },
+    openCredential: { stdout: false, stderr: false },
   };
   if (tracked.exitCode !== null || tracked.signal !== null) tracked.exitedAt = tracked.startedAt;
   target.processes.push(tracked);
@@ -155,7 +171,19 @@ export function trackChildProcess(child, { label, captureOutput = true, scope } 
 }
 
 const SECRET_LABEL =
-  /(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:\\?"([^"\\\n]{4,})\\?"|'([^'\n]{4,})'|(?:(?:Bearer|Basic)\s+)?([^\s"',;}\\\]]{4,}))/gi;
+  /(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:\\?"((?:[^"\\\n]|\\.){4,})\\?"|'((?:[^'\\\n]|\\.){4,})'|(?:(?:Bearer|Basic)\s+)?(?!\[REDACTED\])(?!(?:Bearer|Basic)(?:\s|$))([^\s"',;}\\\]]{4,}))/gi;
+// Fail-closed leftover: a label whose value is short, quoted-but-unterminated
+// (to end of line) or otherwise outside the specific shapes above still
+// redacts rather than exposing the remainder.
+const SECRET_OPEN =
+  /(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?!(?:Bearer|Basic)(?:\s|$))(?:\\?["'][^\n]*|[^\s"',;}\\\]]{1,})/gi;
+
+// Streaming fail-closed state: a value that reached the end of the captured
+// text without a delimiter may continue in the next chunk. The next chunk's
+// leading value run is then dropped rather than rendered naked.
+const VALUE_CHAR_RUN = /^[^\s"',;}\]]+/;
+const UNTERMINATED_VALUE =
+  /(?:\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:\\?"[^"\n]*|[^\s"',;}\]]+)$|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+$|\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]+$|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$|\bAKIA[0-9A-Z]+$/i;
 const BEARER_TOKEN = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}\b/gi;
 const SECRET_VALUE = /\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b/g;
 const JWT = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b/g;
@@ -168,7 +196,8 @@ export function redactDiagnosticText(text) {
     .replace(BEARER_TOKEN, 'Bearer [REDACTED]')
     .replace(SECRET_VALUE, '[REDACTED]')
     .replace(JWT, '[REDACTED]')
-    .replace(AWS_KEY, '[REDACTED]');
+    .replace(AWS_KEY, '[REDACTED]')
+    .replace(SECRET_OPEN, '$1[REDACTED]');
 }
 
 function errorText(error) {

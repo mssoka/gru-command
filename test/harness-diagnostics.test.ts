@@ -439,6 +439,46 @@ describe('harness diagnostics', () => {
     // JSON-escaped credentials in log records.
     const jsonEscaped = String.raw`{\"token\":\"JSON-secret-123456\"}`;
     expect(redactDiagnosticText(jsonEscaped)).not.toContain('JSON-secret-123456');
+
+    // Multi-chunk continuation (Perkins r3): a value split across three
+    // chunks keeps the fail-closed state until a terminator arrives.
+    trackChildProcess(
+      fakeChild({ pid: 766_006, exitCode: 0, stderr: fakeStream('token=BBBB', 'CCCCDDDD', ` ${'w'.repeat(300)}`) }),
+      { label: 'continuation child', scope },
+    );
+    const continuationRendered = renderFailureDiagnostics(scope, new Error('continuation check'));
+    expect(continuationRendered).not.toContain('BBBB');
+    expect(continuationRendered).not.toContain('CCCCDDDD');
+    expect(continuationRendered).not.toContain('CCCC');
+    expect(continuationRendered).not.toContain('DDDD');
+
+    // Retention-boundary counterexamples (Perkins r3): a value whose label
+    // sits exactly at the trim point (or far before it) is redacted before
+    // any trim, so no suffix can survive.
+    const boundaryCases = [
+      `token=${'E'.repeat(32)}${' '.repeat(20_000)}`,
+      `${'x'.repeat(16_384 - 6)}token=${'F'.repeat(32)} ${' '.repeat(200)}`,
+      `${'x'.repeat(4_000)}token=${'G'.repeat(32)} ${' '.repeat(200)}`,
+    ];
+    for (const [index, boundaryText] of boundaryCases.entries()) {
+      trackChildProcess(
+        fakeChild({ pid: 766_100 + index, exitCode: 0, stderr: fakeStream(boundaryText) }),
+        { label: `retention child ${index}`, scope },
+      );
+    }
+    const retentionRendered = renderFailureDiagnostics(scope, new Error('retention check'));
+    expect(retentionRendered).not.toContain('E'.repeat(32));
+    expect(retentionRendered).not.toContain('F'.repeat(32));
+    expect(retentionRendered).not.toContain('G'.repeat(32));
+
+    // Escaped characters inside quoted values (JSON log records).
+    const escaped = String.raw`{"password":"abcd\\efgh"}`;
+    expect(redactDiagnosticText(escaped)).not.toContain('abcd');
+    expect(redactDiagnosticText(escaped)).not.toContain('efgh');
+    const escapedQuote = String.raw`{"password":"abc\\\"def"}`;
+    expect(redactDiagnosticText(escapedQuote)).not.toContain('def');
+    // An unterminated quoted value fails closed rather than exposing the rest.
+    expect(redactDiagnosticText('token="unterminated-secret')).not.toContain('unterminated-secret');
   });
 
   it('bounds an owned command past its deadline and reaps it (Perkins r1)', async () => {

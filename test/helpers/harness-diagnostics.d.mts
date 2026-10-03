@@ -20,6 +20,7 @@ export interface TrackedProcess {
   spawnError: string | null;
   output: { stdout: string; stderr: string };
   outputTruncated: { stdout: boolean; stderr: boolean };
+  openCredential: { stdout: boolean; stderr: boolean };
 }
 
 export interface DiagnosticsScope {
