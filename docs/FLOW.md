@@ -74,7 +74,20 @@ admission carries two `arm`-phase `branch-idle.forced` records where the
 native route carries `arm` + `freeze`. A running fallback gate also
 re-proves its lane, marker and replay-authorization facts at each round
 intake and after the default reviewer's worker admission, stopping
-fail-closed before a stale diff or reviewer. The arm passes
+fail-closed before a stale diff or reviewer. Those boundary re-proofs
+emit no branch-idle audit rows: at admission a replay whose job is
+blocked/parked is HELD (`job.review-handoff-held` plus escalation,
+requiring a new validated request), while after admission the gate stops
+as `job.fallback-review` phase `aborted` with a free-text reason and no
+held identity. Terminal (`merged`/`done`) jobs take the canonical
+terminal refusal before any busy check — a stale marker never answers
+`branch_busy` and never resurrects the job. The reviewed job's OWN
+unresolved request fences the review regardless of an explicit
+`target_ref` naming another lane; unrelated foreign lanes keep their own
+branch-matched busy semantics. A `blocked` gate terminal reports the
+failing round in `iterations`; an `aborted` terminal reports only
+completed rounds (the aborted event's `iteration` names the round not
+taken). The arm passes
 only when the target work is genuinely
 settled AND no re-brief request is unresolved — a delivery alone does not
 release a fenced lane. A lane with an unresolved re-brief request counts

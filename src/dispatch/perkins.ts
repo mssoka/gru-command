@@ -7,10 +7,13 @@ import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
+import { isJobTerminal } from '../ledger/states.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import {
   BranchBusyError,
   findBusyLanes,
+  laneBranch,
+  normalizeBranch,
   resolveReviewTargetBranch,
   type BranchIdleBlocker,
   type BranchIdlePhase,
@@ -1507,6 +1510,14 @@ export class WaveRunner {
       ? await preflight({ repoPath })
       : { ok: true, failures: [] };
     if (!result.ok) {
+      // The canonical terminal refusal owns terminal lanes FIRST: terminal
+      // jobs are never busy, so a stale pending marker must not mask the
+      // refusal as branch_busy, and no branch-idle audit row is written
+      // for a job that can never be reviewed again.
+      const jobNow = this.opts.ledger.getJob(input.jobId);
+      if (jobNow !== null && isJobTerminal(jobNow.status)) {
+        throw new Error(`job "${input.jobId}" is ${jobNow.status} — terminal lanes do not go back under review`);
+      }
       // The fallback gate has no freeze leg of its own: the awaited
       // pre-flight is an asynchronous admission window, and a re-brief (or
       // lane re-open) admitted while it ran must fence fallback admission
@@ -1744,12 +1755,33 @@ export class WaveRunner {
       lanePath: input.jobLane?.path ?? null,
       laneBranch: input.jobLane?.branch ?? null,
     });
-    const blockers = findBusyLanes({
+    const laneMatched = findBusyLanes({
       ledger: this.opts.ledger,
       lanes: this.opts.worktrees.listWorktrees(),
       targetBranch,
       ...(input.reviewedStatus !== undefined ? { reviewedStatus: input.reviewedStatus } : {}),
     });
+    // A reviewed job's OWN unresolved re-brief fences the review regardless
+    // of which branch the request targets: an explicit `target_ref` naming
+    // another lane must not bypass the job's own newer request. Foreign
+    // lanes keep the existing branch-match semantics, and terminal jobs are
+    // never busy (the canonical terminal refusal owns them).
+    const blockers: BranchIdleBlocker[] = [...laneMatched];
+    const jobNow = this.opts.ledger.getJob(input.job.id);
+    if (
+      jobNow !== null &&
+      !isJobTerminal(jobNow.status) &&
+      !blockers.some((blocker) => blocker.jobId === input.job.id) &&
+      this.opts.ledger.listPendingRebriefs({ jobId: input.job.id }).length > 0
+    ) {
+      blockers.push({
+        jobId: input.job.id,
+        status: jobNow.status,
+        branch: input.jobLane?.branch != null && input.jobLane.branch.trim() !== ''
+          ? normalizeBranch(input.jobLane.branch)
+          : laneBranch(input.job.id),
+      });
+    }
     if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers };
     this.opts.ledger.appendCustomEvent({
       kind: input.force === true ? 'branch-idle.forced' : 'branch-idle.refused',
@@ -1792,24 +1824,28 @@ export class WaveRunner {
       throw new Error(`job "${input.jobId}" has no active job lane in the registry — the fallback review cannot start`);
     }
     if (input.force !== true) {
-      const markers = this.opts.ledger.listPendingRebriefs({ jobId: input.jobId });
-      if (markers.length > 0) {
-        const targetBranch = resolveReviewTargetBranch({
-          jobId: input.jobId,
-          ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
-          lanePath: lane.path,
-          laneBranch: lane.branch,
-        });
-        const job = this.opts.ledger.getJob(input.jobId);
-        const blockers: readonly BranchIdleBlocker[] = [
-          { jobId: input.jobId, status: job?.status ?? 'working', branch: targetBranch },
-        ];
-        this.opts.ledger.appendCustomEvent({
-          kind: 'branch-idle.refused',
-          jobId: input.jobId,
-          payload: { phase: 'arm', forced: false, targetBranch, blockers },
-        });
-        throw new BranchBusyError(targetBranch, blockers, 'arm');
+      const job = this.opts.ledger.getJob(input.jobId);
+      // Terminal jobs are never busy (mirrors laneIsBusy): the canonical
+      // terminal guard wins over a stale marker, handled before this call.
+      if (job === null || !isJobTerminal(job.status)) {
+        const markers = this.opts.ledger.listPendingRebriefs({ jobId: input.jobId });
+        if (markers.length > 0) {
+          const targetBranch = resolveReviewTargetBranch({
+            jobId: input.jobId,
+            ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+            lanePath: lane.path,
+            laneBranch: lane.branch,
+          });
+          const blockers: readonly BranchIdleBlocker[] = [
+            { jobId: input.jobId, status: job?.status ?? 'working', branch: targetBranch },
+          ];
+          this.opts.ledger.appendCustomEvent({
+            kind: 'branch-idle.refused',
+            jobId: input.jobId,
+            payload: { phase: 'arm', forced: false, targetBranch, blockers },
+          });
+          throw new BranchBusyError(targetBranch, blockers, 'arm');
+        }
       }
     }
     if (input.fromHandoff === true) {
@@ -1830,6 +1866,12 @@ export class WaveRunner {
     force?: boolean | undefined;
     fromHandoff?: boolean | undefined;
   }): void {
+    const jobNow = this.opts.ledger.getJob(input.jobId);
+    if (jobNow !== null && isJobTerminal(jobNow.status)) {
+      throw new FallbackSafetyRefusal(
+        `job "${input.jobId}" is ${jobNow.status} — terminal lanes do not continue under fallback review`,
+      );
+    }
     const lane = this.opts.worktrees
       .listWorktrees({ jobId: input.jobId })
       .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept') ?? null;

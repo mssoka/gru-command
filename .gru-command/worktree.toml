@@ -79,7 +79,9 @@ native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f0
 # (phase pr144-baseline-proof-readiness-20261002; blob pin corrected
 # 2026-10-03, phase pr144-followup14-feedback): the WHOLE 35-test
 # test/silas-driver.test.ts extracted from the pinned shipped revision
-# (headrev ec2a490 — the file is unchanged by the final-feedback repair; the
+# (headrev ec2a490; blob f722a377f8dd5b1c3c2a665493e09a13b2cb34df, byte-equal
+# to the current head's file; static check: every import resolves at the base,
+# so an expected RED is an assertion RED, not a setup/type failure; the
 # historical 28779fe pin pointed at a PRE-integration blob whose file differs
 # from the shipped one by +2/-1: the two providerRecoveryPending literals
 # added by the current-main integration, so it was not the identical final

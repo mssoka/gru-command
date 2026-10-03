@@ -287,6 +287,17 @@ function deferred(): { readonly promise: Promise<void>; release: () => void } {
   return { promise, release };
 }
 
+/** One release-safety blocker finding for the custom fallback double. */
+function fallbackBlocker(title = 'Release-safety blocker'): FallbackFinding {
+  return {
+    title,
+    category: 'correctness',
+    location: 'src/a.ts',
+    evidence: 'return 1;',
+    detail: 'The change breaks the contract.',
+  };
+}
+
 /** A full pending-re-brief marker fixture (the guard reads only jobId). */
 function pendingMarker(
   jobId: string,
@@ -1157,6 +1168,211 @@ describe('branch-idle guard', () => {
       expect(h.ledger.listJobEvents('fallback-nolane').some((event) => event.kind === 'job.fallback-review')).toBe(false);
     } finally {
       gate.release();
+      await h.close();
+    }
+  });
+
+  it('a terminal job with a stale marker gets the canonical terminal refusal, never branch_busy', async () => {
+    const repo = makeFixtureRepo('branch-idle-terminal-marker');
+    cleanupRepos.push(repo);
+    const h = await boot({ preflightFails: true });
+    try {
+      // merged reaches terminal via in-review; done is reachable directly.
+      await createLaneJob(h, repo, { jobId: 'terminal-merged', status: 'delivered' });
+      h.ledger.setJobStatus('terminal-merged', 'in-review');
+      h.ledger.setJobStatus('terminal-merged', 'merged');
+      await createLaneJob(h, repo, { jobId: 'terminal-done', status: 'delivered' });
+      h.ledger.setJobStatus('terminal-done', 'done');
+      for (const [jobId, status] of [['terminal-merged', 'merged'], ['terminal-done', 'done']] as const) {
+        h.ledger.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+        const refused = await postReview(h, { job_id: jobId });
+        expect(refused.status).toBe(400);
+        expect((refused.json as { detail?: string }).detail).toContain(
+          `is ${status} — terminal lanes do not go back under review`,
+        );
+        // No misleading busy audit rows, no gate/reviewer, no resurrection.
+        const kinds = h.ledger.listJobEvents(jobId).map((event) => event.kind);
+        expect(kinds).not.toContain('branch-idle.refused');
+        expect(kinds).not.toContain('branch-idle.forced');
+        expect(kinds).not.toContain('job.fallback-review');
+        expect(h.ledger.listRounds(jobId)).toHaveLength(0);
+        expect(h.ledger.getJob(jobId)?.status).toBe(status);
+      }
+      expect(h.fallbackRuns).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('an explicit foreign target_ref cannot bypass the reviewed job’s own pending request', async () => {
+    const repo = makeFixtureRepo('branch-idle-own-marker-target');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    try {
+      await createLaneJob(h, repo, { jobId: 'own-marker', status: 'delivered' });
+      await createLaneJob(h, repo, { jobId: 'foreign-target', status: 'delivered' });
+      h.ledger.beginPendingRebrief({ jobId: 'own-marker', note: 'n', briefing: 'b' });
+      const refused = await postReview(h, { job_id: 'own-marker', target_ref: 'gru/foreign-target' });
+      expect(refused.status).toBe(409);
+      expect(refused.json).toMatchObject({
+        error: 'branch_busy',
+        blockers: [{ job_id: 'own-marker', status: 'delivered', branch: 'gru/own-marker' }],
+      });
+      const refusal = h.ledger
+        .listJobEvents('own-marker')
+        .find((event) => event.kind === 'branch-idle.refused');
+      expect(refusal?.payload).toMatchObject({ phase: 'arm', forced: false });
+      // With the request settled, the explicit foreign-target review arms.
+      h.ledger.clearPendingRebriefs(
+        h.ledger.listPendingRebriefs({ jobId: 'own-marker' }).map((marker) => marker.id),
+      );
+      expect((await postReview(h, { job_id: 'own-marker', target_ref: 'gru/foreign-target' })).status).toBe(202);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a fallback admission with an explicit foreign target_ref still fences the reviewed job’s own request', async () => {
+    const repo = makeFixtureRepo('branch-idle-own-marker-fallback');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const gate = deferred();
+    const h = await boot({
+      preflightFails: true,
+      onPreflight: async () => {
+        entered.release();
+        await gate.promise;
+      },
+    });
+    try {
+      await createLaneJob(h, repo, { jobId: 'own-marker-fallback', status: 'delivered' });
+      await createLaneJob(h, repo, { jobId: 'fallback-foreign', status: 'delivered' });
+      const pending = postReview(h, { job_id: 'own-marker-fallback', target_ref: 'gru/fallback-foreign' });
+      await entered.promise;
+      h.ledger.beginPendingRebrief({ jobId: 'own-marker-fallback', note: 'n', briefing: 'b' });
+      gate.release();
+      const refused = await pending;
+      expect(refused.status).toBe(409);
+      expect(refused.json).toMatchObject({
+        error: 'branch_busy',
+        blockers: [{ job_id: 'own-marker-fallback', status: 'delivered', branch: 'gru/own-marker-fallback' }],
+      });
+      expect(h.fallbackRuns).toHaveLength(0);
+      expect(h.ledger.listRounds('own-marker-fallback')).toHaveLength(0);
+    } finally {
+      gate.release();
+      await h.close();
+    }
+  });
+
+  it('a fallback gate that loses its lane after the first fix aborts with completed-round bookkeeping', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-lanelost');
+    cleanupRepos.push(repo);
+    let released = false;
+    const h = await boot({
+      preflightFails: true,
+      onFallbackReview: (iteration) => (iteration === 1 ? [fallbackBlocker()] : []),
+      onFixDirective: () => {
+        if (!released) {
+          released = true;
+          void h.worktrees.release({ worktreeId: 'fallback-lanelost' });
+        }
+      },
+    });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-lanelost', status: 'delivered' });
+      const outcome = await h.wave.runRound({ jobId: 'fallback-lanelost' });
+      if (!('route' in outcome)) throw new Error('expected the bmad-review fallback route');
+      // A3 oracle: one round completed; the event names the round never taken.
+      expect(outcome.iterations).toBe(1);
+      expect(outcome.note).toContain('aborted');
+      expect(h.fallbackRuns).toHaveLength(1);
+      const aborted = h.ledger
+        .listJobEvents('fallback-lanelost')
+        .find(
+          (event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'aborted',
+        );
+      expect(aborted).toBeDefined();
+      expect(aborted?.payload).toMatchObject({ iteration: 2, clearToMerge: false });
+      expect(String((aborted?.payload as { reason?: string }).reason)).toContain('lost its active job lane');
+      expect(h.escalations.some((line) => line.includes('ABORTED'))).toBe(true);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a replay-started fallback gate stops when the job is revoked before the next round', async () => {
+    const repo = makeFixtureRepo('branch-idle-replay-revoked-round');
+    cleanupRepos.push(repo);
+    let revoked = false;
+    const h = await boot({
+      preflightFails: true,
+      onFallbackReview: (iteration) => (iteration === 1 ? [fallbackBlocker()] : []),
+      onFixDirective: () => {
+        if (!revoked) {
+          revoked = true;
+          h.ledger.setJobStatus('replay-revoked-round', 'blocked');
+        }
+      },
+    });
+    try {
+      await createLaneJob(h, repo, { jobId: 'replay-revoked-round', status: 'working' });
+      const queued = await postReview(h, { job_id: 'replay-revoked-round', by: 'minion' });
+      expect(queued.status).toBe(202);
+      expect(queued.json).toMatchObject({ route: 'queued' });
+      h.ledger.setJobStatus('replay-revoked-round', 'delivered');
+      const abortedPromise = joinJobEvent(
+        h,
+        'replay-revoked-round',
+        'job.fallback-review',
+        (event) => (event.payload as { phase?: string }).phase === 'aborted',
+      );
+      h.wave.reconcilePendingHandoffs();
+      const aborted = await abortedPromise;
+      expect(aborted.payload).toMatchObject({ phase: 'aborted', iteration: 2, clearToMerge: false });
+      expect(String((aborted.payload as { reason?: string }).reason)).toContain('no longer authorized');
+      expect(h.fallbackRuns).toHaveLength(1);
+      expect(h.escalations.some((line) => line.includes('ABORTED'))).toBe(true);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a replay-started default reviewer stops when the job is revoked in the worker-gate wait', async () => {
+    const repo = makeFixtureRepo('branch-idle-replay-revoked-lease');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const leaseGate = deferred();
+    const workerGate = {
+      acquireWorkerTurn: async () => {
+        entered.release();
+        await leaseGate.promise;
+        return { release: () => {}, waitedMs: 0 };
+      },
+    } as unknown as PacingGate;
+    const h = await boot({ preflightFails: true, fallbackDefault: true, workerGate });
+    try {
+      await createLaneJob(h, repo, { jobId: 'replay-revoked-lease', status: 'working' });
+      const queued = await postReview(h, { job_id: 'replay-revoked-lease', by: 'minion' });
+      expect(queued.status).toBe(202);
+      h.ledger.setJobStatus('replay-revoked-lease', 'delivered');
+      const abortedPromise = joinJobEvent(
+        h,
+        'replay-revoked-lease',
+        'job.fallback-review',
+        (event) => (event.payload as { phase?: string }).phase === 'aborted',
+      );
+      h.wave.reconcilePendingHandoffs();
+      await entered.promise;
+      h.ledger.setJobStatus('replay-revoked-lease', 'blocked');
+      leaseGate.release();
+      const aborted = await abortedPromise;
+      expect(aborted.payload).toMatchObject({ phase: 'aborted', iteration: 1, clearToMerge: false });
+      expect(String((aborted.payload as { reason?: string }).reason)).toContain('no longer authorized');
+      expect(h.spawnCalls.filter((call) => call.role === 'minion')).toHaveLength(0);
+      expect(h.escalations.some((line) => line.includes('ABORTED'))).toBe(true);
+    } finally {
+      leaseGate.release();
       await h.close();
     }
   });
