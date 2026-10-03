@@ -2,7 +2,7 @@
 title: 'gh-167 Stage 1 — activity-bounded Perkins execution across the transport waits'
 type: 'feature'
 created: '2026-10-03'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 baseline_commit: '9bb51b05af5d8f0a0cd389788d1d3f19607d5361'
 review_loop_iteration: 0
@@ -51,12 +51,12 @@ context: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `src/dispatch/perkins-review/whole.ts` — remove the child turn lifetime; optional budgets; tool description.
-- [ ] `src/runtime/review-mcp-server.mjs` — still-running wait slice + env seam.
-- [ ] `src/runtime/review-mcp-bridge.ts` — execution join/retention with no execution abort; refresh the server pin.
-- [ ] `tools/verify-perkins-resource.mjs` — refresh the server pin.
-- [ ] `src/dispatch/perkins.ts` — fallback slice loop + still-running report.
-- [ ] tests — deterministic coverage plus pin/regression updates.
+- [x] `src/dispatch/perkins-review/whole.ts` — remove the child turn lifetime; optional budgets; tool description.
+- [x] `src/runtime/review-mcp-server.mjs` — still-running wait slice + env seam.
+- [x] `src/runtime/review-mcp-bridge.ts` — execution join/retention with no execution abort; refresh the server pin.
+- [x] `tools/verify-perkins-resource.mjs` — refresh the server pin.
+- [x] `src/dispatch/perkins.ts` — fallback slice loop + still-running report.
+- [x] tests — deterministic coverage plus pin/regression updates.
 
 **Acceptance Criteria:**
 - Given a specialist whose turn settles valid after more than 600000 ms of deterministic time, then the run is recorded exactly once as valid, with no timeout classification.
@@ -69,10 +69,16 @@ context: []
 ## Implementation Notes
 
 - Checkpoint 1: no Open Questions were open. Spec approved and status moved to `ready-for-dev` under the dispatch briefing's j-1065 authorization (ordinary BMAD planning/refinement needs no further owner round); token estimate ~1840, kept whole because the four transport surfaces are one stage goal and splitting them would break the briefing's stage separation.
+- Design decisions (final): (1) the bridge, not the server, owns execution identity — canonical `(tool, input)` join, settled successes retained (soft 16 MiB bound, oldest settled evicted first), failures never retained so a retry really executes; (2) the server's 15-minute wait is the only transport boundary and on expiry answers a still-running tool result (never an error, never a socket kill), so the bridge carries no execution timer at all; (3) `whole.ts` specialist turns have no lifetime timer and no elapsed retry budget — retries stay count-bounded by the existing rate-limit policy and host supervision owns stall diagnosis via its silence + live-tool/compaction evidence; `LEAD_TOTAL_TIMEOUT_MS` (round bound) is untouched; (4) the fallback review's slice loop reports `still-running` durably per expired wait and re-attaches to the SAME live session; an open turn plus a terminal (`disposed`/`error`) session state fails loud instead of waiting forever; timers/listeners are cleaned per slice; (5) `GRU_REVIEW_RESPONSE_WAIT_MS` is a test-only seam — the bridge passes only `GRU_REVIEW_BRIDGE_SOCKET` into the server env, the default is the unchanged 15 minutes, and a malformed value exits 2.
+- Fail-before evidence (prepared in a throwaway copy carrying the pre-change sources and the new tests, `/tmp/gru-fail-before-167`; no git metadata touched): crossing the retired 600000 ms deadline produced TWO failed envelopes instead of one valid; the retry test observed 2 model invocations instead of the count-bounded 4; the fallback test recorded `started, blocked` instead of `still-running` + live session; the transport join test executed the tool twice, the server answered a wait-expired call with an error, and the wait seam did not exist. The durable reproduction is the declared `perkins-reliability-stage1-baseline` scheduled scope (pinned base 9bb51b0 + identical final tests, expected RED, exits never masked).
+- Pass-after development runs (local iteration; the scheduled scopes are the gate): `test/review-mcp-transport.test.ts` 7/7; `test/perkins-builtin-wave.test.ts` 93/93; `test/claude-adapter.test.ts` 89/89; `test/native-tools-parity.test.ts`, `test/verify-perkins-resource.test.ts`, `test/tool-heartbeat.test.ts`, `test/review-path.test.ts` 31/31; `test/perkins-whole-review.test.ts` 76/78 with two 30-second-ceiling timeouts under co-tenant load that pass in isolation (25 s/12 s — the environment class documented in `vitest.config.ts`), so the scheduled FULL is the authoritative gate. Lint, typecheck and the build (with the refreshed pinned-resource verifier) are green at the freeze head.
+- Scheduled gates are frozen-head runs through the authenticated `/api/verify` scheduler with exclusive pre-opened raw/decoded captures, head/dirty binding and both sink hashes (client + receipts under `_bmad-output/gate-prep/perkins-reliability-stage1/`): `perkins-reliability-stage1-static`, `perkins-reliability-stage1-focused`, `perkins-reliability-stage1-baseline`, and `full`. Exact-head CI, the independent whole-change review and installed native Perkins READY are the operations-owned gates; this lane cannot launch review children.
 
 ## Spec Change Log
 
 ## Review Triage Log
+
+- Self-triage (no review children available in this lane; the independent whole-change review remains the downstream gate). Reviewed the full diff against the retired-lifetime/transport contract: (1) bridge key canonicalization handles reordered keys and cannot collide (NUL separator; JSON escapes NUL inside strings) — covered by the join test; (2) failure outcomes are never retained, so identical retries execute for real — covered; (3) teardown still aborts pending executions and awaits handlers/executions with the existing bounded close — covered by the abort test and preserved bridge suites; (4) the fallback open-turn guard is evidence-based (terminal session state), not a wall clock — no healthy-work kill found; (5) `retryPrompt` keeps its rate-limit count bound; the `timeout` failure kind remains only for compatibility and the lead budget; (6) no `pass`/merge semantics touched, no validation weakened, pins refreshed and pinned by a new consistency test. No `high`/`medium` defect identified in the changed lines.
 
 ## Design Notes
 
@@ -82,6 +88,8 @@ context: []
 
 ## Verification
 
-**Commands:**
-- `npx vitest run test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/claude-adapter.test.ts` — expected: all pass.
-- `npm run lint && npm run typecheck && npm run build` — expected: clean build including the pinned-resource verifier.
+**Commands (scheduled, authenticated, frozen head):**
+- `perkins-reliability-stage1-static` — expected: lint + typecheck + build (pinned verifier) exit 0.
+- `perkins-reliability-stage1-focused` — expected: the transport/engine/fallback/parity suites exit 0.
+- `perkins-reliability-stage1-baseline` — expected: RED on the pinned pre-change head (fail-before), never masked.
+- `full` — expected: `npm test` exit 0.
