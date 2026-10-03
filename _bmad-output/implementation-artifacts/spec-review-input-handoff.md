@@ -229,6 +229,39 @@ bmad-build interactive checkpoint is not available in this confined worker.
   the gate for the final head; its result is recorded in the completion report
   and ledger (not rewritten into the head it proves).
 
+### 2026-10-03 fresh-worker resumption (after disposal at 16:31:39Z)
+
+- Reconciled the prior full-run line before any new submission: r12 green
+  `55d7dea4` at `cea7bbf` (FULL ok, 1819 passed/12 skipped); merged `3c8e699`
+  typecheck red; `13b8734` fix+typecheck+focused green; FULL `15bfc4a9` at
+  `13b8734` RED with exactly two 30000 ms default-ceiling timeouts and zero
+  assertion failures: `install-one-line.test.ts > restarts only an owned
+  service…` (31324 ms) and `perkins-builtin-wave.test.ts > …(T4)` (37326 ms);
+  1889 passed / 12 skipped / 2 failed (1903). Raw capture 153 frames
+  (`queued`→`started`→`output`×150→`completed`), transport EOF clean, ledger
+  start/completion seqs 43056/43110; decoded copy sha256
+  `932864d2…b510a21` equals the producer's declared whole-output hash.
+- No orphan producer existed: no `m7` capture file, no `m7` run in the ledger,
+  no `review-input-handoff` slot or queued request in `scheduler.json`, and no
+  argv/cwd/open-FD producer matching this lane. The prior author's intended
+  quiet-window m7 loop is superseded by this resumption.
+- Diagnosis (before any rerun): both failing test files AND `install.sh` are
+  byte-identical between the green `cea7bbf` head and the red `13b8734` head
+  (`git diff --quiet` per file); in the same window every untouched suite ran
+  ~60% slower than at r12 (e.g. worktree-manager 332s→546s, wizard-interactive
+  44s→70s) while the run queued 699 s behind other lanes; the lane's added
+  per-round work is a bounded set of indexed ledger reads. Classification was
+  therefore scheduled at the clean head, not a blind FULL replay: the existing
+  `t4-oracle` scope plus a new additive `installer-isolation` scope (commit
+  `68ce75c`; no test, timeout, assertion, budget or gate changed).
+- Producer defect found and fixed while resuming: the first classification
+  producer used `fetch`, whose default 300 s body timeout truncated the queued
+  NDJSON stream (`streamError: terminated`) while the server-side request
+  stayed queued. The run id (`170e2be1`) remains outstanding in the service
+  and must be reconciled from the ledger before the next submission; the
+  producer was rewritten onto `node:http` with no body timeout, and every sink
+  is still pre-opened exclusively before the single POST.
+
 ## Verification
 
 **Commands:**
