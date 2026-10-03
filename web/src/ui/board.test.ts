@@ -111,6 +111,7 @@ function snapshot(
     unackedNeedsOwner?: number;
     wakes?: { readonly count: number; readonly lastAt: string | null };
     ownerPrs?: NonNullable<BoardSnapshot['ownerPrs']>;
+    pipeline?: NonNullable<BoardSnapshot['pipeline']>;
   } = {},
 ): BoardSnapshot {
   return {
@@ -138,6 +139,7 @@ function snapshot(
     unackedNeedsOwner: options.unackedNeedsOwner ?? 0,
     wakes: options.wakes ?? { count: 0, lastAt: null },
     ownerPrs: options.ownerPrs,
+    pipeline: options.pipeline,
   };
 }
 
@@ -148,6 +150,7 @@ function mountBoardDom(): void {
       <span id="board-unacked" hidden></span>
       <span id="board-wakes" hidden></span>
     </div>
+    <nav id="board-nav" hidden></nav>
     <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
@@ -861,7 +864,7 @@ describe('board lens chips — unused lenses are neutral, never a pass', () => {
 describe('board v6 — bands', () => {
   beforeEach(mountBoardDom);
 
-  it('renders sticky band headers with counts in NEEDS GRU → IN FLIGHT → SETTLED → COLD order', () => {
+  it('renders the six sections in the approved owner-first order with counts', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -871,31 +874,63 @@ describe('board v6 — bands', () => {
           baseJob({ id: 'flight-1', status: 'in-review' }),
           baseJob({ id: 'needs-1', status: 'blocked' }),
         ],
+        pipeline: {
+          entries: [
+            { id: 'pipe-1', repo: 'demo', title: 'Queued one', priority: 3, enqueueSeq: 1, state: 'waiting', reason: 'waiting for dep — not enqueued', queuedAt: '2026-01-01T00:00:00.000Z' },
+          ],
+          pending: 1,
+        },
       }),
     );
+    // The jobs mount carries the five ordered sections; FOR YOU lives in
+    // its own mount above (and stays first in document order).
     const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
     expect(bands.map((band) => band.querySelector('.board-band__label')?.textContent)).toEqual([
-      'NEEDS GRU',
       'IN FLIGHT',
+      'PIPELINE',
+      'FOR GRU',
       'SETTLED',
       'COLD',
     ]);
-    // Sticky separators: a header per band, carrying the count.
+    const owner = document.querySelector<HTMLElement>('#board-owner');
+    expect(owner?.querySelector('.board-band__label')?.textContent).toBe('FOR YOU');
+    expect(owner?.nextElementSibling?.id).toBe('board-jobs');
     for (const band of bands) {
       expect(band.querySelector('.board-band__head')).not.toBeNull();
-      expect(band.querySelector('.board-band__count')?.textContent).toBe('1 heist');
     }
-    expect(bands[0]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('needs-1');
-    expect(bands[1]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('flight-1');
-    expect(bands[2]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('settled-1');
-    expect(bands[3]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('cold-1');
-    expect(bands[0]?.querySelector('.board-job')?.getAttribute('data-band')).toBe('needs-you');
+    expect(document.querySelector('.board-band--in-flight .board-job')?.getAttribute('data-job-id')).toBe('flight-1');
+    expect(document.querySelector('.board-band--pipeline .board-pipeline__title')?.textContent).toBe('Queued one');
+    expect(document.querySelector('.board-band--needs-you .board-job')?.getAttribute('data-job-id')).toBe('needs-1');
+    expect(document.querySelector('.board-band--settled .board-job')?.getAttribute('data-job-id')).toBe('settled-1');
+    expect(document.querySelector('.board-band--cold .board-job')).toBeNull(); // count-only by default
+    expect(document.querySelector('.board-band--settled .board-band__count')?.textContent).toBe('1 heist');
+
+    // The sticky shortcut strip lists every section with its full count.
+    const nav = [...document.querySelectorAll<HTMLAnchorElement>('#board-nav .board-nav__link')];
+    expect(nav.map((link) => link.dataset.nav)).toEqual(['for-you', 'in-flight', 'pipeline', 'for-gru', 'settled', 'cold']);
+    expect(nav.map((link) => link.querySelector('.board-nav__label')?.textContent)).toEqual([
+      'For you',
+      'In flight',
+      'Pipeline',
+      'For Gru',
+      'Settled',
+      'Cold',
+    ]);
+    expect(nav.map((link) => link.querySelector('.board-nav__count')?.textContent)).toEqual(['0', '1', '1', '1', '1', '1']);
+    expect(nav.map((link) => link.getAttribute('href'))).toEqual([
+      '#board-owner',
+      '#board-section-in-flight',
+      '#board-section-pipeline',
+      '#board-section-for-gru',
+      '#board-section-settled',
+      '#board-section-cold',
+    ]);
+    expect(document.getElementById('board-nav')?.hidden).toBe(false);
     // Dense rows, not a card grid.
     expect(document.querySelector('.board-band__grid')).toBeNull();
-    expect(document.querySelector('.board-band__rows')).not.toBeNull();
   });
 
-  it('promotes a conflicting PR to NEEDS GRU and demotes a stalled working lane to COLD with a stale flag', () => {
+  it('promotes a conflicting PR to FOR GRU and demotes a stalled working lane to COLD with a stale flag', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -915,16 +950,19 @@ describe('board v6 — bands', () => {
         ],
       }),
     );
-    const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
-    expect(bands.map((band) => band.querySelector('.board-band__label')?.textContent)).toEqual(['NEEDS GRU', 'IN FLIGHT', 'COLD']);
-    expect(bands[0]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('conflicting-job');
-    expect(bands[1]?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('fresh-job');
-    const stalled = bands[2]?.querySelector<HTMLElement>('.board-job');
-    expect(stalled?.getAttribute('data-job-id')).toBe('stalled-job');
-    expect(stalled?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+    expect(document.querySelector('.board-band--needs-you .board-job')?.getAttribute('data-job-id')).toBe('conflicting-job');
+    expect(document.querySelector('.board-band--in-flight .board-job')?.getAttribute('data-job-id')).toBe('fresh-job');
+    const stalled = document.querySelector<HTMLElement>('.board-band--cold .board-job');
+    expect(stalled).toBeNull(); // cold stays count-only until expanded
+    const coldToggle = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more');
+    expect(coldToggle?.getAttribute('aria-expanded')).toBe('false');
+    coldToggle?.click();
+    const stalledRow = document.querySelector<HTMLElement>('.board-band--cold .board-job');
+    expect(stalledRow?.getAttribute('data-job-id')).toBe('stalled-job');
+    expect(stalledRow?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
     // v6.1 vocabulary rides the flag's tooltip too: the worker word is
     // minion, never agent (owner ruling 3).
-    expect(stalled?.querySelector<HTMLElement>('.board-job__stale')?.title).toBe(
+    expect(stalledRow?.querySelector<HTMLElement>('.board-job__stale')?.title).toBe(
       'working with no minion frames past the stall window',
     );
   });
@@ -939,8 +977,8 @@ describe('board v6 — bands', () => {
         unackedActionRequired: 1,
       }),
     );
-    const band = document.querySelector<HTMLElement>('#board-jobs .board-band');
-    expect(band?.querySelector('.board-band__label')?.textContent).toBe('NEEDS GRU');
+    const band = document.querySelector<HTMLElement>('.board-band--needs-you');
+    expect(band?.querySelector('.board-band__label')?.textContent).toBe('FOR GRU');
     expect(band?.querySelector('.board-job')?.getAttribute('data-job-id')).toBe('quiet-job');
   });
 
@@ -960,17 +998,16 @@ describe('board v6 — bands', () => {
         ],
       }),
     );
-    const bands = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band')];
-    const needsYou = bands[0];
-    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS GRU');
+    const needsYou = document.querySelector<HTMLElement>('.board-band--needs-you');
+    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('FOR GRU');
     const needsRepos = [...(needsYou?.querySelectorAll('.board-job__repo') ?? [])].map((node) => node.textContent);
     expect(needsRepos).toContain('📦 alpha');
     expect(needsRepos).toContain('📦 beta');
-    const flight = bands[1];
+    const flight = document.querySelector<HTMLElement>('.board-band--in-flight');
     expect(flight?.querySelector('.board-job__repo')?.textContent).toBe('📦 alpha');
   });
 
-  it('renders the latest 10 settled jobs with a +K footer that expands the tail for the session', () => {
+  it('previews the 3 newest settled jobs with a show-older control; expansion and collapse are reversible session state', () => {
     const jobs = Array.from({ length: 12 }, (_, index) =>
       baseJob({
         id: `settled-${String(index).padStart(2, '0')}`,
@@ -982,38 +1019,48 @@ describe('board v6 — bands', () => {
     view.render(snapshot({ jobs }));
 
     const settled = document.querySelector('.board-band--settled');
-    expect(settled?.querySelectorAll('.board-job')).toHaveLength(10);
+    expect(settled?.querySelectorAll('.board-job')).toHaveLength(3);
     expect(settled?.querySelector('.board-band__count')?.textContent).toBe('12 heists');
     const more = settled?.querySelector<HTMLButtonElement>('.board-band__more');
-    expect(more?.textContent).toBe('+2 older settled');
+    expect(more?.textContent).toBe('Show older settled (+9)');
+    expect(more?.getAttribute('aria-expanded')).toBe('false');
+    expect(more?.getAttribute('aria-controls')).toBe('board-section-settled-body');
 
     more?.click();
     const expanded = document.querySelector('.board-band--settled');
     expect(expanded?.querySelectorAll('.board-job')).toHaveLength(12);
-    expect(expanded?.querySelector('.board-band__more')).toBeNull();
+    const fewer = expanded?.querySelector<HTMLButtonElement>('.board-band__more');
+    expect(fewer?.textContent).toBe('Show fewer');
+    expect(fewer?.getAttribute('aria-expanded')).toBe('true');
 
-    // Expanded is a session state: the next snapshot push keeps it open.
+    // Expanded is a session state: the next snapshot push keeps it open...
     view.render(snapshot({ jobs }));
     expect(document.querySelectorAll('.board-band--settled .board-job')).toHaveLength(12);
+    // ...and Show fewer closes it again.
+    document.querySelector<HTMLButtonElement>('.board-band--settled .board-band__more')?.click();
+    expect(document.querySelectorAll('.board-band--settled .board-job')).toHaveLength(3);
   });
 
-  it('never hides an empty NEEDS GRU — a calm satisfied state carries the good news', () => {
+  it('keeps an empty FOR GRU section visible as a calm compact state', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ jobs: [baseJob({ id: 'flight', status: 'in-review' })] }));
     const needsYou = document.querySelector('.board-band--needs-you');
-    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('NEEDS GRU');
+    expect(needsYou?.querySelector('.board-band__label')?.textContent).toBe('FOR GRU');
     expect(needsYou?.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs Gru');
     expect(needsYou?.querySelector('.board-band__clear-mark')?.textContent).toBe('✓');
   });
 
-  it('v6.1 vocabulary pins the quiet states: empty board and empty crew (vgap r5)', () => {
+  it('renders compact empty states for every section when the board is quiet', () => {
     const view = new BoardView(() => {});
-    // No repos, no jobs: the board's empty hint speaks heists.
+    // No repos, no jobs, no pipeline: every shortcut keeps a valid target.
     view.render(snapshot({ repos: [] }));
-    expect(document.querySelector('.board-empty__title')?.textContent).toBe('The board is quiet');
-    expect(document.querySelector('.board-empty__hint')?.textContent).toBe(
-      'Heists land here once work is dispatched — the ledger is the record, this board is the window.',
+    const labels = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band__label')].map(
+      (node) => node.textContent,
     );
+    expect(labels).toEqual(['IN FLIGHT', 'PIPELINE', 'FOR GRU', 'SETTLED', 'COLD']);
+    expect(document.querySelectorAll('#board-jobs .board-band__empty')).toHaveLength(4);
+    expect(document.querySelector('.board-band--needs-you .board-band__clear-text')?.textContent).toBe('nothing needs Gru');
+    expect(document.querySelector('.board-band--pipeline .board-band__empty')?.textContent).toBe('no approved work waiting');
 
     // Jobs on the board but nobody aboard: the crew rail says crew, not agents.
     view.render(snapshot({ jobs: [baseJob({ id: 'solo', status: 'working' })], agents: [] }));
@@ -1376,10 +1423,212 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     document.body.innerHTML = `<div hidden><section id="board-owner"></section></div>
       <div id="chip-rail" hidden><span id="board-decisions"></span><span id="board-unacked" hidden></span><span id="board-wakes" hidden></span></div>
       <div id="board-jobs"></div><div id="board-agents"></div><span id="rail-agents-count">0</span>
+      <nav id="board-nav" hidden></nav>
       <button id="notification-bell"><span id="notification-badge">0</span></button>
       <div id="notification-panel"><div id="notification-list"></div></div>`;
     const view2 = new BoardView(() => {}, client2);
     view2.render(snapshot({ notifications: [stop] }));
     expect(client2.markNotificationShown).not.toHaveBeenCalled();
+  });
+});
+
+describe('board — compact owner-first presentation (j-1064)', () => {
+  beforeEach(mountBoardDom);
+
+  const pipeEntry = (
+    id: string,
+    overrides: Partial<NonNullable<BoardSnapshot['pipeline']>['entries'][number]> = {},
+  ): NonNullable<BoardSnapshot['pipeline']>['entries'][number] => ({
+    id,
+    repo: 'demo',
+    title: `Queued ${id}`,
+    priority: 5,
+    enqueueSeq: 1,
+    state: 'waiting',
+    reason: 'waiting for dep — not enqueued',
+    queuedAt: '2026-01-01T00:00:00.000Z',
+    ...overrides,
+  });
+
+  it('For Gru is collapsed by default with the complete count and zero rows; expanding and hiding are reversible', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ id: 'm1', status: 'blocked' }),
+          baseJob({ id: 'm2', status: 'blocked' }),
+          baseJob({ id: 'm3', status: 'blocked' }),
+        ],
+      }),
+    );
+    const section = document.querySelector<HTMLElement>('.board-band--needs-you')!;
+    expect(section.querySelector('.board-band__count')?.textContent).toBe('3 heists');
+    expect(section.querySelectorAll('.board-job')).toHaveLength(0);
+    const toggle = section.querySelector<HTMLButtonElement>('.board-band__more')!;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.textContent).toBe('Show machine queue');
+    expect(toggle.getAttribute('aria-controls')).toBe('board-section-for-gru-body');
+
+    toggle.click();
+    const expanded = document.querySelector<HTMLElement>('.board-band--needs-you')!;
+    expect(expanded.querySelectorAll('.board-job')).toHaveLength(3);
+    expect(expanded.querySelector<HTMLButtonElement>('.board-band__more')?.textContent).toBe('Hide machine queue');
+    expanded.querySelector<HTMLButtonElement>('.board-band__more')!.click();
+    expect(document.querySelector('.board-band--needs-you .board-job')).toBeNull();
+    expect(document.querySelector('.board-band--needs-you .board-band__count')?.textContent).toBe('3 heists');
+  });
+
+  it('Cold is COUNT ONLY by default: zero job rows until deliberately expanded, hide restores zero', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: Array.from({ length: 4 }, (_, index) => baseJob({ id: `cold-${index}`, status: 'done' })),
+      }),
+    );
+    const section = document.querySelector<HTMLElement>('.board-band--cold')!;
+    expect(section.querySelector('.board-band__count')?.textContent).toBe('4 heists');
+    expect(section.querySelectorAll('.board-job')).toHaveLength(0);
+    const toggle = section.querySelector<HTMLButtonElement>('.board-band__more')!;
+    expect(toggle.textContent).toBe('Show records');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    toggle.click();
+    const expanded = document.querySelector<HTMLElement>('.board-band--cold')!;
+    expect(expanded.querySelectorAll('.board-job')).toHaveLength(4);
+    expanded.querySelector<HTMLButtonElement>('.board-band__more')!.click();
+    expect(document.querySelectorAll('.board-band--cold .board-job')).toHaveLength(0);
+  });
+
+  it('In flight previews 5 of 6 in the authoritative order, then Show all / Show fewer', () => {
+    const jobs = Array.from({ length: 6 }, (_, index) =>
+      baseJob({
+        id: `flight-${index}`,
+        status: 'in-review',
+        updatedAt: new Date(Date.now() - index * 60_000).toISOString(),
+      }),
+    );
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs }));
+    const section = document.querySelector<HTMLElement>('.board-band--in-flight')!;
+    const ids = [...section.querySelectorAll<HTMLElement>('.board-job')].map((row) => row.dataset.jobId);
+    expect(ids).toEqual(['flight-0', 'flight-1', 'flight-2', 'flight-3', 'flight-4']);
+    const more = section.querySelector<HTMLButtonElement>('.board-band__more')!;
+    expect(more.textContent).toBe('Show all 6 (1 more)');
+    more.click();
+    expect(document.querySelectorAll('.board-band--in-flight .board-job')).toHaveLength(6);
+    const fewer = document.querySelector<HTMLButtonElement>('.board-band--in-flight .board-band__more')!;
+    expect(fewer.textContent).toBe('Show fewer');
+    fewer.click();
+    expect(document.querySelectorAll('.board-band--in-flight .board-job')).toHaveLength(5);
+  });
+
+  it('Pipeline previews 5 in server order; waiting rows carry exact reasons and ready rows are labelled', () => {
+    const entries = [
+      pipeEntry('p1', { priority: 0, enqueueSeq: 1, state: 'ready', reason: null }),
+      pipeEntry('p2', { priority: 0, enqueueSeq: 2, reason: 'owner hold: deciding' }),
+      pipeEntry('p3', { priority: 1, enqueueSeq: 3, reason: 'prerequisite p-dead cancelled' }),
+      pipeEntry('p4', { priority: 2, enqueueSeq: 4, reason: 'dependency cycle: p4 → p5 → p4' }),
+      pipeEntry('p5', { priority: 3, enqueueSeq: 5, reason: 'exclusive scope "repo:demo" held by p1' }),
+      pipeEntry('p6', { priority: 4, enqueueSeq: 6, reason: 'waiting for p-ghost — not enqueued' }),
+    ];
+    const view = new BoardView(() => {});
+    view.render(snapshot({ pipeline: { entries, pending: entries.length } }));
+    const section = document.querySelector<HTMLElement>('.board-band--pipeline')!;
+    expect(section.querySelector('.board-band__count')?.textContent).toBe('6 queued');
+    expect([...section.querySelectorAll<HTMLElement>('.board-pipeline')].map((row) => row.dataset.entryId)).toEqual([
+      'p1',
+      'p2',
+      'p3',
+      'p4',
+      'p5',
+    ]);
+    const first = section.querySelector<HTMLElement>('.board-pipeline')!;
+    expect(first.dataset.state).toBe('ready');
+    expect(first.querySelector('.board-pipeline__state')?.textContent).toBe('ready');
+    expect(first.querySelector('.board-pipeline__reason')).toBeNull();
+    const held = section.querySelectorAll<HTMLElement>('.board-pipeline')[1]!;
+    expect(held.querySelector('.board-pipeline__state')?.textContent).toBe('waiting');
+    expect(held.querySelector('.board-pipeline__reason')?.textContent).toBe('owner hold: deciding');
+    expect(held.querySelector('.board-pipeline__priority')?.textContent).toBe('P0');
+    expect(held.querySelector('.board-pipeline__seq')?.textContent).toBe('#2');
+
+    const more = section.querySelector<HTMLButtonElement>('.board-band__more')!;
+    expect(more.textContent).toBe('Show all 6 (1 more)');
+    more.click();
+    expect(document.querySelectorAll('.board-band--pipeline .board-pipeline')).toHaveLength(6);
+    expect(document.querySelector('.board-band--pipeline .board-band__more')?.textContent).toBe('Show fewer');
+  });
+
+  it('global counts stay full even when the pipeline preview and entries differ; admitted work is absent', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ pipeline: { entries: [pipeEntry('p1', { state: 'ready', reason: null })], pending: 9 } }));
+    expect(document.querySelector('.board-band--pipeline .board-band__count')?.textContent).toBe('9 queued');
+    expect(document.querySelectorAll('.board-band--pipeline .board-pipeline')).toHaveLength(1);
+    const nav = [...document.querySelectorAll<HTMLAnchorElement>('#board-nav .board-nav__link')].find(
+      (link) => link.dataset.nav === 'pipeline',
+    )!;
+    expect(nav.querySelector('.board-nav__count')?.textContent).toBe('9');
+  });
+
+  it('renders a pre-upgrade server honestly: pipeline count unknown, compact unavailable state', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot());
+    const nav = [...document.querySelectorAll<HTMLAnchorElement>('#board-nav .board-nav__link')].find(
+      (link) => link.dataset.nav === 'pipeline',
+    )!;
+    expect(nav.querySelector('.board-nav__count')?.textContent).toBe('—');
+    expect(document.querySelector('.board-band--pipeline .board-band__empty')?.textContent).toBe(
+      'pipeline queue unavailable on this server',
+    );
+  });
+
+  it('keeps focus and disclosure state across ordinary live snapshot pushes', () => {
+    const entries = Array.from({ length: 6 }, (_, index) => pipeEntry(`p${index}`));
+    const view = new BoardView(() => {});
+    view.render(snapshot({ pipeline: { entries, pending: 6 } }));
+    const more = document.querySelector<HTMLButtonElement>('.board-band--pipeline .board-band__more')!;
+    more.focus();
+    more.click();
+    expect(document.activeElement).toBe(document.querySelector('.board-band--pipeline .board-band__more'));
+    expect(document.activeElement?.getAttribute('aria-expanded')).toBe('true');
+    // A live push re-renders everything; the operator's control keeps focus
+    // and the expanded disclosure stays open.
+    view.render(snapshot({ pipeline: { entries, pending: 6 } }));
+    const restored = document.activeElement as HTMLElement | null;
+    expect(restored?.dataset.focusKey).toBe('section:pipeline');
+    expect(restored?.getAttribute('aria-expanded')).toBe('true');
+    expect(document.querySelectorAll('.board-band--pipeline .board-pipeline')).toHaveLength(6);
+  });
+
+  it('renders untrusted pipeline titles and wait reasons as text, never markup or instructions', () => {
+    const html = '<img src=x onerror=alert(1)>';
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        pipeline: {
+          entries: [pipeEntry('evil', { title: html, reason: '<b>owner hold</b>' })],
+          pending: 1,
+        },
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-pipeline')!;
+    expect(row.querySelector('.board-pipeline__title')?.textContent).toBe(html);
+    expect(row.querySelector('.board-pipeline__reason')?.textContent).toBe('<b>owner hold</b>');
+    expect(row.querySelectorAll('img, b')).toHaveLength(0);
+  });
+
+  it('every shortcut points at a real labelled target, even when all sections are empty', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ repos: [] }));
+    const links = [...document.querySelectorAll<HTMLAnchorElement>('#board-nav .board-nav__link')];
+    expect(links).toHaveLength(6);
+    for (const link of links) {
+      const href = link.getAttribute('href')!;
+      const target = document.querySelector<HTMLElement>(href);
+      expect(target, `shortcut target ${href}`).not.toBeNull();
+      expect(target?.hidden).toBe(false);
+      expect(link.querySelector('.board-nav__label')?.textContent).not.toBe('');
+      expect(link.querySelector('.board-nav__count')?.textContent).not.toBe('');
+    }
   });
 });

@@ -143,6 +143,7 @@ function mountBoardDom(): void {
       <span id="board-unacked" hidden></span>
       <span id="board-wakes" hidden></span>
     </div>
+    <nav id="board-nav" hidden></nav>
     <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>

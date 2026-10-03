@@ -29,16 +29,28 @@ import {
   type BoardSnapshot,
   type JobView,
   type NotificationView,
+  type PipelineEntryView,
   type RoundView,
 } from '../lib/board-protocol.js';
 import { loadExpandedJobs, saveExpandedJobs } from '../lib/board-collapse.js';
 import {
   BAND_LABELS,
-  BAND_ORDER,
-  bucketSnapshot,
-  settledWindow,
   type BandId,
+  type BandedJob,
 } from '../lib/board-bands.js';
+import {
+  boardSections,
+  inFlightWindow,
+  pipelineStateLabel,
+  pipelineStateTone,
+  pipelineWindow,
+  settledJobs,
+  settledPreview,
+  IN_FLIGHT_PREVIEW_SIZE,
+  PIPELINE_PREVIEW_SIZE,
+  SETTLED_PREVIEW_SIZE,
+  type SectionId,
+} from '../lib/board-sections.js';
 import { railChips, type RailChip } from '../lib/board-rail.js';
 import { BOARD_WORDS, heistCount } from '../lib/board-vocabulary.js';
 import { formatAge } from '../lib/board-time.js';
@@ -93,6 +105,7 @@ export interface TranscriptOpenRequest {
 export class BoardView {
   private readonly mount: HTMLElement;
   private readonly ownerMount: HTMLElement;
+  private readonly boardNav: HTMLElement;
   private readonly chipRail: HTMLElement;
   private readonly agentsCount: HTMLElement;
   private readonly notificationBell: HTMLButtonElement;
@@ -132,8 +145,15 @@ export class BoardView {
   private readonly sentShown = new Map<string, Set<string>>();
   /** E7: notification ids previously seen (new arrivals toast). */
   private readonly knownNotificationIds = new Set<string>();
-  /** v4.1/v5: the SETTLED rolling window — expanded for this session only. */
+  /** v4.1/v5: the SETTLED rolling window — now reversible (3-preview). */
   private settledExpanded = false;
+  /** Compact section disclosures (owner approval j-1064): session state,
+   * preserved across ordinary live snapshot pushes so a push never
+   * reopens a section or resets the operator's view. */
+  private inFlightExpanded = false;
+  private pipelineExpanded = false;
+  private forGruExpanded = false;
+  private coldExpanded = false;
   /** v5: job ids already on screen (new rows slide in; old ones do not). */
   private readonly knownJobIds = new Set<string>();
   private firstJobsRender = true;
@@ -148,6 +168,7 @@ export class BoardView {
   ) {
     this.mount = mustGet('board-jobs');
     this.ownerMount = mustGet('board-owner');
+    this.boardNav = mustGet('board-nav');
     this.chipRail = mustGet('chip-rail');
     this.agentsCount = mustGet('rail-agents-count');
     this.notificationBell = mustGet<HTMLButtonElement>('notification-bell');
@@ -160,6 +181,9 @@ export class BoardView {
     this.boardClient = boardClient;
     this.collapseStorage = collapseStorage;
     this.expandedJobs = collapseStorage === null ? new Set() : loadExpandedJobs(collapseStorage);
+    // The strip's measured height feeds the sticky offsets; re-measure on
+    // viewport changes so wrapped rows never cover a focused target.
+    window.addEventListener('resize', () => this.measureNav());
     this.notificationBell.addEventListener('click', () => {
       this.notificationPanel.hidden = !this.notificationPanel.hidden;
       this.notificationBell.dataset.open = String(!this.notificationPanel.hidden);
@@ -192,12 +216,76 @@ export class BoardView {
   render(snapshot: BoardSnapshot): void {
     const previous = this.snapshot;
     this.snapshot = snapshot;
+    // Focus preservation across live pushes: the control the operator was
+    // on keeps its place (stable focus keys), so a snapshot update never
+    // steals focus or resets a disclosure mid-interaction.
+    const focusKey = this.captureFocusKey();
     this.renderOwnerActions(snapshot);
     this.renderRail(snapshot);
+    this.renderNav(snapshot);
     this.renderJobs(snapshot);
+    this.restoreFocusKey(focusKey);
     this.renderAgents(snapshot.agents);
     this.renderNotifications(snapshot);
     this.surfaceNewNotifications(previous, snapshot.notifications);
+  }
+
+  // ------------------------------------------------------------------
+  // Sticky section shortcut strip (owner approval j-1064)
+  // ------------------------------------------------------------------
+
+  /** One compact sticky row of labelled, uncapped counts that jumps to
+   * each section. Every section always exists (empty sections carry a
+   * compact empty state), so every shortcut has a valid labelled target. */
+  private renderNav(snapshot: BoardSnapshot): void {
+    const sections = boardSections(snapshot);
+    const nav = this.boardNav;
+    nav.hidden = false;
+    nav.replaceChildren();
+    for (const row of sectionNav(sections.counts, sections.pipelineAvailable)) {
+      const link = document.createElement('a');
+      link.className = 'board-nav__link';
+      link.href = row.href;
+      link.dataset.nav = row.id;
+      link.dataset.focusKey = `nav:${row.id}`;
+      link.append(
+        el('span', 'board-nav__label', row.label),
+        el('span', 'board-nav__count', row.counted ? String(row.count) : '—'),
+      );
+      link.title = row.counted
+        ? `${row.label}: ${row.count} — jump to section`
+        : `${row.label}: not hosted on this server`;
+      nav.append(link);
+    }
+    this.measureNav();
+  }
+
+  /** Focus key of the control the operator is on (inside the job list or
+   * the strip), or null when focus is elsewhere. */
+  private captureFocusKey(): string | null {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement)) return null;
+    if (!this.mount.contains(active) && !this.boardNav.contains(active)) return null;
+    return active.dataset.focusKey ?? null;
+  }
+
+  private restoreFocusKey(key: string | null): void {
+    if (key === null) return;
+    for (const node of [
+      ...this.mount.querySelectorAll<HTMLElement>('[data-focus-key]'),
+      ...this.boardNav.querySelectorAll<HTMLElement>('[data-focus-key]'),
+    ]) {
+      if (node.dataset.focusKey === key) {
+        node.focus();
+        return;
+      }
+    }
+  }
+
+  private measureNav(): void {
+    if (this.boardNav.hidden) return;
+    const height = this.boardNav.offsetHeight;
+    if (height > 0) document.documentElement.style.setProperty('--board-nav-h', `${height}px`);
   }
 
   // ------------------------------------------------------------------
@@ -497,70 +585,263 @@ export class BoardView {
   // Attention-bucketed dense job rows
   // ------------------------------------------------------------------
 
-  /** Banded job rows: NEEDS GRU / IN FLIGHT / SETTLED / COLD, recency
-   * within each band. Every band is a full-width row list; band headers
-   * are sticky separators with counts, so the operator never loses the
-   * band they are reading. NEEDS GRU is always on screen (its clear
-   * state is information); SETTLED is a rolling window over its
-   * recency-sorted tail (v4.1). */
+  /** The approved six-section stack, in order: For you (owner mount,
+   * rendered above) → In flight → Pipeline → For Gru → Settled → Cold.
+   * Every section always exists (a valid shortcut target) with either
+   * rows or a compact empty state. In flight previews 5, Pipeline 5,
+   * Settled 3; For Gru and Cold render no rows until deliberately
+   * expanded; disclosures are reversible and survive snapshot pushes. */
   private renderJobs(snapshot: BoardSnapshot): void {
     this.mount.replaceChildren();
-    if (snapshot.repos.length === 0 || snapshot.repos.every((repo) => repo.jobs.length === 0)) {
-      const empty = el('div', 'board-empty');
-      empty.append(
-        el('div', 'board-empty__title', 'The board is quiet'),
-        el(
-          'div',
-          'board-empty__hint',
-          'Heists land here once work is dispatched — the ledger is the record, this board is the window.',
-        ),
-      );
-      this.mount.append(empty);
-      return;
-    }
+    const sections = boardSections(snapshot);
     const unacked = unackedByJob(snapshot);
-    const bands = bucketSnapshot(snapshot, { now: Date.now(), unackedByJob: unacked });
+    this.mount.append(this.jobsSection('in-flight', sections.bands.get('in-flight') ?? [], unacked));
+    this.mount.append(this.pipelineSection(sections));
+    this.mount.append(this.forGruSection(sections.bands.get('needs-you') ?? [], unacked));
+    this.mount.append(this.jobsSection('settled', settledJobs(sections.bands.get('settled') ?? []), unacked));
+    this.mount.append(this.coldSection(sections.bands.get('cold') ?? [], unacked));
     const seenIds = new Set<string>();
-    for (const band of BAND_ORDER) {
-      const jobs = bands.find((group) => group.band === band)?.jobs ?? [];
-      if (band !== 'needs-you' && jobs.length === 0) continue;
-      const section = el('section', `board-band board-band--${band}`);
-      const head = el('h2', 'board-band__head');
-      head.append(
-        el('span', 'board-band__label', BAND_LABELS[band]),
-        el('span', 'board-band__count lbl', heistCount(jobs.length)),
-      );
-      section.append(head);
-      if (band === 'needs-you' && jobs.length === 0) {
-        section.append(this.clearNeedsYou());
-      } else {
-        const window = band === 'settled' ? settledWindow(jobs, this.settledExpanded) : { jobs, hidden: 0 };
-        const rows = el('div', 'board-band__rows');
-        for (const entry of window.jobs) {
-          rows.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, band));
-        }
-        section.append(rows);
-        if (window.hidden > 0) {
-          const more = el('button', 'board-band__more', `+${window.hidden} older settled`);
-          more.type = 'button';
-          more.setAttribute('aria-expanded', 'false');
-          more.addEventListener('click', () => {
-            this.settledExpanded = true;
-            if (this.snapshot !== null) this.render(this.snapshot);
-          });
-          section.append(more);
-        }
-      }
-      this.mount.append(section);
-    }
-    for (const group of bands) for (const entry of group.jobs) seenIds.add(entry.job.id);
+    for (const group of sections.bands.values()) for (const entry of group) seenIds.add(entry.job.id);
     for (const id of seenIds) this.knownJobIds.add(id);
     this.firstJobsRender = false;
   }
 
-  /** An empty NEEDS GRU band is good news, not absence: a calm green
-   * satisfied state (never hidden, never a false alarm). */
-  private clearNeedsYou(): HTMLElement {
+  /** Shared section shell: sticky head (label + authoritative count) and
+   * the body region every disclosure targets by a stable id. */
+  private sectionShell(
+    sectionId: SectionId,
+    cssBand: string,
+    label: string,
+    countText: string,
+  ): { section: HTMLElement; head: HTMLElement; body: HTMLElement; bodyId: string } {
+    const section = el('section', `board-band board-band--${cssBand}`);
+    section.id = `board-section-${sectionId}`;
+    section.dataset.section = sectionId;
+    const headId = `${section.id}-head`;
+    const bodyId = `${section.id}-body`;
+    section.setAttribute('aria-labelledby', headId);
+    const head = el('h2', 'board-band__head');
+    head.id = headId;
+    head.append(el('span', 'board-band__label', label), el('span', 'board-band__count lbl', countText));
+    const body = el('div', 'board-band__body');
+    body.id = bodyId;
+    section.append(head, body);
+    return { section, head, body, bodyId };
+  }
+
+  /** A disclosure control with proper name/state/controls and a stable
+   * focus key — the SAME control before and after a snapshot push. */
+  private sectionToggle(input: {
+    sectionId: SectionId;
+    bodyId: string;
+    expanded: boolean;
+    label: string;
+  }): HTMLButtonElement {
+    const button = el('button', 'board-band__more');
+    button.type = 'button';
+    button.dataset.focusKey = `section:${input.sectionId}`;
+    button.setAttribute('aria-expanded', String(input.expanded));
+    button.setAttribute('aria-controls', input.bodyId);
+    button.textContent = input.label;
+    return button;
+  }
+
+  private rerender(): void {
+    if (this.snapshot !== null) this.render(this.snapshot);
+  }
+
+  private emptyLine(text: string): HTMLElement {
+    return el('div', 'board-band__empty lbl', text);
+  }
+
+  /** In flight (preview 5) and Settled (preview 3): the existing
+   * authoritative band order, bounded; Show all/Show fewer reversible. */
+  private jobsSection(
+    band: 'in-flight' | 'settled',
+    jobs: readonly BandedJob[],
+    unacked: ReadonlyMap<string, number>,
+  ): HTMLElement {
+    const label = band === 'in-flight' ? BAND_LABELS['in-flight'] : BAND_LABELS.settled;
+    const { section, body, bodyId } = this.sectionShell(band, band, label, heistCount(jobs.length));
+    if (jobs.length === 0) {
+      body.append(this.emptyLine(band === 'in-flight' ? 'nothing in flight right now' : 'nothing settled yet'));
+      return section;
+    }
+    const expanded = band === 'in-flight' ? this.inFlightExpanded : this.settledExpanded;
+    const window = band === 'in-flight' ? inFlightWindow(jobs, expanded) : settledPreview(jobs, expanded);
+    const rows = el('div', 'board-band__rows');
+    for (const entry of window.rows) {
+      rows.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, band));
+    }
+    body.append(rows);
+    if (window.hidden > 0) {
+      const more = this.sectionToggle({
+        sectionId: band,
+        bodyId,
+        expanded: false,
+        label: band === 'in-flight' ? `Show all ${jobs.length} (${window.hidden} more)` : `Show older settled (+${window.hidden})`,
+      });
+      more.addEventListener('click', () => {
+        if (band === 'in-flight') this.inFlightExpanded = true;
+        else this.settledExpanded = true;
+        this.rerender();
+      });
+      body.append(more);
+    } else if (expanded && jobs.length > (band === 'in-flight' ? IN_FLIGHT_PREVIEW_SIZE : SETTLED_PREVIEW_SIZE)) {
+      const fewer = this.sectionToggle({ sectionId: band, bodyId, expanded: true, label: 'Show fewer' });
+      fewer.addEventListener('click', () => {
+        if (band === 'in-flight') this.inFlightExpanded = false;
+        else this.settledExpanded = false;
+        this.rerender();
+      });
+      body.append(fewer);
+    }
+    return section;
+  }
+
+  /** Pipeline: the server-evaluated durable queue in its deterministic
+   * priority order, preview 5 + Show all. Each waiting entry carries its
+   * real dependency/resource/capacity/hold reason as plain text; ready
+   * entries are labelled honestly. */
+  private pipelineSection(sections: ReturnType<typeof boardSections>): HTMLElement {
+    const entries = sections.pipelineEntries;
+    const { section, body, bodyId } = this.sectionShell('pipeline', 'pipeline', 'PIPELINE', `${entries.length} queued`);
+    if (!sections.pipelineAvailable) {
+      body.append(this.emptyLine('pipeline queue unavailable on this server'));
+      return section;
+    }
+    if (entries.length === 0) {
+      body.append(this.emptyLine('no approved work waiting'));
+      return section;
+    }
+    const window = pipelineWindow(entries, this.pipelineExpanded);
+    const rows = el('div', 'board-band__rows board-pipeline__rows');
+    for (const entry of window.rows) rows.append(this.pipelineRow(entry));
+    body.append(rows);
+    if (window.hidden > 0) {
+      const more = this.sectionToggle({
+        sectionId: 'pipeline',
+        bodyId,
+        expanded: false,
+        label: `Show all ${entries.length} (${window.hidden} more)`,
+      });
+      more.addEventListener('click', () => {
+        this.pipelineExpanded = true;
+        this.rerender();
+      });
+      body.append(more);
+    } else if (this.pipelineExpanded && entries.length > PIPELINE_PREVIEW_SIZE) {
+      const fewer = this.sectionToggle({ sectionId: 'pipeline', bodyId, expanded: true, label: 'Show fewer' });
+      fewer.addEventListener('click', () => {
+        this.pipelineExpanded = false;
+        this.rerender();
+      });
+      body.append(fewer);
+    }
+    return section;
+  }
+
+  /** For Gru: the existing machine band, collapsed by default with its
+   * complete count; expanding inspects the machine queue. Genuine
+   * owner-only matters stay in For you. Collapse never resolves or
+   * suppresses anything — it only hides rows. */
+  private forGruSection(jobs: readonly BandedJob[], unacked: ReadonlyMap<string, number>): HTMLElement {
+    const { section, head, body, bodyId } = this.sectionShell(
+      'for-gru',
+      'needs-you',
+      BAND_LABELS['needs-you'],
+      heistCount(jobs.length),
+    );
+    if (jobs.length === 0) {
+      body.append(this.clearForGru());
+      return section;
+    }
+    const toggle = this.sectionToggle({
+      sectionId: 'for-gru',
+      bodyId,
+      expanded: this.forGruExpanded,
+      label: this.forGruExpanded ? 'Hide machine queue' : 'Show machine queue',
+    });
+    toggle.addEventListener('click', () => {
+      this.forGruExpanded = !this.forGruExpanded;
+      this.rerender();
+    });
+    head.append(toggle);
+    if (!this.forGruExpanded) {
+      body.hidden = true;
+      return section;
+    }
+    const rows = el('div', 'board-band__rows');
+    for (const entry of jobs) {
+      rows.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'needs-you'));
+    }
+    body.append(rows);
+    return section;
+  }
+
+  /** Cold: COUNT ONLY by default — zero job rows render until the
+   * operator deliberately expands; expansion shows the retained records
+   * and can be collapsed again. Never a deletion or a completion. */
+  private coldSection(jobs: readonly BandedJob[], unacked: ReadonlyMap<string, number>): HTMLElement {
+    const { section, head, body, bodyId } = this.sectionShell('cold', 'cold', BAND_LABELS.cold, heistCount(jobs.length));
+    if (jobs.length === 0) {
+      body.append(this.emptyLine('no cold records'));
+      return section;
+    }
+    const toggle = this.sectionToggle({
+      sectionId: 'cold',
+      bodyId,
+      expanded: this.coldExpanded,
+      label: this.coldExpanded ? 'Hide records' : 'Show records',
+    });
+    toggle.addEventListener('click', () => {
+      this.coldExpanded = !this.coldExpanded;
+      this.rerender();
+    });
+    head.append(toggle);
+    if (!this.coldExpanded) {
+      body.hidden = true;
+      return section;
+    }
+    const rows = el('div', 'board-band__rows');
+    for (const entry of jobs) {
+      rows.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'cold'));
+    }
+    body.append(rows);
+    return section;
+  }
+
+  /** One pipeline entry row: state chip + title + priority; meta line
+   * carries repo, durable enqueue order, age and the exact wait reason
+   * (untrusted text renders as text, never markup/instructions). */
+  private pipelineRow(entry: PipelineEntryView): HTMLElement {
+    const row = el('article', `board-pipeline board-pipeline--${entry.state}`);
+    row.dataset.entryId = entry.id;
+    row.dataset.state = entry.state;
+    const head = el('div', 'board-pipeline__head');
+    const title = el('span', 'board-pipeline__title', entry.title);
+    title.title = entry.title;
+    head.append(
+      el('span', `pp-chip board-pipeline__state ${pipelineStateTone(entry)}`, pipelineStateLabel(entry)),
+      title,
+      el('span', 'pp-chip pp-chip--park board-pipeline__priority', `P${entry.priority}`),
+    );
+    const meta = el('div', 'board-pipeline__meta lbl');
+    meta.append(
+      el('span', 'board-pipeline__repo', `📦 ${entry.repo}`),
+      el('span', 'board-pipeline__seq', `#${entry.enqueueSeq}`),
+      this.ageNode('board-pipeline__age', entry.queuedAt, 'queued ', ''),
+    );
+    if (entry.reason !== null && entry.reason !== '') {
+      meta.append(el('span', 'board-pipeline__reason', entry.reason));
+    }
+    row.append(head, meta);
+    return row;
+  }
+
+  /** An empty FOR GRU band is good news, not absence: a calm green
+   * satisfied state that is never hidden. */
+  private clearForGru(): HTMLElement {
     const node = el('div', 'board-band__clear');
     node.append(
       el('span', 'board-band__clear-mark', '✓'),
@@ -592,6 +873,7 @@ export class BoardView {
     const head = el('div', 'board-job__head');
     const toggle = el('button', 'board-job__toggle');
     toggle.type = 'button';
+    toggle.dataset.focusKey = `job:${job.id}`;
     const chevron = el('span', 'board-job__chevron', '▸');
     chevron.setAttribute('aria-hidden', 'true');
     const dot = el('span', `board-job__dot board-job__dot--${jobStatusTone(job.status)}`);
@@ -704,6 +986,7 @@ export class BoardView {
     const summary = roundSummary(round);
     const toggle = el('button', 'board-round__toggle');
     toggle.type = 'button';
+    toggle.dataset.focusKey = `round:${round.id}`;
     const chevron = el('span', 'board-round__chevron', '▸');
     chevron.setAttribute('aria-hidden', 'true');
     toggle.append(

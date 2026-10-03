@@ -121,3 +121,31 @@ t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perk
 # out, and no branch/worktree holds the sha.
 board-merged-attention-baseline = 'set -e; base=059c076290145d4aae6e0b47c7b3f87156862c43; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-merged-attention.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board-merged-attention.test.ts > "$d/web/src/ui/board-merged-attention.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-merged-attention-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-merged-attention-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts'
 finding-dedupe-recency = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-findings-dedupe.test.ts test/suite-shape.test.ts"
+
+# Durable approved pipeline queue + compact owner-first board (owner
+# approvals j-239/j-1064). Focused backend regression: ledger/domain,
+# consumer service, authenticated HTTP surface, board snapshot
+# integration and the suite-shape pins. Approved RPC patch first; plain
+# vitest invocations, no worker/timeout flags, never the npm chain.
+pipeline-queue = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-pipeline.test.ts test/pipeline-service.test.ts test/pipeline-server.test.ts test/board-pipeline-view.test.ts test/suite-shape.test.ts"
+
+# Focused web regression: the six-section model, the pipeline protocol
+# validator, the FOR GRU display label and the BoardView DOM contract.
+pipeline-board-web = "node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-sections.test.ts src/lib/board-protocol.test.ts src/lib/board-bands.test.ts src/ui/board.test.ts"
+
+# Browser geometry proof at desktop 1440 / tablet 768 / phone 390+360:
+# production web build + the pipeline-board Playwright project (synthetic
+# snapshots only). Captures land in the ignored
+# _bmad-output/silas-in-pipeline-queue-20261003/captures/ root.
+pipeline-board-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=pipeline-board"
+
+# Isolated pre-change baseline: the frozen base source (9bb51b0, before the
+# pipeline presentation existed) with the IDENTICAL final behavioral tests
+# from the scheduled head, dependencies linked (no download/install), same
+# web config/runner/budgets and RPC prerequisite. The base lacks the
+# six-section order, FOR GRU label, pipeline validator and disclosures, so
+# assertion RED is expected; compilation/import/setup failure is not RED
+# evidence (board-sections.test.ts imports a module the base lacks and is
+# deliberately excluded). Exit left intact, never masked; snapshot dir +
+# ignored pointer preserved.
+pipeline-board-web-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-pipeline-board.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-protocol.test.ts > "$d/web/src/lib/board-protocol.test.ts"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "pipeline-board-web-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/pipeline-board-web-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-protocol.test.ts src/lib/board-bands.test.ts src/ui/board.test.ts'

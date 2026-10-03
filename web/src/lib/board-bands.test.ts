@@ -177,7 +177,7 @@ describe('board bands — deterministic bucketing', () => {
     ];
     const bands = bucketJobs(jobs, { now: NOW });
     expect(bands.map((group) => group.band)).toEqual(['needs-you', 'in-flight', 'settled', 'cold']);
-    expect(BAND_LABELS['needs-you']).toBe('NEEDS GRU');
+    expect(BAND_LABELS['needs-you']).toBe('FOR GRU');
     expect(bucketJobs([], { now: NOW })).toEqual([]);
     expect(bucketJobs([job({ id: 'only-parked', status: 'parked' })], { now: NOW }).map((g) => g.band)).toEqual(['cold']);
   });

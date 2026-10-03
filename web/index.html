@@ -146,6 +146,10 @@
 
       <section id="board-view" class="board-view" hidden>
         <div class="board-main">
+          <!-- Sticky section shortcut strip (owner approval j-1064): labelled
+               uncapped counts that jump to each of the six sections. Rendered
+               by BoardView.renderNav once the first snapshot lands. -->
+          <nav id="board-nav" class="board-nav" aria-label="Board sections" hidden></nav>
           <!-- FOR YOU (owner approval 2026-09-28): the permanent owner-action
                band — pending acks + evidence-bound ready PRs — above the
                machine bands. Rendered by BoardView.renderOwnerActions. -->

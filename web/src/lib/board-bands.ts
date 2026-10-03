@@ -29,7 +29,10 @@ export const JOB_STALLED_AFTER_MS = 30 * 60_000;
 export const BAND_ORDER: readonly BandId[] = ['needs-you', 'in-flight', 'settled', 'cold'];
 
 export const BAND_LABELS: Readonly<Record<BandId, string>> = {
-  'needs-you': 'NEEDS GRU',
+  // Display label only (owner approval j-1064): the internal band id
+  // stays `needs-you` (classification unchanged); the operator-facing
+  // label is FOR GRU.
+  'needs-you': 'FOR GRU',
   'in-flight': 'IN FLIGHT',
   settled: 'SETTLED',
   cold: 'COLD',

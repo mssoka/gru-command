@@ -1064,7 +1064,7 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   pipelineView = () => pipeline?.view() ?? null;
-  state.pipeline = pipeline;
+  state.pipeline = pipeline ?? undefined;
   const pipelineRecovery = pipeline.reconcileAtBoot();
   if (pipelineRecovery.examined > 0) {
     logger.info('pipeline admission reconciliation', {

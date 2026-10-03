@@ -66,6 +66,14 @@ export default defineConfig({
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
+      // Compact owner-first board proof (j-1064): synthetic WebSocket-
+      // seeded snapshots; geometry at desktop/tablet/phone, no owner
+      // control is ever clicked.
+      name: 'pipeline-board',
+      testMatch: 'pipeline-board.spec.ts',
+      use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
+    },
+    {
       name: 'real',
       testMatch: 'real-server.spec.ts',
       use: { baseURL: `http://localhost:${REAL_PORT}` },
