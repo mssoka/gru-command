@@ -187,6 +187,18 @@ bmad-build interactive checkpoint is not available in this confined worker.
 - `decisions` hot-reload (r8 + r10): reproducible in isolation without this
   lane's suites; pre-existing fs-watch timing, outside the diff and outside
   this lane's ownership; preserved for the review/owner disposition.
+- `install-one-line` owned/foreign-service timeout (full `15bfc4a9` at
+  `13b8734`): classified CONTENTION — isolation scope `installer-isolation`
+  PASS at `c08b7e1` (18219 ms), failing test file and `install.sh`
+  byte-identical to the earlier green head. No repair needed.
+- `perkins-builtin-wave` T4 timeout (full `15bfc4a9`): test file byte-identical
+  to the green `cea7bbf` head (T4 passed there at 21884 ms); one `t4-oracle`
+  attempt refused at the unchanged lock bound (never started). Classification
+  folds into the next FULL; retry the oracle first if the FULL reds on T4.
+- FULL lint red at `c08b7e1` (run `95f43be3`, 35.6 s): REAL and repaired —
+  lane helper `.mjs` scripts under the linted (gitignored) runs directory
+  failed `no-undef`; tooling relocated out of the tree. This red was not a
+  product regression and never reached the suite.
 ## Implementation Notes
 
 - 2026-10-03: lane workflow rendered via `bmad-build`; Checkpoint-1 approval
@@ -256,11 +268,40 @@ bmad-build interactive checkpoint is not available in this confined worker.
   `68ce75c`; no test, timeout, assertion, budget or gate changed).
 - Producer defect found and fixed while resuming: the first classification
   producer used `fetch`, whose default 300 s body timeout truncated the queued
-  NDJSON stream (`streamError: terminated`) while the server-side request
-  stayed queued. The run id (`170e2be1`) remains outstanding in the service
-  and must be reconciled from the ledger before the next submission; the
-  producer was rewritten onto `node:http` with no body timeout, and every sink
-  is still pre-opened exclusively before the single POST.
+  NDJSON stream (`streamError: terminated`). The server-side request was not
+  cancelled: run `170e2be1` stayed queued and settled as a positively typed
+  `verification.lock-timeout` (seq 43713, 19:10:28Z) — never started, no side
+  effects; the reconciliation note is preserved beside the truncated receipt.
+  The producer was rewritten onto `node:http` with no body timeout, and every
+  sink is still pre-opened exclusively before the single POST.
+- Classification evidence now recorded at the clean head `c08b7e1` (all runs
+  via authenticated `/api/verify`, exclusive sinks, complete terminal + EOF,
+  receipts under `review-inputs-verify-runs/`):
+  - `installer-isolation` (run `0a8f8e6d`, receipts kept): **PASS** — the
+    exact failing installer case ran in 18219 ms in isolation; 31 passed /
+    4 skipped; whole-output sha256 `e35251ea…`. The m6 FULL timeout was
+    contention, not a defect.
+  - `t4-oracle` retry (run `7c189537`): typed never-started refusal
+    (`verification.lock-timeout`, seq 43853, 900042 ms wait) — the queue was
+    held by other lanes' long `full` scopes. T4 isolation classification is
+    still open; it is folded into the next FULL attempt (if the FULL is green,
+    T4 passed; if it reds on T4 again, the oracle is retried first).
+  - `full` attempt (run `95f43be3`): RED at lint in 35.6 s — **a real,
+    self-inflicted defect repaired**: the lane's newly written producer/helper
+    `.mjs` scripts under `_bmad-output/…/review-inputs-verify-runs/` are not
+    covered by eslint's ignore list (only `.gitignore` covers them), so
+    `eslint .` failed on their Node globals. Repair: the helper tooling was
+    relocated out of the repository tree to
+    `~/.gru-command/investigations/review-input-handoff-tools/`; the runs
+    directory keeps data artifacts only. No product or config file changed;
+    the head stays `c08b7e1` for product content.
+- Capacity note (exposed for ops, exact): the shared verify scheduler runs at
+  `maxConcurrent=1`; on 2026-10-03 19:00–19:50Z other lanes' back-to-back
+  `full` scopes held the single slot for ~30 min each and several requests
+  (this lane's, pipeline-check's, others') hit the unchanged 900 s lock bound
+  and refused cleanly (never started). Every refusal here is a positively
+  typed `verification.lock-timeout` and the next attempt is separately
+  accounted; capacity, not policy, is the constraint.
 
 ## Verification
 
