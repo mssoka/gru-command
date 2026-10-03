@@ -126,7 +126,7 @@ finding-dedupe-recency = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest 
 # static product checks — lint, compiler, and the build (including the
 # pinned Perkins resource verifier) — through the authenticated scheduler
 # at unchanged budgets/thresholds; approved RPC patch first.
-perkins-reliability-stage1-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build"
+perkins-stage1-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build"
 
 # Stage 1 focused unit/integration: the new MCP transport suite (join,
 # retention, explicit abort, spawned-server still-running/re-attach), the
@@ -134,13 +134,13 @@ perkins-reliability-stage1-static = "node tools/patch-vitest-rpc-timeout.mjs && 
 # the pi/claude adapter parity replay and the adjacent engine suites —
 # explicit installed Vitest CLI invocation, no worker/timeout flags and
 # never the npm chain; exits never masked.
-perkins-reliability-stage1-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/native-tools-parity.test.ts test/perkins-lead-schema-compat.test.ts test/perkins-crash-child.test.ts test/tool-heartbeat.test.ts"
+perkins-stage1-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/native-tools-parity.test.ts test/perkins-lead-schema-compat.test.ts test/perkins-crash-child.test.ts test/tool-heartbeat.test.ts"
 
 # Stage 1 adapter/transport integration: the real Claude adapter suites
 # (session-scoped MCP bridge + CLI double), the supervisor whose stall
 # ladder owns the remaining specialist lifetime, the fallback review path
 # and the pinned-resource verifier; approved RPC patch first.
-perkins-reliability-stage1-adapters = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/claude-adapter.test.ts test/supervisor.test.ts test/review-path.test.ts test/verify-perkins-resource.test.ts"
+perkins-stage1-adapters = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/claude-adapter.test.ts test/supervisor.test.ts test/review-path.test.ts test/verify-perkins-resource.test.ts"
 
 # Stage 1 fails-before baseline: the pinned pre-change head 9bb51b0 source
 # with the IDENTICAL final behavioral tests overlaid (the new transport
@@ -150,4 +150,4 @@ perkins-reliability-stage1-adapters = "node tools/patch-vitest-rpc-timeout.mjs &
 # Vitest exit status is echoed intact and never masked into a PASS; a
 # baseline that passes is called out as a broken fail-before claim. The
 # snapshot directory and ignored pointer file are preserved for inspection.
-perkins-reliability-stage1-baseline = 'root="$PWD"; prep=_bmad-output/gate-prep/perkins-reliability-stage1; mkdir -p "$prep"; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-reliability-stage1.XXXXXX"); git archive "$base" | tar -x -C "$d" || { echo "baseline archive failed"; exit 3; }; cp test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "perkins-reliability-stage1-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-reliability-stage1-baseline.last-snapshot.txt"; ( cd "$d" && node tools/patch-vitest-rpc-timeout.mjs >/dev/null 2>&1; npx vitest run test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts -t "count-bounded|crossing the retired|open at the transport wait|join an identical|wait-expired|malformed wait" ); a=$?; echo "baseline pre-change $base + current tests exit=$a EXPECTED-NONZERO"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; fi; exit 1'
+perkins-stage1-baseline = 'root="$PWD"; prep=_bmad-output/gate-prep/perkins-reliability-stage1; mkdir -p "$prep"; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-reliability-stage1.XXXXXX"); git archive "$base" | tar -x -C "$d" || { echo "baseline archive failed"; exit 3; }; cp test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "perkins-reliability-stage1-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-reliability-stage1-baseline.last-snapshot.txt"; ( cd "$d" && node tools/patch-vitest-rpc-timeout.mjs >/dev/null 2>&1; npx vitest run test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts -t "count-bounded|crossing the retired|open at the transport wait|join an identical|wait-expired|malformed wait" ); a=$?; echo "baseline pre-change $base + current tests exit=$a EXPECTED-NONZERO"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; fi; exit 1'
