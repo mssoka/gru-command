@@ -22,6 +22,18 @@ edge-case-hunter and verification-gap lenses).
   this packet directory. This packet adds no product bytes; the verified
   product tree is exactly the tree above.
 
+## Hygiene sanitization (one mechanical substitution)
+
+This packet is committed to the shared product repo and must satisfy the
+repo hygiene gate (SPEC ruling 8: zero personal paths). Every copy in this
+packet therefore has the literal personal home prefix replaced with
+`<HOME>` and the lane-worktree absolute path replaced with
+`<LANE_WORKTREE>`; your briefing provides the machine paths. Nothing else
+was altered: the evidence copies are otherwise byte-complete, and each
+file's sanitization count plus its shipped SHA-256 are in `manifest.json`.
+The original evidence bytes remain bound by the receipts' own
+`output_sha256` fields (also inside this packet).
+
 ## How to verify this packet
 
 1. Read `manifest.json`. It lists every packet file with its SHA-256, plus
@@ -38,7 +50,7 @@ edge-case-hunter and verification-gap lenses).
 - This packet directory — the whole bounded evidence set.
 - The named lens instruction file only (path provided in your briefing).
 - The frozen source tree, for context and symbol/test search:
-  `/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/`
+  `<LANE_WORKTREE>/`
   at product head `5c0d1d3`. Read-only; tracked content is frozen for the
   duration of the review. Do NOT read: `_bmad-output/gate-prep/` (run
   logs), `node_modules/`, `.git/`, `dist/`, `web/dist/`, `web/test-results/`,

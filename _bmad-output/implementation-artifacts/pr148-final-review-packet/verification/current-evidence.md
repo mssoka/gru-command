@@ -1,5 +1,9 @@
 # Verification evidence (as frozen at packet v1)
 
+Hygiene note: every copy here has the personal home prefix replaced with
+`<HOME>` / `<LANE_WORKTREE>` (SPEC ruling 8); see README. The receipts
+themselves carry the original `output_sha256` bindings.
+
 All runs below execute through the authenticated `/api/verify` scheduler with
 committed declared scopes, one outstanding request per lane, unique
 pre-opened raw-NDJSON and decoded sinks flushed to EOF; each receipt binds

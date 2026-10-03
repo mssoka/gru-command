@@ -9,7 +9,7 @@ vitest-rpc-timeout: 0 file(s) patched this run, 1 checked
 > tsc --noEmit -p tsconfig.json && vitest run
 
 
- RUN  v3.2.7 /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web
+ RUN  v3.2.7 <LANE_WORKTREE>/web
 
  ✓ src/lib/uuid.test.ts (5 tests) 92ms
  ✓ src/lib/mock-server-http.test.ts (1 test) 1278ms
@@ -85,8 +85,8 @@ gru-chat: ignoring malformed frame {"type":
 > gru-command@1.0.0 build
 > tsc && node -e "const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs
 
-{"loadedFile":"/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/resources/perkins-code-review/policy.json","bridgeFile":"/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/dist/runtime/review-mcp-server.mjs","policySha256":"5622da6b100dff79cda29147cb7a3ecd8dd5e0e4905b8bcfb4dcd22f58dfb6a9","bridgeSha256":"badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032","canonicalSourceSha256":"f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7","residueScan":{"scannedBytes":629159,"scannedFiles":33}}
-build rev 81d3f1081486a6cbb39f1d56876375709ebb087f → /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/dist/build-rev.json
+{"loadedFile":"<LANE_WORKTREE>/resources/perkins-code-review/policy.json","bridgeFile":"<LANE_WORKTREE>/dist/runtime/review-mcp-server.mjs","policySha256":"5622da6b100dff79cda29147cb7a3ecd8dd5e0e4905b8bcfb4dcd22f58dfb6a9","bridgeSha256":"badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032","canonicalSourceSha256":"f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7","residueScan":{"scannedBytes":629159,"scannedFiles":33}}
+build rev 81d3f1081486a6cbb39f1d56876375709ebb087f → <LANE_WORKTREE>/dist/build-rev.json
 
 > @gru-command/web@1.0.0 e2e
 > npm run build && playwright test
@@ -190,8 +190,8 @@ Running 51 tests using 1 worker
       915 |     await expect(page.locator('.tool-line', { hasText: 'failed:' })).toBeVisible();
       916 |   }
       917 |
-        at sendStressReply (/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web/e2e/smoke.spec.ts:914:68)
-        at /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web/e2e/smoke.spec.ts:927:5
+        at sendStressReply (<LANE_WORKTREE>/web/e2e/smoke.spec.ts:914:68)
+        at <LANE_WORKTREE>/web/e2e/smoke.spec.ts:927:5
 
     Error Context: test-results/smoke-chat-pane-reflow-own-58f81--a-live-drag-light-and-dark-mock/error-context.md
 
@@ -218,8 +218,8 @@ Running 51 tests using 1 worker
       915 |     await expect(page.locator('.tool-line', { hasText: 'failed:' })).toBeVisible();
       916 |   }
       917 |
-        at sendStressReply (/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web/e2e/smoke.spec.ts:914:68)
-        at /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web/e2e/smoke.spec.ts:968:5
+        at sendStressReply (<LANE_WORKTREE>/web/e2e/smoke.spec.ts:914:68)
+        at <LANE_WORKTREE>/web/e2e/smoke.spec.ts:968:5
 
     Error Context: test-results/smoke-chat-pane-reflow-own-c790e--drawer-and-the-phone-sheet-mock/error-context.md
 
@@ -255,7 +255,7 @@ Running 51 tests using 1 worker
       992 |
       993 |     await page.locator('#theme-toggle').click();
       994 |     await expect(page.locator('html')).toHaveClass(/dark/);
-        at /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web/e2e/smoke.spec.ts:991:24
+        at <LANE_WORKTREE>/web/e2e/smoke.spec.ts:991:24
 
     attachment #1: chat-light (image/png) ──────────────────────────────────────────────────────────
     Expected: e2e/smoke.spec.ts-snapshots/chat-light-darwin.png
@@ -279,7 +279,7 @@ Running 51 tests using 1 worker
       146 |   const controlsAfter = await page.locator('.chat-context__button').evaluateAll((nodes) =>
       147 |     nodes.map((node) => {
       148 |       const rect = node.getBoundingClientRect();
-        at /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web/e2e/working-flavor.spec.ts:145:34
+        at <LANE_WORKTREE>/web/e2e/working-flavor.spec.ts:145:34
 
     Error Context: test-results/working-flavor-busy-phrase-4ecaa-l-geometry-on-every-surface-mock/error-context.md
 
@@ -315,7 +315,7 @@ Running 51 tests using 1 worker
       486 |
       487 |     await page.locator('#theme-toggle').click();
       488 |     await expect(page.locator('html')).toHaveClass(/dark/);
-        at /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web/e2e/real-server.spec.ts:485:24
+        at <LANE_WORKTREE>/web/e2e/real-server.spec.ts:485:24
 
     attachment #1: real-chat-light (image/png) ─────────────────────────────────────────────────────
     Expected: e2e/real-server.spec.ts-snapshots/real-chat-light-darwin.png
@@ -334,8 +334,8 @@ Running 51 tests using 1 worker
   46 passed (4.4m)
 npm error Lifecycle script `e2e` failed with error:
 npm error code 1
-npm error path /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web
+npm error path <LANE_WORKTREE>/web
 npm error workspace @gru-command/web@1.0.0
-npm error location /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web
+npm error location <LANE_WORKTREE>/web
 npm error command failed
 npm error command sh -c npm run build && playwright test

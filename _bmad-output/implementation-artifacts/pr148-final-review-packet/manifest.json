@@ -1,5 +1,5 @@
 {
-  "at": "2026-10-03T03:05:30.493025+00:00",
+  "at": "2026-10-03T03:38:05.227937+00:00",
   "job": "wizard-bmad-deterministic-retry-32",
   "pr": 148,
   "lane_branch": "gru/wizard-bmad-deterministic-retry-32",
@@ -19,13 +19,15 @@
   "packet_files": [
     {
       "path": "README.md",
-      "bytes": 4834,
-      "sha256": "cf5a1212c90e86579903a8a71f73b9e3db33ad9118d019a3e4436e799218c89a"
+      "bytes": 5426,
+      "sha256": "43b2abd4638aad84e9a7c2cd80876de13baa9f07c563c06d1bacfd71bf2371ad",
+      "sanitized": 3
     },
     {
       "path": "claims/issue-32.json",
-      "bytes": 1629,
-      "sha256": "0e3c0041ba1770300ca914e94eff6ff7c2943c68b22f92cdd80abc86ea99810f"
+      "bytes": 1623,
+      "sha256": "db0c673636d921de1fce91f382ddf1738c085b09fc9168a3af52e67aa9c452bd",
+      "sanitized": 1
     },
     {
       "path": "claims/native-r1-dispositions.md",
@@ -94,18 +96,21 @@
     },
     {
       "path": "repair-lineage/intermediate-red-554e51c.output.txt",
-      "bytes": 21649,
-      "sha256": "f1fb3e7cfbdc829f676ce6dde8b00cceda31e74b702fa0520e0eba2e864d004f"
+      "bytes": 21010,
+      "sha256": "0d0d90f60c8a564fab8e24d013b7215bf3702352ae247f2591ad5faea3ebd2df",
+      "sanitized": 9
     },
     {
       "path": "repair-lineage/intermediate-red-c275cfb.output.txt",
-      "bytes": 16596,
-      "sha256": "7f7a8b28474eab6f8f4e30ad06d7e041ce7692526cd6b707618e8ea821362910"
+      "bytes": 16099,
+      "sha256": "4efe5a1f9caa9c622920e00325373db0ff7343cdb2ec74f5822629f99309dc6a",
+      "sanitized": 7
     },
     {
       "path": "repair-lineage/intermediate-red-d93ba27.output.txt",
-      "bytes": 17524,
-      "sha256": "9df2e7d172f3127ff1419a703b62fe5c85523d028f19bca7857893e6552427b5"
+      "bytes": 17027,
+      "sha256": "25beb730201c2ec395a0cd086d1fef96a2a70f269c08ad537321bb1ea018c9b1",
+      "sanitized": 7
     },
     {
       "path": "repair-lineage/lineage.md",
@@ -114,8 +119,9 @@
     },
     {
       "path": "repair-lineage/original-browser-red.output.txt",
-      "bytes": 24833,
-      "sha256": "7587a6af65c3a2a485f724d27de6cb1aa878e2a4ea03fcea9bd54074896f4aa7"
+      "bytes": 23910,
+      "sha256": "edd63c24c0e2b53d32d375c7b44e5dd427c14ac4df48fd98ff91cf69a92eb814",
+      "sanitized": 13
     },
     {
       "path": "source/changed/.gru-command/worktree.toml",
@@ -239,13 +245,15 @@
     },
     {
       "path": "verification/browser.complete-output.txt",
-      "bytes": 14834,
-      "sha256": "91ef95bff47efc596b45c15bbeba5afe9e02ade7065977a3588dc6650b8f56ae"
+      "bytes": 14550,
+      "sha256": "4d0cc61d37ab1882482e73480e86f7094fab06cc979032f2b850171534673275",
+      "sanitized": 4
     },
     {
       "path": "verification/browser.receipt.json",
-      "bytes": 14098,
-      "sha256": "00de33f4bb393e04529fb21266b6f20ad1ae5e983635cd482b4348246b6d34f2"
+      "bytes": 13885,
+      "sha256": "8a6680781834a19a13150285313ba5183d5c1229dd41fd6178fb7a8528ec4467",
+      "sanitized": 3
     },
     {
       "path": "verification/ci.json",
@@ -254,30 +262,53 @@
     },
     {
       "path": "verification/current-evidence.md",
-      "bytes": 4440,
-      "sha256": "f8c0a793992d36ccf414fd25f2c2f834afc7454c958f9fcfd487197a94e954d9"
+      "bytes": 4641,
+      "sha256": "ee1eb6c86e3f8311d3e4c006e8445162c3827e76fef58d069097021bd5a5ee4f",
+      "sanitized": 2
     },
     {
       "path": "verification/focused.complete-output.txt",
-      "bytes": 7361,
-      "sha256": "6795bdb904302fa6888bff525f4fb04658960a58a730998e63e8b0831bcab9b3"
+      "bytes": 7077,
+      "sha256": "fc76985b4dc6f64ef1621bfbddb46772772f8b8bc2b3b8c7fb128e33e2d42ff9",
+      "sanitized": 4
     },
     {
       "path": "verification/focused.receipt.json",
-      "bytes": 13507,
-      "sha256": "3f805ab346fd226e6dc1d63232cbdd6a0d4d75edc5281e7ef55f7da7bf97a37e"
+      "bytes": 13294,
+      "sha256": "ec61cf52d64f1ad3761c605c90a4a9494dbcacf72d94a15614f17c54e62132d8",
+      "sanitized": 3
     },
     {
       "path": "verification/full.complete-output.txt",
-      "bytes": 111477,
-      "sha256": "49265cbadf761913a37ba98ef2ec845301e93aa56c9dcdc07532388cd7c919dd"
+      "bytes": 111122,
+      "sha256": "091b49d65cb73e100a004a895702736dd27a9ad36c6716b9935014ac266df5fa",
+      "sanitized": 5
     },
     {
       "path": "verification/full.receipt.json",
-      "bytes": 13320,
-      "sha256": "f68f98a414895ba9af6b1809521b7c4ad51e5d5592e5b821bac37e61b2f449a0"
+      "bytes": 12965,
+      "sha256": "5a134616b41baca121e2688a83a48d89ba5a07a044f847bb073ae5e17e4324c5",
+      "sanitized": 5
     }
   ],
+  "sanitization": {
+    "scheme": "literal personal home prefix -> <HOME>; lane worktree absolute path -> <LANE_WORKTREE> (SPEC ruling 8)",
+    "counts": {
+      "README.md": 3,
+      "claims/issue-32.json": 1,
+      "repair-lineage/intermediate-red-554e51c.output.txt": 9,
+      "repair-lineage/intermediate-red-c275cfb.output.txt": 7,
+      "repair-lineage/intermediate-red-d93ba27.output.txt": 7,
+      "repair-lineage/original-browser-red.output.txt": 13,
+      "verification/browser.complete-output.txt": 4,
+      "verification/browser.receipt.json": 3,
+      "verification/current-evidence.md": 2,
+      "verification/focused.complete-output.txt": 4,
+      "verification/focused.receipt.json": 3,
+      "verification/full.complete-output.txt": 5,
+      "verification/full.receipt.json": 5
+    }
+  },
   "product_files_at_head": [
     {
       "path": ".gru-command/worktree.toml",
@@ -375,34 +406,28 @@
   },
   "verification_runs": {
     "focused": {
-      "runId": "5f642709-71cd-4722-9142-e3180e32fdb3",
+      "runId": "220dfad8-f77f-4add-9c6b-bbd8213019d2",
       "exit": 0,
-      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
-      "bytes": 7361,
-      "sha256": "6795bdb904302fa6888bff525f4fb04658960a58a730998e63e8b0831bcab9b3",
-      "ledger_seq": 40553
+      "sha": "255ef07d57c0a82fd00e9b2b793dfaa93efa393f",
+      "bytes": 7372,
+      "sha256": "a3f65315206b1e63dc68644098f803b146401fda96fe078416d5ac85aa67d8ca"
     },
     "full": {
-      "runId": "4261b840-9b0d-40d9-938a-e1d527afe341",
-      "exit": 0,
-      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
-      "bytes": 111477,
-      "sha256": "49265cbadf761913a37ba98ef2ec845301e93aa56c9dcdc07532388cd7c919dd",
-      "ledger_seq": 40674
+      "runId": "57a6894c-c964-4f00-8f95-807999af3bc5",
+      "exit": 1,
+      "sha": "255ef07d57c0a82fd00e9b2b793dfaa93efa393f",
+      "failure": "hygiene-grep: 55 personal-path violations from the packet copies \u2014 repaired by this sanitization (renumbered head), FULL pending re-run"
     },
     "browser": {
-      "runId": "8473ecde-e10f-4c7c-b5c5-d8ea9c2a643a",
-      "exit": 0,
-      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
-      "bytes": 14834,
-      "sha256": "91ef95bff47efc596b45c15bbeba5afe9e02ade7065977a3588dc6650b8f56ae",
-      "ledger_seq": 40521
+      "status": "pending at this head"
     },
-    "ci": {
-      "run": 37087368772,
-      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
-      "conclusion": "success"
+    "pre_merge_green": {
+      "focused": "5f642709-71cd-4722-9142-e3180e32fdb3",
+      "full": "4261b840-9b0d-40d9-938a-e1d527afe341",
+      "browser": "8473ecde-e10f-4c7c-b5c5-d8ea9c2a643a",
+      "ci": 37087368772,
+      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9"
     }
   },
-  "note": "packet_files excludes this manifest.json (a file cannot contain its own hash); the manifest hash is stated in the review dispatch briefing."
+  "note": "packet_files excludes manifest.json (cannot contain its own hash); the manifest hash is stated in the review dispatch briefing."
 }

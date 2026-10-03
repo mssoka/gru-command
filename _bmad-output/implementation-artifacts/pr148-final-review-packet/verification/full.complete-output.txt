@@ -20,10 +20,10 @@ vitest-rpc-timeout: 0 file(s) patched this run, 1 checked
 > gru-command@1.0.0 build
 > tsc && node -e "const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs
 
-{"loadedFile":"/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/resources/perkins-code-review/policy.json","bridgeFile":"/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/dist/runtime/review-mcp-server.mjs","policySha256":"5622da6b100dff79cda29147cb7a3ecd8dd5e0e4905b8bcfb4dcd22f58dfb6a9","bridgeSha256":"badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032","canonicalSourceSha256":"f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7","residueScan":{"scannedBytes":629159,"scannedFiles":33}}
-build rev 1bac32d4ad2f006e863afa5cf3f480d47e83c9d9 → /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/dist/build-rev.json
+{"loadedFile":"<LANE_WORKTREE>/resources/perkins-code-review/policy.json","bridgeFile":"<LANE_WORKTREE>/dist/runtime/review-mcp-server.mjs","policySha256":"5622da6b100dff79cda29147cb7a3ecd8dd5e0e4905b8bcfb4dcd22f58dfb6a9","bridgeSha256":"badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032","canonicalSourceSha256":"f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7","residueScan":{"scannedBytes":629159,"scannedFiles":33}}
+build rev 1bac32d4ad2f006e863afa5cf3f480d47e83c9d9 → <LANE_WORKTREE>/dist/build-rev.json
 
- RUN  v3.2.7 /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32
+ RUN  v3.2.7 <LANE_WORKTREE>
 
 (node:7657) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)
@@ -904,7 +904,7 @@ Preparing worktree (new branch 'fixture-worktree')
 > tsc --noEmit -p tsconfig.json && vitest run
 
 
- RUN  v3.2.7 /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web
+ RUN  v3.2.7 <LANE_WORKTREE>/web
 
  ✓ src/lib/uuid.test.ts (5 tests) 110ms
  ✓ src/lib/mock-server-http.test.ts (1 test) 967ms

@@ -9,7 +9,7 @@ vitest-rpc-timeout: 0 file(s) patched this run, 1 checked
 > tsc --noEmit -p tsconfig.json && vitest run
 
 
- RUN  v3.2.7 /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web
+ RUN  v3.2.7 <LANE_WORKTREE>/web
 
  ✓ src/lib/uuid.test.ts (5 tests) 140ms
  ✓ src/lib/mock-server-http.test.ts (1 test) 1197ms
@@ -85,8 +85,8 @@ gru-chat: ignoring malformed frame {"type":
 > gru-command@1.0.0 build
 > tsc && node -e "const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs
 
-{"loadedFile":"/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/resources/perkins-code-review/policy.json","bridgeFile":"/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/dist/runtime/review-mcp-server.mjs","policySha256":"5622da6b100dff79cda29147cb7a3ecd8dd5e0e4905b8bcfb4dcd22f58dfb6a9","bridgeSha256":"badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032","canonicalSourceSha256":"f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7","residueScan":{"scannedBytes":629159,"scannedFiles":33}}
-build rev 554e51cfe721ace6b444cc6af7e56aaffb6cd31a → /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/dist/build-rev.json
+{"loadedFile":"<LANE_WORKTREE>/resources/perkins-code-review/policy.json","bridgeFile":"<LANE_WORKTREE>/dist/runtime/review-mcp-server.mjs","policySha256":"5622da6b100dff79cda29147cb7a3ecd8dd5e0e4905b8bcfb4dcd22f58dfb6a9","bridgeSha256":"badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032","canonicalSourceSha256":"f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7","residueScan":{"scannedBytes":629159,"scannedFiles":33}}
+build rev 554e51cfe721ace6b444cc6af7e56aaffb6cd31a → <LANE_WORKTREE>/dist/build-rev.json
 
 > @gru-command/web@1.0.0 e2e
 > npm run build && playwright test
@@ -245,8 +245,8 @@ Running 51 tests using 1 worker
        98 | }
        99 |
       100 | test.afterEach(async ({ request }) => {
-        at sweepApprovedLabels (/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web/e2e/working-flavor.spec.ts:97:20)
-        at /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web/e2e/working-flavor.spec.ts:154:3
+        at sweepApprovedLabels (<LANE_WORKTREE>/web/e2e/working-flavor.spec.ts:97:20)
+        at <LANE_WORKTREE>/web/e2e/working-flavor.spec.ts:154:3
 
     Error Context: test-results/working-flavor-busy-phrase-4ecaa-l-geometry-on-every-surface-mock/error-context.md
 
@@ -271,7 +271,7 @@ Running 51 tests using 1 worker
       710 |   });
       711 |
       712 |   test('chips replay with history after reload (the durable log carries them)', async ({ page }) => {
-        at /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web/e2e/real-server.spec.ts:709:7
+        at <LANE_WORKTREE>/web/e2e/real-server.spec.ts:709:7
 
     Error Context: test-results/real-server-attach-flow-SP-80b54--materialized-→-chip-→-send-real/error-context.md
 
@@ -281,8 +281,8 @@ Running 51 tests using 1 worker
   49 passed (3.4m)
 npm error Lifecycle script `e2e` failed with error:
 npm error code 1
-npm error path /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web
+npm error path <LANE_WORKTREE>/web
 npm error workspace @gru-command/web@1.0.0
-npm error location /Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web
+npm error location <LANE_WORKTREE>/web
 npm error command failed
 npm error command sh -c npm run build && playwright test
