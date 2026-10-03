@@ -39,7 +39,7 @@ const PINS: Record<string, number> = {
   'github-poll.test.ts': 24,
   'health.test.ts': 19,
   'identity.test.ts': 3,
-  'install-one-line.test.ts': 35,
+  'install-one-line.test.ts': 36,
   'install.test.ts': 13,
   'lan-phone-raw-client.test.ts': 6,
   'ledger-api.test.ts': 23,
@@ -59,7 +59,7 @@ const PINS: Record<string, number> = {
   'pacing-admission.test.ts': 14,
   'pacing.test.ts': 28,
   'patch-vitest-rpc-timeout.test.ts': 11,
-  'perkins-builtin-wave.test.ts': 92,
+  'perkins-builtin-wave.test.ts': 93,
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
   'perkins-findings-dedupe.test.ts': 11,
   'perkins-freeze-freshhead.test.ts': 24,

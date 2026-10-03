@@ -154,6 +154,10 @@ interface CancellationObservation {
   readonly recoveredReplyDurable: boolean;
   readonly queuedPendingDuringStall: boolean;
   readonly queuedModelCallsDuringStall: number;
+  readonly queuedSettledAfterCancel: boolean | null;
+  readonly queuedModelCallsAfterCancel: number | null;
+  readonly continuationCallsAfterCancel: number | null;
+  readonly postCancelGuardMessages: readonly string[] | null;
   readonly guardMessages: readonly string[];
   readonly guardModelCallsDuringStall: number;
   readonly guardModelCalls: number;
@@ -309,6 +313,10 @@ async function observeCompactionCancellation(
       cancellations += 1;
       abortCompaction.call(internal.session);
     }
+    let queuedSettledAfterCancel: boolean | null = null;
+    let queuedModelCallsAfterCancel: number | null = null;
+    let continuationCallsAfterCancel: number | null = null;
+    let postCancelGuardMessages: readonly string[] | null = null;
     if (summaryMode === 'late-terminal') {
       // The transport ignores the request signal: give the SDK abort path a
       // bounded probe window for its own terminal, then settle the transport
@@ -318,6 +326,32 @@ async function observeCompactionCancellation(
       while (Date.now() < until && !rawSdkEvents.includes('compaction_end')) {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
+      // Post-cancellation held-transport checkpoint: while the cancelled
+      // transport is STILL held (the release is below), the pending work must
+      // remain owed, nothing may reach the model, and the admission guard
+      // must still refuse fresh execution — the zero-premature-delivery
+      // interval is measured on the actual surface, not only before cancel.
+      queuedSettledAfterCancel = queuedSettled;
+      queuedModelCallsAfterCancel = fx.script.calls.filter(
+        (call) => call.prompt === 'queued work',
+      ).length;
+      continuationCallsAfterCancel = fx.script.calls.filter(
+        (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
+      ).length;
+      postCancelGuardMessages = await Promise.all([
+        handle.prompt('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+        handle.steer('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+        handle.followUp('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+      ]);
     }
     releaseSummary(); // no-op for an already-aborted stream; settles a late one
     await waitFor(
@@ -461,6 +495,9 @@ interface NativeQueueObservation {
   readonly pendingAfterAdmission: number;
   readonly pendingDuringStall: number;
   readonly modelCallsDuringStall: number;
+  readonly pendingAfterCancel: number | null;
+  readonly modelCallsAfterCancel: number | null;
+  readonly postCancelGuardMessages: readonly string[] | null;
   readonly turn: string;
   readonly errorEvents: number;
   readonly continuationReachedModel: boolean;
@@ -570,6 +607,9 @@ async function observeNativeFollowUpCancellation(
     ).length;
     // The cancellation seam under test: summary-only.
     sdkSession.abortCompaction!();
+    let pendingAfterCancel: number | null = null;
+    let modelCallsAfterCancel: number | null = null;
+    let postCancelGuardMessages: readonly string[] | null = null;
     if (summaryMode === 'late-terminal') {
       // The transport ignores the request signal: give the SDK abort path a
       // bounded probe window for its own terminal, then settle the transport
@@ -578,6 +618,28 @@ async function observeNativeFollowUpCancellation(
       while (Date.now() < until && !rawSdkEvents.includes('compaction_end')) {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
+      // r7: post-cancellation held-transport checkpoint — the native queue's
+      // pending work must remain owed, nothing may reach the model, and the
+      // admission guard must still refuse fresh execution while the cancelled
+      // transport is still held (the release is below).
+      pendingAfterCancel = pendingCount();
+      modelCallsAfterCancel = fx.script.calls.filter(
+        (call) => call.prompt === 'native follow-up',
+      ).length;
+      postCancelGuardMessages = await Promise.all([
+        handle.prompt('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+        handle.steer('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+        handle.followUp('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+      ]);
     }
     releaseSummary();
     await waitFor(
@@ -605,6 +667,9 @@ async function observeNativeFollowUpCancellation(
       pendingAfterAdmission,
       pendingDuringStall,
       modelCallsDuringStall,
+      pendingAfterCancel,
+      modelCallsAfterCancel,
+      postCancelGuardMessages,
       turn: turnOutcome,
       errorEvents: events.filter((event) => event.type === 'error').length,
       continuationReachedModel: fx.script.calls.some(
@@ -1376,6 +1441,17 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.afterSettleDelivered).toBe(1);
       expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
+      // r7: the zero-premature-delivery interval is pinned AFTER cancellation
+      // while the transport is still held: work stays owed on the actual
+      // surface, nothing reached the model, and fresh execution is refused.
+      expect(observation.queuedSettledAfterCancel).toBe(false);
+      expect(observation.queuedModelCallsAfterCancel).toBe(0);
+      expect(observation.continuationCallsAfterCancel).toBe(0);
+      expect(observation.postCancelGuardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
     });
 
     it('late terminal under narrow cancellation: the run recovers and no terminal duplicates publish', async () => {
@@ -1410,6 +1486,17 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.afterSettleDelivered).toBe(1);
       expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
+      // r7: the zero-premature-delivery interval is pinned AFTER cancellation
+      // while the transport is still held: work stays owed on the actual
+      // surface, nothing reached the model, and fresh execution is refused.
+      expect(observation.queuedSettledAfterCancel).toBe(false);
+      expect(observation.queuedModelCallsAfterCancel).toBe(0);
+      expect(observation.continuationCallsAfterCancel).toBe(0);
+      expect(observation.postCancelGuardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
     });
 
     it('explicit stop context: dispose aborts the live stream, rejects queued work, and releases the session', async () => {
@@ -1635,6 +1722,16 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.summarySettledByAbort).toBe(false);
       expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
+      // r7: the held-transport interval is pinned AFTER cancellation too: the
+      // native queue still owes the message on its real surface, nothing
+      // reached the model, and fresh execution is refused.
+      expect(observation.pendingAfterCancel).toBe(1);
+      expect(observation.modelCallsAfterCancel).toBe(0);
+      expect(observation.postCancelGuardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
     });
   });
 

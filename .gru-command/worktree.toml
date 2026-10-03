@@ -52,7 +52,7 @@ native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f0
 compaction-timeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pi-adapter.test.ts test/chat-server.test.ts test/suite-shape.test.ts"
 # W5 LAN-phone replay-barrier repair: the real-socket phone replay test,
 # runnable via the scheduler so the barrier fix has committed evidence.
-lan-phone-w5 = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/lan-phone-raw-client.test.ts"
+lan-phone-w5 = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/lan-phone-raw-client.test.ts"
 lens-unused-neutral = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-signals.test.ts src/lib/board-protocol.test.ts"
 lens-unused-neutral-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=43e437a2e61b0c25351ed6147639aefbac4ccd77; root="$PWD"; prep=_bmad-output/ops-readiness-repair-20261002; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-lens-unused-neutral.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; git show "$headrev":web/src/lib/board-signals.test.ts > "$d/web/src/lib/board-signals.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/lens-unused-neutral-baseline.last-snapshot.txt"; cd "$d" && node tools/patch-vitest-rpc-timeout.mjs && cd "$d/web" && node "$root/node_modules/vitest/vitest.mjs" run src/ui/board.test.ts src/lib/board-signals.test.ts'
 lens-unused-neutral-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=lens-pills"
@@ -108,6 +108,12 @@ board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && .
 # default ceiling so a FULL timeout can be classified (isolation pass vs
 # deterministic fail); it changes no test, timeout, assertion or gate.
 t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
+
+# r7 timeout-cliff checks: the two 30s test-body timeouts from the d1395b8
+# FULL, run under their unchanged deadline. The install one-liner scenarios
+# and the two T4 reconciliation scenarios are each split so no single test
+# body carries two full installer cycles / two full round fixtures.
+r7-timeout-cliff = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/install-one-line.test.ts test/perkins-builtin-wave.test.ts -t \"restarts only an owned service|refuses a foreign unit with the same public name|does not record a reconciled delivery\""
 
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
