@@ -2369,7 +2369,17 @@ export class LedgerApi {
   }
 
   listObligations(
-    opts: { jobId?: string; state?: ObligationState; limit?: number; cursor?: number } = {},
+    opts: {
+      jobId?: string;
+      state?: ObligationState;
+      /** Multi-state filter for lifecycle sweeps (exactly one of
+       * `state`/`states` may be given). */
+      states?: readonly ObligationState[];
+      limit?: number;
+      cursor?: number;
+      /** Inclusive rowid ceiling: a stable watermark for paged sweeps. */
+      maxRowid?: number;
+    } = {},
   ): readonly ObligationRecord[] {
     // Bounded by default and hard-capped (ruling E): a reconcile/adoption
     // pass never scans unbounded, and a cursor pages past the cap.
@@ -2380,13 +2390,24 @@ export class LedgerApi {
       where.push('job_id = ?');
       params.push(opts.jobId);
     }
-    if (opts.state !== undefined) {
+    if (opts.states !== undefined) {
+      if (opts.states.length === 0) throw new Error('listObligations "states" filter must not be empty');
+      for (const state of opts.states) {
+        if (!isObligationState(state)) throw new Error(`listObligations got unknown obligation state "${state}"`);
+      }
+      where.push(`state IN (${opts.states.map(() => '?').join(', ')})`);
+      params.push(...opts.states);
+    } else if (opts.state !== undefined) {
       where.push('state = ?');
       params.push(opts.state);
     }
     if (opts.cursor !== undefined) {
       where.push('rowid > ?');
       params.push(opts.cursor);
+    }
+    if (opts.maxRowid !== undefined) {
+      where.push('rowid <= ?');
+      params.push(opts.maxRowid);
     }
     const sql = `SELECT rowid AS _rowid, * FROM job_obligations${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY rowid LIMIT ?`;
     return (this.db.prepare(sql).all(...(params as never[]), limit) as Row[]).map((row) =>
@@ -2916,8 +2937,8 @@ export class LedgerApi {
   }): { readonly superseded: readonly ObligationRecord[]; readonly successors: readonly ObligationRecord[] } {
     return this.transaction(() => {
       if (this.getJob(input.jobId) === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
-      const applicable = this.listObligations({ jobId: input.jobId, limit: 1000 }).filter(
-        (row) => (row.state === 'open' || row.state === 'waiting') && row.lastOriginSeq <= input.newerThanSeq,
+      const applicable = this.listApplicableObligations(input.jobId, ['open', 'waiting']).filter(
+        (row) => row.lastOriginSeq <= input.newerThanSeq,
       );
       const superseded: ObligationRecord[] = [];
       const successors: ObligationRecord[] = [];
@@ -3244,23 +3265,57 @@ export class LedgerApi {
   /** Suspend the job's applicable obligations (open/waiting). Used by the
    * parked transition; explicit human/chief resume re-opens. */
   private suspendApplicableObligations(jobId: string, reason: string): void {
-    for (const row of this.listObligations({ jobId, limit: 1000 })) {
-      if (row.state === 'open' || row.state === 'waiting') {
-        this.suspendObligation(row.id, reason);
-      }
+    for (const row of this.listApplicableObligations(jobId, ['open', 'waiting'])) {
+      this.suspendObligation(row.id, reason);
     }
   }
 
   /** Close the job's applicable obligations (open/waiting/suspended) on a
    * terminal transition — settled rows and history stay untouched. */
   private closeApplicableObligations(jobId: string, terminal: 'done' | 'merged'): void {
-    for (const row of this.listObligations({ jobId, limit: 1000 })) {
-      if (row.state === 'open' || row.state === 'waiting' || row.state === 'suspended') {
-        this.settleObligation({
-          obligationId: row.id,
-          settlement: { kind: 'job-terminal', jobStatus: terminal },
-        });
-      }
+    for (const row of this.listApplicableObligations(jobId, ['open', 'waiting', 'suspended'])) {
+      this.settleObligation({
+        obligationId: row.id,
+        settlement: { kind: 'job-terminal', jobStatus: terminal },
+      });
+    }
+  }
+
+  /**
+   * Every obligation of one job matching a state set, read in bounded
+   * state-filtered cursor pages up to a rowid watermark captured first
+   * (r6 warning): a long settled/closed history prefix must never hide
+   * newer live debt from the whole-job lifecycle sweeps. Callers run this
+   * inside the status transaction, so the watermark keeps the page set
+   * stable and every row is visited exactly once. */
+  private listApplicableObligations(
+    jobId: string,
+    states: readonly ObligationState[],
+  ): readonly ObligationRecord[] {
+    const ceilingRow = this.db
+      .prepare('SELECT MAX(rowid) AS ceiling FROM job_obligations WHERE job_id = ?')
+      .get(jobId) as Row | undefined;
+    const ceiling = ceilingRow?.ceiling;
+    if (ceiling === null || ceiling === undefined) return [];
+    const watermark = Number(ceiling);
+    const pageSize = 200;
+    const rows: ObligationRecord[] = [];
+    let cursor = 0;
+    for (;;) {
+      const page = this.listObligations({
+        jobId,
+        states,
+        limit: pageSize,
+        cursor,
+        maxRowid: watermark,
+      });
+      rows.push(...page);
+      if (page.length < pageSize) return rows;
+      const last = page[page.length - 1];
+      if (last === undefined) return rows;
+      const rowid = this.obligationRowid(last.id);
+      if (rowid === null) return rows; // defensive: a listed row always has its rowid
+      cursor = rowid;
     }
   }
 

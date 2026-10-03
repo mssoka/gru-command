@@ -624,6 +624,75 @@ describe('obligations — restart persistence, reclassification, authority valid
     expect(later?.state).toBe('open');
   });
 
+  it('lifecycle sweeps reach live debt behind a long settled history prefix (r6 warning)', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle, { bus: new EventBus() });
+    const ts = '2026-10-03T00:00:00.000Z';
+    const insert = db.handle.prepare(
+      `INSERT INTO job_obligations
+         (id, job_id, logical_step, incident_key, generation, description, category, next_action, wake_condition,
+          authority, firing_rule, state, settlement, due_at, receipt_kind, deadline_at, receipt_correlation,
+          recorded_receipts, observations, plan_revision, first_origin_seq, last_origin_seq, superseded_by, claim, claim_log,
+          created_at, updated_at)
+       VALUES (?, ?, 'review', ?, 1, NULL, '{"kind":"known","category":"review-verdict"}',
+               '{"kind":"gru-decision","decision":"history"}', '{"kind":"sweep"}',
+               NULL, 'review-verdict-gru-decision', 'settled', '{"kind":"cancelled","reason":"history"}',
+               NULL, NULL, NULL, NULL, '[]', 1, 0, 1, 1, NULL, NULL, '[]', ?, ?)`,
+    );
+    const seedHistory = (jobId: string): void => {
+      db.handle.exec('BEGIN');
+      for (let i = 0; i < 1000; i += 1) {
+        insert.run(`${jobId}:review:history-${i}`, jobId, `history-${i}`, ts, ts);
+      }
+      db.handle.exec('COMMIT');
+    };
+    const liveObservation = (jobId: string, incidentKey: string): void => {
+      api.recordBlockedObservation(jobId, {
+        logicalStep: 'review',
+        category: { kind: 'known', category: 'review-verdict' },
+        incidentKey,
+        observedAtSeq: api.latestEventSeq(),
+      });
+    };
+
+    // Parking: the live row sits behind 1,000 settled history rows.
+    api.addJob({ id: 'job-prefix-park', repo: 'r', title: 'park prefix' });
+    api.setJobStatus('job-prefix-park', 'working');
+    seedHistory('job-prefix-park');
+    liveObservation('job-prefix-park', 'live-park');
+    const parkRow = api.listObligations({ jobId: 'job-prefix-park' }).find((row) => row.incidentKey === 'live-park')!;
+    expect(parkRow.state).toBe('open');
+    api.setJobStatus('job-prefix-park', 'parked');
+    expect(api.getObligation(parkRow.id)?.state).toBe('suspended');
+
+    // Terminal closure: same shape, closed as job-terminal.
+    api.addJob({ id: 'job-prefix-done', repo: 'r', title: 'done prefix' });
+    api.setJobStatus('job-prefix-done', 'working');
+    seedHistory('job-prefix-done');
+    liveObservation('job-prefix-done', 'live-done');
+    const doneRow = api.listObligations({ jobId: 'job-prefix-done' }).find((row) => row.incidentKey === 'live-done')!;
+    api.setJobStatus('job-prefix-done', 'done');
+    expect(api.getObligation(doneRow.id)?.state).toBe('closed');
+    expect(api.getObligation(doneRow.id)?.settlement).toMatchObject({ kind: 'job-terminal', jobStatus: 'done' });
+
+    // Invalidation: the live continuation is superseded onto a successor.
+    api.addJob({ id: 'job-prefix-inv', repo: 'r', title: 'invalidate prefix' });
+    api.setJobStatus('job-prefix-inv', 'working');
+    seedHistory('job-prefix-inv');
+    liveObservation('job-prefix-inv', 'live-inv');
+    const invRow = api.listObligations({ jobId: 'job-prefix-inv' }).find((row) => row.incidentKey === 'live-inv')!;
+    const result = api.invalidateStaleContinuations({
+      jobId: 'job-prefix-inv',
+      newerThanSeq: invRow.lastOriginSeq,
+      reason: 'head moved past the fenced continuation',
+    });
+    expect(result.superseded.map((row) => row.id)).toContain(invRow.id);
+    expect(result.successors).toHaveLength(1);
+    expect(api.getObligation(invRow.id)?.state).toBe('closed');
+    expect(api.getObligation(result.successors[0]!.id)?.state).toBe('open');
+  });
+
   it('authority is validated against LEDGER FACTS — an unverifiable reference is non-executable (repair E)', () => {
     const api = new LedgerApi(new LedgerDb(tmpDir()).handle, { bus: new EventBus() });
     api.addJob({ id: 'job-j', repo: 'r', title: 'Job J' });
