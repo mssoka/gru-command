@@ -486,6 +486,37 @@ describe('harness diagnostics', () => {
       expect(splitRendered, `escaped single split ${split}`).not.toContain('gamma');
     }
 
+    // Short credential prefixes (Perkins r6): a fragment shorter than the
+    // old length threshold must still be redacted, and every split point of
+    // a short bearer/Basic or prefix token stays clean.
+    trackChildProcess(
+      fakeChild({ pid: 773_001, exitCode: 0, stderr: fakeStream('Bearer ABCDEFG', 'HIJKLMNOP\n') }),
+      { label: 'short bearer split child', scope },
+    );
+    const shortBearerRendered = renderFailureDiagnostics(scope, new Error('short bearer check'));
+    expect(shortBearerRendered).not.toContain('ABCDEFG');
+    expect(shortBearerRendered).not.toContain('HIJKLMNOP');
+    expect(redactDiagnosticText('Basic dTpw')).not.toContain('dTpw');
+    let shortPid = 773_100;
+    for (const shape of ['ghp_QQQQ', 'sk-ZZZZ', 'AKIAWWWW', 'eyJab.eyJcd.eyJef']) {
+      for (let split = 1; split < shape.length; split += 1) {
+        shortPid += 1;
+        trackChildProcess(
+          fakeChild({
+            pid: shortPid,
+            exitCode: 0,
+            stderr: fakeStream(shape.slice(0, split), shape.slice(split)),
+          }),
+          { label: `short prefix split ${split}`, scope },
+        );
+        const renderedSplit = renderFailureDiagnostics(scope, new Error('short prefix check'));
+        const leaked = Array.from({ length: shape.length - 3 }, (_, index) => shape.slice(index)).some(
+          (suffix) => renderedSplit.includes(suffix),
+        );
+        expect(leaked, `${shape} split ${split}`).toBe(false);
+      }
+    }
+
     // JSON-escaped credentials in log records.
     const jsonEscaped = String.raw`{\"token\":\"JSON-secret-123456\"}`;
     expect(redactDiagnosticText(jsonEscaped)).not.toContain('JSON-secret-123456');
