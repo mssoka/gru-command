@@ -422,7 +422,7 @@ describe('board v6 — dense job rows', () => {
 
   it('renders one row pair: line 1 dot/title/status, line 2 branch/ages/PR link', () => {
     const view = new BoardView(() => {});
-    view.render(snapshot({ jobs: [baseJob({ prUrl: 'https://example.invalid/pr/7' })] }));
+    view.render(snapshot({ jobs: [baseJob({ prUrl: 'https://github.com/acme/demo/pull/7' })] }));
     const row = document.querySelector<HTMLElement>('.board-job');
     if (row === null) throw new Error('row missing');
     expect(row.dataset.jobId).toBe('job-1');
@@ -439,9 +439,11 @@ describe('board v6 — dense job rows', () => {
     expect(meta?.querySelector('.board-job__branch')?.textContent).toContain('gru/job-1');
     expect(meta?.querySelector('.board-job__lane-age')?.textContent).toMatch(/^heist \d+[smhd]$/);
     expect(meta?.querySelector('.board-job__agent-age')?.textContent).toMatch(/^minion \d+[smhd]$/);
-    expect(meta?.querySelector<HTMLAnchorElement>('.board-job__pr')?.getAttribute('href')).toBe(
-      'https://example.invalid/pr/7',
-    );
+    const pr = meta?.querySelector<HTMLAnchorElement>('.board-job__pr');
+    expect(pr?.getAttribute('href')).toBe('https://github.com/acme/demo/pull/7');
+    expect(pr?.textContent).toBe('PR #7 ↗');
+    expect(pr?.target).toBe('_blank');
+    expect(pr?.rel).toBe('noreferrer');
 
     // No detail nodes exist until the row is expanded.
     expect(row.querySelector('.board-job__body')).toBeNull();
@@ -476,9 +478,41 @@ describe('board v6 — dense job rows', () => {
     expect(jobFailing(baseJob({ status: 'done', rounds: [] }))).toBe(false);
   });
 
+  it("labels each heist's PR link with its own canonical number; unprovable or absent URLs stay generic", () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        repos: [
+          {
+            name: 'demo',
+            jobs: [
+              baseJob({ id: 'gh', prUrl: 'https://github.com/acme/demo/pull/138' }),
+              baseJob({ id: 'gl', prUrl: 'https://gitlab.example.test/group/demo/-/merge_requests/42' }),
+              baseJob({ id: 'generic', prUrl: 'https://example.invalid/pr/43' }),
+              baseJob({ id: 'none', prUrl: null }),
+            ],
+          },
+        ],
+      }),
+    );
+    const rows = [...document.querySelectorAll<HTMLElement>('.board-job')];
+    const read = (id: string): { readonly label: string | null; readonly href: string | null } => {
+      const row = rows.find((candidate) => candidate.dataset.jobId === id);
+      if (row === undefined) throw new Error(`row ${id} missing`);
+      const link = row.querySelector<HTMLAnchorElement>('.board-job__pr');
+      return { label: link?.textContent ?? null, href: link?.getAttribute('href') ?? null };
+    };
+    // Each heist shows its OWN number (never a shared/stale constant) and
+    // the href stays exactly the URL the snapshot carried.
+    expect(read('gh')).toEqual({ label: 'PR #138 ↗', href: 'https://github.com/acme/demo/pull/138' });
+    expect(read('gl')).toEqual({ label: 'PR #42 ↗', href: 'https://gitlab.example.test/group/demo/-/merge_requests/42' });
+    expect(read('generic')).toEqual({ label: 'PR ↗', href: 'https://example.invalid/pr/43' });
+    expect(read('none')).toEqual({ label: null, href: null });
+  });
+
   it('expands inline from a click anywhere on the summary and collapses again; the PR link does not toggle', () => {
     const view = new BoardView(() => {});
-    view.render(snapshot({ jobs: [baseJob({ prUrl: 'https://example.invalid/pr/7' })] }));
+    view.render(snapshot({ jobs: [baseJob({ prUrl: 'https://github.com/acme/demo/pull/7' })] }));
     const row = document.querySelector<HTMLElement>('.board-job');
     if (row === null) throw new Error('row missing');
     const control = row.querySelector<HTMLButtonElement>('.board-job__toggle');
@@ -493,9 +527,11 @@ describe('board v6 — dense job rows', () => {
     expect(row.querySelector('.board-job__chevron')?.textContent).toBe('▾');
 
     const pr = row.querySelector<HTMLAnchorElement>('.board-job__pr');
+    expect(pr?.textContent).toBe('PR #7 ↗');
     pr?.addEventListener('click', (event) => event.preventDefault());
     pr?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
     expect(row.dataset.expanded).toBe('true');
+    expect(pr?.textContent).toBe('PR #7 ↗');
 
     control.click();
     expect(row.dataset.expanded).toBe('false');
