@@ -99,33 +99,39 @@ function appendTail(tracked, streamName, chunk) {
     // The previous chunk ended inside a credential value. Discard the rest
     // of that credential's line fail-closed (the reviewer-sanctioned
     // fallback): nothing from the continuation — quoted or not, with any
-    // embedded whitespace — is ever rendered. A newline resolves the state;
-    // only the following line resumes normal processing.
+    // embedded whitespace — is ever rendered. A newline resolves the state
+    // and is kept, so the following line resumes on its own line.
     const newline = text.indexOf('\n');
     if (newline === -1) {
       text = '';
       stillOpen = true;
     } else {
-      text = text.slice(newline + 1);
+      text = text.slice(newline);
     }
     tracked.openCredential[streamName] = false;
   }
   const combined = tracked.output[streamName] + text;
+  // A value the streaming detector sees as unfinished is masked BEFORE it
+  // is retained: whatever opens continuation suppression is itself removed,
+  // so no fragment can be kept while its continuation is discarded,
+  // whether or not the redactor below would have matched it. JS `$` (no
+  // `m` flag) matches only at the very end, so a newline-terminated value
+  // is complete and never opens the state.
+  const open = UNTERMINATED_VALUE.test(combined);
+  const masked = open ? combined.replace(UNTERMINATED_VALUE, maskUnterminatedValue) : combined;
   // Redact BEFORE trimming: the retained tail is always sanitized text, so
   // a credential pair split across chunks is redacted the moment its second
   // half arrives, and no trim can ever cut a label away from its value.
-  const redacted = redactDiagnosticText(combined);
+  const redacted = redactDiagnosticText(masked);
   const bounded = redacted.length > OUTPUT_TAIL_LIMIT ? redacted.slice(-OUTPUT_TAIL_LIMIT) : redacted;
   if (combined.length > OUTPUT_TAIL_LIMIT) tracked.outputTruncated[streamName] = true;
   tracked.output[streamName] = bounded;
-  tracked.openCredential[streamName] = stillOpen || endsWithUnterminatedValue(combined);
+  tracked.openCredential[streamName] = stillOpen || open;
 }
 
-function endsWithUnterminatedValue(text) {
-  // `$` also matches before a single trailing newline, and a newline IS a
-  // terminator; probe without it so completed values do not stay "open".
-  const probe = text.endsWith('\n') ? text.slice(0, -1) : text;
-  return UNTERMINATED_VALUE.test(probe);
+/** Keep an unfinished credential's label or auth scheme; mask its value. */
+function maskUnterminatedValue(_match, label, scheme) {
+  return `${label ?? scheme ?? ''}[REDACTED]`;
 }
 
 /**
@@ -172,31 +178,37 @@ export function trackChildProcess(child, { label, captureOutput = true, scope } 
   return tracked;
 }
 
+// Unquoted label values run to whitespace or a delimiter. A backslash is part
+// of the value unless it escapes a quote (a JSON-escaped closing delimiter),
+// so `password=abcd\efgh` redacts whole instead of exposing `\efgh`.
 const SECRET_LABEL =
-  /(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:"((?:[^"\\\n]|\\.){4,})"|\\"((?:[^"\\\n]|\\.){4,})\\"|'((?:[^'\\\n]|\\.){4,})'|\\'((?:[^'\\\n]|\\.){4,})\\'|(?:(?:Bearer|Basic)\s+)?(?!\[REDACTED\])(?!(?:Bearer|Basic)(?:\s|$))([^\s"',;}\\\]]{4,}))/gi;
+  /(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:"((?:[^"\\\n]|\\.){4,})"|\\"((?:[^"\\\n]|\\.){4,})\\"|'((?:[^'\\\n]|\\.){4,})'|\\'((?:[^'\\\n]|\\.){4,})\\'|(?:(?:Bearer|Basic)\s+)?(?!\[REDACTED\])(?!(?:Bearer|Basic)(?:\s|$))((?:[^\s"',;}\\\]]|\\(?!["'])){4,}))/gi;
 // Fail-closed leftover: a label whose value is short, quoted-but-unterminated
 // (to end of line) or otherwise outside the specific shapes above still
 // redacts rather than exposing the remainder.
 const SECRET_OPEN =
-  /(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?!(?:Bearer|Basic)(?:\s|$))(?:\\?["'][^\n]*|[^\s"',;}\\\]]{1,})/gi;
+  /(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?!(?:Bearer|Basic)(?:\s|$))(?:\\?["'][^\n]*|(?:[^\s"',;}\\\]]|\\(?!["']))+)/gi;
 
 // Streaming fail-closed state: a value that reached the end of the captured
 // text without a delimiter may continue in the next chunk; the rest of that
-// credential's line is then discarded rather than rendered naked.
+// credential's line is then discarded rather than rendered naked, and the
+// match itself is masked before retention (group 1: label, group 2: auth
+// scheme; both kept).
 const UNTERMINATED_VALUE =
-  /(?:\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:\\?"(?:[^"\\\n]|\\.)*\\?$|\\?'(?:[^'\\\n]|\\.)*\\?$|[^\s"',;}\]]+)$|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+$|\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]+$|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$|\bAKIA[0-9A-Z]+$/i;
-// Thresholds MUST match the streaming detector (any positive length): a
-// short prefix is still a credential fragment and must never be retained.
-const BEARER_TOKEN = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
-const SECRET_VALUE = /\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]+/g;
-const JWT = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g;
-const AWS_KEY = /\bAKIA[0-9A-Z]+/g;
+  /(?:(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:\\?"(?:[^"\\\n]|\\.)*\\?|\\?'(?:[^'\\\n]|\\.)*\\?|[^\s"',;}\]]+)|\b((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]+|\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]+|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|\bAKIA[0-9A-Z]+)$/i;
+// Shapes MUST agree with the streaming detector — any positive length, the
+// same case-insensitivity — so a complete value redacts exactly like an
+// unfinished one is masked. The auth scheme is kept as written.
+const BEARER_TOKEN = /\b((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]+/gi;
+const SECRET_VALUE = /\b(?:sk|gho|ghp|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]+/gi;
+const JWT = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/gi;
+const AWS_KEY = /\bAKIA[0-9A-Z]+/gi;
 
 /** Redact credential-shaped values; safe for bounded child output tails. */
 export function redactDiagnosticText(text) {
   return String(text)
     .replace(SECRET_LABEL, '$1[REDACTED]')
-    .replace(BEARER_TOKEN, 'Bearer [REDACTED]')
+    .replace(BEARER_TOKEN, '$1[REDACTED]')
     .replace(SECRET_VALUE, '[REDACTED]')
     .replace(JWT, '[REDACTED]')
     .replace(AWS_KEY, '[REDACTED]')

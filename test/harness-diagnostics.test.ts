@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   FixtureStepTimeoutError,
   activateTestScope,
+  createTestScope,
   currentTestScope,
   deactivateTestScope,
   disposeScopeProcesses,
@@ -486,37 +487,6 @@ describe('harness diagnostics', () => {
       expect(splitRendered, `escaped single split ${split}`).not.toContain('gamma');
     }
 
-    // Short credential prefixes (Perkins r6): a fragment shorter than the
-    // old length threshold must still be redacted, and every split point of
-    // a short bearer/Basic or prefix token stays clean.
-    trackChildProcess(
-      fakeChild({ pid: 773_001, exitCode: 0, stderr: fakeStream('Bearer ABCDEFG', 'HIJKLMNOP\n') }),
-      { label: 'short bearer split child', scope },
-    );
-    const shortBearerRendered = renderFailureDiagnostics(scope, new Error('short bearer check'));
-    expect(shortBearerRendered).not.toContain('ABCDEFG');
-    expect(shortBearerRendered).not.toContain('HIJKLMNOP');
-    expect(redactDiagnosticText('Basic dTpw')).not.toContain('dTpw');
-    let shortPid = 773_100;
-    for (const shape of ['ghp_QQQQ', 'sk-ZZZZ', 'AKIAWWWW', 'eyJab.eyJcd.eyJef']) {
-      for (let split = 1; split < shape.length; split += 1) {
-        shortPid += 1;
-        trackChildProcess(
-          fakeChild({
-            pid: shortPid,
-            exitCode: 0,
-            stderr: fakeStream(shape.slice(0, split), shape.slice(split)),
-          }),
-          { label: `short prefix split ${split}`, scope },
-        );
-        const renderedSplit = renderFailureDiagnostics(scope, new Error('short prefix check'));
-        const leaked = Array.from({ length: shape.length - 3 }, (_, index) => shape.slice(index)).some(
-          (suffix) => renderedSplit.includes(suffix),
-        );
-        expect(leaked, `${shape} split ${split}`).toBe(false);
-      }
-    }
-
     // JSON-escaped credentials in log records.
     const jsonEscaped = String.raw`{\"token\":\"JSON-secret-123456\"}`;
     expect(redactDiagnosticText(jsonEscaped)).not.toContain('JSON-secret-123456');
@@ -560,6 +530,42 @@ describe('harness diagnostics', () => {
     expect(redactDiagnosticText(escapedQuote)).not.toContain('def');
     // An unterminated quoted value fails closed rather than exposing the rest.
     expect(redactDiagnosticText('token="unterminated-secret')).not.toContain('unterminated-secret');
+  });
+
+  it('masks every detector-recognized credential at every split point and keeps the next line (Perkins r6)', () => {
+    // Each record is streamed as two chunks split at every boundary (0 and
+    // length are the single-chunk forms) into a fresh scope. The rendered
+    // tail must be EXACTLY the masked form: no fragment of the value, however
+    // short, odd-cased or backslashed, and the line after the credential
+    // survives intact on its own line.
+    const cases: ReadonlyArray<readonly [record: string, expectedTail: string]> = [
+      ['Bearer ABCDEFGHIJKLMNOP\nnext-line-kept\n', 'Bearer [REDACTED] | next-line-kept'],
+      ['Basic dTpw\nnext-line-kept\n', 'Basic [REDACTED] | next-line-kept'],
+      ['ghp_QQQQ\nnext-line-kept\n', '[REDACTED] | next-line-kept'],
+      ['sk-ZZZZ\nnext-line-kept\n', '[REDACTED] | next-line-kept'],
+      ['AKIAWWWW\nnext-line-kept\n', '[REDACTED] | next-line-kept'],
+      ['eyJab.eyJcd.eyJef\nnext-line-kept\n', '[REDACTED] | next-line-kept'],
+      // The streaming detector is case-insensitive; the redactor agrees.
+      ['GHP_QQQQ\nnext-line-kept\n', '[REDACTED] | next-line-kept'],
+      ['akiaWWWW\nnext-line-kept\n', '[REDACTED] | next-line-kept'],
+      ['EYJab.EYJcd.EYJef\nnext-line-kept\n', '[REDACTED] | next-line-kept'],
+      // Unquoted labeled values containing a backslash.
+      ['token=\\abcdefgh\nnext-line-kept\n', 'token=[REDACTED] | next-line-kept'],
+      ['password=abcd\\efgh\nnext-line-kept\n', 'password=[REDACTED] | next-line-kept'],
+    ];
+    for (const [record, expectedTail] of cases) {
+      for (let split = 0; split <= record.length; split += 1) {
+        const scope = createTestScope({ file: 'split.test.ts', name: 'split check' });
+        trackChildProcess(
+          fakeChild({ pid: 774_001, exitCode: 0, stderr: fakeStream(record.slice(0, split), record.slice(split)) }),
+          { label: 'split child', scope },
+        );
+        const tailLine = renderFailureDiagnostics(scope, new Error('split check'))
+          .split('\n')
+          .find((line) => line.includes('stderr tail'));
+        expect(tailLine?.trim(), `${JSON.stringify(record)} split ${split}`).toBe(`stderr tail: ${expectedTail}`);
+      }
+    }
   });
 
   it('bounds an owned command past its deadline and reaps it (Perkins r1)', async () => {
