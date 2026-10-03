@@ -661,8 +661,8 @@ describe('obligations — restart persistence, reclassification, authority valid
     api.setJobStatus('job-prefix-park', 'working');
     seedHistory('job-prefix-park');
     liveObservation('job-prefix-park', 'live-park');
-    const parkRow = api.listObligations({ jobId: 'job-prefix-park' }).find((row) => row.incidentKey === 'live-park')!;
-    expect(parkRow.state).toBe('open');
+    const parkRow = api.listObligations({ jobId: 'job-prefix-park', states: ['open'] })[0]!;
+    expect(parkRow.incidentKey).toBe('live-park');
     api.setJobStatus('job-prefix-park', 'parked');
     expect(api.getObligation(parkRow.id)?.state).toBe('suspended');
 
@@ -671,7 +671,8 @@ describe('obligations — restart persistence, reclassification, authority valid
     api.setJobStatus('job-prefix-done', 'working');
     seedHistory('job-prefix-done');
     liveObservation('job-prefix-done', 'live-done');
-    const doneRow = api.listObligations({ jobId: 'job-prefix-done' }).find((row) => row.incidentKey === 'live-done')!;
+    const doneRow = api.listObligations({ jobId: 'job-prefix-done', states: ['open'] })[0]!;
+    expect(doneRow.incidentKey).toBe('live-done');
     api.setJobStatus('job-prefix-done', 'done');
     expect(api.getObligation(doneRow.id)?.state).toBe('closed');
     expect(api.getObligation(doneRow.id)?.settlement).toMatchObject({ kind: 'job-terminal', jobStatus: 'done' });
@@ -681,7 +682,8 @@ describe('obligations — restart persistence, reclassification, authority valid
     api.setJobStatus('job-prefix-inv', 'working');
     seedHistory('job-prefix-inv');
     liveObservation('job-prefix-inv', 'live-inv');
-    const invRow = api.listObligations({ jobId: 'job-prefix-inv' }).find((row) => row.incidentKey === 'live-inv')!;
+    const invRow = api.listObligations({ jobId: 'job-prefix-inv', states: ['open'] })[0]!;
+    expect(invRow.incidentKey).toBe('live-inv');
     const result = api.invalidateStaleContinuations({
       jobId: 'job-prefix-inv',
       newerThanSeq: invRow.lastOriginSeq,
