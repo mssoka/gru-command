@@ -23,10 +23,15 @@ export interface StubTurn {
   readonly thinking?: readonly string[];
   /** Keep the turn open until this resolves (single-writer tests). */
   readonly hold?: Promise<void>;
+  /** With `hold`: settle the held stream when the request signal aborts,
+   * ending it with an aborted message like a real provider transport. */
+  readonly honorAbort?: boolean;
   /** Fail the turn with an error after the deltas. */
   readonly error?: string;
   /** Emit a tool call (the session executes the tool, then calls again). */
   readonly toolCall?: { readonly id: string; readonly name: string; readonly args: Record<string, unknown> };
+  /** Reported assistant usage tokens — drives native compaction thresholds. */
+  readonly usageTokens?: number;
 }
 
 export interface StubImage {
@@ -38,6 +43,8 @@ export interface StubCall {
   readonly prompt: string;
   readonly imageCount: number;
   readonly images: readonly StubImage[];
+  /** True when a held stream settled because its request signal aborted. */
+  aborted: boolean;
 }
 
 function makeStubModel(input: readonly ('text' | 'image')[] = ['text']): Model<Api> {
@@ -66,11 +73,24 @@ function zeroUsage() {
   };
 }
 
+/** Usage with internally consistent totals (input + the one output token). */
+function countedUsage(inputTokens: number) {
+  return {
+    input: inputTokens,
+    output: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: inputTokens + 1,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
 function makeMessage(
   text: string,
   stopReason: 'stop' | 'error' | 'toolUse',
   errorMessage?: string,
   toolCall?: { id: string; name: string; args: Record<string, unknown> },
+  usageTokens?: number,
 ): AssistantMessage {
   const content: unknown[] = [];
   if (toolCall !== undefined) {
@@ -88,7 +108,7 @@ function makeMessage(
     api: 'gru-stub',
     provider: STUB_PROVIDER_ID,
     model: STUB_MODEL_ID,
-    usage: zeroUsage(),
+    usage: usageTokens !== undefined ? countedUsage(usageTokens) : zeroUsage(),
     stopReason,
     ...(errorMessage !== undefined ? { errorMessage } : {}),
     timestamp: Date.now(),
@@ -145,7 +165,7 @@ export class StubScript {
   }
 
   next(prompt: string, images: StubImage[] = []): StubTurn {
-    this.calls.push({ prompt, imageCount: images.length, images });
+    this.calls.push({ prompt, imageCount: images.length, images, aborted: false });
     return this.responder?.(prompt, this.calls.length - 1) ?? this.turns.shift() ?? { deltas: ['stub: ', 'ok'] };
   }
 }
@@ -182,8 +202,15 @@ export async function makeStubModelRuntime(
     modelsPath,
   });
   const model = makeStubModel(options.input);
-  const streamTurn = (prompt: string, images: StubImage[]): AssistantMessageEventStream => {
+  const streamTurn = (prompt: string, images: StubImage[], signal?: AbortSignal): AssistantMessageEventStream => {
     const turn = script.next(prompt, images);
+    // Fail loud on a dishonest fixture: honorAbort is meaningless without a
+    // hold to settle and a request signal to observe, and the silent
+    // fallbacks were how a wiring regression could go unnoticed.
+    if (turn.honorAbort === true && (turn.hold === undefined || signal === undefined)) {
+      throw new Error('stub honorAbort requires a hold and a request signal');
+    }
+    const call = script.calls[script.calls.length - 1]!;
     const stream = new AssistantMessageEventStream();
     const text = turn.deltas.join('');
     void (async () => {
@@ -193,6 +220,7 @@ export async function makeStubModelRuntime(
         turn.error !== undefined ? 'error' : isTool ? 'toolUse' : 'stop',
         turn.error,
         turn.toolCall,
+        turn.usageTokens,
       );
       stream.push({ type: 'start', partial: final });
       let index = 0;
@@ -224,7 +252,50 @@ export async function makeStubModelRuntime(
         }
         stream.push({ type: 'text_end', contentIndex: index, content: text, partial: final });
       }
-      if (turn.hold !== undefined) await turn.hold;
+      if (turn.hold !== undefined) {
+        if (turn.honorAbort === true && signal !== undefined) {
+          // Faithful transport: the held stream settles when the request
+          // signal aborts, ending with an aborted assistant message. The
+          // listener is detached when the hold wins, so a settled stream can
+          // never read a later abort as its own.
+          let abortedBySignal = false;
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) {
+              abortedBySignal = true;
+              resolve();
+              return;
+            }
+            const onAbort = () => {
+              abortedBySignal = true;
+              resolve();
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+            void turn.hold!.then(
+              () => {
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+              },
+              () => {
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+              },
+            );
+          });
+          if (abortedBySignal) {
+            call.aborted = true;
+            const aborted = {
+              ...final,
+              stopReason: 'aborted',
+              errorMessage: 'This operation was aborted',
+            } as unknown as AssistantMessage;
+            stream.push({ type: 'error', reason: 'aborted', error: aborted });
+            stream.end(aborted);
+            return;
+          }
+        } else {
+          await turn.hold;
+        }
+      }
       if (turn.error !== undefined) {
         stream.push({ type: 'error', reason: 'error', error: final });
         stream.end(final);
@@ -249,13 +320,13 @@ export async function makeStubModelRuntime(
       },
     },
     getModels: () => [model],
-    stream: (m: Model<Api>, context: Context) => {
+    stream: (m: Model<Api>, context: Context, options?: unknown) => {
       const { text, images } = lastUserPrompt(context);
-      return streamTurn(text, images);
+      return streamTurn(text, images, (options as { signal?: AbortSignal } | undefined)?.signal);
     },
-    streamSimple: (m: Model<Api>, context: Context, _options?: SimpleStreamOptions) => {
+    streamSimple: (m: Model<Api>, context: Context, options?: SimpleStreamOptions) => {
       const { text, images } = lastUserPrompt(context);
-      return streamTurn(text, images);
+      return streamTurn(text, images, options?.signal);
     },
   };
   runtime.registerNativeProvider(provider);

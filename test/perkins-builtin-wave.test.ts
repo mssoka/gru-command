@@ -1702,7 +1702,9 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     }
   });
 
-  it('does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)', async () => {
+  it('does not record a reconciled delivery when the ref moved during the lookup (T4a)', async () => {
+    // Split from the former composite T4 (moved + aborted in one body): each scenario runs
+    // under its own unchanged 30s budget with its assertions intact.
     const prepare = async (name: string, branch: string) => {
       const repo = makeFixtureRepo(name);
       repos.push(repo);
@@ -1724,7 +1726,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       attachOrigin(repo, branch, root);
       return { repo, ledger, port, artifacts, sessions, target, job, root };
     };
-    // (a) The movement ref advances while the reconciliation lookup is
+    // The movement ref advances while the reconciliation lookup is
     // outstanding: the receipt is preserved, never recorded as delivery.
     const moved = await prepare('perkins-t4-moved', 'feature/t4-moved');
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
@@ -1761,7 +1763,33 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(unrecorded.reason).toContain('moved while the reconciliation lookup was outstanding');
     expect(unrecorded.receipt?.reviewId).toBe('9200');
     expect(moved.ledger.latestRoundEvent(movedOutcome.round.id, 'round.posted')).toBeNull();
-    // (b) The run's abort signal fires while the lookup is outstanding.
+  });
+
+  it('does not record a reconciled delivery when the run aborted during the lookup (T4b)', async () => {
+    // Split from the former composite T4 (moved + aborted in one body): each scenario runs
+    // under its own unchanged 30s budget with its assertions intact.
+    const prepare = async (name: string, branch: string) => {
+      const repo = makeFixtureRepo(name);
+      repos.push(repo);
+      repo.git(['checkout', '-b', branch]);
+      const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+      const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+      const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+      const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+      dirs.push(root, artifacts, sessions);
+      const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+      dbs.push(db);
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      const port = new GitReviewPort(root, branch, target);
+      await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
+      const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+      ledger.setJobStatus(job.id, 'working');
+      settleLane(ledger, job.id);
+      ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
+      attachOrigin(repo, branch, root);
+      return { repo, ledger, port, artifacts, sessions, target, job, root };
+    };
+    // The run's abort signal fires while the lookup is outstanding.
     const aborted = await prepare('perkins-t4-aborted', 'feature/t4-aborted');
     const abortPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const abortReconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
@@ -1782,8 +1810,10 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const abortedOutcome = asWave(await abortedWave.runRound({ jobId: aborted.job.id }));
     expect(abortedOutcome.posted).toBe(false);
     expect(abortedOutcome.verdict).toBeNull();
-    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { reason?: string };
+    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
+    expect(unrecordedAbort.recorded).toBe(false);
     expect(unrecordedAbort.reason).toContain('aborted while the reconciliation lookup was outstanding');
+    expect(unrecordedAbort.receipt?.reviewId).toBe('9201');
     expect(aborted.ledger.latestRoundEvent(abortedOutcome.round.id, 'round.posted')).toBeNull();
   });
 });

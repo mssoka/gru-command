@@ -601,7 +601,8 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(join(target, 'local-commit.txt'))).toBe(true);
   });
 
-  it('restarts only an owned service and refuses a foreign unit with the same public name', () => {
+  it('refuses a foreign unit with the same public name', () => {
+    // Split from the former composite: the foreign refusal runs under its own unchanged 30s budget.
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const bare = tempDir('gru-command-service-update-bare-');
@@ -634,9 +635,39 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(foreign.status).toBe(1);
     expect(foreign.stderr).toContain('refusing to restart unrelated service unit');
     expect(readFileSync(unit, 'utf-8')).toContain('/someone/else');
+  });
+
+  it('restarts only an owned service unit', () => {
+    // Split from the former composite: the owned restart runs under its own unchanged 30s budget.
+    const { fixture, home } = buildFixtureRepo();
+    gitInitCommit(fixture);
+    const bare = tempDir('gru-command-service-update-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    const target = join(home, 'gru-command');
+    const instance = join(home, '.gru-command');
+    const managerLog = join(home, 'manager.log');
+    const manager = join(home, 'service-manager');
+    writeFileSync(manager, '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"\nexit 0\n', {
+      encoding: 'utf-8',
+      mode: 0o755,
+    });
+    const unit = process.platform === 'darwin'
+      ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
+      : join(home, '.config', 'systemd', 'user', 'gru-command.service');
+    const env = {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_ORIGIN: `file://${fixture}`,
+      GRU_COMMAND_TARGET: target,
+      GRU_MANAGER_LOG: managerLog,
+      GRU_COMMAND_LAUNCHCTL: manager,
+      GRU_COMMAND_SYSTEMCTL: manager,
+    };
+    expect(run(join(bare, 'install.sh'), ['--answers', '{}'], env).status).toBe(0);
 
     const renderedOwned = run(join(target, 'install.sh'), ['--print'], env);
     expect(renderedOwned.status, renderedOwned.stderr).toBe(0);
+    mkdirSync(dirname(unit), { recursive: true });
     writeFileSync(unit, renderedOwned.stdout);
     const owned = run(join(bare, 'install.sh'), [], env);
     expect(owned.status, `${owned.stdout}\n${owned.stderr}`).toBe(0);
